@@ -1,0 +1,17 @@
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+.glm5_model_lib_cache/
+.tmp_build/
+__pycache__/
+
+# Model/runtime artifacts belong in the external model repo, not this engine repo.
+/tokenizer.json
+/tensors.csv
+/glm5_scale4.gsc4
+/parts/
+*.juju

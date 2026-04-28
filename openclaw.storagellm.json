@@ -1,0 +1,32 @@
+{
+  "agents": {
+    "defaults": {
+      "model": { "primary": "storagellm/glm5.1-storage" },
+      "models": {
+        "storagellm/glm5.1-storage": { "alias": "StorageLLM" }
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "storagellm": {
+        "baseUrl": "http://127.0.0.1:8000/v1",
+        "apiKey": "sk-local",
+        "api": "openai-responses",
+        "models": [
+          {
+            "id": "glm5.1-storage",
+            "name": "GLM5.1 StorageLLM",
+            "reasoning": false,
+            "input": ["text"],
+            "contextWindow": 131072,
+            "maxTokens": 4096,
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "compat": { "requiresStringContent": true, "supportsTools": false }
+          }
+        ]
+      }
+    }
+  }
+}

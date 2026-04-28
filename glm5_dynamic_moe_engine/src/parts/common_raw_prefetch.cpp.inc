@@ -1,0 +1,210 @@
+static constexpr uint32_t GLM5_RAW_ROLE_ROUTER = 1u;
+static constexpr uint32_t GLM5_RAW_ROLE_ATTENTION = 2u;
+static constexpr uint32_t GLM5_RAW_ROLE_NORM = 4u;
+static constexpr uint32_t GLM5_RAW_ROLE_SHARED = 8u;
+static constexpr uint32_t GLM5_RAW_ROLE_EMBED = 16u;
+static constexpr uint32_t GLM5_RAW_ROLE_LM_HEAD = 32u;
+static constexpr uint32_t GLM5_RAW_ROLE_DENSE_MLP = 64u;
+
+static uint64_t raw_phase_budget_left(const glm5_pc_engine* e) {
+    if (!e || e->config.vram_budget_bytes == 0) {
+        return UINT64_MAX;
+    }
+    const uint64_t used = e->device_allocated_bytes.load();
+    return e->config.vram_budget_bytes > used ? e->config.vram_budget_bytes - used : 0;
+}
+
+static int prefetch_one_raw_span(glm5_pc_engine* e, const glm5_storage_raw_span_spec_t& s, uint8_t pool) {
+    if (!e || e->model_root.empty() || s.bytes == 0) {
+        return 0;
+    }
+    if (device_copy_raw_span(e, s, pool)) {
+        e->io_atomic.bytes_prefetched.fetch_add(s.bytes);
+        e->io_atomic.bytes_pinned_to_gpu.fetch_add(s.bytes);
+        e->io_atomic.gpu_stage_done.fetch_add(1);
+        return 1;
+    }
+    const glm5_storage_part_spec_t* part = glm5_storage_part_by_id(s.part);
+        mmap_context_t* mapped = part ? get_or_map_shard_partial_by_id(
+            e,
+            s.part,
+            resolve_model_file_path(e->model_root, part->path ? part->path : "", ""),
+            s.offset,
+            s.bytes
+        ) : nullptr;
+    const uint64_t file_size = mapped ? (uint64_t)mmap_get_size(mapped) : 0;
+    if (!mapped || !mmap_get_ptr(mapped, 0) || s.bytes > file_size) {
+        return 0;
+    }
+    bool hint_issued = false;
+    if (e->io_config.enable_mmap_prefetch) {
+        mmap_prefetch(mapped, 0, (size_t)s.bytes);
+        hint_issued = true;
+    }
+    const uint8_t* src = static_cast<const uint8_t*>(mmap_get_ptr(mapped, 0));
+    if (!src) {
+        return 0;
+    }
+    if (!hint_issued) {
+        touch_mapped_range(src, s.bytes);
+        e->io_atomic.bytes_touch_fallback.fetch_add(s.bytes);
+    }
+    e->io_atomic.bytes_prefetched.fetch_add(s.bytes);
+    e->io_atomic.bytes_disk_to_ram.fetch_add(s.bytes);
+    e->io_atomic.disk_stage_done.fetch_add(1);
+    return 1;
+}
+
+static int enqueue_raw_span_prefetch(glm5_pc_engine* e, uint32_t span_index, uint8_t pool) {
+    if (!e) {
+        return 0;
+    }
+    if (!ensure_io_ready(e)) {
+        return 0;
+    }
+    glm5_prefetch_task task{};
+    task.raw_span_index = (int32_t)span_index;
+    task.raw_pool = pool;
+    task.urgent = 1;
+    if (!enqueue_stage_or_retry(e, e->disk_stage, task)) {
+        return 0;
+    }
+    e->io_atomic.queued_requests.fetch_add(1);
+    e->disk_stage.cv.notify_one();
+    return 1;
+}
+
+static uint64_t prefetch_raw_layer_roles(
+    glm5_pc_engine* e,
+    int32_t layer,
+    uint32_t roles,
+    uint8_t pool,
+    uint64_t budget,
+    int enqueue_only = 0
+) {
+    uint64_t bytes = 0;
+    uint64_t spans = 0;
+    const uint32_t begin = glm5_storage_raw_span_find_first(layer);
+    const uint32_t end = glm5_storage_raw_span_find_end(layer);
+    for (uint32_t i = begin; i < end; ++i) {
+        const glm5_storage_raw_span_spec_t* s = glm5_storage_raw_span_at(i);
+        if (!s || (s->role & roles) == 0 || bytes >= budget || s->bytes > budget - bytes ||
+            s->bytes > raw_phase_budget_left(e)) {
+            continue;
+        }
+        const int ok = enqueue_only ?
+            enqueue_raw_span_prefetch(e, i, pool) :
+            prefetch_one_raw_span(e, *s, pool);
+        if (ok) {
+            bytes += s->bytes;
+            ++spans;
+        }
+    }
+    if (bytes) {
+        e->common_raw_prefetched_bytes.fetch_add(bytes);
+        e->common_raw_prefetched_spans.fetch_add(spans);
+    }
+    return bytes;
+}
+
+static int prefetch_fixed_core_raw(glm5_pc_engine* e) {
+    uint64_t budget = e ? e->common_vram_reserved_bytes.load() : 0;
+    uint64_t bytes = 0;
+    if (!e || !e->io_config.enable_common_raw_vram_pin || budget == 0) {
+        return 0;
+    }
+    const glm5_storage_constants_t* storage = glm5_storage_constants();
+    const int32_t norm_layer = storage ? (int32_t)storage->num_hidden_layers : 79;
+    const int32_t lm_head_layer = norm_layer + 1;
+    bytes += prefetch_raw_layer_roles(e, norm_layer, GLM5_RAW_ROLE_NORM, GLM5_DEVICE_POOL_FIXED, budget - bytes);
+    bytes += prefetch_raw_layer_roles(e, lm_head_layer, GLM5_RAW_ROLE_LM_HEAD, GLM5_DEVICE_POOL_FIXED, budget - bytes);
+    if (bytes < budget) {
+        bytes += prefetch_raw_layer_roles(e, -1, GLM5_RAW_ROLE_EMBED, GLM5_DEVICE_POOL_FIXED, budget - bytes);
+    }
+    return bytes > 0 ? 1 : 0;
+}
+
+static int prefetch_common_raw_storage(glm5_pc_engine* e) {
+    return prefetch_fixed_core_raw(e);
+}
+
+// static thread_local int tls_last_activation_layer = -1; // Removed in favor of engine member
+
+static int prefetch_moe_activation_raw(glm5_pc_engine* e, int layer) {
+    if (!e || layer < 0) {
+        return 0;
+    }
+    int previous_layer = e->last_activation_layer.load(std::memory_order_acquire);
+    while (previous_layer != layer) {
+        if (e->last_activation_layer.compare_exchange_weak(
+                previous_layer,
+                layer,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            break;
+        }
+    }
+    if (previous_layer == layer) {
+        return 1;
+    }
+    const glm5_storage_constants_t* c = glm5_storage_constants();
+    const int is_moe = c && layer >= (int)c->first_moe_layer && layer <= (int)c->last_moe_layer;
+    const uint32_t roles = GLM5_RAW_ROLE_NORM | GLM5_RAW_ROLE_ATTENTION |
+        (is_moe ? GLM5_RAW_ROLE_ROUTER : 0u);
+    const int ok = prefetch_raw_layer_roles(
+        e,
+        layer,
+        roles,
+        GLM5_DEVICE_POOL_ACTIVATION,
+        raw_phase_budget_left(e),
+        1
+    ) > 0 ? 1 : 0;
+    if (ok) {
+        // Bug #6: Single lock pass - activation_keys is small (~80 entries)
+        {
+            std::vector<CUdeviceptr> deferred_free_ptrs;
+            {
+                std::lock_guard<std::mutex> lock(e->device_mutex);
+                for (uint64_t k : e->activation_keys) {
+                    const uint32_t key_type = (uint32_t)((k >> 60) & 0xF);
+                    bool should_free = false;
+                    if (key_type == 3) {
+                        should_free = ((int)((k >> 48) & 0xFFF) != layer);
+                    } else {
+                        auto it = e->device_allocations.find(k);
+                        should_free = (it != e->device_allocations.end() && it->second.inflight_copies == 0);
+                    }
+                    if (should_free) {
+                        device_free_locked(e, k, &deferred_free_ptrs);
+                    }
+                }
+            }
+            device_free_deferred_ptrs(e, deferred_free_ptrs);
+        }
+    } else {
+        int claimed_layer = layer;
+        e->last_activation_layer.compare_exchange_strong(
+            claimed_layer,
+            -1,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+    return ok;
+}
+
+static void release_moe_activation_raw(glm5_pc_engine* e) {
+    e->last_activation_layer.store(-1);
+    device_free_pool(e, GLM5_DEVICE_POOL_ACTIVATION);
+    device_free_pool(e, GLM5_DEVICE_POOL_STREAM);
+}
+
+static void prefetch_moe_shared_compute_raw(glm5_pc_engine* e, int layer) {
+    prefetch_raw_layer_roles(
+        e,
+        layer,
+        GLM5_RAW_ROLE_SHARED,
+        GLM5_DEVICE_POOL_STREAM,
+        raw_phase_budget_left(e),
+        1
+    );
+}
