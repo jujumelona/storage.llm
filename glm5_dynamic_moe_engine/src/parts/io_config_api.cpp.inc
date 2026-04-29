@@ -60,11 +60,21 @@ int glm5_pc_engine_configure_io(glm5_pc_engine_t* engine, const glm5_io_config_t
         engine->io_config.pinned_staging_bytes = 0;
     }
     if (engine->io_config.enable_pinned_host && engine->io_config.pinned_staging_bytes > 0) {
+        const uint64_t requested_staging_bytes = engine->io_config.pinned_staging_bytes;
         engine->staging = allocate_best_staging(
-            engine->io_config.pinned_staging_bytes,
+            requested_staging_bytes,
             &engine->staging_size,
             &engine->staging_pinned
         );
+        if (!engine->staging) {
+            engine->io_config.enable_pinned_host = 0;
+            engine->io_config.pinned_staging_bytes = 0;
+            engine->io_config.enable_multistage_pipeline = 0;
+            fprintf(stderr,
+                "[storagellm] pinned staging unavailable; continuing without pinned staging "
+                "(requested=%llu bytes)\n",
+                (unsigned long long)requested_staging_bytes);
+        }
         if (engine->staging) {
             std::memset(engine->staging, 0, static_cast<size_t>(std::min<uint64_t>(engine->staging_size, 4096)));
             configure_staging_slots(engine);

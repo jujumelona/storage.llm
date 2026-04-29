@@ -59,6 +59,26 @@ static uint8_t* allocate_best_staging(uint64_t requested_bytes, uint64_t* actual
     }
     uint64_t bytes = requested_bytes;
     const uint64_t min_pinned = 1ull * 1024ull * 1024ull;
+#ifndef _WIN32
+    struct rlimit memlock_limit {};
+    if (getrlimit(RLIMIT_MEMLOCK, &memlock_limit) == 0 && memlock_limit.rlim_cur != RLIM_INFINITY) {
+        const uint64_t limit = static_cast<uint64_t>(memlock_limit.rlim_cur);
+        if (limit < min_pinned) {
+            fprintf(stderr,
+                "[storagellm] pinned staging skipped: RLIMIT_MEMLOCK=%llu bytes < %llu bytes\n",
+                (unsigned long long)limit,
+                (unsigned long long)min_pinned);
+            return nullptr;
+        }
+        if (bytes > limit) {
+            bytes = limit & ~4095ull;
+            fprintf(stderr,
+                "[storagellm] pinned staging capped by RLIMIT_MEMLOCK: requested=%llu actual=%llu\n",
+                (unsigned long long)requested_bytes,
+                (unsigned long long)bytes);
+        }
+    }
+#endif
     while (bytes >= min_pinned) {
         bool got_pinned = false;
         uint8_t* ptr = allocate_staging(bytes, &got_pinned);
