@@ -71,19 +71,18 @@ static uint8_t* allocate_best_staging(uint64_t requested_bytes, uint64_t* actual
             }
             return ptr;
         }
-        // Fix 60: Non-pinned success → free and try smaller pinned allocation
-        // Non-pinned staging defeats async DMA (cuMemcpyHtoDAsync becomes sync)
+        // Bug 12 Fix: Non-pinned success → free and try smaller pinned allocation.
+        // Non-pinned staging defeats async DMA (cuMemcpyHtoDAsync becomes sync).
+        // This ensures allocate_best_staging only returns pinned memory or NULL,
+        // preventing silent sync DMA disguised as async.
         if (ptr) {
             free_staging(ptr, bytes, false);
         }
         bytes /= 2;
     }
 
-    // Final fallback: original requested size, unpinned (honest sync path)
-    uint8_t* ptr = allocate_staging(requested_bytes, pinned);
-    if (ptr && actual_bytes) {
-        *actual_bytes = requested_bytes;
-    }
-    return ptr;
+    // Bug 12 Fix: Return NULL instead of non-pinned fallback.
+    // Callers must check staging_slot.pinned before assuming async DMA.
+    return nullptr;
 }
 

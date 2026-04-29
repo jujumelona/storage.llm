@@ -53,6 +53,7 @@ typedef struct {
     uint32_t disk_queue_depth;
     uint32_t pinned_queue_depth;
     uint32_t gpu_queue_depth;
+    uint64_t bytes_disk_hint_issued;
     glm5_io_path_t active_path;
     int pinned_host_active;
     int directstorage_active;

@@ -14,6 +14,7 @@ int glm5_pc_engine_plan_moe_prefetch(
     }
 
     std::vector<glm5_expert_prefetch_item_t> items;
+    std::lock_guard<std::mutex> plan_lock(engine->prefetch_plan_mutex);
     prefetch_plan_clear_seen(engine);
     items.reserve((size_t)selected_count + (size_t)next_count +
         (size_t)engine->io_config.topology_max_candidates);

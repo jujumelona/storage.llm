@@ -11,14 +11,14 @@ static float glm5_dot_raw_fp16_row(const uint8_t* packed, const float* x, uint32
         __m256 f1 = _mm256_cvtph_ps(h1);
         __m256 x0 = _mm256_loadu_ps(x + col);
         __m256 x1 = _mm256_loadu_ps(x + col + 8u);
-        acc0 = _mm256_fmadd_ps(f0, x0, acc0);
-        acc1 = _mm256_fmadd_ps(f1, x1, acc1);
+        acc0 = glm5_madd_ps(f0, x0, acc0);
+        acc1 = glm5_madd_ps(f1, x1, acc1);
     }
     for (; col + 7u < cols; col += 8u) {
         __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(fp16 + col));
         __m256 f = _mm256_cvtph_ps(h);
         __m256 xv = _mm256_loadu_ps(x + col);
-        acc0 = _mm256_fmadd_ps(f, xv, acc0);
+        acc0 = glm5_madd_ps(f, xv, acc0);
     }
     acc0 = _mm256_add_ps(acc0, acc1);
     // horizontal sum
@@ -68,13 +68,13 @@ static float glm5_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32
         __m256 f1 = _mm256_loadu_ps(fp32 + col + 8u);
         __m256 x0 = _mm256_loadu_ps(x + col);
         __m256 x1 = _mm256_loadu_ps(x + col + 8u);
-        acc0 = _mm256_fmadd_ps(f0, x0, acc0);
-        acc1 = _mm256_fmadd_ps(f1, x1, acc1);
+        acc0 = glm5_madd_ps(f0, x0, acc0);
+        acc1 = glm5_madd_ps(f1, x1, acc1);
     }
     for (; col + 7u < cols; col += 8u) {
         __m256 f = _mm256_loadu_ps(fp32 + col);
         __m256 xv = _mm256_loadu_ps(x + col);
-        acc0 = _mm256_fmadd_ps(f, xv, acc0);
+        acc0 = glm5_madd_ps(f, xv, acc0);
     }
     acc0 = _mm256_add_ps(acc0, acc1);
     // horizontal sum
@@ -146,7 +146,7 @@ static float glm5_dot_fp4_row(
         const uint32_t start = group * rec.info.group_size;
         const uint32_t limit = std::min<uint32_t>(start + rec.info.group_size, rec.info.cols);
 #if defined(__AVX2__)
-        // Fix 25: True SIMD nibble extraction — process 16 nibbles (8 bytes) per iteration
+        // Fix 25: True SIMD nibble extraction; process 16 nibbles (8 bytes) per iteration.
         // Each byte contains 2 nibbles: low nibble at even col, high nibble at odd col
         const __m256 vscale = _mm256_set1_ps(scale);
         __m256 vacc = _mm256_setzero_ps();
@@ -155,21 +155,22 @@ static float glm5_dot_fp4_row(
         // AVX2 gather latency on the 16-entry FP4 table.
         for (; col + 7u < limit; col += 8u) {
             uint32_t byte_offset = col / 2;
-            alignas(32) int32_t idx[8];
-            // Extract 8 nibbles from 4 bytes
-            for (int k = 0; k < 4; ++k) {
-                uint8_t b = packed[byte_offset + k];
-                idx[k * 2] = b & 0x0F;           // Low nibble
-                idx[k * 2 + 1] = (b >> 4) & 0x0F; // High nibble
-            }
-            alignas(32) float decoded[8];
-            for (int k = 0; k < 8; ++k) {
-                decoded[k] = glm5_engine::kNvFp4Table[idx[k] & 0x0F];
-            }
-            __m256 vals = _mm256_load_ps(decoded);
+            const uint8_t b0 = packed[byte_offset + 0u];
+            const uint8_t b1 = packed[byte_offset + 1u];
+            const uint8_t b2 = packed[byte_offset + 2u];
+            const uint8_t b3 = packed[byte_offset + 3u];
+            const float t0 = glm5_engine::kNvFp4Table[b0 & 0x0F];
+            const float t1 = glm5_engine::kNvFp4Table[(b0 >> 4) & 0x0F];
+            const float t2 = glm5_engine::kNvFp4Table[b1 & 0x0F];
+            const float t3 = glm5_engine::kNvFp4Table[(b1 >> 4) & 0x0F];
+            const float t4 = glm5_engine::kNvFp4Table[b2 & 0x0F];
+            const float t5 = glm5_engine::kNvFp4Table[(b2 >> 4) & 0x0F];
+            const float t6 = glm5_engine::kNvFp4Table[b3 & 0x0F];
+            const float t7 = glm5_engine::kNvFp4Table[(b3 >> 4) & 0x0F];
+            __m256 vals = _mm256_set_ps(t7, t6, t5, t4, t3, t2, t1, t0);
             vals = _mm256_mul_ps(vals, vscale);
             __m256 xv = _mm256_loadu_ps(x + col);
-            vacc = _mm256_fmadd_ps(vals, xv, vacc);
+            vacc = glm5_madd_ps(vals, xv, vacc);
         }
         // Horizontal sum
         __m128 lo = _mm256_castps256_ps128(vacc);

@@ -1,4 +1,4 @@
-#if defined(__F16C__) || (defined(_MSC_VER) && defined(__AVX2__))
+#if defined(__F16C__) && !defined(_MSC_VER)
 #include <immintrin.h>
 static float glm5_raw_fp16_to_f32(uint16_t h) {
     return _cvtsh_ss(h);

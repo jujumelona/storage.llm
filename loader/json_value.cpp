@@ -9,12 +9,19 @@ static size_t find_value(const JsonSlice& slice, const char* key) {
         return std::string::npos;
     }
     const std::string needle = std::string("\"") + key + "\"";
-    const size_t key_pos = slice.text->find(needle, slice.begin);
-    if (key_pos == std::string::npos || key_pos >= slice.end) {
-        return std::string::npos;
+    size_t pos = slice.begin;
+    for (;;) {
+        const size_t key_pos = slice.text->find(needle, pos);
+        if (key_pos == std::string::npos || key_pos >= slice.end) {
+            return std::string::npos;
+        }
+        // Verify the key is followed by ':'; otherwise this was text inside a string value.
+        const size_t colon = slice.text->find_first_not_of(" \t\r\n", key_pos + needle.size());
+        if (colon != std::string::npos && colon < slice.end && (*slice.text)[colon] == ':') {
+            return colon + 1;
+        }
+        pos = key_pos + 1;
     }
-    const size_t colon = slice.text->find(':', key_pos + needle.size());
-    return colon == std::string::npos || colon >= slice.end ? std::string::npos : colon + 1;
 }
 
 bool json_get_u64(const JsonSlice& slice, const char* key, uint64_t* out) {
@@ -22,9 +29,14 @@ bool json_get_u64(const JsonSlice& slice, const char* key, uint64_t* out) {
     if (value == std::string::npos || !out) {
         return false;
     }
+    if (value >= slice.end) return false;
     char* end = nullptr;
-    *out = std::strtoull(slice.text->c_str() + value, &end, 10);
-    return end && end != slice.text->c_str() + value;
+    const char* begin = slice.text->c_str() + value;
+    const char* limit = slice.text->c_str() + slice.end;
+    *out = std::strtoull(begin, &end, 10);
+    // Bug 1: Verify strtoull didn't read past slice boundary
+    if (!end || end == begin || end > limit) return false;
+    return true;
 }
 
 bool json_get_string(const JsonSlice& slice, const char* key, std::string* out) {

@@ -50,31 +50,38 @@ static void gpu_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                     0
                 );
                 if (ok[i] == GLM5_DEVICE_COPY_BACKPRESSURE) {
-                    // Keep pinned data! Re-enqueue to gpu_stage for retry.
-                    // Discarding to disk_stage wastes the RAM→pinned copy.
-                    glm5_prefetch_task retry = batch[i];
-                    retry.stage = GLM5_TRANSFER_STAGE_PINNED_TO_GPU;
-                    retry.urgent = 0;  // back of queue — wait for VRAM to free
-                    if (enqueue_stage_or_retry(engine, engine->gpu_stage, retry)) {
+                    // Problem 3 Fix: Give GPU 2ms to free space before discarding pinned data.
+                    // Immediate discard wastes completed RAM→pinned copy (tens of ms).
+                    // 2ms wait allows in-flight GPU copies to complete and free VRAM.
+                    {
+                        std::unique_lock<std::mutex> lk(engine->gpu_stage.mtx);
+                        engine->gpu_stage.pop_cv.wait_for(lk, std::chrono::milliseconds(2));
+                    }
+                    glm5_prefetch_task once_more = batch[i];
+                    once_more.stage = GLM5_TRANSFER_STAGE_PINNED_TO_GPU;
+                    once_more.urgent = 0;
+                    if (enqueue_stage_or_retry(engine, engine->gpu_stage, once_more)) {
                         ok[i] = 1;
                         terminal[i] = 0;
                         engine->gpu_stage.cv.notify_one();
                     } else {
-                        // gpu_stage full: release slot and fall back to disk retry
+                        // Last resort: discard pinned slot and re-queue to disk_stage
                         if (batch[i].staging_slot != UINT32_MAX) {
                             release_staging_slot(engine, batch[i].staging_slot);
                             batch[i].staging_slot = UINT32_MAX;
                         }
-                        glm5_prefetch_task disk_retry = batch[i];
-                        disk_retry.stage = GLM5_TRANSFER_STAGE_DISK_TO_RAM;
-                        disk_retry.staging_slot = UINT32_MAX;
-                        disk_retry.staging_bytes = 0;
-                        disk_retry.staging_valid = 0;
-                        disk_retry.urgent = 1;
-                        ok[i] = enqueue_stage_or_retry(engine, engine->disk_stage, disk_retry) ? 1 : 0;
+                        glm5_prefetch_task pinned_retry = batch[i];
+                        pinned_retry.stage = GLM5_TRANSFER_STAGE_RAM_TO_PINNED;
+                        pinned_retry.staging_slot = UINT32_MAX;
+                        pinned_retry.staging_bytes = 0;
+                        pinned_retry.staging_valid = 0;
+                        pinned_retry.urgent = 1;
+                        ok[i] = enqueue_stage_or_retry(engine, engine->pinned_stage, pinned_retry) ? 1 : 0;
                         if (ok[i]) {
                             terminal[i] = 0;
-                            engine->disk_stage.cv.notify_one();
+                            engine->pinned_stage.cv.notify_one();
+                        } else {
+                            engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
                 }

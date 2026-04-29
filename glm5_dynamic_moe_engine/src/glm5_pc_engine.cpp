@@ -34,6 +34,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -45,6 +49,22 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
+
+#if defined(__AVX2__)
+#if defined(__FMA__) || defined(_MSC_VER)
+#define GLM5_HAVE_FMA_INTRINSICS 1
+#else
+#define GLM5_HAVE_FMA_INTRINSICS 0
+#endif
+
+static inline __m256 glm5_madd_ps(__m256 a, __m256 b, __m256 c) {
+#if GLM5_HAVE_FMA_INTRINSICS
+    return _mm256_fmadd_ps(a, b, c);
+#else
+    return _mm256_add_ps(_mm256_mul_ps(a, b), c);
+#endif
+}
 #endif
 
 #include "storage_llm_tools.h"
@@ -74,11 +94,12 @@
 #include "parts/common_residency.cpp.inc"
 #include "parts/staging_alloc.cpp.inc"
 #include "parts/prefetch_bytes.cpp.inc"
+#include "parts/worker_caps.cpp.inc"
 #include "parts/staging_slots.cpp.inc"
 #include "parts/io_stats_helpers.cpp.inc"
+#include "parts/residency_eviction.cpp.inc"
 #include "parts/device_allocator.cpp.inc"
 #include "parts/device_tensor_copy.cpp.inc"
-#include "parts/residency_eviction.cpp.inc"
 #include "parts/device_raw_copy.cpp.inc"
 #include "parts/prefetch_model_bytes.cpp.inc"
 #include "parts/prefetch_disk.cpp.inc"
@@ -88,7 +109,6 @@
 #include "parts/io_worker_loop.cpp.inc"
 #include "parts/pinned_worker_loop.cpp.inc"
 #include "parts/gpu_worker_loop.cpp.inc"
-#include "parts/worker_caps.cpp.inc"
 #include "parts/runtime_orchestrator_workers.cpp.inc"
 #include "parts/io_worker_lifecycle.cpp.inc"
 #include "parts/enqueue_tensor_prefetch.cpp.inc"

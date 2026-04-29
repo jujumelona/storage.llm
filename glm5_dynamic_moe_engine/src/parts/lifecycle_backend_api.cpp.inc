@@ -15,6 +15,7 @@ glm5_pc_engine_t* glm5_pc_engine_create(const glm5_pc_engine_config_t* config) {
     }
     apply_common_vram_reservation(engine);
     glm5_pc_engine_configure_io(engine, nullptr);
+    ensure_cpu_row_workers(engine, 0);
     return engine;
 }
 
@@ -34,25 +35,37 @@ void glm5_pc_engine_destroy(glm5_pc_engine_t* engine) {
     }
     engine->qkv_head_state_slots.clear();
     engine->qkv_head_state_valid.clear();
+    engine->qkv_head_state_locks.clear();
     device_allocator_shutdown(engine);
     model_lib_unload(engine);
     {
-        // Fix 70: shard_mutex protects shard_mmaps (Fix 61 consistency)
-        std::lock_guard<std::mutex> lock(engine->shard_mutex);
+        std::unique_lock<std::shared_mutex> lock(engine->shard_mutex);
         for (auto& item : engine->shard_mmaps) {
             unload_mapped_shard(item.second);
         }
         engine->shard_mmaps.clear();
         engine->shard_mmaps_by_id.clear();
+        engine->shard_mmap_cvs.clear();
         engine->locked_mmaps.clear();
     }
     reset_source_mmap_slots(engine);
+    {
+        std::lock_guard<std::mutex> lock(engine->raw_file_size_cache_mutex);
+        engine->raw_file_size_cache.clear();
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        engine->raw_tensor_cache.clear();
+    }
     if (engine->scale4) {
         glm5_scale4_close(engine->scale4);
         engine->scale4 = nullptr;
     }
-    free_staging(engine->staging, engine->staging_size, engine->staging_pinned);
+    // Bug 13 Fix: Call reset_staging_slots BEFORE free_staging to prevent use-after-free.
+    // Workers may still reference staging_slots[i].buf in 5ms race window.
+    // reset_staging_slots clears in_use flags and waits for workers to exit.
     reset_staging_slots(engine);
+    free_staging(engine->staging, engine->staging_size, engine->staging_pinned);
     engine->staging = nullptr;
     engine->staging_size = 0;
     engine->staging_pinned = false;

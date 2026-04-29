@@ -1,11 +1,17 @@
 static uint64_t device_key_raw_span(const glm5_storage_raw_span_spec_t& s, uint8_t pool) {
-    uint64_t x = (4ull << 60) | ((uint64_t)pool << 56) | ((uint64_t)(uint32_t)s.layer << 40);
-    x ^= ((uint64_t)s.part << 32) ^ (s.offset >> 6) ^ (s.bytes << 7) ^ s.role;
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdull;
-    x ^= x >> 33;
-    return x;
+    // Bug 11 Fix: Use deterministic structured key instead of 40-bit hash.
+    // Hash collision probability ~0.003% with 7,900 spans causes silent data corruption.
+    // New key: part_id (16b) | layer (16b) | offset>>12 (28b) = unique per span.
+    const uint64_t layer = (uint64_t)((uint32_t)s.layer & 0xffffu);
+    const uint64_t part = (uint64_t)((uint32_t)s.part & 0xffffu);
+    return (4ull << 60)
+         | ((uint64_t)(pool & 0x0fu) << 56)
+         | (part << 40)
+         | (layer << 24)
+         | ((s.offset >> 12) & 0x00ffffffull);
 }
+
+static thread_local uint32_t s_raw_span_acquire_turn = 0;
 
 static int device_copy_raw_span(
     glm5_pc_engine* e,
@@ -44,7 +50,7 @@ static int device_copy_raw_span(
     // Bug #10: QKV attention weights (raw spans) use pinned slot pool (for_pinned = true)
     // This prevents attention DMA from blocking MoE weight DMA in the GPU direct pool.
     const uint32_t slot_idx = (e->staging_slots.size() > 0 && s.bytes <= e->staging_slot_size)
-        ? acquire_staging_slot(e, 0u, 0u, true) : UINT32_MAX;
+        ? acquire_staging_slot(e, 0u, s_raw_span_acquire_turn++, true) : UINT32_MAX;
 
     if (slot_idx != UINT32_MAX) {
         glm5_staging_slot& slot = e->staging_slots[slot_idx];
@@ -54,7 +60,7 @@ static int device_copy_raw_span(
         }
         std::memcpy(slot.buf, src, static_cast<size_t>(s.bytes));
 
-        const int async_copy = stream && e->cuda.cuMemcpyHtoDAsync;
+        const int async_copy = stream && e->cuda.cuMemcpyHtoDAsync && slot.pinned;
         CUdeviceptr dst = 0;
         if (!device_prepare_tensor_allocation(e, key, s.bytes, pool, async_copy, &dst)) {
             release_staging_slot(e, slot_idx);

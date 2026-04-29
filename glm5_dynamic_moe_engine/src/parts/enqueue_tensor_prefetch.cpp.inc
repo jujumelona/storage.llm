@@ -43,6 +43,7 @@ static int enqueue_tensor_prefetch(
         const int ok = prefetch_tensor_record(engine, engine->tensors[tensor_index]);
         if (ok && target_tier == GLM5_TIER_VRAM) {
             const int gpu_ok = prefetch_tensor_pinned_to_gpu(engine, engine->tensors[tensor_index]);
+            device_stream_destroy_current(engine);
             if (!gpu_ok) {
                 demote_failed_device_expert(engine, engine->tensors[tensor_index]);
             }

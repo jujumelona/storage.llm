@@ -23,22 +23,26 @@ bool JujuFooter::find_block(uint32_t id, JujuFooterBlock* out) const {
     }
     if (text_.empty()) return false;
     size_t pos = text_.find("\"blocks\"");
-    while ((pos = text_.find("\"id\"", pos)) != std::string::npos) {
-        const size_t begin = text_.rfind('{', pos);
-        // Bug 6: Don't abort entire search if one block has no opening brace
-        if (begin == std::string::npos) {
-            pos += 4;  // Skip this "id" and continue searching
+    if (pos == std::string::npos) return false;
+    pos = text_.find('[', pos);
+    if (pos == std::string::npos) return false;
+
+    const size_t array_end = text_.find(']', pos);
+    if (array_end == std::string::npos) return false;
+
+    // Bug 1: Use forward scan to avoid infinite loop with nested objects
+    while ((pos = text_.find('{', pos)) != std::string::npos && pos < array_end) {
+        const size_t end = json_match_object(text_, pos);
+        if (end == std::string::npos) {
+            pos++;
             continue;
         }
-        const size_t end = json_match_object(text_, begin);
-        if (end == std::string::npos || end > text_.size()) {
-            pos = begin + 1;  // Continue from after the brace
-            continue;
-        }
-        JsonSlice slice{&text_, begin, end};
+        JsonSlice slice{&text_, pos, end};
         JujuFooterBlock block{};
         if (block_from_slice(slice, &block) && block.id == id) {
             *out = block;
+            // Bug 2: Cache the result to avoid repeated scans
+            block_cache_[id] = block;
             return true;
         }
         pos = end;

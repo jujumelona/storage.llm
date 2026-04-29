@@ -1,13 +1,4 @@
 static int prefetch_tensor_disk_to_ram(glm5_pc_engine* engine, const glm5_tensor_record& rec) {
-    if (engine && (int)rec.info.expert >= 0) {
-        const size_t eslot = expert_dense_slot((int)rec.info.layer, (int)rec.info.expert);
-        std::lock_guard<std::mutex> lock(engine->map_mutex);
-        if (eslot < engine->expert_states.size() && engine->expert_states[eslot].active &&
-            (engine->expert_states[eslot].tier == GLM5_TIER_RAM ||
-             engine->expert_states[eslot].tier == GLM5_TIER_VRAM)) {
-            return 1;
-        }
-    }
     mmap_context_t* shard = get_or_map_tensor_shard(engine, rec);
     if (!engine || !shard || !mmap_get_ptr(shard, 0)) {
         return 0;
@@ -50,8 +41,8 @@ static int prefetch_tensor_disk_to_ram(glm5_pc_engine* engine, const glm5_tensor
             if (!src) {
                 return 0;
             }
+            touch_mapped_range(src, length);
             if (!hint_issued) {
-                touch_mapped_range(src, length);
                 engine->io_atomic.bytes_touch_fallback.fetch_add(length);
             }
             prefetched += length;
@@ -59,7 +50,9 @@ static int prefetch_tensor_disk_to_ram(glm5_pc_engine* engine, const glm5_tensor
     }
 
     engine->io_atomic.bytes_prefetched.fetch_add(prefetched);
-    engine->io_atomic.bytes_disk_to_ram.fetch_add(prefetched);
+    if (hint_issued) {
+        engine->io_atomic.bytes_disk_hint_issued.fetch_add(prefetched);
+    }
     engine->io_atomic.disk_stage_done.fetch_add(1);
     return 1;
 }

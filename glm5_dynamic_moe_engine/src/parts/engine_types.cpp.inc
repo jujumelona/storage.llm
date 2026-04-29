@@ -4,6 +4,7 @@ struct glm5_block_state {
     double hot_score = 0.0;
     uint64_t last_touch_epoch = 0;
     bool active = false;
+    bool pending_evict = false;
 };
 
 struct glm5_tensor_record {
@@ -13,6 +14,16 @@ struct glm5_tensor_record {
     uint64_t weight_row_bytes = 0;
     uint8_t weight_format = 0;
     uint8_t scale_format = 0;
+};
+
+struct glm5_raw_tensor_cache_entry {
+    const glm5_storage_raw_span_spec_t* span = nullptr;
+    mmap_context_t* mapped = nullptr;
+    const uint8_t* base = nullptr;
+    uint64_t rel_offset = 0;
+    uint64_t bytes = 0;
+    uint32_t rows = 0;
+    uint32_t cols = 0;
 };
 
 struct glm5_prefetch_task {
@@ -25,11 +36,13 @@ struct glm5_prefetch_task {
     uint8_t raw_pool = 0;
     int staging_valid = 0;
     int urgent = 0;
+    uint8_t requeue_count = 0;
 };
 
 struct glm5_stage_queue {
     std::mutex mtx;
     std::condition_variable cv;
+    std::condition_variable pop_cv;
     std::deque<glm5_prefetch_task> queue;
     std::deque<glm5_prefetch_task> urgent_queue;  // Fix 12: separate deque for O(1) urgent insertion
     std::atomic<uint32_t> depth{0};
@@ -39,6 +52,7 @@ struct glm5_stage_queue {
 struct glm5_staging_slot {
     uint8_t* buf = nullptr;
     uint64_t size = 0;
+    bool pinned = false;
     std::atomic<bool> in_use{false};
 
     glm5_staging_slot() = default;
@@ -76,6 +90,18 @@ struct glm5_evict_colder_first {
         if (a.hot_score != b.hot_score) {
             return a.hot_score > b.hot_score;
         }
+        return a.last_touch_epoch > b.last_touch_epoch;
+    }
+};
+
+struct glm5_device_evict_candidate {
+    uint64_t key = 0;
+    uint64_t bytes = 0;
+    uint64_t last_touch_epoch = 0;
+};
+
+struct glm5_device_evict_colder_first {
+    bool operator()(const glm5_device_evict_candidate& a, const glm5_device_evict_candidate& b) const {
         return a.last_touch_epoch > b.last_touch_epoch;
     }
 };

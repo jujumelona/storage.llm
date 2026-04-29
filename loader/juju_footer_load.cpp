@@ -23,18 +23,17 @@ bool JujuFooter::load(const char* path) {
     if (pos == std::string::npos) {
         return false;
     }
-    while ((pos = text_.find("\"id\"", pos)) != std::string::npos) {
-        const size_t begin = text_.rfind('{', pos);
-        if (begin == std::string::npos) {
-            pos += 4;  // skip this "id" and continue searching
-            continue;  // malformed block, don't abort entire load
-        }
-        const size_t end = json_match_object(text_, begin);
+    const size_t array_end = text_.find(']', pos);
+    if (array_end == std::string::npos) {
+        return false;
+    }
+    while ((pos = text_.find('{', pos)) != std::string::npos && pos < array_end) {
+        const size_t end = json_match_object(text_, pos);
         if (end == std::string::npos || end > text_.size()) {
-            pos = begin + 1;  // resume after opening brace
+            pos++;  // resume after opening brace
             continue;  // malformed block, don't abort entire load
         }
-        JsonSlice slice{&text_, begin, end};
+        JsonSlice slice{&text_, pos, end};
         JujuFooterBlock block{};
         uint64_t value = 0;
         if (json_get_u64(slice, "id", &value) && value <= UINT32_MAX &&

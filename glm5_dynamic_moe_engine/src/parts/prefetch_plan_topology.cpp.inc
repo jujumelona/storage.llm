@@ -13,12 +13,12 @@ static void prefetch_plan_topology_candidates(
         return;
     }
     out->reserve((size_t)count * (size_t)engine->io_config.topology_max_edges_per_source);
-    std::shared_lock<std::shared_mutex> lock(engine->topology_mutex);
     for (uint32_t i = 0; i < count; ++i) {
         const uint64_t src_key = topology_key(layer, experts[i]);
         if (src_key == UINT64_MAX) {
             continue;
         }
+        std::shared_lock<std::shared_mutex> lock(engine->topology_mutex);
         const auto src = engine->topology_edges.find(src_key);
         if (src == engine->topology_edges.end()) {
             continue;
@@ -51,8 +51,7 @@ static void prefetch_plan_add_topology(
     if (!engine) {
         return;
     }
-    std::lock_guard<std::mutex> scratch_lock(engine->topology_candidates_mutex);
-    auto& candidates = engine->topology_candidates_scratch;
+    static thread_local std::vector<std::tuple<uint64_t, int, int>> candidates;
     prefetch_plan_topology_candidates(engine, layer, experts, count, &candidates);
     prefetch_plan_sort_topology(candidates);
     uint32_t added = 0;

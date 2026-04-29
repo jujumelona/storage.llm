@@ -28,8 +28,8 @@ struct glm5_pc_engine {
     uint32_t model_lib_abi_version = 0;
 
     mutable std::mutex map_mutex;       // protects expert_states
-    mutable std::mutex shard_mutex;     // Fix 61: protects shard_mmaps (separate from expert_states)
-    std::condition_variable map_cv;
+    mutable std::shared_mutex shard_mutex; // protects shard_mmaps; cached reads use shared_lock
+    std::unordered_map<std::string, std::shared_ptr<std::condition_variable_any>> shard_mmap_cvs;
     mutable std::mutex device_mutex;
     mutable std::shared_mutex topology_mutex;
     mutable std::mutex topology_queue_mutex;
@@ -47,6 +47,10 @@ struct glm5_pc_engine {
     std::atomic<uint32_t> disk_worker_target{0};
     std::atomic<uint32_t> pinned_worker_target{0};
     std::atomic<uint32_t> gpu_worker_target{0};
+    std::atomic<uint32_t> runtime_prefetch_window_layers{0};
+    std::atomic<uint32_t> runtime_disk_worker_threads{0};
+    std::atomic<uint32_t> runtime_pinned_worker_threads{0};
+    std::atomic<uint32_t> runtime_gpu_worker_threads{0};
     uint32_t worker_resize_pending_disk{0};
     uint32_t worker_resize_pending_pinned{0};
     uint32_t worker_resize_pending_gpu{0};
@@ -63,8 +67,6 @@ struct glm5_pc_engine {
     std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> topology_edges;
     std::mutex prefetch_plan_mutex;
     std::unordered_set<uint64_t> prefetch_plan_seen_set;
-    std::mutex topology_candidates_mutex;
-    std::vector<std::tuple<uint64_t, int, int>> topology_candidates_scratch;
     alignas(64) std::atomic<uint64_t> vram_used_bytes{0};
     alignas(64) std::atomic<uint64_t> ram_used_bytes{0};
     alignas(64) std::atomic<uint64_t> db_used_bytes{0};
@@ -86,10 +88,20 @@ struct glm5_pc_engine {
     std::atomic<int> device_allocator_ready{0};
     std::unordered_map<uint64_t, glm5_device_allocation> device_allocations;
     std::unordered_set<uint64_t> activation_keys;
+    std::priority_queue<
+        glm5_device_evict_candidate,
+        std::vector<glm5_device_evict_candidate>,
+        glm5_device_evict_colder_first> activation_evict_heap;
     std::atomic<int> last_activation_layer{-1};
     std::atomic<uint64_t> expert_touch_epoch{0};
     std::priority_queue<glm5_evict_candidate, std::vector<glm5_evict_candidate>, glm5_evict_colder_first> evict_heaps[3];
-    std::mutex heap_mutex;  // Fix 42: protects evict_heaps from device_mutex/map_mutex race
+    std::mutex heap_mutexes[3];  // Per-tier evict heap locks: VRAM, RAM, DB.
+    std::atomic<uint64_t> evict_heap_versions[3]{};
+    std::mutex heap_mutex_abi_compat_unused;  // DEAD LOCK: do not use. Use heap_mutexes[0/1/2] via evict_heap_mutex(); ABI layout only.
+    std::atomic<bool> vram_eviction_in_progress{false};
+    std::condition_variable vram_eviction_cv;
+    alignas(64) std::atomic<uint32_t> staging_free_slot_count{0};
+    std::atomic<bool> io_proactive_eviction_in_progress{false};
     std::mutex io_start_mutex;
     std::mutex cpu_row_mutex;
     std::condition_variable cpu_row_cv;
@@ -113,16 +125,62 @@ struct glm5_pc_engine {
     mutable std::atomic<int> tokenizer_valid{-1};
     mutable std::atomic<int> attention_projector_valid{-1};  // Fix 72: -1=unchecked, 0=no, 1=yes
     std::vector<std::thread> deferred_joins;  // Fix 44: engine-owned deferred worker joins
-    uint32_t staging_pinned_slot_count = 0;
+    std::atomic<uint32_t> staging_pinned_slot_count{0};
     mutable std::mutex raw_file_size_cache_mutex;
     mutable std::unordered_map<int32_t, uint64_t> raw_file_size_cache;
+    mutable std::shared_mutex raw_tensor_cache_mutex;
+    std::unordered_map<uint64_t, glm5_raw_tensor_cache_entry> raw_tensor_cache;
 
     // GAP 1A: Persistent per-head quantized KV cache
     // Key = head_index, value = qkv_state_t with quantized K/V for that head
-    std::mutex qkv_mutex;
+    std::mutex qkv_mutex;  // protects qkv_cfg and head-state vector growth
     std::vector<qkv_state_t> qkv_head_state_slots;
     std::vector<uint8_t> qkv_head_state_valid;
+    std::vector<std::unique_ptr<std::mutex>> qkv_head_state_locks;
     qkv_config_t qkv_cfg{};
     std::atomic<bool> qkv_cfg_initialized{false};
     uint32_t qkv_last_ctx = 0;  // Track context size for reallocation
 };
+
+static uint32_t runtime_disk_workers(const glm5_pc_engine* engine) {
+    if (!engine) {
+        return 1u;
+    }
+    uint32_t workers = engine->runtime_disk_worker_threads.load(std::memory_order_relaxed);
+    if (workers == 0) {
+        workers = engine->io_config.disk_worker_threads ?
+            engine->io_config.disk_worker_threads : engine->io_config.io_worker_threads;
+    }
+    return workers ? workers : 1u;
+}
+
+static uint32_t runtime_pinned_workers(const glm5_pc_engine* engine) {
+    if (!engine) {
+        return 1u;
+    }
+    uint32_t workers = engine->runtime_pinned_worker_threads.load(std::memory_order_relaxed);
+    if (workers == 0) {
+        workers = engine->io_config.pinned_worker_threads;
+    }
+    return workers ? workers : 1u;
+}
+
+static uint32_t runtime_gpu_workers(const glm5_pc_engine* engine) {
+    if (!engine) {
+        return 1u;
+    }
+    uint32_t workers = engine->runtime_gpu_worker_threads.load(std::memory_order_relaxed);
+    if (workers == 0) {
+        workers = engine->io_config.gpu_worker_threads;
+    }
+    return workers ? workers : 1u;
+}
+
+static void runtime_store_io_workers(glm5_pc_engine* engine, uint32_t disk, uint32_t pinned, uint32_t gpu) {
+    if (!engine) {
+        return;
+    }
+    engine->runtime_disk_worker_threads.store(disk, std::memory_order_relaxed);
+    engine->runtime_pinned_worker_threads.store(pinned, std::memory_order_relaxed);
+    engine->runtime_gpu_worker_threads.store(gpu, std::memory_order_relaxed);
+}

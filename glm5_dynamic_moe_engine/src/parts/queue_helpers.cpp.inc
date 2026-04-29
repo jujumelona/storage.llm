@@ -61,9 +61,12 @@ static int enqueue_stage_or_retry(
             engine->io_atomic.dropped_requests.fetch_add(1);
             return 0;
         }
-        if (total >= normal_cap) {
-            queued.urgent = 1;
-        }
+        // Bug 9: Remove requeue_count-based urgent promotion
+        // Requeued speculative tasks should not jump ahead of router-selected tasks
+        // Original caller's urgent flag is the only priority signal
+        // if (total >= normal_cap && queued.requeue_count > 0) {
+        //     queued.urgent = 1;
+        // }
         if (queued.urgent) {
             stage.urgent_queue.push_back(queued);
         } else {
@@ -99,6 +102,7 @@ static bool pop_stage_task(
         stage.queue.pop_front();
     }
     stage.depth.store(static_cast<uint32_t>(stage.queue.size() + stage.urgent_queue.size()));
+    stage.pop_cv.notify_one();
     queue_total_depth_sub(engine, 1);
     stage.inflight.fetch_add(1);
     return true;

@@ -50,14 +50,29 @@ artifacts first, then pass the local folder as `model_root`.
 | Purpose | Repository |
 | --- | --- |
 | Official GLM-5.1 base model | <https://huggingface.co/zai-org/GLM-5.1> |
-| StorageLLM converted JUJU artifact target | <https://huggingface.co/storagejuju/GLM5.1-4q-storage> |
+| StorageLLM converted JUJU artifacts | <https://huggingface.co/storagejuju/GLM5.1-4q-storage> |
+| Direct browser download page | <https://huggingface.co/storagejuju/GLM5.1-4q-storage/tree/main> |
 | Hugging Face model download docs | <https://huggingface.co/docs/hub/models-downloading> |
 
-Provisioning example:
+Provisioning example for downloading the ready-to-run model files:
 
 ```text
 hf download storagejuju/GLM5.1-4q-storage --local-dir <model_root>
 glm5_pc_engine_server --openclaw --host 127.0.0.1 --port 8000 --model-root <model_root>
+```
+
+Individual files can also be downloaded through Hugging Face's direct resolve
+URL pattern:
+
+```text
+https://huggingface.co/storagejuju/GLM5.1-4q-storage/resolve/main/<relative-path>?download=true
+```
+
+For example, if the repo contains `parts/glm5.1-storage-part01.juju`, the direct
+file URL is:
+
+```text
+https://huggingface.co/storagejuju/GLM5.1-4q-storage/resolve/main/parts/glm5.1-storage-part01.juju?download=true
 ```
 
 The expected StorageLLM Hugging Face repo must contain the same runtime assets
@@ -206,7 +221,7 @@ Current GLM-5.1 constants used by this runtime:
 | Total expert cache units | 19,456 |
 | Hidden size | 6,144 |
 | Expert intermediate size | 2,048 |
-| Plain KV full preallocation | 1,491,075,072 bytes, about 1.39 GiB |
+| Plain KV full preallocation | 745,537,536 bytes, about 0.69 GiB |
 
 Optimal VRAM contents under enough budget:
 
@@ -433,7 +448,7 @@ is `%USERPROFILE%\.openclaw\openclaw.json`; on Linux/macOS it is
 | Low-impact policy | `--low-impact` | Smaller prefetch window and fewer workers for shared desktop use. |
 | Backend auto mode | `--backend auto` | Detect CUDA/HIP/Metal/Vulkan/DirectML/OpenCL/CPU capability and choose the best available path. |
 | Explicit backend mode | `--backend <name>` | Force a backend preference while keeping CPU as correctness fallback. |
-| Plain KV mode | default | Use the GLM runtime float KV cache. |
+| Plain KV mode | default | Use the GLM runtime KV cache with bf16 backing storage and float decode scratch. |
 | QKV mode | `--qkv` | Opt into the experimental quantized KV path. |
 | Active-set VRAM residency | `--vram-budget <bytes>` | Promote mandatory state and selected MoE triplets to VRAM within budget. |
 | RAM-backed residency | `--ram-budget <bytes>` | Keep warm blocks and staging buffers in RAM when VRAM is not enough. |
@@ -507,3 +522,10 @@ Streaming:
 
 - `stream: true` is supported for chat/completions style responses.
 - `/v1/responses` currently returns a normal JSON response.
+
+### License
+
+This runtime code is released under the repository MIT License. The converted
+GLM5.1 model files distributed on Hugging Face follow the upstream GLM-5.1 MIT
+license. Keep the upstream model license and copyright notices with
+redistributed model files.

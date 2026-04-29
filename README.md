@@ -69,6 +69,18 @@ connection config, server options, backend modes, KV mode, and request shapes:
 glm5_dynamic_moe_engine/README.md
 ```
 
+Model weights are distributed separately on Hugging Face:
+
+```text
+https://huggingface.co/storagejuju/GLM5.1-4q-storage
+```
+
+Download the converted StorageLLM artifact before starting the server:
+
+```text
+hf download storagejuju/GLM5.1-4q-storage --local-dir <model_root>
+```
+
 The normal local API command is:
 
 ```text
@@ -94,4 +106,8 @@ glm5_pc_engine_server --openclaw --host 127.0.0.1 --port 8000 --model-root <mode
 
 ## License
 
-No license has been declared yet. Add one before publishing a public release.
+This code repository is released under the MIT License. See `LICENSE`.
+
+The converted StorageLLM model artifacts are distributed separately on Hugging
+Face and follow the upstream GLM-5.1 MIT license. Keep the upstream model
+license and copyright notices with redistributed model files.

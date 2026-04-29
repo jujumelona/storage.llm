@@ -59,9 +59,31 @@ static int prefetch_expert_batch_raw(
     if (!engine || !experts || expert_count == 0) {
         return 0;
     }
+    std::vector<uint8_t> stream_inflight(expert_count, 0);
+    {
+        std::lock_guard<std::mutex> lock(engine->map_mutex);
+        for (uint32_t i = 0; i < expert_count; ++i) {
+            const size_t slot = expert_dense_slot(layer, experts[i]);
+            if (slot < engine->expert_states.size()) {
+                const glm5_block_state& state = engine->expert_states[slot];
+                stream_inflight[i] = state.active && state.tier == GLM5_TIER_STREAM ? 1u : 0u;
+            }
+        }
+    }
     int ok_count = 0;
     for (uint32_t i = 0; i < expert_count; ++i) {
-        ok_count += glm5_pc_engine_prefetch_expert_triplet(engine, layer, experts[i], preferred_tier) ? 1 : 0;
+        if (stream_inflight[i]) {
+            ++ok_count;
+            continue;
+        }
+        ok_count += glm5_pc_engine_prefetch_expert_triplet_impl(
+            engine,
+            layer,
+            experts[i],
+            preferred_tier,
+            1,
+            1
+        ) ? 1 : 0;
     }
     return ok_count > 0 ? 1 : 0;
 }
@@ -77,6 +99,7 @@ int glm5_pc_engine_prefetch_moe_lookahead(
     if (!engine || current_layer < 0) {
         return 0;
     }
+    std::lock_guard<std::mutex> plan_lock(engine->prefetch_plan_mutex);
     prefetch_plan_clear_seen(engine);
 
     int ok_count = 0;

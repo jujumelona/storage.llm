@@ -19,9 +19,10 @@ static uint64_t juju_u64(const uint8_t* p) {
 bool juju_header_valid(const JujuHeader& h, size_t mapped_size) {
     if (std::memcmp(h.magic, "G51STOR1", 8) != 0) return false;
     if (h.header_bytes < 64 || h.data_offset < h.header_bytes) return false;
+    if (h.data_offset > mapped_size) return false;  // Bug 1: Validate data_offset
     if (h.file_size != 0 && h.file_size != mapped_size) return false;
     if (h.json_offset > mapped_size || h.json_bytes > mapped_size) return false;
-    return h.json_offset + h.json_bytes <= mapped_size;
+    return h.json_bytes <= mapped_size - h.json_offset;
 }
 
 bool juju_parse_header(const void* data, size_t size, JujuHeader* out) {

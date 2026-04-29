@@ -11,6 +11,7 @@ struct alignas(64) glm5_io_atomic_stats {
 
     // --- Cache line 2: disk worker counters ---
     alignas(64) std::atomic<uint64_t> bytes_disk_to_ram{0};
+    std::atomic<uint64_t> bytes_disk_hint_issued{0};
     std::atomic<uint64_t> disk_stage_done{0};
     std::atomic<uint64_t> bytes_touch_fallback{0};  // Fix 38: fallback touch bytes
 

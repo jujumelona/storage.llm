@@ -8,6 +8,7 @@ static void reset_io_stats_for_config(glm5_pc_engine* engine) {
     engine->io_atomic.dropped_requests.store(0);
     engine->io_atomic.bytes_prefetched.store(0);
     engine->io_atomic.bytes_disk_to_ram.store(0);
+    engine->io_atomic.bytes_disk_hint_issued.store(0);
     engine->io_atomic.bytes_ram_to_pinned.store(0);
     engine->io_atomic.bytes_pinned_to_gpu.store(0);
     engine->io_atomic.bytes_direct_to_gpu.store(0);
@@ -41,6 +42,7 @@ static void snapshot_io_stats(const glm5_pc_engine* engine, glm5_io_stats_t* out
     out->dropped_requests = engine->io_atomic.dropped_requests.load();
     out->bytes_prefetched = engine->io_atomic.bytes_prefetched.load();
     out->bytes_disk_to_ram = engine->io_atomic.bytes_disk_to_ram.load();
+    out->bytes_disk_hint_issued = engine->io_atomic.bytes_disk_hint_issued.load();
     out->bytes_ram_to_pinned = engine->io_atomic.bytes_ram_to_pinned.load();
     out->bytes_pinned_to_gpu = engine->io_atomic.bytes_pinned_to_gpu.load();
     out->bytes_direct_to_gpu = engine->io_atomic.bytes_direct_to_gpu.load();

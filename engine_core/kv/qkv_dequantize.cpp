@@ -1,0 +1,162 @@
+#include "qkv_dequantize.h"
+#include "qkv_helpers.h"
+#include "qkv_codebook.h"
+#include "qkv_packing.h"
+#include <math.h>
+#include <string.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// Paper Algorithm 2: TurboQuant_prod dequantization
+// x_hat = Pi^T * y_hat_mse + sqrt(pi/2d) * ||r|| * S^T * sign(S*r)
+int qkv_dequant_one(
+    const qkv_state_t* s,
+    const qkv_config_t* cfg,
+    const uint8_t* idx,
+    const uint8_t* qjl,
+    const float* residual_norms,
+    const float* norms,
+    int token_idx,
+    int bits,
+    bool use_qjl,
+    float* output
+) {
+    if (!s || !cfg || !idx || !norms || !output || token_idx < 0) {
+        return 0;
+    }
+
+    const int d = s->head_dim;
+    const int mse_bits = use_qjl ? bits - 1 : bits;
+    const int stride = (d * mse_bits + 7) / 8;
+    const int qstride = (d + 7) / 8;
+
+    // Step 1: Unpack MSE indices
+    const uint8_t* tidx = idx + token_idx * stride;
+    int* indices = s->scratch_indices;
+    float* y_tilde = s->scratch_y_tilde;
+    if (!indices || !y_tilde) return 0;
+
+    qkv_unpack_indices(tidx, indices, d, mse_bits);
+
+    // Step 2: Lookup centroids (in rotated space)
+    const float* centroids = qkv_codebook_for_bits(s, mse_bits);
+    for (int i = 0; i < d; i++) {
+        y_tilde[i] = centroids[indices[i]];
+    }
+
+    // Step 3: Apply inverse rotation Pi^T
+    float* x_tilde = s->scratch_x_tilde;
+    if (!x_tilde) return 0;
+
+    if (cfg->enable_rotation && s->rotation_matrix) {
+        // x_tilde = Pi^T * y_tilde
+        for (int i = 0; i < d; i++) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                // Pi^T[i,j] = Pi[j,i] (transpose)
+                sum += s->rotation_matrix[j * d + i] * y_tilde[j];
+            }
+            x_tilde[i] = sum;
+        }
+    } else {
+        memcpy(x_tilde, y_tilde, d * sizeof(float));
+    }
+
+    // Step 4: Add QJL residual if enabled (Paper Algorithm 2)
+    // residual = sqrt(pi/2d) * ||r|| * S^T * sign(S*r)
+    if (use_qjl && qjl && residual_norms && s->qjl_matrix) {
+        const float r_norm = residual_norms[token_idx];
+        if (r_norm > 1e-10f) {
+            const uint8_t* tqjl = qjl + token_idx * qstride;
+            float* qjl_signs = s->scratch_qjl_signs;
+            float* s_t_qjl = s->scratch_s_t_qjl;
+            if (!qjl_signs || !s_t_qjl) return 0;
+
+            // Unpack signs
+            qkv_unpack_signs(tqjl, qjl_signs, d);
+
+            // Compute S^T * qjl_signs
+            for (int i = 0; i < d; i++) {
+                float sum = 0.0f;
+                for (int j = 0; j < d; j++) {
+                    // S^T[i,j] = S[j,i]
+                    sum += s->qjl_matrix[j * d + i] * qjl_signs[j];
+                }
+                s_t_qjl[i] = sum;
+            }
+
+            // Add residual: x_hat = x_tilde + scale * ||r|| * S^T * z
+            const float qjl_scale = sqrtf((float)M_PI / (2.0f * (float)d));
+            for (int i = 0; i < d; i++) {
+                x_tilde[i] += qjl_scale * r_norm * s_t_qjl[i];
+            }
+        }
+    }
+
+    // Step 5: Denormalize by stored norm
+    const float norm = norms[token_idx];
+    for (int i = 0; i < d; i++) {
+        output[i] = x_tilde[i] * norm;
+    }
+
+    return 1;
+}
+
+// Dot product with MSE split rotated token (for outlier channels)
+int qkv_dot_mse_split_rotated_token(
+    const qkv_state_t* s,
+    const qkv_config_t* cfg,
+    int target,
+    int token_idx,
+    const float* q_rotated,
+    float* out_dot
+) {
+    if (!s || !cfg || !q_rotated || !out_dot) return 0;
+
+    const int d = s->head_dim;
+    const int n_out = cfg->outlier_channels;
+    const int n_norm = d - n_out;
+    const int out_bits = cfg->outlier_bits;
+    const int norm_bits = cfg->normal_bits;
+
+    const int* outlier_channels = qkv_outlier_indices_for_target_const(s, target);
+    const uint8_t* split_outlier = qkv_idx_outlier_for_target_const(s, target);
+    const uint8_t* split_normal = qkv_idx_normal_for_target_const(s, target);
+    const uint8_t* is_outlier = qkv_is_outlier_for_target_const(s, target);
+
+    if (!outlier_channels || !split_outlier || !split_normal || !is_outlier) {
+        return 0;
+    }
+
+    const float* out_centroids = qkv_codebook_for_bits(s, out_bits);
+    const float* norm_centroids = qkv_codebook_for_bits(s, norm_bits);
+
+    const int out_packed_size = (n_out * out_bits + 7) / 8;
+    const int norm_packed_size = (n_norm * norm_bits + 7) / 8;
+
+    int* indices = s->scratch_indices;
+    if (!indices) return 0;
+
+    float dot = 0.0f;
+
+    // Outlier channels
+    qkv_unpack_indices(split_outlier + token_idx * out_packed_size, indices, n_out, out_bits);
+    for (int i = 0; i < n_out; i++) {
+        const int channel = outlier_channels[i];
+        if (channel < 0 || channel >= d) return 0;
+        dot += q_rotated[channel] * out_centroids[indices[i]];
+    }
+
+    // Normal channels
+    qkv_unpack_indices(split_normal + token_idx * norm_packed_size, indices, n_norm, norm_bits);
+    int normal_pos = 0;
+    for (int i = 0; i < d; i++) {
+        if (is_outlier[i]) continue;
+        dot += q_rotated[i] * norm_centroids[indices[normal_pos++]];
+    }
+
+    *out_dot = dot;
+    return 1;
+}

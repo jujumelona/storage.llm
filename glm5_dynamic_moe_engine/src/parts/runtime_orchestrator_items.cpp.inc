@@ -47,8 +47,7 @@ static void orchestrator_append_topology(
     if (!engine || !selected || !items || !count) {
         return;
     }
-    std::lock_guard<std::mutex> scratch_lock(engine->topology_candidates_mutex);
-    auto& candidates = engine->topology_candidates_scratch;
+    static thread_local std::vector<std::tuple<uint64_t, int, int>> candidates;
     prefetch_plan_topology_candidates(engine, layer, selected, selected_count, &candidates);
     prefetch_plan_sort_topology(candidates);
     uint32_t added = 0;

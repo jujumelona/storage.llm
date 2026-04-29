@@ -55,7 +55,7 @@ static int glm5_parallel_rows(glm5_pc_engine* engine, uint32_t row_count, uint32
     std::unique_lock<std::mutex> lock(engine->cpu_row_mutex);
     engine->cpu_row_done_cv.wait(lock, [&] { return engine->cpu_row_done_generation == engine->cpu_row_generation; });
     lock.unlock();
-    ensure_cpu_row_workers(engine, workers);
+    ensure_cpu_row_workers(engine, 0);
     lock.lock();
     engine->cpu_row_ctx = &fn;
     engine->cpu_row_fn = [](void* ctx, uint32_t row) { return (*static_cast<RowFn*>(ctx))(row); };

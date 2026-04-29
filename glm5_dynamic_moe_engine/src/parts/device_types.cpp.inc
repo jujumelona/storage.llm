@@ -3,6 +3,7 @@
 typedef uint64_t CUdeviceptr;
 typedef void* CUstream;
 typedef void* CUcontext;
+typedef void* CUevent;
 #endif
 
 typedef int (*glm5_cu_init_fn)(unsigned int);
@@ -18,6 +19,10 @@ typedef int (*glm5_cu_mem_get_info_fn)(size_t*, size_t*);
 typedef int (*glm5_cu_stream_create_fn)(void**, unsigned int);
 typedef int (*glm5_cu_stream_synchronize_fn)(void*);
 typedef int (*glm5_cu_stream_destroy_fn)(void*);
+typedef int (*glm5_cu_event_create_fn)(void**, unsigned int);
+typedef int (*glm5_cu_event_record_fn)(void*, void*);
+typedef int (*glm5_cu_event_query_fn)(void*);
+typedef int (*glm5_cu_event_destroy_fn)(void*);
 
 struct glm5_cuda_driver_api {
     void* library = nullptr;
@@ -36,6 +41,10 @@ struct glm5_cuda_driver_api {
     glm5_cu_stream_create_fn cuStreamCreate = nullptr;
     glm5_cu_stream_synchronize_fn cuStreamSynchronize = nullptr;
     glm5_cu_stream_destroy_fn cuStreamDestroy = nullptr;
+    glm5_cu_event_create_fn cuEventCreate = nullptr;
+    glm5_cu_event_record_fn cuEventRecord = nullptr;
+    glm5_cu_event_query_fn cuEventQuery = nullptr;
+    glm5_cu_event_destroy_fn cuEventDestroy = nullptr;
 };
 
 struct glm5_device_allocation {

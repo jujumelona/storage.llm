@@ -7,16 +7,24 @@ int glm5_pc_engine_set_model_root(
     }
     glm5_pc_engine_wait_io(engine);
     {
-        // Fix 70: shard_mutex protects shard_mmaps (Fix 61 consistency)
-        std::lock_guard<std::mutex> lock(engine->shard_mutex);
+        std::unique_lock<std::shared_mutex> lock(engine->shard_mutex);
         for (auto& item : engine->shard_mmaps) {
             unload_mapped_shard(item.second);
         }
         engine->shard_mmaps.clear();
         engine->shard_mmaps_by_id.clear();
+        engine->shard_mmap_cvs.clear();
         engine->locked_mmaps.clear();
     }
     reset_source_mmap_slots(engine);
+    {
+        std::lock_guard<std::mutex> lock(engine->raw_file_size_cache_mutex);
+        engine->raw_file_size_cache.clear();
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        engine->raw_tensor_cache.clear();
+    }
     engine->model_root = model_root ? model_root : "";
     glm5_model_root_check_t check{};
     const int valid = !engine->model_root.empty() &&
@@ -48,16 +56,24 @@ int glm5_pc_engine_load_codec_table(
     engine->db_used_bytes.store(0);
     apply_common_vram_reservation(engine);
     {
-        // Fix 70: shard_mutex protects shard_mmaps (Fix 61 consistency)
-        std::lock_guard<std::mutex> lock(engine->shard_mutex);
+        std::unique_lock<std::shared_mutex> lock(engine->shard_mutex);
         for (auto& item : engine->shard_mmaps) {
             unload_mapped_shard(item.second);
         }
         engine->shard_mmaps.clear();
         engine->shard_mmaps_by_id.clear();
+        engine->shard_mmap_cvs.clear();
         engine->locked_mmaps.clear();
     }
     reset_source_mmap_slots(engine);
+    {
+        std::lock_guard<std::mutex> lock(engine->raw_file_size_cache_mutex);
+        engine->raw_file_size_cache.clear();
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        engine->raw_tensor_cache.clear();
+    }
     engine->tensors.clear();
     engine->tensor_paths.clear();
     engine->max_tensor_stream_bytes = 0;
@@ -160,7 +176,12 @@ int glm5_pc_engine_load_codec_table(
         expert_bytes_add(engine, (int)rec.info.layer, (int)rec.info.expert, stream_bytes);
         engine->tensors.push_back(std::move(rec));
     }
-    update_staging_slot_deficit(engine);
+    if (engine->staging && engine->staging_size > 0) {
+        configure_staging_slots(engine);
+        engine->staging_slot_cv.notify_all();
+    } else {
+        update_staging_slot_deficit(engine);
+    }
     prefetch_common_raw_storage(engine);
     return engine->tensors.empty() ? 0 : 1;
 }

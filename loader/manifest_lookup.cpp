@@ -102,11 +102,9 @@ bool ManifestLookup::find_expert(
         *out = cached->second;
         return true;
     }
-    JsonSlice expert_obj{};
-    if (!json_find_key_object(text_, manifest_expert_key(layer, expert), &expert_obj)) {
-        return false;
-    }
-    return parse_expert_entry(expert_obj, layer, expert, out);
+    // Bug 3: Remove fallback to avoid inconsistency with load() caching
+    // If not in cache, it means load() didn't find it or wasn't called
+    return false;
 }
 
 }  // namespace storagellm

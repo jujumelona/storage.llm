@@ -4,10 +4,18 @@
 *.ilk
 *.exp
 *.lib
+debug.txt
 
+.codex_msvc_check/
 .glm5_model_lib_cache/
 .tmp_build/
 __pycache__/
+*.backup
+
+# Local conversion notebooks/scripts do not belong in this runtime repo.
+/tools/
+/glm51_runtime_colab/
+*.ipynb
 
 # Model/runtime artifacts belong in the external model repo, not this engine repo.
 /tokenizer.json
@@ -15,3 +23,12 @@ __pycache__/
 /glm5_scale4.gsc4
 /parts/
 *.juju
+glm5_dynamic_moe_engine/model_profiles/*/tensors.csv
+
+# Local split/refactor scratch files. Only commit part files that are included
+# by the runtime entrypoint or explicitly documented as source.
+glm5_dynamic_moe_engine/src/parts/gen_*.cpp.inc
+glm5_dynamic_moe_engine/src/parts/generation_*.cpp.inc
+glm5_dynamic_moe_engine/src/parts/raw_bf16_convert.cpp.inc
+glm5_dynamic_moe_engine/src/parts/raw_span_helpers.cpp.inc
+glm5_dynamic_moe_engine/src/parts/raw_tensor_desc.cpp.inc

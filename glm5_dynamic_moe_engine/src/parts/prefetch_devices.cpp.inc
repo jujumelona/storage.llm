@@ -77,7 +77,11 @@ static int prefetch_tensor_direct_to_gpu(glm5_pc_engine* engine, const glm5_tens
         return 0;
     }
     const uint64_t bytes = tensor_stream_bytes(rec);
-    if (!device_copy_tensor(engine, rec, GLM5_DEVICE_POOL_EXPERT)) {
+    const int copied = device_copy_tensor(engine, rec, GLM5_DEVICE_POOL_EXPERT, 0);
+    if (copied == GLM5_DEVICE_COPY_BACKPRESSURE) {
+        return GLM5_DEVICE_COPY_BACKPRESSURE;
+    }
+    if (!copied) {
         demote_failed_device_expert(engine, rec);
         return 0;
     }

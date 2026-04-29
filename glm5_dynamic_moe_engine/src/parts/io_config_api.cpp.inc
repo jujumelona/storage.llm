@@ -40,6 +40,13 @@ int glm5_pc_engine_configure_io(glm5_pc_engine_t* engine, const glm5_io_config_t
     }
     engine->io_config.gpu_worker_threads =
         clamp_to_cap(engine->io_config.gpu_worker_threads, gpu_worker_cap(engine));
+    engine->runtime_prefetch_window_layers.store(
+        engine->io_config.prefetch_window_layers, std::memory_order_relaxed);
+    runtime_store_io_workers(
+        engine,
+        engine->io_config.disk_worker_threads,
+        engine->io_config.pinned_worker_threads,
+        engine->io_config.gpu_worker_threads);
     if (engine->io_config.direct_upload_min_bytes == 0) {
         const glm5_storage_constants_t* storage = glm5_storage_constants();
         engine->io_config.direct_upload_min_bytes =

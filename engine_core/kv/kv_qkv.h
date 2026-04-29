@@ -62,6 +62,9 @@ typedef struct {
     int outlier_channels;     // Number of outlier channels (0 = disabled, paper uses 32)
     int outlier_bits;         // Bits for outlier channels (paper uses 3)
     int normal_bits;          // Bits for normal channels (paper uses 2)
+    // Problem 11 Fix: Engine IO thread count to prevent CPU over-subscription
+    uint32_t engine_io_thread_count;  // disk+pinned+gpu workers from engine
+    const int* outlier_channel_indices; // Bug 4: Allow custom outlier indices instead of hardcoded 0..n
 } qkv_config_t;
 
 // Default configuration
@@ -78,6 +81,9 @@ static inline qkv_config_t qkv_config_default(int head_dim) {
     cfg.outlier_channels = 0;
     cfg.outlier_bits = 3;
     cfg.normal_bits = 2;
+    // Problem 11 Fix: Default to 0 (no adjustment)
+    cfg.engine_io_thread_count = 0;
+    cfg.outlier_channel_indices = nullptr;
     return cfg;
 }
 
@@ -117,12 +123,16 @@ typedef struct {
     float* thresholds_2bit;
     float* codebook_3bit;
     float* thresholds_3bit;
+    float* codebook_4bit;     // 4-bit support: 16 levels
+    float* thresholds_4bit;
 
     // Fix 4: Outlier channel indices (paper Section 4.3)
     // Outliers are channels with highest magnitude across calibration data
     int* outlier_indices;     // [outlier_channels] indices of outlier channels
     int* k_outlier_indices;   // [outlier_channels] key-specific outlier channels
     int* v_outlier_indices;   // [outlier_channels] value-specific outlier channels
+    uint8_t* k_is_outlier;    // [head_dim] O(1) boolean lookup
+    uint8_t* v_is_outlier;    // [head_dim] O(1) boolean lookup
     uint8_t* k_idx_outlier;   // Packed indices for outlier channels
     uint8_t* v_idx_outlier;
     uint8_t* k_idx_normal;    // Packed indices for normal channels
@@ -138,7 +148,7 @@ typedef struct {
     float* scratch_residual;   // [head_dim]
     float* scratch_s_times_r;  // [head_dim]
     float* scratch_y_tilde;    // [head_dim] for dequantize
-    float* scratch_x_tilde;    // [n_tokens * head_dim] for prod mode
+    float* scratch_x_tilde;    // [head_dim] single-token scratch for dequant/quantize
     float* scratch_attention;  // [n_tokens] for attention scores
     float* scratch_rotated_q;  // [head_dim] for rotated query
     int* scratch_indices;      // [head_dim] for dequantize
@@ -148,6 +158,9 @@ typedef struct {
     int head_dim;
     int k_bits;
     int v_bits;
+
+    void* thread_pool;
+    int computed_workers; // Bug 2: Cache thread pool size to avoid OS calls
 } qkv_state_t;
 
 // ============================================================

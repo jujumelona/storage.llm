@@ -26,6 +26,10 @@ static int prefetch_tensor_ram_to_pinned(
         slot_index < engine->staging_slots.size() &&
         engine->staging_slots[slot_index].buf &&
         total_bytes <= engine->staging_slots[slot_index].size;
+    if (!can_stage) {
+        engine->io_atomic.staging_wraps.fetch_add(1);
+        return 0;
+    }
     for (const auto& range : ranges) {
         const uint64_t offset = range[0];
         const uint64_t length = range[1];
@@ -39,23 +43,20 @@ static int prefetch_tensor_ram_to_pinned(
         if (!src) {
             return 0;
         }
-        if (can_stage) {
-            copied += copy_mapped_range_to_staging_linear(engine, src, length, slot_index, &staging_offset);
-        } else {
-            touch_mapped_range(src, length);
-            copied += length;
+        const uint64_t before = staging_offset;
+        const uint64_t n = copy_mapped_range_to_staging_linear(engine, src, length, slot_index, &staging_offset);
+        if (n != length || staging_offset != before + length) {
+            return 0;
         }
+        copied += n;
     }
 
     if (out_staging_bytes && can_stage && staging_offset == total_bytes && copied == total_bytes) {
         *out_staging_bytes = staging_offset;
     }
     // Fix 38: Only count actual pinned staging copies, not touch-fallback bytes
-    if (can_stage) {
-        engine->io_atomic.bytes_ram_to_pinned.fetch_add(copied);
-    } else {
-        engine->io_atomic.bytes_touch_fallback.fetch_add(copied);
-    }
+    engine->io_atomic.bytes_disk_to_ram.fetch_add(copied);
+    engine->io_atomic.bytes_ram_to_pinned.fetch_add(copied);
     engine->io_atomic.pinned_stage_done.fetch_add(1);
     return 1;
 }

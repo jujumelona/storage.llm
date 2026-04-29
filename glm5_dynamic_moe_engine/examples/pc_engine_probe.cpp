@@ -451,12 +451,13 @@ static int probe_main(int argc, char** argv) {
             glm5_io_stats_t io_stats;
             if (glm5_pc_engine_get_io_stats(engine, &io_stats)) {
                 printf(
-                    "io path=%s queued=%llu done=%llu failed=%llu dropped=%llu disk=%llu pinned=%llu gpu=%llu direct=%llu q=%u/%u/%u topology=%llu pinned_active=%d staging_deficit=%u recommended_staging=%llu\n",
+                    "io path=%s queued=%llu done=%llu failed=%llu dropped=%llu hint=%llu disk=%llu pinned=%llu gpu=%llu direct=%llu q=%u/%u/%u topology=%llu pinned_active=%d staging_deficit=%u recommended_staging=%llu\n",
                     glm5_io_path_name(io_stats.active_path),
                     (unsigned long long)io_stats.queued_requests,
                     (unsigned long long)io_stats.completed_requests,
                     (unsigned long long)io_stats.failed_requests,
                     (unsigned long long)io_stats.dropped_requests,
+                    (unsigned long long)io_stats.bytes_disk_hint_issued,
                     (unsigned long long)io_stats.bytes_disk_to_ram,
                     (unsigned long long)io_stats.bytes_ram_to_pinned,
                     (unsigned long long)io_stats.bytes_pinned_to_gpu,

@@ -32,11 +32,21 @@ bool json_find_member_object(const JsonSlice& slice, const char* key, JsonSlice*
         return false;
     }
     const std::string needle = std::string("\"") + key + "\"";
-    const size_t pos = slice.text->find(needle, slice.begin);
-    if (pos == std::string::npos || pos >= slice.end) {
-        return false;
+    size_t pos = slice.begin;
+    while ((pos = slice.text->find(needle, pos)) != std::string::npos && pos < slice.end) {
+        const size_t after_key = pos + needle.size();
+        if (after_key > slice.end) {
+            return false;
+        }
+        // Bug 5: Verify this is a real JSON key (followed by ':'), not text in a string value
+        const size_t colon = slice.text->find_first_not_of(" \t\r\n", after_key);
+        if (colon == std::string::npos || colon >= slice.end || (*slice.text)[colon] != ':') {
+            ++pos;
+            continue;
+        }
+        return find_object_after(*slice.text, pos, out) && out->end <= slice.end;
     }
-    return find_object_after(*slice.text, pos, out) && out->end <= slice.end;
+    return false;
 }
 
 }  // namespace storagellm

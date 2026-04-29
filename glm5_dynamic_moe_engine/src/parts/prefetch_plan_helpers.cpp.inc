@@ -6,7 +6,6 @@ static void prefetch_plan_clear_seen(glm5_pc_engine* engine) {
     if (!engine) {
         return;
     }
-    std::lock_guard<std::mutex> lock(engine->prefetch_plan_mutex);
     engine->prefetch_plan_seen_set.clear();
 }
 
@@ -14,7 +13,6 @@ static bool prefetch_plan_has_item(glm5_pc_engine* engine, int layer, int expert
     if (!engine || layer < 0 || expert < 0) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(engine->prefetch_plan_mutex);
     return engine->prefetch_plan_seen_set.count(
         prefetch_plan_item_key((uint32_t)layer, (uint32_t)expert)) > 0;
 }
@@ -23,7 +21,6 @@ static void prefetch_plan_mark_seen(glm5_pc_engine* engine, int layer, int exper
     if (!engine || layer < 0 || expert < 0) {
         return;
     }
-    std::lock_guard<std::mutex> lock(engine->prefetch_plan_mutex);
     engine->prefetch_plan_seen_set.insert(
         prefetch_plan_item_key((uint32_t)layer, (uint32_t)expert));
 }

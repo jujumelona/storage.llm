@@ -65,6 +65,11 @@ static int cuda_driver_load(glm5_cuda_driver_api* api) {
     api->cuStreamCreate = (glm5_cu_stream_create_fn)glm5_find_shared_symbol(api->library, "cuStreamCreate");
     api->cuStreamSynchronize = (glm5_cu_stream_synchronize_fn)glm5_find_shared_symbol(api->library, "cuStreamSynchronize");
     api->cuStreamDestroy = (glm5_cu_stream_destroy_fn)glm5_find_cuda_symbol(api->library, "cuStreamDestroy_v2", "cuStreamDestroy");
+    // CUDA event API is optional and enables non-blocking stream completion checks.
+    api->cuEventCreate = (glm5_cu_event_create_fn)glm5_find_shared_symbol(api->library, "cuEventCreate");
+    api->cuEventRecord = (glm5_cu_event_record_fn)glm5_find_shared_symbol(api->library, "cuEventRecord");
+    api->cuEventQuery = (glm5_cu_event_query_fn)glm5_find_shared_symbol(api->library, "cuEventQuery");
+    api->cuEventDestroy = (glm5_cu_event_destroy_fn)glm5_find_cuda_symbol(api->library, "cuEventDestroy_v2", "cuEventDestroy");
     return api->cuInit && api->cuDeviceGet && api->cuCtxSetCurrent &&
         api->cuDevicePrimaryCtxRetain && api->cuDevicePrimaryCtxRelease &&
         api->cuMemAlloc && api->cuMemFree && api->cuMemcpyHtoD && api->cuMemGetInfo;

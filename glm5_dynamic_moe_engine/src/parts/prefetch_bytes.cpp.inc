@@ -22,10 +22,8 @@ static void touch_mapped_range(const uint8_t* src, uint64_t bytes) {
     if (!src || bytes == 0) {
         return;
     }
-    // OS readahead hint only — no blocking page walk.
-    // Sequential volatile reads were defeating async prefetch by triggering
-    // sync page faults before OS could read ahead. Compute thread faults
-    // naturally on actual access; no pre-touch needed.
+    // Async prefetch hint. No blocking page walk here.
+    // The actual blocking page fault will naturally occur in pinned_stage memcpy.
 #ifdef _WIN32
     WIN32_MEMORY_RANGE_ENTRY entry;
     entry.VirtualAddress = const_cast<uint8_t*>(src);
@@ -46,9 +44,10 @@ static uint32_t acquire_staging_slot(glm5_pc_engine* engine, uint32_t worker_ind
     if (total_count < 2) {
         return acquire_staging_slot_internal(engine, 0, total_count, worker_index, turn);
     }
-    const uint32_t mid = engine->staging_pinned_slot_count > 0 &&
-        engine->staging_pinned_slot_count < total_count
-        ? engine->staging_pinned_slot_count
+    const uint32_t pinned_slot_count = engine->staging_pinned_slot_count.load(std::memory_order_acquire);
+    const uint32_t mid = pinned_slot_count > 0 &&
+        pinned_slot_count < total_count
+        ? pinned_slot_count
         : total_count / 2;
     // Fix S7-5: Try preferred range first, then steal from other pool.
     const uint32_t pref_start = for_pinned ? 0 : mid;
@@ -72,6 +71,7 @@ static uint32_t acquire_staging_slot_internal(glm5_pc_engine* engine, uint32_t s
                     true,
                     std::memory_order_acquire,
                     std::memory_order_relaxed)) {
+                engine->staging_free_slot_count.fetch_sub(1, std::memory_order_relaxed);
                 return idx;
             }
         }
@@ -83,14 +83,8 @@ static uint32_t acquire_staging_slot_internal(glm5_pc_engine* engine, uint32_t s
         // Wake immediately when a slot is freed, timeout after 5ms max.
         const bool got_slot = engine->staging_slot_cv.wait_for(
             lock, std::chrono::milliseconds(5),
-            [&]() {
-                for (size_t i = 0; i < engine->staging_slots.size(); ++i) {
-                    if (!engine->staging_slots[i].in_use.load(std::memory_order_acquire)) {
-                        return true;
-                    }
-                }
-                return false;
-            });
+            [&]() { return engine->staging_free_slot_count.load(std::memory_order_acquire) > 0; }
+        );
         if (!got_slot) {
             return UINT32_MAX;
         }
@@ -100,8 +94,13 @@ static uint32_t acquire_staging_slot_internal(glm5_pc_engine* engine, uint32_t s
 static void release_staging_slot(glm5_pc_engine* engine, uint32_t slot_index) {
     if (engine && slot_index < engine->staging_slots.size()) {
         engine->staging_slots[slot_index].in_use.store(false, std::memory_order_release);
-        // Fix 5: notify_one — only one waiter can use the freed slot.
-        // notify_all caused O(W×S) thundering herd on each release.
+        engine->staging_free_slot_count.fetch_add(1, std::memory_order_release);
+        // Problem 4 Fix: Acquire staging_slot_mutex before notify to prevent missed wakeups.
+        // Without mutex, notify_one can fire between wait_for predicate check and actual wait,
+        // causing 5ms timeout delay on every slot acquisition under contention.
+        {
+            std::lock_guard<std::mutex> lock(engine->staging_slot_mutex);
+        }
         engine->staging_slot_cv.notify_one();
     }
 }
@@ -117,16 +116,43 @@ static uint64_t copy_mapped_range_to_staging(
         if (engine && slot_index == UINT32_MAX) {
             engine->io_atomic.staging_wraps.fetch_add(1);
         }
-        touch_mapped_range(src, bytes);
-        return bytes;
+        return 0;
     }
     glm5_staging_slot& slot = engine->staging_slots[slot_index];
     if (!slot.buf || slot.size == 0 || bytes > slot.size) {
-        touch_mapped_range(src, bytes);
-        return bytes;
+        engine->io_atomic.staging_wraps.fetch_add(1);
+        return 0;
     }
 
-    std::memcpy(slot.buf, src, static_cast<size_t>(bytes));
+    if (bytes >= 1024ull * 1024ull) {
+#if defined(__AVX2__)
+        if (reinterpret_cast<uintptr_t>(slot.buf) % 32 == 0) {
+            uint8_t* d = static_cast<uint8_t*>(slot.buf);
+            const uint8_t* s = static_cast<const uint8_t*>(src);
+            size_t i = 0;
+            for (; i + 127 < static_cast<size_t>(bytes); i += 128) {
+                __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+                __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 32));
+                __m256i v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 64));
+                __m256i v3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 96));
+                _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i), v0);
+                _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 32), v1);
+                _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 64), v2);
+                _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 96), v3);
+            }
+            _mm_sfence();
+            if (i < static_cast<size_t>(bytes)) {
+                std::memcpy(d + i, s + i, static_cast<size_t>(bytes) - i);
+            }
+        } else {
+            std::memcpy(slot.buf, src, static_cast<size_t>(bytes));
+        }
+#else
+        std::memcpy(slot.buf, src, static_cast<size_t>(bytes));
+#endif
+    } else {
+        std::memcpy(slot.buf, src, static_cast<size_t>(bytes));
+    }
     return bytes;
 }
 
@@ -138,16 +164,45 @@ static uint64_t copy_mapped_range_to_staging_linear(
     uint64_t* staging_offset
 ) {
     if (!engine || !src || bytes == 0 || slot_index >= engine->staging_slots.size() || !staging_offset) {
-        touch_mapped_range(src, bytes);
-        return bytes;
+        if (engine && slot_index == UINT32_MAX) {
+            engine->io_atomic.staging_wraps.fetch_add(1);
+        }
+        return 0;
     }
     glm5_staging_slot& slot = engine->staging_slots[slot_index];
     if (!slot.buf || *staging_offset > slot.size || bytes > slot.size - *staging_offset) {
-        touch_mapped_range(src, bytes);
         engine->io_atomic.staging_wraps.fetch_add(1);
-        return bytes;
+        return 0;
     }
-    std::memcpy(slot.buf + *staging_offset, src, static_cast<size_t>(bytes));
+    if (bytes >= 1024ull * 1024ull) {
+#if defined(__AVX2__)
+        if (reinterpret_cast<uintptr_t>(slot.buf + *staging_offset) % 32 == 0) {
+            uint8_t* d = static_cast<uint8_t*>(slot.buf + *staging_offset);
+            const uint8_t* s = static_cast<const uint8_t*>(src);
+            size_t i = 0;
+            for (; i + 127 < static_cast<size_t>(bytes); i += 128) {
+                __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+                __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 32));
+                __m256i v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 64));
+                __m256i v3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 96));
+                _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i), v0);
+                _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 32), v1);
+                _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 64), v2);
+                _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 96), v3);
+            }
+            _mm_sfence();
+            if (i < static_cast<size_t>(bytes)) {
+                std::memcpy(d + i, s + i, static_cast<size_t>(bytes) - i);
+            }
+        } else {
+            std::memcpy(slot.buf + *staging_offset, src, static_cast<size_t>(bytes));
+        }
+#else
+        std::memcpy(slot.buf + *staging_offset, src, static_cast<size_t>(bytes));
+#endif
+    } else {
+        std::memcpy(slot.buf + *staging_offset, src, static_cast<size_t>(bytes));
+    }
     *staging_offset += bytes;
     return bytes;
 }

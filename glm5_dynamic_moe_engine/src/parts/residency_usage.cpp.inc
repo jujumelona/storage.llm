@@ -50,9 +50,14 @@ static void subtract_tier_usage(glm5_pc_engine* engine, glm5_tier_t tier, uint64
     }
 }
 
-// Fix 53: Single compaction function — caller must hold heap_mutex AND map_mutex
+// Eviction heap compaction snapshots under heap_mutex, then validates/rebuilds outside it.
 static constexpr size_t EVICT_HEAP_COMPACTION_NUMERATOR = 3;
 static constexpr size_t EVICT_HEAP_COMPACTION_DENOMINATOR = 2;
+
+static std::mutex& evict_heap_mutex(glm5_pc_engine* engine, int idx) {
+    const int safe_idx = (idx >= 0 && idx < 3) ? idx : 0;
+    return engine->heap_mutexes[safe_idx];
+}
 
 static int try_add_tier_usage(glm5_pc_engine* engine, glm5_tier_t tier, uint64_t bytes, uint64_t budget) {
     std::atomic<uint64_t>* counter = tier_counter(engine, tier);
@@ -74,20 +79,54 @@ static int try_add_tier_usage(glm5_pc_engine* engine, glm5_tier_t tier, uint64_t
     }
 }
 
-// Caller must hold heap_mutex and must not already hold map_mutex.
-static void compact_evict_heap_locked(glm5_pc_engine* engine, int idx, bool force = false) {
-    if (!engine || idx < 0 || idx >= 3) return;
-    const size_t heap_size = engine->evict_heaps[idx].size();
-    if (heap_size == 0) {
-        return;
+static uint64_t evict_heap_active_count(const glm5_pc_engine* engine, int idx) {
+    if (!engine) {
+        return 0;
     }
+    if (idx == 0) {
+        return engine->vram_expert_count.load(std::memory_order_relaxed);
+    }
+    if (idx == 1) {
+        return engine->ram_expert_count.load(std::memory_order_relaxed);
+    }
+    if (idx == 2) {
+        return engine->db_expert_count.load(std::memory_order_relaxed);
+    }
+    return 0;
+}
+
+static void compact_evict_heap(glm5_pc_engine* engine, int idx, bool force = false) {
+    if (!engine || idx < 0 || idx >= 3) return;
+    using heap_t = std::priority_queue<glm5_evict_candidate, std::vector<glm5_evict_candidate>, glm5_evict_colder_first>;
+    heap_t snapshot;
+    size_t heap_size = 0;
+    uint64_t heap_version = 0;
+    {
+        std::lock_guard<std::mutex> heap_lock(evict_heap_mutex(engine, idx));
+        heap_size = engine->evict_heaps[idx].size();
+        if (heap_size == 0) {
+            return;
+        }
+        const uint64_t active_count = evict_heap_active_count(engine, idx);
+        if (!force && heap_size <= active_count * 4u + 512u) {
+            return;
+        }
+        snapshot = engine->evict_heaps[idx];
+        heap_version = engine->evict_heap_versions[idx].load(std::memory_order_acquire);
+    }
+
+    std::vector<glm5_evict_candidate> entries;
+    entries.reserve(heap_size);
+    while (!snapshot.empty()) {
+        entries.push_back(snapshot.top());
+        snapshot.pop();
+    }
+
     std::vector<glm5_evict_candidate> valid;
-    valid.reserve(heap_size);
+    valid.reserve(entries.size());
     {
         std::lock_guard<std::mutex> map_lock(engine->map_mutex);
-        while (!engine->evict_heaps[idx].empty()) {
-            const auto top = engine->evict_heaps[idx].top();
-            engine->evict_heaps[idx].pop();
+        for (const auto& top : entries) {
             if (top.slot >= engine->expert_states.size()) {
                 continue;
             }
@@ -98,8 +137,15 @@ static void compact_evict_heap_locked(glm5_pc_engine* engine, int idx, bool forc
             }
         }
     }
-    using heap_t = std::priority_queue<glm5_evict_candidate, std::vector<glm5_evict_candidate>, glm5_evict_colder_first>;
-    engine->evict_heaps[idx] = heap_t(glm5_evict_colder_first{}, std::move(valid));
+    heap_t compacted(glm5_evict_colder_first{}, std::move(valid));
+    {
+        std::lock_guard<std::mutex> heap_lock(evict_heap_mutex(engine, idx));
+        if (engine->evict_heap_versions[idx].load(std::memory_order_acquire) == heap_version &&
+            engine->evict_heaps[idx].size() == heap_size) {
+            engine->evict_heaps[idx] = std::move(compacted);
+            engine->evict_heap_versions[idx].fetch_add(1, std::memory_order_release);
+        }
+    }
 }
 
 static void push_evict_candidate(glm5_pc_engine* engine, size_t slot, const glm5_block_state& state) {
@@ -114,9 +160,9 @@ static void push_evict_candidate(glm5_pc_engine* engine, size_t slot, const glm5
     candidate.hot_score = state.hot_score;
     candidate.last_touch_epoch = state.last_touch_epoch;
 
-    // Fix 42: Dedicated heap_mutex protects evict_heaps from device/map mutex races
-    std::lock_guard<std::mutex> heap_lock(engine->heap_mutex);
+    std::lock_guard<std::mutex> heap_lock(evict_heap_mutex(engine, idx));
     engine->evict_heaps[idx].push(candidate);
+    engine->evict_heap_versions[idx].fetch_add(1, std::memory_order_release);
 }
 
 static void replace_evict_candidate(glm5_pc_engine* engine, size_t slot, const glm5_block_state& state) {
@@ -124,20 +170,6 @@ static void replace_evict_candidate(glm5_pc_engine* engine, size_t slot, const g
         return;
     }
     const int target_idx = tier_heap_index(state.tier);
-    std::lock_guard<std::mutex> heap_lock(engine->heap_mutex);
-    using heap_t = std::priority_queue<glm5_evict_candidate, std::vector<glm5_evict_candidate>, glm5_evict_colder_first>;
-    for (int idx = 0; idx < 3; ++idx) {
-        std::vector<glm5_evict_candidate> kept;
-        kept.reserve(engine->evict_heaps[idx].size());
-        while (!engine->evict_heaps[idx].empty()) {
-            const glm5_evict_candidate top = engine->evict_heaps[idx].top();
-            engine->evict_heaps[idx].pop();
-            if (top.slot != slot) {
-                kept.push_back(top);
-            }
-        }
-        engine->evict_heaps[idx] = heap_t(glm5_evict_colder_first{}, std::move(kept));
-    }
     if (target_idx >= 0 && state.bytes != 0) {
         glm5_evict_candidate candidate;
         candidate.slot = slot;
@@ -145,7 +177,10 @@ static void replace_evict_candidate(glm5_pc_engine* engine, size_t slot, const g
         candidate.bytes = state.bytes;
         candidate.hot_score = state.hot_score;
         candidate.last_touch_epoch = state.last_touch_epoch;
+
+        std::lock_guard<std::mutex> heap_lock(evict_heap_mutex(engine, target_idx));
         engine->evict_heaps[target_idx].push(candidate);
+        engine->evict_heap_versions[target_idx].fetch_add(1, std::memory_order_release);
     }
 }
 

@@ -9,6 +9,9 @@ static void stop_io_workers(glm5_pc_engine* engine) {
     engine->disk_stage.cv.notify_all();
     engine->pinned_stage.cv.notify_all();
     engine->gpu_stage.cv.notify_all();
+    engine->disk_stage.pop_cv.notify_all();
+    engine->pinned_stage.pop_cv.notify_all();
+    engine->gpu_stage.pop_cv.notify_all();
     engine->staging_slot_cv.notify_all();
     for (std::thread& worker : engine->io_workers) {
         if (worker.joinable()) {
@@ -45,8 +48,7 @@ static void start_io_workers(glm5_pc_engine* engine) {
     if (!engine || !engine->io_config.enable_compute_io_overlap) {
         return;
     }
-    uint32_t workers = engine->io_config.disk_worker_threads ?
-        engine->io_config.disk_worker_threads : engine->io_config.io_worker_threads;
+    uint32_t workers = runtime_disk_workers(engine);
     if (workers == 0) {
         workers = 1;
     }
@@ -56,7 +58,7 @@ static void start_io_workers(glm5_pc_engine* engine) {
         engine->io_workers.emplace_back(io_worker_loop, engine, i);
     }
     if (engine->io_config.enable_multistage_pipeline) {
-        uint32_t pinned_workers = engine->io_config.pinned_worker_threads;
+        uint32_t pinned_workers = runtime_pinned_workers(engine);
         if (pinned_workers == 0) {
             pinned_workers = 1;
         }
@@ -65,8 +67,10 @@ static void start_io_workers(glm5_pc_engine* engine) {
         for (uint32_t i = 0; i < pinned_workers; ++i) {
             engine->pinned_workers.emplace_back(pinned_worker_loop, engine, i);
         }
+    }
 
-        uint32_t gpu_workers = engine->io_config.gpu_worker_threads;
+    if (engine->io_config.enable_multistage_pipeline || (engine->io_config.enable_pinned_host && engine->staging)) {
+        uint32_t gpu_workers = runtime_gpu_workers(engine);
         if (gpu_workers == 0) {
             gpu_workers = 1;
         }

@@ -27,9 +27,15 @@ static void pinned_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                     return;
                 }
                 if (task.staging_slot == UINT32_MAX) {
-                    // Bug #3: Sleep before re-enqueue to prevent CPU spin
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    task.urgent = 1;
+                    engine->io_atomic.staging_slot_deficit.fetch_add(1);
+                    // Problem 1 Fix: Preserve original urgent flag from router-selected experts.
+                    // Only promote to urgent after 3+ retries, never demote existing urgent=1.
+                    if (!task.urgent && task.requeue_count >= 3u) {
+                        task.urgent = 1;
+                    }
+                    if (task.requeue_count < UINT8_MAX) {
+                        ++task.requeue_count;
+                    }
                     if (enqueue_stage_or_retry(engine, engine->pinned_stage, task)) {
                         ok = 1;
                         terminal = 0;
@@ -61,13 +67,29 @@ static void pinned_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                     terminal = 0;
                     engine->gpu_stage.cv.notify_one();
                 } else {
-                    next.stage = GLM5_TRANSFER_STAGE_RAM_TO_PINNED;
-                    next.urgent = 1;
-                    if (next.staging_valid &&
-                        enqueue_stage_or_retry(engine, engine->pinned_stage, next)) {
-                        terminal = 0;
-                        engine->pinned_stage.cv.notify_one();
-                    } else {
+                    bool queued_retry = false;
+                    for (uint32_t retry = 0; retry < 3u && !engine->io_stop.load(); ++retry) {
+                        next.stage = GLM5_TRANSFER_STAGE_PINNED_TO_GPU;
+                        next.urgent = 1;
+                        if (enqueue_stage_or_retry(engine, engine->gpu_stage, next)) {
+                            terminal = 0;
+                            engine->gpu_stage.cv.notify_one();
+                            queued_retry = true;
+                            break;
+                        }
+                        next.stage = GLM5_TRANSFER_STAGE_RAM_TO_PINNED;
+                        next.urgent = 1;
+                        if (next.staging_valid &&
+                            enqueue_stage_or_retry(engine, engine->pinned_stage, next)) {
+                            terminal = 0;
+                            engine->pinned_stage.cv.notify_one();
+                            queued_retry = true;
+                            break;
+                        }
+                        std::unique_lock<std::mutex> lock(engine->gpu_stage.mtx);
+                        engine->gpu_stage.pop_cv.wait_for(lock, std::chrono::milliseconds(1));
+                    }
+                    if (!queued_retry) {
                         ok = 0;
                         if (next.staging_slot != UINT32_MAX) {
                             release_staging_slot(engine, next.staging_slot);

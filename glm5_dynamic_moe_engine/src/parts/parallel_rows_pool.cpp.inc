@@ -44,36 +44,34 @@ static void cpu_row_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
     }
 }
 
-static void ensure_cpu_row_workers(glm5_pc_engine* engine, uint32_t workers) {
-    // Fix 7: Early return when pool already sized correctly (hot path optimization).
-    // Avoids hw_concurrency + io_config recalc on every matmul call.
-    if (engine->cpu_row_workers.size() == workers &&
-        engine->cpu_row_target_workers.load(std::memory_order_relaxed) == workers) {
-        return;
-    }
-    const unsigned int hw_raw = std::thread::hardware_concurrency();
-    const uint32_t hw = std::max(2u, hw_raw ? (uint32_t)hw_raw : 1u);
-    const uint32_t io_threads = engine ?
-        (engine->io_config.disk_worker_threads +
-         engine->io_config.pinned_worker_threads +
-         engine->io_config.gpu_worker_threads) : 0u;
-    const uint32_t max_cap = hw > io_threads + 1u ? hw - io_threads - 1u : 1u;
-    if (workers > max_cap) {
-        workers = max_cap;
+static void ensure_cpu_row_workers(glm5_pc_engine* engine, uint32_t /*ignored*/) {
+    if (!engine) return;
+    uint32_t target = engine->cpu_row_target_workers.load(std::memory_order_relaxed);
+    if (target == 0) {
+        const unsigned int hw_raw = std::thread::hardware_concurrency();
+        const uint32_t hw = std::max(2u, hw_raw ? (uint32_t)hw_raw : 1u);
+        const uint32_t io_threads = runtime_disk_workers(engine) +
+             runtime_pinned_workers(engine) +
+             runtime_gpu_workers(engine);
+        target = hw > io_threads + 1u ? hw - io_threads - 1u : 1u;
+        engine->cpu_row_target_workers.store(target, std::memory_order_relaxed);
     }
 
-    engine->cpu_row_target_workers.store(workers, std::memory_order_relaxed);
-    if (engine->cpu_row_workers.size() > workers) {
+    if (engine->cpu_row_workers.size() == target) {
+        return;
+    }
+
+    if (engine->cpu_row_workers.size() > target) {
         // Fix 6: Don't join on hot path — move excess threads to deferred_joins.
         // Workers self-terminate when they see worker_index >= target.
         engine->cpu_row_cv.notify_all();
-        for (size_t i = workers; i < engine->cpu_row_workers.size(); ++i) {
+        for (size_t i = target; i < engine->cpu_row_workers.size(); ++i) {
             engine->deferred_joins.emplace_back(std::move(engine->cpu_row_workers[i]));
         }
-        engine->cpu_row_workers.resize(workers);
+        engine->cpu_row_workers.resize(target);
     }
 
-    while (engine->cpu_row_workers.size() < workers) {
+    while (engine->cpu_row_workers.size() < target) {
         const uint32_t index = static_cast<uint32_t>(engine->cpu_row_workers.size());
         engine->cpu_row_workers.emplace_back(cpu_row_worker_loop, engine, index);
     }

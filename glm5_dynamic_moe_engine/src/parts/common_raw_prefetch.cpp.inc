@@ -45,8 +45,8 @@ static int prefetch_one_raw_span(glm5_pc_engine* e, const glm5_storage_raw_span_
     if (!src) {
         return 0;
     }
+    touch_mapped_range(src, s.bytes);
     if (!hint_issued) {
-        touch_mapped_range(src, s.bytes);
         e->io_atomic.bytes_touch_fallback.fetch_add(s.bytes);
     }
     e->io_atomic.bytes_prefetched.fetch_add(s.bytes);
@@ -130,6 +130,37 @@ static int prefetch_common_raw_storage(glm5_pc_engine* e) {
 
 // static thread_local int tls_last_activation_layer = -1; // Removed in favor of engine member
 
+static int activation_key_layer(uint64_t key, int* out_layer) {
+    if (!out_layer) {
+        return 0;
+    }
+    const uint32_t key_type = (uint32_t)((key >> 60) & 0x0f);
+    if (key_type == 3u) {
+        *out_layer = (int)((key >> 48) & 0x0fffu);
+        return 1;
+    }
+    if (key_type == 4u) {
+        const uint32_t encoded = (uint32_t)((key >> 40) & 0xffffu);
+        *out_layer = encoded == 0xffffu ? -1 : (int)encoded;
+        return 1;
+    }
+    return 0;
+}
+
+static uint32_t runtime_prefetch_window(const glm5_pc_engine* engine) {
+    if (!engine) {
+        return 1u;
+    }
+    uint32_t window = engine->runtime_prefetch_window_layers.load(std::memory_order_relaxed);
+    if (window == 0) {
+        window = engine->io_config.prefetch_window_layers;
+    }
+    if (window == 0) {
+        window = 1u;
+    }
+    return std::min<uint32_t>(window, 8u);
+}
+
 static int prefetch_moe_activation_raw(glm5_pc_engine* e, int layer) {
     if (!e || layer < 0) {
         return 0;
@@ -149,8 +180,7 @@ static int prefetch_moe_activation_raw(glm5_pc_engine* e, int layer) {
     }
     const glm5_storage_constants_t* c = glm5_storage_constants();
     const int is_moe = c && layer >= (int)c->first_moe_layer && layer <= (int)c->last_moe_layer;
-    const uint32_t roles = GLM5_RAW_ROLE_NORM | GLM5_RAW_ROLE_ATTENTION |
-        (is_moe ? GLM5_RAW_ROLE_ROUTER : 0u);
+    const uint32_t roles = GLM5_RAW_ROLE_NORM | GLM5_RAW_ROLE_ATTENTION;
     const int ok = prefetch_raw_layer_roles(
         e,
         layer,
@@ -160,23 +190,29 @@ static int prefetch_moe_activation_raw(glm5_pc_engine* e, int layer) {
         1
     ) > 0 ? 1 : 0;
     if (ok) {
-        // Bug #6: Single lock pass - activation_keys is small (~80 entries)
+        // Bug #6: Single lock pass - activation_keys is small.
         {
-            std::vector<CUdeviceptr> deferred_free_ptrs;
+            std::vector<std::pair<CUdeviceptr, uint64_t>> deferred_free_ptrs;
             {
                 std::lock_guard<std::mutex> lock(e->device_mutex);
+                const int keep_begin = layer > 0 ? layer - 1 : layer;
+                const int keep_end = layer + (int)runtime_prefetch_window(e);
+                std::vector<uint64_t> to_free_keys;
                 for (uint64_t k : e->activation_keys) {
-                    const uint32_t key_type = (uint32_t)((k >> 60) & 0xF);
                     bool should_free = false;
-                    if (key_type == 3) {
-                        should_free = ((int)((k >> 48) & 0xFFF) != layer);
+                    int key_layer = 0;
+                    if (activation_key_layer(k, &key_layer)) {
+                        should_free = key_layer < keep_begin || key_layer > keep_end;
                     } else {
                         auto it = e->device_allocations.find(k);
                         should_free = (it != e->device_allocations.end() && it->second.inflight_copies == 0);
                     }
                     if (should_free) {
-                        device_free_locked(e, k, &deferred_free_ptrs);
+                        to_free_keys.push_back(k);
                     }
+                }
+                for (uint64_t k : to_free_keys) {
+                    device_free_locked(e, k, &deferred_free_ptrs);
                 }
             }
             device_free_deferred_ptrs(e, deferred_free_ptrs);
