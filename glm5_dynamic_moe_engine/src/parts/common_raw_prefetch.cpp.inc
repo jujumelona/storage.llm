@@ -119,11 +119,21 @@ static int prefetch_fixed_core_raw(glm5_pc_engine* e) {
     const glm5_storage_constants_t* storage = glm5_storage_constants();
     const int32_t norm_layer = storage ? (int32_t)storage->num_hidden_layers : 79;
     const int32_t lm_head_layer = norm_layer + 1;
+    std::fprintf(stderr, "[storagellm] common raw device pin start: budget=%llu\n",
+        (unsigned long long)budget);
+    std::fflush(stderr);
     bytes += prefetch_raw_layer_roles(e, norm_layer, GLM5_RAW_ROLE_NORM, GLM5_DEVICE_POOL_FIXED, budget - bytes);
     bytes += prefetch_raw_layer_roles(e, lm_head_layer, GLM5_RAW_ROLE_LM_HEAD, GLM5_DEVICE_POOL_FIXED, budget - bytes);
     if (bytes < budget) {
         bytes += prefetch_raw_layer_roles(e, -1, GLM5_RAW_ROLE_EMBED, GLM5_DEVICE_POOL_FIXED, budget - bytes);
     }
+    std::fprintf(stderr, "[storagellm] common raw device pin done: bytes=%llu reserve=%llu device=%llu allocs=%llu failures=%llu\n",
+        (unsigned long long)bytes,
+        (unsigned long long)budget,
+        (unsigned long long)e->device_allocated_bytes.load(std::memory_order_relaxed),
+        (unsigned long long)e->device_allocation_count.load(std::memory_order_relaxed),
+        (unsigned long long)e->io_atomic.device_alloc_failures.load(std::memory_order_relaxed));
+    std::fflush(stderr);
     return bytes > 0 ? 1 : 0;
 }
 

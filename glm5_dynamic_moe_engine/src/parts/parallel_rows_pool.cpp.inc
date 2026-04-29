@@ -48,6 +48,18 @@ static void ensure_cpu_row_workers(glm5_pc_engine* engine, uint32_t /*ignored*/)
     if (!engine) return;
     uint32_t target = engine->cpu_row_target_workers.load(std::memory_order_relaxed);
     if (target == 0) {
+        // Existing workers were asked to retire by setting the target to zero.
+        // Join them before recreating the pool; otherwise a later dispatch can
+        // count dead joinable threads as active workers and wait forever.
+        engine->cpu_row_cv.notify_all();
+        for (std::thread& worker : engine->cpu_row_workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        engine->cpu_row_workers.clear();
+        engine->cpu_row_done_generation = engine->cpu_row_generation;
+        engine->cpu_active_workers.store(0, std::memory_order_relaxed);
         const unsigned int hw_raw = std::thread::hardware_concurrency();
         const uint32_t hw = std::max(2u, hw_raw ? (uint32_t)hw_raw : 1u);
         const uint32_t io_threads = runtime_disk_workers(engine) +
