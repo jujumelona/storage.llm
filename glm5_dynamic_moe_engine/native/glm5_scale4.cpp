@@ -4,6 +4,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "parts/scale4_state.cpp.inc"
 #include "parts/scale4_bounds.cpp.inc"

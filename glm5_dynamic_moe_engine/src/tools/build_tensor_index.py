@@ -5,8 +5,8 @@ import struct
 import sys
 
 
-MAGIC = b"SLTIDX1\0"
-VERSION = 1
+MAGIC = b"SLTIDX2\0"
+VERSION = 2
 PROJ = {
     "gate": 0,
     "gate_proj": 0,
@@ -37,6 +37,8 @@ def main(argv):
     paths = []
     path_index = {}
     records = []
+    keys = []
+    key_index = {}
     required = [
         "part", "shard", "shard_file", "layer", "expert", "proj",
         "rows", "cols", "groups", "group_size",
@@ -64,6 +66,17 @@ def main(argv):
             proj = PROJ.get((row.get("proj") or "").strip())
             if proj is None:
                 raise SystemExit("unknown proj: " + str(row.get("proj")))
+            weight_key = (row.get("weight_key") or "").strip()
+            if weight_key:
+                kidx = key_index.get(weight_key)
+                if kidx is None:
+                    kidx = len(keys)
+                    key_index[weight_key] = kidx
+                    keys.append(weight_key)
+                flags = 1
+            else:
+                kidx = 0xFFFFFFFF
+                flags = 0
             records.append((
                 u32(row, "part"),
                 u32(row, "shard"),
@@ -81,24 +94,30 @@ def main(argv):
                 u64(row, "scale2_byte_offset"),
                 u64(row, "scale2_byte_length"),
                 idx,
-                0,
-                0,
+                flags,
+                kidx,
             ))
 
     tmp_path = out_path + ".tmp"
     with open(tmp_path, "wb") as out:
         out.write(MAGIC)
-        out.write(struct.pack("<IIII", VERSION, len(paths), len(records), 0))
+        out.write(struct.pack("<IIII", VERSION, len(paths), len(records), len(keys)))
         for path in paths:
             data = path.encode("utf-8")
             if not data or len(data) > 65535:
                 raise SystemExit("bad path length: " + path)
             out.write(struct.pack("<H", len(data)))
             out.write(data)
+        for key in keys:
+            data = key.encode("utf-8")
+            if not data or len(data) > 65535:
+                raise SystemExit("bad key length")
+            out.write(struct.pack("<H", len(data)))
+            out.write(data)
         for rec in records:
             out.write(struct.pack("<IIIIIIIIIQQQQQQHHI", *rec))
     os.replace(tmp_path, out_path)
-    print(f"wrote {out_path} tensors={len(records)} paths={len(paths)}")
+    print(f"wrote {out_path} tensors={len(records)} paths={len(paths)} scale4_keys={len(keys)}")
     return 0
 
 

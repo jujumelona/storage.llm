@@ -22,10 +22,6 @@ static void touch_mapped_range(const uint8_t* src, uint64_t bytes) {
     if (!src || bytes == 0) {
         return;
     }
-    // Bug Fix: Renamed from touch_mapped_range to clarify async behavior
-    // MADV_WILLNEED (Linux) and PrefetchVirtualMemory (Windows) are ASYNC hints.
-    // Pages are NOT guaranteed in RAM after return. Actual page-in occurs during
-    // memcpy in prefetch_tensor_ram_to_pinned (page fault triggers blocking disk I/O).
 #ifdef _WIN32
     WIN32_MEMORY_RANGE_ENTRY entry;
     entry.VirtualAddress = const_cast<uint8_t*>(src);
@@ -34,6 +30,13 @@ static void touch_mapped_range(const uint8_t* src, uint64_t bytes) {
 #elif defined(__linux__)
     madvise(const_cast<uint8_t*>(src), (size_t)bytes, MADV_WILLNEED);
 #endif
+    volatile uint8_t sink = 0;
+    const uint64_t page = 4096;
+    for (uint64_t offset = 0; offset < bytes; offset += page) {
+        sink ^= src[offset];
+    }
+    sink ^= src[bytes - 1];
+    (void)sink;
 }
 
 static uint32_t acquire_staging_slot_internal(glm5_pc_engine* engine, uint32_t start_idx, uint32_t count, uint32_t worker_index, uint32_t turn);

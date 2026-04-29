@@ -84,16 +84,23 @@ static int load_binary_tensor_index(glm5_pc_engine* engine, const char* index_pa
     uint32_t tensor_count = 0;
     uint32_t reserved = 0;
     if (!tensor_index_read_exact(input, magic, sizeof(magic)) ||
-        std::memcmp(magic, "SLTIDX1", 7) != 0 ||
+        (std::memcmp(magic, "SLTIDX1", 7) != 0 && std::memcmp(magic, "SLTIDX2", 7) != 0) ||
         !tensor_index_read_u32(input, &version) ||
         !tensor_index_read_u32(input, &path_count) ||
         !tensor_index_read_u32(input, &tensor_count) ||
         !tensor_index_read_u32(input, &reserved) ||
-        version != 1 ||
+        (version != 1 && version != 2) ||
         path_count == 0 ||
         path_count > 4096 ||
         tensor_count == 0 ||
         tensor_count > 1000000u) {
+        return 0;
+    }
+    if (engine->scale4 && version < 2) {
+        std::fprintf(stderr,
+            "[storagellm] stale tensor index has no scale4 keys, falling back to tensors.csv: %s\n",
+            index_path);
+        std::fflush(stderr);
         return 0;
     }
 
@@ -112,6 +119,25 @@ static int load_binary_tensor_index(glm5_pc_engine* engine, const char* index_pa
             resolved_path = raw_path;
         }
         engine->tensor_paths.push_back(std::move(resolved_path));
+    }
+    std::vector<std::string> scale4_keys;
+    if (version >= 2) {
+        const uint32_t key_count = reserved;
+        if (key_count > tensor_count) {
+            return 0;
+        }
+        scale4_keys.reserve(key_count);
+        for (uint32_t i = 0; i < key_count; ++i) {
+            uint16_t len = 0;
+            if (!tensor_index_read_u16(input, &len) || len == 0) {
+                return 0;
+            }
+            std::string key(len, '\0');
+            if (!tensor_index_read_exact(input, &key[0], key.size())) {
+                return 0;
+            }
+            scale4_keys.push_back(std::move(key));
+        }
     }
 
     engine->tensors.reserve(tensor_count);
@@ -144,9 +170,13 @@ static int load_binary_tensor_index(glm5_pc_engine* engine, const char* index_pa
             return 0;
         }
         rec.info.proj = static_cast<glm5_projection_t>(proj);
-        rec.info.has_scale4 = flags & 1u ? 1 : 0;
         rec.resolved_path_index = path_index;
         rec.scale4_entry = nullptr;
+        rec.info.has_scale4 = 0;
+        if (engine->scale4 && version >= 2 && (flags & 1u) && rec_reserved < scale4_keys.size()) {
+            rec.scale4_entry = glm5_scale4_find(engine->scale4, scale4_keys[rec_reserved].c_str());
+            rec.info.has_scale4 = rec.scale4_entry ? 1 : 0;
+        }
         finalize_tensor_layout(&rec);
         const uint64_t stream_bytes = tensor_stream_bytes(rec);
         if (stream_bytes > engine->max_tensor_stream_bytes) {
@@ -161,9 +191,10 @@ static int load_binary_tensor_index(glm5_pc_engine* engine, const char* index_pa
         return 0;
     }
     finish_tensor_index_load(engine);
-    std::fprintf(stderr, "[storagellm] binary tensor index loaded: %u tensors paths=%u\n",
+    std::fprintf(stderr, "[storagellm] binary tensor index loaded: %u tensors paths=%u scale4=%s\n",
         tensor_count,
-        path_count);
+        path_count,
+        engine->scale4 ? "on" : "off");
     std::fflush(stderr);
     return 1;
 }
@@ -235,26 +266,53 @@ int glm5_pc_engine_load_codec_table(
     }
     if (scale4_path && scale4_path[0]) {
         std::fprintf(stderr,
-            "[storagellm] scale4 startup attach deferred: %s\n",
+            "[storagellm] scale4 attach: %s\n",
             scale4_path);
+        std::fflush(stderr);
+        engine->scale4 = glm5_scale4_open(scale4_path);
+        if (!engine->scale4 || glm5_scale4_entry_count(engine->scale4) == 0) {
+            std::fprintf(stderr, "[storagellm] failed to attach scale4: %s\n", scale4_path);
+            std::fflush(stderr);
+            if (engine->scale4) {
+                glm5_scale4_close(engine->scale4);
+                engine->scale4 = nullptr;
+            }
+            return 0;
+        }
+        std::fprintf(stderr, "[storagellm] scale4 attached entries=%u\n",
+            glm5_scale4_entry_count(engine->scale4));
         std::fflush(stderr);
     }
 
     if (load_binary_tensor_index(engine, csv_path)) {
         return 1;
     }
+    std::string fallback_csv;
+    const char* csv_load_path = csv_path;
     if (!path_ends_with_csv(csv_path)) {
-        return 0;
+        if (!engine->model_root.empty()) {
+            fallback_csv = storagellm::path_join(engine->model_root, "tensors.csv");
+            uint64_t ignored = 0;
+            if (file_size_bytes(fallback_csv, &ignored)) {
+                csv_load_path = fallback_csv.c_str();
+                std::fprintf(stderr, "[storagellm] loading csv fallback: %s\n", csv_load_path);
+                std::fflush(stderr);
+            } else {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
     }
 
     std::ifstream input;
 #ifdef _WIN32
-    const std::wstring wide_csv_path = storagellm::wide_path_from_utf8(csv_path);
+    const std::wstring wide_csv_path = storagellm::wide_path_from_utf8(csv_load_path);
     if (!wide_csv_path.empty()) {
         input.open(wide_csv_path.c_str());
     }
 #else
-    input.open(csv_path);
+    input.open(csv_load_path);
 #endif
     if (!input) {
         return 0;
@@ -287,6 +345,7 @@ int glm5_pc_engine_load_codec_table(
         rec.info.scale_byte_length = parse_csv_u64_col_fast(line, GLM5_CODEC_COL_SCALE_LENGTH);
         rec.info.scale2_byte_offset = parse_csv_u64_col_fast(line, GLM5_CODEC_COL_SCALE2_OFFSET);
         rec.info.scale2_byte_length = parse_csv_u64_col_fast(line, GLM5_CODEC_COL_SCALE2_LENGTH);
+        const std::string weight_key = csv_string_col_fast(line, GLM5_CODEC_COL_WEIGHT_KEY);
         std::string shard_file = csv_string_col_fast(line, GLM5_CODEC_COL_SHARD_FILE);
         std::string source_file = csv_string_col_fast(line, GLM5_CODEC_COL_SOURCE_FILE);
         const std::string path_cache_key = shard_file + "\n" + source_file;
@@ -314,7 +373,10 @@ int glm5_pc_engine_load_codec_table(
         rec.resolved_path_index = path_idx;
 
         rec.scale4_entry = nullptr;
-        rec.info.has_scale4 = 0;
+        if (engine->scale4 && !weight_key.empty()) {
+            rec.scale4_entry = glm5_scale4_find(engine->scale4, weight_key.c_str());
+        }
+        rec.info.has_scale4 = rec.scale4_entry ? 1 : 0;
         finalize_tensor_layout(&rec);
         const uint64_t stream_bytes = tensor_stream_bytes(rec);
         if (stream_bytes > engine->max_tensor_stream_bytes) {
