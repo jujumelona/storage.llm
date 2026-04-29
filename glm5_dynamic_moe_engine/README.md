@@ -488,6 +488,30 @@ Eval/perplexity routes:
 - `POST /v1/storagellm/perplexity`
 - `POST /v1/perplexity`
 
+### Benchmarking
+
+The benchmark helper targets the OpenAI-compatible HTTP surface and runs several
+checks in one pass: system/GPU/RAM snapshots, direct `curl` latency/tok/s tests,
+perplexity through `/v1/perplexity`, NVIDIA GenAI-Perf, NVIDIA AIPerf, and
+GuideLLM if it is already installed:
+
+```bash
+cd /teamspace/studios/this_studio/storagellm_bench/storage.llm
+bash benchmarks/run_openai_benchmarks.sh
+```
+
+Useful overrides:
+
+```bash
+PROMPT_TOKENS=512 OUTPUT_TOKENS=256 NUM_PROMPTS=50 CONCURRENCY=1 bash benchmarks/run_openai_benchmarks.sh
+TOKENIZER=/teamspace/studios/this_studio/storagellm_bench/models/GLM5.1-4q-storage bash benchmarks/run_openai_benchmarks.sh
+```
+
+Results are written under
+`/teamspace/studios/this_studio/storagellm_bench/benchmark_results`. Key files
+include `curl_latency.jsonl`, `ppl_results.jsonl`, `genai_perf_profile.json`,
+`aiperf_profile*`, and `summary.jsonl`.
+
 Text requests can use `input`, `prompt`, `messages[].content`, or collected
 `text` fields. `input_ids` is accepted for clients that already tokenize.
 

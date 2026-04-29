@@ -123,6 +123,8 @@ int glm5_pc_engine_load_codec_table(
     }
 
     std::unordered_map<std::string, uint16_t> path_index_map;
+    std::unordered_map<std::string, std::string> resolved_path_cache;
+    uint64_t parsed_rows = 0;
     while (std::getline(input, line)) {
         if (line.empty()) {
             continue;
@@ -147,9 +149,17 @@ int glm5_pc_engine_load_codec_table(
         std::string weight_key = codec_col(row, GLM5_CODEC_COL_WEIGHT_KEY);
         std::string shard_file = codec_col(row, GLM5_CODEC_COL_SHARD_FILE);
         std::string source_file = codec_col(row, GLM5_CODEC_COL_SOURCE_FILE);
-        std::string resolved_path = resolve_model_file_path(engine->model_root, shard_file, source_file);
-        if (resolved_path.empty()) {
-            resolved_path = shard_file;
+        const std::string path_cache_key = shard_file + "\n" + source_file;
+        std::string resolved_path;
+        auto resolved_it = resolved_path_cache.find(path_cache_key);
+        if (resolved_it != resolved_path_cache.end()) {
+            resolved_path = resolved_it->second;
+        } else {
+            resolved_path = resolve_model_file_path(engine->model_root, shard_file, source_file);
+            if (resolved_path.empty()) {
+                resolved_path = shard_file;
+            }
+            resolved_path_cache.emplace(path_cache_key, resolved_path);
         }
 
         uint16_t path_idx = 0xFFFF;
@@ -175,7 +185,14 @@ int glm5_pc_engine_load_codec_table(
         tensor_slots_set(engine, (int)rec.info.layer, (int)rec.info.expert, rec.info.proj, engine->tensors.size());
         expert_bytes_add(engine, (int)rec.info.layer, (int)rec.info.expert, stream_bytes);
         engine->tensors.push_back(std::move(rec));
+        ++parsed_rows;
+        if ((parsed_rows % 10000ull) == 0ull) {
+            std::cerr << "[storagellm] codec rows loaded: " << parsed_rows
+                      << " paths=" << engine->tensor_paths.size() << "\n" << std::flush;
+        }
     }
+    std::cerr << "[storagellm] codec rows loaded: " << parsed_rows
+              << " paths=" << engine->tensor_paths.size() << "\n" << std::flush;
     if (engine->staging && engine->staging_size > 0) {
         configure_staging_slots(engine);
         engine->staging_slot_cv.notify_all();
