@@ -1,5 +1,11 @@
 static void cpu_row_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
     uint64_t seen = 0;
+    {
+        std::lock_guard<std::mutex> lock(engine->cpu_row_mutex);
+        const bool row_job_active = engine->cpu_row_done_generation != engine->cpu_row_generation;
+        seen = row_job_active && engine->cpu_row_generation > 0 ?
+            engine->cpu_row_generation - 1u : engine->cpu_row_generation;
+    }
     for (;;) {
         uint32_t rows = 0;
         uint32_t block = 1;

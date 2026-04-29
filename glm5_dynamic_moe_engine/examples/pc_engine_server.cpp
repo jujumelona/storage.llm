@@ -781,6 +781,18 @@ static std::string make_eval_error_json(const server_eval_result& result) {
     return out.str();
 }
 
+static const char* generation_phase_name(uint32_t phase) {
+    switch (phase) {
+        case GLM5_GEN_PHASE_INIT: return "init";
+        case GLM5_GEN_PHASE_PREFILL: return "prefill";
+        case GLM5_GEN_PHASE_ATTENTION: return "attention";
+        case GLM5_GEN_PHASE_MLP: return "mlp";
+        case GLM5_GEN_PHASE_LM_HEAD: return "lm_head";
+        case GLM5_GEN_PHASE_DONE: return "done";
+        default: return "idle";
+    }
+}
+
 static std::string make_health_json(
     const server_options& opts,
     const glm5_backend_caps_t& caps,
@@ -803,6 +815,7 @@ static std::string make_health_json(
         << "\"base_url\":\"http://" << json_escape(opts.host) << ":" << opts.port << "/v1\","
         << "\"backend\":\"" << glm5_backend_name(caps.backend) << "\","
         << "\"platform\":\"" << glm5_platform_name(caps.platform) << "\","
+        << "\"forwardPath\":\"cpu_mmap_raw\","
         << "\"storageStateValid\":" << (forward.storage_state_valid ? "true" : "false") << ","
         << "\"tensorTableLoaded\":" << (forward.tensor_table_loaded ? "true" : "false") << ","
         << "\"expertTripletAvailable\":" << (forward.expert_triplet_available ? "true" : "false") << ","
@@ -825,6 +838,8 @@ static std::string make_health_json(
         << "\"commonRawPrefetchedBytes\":" << stats.common_raw_prefetched_bytes << ","
         << "\"commonRawPrefetchedSpans\":" << stats.common_raw_prefetched_spans << ","
         << "\"commonRawTensorCount\":" << stats.common_raw_tensor_count << ","
+        << "\"processRssBytes\":" << storagellm::current_process_rss_bytes() << ","
+        << "\"availableRamBytes\":" << storagellm::available_ram_bytes() << ","
         << "\"deviceAllocatedBytes\":" << stats.device_allocated_bytes << ","
         << "\"deviceAllocationCount\":" << stats.device_allocation_count << ","
         << "\"deviceFixedBytes\":" << stats.device_fixed_bytes << ","
@@ -843,6 +858,13 @@ static std::string make_health_json(
         << "\"vramExpertCount\":" << stats.vram_expert_count << ","
         << "\"ramExpertCount\":" << stats.ram_expert_count << ","
         << "\"storageExpertCount\":" << stats.db_expert_count << ","
+        << "\"generationStarted\":" << stats.generation_started << ","
+        << "\"generationCompleted\":" << stats.generation_completed << ","
+        << "\"generationFailed\":" << stats.generation_failed << ","
+        << "\"generationActive\":" << stats.generation_active << ","
+        << "\"generationToken\":" << stats.generation_token << ","
+        << "\"generationLayer\":" << stats.generation_layer << ","
+        << "\"generationPhase\":\"" << generation_phase_name(stats.generation_phase) << "\","
         << "\"kvMode\":\"" << glm5_kv_mode_name(opts.engine_config.kv_mode) << "\","
         << "\"recommendedVramCacheBytes\":" << caps.recommended_vram_cache_bytes << ","
         << "\"recommendedVramCommonBytes\":" << caps.recommended_vram_common_bytes << ","

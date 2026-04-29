@@ -33,6 +33,13 @@ int glm5_pc_engine_get_stats(const glm5_pc_engine_t* engine, glm5_pc_engine_stat
     out_stats->ram_expert_count = engine->ram_expert_count.load();
     out_stats->db_expert_count = engine->db_expert_count.load();
     out_stats->hot_expert_count = out_stats->vram_expert_count + out_stats->ram_expert_count + out_stats->db_expert_count;
+    out_stats->generation_started = engine->generation_started.load(std::memory_order_relaxed);
+    out_stats->generation_completed = engine->generation_completed.load(std::memory_order_relaxed);
+    out_stats->generation_failed = engine->generation_failed.load(std::memory_order_relaxed);
+    out_stats->generation_active = engine->generation_active.load(std::memory_order_relaxed);
+    out_stats->generation_token = engine->generation_token.load(std::memory_order_relaxed);
+    out_stats->generation_layer = engine->generation_layer.load(std::memory_order_relaxed);
+    out_stats->generation_phase = engine->generation_phase.load(std::memory_order_relaxed);
     out_stats->kv_mode = engine->config.kv_mode;
     return 1;
 }

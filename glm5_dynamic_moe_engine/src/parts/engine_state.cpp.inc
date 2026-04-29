@@ -122,6 +122,13 @@ struct glm5_pc_engine {
     uint64_t cpu_row_done_generation = 0;
     bool cpu_row_stop = false;
     std::atomic<int> cpu_row_active{0};  // Re-entry counter for parallel_rows
+    std::atomic<uint64_t> generation_started{0};
+    std::atomic<uint64_t> generation_completed{0};
+    std::atomic<uint64_t> generation_failed{0};
+    std::atomic<uint32_t> generation_active{0};
+    std::atomic<uint32_t> generation_token{0};
+    std::atomic<uint32_t> generation_layer{0xffffffffu};
+    std::atomic<uint32_t> generation_phase{GLM5_GEN_PHASE_IDLE};
     std::mutex forward_scratch_mutex;
     std::vector<float> lm_head_scores;
     std::atomic<int> model_root_valid{0};  // Fix 59: cache model root validation result

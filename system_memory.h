@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <sys/sysinfo.h>
+#include <unistd.h>
 #endif
 
 namespace storagellm {
@@ -50,6 +51,26 @@ inline uint64_t default_ram_budget_bytes(uint32_t percent) {
         return 8ull * 1024ull * 1024ull * 1024ull;
     }
     return (available * (percent > 90u ? 90u : percent)) / 100ull;
+}
+
+inline uint64_t current_process_rss_bytes() {
+#if defined(__linux__)
+    std::FILE* statm = std::fopen("/proc/self/statm", "r");
+    if (!statm) {
+        return 0;
+    }
+    unsigned long long total_pages = 0;
+    unsigned long long resident_pages = 0;
+    const int parsed = std::fscanf(statm, "%llu %llu", &total_pages, &resident_pages);
+    std::fclose(statm);
+    if (parsed != 2) {
+        return 0;
+    }
+    const long page_size = sysconf(_SC_PAGESIZE);
+    return page_size > 0 ? resident_pages * static_cast<uint64_t>(page_size) : 0;
+#else
+    return 0;
+#endif
 }
 
 }  // namespace storagellm

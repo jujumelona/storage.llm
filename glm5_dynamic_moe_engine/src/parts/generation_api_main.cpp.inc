@@ -15,6 +15,31 @@ int glm5_pc_engine_generate_token_ids(
         glm5_generation_set_error(out_stats, "invalid generation arguments");
         return 0;
     }
+    struct generation_scope_t {
+        glm5_pc_engine_t* engine = nullptr;
+        int ok = 0;
+        explicit generation_scope_t(glm5_pc_engine_t* e) : engine(e) {
+            if (!engine) return;
+            engine->generation_started.fetch_add(1, std::memory_order_relaxed);
+            engine->generation_active.fetch_add(1, std::memory_order_relaxed);
+            engine->generation_token.store(0, std::memory_order_relaxed);
+            engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
+            engine->generation_phase.store(GLM5_GEN_PHASE_INIT, std::memory_order_relaxed);
+        }
+        ~generation_scope_t() {
+            if (!engine) return;
+            if (ok) {
+                engine->generation_completed.fetch_add(1, std::memory_order_relaxed);
+                engine->generation_phase.store(GLM5_GEN_PHASE_DONE, std::memory_order_relaxed);
+            } else {
+                engine->generation_failed.fetch_add(1, std::memory_order_relaxed);
+            }
+            engine->generation_active.fetch_sub(1, std::memory_order_relaxed);
+            if (engine->generation_active.load(std::memory_order_relaxed) == 0) {
+                engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
+            }
+        }
+    } generation_scope(engine);
     glm5_forward_status_t forward{};
     if (!glm5_pc_engine_get_forward_status(engine, &forward) ||
         !forward.storage_state_valid ||
@@ -75,6 +100,7 @@ int glm5_pc_engine_generate_token_ids(
     // Memory is N*hidden_size*4 bytes, about 14.7 MiB for N=512 and hidden=7168.
     const uint32_t prefill_count = input_token_count - 1u;
     if (prefill_count > 0) {
+        engine->generation_phase.store(GLM5_GEN_PHASE_PREFILL, std::memory_order_relaxed);
         // Validate all prompt tokens first
         for (uint32_t i = 0; i < prefill_count; ++i) {
             if (input_token_ids[i] < 0 || (uint32_t)input_token_ids[i] >= c->vocab_size) {
@@ -91,6 +117,7 @@ int glm5_pc_engine_generate_token_ids(
                     return 0;
                 }
                 ++scratch.position;
+                engine->generation_token.store(scratch.position, std::memory_order_relaxed);
             }
         } else {
             // Allocate batch hidden states: one per prefill token
@@ -121,6 +148,7 @@ int glm5_pc_engine_generate_token_ids(
 
             // Phase 2: layer-first, process all prompt tokens per layer.
             for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
+                engine->generation_layer.store(layer, std::memory_order_relaxed);
                 // Lookahead prefetch: load layer+2 attention spans into VRAM/page cache
                 if (layer + 2u < c->num_hidden_layers &&
                     glm5_can_enqueue_attention_lookahead(engine, (int32_t)(layer + 2u))) {
@@ -134,7 +162,9 @@ int glm5_pc_engine_generate_token_ids(
 
                 for (uint32_t t = 0; t < prefill_count; ++t) {
                     float* current_hidden = batch_hidden.data() + t * hs;
+                    engine->generation_token.store(t, std::memory_order_relaxed);
 
+                    engine->generation_phase.store(GLM5_GEN_PHASE_ATTENTION, std::memory_order_relaxed);
                     if (!glm5_layer_attention_f32(engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs, t)) {
                         glm5_generation_set_error(out_stats, "prefill attention failed");
                         return 0;
@@ -147,6 +177,7 @@ int glm5_pc_engine_generate_token_ids(
                         return 0;
                     }
 
+                    engine->generation_phase.store(GLM5_GEN_PHASE_MLP, std::memory_order_relaxed);
                     const int is_moe = layer >= c->first_moe_layer && layer <= c->last_moe_layer;
                     const int mlp_ok = is_moe ?
                         glm5_layer_moe_mlp_f32(engine, (int32_t)layer, &scratch, current_hidden, c) :
@@ -171,6 +202,7 @@ int glm5_pc_engine_generate_token_ids(
     }
     // Decode: generate new tokens
     for (; produced < max_new_tokens; ++produced) {
+        engine->generation_token.store(prefill_count + produced, std::memory_order_relaxed);
         if (!glm5_forward_one_token_f32(
                 engine, (uint32_t)current, &scratch, out_stats, scratch.position, pre_allocate_kv)) {
             failed = 1;
@@ -199,5 +231,6 @@ int glm5_pc_engine_generate_token_ids(
         out_stats->finish_reason = produced >= max_new_tokens ? 1u : 0u;
         out_stats->last_logit = last_logit;
     }
-    return !failed && produced > 0 ? 1 : 0;
+    generation_scope.ok = !failed && produced > 0 ? 1 : 0;
+    return generation_scope.ok;
 }

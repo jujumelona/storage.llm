@@ -14,6 +14,9 @@ static int glm5_forward_one_token_f32(
     glm5_decode_scratch_resize(s, c, pre_allocate_kv);
     glm5_kv_cache_track_ram(engine, &s->kv_cache);
     float* hidden = s->hidden.data();
+    engine->generation_phase.store(GLM5_GEN_PHASE_INIT, std::memory_order_relaxed);
+    engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
+    engine->generation_token.store(position, std::memory_order_relaxed);
     if (!glm5_pc_engine_embed_token_f32(engine, token_id, hidden, c->hidden_size)) {
         glm5_generation_set_error(stats, "failed to read token embedding");
         return 0;
@@ -23,7 +26,8 @@ static int glm5_forward_one_token_f32(
         // Pipeline Fix 2: Removed layer+2 lookahead to eliminate duplicate attention prefetch
         // layer+2 prefetch here + layer+1 prefetch after attention = same layer queued twice.
         // layer+1 prefetch alone provides sufficient DMA overlap during MLP compute.
-
+        engine->generation_layer.store(layer, std::memory_order_relaxed);
+        engine->generation_phase.store(GLM5_GEN_PHASE_ATTENTION, std::memory_order_relaxed);
         if (!glm5_layer_attention_f32(engine, (int32_t)layer, s, s->hidden.data(), c->hidden_size, position)) {
             glm5_generation_set_error(stats, "attention block failed");
             return 0;
@@ -44,6 +48,7 @@ static int glm5_forward_one_token_f32(
             glm5_enqueue_attention_prefetch(engine, (int32_t)(layer + 1u));
         }
 
+        engine->generation_phase.store(GLM5_GEN_PHASE_MLP, std::memory_order_relaxed);
         const int ok = is_moe ?
             glm5_layer_moe_mlp_f32(engine, (int32_t)layer, s, s->hidden.data(), c) :
             glm5_layer_dense_mlp_f32(engine, (int32_t)layer, s, s->hidden.data(), c->hidden_size);

@@ -1,3 +1,13 @@
+enum {
+    GLM5_GEN_PHASE_IDLE = 0u,
+    GLM5_GEN_PHASE_INIT = 1u,
+    GLM5_GEN_PHASE_PREFILL = 2u,
+    GLM5_GEN_PHASE_ATTENTION = 3u,
+    GLM5_GEN_PHASE_MLP = 4u,
+    GLM5_GEN_PHASE_LM_HEAD = 5u,
+    GLM5_GEN_PHASE_DONE = 6u
+};
+
 typedef struct {
     uint64_t vram_used_bytes;
     uint64_t ram_used_bytes;
@@ -25,6 +35,13 @@ typedef struct {
     uint64_t ram_expert_count;
     uint64_t db_expert_count;
     uint64_t common_raw_tensor_count;
+    uint64_t generation_started;
+    uint64_t generation_completed;
+    uint64_t generation_failed;
+    uint32_t generation_active;
+    uint32_t generation_token;
+    uint32_t generation_layer;
+    uint32_t generation_phase;
     glm5_kv_mode_t kv_mode;
 } glm5_pc_engine_stats_t;
 

@@ -28,6 +28,9 @@ int glm5_pc_engine_lm_head_top1_f32(
         return 0;
     }
 
+    engine->generation_phase.store(GLM5_GEN_PHASE_LM_HEAD, std::memory_order_relaxed);
+    engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
+
     const uint32_t chunk_size = 1024;
     const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
 
@@ -106,6 +109,9 @@ int glm5_pc_engine_lm_head_token_logprob_f32(
     if (!base) {
         return 0;
     }
+
+    engine->generation_phase.store(GLM5_GEN_PHASE_LM_HEAD, std::memory_order_relaxed);
+    engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
 
     const uint32_t chunk_size = 1024;
     const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
