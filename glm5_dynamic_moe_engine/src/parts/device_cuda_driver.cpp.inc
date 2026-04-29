@@ -74,3 +74,37 @@ static int cuda_driver_load(glm5_cuda_driver_api* api) {
         api->cuDevicePrimaryCtxRetain && api->cuDevicePrimaryCtxRelease &&
         api->cuMemAlloc && api->cuMemFree && api->cuMemcpyHtoD && api->cuMemGetInfo;
 }
+
+static uint64_t cuda_driver_detect_free_memory_bytes(uint32_t device_id, uint64_t* total_out) {
+    if (total_out) {
+        *total_out = 0;
+    }
+    glm5_cuda_driver_api api{};
+    if (!cuda_driver_load(&api) || api.cuInit(0) != 0) {
+        glm5_close_shared_library(api.library);
+        return 0;
+    }
+    if (api.cuDeviceGet(&api.device, static_cast<int>(device_id)) != 0 ||
+        api.cuDevicePrimaryCtxRetain(&api.context, api.device) != 0 ||
+        api.cuCtxSetCurrent(api.context) != 0) {
+        if (api.cuDevicePrimaryCtxRelease && api.context) {
+            api.cuDevicePrimaryCtxRelease(api.device);
+        }
+        glm5_close_shared_library(api.library);
+        return 0;
+    }
+    size_t free_b = 0;
+    size_t total_b = 0;
+    const int ok = api.cuMemGetInfo(&free_b, &total_b) == 0;
+    if (api.cuDevicePrimaryCtxRelease && api.context) {
+        api.cuDevicePrimaryCtxRelease(api.device);
+    }
+    glm5_close_shared_library(api.library);
+    if (!ok) {
+        return 0;
+    }
+    if (total_out) {
+        *total_out = static_cast<uint64_t>(total_b);
+    }
+    return static_cast<uint64_t>(free_b);
+}

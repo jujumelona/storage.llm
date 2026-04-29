@@ -2,7 +2,8 @@ static int prefetch_tensor_ram_to_pinned(
     glm5_pc_engine* engine,
     const glm5_tensor_record& rec,
     uint32_t slot_index,
-    uint64_t* out_staging_bytes
+    uint64_t* out_staging_bytes,
+    glm5_tier_t target_tier = GLM5_TIER_VRAM
 ) {
     if (out_staging_bytes) {
         *out_staging_bytes = 0;
@@ -50,12 +51,23 @@ static int prefetch_tensor_ram_to_pinned(
         }
         copied += n;
 
-        // Bug Fix: MADV_DONTNEED race condition with concurrent readers
-        // If another pinned_worker is reading the same tensor, MADV_DONTNEED evicts pages
-        // while the other worker is still copying, causing page faults and disk re-reads.
-        // Only call MADV_DONTNEED when io_stop is set (engine shutdown) to avoid this race.
-        // During normal operation, page cache eviction is handled by kernel LRU.
+        // Pipeline Fix 3: Use MADV_COLD to accelerate page cache eviction without race
+        // MADV_DONTNEED causes page faults if concurrent readers access same mmap range.
+        // MADV_COLD (Linux 5.4+) lowers LRU priority without invalidating pages,
+        // allowing safe concurrent access while accelerating memory reclaim.
+        //
+        // Pipeline Fix 3b: Only apply MADV_COLD when target is not VRAM
+        // If expert will be in VRAM and later evicted to RAM tier, we want mmap pages
+        // to remain in page cache for fast re-access. Only evict pages for DB-bound data.
 #ifdef __linux__
+        #ifndef MADV_COLD
+        #define MADV_COLD 20
+        #endif
+        // Apply MADV_COLD only for non-VRAM targets (DB fallback path)
+        if (target_tier != GLM5_TIER_VRAM) {
+            madvise(const_cast<uint8_t*>(src), static_cast<size_t>(length), MADV_COLD);
+        }
+        // MADV_DONTNEED only on shutdown when no concurrent readers exist
         if (engine->io_stop.load(std::memory_order_relaxed)) {
             madvise(const_cast<uint8_t*>(src), static_cast<size_t>(length), MADV_DONTNEED);
         }
@@ -70,4 +82,3 @@ static int prefetch_tensor_ram_to_pinned(
     engine->io_atomic.pinned_stage_done.fetch_add(1);
     return 1;
 }
-

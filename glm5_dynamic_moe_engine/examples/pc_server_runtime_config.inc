@@ -1,12 +1,31 @@
+static uint64_t server_auto_ram_budget_bytes() {
+    const uint64_t available = storagellm::available_ram_bytes();
+    const uint64_t reserve = 2ull * 1024ull * 1024ull * 1024ull;
+    if (available > reserve * 2ull) {
+        return available - reserve;
+    }
+    return (available * 9ull) / 10ull;
+}
+
 static void apply_detected_budgets(server_options* opts, const glm5_backend_caps_t& caps) {
     if (!opts) {
         return;
     }
     if (!opts->vram_budget_override) {
         opts->engine_config.vram_budget_bytes = caps.recommended_vram_cache_bytes;
+        if (caps.device_memory_bytes > 0) {
+            const uint64_t reserve = 512ull * 1024ull * 1024ull;
+            const uint64_t detected_budget = caps.device_memory_bytes > reserve * 2ull
+                ? caps.device_memory_bytes - reserve
+                : (caps.device_memory_bytes * 9ull) / 10ull;
+            opts->engine_config.vram_budget_bytes = std::max<uint64_t>(
+                opts->engine_config.vram_budget_bytes,
+                detected_budget
+            );
+        }
     }
     if (!opts->ram_budget_override) {
-        opts->engine_config.ram_budget_bytes = storagellm::default_ram_budget_bytes(60);
+        opts->engine_config.ram_budget_bytes = server_auto_ram_budget_bytes();
     }
     opts->engine_config.allow_db_streaming = 1;
 }
@@ -33,8 +52,12 @@ static glm5_io_config_t make_server_io_config(const server_options& opts, const 
     io.pinned_worker_threads = caps.copy_streams > 1 ? 4u : 2u;
     io.gpu_worker_threads = caps.copy_streams ? caps.copy_streams : 1u;
     io.direct_upload_min_bytes = expert_bytes;
-    io.pinned_staging_bytes = std::max<uint64_t>(caps.recommended_pinned_bytes, expert_bytes * 3ull);
+    io.pinned_staging_bytes = std::max<uint64_t>(caps.recommended_pinned_bytes, expert_bytes * 16ull);
     if (opts.engine_config.ram_budget_bytes > 0) {
+        io.pinned_staging_bytes = std::max<uint64_t>(
+            io.pinned_staging_bytes,
+            std::min<uint64_t>(opts.engine_config.ram_budget_bytes / 8ull, 4ull * 1024ull * 1024ull * 1024ull)
+        );
         io.pinned_staging_bytes = std::min<uint64_t>(io.pinned_staging_bytes, opts.engine_config.ram_budget_bytes / 4ull);
     }
     return io;

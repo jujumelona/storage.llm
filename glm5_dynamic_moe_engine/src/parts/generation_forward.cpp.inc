@@ -20,13 +20,10 @@ static int glm5_forward_one_token_f32(
     }
 
     for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
-        // Fix #5: Lookahead attention prefetch: enqueue layer+2 attention spans
-        // so DMA has time to complete before that layer's attention begins.
-        // Current-layer synchronous mmap hints were too late.
-        if (layer + 2u < c->num_hidden_layers &&
-            glm5_can_enqueue_attention_lookahead(engine, (int32_t)(layer + 2u))) {
-            glm5_enqueue_attention_prefetch(engine, (int32_t)(layer + 2u));
-        }
+        // Pipeline Fix 2: Removed layer+2 lookahead to eliminate duplicate attention prefetch
+        // layer+2 prefetch here + layer+1 prefetch after attention = same layer queued twice.
+        // layer+1 prefetch alone provides sufficient DMA overlap during MLP compute.
+
         if (!glm5_layer_attention_f32(engine, (int32_t)layer, s, s->hidden.data(), c->hidden_size, position)) {
             glm5_generation_set_error(stats, "attention block failed");
             return 0;
@@ -41,7 +38,9 @@ static int glm5_forward_one_token_f32(
 
         // Next-layer attention VRAM prefetch: enqueue layer+1 attention spans
         // so DMA overlaps with current layer's MLP compute.
-        if (layer + 1u < c->num_hidden_layers) {
+        // Pipeline Fix 4: Add VRAM budget check to prevent evicting expert prefetch
+        if (layer + 1u < c->num_hidden_layers &&
+            glm5_can_enqueue_attention_lookahead(engine, (int32_t)(layer + 1u))) {
             glm5_enqueue_attention_prefetch(engine, (int32_t)(layer + 1u));
         }
 

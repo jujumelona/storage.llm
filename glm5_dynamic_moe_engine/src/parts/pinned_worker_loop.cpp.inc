@@ -51,7 +51,8 @@ static void pinned_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                     engine,
                     engine->tensors[task.tensor_index],
                     task.staging_slot,
-                    &staging_bytes
+                    &staging_bytes,
+                    task.target_tier
                 );
             }
             if (ok && task.target_tier == GLM5_TIER_VRAM) {

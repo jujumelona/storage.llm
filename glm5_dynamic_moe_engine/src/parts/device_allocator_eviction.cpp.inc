@@ -57,6 +57,10 @@ static uint32_t device_collect_activation_victims_locked(
     }
     uint64_t projected_free = 0;
     uint32_t stale = 0;
+    // Pipeline Fix 4: Dynamic stale limit based on heap size
+    // Fixed 128 limit causes eviction failure when heap has many stale entries.
+    // Allow scanning up to half the heap size to find valid victims.
+    const uint32_t stale_limit = std::max(128u, (uint32_t)e->activation_evict_heap.size() / 2u);
     while (e->device_allocated_bytes.load(std::memory_order_relaxed) > projected_free &&
            e->device_allocated_bytes.load(std::memory_order_relaxed) - projected_free + bytes > budget &&
            !e->activation_evict_heap.empty()) {
@@ -66,7 +70,7 @@ static uint32_t device_collect_activation_victims_locked(
         if (it == e->device_allocations.end() || it->second.pool != GLM5_DEVICE_POOL_ACTIVATION ||
             it->second.pending_free || it->second.inflight_copies != 0 ||
             it->second.bytes != victim.bytes || it->second.last_touch_epoch != victim.last_touch_epoch) {
-            if (++stale >= 128u) {
+            if (++stale >= stale_limit) {
                 break;
             }
             continue;
@@ -133,8 +137,11 @@ static void device_make_room_locked(
                 device_free_expert_if_pending_evict_locked(e, victim.first, victim.second, &deferred_free_ptrs);
             }
         }
+        // Pipeline Fix 2: Break loop if no victims found to prevent infinite spin
+        // Without this, caller spins on vram_eviction_in_progress when VRAM is full
+        // and no evictable candidates exist
         if (expert_victims.empty() && activation_victims.empty()) {
-            return;
+            break;
         }
     }
 }

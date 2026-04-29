@@ -16,6 +16,14 @@ static uint64_t cache_with_common_for_experts(uint32_t expert_count) {
     return working_common_cache_bytes() + cache_for_experts(expert_count);
 }
 
+static uint64_t glm5_budget_from_free_device_memory(uint64_t free_bytes) {
+    const uint64_t reserve = 512ull * 1024ull * 1024ull;
+    if (free_bytes > reserve * 2ull) {
+        return free_bytes - reserve;
+    }
+    return (free_bytes * 9ull) / 10ull;
+}
+
 static void fill_cpu_backend_caps(glm5_backend_caps_t* caps) {
     const uint32_t hw = caps_hw_threads();
     caps->supports_fp4 = 1;
@@ -46,6 +54,17 @@ static void fill_cuda_backend_caps(glm5_backend_caps_t* caps) {
     caps->supports_gpu_direct_file_io =
         caps->supports_directstorage || caps->supports_gpudirect_storage || compiled_bam_nvme_available();
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(64);
+    uint64_t total_bytes = 0;
+    const uint64_t free_bytes = cuda_driver_detect_free_memory_bytes(caps->device_id, &total_bytes);
+    if (free_bytes > 0) {
+        caps->device_memory_bytes = free_bytes;
+        caps->recommended_vram_cache_bytes = std::max<uint64_t>(
+            caps->recommended_vram_cache_bytes,
+            glm5_budget_from_free_device_memory(free_bytes)
+        );
+    } else if (total_bytes > 0) {
+        caps->device_memory_bytes = total_bytes;
+    }
 }
 
 static void fill_hip_backend_caps(glm5_backend_caps_t* caps) {

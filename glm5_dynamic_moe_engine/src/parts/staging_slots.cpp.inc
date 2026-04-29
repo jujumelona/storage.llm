@@ -35,9 +35,11 @@ static uint32_t glm5_staging_min_slot_count(const glm5_pc_engine* engine) {
     // during device_stream_sync_current(). Without this, staging starvation occurs.
     uint32_t gpu_workers = runtime_gpu_workers(engine);
     if (gpu_workers == 0) gpu_workers = 1;
-    // Bug 18 Fix: Clamp gpu_batch_max to 4 to reduce pinned RAM requirement
+    // Pipeline Fix 1: Match gpu_worker_loop batch_max=8 to prevent slot starvation
+    // GPU workers hold up to 8 slots during device_stream_sync_current().
+    // Clamping to 4 causes staging_wraps when GPU workers run.
     constexpr uint32_t gpu_batch_max = 8;
-    const uint32_t gpu_batch_eff = std::min(gpu_batch_max, 4u);
+    const uint32_t gpu_batch_eff = gpu_batch_max; // 8, not clamped
     return std::max(4u, (disk_workers + pinned_workers) * 2u + gpu_workers * gpu_batch_eff);
 }
 
@@ -48,9 +50,11 @@ static uint32_t glm5_staging_target_slot_count_for_workers(uint32_t pinned_worke
     if (gpu_workers == 0) {
         gpu_workers = 1;
     }
-    // Bug 18 Fix: Clamp gpu_batch_max to 4
+    // Pipeline Fix 1: Match gpu_worker_loop batch_max=8 for correct ratio calculation
+    // This function is used by update_staging_slot_split_for_workers to compute
+    // pinned vs GPU slot distribution. Must match actual gpu_batch_max=8.
     constexpr uint32_t gpu_batch_max = 8;
-    const uint32_t gpu_batch_eff = std::min(gpu_batch_max, 4u);
+    const uint32_t gpu_batch_eff = gpu_batch_max; // 8, not clamped
     const uint32_t pinned_slot_target = std::max(1u, pinned_workers * 2u);
     const uint32_t gpu_slot_target = std::max(1u, gpu_workers * gpu_batch_eff);
     return pinned_slot_target + gpu_slot_target;
@@ -107,9 +111,9 @@ static void update_staging_slot_split_for_workers(glm5_pc_engine* engine) {
     if (gpu_workers == 0) {
         gpu_workers = 1;
     }
-    // Bug 18 Fix: Clamp gpu_batch_max to 4
+    // Pipeline Fix 1: Match gpu_worker_loop batch_max=8
     constexpr uint32_t gpu_batch_max = 8;
-    const uint32_t gpu_batch_eff = std::min(gpu_batch_max, 4u);
+    const uint32_t gpu_batch_eff = gpu_batch_max; // 8
     const uint32_t pinned_slot_target = std::max(1u, pinned_workers * 2u);
     const uint32_t gpu_slot_target = std::max(1u, gpu_workers * gpu_batch_eff);
     const uint32_t total_count = static_cast<uint32_t>(engine->staging_slots.size());
@@ -156,9 +160,9 @@ static void configure_staging_slots(glm5_pc_engine* engine) {
     if (gpu_workers == 0) {
         gpu_workers = 1;
     }
-    // Bug 18 Fix: Clamp gpu_batch_max to 4
+    // Pipeline Fix 1: Match gpu_worker_loop batch_max=8
     constexpr uint32_t gpu_batch_max = 8;
-    const uint32_t gpu_batch_eff = std::min(gpu_batch_max, 4u);
+    const uint32_t gpu_batch_eff = gpu_batch_max; // 8
     uint32_t pinned_slot_target = std::max(1u, pinned_workers * 2u);
     uint32_t gpu_slot_target = std::max(1u, gpu_workers * gpu_batch_eff);
     uint32_t slot_count = pinned_slot_target + gpu_slot_target;
@@ -219,7 +223,7 @@ static void configure_staging_slots(glm5_pc_engine* engine) {
     }
     engine->staging_free_slot_count.store(slot_count, std::memory_order_release);
     update_staging_slot_split_for_workers(engine);
-    // Bug 18 Fix: Use clamped gpu_batch_eff for warning threshold
+    // Pipeline Fix 1: Use gpu_batch_eff=8 for warning threshold
     const uint32_t warning_slot_target = (disk_workers + pinned_workers) * 2u + gpu_workers * gpu_batch_eff;
     if (slot_count < warning_slot_target) {
         fprintf(stderr, "[WARNING] Insufficient staging slots: %u < %u. Expect pipeline stalls.\n",
