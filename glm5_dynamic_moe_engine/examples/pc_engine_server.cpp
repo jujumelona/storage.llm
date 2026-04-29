@@ -2079,54 +2079,6 @@ static void load_server_model_background(
     }
 }
 
-static bool parse_backend_name(const char* name, glm5_backend_t* out) {
-    if (!name || !out) {
-        return false;
-    }
-    if (std::strcmp(name, "cpu") == 0) {
-        *out = GLM5_BACKEND_CPU;
-    } else if (std::strcmp(name, "cuda") == 0) {
-        *out = GLM5_BACKEND_CUDA;
-    } else if (std::strcmp(name, "hip") == 0 || std::strcmp(name, "rocm") == 0 || std::strcmp(name, "amd") == 0) {
-        *out = GLM5_BACKEND_HIP;
-    } else if (std::strcmp(name, "metal") == 0) {
-        *out = GLM5_BACKEND_METAL;
-    } else if (std::strcmp(name, "vulkan") == 0) {
-        *out = GLM5_BACKEND_VULKAN;
-    } else if (std::strcmp(name, "directml") == 0) {
-        *out = GLM5_BACKEND_DIRECTML;
-    } else if (std::strcmp(name, "opencl") == 0) {
-        *out = GLM5_BACKEND_OPENCL;
-    } else if (std::strcmp(name, "levelzero") == 0 || std::strcmp(name, "level_zero") == 0 || std::strcmp(name, "intel") == 0) {
-        *out = GLM5_BACKEND_LEVEL_ZERO;
-    } else if (std::strcmp(name, "sycl") == 0 || std::strcmp(name, "oneapi") == 0) {
-        *out = GLM5_BACKEND_SYCL;
-    } else if (std::strcmp(name, "webgpu") == 0) {
-        *out = GLM5_BACKEND_WEBGPU;
-    } else {
-        *out = GLM5_BACKEND_AUTO;
-    }
-    return true;
-}
-
-static bool parse_platform_name(const char* name, glm5_platform_t* out) {
-    if (!name || !out) {
-        return false;
-    }
-    if (std::strcmp(name, "windows") == 0) {
-        *out = GLM5_PLATFORM_WINDOWS_PC;
-    } else if (std::strcmp(name, "linux") == 0) {
-        *out = GLM5_PLATFORM_LINUX_PC;
-    } else if (std::strcmp(name, "mac") == 0 || std::strcmp(name, "apple") == 0) {
-        *out = GLM5_PLATFORM_MACOS_APPLE;
-    } else if (std::strcmp(name, "cpu") == 0) {
-        *out = GLM5_PLATFORM_CPU_ONLY;
-    } else {
-        *out = GLM5_PLATFORM_AUTO;
-    }
-    return true;
-}
-
 static void print_usage() {
     std::cout
         << "Usage:\n"
@@ -2179,20 +2131,6 @@ static server_options parse_args(int argc, char** argv) {
             opts.openclaw_config_path = argv[++i];
         } else if (std::strcmp(argv[i], "--openclaw-config-only") == 0) {
             opts.openclaw_config_only = true;
-        } else if (std::strcmp(argv[i], "--ram-budget") == 0 && i + 1 < argc) {
-            opts.engine_config.ram_budget_bytes = storagellm::parse_byte_size(argv[++i]);
-            opts.ram_budget_override = opts.engine_config.ram_budget_bytes > 0;
-        } else if (std::strcmp(argv[i], "--vram-budget") == 0 && i + 1 < argc) {
-            opts.engine_config.vram_budget_bytes = storagellm::parse_byte_size(argv[++i]);
-            opts.vram_budget_override = opts.engine_config.vram_budget_bytes > 0;
-        } else if (std::strcmp(argv[i], "--performance") == 0) {
-            opts.policy = GLM5_EXECUTION_PERFORMANCE;
-        } else if (std::strcmp(argv[i], "--low-impact") == 0) {
-            opts.policy = GLM5_EXECUTION_LOW_IMPACT;
-        } else if (std::strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
-            parse_backend_name(argv[++i], &opts.engine_config.preferred_backend);
-        } else if (std::strcmp(argv[i], "--platform") == 0 && i + 1 < argc) {
-            parse_platform_name(argv[++i], &opts.engine_config.platform);
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_usage();
             std::exit(0);
