@@ -1,4 +1,9 @@
-static int prefetch_one_raw_span(glm5_pc_engine* e, const glm5_storage_raw_span_spec_t& s, uint8_t pool);
+static int prefetch_one_raw_span(
+    glm5_pc_engine* e,
+    const glm5_storage_raw_span_spec_t& s,
+    uint8_t pool,
+    int allow_sync_fallback = 1
+);
 
 static int io_worker_requeue_disk_task(
     glm5_pc_engine* engine,
@@ -105,8 +110,10 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
         {
             glm5_prefetch_task lookahead_task{};
             if (peek_stage_task(engine, engine->disk_stage, &lookahead_task)) {
+                // Only lookahead for tensor tasks, not raw_span tasks
                 if (lookahead_task.tensor_index >= 0 &&
-                    (size_t)lookahead_task.tensor_index < engine->tensors.size()) {
+                    (size_t)lookahead_task.tensor_index < engine->tensors.size() &&
+                    lookahead_task.raw_span_index < 0) {
                     const glm5_tensor_record& next_rec = engine->tensors[lookahead_task.tensor_index];
                     mmap_context_t* next_shard = get_or_map_tensor_shard(engine, next_rec);
                     if (next_shard) {
@@ -123,7 +130,7 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
         int terminal = 1;
         if (task.raw_span_index >= 0) {
             const glm5_storage_raw_span_spec_t* span = glm5_storage_raw_span_at((uint32_t)task.raw_span_index);
-            ok = span ? prefetch_one_raw_span(engine, *span, task.raw_pool) : 0;
+            ok = span ? prefetch_one_raw_span(engine, *span, task.raw_pool, 0) : 0;
             // Bug Fix: Raw span BACKPRESSURE handling (same as tensor path)
             // Without this, staging slot exhaustion causes sync H2D fallback, blocking IO worker
             if (ok == GLM5_DEVICE_COPY_BACKPRESSURE) {

@@ -14,11 +14,15 @@ static uint64_t raw_phase_budget_left(const glm5_pc_engine* e) {
     return e->config.vram_budget_bytes > used ? e->config.vram_budget_bytes - used : 0;
 }
 
-static int prefetch_one_raw_span(glm5_pc_engine* e, const glm5_storage_raw_span_spec_t& s, uint8_t pool) {
+static int prefetch_one_raw_span(glm5_pc_engine* e, const glm5_storage_raw_span_spec_t& s, uint8_t pool, int allow_sync_fallback) {
     if (!e || e->model_root.empty() || s.bytes == 0) {
         return 0;
     }
-    if (device_copy_raw_span(e, s, pool)) {
+    const int copy_ok = device_copy_raw_span(e, s, pool, allow_sync_fallback);
+    if (copy_ok == GLM5_DEVICE_COPY_BACKPRESSURE) {
+        return GLM5_DEVICE_COPY_BACKPRESSURE;
+    }
+    if (copy_ok) {
         e->io_atomic.bytes_prefetched.fetch_add(s.bytes);
         e->io_atomic.bytes_pinned_to_gpu.fetch_add(s.bytes);
         e->io_atomic.gpu_stage_done.fetch_add(1);

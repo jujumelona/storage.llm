@@ -123,6 +123,12 @@ static void orchestrator_resize_workers(
     if (disk != old_disk || pinned != old_pinned || gpu != old_gpu) {
         runtime_store_io_workers(engine, disk, pinned, gpu);
         update_staging_slot_split_for_workers(engine);
-        engine->cpu_row_target_workers.store(0, std::memory_order_relaxed);
+        if (engine->cpu_row_active.load(std::memory_order_acquire) == 0) {
+            std::lock_guard<std::mutex> row_lock(engine->cpu_row_mutex);
+            if (engine->cpu_row_active.load(std::memory_order_relaxed) == 0 &&
+                engine->cpu_row_done_generation == engine->cpu_row_generation) {
+                engine->cpu_row_target_workers.store(0, std::memory_order_relaxed);
+            }
+        }
     }
 }
