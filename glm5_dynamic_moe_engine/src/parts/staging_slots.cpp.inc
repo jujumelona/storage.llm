@@ -94,9 +94,10 @@ static void update_staging_slot_deficit(glm5_pc_engine* engine) {
         }
     }
     engine->io_atomic.staging_slot_deficit.store(deficit);
-    if (deficit) {
-        engine->io_atomic.staging_wraps.fetch_add(1);
-    }
+    // Problem 5 Fix: Don't increment staging_wraps here — that's for transient contention
+    // staging_slot_deficit = structural shortage (config issue, tracked here)
+    // staging_slot_contention = transient slot exhaustion (tracked in prefetch_bytes.cpp.inc)
+    // Mixing them in staging_wraps made diagnostics impossible.
 }
 
 static void update_staging_slot_split_for_workers(glm5_pc_engine* engine) {

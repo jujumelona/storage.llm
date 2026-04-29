@@ -72,6 +72,8 @@ struct server_runtime_state {
     glm5_backend_caps_t initial_caps{};
     mutable std::mutex error_mutex;
     std::string error_message;
+    mutable std::mutex stage_mutex;
+    std::string load_stage{"not_started"};
 };
 
 #include "pc_server_runtime_config.inc"
@@ -868,6 +870,10 @@ static std::string make_health_json(
         std::lock_guard<std::mutex> lock(runtime->error_mutex);
         out << ",\"modelLoadError\":\"" << json_escape(runtime->error_message) << "\"";
     }
+    if (runtime) {
+        std::lock_guard<std::mutex> lock(runtime->stage_mutex);
+        out << ",\"modelLoadStage\":\"" << json_escape(runtime->load_stage) << "\"";
+    }
     out << "}";
     return out.str();
 }
@@ -1478,6 +1484,17 @@ static void mark_model_load_failed(server_runtime_state* runtime, const std::str
     runtime->model_failed.store(1, std::memory_order_release);
 }
 
+static void set_model_load_stage(server_runtime_state* runtime, const char* stage) {
+    if (!runtime || !stage) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(runtime->stage_mutex);
+        runtime->load_stage = stage;
+    }
+    std::cerr << "[storagellm] load stage: " << stage << "\n" << std::flush;
+}
+
 static void load_server_model_background(
     server_options opts,
     glm5_io_config_t io_config,
@@ -1486,6 +1503,7 @@ static void load_server_model_background(
     if (!runtime) {
         return;
     }
+    set_model_load_stage(runtime, "engine_create");
     glm5_pc_engine_t* engine = glm5_pc_engine_create(&opts.engine_config);
     if (!engine) {
         mark_model_load_failed(runtime, "engine create failed");
@@ -1493,7 +1511,9 @@ static void load_server_model_background(
         return;
     }
     runtime->engine.store(engine, std::memory_order_release);
+    set_model_load_stage(runtime, "configure_io");
     glm5_pc_engine_configure_io(engine, &io_config);
+    set_model_load_stage(runtime, "resolve_model_paths");
     if (!opts.model_root.empty()) {
         glm5_pc_engine_set_model_root(engine, opts.model_root.c_str());
     }
@@ -1501,6 +1521,7 @@ static void load_server_model_background(
     if (!opts.table_path.empty()) {
         const char* root = opts.model_root.empty() ? nullptr : opts.model_root.c_str();
         const char* scale4 = opts.scale4_path.empty() ? nullptr : opts.scale4_path.c_str();
+        set_model_load_stage(runtime, "load_codec_table");
         std::cerr << "[storagellm] loading codec table: " << opts.table_path << "\n" << std::flush;
         if (!glm5_pc_engine_load_codec_table(engine, opts.table_path.c_str(), root, scale4)) {
             mark_model_load_failed(runtime, "failed to load codec table: " + opts.table_path);
@@ -1510,8 +1531,10 @@ static void load_server_model_background(
         std::cerr << "[storagellm] codec table loaded\n" << std::flush;
     }
     if (!opts.topology_path.empty()) {
+        set_model_load_stage(runtime, "load_topology");
         glm5_pc_engine_load_topology(engine, opts.topology_path.c_str());
     }
+    set_model_load_stage(runtime, "ready");
     runtime->model_ready.store(1, std::memory_order_release);
     print_optimization_plan(engine);
 }
@@ -1681,6 +1704,7 @@ static int server_main(int argc, char** argv) {
     }
     server_runtime_state runtime;
     runtime.initial_caps = caps;
+    set_model_load_stage(&runtime, "queued");
     std::thread(load_server_model_background, opts, io_config, &runtime).detach();
 
     std::cout << "StorageLLM server listening on http://" << opts.host << ":" << opts.port << "/v1\n";

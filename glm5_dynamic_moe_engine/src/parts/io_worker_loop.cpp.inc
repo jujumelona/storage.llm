@@ -285,8 +285,13 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                     }
                 }
                 const uint64_t ram_used_snap = tier_used(engine, GLM5_TIER_RAM);
+                // Problem 4 Fix: Raise proactive eviction threshold from 75% to 80%
+                // Bug 1 raised admission threshold from 87% to 93%. The 75%→93% gap (18%)
+                // is too wide — RAM fills faster than eviction can keep up, causing DB routing.
+                // Narrowing to 80%→93% (13% gap) reduces DB fallback frequency while maintaining
+                // sufficient headroom to prevent admission-triggered synchronous eviction.
                 const uint64_t ram_target = (ram_bud * 65ull) / 100ull;
-                if (ram_bud > 0 && ram_used_snap > (ram_bud * 75ull) / 100ull && ram_used_snap > ram_target) {
+                if (ram_bud > 0 && ram_used_snap > (ram_bud * 80ull) / 100ull && ram_used_snap > ram_target) {
                     std::vector<std::pair<int, int>> freed_dummy;
                     demote_cold_until(engine, GLM5_TIER_RAM, ram_used_snap - ram_target, freed_dummy);
                 }

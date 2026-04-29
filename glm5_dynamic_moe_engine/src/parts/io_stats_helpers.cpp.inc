@@ -20,6 +20,7 @@ static void reset_io_stats_for_config(glm5_pc_engine* engine) {
     engine->io_atomic.direct_stage_done.store(0);
     engine->io_atomic.staging_wraps.store(0);
     engine->io_atomic.staging_slot_waits.store(0);
+    engine->io_atomic.staging_slot_contention.store(0);
     engine->io_atomic.topology_predictions.store(0);
     engine->io_atomic.topology_updates.store(0);
     engine->io_atomic.active_path.store(static_cast<uint32_t>(choose_active_io_path(engine)));
@@ -56,6 +57,7 @@ static void snapshot_io_stats(const glm5_pc_engine* engine, glm5_io_stats_t* out
     out->staging_wraps = engine->io_atomic.staging_wraps.load();
     out->staging_slot_deficit = engine->io_atomic.staging_slot_deficit.load();
     out->staging_slot_waits = engine->io_atomic.staging_slot_waits.load();
+    out->staging_slot_contention = engine->io_atomic.staging_slot_contention.load();
     out->recommended_staging_bytes = glm5_recommended_staging_bytes(engine);
     out->topology_predictions = engine->io_atomic.topology_predictions.load();
     out->topology_updates = engine->io_atomic.topology_updates.load();

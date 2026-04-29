@@ -28,6 +28,8 @@ static int prefetch_tensor_ram_to_pinned(
         engine->staging_slots[slot_index].buf &&
         total_bytes <= engine->staging_slots[slot_index].size;
     if (!can_stage) {
+        // Problem 5 Fix: can_stage==false is transient contention, not structural deficit
+        engine->io_atomic.staging_slot_contention.fetch_add(1);
         engine->io_atomic.staging_wraps.fetch_add(1);
         return 0;
     }

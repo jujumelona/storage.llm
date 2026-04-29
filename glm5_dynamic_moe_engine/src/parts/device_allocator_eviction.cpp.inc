@@ -92,6 +92,12 @@ static void device_make_room_locked(
     const uint64_t budget = device_budget_bytes(e);
     if (budget == 0) return;
     const uint64_t room_bytes = bytes > UINT64_MAX - bytes / 10ull ? UINT64_MAX : bytes + bytes / 10ull;
+    
+    // Problem 1 Fix: Track actual freed bytes to prevent loop exit without freeing memory
+    // device_free_locked sets pending_free=true when inflight_copies!=0, but doesn't
+    // actually reduce device_allocated_bytes. Loop must verify real progress.
+    uint64_t freed_this_iteration = 0;
+    
     while (e->device_allocated_bytes.load(std::memory_order_relaxed) + bytes > budget) {
         bool expected = false;
         if (!e->vram_eviction_in_progress.compare_exchange_strong(
@@ -115,6 +121,8 @@ static void device_make_room_locked(
             }
         } guard{&e->vram_eviction_in_progress, &e->vram_eviction_cv};
 
+        const uint64_t allocated_before = e->device_allocated_bytes.load(std::memory_order_relaxed);
+        
         std::vector<std::pair<int, int>> expert_victims;
         // Bug Fix: ACTIVATION pool can also evict experts when activation eviction is insufficient
         // Without this, ACTIVATION allocation fails when activation_evict_heap is empty,
@@ -137,10 +145,17 @@ static void device_make_room_locked(
                 device_free_expert_if_pending_evict_locked(e, victim.first, victim.second, &deferred_free_ptrs);
             }
         }
-        // Pipeline Fix 2: Break loop if no victims found to prevent infinite spin
-        // Without this, caller spins on vram_eviction_in_progress when VRAM is full
-        // and no evictable candidates exist
+        
+        const uint64_t allocated_after = e->device_allocated_bytes.load(std::memory_order_relaxed);
+        freed_this_iteration = allocated_before > allocated_after ? allocated_before - allocated_after : 0;
+        
+        // Problem 1 Fix: Break if no actual memory was freed (all victims had inflight_copies)
+        // Without this, loop spins when all eviction candidates are pending DMA completion
         if (expert_victims.empty() && activation_victims.empty()) {
+            break;
+        }
+        if (freed_this_iteration == 0) {
+            // No actual bytes freed — all victims were inflight. Break to prevent infinite loop.
             break;
         }
     }

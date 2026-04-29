@@ -111,14 +111,19 @@ static uint64_t copy_mapped_range_to_staging(
     uint32_t slot_index
 ) {
     if (!engine || !src || bytes == 0 || slot_index >= engine->staging_slots.size()) {
-        // Bug #7 Fix: Log staging miss to io_atomic so callers can detect throughput drops.
+        // Problem 5 Fix: Separate transient contention from structural deficit
+        // staging_slot_contention = can't acquire slot (transient, retry will succeed)
+        // staging_wraps is kept for backward compatibility but now tracks contention
         if (engine && slot_index == UINT32_MAX) {
+            engine->io_atomic.staging_slot_contention.fetch_add(1);
             engine->io_atomic.staging_wraps.fetch_add(1);
         }
         return 0;
     }
     glm5_staging_slot& slot = engine->staging_slots[slot_index];
     if (!slot.buf || slot.size == 0 || bytes > slot.size) {
+        // Problem 5 Fix: This is also transient contention (slot too small for this tensor)
+        engine->io_atomic.staging_slot_contention.fetch_add(1);
         engine->io_atomic.staging_wraps.fetch_add(1);
         return 0;
     }
@@ -163,13 +168,17 @@ static uint64_t copy_mapped_range_to_staging_linear(
     uint64_t* staging_offset
 ) {
     if (!engine || !src || bytes == 0 || slot_index >= engine->staging_slots.size() || !staging_offset) {
+        // Problem 5 Fix: Separate transient contention from structural deficit
         if (engine && slot_index == UINT32_MAX) {
+            engine->io_atomic.staging_slot_contention.fetch_add(1);
             engine->io_atomic.staging_wraps.fetch_add(1);
         }
         return 0;
     }
     glm5_staging_slot& slot = engine->staging_slots[slot_index];
     if (!slot.buf || *staging_offset > slot.size || bytes > slot.size - *staging_offset) {
+        // Problem 5 Fix: This is also transient contention
+        engine->io_atomic.staging_slot_contention.fetch_add(1);
         engine->io_atomic.staging_wraps.fetch_add(1);
         return 0;
     }

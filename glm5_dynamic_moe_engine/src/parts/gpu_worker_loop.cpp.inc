@@ -2,6 +2,20 @@ static void gpu_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
     if (!engine) {
         return;
     }
+    
+    // Problem 6 Fix: RAII guard to prevent CUDA stream leak on abnormal termination
+    // If gpu_worker exits via exception or forced termination (not normal pop_stage_task→false),
+    // device_stream_destroy_current would not be called → stream leak.
+    // This guard ensures cleanup regardless of exit path.
+    struct StreamGuard {
+        glm5_pc_engine* e;
+        ~StreamGuard() { 
+            if (e) {
+                device_stream_destroy_current(e);
+            }
+        }
+    } stream_guard{engine};
+    
     for (;;) {
         glm5_prefetch_task task{};
         if (!pop_stage_task(engine, engine->gpu_stage, &task, &engine->gpu_worker_target, worker_index)) {
