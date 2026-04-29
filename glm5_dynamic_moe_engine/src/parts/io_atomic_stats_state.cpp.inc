@@ -24,6 +24,8 @@ struct alignas(64) glm5_io_atomic_stats {
     alignas(64) std::atomic<uint64_t> bytes_pinned_to_gpu{0};
     std::atomic<uint64_t> gpu_stage_done{0};
     std::atomic<uint64_t> bytes_sync_h2d_fallback{0};
+    std::atomic<uint64_t> device_alloc_failures{0};
+    std::atomic<uint64_t> device_copy_failures{0};
 
     // --- Cache line 5: direct upload + topology ---
     alignas(64) std::atomic<uint64_t> bytes_direct_to_gpu{0};

@@ -14,6 +14,8 @@ static void reset_io_stats_for_config(glm5_pc_engine* engine) {
     engine->io_atomic.bytes_direct_to_gpu.store(0);
     engine->io_atomic.bytes_touch_fallback.store(0);
     engine->io_atomic.bytes_sync_h2d_fallback.store(0);
+    engine->io_atomic.device_alloc_failures.store(0);
+    engine->io_atomic.device_copy_failures.store(0);
     engine->io_atomic.disk_stage_done.store(0);
     engine->io_atomic.pinned_stage_done.store(0);
     engine->io_atomic.gpu_stage_done.store(0);
@@ -50,6 +52,8 @@ static void snapshot_io_stats(const glm5_pc_engine* engine, glm5_io_stats_t* out
     out->bytes_direct_to_gpu = engine->io_atomic.bytes_direct_to_gpu.load();
     out->bytes_touch_fallback = engine->io_atomic.bytes_touch_fallback.load();
     out->bytes_sync_h2d_fallback = engine->io_atomic.bytes_sync_h2d_fallback.load();
+    out->device_alloc_failures = engine->io_atomic.device_alloc_failures.load();
+    out->device_copy_failures = engine->io_atomic.device_copy_failures.load();
     out->disk_stage_done = engine->io_atomic.disk_stage_done.load();
     out->pinned_stage_done = engine->io_atomic.pinned_stage_done.load();
     out->gpu_stage_done = engine->io_atomic.gpu_stage_done.load();

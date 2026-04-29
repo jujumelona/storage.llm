@@ -84,6 +84,7 @@ static int device_prepare_tensor_allocation(
             }
         }
         if (!a && device_budget_bytes(e) && e->device_allocated_bytes.load() + bytes > device_budget_bytes(e)) {
+            e->io_atomic.device_alloc_failures.fetch_add(1, std::memory_order_relaxed);
             e->io_atomic.staging_wraps.fetch_add(1);
             return 0;
         }
@@ -93,6 +94,7 @@ static int device_prepare_tensor_allocation(
             next.bytes = bytes;
             next.pool = pool;
             if (e->cuda.cuMemAlloc(&next.ptr, (size_t)bytes) != 0) {
+                e->io_atomic.device_alloc_failures.fetch_add(1, std::memory_order_relaxed);
                 lock.unlock();
                 device_refresh_mem_info(e);
                 return 0;

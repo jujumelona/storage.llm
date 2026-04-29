@@ -89,6 +89,7 @@ static int device_copy_tensor_from_host(
         e->cuda.cuMemcpyHtoDAsync(dst, host, (size_t)bytes, stream) == 0 :
         (e->cuda.cuMemcpyHtoD && e->cuda.cuMemcpyHtoD(dst, host, (size_t)bytes) == 0);
     if (!ok) {
+        e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
         if (async_copy && e->cuda.cuStreamSynchronize) {
             e->cuda.cuStreamSynchronize(stream);
         }
@@ -182,6 +183,7 @@ static int device_copy_tensor(
             release_staging_slot(e, slot_idx);
         }
         if (!ok) {
+            e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
             if (async_copy) device_cancel_pending_copy(e, key);
             device_free_key(e, key);
             return 0;
@@ -212,6 +214,7 @@ static int device_copy_tensor(
             return 0;
         }
         if (!e->cuda.cuMemcpyHtoD || e->cuda.cuMemcpyHtoD(cur, src, (size_t)range[1]) != 0) {
+            e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
             device_free_key(e, key);
             return 0;
         }

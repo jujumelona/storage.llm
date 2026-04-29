@@ -39,6 +39,22 @@ static HANDLE mmap_open_read_file(const char* path) {
 extern "C" {
 #endif
 
+#ifndef _WIN32
+static void mmap_discard_pages(mmap_context_t* ctx, void* addr, size_t size) {
+    if (!ctx || !addr || addr == MAP_FAILED || size == 0) {
+        return;
+    }
+    madvise(addr, size, MADV_DONTNEED);
+#ifdef POSIX_FADV_DONTNEED
+    if (ctx->fd >= 0) {
+        posix_fadvise(ctx->fd, 0, 0, POSIX_FADV_DONTNEED);
+    }
+#endif
+}
+#else
+static void mmap_discard_pages(mmap_context_t*, void*, size_t) {}
+#endif
+
 // ============================================================
 // Map or unmap into an existing context
 // ============================================================
@@ -159,6 +175,7 @@ void munmap_file(mmap_context_t* ctx) {
     }
 #else
     if (unmap_addr && unmap_addr != MAP_FAILED) {
+        mmap_discard_pages(ctx, unmap_addr, unmap_size);
         munmap(unmap_addr, unmap_size);
         ctx->addr = NULL;
     }
@@ -316,6 +333,7 @@ void mmap_unload(mmap_context_t* ctx) {
     void* unmap_addr = ctx->mapped_size > 0 ? (char*)ctx->addr - ctx->mapped_offset : ctx->addr;
     size_t unmap_size = ctx->mapped_size > 0 ? ctx->mapped_size : ctx->size;
     if (unmap_addr && unmap_addr != MAP_FAILED) {
+        mmap_discard_pages(ctx, unmap_addr, unmap_size);
         munmap(unmap_addr, unmap_size);
     }
     if (ctx->fd >= 0) {

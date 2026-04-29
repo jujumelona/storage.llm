@@ -14,10 +14,7 @@ static void apply_detected_budgets(server_options* opts, const glm5_backend_caps
     if (!opts->vram_budget_override) {
         opts->engine_config.vram_budget_bytes = caps.recommended_vram_cache_bytes;
         if (caps.device_memory_bytes > 0) {
-            const uint64_t reserve = 512ull * 1024ull * 1024ull;
-            const uint64_t detected_budget = caps.device_memory_bytes > reserve * 2ull
-                ? caps.device_memory_bytes - reserve
-                : (caps.device_memory_bytes * 9ull) / 10ull;
+            const uint64_t detected_budget = (caps.device_memory_bytes * 9ull) / 10ull;
             opts->engine_config.vram_budget_bytes = std::max<uint64_t>(
                 opts->engine_config.vram_budget_bytes,
                 detected_budget

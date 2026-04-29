@@ -40,6 +40,8 @@ typedef struct {
     uint64_t bytes_direct_to_gpu;
     uint64_t bytes_touch_fallback;
     uint64_t bytes_sync_h2d_fallback;
+    uint64_t device_alloc_failures;
+    uint64_t device_copy_failures;
     uint64_t disk_stage_done;
     uint64_t pinned_stage_done;
     uint64_t gpu_stage_done;

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <csignal>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -30,6 +31,7 @@ static const socket_handle_t invalid_socket_handle = INVALID_SOCKET;
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 using socket_handle_t = int;
@@ -40,6 +42,12 @@ static const socket_handle_t invalid_socket_handle = -1;
 #include "../../json_request.h"
 #include "../../system_memory.h"
 #include "../../loader/wide_path.h"
+
+static volatile std::sig_atomic_t g_server_shutdown_requested = 0;
+
+static void handle_server_shutdown_signal(int) {
+    g_server_shutdown_requested = 1;
+}
 
 struct server_options {
     bool allow_remote = false;
@@ -69,6 +77,7 @@ struct server_runtime_state {
     std::atomic<glm5_pc_engine_t*> engine{nullptr};
     std::atomic<int> model_ready{0};
     std::atomic<int> model_failed{0};
+    std::atomic<int> shutdown_requested{0};
     glm5_backend_caps_t initial_caps{};
     mutable std::mutex error_mutex;
     std::string error_message;
@@ -838,6 +847,16 @@ static std::string make_health_json(
         << "\"recommendedVramCacheBytes\":" << caps.recommended_vram_cache_bytes << ","
         << "\"recommendedVramCommonBytes\":" << caps.recommended_vram_common_bytes << ","
         << "\"recommendedPinnedBytes\":" << caps.recommended_pinned_bytes << ","
+        << "\"queuedRequests\":" << io_stats.queued_requests << ","
+        << "\"completedRequests\":" << io_stats.completed_requests << ","
+        << "\"failedRequests\":" << io_stats.failed_requests << ","
+        << "\"droppedRequests\":" << io_stats.dropped_requests << ","
+        << "\"deviceAllocFailures\":" << io_stats.device_alloc_failures << ","
+        << "\"deviceCopyFailures\":" << io_stats.device_copy_failures << ","
+        << "\"diskQueueDepth\":" << io_stats.disk_queue_depth << ","
+        << "\"pinnedQueueDepth\":" << io_stats.pinned_queue_depth << ","
+        << "\"gpuQueueDepth\":" << io_stats.gpu_queue_depth << ","
+        << "\"activeWorkers\":" << io_stats.active_workers << ","
         << "\"stagingSlotDeficit\":" << io_stats.staging_slot_deficit << ","
         << "\"recommendedStagingBytes\":" << io_stats.recommended_staging_bytes;
     if (!opts.model_root.empty()) {
@@ -1495,6 +1514,27 @@ static void set_model_load_stage(server_runtime_state* runtime, const char* stag
     std::cerr << "[storagellm] load stage: " << stage << "\n" << std::flush;
 }
 
+static bool cleanup_background_engine_if_shutdown(server_runtime_state* runtime) {
+    if (!runtime || runtime->shutdown_requested.load(std::memory_order_acquire) == 0) {
+        return false;
+    }
+    set_model_load_stage(runtime, "shutdown");
+    if (glm5_pc_engine_t* engine = runtime->engine.exchange(nullptr, std::memory_order_acq_rel)) {
+        glm5_pc_engine_destroy(engine);
+    }
+    return true;
+}
+
+static void fail_model_load_and_destroy(server_runtime_state* runtime, const std::string& message) {
+    mark_model_load_failed(runtime, message);
+    set_model_load_stage(runtime, "failed");
+    if (runtime) {
+        if (glm5_pc_engine_t* engine = runtime->engine.exchange(nullptr, std::memory_order_acq_rel)) {
+            glm5_pc_engine_destroy(engine);
+        }
+    }
+}
+
 static void load_server_model_background(
     server_options opts,
     glm5_io_config_t io_config,
@@ -1511,11 +1551,20 @@ static void load_server_model_background(
         return;
     }
     runtime->engine.store(engine, std::memory_order_release);
+    if (cleanup_background_engine_if_shutdown(runtime)) {
+        return;
+    }
     set_model_load_stage(runtime, "configure_io");
     glm5_pc_engine_configure_io(engine, &io_config);
+    if (cleanup_background_engine_if_shutdown(runtime)) {
+        return;
+    }
     set_model_load_stage(runtime, "resolve_model_paths");
     if (!opts.model_root.empty()) {
         glm5_pc_engine_set_model_root(engine, opts.model_root.c_str());
+    }
+    if (cleanup_background_engine_if_shutdown(runtime)) {
+        return;
     }
     prepare_model_paths(&opts);
     if (!opts.table_path.empty()) {
@@ -1524,15 +1573,21 @@ static void load_server_model_background(
         set_model_load_stage(runtime, "load_codec_table");
         std::cerr << "[storagellm] loading codec table: " << opts.table_path << "\n" << std::flush;
         if (!glm5_pc_engine_load_codec_table(engine, opts.table_path.c_str(), root, scale4)) {
-            mark_model_load_failed(runtime, "failed to load codec table: " + opts.table_path);
+            fail_model_load_and_destroy(runtime, "failed to load codec table: " + opts.table_path);
             std::cerr << "Failed to load codec table: " << opts.table_path << "\n";
             return;
         }
         std::cerr << "[storagellm] codec table loaded\n" << std::flush;
     }
+    if (cleanup_background_engine_if_shutdown(runtime)) {
+        return;
+    }
     if (!opts.topology_path.empty()) {
         set_model_load_stage(runtime, "load_topology");
         glm5_pc_engine_load_topology(engine, opts.topology_path.c_str());
+    }
+    if (cleanup_background_engine_if_shutdown(runtime)) {
+        return;
     }
     set_model_load_stage(runtime, "ready");
     runtime->model_ready.store(1, std::memory_order_release);
@@ -1666,6 +1721,13 @@ static server_options parse_args(int argc, char** argv) {
 static int server_main(int argc, char** argv) {
     server_options opts = parse_args(argc, argv);
 
+    g_server_shutdown_requested = 0;
+    std::signal(SIGINT, handle_server_shutdown_signal);
+    std::signal(SIGTERM, handle_server_shutdown_signal);
+#ifdef SIGBREAK
+    std::signal(SIGBREAK, handle_server_shutdown_signal);
+#endif
+
     if (!network_startup()) {
         std::cerr << "Network startup failed\n";
         return 1;
@@ -1705,7 +1767,7 @@ static int server_main(int argc, char** argv) {
     server_runtime_state runtime;
     runtime.initial_caps = caps;
     set_model_load_stage(&runtime, "queued");
-    std::thread(load_server_model_background, opts, io_config, &runtime).detach();
+    std::thread loader_thread(load_server_model_background, opts, io_config, &runtime);
 
     std::cout << "StorageLLM server listening on http://" << opts.host << ":" << opts.port << "/v1\n";
     std::cout << "Model: " << opts.model_id << "\n";
@@ -1736,7 +1798,21 @@ static int server_main(int argc, char** argv) {
     std::mutex engine_mutex;
     const uint32_t worker_limit = max_http_workers(caps);
     auto active_clients = std::make_shared<std::atomic<uint32_t>>(0);
-    for (;;) {
+    while (!g_server_shutdown_requested) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(server, &readfds);
+        timeval timeout{};
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 250000;
+#ifdef _WIN32
+        const int ready = select(0, &readfds, nullptr, nullptr, &timeout);
+#else
+        const int ready = select(server + 1, &readfds, nullptr, nullptr, &timeout);
+#endif
+        if (ready <= 0) {
+            continue;
+        }
         sockaddr_in client_addr{};
 #ifdef _WIN32
         int client_len = sizeof(client_addr);
@@ -1758,8 +1834,15 @@ static int server_main(int argc, char** argv) {
         }).detach();
     }
 
+    runtime.shutdown_requested.store(1, std::memory_order_release);
     close_socket_handle(server);
-    if (glm5_pc_engine_t* engine = runtime.engine.load(std::memory_order_acquire)) {
+    while (active_clients->load(std::memory_order_acquire) > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (loader_thread.joinable()) {
+        loader_thread.join();
+    }
+    if (glm5_pc_engine_t* engine = runtime.engine.exchange(nullptr, std::memory_order_acq_rel)) {
         glm5_pc_engine_destroy(engine);
     }
     network_cleanup();

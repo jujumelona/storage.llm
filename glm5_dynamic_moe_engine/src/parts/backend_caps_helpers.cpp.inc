@@ -17,10 +17,6 @@ static uint64_t cache_with_common_for_experts(uint32_t expert_count) {
 }
 
 static uint64_t glm5_budget_from_free_device_memory(uint64_t free_bytes) {
-    const uint64_t reserve = 512ull * 1024ull * 1024ull;
-    if (free_bytes > reserve * 2ull) {
-        return free_bytes - reserve;
-    }
     return (free_bytes * 9ull) / 10ull;
 }
 
