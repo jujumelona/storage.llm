@@ -402,7 +402,11 @@ mmap_context_t* mmap_load_partial(const char* path, size_t offset, size_t length
     void* addr = mmap(NULL, map_length, PROT_READ, MAP_SHARED, ctx->fd, aligned_offset);
     if (addr == MAP_FAILED) { close(ctx->fd); free(ctx); return NULL; }
 
-    madvise(addr, map_length, MADV_SEQUENTIAL);
+    // Bug Fix: MADV_SEQUENTIAL → MADV_WILLNEED for partial expert mappings.
+    // Expert access is random (MoE router), not sequential. SEQUENTIAL causes
+    // kernel to prefetch beyond requested range, wasting RAM bandwidth and page cache.
+    // WILLNEED only prefetches the specified range.
+    madvise(addr, map_length, MADV_WILLNEED);
 
     ctx->mapped_offset = offset_diff;
     ctx->mapped_size = map_length;

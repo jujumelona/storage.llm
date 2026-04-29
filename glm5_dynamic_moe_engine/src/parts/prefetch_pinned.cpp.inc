@@ -49,6 +49,13 @@ static int prefetch_tensor_ram_to_pinned(
             return 0;
         }
         copied += n;
+
+        // Bug Fix: RAM→Pinned copy leaves original mmap pages in page cache.
+        // Same data occupies RAM twice (page cache + pinned staging).
+        // MADV_DONTNEED releases page cache copy after staging copy completes.
+#ifdef __linux__
+        madvise(const_cast<uint8_t*>(src), static_cast<size_t>(length), MADV_DONTNEED);
+#endif
     }
 
     if (out_staging_bytes && can_stage && staging_offset == total_bytes && copied == total_bytes) {

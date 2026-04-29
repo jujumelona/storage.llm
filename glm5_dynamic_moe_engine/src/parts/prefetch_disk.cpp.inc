@@ -5,7 +5,10 @@ static int prefetch_tensor_disk_to_ram(glm5_pc_engine* engine, const glm5_tensor
     }
 
     const uint64_t file_size = static_cast<uint64_t>(mmap_get_size(shard));
-    if (engine->staging_pinned && file_size > 0 && file_size <= engine->io_config.pinned_staging_bytes) {
+    // Bug Fix: file_size (entire shard, GB) vs pinned_staging_bytes (hundreds MB) → always false.
+    // Use tensor_stream_bytes (actual transfer size) instead.
+    const uint64_t transfer_bytes = tensor_stream_bytes(rec);
+    if (engine->staging_pinned && transfer_bytes > 0 && transfer_bytes <= engine->io_config.pinned_staging_bytes) {
         lock_mapped_shard_once(engine, shard);
     }
     const uint64_t ranges[][2] = {

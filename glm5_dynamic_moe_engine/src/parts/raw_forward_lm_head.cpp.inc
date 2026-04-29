@@ -76,3 +76,116 @@ int glm5_pc_engine_lm_head_top1_f32(
     *out_logit = best_score;
     return 1;
 }
+
+int glm5_pc_engine_lm_head_token_logprob_f32(
+    glm5_pc_engine_t* engine,
+    const float* hidden,
+    uint32_t hidden_count,
+    uint32_t target_token_id,
+    float* out_target_logit,
+    float* out_logsumexp,
+    float* out_logprob
+) {
+    const glm5_storage_constants_t* c = glm5_storage_constants();
+    if (!engine || !c || !hidden || !out_target_logit || !out_logsumexp || !out_logprob ||
+        hidden_count != c->hidden_size || c->vocab_size == 0 || target_token_id >= c->vocab_size) {
+        return 0;
+    }
+    const int32_t lm_head_layer = (int32_t)c->num_hidden_layers + 1;
+    const glm5_storage_raw_span_spec_t* span = find_raw_role_span(lm_head_layer, GLM5_RAW_ROLE_LM_HEAD);
+    mmap_context_t* mapped = map_raw_span_part(engine, span);
+    if (!raw_span_bounds_ok(span, mapped)) {
+        return 0;
+    }
+    const uint64_t row_bytes = (uint64_t)c->hidden_size * 2ull;
+    if (span->bytes < row_bytes * (uint64_t)c->vocab_size) {
+        return 0;
+    }
+
+    const uint8_t* base = raw_span_ptr(span, mapped, 0, row_bytes * (uint64_t)c->vocab_size);
+    if (!base) {
+        return 0;
+    }
+
+    const uint32_t chunk_size = 1024;
+    const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
+
+    struct chunk_max_t {
+        float max_score;
+        float target_score;
+        int has_target;
+    };
+    std::vector<chunk_max_t> chunk_maxes(num_chunks);
+
+    if (!glm5_parallel_rows(engine, num_chunks, 0, [&](uint32_t chunk) {
+        const uint32_t start = chunk * chunk_size;
+        const uint32_t end = std::min(start + chunk_size, c->vocab_size);
+        float local_max = -std::numeric_limits<float>::infinity();
+        float target_score = 0.0f;
+        int has_target = 0;
+
+        for (uint32_t t = start; t < end; ++t) {
+            const uint8_t* row = base + row_bytes * (uint64_t)t;
+            const float score = glm5_dot_bf16_row(row, hidden, hidden_count);
+            if (score > local_max) {
+                local_max = score;
+            }
+            if (t == target_token_id) {
+                target_score = score;
+                has_target = 1;
+            }
+        }
+
+        chunk_maxes[chunk] = {local_max, target_score, has_target};
+        return 1;
+    })) {
+        return 0;
+    }
+
+    float global_max = -std::numeric_limits<float>::infinity();
+    float target_score = 0.0f;
+    int found_target = 0;
+    for (uint32_t i = 0; i < num_chunks; ++i) {
+        if (chunk_maxes[i].max_score > global_max) {
+            global_max = chunk_maxes[i].max_score;
+        }
+        if (chunk_maxes[i].has_target) {
+            target_score = chunk_maxes[i].target_score;
+            found_target = 1;
+        }
+    }
+    if (!found_target || !std::isfinite(global_max)) {
+        return 0;
+    }
+
+    std::vector<double> chunk_sums(num_chunks, 0.0);
+    if (!glm5_parallel_rows(engine, num_chunks, 0, [&](uint32_t chunk) {
+        const uint32_t start = chunk * chunk_size;
+        const uint32_t end = std::min(start + chunk_size, c->vocab_size);
+        double local_sum = 0.0;
+        for (uint32_t t = start; t < end; ++t) {
+            const uint8_t* row = base + row_bytes * (uint64_t)t;
+            const float score = glm5_dot_bf16_row(row, hidden, hidden_count);
+            local_sum += std::exp((double)score - (double)global_max);
+        }
+        chunk_sums[chunk] = local_sum;
+        return 1;
+    })) {
+        return 0;
+    }
+
+    double exp_sum = 0.0;
+    for (double v : chunk_sums) {
+        exp_sum += v;
+    }
+    if (!(exp_sum > 0.0) || !std::isfinite(exp_sum)) {
+        return 0;
+    }
+
+    const double logsumexp = (double)global_max + std::log(exp_sum);
+    const double logprob = (double)target_score - logsumexp;
+    *out_target_logit = target_score;
+    *out_logsumexp = (float)logsumexp;
+    *out_logprob = (float)logprob;
+    return std::isfinite(logprob) ? 1 : 0;
+}

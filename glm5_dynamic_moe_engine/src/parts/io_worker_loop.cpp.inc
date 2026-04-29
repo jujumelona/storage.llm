@@ -205,18 +205,23 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
 
                 const uint64_t vram_bud = tier_budget(engine, GLM5_TIER_VRAM);
                 const uint64_t ram_bud = tier_budget(engine, GLM5_TIER_RAM);
-                if (vram_bud > 0 && tier_used(engine, GLM5_TIER_VRAM) > (vram_bud * 75ull) / 100ull) {
+                // Bug Fix: TOCTOU uint64 underflow. tier_used() called twice without lock.
+                // If another thread evicts between calls, second tier_used() < target → underflow.
+                // Snapshot once, check both conditions before subtraction.
+                const uint64_t vram_used_snap = tier_used(engine, GLM5_TIER_VRAM);
+                const uint64_t vram_target = (vram_bud * 65ull) / 100ull;
+                if (vram_bud > 0 && vram_used_snap > (vram_bud * 75ull) / 100ull && vram_used_snap > vram_target) {
                     std::vector<std::pair<int, int>> freed;
-                    demote_cold_until(engine, GLM5_TIER_VRAM,
-                        tier_used(engine, GLM5_TIER_VRAM) - (vram_bud * 65ull) / 100ull, freed);
+                    demote_cold_until(engine, GLM5_TIER_VRAM, vram_used_snap - vram_target, freed);
                     if (!freed.empty()) {
                         device_free_experts_batched(engine, freed, 8);
                     }
                 }
-                if (ram_bud > 0 && tier_used(engine, GLM5_TIER_RAM) > (ram_bud * 75ull) / 100ull) {
+                const uint64_t ram_used_snap = tier_used(engine, GLM5_TIER_RAM);
+                const uint64_t ram_target = (ram_bud * 65ull) / 100ull;
+                if (ram_bud > 0 && ram_used_snap > (ram_bud * 75ull) / 100ull && ram_used_snap > ram_target) {
                     std::vector<std::pair<int, int>> freed_dummy;
-                    demote_cold_until(engine, GLM5_TIER_RAM,
-                        tier_used(engine, GLM5_TIER_RAM) - (ram_bud * 65ull) / 100ull, freed_dummy);
+                    demote_cold_until(engine, GLM5_TIER_RAM, ram_used_snap - ram_target, freed_dummy);
                 }
             }
         }

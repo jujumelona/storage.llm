@@ -83,6 +83,10 @@ static uint8_t* allocate_best_staging(uint64_t requested_bytes, uint64_t* actual
 
     // Bug 12 Fix: Return NULL instead of non-pinned fallback.
     // Callers must check staging_slot.pinned before assuming async DMA.
+    // Bug Fix: Silent failure → warn user about mlock denial.
+    fprintf(stderr, "[storageLLM WARNING] pinned staging allocation failed "
+        "(mlock denied for all sizes). Multistage pipeline is DISABLED. "
+        "Check 'ulimit -l' and /proc/sys/vm/max_map_count.\n");
     return nullptr;
 }
 

@@ -56,6 +56,15 @@ typedef struct {
     char error[160];
 } glm5_generation_stats_t;
 
+typedef struct {
+    uint32_t input_tokens;
+    uint32_t evaluated_tokens;
+    double nll;
+    double mean_nll;
+    double perplexity;
+    char error[160];
+} glm5_eval_stats_t;
+
 int glm5_pc_engine_get_forward_status(
     const glm5_pc_engine_t* engine,
     glm5_forward_status_t* out_status
@@ -97,6 +106,16 @@ int glm5_pc_engine_lm_head_top1_f32(
     float* out_logit
 );
 
+int glm5_pc_engine_lm_head_token_logprob_f32(
+    glm5_pc_engine_t* engine,
+    const float* hidden,
+    uint32_t hidden_count,
+    uint32_t target_token_id,
+    float* out_target_logit,
+    float* out_logsumexp,
+    float* out_logprob
+);
+
 int glm5_pc_engine_generate_token_ids(
     glm5_pc_engine_t* engine,
     const int32_t* input_token_ids,
@@ -105,6 +124,13 @@ int glm5_pc_engine_generate_token_ids(
     uint32_t* out_token_ids,
     uint32_t out_token_capacity,
     glm5_generation_stats_t* out_stats
+);
+
+int glm5_pc_engine_eval_token_ids(
+    glm5_pc_engine_t* engine,
+    const int32_t* input_token_ids,
+    uint32_t input_token_count,
+    glm5_eval_stats_t* out_stats
 );
 
 int glm5_pc_engine_find_raw_tensor(

@@ -31,7 +31,12 @@ static uint32_t glm5_staging_min_slot_count(const glm5_pc_engine* engine) {
     if (pinned_workers == 0) pinned_workers = 1;
     uint32_t disk_workers = runtime_disk_workers(engine);
     if (disk_workers == 0) disk_workers = engine->io_config.disk_worker_threads ? engine->io_config.disk_worker_threads : 1u;
-    return std::max(4u, (disk_workers + pinned_workers) * 2u);
+    // Bug Fix: GPU worker slots missing. Each gpu_worker holds up to 8 slots
+    // during device_stream_sync_current(). Without this, staging starvation occurs.
+    uint32_t gpu_workers = runtime_gpu_workers(engine);
+    if (gpu_workers == 0) gpu_workers = 1;
+    constexpr uint32_t gpu_batch_max = 8;
+    return std::max(4u, (disk_workers + pinned_workers) * 2u + gpu_workers * gpu_batch_max);
 }
 
 static uint32_t glm5_staging_target_slot_count_for_workers(uint32_t pinned_workers, uint32_t gpu_workers) {

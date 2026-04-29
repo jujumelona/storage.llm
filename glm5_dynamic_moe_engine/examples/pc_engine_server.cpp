@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -647,7 +648,109 @@ static server_generation_result run_server_generation(
     return result;
 }
 
+struct server_eval_result {
+    int ok = 0;
+    int http_status = 200;
+    std::string error_code;
+    std::string error_message;
+    uint32_t input_tokens = 0;
+    uint32_t evaluated_tokens = 0;
+    double nll = 0.0;
+    double mean_nll = 0.0;
+    double perplexity = 0.0;
+};
+
+static server_eval_result run_server_eval(
+    glm5_pc_engine_t* engine,
+    std::mutex* engine_mutex,
+    const server_options& opts,
+    const std::string& body
+) {
+    server_eval_result result;
+    std::vector<int> request_ids = storagellm::json_read_int_array(body, "input_ids");
+    std::vector<int32_t> input_ids;
+    server_tokenizer& tok = get_server_tokenizer(opts);
+    if (!request_ids.empty()) {
+        input_ids.reserve(request_ids.size());
+        for (int id : request_ids) {
+            input_ids.push_back((int32_t)id);
+        }
+    } else {
+        const std::string text = extract_generation_text(body);
+        if (text.empty()) {
+            result.http_status = 400;
+            result.error_code = "invalid_request_error";
+            result.error_message = "eval request must include input, prompt, messages/content, or input_ids";
+            return result;
+        }
+        if (!tok.loaded) {
+            result.http_status = 503;
+            result.error_code = "tokenizer_unavailable";
+            result.error_message = tok.error.empty() ? "tokenizer.json is not loaded" : tok.error;
+            return result;
+        }
+        if (!tokenizer_encode_greedy(tok, text, &input_ids)) {
+            result.http_status = 422;
+            result.error_code = "tokenization_failed";
+            result.error_message = "tokenizer vocab could not encode the eval text";
+            return result;
+        }
+    }
+    if (input_ids.size() < 2) {
+        result.http_status = 400;
+        result.error_code = "invalid_request_error";
+        result.error_message = "eval requires at least two tokens";
+        return result;
+    }
+
+    glm5_eval_stats_t stats{};
+    int evaluated = 0;
+    if (engine_mutex) {
+        std::lock_guard<std::mutex> lock(*engine_mutex);
+        server_orchestrate_request_prefetch(engine, opts, body);
+        evaluated = glm5_pc_engine_eval_token_ids(
+            engine,
+            input_ids.data(),
+            static_cast<uint32_t>(input_ids.size()),
+            &stats
+        );
+    } else {
+        evaluated = glm5_pc_engine_eval_token_ids(
+            engine,
+            input_ids.data(),
+            static_cast<uint32_t>(input_ids.size()),
+            &stats
+        );
+    }
+    if (!evaluated) {
+        result.http_status = 503;
+        result.error_code = "eval_not_ready";
+        result.error_message = stats.error[0] ? stats.error : "eval failed";
+        return result;
+    }
+
+    result.ok = 1;
+    result.input_tokens = stats.input_tokens;
+    result.evaluated_tokens = stats.evaluated_tokens;
+    result.nll = stats.nll;
+    result.mean_nll = stats.mean_nll;
+    result.perplexity = stats.perplexity;
+    return result;
+}
+
 static std::string make_openai_error_json(const server_generation_result& result) {
+    std::ostringstream out;
+    out << "{"
+        << "\"error\":{"
+        << "\"message\":\"" << json_escape(result.error_message) << "\","
+        << "\"type\":\"" << json_escape(result.error_code.empty() ? "server_error" : result.error_code) << "\","
+        << "\"code\":\"" << json_escape(result.error_code.empty() ? "server_error" : result.error_code) << "\""
+        << "}"
+        << "}";
+    return out.str();
+}
+
+static std::string make_eval_error_json(const server_eval_result& result) {
     std::ostringstream out;
     out << "{"
         << "\"error\":{"
@@ -945,6 +1048,34 @@ static std::string make_response_json(
     return out.str();
 }
 
+static std::string json_double(double value) {
+    if (!std::isfinite(value)) {
+        return "null";
+    }
+    std::ostringstream out;
+    out.precision(17);
+    out << value;
+    return out.str();
+}
+
+static std::string make_eval_json(
+    const server_options& opts,
+    const server_eval_result& evaluated
+) {
+    std::ostringstream out;
+    out << "{"
+        << "\"object\":\"storagellm.eval\","
+        << "\"model\":\"" << json_escape(opts.model_id) << "\","
+        << "\"input_tokens\":" << evaluated.input_tokens << ","
+        << "\"evaluated_tokens\":" << evaluated.evaluated_tokens << ","
+        << "\"nll\":" << json_double(evaluated.nll) << ","
+        << "\"mean_nll\":" << json_double(evaluated.mean_nll) << ","
+        << "\"ppl\":" << json_double(evaluated.perplexity) << ","
+        << "\"perplexity\":" << json_double(evaluated.perplexity)
+        << "}";
+    return out.str();
+}
+
 static std::string make_chat_not_ready_json(const glm5_forward_status_t& forward) {
     std::ostringstream out;
     out << "{"
@@ -986,6 +1117,8 @@ static std::string http_reason(int status) {
             return "Bad Request";
         case 404:
             return "Not Found";
+        case 422:
+            return "Unprocessable Entity";
         case 405:
             return "Method Not Allowed";
         case 500:
@@ -1179,6 +1312,16 @@ static std::string route_request(
         }
         return make_response(200, "application/json", make_response_json(opts, generated));
     }
+    if (req.method == "POST" &&
+        (req.path == "/v1/storagellm/eval" ||
+         req.path == "/v1/storagellm/perplexity" ||
+         req.path == "/v1/perplexity")) {
+        const server_eval_result evaluated = run_server_eval(engine, engine_mutex, opts, req.body);
+        if (!evaluated.ok) {
+            return make_response(evaluated.http_status, "application/json", make_eval_error_json(evaluated));
+        }
+        return make_response(200, "application/json", make_eval_json(opts, evaluated));
+    }
 
     const std::string body = "{\"error\":{\"message\":\"unknown endpoint\",\"type\":\"not_found\"}}";
     return make_response(404, "application/json", body);
@@ -1320,6 +1463,7 @@ static void print_usage() {
         << "  POST /v1/chat/completions\n"
         << "  POST /v1/completions\n"
         << "  POST /v1/responses\n"
+        << "  POST /v1/storagellm/eval\n"
         << "  GET  /openclaw/config\n";
 }
 

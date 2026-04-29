@@ -38,3 +38,6 @@
 
 // Main API (depends on: forward, kv_cache, scratch, error)
 #include "generation_api_main.cpp.inc"
+
+// Eval API (depends on: forward, lm_head logprob, kv_cache, scratch, error)
+#include "generation_eval.cpp.inc"
