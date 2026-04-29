@@ -196,6 +196,9 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                     const uint32_t pinned_depth_pre = engine->pinned_stage.depth.load(std::memory_order_relaxed);
                     const uint32_t pinned_hard_cap = engine->io_config.max_prefetch_queue;
                     if (pinned_hard_cap > 0 && pinned_depth_pre >= pinned_hard_cap) {
+                        if (task.requeue_count > 0) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        }
                         ok = preserve_requeue(task, GLM5_TRANSFER_STAGE_DISK_TO_RAM);
                         terminal = 0;
                         finish_stage_task(engine, engine->disk_stage, ok, terminal);

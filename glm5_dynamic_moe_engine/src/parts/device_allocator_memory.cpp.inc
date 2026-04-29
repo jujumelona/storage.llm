@@ -2,41 +2,17 @@
 
 static uint64_t device_budget_bytes(const glm5_pc_engine* e) {
     if (!e) return 0;
-    
-    // Problem 3 Fix: Account for external VRAM usage in budget calculation
-    // External usage = VRAM used by other processes, CUDA JIT cache, NCCL, etc.
-    // Without this, device_budget_bytes() overestimates available VRAM → cuMemAlloc fails
-    const uint64_t external_usage = e->device_external_usage_estimate.load(std::memory_order_relaxed);
-    const uint64_t total_bytes = e->device_total_bytes.load(std::memory_order_relaxed);
-    
-    uint64_t budget = 0;
-    if (e->config.vram_budget_bytes) {
-        budget = e->config.vram_budget_bytes;
-    } else {
-        const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
-        const uint64_t free_b = e->device_free_bytes.load(std::memory_order_relaxed);
-        if (allocated || free_b) {
-            budget = allocated > UINT64_MAX - free_b ? UINT64_MAX : allocated + free_b;
-        } else {
-            budget = e->backend_caps.device_memory_bytes ?
-                e->backend_caps.device_memory_bytes : e->backend_caps.recommended_vram_cache_bytes;
-        }
+    if (e->config.vram_budget_bytes) return e->config.vram_budget_bytes;
+    const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
+    const uint64_t free_b = e->device_free_bytes.load(std::memory_order_relaxed);
+    if (allocated || free_b) {
+        return allocated > UINT64_MAX - free_b ? UINT64_MAX : allocated + free_b;
     }
-    
-    // Clamp budget to available VRAM (total - external usage)
-    if (total_bytes > 0 && external_usage < total_bytes) {
-        const uint64_t available = total_bytes - external_usage;
-        if (budget > available) {
-            budget = available;
-        }
-    }
-    
-    return budget;
+    return e->backend_caps.device_memory_bytes ? e->backend_caps.device_memory_bytes : e->backend_caps.recommended_vram_cache_bytes;
 }
 
 static void device_refresh_mem_info(glm5_pc_engine* e) {
     if (!e) return;
-    // Problem 3 Fix: Track external VRAM usage to prevent cuMemAlloc failures
     // Diagnostics/failure-path refresh only. Hot paths maintain device_free_bytes directly.
     const auto now = std::chrono::steady_clock::now();
     int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
@@ -52,14 +28,6 @@ static void device_refresh_mem_info(glm5_pc_engine* e) {
         // Bug 1: Do NOT overwrite device_free_bytes — it's maintained by alloc/free counters
         // Overwriting causes race with concurrent alloc/free, leading to budget miscalculation
         // e->device_free_bytes.store((uint64_t)free_b);  // REMOVED
-        
-        // Problem 3 Fix: Estimate external VRAM usage (other processes, CUDA JIT, NCCL, etc.)
-        // external_usage = (device_total_bytes - cuMemGetInfo.free) - device_allocated_bytes
-        // This captures VRAM used outside this engine's tracking.
-        const uint64_t allocated_by_engine = e->device_allocated_bytes.load(std::memory_order_relaxed);
-        const uint64_t total_used = total_b > free_b ? total_b - free_b : 0;
-        const uint64_t external_usage = total_used > allocated_by_engine ? total_used - allocated_by_engine : 0;
-        e->device_external_usage_estimate.store(external_usage, std::memory_order_relaxed);
         e->device_total_bytes.store((uint64_t)total_b);
     }
 }

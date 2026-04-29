@@ -27,28 +27,6 @@ static int prefetch_tensor_ram_to_pinned(
         slot_index < engine->staging_slots.size() &&
         engine->staging_slots[slot_index].buf &&
         total_bytes <= engine->staging_slots[slot_index].size;
-
-    if (!can_stage && target_tier == GLM5_TIER_VRAM) {
-        const int copied_to_gpu = device_copy_tensor(
-            engine,
-            rec,
-            GLM5_DEVICE_POOL_EXPERT,
-            1
-        );
-        if (copied_to_gpu == 1) {
-            if (out_staging_bytes) {
-                *out_staging_bytes = total_bytes;
-            }
-            return 1;
-        }
-        if (copied_to_gpu == GLM5_DEVICE_COPY_BACKPRESSURE) {
-            return GLM5_DEVICE_COPY_BACKPRESSURE;
-        }
-        engine->io_atomic.staging_slot_contention.fetch_add(1);
-        engine->io_atomic.staging_wraps.fetch_add(1);
-        return 0;
-    }
-
     if (!can_stage) {
         // Problem 5 Fix: can_stage==false is transient contention, not structural deficit
         engine->io_atomic.staging_slot_contention.fetch_add(1);

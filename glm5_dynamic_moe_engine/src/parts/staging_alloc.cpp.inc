@@ -65,9 +65,21 @@ static uint8_t* allocate_best_staging(uint64_t requested_bytes, uint64_t* actual
         const uint64_t limit = static_cast<uint64_t>(memlock_limit.rlim_cur);
         if (limit < min_pinned) {
             fprintf(stderr,
-                "[storagellm] pinned staging skipped: RLIMIT_MEMLOCK=%llu bytes < %llu bytes\n",
+                "[storagellm] pinned staging skipped: RLIMIT_MEMLOCK=%llu bytes < %llu bytes. "
+                "Falling back to non-pinned staging (sync DMA only).\n",
                 (unsigned long long)limit,
                 (unsigned long long)min_pinned);
+            // Fallback: allocate non-pinned buffer
+            uint8_t* ptr = allocate_staging(requested_bytes, nullptr);
+            if (ptr) {
+                if (actual_bytes) {
+                    *actual_bytes = requested_bytes;
+                }
+                if (pinned) {
+                    *pinned = false;
+                }
+                return ptr;
+            }
             return nullptr;
         }
         if (bytes > limit) {
@@ -101,16 +113,30 @@ static uint8_t* allocate_best_staging(uint64_t requested_bytes, uint64_t* actual
         bytes /= 2;
     }
 
-    // Bug 12 Fix: Return NULL instead of non-pinned fallback.
-    // Callers must check staging_slot.pinned before assuming async DMA.
-    // Problem 2 Fix: Fatal error when staging allocation fails completely.
-    // Silent NULL return causes soft deadlock — VRAM prefetch silently drops all tasks.
-    // User must know staging is unavailable to adjust ulimit -l or staging_size config.
-    fprintf(stderr, "[storageLLM FATAL] pinned staging allocation failed "
-        "(mlock denied for all sizes). Multistage pipeline CANNOT function. "
-        "Check 'ulimit -l' (must be >= %llu MB) and /proc/sys/vm/max_map_count.\n",
+    // CRITICAL FIX: When pinned allocation fails completely, return non-pinned fallback
+    // instead of NULL to prevent pipeline shutdown. Non-pinned staging allows sync DMA,
+    // which is slower but functional. Returning NULL disables multistage pipeline entirely,
+    // preventing model from loading at all.
+    fprintf(stderr, "[storageLLM WARNING] pinned staging allocation failed (mlock denied). "
+        "Falling back to non-pinned staging (sync DMA only, slower but functional). "
+        "Check 'ulimit -l' (must be >= %llu MB) for async DMA.\n",
         (unsigned long long)(requested_bytes / (1024ull * 1024ull)));
-    fprintf(stderr, "[storageLLM FATAL] Engine will operate in degraded mode with sync fallback.\n");
+    
+    // Allocate non-pinned buffer as last resort
+    uint8_t* fallback_ptr = allocate_staging(requested_bytes, nullptr);
+    if (fallback_ptr) {
+        if (actual_bytes) {
+            *actual_bytes = requested_bytes;
+        }
+        if (pinned) {
+            *pinned = false;
+        }
+        return fallback_ptr;
+    }
+    
+    // Only return NULL if even non-pinned allocation fails (out of memory)
+    fprintf(stderr, "[storageLLM FATAL] staging allocation failed completely (out of memory). "
+        "Engine cannot function.\n");
     return nullptr;
 }
 

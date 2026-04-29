@@ -196,6 +196,12 @@ static void lock_mapped_shard_once(glm5_pc_engine* engine, mmap_context_t* ctx) 
         return;
     }
     {
+        std::shared_lock<std::shared_mutex> lock(engine->shard_mutex);
+        if (engine->locked_mmaps.count(ctx)) {
+            return;
+        }
+    }
+    {
         std::unique_lock<std::shared_mutex> lock(engine->shard_mutex);
         if (!engine->locked_mmaps.insert(ctx).second) {
             return;

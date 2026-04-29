@@ -85,8 +85,6 @@ struct glm5_pc_engine {
     std::atomic<uint64_t> device_stream_bytes{0};
     std::atomic<uint64_t> device_total_bytes{0};
     std::atomic<uint64_t> device_free_bytes{0};
-    // Problem 3 Fix: Track external VRAM usage (other processes, CUDA JIT, NCCL, etc.)
-    std::atomic<uint64_t> device_external_usage_estimate{0};
     std::atomic<int64_t> last_mem_query_ms{0};  // Fix 41: per-engine cuMemGetInfo throttle
     std::atomic<int> device_allocator_ready{0};
     std::unordered_map<uint64_t, glm5_device_allocation> device_allocations;

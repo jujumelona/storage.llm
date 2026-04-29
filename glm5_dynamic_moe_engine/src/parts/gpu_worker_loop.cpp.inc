@@ -117,19 +117,9 @@ static void gpu_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                                 release_staging_slot(engine, batch[i].staging_slot);
                                 batch[i].staging_slot = UINT32_MAX;
                             }
-                            glm5_prefetch_task pinned_retry = batch[i];
-                            pinned_retry.stage = GLM5_TRANSFER_STAGE_RAM_TO_PINNED;
-                            pinned_retry.staging_slot = UINT32_MAX;
-                            pinned_retry.staging_bytes = 0;
-                            pinned_retry.staging_valid = 0;
-                            pinned_retry.urgent = 1;
-                            ok[i] = enqueue_stage_or_retry(engine, engine->pinned_stage, pinned_retry) ? 1 : 0;
-                            if (ok[i]) {
-                                terminal[i] = 0;
-                                engine->pinned_stage.cv.notify_one();
-                            } else {
-                                engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
-                            }
+                            engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                            ok[i] = 0;
+                            terminal[i] = 1; // Drop it, avoid ping-pong livelock
                         }
                     }
                 }

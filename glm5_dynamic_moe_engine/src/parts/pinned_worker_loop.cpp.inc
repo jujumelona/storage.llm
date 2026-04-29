@@ -81,15 +81,8 @@ static void pinned_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                             queued_retry = true;
                             break;
                         }
-                        next.stage = GLM5_TRANSFER_STAGE_RAM_TO_PINNED;
-                        next.urgent = 1;
-                        if (next.staging_valid &&
-                            enqueue_stage_or_retry(engine, engine->pinned_stage, next)) {
-                            terminal = 0;
-                            engine->pinned_stage.cv.notify_one();
-                            queued_retry = true;
-                            break;
-                        }
+                        // Fix: Do NOT push back to pinned_stage, this causes self-ping-pong spin livelocks!
+                        // If gpu_stage is full, we must wait, not spin.
                         std::unique_lock<std::mutex> lock(engine->gpu_stage.mtx);
                         engine->gpu_stage.pop_cv.wait_for(lock, std::chrono::milliseconds(1));
                     }
