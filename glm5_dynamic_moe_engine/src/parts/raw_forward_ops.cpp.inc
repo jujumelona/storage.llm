@@ -83,10 +83,17 @@ int glm5_pc_engine_raw_rmsnorm_f32(
         __m256d xd1 = _mm256_cvtps_pd(_mm256_extractf128_ps(x0, 1));
         __m256d xd2 = _mm256_cvtps_pd(_mm256_castps256_ps128(x1));
         __m256d xd3 = _mm256_cvtps_pd(_mm256_extractf128_ps(x1, 1));
+#if defined(__FMA__)
         sum0 = _mm256_fmadd_pd(xd0, xd0, sum0);
         sum1 = _mm256_fmadd_pd(xd1, xd1, sum1);
         sum0 = _mm256_fmadd_pd(xd2, xd2, sum0);
         sum1 = _mm256_fmadd_pd(xd3, xd3, sum1);
+#else
+        sum0 = _mm256_add_pd(_mm256_mul_pd(xd0, xd0), sum0);
+        sum1 = _mm256_add_pd(_mm256_mul_pd(xd1, xd1), sum1);
+        sum0 = _mm256_add_pd(_mm256_mul_pd(xd2, xd2), sum0);
+        sum1 = _mm256_add_pd(_mm256_mul_pd(xd3, xd3), sum1);
+#endif
     }
     sum0 = _mm256_add_pd(sum0, sum1);
     double buf[4];

@@ -184,39 +184,41 @@ int qkv_attention_decode_impl(
     } else {
         // Serial K scoring for small context (n < 1024)
         for (int t = 0; t < n; t++) {
-        float norm_k = s->k_norms[t];
-        float dot = 0.0f;
+            float norm_k = s->k_norms[t];
+            float dot = 0.0f;
 
-        if (k_split) {
-            if (!qkv_dot_mse_split_rotated_token(s, cfg, QKV_TARGET_KEY, t, q_eff, &dot)) return 0;
-        } else if (k_mse_bits == 2) {
-            const uint8_t* tidx = s->k_idx + t * k_stride;
-            for (int i = 0; i < d; i++) {
-                int byte_pos = (i * 2) / 8;
-                int bit_pos = (i * 2) % 8;
-                int code = (tidx[byte_pos] >> bit_pos) & 0x3;
-                dot += q_eff[i] * k_centroids[code];
-            }
-        } else {
-            const uint8_t* tidx = s->k_idx + t * k_stride;
-            int* indices = s->scratch_indices;
-            if (!indices) return 0;
-            qkv_unpack_indices(tidx, indices, d, k_mse_bits);
-            for (int i = 0; i < d; i++) {
-                dot += q_eff[i] * k_centroids[indices[i]];
-            }
-        }
-
-        // Add QJL residual
-        if (use_qjl_key_residual) {
-            const uint8_t* tqjl = s->k_qjl + t * k_qstride;
-            float r_norm = s->k_residual_norms[t];
-            if (r_norm > 1e-10f) {
-                qkv_unpack_signs(tqjl, qjl_z, d);
+            if (k_split) {
+                if (!qkv_dot_mse_split_rotated_token(s, cfg, QKV_TARGET_KEY, t, q_eff, &dot)) return 0;
+            } else if (k_mse_bits == 2) {
+                const uint8_t* tidx = s->k_idx + t * k_stride;
                 for (int i = 0; i < d; i++) {
-                    dot += qjl_scale * r_norm * s_q_precomputed[i] * qjl_z[i];
+                    int byte_pos = (i * 2) / 8;
+                    int bit_pos = (i * 2) % 8;
+                    int code = (tidx[byte_pos] >> bit_pos) & 0x3;
+                    dot += q_eff[i] * k_centroids[code];
+                }
+            } else {
+                const uint8_t* tidx = s->k_idx + t * k_stride;
+                int* indices = s->scratch_indices;
+                if (!indices) return 0;
+                qkv_unpack_indices(tidx, indices, d, k_mse_bits);
+                for (int i = 0; i < d; i++) {
+                    dot += q_eff[i] * k_centroids[indices[i]];
                 }
             }
+
+            // Add QJL residual
+            if (use_qjl_key_residual) {
+                const uint8_t* tqjl = s->k_qjl + t * k_qstride;
+                float r_norm = s->k_residual_norms[t];
+                if (r_norm > 1e-10f) {
+                    qkv_unpack_signs(tqjl, qjl_z, d);
+                    for (int i = 0; i < d; i++) {
+                        dot += qjl_scale * r_norm * s_q_precomputed[i] * qjl_z[i];
+                    }
+                }
+            }
+            att[t] = dot * norm_k * sc;
         }
     }
 
