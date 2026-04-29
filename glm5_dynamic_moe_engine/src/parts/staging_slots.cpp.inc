@@ -222,6 +222,15 @@ static void configure_staging_slots(glm5_pc_engine* engine) {
         slot.in_use.store(false);
         engine->staging_slots.emplace_back(std::move(slot));
     }
+    
+    // CRITICAL FIX: When staging is non-pinned, log warning about sync DMA performance impact
+    if (!engine->staging_pinned && slot_count > 0) {
+        fprintf(stderr, "[storageLLM WARNING] All %u staging slots are NON-PINNED (mlock failed). "
+            "DMA will be SYNCHRONOUS, blocking IO workers. Performance will be severely degraded. "
+            "Increase 'ulimit -l' to at least %llu bytes for async DMA.\n",
+            slot_count,
+            (unsigned long long)engine->staging_size);
+    }
     engine->staging_free_slot_count.store(slot_count, std::memory_order_release);
     update_staging_slot_split_for_workers(engine);
     // Pipeline Fix 1: Use gpu_batch_eff=8 for warning threshold

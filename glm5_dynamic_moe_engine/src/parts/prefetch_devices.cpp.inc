@@ -77,7 +77,11 @@ static int prefetch_tensor_direct_to_gpu(glm5_pc_engine* engine, const glm5_tens
         return 0;
     }
     const uint64_t bytes = tensor_stream_bytes(rec);
-    const int copied = device_copy_tensor(engine, rec, GLM5_DEVICE_POOL_EXPERT, 0);
+    // CRITICAL FIX: Allow sync fallback when staging slots are exhausted.
+    // Before: allow_sync_fallback=0 caused infinite BACKPRESSURE loop when slots unavailable.
+    // After: allow_sync_fallback=1 enables sync DMA as last resort, ensuring forward progress.
+    // Sync DMA blocks IO worker but completes the transfer; BACKPRESSURE blocks forever.
+    const int copied = device_copy_tensor(engine, rec, GLM5_DEVICE_POOL_EXPERT, 1);
     if (copied == GLM5_DEVICE_COPY_BACKPRESSURE) {
         return GLM5_DEVICE_COPY_BACKPRESSURE;
     }
