@@ -33,6 +33,13 @@ static int io_worker_requeue_disk_task(
     return 0;
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((noinline))
+#endif
+static uint64_t io_worker_device_allocated_bytes(const glm5_pc_engine* engine) {
+    return engine ? engine->device_allocated_bytes.load(std::memory_order_relaxed) : 0;
+}
+
 static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
     if (!engine) {
         return;
@@ -41,7 +48,7 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
     engine->io_atomic.active_path.store(static_cast<uint32_t>(active_path));
     uint32_t refresh_turn = 0;
     const uint64_t initial_budget = device_budget_bytes(engine);
-    const uint64_t initial_allocated = engine->device_allocated_bytes.load(std::memory_order_relaxed);
+    const uint64_t initial_allocated = io_worker_device_allocated_bytes(engine);
     uint64_t last_vram_room = initial_budget > initial_allocated ? initial_budget - initial_allocated : 0;
     std::deque<std::pair<glm5_prefetch_task, glm5_transfer_stage_t>> local_requeues;
     auto preserve_requeue = [&](const glm5_prefetch_task& retry_task, glm5_transfer_stage_t retry_stage) {
@@ -61,7 +68,7 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
         // Fix 10: GDS/mmap routing changes rarely — refresh every 10 tasks.
         // VRAM pressure changes fast; refresh when allocator budget headroom shifts >10%.
         const uint64_t cur_budget = device_budget_bytes(engine);
-        const uint64_t cur_allocated = engine->device_allocated_bytes.load(std::memory_order_relaxed);
+        const uint64_t cur_allocated = io_worker_device_allocated_bytes(engine);
         const uint64_t cur_vram_room = cur_budget > cur_allocated ? cur_budget - cur_allocated : 0;
         const bool vram_shifted = last_vram_room == 0
             ? cur_vram_room > 0
@@ -84,13 +91,19 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
             ok = span ? prefetch_one_raw_span(engine, *span, task.raw_pool) : 0;
             if (ok) {
                 auto it = s_tl_deferred_staging_slots.find(engine);
-                if (it != s_tl_deferred_staging_slots.end() && it->second.size() >= 4u) {
-                    device_stream_sync_current(engine);
-                    device_complete_pending_copies(engine);
-                    for (uint32_t sidx : it->second) {
-                        release_staging_slot(engine, sidx);
+                if (it != s_tl_deferred_staging_slots.end()) {
+                    const bool should_flush = it->second.size() >= 4u
+                        || (it->second.size() >= 1u
+                            && engine->disk_stage.depth.load(std::memory_order_relaxed) == 0
+                            && engine->disk_stage.inflight.load(std::memory_order_relaxed) <= 1u);
+                    if (should_flush) {
+                        device_stream_sync_current(engine);
+                        device_complete_pending_copies(engine);
+                        for (uint32_t sidx : it->second) {
+                            release_staging_slot(engine, sidx);
+                        }
+                        it->second.clear();
                     }
-                    it->second.clear();
                 }
             }
         } else if (task.tensor_index < engine->tensors.size()) {

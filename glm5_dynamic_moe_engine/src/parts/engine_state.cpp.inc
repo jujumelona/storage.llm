@@ -73,6 +73,7 @@ struct glm5_pc_engine {
     std::atomic<uint32_t> vram_expert_count{0};
     std::atomic<uint32_t> ram_expert_count{0};
     std::atomic<uint32_t> db_expert_count{0};
+    std::atomic<bool> common_vram_upload_complete{false};
     std::atomic<uint64_t> common_vram_reserved_bytes{0};
     std::atomic<uint64_t> common_raw_prefetched_bytes{0};
     std::atomic<uint64_t> common_raw_prefetched_spans{0};

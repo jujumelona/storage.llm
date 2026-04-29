@@ -125,7 +125,13 @@ static int prefetch_fixed_core_raw(glm5_pc_engine* e) {
 }
 
 static int prefetch_common_raw_storage(glm5_pc_engine* e) {
-    return prefetch_fixed_core_raw(e);
+    int ok = prefetch_fixed_core_raw(e);
+    if (e && ok) {
+        if (!e->common_vram_upload_complete.exchange(true)) {
+            e->vram_used_bytes.fetch_add(e->common_vram_reserved_bytes.load());
+        }
+    }
+    return ok;
 }
 
 // static thread_local int tls_last_activation_layer = -1; // Removed in favor of engine member

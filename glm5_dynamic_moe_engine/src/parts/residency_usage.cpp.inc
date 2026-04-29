@@ -100,7 +100,6 @@ static void compact_evict_heap(glm5_pc_engine* engine, int idx, bool force = fal
     using heap_t = std::priority_queue<glm5_evict_candidate, std::vector<glm5_evict_candidate>, glm5_evict_colder_first>;
     heap_t snapshot;
     size_t heap_size = 0;
-    uint64_t heap_version = 0;
     {
         std::lock_guard<std::mutex> heap_lock(evict_heap_mutex(engine, idx));
         heap_size = engine->evict_heaps[idx].size();
@@ -111,8 +110,8 @@ static void compact_evict_heap(glm5_pc_engine* engine, int idx, bool force = fal
         if (!force && heap_size <= active_count * 4u + 512u) {
             return;
         }
-        snapshot = engine->evict_heaps[idx];
-        heap_version = engine->evict_heap_versions[idx].load(std::memory_order_acquire);
+        snapshot = std::move(engine->evict_heaps[idx]);
+        engine->evict_heaps[idx] = heap_t();
     }
 
     std::vector<glm5_evict_candidate> entries;
@@ -140,11 +139,12 @@ static void compact_evict_heap(glm5_pc_engine* engine, int idx, bool force = fal
     heap_t compacted(glm5_evict_colder_first{}, std::move(valid));
     {
         std::lock_guard<std::mutex> heap_lock(evict_heap_mutex(engine, idx));
-        if (engine->evict_heap_versions[idx].load(std::memory_order_acquire) == heap_version &&
-            engine->evict_heaps[idx].size() == heap_size) {
-            engine->evict_heaps[idx] = std::move(compacted);
-            engine->evict_heap_versions[idx].fetch_add(1, std::memory_order_release);
+        while (!engine->evict_heaps[idx].empty()) {
+            compacted.push(engine->evict_heaps[idx].top());
+            engine->evict_heaps[idx].pop();
         }
+        engine->evict_heaps[idx] = std::move(compacted);
+        engine->evict_heap_versions[idx].fetch_add(1, std::memory_order_release);
     }
 }
 

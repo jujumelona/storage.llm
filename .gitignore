@@ -28,7 +28,6 @@ glm5_dynamic_moe_engine/model_profiles/*/tensors.csv
 # Local split/refactor scratch files. Only commit part files that are included
 # by the runtime entrypoint or explicitly documented as source.
 glm5_dynamic_moe_engine/src/parts/gen_*.cpp.inc
-glm5_dynamic_moe_engine/src/parts/generation_*.cpp.inc
 glm5_dynamic_moe_engine/src/parts/raw_bf16_convert.cpp.inc
 glm5_dynamic_moe_engine/src/parts/raw_span_helpers.cpp.inc
 glm5_dynamic_moe_engine/src/parts/raw_tensor_desc.cpp.inc

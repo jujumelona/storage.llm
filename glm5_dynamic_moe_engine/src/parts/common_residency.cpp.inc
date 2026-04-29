@@ -58,5 +58,5 @@ static void apply_common_vram_reservation(glm5_pc_engine* engine) {
         engine->config.vram_budget_bytes
     );
     engine->common_vram_reserved_bytes.store(reserve);
-    engine->vram_used_bytes.store(reserve);
+    engine->vram_used_bytes.store(0);
 }

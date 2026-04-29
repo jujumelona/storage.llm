@@ -55,7 +55,6 @@ static int prefetch_tensor_ram_to_pinned(
         *out_staging_bytes = staging_offset;
     }
     // Fix 38: Only count actual pinned staging copies, not touch-fallback bytes
-    engine->io_atomic.bytes_disk_to_ram.fetch_add(copied);
     engine->io_atomic.bytes_ram_to_pinned.fetch_add(copied);
     engine->io_atomic.pinned_stage_done.fetch_add(1);
     return 1;

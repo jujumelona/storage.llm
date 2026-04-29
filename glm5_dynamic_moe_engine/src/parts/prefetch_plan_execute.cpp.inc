@@ -7,14 +7,12 @@ int glm5_pc_engine_execute_prefetch_plan(
         return 0;
     }
     std::vector<uint8_t> stream_inflight(item_count, 0);
-    {
+    for (uint32_t i = 0; i < item_count; ++i) {
         std::lock_guard<std::mutex> lock(engine->map_mutex);
-        for (uint32_t i = 0; i < item_count; ++i) {
-            const size_t slot = expert_dense_slot((int)items[i].layer, (int)items[i].expert);
-            if (slot < engine->expert_states.size()) {
-                const glm5_block_state& state = engine->expert_states[slot];
-                stream_inflight[i] = state.active && state.tier == GLM5_TIER_STREAM ? 1u : 0u;
-            }
+        const size_t slot = expert_dense_slot((int)items[i].layer, (int)items[i].expert);
+        if (slot < engine->expert_states.size()) {
+            const glm5_block_state& state = engine->expert_states[slot];
+            stream_inflight[i] = state.active && state.tier == GLM5_TIER_STREAM ? 1u : 0u;
         }
     }
 
@@ -28,11 +26,15 @@ int glm5_pc_engine_execute_prefetch_plan(
     std::vector<std::vector<std::pair<int, int>>> all_to_free(item_count);
 
     // Pass 1: Admission and eviction decisions
+    uint64_t batch_ram_reserved = 0;
     for (uint32_t i = 0; i < item_count; ++i) {
         if (stream_inflight[i]) {
             continue;
         }
-        admitted_tiers[i] = prefetch_admitted_tier(engine, items[i], all_to_free[i]);
+        admitted_tiers[i] = prefetch_admitted_tier(engine, items[i], all_to_free[i], batch_ram_reserved);
+        if (admitted_tiers[i] == GLM5_TIER_RAM) {
+            batch_ram_reserved += items[i].bytes;
+        }
     }
 
     std::vector<std::pair<int, int>> flat_to_free;
@@ -44,14 +46,15 @@ int glm5_pc_engine_execute_prefetch_plan(
     }
 
     // Pass 2 직전: VRAM 해제 이후 잔량 재확인하여 RAM으로 강등된 항목만 재평가
-    const uint64_t vram_after_free = tier_budget(engine, GLM5_TIER_VRAM) > tier_used(engine, GLM5_TIER_VRAM)
+    uint64_t vram_remaining = tier_budget(engine, GLM5_TIER_VRAM) > tier_used(engine, GLM5_TIER_VRAM)
         ? tier_budget(engine, GLM5_TIER_VRAM) - tier_used(engine, GLM5_TIER_VRAM) : 0;
     for (uint32_t i = 0; i < item_count; ++i) {
         if (admitted_tiers[i] == GLM5_TIER_RAM
             && items[i].target_tier == GLM5_TIER_VRAM
             && !prefetch_is_router_selected(items[i])
-            && vram_after_free >= items[i].bytes * 2u) {
+            && vram_remaining >= items[i].bytes * 2u) {
             admitted_tiers[i] = GLM5_TIER_VRAM;
+            vram_remaining -= items[i].bytes;
         }
     }
 

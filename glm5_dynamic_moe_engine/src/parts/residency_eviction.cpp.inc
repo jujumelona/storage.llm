@@ -13,7 +13,8 @@ static int pop_valid_evict_candidate(glm5_pc_engine* engine, glm5_tier_t tier, g
     if (idx < 0) {
         return 0;
     }
-    const uint32_t stale_limit = 256u;
+    const uint32_t heap_size = (uint32_t)engine->evict_heaps[idx].size();
+    const uint32_t stale_limit = std::max<uint32_t>(256u, std::min<uint32_t>(1024u, heap_size / 4u));
     uint32_t stale_count = 0;
     std::unique_lock<std::mutex> heap_lock(evict_heap_mutex(engine, idx));
     while (!engine->evict_heaps[idx].empty() && stale_count < stale_limit) {

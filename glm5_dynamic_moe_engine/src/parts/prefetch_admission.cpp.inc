@@ -28,20 +28,26 @@ static int prefetch_under_queue_pressure(
 static glm5_tier_t prefetch_admitted_tier(
     glm5_pc_engine* engine,
     const glm5_expert_prefetch_item_t& item,
-    std::vector<std::pair<int, int>>& to_free
+    std::vector<std::pair<int, int>>& to_free,
+    uint64_t extra_reserved = 0
 ) {
     if (!engine || prefetch_is_router_selected(item)) {
         return item.target_tier;
     }
+    // Bug 3 Fix: Block VRAM admission if common tensors are not fully uploaded
+    if (item.target_tier == GLM5_TIER_VRAM && !engine->common_vram_upload_complete.load(std::memory_order_acquire)) {
+        return GLM5_TIER_RAM;
+    }
+
     glm5_tier_t target = item.target_tier;
     if (prefetch_under_queue_pressure(engine, item)) {
         target = GLM5_TIER_RAM;
     }
     const uint64_t ram_budget = tier_budget(engine, GLM5_TIER_RAM);
     if (target == GLM5_TIER_RAM && ram_budget > 0 &&
-        tier_used(engine, GLM5_TIER_RAM) + item.bytes > (ram_budget * 87ull) / 100ull) {
+        tier_used(engine, GLM5_TIER_RAM) + extra_reserved + item.bytes > (ram_budget * 87ull) / 100ull) {
         demote_cold_until(engine, GLM5_TIER_RAM, item.bytes, to_free);
-        if (tier_used(engine, GLM5_TIER_RAM) + item.bytes > (ram_budget * 87ull) / 100ull) {
+        if (tier_used(engine, GLM5_TIER_RAM) + extra_reserved + item.bytes > (ram_budget * 87ull) / 100ull) {
             target = GLM5_TIER_DB;
         }
     }
