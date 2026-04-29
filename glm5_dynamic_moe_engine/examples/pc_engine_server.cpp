@@ -1958,9 +1958,19 @@ static bool prepare_model_paths(server_options* opts) {
         return true;
     }
     if (opts->table_path.empty()) {
-        const std::string table = join_model_file(opts->model_root, "tensors.csv");
-        if (file_exists_utf8(table)) {
-            opts->table_path = table;
+        const char* index_names[] = {"tensor_index.bin", "tensors.sltidx"};
+        for (const char* name : index_names) {
+            const std::string index = join_model_file(opts->model_root, name);
+            if (file_exists_utf8(index)) {
+                opts->table_path = index;
+                break;
+            }
+        }
+        if (opts->table_path.empty()) {
+            const std::string table = join_model_file(opts->model_root, "tensors.csv");
+            if (file_exists_utf8(table)) {
+                opts->table_path = table;
+            }
         }
     }
     if (opts->scale4_path.empty()) {
@@ -2047,7 +2057,12 @@ static void load_server_model_background(
         return;
     }
     prepare_model_paths(&opts);
-    if (!opts.table_path.empty()) {
+    if (opts.table_path.empty()) {
+        fail_model_load_and_destroy(runtime, "missing tensor index under model root");
+        std::cerr << "Missing tensor index under model root\n";
+        return;
+    }
+    {
         const char* root = opts.model_root.empty() ? nullptr : opts.model_root.c_str();
         const char* scale4 = opts.scale4_path.empty() ? nullptr : opts.scale4_path.c_str();
         set_model_load_stage(runtime, "load_tensor_index");
@@ -2072,6 +2087,11 @@ static void load_server_model_background(
     set_model_load_stage(runtime, "ready");
     runtime->model_ready.store(1, std::memory_order_release);
     print_optimization_plan(engine);
+    set_model_load_stage(runtime, "startup_warm");
+    std::cerr << "[storagellm] startup warm begin\n" << std::flush;
+    const int warm_started = glm5_pc_engine_startup_warm_model(engine);
+    std::cerr << "[storagellm] startup warm " << (warm_started ? "queued" : "skipped") << "\n" << std::flush;
+    set_model_load_stage(runtime, "ready");
     if (opts.engine_config.prefer_gpu && io_config.enable_common_raw_vram_pin) {
         set_model_load_stage(runtime, "warm_common_raw");
         glm5_pc_engine_prefetch_common_raw(engine);

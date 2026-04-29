@@ -36,6 +36,146 @@ int glm5_pc_engine_set_model_root(
     return 1;
 }
 
+static int tensor_index_read_exact(std::ifstream& input, void* data, size_t bytes) {
+    if (bytes == 0) {
+        return 1;
+    }
+    input.read(static_cast<char*>(data), static_cast<std::streamsize>(bytes));
+    return input.good() ? 1 : 0;
+}
+
+static int tensor_index_read_u16(std::ifstream& input, uint16_t* out) {
+    return out && tensor_index_read_exact(input, out, sizeof(*out));
+}
+
+static int tensor_index_read_u32(std::ifstream& input, uint32_t* out) {
+    return out && tensor_index_read_exact(input, out, sizeof(*out));
+}
+
+static int tensor_index_read_u64(std::ifstream& input, uint64_t* out) {
+    return out && tensor_index_read_exact(input, out, sizeof(*out));
+}
+
+static void finish_tensor_index_load(glm5_pc_engine* engine) {
+    if (!engine) {
+        return;
+    }
+    if (engine->staging && engine->staging_size > 0) {
+        configure_staging_slots(engine);
+        engine->staging_slot_cv.notify_all();
+    } else {
+        update_staging_slot_deficit(engine);
+    }
+}
+
+static int load_binary_tensor_index(glm5_pc_engine* engine, const char* index_path) {
+    if (!engine || !index_path || !index_path[0]) {
+        return 0;
+    }
+    std::ifstream input;
+    open_ifstream_path(input, index_path, std::ios::in | std::ios::binary);
+    if (!input) {
+        return 0;
+    }
+
+    char magic[8]{};
+    uint32_t version = 0;
+    uint32_t path_count = 0;
+    uint32_t tensor_count = 0;
+    uint32_t reserved = 0;
+    if (!tensor_index_read_exact(input, magic, sizeof(magic)) ||
+        std::memcmp(magic, "SLTIDX1", 7) != 0 ||
+        !tensor_index_read_u32(input, &version) ||
+        !tensor_index_read_u32(input, &path_count) ||
+        !tensor_index_read_u32(input, &tensor_count) ||
+        !tensor_index_read_u32(input, &reserved) ||
+        version != 1 ||
+        path_count == 0 ||
+        path_count > 4096 ||
+        tensor_count == 0 ||
+        tensor_count > 1000000u) {
+        return 0;
+    }
+
+    engine->tensor_paths.reserve(path_count);
+    for (uint32_t i = 0; i < path_count; ++i) {
+        uint16_t len = 0;
+        if (!tensor_index_read_u16(input, &len) || len == 0) {
+            return 0;
+        }
+        std::string raw_path(len, '\0');
+        if (!tensor_index_read_exact(input, &raw_path[0], raw_path.size())) {
+            return 0;
+        }
+        std::string resolved_path = resolve_model_file_path(engine->model_root, raw_path, raw_path);
+        if (resolved_path.empty()) {
+            resolved_path = raw_path;
+        }
+        engine->tensor_paths.push_back(std::move(resolved_path));
+    }
+
+    engine->tensors.reserve(tensor_count);
+    for (uint32_t i = 0; i < tensor_count; ++i) {
+        glm5_tensor_record rec{};
+        uint32_t proj = 0;
+        uint16_t path_index = 0;
+        uint16_t flags = 0;
+        uint32_t rec_reserved = 0;
+        if (!tensor_index_read_u32(input, &rec.info.part) ||
+            !tensor_index_read_u32(input, &rec.info.shard) ||
+            !tensor_index_read_u32(input, &rec.info.layer) ||
+            !tensor_index_read_u32(input, &rec.info.expert) ||
+            !tensor_index_read_u32(input, &proj) ||
+            !tensor_index_read_u32(input, &rec.info.rows) ||
+            !tensor_index_read_u32(input, &rec.info.cols) ||
+            !tensor_index_read_u32(input, &rec.info.groups) ||
+            !tensor_index_read_u32(input, &rec.info.group_size) ||
+            !tensor_index_read_u64(input, &rec.info.weight_byte_offset) ||
+            !tensor_index_read_u64(input, &rec.info.weight_byte_length) ||
+            !tensor_index_read_u64(input, &rec.info.scale_byte_offset) ||
+            !tensor_index_read_u64(input, &rec.info.scale_byte_length) ||
+            !tensor_index_read_u64(input, &rec.info.scale2_byte_offset) ||
+            !tensor_index_read_u64(input, &rec.info.scale2_byte_length) ||
+            !tensor_index_read_u16(input, &path_index) ||
+            !tensor_index_read_u16(input, &flags) ||
+            !tensor_index_read_u32(input, &rec_reserved) ||
+            proj > (uint32_t)GLM5_PROJ_DOWN ||
+            path_index >= engine->tensor_paths.size()) {
+            return 0;
+        }
+        rec.info.proj = static_cast<glm5_projection_t>(proj);
+        rec.info.has_scale4 = flags & 1u ? 1 : 0;
+        rec.resolved_path_index = path_index;
+        rec.scale4_entry = nullptr;
+        finalize_tensor_layout(&rec);
+        const uint64_t stream_bytes = tensor_stream_bytes(rec);
+        if (stream_bytes > engine->max_tensor_stream_bytes) {
+            engine->max_tensor_stream_bytes = stream_bytes;
+        }
+        tensor_slots_set(engine, (int)rec.info.layer, (int)rec.info.expert, rec.info.proj, engine->tensors.size());
+        expert_bytes_add(engine, (int)rec.info.layer, (int)rec.info.expert, stream_bytes);
+        engine->tensors.push_back(std::move(rec));
+    }
+
+    if (!input.good() && !input.eof()) {
+        return 0;
+    }
+    finish_tensor_index_load(engine);
+    std::fprintf(stderr, "[storagellm] binary tensor index loaded: %u tensors paths=%u\n",
+        tensor_count,
+        path_count);
+    std::fflush(stderr);
+    return 1;
+}
+
+static int path_ends_with_csv(const char* path) {
+    if (!path) {
+        return 0;
+    }
+    const std::string value(path);
+    return value.size() >= 4 && value.substr(value.size() - 4) == ".csv";
+}
+
 int glm5_pc_engine_load_codec_table(
     glm5_pc_engine_t* engine,
     const char* csv_path,
@@ -98,6 +238,13 @@ int glm5_pc_engine_load_codec_table(
             "[storagellm] scale4 startup attach deferred: %s\n",
             scale4_path);
         std::fflush(stderr);
+    }
+
+    if (load_binary_tensor_index(engine, csv_path)) {
+        return 1;
+    }
+    if (!path_ends_with_csv(csv_path)) {
+        return 0;
     }
 
     std::ifstream input;
@@ -188,11 +335,6 @@ int glm5_pc_engine_load_codec_table(
         (unsigned long long)parsed_rows,
         engine->tensor_paths.size());
     std::fflush(stderr);
-    if (engine->staging && engine->staging_size > 0) {
-        configure_staging_slots(engine);
-        engine->staging_slot_cv.notify_all();
-    } else {
-        update_staging_slot_deficit(engine);
-    }
+    finish_tensor_index_load(engine);
     return engine->tensors.empty() ? 0 : 1;
 }

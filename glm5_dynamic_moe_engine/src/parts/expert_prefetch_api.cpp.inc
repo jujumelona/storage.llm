@@ -49,6 +49,86 @@ int glm5_pc_engine_prefetch_expert_triplet(
     );
 }
 
+int glm5_pc_engine_startup_warm_model(glm5_pc_engine_t* engine) {
+    if (!engine || engine->tensors.empty()) {
+        return 0;
+    }
+    if (!ensure_io_ready(engine)) {
+        return 0;
+    }
+    const glm5_storage_constants_t* c = glm5_storage_constants();
+    if (!c || c->experts_per_moe_layer == 0) {
+        return 0;
+    }
+    const uint64_t vram_limit = tier_budget(engine, GLM5_TIER_VRAM) ?
+        (tier_budget(engine, GLM5_TIER_VRAM) * 90ull) / 100ull : 0;
+    const uint64_t ram_limit = tier_budget(engine, GLM5_TIER_RAM) ?
+        (tier_budget(engine, GLM5_TIER_RAM) * 90ull) / 100ull : 0;
+    uint64_t planned_vram = tier_used(engine, GLM5_TIER_VRAM);
+    uint64_t planned_ram = tier_used(engine, GLM5_TIER_RAM);
+    uint32_t queued = 0;
+    const uint32_t queue_cap = engine->io_config.max_prefetch_queue ?
+        engine->io_config.max_prefetch_queue : 4096u;
+    const uint32_t queue_high = queue_cap > 32u ? queue_cap - 32u : queue_cap;
+
+    for (uint32_t layer = c->first_moe_layer; layer <= c->last_moe_layer; ++layer) {
+        for (uint32_t expert = 0; expert < c->experts_per_moe_layer; ++expert) {
+            const uint64_t bytes = expert_triplet_or_hardcoded_bytes(
+                engine,
+                (int)layer,
+                (int)expert
+            );
+            if (bytes == 0) {
+                continue;
+            }
+            glm5_tier_t target = GLM5_TIER_DB;
+            if (vram_limit > 0 && planned_vram + bytes <= vram_limit) {
+                target = GLM5_TIER_VRAM;
+                planned_vram += bytes;
+            } else if (ram_limit > 0 && planned_ram + bytes <= ram_limit) {
+                target = GLM5_TIER_RAM;
+                planned_ram += bytes;
+            } else {
+                return queued > 0 ? 1 : 0;
+            }
+
+            while (!engine->io_stop.load(std::memory_order_relaxed) &&
+                   engine->total_queue_depth.load(std::memory_order_relaxed) >= queue_high) {
+                engine->disk_stage.cv.notify_all();
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            if (engine->io_stop.load(std::memory_order_relaxed)) {
+                return queued > 0 ? 1 : 0;
+            }
+            if (glm5_pc_engine_prefetch_expert_triplet_impl(
+                    engine,
+                    (int)layer,
+                    (int)expert,
+                    target,
+                    0,
+                    1)) {
+                ++queued;
+                if ((queued & 31u) == 0u) {
+                    engine->disk_stage.cv.notify_all();
+                }
+                if ((queued & 127u) == 0u) {
+                    std::fprintf(stderr,
+                        "[storagellm] startup warm queued experts=%u ram=%llu vram=%llu queue=%u\n",
+                        queued,
+                        (unsigned long long)tier_used(engine, GLM5_TIER_RAM),
+                        (unsigned long long)tier_used(engine, GLM5_TIER_VRAM),
+                        engine->total_queue_depth.load(std::memory_order_relaxed));
+                    std::fflush(stderr);
+                }
+            }
+        }
+    }
+    if (queued > 0) {
+        engine->disk_stage.cv.notify_all();
+    }
+    return queued > 0 ? 1 : 0;
+}
+
 static int prefetch_expert_batch_raw(
     glm5_pc_engine_t* engine,
     int layer,

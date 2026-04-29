@@ -7,6 +7,8 @@ int glm5_pc_engine_prefetch_expert_triplet(
     glm5_tier_t preferred_tier
 );
 
+int glm5_pc_engine_startup_warm_model(glm5_pc_engine_t* engine);
+
 int glm5_pc_engine_prepare_moe_activation(glm5_pc_engine_t* engine, int layer);
 
 int glm5_pc_engine_prefetch_moe_lookahead(
