@@ -53,13 +53,6 @@ static glm5_io_config_t make_server_io_config(const server_options& opts, const 
     io.gpu_worker_threads = caps.copy_streams ? caps.copy_streams : 1u;
     io.direct_upload_min_bytes = expert_bytes;
     io.pinned_staging_bytes = std::max<uint64_t>(caps.recommended_pinned_bytes, expert_bytes * 16ull);
-    if (opts.engine_config.ram_budget_bytes > 0) {
-        io.pinned_staging_bytes = std::max<uint64_t>(
-            io.pinned_staging_bytes,
-            std::min<uint64_t>(opts.engine_config.ram_budget_bytes / 8ull, 4ull * 1024ull * 1024ull * 1024ull)
-        );
-        io.pinned_staging_bytes = std::min<uint64_t>(io.pinned_staging_bytes, opts.engine_config.ram_budget_bytes / 4ull);
-    }
     return io;
 }
 
