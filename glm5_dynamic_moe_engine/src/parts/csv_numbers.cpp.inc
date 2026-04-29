@@ -20,6 +20,9 @@ static std::vector<std::string> split_csv_line(const std::string& line) {
         }
     }
     out.push_back(cur);
+    if (!out.empty() && !out.back().empty() && out.back().back() == '\r') {
+        out.back().pop_back();
+    }
     return out;
 }
 
