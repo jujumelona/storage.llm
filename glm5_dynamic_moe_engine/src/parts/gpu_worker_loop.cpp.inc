@@ -54,7 +54,10 @@ static void gpu_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
 
         for (uint32_t i = 0; i < batch_count; ++i) {
             terminal[i] = 1;
-            if (batch[i].tensor_index < engine->tensors.size()) {
+            if (batch[i].raw_span_index >= 0) {
+                const glm5_storage_raw_span_spec_t* span = glm5_storage_raw_span_at((uint32_t)batch[i].raw_span_index);
+                ok[i] = span ? prefetch_one_raw_span(engine, *span, batch[i].raw_pool, 1) : 0;
+            } else if (batch[i].tensor_index < engine->tensors.size()) {
                 ok[i] = prefetch_tensor_pinned_to_gpu(
                     engine,
                     engine->tensors[batch[i].tensor_index],

@@ -94,15 +94,10 @@ int glm5_pc_engine_load_codec_table(
         engine->scale4 = nullptr;
     }
     if (scale4_path && scale4_path[0]) {
-        engine->scale4 = glm5_scale4_open(scale4_path);
-        if (!engine->scale4) {
-            return 0;
-        }
-        if (glm5_scale4_entry_count(engine->scale4) == 0) {
-            glm5_scale4_close(engine->scale4);
-            engine->scale4 = nullptr;
-            return 0;
-        }
+        std::fprintf(stderr,
+            "[storagellm] scale4 startup attach deferred: %s\n",
+            scale4_path);
+        std::fflush(stderr);
     }
 
     std::ifstream input;
@@ -129,26 +124,24 @@ int glm5_pc_engine_load_codec_table(
         if (line.empty()) {
             continue;
         }
-        const std::vector<std::string> row = split_csv_line(line);
         glm5_tensor_record rec{};
-        rec.info.part = parse_u32(codec_col(row, GLM5_CODEC_COL_PART));
-        rec.info.shard = parse_u32(codec_col(row, GLM5_CODEC_COL_SHARD));
-        rec.info.layer = parse_u32(codec_col(row, GLM5_CODEC_COL_LAYER));
-        rec.info.expert = parse_u32(codec_col(row, GLM5_CODEC_COL_EXPERT));
-        rec.info.proj = parse_projection(codec_col(row, GLM5_CODEC_COL_PROJ));
-        rec.info.rows = parse_u32(codec_col(row, GLM5_CODEC_COL_ROWS));
-        rec.info.cols = parse_u32(codec_col(row, GLM5_CODEC_COL_COLS));
-        rec.info.groups = parse_u32(codec_col(row, GLM5_CODEC_COL_GROUPS));
-        rec.info.group_size = parse_u32(codec_col(row, GLM5_CODEC_COL_GROUP_SIZE));
-        rec.info.weight_byte_offset = parse_u64(codec_col(row, GLM5_CODEC_COL_WEIGHT_OFFSET));
-        rec.info.weight_byte_length = parse_u64(codec_col(row, GLM5_CODEC_COL_WEIGHT_LENGTH));
-        rec.info.scale_byte_offset = parse_u64(codec_col(row, GLM5_CODEC_COL_SCALE_OFFSET));
-        rec.info.scale_byte_length = parse_u64(codec_col(row, GLM5_CODEC_COL_SCALE_LENGTH));
-        rec.info.scale2_byte_offset = parse_u64(codec_col(row, GLM5_CODEC_COL_SCALE2_OFFSET));
-        rec.info.scale2_byte_length = parse_u64(codec_col(row, GLM5_CODEC_COL_SCALE2_LENGTH));
-        std::string weight_key = codec_col(row, GLM5_CODEC_COL_WEIGHT_KEY);
-        std::string shard_file = codec_col(row, GLM5_CODEC_COL_SHARD_FILE);
-        std::string source_file = codec_col(row, GLM5_CODEC_COL_SOURCE_FILE);
+        rec.info.part = parse_csv_u32_col_fast(line, GLM5_CODEC_COL_PART);
+        rec.info.shard = parse_csv_u32_col_fast(line, GLM5_CODEC_COL_SHARD);
+        rec.info.layer = parse_csv_u32_col_fast(line, GLM5_CODEC_COL_LAYER);
+        rec.info.expert = parse_csv_u32_col_fast(line, GLM5_CODEC_COL_EXPERT);
+        rec.info.proj = parse_projection(csv_string_col_fast(line, GLM5_CODEC_COL_PROJ));
+        rec.info.rows = parse_csv_u32_col_fast(line, GLM5_CODEC_COL_ROWS);
+        rec.info.cols = parse_csv_u32_col_fast(line, GLM5_CODEC_COL_COLS);
+        rec.info.groups = parse_csv_u32_col_fast(line, GLM5_CODEC_COL_GROUPS);
+        rec.info.group_size = parse_csv_u32_col_fast(line, GLM5_CODEC_COL_GROUP_SIZE);
+        rec.info.weight_byte_offset = parse_csv_u64_col_fast(line, GLM5_CODEC_COL_WEIGHT_OFFSET);
+        rec.info.weight_byte_length = parse_csv_u64_col_fast(line, GLM5_CODEC_COL_WEIGHT_LENGTH);
+        rec.info.scale_byte_offset = parse_csv_u64_col_fast(line, GLM5_CODEC_COL_SCALE_OFFSET);
+        rec.info.scale_byte_length = parse_csv_u64_col_fast(line, GLM5_CODEC_COL_SCALE_LENGTH);
+        rec.info.scale2_byte_offset = parse_csv_u64_col_fast(line, GLM5_CODEC_COL_SCALE2_OFFSET);
+        rec.info.scale2_byte_length = parse_csv_u64_col_fast(line, GLM5_CODEC_COL_SCALE2_LENGTH);
+        std::string shard_file = csv_string_col_fast(line, GLM5_CODEC_COL_SHARD_FILE);
+        std::string source_file = csv_string_col_fast(line, GLM5_CODEC_COL_SOURCE_FILE);
         const std::string path_cache_key = shard_file + "\n" + source_file;
         std::string resolved_path;
         auto resolved_it = resolved_path_cache.find(path_cache_key);
@@ -173,10 +166,8 @@ int glm5_pc_engine_load_codec_table(
         }
         rec.resolved_path_index = path_idx;
 
-        if (engine->scale4 && !weight_key.empty()) {
-            rec.scale4_entry = glm5_scale4_find(engine->scale4, weight_key.c_str());
-            rec.info.has_scale4 = rec.scale4_entry ? 1 : 0;
-        }
+        rec.scale4_entry = nullptr;
+        rec.info.has_scale4 = 0;
         finalize_tensor_layout(&rec);
         const uint64_t stream_bytes = tensor_stream_bytes(rec);
         if (stream_bytes > engine->max_tensor_stream_bytes) {
@@ -203,6 +194,5 @@ int glm5_pc_engine_load_codec_table(
     } else {
         update_staging_slot_deficit(engine);
     }
-    prefetch_common_raw_storage(engine);
     return engine->tensors.empty() ? 0 : 1;
 }

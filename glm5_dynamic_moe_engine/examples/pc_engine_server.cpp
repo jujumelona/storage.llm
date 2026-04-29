@@ -2050,14 +2050,14 @@ static void load_server_model_background(
     if (!opts.table_path.empty()) {
         const char* root = opts.model_root.empty() ? nullptr : opts.model_root.c_str();
         const char* scale4 = opts.scale4_path.empty() ? nullptr : opts.scale4_path.c_str();
-        set_model_load_stage(runtime, "load_codec_table");
-        std::cerr << "[storagellm] loading codec table: " << opts.table_path << "\n" << std::flush;
+        set_model_load_stage(runtime, "load_tensor_index");
+        std::cerr << "[storagellm] loading tensor index: " << opts.table_path << "\n" << std::flush;
         if (!glm5_pc_engine_load_codec_table(engine, opts.table_path.c_str(), root, scale4)) {
-            fail_model_load_and_destroy(runtime, "failed to load codec table: " + opts.table_path);
-            std::cerr << "Failed to load codec table: " << opts.table_path << "\n";
+            fail_model_load_and_destroy(runtime, "failed to load tensor index: " + opts.table_path);
+            std::cerr << "Failed to load tensor index: " << opts.table_path << "\n";
             return;
         }
-        std::cerr << "[storagellm] codec table loaded\n" << std::flush;
+        std::cerr << "[storagellm] tensor index loaded\n" << std::flush;
     }
     if (cleanup_background_engine_if_shutdown(runtime)) {
         return;
@@ -2072,6 +2072,11 @@ static void load_server_model_background(
     set_model_load_stage(runtime, "ready");
     runtime->model_ready.store(1, std::memory_order_release);
     print_optimization_plan(engine);
+    if (opts.engine_config.prefer_gpu && io_config.enable_common_raw_vram_pin) {
+        set_model_load_stage(runtime, "warm_common_raw");
+        glm5_pc_engine_prefetch_common_raw(engine);
+        set_model_load_stage(runtime, "ready");
+    }
 }
 
 static bool parse_backend_name(const char* name, glm5_backend_t* out) {

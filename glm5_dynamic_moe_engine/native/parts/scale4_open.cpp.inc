@@ -35,24 +35,5 @@ glm5_scale4_file_t* glm5_scale4_open(const char* path) {
     }
     file->entries = (const glm5_scale4_entry_t*)(file->data + file->header->entry_table_offset);
 
-    // Bug #26: Build hash map for O(1) lookup at open time
-    file->key_map = new (std::nothrow) std::unordered_map<std::string, uint32_t>();
-    if (file->key_map) {
-        file->key_map->reserve(file->header->entry_count);
-        for (uint32_t i = 0; i < file->header->entry_count; ++i) {
-            const glm5_scale4_entry_t* entry = &file->entries[i];
-            // Bug #25: Use memcpy for reading packed struct fields (ARM safety)
-            uint64_t key_off;
-            uint32_t key_len;
-            memcpy(&key_off, &entry->key_offset, sizeof(key_off));
-            memcpy(&key_len, &entry->key_length, sizeof(key_len));
-            if (key_off + key_len <= file->size) {
-                const char* k = (const char*)(file->data + key_off);
-                file->key_map->emplace(std::string(k, key_len), i);
-            }
-        }
-    }
-
     return file;
 }
-

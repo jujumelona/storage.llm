@@ -98,7 +98,7 @@ static uint64_t prefetch_raw_layer_roles(
         }
         const int ok = enqueue_only ?
             enqueue_raw_span_prefetch(e, i, pool) :
-            prefetch_one_raw_span(e, *s, pool);
+            prefetch_one_raw_span(e, *s, pool, 1);
         if (ok) {
             bytes += s->bytes;
             ++spans;
@@ -143,48 +143,59 @@ static int prefetch_fixed_core_raw(glm5_pc_engine* e) {
 
 static int prefetch_common_raw_storage(glm5_pc_engine* e) {
     int ok = prefetch_fixed_core_raw(e);
-    if (e && ok) {
-        const bool was_incomplete = !e->common_vram_upload_complete.exchange(true);
-        if (was_incomplete) {
-            e->vram_used_bytes.fetch_add(e->common_vram_reserved_bytes.load());
-            // Bug 19 Fix: Re-evaluate RAM-staged experts for VRAM promotion
-            // When common_vram_upload_complete flips to true, hot experts that were
-            // demoted to RAM can now be promoted to VRAM
-            const uint64_t vram_budget = tier_budget(e, GLM5_TIER_VRAM);
-            const uint64_t vram_used = tier_used(e, GLM5_TIER_VRAM);
-            if (vram_budget > vram_used) {
-                const uint64_t vram_room = vram_budget - vram_used;
-                const uint64_t avg_expert_bytes = e->max_tensor_stream_bytes > 0
-                    ? e->max_tensor_stream_bytes : 20ull * 1024ull * 1024ull;
-                const uint32_t max_promote = vram_room > 0 && avg_expert_bytes > 0
-                    ? std::min<uint32_t>(32u, (uint32_t)(vram_room / avg_expert_bytes)) : 0u;
-                if (max_promote > 0) {
-                    std::vector<std::pair<size_t, double>> ram_experts;
-                    {
-                        std::lock_guard<std::mutex> map_lock(e->map_mutex);
-                        for (size_t slot = 0; slot < e->expert_states.size(); ++slot) {
-                            const glm5_block_state& state = e->expert_states[slot];
-                            if (state.active && state.tier == GLM5_TIER_RAM && !state.pending_evict) {
-                                ram_experts.push_back({slot, state.hot_score});
-                            }
+    if (!e) {
+        return ok;
+    }
+    if (!ok) {
+        e->common_vram_reserved_bytes.store(0, std::memory_order_release);
+        e->common_vram_upload_complete.store(true, std::memory_order_release);
+        return 0;
+    }
+
+    const bool was_incomplete = !e->common_vram_upload_complete.exchange(true);
+    if (was_incomplete) {
+        e->vram_used_bytes.fetch_add(e->common_vram_reserved_bytes.load());
+        // Bug 19 Fix: Re-evaluate RAM-staged experts for VRAM promotion
+        // When common_vram_upload_complete flips to true, hot experts that were
+        // demoted to RAM can now be promoted to VRAM
+        const uint64_t vram_budget = tier_budget(e, GLM5_TIER_VRAM);
+        const uint64_t vram_used = tier_used(e, GLM5_TIER_VRAM);
+        if (vram_budget > vram_used) {
+            const uint64_t vram_room = vram_budget - vram_used;
+            const uint64_t avg_expert_bytes = e->max_tensor_stream_bytes > 0
+                ? e->max_tensor_stream_bytes : 20ull * 1024ull * 1024ull;
+            const uint32_t max_promote = vram_room > 0 && avg_expert_bytes > 0
+                ? std::min<uint32_t>(32u, (uint32_t)(vram_room / avg_expert_bytes)) : 0u;
+            if (max_promote > 0) {
+                std::vector<std::pair<size_t, double>> ram_experts;
+                {
+                    std::lock_guard<std::mutex> map_lock(e->map_mutex);
+                    for (size_t slot = 0; slot < e->expert_states.size(); ++slot) {
+                        const glm5_block_state& state = e->expert_states[slot];
+                        if (state.active && state.tier == GLM5_TIER_RAM && !state.pending_evict) {
+                            ram_experts.push_back({slot, state.hot_score});
                         }
                     }
-                    std::sort(ram_experts.begin(), ram_experts.end(),
-                        [](const auto& a, const auto& b) { return a.second > b.second; });
-                    const uint32_t promote_count = std::min<uint32_t>(max_promote, (uint32_t)ram_experts.size());
-                    for (uint32_t i = 0; i < promote_count; ++i) {
-                        int layer = 0, expert = 0;
-                        expert_dense_slot_decode(ram_experts[i].first, &layer, &expert);
-                        const uint64_t bytes = expert_triplet_bytes(e, layer, expert);
-                        if (bytes > 0) {
-                            glm5_pc_engine_request_expert(e, layer, expert, bytes, GLM5_TIER_VRAM);
-                        }
+                }
+                std::sort(ram_experts.begin(), ram_experts.end(),
+                    [](const auto& a, const auto& b) { return a.second > b.second; });
+                const uint32_t promote_count = std::min<uint32_t>(max_promote, (uint32_t)ram_experts.size());
+                for (uint32_t i = 0; i < promote_count; ++i) {
+                    int layer = 0, expert = 0;
+                    expert_dense_slot_decode(ram_experts[i].first, &layer, &expert);
+                    const uint64_t bytes = expert_triplet_bytes(e, layer, expert);
+                    if (bytes > 0) {
+                        glm5_pc_engine_request_expert(e, layer, expert, bytes, GLM5_TIER_VRAM);
                     }
                 }
             }
         }
     }
     return ok;
+}
+
+int glm5_pc_engine_prefetch_common_raw(glm5_pc_engine_t* engine) {
+    return prefetch_common_raw_storage(engine);
 }
 
 // static thread_local int tls_last_activation_layer = -1; // Removed in favor of engine member

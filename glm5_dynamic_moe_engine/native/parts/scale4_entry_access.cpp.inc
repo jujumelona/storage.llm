@@ -2,6 +2,8 @@ void glm5_scale4_close(glm5_scale4_file_t* file) {
     if (!file) {
         return;
     }
+    delete file->key_map;
+    file->key_map = nullptr;
     munmap_file(&file->mmap);
     free(file);
 }
