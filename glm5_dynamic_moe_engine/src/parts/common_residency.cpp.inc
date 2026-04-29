@@ -19,8 +19,10 @@ static uint64_t common_vram_wanted_bytes(const glm5_pc_engine* engine) {
     const glm5_storage_constants_t* s = glm5_storage_constants();
     // Fix: Use distinct fallback values for lm_head and embedding
     // lm_head is typically smaller than embedding in GLM-5.1
-    const uint64_t router_bytes = s ? (uint64_t)s->experts_per_moe_layer * (uint64_t)s->hidden_size * 2ull * (uint64_t)(s->last_moe_layer - s->first_moe_layer + 1u) : 0ull;
-    const uint64_t core = (s ? s->raw_tensor_lm_head_bytes : 0ull) + 12288ull + router_bytes;
+    // Bug Fix: Router bytes removed from common VRAM reservation
+    // Router weights are already prefetched via glm5_enqueue_attention_prefetch (activation pool)
+    // Including them here double-counts ~600MB, reducing expert VRAM budget unnecessarily
+    const uint64_t core = (s ? s->raw_tensor_lm_head_bytes : 0ull) + 12288ull;
     const uint64_t embed = s ? s->raw_tensor_embedding_bytes : 0ull;
     const uint64_t bundle = s && s->normal_bundle_max_bytes ? s->normal_bundle_max_bytes : 32ull * 1024ull * 1024ull;
     const uint64_t expert_floor = bundle * 8ull;

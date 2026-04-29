@@ -87,7 +87,9 @@ int glm5_pc_engine_request_expert(
         }
         if (target == GLM5_TIER_RAM) {
             const uint64_t ram_budget = tier_budget(engine, GLM5_TIER_RAM);
-            const uint64_t ram_limit = (ram_budget * 9ull) / 10ull;
+            // Bug Fix: RAM threshold unified to 87% (was 90%)
+            // prefetch_admitted_tier uses 87%, this was 90% → 3% inconsistency zone
+            const uint64_t ram_limit = (ram_budget * 87ull) / 100ull;
             const bool too_big = ram_budget > 0 && bytes > ram_budget;
             const bool over_limit = ram_budget > 0 &&
                 tier_used(engine, GLM5_TIER_RAM) + bytes > ram_limit;
@@ -128,8 +130,9 @@ int glm5_pc_engine_request_expert(
         glm5_block_state& state = engine->expert_states[slot];
         glm5_tier_t final_target = target;
         const uint64_t ram_budget = tier_budget(engine, GLM5_TIER_RAM);
+        // Bug Fix: RAM threshold unified to 87% (was 90%)
         if (final_target == GLM5_TIER_RAM && ram_budget > 0 &&
-            tier_used(engine, GLM5_TIER_RAM) + bytes > (ram_budget * 9ull) / 10ull) {
+            tier_used(engine, GLM5_TIER_RAM) + bytes > (ram_budget * 87ull) / 100ull) {
             final_target = GLM5_TIER_DB;
         }
         if (try_add_tier_usage(engine, final_target, bytes, tier_budget(engine, final_target))) {

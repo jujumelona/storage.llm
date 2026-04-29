@@ -53,7 +53,14 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
     std::deque<std::pair<glm5_prefetch_task, glm5_transfer_stage_t>> local_requeues;
     auto preserve_requeue = [&](const glm5_prefetch_task& retry_task, glm5_transfer_stage_t retry_stage) {
         if (!io_worker_requeue_disk_task(engine, retry_task, retry_stage, 3u, 1u)) {
-            local_requeues.emplace_back(retry_task, retry_stage);
+            // Bug Fix: Cap local_requeues size to prevent unbounded growth
+            // When both disk_stage and gpu_stage are full, local_requeues grows indefinitely
+            const uint32_t cap = std::max(8u, engine->io_config.max_prefetch_queue / 2u);
+            if (local_requeues.size() < cap) {
+                local_requeues.emplace_back(retry_task, retry_stage);
+            } else {
+                engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         return 1;
     };
@@ -64,6 +71,11 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                 local_requeues.pop_front();
                 continue;
             }
+            // Bug Fix: Wait for queue space instead of spinning
+            // Without this, worker spins when queues are full, wasting CPU
+            std::unique_lock<std::mutex> lock(engine->disk_stage.mtx);
+            engine->disk_stage.pop_cv.wait_for(lock, std::chrono::milliseconds(2));
+            continue;
         }
         // Fix 10: GDS/mmap routing changes rarely — refresh every 10 tasks.
         // VRAM pressure changes fast; refresh when allocator budget headroom shifts >10%.
@@ -89,7 +101,20 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
         if (task.raw_span_index >= 0) {
             const glm5_storage_raw_span_spec_t* span = glm5_storage_raw_span_at((uint32_t)task.raw_span_index);
             ok = span ? prefetch_one_raw_span(engine, *span, task.raw_pool) : 0;
-            if (ok) {
+            // Bug Fix: Raw span BACKPRESSURE handling (same as tensor path)
+            // Without this, staging slot exhaustion causes sync H2D fallback, blocking IO worker
+            if (ok == GLM5_DEVICE_COPY_BACKPRESSURE) {
+                task.urgent = 1;
+                task.stage = GLM5_TRANSFER_STAGE_PINNED_TO_GPU;
+                ok = enqueue_stage_or_retry(engine, engine->gpu_stage, task) ? 1 : 0;
+                if (ok) {
+                    terminal = 0;
+                    engine->gpu_stage.cv.notify_one();
+                } else {
+                    ok = preserve_requeue(task, GLM5_TRANSFER_STAGE_DISK_TO_RAM);
+                    terminal = 0;
+                }
+            } else if (ok) {
                 auto it = s_tl_deferred_staging_slots.find(engine);
                 if (it != s_tl_deferred_staging_slots.end()) {
                     const bool should_flush = it->second.size() >= 4u

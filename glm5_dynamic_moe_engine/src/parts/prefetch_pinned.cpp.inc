@@ -50,11 +50,15 @@ static int prefetch_tensor_ram_to_pinned(
         }
         copied += n;
 
-        // Bug Fix: RAM→Pinned copy leaves original mmap pages in page cache.
-        // Same data occupies RAM twice (page cache + pinned staging).
-        // MADV_DONTNEED releases page cache copy after staging copy completes.
+        // Bug Fix: MADV_DONTNEED race condition with concurrent readers
+        // If another pinned_worker is reading the same tensor, MADV_DONTNEED evicts pages
+        // while the other worker is still copying, causing page faults and disk re-reads.
+        // Only call MADV_DONTNEED when io_stop is set (engine shutdown) to avoid this race.
+        // During normal operation, page cache eviction is handled by kernel LRU.
 #ifdef __linux__
-        madvise(const_cast<uint8_t*>(src), static_cast<size_t>(length), MADV_DONTNEED);
+        if (engine->io_stop.load(std::memory_order_relaxed)) {
+            madvise(const_cast<uint8_t*>(src), static_cast<size_t>(length), MADV_DONTNEED);
+        }
 #endif
     }
 

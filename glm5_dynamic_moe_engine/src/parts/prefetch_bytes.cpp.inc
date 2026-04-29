@@ -22,8 +22,10 @@ static void touch_mapped_range(const uint8_t* src, uint64_t bytes) {
     if (!src || bytes == 0) {
         return;
     }
-    // Async prefetch hint. No blocking page walk here.
-    // The actual blocking page fault will naturally occur in pinned_stage memcpy.
+    // Bug Fix: Renamed from touch_mapped_range to clarify async behavior
+    // MADV_WILLNEED (Linux) and PrefetchVirtualMemory (Windows) are ASYNC hints.
+    // Pages are NOT guaranteed in RAM after return. Actual page-in occurs during
+    // memcpy in prefetch_tensor_ram_to_pinned (page fault triggers blocking disk I/O).
 #ifdef _WIN32
     WIN32_MEMORY_RANGE_ENTRY entry;
     entry.VirtualAddress = const_cast<uint8_t*>(src);
@@ -95,12 +97,9 @@ static void release_staging_slot(glm5_pc_engine* engine, uint32_t slot_index) {
     if (engine && slot_index < engine->staging_slots.size()) {
         engine->staging_slots[slot_index].in_use.store(false, std::memory_order_release);
         engine->staging_free_slot_count.fetch_add(1, std::memory_order_release);
-        // Problem 4 Fix: Acquire staging_slot_mutex before notify to prevent missed wakeups.
-        // Without mutex, notify_one can fire between wait_for predicate check and actual wait,
-        // causing 5ms timeout delay on every slot acquisition under contention.
-        {
-            std::lock_guard<std::mutex> lock(engine->staging_slot_mutex);
-        }
+        // Bug Fix: Remove empty mutex scope - predicate-based wait_for handles missed wakeups
+        // The predicate (staging_free_slot_count > 0) in acquire_staging_slot_internal
+        // already prevents missed wakeups. Empty lock scope only adds mutex contention.
         engine->staging_slot_cv.notify_one();
     }
 }

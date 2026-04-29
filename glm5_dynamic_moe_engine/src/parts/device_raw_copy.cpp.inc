@@ -86,7 +86,7 @@ static int device_copy_raw_span(
         return 1;
     }
 
-    if (!allow_sync_fallback && e->staging_slots.size() > 0 && s.bytes <= e->staging_slot_size) {
+    if (!allow_sync_fallback) {
         return GLM5_DEVICE_COPY_BACKPRESSURE;
     }
     e->io_atomic.bytes_sync_h2d_fallback.fetch_add(s.bytes);

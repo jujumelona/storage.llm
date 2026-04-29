@@ -58,7 +58,7 @@ Provisioning example for downloading the ready-to-run model files:
 
 ```text
 hf download storagejuju/GLM5.1-4q-storage --local-dir <model_root>
-glm5_pc_engine_server --openclaw --host 127.0.0.1 --port 8000 --model-root <model_root>
+glm5_pc_engine_server <model_root>
 ```
 
 Individual files can also be downloaded through Hugging Face's direct resolve
@@ -279,8 +279,9 @@ a slower operating mode rather than the target fast path.
 
 ## KV Default
 
-Default KV mode is plain/original KV. QKV is explicit opt-in through
-`GLM5_KV_MODE_QKV` or `--qkv`. Do not silently replace plain KV.
+Default KV mode is plain/original KV. QKV is explicit opt-in through the C API
+`GLM5_KV_MODE_QKV` or the server's positional `qkv` selector. Do not silently
+replace plain KV.
 
 ## Backend Target
 
@@ -356,33 +357,38 @@ Do not bake runtime routing predictions into the static engine. The static
 manifest supplies offsets and bundle sizes; router telemetry updates prefetch
 and cache policy while the engine runs.
 
-## OpenClaw Local Server Mode
+## Local Server
 
 The C++ engine and the local API server are separate layers:
 
 - `glm5_pc_engine` is the in-process runtime API.
-- `glm5_pc_engine_server` is the local OpenAI-compatible `/v1` wrapper used by
-  OpenClaw or any client that expects OpenAI-style HTTP endpoints.
+- `glm5_pc_engine_server` is the local OpenAI-compatible `/v1` wrapper.
 
 The server does not upload the model anywhere. It binds a local endpoint and
-passes requests into the engine.
+passes requests into the engine. Normal startup does not require backend,
+platform, RAM, VRAM, performance, or OpenClaw mode flags; those are selected
+from the local machine and model root.
 
 ### Quick Start
 
-Start the OpenAI-compatible local API:
+Start the local API with the model root:
 
 ```text
-glm5_pc_engine_server --openclaw --host 127.0.0.1 --port 8000
+glm5_pc_engine_server <model_root>
 ```
 
-For real text generation, run it with the model root. If `tensors.csv` and
-`glm5_scale4.gsc4` are present under that root, they are auto-detected:
+If `tensors.csv` and `glm5_scale4.gsc4` are present under that root, they are
+auto-detected. The server binds `127.0.0.1:8000`, exposes `/v1`, chooses the
+available CPU/GPU/Metal-style runtime path, and sizes RAM/VRAM caches
+automatically.
+
+The only normal startup selector is QKV:
 
 ```text
-glm5_pc_engine_server --openclaw --host 127.0.0.1 --port 8000 --model-root <model_root>
+glm5_pc_engine_server <model_root> qkv
 ```
 
-Smoke-test the endpoint:
+Check the server:
 
 ```text
 curl http://127.0.0.1:8000/v1/models
@@ -401,20 +407,8 @@ On Linux/macOS, replace `^` with `\`.
 
 ### OpenClaw Connection
 
-To connect OpenClaw, write a one-file provider config and point OpenClaw at the
-same local `/v1` endpoint:
-
-```text
-glm5_pc_engine_server --openclaw --host 127.0.0.1 --port 8000 --model-root <model_root> --openclaw-config openclaw.storagellm.json
-```
-
-To only write the config file without keeping the local API server running:
-
-```text
-glm5_pc_engine_server --openclaw --host 127.0.0.1 --port 8000 --openclaw-config openclaw.storagellm.json --openclaw-config-only
-```
-
-The generated config uses this provider shape:
+OpenClaw should point at the same local `/v1` endpoint. The checked-in
+`openclaw.storagellm.json` template uses this provider shape:
 
 ```json
 {
@@ -431,54 +425,30 @@ The generated config uses this provider shape:
 }
 ```
 
-Copy or merge that JSON into OpenClaw's config file. On Windows the usual path
-is `%USERPROFILE%\.openclaw\openclaw.json`; on Linux/macOS it is
-`~/.openclaw/openclaw.json`.
+Copy or merge that JSON into OpenClaw's config file.
 
-### Runtime And Server Modes
+### Runtime Selection
 
-| Mode | Selector | Purpose |
+| Runtime behavior | User action | Purpose |
 | --- | --- | --- |
-| Local API server | `--openclaw` | Start the OpenAI-compatible HTTP server. |
-| Local API alias | `--serve-openai` | Same as `--openclaw`; kept for clients that use OpenAI naming. |
-| OpenClaw config writer | `--openclaw-config <file>` | Write an OpenClaw provider config file before serving. |
-| Config-only mode | `--openclaw-config <file> --openclaw-config-only` | Write the config file and exit without starting the server. |
-| Performance policy | `--performance` | Larger prefetch windows and more IO/GPU worker activity for throughput. |
-| Balanced policy | default | Middle-ground worker counts and prefetch behavior. |
-| Low-impact policy | `--low-impact` | Smaller prefetch window and fewer workers for shared desktop use. |
-| Backend auto mode | `--backend auto` | Detect CUDA/HIP/Metal/Vulkan/DirectML/OpenCL/CPU capability and choose the best available path. |
-| Explicit backend mode | `--backend <name>` | Force a backend preference while keeping CPU as correctness fallback. |
+| Local API server | default | Start the OpenAI-compatible HTTP server on `127.0.0.1:8000`. |
+| Backend and platform | automatic | Detect the best available local path and keep CPU correctness fallback. |
+| RAM/VRAM budgets | automatic | Size cache and staging budgets from detected hardware. |
 | Plain KV mode | default | Use the GLM runtime KV cache with bf16 backing storage and float decode scratch. |
-| QKV mode | `--qkv` | Opt into the experimental quantized KV path. |
-| Active-set VRAM residency | `--vram-budget <bytes>` | Promote mandatory state and selected MoE triplets to VRAM within budget. |
-| RAM-backed residency | `--ram-budget <bytes>` | Keep warm blocks and staging buffers in RAM when VRAM is not enough. |
+| QKV mode | `qkv` | Opt into the experimental quantized KV path. |
 | Storage streaming fallback | default when needed | Stream cold blocks from local model-root storage; correct but slower. |
 
-### Server Options
+### Server Surface
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `--openclaw` | off | Start the local OpenAI-compatible server. |
-| `--serve-openai` | off | Alias for `--openclaw`. |
-| `--host <addr>` | `127.0.0.1` | Bind address. Non-loopback requires `--allow-remote`. |
-| `--port <port>` | `8000` | Local HTTP port. |
-| `--model-id <id>` | `glm5.1-storage` | Model id returned by `/v1/models` and used in OpenClaw config. |
-| `--model-root <path>` | none | Folder containing `tokenizer.json`, `tensors.csv`, `glm5_scale4.gsc4`, and JUJU parts. |
-| `--table <path>` | `<model_root>/tensors.csv` if present | Explicit tensor metadata table. |
-| `--scale4 <path>` | `<model_root>/glm5_scale4.gsc4` if present | Explicit scale4 index/cache file. |
-| `--topology <path>` | none | Read/write router transition topology for lookahead prefetch. |
-| `--backend <name>` | `auto` | Backend preference. Accepted: `auto`, `cpu`, `cuda`, `hip`, `rocm`, `amd`, `metal`, `vulkan`, `directml`, `opencl`, `levelzero`, `level_zero`, `intel`, `sycl`, `oneapi`, `webgpu`. |
-| `--platform <name>` | `auto` | Platform hint. Accepted: `auto`, `windows`, `linux`, `mac`, `apple`, `cpu`. |
-| `--ram-budget <bytes>` | detected | RAM budget. Supports suffixes handled by `parse_byte_size`, for example `8G`. |
-| `--vram-budget <bytes>` | detected | VRAM budget, for example `1G` or `8G`. |
-| `--allow-remote` | off | Permit binding to non-loopback hosts. Use only behind a trusted network boundary. |
-| `--openclaw-config <file>` | none | Emit an OpenClaw provider config matching this server's host, port, and model id. |
-| `--write-openclaw-config <file>` | none | Alias for `--openclaw-config`. |
-| `--openclaw-config-only` | off | Exit after writing the OpenClaw config. |
-| `--qkv` | off | Use `GLM5_KV_MODE_QKV`; otherwise plain KV is used. |
-| `--performance` | off | Use `GLM5_EXECUTION_PERFORMANCE`. |
-| `--low-impact` | off | Use `GLM5_EXECUTION_LOW_IMPACT`. |
-| `--help`, `-h` | off | Print usage. |
+Normal startup has two forms:
+
+```text
+glm5_pc_engine_server <model_root>
+glm5_pc_engine_server <model_root> qkv
+```
+
+Other command-line flags are for integration harnesses and debugging only. They
+are intentionally not part of the normal user path.
 
 Default endpoints:
 
@@ -487,20 +457,22 @@ Default endpoints:
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
 - `POST /v1/responses`
+- `POST /v1/storagellm/eval`
+- `POST /v1/storagellm/perplexity`
+- `POST /v1/perplexity`
 - `GET /openclaw/config` (returns the same OpenClaw provider config JSON)
 
 Security rule: bind to `127.0.0.1` by default. Non-loopback hosts require the
 explicit `--allow-remote` flag so model control is not exposed by accident.
 
-The server mode provides the OpenAI-compatible API surface, backend
-auto-detection, forward-status reporting, tokenizer-backed text requests, and
-`input_ids` requests for tokenizer-free smoke tests. Generation calls the
-engine-native token loop, which executes embedding, per-layer attention
-projectors, dense/MoE MLPs, router-selected expert triplets, final norm, and
-`lm_head` top-1 sampling through the C API. `/health` reports staging deficits,
-recommended staging bytes, tensor-table readiness, tokenizer readiness, and
-decode/chat readiness so deployment failures are visible instead of silently
-stalling.
+The server mode provides the OpenAI-compatible API surface, automatic runtime
+selection, forward-status reporting, tokenizer-backed text requests, generation,
+and eval/perplexity routes. Generation calls the engine-native token loop,
+which executes embedding, per-layer attention projectors, dense/MoE MLPs,
+router-selected expert triplets, final norm, and `lm_head` sampling through the
+C API. `/health` reports staging deficits, recommended staging bytes,
+tensor-table readiness, tokenizer readiness, and decode/chat readiness so
+deployment failures are visible instead of silently stalling.
 
 ### Request Shapes
 
@@ -510,8 +482,14 @@ The server accepts three OpenAI-style generation routes:
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
 
+Eval/perplexity routes:
+
+- `POST /v1/storagellm/eval`
+- `POST /v1/storagellm/perplexity`
+- `POST /v1/perplexity`
+
 Text requests can use `input`, `prompt`, `messages[].content`, or collected
-`text` fields. Smoke tests can bypass tokenization with `input_ids`.
+`text` fields. `input_ids` is accepted for clients that already tokenize.
 
 Token limits:
 

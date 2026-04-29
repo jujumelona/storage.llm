@@ -62,8 +62,8 @@ shared optional quantized KV implementation and lives under
 ## GLM5.1 Runtime Usage
 
 The GLM5.1 model runtime lives in `glm5_dynamic_moe_engine/`. Its README is the
-source of truth for model layout, local OpenAI-compatible API mode, OpenClaw
-connection config, server options, backend modes, KV mode, and request shapes:
+source of truth for model layout, the local OpenAI-compatible API, automatic
+runtime selection, the optional QKV path, and request shapes:
 
 ```text
 glm5_dynamic_moe_engine/README.md
@@ -81,18 +81,23 @@ Download the converted StorageLLM artifact before starting the server:
 hf download storagejuju/GLM5.1-4q-storage --local-dir <model_root>
 ```
 
-The normal local API command is:
+The normal local API command is only the server binary plus the model root. The
+server starts the local `/v1` API automatically, binds to `127.0.0.1:8000`,
+detects the available CPU/GPU/Metal-style runtime path, and sizes RAM/VRAM
+caches from the machine:
 
 ```text
-glm5_pc_engine_server --openclaw --host 127.0.0.1 --port 8000 --model-root <model_root>
+glm5_pc_engine_server <model_root>
 ```
 
-For OpenClaw, either use the checked-in `openclaw.storagellm.json` template or
-let the server write one matched to its host, port, and model id:
+QKV is the only normal startup choice:
 
 ```text
-glm5_pc_engine_server --openclaw --host 127.0.0.1 --port 8000 --model-root <model_root> --openclaw-config openclaw.storagellm.json
+glm5_pc_engine_server <model_root> qkv
 ```
+
+Clients can use `http://127.0.0.1:8000/v1` directly. The checked-in
+`openclaw.storagellm.json` template points OpenClaw at that same local API.
 
 ## Repository Rules
 

@@ -42,7 +42,6 @@ static const socket_handle_t invalid_socket_handle = -1;
 #include "../../loader/wide_path.h"
 
 struct server_options {
-    bool openclaw_mode = false;
     bool allow_remote = false;
     std::string host = "127.0.0.1";
     uint16_t port = 8000;
@@ -1449,13 +1448,11 @@ static bool parse_platform_name(const char* name, glm5_platform_t* out) {
 static void print_usage() {
     std::cout
         << "Usage:\n"
-        << "  glm5_pc_engine_server --openclaw [--host 127.0.0.1] [--port 8000]\n"
-        << "                        [--model-id glm5.1-storage] [--backend auto]\n"
-        << "                        [--ram-budget 32G] [--vram-budget 8G]\n"
-        << "                        [--qkv] [--topology file]\n"
-        << "                        [--table tensors.csv] [--model-root path] [--scale4 file]\n"
-        << "                        [--openclaw-config file] [--openclaw-config-only]\n"
-        << "                        [--performance|--low-impact]\n"
+        << "  glm5_pc_engine_server [model_root] [qkv]\n"
+        << "  glm5_pc_engine_server --model-root path\n"
+        << "\n"
+        << "Backend, platform, RAM, VRAM, and local API mode are detected automatically.\n"
+        << "Use qkv only when opting into the quantized KV path.\n"
         << "\n"
         << "Endpoints:\n"
         << "  GET  /health\n"
@@ -1473,7 +1470,7 @@ static server_options parse_args(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--openclaw") == 0 || std::strcmp(argv[i], "--serve-openai") == 0) {
-            opts.openclaw_mode = true;
+            continue;
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
             opts.host = argv[++i];
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -1485,7 +1482,7 @@ static server_options parse_args(int argc, char** argv) {
             opts.model_id = argv[++i];
         } else if (std::strcmp(argv[i], "--allow-remote") == 0) {
             opts.allow_remote = true;
-        } else if (std::strcmp(argv[i], "--qkv") == 0) {
+        } else if (std::strcmp(argv[i], "--qkv") == 0 || std::strcmp(argv[i], "qkv") == 0) {
             opts.engine_config.kv_mode = GLM5_KV_MODE_QKV;
         } else if (std::strcmp(argv[i], "--topology") == 0 && i + 1 < argc) {
             opts.topology_path = argv[++i];
@@ -1517,6 +1514,8 @@ static server_options parse_args(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_usage();
             std::exit(0);
+        } else if (argv[i][0] != '-' && opts.model_root.empty()) {
+            opts.model_root = argv[i];
         }
     }
     return opts;
@@ -1524,10 +1523,6 @@ static server_options parse_args(int argc, char** argv) {
 
 static int server_main(int argc, char** argv) {
     server_options opts = parse_args(argc, argv);
-    if (!opts.openclaw_mode) {
-        print_usage();
-        return 2;
-    }
 
     if (!network_startup()) {
         std::cerr << "Network startup failed\n";
@@ -1606,7 +1601,7 @@ static int server_main(int argc, char** argv) {
         return 1;
     }
 
-    std::cout << "StorageLLM OpenClaw mode listening on http://" << opts.host << ":" << opts.port << "/v1\n";
+    std::cout << "StorageLLM server listening on http://" << opts.host << ":" << opts.port << "/v1\n";
     std::cout << "Model: " << opts.model_id << "\n";
     std::cout << "Backend: " << glm5_backend_name(caps.backend) << " / " << glm5_platform_name(caps.platform) << "\n";
     std::cout << "Budgets: VRAM=" << opts.engine_config.vram_budget_bytes

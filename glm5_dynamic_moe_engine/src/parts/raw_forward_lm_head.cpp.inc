@@ -110,25 +110,33 @@ int glm5_pc_engine_lm_head_token_logprob_f32(
     const uint32_t chunk_size = 1024;
     const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
 
-    struct chunk_max_t {
+    struct chunk_logsum_t {
         float max_score;
+        double exp_sum;
         float target_score;
         int has_target;
     };
-    std::vector<chunk_max_t> chunk_maxes(num_chunks);
+    std::vector<chunk_logsum_t> chunk_results(num_chunks);
 
     if (!glm5_parallel_rows(engine, num_chunks, 0, [&](uint32_t chunk) {
         const uint32_t start = chunk * chunk_size;
         const uint32_t end = std::min(start + chunk_size, c->vocab_size);
         float local_max = -std::numeric_limits<float>::infinity();
+        double local_sum = 0.0;
         float target_score = 0.0f;
         int has_target = 0;
 
         for (uint32_t t = start; t < end; ++t) {
             const uint8_t* row = base + row_bytes * (uint64_t)t;
             const float score = glm5_dot_bf16_row(row, hidden, hidden_count);
-            if (score > local_max) {
+            if (score <= local_max) {
+                local_sum += std::exp((double)score - (double)local_max);
+            } else if (std::isfinite(local_max)) {
+                local_sum = local_sum * std::exp((double)local_max - (double)score) + 1.0;
                 local_max = score;
+            } else {
+                local_max = score;
+                local_sum = 1.0;
             }
             if (t == target_token_id) {
                 target_score = score;
@@ -136,21 +144,33 @@ int glm5_pc_engine_lm_head_token_logprob_f32(
             }
         }
 
-        chunk_maxes[chunk] = {local_max, target_score, has_target};
+        chunk_results[chunk] = {local_max, local_sum, target_score, has_target};
         return 1;
     })) {
         return 0;
     }
 
     float global_max = -std::numeric_limits<float>::infinity();
+    double exp_sum = 0.0;
     float target_score = 0.0f;
     int found_target = 0;
     for (uint32_t i = 0; i < num_chunks; ++i) {
-        if (chunk_maxes[i].max_score > global_max) {
-            global_max = chunk_maxes[i].max_score;
+        if (!(chunk_results[i].exp_sum > 0.0) || !std::isfinite(chunk_results[i].max_score)) {
+            continue;
         }
-        if (chunk_maxes[i].has_target) {
-            target_score = chunk_maxes[i].target_score;
+        if (chunk_results[i].max_score <= global_max) {
+            exp_sum += chunk_results[i].exp_sum *
+                std::exp((double)chunk_results[i].max_score - (double)global_max);
+        } else if (std::isfinite(global_max)) {
+            exp_sum = exp_sum * std::exp((double)global_max - (double)chunk_results[i].max_score) +
+                chunk_results[i].exp_sum;
+            global_max = chunk_results[i].max_score;
+        } else {
+            global_max = chunk_results[i].max_score;
+            exp_sum = chunk_results[i].exp_sum;
+        }
+        if (chunk_results[i].has_target) {
+            target_score = chunk_results[i].target_score;
             found_target = 1;
         }
     }
@@ -158,26 +178,6 @@ int glm5_pc_engine_lm_head_token_logprob_f32(
         return 0;
     }
 
-    std::vector<double> chunk_sums(num_chunks, 0.0);
-    if (!glm5_parallel_rows(engine, num_chunks, 0, [&](uint32_t chunk) {
-        const uint32_t start = chunk * chunk_size;
-        const uint32_t end = std::min(start + chunk_size, c->vocab_size);
-        double local_sum = 0.0;
-        for (uint32_t t = start; t < end; ++t) {
-            const uint8_t* row = base + row_bytes * (uint64_t)t;
-            const float score = glm5_dot_bf16_row(row, hidden, hidden_count);
-            local_sum += std::exp((double)score - (double)global_max);
-        }
-        chunk_sums[chunk] = local_sum;
-        return 1;
-    })) {
-        return 0;
-    }
-
-    double exp_sum = 0.0;
-    for (double v : chunk_sums) {
-        exp_sum += v;
-    }
     if (!(exp_sum > 0.0) || !std::isfinite(exp_sum)) {
         return 0;
     }

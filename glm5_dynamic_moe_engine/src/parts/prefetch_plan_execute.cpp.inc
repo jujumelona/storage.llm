@@ -46,15 +46,18 @@ int glm5_pc_engine_execute_prefetch_plan(
     }
 
     // Pass 2 직전: VRAM 해제 이후 잔량 재확인하여 RAM으로 강등된 항목만 재평가
-    uint64_t vram_remaining = tier_budget(engine, GLM5_TIER_VRAM) > tier_used(engine, GLM5_TIER_VRAM)
-        ? tier_budget(engine, GLM5_TIER_VRAM) - tier_used(engine, GLM5_TIER_VRAM) : 0;
+    // Bug Fix: Use try_add_tier_usage instead of non-atomic vram_remaining calculation
+    // vram_remaining = tier_budget - tier_used is racy (other threads can allocate between calls)
+    // This can cause VRAM over-allocation → cascading evictions
     for (uint32_t i = 0; i < item_count; ++i) {
         if (admitted_tiers[i] == GLM5_TIER_RAM
             && items[i].target_tier == GLM5_TIER_VRAM
-            && !prefetch_is_router_selected(items[i])
-            && vram_remaining >= items[i].bytes * 2u) {
-            admitted_tiers[i] = GLM5_TIER_VRAM;
-            vram_remaining -= items[i].bytes;
+            && !prefetch_is_router_selected(items[i])) {
+            // Atomically reserve VRAM space with CAS
+            if (try_add_tier_usage(engine, GLM5_TIER_VRAM, items[i].bytes,
+                                   tier_budget(engine, GLM5_TIER_VRAM))) {
+                admitted_tiers[i] = GLM5_TIER_VRAM;
+            }
         }
     }
 

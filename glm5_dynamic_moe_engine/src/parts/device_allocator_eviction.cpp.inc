@@ -110,7 +110,16 @@ static void device_make_room_locked(
         } guard{&e->vram_eviction_in_progress, &e->vram_eviction_cv};
 
         std::vector<std::pair<int, int>> expert_victims;
-        if (pool != GLM5_DEVICE_POOL_ACTIVATION) {
+        // Bug Fix: ACTIVATION pool can also evict experts when activation eviction is insufficient
+        // Without this, ACTIVATION allocation fails when activation_evict_heap is empty,
+        // even though expert triplets could be evicted to make room
+        std::vector<uint64_t> activation_victims;
+        device_collect_activation_victims_locked(e, room_bytes, activation_victims);
+        for (uint64_t key : activation_victims) {
+            device_free_locked(e, key, &deferred_free_ptrs);
+        }
+        // If activation eviction didn't free enough, evict experts
+        if (e->device_allocated_bytes.load(std::memory_order_relaxed) + bytes > budget) {
             device_lock.unlock();
             demote_cold_until(e, GLM5_TIER_VRAM, room_bytes, expert_victims);
             if (expert_victims.empty() &&
@@ -121,11 +130,6 @@ static void device_make_room_locked(
             for (auto& victim : expert_victims) {
                 device_free_expert_if_pending_evict_locked(e, victim.first, victim.second, &deferred_free_ptrs);
             }
-        }
-        std::vector<uint64_t> activation_victims;
-        device_collect_activation_victims_locked(e, room_bytes, activation_victims);
-        for (uint64_t key : activation_victims) {
-            device_free_locked(e, key, &deferred_free_ptrs);
         }
         if (expert_victims.empty() && activation_victims.empty()) {
             return;
