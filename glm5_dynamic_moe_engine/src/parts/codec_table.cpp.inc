@@ -187,12 +187,16 @@ int glm5_pc_engine_load_codec_table(
         engine->tensors.push_back(std::move(rec));
         ++parsed_rows;
         if ((parsed_rows % 10000ull) == 0ull) {
-            std::cerr << "[storagellm] codec rows loaded: " << parsed_rows
-                      << " paths=" << engine->tensor_paths.size() << "\n" << std::flush;
+            std::fprintf(stderr, "[storagellm] codec rows loaded: %llu paths=%zu\n",
+                (unsigned long long)parsed_rows,
+                engine->tensor_paths.size());
+            std::fflush(stderr);
         }
     }
-    std::cerr << "[storagellm] codec rows loaded: " << parsed_rows
-              << " paths=" << engine->tensor_paths.size() << "\n" << std::flush;
+    std::fprintf(stderr, "[storagellm] codec rows loaded: %llu paths=%zu\n",
+        (unsigned long long)parsed_rows,
+        engine->tensor_paths.size());
+    std::fflush(stderr);
     if (engine->staging && engine->staging_size > 0) {
         configure_staging_slots(engine);
         engine->staging_slot_cv.notify_all();
