@@ -28,51 +28,22 @@ static int prefetch_tensor_ram_to_pinned(
         engine->staging_slots[slot_index].buf &&
         total_bytes <= engine->staging_slots[slot_index].size;
 
-    // Problem 2 Fix: Sync fallback when staging is NULL (mlock failed)
-    // Without staging, use direct sync H2D copy instead of failing silently
     if (!can_stage && target_tier == GLM5_TIER_VRAM) {
-        // Sync fallback: allocate temp pinned buffer and copy directly to GPU
-        void* temp_pinned = nullptr;
-        if (engine->cuda.cuMemAllocHost && engine->cuda.cuMemcpyHtoD && engine->cuda.cuMemFreeHost) {
-            if (engine->cuda.cuMemAllocHost(&temp_pinned, (size_t)total_bytes) == 0 && temp_pinned) {
-                uint64_t temp_offset = 0;
-                int copy_ok = 1;
-                for (const auto& range : ranges) {
-                    const uint64_t offset = range[0];
-                    const uint64_t length = range[1];
-                    if (length == 0) continue;
-                    if (offset > file_size || length > file_size - offset) {
-                        copy_ok = 0;
-                        break;
-                    }
-                    const uint8_t* src = static_cast<const uint8_t*>(mmap_get_ptr(shard, static_cast<size_t>(offset)));
-                    if (!src) {
-                        copy_ok = 0;
-                        break;
-                    }
-                    std::memcpy(static_cast<uint8_t*>(temp_pinned) + temp_offset, src, (size_t)length);
-                    temp_offset += length;
-                }
-                if (copy_ok && temp_offset == total_bytes) {
-                    // Now copy to GPU synchronously
-                    const uint64_t key = device_key_tensor(rec);
-                    CUdeviceptr gpu_ptr = 0;
-                    if (device_alloc_tensor(engine, rec, &gpu_ptr) && gpu_ptr) {
-                        device_set_current(engine);
-                        if (engine->cuda.cuMemcpyHtoD(gpu_ptr, temp_pinned, (size_t)total_bytes) == 0) {
-                            engine->io_atomic.bytes_sync_h2d_fallback.fetch_add(total_bytes);
-                            engine->cuda.cuMemFreeHost(temp_pinned);
-                            if (out_staging_bytes) {
-                                *out_staging_bytes = total_bytes;
-                            }
-                            return 1;
-                        }
-                    }
-                }
-                engine->cuda.cuMemFreeHost(temp_pinned);
+        const int copied_to_gpu = device_copy_tensor(
+            engine,
+            rec,
+            GLM5_DEVICE_POOL_EXPERT,
+            1
+        );
+        if (copied_to_gpu == 1) {
+            if (out_staging_bytes) {
+                *out_staging_bytes = total_bytes;
             }
+            return 1;
         }
-        // Sync fallback failed
+        if (copied_to_gpu == GLM5_DEVICE_COPY_BACKPRESSURE) {
+            return GLM5_DEVICE_COPY_BACKPRESSURE;
+        }
         engine->io_atomic.staging_slot_contention.fetch_add(1);
         engine->io_atomic.staging_wraps.fetch_add(1);
         return 0;
