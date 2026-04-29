@@ -108,6 +108,27 @@ static bool pop_stage_task(
     return true;
 }
 
+// Bug 2 Fix: Non-destructive peek to enable lookahead touch_mapped_range
+// Allows io_worker to prefetch next task's mmap pages before processing current task
+static bool peek_stage_task(
+    glm5_pc_engine* engine,
+    glm5_stage_queue& stage,
+    glm5_prefetch_task* out_task
+) {
+    if (!engine || !out_task) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(stage.mtx);
+    if (!stage.urgent_queue.empty()) {
+        *out_task = stage.urgent_queue.front();
+        return true;
+    } else if (!stage.queue.empty()) {
+        *out_task = stage.queue.front();
+        return true;
+    }
+    return false;
+}
+
 static void finish_stage_task(glm5_pc_engine* engine, glm5_stage_queue& stage, int ok, int count_completed) {
     if (ok && count_completed) {
         engine->io_atomic.completed_requests.fetch_add(1);

@@ -65,6 +65,15 @@ struct http_request {
     std::string body;
 };
 
+struct server_runtime_state {
+    std::atomic<glm5_pc_engine_t*> engine{nullptr};
+    std::atomic<int> model_ready{0};
+    std::atomic<int> model_failed{0};
+    glm5_backend_caps_t initial_caps{};
+    mutable std::mutex error_mutex;
+    std::string error_message;
+};
+
 #include "pc_server_runtime_config.inc"
 #include "pc_server_prefetch.inc"
 
@@ -766,11 +775,18 @@ static std::string make_health_json(
     const glm5_backend_caps_t& caps,
     const glm5_forward_status_t& forward,
     const glm5_pc_engine_stats_t& stats,
-    const glm5_io_stats_t& io_stats
+    const glm5_io_stats_t& io_stats,
+    const server_runtime_state* runtime = nullptr
 ) {
     std::ostringstream out;
+    const bool loading = runtime && runtime->model_ready.load(std::memory_order_acquire) == 0 &&
+        runtime->model_failed.load(std::memory_order_acquire) == 0;
+    const bool failed = runtime && runtime->model_failed.load(std::memory_order_acquire) != 0;
     out << "{"
         << "\"status\":\"ok\","
+        << "\"modelLoading\":" << (loading ? "true" : "false") << ","
+        << "\"modelReady\":" << (!loading && !failed ? "true" : "false") << ","
+        << "\"modelFailed\":" << (failed ? "true" : "false") << ","
         << "\"mode\":\"openclaw\","
         << "\"model\":\"" << json_escape(opts.model_id) << "\","
         << "\"base_url\":\"http://" << json_escape(opts.host) << ":" << opts.port << "/v1\","
@@ -847,7 +863,12 @@ static std::string make_health_json(
     }
     out << ","
         << "\"loopback_only\":" << (is_loopback_host(opts.host) ? "true" : "false")
-        << "}";
+        ;
+    if (failed && runtime) {
+        std::lock_guard<std::mutex> lock(runtime->error_mutex);
+        out << ",\"modelLoadError\":\"" << json_escape(runtime->error_message) << "\"";
+    }
+    out << "}";
     return out.str();
 }
 
@@ -1255,8 +1276,12 @@ static std::string route_request(
     const http_request& req,
     const server_options& opts,
     glm5_pc_engine_t* engine,
-    std::mutex* engine_mutex
+    std::mutex* engine_mutex,
+    const server_runtime_state* runtime = nullptr
 ) {
+    if (!engine && runtime) {
+        engine = runtime->engine.load(std::memory_order_acquire);
+    }
     if (req.method == "OPTIONS") {
         return make_response(204, "text/plain", "");
     }
@@ -1268,21 +1293,46 @@ static std::string route_request(
     }
     auto load_backend_caps = [&]() {
         glm5_backend_caps_t caps{};
-        if (!glm5_pc_engine_get_backend_caps(engine, &caps)) {
+        const bool ready = !runtime || runtime->model_ready.load(std::memory_order_acquire) != 0;
+        if (engine && ready && !glm5_pc_engine_get_backend_caps(engine, &caps)) {
             glm5_pc_detect_backend_caps(opts.engine_config.preferred_backend, opts.engine_config.platform, &caps);
+        } else if (!engine && runtime) {
+            caps = runtime->initial_caps;
+        } else if (!ready && runtime) {
+            caps = runtime->initial_caps;
         }
         return caps;
     };
 
     if (req.method == "GET" && req.path == "/health") {
         const glm5_backend_caps_t caps = load_backend_caps();
+        const bool ready = !runtime || runtime->model_ready.load(std::memory_order_acquire) != 0;
         glm5_forward_status_t forward{};
-        glm5_pc_engine_get_forward_status(engine, &forward);
+        if (engine && ready) {
+            glm5_pc_engine_get_forward_status(engine, &forward);
+        }
         glm5_pc_engine_stats_t stats{};
-        glm5_pc_engine_get_stats(engine, &stats);
+        if (engine && ready) {
+            glm5_pc_engine_get_stats(engine, &stats);
+        }
         glm5_io_stats_t io_stats{};
-        glm5_pc_engine_get_io_stats(engine, &io_stats);
-        return make_response(200, "application/json", make_health_json(opts, caps, forward, stats, io_stats));
+        if (engine && ready) {
+            glm5_pc_engine_get_io_stats(engine, &io_stats);
+        }
+        return make_response(200, "application/json", make_health_json(opts, caps, forward, stats, io_stats, runtime));
+    }
+    if (runtime && runtime->model_ready.load(std::memory_order_acquire) == 0) {
+        const std::string body = runtime->model_failed.load(std::memory_order_acquire) != 0
+            ? "{\"error\":{\"message\":\"model load failed; check /health\",\"type\":\"model_load_failed\"}}"
+            : "{\"error\":{\"message\":\"model is still loading; check /health\",\"type\":\"model_loading\"}}";
+        return make_response(503, "application/json", body);
+    }
+    if (!engine) {
+        return make_response(
+            503,
+            "application/json",
+            "{\"error\":{\"message\":\"model is not ready; check /health\",\"type\":\"model_not_ready\"}}"
+        );
     }
     if (req.method == "POST" && req.path == "/v1/chat/completions") {
         const server_generation_result generated = run_server_generation(engine, engine_mutex, opts, req.body);
@@ -1330,7 +1380,8 @@ static void handle_client(
     socket_handle_t client,
     const server_options* opts,
     glm5_pc_engine_t* engine,
-    std::mutex* engine_mutex
+    std::mutex* engine_mutex,
+    const server_runtime_state* runtime = nullptr
 ) {
     std::unique_ptr<socket_handle_t, void(*)(socket_handle_t*)> guard(
         new socket_handle_t(client),
@@ -1343,7 +1394,7 @@ static void handle_client(
     http_request req;
     std::string response;
     if (parse_http_request(client, &req)) {
-        response = route_request(req, *opts, engine, engine_mutex);
+        response = route_request(req, *opts, engine, engine_mutex, runtime);
     } else {
         response = make_response(
             400,
@@ -1395,6 +1446,74 @@ static socket_handle_t create_server_socket(const server_options& opts) {
         return invalid_socket_handle;
     }
     return server;
+}
+
+static bool prepare_model_paths(server_options* opts) {
+    if (!opts || opts->model_root.empty()) {
+        return true;
+    }
+    if (opts->table_path.empty()) {
+        const std::string table = join_model_file(opts->model_root, "tensors.csv");
+        if (file_exists_utf8(table)) {
+            opts->table_path = table;
+        }
+    }
+    if (opts->scale4_path.empty()) {
+        const std::string scale4 = join_model_file(opts->model_root, "glm5_scale4.gsc4");
+        if (file_exists_utf8(scale4)) {
+            opts->scale4_path = scale4;
+        }
+    }
+    return true;
+}
+
+static void mark_model_load_failed(server_runtime_state* runtime, const std::string& message) {
+    if (!runtime) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(runtime->error_mutex);
+        runtime->error_message = message;
+    }
+    runtime->model_failed.store(1, std::memory_order_release);
+}
+
+static void load_server_model_background(
+    server_options opts,
+    glm5_io_config_t io_config,
+    server_runtime_state* runtime
+) {
+    if (!runtime) {
+        return;
+    }
+    glm5_pc_engine_t* engine = glm5_pc_engine_create(&opts.engine_config);
+    if (!engine) {
+        mark_model_load_failed(runtime, "engine create failed");
+        std::cerr << "Engine create failed\n";
+        return;
+    }
+    runtime->engine.store(engine, std::memory_order_release);
+    glm5_pc_engine_configure_io(engine, &io_config);
+    if (!opts.model_root.empty()) {
+        glm5_pc_engine_set_model_root(engine, opts.model_root.c_str());
+    }
+    prepare_model_paths(&opts);
+    if (!opts.table_path.empty()) {
+        const char* root = opts.model_root.empty() ? nullptr : opts.model_root.c_str();
+        const char* scale4 = opts.scale4_path.empty() ? nullptr : opts.scale4_path.c_str();
+        std::cerr << "[storagellm] loading codec table: " << opts.table_path << "\n" << std::flush;
+        if (!glm5_pc_engine_load_codec_table(engine, opts.table_path.c_str(), root, scale4)) {
+            mark_model_load_failed(runtime, "failed to load codec table: " + opts.table_path);
+            std::cerr << "Failed to load codec table: " << opts.table_path << "\n";
+            return;
+        }
+        std::cerr << "[storagellm] codec table loaded\n" << std::flush;
+    }
+    if (!opts.topology_path.empty()) {
+        glm5_pc_engine_load_topology(engine, opts.topology_path.c_str());
+    }
+    runtime->model_ready.store(1, std::memory_order_release);
+    print_optimization_plan(engine);
 }
 
 static bool parse_backend_name(const char* name, glm5_backend_t* out) {
@@ -1552,56 +1671,17 @@ static int server_main(int argc, char** argv) {
         }
     }
 
-    glm5_pc_engine_t* engine = glm5_pc_engine_create(&opts.engine_config);
-    if (!engine) {
-        network_cleanup();
-        std::cerr << "Engine create failed\n";
-        return 1;
-    }
-
-    glm5_pc_engine_get_backend_caps(engine, &caps);
     glm5_io_config_t io_config = make_server_io_config(opts, caps);
-    glm5_pc_engine_configure_io(engine, &io_config);
-    if (!opts.model_root.empty()) {
-        glm5_pc_engine_set_model_root(engine, opts.model_root.c_str());
-    }
-    if (!opts.model_root.empty()) {
-        if (opts.table_path.empty()) {
-            const std::string table = join_model_file(opts.model_root, "tensors.csv");
-            if (file_exists_utf8(table)) {
-                opts.table_path = table;
-            }
-        }
-        if (opts.scale4_path.empty()) {
-            const std::string scale4 = join_model_file(opts.model_root, "glm5_scale4.gsc4");
-            if (file_exists_utf8(scale4)) {
-                opts.scale4_path = scale4;
-            }
-        }
-    }
-    if (!opts.table_path.empty()) {
-        const char* root = opts.model_root.empty() ? nullptr : opts.model_root.c_str();
-        const char* scale4 = opts.scale4_path.empty() ? nullptr : opts.scale4_path.c_str();
-        std::cerr << "[storagellm] loading codec table: " << opts.table_path << "\n" << std::flush;
-        if (!glm5_pc_engine_load_codec_table(engine, opts.table_path.c_str(), root, scale4)) {
-            glm5_pc_engine_destroy(engine);
-            network_cleanup();
-            std::cerr << "Failed to load codec table: " << opts.table_path << "\n";
-            return 1;
-        }
-        std::cerr << "[storagellm] codec table loaded\n" << std::flush;
-    }
-    if (!opts.topology_path.empty()) {
-        glm5_pc_engine_load_topology(engine, opts.topology_path.c_str());
-    }
 
     socket_handle_t server = create_server_socket(opts);
     if (server == invalid_socket_handle) {
-        glm5_pc_engine_destroy(engine);
         network_cleanup();
         std::cerr << "Failed to bind " << opts.host << ":" << opts.port << "\n";
         return 1;
     }
+    server_runtime_state runtime;
+    runtime.initial_caps = caps;
+    std::thread(load_server_model_background, opts, io_config, &runtime).detach();
 
     std::cout << "StorageLLM server listening on http://" << opts.host << ":" << opts.port << "/v1\n";
     std::cout << "Model: " << opts.model_id << "\n";
@@ -1627,7 +1707,6 @@ static int server_main(int argc, char** argv) {
     if (!opts.topology_path.empty()) {
         std::cout << "Topology: " << opts.topology_path << "\n";
     }
-    print_optimization_plan(engine);
     std::cout << "OpenClaw config: http://" << opts.host << ":" << opts.port << "/openclaw/config\n";
 
     std::mutex engine_mutex;
@@ -1649,14 +1728,16 @@ static int server_main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         active_clients->fetch_add(1);
-        std::thread([client, &opts, engine, &engine_mutex, active_clients]() {
-            handle_client(client, &opts, engine, &engine_mutex);
+        std::thread([client, &opts, &engine_mutex, active_clients, &runtime]() {
+            handle_client(client, &opts, nullptr, &engine_mutex, &runtime);
             active_clients->fetch_sub(1);
         }).detach();
     }
 
     close_socket_handle(server);
-    glm5_pc_engine_destroy(engine);
+    if (glm5_pc_engine_t* engine = runtime.engine.load(std::memory_order_acquire)) {
+        glm5_pc_engine_destroy(engine);
+    }
     network_cleanup();
     return 0;
 }

@@ -27,7 +27,10 @@ static void pinned_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                     return;
                 }
                 if (task.staging_slot == UINT32_MAX) {
-                    engine->io_atomic.staging_slot_deficit.fetch_add(1);
+                    // Bug 3 Fix: Separate staging_slot_waits from staging_slot_deficit
+                    // staging_slot_deficit = structural shortage (update_staging_slot_deficit)
+                    // staging_slot_waits = transient wait events (pinned_worker retries)
+                    engine->io_atomic.staging_slot_waits.fetch_add(1);
                     // Problem 1 Fix: Preserve original urgent flag from router-selected experts.
                     // Only promote to urgent after 3+ retries, never demote existing urgent=1.
                     if (!task.urgent && task.requeue_count >= 3u) {

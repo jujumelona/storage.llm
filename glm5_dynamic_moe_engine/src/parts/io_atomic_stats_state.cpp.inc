@@ -38,4 +38,5 @@ struct alignas(64) glm5_io_atomic_stats {
     std::atomic<uint32_t> gpudirect_storage_active{0};
     std::atomic<uint32_t> bam_nvme_active{0};
     std::atomic<uint32_t> staging_slot_deficit{0};
+    std::atomic<uint64_t> staging_slot_waits{0};
 };

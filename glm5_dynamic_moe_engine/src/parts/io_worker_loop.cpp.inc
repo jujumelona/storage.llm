@@ -96,6 +96,29 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
             device_stream_destroy_current(engine);
             return;
         }
+
+        // Bug 2 Fix: Lookahead touch_mapped_range to prevent blocking page faults
+        // touch_mapped_range (MADV_WILLNEED/PrefetchVirtualMemory) is async. If we call it
+        // immediately before memcpy, pages may not be in RAM yet → page fault blocks IO worker.
+        // Solution: peek next task and touch its pages NOW, while processing current task.
+        // By the time we process next task, its pages will likely be in RAM.
+        {
+            glm5_prefetch_task lookahead_task{};
+            if (peek_stage_task(engine, engine->disk_stage, &lookahead_task)) {
+                if (lookahead_task.tensor_index >= 0 &&
+                    (size_t)lookahead_task.tensor_index < engine->tensors.size()) {
+                    const glm5_tensor_record& next_rec = engine->tensors[lookahead_task.tensor_index];
+                    mmap_context_t* next_shard = get_or_map_tensor_shard(engine, next_rec);
+                    if (next_shard) {
+                        const uint8_t* next_src = static_cast<const uint8_t*>(mmap_get_ptr(next_shard, 0));
+                        if (next_src) {
+                            touch_mapped_range(next_src, tensor_stream_bytes(next_rec));
+                        }
+                    }
+                }
+            }
+        }
+
         int ok = 0;
         int terminal = 1;
         if (task.raw_span_index >= 0) {
@@ -158,6 +181,25 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                     }
                 }
             } else {
+                // Critical Fix 5: Check pinned_stage capacity BEFORE disk read
+                // Reading from disk then discovering pinned_stage is full wastes disk bandwidth.
+                // Check hard-cap before prefetch_tensor_disk_to_ram to avoid unnecessary I/O.
+                if (task.target_tier == GLM5_TIER_VRAM &&
+                    engine->io_config.enable_multistage_pipeline && engine->staging) {
+                    const uint32_t pinned_depth_pre = engine->pinned_stage.depth.load(std::memory_order_relaxed);
+                    const uint32_t pinned_hard_cap = engine->io_config.max_prefetch_queue;
+                    if (pinned_hard_cap > 0 && pinned_depth_pre >= pinned_hard_cap) {
+                        ok = preserve_requeue(task, GLM5_TRANSFER_STAGE_DISK_TO_RAM);
+                        terminal = 0;
+                        finish_stage_task(engine, engine->disk_stage, ok, terminal);
+                        if (worker_index >= engine->disk_worker_target.load()) {
+                            device_stream_destroy_current(engine);
+                            return;
+                        }
+                        continue;
+                    }
+                }
+
                 if (task.target_tier == GLM5_TIER_VRAM &&
                     engine->io_config.enable_multistage_pipeline && engine->staging) {
                     const uint32_t pinned_depth = engine->pinned_stage.depth.load(std::memory_order_relaxed);

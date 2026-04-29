@@ -6,6 +6,9 @@ bool WeightLoader::load_expert(uint32_t layer, uint32_t expert, ExpertWeights* o
     if (!out) {
         return false;
     }
+    // Critical Fix 1: Lock to prevent concurrent access race on active_part_
+    std::lock_guard<std::mutex> lock(mtx_);
+
     ExpertManifestEntry entry{};
     if (!manifest_.find_expert(layer, expert, &entry)) {
         return false;

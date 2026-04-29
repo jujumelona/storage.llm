@@ -18,6 +18,7 @@ bool WeightLoader::open(
 }
 
 void WeightLoader::close() {
+    std::lock_guard<std::mutex> lock(mtx_);
     part_.close();
     footer_ = JujuFooter{};
     model_root_.clear();

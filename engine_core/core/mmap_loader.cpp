@@ -454,12 +454,21 @@ void mmap_prefetch(mmap_context_t* ctx, size_t offset, size_t length) {
 
 #ifndef _WIN32
     // POSIX: MADV_WILLNEED
+    // Critical Fix 2: Prevent integer overflow in offset + length
+    // If offset + length > SIZE_MAX, wraps to small value causing massive madvise call
+    if (length > ctx->size - offset) {
+        length = ctx->size - offset;
+    }
     char* addr = (char*)ctx->addr + offset;
-    size_t end = offset + length;
+    size_t end = offset + length; // Now safe from overflow
     if (end > ctx->size) end = ctx->size;
 
     madvise(addr, end - offset, MADV_WILLNEED);
 #else
+    // Critical Fix 2: Prevent integer overflow (Windows path)
+    if (length > ctx->size - offset) {
+        length = ctx->size - offset;
+    }
     char* addr = (char*)ctx->addr + offset;
     size_t end = offset + length;
     if (end > ctx->size) end = ctx->size;

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <string>
+#include <mutex>
 
 namespace storagellm {
 
@@ -54,6 +55,10 @@ private:
     std::string model_root_;
     std::string footer_root_;
     uint32_t active_part_ = UINT32_MAX;
+    // Critical Fix 1: Thread safety for concurrent io_worker access
+    // Multiple io_workers calling load_expert() simultaneously cause race on active_part_,
+    // leading to wrong weights loaded into VRAM (data corruption).
+    std::mutex mtx_;
 };
 
 }  // namespace storagellm

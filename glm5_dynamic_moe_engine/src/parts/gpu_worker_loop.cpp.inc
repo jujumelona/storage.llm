@@ -50,38 +50,69 @@ static void gpu_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                     0
                 );
                 if (ok[i] == GLM5_DEVICE_COPY_BACKPRESSURE) {
-                    // Problem 3 Fix: Give GPU 2ms to free space before discarding pinned data.
-                    // Immediate discard wastes completed RAM→pinned copy (tens of ms).
-                    // 2ms wait allows in-flight GPU copies to complete and free VRAM.
-                    {
-                        std::unique_lock<std::mutex> lk(engine->gpu_stage.mtx);
-                        engine->gpu_stage.pop_cv.wait_for(lk, std::chrono::milliseconds(2));
-                    }
+                    // Bug 4 Fix: Preserve staging_slot when staging_valid==1 to avoid wasting RAM→pinned copy
+                    // BACKPRESSURE means GPU is temporarily full. If staging data is valid, keep the slot
+                    // and retry gpu_stage with 5ms wait. Only discard as last resort after retry fails.
                     glm5_prefetch_task once_more = batch[i];
                     once_more.stage = GLM5_TRANSFER_STAGE_PINNED_TO_GPU;
-                    once_more.urgent = 0;
-                    if (enqueue_stage_or_retry(engine, engine->gpu_stage, once_more)) {
-                        ok[i] = 1;
-                        terminal[i] = 0;
-                        engine->gpu_stage.cv.notify_one();
-                    } else {
-                        // Last resort: discard pinned slot and re-queue to disk_stage
-                        if (batch[i].staging_slot != UINT32_MAX) {
+                    once_more.urgent = 1;
+
+                    // If staging data is valid, preserve it and retry with longer wait
+                    if (batch[i].staging_valid && batch[i].staging_slot != UINT32_MAX) {
+                        {
+                            std::unique_lock<std::mutex> lk(engine->gpu_stage.mtx);
+                            engine->gpu_stage.pop_cv.wait_for(lk, std::chrono::milliseconds(5));
+                        }
+                        if (enqueue_stage_or_retry(engine, engine->gpu_stage, once_more)) {
+                            ok[i] = 1;
+                            terminal[i] = 0;
+                            engine->gpu_stage.cv.notify_one();
+                        } else {
+                            // Last resort: discard staging slot after retry failed
                             release_staging_slot(engine, batch[i].staging_slot);
                             batch[i].staging_slot = UINT32_MAX;
+                            glm5_prefetch_task pinned_retry = batch[i];
+                            pinned_retry.stage = GLM5_TRANSFER_STAGE_RAM_TO_PINNED;
+                            pinned_retry.staging_slot = UINT32_MAX;
+                            pinned_retry.staging_bytes = 0;
+                            pinned_retry.staging_valid = 0;
+                            pinned_retry.urgent = 1;
+                            ok[i] = enqueue_stage_or_retry(engine, engine->pinned_stage, pinned_retry) ? 1 : 0;
+                            if (ok[i]) {
+                                terminal[i] = 0;
+                                engine->pinned_stage.cv.notify_one();
+                            } else {
+                                engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                            }
                         }
-                        glm5_prefetch_task pinned_retry = batch[i];
-                        pinned_retry.stage = GLM5_TRANSFER_STAGE_RAM_TO_PINNED;
-                        pinned_retry.staging_slot = UINT32_MAX;
-                        pinned_retry.staging_bytes = 0;
-                        pinned_retry.staging_valid = 0;
-                        pinned_retry.urgent = 1;
-                        ok[i] = enqueue_stage_or_retry(engine, engine->pinned_stage, pinned_retry) ? 1 : 0;
-                        if (ok[i]) {
+                    } else {
+                        // No valid staging data, use shorter 2ms wait
+                        {
+                            std::unique_lock<std::mutex> lk(engine->gpu_stage.mtx);
+                            engine->gpu_stage.pop_cv.wait_for(lk, std::chrono::milliseconds(2));
+                        }
+                        if (enqueue_stage_or_retry(engine, engine->gpu_stage, once_more)) {
+                            ok[i] = 1;
                             terminal[i] = 0;
-                            engine->pinned_stage.cv.notify_one();
+                            engine->gpu_stage.cv.notify_one();
                         } else {
-                            engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                            if (batch[i].staging_slot != UINT32_MAX) {
+                                release_staging_slot(engine, batch[i].staging_slot);
+                                batch[i].staging_slot = UINT32_MAX;
+                            }
+                            glm5_prefetch_task pinned_retry = batch[i];
+                            pinned_retry.stage = GLM5_TRANSFER_STAGE_RAM_TO_PINNED;
+                            pinned_retry.staging_slot = UINT32_MAX;
+                            pinned_retry.staging_bytes = 0;
+                            pinned_retry.staging_valid = 0;
+                            pinned_retry.urgent = 1;
+                            ok[i] = enqueue_stage_or_retry(engine, engine->pinned_stage, pinned_retry) ? 1 : 0;
+                            if (ok[i]) {
+                                terminal[i] = 0;
+                                engine->pinned_stage.cv.notify_one();
+                            } else {
+                                engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                            }
                         }
                     }
                 }

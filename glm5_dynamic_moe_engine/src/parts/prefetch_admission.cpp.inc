@@ -44,12 +44,15 @@ static glm5_tier_t prefetch_admitted_tier(
         target = GLM5_TIER_RAM;
     }
     const uint64_t ram_budget = tier_budget(engine, GLM5_TIER_RAM);
+    // Critical Fix 4: Raise RAM threshold from 87% to 93% to reduce hot-path eviction
+    // io_worker proactive eviction at 75% provides sufficient headroom.
+    // Admission-triggered demote_cold_until causes token generation latency spikes.
+    // By raising threshold, we delegate eviction to background io_worker and only
+    // route to DB when RAM is critically full.
     if (target == GLM5_TIER_RAM && ram_budget > 0 &&
-        tier_used(engine, GLM5_TIER_RAM) + extra_reserved + item.bytes > (ram_budget * 87ull) / 100ull) {
-        demote_cold_until(engine, GLM5_TIER_RAM, item.bytes, to_free);
-        if (tier_used(engine, GLM5_TIER_RAM) + extra_reserved + item.bytes > (ram_budget * 87ull) / 100ull) {
-            target = GLM5_TIER_DB;
-        }
+        tier_used(engine, GLM5_TIER_RAM) + extra_reserved + item.bytes > (ram_budget * 93ull) / 100ull) {
+        // Route to DB instead of synchronous eviction
+        target = GLM5_TIER_DB;
     }
     return target;
 }

@@ -46,6 +46,7 @@ typedef struct {
     uint64_t direct_stage_done;
     uint64_t staging_wraps;
     uint32_t staging_slot_deficit;
+    uint64_t staging_slot_waits;
     uint64_t recommended_staging_bytes;
     uint64_t topology_predictions;
     uint64_t topology_updates;
