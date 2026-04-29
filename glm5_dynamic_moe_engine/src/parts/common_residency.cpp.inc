@@ -52,7 +52,9 @@ static void apply_common_vram_reservation(glm5_pc_engine* engine) {
     }
     engine->common_vram_reserved_bytes.store(0);
     engine->vram_used_bytes.store(0);
-    if (!engine->config.prefer_gpu || !caps_gpu_backend_available(engine->backend_caps)) {
+    if (!engine->config.prefer_gpu || !caps_gpu_backend_available(engine->backend_caps) ||
+        !engine->io_config.enable_common_raw_vram_pin) {
+        engine->common_vram_upload_complete.store(true, std::memory_order_release);
         return;
     }
     const uint64_t reserve = std::min<uint64_t>(
@@ -61,4 +63,5 @@ static void apply_common_vram_reservation(glm5_pc_engine* engine) {
     );
     engine->common_vram_reserved_bytes.store(reserve);
     engine->vram_used_bytes.store(0);
+    engine->common_vram_upload_complete.store(reserve == 0, std::memory_order_release);
 }

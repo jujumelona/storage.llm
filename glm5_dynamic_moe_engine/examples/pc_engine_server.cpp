@@ -54,7 +54,7 @@ struct server_options {
     bool openclaw_config_only = false;
     bool ram_budget_override = false;
     bool vram_budget_override = false;
-    glm5_execution_policy_t policy = GLM5_EXECUTION_BALANCED;
+    glm5_execution_policy_t policy = GLM5_EXECUTION_PERFORMANCE;
     glm5_pc_engine_config_t engine_config = glm5_pc_default_config();
 };
 

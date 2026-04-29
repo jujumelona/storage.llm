@@ -66,9 +66,11 @@ static void fill_orchestrator_plan(glm5_pc_engine* engine, const glm5_runtime_or
     }
     plan->throttle_speculative = !plan->allow_gpu_dense || !plan->route_sparse_to_cpu || os_busy;
     plan->drop_speculative = policy == GLM5_EXECUTION_LOW_IMPACT && plan->throttle_speculative;
-    plan->selected_tier = caps_gpu_backend_available(engine->backend_caps) &&
-        vram_expert_budget_bytes(engine) > 0 && plan->allow_gpu_dense ? GLM5_TIER_VRAM : GLM5_TIER_RAM;
-    plan->speculative_tier = plan->drop_speculative ? GLM5_TIER_DB : GLM5_TIER_RAM;
+    const bool gpu_cache_ready = caps_gpu_backend_available(engine->backend_caps) &&
+        vram_expert_budget_bytes(engine) > 0 && plan->allow_gpu_dense;
+    plan->selected_tier = gpu_cache_ready ? GLM5_TIER_VRAM : GLM5_TIER_RAM;
+    plan->speculative_tier = plan->drop_speculative ? GLM5_TIER_DB :
+        (gpu_cache_ready ? GLM5_TIER_VRAM : GLM5_TIER_RAM);
 }
 
 static int worker_resize_direction(

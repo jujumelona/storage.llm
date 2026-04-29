@@ -111,6 +111,9 @@ static int prefetch_fixed_core_raw(glm5_pc_engine* e) {
     uint64_t budget = e ? e->common_vram_reserved_bytes.load() : 0;
     uint64_t bytes = 0;
     if (!e || !e->io_config.enable_common_raw_vram_pin || budget == 0) {
+        if (e) {
+            e->common_vram_upload_complete.store(true, std::memory_order_release);
+        }
         return 0;
     }
     const glm5_storage_constants_t* storage = glm5_storage_constants();

@@ -34,8 +34,12 @@ static glm5_tier_t prefetch_admitted_tier(
     if (!engine || prefetch_is_router_selected(item)) {
         return item.target_tier;
     }
-    // Bug 3 Fix: Block VRAM admission if common tensors are not fully uploaded
-    if (item.target_tier == GLM5_TIER_VRAM && !engine->common_vram_upload_complete.load(std::memory_order_acquire)) {
+    const bool waits_for_common_vram =
+        engine->io_config.enable_common_raw_vram_pin &&
+        engine->common_vram_reserved_bytes.load(std::memory_order_relaxed) > 0;
+    if (item.target_tier == GLM5_TIER_VRAM &&
+        waits_for_common_vram &&
+        !engine->common_vram_upload_complete.load(std::memory_order_acquire)) {
         return GLM5_TIER_RAM;
     }
 

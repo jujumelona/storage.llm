@@ -83,8 +83,9 @@ static void prefetch_plan_add_lookahead(
     if (!engine->io_config.enable_lookahead_prefetch || !experts) {
         return;
     }
+    const glm5_tier_t tier = prefetch_plan_selected_tier(engine);
     for (uint32_t i = 0; i < count; ++i) {
-        prefetch_plan_add_item(engine, items, next_layer, experts[i], GLM5_TIER_RAM, GLM5_PREFETCH_REASON_LOOKAHEAD, 100.0f);
+        prefetch_plan_add_item(engine, items, next_layer, experts[i], tier, GLM5_PREFETCH_REASON_LOOKAHEAD, 100.0f);
     }
 }
 
