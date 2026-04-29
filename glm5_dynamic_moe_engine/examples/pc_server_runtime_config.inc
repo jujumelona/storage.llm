@@ -24,6 +24,10 @@ static glm5_io_config_t make_server_io_config(const server_options& opts, const 
     io.enable_directstorage = caps.supports_directstorage;
     io.enable_gpudirect_storage = caps.supports_gpudirect_storage;
     io.enable_bam_nvme = caps.supports_gpu_direct_file_io;
+    // Keep server startup responsive. Fixed/common raw tensors are read lazily
+    // by the forward path; synchronous VRAM pinning before listen() can make the
+    // local API look dead on large model roots.
+    io.enable_common_raw_vram_pin = 0;
     io.prefetch_window_layers = std::max<uint32_t>(2u, io.prefetch_window_layers);
     io.disk_worker_threads = 4;
     io.pinned_worker_threads = caps.copy_streams > 1 ? 4u : 2u;

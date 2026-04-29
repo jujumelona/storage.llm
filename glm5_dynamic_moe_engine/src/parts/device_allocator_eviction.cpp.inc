@@ -92,9 +92,11 @@ static void device_make_room_locked(
         bool expected = false;
         if (!e->vram_eviction_in_progress.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            // Bug 17 Fix: 5ms → 500µs to reduce hot-path latency during frequent expert swaps
+            std::this_thread::yield();
             e->vram_eviction_cv.wait_for(
                 device_lock,
-                std::chrono::milliseconds(5),
+                std::chrono::microseconds(500),
                 [&]() {
                     return !e->vram_eviction_in_progress.load(std::memory_order_acquire);
                 });

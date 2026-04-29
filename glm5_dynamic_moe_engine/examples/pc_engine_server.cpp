@@ -1582,12 +1582,14 @@ static int server_main(int argc, char** argv) {
     if (!opts.table_path.empty()) {
         const char* root = opts.model_root.empty() ? nullptr : opts.model_root.c_str();
         const char* scale4 = opts.scale4_path.empty() ? nullptr : opts.scale4_path.c_str();
+        std::cerr << "[storagellm] loading codec table: " << opts.table_path << "\n" << std::flush;
         if (!glm5_pc_engine_load_codec_table(engine, opts.table_path.c_str(), root, scale4)) {
             glm5_pc_engine_destroy(engine);
             network_cleanup();
             std::cerr << "Failed to load codec table: " << opts.table_path << "\n";
             return 1;
         }
+        std::cerr << "[storagellm] codec table loaded\n" << std::flush;
     }
     if (!opts.topology_path.empty()) {
         glm5_pc_engine_load_topology(engine, opts.topology_path.c_str());

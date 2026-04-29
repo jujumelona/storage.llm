@@ -89,7 +89,18 @@ static void pinned_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                         std::unique_lock<std::mutex> lock(engine->gpu_stage.mtx);
                         engine->gpu_stage.pop_cv.wait_for(lock, std::chrono::milliseconds(1));
                     }
-                    if (!queued_retry) {
+                    // Bug 22 Fix: Sync fallback when gpu_stage is saturated
+                    // Without this, staging data is discarded and must be re-fetched from disk
+                    if (!queued_retry && next.staging_valid && next.staging_slot != UINT32_MAX) {
+                        const glm5_tensor_record& rec = engine->tensors[task.tensor_index];
+                        const int sync_ok = prefetch_tensor_pinned_to_gpu(
+                            engine, rec, next.staging_slot, 0, 1, 1);
+                        if (sync_ok) {
+                            ok = 1;
+                            queued_retry = true;
+                        }
+                        release_staging_slot(engine, next.staging_slot);
+                    } else if (!queued_retry) {
                         ok = 0;
                         if (next.staging_slot != UINT32_MAX) {
                             release_staging_slot(engine, next.staging_slot);

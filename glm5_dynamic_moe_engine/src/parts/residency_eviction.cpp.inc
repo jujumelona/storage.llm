@@ -14,7 +14,8 @@ static int pop_valid_evict_candidate(glm5_pc_engine* engine, glm5_tier_t tier, g
         return 0;
     }
     const uint32_t heap_size = (uint32_t)engine->evict_heaps[idx].size();
-    const uint32_t stale_limit = std::max<uint32_t>(256u, std::min<uint32_t>(1024u, heap_size / 4u));
+    // Bug 21 Fix: Reduce stale_limit from 128 to 64 to reduce map_mutex contention
+    const uint32_t stale_limit = std::max<uint32_t>(64u, std::min<uint32_t>(256u, heap_size / 8u));
     uint32_t stale_count = 0;
     std::unique_lock<std::mutex> heap_lock(evict_heap_mutex(engine, idx));
     while (!engine->evict_heaps[idx].empty() && stale_count < stale_limit) {
@@ -23,9 +24,8 @@ static int pop_valid_evict_candidate(glm5_pc_engine* engine, glm5_tier_t tier, g
         engine->evict_heap_versions[idx].fetch_add(1, std::memory_order_release);
         if (victim.slot >= engine->expert_states.size()) {
             ++stale_count;
-            // Bottleneck 1: Increase compaction threshold to reduce heap_mutex hold time
-            // 64 → 128 reduces compaction frequency by 2x, trading heap memory for latency
-            if (stale_count >= 128u) {
+            // Bug 21 Fix: Reduce compaction threshold from 128 to 64
+            if (stale_count >= 64u) {
                 heap_lock.unlock();
                 compact_evict_heap(engine, idx, true);
                 heap_lock.lock();
@@ -44,8 +44,8 @@ static int pop_valid_evict_candidate(glm5_pc_engine* engine, glm5_tier_t tier, g
             }
         }
         ++stale_count;
-        // Bottleneck 1: Increase compaction threshold (64 → 128)
-        if (stale_count >= 128u) {
+        // Bug 21 Fix: Reduce compaction threshold from 128 to 64
+        if (stale_count >= 64u) {
             heap_lock.unlock();
             compact_evict_heap(engine, idx, true);
             heap_lock.lock();
