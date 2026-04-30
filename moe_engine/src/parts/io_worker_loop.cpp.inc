@@ -1,11 +1,11 @@
-static int prefetch_one_raw_span(
+锘縮tatic int prefetch_one_raw_span(
     moe_pc_engine* e,
     const moe_storage_raw_span_spec_t& s,
     uint8_t pool,
     int allow_sync_fallback = 1
 );
 
-// BUGFIX 62: Forward declaration for dynamic batch_max function ?呪槄
+// BUGFIX 62: Forward declaration for dynamic batch_max function ?锟解槄
 static uint32_t moe_gpu_stage_batch_max(const moe_pc_engine* engine);
 
 static int io_worker_requeue_disk_task(
@@ -53,7 +53,7 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         return;
     }
     while (!engine->io_stop.load(std::memory_order_relaxed)) {
-        // BUGFIX 81: Problem 6 - Replace 5ms polling with event-driven CV ?呪槄??
+        // BUGFIX 81: Problem 6 - Replace 5ms polling with event-driven CV ?锟解槄??
         // Old: 5ms sleep caused CPU overhead and potential oscillation.
         // New: Wait on vram_eviction_cv. Triggered instantly when allocation > 85%.
         // Fallback to 50ms wait to periodically check RAM eviction.
@@ -70,7 +70,7 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         const uint64_t ram_bud = tier_budget(engine, moe_TIER_RAM);
         const uint64_t vram_used = tier_used(engine, moe_TIER_VRAM);
 
-        // BUGFIX 57: Issue 2 - Lower proactive eviction trigger to 85% ?呪槄
+        // BUGFIX 57: Issue 2 - Lower proactive eviction trigger to 85% ?锟解槄
         // Problem: Attention prefetch cutoff at 87%, proactive eviction at 90%
         // ??3% dead zone where attention blocked but eviction not started
         // ??CPU fallback or mmap streaming for attention weights
@@ -82,7 +82,7 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
             std::vector<std::pair<int, int>> freed;
             demote_cold_until(engine, moe_TIER_VRAM, vram_used - vram_target, freed);
             if (!freed.empty() && !engine->io_stop.load(std::memory_order_relaxed)) {
-                // BUGFIX 36: Reduce batch_size from 8 to 4 to lower mutex hold time ?呪槄??
+                // BUGFIX 36: Reduce batch_size from 8 to 4 to lower mutex hold time ?锟解槄??
                 // Old: 8 脳 cuMemFree (100碌s each) = 800碌s device_mutex hold
                 // New: 4 脳 cuMemFree = 400碌s device_mutex hold
                 // All device_copy_tensor calls wait on device_mutex ??halving hold time improves throughput
@@ -104,7 +104,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         return;
     }
 
-    // BUGFIX 27: Add StreamGuard to prevent CUDA stream leak ?呪槄
+    // BUGFIX 27: Add StreamGuard to prevent CUDA stream leak ?锟解槄
     // Old: device_stream_destroy_current only on normal exit paths
     // New: RAII guard ensures cleanup on exception/abnormal termination
     // Matches gpu_worker_loop pattern for consistency
@@ -160,7 +160,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 local_requeues.pop_front();
                 continue;
             }
-            // PIPELINE FIX 10: Wait on correct CV based on requeue target ?呪槄??
+            // PIPELINE FIX 10: Wait on correct CV based on requeue target ?锟解槄??
             // Old: Always waited on disk_stage.pop_cv even when gpu_stage was full
             // New: Wait on gpu_stage.pop_cv when target is GPU, disk_stage.pop_cv otherwise
             // Eliminates 2ms polling delay when GPU stage is the actual bottleneck
@@ -195,10 +195,10 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         // immediately before memcpy, pages may not be in RAM yet ??page fault blocks IO worker.
         // Solution: peek next task and touch its pages NOW, while processing current task.
         // By the time we process next task, its pages will likely be in RAM.
-        // PIPELINE FIX 11: Multi-task lookahead for multiple disk workers ?呪槄
+        // PIPELINE FIX 11: Multi-task lookahead for multiple disk workers ?锟解槄
         // Old: Single lookahead ??only helps 1 worker, others still hit page faults
         // New: Lookahead N tasks where N = disk_workers ??all workers benefit
-        // BUGFIX 34: Increase lookahead cap for high disk worker counts ?呪槄
+        // BUGFIX 34: Increase lookahead cap for high disk worker counts ?锟解槄
         // Old: min(disk_workers, 4) ??workers 5+ still hit page faults
         // New: min(disk_workers * 2, 8) ??scales with worker count, caps at 8
         // Rationale: OS prefetcher can handle 8 concurrent MADV_WILLNEED hints efficiently
@@ -230,7 +230,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 if (next_shard) {
                     const uint8_t* next_src = static_cast<const uint8_t*>(mmap_get_ptr(next_shard, 0));
                     if (next_src) {
-                        touch_mapped_range(next_src, tensor_stream_bytes(next_rec));
+                        touch_mapped_range(engine, next_src, tensor_stream_bytes(next_rec));
                     }
                 }
             }
@@ -351,7 +351,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 // Critical Fix 5: Check pinned_stage capacity BEFORE disk read
                 // Reading from disk then discovering pinned_stage is full wastes disk bandwidth.
                 // Check hard-cap before prefetch_tensor_disk_to_ram to avoid unnecessary I/O.
-                // BUGFIX 22: Snapshot pinned_depth once to avoid TOCTOU ?呪槄
+                // BUGFIX 22: Snapshot pinned_depth once to avoid TOCTOU ?锟解槄
                 if (task.target_tier == moe_TIER_VRAM &&
                     engine->io_config.enable_multistage_pipeline && engine->staging) {
                     const uint32_t pinned_depth = engine->pinned_stage.depth.load(std::memory_order_relaxed);

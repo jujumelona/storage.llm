@@ -1,4 +1,4 @@
-static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
+﻿static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
     if (!engine) {
         return;
     }
@@ -20,7 +20,9 @@ static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                     engine,
                     worker_index,
                     pingpong++,
-                    task.target_tier != moe_TIER_VRAM
+                    task.bytes,
+                    true,
+                    false
                 );
                 if (task.staging_slot == UINT32_MAX && engine->io_stop.load()) {
                     finish_stage_task(engine, engine->pinned_stage, 0, terminal);
@@ -44,7 +46,7 @@ static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                         terminal = 0;
                         engine->pinned_stage.cv.notify_one();
                     } else {
-                        // BUGFIX 64: Issue 8 - Track dropped_requests when enqueue fails ?�★
+                        // BUGFIX 64: Issue 8 - Track dropped_requests when enqueue fails ?�★
                         // Problem: enqueue_stage_or_retry fails ??task silently lost
                         // Only staging_slot_waits increments, dropped_requests stays 0
                         // /health shows dropped_requests=0 but tasks are actually dropping

@@ -1,4 +1,4 @@
-static int prefetch_tensor_disk_to_ram(moe_pc_engine* engine, const moe_tensor_record& rec) {
+﻿static int prefetch_tensor_disk_to_ram(moe_pc_engine* engine, const moe_tensor_record& rec) {
     mmap_context_t* shard = get_or_map_tensor_shard(engine, rec);
     if (!engine || !shard || !mmap_get_ptr(shard, 0)) {
         return 0;
@@ -44,7 +44,7 @@ static int prefetch_tensor_disk_to_ram(moe_pc_engine* engine, const moe_tensor_r
             if (!src) {
                 return 0;
             }
-            touch_mapped_range(src, length);
+            touch_mapped_range(e, src, length);
             if (!hint_issued) {
                 engine->io_atomic.bytes_touch_fallback.fetch_add(length);
             }

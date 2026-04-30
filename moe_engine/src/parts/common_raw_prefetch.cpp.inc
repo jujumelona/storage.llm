@@ -1,4 +1,4 @@
-static constexpr uint32_t moe_RAW_ROLE_ROUTER = 1u;
+﻿static constexpr uint32_t moe_RAW_ROLE_ROUTER = 1u;
 static constexpr uint32_t moe_RAW_ROLE_ATTENTION = 2u;
 static constexpr uint32_t moe_RAW_ROLE_NORM = 4u;
 static constexpr uint32_t moe_RAW_ROLE_SHARED = 8u;
@@ -49,7 +49,7 @@ static int prefetch_one_raw_span(moe_pc_engine* e, const moe_storage_raw_span_sp
     if (!src) {
         return 0;
     }
-    touch_mapped_range(src, s.bytes);
+    touch_mapped_range(e, src, s.bytes);
     if (!hint_issued) {
         e->io_atomic.bytes_touch_fallback.fetch_add(s.bytes);
     }
@@ -104,7 +104,7 @@ static uint64_t prefetch_raw_layer_roles(
             ++spans;
         }
     }
-    // BUGFIX 33: Separate queued vs transferred byte counters ?�★??    // Old: Both enqueue_only and actual transfer incremented common_raw_prefetched_bytes
+    // BUGFIX 33: Separate queued vs transferred byte counters ?�★??    // Old: Both enqueue_only and actual transfer incremented common_raw_prefetched_bytes
     // New: enqueue_only ??common_raw_queued_bytes, actual transfer ??common_raw_prefetched_bytes
     // Prevents stats confusion: "prefetched" now means actually in VRAM, "queued" means in pipeline
     if (bytes) {

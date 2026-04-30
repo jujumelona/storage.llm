@@ -152,7 +152,7 @@ static int device_copy_tensor(
     // New: thread-local turn counter ??workers spread across slot pool
     static thread_local uint32_t tl_device_copy_turn = 0;
     const uint32_t slot_idx = (e->staging_slots.size() > 0 && bytes <= e->staging_slot_size)
-        ? acquire_staging_slot(e, 0u, tl_device_copy_turn++, false) : UINT32_MAX;
+        ? acquire_staging_slot(e, 0u, tl_device_copy_turn++, bytes, false) : UINT32_MAX;
 
     if (slot_idx != UINT32_MAX) {
         // Staging fast-path: memcpy ranges ??pinned staging ??single H2D async

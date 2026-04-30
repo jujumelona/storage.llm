@@ -27,7 +27,12 @@ static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int
 // 2. CreateFile + ReadFileEx with overlapped I/O
 // 3. Use OpenProcess(PROCESS_ALL_ACCESS, FALSE, GetCurrentProcessId())
 // Status: Documented as TODO, requires Windows-specific testing
-static void touch_mapped_range(const uint8_t* src, uint64_t bytes) {
+static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, uint64_t bytes) {
+#ifdef _WIN32
+    if (engine && engine->io_config.enable_directstorage) {
+        return; // DirectStorage가 prefetch를 처리하므로 불필요
+    }
+#endif
     if (!src || bytes == 0) {
         return;
     }
@@ -60,12 +65,13 @@ static void touch_mapped_range(const uint8_t* src, uint64_t bytes) {
     // Removed: volatile uint8_t sink loop that caused blocking page faults
 }
 
-static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t start_idx, uint32_t count, uint32_t worker_index, uint32_t turn);
+static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t start_idx, uint32_t count, uint32_t worker_index, uint32_t turn, uint64_t required_bytes);
 
 static uint32_t acquire_staging_slot(
     moe_pc_engine* engine,
     uint32_t worker_index,
     uint32_t turn,
+    uint64_t required_bytes,
     bool for_pinned = true,
     bool for_direct = false
 ) {
@@ -106,10 +112,10 @@ static uint32_t acquire_staging_slot(
     if (pref_count == 0) {
         return UINT32_MAX;
     }
-    return acquire_staging_slot_internal(engine, pref_start, pref_count, worker_index, turn);
+    return acquire_staging_slot_internal(engine, pref_start, pref_count, worker_index, turn, required_bytes);
 }
 
-static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t start_idx, uint32_t count, uint32_t worker_index, uint32_t turn) {
+static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t start_idx, uint32_t count, uint32_t worker_index, uint32_t turn, uint64_t required_bytes) {
     const uint32_t preferred = count > 1 ? (worker_index * 2u + turn) % count : 0u;
     for (;;) {
         for (uint32_t probe = 0; probe < count; ++probe) {
@@ -120,6 +126,10 @@ static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t st
                     true,
                     std::memory_order_acquire,
                     std::memory_order_relaxed)) {
+                if (required_bytes > 0 && engine->staging_slots[idx].size < required_bytes) {
+                    engine->staging_slots[idx].in_use.store(false, std::memory_order_release);
+                    continue;
+                }
                 engine->staging_free_slot_count.fetch_sub(1, std::memory_order_relaxed);
                 return idx;
             }

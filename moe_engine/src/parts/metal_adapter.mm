@@ -3,8 +3,8 @@
 
 extern "C" {
 
-void* metal_zero_copy_map(void* src, uint64_t bytes) {
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+void* metal_zero_copy_map(void* device_handle, void* src, uint64_t bytes) {
+    id<MTLDevice> device = device_handle ? (__bridge id<MTLDevice>)device_handle : MTLCreateSystemDefaultDevice();
     if (!device || !src || bytes == 0) return nullptr;
     
     // Create an MTLBuffer that wraps the existing mmap pointer without copying

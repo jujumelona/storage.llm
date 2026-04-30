@@ -6,6 +6,7 @@ typedef struct {
     uint32_t copy_streams;
     uint32_t prefetch_streams;
     uint64_t device_memory_bytes;
+    uint64_t system_memory_bytes;
     uint64_t recommended_vram_cache_bytes;
     uint64_t recommended_vram_common_bytes;
     uint64_t recommended_pinned_bytes;

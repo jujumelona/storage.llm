@@ -767,6 +767,33 @@ static int moe_read_gguf_tensor_directory(
         &executable);
 }
 
+static int moe_scan_gguf_tensor_infos(
+    std::ifstream& input,
+    uint64_t tensor_count,
+    moe_offload_gguf_file_t* out
+) {
+    if (!out) {
+        return 0;
+    }
+    std::vector<moe_gguf_tensor_dir_entry_t> tensors;
+    uint64_t data_start = 0;
+    uint64_t executable = 0;
+    if (!moe_read_gguf_tensor_infos(
+            input,
+            tensor_count,
+            out->alignment,
+            out->bytes,
+            &tensors,
+            &data_start,
+            &executable)) {
+        return 0;
+    }
+    out->tensor_count = tensor_count;
+    out->data_start = data_start;
+    out->executable_tensor_count = executable;
+    return 1;
+}
+
 static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
     if (!meta || meta->metadata_json.empty()) {
         return;
@@ -937,7 +964,12 @@ static int moe_read_offload_gguf_file(
         double f64_value = 0.0;
         std::string string_value;
         int consumed = 0;
-        if ((key == "general.name" || key == "general.basename" || key == "general.file_type") &&
+        if (key == "general.alignment" && moe_gguf_read_uint_value(input, type, &u64_value)) {
+            consumed = 1;
+            if (u64_value >= 8 && u64_value <= 65536) {
+                out->alignment = moe_u64_to_u32_clamped(u64_value, 32);
+            }
+        } else if ((key == "general.name" || key == "general.basename" || key == "general.file_type") &&
             type == moe_GGUF_TYPE_STRING) {
             consumed = 1;
             if (moe_gguf_read_string(input, &string_value, 65536) &&

@@ -1,4 +1,4 @@
-static uint64_t moe_rt_align_4k(uint64_t value) {
+﻿static uint64_t moe_rt_align_4k(uint64_t value) {
     return moe_juju_align_up(value, 4096ull);
 }
 
@@ -43,6 +43,7 @@ static uint64_t moe_rt_model_bytes_hint(const moe_offload_gguf_scan_t& scan) {
 }
 
 static double moe_rt_compute_tflops_hint(const moe_backend_caps_t& caps) {
+    if (caps.tflops_hint > 0.0) return caps.tflops_hint;
     if (caps.tflops_hint > 0.0) return caps.tflops_hint;
     switch (caps.backend) {
     case moe_BACKEND_CUDA:

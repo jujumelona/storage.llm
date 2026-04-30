@@ -16,6 +16,7 @@ static void fill_backend_caps(
     out_caps->platform = platform;
     out_caps->device_id = 0;
     out_caps->supports_mmap = 1;
+    out_caps->system_memory_bytes = storagellm::available_ram_bytes();
 
     if (backend == moe_BACKEND_CPU) {
         fill_cpu_backend_caps(out_caps);

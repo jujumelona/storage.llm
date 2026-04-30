@@ -97,8 +97,14 @@ static uint32_t device_collect_activation_victims_locked(
     uint32_t active_count = 0;
     const bool should_rebuild = e->activation_evict_heap.size() > 32u;  // Only check if heap is large
     if (should_rebuild) {
-        // Single map scan: returns active_count while rebuilding heap
-        active_count = device_rebuild_activation_heap_locked(e);
+        // 비율 체크 없이 바로 rebuild 하는 대신, 먼저 heap 대비 예상 active 비율 확인
+        // heap이 active의 2배 이상일 때만 rebuild
+        if (e->activation_evict_heap.size() > (uint32_t)e->device_allocations.size() * 2u) {
+            active_count = device_rebuild_activation_heap_locked(e);
+        } else {
+            // rebuild 없이 active_count는 맵 크기로 근사치 사용
+            active_count = (uint32_t)e->device_allocations.size();
+        }
         const bool was_stale = e->activation_evict_heap.size() > active_count * 2u;
         if (was_stale) {
             stale = 0;  // Reset stale counter after rebuild

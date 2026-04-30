@@ -16,6 +16,7 @@
     std::string model_root;
     moe_scale4_file_t* scale4 = nullptr;
     moe_cuda_driver_api cuda{};
+    moe_hip_driver_api hip{};
     void* model_lib_handle = nullptr;
     std::string model_lib_cache_dir;
     std::string model_lib_path;
@@ -30,8 +31,8 @@
     mutable std::mutex map_mutex;       // protects expert_states
     mutable std::shared_mutex shard_mutex; // protects shard_mmaps; cached reads use shared_lock
     std::unordered_map<std::string, std::shared_ptr<std::condition_variable_any>> shard_mmap_cvs;
-    mutable std::mutex device_mutexes[4];
-    std::unordered_map<uint64_t, moe_device_allocation> device_allocations[4];
+    mutable std::mutex device_mutex;
+    std::unordered_map<uint64_t, moe_device_allocation> device_allocations;
     mutable std::shared_mutex topology_mutex;
     mutable std::mutex topology_queue_mutex;
     std::vector<std::pair<uint64_t, uint64_t>> topology_update_queue;
@@ -69,6 +70,7 @@
     uint32_t worker_resize_pending_gpu{0};
     int worker_resize_pending_direction{0};
     uint32_t worker_resize_streak{0};
+    uint64_t last_dropped_requests_snapshot{0};
 
     // BUG 3 FIX: Prefetch window hysteresis (same pattern as worker resize) ?�★
     uint32_t prefetch_window_pending{0};
@@ -80,6 +82,9 @@
     uint64_t staging_slot_size = 0;
     std::mutex staging_slot_mutex;
     std::condition_variable staging_slot_cv;
+    std::condition_variable staging_pinned_cv;
+    std::condition_variable staging_gpu_cv;
+    std::condition_variable staging_direct_cv;
     std::string topology_path;
     std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> topology_edges;
     std::mutex prefetch_plan_mutex;

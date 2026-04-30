@@ -1,4 +1,4 @@
-// BUGFIX 58/62: Issue 4A - Dynamic batch_max based on backend_caps ?�★
+﻿// BUGFIX 58/62: Issue 4A - Dynamic batch_max based on backend_caps ?�★
 // Problem: moe_gpu_stage_batch_max = 4 hardcoded
 // PCIe 5.0 x16: 4 too low (underutilizes bandwidth)
 // PCIe 3.0 x4: 4 too high (causes queue backup)
@@ -85,7 +85,7 @@ static void moe_staging_slot_targets(
     if (direct_out) *direct_out = direct_target;
 }
 
-// BUGFIX 75: Issue 10 - Use largest remainder method for slot distribution ?�★
+// BUGFIX 75: Issue 10 - Use largest remainder method for slot distribution ?�★
 // Problem: Integer division rounding causes direct_slots to become 0
 // Example: total=7, ratio 2:3:1 ??pinned=2, gpu=3, direct=1, sum=6
 // while loop adds 1 to gpu ??direct=0 ??DirectStorage disabled
@@ -293,7 +293,7 @@ static void configure_staging_slots(moe_pc_engine* engine) {
         update_staging_slot_deficit(engine);
         return;
     }
-    // PIPELINE FIX 5: Validate initialization order ?�★
+    // PIPELINE FIX 5: Validate initialization order ?�★
     // max_tensor_stream_bytes must be set BEFORE configure_staging_slots is called.
     // It's set during tensor index parsing (safetensors manifest load).
     // If 0, slot size defaults to 4MB ??NVFP4 expert triplets (~20MB) fail to copy.
@@ -349,7 +349,7 @@ static void configure_staging_slots(moe_pc_engine* engine) {
     engine->staging_slot_size = slot_size;
     engine->staging_slots.reserve(slot_count);
 #if defined(__APPLE__) && defined(__MACH__)
-extern "C" void* metal_zero_copy_map(void* src, uint64_t bytes);
+extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t bytes);
 #endif
 
     for (uint32_t i = 0; i < slot_count; ++i) {
@@ -359,7 +359,7 @@ extern "C" void* metal_zero_copy_map(void* src, uint64_t bytes);
         slot.pinned = engine->staging_pinned;
 #if defined(__APPLE__) && defined(__MACH__)
         if (engine->backend_caps.backend == moe_BACKEND_METAL) {
-            slot.metal_buffer = metal_zero_copy_map(slot.buf, slot.size);
+            slot.metal_buffer = metal_zero_copy_map(nullptr, slot.buf, slot.size);
         } else {
             slot.metal_buffer = nullptr;
         }
