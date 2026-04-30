@@ -324,26 +324,6 @@ def json_section_bytes(payload):
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def hash_remote_tensor_group(session, url, group, token=None, chunk_size=16 * 1024 * 1024):
-    digest = hashlib.sha256()
-    for tensor in group:
-        resp = fetch_range(
-            session,
-            url,
-            tensor["source_offset"],
-            tensor["source_offset"] + tensor["bytes"] - 1,
-            token=token,
-            stream=True,
-        )
-        try:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    digest.update(chunk)
-        finally:
-            resp.close()
-    return digest.hexdigest()
-
-
 def build_juju_shard_plan_from_hf_url(
     *,
     source_url,
@@ -418,7 +398,6 @@ def build_juju_shard_plan_from_hf_url(
                 continue
             pos = align_up(pos, 4096)
             section_offset = pos
-            section_hash = hash_remote_tensor_group(session, source_url, group, token=token, chunk_size=chunk_size)
             for tensor in group:
                 pos = align_up(pos, 4096)
                 tensor_offset = pos
@@ -447,7 +426,7 @@ def build_juju_shard_plan_from_hf_url(
                 "name": bucket.upper()[:32],
                 "offset": section_offset,
                 "size": size,
-                "sha256": section_hash,
+                "sha256": "0" * 64,
                 "prefetch_distance": 2 if bucket != "shared_weights" else 0,
                 "mmap_friendly": 1,
             })
@@ -502,6 +481,10 @@ class JujuVirtualFile(io.BufferedIOBase):
         self._size = int(plan["bytes"])
         self._pos = 0
         self._session = requests.Session()
+        self._remote_chunk = max(1, int(plan.get("chunk_size") or (16 * 1024 * 1024)))
+        self._cache_start = -1
+        self._cache_end = -1
+        self._cache_data = b""
         segments = []
         for segment in plan["fixed_segments"]:
             segments.append({
@@ -553,7 +536,7 @@ class JujuVirtualFile(io.BufferedIOBase):
         if self.closed or self._pos >= self._size:
             return b""
         if size is None or size < 0:
-            end = self._size
+            end = min(self._size, self._pos + self._remote_chunk)
         else:
             end = min(self._size, self._pos + int(size))
         chunks = []
@@ -566,19 +549,7 @@ class JujuVirtualFile(io.BufferedIOBase):
                 if segment["kind"] == "fixed":
                     chunks.append(segment["data"][rel:rel + take])
                 else:
-                    start = segment["source_offset"] + rel
-                    resp = fetch_range(
-                        self._session,
-                        self._plan["source_url"],
-                        start,
-                        start + take - 1,
-                        token=self._plan.get("token"),
-                        stream=False,
-                    )
-                    try:
-                        chunks.append(resp.content)
-                    finally:
-                        resp.close()
+                    chunks.append(self._read_source_segment(segment, rel, take))
                 self._pos += take
                 continue
             next_offset = self._segments[idx + 1]["offset"] if idx + 1 < len(self._segments) else self._size
@@ -586,6 +557,39 @@ class JujuVirtualFile(io.BufferedIOBase):
             chunks.append(b"\x00" * take)
             self._pos += take
         return b"".join(chunks)
+
+    def _read_source_segment(self, segment, rel, size):
+        out = []
+        remaining = int(size)
+        source_abs = int(segment["source_offset"]) + int(rel)
+        segment_end = int(segment["source_offset"]) + int(segment["size"])
+        while remaining > 0:
+            if self._cache_start <= source_abs < self._cache_end:
+                cache_rel = source_abs - self._cache_start
+                take = min(remaining, self._cache_end - source_abs)
+                out.append(self._cache_data[cache_rel:cache_rel + take])
+                source_abs += take
+                remaining -= take
+                continue
+            fetch_end = min(segment_end, source_abs + max(self._remote_chunk, remaining)) - 1
+            resp = fetch_range(
+                self._session,
+                self._plan["source_url"],
+                source_abs,
+                fetch_end,
+                token=self._plan.get("token"),
+                stream=False,
+            )
+            try:
+                data = resp.content
+            finally:
+                resp.close()
+            if not data:
+                raise EOFError("empty source range while streaming JUJU upload")
+            self._cache_start = source_abs
+            self._cache_end = source_abs + len(data)
+            self._cache_data = data
+        return b"".join(out)
 
     def close(self):
         try:
