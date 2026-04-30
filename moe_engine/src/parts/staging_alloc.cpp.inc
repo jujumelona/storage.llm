@@ -1,4 +1,4 @@
-﻿// TODO: Issue 11 - NUMA-aware pinned memory allocation ★
+// TODO: Issue 11 - NUMA-aware pinned memory allocation ★
 // Problem: cuMemAllocHost/mlock doesn't specify NUMA node
 // On AMD Ryzen (multi-CCD), memory on wrong NUMA node → 20-30% DMA bandwidth loss
 // Cross-chiplet memory access adds latency, reduces PCIe throughput
@@ -61,6 +61,14 @@ static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* 
         ptr = numa_alloc_onnode(static_cast<size_t>(bytes), preferred_numa_node);
         if (ptr && numa_allocated) {
             *numa_allocated = true;
+        }
+    }
+#else
+    if (preferred_numa_node >= 0) {
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr, "[storageLLM WARNING] NUMA: disabled (install libnuma-dev and define HAVE_NUMA for +20%% DMA bandwidth on multi-CCD AMD systems)\n");
+            warned = true;
         }
     }
 #endif

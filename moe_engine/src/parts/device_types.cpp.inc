@@ -8,6 +8,7 @@ typedef void* CUevent;
 
 typedef int (*moe_cu_init_fn)(unsigned int);
 typedef int (*moe_cu_device_get_fn)(int*, int);
+typedef int (*moe_cu_device_get_pci_bus_id_fn)(char*, int, int);
 typedef int (*moe_cu_ctx_set_current_fn)(void*);
 typedef int (*moe_cu_primary_ctx_retain_fn)(void**, int);
 typedef int (*moe_cu_primary_ctx_release_fn)(int);
@@ -31,6 +32,7 @@ struct moe_cuda_driver_api {
     int device = 0;
     moe_cu_init_fn cuInit = nullptr;
     moe_cu_device_get_fn cuDeviceGet = nullptr;
+    moe_cu_device_get_pci_bus_id_fn cuDeviceGetPCIBusId = nullptr;
     moe_cu_ctx_set_current_fn cuCtxSetCurrent = nullptr;
     moe_cu_primary_ctx_retain_fn cuDevicePrimaryCtxRetain = nullptr;
     moe_cu_primary_ctx_release_fn cuDevicePrimaryCtxRelease = nullptr;
@@ -55,6 +57,7 @@ struct moe_hip_driver_api {
     int device = 0;
     moe_cu_init_fn hipInit = nullptr;
     moe_cu_device_get_fn hipDeviceGet = nullptr;
+    moe_cu_device_get_pci_bus_id_fn hipDeviceGetPCIBusId = nullptr;
     moe_cu_ctx_set_current_fn hipCtxSetCurrent = nullptr;
     moe_cu_primary_ctx_retain_fn hipDevicePrimaryCtxRetain = nullptr;
     moe_cu_primary_ctx_release_fn hipDevicePrimaryCtxRelease = nullptr;

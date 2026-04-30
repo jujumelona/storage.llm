@@ -98,9 +98,15 @@ static void fill_hip_backend_caps(moe_backend_caps_t* caps) {
 
 static void fill_shared_memory_backend_caps(moe_backend_caps_t* caps) {
     caps->supports_pinned_host = 1;
-    caps->supports_unified_memory = 1;
-    caps->supports_zero_copy_host = 1;
-    caps->supports_zero_copy_mmap = 1;
+    if (caps->device_id == 0) {
+        caps->supports_unified_memory = 1;
+        caps->supports_zero_copy_host = 1;
+        caps->supports_zero_copy_mmap = 1;
+    } else {
+        caps->supports_unified_memory = 0;
+        caps->supports_zero_copy_host = 0;
+        caps->supports_zero_copy_mmap = 0;
+    }
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(48);
 }
 
@@ -151,4 +157,3 @@ static void fill_webgpu_backend_caps(moe_backend_caps_t* caps) {
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(16);
     caps->recommended_pinned_bytes = 0;
 }
-

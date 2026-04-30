@@ -44,6 +44,13 @@ static uint32_t device_rebuild_activation_heap_locked(moe_pc_engine* e) {
     return active_count;
 }
 
+static uint32_t device_rebuild_activation_heap_unlocked(
+    moe_pc_engine* e,
+    std::unique_lock<std::mutex>&
+) {
+    return device_rebuild_activation_heap_locked(e);
+}
+
 static int device_free_expert_if_pending_evict_locked(
     moe_pc_engine* e,
     int layer,

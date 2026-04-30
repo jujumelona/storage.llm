@@ -236,8 +236,12 @@ static void device_stream_pool_init(moe_pc_engine* e) {
     if (!e->stream_pool.empty()) return;
 
     // Issue 7: Pre-allocate stream pool to avoid cuStreamCreate overhead
-    uint32_t max_workers = runtime_gpu_workers(e);
-    if (max_workers == 0) max_workers = 1;
+    uint32_t gpu_workers = runtime_gpu_workers(e);
+    uint32_t io_workers = runtime_disk_workers(e);
+    if (io_workers == 0) io_workers = e->io_config.io_worker_threads;
+    uint32_t pinned_workers = runtime_pinned_workers(e);
+    uint32_t max_workers = gpu_workers + io_workers + pinned_workers + 2; // +2 for main thread and safety margin
+    if (max_workers == 0) max_workers = 4;
     uint32_t pool_size = max_workers * (e->backend_caps.copy_streams > 0 ? e->backend_caps.copy_streams : 1);
 
     for (uint32_t i = 0; i < pool_size; i++) {

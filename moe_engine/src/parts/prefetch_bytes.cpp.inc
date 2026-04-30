@@ -53,11 +53,16 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
     entry.VirtualAddress = const_cast<uint8_t*>(src);
     entry.NumberOfBytes = (SIZE_T)bytes;
     HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, GetCurrentProcessId());
+    BOOL success = FALSE;
     if (hProcess) {
-        PrefetchVirtualMemory(hProcess, 1, &entry, 0);
+        success = PrefetchVirtualMemory(hProcess, 1, &entry, 0);
         CloseHandle(hProcess);
     } else {
-        PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+        success = PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+    }
+    if (!success && engine) {
+        // Cast away const to update atomic metrics
+        const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_touch_fallback.fetch_add(bytes, std::memory_order_relaxed);
     }
 #elif defined(__linux__)
     madvise(const_cast<uint8_t*>(src), (size_t)bytes, MADV_WILLNEED);

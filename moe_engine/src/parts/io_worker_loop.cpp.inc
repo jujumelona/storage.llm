@@ -59,9 +59,17 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         // Fallback to 50ms wait to periodically check RAM eviction.
         {
             std::unique_lock<std::mutex> lock(engine->vram_eviction_mutex);
-            engine->vram_eviction_cv.wait_for(lock, std::chrono::milliseconds(50), [&]() {
-                return engine->io_stop.load(std::memory_order_relaxed);
+            engine->vram_eviction_cv.wait_for(lock, std::chrono::milliseconds(25), [&]() {
+                return engine->vram_eviction_needed.load(std::memory_order_relaxed) || engine->io_stop.load(std::memory_order_relaxed);
             });
+            engine->vram_eviction_needed.store(false, std::memory_order_relaxed);
+        }
+        {
+            std::unique_lock<std::mutex> lock(engine->ram_eviction_mutex);
+            engine->ram_eviction_cv.wait_for(lock, std::chrono::milliseconds(25), [&]() {
+                return engine->ram_eviction_needed.load(std::memory_order_relaxed) || engine->io_stop.load(std::memory_order_relaxed);
+            });
+            engine->ram_eviction_needed.store(false, std::memory_order_relaxed);
         }
         if (engine->io_stop.load(std::memory_order_relaxed)) {
             break;

@@ -136,6 +136,9 @@
     std::mutex vram_eviction_mutex;
     std::condition_variable vram_eviction_cv;
     std::atomic<bool> vram_eviction_needed{false};
+    std::mutex ram_eviction_mutex;
+    std::condition_variable ram_eviction_cv;
+    std::atomic<bool> ram_eviction_needed{false};
     alignas(64) std::atomic<uint32_t> staging_free_slot_count{0};
     std::mutex io_start_mutex;
     std::mutex cpu_row_mutex;

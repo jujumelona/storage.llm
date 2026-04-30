@@ -1,4 +1,5 @@
-﻿// BUGFIX 58/62: Issue 4A - Dynamic batch_max based on backend_caps ?�★
+#include <cassert>
+// BUGFIX 58/62: Issue 4A - Dynamic batch_max based on backend_caps ?�★
 // Problem: moe_gpu_stage_batch_max = 4 hardcoded
 // PCIe 5.0 x16: 4 too low (underutilizes bandwidth)
 // PCIe 3.0 x4: 4 too high (causes queue backup)
@@ -185,6 +186,9 @@ static void moe_scale_staging_slot_counts(
             }
         }
     }
+    #ifndef NDEBUG
+    assert(pinned + gpu + direct <= total_count);
+#endif
     if (pinned_out) *pinned_out = pinned;
     if (gpu_out) *gpu_out = gpu;
     if (direct_out) *direct_out = direct;
