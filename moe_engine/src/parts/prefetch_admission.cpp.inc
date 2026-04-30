@@ -43,8 +43,7 @@ static int prefetch_under_queue_pressure(
 static moe_tier_t prefetch_admitted_tier(
     moe_pc_engine* engine,
     const moe_expert_prefetch_item_t& item,
-    std::vector<std::pair<int, int>>& to_free,
-    uint64_t extra_reserved = 0
+    std::vector<std::pair<int, int>>& to_free
 ) {
     if (!engine || prefetch_is_router_selected(item)) {
         return item.target_tier;
@@ -68,10 +67,30 @@ static moe_tier_t prefetch_admitted_tier(
     // Admission-triggered demote_cold_until causes token generation latency spikes.
     // By raising threshold, we delegate eviction to background io_worker and only
     // route to DB when RAM is critically full.
-    if (target == moe_TIER_RAM && ram_budget > 0 &&
-        tier_used(engine, moe_TIER_RAM) + extra_reserved + item.bytes > (ram_budget * 93ull) / 100ull) {
-        // Route to DB instead of synchronous eviction
-        target = moe_TIER_DB;
+    if (target == moe_TIER_RAM && ram_budget > 0) {
+        if (tier_used(engine, moe_TIER_RAM) + engine->pending_ram_reservation.load(std::memory_order_relaxed) + item.bytes > (ram_budget * 93ull) / 100ull) {
+            // Route to DB instead of synchronous eviction
+            target = moe_TIER_DB;
+        } else {
+            engine->pending_ram_reservation.fetch_add(item.bytes, std::memory_order_relaxed);
+        }
     }
     return target;
+}
+
+static void prefetch_release_pending_ram_reservation(moe_pc_engine* engine, uint64_t bytes) {
+    if (!engine || bytes == 0) {
+        return;
+    }
+    uint64_t current = engine->pending_ram_reservation.load(std::memory_order_relaxed);
+    while (current > 0) {
+        const uint64_t next = current > bytes ? current - bytes : 0;
+        if (engine->pending_ram_reservation.compare_exchange_weak(
+                current,
+                next,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return;
+        }
+    }
 }

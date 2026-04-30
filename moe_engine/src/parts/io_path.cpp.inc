@@ -37,7 +37,7 @@ static int engine_bypass_staging_pipeline(const moe_pc_engine* engine) {
 static int engine_has_device_upload_workers(const moe_pc_engine* engine) {
     return engine &&
         engine->config.prefer_gpu &&
-        engine->backend_caps.backend == moe_BACKEND_CUDA &&
+        (engine->backend_caps.backend == moe_BACKEND_CUDA || engine->backend_caps.backend == moe_BACKEND_HIP) &&
         engine->backend_caps.supports_backend_async_api;
 }
 

@@ -96,7 +96,11 @@
         }
         if (engine->staging) {
             std::memset(engine->staging, 0, static_cast<size_t>(std::min<uint64_t>(engine->staging_size, 4096)));
-            configure_staging_slots(engine);
+            if (engine->max_tensor_stream_bytes > 0) {
+                configure_staging_slots(engine);
+            } else {
+                update_staging_slot_deficit(engine);
+            }
         }
     }
 

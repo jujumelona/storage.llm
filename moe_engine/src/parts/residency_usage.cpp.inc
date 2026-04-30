@@ -74,6 +74,10 @@ static int try_add_tier_usage(moe_pc_engine* engine, moe_tier_t tier, uint64_t b
                 current + bytes,
                 std::memory_order_relaxed,
                 std::memory_order_relaxed)) {
+            if (tier == moe_TIER_VRAM && budget > 0 && (current + bytes) > (budget * 85ull) / 100ull) {
+                engine->vram_eviction_needed.store(true, std::memory_order_relaxed);
+                engine->vram_eviction_cv.notify_one();
+            }
             return 1;
         }
     }

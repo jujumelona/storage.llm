@@ -31,13 +31,13 @@ int moe_pc_engine_execute_prefetch_plan(
         if (stream_inflight[i]) {
             continue;
         }
-        admitted_tiers[i] = prefetch_admitted_tier(engine, items[i], all_to_free[i], batch_ram_reserved);
+        admitted_tiers[i] = prefetch_admitted_tier(engine, items[i], all_to_free[i]);
         if (admitted_tiers[i] == moe_TIER_RAM) {
             batch_ram_reserved += items[i].bytes;
         }
     }
 
-    // BUGFIX 60: Issue 3 - TOCTOU deferred free pattern ?�★
+    // BUGFIX 60: Issue 3 - TOCTOU deferred free pattern ?�★
     // Problem: Pass 1 collects to_free with map_mutex, releases lock,
     // then device_free_experts_batched. Between these, IO worker can start DMA
     // on same expert ??inflight_copies != 0 ??free fails or crashes.
@@ -84,7 +84,7 @@ int moe_pc_engine_execute_prefetch_plan(
             if (try_add_tier_usage(engine, moe_TIER_VRAM, items[i].bytes,
                                    tier_budget(engine, moe_TIER_VRAM))) {
                 admitted_tiers[i] = moe_TIER_VRAM;
-                // PIPELINE FIX 14: Subtract from batch_ram_reserved when upgrading to VRAM ?�★
+                // PIPELINE FIX 14: Subtract from batch_ram_reserved when upgrading to VRAM ?�★
                 // Old: batch_ram_reserved still includes upgraded bytes ??over-reserves RAM
                 // New: Subtract upgraded bytes ??accurate RAM reservation for subsequent batches
                 // Prevents unnecessary DB demotion of later experts
@@ -135,6 +135,11 @@ int moe_pc_engine_execute_prefetch_plan(
                     admitted_tiers[i]
                 ) ? 1 : 0;
             }
+        }
+        if (admitted_tiers[i] == moe_TIER_RAM &&
+            !prefetch_is_router_selected(items[i]) &&
+            items[i].bytes > 0) {
+            prefetch_release_pending_ram_reservation(engine, items[i].bytes);
         }
     }
     if (ok_count > 0) {
