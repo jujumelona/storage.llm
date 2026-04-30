@@ -221,7 +221,7 @@ a slower operating mode rather than the target fast path.
 - `src/parts/tensor_query.cpp.inc`: mmap packed FP4 row query and dot fallback.
 - `src/parts/codec_table.cpp.inc`: offset manifest loader for original
   safetensors shards.
-- `native/moe_scale4.*`: runtime scale4 decoder copied from the working
+- `native/scale4.*`: runtime scale4 decoder copied from the working
   implementation.
 - `native/fp4_decode.h`: native FP4 decode reference.
 - `COMPRESSION_CONTRACT.md`: exact rules for what can become a runtime codec.

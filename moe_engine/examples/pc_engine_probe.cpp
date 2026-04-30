@@ -1,5 +1,5 @@
 #include "moe_pc_engine.h"
-#include "../native/moe_scale4.h"
+#include "../native/scale4.h"
 
 #include <stdio.h>
 #include <stdlib.h>

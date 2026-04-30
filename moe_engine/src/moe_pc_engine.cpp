@@ -2,7 +2,7 @@
 
 #include "../../system_memory.h"
 #include "../native/fp4_decode.h"
-#include "../native/moe_scale4.h"
+#include "../native/scale4.h"
 #include "../../engine_core/kv/kv_qkv.h"
 #include "../../engine_core/core/mmap_loader.h"
 #include "../../loader/path_join.h"

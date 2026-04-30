@@ -1,4 +1,4 @@
-#include "moe_scale4.h"
+#include "scale4.h"
 
 #include "../../engine_core/core/mmap_loader.h"
 

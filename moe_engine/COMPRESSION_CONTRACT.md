@@ -47,8 +47,8 @@ never inflate the full model to fp16/bf16
 
 Source of truth:
 
-- `native/moe_scale4.h`
-- `native/moe_scale4.cpp`
+- `native/scale4.h`
+- `native/scale4.cpp`
 
 Required metadata is carried by `moe_scale4_entry_t`:
 

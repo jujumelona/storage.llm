@@ -1,4 +1,4 @@
-﻿// Device allocator initialization and shutdown
+// Device allocator initialization and shutdown
 
 static std::atomic<uint64_t>* device_pool_counter(moe_pc_engine* e, uint8_t pool) {
     if (!e) return nullptr;
@@ -49,17 +49,31 @@ static int device_allocator_init(moe_pc_engine* e) {
             e->device_total_bytes.store((uint64_t)total_b);
             if (e->backend_caps.device_memory_bytes == 0) e->backend_caps.device_memory_bytes = (uint64_t)free_b;
         }
-    } else if (e->backend_caps.backend == moe_BACKEND_METAL || e->backend_caps.backend == moe_BACKEND_VULKAN || e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || e->backend_caps.backend == moe_BACKEND_SYCL) {
+    // BUGFIX 80: Issue 2 - Fix Metal budget calculation and remove dead code.
+    // Problem: Metal uses full system_memory_bytes as VRAM budget
+    // 32GB Mac -> 32GB VRAM budget -> OS pressure and excessive expert caching.
+    // Also: if (false) block is dead code from refactoring
+    // Solution: Reserve 25% for OS, remove dead code
+    } else if (e->backend_caps.backend == moe_BACKEND_METAL) {
+        // Apple Silicon unified memory: reserve 25% for OS
+        const uint64_t sys = e->backend_caps.system_memory_bytes > 0
+            ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
+        const uint64_t usable = (sys * 3ull) / 4ull;  // 75% usable, 25% OS reserve
         if (e->backend_caps.device_memory_bytes == 0) {
-            e->backend_caps.device_memory_bytes = e->backend_caps.system_memory_bytes > 0 ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
+            e->backend_caps.device_memory_bytes = usable;
         }
         e->device_free_bytes.store(e->backend_caps.device_memory_bytes);
         e->device_total_bytes.store(e->backend_caps.device_memory_bytes);
-        if (false) {
-            e->device_free_bytes.store((uint64_t)free_b);
-            e->device_total_bytes.store((uint64_t)total_b);
-            if (e->backend_caps.device_memory_bytes == 0) e->backend_caps.device_memory_bytes = (uint64_t)free_b;
+    } else if (e->backend_caps.backend == moe_BACKEND_VULKAN ||
+               e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
+               e->backend_caps.backend == moe_BACKEND_SYCL) {
+        // Vulkan/Level Zero/SYCL: use reported device memory or fallback
+        if (e->backend_caps.device_memory_bytes == 0) {
+            e->backend_caps.device_memory_bytes = e->backend_caps.system_memory_bytes > 0
+                ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
         }
+        e->device_free_bytes.store(e->backend_caps.device_memory_bytes);
+        e->device_total_bytes.store(e->backend_caps.device_memory_bytes);
     }
     e->device_allocator_ready.store(1);
     device_stream_pool_init(e);
