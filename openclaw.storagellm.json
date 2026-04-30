@@ -1,9 +1,9 @@
 {
   "agents": {
     "defaults": {
-      "model": { "primary": "storagellm/glm5.1-storage" },
+      "model": { "primary": "storagellm/offload" },
       "models": {
-        "storagellm/glm5.1-storage": { "alias": "StorageLLM" }
+        "storagellm/offload": { "alias": "StorageLLM" }
       }
     }
   },
@@ -16,8 +16,8 @@
         "api": "openai-responses",
         "models": [
           {
-            "id": "glm5.1-storage",
-            "name": "GLM5.1 StorageLLM",
+            "id": "offload",
+            "name": "StorageLLM Offload",
             "reasoning": false,
             "input": ["text"],
             "contextWindow": 131072,

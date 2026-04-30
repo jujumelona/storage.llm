@@ -12,11 +12,11 @@ This repository does not ship model weights.
 - `engine_core/core/` - shared mmap loader.
 - `engine_core/kv/` - default packed QKV cache implementation.
 - `loader/` - shared manifest loader and path helpers.
-- `glm5_dynamic_moe_engine/` - model runtime folder; see its README for
+- `moe_engine/` - model runtime folder; see its README for
   model-specific API, metadata, numeric helpers, planning, and examples.
 
 Common runtime code belongs at the repository root. A new model should add a
-new model folder beside `glm5_dynamic_moe_engine/` and reuse `engine_core/` and
+new model folder beside `moe_engine/` and reuse `engine_core/` and
 `loader/` instead of copying them inside the model folder.
 
 ## Common Build Inputs
@@ -58,15 +58,15 @@ selection and residency policy live in the model runtime folder.
 Packed QKV append/cache/reuse is the normal KV contract. Plain float KV is kept
 only as a debug/fallback path when the loaded format does not forbid it.
 
-## GLM5.1 Runtime Usage
+## GGUF Offload Runtime Usage
 
-The GLM5.1 model runtime lives in `glm5_dynamic_moe_engine/`. Its README is the
+The GGUF offload model runtime lives in `moe_engine/`. Its README is the
 source of truth for model layout, the local OpenAI-compatible API, automatic
 runtime selection, the dedicated GGUF layout, QKV cache contract, and request
 shapes:
 
 ```text
-glm5_dynamic_moe_engine/README.md
+moe_engine/README.md
 ```
 
 Model weights are distributed separately on Hugging Face. The dedicated GGUF
@@ -74,7 +74,7 @@ path keeps the `.gguf` file extension and embeds StorageLLM offload metadata in
 `offload.*` GGUF KV entries:
 
 ```text
-https://huggingface.co/storagejuju/GLM-5.1-GGUF-MXFP4-MOE-Offload
+https://huggingface.co/storagejuju/gemma-4-26b-a4b-it-mxfp4-moe-storagellm-offload
 ```
 
 The reusable Colab patcher is tracked at:
@@ -90,7 +90,7 @@ enough; shard prefix/count are auto-discovered from Hugging Face.
 Download the converted StorageLLM GGUF artifact before starting the server:
 
 ```text
-hf download storagejuju/GLM-5.1-GGUF-MXFP4-MOE-Offload --local-dir <model_root>
+hf download storagejuju/gemma-4-26b-a4b-it-mxfp4-moe-storagellm-offload --local-dir <model_root>
 ```
 
 The normal local API command is only the server binary plus the model root. The
@@ -99,7 +99,7 @@ detects the available CPU/GPU/Metal-style runtime path, and sizes RAM/VRAM
 caches from the machine:
 
 ```text
-glm5_pc_engine_server <model_root>
+moe_pc_engine_server <model_root>
 ```
 
 QKV is now the default KV cache path. The old `qkv` selector is accepted as a
@@ -141,6 +141,6 @@ Clients can use `http://127.0.0.1:8000/v1` directly. The checked-in
 
 This code repository is released under the MIT License. See `LICENSE`.
 
-The converted StorageLLM model artifacts are distributed separately on Hugging
-Face and follow the upstream GLM-5.1 MIT license. Keep the upstream model
+Converted StorageLLM model artifacts are distributed separately on Hugging
+Face and keep the license of their upstream base model. Keep the upstream model
 license and copyright notices with redistributed model files.

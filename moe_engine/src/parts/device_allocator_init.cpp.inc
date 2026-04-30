@@ -1,0 +1,110 @@
+﻿// Device allocator initialization and shutdown
+
+static std::atomic<uint64_t>* device_pool_counter(moe_pc_engine* e, uint8_t pool) {
+    if (!e) return nullptr;
+    if (pool == moe_DEVICE_POOL_FIXED) return &e->device_fixed_bytes;
+    if (pool == moe_DEVICE_POOL_ACTIVATION) return &e->device_activation_bytes;
+    if (pool == moe_DEVICE_POOL_EXPERT) return &e->device_expert_bytes;
+    return &e->device_stream_bytes;
+}
+
+static void device_stream_pool_init(moe_pc_engine* e);
+
+static int device_allocator_init(moe_pc_engine* e) {
+    if (!e || e->device_allocator_ready.load() != 0) return e && e->device_allocator_ready.load() > 0;
+    if (!e->config.prefer_gpu) return 0;
+    if (e->backend_caps.backend != moe_BACKEND_CUDA && e->backend_caps.backend != moe_BACKEND_HIP && e->backend_caps.backend != moe_BACKEND_METAL && e->backend_caps.backend != moe_BACKEND_VULKAN && e->backend_caps.backend != moe_BACKEND_LEVEL_ZERO && e->backend_caps.backend != moe_BACKEND_SYCL) return 0;
+    std::lock_guard<std::mutex> lock(e->device_mutex);
+    if (e->device_allocator_ready.load() != 0) return e->device_allocator_ready.load() > 0;
+
+    if (e->backend_caps.backend == moe_BACKEND_CUDA) {
+        if (!cuda_driver_load(&e->cuda) || e->cuda.cuInit(0) != 0 ||
+            e->cuda.cuDeviceGet(&e->cuda.device, (int)e->backend_caps.device_id) != 0 ||
+            e->cuda.cuDevicePrimaryCtxRetain(&e->cuda.context, e->cuda.device) != 0 ||
+            e->cuda.cuCtxSetCurrent(e->cuda.context) != 0) {
+            moe_close_shared_library(e->cuda.library);
+            e->cuda = moe_cuda_driver_api{};
+            e->device_allocator_ready.store(-1);
+            return 0;
+        }
+        size_t free_b = 0, total_b = 0;
+        if (e->cuda.cuMemGetInfo(&free_b, &total_b) == 0) {
+            e->device_free_bytes.store((uint64_t)free_b);
+            e->device_total_bytes.store((uint64_t)total_b);
+            if (e->backend_caps.device_memory_bytes == 0) e->backend_caps.device_memory_bytes = (uint64_t)free_b;
+        }
+    } else if (e->backend_caps.backend == moe_BACKEND_HIP) {
+        if (!hip_driver_load(&e->hip) || e->hip.hipInit(0) != 0 ||
+            e->hip.hipDeviceGet(&e->hip.device, (int)e->backend_caps.device_id) != 0 ||
+            e->hip.hipDevicePrimaryCtxRetain(&e->hip.context, e->hip.device) != 0 ||
+            e->hip.hipCtxSetCurrent(e->hip.context) != 0) {
+            moe_close_shared_library(e->hip.library);
+            e->hip = moe_hip_driver_api{};
+            e->device_allocator_ready.store(-1);
+            return 0;
+        }
+        size_t free_b = 0, total_b = 0;
+        if (e->hip.hipMemGetInfo(&free_b, &total_b) == 0) {
+            e->device_free_bytes.store((uint64_t)free_b);
+            e->device_total_bytes.store((uint64_t)total_b);
+            if (e->backend_caps.device_memory_bytes == 0) e->backend_caps.device_memory_bytes = (uint64_t)free_b;
+        }
+    } else if (e->backend_caps.backend == moe_BACKEND_METAL || e->backend_caps.backend == moe_BACKEND_VULKAN || e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || e->backend_caps.backend == moe_BACKEND_SYCL) {
+        if (e->backend_caps.device_memory_bytes == 0) {
+            e->backend_caps.device_memory_bytes = e->backend_caps.system_memory_bytes > 0 ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
+        }
+        e->device_free_bytes.store(e->backend_caps.device_memory_bytes);
+        e->device_total_bytes.store(e->backend_caps.device_memory_bytes);
+        if (false) {
+            e->device_free_bytes.store((uint64_t)free_b);
+            e->device_total_bytes.store((uint64_t)total_b);
+            if (e->backend_caps.device_memory_bytes == 0) e->backend_caps.device_memory_bytes = (uint64_t)free_b;
+        }
+    }
+    e->device_allocator_ready.store(1);
+    device_stream_pool_init(e);
+    return 1;
+}
+
+static int device_set_current(moe_pc_engine* e) {
+    static thread_local CUcontext tls_ctx = nullptr;
+    if (!e) return 0;
+    if (e->backend_caps.backend == moe_BACKEND_CUDA) {
+        if (!e->cuda.cuCtxSetCurrent) return 0;
+        if (tls_ctx == e->cuda.context) return 1;
+        if (e->cuda.cuCtxSetCurrent(e->cuda.context) != 0) return 0;
+        tls_ctx = e->cuda.context;
+        return 1;
+    } else if (e->backend_caps.backend == moe_BACKEND_HIP) {
+        if (!e->hip.hipCtxSetCurrent) return 0;
+        if (tls_ctx == e->hip.context) return 1;
+        if (e->hip.hipCtxSetCurrent(e->hip.context) != 0) return 0;
+        tls_ctx = e->hip.context;
+        return 1;
+    }
+    return 0;
+}
+
+static void device_allocator_shutdown(moe_pc_engine* e) {
+    if (!e) return;
+    std::vector<std::pair<CUdeviceptr, uint64_t>> deferred_free_ptrs;
+    std::vector<uint64_t> keys;
+    {
+        std::lock_guard<std::mutex> lock(e->device_mutex);
+        for (const auto& it : e->device_allocations) keys.push_back(it.first);
+        for (uint64_t key : keys) device_free_locked(e, key, &deferred_free_ptrs);
+        decltype(e->activation_evict_heap) empty;
+        e->activation_evict_heap.swap(empty);
+    }
+    device_free_deferred_ptrs(e, deferred_free_ptrs);
+    if (e->backend_caps.backend == moe_BACKEND_CUDA) {
+        if (e->cuda.cuDevicePrimaryCtxRelease && e->cuda.context) e->cuda.cuDevicePrimaryCtxRelease(e->cuda.device);
+        moe_close_shared_library(e->cuda.library);
+        e->cuda = moe_cuda_driver_api{};
+    } else if (e->backend_caps.backend == moe_BACKEND_HIP) {
+        if (e->hip.hipDevicePrimaryCtxRelease && e->hip.context) e->hip.hipDevicePrimaryCtxRelease(e->hip.device);
+        moe_close_shared_library(e->hip.library);
+        e->hip = moe_hip_driver_api{};
+    }
+    e->device_allocator_ready.store(0);
+}

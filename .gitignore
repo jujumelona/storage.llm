@@ -32,6 +32,7 @@ __pycache__/
 /parts/
 *.juju
 glm5_dynamic_moe_engine/model_profiles/*/tensors.csv
+moe_engine/model_profiles/*/tensors.csv
 
 # Local split/refactor scratch files. Only commit part files that are included
 # by the runtime entrypoint or explicitly documented as source.

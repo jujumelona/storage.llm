@@ -46,8 +46,8 @@ inline uint64_t available_ram_bytes() {
     }
     return 0;
 #elif defined(__APPLE__)
-    // BUGFIX 48: Issue 19 - macOS available RAM implementation ★★
-    // Problem: macOS path returned 0, causing glm5_generation_should_preallocate_kv_cache
+    // BUGFIX 48: Issue 19 - macOS available RAM implementation ?�★
+    // Problem: macOS path returned 0, causing moe_generation_should_preallocate_kv_cache
     // to always return false. KV cache never pre-allocates on macOS.
     // Solution: Use host_statistics64 to get vm_statistics64_data_t, then calculate
     // available bytes as (free_count + inactive_count) * PAGE_SIZE.

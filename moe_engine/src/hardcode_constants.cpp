@@ -1,0 +1,42 @@
+#include "moe_pc_engine.h"
+
+static const moe_storage_constants_t kMoeStorageConstants = {
+    21,
+    84,
+    79,
+    3,
+    78,
+    256,
+    3,
+    6144,
+    2048,
+    154880,
+    464868188365ull,
+    176098,
+    19200,
+    256,
+    2530,
+    12110,
+    45490,
+    768,
+    21,
+    19456,
+    20054208ull,
+    21233796ull,
+    75497472ull,
+    41270927196ull,
+    27554269696ull,
+    4019533148ull,
+    1903165440ull,
+    1903165440ull,
+    1990656ull,
+    150994944ull,
+    5737807872ull,
+    "GGUF-Offload",
+    ".gguf",
+    "GGUF"
+};
+
+const moe_storage_constants_t* moe_storage_constants(void) {
+    return &kMoeStorageConstants;
+}
