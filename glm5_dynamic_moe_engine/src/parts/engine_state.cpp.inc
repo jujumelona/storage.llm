@@ -43,6 +43,7 @@ struct glm5_pc_engine {
     std::vector<std::thread> io_workers;
     std::vector<std::thread> pinned_workers;
     std::vector<std::thread> gpu_workers;
+    std::thread eviction_worker;
     std::atomic<bool> io_stop{false};
     std::atomic<uint32_t> disk_worker_target{0};
     std::atomic<uint32_t> pinned_worker_target{0};
@@ -110,7 +111,6 @@ struct glm5_pc_engine {
     std::atomic<bool> vram_eviction_in_progress{false};
     std::condition_variable vram_eviction_cv;
     alignas(64) std::atomic<uint32_t> staging_free_slot_count{0};
-    std::atomic<bool> io_proactive_eviction_in_progress{false};
     std::mutex io_start_mutex;
     std::mutex cpu_row_mutex;
     std::condition_variable cpu_row_cv;
@@ -156,6 +156,8 @@ struct glm5_pc_engine {
     mutable std::atomic<int> attention_projector_valid{-1};  // Fix 72: -1=unchecked, 0=no, 1=yes
     std::vector<std::thread> deferred_joins;  // Fix 44: engine-owned deferred worker joins
     std::atomic<uint32_t> staging_pinned_slot_count{0};
+    std::atomic<uint32_t> staging_gpu_slot_count{0};
+    std::atomic<uint32_t> staging_direct_slot_count{0};
     mutable std::mutex raw_file_size_cache_mutex;
     mutable std::unordered_map<int32_t, uint64_t> raw_file_size_cache;
     mutable std::shared_mutex raw_tensor_cache_mutex;

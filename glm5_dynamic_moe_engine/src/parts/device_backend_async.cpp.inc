@@ -32,6 +32,59 @@ static void device_backend_stream_destroy(glm5_pc_engine* e, CUstream stream) {
     }
 }
 
+static int device_backend_event_create(glm5_pc_engine* e, CUevent* out_event) {
+    if (out_event) {
+        *out_event = nullptr;
+    }
+    if (!out_event || !device_backend_is_cuda(e) || !e->cuda.cuEventCreate) {
+        return 0;
+    }
+    constexpr unsigned int disable_timing = 2u;
+    return e->cuda.cuEventCreate(out_event, disable_timing) == 0;
+}
+
+static int device_backend_event_record(glm5_pc_engine* e, CUevent event, CUstream stream) {
+    if (!event || !stream || !device_backend_is_cuda(e) || !e->cuda.cuEventRecord) {
+        return 0;
+    }
+    return e->cuda.cuEventRecord(event, stream) == 0;
+}
+
+static int device_backend_event_query(glm5_pc_engine* e, CUevent event) {
+    if (!event || !device_backend_is_cuda(e) || !e->cuda.cuEventQuery) {
+        return 0;
+    }
+    return e->cuda.cuEventQuery(event) == 0;
+}
+
+static int device_backend_event_sync(glm5_pc_engine* e, CUevent event) {
+    if (!event) {
+        return 1;
+    }
+    if (!device_backend_is_cuda(e)) {
+        return 0;
+    }
+    if (e->cuda.cuEventSynchronize) {
+        return e->cuda.cuEventSynchronize(event) == 0;
+    }
+    if (!e->cuda.cuEventQuery) {
+        return 0;
+    }
+    while (!e->io_stop.load(std::memory_order_relaxed)) {
+        if (e->cuda.cuEventQuery(event) == 0) {
+            return 1;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    return e->cuda.cuEventQuery(event) == 0;
+}
+
+static void device_backend_event_destroy(glm5_pc_engine* e, CUevent event) {
+    if (event && device_backend_is_cuda(e) && e->cuda.cuEventDestroy) {
+        e->cuda.cuEventDestroy(event);
+    }
+}
+
 static int device_backend_async_h2d_available(glm5_pc_engine* e, CUstream stream, int host_pinned) {
     return device_backend_is_cuda(e) &&
         stream &&

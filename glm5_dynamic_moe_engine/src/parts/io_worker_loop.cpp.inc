@@ -45,6 +45,35 @@ static uint64_t io_worker_device_allocated_bytes(const glm5_pc_engine* engine) {
     return engine ? engine->device_allocated_bytes.load(std::memory_order_relaxed) : 0;
 }
 
+static void proactive_eviction_worker_loop(glm5_pc_engine* engine) {
+    if (!engine) {
+        return;
+    }
+    while (!engine->io_stop.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (engine->io_stop.load(std::memory_order_relaxed)) {
+            break;
+        }
+        const uint64_t vram_bud = tier_budget(engine, GLM5_TIER_VRAM);
+        const uint64_t ram_bud = tier_budget(engine, GLM5_TIER_RAM);
+        const uint64_t vram_used = tier_used(engine, GLM5_TIER_VRAM);
+        const uint64_t vram_target = (vram_bud * 80ull) / 100ull;
+        if (vram_bud > 0 && vram_used > (vram_bud * 90ull) / 100ull && vram_used > vram_target) {
+            std::vector<std::pair<int, int>> freed;
+            demote_cold_until(engine, GLM5_TIER_VRAM, vram_used - vram_target, freed);
+            if (!freed.empty() && !engine->io_stop.load(std::memory_order_relaxed)) {
+                device_free_experts_batched(engine, freed, 8);
+            }
+        }
+        const uint64_t ram_used = tier_used(engine, GLM5_TIER_RAM);
+        const uint64_t ram_target = (ram_bud * 80ull) / 100ull;
+        if (ram_bud > 0 && ram_used > (ram_bud * 90ull) / 100ull && ram_used > ram_target) {
+            std::vector<std::pair<int, int>> ignored;
+            demote_cold_until(engine, GLM5_TIER_RAM, ram_used - ram_target, ignored);
+        }
+    }
+}
+
 static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
     if (!engine) {
         return;
@@ -83,6 +112,22 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
         }
         return 1;
     };
+    auto drain_local_requeues = [&]() {
+        while (!local_requeues.empty() && !engine->io_stop.load(std::memory_order_relaxed)) {
+            const auto pending = local_requeues.front();
+            if (io_worker_requeue_disk_task(engine, pending.first, pending.second, 5u, 1u)) {
+                local_requeues.pop_front();
+            } else {
+                engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                local_requeues.pop_front();
+            }
+        }
+    };
+    auto exit_worker = [&]() {
+        drain_local_requeues();
+        stream_guard.e = nullptr;
+        device_stream_destroy_current(engine);
+    };
     for (;;) {
         if (!local_requeues.empty()) {
             const auto pending = local_requeues.front();
@@ -116,8 +161,7 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
         }
         glm5_prefetch_task task{};
         if (!pop_stage_task(engine, engine->disk_stage, &task, &engine->disk_worker_target, worker_index)) {
-            stream_guard.e = nullptr;  // BUGFIX 27: Prevent double-destroy
-            device_stream_destroy_current(engine);
+            exit_worker();
             return;
         }
 
@@ -130,42 +174,34 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
         // Old: Single lookahead → only helps 1 worker, others still hit page faults
         // New: Lookahead N tasks where N = disk_workers → all workers benefit
         {
-            const uint32_t n_workers = runtime_disk_workers(engine);
-            std::unique_lock<std::mutex> peek_lock(engine->disk_stage.mtx);
-            uint32_t peeked = 0;
-            const uint32_t max_lookahead = std::min(n_workers, 4u);  // Cap at 4 to limit lock time
-
-            // Peek urgent queue first, then normal queue
-            for (const auto& lookahead_task : engine->disk_stage.urgent_queue) {
-                if (peeked >= max_lookahead) break;
-                if (lookahead_task.tensor_index >= 0 &&
-                    (size_t)lookahead_task.tensor_index < engine->tensors.size() &&
-                    lookahead_task.raw_span_index < 0) {
-                    const glm5_tensor_record& next_rec = engine->tensors[lookahead_task.tensor_index];
-                    mmap_context_t* next_shard = get_or_map_tensor_shard(engine, next_rec);
-                    if (next_shard) {
-                        const uint8_t* next_src = static_cast<const uint8_t*>(mmap_get_ptr(next_shard, 0));
-                        if (next_src) {
-                            touch_mapped_range(next_src, tensor_stream_bytes(next_rec));
-                            ++peeked;
+            const uint32_t max_lookahead = std::min(runtime_disk_workers(engine), 4u);
+            std::vector<int32_t> lookahead_indices;
+            lookahead_indices.reserve(max_lookahead);
+            {
+                std::unique_lock<std::mutex> peek_lock(engine->disk_stage.mtx);
+                auto collect_indices = [&](const std::deque<glm5_prefetch_task>& queue) {
+                    for (const auto& lookahead_task : queue) {
+                        if (lookahead_indices.size() >= max_lookahead) break;
+                        if (lookahead_task.tensor_index >= 0 &&
+                            (size_t)lookahead_task.tensor_index < engine->tensors.size() &&
+                            lookahead_task.raw_span_index < 0) {
+                            lookahead_indices.push_back(lookahead_task.tensor_index);
                         }
                     }
-                }
+                };
+                collect_indices(engine->disk_stage.urgent_queue);
+                collect_indices(engine->disk_stage.queue);
             }
-
-            for (const auto& lookahead_task : engine->disk_stage.queue) {
-                if (peeked >= max_lookahead) break;
-                if (lookahead_task.tensor_index >= 0 &&
-                    (size_t)lookahead_task.tensor_index < engine->tensors.size() &&
-                    lookahead_task.raw_span_index < 0) {
-                    const glm5_tensor_record& next_rec = engine->tensors[lookahead_task.tensor_index];
-                    mmap_context_t* next_shard = get_or_map_tensor_shard(engine, next_rec);
-                    if (next_shard) {
-                        const uint8_t* next_src = static_cast<const uint8_t*>(mmap_get_ptr(next_shard, 0));
-                        if (next_src) {
-                            touch_mapped_range(next_src, tensor_stream_bytes(next_rec));
-                            ++peeked;
-                        }
+            for (int32_t tensor_index : lookahead_indices) {
+                if (tensor_index < 0 || (size_t)tensor_index >= engine->tensors.size()) {
+                    continue;
+                }
+                const glm5_tensor_record& next_rec = engine->tensors[tensor_index];
+                mmap_context_t* next_shard = get_or_map_tensor_shard(engine, next_rec);
+                if (next_shard) {
+                    const uint8_t* next_src = static_cast<const uint8_t*>(mmap_get_ptr(next_shard, 0));
+                    if (next_src) {
+                        touch_mapped_range(next_src, tensor_stream_bytes(next_rec));
                     }
                 }
             }
@@ -190,19 +226,14 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                     terminal = 0;
                 }
             } else if (ok) {
-                auto it = s_tl_deferred_staging_slots.find(engine);
-                if (it != s_tl_deferred_staging_slots.end()) {
-                    const bool should_flush = it->second.size() >= 4u
-                        || (it->second.size() >= 1u
+                const size_t deferred_copies = device_deferred_staging_copy_count(engine);
+                if (deferred_copies > 0) {
+                    const bool should_flush = deferred_copies >= glm5_gpu_stage_batch_max
+                        || (deferred_copies >= 1u
                             && engine->disk_stage.depth.load(std::memory_order_relaxed) == 0
                             && engine->disk_stage.inflight.load(std::memory_order_relaxed) <= 1u);
                     if (should_flush) {
-                        device_stream_sync_current(engine);
-                        device_complete_pending_copies(engine);
-                        for (uint32_t sidx : it->second) {
-                            release_staging_slot(engine, sidx);
-                        }
-                        it->second.clear();
+                        device_drain_deferred_staging_copies(engine, true);
                     }
                 }
             }
@@ -256,6 +287,7 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                             engine,
                             worker_index,
                             refresh_turn,
+                            false,
                             true
                         );
                         if (slot != UINT32_MAX) {
@@ -305,8 +337,7 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                         terminal = 0;
                         finish_stage_task(engine, engine->disk_stage, ok, terminal);
                         if (worker_index >= engine->disk_worker_target.load()) {
-                            stream_guard.e = nullptr;  // BUGFIX 27: Prevent double-destroy
-                            device_stream_destroy_current(engine);
+                            exit_worker();
                             return;
                         }
                         continue;
@@ -317,8 +348,7 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                         terminal = 0;
                         finish_stage_task(engine, engine->disk_stage, ok, terminal);
                         if (worker_index >= engine->disk_worker_target.load()) {
-                            stream_guard.e = nullptr;  // BUGFIX 27: Prevent double-destroy
-                            device_stream_destroy_current(engine);
+                            exit_worker();
                             return;
                         }
                         continue;
@@ -327,20 +357,6 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                 ok = prefetch_tensor_disk_to_ram(engine, rec);
                 if (ok && task.target_tier == GLM5_TIER_VRAM &&
                     engine->io_config.enable_multistage_pipeline && engine->staging) {
-                    const uint32_t pinned_hard_cap = engine->io_config.max_prefetch_queue;
-                    const uint32_t pinned_depth_after_read =
-                        engine->pinned_stage.depth.load(std::memory_order_relaxed);
-                    if (pinned_hard_cap > 0 && pinned_depth_after_read >= pinned_hard_cap) {
-                        ok = preserve_requeue(task, GLM5_TRANSFER_STAGE_RAM_TO_PINNED);
-                        terminal = 0;
-                        finish_stage_task(engine, engine->disk_stage, ok, terminal);
-                        if (worker_index >= engine->disk_worker_target.load()) {
-                            stream_guard.e = nullptr;  // BUGFIX 27: Prevent double-destroy
-                            device_stream_destroy_current(engine);
-                            return;
-                        }
-                        continue;
-                    }
                     glm5_prefetch_task next = task;
                     next.stage = GLM5_TRANSFER_STAGE_RAM_TO_PINNED;
                     if (enqueue_stage_or_retry(engine, engine->pinned_stage, next)) {
@@ -370,58 +386,8 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
 
         finish_stage_task(engine, engine->disk_stage, ok, terminal);
 
-        // Problem 2 Fix: Proactive eviction at 75% threshold to prevent latency spikes.
-        // Without this, demote_cold_until only runs when admission is nearly full, causing synchronous
-        // eviction on every prefetch admission. This background eviction keeps headroom.
-        if ((refresh_turn % 32u) == 0u) {
-            bool ev_expected = false;
-            if (engine->io_proactive_eviction_in_progress.compare_exchange_strong(
-                    ev_expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
-                struct ProactiveGuard {
-                    std::atomic<bool>* flag;
-                    ~ProactiveGuard() { flag->store(false, std::memory_order_release); }
-                } pguard{&engine->io_proactive_eviction_in_progress};
-
-                const uint64_t vram_bud = tier_budget(engine, GLM5_TIER_VRAM);
-                const uint64_t ram_bud = tier_budget(engine, GLM5_TIER_RAM);
-                // Bug Fix: TOCTOU uint64 underflow. tier_used() called twice without lock.
-                // If another thread evicts between calls, second tier_used() < target → underflow.
-                // Snapshot once, check both conditions before subtraction.
-                // PIPELINE FIX 2: Lower VRAM preemptive eviction threshold 97%→90% ★★★
-                // Old: 97% trigger → only 3% headroom → blocking eviction on hot path
-                // New: 90% trigger, evict to 80% → 10% headroom prevents token latency spikes
-                // Trade-off: More frequent eviction, slightly higher CPU usage, but eliminates
-                // synchronous eviction during token generation. GLM-5.1 top-k=8 router has high
-                // expert reuse, so hotness-based eviction rarely evicts hot experts.
-                // PIPELINE FIX 12: Refresh VRAM usage snapshot before eviction ★★
-                // Old: Stale snapshot → evict wrong amount (other workers changed VRAM usage)
-                // New: Fresh snapshot right before demote_cold_until → accurate eviction
-                const uint64_t vram_used_fresh = tier_used(engine, GLM5_TIER_VRAM);
-                const uint64_t vram_target = (vram_bud * 80ull) / 100ull;
-                if (vram_bud > 0 && vram_used_fresh > (vram_bud * 90ull) / 100ull && vram_used_fresh > vram_target) {
-                    const uint64_t to_free = vram_used_fresh - vram_target;
-                    std::vector<std::pair<int, int>> freed;
-                    demote_cold_until(engine, GLM5_TIER_VRAM, to_free, freed);
-                    if (!freed.empty()) {
-                        device_free_experts_batched(engine, freed, 8);
-                    }
-                }
-                // PIPELINE FIX 2: Lower RAM preemptive eviction threshold 97%→90% (same as VRAM)
-                // PIPELINE FIX 12: Refresh RAM usage snapshot (same as VRAM)
-                // BUGFIX 21: Remove dead variable ram_used_snap ★
-                const uint64_t ram_used_fresh = tier_used(engine, GLM5_TIER_RAM);
-                const uint64_t ram_target = (ram_bud * 80ull) / 100ull;
-                if (ram_bud > 0 && ram_used_fresh > (ram_bud * 90ull) / 100ull && ram_used_fresh > ram_target) {
-                    const uint64_t to_free = ram_used_fresh - ram_target;
-                    std::vector<std::pair<int, int>> freed_dummy;
-                    demote_cold_until(engine, GLM5_TIER_RAM, to_free, freed_dummy);
-                }
-            }
-        }
-
         if (worker_index >= engine->disk_worker_target.load()) {
-            stream_guard.e = nullptr;  // BUGFIX 27: Prevent double-destroy
-            device_stream_destroy_current(engine);
+            exit_worker();
             return;
         }
     }

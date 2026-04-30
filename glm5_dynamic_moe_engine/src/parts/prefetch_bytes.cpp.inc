@@ -40,28 +40,51 @@ static void touch_mapped_range(const uint8_t* src, uint64_t bytes) {
 
 static uint32_t acquire_staging_slot_internal(glm5_pc_engine* engine, uint32_t start_idx, uint32_t count, uint32_t worker_index, uint32_t turn);
 
-static uint32_t acquire_staging_slot(glm5_pc_engine* engine, uint32_t worker_index, uint32_t turn, bool for_pinned = true) {
+static uint32_t acquire_staging_slot(
+    glm5_pc_engine* engine,
+    uint32_t worker_index,
+    uint32_t turn,
+    bool for_pinned = true,
+    bool for_direct = false
+) {
     if (!engine || engine->staging_slots.empty()) {
         return UINT32_MAX;
     }
     const uint32_t total_count = static_cast<uint32_t>(engine->staging_slots.size());
-    if (total_count < 2) {
-        return acquire_staging_slot_internal(engine, 0, total_count, worker_index, turn);
-    }
     const uint32_t pinned_slot_count = engine->staging_pinned_slot_count.load(std::memory_order_acquire);
-    const uint32_t mid = pinned_slot_count > 0 &&
-        pinned_slot_count < total_count
-        ? pinned_slot_count
-        : total_count / 2;
-    // Fix S7-5: Try preferred range first, then steal from other pool.
-    const uint32_t pref_start = for_pinned ? 0 : mid;
-    const uint32_t pref_count = for_pinned ? mid : (total_count - mid);
-    uint32_t slot = acquire_staging_slot_internal(engine, pref_start, pref_count, worker_index, turn);
-    if (slot != UINT32_MAX) return slot;
-    // Fallback: steal from the other pool to eliminate starvation
-    const uint32_t alt_start = for_pinned ? mid : 0;
-    const uint32_t alt_count = for_pinned ? (total_count - mid) : mid;
-    return acquire_staging_slot_internal(engine, alt_start, alt_count, worker_index, turn);
+    const uint32_t gpu_slot_count = engine->staging_gpu_slot_count.load(std::memory_order_acquire);
+    const uint32_t direct_slot_count = engine->staging_direct_slot_count.load(std::memory_order_acquire);
+    uint32_t pinned_count = std::min(pinned_slot_count, total_count);
+    uint32_t gpu_count = std::min(gpu_slot_count, total_count - pinned_count);
+    uint32_t direct_count = std::min(direct_slot_count, total_count - pinned_count - gpu_count);
+    if (pinned_count + gpu_count + direct_count < total_count) {
+        const uint32_t spare = total_count - pinned_count - gpu_count - direct_count;
+        if (direct_count > 0 || for_direct) {
+            direct_count += spare;
+        } else if (gpu_count > 0 || !for_pinned) {
+            gpu_count += spare;
+        } else {
+            pinned_count += spare;
+        }
+    }
+    const uint32_t gpu_start = pinned_count;
+    const uint32_t direct_start = pinned_count + gpu_count;
+    uint32_t pref_start = 0;
+    uint32_t pref_count = 0;
+    if (for_direct) {
+        pref_start = direct_start;
+        pref_count = direct_count;
+    } else if (for_pinned) {
+        pref_start = 0;
+        pref_count = pinned_count;
+    } else {
+        pref_start = gpu_start;
+        pref_count = gpu_count;
+    }
+    if (pref_count == 0) {
+        return UINT32_MAX;
+    }
+    return acquire_staging_slot_internal(engine, pref_start, pref_count, worker_index, turn);
 }
 
 static uint32_t acquire_staging_slot_internal(glm5_pc_engine* engine, uint32_t start_idx, uint32_t count, uint32_t worker_index, uint32_t turn) {
@@ -102,7 +125,7 @@ static void release_staging_slot(glm5_pc_engine* engine, uint32_t slot_index) {
         // Bug Fix: Remove empty mutex scope - predicate-based wait_for handles missed wakeups
         // The predicate (staging_free_slot_count > 0) in acquire_staging_slot_internal
         // already prevents missed wakeups. Empty lock scope only adds mutex contention.
-        engine->staging_slot_cv.notify_one();
+        engine->staging_slot_cv.notify_all();
     }
 }
 

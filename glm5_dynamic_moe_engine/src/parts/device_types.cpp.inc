@@ -22,6 +22,7 @@ typedef int (*glm5_cu_stream_destroy_fn)(void*);
 typedef int (*glm5_cu_event_create_fn)(void**, unsigned int);
 typedef int (*glm5_cu_event_record_fn)(void*, void*);
 typedef int (*glm5_cu_event_query_fn)(void*);
+typedef int (*glm5_cu_event_synchronize_fn)(void*);
 typedef int (*glm5_cu_event_destroy_fn)(void*);
 
 struct glm5_cuda_driver_api {
@@ -44,6 +45,7 @@ struct glm5_cuda_driver_api {
     glm5_cu_event_create_fn cuEventCreate = nullptr;
     glm5_cu_event_record_fn cuEventRecord = nullptr;
     glm5_cu_event_query_fn cuEventQuery = nullptr;
+    glm5_cu_event_synchronize_fn cuEventSynchronize = nullptr;
     glm5_cu_event_destroy_fn cuEventDestroy = nullptr;
 };
 

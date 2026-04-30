@@ -47,6 +47,23 @@ static void device_complete_pending_copies(glm5_pc_engine* e) {
     device_free_deferred_ptrs(e, deferred_free_ptrs);
 }
 
+static void device_complete_pending_copy_key(glm5_pc_engine* e, uint64_t key) {
+    if (!e || key == 0) return;
+    std::vector<std::pair<CUdeviceptr, uint64_t>> deferred_free_ptrs;
+    {
+        std::lock_guard<std::mutex> lock(e->device_mutex);
+        device_complete_copy_locked(e, key, &deferred_free_ptrs);
+    }
+    auto it = s_tl_tensor_pending_keys.find(e);
+    if (it != s_tl_tensor_pending_keys.end() && !it->second.empty()) {
+        auto key_it = std::find(it->second.begin(), it->second.end(), key);
+        if (key_it != it->second.end()) {
+            it->second.erase(key_it);
+        }
+    }
+    device_free_deferred_ptrs(e, deferred_free_ptrs);
+}
+
 static void device_force_clear_pending_copies(glm5_pc_engine* e) {
     if (!e) return;
     std::vector<std::pair<CUdeviceptr, uint64_t>> deferred_free_ptrs;

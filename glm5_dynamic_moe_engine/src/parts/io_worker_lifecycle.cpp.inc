@@ -28,6 +28,9 @@ static void stop_io_workers(glm5_pc_engine* engine) {
             worker.join();
         }
     }
+    if (engine->eviction_worker.joinable()) {
+        engine->eviction_worker.join();
+    }
     device_force_clear_pending_copies(engine);
     // Fix 71: force_blocking=true on shutdown to ensure all threads joined
     flush_deferred_joins(engine, true);
@@ -75,6 +78,9 @@ static void start_io_workers(glm5_pc_engine* engine) {
         for (uint32_t i = 0; i < gpu_workers; ++i) {
             engine->gpu_workers.emplace_back(gpu_worker_loop, engine, i);
         }
+    }
+    if (!engine->eviction_worker.joinable()) {
+        engine->eviction_worker = std::thread(proactive_eviction_worker_loop, engine);
     }
 }
 

@@ -52,7 +52,8 @@ static int prefetch_tensor_pinned_to_gpu(
             rec,
             GLM5_DEVICE_POOL_EXPERT,
             engine->staging_slots[staging_slot].buf,
-            staging_bytes
+            staging_bytes,
+            staging_slot
         );
     } else {
         copied = device_copy_tensor(engine, rec, GLM5_DEVICE_POOL_EXPERT, allow_sync_fallback);

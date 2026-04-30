@@ -71,8 +71,7 @@ static int device_copy_raw_span(
             device_backend_copy_h2d_async(e, dst, slot.buf, s.bytes, stream) :
             device_backend_copy_h2d_sync(e, dst, slot.buf, s.bytes);
         if (ok && async_copy) {
-            s_tl_tensor_pending_keys[e].push_back(key);
-            s_tl_deferred_staging_slots[e].push_back(slot_idx);
+            device_defer_staging_copy(e, slot_idx, key, stream);
         } else {
             release_staging_slot(e, slot_idx);
         }

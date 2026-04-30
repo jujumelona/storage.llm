@@ -70,7 +70,8 @@ static int device_copy_tensor_from_host(
     const glm5_tensor_record& r,
     uint8_t pool,
     const uint8_t* host,
-    uint64_t host_bytes
+    uint64_t host_bytes,
+    uint32_t staging_slot = UINT32_MAX
 ) {
     const uint64_t bytes = tensor_stream_bytes(r);
     if (!e || !host || host_bytes < bytes || bytes == 0 ||
@@ -100,7 +101,13 @@ static int device_copy_tensor_from_host(
         return 0;
     }
     if (async_copy) {
-        s_tl_tensor_pending_keys[e].push_back(key);
+        if (staging_slot != UINT32_MAX) {
+            device_defer_staging_copy(e, staging_slot, key, stream);
+        } else {
+            s_tl_tensor_pending_keys[e].push_back(key);
+        }
+    } else if (staging_slot != UINT32_MAX) {
+        release_staging_slot(e, staging_slot);
     }
     device_touch_allocation(e, key);
     return 1;
@@ -193,8 +200,7 @@ static int device_copy_tensor(
             ok = device_backend_copy_h2d_sync(e, dst, staging_buf, bytes);
         }
         if (ok && async_copy) {
-            // Fix 63: Defer slot release — GPU still reading from staging buffer
-            s_tl_deferred_staging_slots[e].push_back(slot_idx);
+            device_defer_staging_copy(e, slot_idx, key, stream);
         } else {
             release_staging_slot(e, slot_idx);
         }
@@ -205,7 +211,7 @@ static int device_copy_tensor(
             return 0;
         }
         if (async_copy) {
-            s_tl_tensor_pending_keys[e].push_back(key);
+            // Staged async copies are completed by their per-copy event.
         }
         device_touch_allocation(e, key);
         return 1;

@@ -10,13 +10,13 @@ static void gpu_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
     // BUG 4 FIX: Make 'e' mutable to prevent double-destroy on normal exit ★
     struct StreamGuard {
         glm5_pc_engine* e;
-        ~StreamGuard() { 
+        ~StreamGuard() {
             if (e) {
                 device_stream_destroy_current(e);
             }
         }
     } stream_guard{engine};
-    
+
     for (;;) {
         glm5_prefetch_task task{};
         if (!pop_stage_task(engine, engine->gpu_stage, &task, &engine->gpu_worker_target, worker_index)) {
@@ -131,20 +131,18 @@ static void gpu_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                     }
                 }
             }
+            device_drain_deferred_staging_copies(engine, false);
         }
 
-        device_stream_sync_current(engine);
+        device_drain_deferred_staging_copies(engine, true);
 
-        // Fix 29 + Bug #7: Guard against double-release.
-        // If prefetch_tensor_pinned_to_gpu pushed the slot to s_tl_deferred_staging_slots,
-        // device_stream_sync_current already released it. Check before outer release.
+        // Successful async copies release their staging slot through per-copy events.
+        // Failed copies never registered an event, so they are safe to release here.
         for (uint32_t i = 0; i < batch_count; ++i) {
             if (batch[i].staging_slot != UINT32_MAX && !ok[i]) {
                 // Copy failed before async enqueue — slot was NOT deferred, safe to release
                 release_staging_slot(engine, batch[i].staging_slot);
             }
-            // If ok[i]==true, slot was consumed by async copy and released via
-            // device_stream_sync_current → deferred path. Do NOT release again.
         }
         for (uint32_t i = 0; i < batch_count; ++i) {
             finish_stage_task(engine, engine->gpu_stage, ok[i], terminal[i]);

@@ -2,6 +2,7 @@
 // Modularized: Sections extracted to separate files
 
 static void device_complete_pending_copies(glm5_pc_engine* e);
+static void device_complete_pending_copy_key(glm5_pc_engine* e, uint64_t key);
 
 #include "device_backend_async.cpp.inc"
 #include "device_tensor_copy_stream.cpp.inc"
