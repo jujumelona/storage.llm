@@ -119,12 +119,13 @@ static uint64_t prefetch_raw_layer_roles(
     return bytes;
 }
 
+static void trigger_ram_expert_promotion(moe_pc_engine* e);
 static int prefetch_fixed_core_raw(moe_pc_engine* e) {
     uint64_t budget = e ? e->common_vram_reserved_bytes.load() : 0;
     uint64_t bytes = 0;
     if (!e || !e->io_config.enable_common_raw_vram_pin || budget == 0) {
         if (e) {
-            e->common_vram_upload_complete.store(true, std::memory_order_release);
+            trigger_ram_expert_promotion(e);
         }
         return 0;
     }
@@ -149,6 +150,47 @@ static int prefetch_fixed_core_raw(moe_pc_engine* e) {
     return bytes > 0 ? 1 : 0;
 }
 
+static void trigger_ram_expert_promotion(moe_pc_engine* e) {
+    if (!e) return;
+    const bool was_incomplete = !e->common_vram_upload_complete.exchange(true);
+    if (!was_incomplete) return;
+
+    e->vram_used_bytes.fetch_add(e->common_vram_reserved_bytes.load());
+
+    const uint64_t vram_budget = tier_budget(e, moe_TIER_VRAM);
+    const uint64_t vram_used = tier_used(e, moe_TIER_VRAM);
+    if (vram_budget > vram_used) {
+        const uint64_t vram_room = vram_budget - vram_used;
+        const uint64_t avg_expert_bytes = e->max_tensor_stream_bytes > 0
+            ? e->max_tensor_stream_bytes : 20ull * 1024ull * 1024ull;
+        const uint32_t max_promote = vram_room > 0 && avg_expert_bytes > 0
+            ? std::min<uint32_t>(32u, (uint32_t)(vram_room / avg_expert_bytes)) : 0u;
+        if (max_promote > 0) {
+            std::vector<std::pair<size_t, double>> ram_experts;
+            {
+                std::lock_guard<std::mutex> map_lock(e->map_mutex);
+                for (size_t slot = 0; slot < e->expert_states.size(); ++slot) {
+                    const moe_block_state& state = e->expert_states[slot];
+                    if (state.active && state.tier == moe_TIER_RAM && !state.pending_evict) {
+                        ram_experts.push_back({slot, state.hot_score});
+                    }
+                }
+            }
+            std::sort(ram_experts.begin(), ram_experts.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+            const uint32_t promote_count = std::min<uint32_t>(max_promote, (uint32_t)ram_experts.size());
+            for (uint32_t i = 0; i < promote_count; ++i) {
+                int layer = 0, expert = 0;
+                expert_dense_slot_decode(ram_experts[i].first, &layer, &expert);
+                const uint64_t bytes = expert_triplet_bytes(e, layer, expert);
+                if (bytes > 0) {
+                    moe_pc_engine_request_expert(e, layer, expert, bytes, moe_TIER_VRAM);
+                }
+            }
+        }
+    }
+}
+
 static int prefetch_common_raw_storage(moe_pc_engine* e) {
     int ok = prefetch_fixed_core_raw(e);
     if (!e) {
@@ -156,49 +198,8 @@ static int prefetch_common_raw_storage(moe_pc_engine* e) {
     }
     if (!ok) {
         e->common_vram_reserved_bytes.store(0, std::memory_order_release);
-        e->common_vram_upload_complete.store(true, std::memory_order_release);
-        return 0;
     }
-
-    const bool was_incomplete = !e->common_vram_upload_complete.exchange(true);
-    if (was_incomplete) {
-        e->vram_used_bytes.fetch_add(e->common_vram_reserved_bytes.load());
-        // Bug 19 Fix: Re-evaluate RAM-staged experts for VRAM promotion
-        // When common_vram_upload_complete flips to true, hot experts that were
-        // demoted to RAM can now be promoted to VRAM
-        const uint64_t vram_budget = tier_budget(e, moe_TIER_VRAM);
-        const uint64_t vram_used = tier_used(e, moe_TIER_VRAM);
-        if (vram_budget > vram_used) {
-            const uint64_t vram_room = vram_budget - vram_used;
-            const uint64_t avg_expert_bytes = e->max_tensor_stream_bytes > 0
-                ? e->max_tensor_stream_bytes : 20ull * 1024ull * 1024ull;
-            const uint32_t max_promote = vram_room > 0 && avg_expert_bytes > 0
-                ? std::min<uint32_t>(32u, (uint32_t)(vram_room / avg_expert_bytes)) : 0u;
-            if (max_promote > 0) {
-                std::vector<std::pair<size_t, double>> ram_experts;
-                {
-                    std::lock_guard<std::mutex> map_lock(e->map_mutex);
-                    for (size_t slot = 0; slot < e->expert_states.size(); ++slot) {
-                        const moe_block_state& state = e->expert_states[slot];
-                        if (state.active && state.tier == moe_TIER_RAM && !state.pending_evict) {
-                            ram_experts.push_back({slot, state.hot_score});
-                        }
-                    }
-                }
-                std::sort(ram_experts.begin(), ram_experts.end(),
-                    [](const auto& a, const auto& b) { return a.second > b.second; });
-                const uint32_t promote_count = std::min<uint32_t>(max_promote, (uint32_t)ram_experts.size());
-                for (uint32_t i = 0; i < promote_count; ++i) {
-                    int layer = 0, expert = 0;
-                    expert_dense_slot_decode(ram_experts[i].first, &layer, &expert);
-                    const uint64_t bytes = expert_triplet_bytes(e, layer, expert);
-                    if (bytes > 0) {
-                        moe_pc_engine_request_expert(e, layer, expert, bytes, moe_TIER_VRAM);
-                    }
-                }
-            }
-        }
-    }
+    trigger_ram_expert_promotion(e);
     return ok;
 }
 
@@ -243,7 +244,19 @@ static int prefetch_moe_activation_raw(moe_pc_engine* e, int layer) {
     if (!e || layer < 0) {
         return 0;
     }
+    // BUGFIX 89: Issue 13 - Optimize last_activation_layer CAS loop ★
+    // Problem: CAS loop when multiple workers call prefetch_moe_activation_raw
+    // Contention when layer changes frequently (every token in some models)
+    // Solution: Early exit if layer already set (no CAS needed)
+    // Only CAS when layer actually needs to change
     int previous_layer = e->last_activation_layer.load(std::memory_order_acquire);
+
+    // Fast path: layer already set, no CAS needed
+    if (previous_layer == layer) {
+        return 1;
+    }
+
+    // Slow path: CAS to update layer
     while (previous_layer != layer) {
         if (e->last_activation_layer.compare_exchange_weak(
                 previous_layer,
@@ -252,9 +265,10 @@ static int prefetch_moe_activation_raw(moe_pc_engine* e, int layer) {
                 std::memory_order_acquire)) {
             break;
         }
-    }
-    if (previous_layer == layer) {
-        return 1;
+        // After CAS failure, check if another thread already set it
+        if (previous_layer == layer) {
+            return 1;
+        }
     }
     const moe_storage_constants_t* c = moe_storage_constants();
     const int is_moe = c && layer >= (int)c->first_moe_layer && layer <= (int)c->last_moe_layer;

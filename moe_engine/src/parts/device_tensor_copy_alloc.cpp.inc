@@ -119,14 +119,19 @@ static int device_prepare_tensor_allocation(
             if (auto* c = device_pool_counter(e, pool)) {
                 c->fetch_add(bytes);
             }
-        // Fix 64: cuMemGetInfo is slow driver call ??do NOT call under device_mutex
+        // Fix 64: cuMemGetInfo is slow driver call →do NOT call under device_mutex
             const uint64_t bud = device_budget_bytes(e);
-            if (bud > 0 && e->device_allocated_bytes.load(std::memory_order_relaxed) > (bud * 85ull) / 100ull) {
+            // BUGFIX 99: Precompute percentage threshold
+            const uint64_t bud_threshold_85 = (bud * 85ull) / 100ull;
+            if (bud > 0 && e->device_allocated_bytes.load(std::memory_order_relaxed) > bud_threshold_85) {
+                // BUGFIX 90: Fix Lost Wakeup by setting vram_eviction_needed before notify
+                e->vram_eviction_needed.store(true, std::memory_order_relaxed);
                 e->vram_eviction_cv.notify_one();
             }
             a = &e->device_allocations.emplace(key, next).first->second;
             if (pool == moe_DEVICE_POOL_ACTIVATION) {
                 e->activation_keys.insert(key);
+                e->device_activation_count.fetch_add(1, std::memory_order_relaxed);
             }
         }
     } else {

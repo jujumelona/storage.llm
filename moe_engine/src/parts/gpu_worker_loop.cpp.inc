@@ -4,7 +4,7 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
     }
 
     // Problem 6 Fix: RAII guard to prevent CUDA stream leak on abnormal termination
-    // If gpu_worker exits via exception or forced termination (not normal pop_stage_task?’false),
+    // If gpu_worker exits via exception or forced termination (not normal pop_stage_task?ï¿½false),
     // device_stream_destroy_current would not be called ??stream leak.
     // This guard ensures cleanup regardless of exit path.
     // BUG 4 FIX: Make 'e' mutable to prevent double-destroy on normal exit ??
@@ -25,7 +25,7 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
             return;
         }
 
-        // PIPELINE FIX 13: Reduce batch size from 8 to 4 ?…â˜…??
+        // PIPELINE FIX 13: Reduce batch size from 8 to 4 ?ï¿½â˜…??
         // Update (Issue 2): Use dynamic batch max (up to 8)
         const uint32_t batch_max_dyn = moe_gpu_stage_batch_max(engine);
         constexpr uint32_t batch_capacity = 8;
@@ -52,8 +52,10 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 ++batch_count;
                 ++extra_popped;
             }
-            engine->gpu_stage.depth.store(static_cast<uint32_t>(
-                engine->gpu_stage.queue.size() + engine->gpu_stage.urgent_queue.size()));
+            // BUGFIX 97: Cache size calculation in gpu_worker
+            const uint32_t new_depth = static_cast<uint32_t>(
+                engine->gpu_stage.queue.size() + engine->gpu_stage.urgent_queue.size());
+            engine->gpu_stage.depth.store(new_depth);
             queue_total_depth_sub(engine, extra_popped);
         }
 
@@ -72,7 +74,7 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                     0
                 );
                 if (ok[i] == moe_DEVICE_COPY_BACKPRESSURE) {
-                    // PIPELINE FIX 4: Release staging slot immediately if no data ?…â˜…??
+                    // PIPELINE FIX 4: Release staging slot immediately if no data ?ï¿½â˜…??
                     // Old: Hold slot during 5ms wait ??blocks pinned_worker/io_worker
                     // New: Release slot if staging_valid==0 (no data yet) ??unblock pipeline
                     // Keep slot if staging_valid==1 (data already copied) ??preserve work
@@ -81,7 +83,7 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                         batch[i].staging_slot = UINT32_MAX;
                     }
 
-                    // Bug 4 Fix: Preserve staging_slot when staging_valid==1 to avoid wasting RAM?’pinned copy
+                    // Bug 4 Fix: Preserve staging_slot when staging_valid==1 to avoid wasting RAM?ï¿½pinned copy
                     // BACKPRESSURE means GPU is temporarily full. If staging data is valid, keep the slot
                     // and retry gpu_stage with 5ms wait. Only discard as last resort after retry fails.
                     moe_prefetch_task once_more = batch[i];

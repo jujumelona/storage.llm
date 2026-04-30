@@ -2,7 +2,7 @@ static void queue_total_depth_sub(moe_pc_engine* engine, uint32_t count) {
     if (!engine || count == 0) {
         return;
     }
-    // BUGFIX 63: Issue 6 - Remove store(0) race condition ?�★??
+    // BUGFIX 63: Issue 6 - Remove store(0) race condition ?�★??
     // Old: fetch_sub + store(0) correction ??store(0) overwrites concurrent fetch_add
     // Example: Worker A detects underflow, prepares store(0)
     //          Worker B does fetch_add(1) ??counter = 1
@@ -25,7 +25,12 @@ static int enqueue_stage(
     }
     {
         std::lock_guard<std::mutex> lock(stage.mtx);
-        const size_t total = stage.queue.size() + stage.urgent_queue.size();
+        // BUGFIX 97: Issue 18 - Cache queue size calculations ★
+        // Problem: size() called twice per enqueue (total check + depth store)
+        // Solution: Cache size calculation to avoid repeated calls
+        const size_t queue_sz = stage.queue.size();
+        const size_t urgent_sz = stage.urgent_queue.size();
+        const size_t total = queue_sz + urgent_sz;
         if (total >= engine->io_config.max_prefetch_queue) {
             engine->io_atomic.dropped_requests.fetch_add(1);
             return 0;
@@ -36,7 +41,7 @@ static int enqueue_stage(
         } else {
             stage.queue.push_back(task);
         }
-        stage.depth.store(static_cast<uint32_t>(stage.queue.size() + stage.urgent_queue.size()));
+        stage.depth.store(static_cast<uint32_t>(queue_sz + urgent_sz + 1));  // +1 for just-added task
         engine->total_queue_depth.fetch_add(1, std::memory_order_relaxed);
     }
     return 1;
@@ -53,9 +58,12 @@ static int enqueue_stage_or_retry(
     moe_prefetch_task queued = task;
     {
         std::lock_guard<std::mutex> lock(stage.mtx);
-        const size_t total = stage.queue.size() + stage.urgent_queue.size();
+        // BUGFIX 97: Cache queue size calculations
+        const size_t queue_sz = stage.queue.size();
+        const size_t urgent_sz = stage.urgent_queue.size();
+        const size_t total = queue_sz + urgent_sz;
         const size_t normal_cap = engine->io_config.max_prefetch_queue;
-        // PIPELINE FIX 18: Reduce retry_cap from 1.5x to 1.25x ??�쁾
+        // PIPELINE FIX 18: Reduce retry_cap from 1.5x to 1.25x ??�쁾
         // Old: retry_room = normal_cap/2 ??queue can grow to 150%
         // New: retry_room = normal_cap/4 ??queue can grow to 125%
         // Reduces queue inflation and makes dropped_requests metric more meaningful
@@ -66,7 +74,7 @@ static int enqueue_stage_or_retry(
             return 0;
         }
 
-        // BUGFIX 40: Add urgent_queue size limit to prevent unbounded growth ??�쁾??        // Old: urgent_queue has no cap ??can grow infinitely if all requeues become urgent
+        // BUGFIX 40: Add urgent_queue size limit to prevent unbounded growth ??�쁾??        // Old: urgent_queue has no cap ??can grow infinitely if all requeues become urgent
         // New: urgent_queue capped at normal_cap/2
         // Scenario: All tasks requeue with urgent=1 ??urgent_queue grows without bound
         //           ??memory exhaustion, priority inversion (everything is "urgent")
@@ -96,7 +104,7 @@ static int enqueue_stage_or_retry(
         } else {
             stage.queue.push_back(queued);
         }
-        stage.depth.store(static_cast<uint32_t>(stage.queue.size() + stage.urgent_queue.size()));
+        stage.depth.store(static_cast<uint32_t>(queue_sz + urgent_sz + 1));  // +1 for just-added task
         engine->total_queue_depth.fetch_add(1, std::memory_order_relaxed);
     }
     return 1;
@@ -125,8 +133,10 @@ static bool pop_stage_task(
         *out_task = stage.queue.front();
         stage.queue.pop_front();
     }
-    stage.depth.store(static_cast<uint32_t>(stage.queue.size() + stage.urgent_queue.size()));
-    // PIPELINE FIX 6: Increment inflight BEFORE notify to prevent race condition ??�쁾??    // Old order: notify ??inflight++ ??awakened thread sees inflight==0 ??false "idle"
+    // BUGFIX 97: Cache size after pop
+    const size_t new_depth = stage.queue.size() + stage.urgent_queue.size();
+    stage.depth.store(static_cast<uint32_t>(new_depth));
+    // PIPELINE FIX 6: Increment inflight BEFORE notify to prevent race condition ??�쁾??    // Old order: notify ??inflight++ ??awakened thread sees inflight==0 ??false "idle"
     // New order: inflight++ ??notify ??awakened thread always sees inflight>=1
     // Prevents premature "pipeline done" signal when tasks are still processing
     stage.inflight.fetch_add(1);
@@ -163,7 +173,7 @@ static void finish_stage_task(moe_pc_engine* engine, moe_stage_queue& stage, int
         engine->io_atomic.failed_requests.fetch_add(1);
     }
     stage.inflight.fetch_sub(1);
-    // BUGFIX 26: Only notify on terminal completion ??�쁾
+    // BUGFIX 26: Only notify on terminal completion ??�쁾
     // Old: notify on every finish, including requeues ??spurious wakeups
     // New: notify only when count_completed=true ??accurate completion signal
     // Prevents premature "all done" detection in startup_warm and other waiters
@@ -178,6 +188,7 @@ static bool stage_idle(moe_stage_queue& stage) {
 
 static void clear_stage(moe_pc_engine* engine, moe_stage_queue& stage) {
     std::lock_guard<std::mutex> lock(stage.mtx);
+    // BUGFIX 97: Cache size before clear
     const uint32_t removed = static_cast<uint32_t>(stage.queue.size() + stage.urgent_queue.size());
     stage.queue.clear();
     stage.urgent_queue.clear();

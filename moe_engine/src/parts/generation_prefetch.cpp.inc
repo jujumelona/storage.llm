@@ -3,7 +3,7 @@ static void moe_enqueue_attention_prefetch(moe_pc_engine* engine, int32_t layer)
         return;
     }
 
-    // BUGFIX 30: Use O(1) attention span index table instead of O(N) linear search ?呪槄??    // Old: Loop through all spans (begin..end) for each kind, pointer comparison ??O(N) per kind
+    // BUGFIX 30: Use O(1) attention span index table instead of O(N) linear search ?锟解槄??    // Old: Loop through all spans (begin..end) for each kind, pointer comparison ??O(N) per kind
     // New: Direct table lookup moe_storage_attention_span_index ??O(1) per kind
     // Eliminates 5 kinds 脳 79 layers 脳 O(N) pointer comparisons per token generation
     // Hot path optimization per ARCHITECTURE.md: "integer id and offset, no strings"
@@ -52,7 +52,7 @@ static uint64_t moe_attention_prefetch_bytes(int32_t layer) {
         return 0;
     }
 
-    // BUGFIX 30: Use O(1) attention span index table ?呪槄??    // Same optimization as moe_enqueue_attention_prefetch
+    // BUGFIX 30: Use O(1) attention span index table ?锟解槄??    // Same optimization as moe_enqueue_attention_prefetch
     uint64_t bytes = 0;
     uint32_t seen_spans[5] = {};
     uint32_t seen_count = 0;
@@ -88,16 +88,17 @@ static int moe_can_enqueue_attention_lookahead(moe_pc_engine* engine, int32_t la
     if (bytes == 0) {
         return 1;
     }
-    // BUGFIX 23: Use expert VRAM only, not total device allocation ?呪槄??    // Old: device_allocated_bytes includes fixed (KV cache, embeddings) ??premature cutoff
+    // BUGFIX 23: Use expert VRAM only, not total device allocation ?锟解槄??    // Old: device_allocated_bytes includes fixed (KV cache, embeddings) ??premature cutoff
     // New: tier_used(VRAM) only counts expert weights ??accurate threshold
     // Fixed allocations don't compete with attention prefetch, only experts do
     const uint64_t used = tier_used(engine, moe_TIER_VRAM);
     const uint64_t budget = engine->config.vram_budget_bytes;
-    // PIPELINE FIX 19: Raise attention lookahead threshold from 83% to 85% ?呪槄
+    // PIPELINE FIX 19: Raise attention lookahead threshold from 83% to 85% ?锟解槄
     // Old: threshold = budget * 5/6 ??83% ??dead zone between 83%-90%
     // New: threshold = budget * 85/100 = 85% ??aligns better with proactive eviction (90%)
     // Prevents attention prefetch cutoff before expert eviction starts
     // Dead zone reduced from 7% to 5%, improves attention prefetch opportunities
+    // BUGFIX 99: Precompute percentage threshold
     const uint64_t threshold = (budget * 87ull) / 100ull;
     return used < threshold && bytes <= threshold - used;
 }

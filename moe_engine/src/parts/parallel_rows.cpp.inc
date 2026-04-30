@@ -92,6 +92,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     engine->cpu_row_fn = nullptr;
     const int ok = engine->cpu_rows_ok.load(std::memory_order_acquire);
     engine->cpu_row_active.fetch_sub(1, std::memory_order_release);  // Bug #7: Decrement counter
+    lock.unlock();
     engine->cpu_row_done_cv.notify_all();
-    lock.unlock();    return ok;
+    return ok;
 }

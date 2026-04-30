@@ -46,7 +46,8 @@ int moe_juju_read_header(const char* path, moe_juju_header_t* out_header) {
         return 0;
     }
     std::memset(out_header, 0, sizeof(*out_header));
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in;
+    open_ifstream_path(in, path, std::ios::in | std::ios::binary);
     if (!in) {
         return 0;
     }
@@ -88,7 +89,8 @@ int moe_juju_read_section_table(
     if (header->section_table_size && bytes > header->section_table_size) {
         return 0;
     }
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in;
+    open_ifstream_path(in, path, std::ios::in | std::ios::binary);
     if (!in) {
         return 0;
     }

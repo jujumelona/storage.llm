@@ -1,4 +1,4 @@
-﻿moe_pc_engine_t* moe_pc_engine_create(const moe_pc_engine_config_t* config) {
+moe_pc_engine_t* moe_pc_engine_create(const moe_pc_engine_config_t* config) {
     auto* engine = new moe_pc_engine();
     engine->config = config ? *config : moe_pc_default_config();
     qkv_set_mode(engine->config.kv_mode == moe_KV_MODE_QKV);
@@ -14,9 +14,11 @@
         caps_gpu_backend_available(engine->backend_caps)) {
         engine->config.vram_budget_bytes = engine->backend_caps.recommended_vram_cache_bytes;
     }
+    device_allocator_init(engine);
     apply_common_vram_reservation(engine);
     moe_pc_engine_configure_io(engine, nullptr);
     ensure_cpu_row_workers(engine, 0);
+    device_stream_pool_init(engine);
     return engine;
 }
 

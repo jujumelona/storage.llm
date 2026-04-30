@@ -52,23 +52,23 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
     if (!engine) {
         return;
     }
-    while (!engine->io_stop.load(std::memory_order_relaxed)) {
-        // BUGFIX 81: Problem 6 - Replace 5ms polling with event-driven CV ?�★??
+    // BUGFIX 95: Issue 16 - Cache io_stop load outside loop ★
+    // Problem: Atomic load on every iteration adds overhead
+    // Solution: Cache load, re-check only after CV wakeup
+    const auto should_stop = [&]() { return engine->io_stop.load(std::memory_order_relaxed); };
+    while (!should_stop()) {
+        // BUGFIX 81: Problem 6 - Replace 5ms polling with event-driven CV ★★
         // Old: 5ms sleep caused CPU overhead and potential oscillation.
         // New: Wait on vram_eviction_cv. Triggered instantly when allocation > 85%.
         // Fallback to 50ms wait to periodically check RAM eviction.
         {
             std::unique_lock<std::mutex> lock(engine->vram_eviction_mutex);
             engine->vram_eviction_cv.wait_for(lock, std::chrono::milliseconds(25), [&]() {
-                return engine->vram_eviction_needed.load(std::memory_order_relaxed) || engine->io_stop.load(std::memory_order_relaxed);
+                return engine->vram_eviction_needed.load(std::memory_order_relaxed) ||
+                       engine->ram_eviction_needed.load(std::memory_order_relaxed) ||
+                       engine->io_stop.load(std::memory_order_relaxed);
             });
             engine->vram_eviction_needed.store(false, std::memory_order_relaxed);
-        }
-        {
-            std::unique_lock<std::mutex> lock(engine->ram_eviction_mutex);
-            engine->ram_eviction_cv.wait_for(lock, std::chrono::milliseconds(25), [&]() {
-                return engine->ram_eviction_needed.load(std::memory_order_relaxed) || engine->io_stop.load(std::memory_order_relaxed);
-            });
             engine->ram_eviction_needed.store(false, std::memory_order_relaxed);
         }
         if (engine->io_stop.load(std::memory_order_relaxed)) {
@@ -78,15 +78,17 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         const uint64_t ram_bud = tier_budget(engine, moe_TIER_RAM);
         const uint64_t vram_used = tier_used(engine, moe_TIER_VRAM);
 
-        // BUGFIX 57: Issue 2 - Lower proactive eviction trigger to 85% ?�★
+        // BUGFIX 57: Issue 2 - Lower proactive eviction trigger to 85% ★★
         // Problem: Attention prefetch cutoff at 87%, proactive eviction at 90%
-        // ??3% dead zone where attention blocked but eviction not started
-        // ??CPU fallback or mmap streaming for attention weights
+        // →3% dead zone where attention blocked but eviction not started
+        // →CPU fallback or mmap streaming for attention weights
         // Solution: Lower eviction trigger to 85%, target to 75%
         // Ensures eviction starts BEFORE attention prefetch cutoff
         // Trade-off: More frequent eviction, but prevents attention stalls
+        // BUGFIX 99: Precompute percentage thresholds
         const uint64_t vram_target = (vram_bud * 75ull) / 100ull;
-        if (vram_bud > 0 && vram_used > (vram_bud * 85ull) / 100ull && vram_used > vram_target) {
+        const uint64_t vram_threshold_85 = (vram_bud * 85ull) / 100ull;
+        if (vram_bud > 0 && vram_used > vram_threshold_85 && vram_used > vram_target) {
             std::vector<std::pair<int, int>> freed;
             demote_cold_until(engine, moe_TIER_VRAM, vram_used - vram_target, freed);
             if (!freed.empty() && !engine->io_stop.load(std::memory_order_relaxed)) {
@@ -100,7 +102,8 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         }
         const uint64_t ram_used = tier_used(engine, moe_TIER_RAM);
         const uint64_t ram_target = (ram_bud * 80ull) / 100ull;
-        if (ram_bud > 0 && ram_used > (ram_bud * 90ull) / 100ull && ram_used > ram_target) {
+        const uint64_t ram_threshold_90 = (ram_bud * 90ull) / 100ull;
+        if (ram_bud > 0 && ram_used > ram_threshold_90 && ram_used > ram_target) {
             std::vector<std::pair<int, int>> ignored;
             demote_cold_until(engine, moe_TIER_RAM, ram_used - ram_target, ignored);
         }
@@ -146,7 +149,8 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         return 1;
     };
     auto drain_local_requeues = [&]() {
-        while (!local_requeues.empty() && !engine->io_stop.load(std::memory_order_relaxed)) {
+        // BUGFIX 95: Cache io_stop check in requeue loop
+        while (!local_requeues.empty() && !should_stop()) {
             const auto pending = local_requeues.front();
             if (io_worker_requeue_disk_task(engine, pending.first, pending.second, 5u, 1u)) {
                 local_requeues.pop_front();
@@ -161,14 +165,31 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         stream_guard.e = nullptr;
         device_stream_destroy_current(engine);
     };
+    // BUGFIX 84: Issue 6 - Limit local_requeues retry attempts ★★
+    // Problem: Infinite retry when both disk_stage and gpu_stage full
+    // io_worker stuck in requeue loop → no progress
+    // Solution: Max 100 retries per item, then drop
+    uint32_t requeue_retry_count = 0;
+    constexpr uint32_t MAX_REQUEUE_RETRIES = 100;
+
     for (;;) {
         if (!local_requeues.empty()) {
             const auto pending = local_requeues.front();
             if (io_worker_requeue_disk_task(engine, pending.first, pending.second, 1u, 0u)) {
                 local_requeues.pop_front();
+                requeue_retry_count = 0;  // Reset on success
                 continue;
             }
-            // PIPELINE FIX 10: Wait on correct CV based on requeue target ?�★??
+
+            // BUGFIX 84: Check retry limit
+            if (++requeue_retry_count >= MAX_REQUEUE_RETRIES) {
+                engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                local_requeues.pop_front();
+                requeue_retry_count = 0;
+                continue;
+            }
+
+            // PIPELINE FIX 10: Wait on correct CV based on requeue target ★★
             // Old: Always waited on disk_stage.pop_cv even when gpu_stage was full
             // New: Wait on gpu_stage.pop_cv when target is GPU, disk_stage.pop_cv otherwise
             // Eliminates 2ms polling delay when GPU stage is the actual bottleneck
@@ -178,6 +199,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
             target_stage->pop_cv.wait_for(lock, std::chrono::milliseconds(2));
             continue;
         }
+        requeue_retry_count = 0;  // Reset when queue empty
         // Fix 10: GDS/mmap routing changes rarely ??refresh every 10 tasks.
         // VRAM pressure changes fast; refresh when allocator budget headroom shifts >10%.
         const uint64_t cur_budget = device_budget_bytes(engine);

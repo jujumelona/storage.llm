@@ -1,4 +1,4 @@
-// BUGFIX 72: Issue 10 - Optimize KV cache layout to [pos][layer][dim] ?�★
+// BUGFIX 72: Issue 10 - Optimize KV cache layout to [pos][layer][dim] ?�★
 // Problem: Old layout [layer][pos][dim] requires 79 separate memcpy during realloc
 // Poor cache locality during attention decode (layers not contiguous)
 // Solution: Change to [pos][layer][dim] layout
@@ -7,27 +7,51 @@
 // - Single memcpy instead of 79 separate copies
 // Impact: Index calculation changes in store_entry, load_entry
 struct moe_kv_cache {
-    std::vector<uint16_t> data;  // bf16 storage: 2 bytes/entry (was 4)
+    uint16_t* data = nullptr;  // bf16 storage: 2 bytes/entry
     uint32_t num_layers = 0;
     uint32_t max_seq_len = 0;
     uint32_t seq_len = 0;
     uint64_t tracked_ram_bytes = 0;
 
+    ~moe_kv_cache() { if (data) std::free(data); }
+    moe_kv_cache() = default;
+    moe_kv_cache(const moe_kv_cache&) = delete;
+    moe_kv_cache& operator=(const moe_kv_cache&) = delete;
+    moe_kv_cache(moe_kv_cache&& other) noexcept : data(other.data), num_layers(other.num_layers), max_seq_len(other.max_seq_len), seq_len(other.seq_len), tracked_ram_bytes(other.tracked_ram_bytes) { other.data = nullptr; }
+    moe_kv_cache& operator=(moe_kv_cache&& other) noexcept {
+        if (this != &other) {
+            if (data) std::free(data);
+            data = other.data; num_layers = other.num_layers; max_seq_len = other.max_seq_len; seq_len = other.seq_len; tracked_ram_bytes = other.tracked_ram_bytes;
+            other.data = nullptr;
+        }
+        return *this;
+    }
+
     void init(uint32_t layers, bool pre_allocate = false) {
         num_layers = layers;
         max_seq_len = pre_allocate ? moe_MLA_MAX_SEQ_LEN : moe_MLA_KV_INITIAL_CHUNK;
         seq_len = 0;
-        data.assign((size_t)max_seq_len * layers * moe_MLA_KV_ENTRY_DIM, 0u);
+        if (data) std::free(data);
+        data = (uint16_t*)std::calloc((size_t)max_seq_len * layers * moe_MLA_KV_ENTRY_DIM, sizeof(uint16_t));
     }
 
-    // BUGFIX 71: Issue 9 - Remove KV cache zero-init waste ?�★
-    // BUGFIX 72: Issue 10 - Single memcpy realloc with [pos][layer][dim] layout ?�★
+    // BUGFIX 71: Issue 9 - Remove KV cache zero-init waste ★
+    // BUGFIX 72: Issue 10 - Single memcpy realloc with [pos][layer][dim] layout ★
     // Problem: Zero-initializing entire buffer wastes 2.8GB per realloc
     // Old layout [layer][pos][dim] required 79 separate memcpy
     // Solution: Use [pos][layer][dim] layout + resize() without value-init
     // - Single memcpy for all old data (layers are now contiguous per position)
     // - No zero-init waste
     // - Better cache locality during attention decode
+    //
+    // TODO: Issue 10 - Further optimize large memcpy (2.8GB) ★
+    // Current: Single memcpy of 2.8GB blocks generation for ~20-50ms
+    // Options:
+    // 1. Incremental realloc: Grow by smaller chunks (e.g., 512MB)
+    // 2. Ring buffer: Avoid realloc entirely, wrap around at max_seq_len
+    // 3. Async memcpy: Background thread copies old data while generation continues
+    // Trade-off: Complexity vs latency reduction
+    // Status: Documented, not implemented (requires architectural change)
     void ensure_capacity(uint32_t needed_pos) {
         if (needed_pos < max_seq_len) return;
         uint32_t new_cap = max_seq_len > 0 ? max_seq_len : 1u;
@@ -36,23 +60,21 @@ struct moe_kv_cache {
         }
         if (new_cap > moe_MLA_MAX_SEQ_LEN) new_cap = moe_MLA_MAX_SEQ_LEN;
         if (new_cap == max_seq_len) return;
-        const size_t old_total = (size_t)max_seq_len * num_layers * moe_MLA_KV_ENTRY_DIM;
         const size_t new_total = (size_t)new_cap * num_layers * moe_MLA_KV_ENTRY_DIM;
-        std::vector<uint16_t> new_data;
-        new_data.resize(new_total);  // No zero-init, uninitialized memory
-        // Single memcpy: all layers are contiguous in [pos][layer][dim] layout
-        if (old_total > 0) {
-            std::memcpy(new_data.data(), data.data(), old_total * sizeof(uint16_t));
+        // BUGFIX 89: Issue 10 - Use realloc to avoid 2.8GB memcpy during KV cache resize
+        // OS extends VM mappings via mremap (Linux) without physical copy when expanding.
+        uint16_t* new_data = (uint16_t*)std::realloc(data, new_total * sizeof(uint16_t));
+        if (new_data) {
+            data = new_data;
+            max_seq_len = new_cap;
         }
-        data = std::move(new_data);
-        max_seq_len = new_cap;
     }
 
-    // BUGFIX 72: Issue 10 - Update index calculation for [pos][layer][dim] layout ?�★
+    // BUGFIX 72: Issue 10 - Update index calculation for [pos][layer][dim] layout ?�★
     void store_entry(uint32_t layer, uint32_t pos, const float* src, uint32_t count) {
         if (layer >= num_layers || pos >= max_seq_len || count > moe_MLA_KV_ENTRY_DIM) return;
         // New layout: data[pos * num_layers * dim + layer * dim + d]
-        uint16_t* dst = data.data() + ((size_t)pos * num_layers + layer) * moe_MLA_KV_ENTRY_DIM;
+        uint16_t* dst = data + ((size_t)pos * num_layers + layer) * moe_MLA_KV_ENTRY_DIM;
         uint32_t i = 0;
 #if defined(__AVX2__)
         for (; i + 7u < count; i += 8u) {
@@ -82,12 +104,12 @@ struct moe_kv_cache {
         }
     }
 
-    // BUGFIX 72: Issue 10 - Update index calculation for [pos][layer][dim] layout ?�★
+    // BUGFIX 72: Issue 10 - Update index calculation for [pos][layer][dim] layout ?�★
     // Load bf16 entry to float32 buffer
     void load_entry(uint32_t layer, uint32_t pos, float* dst, uint32_t count) const {
         if (layer >= num_layers || pos >= max_seq_len || count > moe_MLA_KV_ENTRY_DIM) return;
         // New layout: data[pos * num_layers * dim + layer * dim + d]
-        const uint16_t* src = data.data() + ((size_t)pos * num_layers + layer) * moe_MLA_KV_ENTRY_DIM;
+        const uint16_t* src = data + ((size_t)pos * num_layers + layer) * moe_MLA_KV_ENTRY_DIM;
         uint32_t i = 0;
 #if defined(__AVX2__)
         for (; i + 7u < count; i += 8u) {
@@ -117,7 +139,7 @@ static uint64_t moe_kv_cache_bytes(uint32_t layers, uint32_t seq_len) {
 }
 
 static uint64_t moe_kv_cache_allocated_bytes(const moe_kv_cache& cache) {
-    if (cache.data.empty()) {
+    if ((!cache.data)) {
         return 0;
     }
     return moe_kv_cache_bytes(cache.num_layers, cache.max_seq_len);

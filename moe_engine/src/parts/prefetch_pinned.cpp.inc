@@ -60,13 +60,14 @@ static int prefetch_tensor_file_to_pinned(
 
     // Thread-local ifstream cache: reuse open streams for same path
     struct cached_stream_t {
+        moe_pc_engine* engine;
         std::string path;
         std::ifstream stream;
     };
     static thread_local cached_stream_t tls_stream_cache;
 
     std::ifstream* input = nullptr;
-    if (tls_stream_cache.path == path && tls_stream_cache.stream.is_open()) {
+    if (tls_stream_cache.engine == engine && tls_stream_cache.path == path && tls_stream_cache.stream.is_open()) {
         // Reuse cached stream
         input = &tls_stream_cache.stream;
     } else {
@@ -78,6 +79,7 @@ static int prefetch_tensor_file_to_pinned(
         if (!tls_stream_cache.stream) {
             return 0;
         }
+        tls_stream_cache.engine = engine;
         tls_stream_cache.path = path;
         input = &tls_stream_cache.stream;
     }

@@ -56,9 +56,21 @@ static int moe_attention_projectors_ready(const moe_pc_engine* engine) {
     return 1;
 }
 
+static int moe_gguf_common_tensor_ready(const moe_pc_engine* engine, const char* name) {
+    if (!engine || !name || !name[0]) {
+        return 0;
+    }
+    return engine->gguf_common_tensor_slots.find(moe_lower_ascii_copy(name)) !=
+        engine->gguf_common_tensor_slots.end() ? 1 : 0;
+}
+
 static int moe_raw_embedding_ready(const moe_pc_engine* engine) {
     const moe_storage_constants_t* c = moe_storage_constants();
     const moe_storage_raw_span_spec_t* span = find_raw_role_span(-1, moe_RAW_ROLE_EMBED);
+    if (engine && engine->offload_gguf_valid.load(std::memory_order_relaxed) &&
+        moe_gguf_common_tensor_ready(engine, "token_embd.weight")) {
+        return 1;
+    }
     if (!engine || engine->model_root.empty() || !c || !span ||
         c->hidden_size == 0 || c->vocab_size == 0) {
         return 0;
@@ -71,6 +83,11 @@ static int moe_raw_lm_head_ready(const moe_pc_engine* engine) {
     const moe_storage_constants_t* c = moe_storage_constants();
     const int32_t lm_head_layer = c ? (int32_t)c->num_hidden_layers + 1 : 80;
     const moe_storage_raw_span_spec_t* span = find_raw_role_span(lm_head_layer, moe_RAW_ROLE_LM_HEAD);
+    if (engine && engine->offload_gguf_valid.load(std::memory_order_relaxed) &&
+        (moe_gguf_common_tensor_ready(engine, "output.weight") ||
+         moe_gguf_common_tensor_ready(engine, "token_embd.weight"))) {
+        return 1;
+    }
     if (!engine || engine->model_root.empty() || !c || !span ||
         c->hidden_size == 0 || c->vocab_size == 0) {
         return 0;

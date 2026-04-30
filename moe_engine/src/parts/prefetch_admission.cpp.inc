@@ -68,7 +68,9 @@ static moe_tier_t prefetch_admitted_tier(
     // By raising threshold, we delegate eviction to background io_worker and only
     // route to DB when RAM is critically full.
     if (target == moe_TIER_RAM && ram_budget > 0) {
-        if (tier_used(engine, moe_TIER_RAM) + engine->pending_ram_reservation.load(std::memory_order_relaxed) + item.bytes > (ram_budget * 93ull) / 100ull) {
+        // BUGFIX 99: Precompute percentage threshold
+        const uint64_t ram_threshold_93 = (ram_budget * 93ull) / 100ull;
+        if (tier_used(engine, moe_TIER_RAM) + engine->pending_ram_reservation.load(std::memory_order_relaxed) + item.bytes > ram_threshold_93) {
             // Route to DB instead of synchronous eviction
             target = moe_TIER_DB;
         } else {
@@ -82,15 +84,8 @@ static void prefetch_release_pending_ram_reservation(moe_pc_engine* engine, uint
     if (!engine || bytes == 0) {
         return;
     }
-    uint64_t current = engine->pending_ram_reservation.load(std::memory_order_relaxed);
-    while (current > 0) {
-        const uint64_t next = current > bytes ? current - bytes : 0;
-        if (engine->pending_ram_reservation.compare_exchange_weak(
-                current,
-                next,
-                std::memory_order_relaxed,
-                std::memory_order_relaxed)) {
-            return;
-        }
+    const uint64_t old_val = engine->pending_ram_reservation.fetch_sub(bytes, std::memory_order_relaxed);
+    if (old_val < bytes) {
+        engine->pending_ram_reservation.store(0, std::memory_order_relaxed);
     }
 }

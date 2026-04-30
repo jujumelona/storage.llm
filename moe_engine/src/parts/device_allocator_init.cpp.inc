@@ -1,4 +1,4 @@
-// Device allocator initialization and shutdown
+﻿// Device allocator initialization and shutdown
 
 static std::atomic<uint64_t>* device_pool_counter(moe_pc_engine* e, uint8_t pool) {
     if (!e) return nullptr;
@@ -76,7 +76,7 @@ static int device_allocator_init(moe_pc_engine* e) {
         e->device_total_bytes.store(e->backend_caps.device_memory_bytes);
     }
     e->device_allocator_ready.store(1);
-    device_stream_pool_init(e);
+    // Stream pool init moved to engine start
     return 1;
 }
 

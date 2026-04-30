@@ -83,9 +83,20 @@ static int device_backend_event_sync(moe_pc_engine* e, CUevent event) {
             return e->cuda.cuEventSynchronize(event) == 0;
         }
         if (!e->cuda.cuEventQuery) return 0;
-        while (!e->io_stop.load(std::memory_order_relaxed)) {
+        // BUGFIX 86: Issue 9 - Reduce CUDA event poll sleep overhead ★
+        // Problem: 50µs sleep on every poll → 5ms for 100 iterations
+        // Solution: First 20 iterations use yield only, then 50µs sleep
+        // Fast events complete without sleep, slow events still get sleep
+        // BUGFIX 95: Reduce atomic load frequency in event poll
+        uint32_t spin_count = 0;
+        while (true) {
             if (e->cuda.cuEventQuery(event) == 0) return 1;
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            if (e->io_stop.load(std::memory_order_relaxed)) break;
+            if (++spin_count < 20) {
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
         }
         return e->cuda.cuEventQuery(event) == 0;
     }
@@ -94,9 +105,17 @@ static int device_backend_event_sync(moe_pc_engine* e, CUevent event) {
             return e->hip.hipEventSynchronize(event) == 0;
         }
         if (!e->hip.hipEventQuery) return 0;
-        while (!e->io_stop.load(std::memory_order_relaxed)) {
+        // BUGFIX 86: Same optimization for HIP
+        // BUGFIX 95: Reduce atomic load frequency in event poll
+        uint32_t spin_count = 0;
+        while (true) {
             if (e->hip.hipEventQuery(event) == 0) return 1;
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            if (e->io_stop.load(std::memory_order_relaxed)) break;
+            if (++spin_count < 20) {
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
         }
         return e->hip.hipEventQuery(event) == 0;
     }

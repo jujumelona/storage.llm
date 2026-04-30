@@ -32,6 +32,7 @@ static void fill_cpu_backend_caps(moe_backend_caps_t* caps) {
     caps->supports_weight_mxfp4 = 0;
     caps->supports_unified_memory = 1;
     caps->supports_zero_copy_host = 1;
+    caps->supports_unified_memory = 1;
     caps->supports_zero_copy_mmap = 1;
     caps->supports_pinned_host = 0;
     caps->supports_backend_async_api = 0;
@@ -61,6 +62,7 @@ static void fill_gpu_backend_base(moe_backend_caps_t* caps) {
 
 static int cuda_driver_get_numa_node(uint32_t device_id);
 static void fill_cuda_backend_caps(moe_backend_caps_t* caps) {
+    caps->preferred_numa_node = cuda_driver_get_numa_node(caps->device_id);
     caps->supports_cuda = compiled_cuda_available();
     caps->supports_pinned_host = 1;
     caps->supports_fixed_read_staging = 1;
@@ -86,6 +88,7 @@ static void fill_cuda_backend_caps(moe_backend_caps_t* caps) {
 
 static int hip_driver_get_numa_node(uint32_t device_id);
 static void fill_hip_backend_caps(moe_backend_caps_t* caps) {
+    caps->preferred_numa_node = hip_driver_get_numa_node(caps->device_id);
     caps->supports_hip = compiled_hip_available();
     caps->supports_pinned_host = 1;
     caps->supports_fixed_read_staging = 1;
@@ -101,7 +104,8 @@ static void fill_shared_memory_backend_caps(moe_backend_caps_t* caps) {
     if (caps->device_id == 0) {
         caps->supports_unified_memory = 1;
         caps->supports_zero_copy_host = 1;
-        caps->supports_zero_copy_mmap = 1;
+        caps->supports_unified_memory = 1;
+    caps->supports_zero_copy_mmap = 1;
     } else {
         caps->supports_unified_memory = 0;
         caps->supports_zero_copy_host = 0;
@@ -129,9 +133,13 @@ static void fill_shared_memory_backend_caps(moe_backend_caps_t* caps) {
 // Trade-off: Metal API dependency, iOS/macOS-specific code, build system changes
 // Status: Documented as TODO, current bypass path is correct (BUGFIX 61)
 static void fill_metal_backend_caps(moe_backend_caps_t* caps) {
+    caps->supports_unified_memory = 1;
+    caps->supports_zero_copy_mmap = 1;
+    caps->supports_pinned_host = 0;
     caps->supports_metal = compiled_metal_available();
     caps->supports_unified_memory = 1;
     caps->supports_zero_copy_host = 1;
+    caps->supports_unified_memory = 1;
     caps->supports_zero_copy_mmap = 1;
     caps->supports_pinned_host = 0;
     caps->supports_backend_async_api = 1;

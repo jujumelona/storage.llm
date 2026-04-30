@@ -7,6 +7,8 @@
     std::vector<moe_tensor_record> tensors;
     std::vector<std::string> tensor_paths;
     std::vector<size_t> tensor_slots;
+    std::vector<moe_gguf_common_tensor_record> gguf_common_tensors;
+    std::unordered_map<std::string, size_t> gguf_common_tensor_slots;
     std::vector<uint64_t> expert_bytes;
     uint64_t max_tensor_stream_bytes = 0;
     std::unordered_map<std::string, mmap_context_t*> shard_mmaps;
@@ -114,6 +116,7 @@
     std::atomic<uint64_t> device_allocation_count{0};
     std::atomic<uint64_t> device_fixed_bytes{0};
     std::atomic<uint64_t> device_activation_bytes{0};
+    std::atomic<uint64_t> device_activation_count{0};
     std::atomic<uint64_t> device_expert_bytes{0};
     std::atomic<uint64_t> device_stream_bytes{0};
     std::atomic<uint64_t> device_total_bytes{0};

@@ -21,6 +21,22 @@ struct moe_tensor_record {
     uint8_t gpu_executable = 0;
 };
 
+enum moe_raw_scalar_encoding_t : uint8_t {
+    moe_RAW_SCALAR_BF16 = 0,
+    moe_RAW_SCALAR_F16 = 1,
+    moe_RAW_SCALAR_F32 = 2
+};
+
+struct moe_gguf_common_tensor_record {
+    std::string name;
+    uint16_t resolved_path_index = 0xFFFF;
+    uint32_t dims = 0;
+    uint64_t shape[4]{};
+    uint32_t type = 0;
+    uint64_t file_offset = 0;
+    uint64_t bytes = 0;
+};
+
 struct moe_raw_tensor_cache_entry {
     const moe_storage_raw_span_spec_t* span = nullptr;
     mmap_context_t* mapped = nullptr;
@@ -29,6 +45,7 @@ struct moe_raw_tensor_cache_entry {
     uint64_t bytes = 0;
     uint32_t rows = 0;
     uint32_t cols = 0;
+    uint8_t scalar_encoding = moe_RAW_SCALAR_BF16;
 };
 
 struct moe_prefetch_task {

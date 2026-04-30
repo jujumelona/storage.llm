@@ -35,14 +35,14 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
             clamp_to_cap(std::min(3u, std::max(1u, engine->backend_caps.copy_streams)), gpu_cap) : 0u;
     }
 
-    // BUGFIX 59: Issue 5 - dropped_requests feedback loop ?�★??
+    // BUGFIX 59: Issue 5 - dropped_requests feedback loop ?�★??
     // Problem: local_requeues full ??tasks dropped ??dropped_requests++
     // But orchestrator never reads dropped_requests ??window never shrinks
     // Drops continue indefinitely, prefetch effectiveness collapses
     // Solution: Check recent drops, immediately reduce window (asymmetric hysteresis)
     // Upside changes need 5-streak, downside (drops) react immediately
     //
-    // BUGFIX 74: Issue 7 - Faster prefetch window recovery ?�★
+    // BUGFIX 74: Issue 7 - Faster prefetch window recovery ?�★
     // Problem: After drops stop, recovery waits for 5-streak (can take dozens of tokens)
     // Orchestrator call interval is long ??window=1 persists too long
     // Solution: Reduce recovery streak from 5 to 3 for faster adaptation
@@ -85,8 +85,8 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
             base_window = std::min(max_window, base_window + 1u);
         }
     }
-    // BUG 3 FIX: Apply 5-streak hysteresis to prevent window oscillation ?�★
-    // BUGFIX 74: Issue 7 - Reduce recovery streak from 5 to 3 ?�★
+    // BUG 3 FIX: Apply 5-streak hysteresis to prevent window oscillation ?�★
+    // BUGFIX 74: Issue 7 - Reduce recovery streak from 5 to 3 ?�★
     // Problem: 5-streak too slow for recovery after drops stop
     // Long orchestrator intervals ??window=1 persists for dozens of tokens
     // Solution: 3-streak for faster adaptation while still preventing oscillation
@@ -125,7 +125,7 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
     float cpu = state ? state->cpu_load_pct : 0.0f;
     float gpu = state ? state->gpu_load_pct : 0.0f;
     if (!state && engine) {
-        // BUGFIX 41: Use cpu_row_active for accurate CPU load estimation ?�★??
+        // BUGFIX 41: Use cpu_row_active for accurate CPU load estimation ?�★??
         // Old: cpu_active = disk_stage.inflight + pinned_stage.inflight
         //      ??Counts workers blocked on GPU/queue as "CPU busy"
         // New: Use cpu_row_active (actual matmul workers) + disk_stage.inflight
@@ -248,17 +248,21 @@ int moe_pc_engine_orchestrate_moe_step(moe_pc_engine_t* engine, int current_laye
     }
     fill_orchestrator_plan(engine, state, out_plan);
 
-    // BUGFIX 29: Release plan_lock before calling execute_prefetch_plan ?�★??
-    // Old: plan_lock held during execute_prefetch_plan ??enqueue_stage_or_retry ??disk_stage.mtx
-    //      Creates lock order: prefetch_plan_mutex ??disk_stage.mtx
-    //      io_worker_loop holds disk_stage.mtx ??get_or_map_tensor_shard (potential deadlock)
+    // BUGFIX 29: Release plan_lock before calling execute_prefetch_plan ★★
+    // Old: plan_lock held during execute_prefetch_plan → enqueue_stage_or_retry → disk_stage.mtx
+    //      Creates lock order: prefetch_plan_mutex → disk_stage.mtx
+    //      io_worker_loop holds disk_stage.mtx → get_or_map_tensor_shard (potential deadlock)
     // New: Release plan_lock after filling out_items, before execute_prefetch_plan
     //      out_items is local snapshot, consistency maintained
     //      prefetch_plan_clear_seen is idempotent, safe for concurrent access
+    // BUGFIX 85: Issue 7 - Move prefetch_plan_clear_seen outside lock ★★
+    // Problem: clear_seen can iterate 50k map entries under lock
+    // Solution: Call before acquiring lock (generation increment is atomic-safe)
+    prefetch_plan_clear_seen(engine);
+
     uint32_t kept = 0;
     {
         std::lock_guard<std::mutex> plan_lock(engine->prefetch_plan_mutex);
-        prefetch_plan_clear_seen(engine);
         engine->runtime_prefetch_window_layers.store(out_plan->prefetch_window_layers, std::memory_order_relaxed);
         if (runtime_disk_workers(engine) != out_plan->disk_workers ||
             runtime_pinned_workers(engine) != out_plan->pinned_workers ||

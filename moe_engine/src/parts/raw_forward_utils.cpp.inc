@@ -7,6 +7,24 @@ static float moe_raw_bf16_to_f32(uint16_t v) {
     return out;
 }
 
+static uint32_t moe_raw_scalar_size(uint8_t encoding) {
+    return encoding == moe_RAW_SCALAR_F32 ? 4u : 2u;
+}
+
+static float moe_raw_scalar_to_f32(const uint8_t* ptr, uint8_t encoding) {
+    if (!ptr) {
+        return 0.0f;
+    }
+    if (encoding == moe_RAW_SCALAR_F32) {
+        float v = 0.0f;
+        std::memcpy(&v, ptr, sizeof(v));
+        return v;
+    }
+    uint16_t v = 0;
+    std::memcpy(&v, ptr, sizeof(v));
+    return encoding == moe_RAW_SCALAR_F16 ? moe_raw_fp16_to_f32(v) : moe_raw_bf16_to_f32(v);
+}
+
 static const moe_storage_raw_span_spec_t* find_raw_role_span(int32_t layer, uint32_t role) {
     const uint32_t begin = moe_storage_raw_span_find_first(layer);
     const uint32_t end = moe_storage_raw_span_find_end(layer);
@@ -115,6 +133,23 @@ static float moe_dot_bf16_row(const uint8_t* row, const float* hidden, uint32_t 
         uint16_t v;
         std::memcpy(&v, row + (uint64_t)i * 2ull, sizeof(v));
         acc += moe_raw_bf16_to_f32(v) * hidden[i];
+    }
+    return acc;
+}
+
+static float moe_dot_raw_row(
+    const uint8_t* row,
+    uint8_t encoding,
+    const float* hidden,
+    uint32_t hidden_count
+) {
+    if (encoding == moe_RAW_SCALAR_BF16) {
+        return moe_dot_bf16_row(row, hidden, hidden_count);
+    }
+    const uint32_t elem = moe_raw_scalar_size(encoding);
+    float acc = 0.0f;
+    for (uint32_t i = 0; i < hidden_count; ++i) {
+        acc += moe_raw_scalar_to_f32(row + (uint64_t)i * elem, encoding) * hidden[i];
     }
     return acc;
 }

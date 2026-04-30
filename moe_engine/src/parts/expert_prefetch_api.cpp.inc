@@ -60,6 +60,7 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
     if (!c || c->experts_per_moe_layer == 0) {
         return 0;
     }
+    // BUGFIX 99: Precompute percentage thresholds
     const uint64_t vram_limit = tier_budget(engine, moe_TIER_VRAM) ?
         (tier_budget(engine, moe_TIER_VRAM) * 90ull) / 100ull : 0;
     const uint64_t ram_limit = tier_budget(engine, moe_TIER_RAM) ?
@@ -92,9 +93,12 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
                 return queued > 0 ? 1 : 0;
             }
 
-            while (!engine->io_stop.load(std::memory_order_relaxed) &&
-                   engine->total_queue_depth.load(std::memory_order_relaxed) >= queue_high) {
-                // BUGFIX 24: Use cv wait instead of polling ?�★
+            // BUGFIX 95: Cache atomic loads in throttle loop
+            while (true) {
+                const bool stop = engine->io_stop.load(std::memory_order_relaxed);
+                const uint32_t depth = engine->total_queue_depth.load(std::memory_order_relaxed);
+                if (stop || depth < queue_high) break;
+                // BUGFIX 24: Use cv wait instead of polling ?�★
                 // Old: 10ms sleep polling ??slow response, unnecessary wakeups
                 // New: io_done_cv wait ??immediate response when queue drains
                 std::unique_lock<std::mutex> lock(engine->done_mutex);
@@ -143,15 +147,18 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
         const uint32_t initial_completed = engine->io_atomic.completed_requests.load();
         const uint32_t initial_failed = engine->io_atomic.failed_requests.load();
 
-        while (!engine->io_stop.load(std::memory_order_relaxed)) {
+        // BUGFIX 95: Cache atomic loads in wait loop
+        while (true) {
+            const bool stop = engine->io_stop.load(std::memory_order_relaxed);
             const uint32_t depth = engine->total_queue_depth.load(std::memory_order_relaxed);
             const uint32_t completed = engine->io_atomic.completed_requests.load();
+            if (stop) break;
             const uint32_t failed = engine->io_atomic.failed_requests.load();
             const uint32_t processed_completed = completed >= initial_completed ? completed - initial_completed : 0;
             const uint32_t processed_failed = failed >= initial_failed ? failed - initial_failed : 0;
             const uint32_t processed = processed_completed + processed_failed;
 
-            // PIPELINE FIX 15: Check inflight counters to ensure all DMA completed ?�★??            // Old: depth==0 only checks queue empty, not actual work completion
+            // PIPELINE FIX 15: Check inflight counters to ensure all DMA completed ?�★??            // Old: depth==0 only checks queue empty, not actual work completion
             // New: Also check inflight==0 for all stages ??ensures GPU DMA finished
             // Prevents "ready" state while cuMemcpyHtoDAsync still in progress
             const bool all_idle =
@@ -181,7 +188,7 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
                 return 0;
             }
 
-            // BUGFIX 28: Use io_done_cv.wait_for instead of sleep polling ?�★??            // Old: sleep_for(100ms) ??up to 100ms delay after loading completes
+            // BUGFIX 28: Use io_done_cv.wait_for instead of sleep polling ?�★??            // Old: sleep_for(100ms) ??up to 100ms delay after loading completes
             // New: io_done_cv.wait_for ??immediate wakeup when IO finishes
             // Reduces startup latency by up to 100ms per check iteration
             std::unique_lock<std::mutex> lock(engine->done_mutex);

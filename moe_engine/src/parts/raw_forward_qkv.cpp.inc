@@ -127,7 +127,10 @@ static qkv_state_t* moe_qkv_ensure_head_state(
     if (!engine || !head_keys || !head_values || !context_tokens || !head_dim) return nullptr;
     std::mutex* head_lock = nullptr;
 
-    {
+    if (head < engine->qkv_head_state_locks.size()) {
+        head_lock = engine->qkv_head_state_locks[head].get();
+    }
+    if (!head_lock) {
         std::lock_guard<std::mutex> lock(engine->qkv_mutex);
         moe_qkv_apply_contract_config_locked(engine, head_dim);
         moe_qkv_ensure_head_storage_locked(engine, (size_t)head + 1u);

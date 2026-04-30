@@ -5,7 +5,7 @@ int moe_pc_engine_set_model_root(
     if (!engine) {
         return 0;
     }
-    // BUGFIX 52: Issue 23 - Stop IO workers before shard cleanup ?�★??    // Problem: wait_io only waits for queue to drain, but io_workers continue running.
+    // BUGFIX 52: Issue 23 - Stop IO workers before shard cleanup ?�★??    // Problem: wait_io only waits for queue to drain, but io_workers continue running.
     // After shard_mmaps.clear(), io_worker can call get_or_map_tensor_shard with stale
     // model_root, causing mmap of wrong files or crashes.
     // Solution: stop_io_workers() terminates all workers, then clear shards, then restart.
@@ -37,6 +37,8 @@ int moe_pc_engine_set_model_root(
     }
     moe_engine_reset_qkv_cache(engine);
     moe_engine_clear_offload_gguf_contract(engine);
+    engine->gguf_common_tensors.clear();
+    engine->gguf_common_tensor_slots.clear();
     engine->model_root = model_root ? model_root : "";
     moe_model_root_check_t check{};
     int valid = 0;
@@ -286,6 +288,32 @@ static uint8_t moe_weight_encoding_from_gguf_type(uint32_t type, const moe_offlo
     return moe_WEIGHT_ENCODING_UNKNOWN;
 }
 
+
+static void moe_register_gguf_common_tensor(
+    moe_pc_engine* engine,
+    const moe_gguf_tensor_dir_entry_t& entry,
+    uint16_t path_idx
+) {
+    if (!engine || entry.name.empty() || entry.bytes == 0) {
+        return;
+    }
+    const std::string key = moe_lower_ascii_copy(entry.name);
+    if (engine->gguf_common_tensor_slots.find(key) != engine->gguf_common_tensor_slots.end()) {
+        return;
+    }
+    moe_gguf_common_tensor_record rec{};
+    rec.name = key;
+    rec.resolved_path_index = path_idx;
+    rec.dims = std::min<uint32_t>(entry.dims, 4u);
+    for (uint32_t i = 0; i < rec.dims; ++i) {
+        rec.shape[i] = entry.shape[i];
+    }
+    rec.type = entry.type;
+    rec.file_offset = entry.file_offset;
+    rec.bytes = entry.bytes;
+    engine->gguf_common_tensor_slots.emplace(rec.name, engine->gguf_common_tensors.size());
+    engine->gguf_common_tensors.push_back(std::move(rec));
+}
 static int load_gguf_tensor_directory_as_tensor_index(
     moe_pc_engine* engine,
     const std::string& root,
@@ -322,6 +350,9 @@ static int load_gguf_tensor_directory_as_tensor_index(
         const uint32_t part_id = dir.file_index ? dir.file_index : (uint32_t)path_idx + 1u;
         const uint32_t shard_id = part_id;
         for (const moe_gguf_tensor_dir_entry_t& entry : dir.tensors) {
+            if (moe_gguf_tensor_name_executable(entry.name)) {
+                moe_register_gguf_common_tensor(engine, entry, path_idx);
+            }
             const std::string lower_name = moe_lower_ascii_copy(entry.name);
             const bool combined_gate_up =
                 lower_name.find("ffn_gate_up_exps.weight") != std::string::npos;
@@ -394,12 +425,150 @@ static int load_gguf_tensor_directory_as_tensor_index(
     return 1;
 }
 
+static int load_juju_tensor_index_as_tensor_index(
+    moe_pc_engine* engine,
+    const std::string& root,
+    const moe_offload_gguf_contract_t& contract
+) {
+    if (!engine || root.empty()) {
+        return 0;
+    }
+    std::vector<std::string> paths;
+    moe_collect_juju_files(root, 4, &paths);
+    if (paths.empty()) {
+        return 0;
+    }
+    std::sort(paths.begin(), paths.end());
+    std::unordered_map<std::string, uint16_t> path_index_map;
+    uint64_t records = 0;
+    for (const std::string& path : paths) {
+        moe_juju_header_t header{};
+        std::vector<moe_juju_section_entry_t> sections;
+        uint64_t file_bytes = 0;
+        if (!moe_juju_read_table_local(path, &header, &sections, &file_bytes)) {
+            continue;
+        }
+        std::string index_json;
+        if (!moe_read_juju_tensor_index_json(path, sections, file_bytes, &index_json)) {
+            continue;
+        }
+        std::vector<moe_juju_tensor_json_entry_t> tensors;
+        if (!moe_parse_juju_tensor_index_json(index_json, &tensors, nullptr, nullptr, nullptr) ||
+            tensors.empty()) {
+            continue;
+        }
+        uint16_t path_idx = 0xFFFFu;
+        auto pit = path_index_map.find(path);
+        if (pit != path_index_map.end()) {
+            path_idx = pit->second;
+        } else {
+            if (engine->tensor_paths.size() >= 0xFFFFu) {
+                continue;
+            }
+            path_idx = (uint16_t)engine->tensor_paths.size();
+            engine->tensor_paths.push_back(path);
+            path_index_map.emplace(path, path_idx);
+        }
+        const uint32_t part_id = (uint32_t)path_idx + 1u;
+        const uint32_t shard_id = part_id;
+        for (const moe_juju_tensor_json_entry_t& entry : tensors) {
+            if (entry.juju_bytes == 0 ||
+                entry.juju_offset > file_bytes ||
+                entry.juju_bytes > file_bytes - entry.juju_offset) {
+                continue;
+            }
+            if (moe_gguf_tensor_name_executable(entry.name)) {
+                moe_gguf_tensor_dir_entry_t common{};
+                common.name = entry.name;
+                common.dims = entry.dims;
+                common.type = entry.gguf_type;
+                common.file_offset = entry.juju_offset;
+                common.bytes = entry.juju_bytes;
+                for (uint32_t i = 0; i < std::min<uint32_t>(entry.dims, 4u); ++i) {
+                    common.shape[i] = entry.shape[i];
+                }
+                moe_register_gguf_common_tensor(engine, common, path_idx);
+            }
+            const std::string lower_name = moe_lower_ascii_copy(entry.name);
+            const bool combined_gate_up =
+                lower_name.find("ffn_gate_up_exps.weight") != std::string::npos;
+            uint32_t layer = 0;
+            moe_projection_t proj = moe_PROJ_GATE;
+            if (!moe_parse_layer_from_gguf_name(entry.name, &layer) ||
+                (!combined_gate_up && !moe_gguf_expert_projection(entry.name, &proj)) ||
+                entry.dims < 3 ||
+                entry.shape[2] == 0) {
+                continue;
+            }
+            const uint64_t expert_count64 = entry.shape[2];
+            const uint64_t per_expert = expert_count64 ? entry.juju_bytes / expert_count64 : 0;
+            if (per_expert == 0 || expert_count64 > 4096ull) {
+                continue;
+            }
+            if (combined_gate_up && ((entry.shape[1] & 1ull) != 0 || per_expert < 2ull)) {
+                continue;
+            }
+            const uint32_t rows_total = (uint32_t)std::min<uint64_t>(entry.shape[1], UINT32_MAX);
+            const uint32_t cols = (uint32_t)std::min<uint64_t>(entry.shape[0], UINT32_MAX);
+            for (uint64_t expert = 0; expert < expert_count64; ++expert) {
+                const uint32_t split_count = combined_gate_up ? 2u : 1u;
+                for (uint32_t split = 0; split < split_count; ++split) {
+                    moe_tensor_record rec{};
+                    rec.info.part = part_id;
+                    rec.info.shard = shard_id;
+                    rec.info.layer = layer;
+                    rec.info.expert = (uint32_t)expert;
+                    rec.info.proj = combined_gate_up ?
+                        (split == 0 ? moe_PROJ_GATE : moe_PROJ_UP) : proj;
+                    rec.info.rows = combined_gate_up ? (rows_total / 2u) : rows_total;
+                    rec.info.cols = cols;
+                    rec.info.groups = cols >= 16u ? std::max<uint32_t>(1u, cols / 16u) : 1u;
+                    rec.info.group_size = cols >= 16u ? 16u : cols;
+                    const uint64_t expert_offset = entry.juju_offset + expert * per_expert;
+                    const uint64_t split_bytes = combined_gate_up ? (per_expert / 2ull) : per_expert;
+                    rec.info.weight_byte_offset = expert_offset + (uint64_t)split * split_bytes;
+                    rec.info.weight_byte_length = combined_gate_up && split == 1u ?
+                        (per_expert - split_bytes) : split_bytes;
+                    rec.info.scale_byte_offset = 0;
+                    rec.info.scale_byte_length = 0;
+                    rec.info.scale2_byte_offset = 0;
+                    rec.info.scale2_byte_length = 0;
+                    rec.resolved_path_index = path_idx;
+                    finalize_tensor_layout(&rec, moe_weight_encoding_from_gguf_type(entry.gguf_type, contract));
+                    const uint64_t stream_bytes = tensor_stream_bytes(rec);
+                    if (stream_bytes > engine->max_tensor_stream_bytes) {
+                        engine->max_tensor_stream_bytes = stream_bytes;
+                    }
+                    tensor_slots_set(engine, (int)rec.info.layer, (int)rec.info.expert, rec.info.proj, engine->tensors.size());
+                    expert_bytes_add(engine, (int)rec.info.layer, (int)rec.info.expert, stream_bytes);
+                    engine->tensors.push_back(std::move(rec));
+                    ++records;
+                }
+            }
+        }
+    }
+    if (!records) {
+        return 0;
+    }
+    finish_tensor_index_load(engine);
+    std::fprintf(stderr,
+        "[storagellm] JUJU tensor index loaded: records=%llu paths=%zu max_stream=%llu\n",
+        (unsigned long long)records,
+        engine->tensor_paths.size(),
+        (unsigned long long)engine->max_tensor_stream_bytes);
+    std::fflush(stderr);
+    return 1;
+}
 static int path_ends_with_csv(const char* path) {
     if (!path) {
         return 0;
     }
+    // BUGFIX 98: Issue 19 - Cache string size for bounds check ★
+    // Problem: value.size() called twice (bounds check + substr offset)
+    // Solution: Cache size to avoid repeated call
     const std::string value(path);
-    return value.size() >= 4 && value.substr(value.size() - 4) == ".csv";
+    const size_t val_size = value.size();
+    return val_size >= 4 && value.substr(val_size - 4) == ".csv";
 }
 
 int moe_pc_engine_load_codec_table(
@@ -445,6 +614,8 @@ int moe_pc_engine_load_codec_table(
     moe_engine_reset_qkv_cache(engine);
     moe_engine_clear_offload_gguf_contract(engine);
     engine->tensors.clear();
+    engine->gguf_common_tensors.clear();
+    engine->gguf_common_tensor_slots.clear();
     engine->tensor_paths.clear();
     engine->max_tensor_stream_bytes = 0;
     engine->common_raw_prefetched_bytes.store(0);
@@ -499,14 +670,18 @@ int moe_pc_engine_load_codec_table(
         tensor_contract.weight_block_size = engine->offload_weight_block_size.load(std::memory_order_relaxed);
         tensor_contract.weight_quant_family = engine->offload_weight_quant_family;
         tensor_contract.weight_kernel_family = engine->offload_weight_kernel_family;
-        if (!load_gguf_tensor_directory_as_tensor_index(
+        if (!load_juju_tensor_index_as_tensor_index(
+                engine,
+                engine->model_root,
+                tensor_contract) &&
+            !load_gguf_tensor_directory_as_tensor_index(
                 engine,
                 engine->model_root,
                 tensor_contract)) {
             finish_tensor_index_load(engine);
         }
         std::fprintf(stderr,
-            "[storagellm] offload GGUF index loaded: files=%u tensor_headers=%llu executable_tensors=%llu runtime_records=%zu\n",
+            "[storagellm] offload JUJU/GGUF index loaded: files=%u tensor_headers=%llu executable_tensors=%llu runtime_records=%zu\n",
             engine->offload_gguf_file_count.load(std::memory_order_relaxed),
             (unsigned long long)engine->offload_gguf_tensor_count.load(std::memory_order_relaxed),
             (unsigned long long)engine->offload_gguf_executable_tensor_count.load(std::memory_order_relaxed),
@@ -579,7 +754,15 @@ int moe_pc_engine_load_codec_table(
         const std::string weight_key = csv_string_col_fast(line, moe_CODEC_COL_WEIGHT_KEY);
         std::string shard_file = csv_string_col_fast(line, moe_CODEC_COL_SHARD_FILE);
         std::string source_file = csv_string_col_fast(line, moe_CODEC_COL_SOURCE_FILE);
-        const std::string path_cache_key = shard_file + "\n" + source_file;
+        // BUGFIX 94: Issue 15 - Avoid string concatenation in hot path ★★
+        // Problem: path_cache_key = shard_file + "\n" + source_file creates temp strings
+        // Called for every tensor row (100k+ times during model load)
+        // Solution: Reserve capacity and use append to avoid reallocation
+        std::string path_cache_key;
+        path_cache_key.reserve(shard_file.size() + 1 + source_file.size());
+        path_cache_key = shard_file;
+        path_cache_key += '\n';
+        path_cache_key += source_file;
         std::string resolved_path;
         auto resolved_it = resolved_path_cache.find(path_cache_key);
         if (resolved_it != resolved_path_cache.end()) {

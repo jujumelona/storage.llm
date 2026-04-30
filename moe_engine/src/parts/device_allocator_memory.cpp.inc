@@ -8,9 +8,20 @@
 // - device_budget_bytes() calculates VRAM for experts, does NOT include KV/QKV
 // - Separate accounting: tier_used(moe_TIER_RAM) for KV, device_allocated_bytes for VRAM
 // - No interaction: KV growth does not reduce expert cache space
+// Helper to encapsulate VRAM budget accounting.
+// Do not modify engine->device_free_bytes directly.
+static void device_account_bytes_freed(moe_pc_engine* e, uint64_t bytes) {
+    if (e) e->device_free_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
 static uint64_t device_budget_bytes(const moe_pc_engine* e) {
     if (!e) return 0;
     if (e->config.vram_budget_bytes) return e->config.vram_budget_bytes;
+    if (e->backend_caps.supports_unified_memory) {
+        const uint64_t sys = e->backend_caps.system_memory_bytes > 0
+            ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
+        return (sys * 3ull) / 4ull; // 75% for Unified VRAM/RAM
+    }
     const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
     const uint64_t free_b = e->device_free_bytes.load(std::memory_order_relaxed);
     if (allocated || free_b) {
@@ -98,7 +109,7 @@ static void device_release_allocation_locked(
             deferred_free_ptrs->push_back({a.ptr, a.bytes});
             // Bug 2: Update device_free_bytes immediately to maintain accurate budget
             // Without this, device_budget_bytes() underestimates during deferred free window
-            e->device_free_bytes.fetch_add(a.bytes, std::memory_order_relaxed);
+            device_account_bytes_freed(e, a.bytes);
         } else {
             device_set_current(e);
             if (1) {
@@ -113,7 +124,7 @@ static void device_release_allocation_locked(
                 } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemFree) {
                     e->cuda.cuMemFree(a.ptr);
                 }
-                e->device_free_bytes.fetch_add(a.bytes, std::memory_order_relaxed);
+                device_account_bytes_freed(e, a.bytes);
             }
         }
     }
@@ -122,6 +133,7 @@ static void device_release_allocation_locked(
     if (auto* c = device_pool_counter(e, a.pool)) c->fetch_sub(a.bytes);
     if (a.pool == moe_DEVICE_POOL_ACTIVATION) {
         e->activation_keys.erase(it->first);
+        e->device_activation_count.fetch_sub(1, std::memory_order_relaxed);
     }
     e->device_allocations.erase(it);
     // Fix 50: Removed device_refresh_mem_info from under device_mutex

@@ -6,13 +6,20 @@ int moe_pc_engine_execute_prefetch_plan(
     if (!engine || !items || item_count == 0) {
         return 0;
     }
+    // BUGFIX 93: Issue 17 - Batch map_mutex locks in prefetch_plan_execute ★★★
+    // Problem: Lock map_mutex once per item in loop (item_count × lock overhead)
+    // High contention when many items (typical: 50-100 items per prefetch plan)
+    // Solution: Single lock for entire loop
+    // Trade-off: Longer lock hold time, but eliminates lock/unlock overhead
     std::vector<uint8_t> stream_inflight(item_count, 0);
-    for (uint32_t i = 0; i < item_count; ++i) {
+    {
         std::lock_guard<std::mutex> lock(engine->map_mutex);
-        const size_t slot = expert_dense_slot((int)items[i].layer, (int)items[i].expert);
-        if (slot < engine->expert_states.size()) {
-            const moe_block_state& state = engine->expert_states[slot];
-            stream_inflight[i] = state.active && state.tier == moe_TIER_STREAM ? 1u : 0u;
+        for (uint32_t i = 0; i < item_count; ++i) {
+            const size_t slot = expert_dense_slot((int)items[i].layer, (int)items[i].expert);
+            if (slot < engine->expert_states.size()) {
+                const moe_block_state& state = engine->expert_states[slot];
+                stream_inflight[i] = state.active && state.tier == moe_TIER_STREAM ? 1u : 0u;
+            }
         }
     }
 

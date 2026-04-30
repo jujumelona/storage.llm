@@ -153,6 +153,75 @@ static void moe_collect_gguf_files(
 #endif
 }
 
+static void moe_collect_juju_files(
+    const std::string& path,
+    int depth_left,
+    std::vector<std::string>* out
+) {
+    if (!out || path.empty() || out->size() >= 512) {
+        return;
+    }
+    uint64_t file_bytes = 0;
+    if (file_size_bytes(path, &file_bytes)) {
+        if (moe_ends_with_ci(path, ".juju") && !moe_ends_with_ci(path, ".juju.idx")) {
+            out->push_back(path);
+        }
+        return;
+    }
+    if (depth_left <= 0 || !moe_path_is_directory_local(path)) {
+        return;
+    }
+#ifdef _WIN32
+    const std::string pattern = storagellm::path_join(path, "*");
+    const std::wstring wide_pattern = storagellm::wide_path_from_utf8(pattern);
+    if (wide_pattern.empty()) {
+        return;
+    }
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileW(wide_pattern.c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    do {
+        const std::string name = moe_wide_to_utf8(data.cFileName);
+        if (moe_skip_scan_dir_name(name)) {
+            continue;
+        }
+        const std::string child = storagellm::path_join(path, name);
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            moe_collect_juju_files(child, depth_left - 1, out);
+        } else if (moe_ends_with_ci(name, ".juju") && !moe_ends_with_ci(name, ".juju.idx")) {
+            out->push_back(child);
+        }
+        if (out->size() >= 512) {
+            break;
+        }
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+#else
+    DIR* dir = opendir(path.c_str());
+    if (!dir) {
+        return;
+    }
+    while (dirent* entry = readdir(dir)) {
+        const std::string name = entry->d_name ? entry->d_name : "";
+        if (moe_skip_scan_dir_name(name)) {
+            continue;
+        }
+        const std::string child = storagellm::path_join(path, name);
+        if (moe_path_is_directory_local(child)) {
+            moe_collect_juju_files(child, depth_left - 1, out);
+        } else if (moe_ends_with_ci(name, ".juju") && !moe_ends_with_ci(name, ".juju.idx")) {
+            out->push_back(child);
+        }
+        if (out->size() >= 512) {
+            break;
+        }
+    }
+    closedir(dir);
+#endif
+}
+
 enum {
     moe_GGUF_TYPE_UINT8 = 0,
     moe_GGUF_TYPE_INT8 = 1,
@@ -353,13 +422,25 @@ static int moe_json_find_scalar(const std::string& text, const char* key, size_t
     if (!key || !value_pos) {
         return 0;
     }
-    const std::string needle = std::string("\"") + key + "\"";
+    // BUGFIX 90: Issue 14 - Optimize JSON key search with string_view ★
+    // Problem: std::string("\"") + key + "\"" creates temporary string on every call
+    // Called frequently during model validation (hundreds of keys)
+    // Solution: Use string_view or pre-compute needle length
+    // Avoid temporary string allocation
+    const size_t key_len = std::strlen(key);
+    const size_t needle_len = key_len + 2;  // "key"
+
     size_t pos = 0;
-    while ((pos = text.find(needle, pos)) != std::string::npos) {
-        const size_t colon = text.find_first_not_of(" \t\r\n", pos + needle.size());
-        if (colon != std::string::npos && colon < text.size() && text[colon] == ':') {
-            *value_pos = text.find_first_not_of(" \t\r\n", colon + 1);
-            return *value_pos != std::string::npos;
+    while (pos + needle_len <= text.size()) {
+        // Manual search: look for "key"
+        if (text[pos] == '"' &&
+            text.compare(pos + 1, key_len, key) == 0 &&
+            text[pos + 1 + key_len] == '"') {
+            const size_t colon = text.find_first_not_of(" \t\r\n", pos + needle_len);
+            if (colon != std::string::npos && colon < text.size() && text[colon] == ':') {
+                *value_pos = text.find_first_not_of(" \t\r\n", colon + 1);
+                return *value_pos != std::string::npos;
+            }
         }
         ++pos;
     }
@@ -432,6 +513,167 @@ static int moe_json_get_string_local(const std::string& text, const char* key, s
         }
     }
     return 0;
+}
+
+static size_t moe_json_match_bracket_local(
+    const std::string& text,
+    size_t begin,
+    char open_ch,
+    char close_ch
+) {
+    if (begin >= text.size() || text[begin] != open_ch) {
+        return std::string::npos;
+    }
+    uint32_t depth = 0;
+    bool in_string = false;
+    bool escape = false;
+    for (size_t i = begin; i < text.size(); ++i) {
+        const char c = text[i];
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+        if (c == open_ch) {
+            ++depth;
+        } else if (c == close_ch) {
+            if (depth == 0) {
+                return std::string::npos;
+            }
+            --depth;
+            if (depth == 0) {
+                return i + 1;
+            }
+        }
+    }
+    return std::string::npos;
+}
+
+static int moe_json_find_array_local(
+    const std::string& text,
+    const char* key,
+    size_t* begin,
+    size_t* end
+) {
+    size_t value = 0;
+    if (!begin || !end || !moe_json_find_scalar(text, key, &value) ||
+        value >= text.size() || text[value] != '[') {
+        return 0;
+    }
+    const size_t close = moe_json_match_bracket_local(text, value, '[', ']');
+    if (close == std::string::npos) {
+        return 0;
+    }
+    *begin = value;
+    *end = close;
+    return 1;
+}
+
+static int moe_json_next_object_in_array(
+    const std::string& text,
+    size_t* cursor,
+    size_t end,
+    size_t* obj_begin,
+    size_t* obj_end
+) {
+    if (!cursor || !obj_begin || !obj_end || *cursor >= end) {
+        return 0;
+    }
+    size_t pos = *cursor;
+    while (pos < end && text[pos] != '{') {
+        ++pos;
+    }
+    if (pos >= end) {
+        *cursor = end;
+        return 0;
+    }
+    const size_t close = moe_json_match_bracket_local(text, pos, '{', '}');
+    if (close == std::string::npos || close > end) {
+        *cursor = end;
+        return 0;
+    }
+    *obj_begin = pos;
+    *obj_end = close;
+    *cursor = close;
+    return 1;
+}
+
+static int moe_json_get_u64_slice(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    uint64_t* out
+) {
+    if (begin >= end || end > text.size()) {
+        return 0;
+    }
+    return moe_json_get_u64_local(text.substr(begin, end - begin), key, out);
+}
+
+static int moe_json_get_string_slice(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    std::string* out
+) {
+    if (begin >= end || end > text.size()) {
+        return 0;
+    }
+    return moe_json_get_string_local(text.substr(begin, end - begin), key, out);
+}
+
+static int moe_json_get_u64_array_slice(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    uint64_t* values,
+    uint32_t max_values,
+    uint32_t* out_count
+) {
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (!values || max_values == 0 || begin >= end || end > text.size()) {
+        return 0;
+    }
+    const std::string slice = text.substr(begin, end - begin);
+    size_t arr_begin = 0;
+    size_t arr_end = 0;
+    if (!moe_json_find_array_local(slice, key, &arr_begin, &arr_end)) {
+        return 0;
+    }
+    uint32_t count = 0;
+    size_t pos = arr_begin + 1;
+    while (pos < arr_end && count < max_values) {
+        pos = slice.find_first_not_of(" \t\r\n,", pos);
+        if (pos == std::string::npos || pos >= arr_end || slice[pos] == ']') {
+            break;
+        }
+        char* parsed_end = nullptr;
+        const char* start = slice.c_str() + pos;
+        const uint64_t value = std::strtoull(start, &parsed_end, 10);
+        if (!parsed_end || parsed_end == start) {
+            break;
+        }
+        values[count++] = value;
+        pos = (size_t)(parsed_end - slice.c_str());
+    }
+    if (out_count) {
+        *out_count = count;
+    }
+    return count > 0 ? 1 : 0;
 }
 
 static uint32_t moe_u64_to_u32_clamped(uint64_t value, uint32_t fallback) {
@@ -571,10 +813,12 @@ struct moe_offload_gguf_file_t {
     uint64_t bytes = 0;
     uint64_t tensor_count = 0;
     uint64_t executable_tensor_count = 0;
+    uint64_t max_executable_tensor_bytes = 0;
     uint64_t data_start = 0;
     uint32_t alignment = 32;
     uint32_t file_index = 0;
     uint32_t file_count = 0;
+    bool is_juju = false;
     bool has_offload = false;
     bool has_metadata = false;
     std::string metadata_json;
@@ -589,7 +833,9 @@ struct moe_offload_gguf_scan_t {
     uint32_t first_missing = 0;
     uint64_t tensor_count = 0;
     uint64_t executable_tensor_count = 0;
+    uint64_t max_executable_tensor_bytes = 0;
     uint64_t present_total_bytes = 0;
+    bool juju_format = false;
     bool valid = false;
 };
 
@@ -619,6 +865,15 @@ struct moe_gguf_tensor_dir_t {
     std::vector<moe_gguf_tensor_dir_entry_t> tensors;
 };
 
+struct moe_juju_tensor_json_entry_t {
+    std::string name;
+    uint64_t shape[4]{};
+    uint32_t dims = 0;
+    uint32_t gguf_type = 0;
+    uint64_t juju_offset = 0;
+    uint64_t juju_bytes = 0;
+};
+
 static uint64_t moe_align_u64(uint64_t value, uint32_t alignment) {
     const uint64_t a = alignment ? (uint64_t)alignment : 32ull;
     const uint64_t r = value % a;
@@ -641,6 +896,205 @@ static int moe_gguf_tensor_name_executable(const std::string& name) {
     return 0;
 }
 
+static int moe_read_binary_range_to_string(
+    const std::string& path,
+    uint64_t offset,
+    uint64_t bytes,
+    uint64_t file_bytes,
+    std::string* out
+) {
+    if (!out || path.empty() || bytes == 0 || bytes > 256ull * 1024ull * 1024ull ||
+        offset > file_bytes || bytes > file_bytes - offset) {
+        return 0;
+    }
+    std::ifstream input;
+    open_ifstream_path(input, path, std::ios::in | std::ios::binary);
+    if (!input) {
+        return 0;
+    }
+    input.seekg((std::streamoff)offset, std::ios::beg);
+    if (!input) {
+        return 0;
+    }
+    std::string data((size_t)bytes, '\0');
+    input.read(&data[0], (std::streamsize)data.size());
+    if ((uint64_t)input.gcount() != bytes) {
+        return 0;
+    }
+    *out = std::move(data);
+    return 1;
+}
+
+static int moe_juju_read_table_local(
+    const std::string& path,
+    moe_juju_header_t* header,
+    std::vector<moe_juju_section_entry_t>* entries,
+    uint64_t* file_bytes
+) {
+    if (!header || !entries || path.empty()) {
+        return 0;
+    }
+    uint64_t actual_bytes = 0;
+    if (!file_size_bytes(path, &actual_bytes) || actual_bytes < MOE_JUJU_HEADER_BYTES) {
+        return 0;
+    }
+    if (!moe_juju_read_header(path.c_str(), header)) {
+        return 0;
+    }
+    const uint64_t declared_bytes = header->file_size ? header->file_size : actual_bytes;
+    if (declared_bytes > actual_bytes || header->section_count == 0 ||
+        header->section_table_offset > declared_bytes ||
+        header->section_table_size > declared_bytes - header->section_table_offset) {
+        return 0;
+    }
+    entries->assign(header->section_count, moe_juju_section_entry_t{});
+    uint32_t out_count = 0;
+    if (!moe_juju_read_section_table(
+            path.c_str(),
+            header,
+            entries->data(),
+            (uint32_t)entries->size(),
+            &out_count) ||
+        out_count != header->section_count) {
+        entries->clear();
+        return 0;
+    }
+    for (const moe_juju_section_entry_t& entry : *entries) {
+        if (entry.size == 0) {
+            continue;
+        }
+        if (entry.offset > declared_bytes || entry.size > declared_bytes - entry.offset) {
+            entries->clear();
+            return 0;
+        }
+    }
+    if (file_bytes) {
+        *file_bytes = declared_bytes;
+    }
+    return 1;
+}
+
+static int moe_read_juju_json_section(
+    const std::string& path,
+    const std::vector<moe_juju_section_entry_t>& entries,
+    uint32_t section_type,
+    uint64_t file_bytes,
+    std::string* out
+) {
+    if (out) {
+        out->clear();
+    }
+    if (!out) {
+        return 0;
+    }
+    for (const moe_juju_section_entry_t& entry : entries) {
+        if (entry.type != section_type || entry.size == 0) {
+            continue;
+        }
+        return moe_read_binary_range_to_string(path, entry.offset, entry.size, file_bytes, out);
+    }
+    return 0;
+}
+
+static int moe_read_text_file_local(const std::string& path, std::string* out) {
+    if (!out) {
+        return 0;
+    }
+    out->clear();
+    uint64_t bytes = 0;
+    if (!file_size_bytes(path, &bytes) || bytes == 0 || bytes > 256ull * 1024ull * 1024ull) {
+        return 0;
+    }
+    return moe_read_binary_range_to_string(path, 0, bytes, bytes, out);
+}
+
+static int moe_read_juju_tensor_index_json(
+    const std::string& path,
+    const std::vector<moe_juju_section_entry_t>& entries,
+    uint64_t file_bytes,
+    std::string* out
+) {
+    if (moe_read_juju_json_section(path, entries, moe_JUJU_SECTION_LAYER_ORDER_INDEX, file_bytes, out)) {
+        return 1;
+    }
+    return moe_read_text_file_local(path + ".idx", out);
+}
+
+static int moe_parse_juju_tensor_index_json(
+    const std::string& json,
+    std::vector<moe_juju_tensor_json_entry_t>* out_entries,
+    uint64_t* out_tensor_count,
+    uint64_t* out_executable_count,
+    uint64_t* out_max_executable_bytes
+) {
+    if (out_entries) {
+        out_entries->clear();
+    }
+    if (out_tensor_count) {
+        *out_tensor_count = 0;
+    }
+    if (out_executable_count) {
+        *out_executable_count = 0;
+    }
+    if (out_max_executable_bytes) {
+        *out_max_executable_bytes = 0;
+    }
+    size_t arr_begin = 0;
+    size_t arr_end = 0;
+    if (json.empty() || !moe_json_find_array_local(json, "tensors", &arr_begin, &arr_end)) {
+        return 0;
+    }
+    uint64_t tensor_count = 0;
+    uint64_t executable_count = 0;
+    uint64_t max_executable = 0;
+    size_t cursor = arr_begin + 1;
+    size_t obj_begin = 0;
+    size_t obj_end = 0;
+    while (moe_json_next_object_in_array(json, &cursor, arr_end, &obj_begin, &obj_end)) {
+        moe_juju_tensor_json_entry_t rec{};
+        uint64_t value = 0;
+        uint64_t shape[4]{};
+        uint32_t shape_count = 0;
+        if (!moe_json_get_string_slice(json, obj_begin, obj_end, "name", &rec.name) ||
+            !moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_offset", &rec.juju_offset) ||
+            !moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_bytes", &rec.juju_bytes)) {
+            continue;
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "gguf_type", &value)) {
+            rec.gguf_type = moe_u64_to_u32_clamped(value, 0);
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "dims", &value)) {
+            rec.dims = moe_u64_to_u32_clamped(value, 0);
+        }
+        if (moe_json_get_u64_array_slice(json, obj_begin, obj_end, "shape", shape, 4, &shape_count)) {
+            rec.dims = rec.dims ? std::min<uint32_t>(rec.dims, 4u) : shape_count;
+            for (uint32_t i = 0; i < std::min<uint32_t>(shape_count, 4u); ++i) {
+                rec.shape[i] = shape[i];
+            }
+        }
+        ++tensor_count;
+        if (moe_gguf_tensor_name_executable(rec.name)) {
+            ++executable_count;
+            if (rec.juju_bytes > max_executable) {
+                max_executable = rec.juju_bytes;
+            }
+        }
+        if (out_entries) {
+            out_entries->push_back(std::move(rec));
+        }
+    }
+    if (out_tensor_count) {
+        *out_tensor_count = tensor_count;
+    }
+    if (out_executable_count) {
+        *out_executable_count = executable_count;
+    }
+    if (out_max_executable_bytes) {
+        *out_max_executable_bytes = max_executable;
+    }
+    return tensor_count > 0 ? 1 : 0;
+}
+
 static int moe_read_gguf_tensor_infos(
     std::ifstream& input,
     uint64_t tensor_count,
@@ -648,7 +1102,8 @@ static int moe_read_gguf_tensor_infos(
     uint64_t file_bytes,
     std::vector<moe_gguf_tensor_dir_entry_t>* tensors,
     uint64_t* data_start,
-    uint64_t* executable_count
+    uint64_t* executable_count,
+    uint64_t* max_executable_bytes
 ) {
     if (!tensors || tensor_count > 10000000ull) {
         return 0;
@@ -686,6 +1141,7 @@ static int moe_read_gguf_tensor_infos(
         return a.tensor_offset < b.tensor_offset;
     });
     uint64_t executable = 0;
+    uint64_t max_exec = 0;
     const uint64_t payload_bytes = file_bytes > base ? file_bytes - base : 0;
     for (size_t i = 0; i < tensors->size(); ++i) {
         moe_gguf_tensor_dir_entry_t& entry = (*tensors)[i];
@@ -694,10 +1150,16 @@ static int moe_read_gguf_tensor_infos(
         entry.file_offset = base + entry.tensor_offset;
         if (moe_gguf_tensor_name_executable(entry.name)) {
             ++executable;
+            if (entry.bytes > max_exec) {
+                max_exec = entry.bytes;
+            }
         }
     }
     if (executable_count) {
         *executable_count = executable;
+    }
+    if (max_executable_bytes) {
+        *max_executable_bytes = max_exec;
     }
     return 1;
 }
@@ -757,6 +1219,7 @@ static int moe_read_gguf_tensor_directory(
         }
     }
     uint64_t executable = 0;
+    uint64_t max_executable = 0;
     return moe_read_gguf_tensor_infos(
         input,
         tensor_count,
@@ -764,7 +1227,8 @@ static int moe_read_gguf_tensor_directory(
         out->file_bytes,
         &out->tensors,
         &out->data_start,
-        &executable);
+        &executable,
+        &max_executable);
 }
 
 static int moe_scan_gguf_tensor_infos(
@@ -778,6 +1242,7 @@ static int moe_scan_gguf_tensor_infos(
     std::vector<moe_gguf_tensor_dir_entry_t> tensors;
     uint64_t data_start = 0;
     uint64_t executable = 0;
+    uint64_t max_executable = 0;
     if (!moe_read_gguf_tensor_infos(
             input,
             tensor_count,
@@ -785,12 +1250,14 @@ static int moe_scan_gguf_tensor_infos(
             out->bytes,
             &tensors,
             &data_start,
-            &executable)) {
+            &executable,
+            &max_executable)) {
         return 0;
     }
     out->tensor_count = tensor_count;
     out->data_start = data_start;
     out->executable_tensor_count = executable;
+    out->max_executable_tensor_bytes = max_executable;
     return 1;
 }
 
@@ -918,6 +1385,86 @@ static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
     if (meta->contract.weight_encoding == 0 && !meta->contract.weight_quant_family.empty()) {
         meta->contract.weight_encoding = moe_weight_encoding_from_family(meta->contract.weight_quant_family);
     }
+}
+
+static int moe_read_offload_juju_file(
+    const std::string& path,
+    moe_offload_gguf_file_t* out
+) {
+    if (!out) {
+        return 0;
+    }
+    *out = moe_offload_gguf_file_t{};
+    out->path = path;
+    out->is_juju = true;
+    out->has_offload = true;
+    out->has_metadata = true;
+    moe_juju_header_t header{};
+    std::vector<moe_juju_section_entry_t> sections;
+    uint64_t file_bytes = 0;
+    if (!moe_juju_read_table_local(path, &header, &sections, &file_bytes)) {
+        return 0;
+    }
+    out->bytes = file_bytes;
+    out->alignment = 4096;
+    out->contract.format_version = header.version_major;
+    out->contract.has_juju_contracts = true;
+    out->contract.qkv_required = header.qkv_policy != 0;
+    out->contract.plain_kv_persistent_allowed = !out->contract.qkv_required;
+    out->contract.weight_bits = header.quant_type;
+    if (header.model_name[0]) {
+        size_t model_name_len = 0;
+        while (model_name_len < sizeof(header.model_name) && header.model_name[model_name_len]) {
+            ++model_name_len;
+        }
+        out->contract.model_name.assign(header.model_name, model_name_len);
+    }
+
+    std::string model_meta_json;
+    if (moe_read_juju_json_section(path, sections, moe_JUJU_SECTION_MODEL_META, file_bytes, &model_meta_json)) {
+        out->metadata_json = model_meta_json;
+    }
+    std::string qkv_json;
+    if (moe_read_juju_json_section(path, sections, moe_JUJU_SECTION_QKV_POLICY, file_bytes, &qkv_json)) {
+        out->contract.qkv_required = true;
+        out->contract.plain_kv_persistent_allowed = false;
+        if (!out->metadata_json.empty()) {
+            out->metadata_json.push_back('\n');
+        }
+        out->metadata_json += qkv_json;
+    }
+    moe_parse_offload_metadata_json(out);
+    out->contract.has_juju_contracts = true;
+    if (out->contract.qkv_required) {
+        out->contract.plain_kv_persistent_allowed = false;
+    }
+    if (out->contract.weight_bits == 0 && header.quant_type != 0) {
+        out->contract.weight_bits = header.quant_type;
+    }
+    if (out->contract.weight_encoding == 0 && !out->contract.weight_quant_family.empty()) {
+        out->contract.weight_encoding = moe_weight_encoding_from_family(out->contract.weight_quant_family);
+    }
+
+    std::string index_json;
+    if (moe_read_juju_tensor_index_json(path, sections, file_bytes, &index_json)) {
+        uint64_t tensor_count = 0;
+        uint64_t executable_count = 0;
+        uint64_t max_executable = 0;
+        if (moe_parse_juju_tensor_index_json(
+                index_json,
+                nullptr,
+                &tensor_count,
+                &executable_count,
+                &max_executable)) {
+            out->tensor_count = tensor_count;
+            out->executable_tensor_count = executable_count;
+            out->max_executable_tensor_bytes = max_executable;
+        }
+    }
+    if (out->tensor_count == 0) {
+        out->tensor_count = header.section_count;
+    }
+    return 1;
 }
 
 static int moe_read_offload_gguf_file(
@@ -1136,6 +1683,9 @@ static int moe_scan_offload_gguf_root(
         out->files.push_back(std::move(file));
         out->tensor_count += out->files.back().tensor_count;
         out->executable_tensor_count += out->files.back().executable_tensor_count;
+        if (out->files.back().max_executable_tensor_bytes > out->max_executable_tensor_bytes) {
+            out->max_executable_tensor_bytes = out->files.back().max_executable_tensor_bytes;
+        }
     }
     if (out->files.empty()) {
         return 0;
@@ -1159,6 +1709,74 @@ static int moe_scan_offload_gguf_root(
     }
     out->valid = out->expected_count > 0 && out->present_count >= out->expected_count;
     return 1;
+}
+
+static int moe_scan_offload_juju_root(
+    const std::string& root,
+    moe_offload_gguf_scan_t* out
+) {
+    if (!out) {
+        return 0;
+    }
+    *out = moe_offload_gguf_scan_t{};
+    std::vector<std::string> paths;
+    moe_collect_juju_files(root, 4, &paths);
+    if (paths.empty()) {
+        return 0;
+    }
+    std::sort(paths.begin(), paths.end());
+    std::unordered_set<uint32_t> seen_indexes;
+    bool saw_indexed = false;
+    for (const std::string& path : paths) {
+        moe_offload_gguf_file_t file{};
+        if (!moe_read_offload_juju_file(path, &file)) {
+            continue;
+        }
+        out->juju_format = true;
+        out->present_total_bytes += file.bytes;
+        if (file.file_count > out->expected_count) {
+            out->expected_count = file.file_count;
+        }
+        if (file.file_index > 0) {
+            saw_indexed = true;
+            seen_indexes.insert(file.file_index);
+        }
+        out->files.push_back(std::move(file));
+        out->tensor_count += out->files.back().tensor_count;
+        out->executable_tensor_count += out->files.back().executable_tensor_count;
+        if (out->files.back().max_executable_tensor_bytes > out->max_executable_tensor_bytes) {
+            out->max_executable_tensor_bytes = out->files.back().max_executable_tensor_bytes;
+        }
+    }
+    if (out->files.empty()) {
+        return 0;
+    }
+    if (out->expected_count == 0) {
+        out->expected_count = (uint32_t)out->files.size();
+    }
+    out->present_count = saw_indexed ? (uint32_t)seen_indexes.size() : (uint32_t)out->files.size();
+    if (out->expected_count > out->present_count) {
+        out->missing_count = out->expected_count - out->present_count;
+    }
+    if (saw_indexed && out->expected_count > 0) {
+        for (uint32_t i = 1; i <= out->expected_count; ++i) {
+            if (seen_indexes.find(i) == seen_indexes.end()) {
+                out->first_missing = i;
+                break;
+            }
+        }
+    } else if (out->missing_count) {
+        out->first_missing = out->present_count + 1;
+    }
+    out->valid = out->expected_count > 0 && out->present_count >= out->expected_count;
+    return 1;
+}
+
+static int moe_scan_offload_model_root(
+    const std::string& root,
+    moe_offload_gguf_scan_t* out
+) {
+    return moe_scan_offload_juju_root(root, out) || moe_scan_offload_gguf_root(root, out);
 }
 
 static std::string moe_model_id_from_offload_scan(
@@ -1203,7 +1821,8 @@ static void moe_fill_check_from_offload_gguf_scan(
     if (scan.missing_count) {
         out_check->first_missing_part = scan.first_missing;
         std::ostringstream missing;
-        missing << "offload GGUF shard index " << scan.first_missing;
+        missing << (scan.juju_format ? "JUJU shard index " : "offload GGUF shard index ")
+                << scan.first_missing;
         copy_check_path(out_check->first_missing_path, sizeof(out_check->first_missing_path), missing.str());
     }
     out_check->valid = scan.valid ? 1 : 0;
@@ -1295,7 +1914,7 @@ static int moe_engine_load_offload_gguf_contract(
     moe_model_root_check_t* out_check
 ) {
     moe_offload_gguf_scan_t scan{};
-    if (!moe_scan_offload_gguf_root(root, &scan)) {
+    if (!moe_scan_offload_model_root(root, &scan)) {
         return 0;
     }
     moe_fill_check_from_offload_gguf_scan(scan, out_check);
@@ -1329,7 +1948,8 @@ static int moe_engine_load_offload_gguf_contract(
     }
     moe_engine_apply_juju_strategy(engine, scan, primary.contract);
     std::fprintf(stderr,
-        "[storagellm] offload GGUF contract loaded: files=%u first=%s qkv=%s weight=%s/%ub catalog=%u\n",
+        "[storagellm] offload %s contract loaded: files=%u first=%s qkv=%s weight=%s/%ub catalog=%u\n",
+        scan.juju_format ? "JUJU" : "GGUF",
         scan.expected_count,
         primary.path.c_str(),
         qkv_required ? "required" : "available",
@@ -1350,7 +1970,7 @@ int moe_storage_validate_model_root(
     std::memset(out_check, 0, sizeof(*out_check));
     const std::string root = model_root ? model_root : "";
     moe_offload_gguf_scan_t gguf_scan{};
-    if (!root.empty() && moe_scan_offload_gguf_root(root, &gguf_scan)) {
+    if (!root.empty() && moe_scan_offload_model_root(root, &gguf_scan)) {
         moe_fill_check_from_offload_gguf_scan(gguf_scan, out_check);
         return 1;
     }
@@ -1371,7 +1991,7 @@ int moe_storage_infer_model_id(
         return 0;
     }
     moe_offload_gguf_scan_t gguf_scan{};
-    if (!moe_scan_offload_gguf_root(root, &gguf_scan)) {
+    if (!moe_scan_offload_model_root(root, &gguf_scan)) {
         return 0;
     }
     const std::string id = moe_model_id_from_offload_scan(root, gguf_scan);

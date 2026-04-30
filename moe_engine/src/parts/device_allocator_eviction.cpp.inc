@@ -102,16 +102,12 @@ static uint32_t device_collect_activation_victims_locked(
 
     // Check if rebuild needed (heap size > 2x active allocations = stale ratio > 50%)
     // Rebuild function does single map scan: count + rebuild simultaneously
-    uint32_t active_count = 0;
+    // BUGFIX 88: Issue 8 - Eliminate O(n) scan with atomic active_count
+    uint32_t active_count = (uint32_t)e->device_activation_count.load(std::memory_order_relaxed);
     const bool should_rebuild = e->activation_evict_heap.size() > 32u;  // Only check if heap is large
     if (should_rebuild) {
-        // 비율 체크 없이 바로 rebuild 하는 대신, 먼저 heap 대비 예상 active 비율 확인
-        // heap이 active의 2배 이상일 때만 rebuild
-        if (e->activation_evict_heap.size() > (uint32_t)e->device_allocations.size() * 2u) {
+        if (e->activation_evict_heap.size() > active_count * 2u) {
             active_count = device_rebuild_activation_heap_unlocked(e, device_lock);
-        } else {
-            // rebuild 없이 active_count는 맵 크기로 근사치 사용
-            active_count = (uint32_t)e->device_allocations.size();
         }
         const bool was_stale = e->activation_evict_heap.size() > active_count * 2u;
         if (was_stale) {

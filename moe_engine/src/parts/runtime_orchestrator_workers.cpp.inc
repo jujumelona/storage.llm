@@ -34,13 +34,18 @@ static void flush_deferred_joins(moe_pc_engine* engine, bool force_blocking = fa
             ++it;
         }
 #else
+        // BUGFIX 96: Issue 17 - Reduce sleep overhead in deferred join ★
+        // Problem: 10 retries × 1ms = 10ms wasted per thread on shutdown
+        // Solution: Use yield for first few attempts, then shorter sleep
         bool joined = false;
         for (int retry = 0; retry < 10 && !joined; ++retry) {
             if (engine->io_stop.load()) {
                 it->join();
                 joined = true;
+            } else if (retry < 5) {
+                std::this_thread::yield();  // Fast path: no sleep for first 5 attempts
             } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::this_thread::sleep_for(std::chrono::microseconds(100));  // 100µs instead of 1ms
             }
         }
         if (joined) {
@@ -133,7 +138,7 @@ static void orchestrator_resize_workers(
             }
         }
 
-        // BUGFIX 43: Ensure new workers enter wait state before first task arrives ?�★
+        // BUGFIX 43: Ensure new workers enter wait state before first task arrives ?�★
         // Old: New thread created ??notify_one() may fire before thread reaches wait()
         //      ??new worker misses first task
         // New: yield() + notify_all() ensures new threads are scheduled and waiting

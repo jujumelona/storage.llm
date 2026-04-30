@@ -25,6 +25,9 @@ static uint64_t moe_rt_expert_bytes_hint(
     if (engine && engine->max_tensor_stream_bytes > expert_bytes) {
         expert_bytes = engine->max_tensor_stream_bytes;
     }
+    if (scan.max_executable_tensor_bytes > expert_bytes) {
+        expert_bytes = scan.max_executable_tensor_bytes;
+    }
     if (scan.executable_tensor_count > 0 && scan.present_total_bytes > 0) {
         const uint64_t avg_tensor = scan.present_total_bytes / scan.executable_tensor_count;
         if (avg_tensor > expert_bytes) {
@@ -286,6 +289,17 @@ static void moe_rt_apply_juju_io_flags(
             io->pinned_staging_bytes = 0;
             io->pinned_worker_threads = 0;
             io->gpu_worker_threads = 0;
+            // Extreme tuning for CPU-only or unified-memory zero-copy paths.
+            if (path == moe_JUJU_EXEC_FULL_COMPUTE_MEM) {
+                // Everything is in RAM, IO workers just waste CPU cycles context switching
+                io->io_worker_threads = 1;
+                io->disk_worker_threads = 1;
+            } else if (!engine->config.prefer_gpu || engine->backend_caps.supports_unified_memory) {
+                // CPU_WITH_CACHE or unified GPU. Limit IO to preserve compute cores.
+                // 2 threads are enough to saturate NVMe page faults without thrashing AVX2.
+                io->io_worker_threads = io->io_worker_threads > 2u ? 2u : io->io_worker_threads;
+                io->disk_worker_threads = io->io_worker_threads;
+            }
         } else {
             io->enable_multistage_pipeline = 1;
             io->enable_pinned_host = engine->backend_caps.supports_pinned_host ? 1 : 0;

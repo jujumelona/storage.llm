@@ -122,6 +122,14 @@ static uint32_t acquire_staging_slot(
 
 static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t start_idx, uint32_t count, uint32_t worker_index, uint32_t turn, uint64_t required_bytes) {
     const uint32_t preferred = count > 1 ? (worker_index * 2u + turn) % count : 0u;
+    // BUGFIX 83: Issue 5 - Limit staging slot acquire retries ★★★
+    // Problem: Infinite loop when staging_free_slot_count=0
+    // All io_workers blocked in this loop → pipeline freeze
+    // Solution: Max 20 retries (100ms total), then return UINT32_MAX
+    // Upper layer handles failure (requeue or drop)
+    uint32_t retry_count = 0;
+    constexpr uint32_t MAX_RETRIES = 20;
+
     for (;;) {
         for (uint32_t probe = 0; probe < count; ++probe) {
             const uint32_t idx = start_idx + ((preferred + probe) % count);
@@ -143,9 +151,15 @@ static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t st
             return UINT32_MAX;
         }
 
-        // BUGFIX 68: Issue 5 - Wait on correct CV based on slot type ??
-        // Old: All workers wait on staging_slot_cv ??Thundering Herd
-        // New: Wait on type-specific CV ??only relevant workers wake
+        // BUGFIX 83: Check retry limit before waiting
+        if (++retry_count >= MAX_RETRIES) {
+            engine->io_atomic.staging_slot_contention.fetch_add(1, std::memory_order_relaxed);
+            return UINT32_MAX;
+        }
+
+        // BUGFIX 68: Issue 5 - Wait on correct CV based on slot type ★★
+        // Old: All workers wait on staging_slot_cv → Thundering Herd
+        // New: Wait on type-specific CV → only relevant workers wake
         std::condition_variable* target_cv = &engine->staging_slot_cv;
         const uint32_t pinned_count = engine->staging_pinned_slot_count.load(std::memory_order_acquire);
         const uint32_t gpu_start = pinned_count;
@@ -168,7 +182,8 @@ static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t st
             [&]() { return engine->staging_free_slot_count.load(std::memory_order_acquire) > 0; }
         );
         if (!got_slot) {
-            return UINT32_MAX;
+            // Timeout but continue retry (up to MAX_RETRIES)
+            continue;
         }
     }
 }
