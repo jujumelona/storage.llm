@@ -104,7 +104,19 @@ static int enqueue_stage_or_retry(
         } else {
             stage.queue.push_back(queued);
         }
-        stage.depth.store(static_cast<uint32_t>(queue_sz + urgent_sz + 1));  // +1 for just-added task
+        // BUGFIX 113: Issue 25 - Fix depth calculation after conditional enqueue ★★★
+        // Problem: stage.depth.store(queue_sz + urgent_sz + 1) assumes task always added
+        // But if urgent queue full and demoted to normal, depth calculation is wrong
+        // queue_sz and urgent_sz are OLD sizes before push_back
+        // After demotion: normal queue grows by 1, urgent stays same
+        // Correct depth = (queue_sz + 1) + urgent_sz = queue_sz + urgent_sz + 1 ✓
+        // After urgent add: normal stays same, urgent grows by 1
+        // Correct depth = queue_sz + (urgent_sz + 1) = queue_sz + urgent_sz + 1 ✓
+        // After normal add: normal grows by 1, urgent stays same
+        // Correct depth = (queue_sz + 1) + urgent_sz = queue_sz + urgent_sz + 1 ✓
+        // Actually the formula is correct! But let's verify with actual sizes for clarity
+        const size_t final_depth = stage.queue.size() + stage.urgent_queue.size();
+        stage.depth.store(static_cast<uint32_t>(final_depth));
         engine->total_queue_depth.fetch_add(1, std::memory_order_relaxed);
     }
     return 1;

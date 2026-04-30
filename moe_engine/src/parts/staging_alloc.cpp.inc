@@ -1,22 +1,7 @@
-// TODO: Issue 11 - NUMA-aware pinned memory allocation ★
-// Problem: cuMemAllocHost/mlock doesn't specify NUMA node
-// On AMD Ryzen (multi-CCD), memory on wrong NUMA node → 20-30% DMA bandwidth loss
-// Cross-chiplet memory access adds latency, reduces PCIe throughput
-// Solution: Allocate pinned buffer on NUMA node closest to GPU
-//   Linux: numa_alloc_onnode() + read /sys/bus/pci/devices/{gpu_pci_id}/numa_node
-//   Windows: VirtualAllocExNuma()
-// Implementation:
-//   1. Add preferred_numa_node to backend_caps (auto-detect from GPU PCI ID)
-//   2. In allocate_staging(), use NUMA-aware allocation:
-//      #ifdef __linux__
-//        if (numa_available() >= 0 && preferred_numa_node >= 0) {
-//            ptr = numa_alloc_onnode(bytes, preferred_numa_node);
-//        }
-//      #endif
-//   3. Fallback to regular allocation if NUMA not available
-// Trade-off: Linux/Windows-specific code, libnuma dependency on Linux
-// Impact: 20-30% DMA bandwidth improvement on multi-CCD AMD systems
-// Status: Documented as TODO, not implemented (platform-specific)
+// BUGFIX 110: Issue 22 - Thread-safe warning flag ★
+// Problem: static bool warned is not thread-safe
+// Multiple threads can print warning simultaneously
+// Solution: Use atomic<bool> with exchange
 static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* pinned, bool* numa_allocated) {
     if (pinned) {
         *pinned = false;
@@ -86,10 +71,9 @@ static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* 
     }
 #else
     if (preferred_numa_node >= 0) {
-        static bool warned = false;
-        if (!warned) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
             fprintf(stderr, "[storageLLM WARNING] NUMA: disabled (install libnuma-dev and define HAVE_NUMA for +20%% DMA bandwidth on multi-CCD AMD systems)\n");
-            warned = true;
         }
     }
 #endif

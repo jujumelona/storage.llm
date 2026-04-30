@@ -101,7 +101,10 @@ static int try_add_tier_usage(moe_pc_engine* engine, moe_tier_t tier, uint64_t b
                 engine->vram_eviction_cv.notify_one();
             } else if (tier == moe_TIER_RAM && (current + bytes) > threshold_85) {
                 engine->ram_eviction_needed.store(true, std::memory_order_relaxed);
-                engine->ram_eviction_cv.notify_one();
+                // BUGFIX 110: Notify vram_eviction_cv for RAM eviction too
+                // proactive_eviction_worker_loop waits ONLY on vram_eviction_cv for BOTH VRAM and RAM evictions.
+                // Notifying ram_eviction_cv here resulted in a Lost Wakeup, delaying RAM eviction by up to 25ms (the wait timeout).
+                engine->vram_eviction_cv.notify_one();
             }
             return 1;
         }

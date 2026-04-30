@@ -13,6 +13,12 @@ static void shrink_worker_tail(std::vector<std::thread>& workers, uint32_t targe
 // Fix 10: POSIX must not detach; use timed join or skip to prevent UAF.
 static void flush_deferred_joins(moe_pc_engine* engine, bool force_blocking = false) {
     if (!engine) return;
+    // BUGFIX 114: Fix fatal data race on deferred_joins ??
+    // Problem: parallel_rows_pool.cpp.inc pushes to deferred_joins lock-free,
+    // while orchestrator thread calls flush_deferred_joins which erases from it.
+    // Concurrent access to std::vector causes UB / Iterator Invalidation (Crash).
+    // Solution: Protect all deferred_joins accesses with io_start_mutex.
+    std::lock_guard<std::mutex> lock(engine->io_start_mutex);
     auto it = engine->deferred_joins.begin();
     while (it != engine->deferred_joins.end()) {
         if (!it->joinable()) {
@@ -61,7 +67,10 @@ static void reap_dead_workers(moe_pc_engine* engine, std::vector<std::thread>& w
     // Deferred joins are only flushed during shutdown.
     const uint32_t target = target_atomic.load();
     while (workers.size() > target) {
-        engine->deferred_joins.push_back(std::move(workers.back()));
+        {
+            std::lock_guard<std::mutex> lock(engine->io_start_mutex);
+            engine->deferred_joins.push_back(std::move(workers.back()));
+        }
         workers.pop_back();
     }
 }

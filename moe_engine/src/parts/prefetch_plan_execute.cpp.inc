@@ -91,10 +91,11 @@ int moe_pc_engine_execute_prefetch_plan(
             if (try_add_tier_usage(engine, moe_TIER_VRAM, items[i].bytes,
                                    tier_budget(engine, moe_TIER_VRAM))) {
                 admitted_tiers[i] = moe_TIER_VRAM;
-                // PIPELINE FIX 14: Subtract from batch_ram_reserved when upgrading to VRAM ?�★
-                // Old: batch_ram_reserved still includes upgraded bytes ??over-reserves RAM
-                // New: Subtract upgraded bytes ??accurate RAM reservation for subsequent batches
-                // Prevents unnecessary DB demotion of later experts
+                // Prevent global RAM reservation leaks when upgrading RAM admission to VRAM.
+                // prefetch_admitted_tier adds to global pending_ram_reservation.
+                // If we change tier to VRAM, the cleanup loop at the end (which checks for RAM tier)
+                // will skip this item, leaking the reservation permanently.
+                prefetch_release_pending_ram_reservation(engine, items[i].bytes);
                 if (batch_ram_reserved >= items[i].bytes) {
                     batch_ram_reserved -= items[i].bytes;
                 }

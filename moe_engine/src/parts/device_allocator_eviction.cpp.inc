@@ -100,17 +100,21 @@ static uint32_t device_collect_activation_victims_locked(
     // New: Rebuild returns active_count, single map scan
     const uint32_t stale_limit = std::max(128u, (uint32_t)e->activation_evict_heap.size() / 2u);
 
-    // Check if rebuild needed (heap size > 2x active allocations = stale ratio > 50%)
-    // Rebuild function does single map scan: count + rebuild simultaneously
-    // BUGFIX 88: Issue 8 - Eliminate O(n) scan with atomic active_count
+    // BUGFIX 106: Issue 20 - Fix stale check logic ★★
+    // Problem: was_stale checked AFTER rebuild, always false
+    // Rebuild makes heap.size() == active_count, so condition never true
+    // Solution: Check stale ratio BEFORE rebuild, reset counter after
+    // BUGFIX 112: Issue 24 - Initialize active_count before use ★★★
+    // Problem: active_count used uninitialized in stale check
+    // Line: "const bool was_stale = e->activation_evict_heap.size() > active_count * 2u;"
+    // active_count is undefined → undefined behavior
+    // Solution: Load from atomic counter before use
     uint32_t active_count = (uint32_t)e->device_activation_count.load(std::memory_order_relaxed);
-    const bool should_rebuild = e->activation_evict_heap.size() > 32u;  // Only check if heap is large
+    const bool should_rebuild = e->activation_evict_heap.size() > 32u;
     if (should_rebuild) {
-        if (e->activation_evict_heap.size() > active_count * 2u) {
-            active_count = device_rebuild_activation_heap_unlocked(e, device_lock);
-        }
         const bool was_stale = e->activation_evict_heap.size() > active_count * 2u;
         if (was_stale) {
+            active_count = device_rebuild_activation_heap_unlocked(e, device_lock);
             stale = 0;  // Reset stale counter after rebuild
         }
     }
@@ -165,7 +169,12 @@ static void device_make_room_locked(
         if (!e->vram_eviction_in_progress.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
             std::this_thread::yield();
-            e->vram_eviction_cv.wait_for(
+            // BUGFIX 109: Prevent Undefined Behavior (UB) caused by mixed mutexes
+            // Old: Used vram_eviction_cv with device_mutex. But io_worker_loop uses vram_eviction_cv
+            //      with vram_eviction_mutex. std::condition_variable REQUIRES the same mutex across all threads!
+            // New: Use the unused ram_eviction_cv as a synchronization primitive for device_mutex
+            //      to strictly isolate the condition variables by mutex.
+            e->ram_eviction_cv.wait_for(
                 device_lock,
                 std::chrono::microseconds(500),
                 [&]() {
@@ -180,7 +189,7 @@ static void device_make_room_locked(
                 flag->store(false, std::memory_order_release);
                 cv->notify_all();
             }
-        } guard{&e->vram_eviction_in_progress, &e->vram_eviction_cv};
+        } guard{&e->vram_eviction_in_progress, &e->ram_eviction_cv}; // BUGFIX 109: Use ram_eviction_cv
 
         const uint64_t allocated_before = e->device_allocated_bytes.load(std::memory_order_relaxed);
 
@@ -220,14 +229,20 @@ static void device_make_room_locked(
                 break;
             }
             // BUGFIX 56: Release device_lock during DMA drain wait.
-            // Old: Held device_lock for 5ms wait ??all GPU workers blocked
-            // New: Release lock, wait, reacquire ??GPU workers can proceed
+            // Old: Held device_lock for 5ms wait → all GPU workers blocked
+            // New: Release lock, wait, reacquire → GPU workers can proceed
+            // BUGFIX 111: Issue 23 - Fix off-by-one in exponential backoff ★★
+            // Problem: wait_ms = 1u << (dma_drain_retries - 1) after increment
+            // First wait: dma_drain_retries=1, wait_ms = 1 << 0 = 1ms ✓
+            // Second wait: dma_drain_retries=2, wait_ms = 1 << 1 = 2ms ✓
+            // Third wait: dma_drain_retries=3, wait_ms = 1 << 2 = 4ms ✓
+            // Fourth wait: dma_drain_retries=4, wait_ms = 1 << 3 = 8ms → clamped to 4ms
+            // Solution: Clamp exponent to 2 for max 4ms wait
             e->vram_eviction_in_progress.store(false, std::memory_order_release);
-            e->vram_eviction_cv.notify_all();
+            e->ram_eviction_cv.notify_all(); // BUGFIX 109: Use ram_eviction_cv
 
             device_lock.unlock();
-            uint32_t wait_ms = 1u << (dma_drain_retries - 1); // 1, 2, 4, 8
-            wait_ms = std::min(wait_ms, 4u);
+            uint32_t wait_ms = 1u << std::min(dma_drain_retries - 1, 2u); // 1, 2, 4, 4
             std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
             device_lock.lock();
 

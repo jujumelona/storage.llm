@@ -150,6 +150,11 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         }
 
         if (worker_index >= engine->gpu_worker_target.load()) {
+            // BUGFIX 111: Prevent CUDA stream double-destroy on dynamic worker downscaling
+            // Old: device_stream_destroy_current called directly, but stream_guard.e was not cleared.
+            //      When function returns, ~StreamGuard calls it AGAIN -> CUDA_ERROR_INVALID_HANDLE (Crash)
+            // New: Clear stream_guard.e before manual destroy, matching pop_stage_task failure path.
+            stream_guard.e = nullptr;
             device_stream_destroy_current(engine);
             return;
         }

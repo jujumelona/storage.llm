@@ -97,7 +97,10 @@ static mmap_context_t* get_or_map_shard(moe_pc_engine* engine, const std::string
     {
         std::unique_lock<std::shared_mutex> lock(engine->shard_mutex);
         engine->shard_mmaps[path] = ctx;
-        cv = shard_mmap_cv_locked(engine, path);
+        // BUGFIX 112: Prevent std::condition_variable memory leak on mmap success
+        // Old: shard_mmap_cv_locked retrieved the CV but left it in the map forever.
+        // New: shard_mmap_take_cv_locked removes it. Waiting threads safely use their shared_ptr.
+        cv = shard_mmap_take_cv_locked(engine, path);
     }
     if (cv) {
         cv->notify_all();
@@ -170,7 +173,8 @@ static mmap_context_t* get_or_map_shard_partial(
     {
         std::unique_lock<std::shared_mutex> lock(engine->shard_mutex);
         engine->shard_mmaps[key] = ctx;
-        cv = shard_mmap_cv_locked(engine, key);
+        // BUGFIX 112: Prevent std::condition_variable memory leak on partial mmap success
+        cv = shard_mmap_take_cv_locked(engine, key);
     }
     if (cv) {
         cv->notify_all();

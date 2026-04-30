@@ -188,14 +188,17 @@ static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t st
     }
 }
 
+// BUGFIX 107: Issue 21 - Cache slot counts to avoid redundant atomic loads ★
+// Problem: Same atomic variables loaded twice in short time
+// Solution: Load once and reuse values
 static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
     if (engine && slot_index < engine->staging_slots.size()) {
         engine->staging_slots[slot_index].in_use.store(false, std::memory_order_release);
         engine->staging_free_slot_count.fetch_add(1, std::memory_order_release);
 
-        // BUGFIX 68: Issue 5 - Notify only relevant CV based on slot type ??
-        // Old: notify_one on staging_slot_cv ??random worker wakes (may be wrong type)
-        // New: Notify type-specific CV ??correct worker type wakes
+        // BUGFIX 68: Issue 5 - Notify only relevant CV based on slot type ★★
+        // Old: notify_one on staging_slot_cv → random worker wakes (may be wrong type)
+        // New: Notify type-specific CV → correct worker type wakes
         // Impact: Eliminates unnecessary wakeups, reduces context switches
         const uint32_t pinned_count = engine->staging_pinned_slot_count.load(std::memory_order_acquire);
         const uint32_t gpu_count = engine->staging_gpu_slot_count.load(std::memory_order_acquire);
@@ -204,7 +207,7 @@ static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
 
         if (slot_index < pinned_count) {
             engine->staging_pinned_cv.notify_one();
-        } else if (slot_index >= pinned_count && slot_index < direct_start) {
+        } else if (slot_index >= gpu_start && slot_index < direct_start) {
             engine->staging_gpu_cv.notify_one();
         } else {
             engine->staging_direct_cv.notify_one();

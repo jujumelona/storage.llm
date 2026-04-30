@@ -9,7 +9,7 @@ static void cpu_row_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
     for (;;) {
         uint32_t rows = 0;
         uint32_t block = 1;
-        // BUGFIX 77: Issue 8 - Fix cpu_row_fn/ctx data race ?�★??        // Problem: fn and ctx read outside lock after lock released
+        // BUGFIX 77: Issue 8 - Fix cpu_row_fn/ctx data race ?★??        // Problem: fn and ctx read outside lock after lock released
         // If moe_parallel_rows changes fn/ctx, worker can mix old fn with new ctx ??UB
         // Solution: Copy fn/ctx inside lock before releasing
         // Impact: Prevents undefined behavior in concurrent generation scenarios
@@ -71,6 +71,22 @@ static void ensure_cpu_row_workers(moe_pc_engine* engine, uint32_t /*ignored*/) 
             }
         }
         engine->cpu_row_workers.clear();
+
+        // BUGFIX 113: Fix memory and thread handle leak in deferred_joins ??
+        // When the orchestrator dynamically resizes CPU workers, it sets target=0 to force a pool recreation.
+        // Old: Only active cpu_row_workers were joined. Any threads lingering in deferred_joins
+        //      from previous hot-path downsizes were completely ignored and accumulated forever,
+        //      causing ERROR_NO_SYSTEM_RESOURCES (thread handle exhaustion) over time.
+        // New: Join and clear the zombie threads in deferred_joins during this sync point.
+        {
+            std::lock_guard<std::mutex> join_lock(engine->io_start_mutex);
+            for (std::thread& worker : engine->deferred_joins) {
+                if (worker.joinable()) {
+                    worker.join();
+                }
+            }
+            engine->deferred_joins.clear();
+        }
         engine->cpu_row_done_generation = engine->cpu_row_generation;
         engine->cpu_active_workers.store(0, std::memory_order_relaxed);
         const unsigned int hw_raw = std::thread::hardware_concurrency();
@@ -90,8 +106,11 @@ static void ensure_cpu_row_workers(moe_pc_engine* engine, uint32_t /*ignored*/) 
         // Fix 6: Don't join on hot path ??move excess threads to deferred_joins.
         // Workers self-terminate when they see worker_index >= target.
         engine->cpu_row_cv.notify_all();
-        for (size_t i = target; i < engine->cpu_row_workers.size(); ++i) {
-            engine->deferred_joins.emplace_back(std::move(engine->cpu_row_workers[i]));
+        {
+            std::lock_guard<std::mutex> join_lock(engine->io_start_mutex);
+            for (size_t i = target; i < engine->cpu_row_workers.size(); ++i) {
+                engine->deferred_joins.emplace_back(std::move(engine->cpu_row_workers[i]));
+            }
         }
         engine->cpu_row_workers.resize(target);
     }

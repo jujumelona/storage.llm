@@ -21,7 +21,7 @@ static int moe_layer_attention_f32(
         return 0;
     }
 
-    // BUGFIX 82: Issue Y - Parallelize Q and KV projections ?�★??
+    // BUGFIX 82: Issue Y - Parallelize Q and KV projections ?★??
     // Problem: q_a_proj and kv_a_proj are independent but run serially, leaving cores idle
     // Solution: Fuse them into a single moe_parallel_rows dispatch
     moe_raw_tensor_cache_entry kv_a_raw{};
@@ -63,7 +63,7 @@ static int moe_layer_attention_f32(
     // with Q-side absorption and historical KV decode in one barrier.
     moe_rope_inplace(k_rope, moe_MLA_K_ROPE_DIM, position, s->rope_k_cos, s->rope_k_sin);
 
-    // BUGFIX 45: Issue 11 - Proactive KV cache pre-allocation ?�★??
+    // BUGFIX 45: Issue 11 - Proactive KV cache pre-allocation ?★??
     // Problem: ensure_capacity triggers demote_cold_until in critical path every time
     // KV cache grows, evicting unrelated MoE experts during token generation.
     // Solution: Pre-allocate full KV cache when RAM budget allows, eliminating
@@ -79,7 +79,12 @@ static int moe_layer_attention_f32(
         // Pre-allocate to max capacity to avoid future reallocations
         const uint64_t old_bytes = moe_kv_cache_bytes(s->kv_cache.num_layers, s->kv_cache.max_seq_len);
         const uint64_t new_bytes = moe_kv_cache_bytes(s->kv_cache.num_layers, moe_MLA_MAX_SEQ_LEN);
-        const uint64_t realloc_peak = old_bytes + new_bytes;
+        // BUGFIX 108: Fix double-counting of old_bytes in KV cache reallocation
+        // Old: realloc_peak = old_bytes + new_bytes. Since ram_used already includes old_bytes,
+        //      checking ram_used + realloc_peak > ram_budget double-counted old_bytes,
+        //      causing aggressive unnecessary eviction of MoE experts from RAM.
+        // New: realloc_peak is just new_bytes, because peak usage during realloc is ram_used + new_bytes.
+        const uint64_t realloc_peak = new_bytes;
         const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
         if (ram_budget > 0) {
             const uint64_t ram_used = tier_used(engine, moe_TIER_RAM);
@@ -104,7 +109,12 @@ static int moe_layer_attention_f32(
         }
         const uint64_t old_bytes = moe_kv_cache_bytes(s->kv_cache.num_layers, s->kv_cache.max_seq_len);
         const uint64_t new_bytes = moe_kv_cache_bytes(s->kv_cache.num_layers, new_cap);
-        const uint64_t realloc_peak = old_bytes + new_bytes;
+        // BUGFIX 108: Fix double-counting of old_bytes in KV cache reallocation
+        // Old: realloc_peak = old_bytes + new_bytes. Since ram_used already includes old_bytes,
+        //      checking ram_used + realloc_peak > ram_budget double-counted old_bytes,
+        //      causing aggressive unnecessary eviction of MoE experts from RAM.
+        // New: realloc_peak is just new_bytes, because peak usage during realloc is ram_used + new_bytes.
+        const uint64_t realloc_peak = new_bytes;
         const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
         if (ram_budget > 0) {
             const uint64_t ram_used = tier_used(engine, moe_TIER_RAM);
@@ -116,7 +126,7 @@ static int moe_layer_attention_f32(
                 }
             }
         }
-        // BUGFIX 65: Issue 9 - Handle ensure_capacity failure ?�★??
+        // BUGFIX 65: Issue 9 - Handle ensure_capacity failure ?★??
         // Problem: ensure_capacity can throw std::bad_alloc if RAM exhausted
         // Exception crosses C API boundary ??undefined behavior
         // Or demote succeeds but another thread allocates ??capacity fails ??KV entry lost
@@ -135,7 +145,7 @@ static int moe_layer_attention_f32(
             return 0;
         }
     }
-    // BUGFIX 65: Issue 9 - Verify capacity before store ?�★??
+    // BUGFIX 65: Issue 9 - Verify capacity before store ?★??
     // Problem: If ensure_capacity failed silently, position >= max_seq_len
     // store_entry is skipped ??KV entry lost ??attention corrupted
     // Solution: Explicit check, return error if capacity insufficient
@@ -214,7 +224,7 @@ static int moe_layer_attention_f32(
     // --- Online softmax: head-outer (parallel), position-inner ---
     // Each head has independent running max/denom/c_weighted; decoded KV is read-only shared.
 
-    // BUGFIX 70: Issue 8 - Remove QKV dead code stub ?�★??
+    // BUGFIX 70: Issue 8 - Remove QKV dead code stub ?★??
     // Problem: BUGFIX 47 added qkv_is_enabled() branch but lambda does nothing (return 1)
     // Standard softmax path always executes ??no memory savings, only overhead
     // QKV integration requires qkv_state_t* in moe_decode_scratch (not implemented)
@@ -236,7 +246,7 @@ static int moe_layer_attention_f32(
         float h_max = -1e30f;
         float h_denom = 0.0f;
 
-        // BUGFIX 42: Fix softmax loop boundary to prevent out-of-bounds access ?�★??
+        // BUGFIX 42: Fix softmax loop boundary to prevent out-of-bounds access ?★??
         // Old: loop_end = position < max_seq_len ? seq_len : seq_len + 1
         //      When position >= max_seq_len, loop_end = seq_len + 1
         //      But layer_decode size = decoded_kv_count = min(position, seq_len)
