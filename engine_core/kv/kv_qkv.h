@@ -133,6 +133,9 @@ typedef struct {
     float* thresholds_3bit;
     float* codebook_4bit;     // 4-bit support: 16 levels
     float* thresholds_4bit;
+    int owns_rotation_matrix;
+    int owns_qjl_matrix;
+    int owns_codebooks;
 
     // Fix 4: Outlier channel indices (paper Section 4.3)
     // Outliers are channels with highest magnitude across calibration data
@@ -160,6 +163,10 @@ typedef struct {
     float* scratch_attention;  // [n_tokens] for attention scores
     float* scratch_rotated_q;  // [head_dim] for rotated query
     int* scratch_indices;      // [head_dim] for dequantize
+    int* work_codes_buf;       // [computed_workers, max(head_dim, outlier dims)]
+    float* work_qjl_buf;       // [computed_workers, head_dim]
+    int work_buf_stride;
+    int work_buf_workers;
 
     // Shape
     int n_tokens;

@@ -2,8 +2,7 @@ static void queue_total_depth_sub(glm5_pc_engine* engine, uint32_t count) {
     if (!engine || count == 0) {
         return;
     }
-    // BUGFIX 39: Replace CAS spin with fetch_sub for better performance ★★★
-    // Old: CAS loop with saturating subtract → contention when multiple workers pop simultaneously
+    // BUGFIX 39: Replace CAS spin with fetch_sub for better performance ?끸쁾??    // Old: CAS loop with saturating subtract ??contention when multiple workers pop simultaneously
     // New: Simple fetch_sub with saturation check
     // Rationale: total_queue_depth is a statistical counter, not a critical invariant
     //            Temporary underflow (wrapping to UINT32_MAX) is acceptable because:
@@ -59,9 +58,9 @@ static int enqueue_stage_or_retry(
         std::lock_guard<std::mutex> lock(stage.mtx);
         const size_t total = stage.queue.size() + stage.urgent_queue.size();
         const size_t normal_cap = engine->io_config.max_prefetch_queue;
-        // PIPELINE FIX 18: Reduce retry_cap from 1.5x to 1.25x ★★
-        // Old: retry_room = normal_cap/2 → queue can grow to 150%
-        // New: retry_room = normal_cap/4 → queue can grow to 125%
+        // PIPELINE FIX 18: Reduce retry_cap from 1.5x to 1.25x ?끸쁾
+        // Old: retry_room = normal_cap/2 ??queue can grow to 150%
+        // New: retry_room = normal_cap/4 ??queue can grow to 125%
         // Reduces queue inflation and makes dropped_requests metric more meaningful
         const size_t retry_room = std::max<size_t>(32u, normal_cap / 4u);
         const size_t retry_cap = normal_cap + retry_room;
@@ -70,11 +69,10 @@ static int enqueue_stage_or_retry(
             return 0;
         }
 
-        // BUGFIX 40: Add urgent_queue size limit to prevent unbounded growth ★★★
-        // Old: urgent_queue has no cap → can grow infinitely if all requeues become urgent
+        // BUGFIX 40: Add urgent_queue size limit to prevent unbounded growth ?끸쁾??        // Old: urgent_queue has no cap ??can grow infinitely if all requeues become urgent
         // New: urgent_queue capped at normal_cap/2
-        // Scenario: All tasks requeue with urgent=1 → urgent_queue grows without bound
-        //           → memory exhaustion, priority inversion (everything is "urgent")
+        // Scenario: All tasks requeue with urgent=1 ??urgent_queue grows without bound
+        //           ??memory exhaustion, priority inversion (everything is "urgent")
         // Solution: Cap urgent_queue separately. If urgent_queue full, drop or demote to normal
         const size_t urgent_cap = std::max<size_t>(16u, normal_cap / 2u);
 
@@ -86,7 +84,6 @@ static int enqueue_stage_or_retry(
         // }
 
         if (queued.urgent) {
-            // BUGFIX 40: Check urgent_queue cap ★★★
             if (stage.urgent_queue.size() >= urgent_cap) {
                 // Urgent queue full: demote to normal queue if space, else drop
                 if (total < retry_cap) {
@@ -132,9 +129,8 @@ static bool pop_stage_task(
         stage.queue.pop_front();
     }
     stage.depth.store(static_cast<uint32_t>(stage.queue.size() + stage.urgent_queue.size()));
-    // PIPELINE FIX 6: Increment inflight BEFORE notify to prevent race condition ★★★
-    // Old order: notify → inflight++ → awakened thread sees inflight==0 → false "idle"
-    // New order: inflight++ → notify → awakened thread always sees inflight>=1
+    // PIPELINE FIX 6: Increment inflight BEFORE notify to prevent race condition ?끸쁾??    // Old order: notify ??inflight++ ??awakened thread sees inflight==0 ??false "idle"
+    // New order: inflight++ ??notify ??awakened thread always sees inflight>=1
     // Prevents premature "pipeline done" signal when tasks are still processing
     stage.inflight.fetch_add(1);
     stage.pop_cv.notify_one();
@@ -170,9 +166,9 @@ static void finish_stage_task(glm5_pc_engine* engine, glm5_stage_queue& stage, i
         engine->io_atomic.failed_requests.fetch_add(1);
     }
     stage.inflight.fetch_sub(1);
-    // BUGFIX 26: Only notify on terminal completion ★★
-    // Old: notify on every finish, including requeues → spurious wakeups
-    // New: notify only when count_completed=true → accurate completion signal
+    // BUGFIX 26: Only notify on terminal completion ?끸쁾
+    // Old: notify on every finish, including requeues ??spurious wakeups
+    // New: notify only when count_completed=true ??accurate completion signal
     // Prevents premature "all done" detection in startup_warm and other waiters
     if (count_completed) {
         engine->io_done_cv.notify_one();

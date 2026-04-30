@@ -6,6 +6,61 @@
 #include <string.h>
 #include <algorithm>
 #include <thread>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+static uint64_t qkv_cache_key(int dim, uint64_t tag) {
+    uint64_t x = tag ^ ((uint64_t)(uint32_t)dim * 0x9e3779b97f4a7c15ull);
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdull;
+    x ^= x >> 33;
+    return x;
+}
+
+static std::shared_ptr<std::vector<float>> qkv_cached_codebook(int dim, int bits, bool thresholds) {
+    static std::mutex mutex;
+    static std::unordered_map<uint64_t, std::shared_ptr<std::vector<float>>> cache;
+    const uint64_t key = qkv_cache_key(dim, (uint64_t)bits | (thresholds ? 0x10000ull : 0ull));
+    std::lock_guard<std::mutex> lock(mutex);
+    auto found = cache.find(key);
+    if (found != cache.end()) return found->second;
+
+    const int levels = 1 << bits;
+    auto codebook = std::make_shared<std::vector<float>>((size_t)levels);
+    auto thresh = std::make_shared<std::vector<float>>((size_t)levels + 1u);
+    qkv_compute_lloyd_max_codebook(codebook->data(), thresh->data(), bits, dim);
+    cache[qkv_cache_key(dim, (uint64_t)bits)] = codebook;
+    cache[qkv_cache_key(dim, (uint64_t)bits | 0x10000ull)] = thresh;
+    return thresholds ? thresh : codebook;
+}
+
+static std::shared_ptr<std::vector<float>> qkv_cached_rotation(int dim, uint64_t seed) {
+    static std::mutex mutex;
+    static std::unordered_map<uint64_t, std::shared_ptr<std::vector<float>>> cache;
+    const uint64_t key = qkv_cache_key(dim, seed);
+    std::lock_guard<std::mutex> lock(mutex);
+    auto found = cache.find(key);
+    if (found != cache.end()) return found->second;
+    auto matrix = std::make_shared<std::vector<float>>((size_t)dim * (size_t)dim);
+    qkv_generate_rotation_matrix(matrix->data(), dim, seed);
+    cache[key] = matrix;
+    return matrix;
+}
+
+static std::shared_ptr<std::vector<float>> qkv_cached_qjl(int dim, uint64_t seed) {
+    static std::mutex mutex;
+    static std::unordered_map<uint64_t, std::shared_ptr<std::vector<float>>> cache;
+    const uint64_t key = qkv_cache_key(dim, seed);
+    std::lock_guard<std::mutex> lock(mutex);
+    auto found = cache.find(key);
+    if (found != cache.end()) return found->second;
+    auto matrix = std::make_shared<std::vector<float>>((size_t)dim * (size_t)dim);
+    qkv_generate_qjl_matrix(matrix->data(), dim, seed);
+    cache[key] = matrix;
+    return matrix;
+}
 
 int qkv_state_init(
     qkv_state_t* state,
@@ -54,36 +109,33 @@ int qkv_state_init(
         }
     }
 
-    // Generate rotation matrix
     if (config->enable_rotation) {
-        state->rotation_matrix = (float*)malloc((size_t)dim * (size_t)dim * sizeof(float));
+        auto matrix = qkv_cached_rotation(dim, config->rotation_seed);
+        state->rotation_matrix = matrix && !matrix->empty() ? matrix->data() : nullptr;
         if (!state->rotation_matrix) {
             qkv_state_free(state);
             return 0;
         }
-        qkv_generate_rotation_matrix(state->rotation_matrix, dim, config->rotation_seed);
     }
 
-    // Generate QJL matrix
     if (config->enable_qjl) {
         state->qjl_signs_matrix = NULL;
-        state->qjl_matrix = (float*)malloc((size_t)dim * (size_t)dim * sizeof(float));
+        auto matrix = qkv_cached_qjl(dim, config->qjl_seed);
+        state->qjl_matrix = matrix && !matrix->empty() ? matrix->data() : nullptr;
         if (!state->qjl_matrix) {
             qkv_state_free(state);
             return 0;
         }
-        qkv_generate_qjl_matrix(state->qjl_matrix, dim, config->qjl_seed);
     }
 
-    // Allocate codebooks
-    state->codebook_1bit = (float*)malloc(2 * sizeof(float));
-    state->thresholds_1bit = (float*)malloc(3 * sizeof(float));
-    state->codebook_2bit = (float*)malloc(4 * sizeof(float));
-    state->thresholds_2bit = (float*)malloc(5 * sizeof(float));
-    state->codebook_3bit = (float*)malloc(8 * sizeof(float));
-    state->thresholds_3bit = (float*)malloc(9 * sizeof(float));
-    state->codebook_4bit = (float*)malloc(16 * sizeof(float));
-    state->thresholds_4bit = (float*)malloc(17 * sizeof(float));
+    state->codebook_1bit = qkv_cached_codebook(dim, 1, false)->data();
+    state->thresholds_1bit = qkv_cached_codebook(dim, 1, true)->data();
+    state->codebook_2bit = qkv_cached_codebook(dim, 2, false)->data();
+    state->thresholds_2bit = qkv_cached_codebook(dim, 2, true)->data();
+    state->codebook_3bit = qkv_cached_codebook(dim, 3, false)->data();
+    state->thresholds_3bit = qkv_cached_codebook(dim, 3, true)->data();
+    state->codebook_4bit = qkv_cached_codebook(dim, 4, false)->data();
+    state->thresholds_4bit = qkv_cached_codebook(dim, 4, true)->data();
 
     if (!state->codebook_1bit || !state->thresholds_1bit ||
         !state->codebook_2bit || !state->thresholds_2bit ||
@@ -92,12 +144,6 @@ int qkv_state_init(
         qkv_state_free(state);
         return 0;
     }
-
-    // Compute codebooks
-    qkv_compute_lloyd_max_codebook(state->codebook_1bit, state->thresholds_1bit, 1, dim);
-    qkv_compute_lloyd_max_codebook(state->codebook_2bit, state->thresholds_2bit, 2, dim);
-    qkv_compute_lloyd_max_codebook(state->codebook_3bit, state->thresholds_3bit, 3, dim);
-    qkv_compute_lloyd_max_codebook(state->codebook_4bit, state->thresholds_4bit, 4, dim);
 
     // Allocate scratch buffers
     state->scratch_qjl_signs = (float*)malloc((size_t)dim * sizeof(float));
@@ -175,11 +221,30 @@ int qkv_state_init(
         }
     }
 
+    // BUGFIX 44: More conservative QKV thread pool sizing to prevent oversubscription ★★★
+    // Old: available = hw - io_threads - 1, workers = min(available, 16)
+    // New: available = max(1, hw - io_threads - 2), workers = min(available, 8)
+    // Rationale: io_threads includes disk+pinned+gpu workers, but not cpu_row_workers
+    //            cpu_row_workers and QKV pool both do CPU matmul at different times
+    //            Reserve 2 cores (not 1) for OS + main thread + eviction worker
+    //            Cap at 8 (not 16) to leave room for cpu_row_workers
+    // Scenario: hw=16, io_threads=6 (3 disk + 2 pinned + 1 gpu)
+    //           Old: QKV pool=9, cpu_row=N → 6+9+N threads compete
+    //           New: QKV pool=8, cpu_row=N → better balance
     const unsigned hw_raw = std::thread::hardware_concurrency();
     const int io_threads = config->engine_io_thread_count > 0
         ? (int)config->engine_io_thread_count : 0;
-    const int available = std::max(1, (int)(hw_raw ? hw_raw : 4) - io_threads - 1);
-    const int workers = std::min(available, 16);
+    const int available = std::max(1, (int)(hw_raw ? hw_raw : 4) - io_threads - 2);
+    const int workers = std::min(available, 8);
+    const int work_stride = std::max(dim, std::max(config->outlier_channels, dim - config->outlier_channels));
+    state->work_codes_buf = (int*)malloc((size_t)workers * (size_t)work_stride * sizeof(int));
+    state->work_qjl_buf = (float*)malloc((size_t)workers * (size_t)dim * sizeof(float));
+    if (!state->work_codes_buf || !state->work_qjl_buf) {
+        qkv_state_free(state);
+        return 0;
+    }
+    state->work_buf_stride = work_stride;
+    state->work_buf_workers = workers;
     state->thread_pool = new QkvThreadPool(workers);
     state->computed_workers = workers;
 
@@ -202,17 +267,19 @@ void qkv_state_free(qkv_state_t* state) {
     free(state->k_residual_norms);
     free(state->v_qjl);
     free(state->v_residual_norms);
-    free(state->rotation_matrix);
-    free(state->qjl_matrix);
+    if (state->owns_rotation_matrix) free(state->rotation_matrix);
+    if (state->owns_qjl_matrix) free(state->qjl_matrix);
     free(state->qjl_signs_matrix);
-    free(state->codebook_1bit);
-    free(state->thresholds_1bit);
-    free(state->codebook_2bit);
-    free(state->thresholds_2bit);
-    free(state->codebook_3bit);
-    free(state->thresholds_3bit);
-    free(state->codebook_4bit);
-    free(state->thresholds_4bit);
+    if (state->owns_codebooks) {
+        free(state->codebook_1bit);
+        free(state->thresholds_1bit);
+        free(state->codebook_2bit);
+        free(state->thresholds_2bit);
+        free(state->codebook_3bit);
+        free(state->thresholds_3bit);
+        free(state->codebook_4bit);
+        free(state->thresholds_4bit);
+    }
     free(state->scratch_qjl_signs);
     free(state->scratch_s_t_qjl);
     free(state->scratch_residual);
@@ -222,6 +289,8 @@ void qkv_state_free(qkv_state_t* state) {
     free(state->scratch_x_tilde);
     free(state->scratch_attention);
     free(state->scratch_rotated_q);
+    free(state->work_codes_buf);
+    free(state->work_qjl_buf);
     free(state->outlier_indices);
     free(state->k_outlier_indices);
     free(state->v_outlier_indices);

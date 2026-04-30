@@ -13,6 +13,7 @@ struct glm5_tensor_record {
     const glm5_scale4_entry_t* scale4_entry = nullptr;
     uint64_t weight_row_bytes = 0;
     uint8_t weight_format = 0;
+    uint8_t weight_format_inferred = 0;
     uint8_t weight_bits = 0;
     uint8_t weight_block_size = 0;
     uint8_t scale_format = 0;

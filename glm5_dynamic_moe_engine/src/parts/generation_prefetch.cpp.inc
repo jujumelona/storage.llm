@@ -22,17 +22,10 @@ static void glm5_enqueue_attention_prefetch(glm5_pc_engine* engine, int32_t laye
 
     const glm5_storage_constants_t* c = glm5_storage_constants();
     if (c && layer >= c->first_moe_layer && layer <= c->last_moe_layer) {
-        const glm5_storage_raw_span_spec_t* router_span = find_raw_role_span(layer, GLM5_RAW_ROLE_ROUTER);
-        if (router_span) {
-            const uint32_t begin = glm5_storage_raw_span_find_first(layer);
-            const uint32_t end = glm5_storage_raw_span_find_end(layer);
-            for (uint32_t si = begin; si < end; ++si) {
-                if (glm5_storage_raw_span_at(si) == router_span) {
-                    queued_spans[queued_count++] = si;
-                    enqueue_raw_span_prefetch(engine, si, GLM5_DEVICE_POOL_ACTIVATION);
-                    break;
-                }
-            }
+        const uint32_t router_si = glm5_storage_router_span_index(layer);
+        if (router_si != 0xFFFFFFFFu) {
+            queued_spans[queued_count++] = router_si;
+            enqueue_raw_span_prefetch(engine, router_si, GLM5_DEVICE_POOL_ACTIVATION);
         }
     }
 
@@ -108,6 +101,6 @@ static int glm5_can_enqueue_attention_lookahead(glm5_pc_engine* engine, int32_t 
     // New: threshold = budget * 85/100 = 85% → aligns better with proactive eviction (90%)
     // Prevents attention prefetch cutoff before expert eviction starts
     // Dead zone reduced from 7% to 5%, improves attention prefetch opportunities
-    const uint64_t threshold = (budget * 85ull) / 100ull;
+    const uint64_t threshold = (budget * 87ull) / 100ull;
     return used < threshold && bytes <= threshold - used;
 }

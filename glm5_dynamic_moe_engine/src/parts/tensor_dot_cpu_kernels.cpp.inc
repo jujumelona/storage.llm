@@ -162,6 +162,42 @@ static float glm5_dot_linear_quant_row(
     return acc;
 }
 
+// BUGFIX 46: Issue 10 - AVX2 vectorized bf16→f32 AXPY for Q-side absorption ★★★
+// Problem: glm5_axpy_bf16_row_f32 called 12,288 times per token (64 heads × 192 nope_dim)
+// in scalar loop. Each call processes 512 elements (cdim). Total: 6.3M scalar ops/token.
+// Solution: AVX2 path processes 8 bf16→f32 conversions + FMA per iteration.
+// Pattern: _mm256_cvtepu16_epi32 + _mm256_slli_epi32(16) + _mm256_fmadd_ps
+// Symmetric to store_entry AVX2 path (inverse direction).
+static void glm5_axpy_bf16_row_f32_unused(float* y, const uint8_t* packed_bf16, float alpha, uint32_t cols) {
+    const uint16_t* bf16 = reinterpret_cast<const uint16_t*>(packed_bf16);
+    uint32_t col = 0;
+#if defined(__AVX2__)
+    const __m256 valpha = _mm256_set1_ps(alpha);
+    for (; col + 7u < cols; col += 8u) {
+        // Load 8 bf16 values (16-bit each)
+        __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bf16 + col));
+        // Zero-extend to 32-bit integers
+        __m256i expanded = _mm256_cvtepu16_epi32(packed);
+        // Shift left by 16 to convert bf16 to f32 (bf16 is upper 16 bits of f32)
+        __m256i shifted = _mm256_slli_epi32(expanded, 16);
+        __m256 values = _mm256_castsi256_ps(shifted);
+        // Load current y values
+        __m256 vy = _mm256_loadu_ps(y + col);
+        // y = y + alpha * values (FMA: fused multiply-add)
+        vy = _mm256_fmadd_ps(values, valpha, vy);
+        // Store result
+        _mm256_storeu_ps(y + col, vy);
+    }
+#endif
+    // Scalar tail
+    for (; col < cols; ++col) {
+        uint32_t bits = (uint32_t)bf16[col] << 16;
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        y[col] += alpha * value;
+    }
+}
+
 static float glm5_dot_fp4_row(
     const glm5_tensor_record& rec,
     const mmap_context_t* shard,

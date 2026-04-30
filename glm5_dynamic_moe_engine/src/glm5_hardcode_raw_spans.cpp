@@ -1246,3 +1246,18 @@ uint32_t glm5_storage_attention_span_index(int32_t layer, uint32_t kind_index) {
     }
     return kAttentionSpanIndices[layer][kind_index];
 }
+
+static const uint32_t kRouterSpanIndices[79] = {
+    1,9,17,25,35,45,60,65,75,89,94,104,114,129,134,144,
+    154,169,174,184,198,203,213,223,238,243,253,263,278,283,293,307,
+    312,322,332,347,352,362,372,387,392,402,416,421,431,441,456,461,
+    471,481,496,501,511,525,530,540,550,565,570,580,590,605,610,620,
+    634,639,649,659,674,679,689,699,714,1063,1073,1085,1093,1103,1113
+};
+
+uint32_t glm5_storage_router_span_index(int32_t layer) {
+    if (layer < 0 || layer >= 79) {
+        return INVALID_SPAN_INDEX;
+    }
+    return kRouterSpanIndices[layer];
+}

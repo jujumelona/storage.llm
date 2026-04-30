@@ -60,7 +60,7 @@ static mmap_context_t* get_or_map_shard(glm5_pc_engine* engine, const std::strin
                 } else {
                     auto cv_it = engine->shard_mmap_cvs.find(path);
                     if (cv_it != engine->shard_mmap_cvs.end() && cv_it->second) {
-                        cv_it->second->notify_one();
+                        cv_it->second->notify_all();
                     }
                     return found->second;
                 }
@@ -91,7 +91,7 @@ static mmap_context_t* get_or_map_shard(glm5_pc_engine* engine, const std::strin
         cv = shard_mmap_cv_locked(engine, path);
     }
     if (cv) {
-        cv->notify_one();
+        cv->notify_all();
     }
     return ctx;
 }
@@ -120,11 +120,11 @@ static mmap_context_t* get_or_map_shard_partial(
             if (found != engine->shard_mmaps.end()) {
                 if (found->second == (mmap_context_t*)1) {
                     auto cv = shard_mmap_cv_locked(engine, key);
-                    cv->wait(lock);
+                    cv->wait_for(lock, std::chrono::milliseconds(300));
                 } else {
                     auto cv_it = engine->shard_mmap_cvs.find(key);
                     if (cv_it != engine->shard_mmap_cvs.end() && cv_it->second) {
-                        cv_it->second->notify_one();
+                        cv_it->second->notify_all();
                     }
                     return found->second;
                 }
@@ -155,7 +155,7 @@ static mmap_context_t* get_or_map_shard_partial(
         cv = shard_mmap_cv_locked(engine, key);
     }
     if (cv) {
-        cv->notify_one();
+        cv->notify_all();
     }
     return ctx;
 }

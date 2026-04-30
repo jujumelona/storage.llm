@@ -7,6 +7,7 @@ glm5_pc_engine_t* glm5_pc_engine_create(const glm5_pc_engine_config_t* config) {
     engine->tensors.reserve(tensor_record_capacity());
     engine->shard_mmaps.reserve(105);
     engine->topology_edges.reserve(19456);
+    engine->prefetch_plan_seen_gen.reserve(24576);
     fill_backend_caps(engine->config.preferred_backend, engine->config.platform, &engine->backend_caps);
     model_lib_prepare(engine);
     if (engine->config.prefer_gpu && engine->config.vram_budget_bytes == 0 &&

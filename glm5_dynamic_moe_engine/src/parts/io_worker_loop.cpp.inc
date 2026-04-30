@@ -104,10 +104,10 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
 
     glm5_io_path_t active_path = choose_active_io_path(engine);
     engine->io_atomic.active_path.store(static_cast<uint32_t>(active_path));
-    uint32_t refresh_turn = 0;
     const uint64_t initial_budget = device_budget_bytes(engine);
     const uint64_t initial_allocated = io_worker_device_allocated_bytes(engine);
     uint64_t last_vram_room = initial_budget > initial_allocated ? initial_budget - initial_allocated : 0;
+    uint32_t staging_turn = 0;
     std::deque<std::pair<glm5_prefetch_task, glm5_transfer_stage_t>> local_requeues;
     auto preserve_requeue = [&](const glm5_prefetch_task& retry_task, glm5_transfer_stage_t retry_stage) {
         if (!io_worker_requeue_disk_task(engine, retry_task, retry_stage, 3u, 1u)) {
@@ -164,7 +164,7 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
             ? cur_vram_room > 0
             : (cur_vram_room > last_vram_room + last_vram_room / 10 ||
                cur_vram_room < last_vram_room - last_vram_room / 10);
-        if (vram_shifted || (refresh_turn++ % 10u) == 0u) {
+        if (vram_shifted) {
             active_path = static_cast<glm5_io_path_t>(
                 engine->io_atomic.active_path.load(std::memory_order_relaxed));
             last_vram_room = cur_vram_room;
@@ -300,7 +300,7 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                         const uint32_t slot = acquire_staging_slot(
                             engine,
                             worker_index,
-                            refresh_turn,
+                            staging_turn++,
                             false,
                             true
                         );

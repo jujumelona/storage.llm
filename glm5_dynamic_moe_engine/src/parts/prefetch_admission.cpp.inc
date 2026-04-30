@@ -32,7 +32,7 @@ static int prefetch_under_queue_pressure(
     if (item.target_tier == GLM5_TIER_RAM) {
         const uint32_t pinned_workers = runtime_pinned_workers(engine);
         constexpr uint32_t gpu_batch_max = 4;
-        const uint32_t pinned_pressure_threshold = std::max(32u, pinned_workers * gpu_batch_max * 4u);
+        const uint32_t pinned_pressure_threshold = std::max(32u, pinned_workers * gpu_batch_max * 8u);
         if (prefetch_stage_load(engine->pinned_stage) >= pinned_pressure_threshold) {
             return 1;
         }

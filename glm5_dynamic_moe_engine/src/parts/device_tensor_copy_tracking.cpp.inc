@@ -58,7 +58,8 @@ static void device_complete_pending_copy_key(glm5_pc_engine* e, uint64_t key) {
     if (it != s_tl_tensor_pending_keys.end() && !it->second.empty()) {
         auto key_it = std::find(it->second.begin(), it->second.end(), key);
         if (key_it != it->second.end()) {
-            it->second.erase(key_it);
+            *key_it = it->second.back();
+            it->second.pop_back();
         }
     }
     device_free_deferred_ptrs(e, deferred_free_ptrs);

@@ -20,6 +20,8 @@ uint32_t glm5_storage_raw_span_find_end(int32_t layer);
 // Returns 0xFFFFFFFF if layer/kind_index out of range or span not found
 uint32_t glm5_storage_attention_span_index(int32_t layer, uint32_t kind_index);
 
+uint32_t glm5_storage_router_span_index(int32_t layer);
+
 uint32_t glm5_storage_layer_count(void);
 
 const glm5_storage_layer_spec_t* glm5_storage_layer_at(uint32_t layer);

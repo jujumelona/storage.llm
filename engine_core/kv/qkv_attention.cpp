@@ -100,14 +100,15 @@ int qkv_attention_decode_impl(
         const float* norm_centroids = k_split ? qkv_codebook_for_bits(s, norm_bits) : nullptr;
         const uint8_t* is_outlier = k_split ? qkv_is_outlier_for_target_const(s, QKV_TARGET_KEY) : nullptr;
 
-        // Problem 12 Fix: Pre-allocate work buffers
-        std::vector<int> work_codes_k((size_t)workers * (size_t)std::max(d, std::max(n_outliers, n_normal)));
-        std::vector<float> work_qjl_k((size_t)workers * (size_t)d);
+        const int local_stride = std::max(d, std::max(n_outliers, n_normal));
+        if (!s->work_codes_buf || !s->work_qjl_buf ||
+            s->work_buf_workers < workers || s->work_buf_stride < local_stride) {
+            return 0;
+        }
 
         auto score_range = [&](int begin, int end, int w, int* ok_flag) {
-            // Bug 1 Fix: local_codes is int*, not vector
-            int* local_codes = work_codes_k.data() + (size_t)w * (size_t)std::max(d, std::max(n_outliers, n_normal));
-            float* local_qjl = work_qjl_k.data() + (size_t)w * (size_t)d;
+            int* local_codes = s->work_codes_buf + (size_t)w * (size_t)s->work_buf_stride;
+            float* local_qjl = s->work_qjl_buf + (size_t)w * (size_t)d;
 
             for (int t = begin; t < end && *ok_flag; t++) {
                 float norm_k = s->k_norms[t];
