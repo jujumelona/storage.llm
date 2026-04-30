@@ -43,6 +43,7 @@ static uint64_t moe_rt_model_bytes_hint(const moe_offload_gguf_scan_t& scan) {
 }
 
 static double moe_rt_compute_tflops_hint(const moe_backend_caps_t& caps) {
+    if (caps.tflops_hint > 0.0) return caps.tflops_hint;
     switch (caps.backend) {
     case moe_BACKEND_CUDA:
         return caps.supports_fp4 || caps.supports_scale4 ? 35.0 : 22.0;

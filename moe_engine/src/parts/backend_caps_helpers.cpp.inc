@@ -99,7 +99,7 @@ static void fill_shared_memory_backend_caps(moe_backend_caps_t* caps) {
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(48);
 }
 
-// TODO: Issue 4 - Metal zero-copy optimization with MTLBuffer ?…â˜…
+// TODO: Issue 4 - Metal zero-copy optimization with MTLBuffer.
 // Current: Metal uses supports_zero_copy_host=1 ??mmap bypass (BUGFIX 61 verified correct)
 // Problem: Still copies mmap data to Metal buffer in some paths
 // Apple Silicon Unified Memory: CPU and GPU share physical memory
@@ -125,6 +125,7 @@ static void fill_metal_backend_caps(moe_backend_caps_t* caps) {
     caps->supports_backend_async_api = 1;
     caps->supports_gpu_direct_file_io = 0;
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(32);
+    caps->tflops_hint = 14.0;
     caps->recommended_pinned_bytes = 0;
 }
 
@@ -134,6 +135,7 @@ static void fill_basic_gpu_caps(moe_backend_caps_t* caps, int available, int* fe
     caps->supports_fixed_read_staging = 1;
     caps->supports_backend_async_api = 0;
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(32);
+    caps->tflops_hint = 14.0;
 }
 
 static void fill_webgpu_backend_caps(moe_backend_caps_t* caps) {
