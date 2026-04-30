@@ -1,4 +1,4 @@
-﻿// Device tensor copy operations
+// Device tensor copy operations
 
 static uint64_t device_key_tensor(const moe_tensor_record& r) {
     return (3ull << 60) |
@@ -82,7 +82,7 @@ static int device_copy_tensor_from_host(
     bool is_host_pinned = true; if (staging_slot != UINT32_MAX && staging_slot < e->staging_slots.size()) { is_host_pinned = e->staging_slots[staging_slot].pinned; } if (!is_host_pinned) { e->io_atomic.nonpinned_fallback_count.fetch_add(1, std::memory_order_relaxed); } const int async_copy = is_host_pinned && device_backend_async_h2d_available(e, stream, 1);
     const uint64_t key = device_key_tensor(r);
     CUdeviceptr dst = 0;
-    if (!device_prepare_tensor_allocation(e, key, bytes, pool, async_copy, &dst)) {
+    if (!device_prepare_tensor_allocation(e, key, bytes, pool, async_copy, &dst, host)) {
         return 0;
     }
 
@@ -187,7 +187,7 @@ static int device_copy_tensor(
         }
         const int async_copy = device_backend_async_h2d_available(
             e, stream, e->staging_slots[slot_idx].pinned ? 1 : 0);
-        if (!device_prepare_tensor_allocation(e, key, bytes, pool, async_copy, &dst)) {
+        if (!device_prepare_tensor_allocation(e, key, bytes, pool, async_copy, &dst, staging_buf)) {
             release_staging_slot(e, slot_idx);
             return 0;
         }
@@ -224,7 +224,8 @@ static int device_copy_tensor(
     if (e) {
         e->io_atomic.bytes_sync_h2d_fallback.fetch_add(bytes);
     }
-    if (!device_prepare_tensor_allocation(e, key, bytes, pool, 0 /*sync*/, &dst)) {
+    const void* host_ptr = shard ? mmap_get_ptr(shard, static_cast<size_t>(ranges[0][0])) : nullptr;
+    if (!device_prepare_tensor_allocation(e, key, bytes, pool, 0 /*sync*/, &dst, host_ptr)) {
         return 0;
     }
     CUdeviceptr cur = dst;

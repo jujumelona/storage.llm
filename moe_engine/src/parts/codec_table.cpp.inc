@@ -322,10 +322,13 @@ static int load_gguf_tensor_directory_as_tensor_index(
         const uint32_t part_id = dir.file_index ? dir.file_index : (uint32_t)path_idx + 1u;
         const uint32_t shard_id = part_id;
         for (const moe_gguf_tensor_dir_entry_t& entry : dir.tensors) {
+            const std::string lower_name = moe_lower_ascii_copy(entry.name);
+            const bool combined_gate_up =
+                lower_name.find("ffn_gate_up_exps.weight") != std::string::npos;
             uint32_t layer = 0;
             moe_projection_t proj = moe_PROJ_GATE;
             if (!moe_parse_layer_from_gguf_name(entry.name, &layer) ||
-                !moe_gguf_expert_projection(entry.name, &proj) ||
+                (!combined_gate_up && !moe_gguf_expert_projection(entry.name, &proj)) ||
                 entry.dims < 3 ||
                 entry.shape[2] == 0 ||
                 entry.bytes == 0) {
@@ -336,36 +339,45 @@ static int load_gguf_tensor_directory_as_tensor_index(
             if (per_expert == 0 || expert_count64 > 4096ull) {
                 continue;
             }
-            const uint32_t rows = (uint32_t)std::min<uint64_t>(entry.shape[1], UINT32_MAX);
+            if (combined_gate_up && ((entry.shape[1] & 1ull) != 0 || per_expert < 2ull)) {
+                continue;
+            }
+            const uint32_t rows_total = (uint32_t)std::min<uint64_t>(entry.shape[1], UINT32_MAX);
             const uint32_t cols = (uint32_t)std::min<uint64_t>(entry.shape[0], UINT32_MAX);
             for (uint64_t expert = 0; expert < expert_count64; ++expert) {
-                moe_tensor_record rec{};
-                rec.info.part = part_id;
-                rec.info.shard = shard_id;
-                rec.info.layer = layer;
-                rec.info.expert = (uint32_t)expert;
-                rec.info.proj = proj;
-                rec.info.rows = rows;
-                rec.info.cols = cols;
-                rec.info.groups = cols >= 16u ? std::max<uint32_t>(1u, cols / 16u) : 1u;
-                rec.info.group_size = cols >= 16u ? 16u : cols;
-                rec.info.weight_byte_offset = entry.file_offset + expert * per_expert;
-                rec.info.weight_byte_length = (expert + 1ull == expert_count64) ?
-                    (entry.file_offset + entry.bytes - rec.info.weight_byte_offset) : per_expert;
-                rec.info.scale_byte_offset = 0;
-                rec.info.scale_byte_length = 0;
-                rec.info.scale2_byte_offset = 0;
-                rec.info.scale2_byte_length = 0;
-                rec.resolved_path_index = path_idx;
-                finalize_tensor_layout(&rec, moe_weight_encoding_from_gguf_type(entry.type, contract));
-                const uint64_t stream_bytes = tensor_stream_bytes(rec);
-                if (stream_bytes > engine->max_tensor_stream_bytes) {
-                    engine->max_tensor_stream_bytes = stream_bytes;
+                const uint32_t split_count = combined_gate_up ? 2u : 1u;
+                for (uint32_t split = 0; split < split_count; ++split) {
+                    moe_tensor_record rec{};
+                    rec.info.part = part_id;
+                    rec.info.shard = shard_id;
+                    rec.info.layer = layer;
+                    rec.info.expert = (uint32_t)expert;
+                    rec.info.proj = combined_gate_up ?
+                        (split == 0 ? moe_PROJ_GATE : moe_PROJ_UP) : proj;
+                    rec.info.rows = combined_gate_up ? (rows_total / 2u) : rows_total;
+                    rec.info.cols = cols;
+                    rec.info.groups = cols >= 16u ? std::max<uint32_t>(1u, cols / 16u) : 1u;
+                    rec.info.group_size = cols >= 16u ? 16u : cols;
+                    const uint64_t expert_offset = entry.file_offset + expert * per_expert;
+                    const uint64_t split_bytes = combined_gate_up ? (per_expert / 2ull) : per_expert;
+                    rec.info.weight_byte_offset = expert_offset + (uint64_t)split * split_bytes;
+                    rec.info.weight_byte_length = combined_gate_up && split == 1u ?
+                        (per_expert - split_bytes) : split_bytes;
+                    rec.info.scale_byte_offset = 0;
+                    rec.info.scale_byte_length = 0;
+                    rec.info.scale2_byte_offset = 0;
+                    rec.info.scale2_byte_length = 0;
+                    rec.resolved_path_index = path_idx;
+                    finalize_tensor_layout(&rec, moe_weight_encoding_from_gguf_type(entry.type, contract));
+                    const uint64_t stream_bytes = tensor_stream_bytes(rec);
+                    if (stream_bytes > engine->max_tensor_stream_bytes) {
+                        engine->max_tensor_stream_bytes = stream_bytes;
+                    }
+                    tensor_slots_set(engine, (int)rec.info.layer, (int)rec.info.expert, rec.info.proj, engine->tensors.size());
+                    expert_bytes_add(engine, (int)rec.info.layer, (int)rec.info.expert, stream_bytes);
+                    engine->tensors.push_back(std::move(rec));
+                    ++records;
                 }
-                tensor_slots_set(engine, (int)rec.info.layer, (int)rec.info.expert, rec.info.proj, engine->tensors.size());
-                expert_bytes_add(engine, (int)rec.info.layer, (int)rec.info.expert, stream_bytes);
-                engine->tensors.push_back(std::move(rec));
-                ++records;
             }
         }
     }

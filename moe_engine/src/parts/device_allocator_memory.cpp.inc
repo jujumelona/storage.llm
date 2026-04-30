@@ -1,4 +1,4 @@
-// Device memory management and accounting
+﻿// Device memory management and accounting
 
 // BUGFIX 76: Issue 11 - Document KV cache vs VRAM budget separation ??
 // Clarification: KV cache is RAM-only, NOT included in VRAM budget
@@ -40,7 +40,7 @@ static void device_refresh_mem_info(moe_pc_engine* e) {
     }
 }
 
-// BUGFIX 54: Issue 29 - Replace CAS spin with fetch_sub ?�★
+// BUGFIX 54: Issue 29 - Replace CAS spin with fetch_sub ?�★
 // Problem: device_account_free_bytes_sub uses CAS loop for saturating subtract.
 // Called on every allocation ??high-frequency contention. Same issue as total_queue_depth.
 // Solution: Use fetch_sub with post-correction. device_refresh_mem_info runs every 1s
@@ -67,7 +67,7 @@ static void device_free_deferred_ptrs(moe_pc_engine* e, std::vector<std::pair<CU
     device_set_current(e);
     for (auto& pair : ptrs) {
         if (pair.first) {
-            e->cuda.cuMemFree(pair.first);
+            if (e->backend_caps.backend == moe_BACKEND_METAL) { extern "C" void metal_zero_copy_unmap(void* buffer); metal_zero_copy_unmap((void*)pair.first); } else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipFree) { e->hip.hipFree((void*)pair.first); } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemFree) { e->cuda.cuMemFree(pair.first); }
             // Bug 2: device_free_bytes already updated in device_release_allocation_locked
             // Do NOT double-add here
             // e->device_free_bytes.fetch_add(pair.second, std::memory_order_relaxed);  // REMOVED
@@ -92,7 +92,7 @@ static void device_release_allocation_locked(
         } else {
             device_set_current(e);
             if (e->cuda.cuMemFree) {
-                e->cuda.cuMemFree(a.ptr);
+                if (e->backend_caps.backend == moe_BACKEND_METAL) { extern "C" void metal_zero_copy_unmap(void* buffer); metal_zero_copy_unmap((void*)a.ptr); } else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipFree) { e->hip.hipFree((void*)a.ptr); } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemFree) { e->cuda.cuMemFree(a.ptr); }
                 e->device_free_bytes.fetch_add(a.bytes, std::memory_order_relaxed);
             }
         }

@@ -23,6 +23,28 @@ static int moe_forward_kv_cache_ready(const moe_pc_engine* engine, int attention
         engine->config.kv_mode == moe_KV_MODE_QKV;
 }
 
+static int moe_forward_expert_triplet_records_ready(const moe_pc_engine* engine) {
+    if (!engine || engine->tensors.empty()) {
+        return 0;
+    }
+    uint64_t gate = 0;
+    uint64_t up = 0;
+    uint64_t down = 0;
+    for (const moe_tensor_record& rec : engine->tensors) {
+        if (rec.info.weight_byte_length == 0) {
+            continue;
+        }
+        if (rec.info.proj == moe_PROJ_GATE) {
+            ++gate;
+        } else if (rec.info.proj == moe_PROJ_UP) {
+            ++up;
+        } else if (rec.info.proj == moe_PROJ_DOWN) {
+            ++down;
+        }
+    }
+    return gate > 0 && up > 0 && down > 0 ? 1 : 0;
+}
+
 int moe_pc_engine_get_forward_status(
     const moe_pc_engine_t* engine,
     moe_forward_status_t* out_status
@@ -32,6 +54,11 @@ int moe_pc_engine_get_forward_status(
     }
     std::memset(out_status, 0, sizeof(*out_status));
     out_status->storage_state_valid = moe_storage_model_state_valid();
+    if (!out_status->storage_state_valid &&
+        engine->offload_gguf_valid.load(std::memory_order_relaxed) &&
+        engine->model_root_valid.load(std::memory_order_relaxed)) {
+        out_status->storage_state_valid = 1;
+    }
     // Fix 59: Use cached model_root_valid flag instead of 21× stat() per call
     if (!engine->model_root.empty() && !engine->model_root_valid.load(std::memory_order_relaxed)) {
         out_status->storage_state_valid = 0;
@@ -39,7 +66,9 @@ int moe_pc_engine_get_forward_status(
     out_status->tensor_count = moe_pc_engine_tensor_count(engine);
     out_status->tensor_table_loaded = out_status->tensor_count > 0;
     out_status->expert_triplet_available =
-        out_status->storage_state_valid && out_status->tensor_table_loaded;
+        out_status->storage_state_valid &&
+        out_status->tensor_table_loaded &&
+        moe_forward_expert_triplet_records_ready(engine);
     {
         int cached = engine->tokenizer_valid.load(std::memory_order_relaxed);
         if (cached < 0) {

@@ -6,7 +6,8 @@ static int device_prepare_tensor_allocation(
     uint64_t bytes,
     uint8_t pool,
     int async_copy,
-    CUdeviceptr* out_dst
+    CUdeviceptr* out_dst,
+    const void* host_ptr = nullptr
 ) {
     if (!e || !out_dst) {
         return 0;
@@ -93,7 +94,17 @@ static int device_prepare_tensor_allocation(
             next.key = key;
             next.bytes = bytes;
             next.pool = pool;
-            if (e->cuda.cuMemAlloc(&next.ptr, (size_t)bytes) != 0) {
+            int alloc_ok = 0;
+            if (e->backend_caps.backend == moe_BACKEND_METAL && host_ptr) {
+                extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t bytes);
+                next.ptr = (CUdeviceptr)metal_zero_copy_map(e, const_cast<void*>(host_ptr), bytes);
+                alloc_ok = (next.ptr != 0) ? 1 : 0;
+            } else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipMalloc) {
+                alloc_ok = (e->hip.hipMalloc((void**)&next.ptr, (size_t)bytes) == 0) ? 1 : 0;
+            } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemAlloc) {
+                alloc_ok = (e->cuda.cuMemAlloc(&next.ptr, (size_t)bytes) == 0) ? 1 : 0;
+            }
+            if (!alloc_ok) {
                 e->io_atomic.device_alloc_failures.fetch_add(1, std::memory_order_relaxed);
                 lock.unlock();
                 device_refresh_mem_info(e);
