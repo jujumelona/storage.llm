@@ -37,4 +37,6 @@ typedef struct {
     int supports_sycl;
     int supports_webgpu;
     int supports_gpu_direct_file_io;
+    int preferred_numa_node;
+    double tflops_hint;
 } moe_backend_caps_t;

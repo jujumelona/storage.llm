@@ -18,8 +18,8 @@ static void device_push_activation_candidate_locked(moe_pc_engine* e, uint64_t k
     e->activation_evict_heap.push(candidate);
 }
 
-// BUGFIX 69: Issue 6 - Periodic heap rebuild to remove stale entries ?…â˜…
-// BUGFIX 73: Issue 9 - Combine active_count and heap rebuild in single map scan ?…â˜…
+// BUGFIX 69: Issue 6 - Periodic heap rebuild to remove stale entries.
+// BUGFIX 73: Issue 9 - Combine active_count and heap rebuild in single map scan.
 // Problem: device_collect_activation_victims_locked scans map twice:
 // 1. Count active allocations (for stale ratio check)
 // 2. Rebuild heap (scan map again to re-push entries)
@@ -86,8 +86,8 @@ static uint32_t device_collect_activation_victims_locked(
     // Pipeline Fix 4: Dynamic stale limit based on heap size
     // Fixed 128 limit causes eviction failure when heap has many stale entries.
     // Allow scanning up to half the heap size to find valid victims.
-    // BUGFIX 69: Issue 6 - Trigger heap rebuild when stale ratio high ?…â˜…
-    // BUGFIX 73: Issue 9 - Single map scan for count + rebuild ?…â˜…
+    // BUGFIX 69: Issue 6 - Trigger heap rebuild when stale ratio high.
+    // BUGFIX 73: Issue 9 - Single map scan for count + rebuild.
     // Old: Scan map to count active ??scan map again in rebuild (double traversal)
     // New: Rebuild returns active_count, single map scan
     const uint32_t stale_limit = std::max(128u, (uint32_t)e->activation_evict_heap.size() / 2u);
@@ -95,7 +95,7 @@ static uint32_t device_collect_activation_victims_locked(
     // Check if rebuild needed (heap size > 2x active allocations = stale ratio > 50%)
     // Rebuild function does single map scan: count + rebuild simultaneously
     uint32_t active_count = 0;
-    const bool should_rebuild = e->activation_evict_heap.size() > 256u;  // Only check if heap is large
+    const bool should_rebuild = e->activation_evict_heap.size() > 32u;  // Only check if heap is large
     if (should_rebuild) {
         // Single map scan: returns active_count while rebuilding heap
         active_count = device_rebuild_activation_heap_locked(e);
@@ -105,7 +105,7 @@ static uint32_t device_collect_activation_victims_locked(
         }
     }
 
-    // BUGFIX 20: Fix TOCTOU - snapshot device_allocated_bytes once ?…â˜…??
+    // BUGFIX 20: Fix TOCTOU - snapshot device_allocated_bytes once.
     // Old: Two loads in while condition ??underflow if freed between loads
     // New: Single snapshot ??prevents uint64 wraparound, accurate eviction
     const uint64_t allocated_snap = e->device_allocated_bytes.load(std::memory_order_relaxed);
@@ -136,7 +136,7 @@ static void device_make_room_locked(
     std::unique_lock<std::mutex>& device_lock,
     std::vector<std::pair<CUdeviceptr, uint64_t>>& deferred_free_ptrs
 ) {
-    // BUGFIX 56: Issue 1 - Release device_lock during DMA drain wait ?…â˜…??
+    // BUGFIX 56: Issue 1 - Release device_lock during DMA drain wait.
     // Problem: device_lock held for up to 20ms (4 retries Ã— 5ms) during DMA drain.
     // All GPU upload workers blocked on device_lock ??entire pipeline frozen.
     // At 10ms/token, this wastes 2 tokens worth of time.
@@ -183,7 +183,7 @@ static void device_make_room_locked(
 
         // If activation eviction didn't free enough, evict experts
         if (e->device_allocated_bytes.load(std::memory_order_relaxed) + bytes > budget) {
-            // BUGFIX 56: Release device_lock before calling demote_cold_until ?…â˜…??
+            // BUGFIX 56: Release device_lock before calling demote_cold_until.
             // demote_cold_until can take several ms (heap compaction + map_mutex operations)
             // Holding device_lock during this blocks all GPU workers
             device_lock.unlock();
@@ -209,7 +209,7 @@ static void device_make_room_locked(
             if (dma_drain_retries++ >= DMA_DRAIN_MAX_RETRIES) {
                 break;
             }
-            // BUGFIX 56: Release device_lock during DMA drain wait ?…â˜…??
+            // BUGFIX 56: Release device_lock during DMA drain wait.
             // Old: Held device_lock for 5ms wait ??all GPU workers blocked
             // New: Release lock, wait, reacquire ??GPU workers can proceed
             e->vram_eviction_in_progress.store(false, std::memory_order_release);

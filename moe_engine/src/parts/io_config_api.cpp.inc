@@ -64,7 +64,7 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
     }
     if (engine->io_config.enable_pinned_host && engine->io_config.pinned_staging_bytes > 0) {
         const uint64_t requested_staging_bytes = engine->io_config.pinned_staging_bytes;
-        engine->staging = allocate_best_staging(
+        engine->staging = allocate_best_staging(engine,
             requested_staging_bytes,
             &engine->staging_size,
             &engine->staging_pinned
@@ -78,7 +78,7 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
                 "(requested=%llu bytes)\n",
                 (unsigned long long)requested_staging_bytes);
         }
-        // BUG 1 FIX: Non-pinned staging mistaken for pinned ?…â˜…??        // allocate_best_staging returns non-null + non-pinned when mlock fails.
+        // BUG 1 FIX: non-pinned staging mistaken for pinned. allocate_best_staging returns non-null + non-pinned when mlock fails.
         // Without this check, enable_pinned_host=1 and enable_multistage_pipeline=1 remain set,
         // causing pinned_worker threads to launch and use non-pinned memory for "async" DMA.
         // CUDA driver internally copies non-pinned memory to temp pinned buffer ??sync blocking.

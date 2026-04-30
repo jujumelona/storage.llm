@@ -17,7 +17,7 @@
 // Trade-off: Linux/Windows-specific code, libnuma dependency on Linux
 // Impact: 20-30% DMA bandwidth improvement on multi-CCD AMD systems
 // Status: Documented as TODO, not implemented (platform-specific)
-static uint8_t* allocate_staging(uint64_t bytes, bool* pinned) {
+static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* pinned) {
     if (pinned) {
         *pinned = false;
     }
@@ -26,7 +26,13 @@ static uint8_t* allocate_staging(uint64_t bytes, bool* pinned) {
     }
 
 #ifdef _WIN32
-    void* ptr = VirtualAlloc(nullptr, (SIZE_T)bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void* ptr = nullptr;
+    if (preferred_numa_node >= 0) {
+        ptr = VirtualAllocExNuma(GetCurrentProcess(), nullptr, (SIZE_T)bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, preferred_numa_node);
+    }
+    if (!ptr) {
+        ptr = VirtualAlloc(nullptr, (SIZE_T)bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    }
     if (!ptr) {
         return nullptr;
     }
@@ -69,7 +75,7 @@ static void free_staging(uint8_t* ptr, uint64_t bytes, bool pinned) {
 #endif
 }
 
-static uint8_t* allocate_best_staging(uint64_t requested_bytes, uint64_t* actual_bytes, bool* pinned) {
+static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes, uint64_t* actual_bytes, bool* pinned) {
     if (actual_bytes) {
         *actual_bytes = 0;
     }
@@ -89,7 +95,7 @@ static uint8_t* allocate_best_staging(uint64_t requested_bytes, uint64_t* actual
                 (unsigned long long)limit,
                 (unsigned long long)min_pinned);
             // Fallback: allocate non-pinned buffer
-            uint8_t* ptr = allocate_staging(requested_bytes, nullptr);
+            uint8_t* ptr = allocate_staging(e ? e->backend_caps.preferred_numa_node : -1, requested_bytes, nullptr);
             if (ptr) {
                 if (actual_bytes) {
                     *actual_bytes = requested_bytes;
@@ -112,7 +118,7 @@ static uint8_t* allocate_best_staging(uint64_t requested_bytes, uint64_t* actual
 #endif
     while (bytes >= min_pinned) {
         bool got_pinned = false;
-        uint8_t* ptr = allocate_staging(bytes, &got_pinned);
+        uint8_t* ptr = allocate_staging(e ? e->backend_caps.preferred_numa_node : -1, bytes, &got_pinned);
         if (ptr && got_pinned) {
             if (actual_bytes) {
                 *actual_bytes = bytes;
@@ -142,7 +148,7 @@ static uint8_t* allocate_best_staging(uint64_t requested_bytes, uint64_t* actual
         (unsigned long long)(requested_bytes / (1024ull * 1024ull)));
 
     // Allocate non-pinned buffer as last resort
-    uint8_t* fallback_ptr = allocate_staging(requested_bytes, nullptr);
+    uint8_t* fallback_ptr = allocate_staging(e ? e->backend_caps.preferred_numa_node : -1, requested_bytes, nullptr);
     if (fallback_ptr) {
         if (actual_bytes) {
             *actual_bytes = requested_bytes;

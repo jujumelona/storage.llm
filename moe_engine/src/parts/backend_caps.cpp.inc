@@ -7,6 +7,7 @@ static void fill_backend_caps(
         return;
     }
     std::memset(out_caps, 0, sizeof(*out_caps));
+    out_caps->preferred_numa_node = -1;
     if (platform == moe_PLATFORM_AUTO) {
         platform = default_platform();
     }

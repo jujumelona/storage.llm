@@ -28,7 +28,10 @@ static moe_io_path_t choose_active_io_path(const moe_pc_engine* engine) {
 }
 
 static int engine_bypass_staging_pipeline(const moe_pc_engine* engine) {
-    return engine && engine->backend_caps.supports_zero_copy_host;
+    if (!engine) return 0;
+    if (engine->backend_caps.supports_zero_copy_host) return 1;
+    if (engine->backend_caps.backend == moe_BACKEND_METAL && engine->backend_caps.supports_unified_memory) return 1;
+    return 0;
 }
 
 static int engine_has_device_upload_workers(const moe_pc_engine* engine) {
