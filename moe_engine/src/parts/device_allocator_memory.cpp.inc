@@ -60,14 +60,24 @@ static void device_account_free_bytes_sub(moe_pc_engine* e, uint64_t bytes) {
 }
 
 static void device_free_deferred_ptrs(moe_pc_engine* e, std::vector<std::pair<CUdeviceptr, uint64_t>>& ptrs) {
-    if (!e || ptrs.empty() || !e->cuda.cuMemFree) {
+    if (!e || ptrs.empty() ) {
         ptrs.clear();
         return;
     }
     device_set_current(e);
     for (auto& pair : ptrs) {
         if (pair.first) {
-            if (e->backend_caps.backend == moe_BACKEND_METAL) { extern "C" void metal_zero_copy_unmap(void* buffer); metal_zero_copy_unmap((void*)pair.first); } else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipFree) { e->hip.hipFree((void*)pair.first); } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemFree) { e->cuda.cuMemFree(pair.first); }
+#if defined(__APPLE__) && defined(__MACH__)
+            if (e->backend_caps.backend == moe_BACKEND_METAL) {
+                extern "C" void metal_zero_copy_unmap(void* buffer);
+                metal_zero_copy_unmap((void*)pair.first);
+            } else
+#endif
+            if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipFree) {
+                e->hip.hipFree(pair.first);
+            } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemFree) {
+                e->cuda.cuMemFree(pair.first);
+            }
             // Bug 2: device_free_bytes already updated in device_release_allocation_locked
             // Do NOT double-add here
             // e->device_free_bytes.fetch_add(pair.second, std::memory_order_relaxed);  // REMOVED
@@ -91,8 +101,18 @@ static void device_release_allocation_locked(
             e->device_free_bytes.fetch_add(a.bytes, std::memory_order_relaxed);
         } else {
             device_set_current(e);
-            if (e->cuda.cuMemFree) {
-                if (e->backend_caps.backend == moe_BACKEND_METAL) { extern "C" void metal_zero_copy_unmap(void* buffer); metal_zero_copy_unmap((void*)a.ptr); } else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipFree) { e->hip.hipFree((void*)a.ptr); } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemFree) { e->cuda.cuMemFree(a.ptr); }
+            if (1) {
+#if defined(__APPLE__) && defined(__MACH__)
+                if (e->backend_caps.backend == moe_BACKEND_METAL) {
+                    extern "C" void metal_zero_copy_unmap(void* buffer);
+                    metal_zero_copy_unmap((void*)a.ptr);
+                } else
+#endif
+                if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipFree) {
+                    e->hip.hipFree(a.ptr);
+                } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemFree) {
+                    e->cuda.cuMemFree(a.ptr);
+                }
                 e->device_free_bytes.fetch_add(a.bytes, std::memory_order_relaxed);
             }
         }

@@ -95,12 +95,15 @@ static int device_prepare_tensor_allocation(
             next.bytes = bytes;
             next.pool = pool;
             int alloc_ok = 0;
+#if defined(__APPLE__) && defined(__MACH__)
             if (e->backend_caps.backend == moe_BACKEND_METAL && host_ptr) {
                 extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t bytes);
                 next.ptr = (CUdeviceptr)metal_zero_copy_map(e, const_cast<void*>(host_ptr), bytes);
                 alloc_ok = (next.ptr != 0) ? 1 : 0;
-            } else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipMalloc) {
-                alloc_ok = (e->hip.hipMalloc((void**)&next.ptr, (size_t)bytes) == 0) ? 1 : 0;
+            } else
+#endif
+            if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipMalloc) {
+                alloc_ok = (e->hip.hipMalloc(&next.ptr, (size_t)bytes) == 0) ? 1 : 0;
             } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemAlloc) {
                 alloc_ok = (e->cuda.cuMemAlloc(&next.ptr, (size_t)bytes) == 0) ? 1 : 0;
             }
