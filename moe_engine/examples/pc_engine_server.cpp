@@ -1256,6 +1256,12 @@ static const char* generation_phase_name(uint32_t phase) {
     }
 }
 
+static bool get_cached_model_root_check(
+    const server_runtime_state* runtime,
+    const std::string& model_root,
+    moe_model_root_check_t* out_check
+);
+
 static std::string make_health_json(
     const server_options& opts,
     const moe_backend_caps_t& caps,
