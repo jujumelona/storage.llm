@@ -94,8 +94,14 @@ int glm5_pc_engine_startup_warm_model(glm5_pc_engine_t* engine) {
 
             while (!engine->io_stop.load(std::memory_order_relaxed) &&
                    engine->total_queue_depth.load(std::memory_order_relaxed) >= queue_high) {
-                engine->disk_stage.cv.notify_all();
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                // BUGFIX 24: Use cv wait instead of polling ★★
+                // Old: 10ms sleep polling → slow response, unnecessary wakeups
+                // New: io_done_cv wait → immediate response when queue drains
+                std::unique_lock<std::mutex> lock(engine->done_mutex);
+                engine->io_done_cv.wait_for(lock, std::chrono::milliseconds(100), [&] {
+                    return engine->io_stop.load(std::memory_order_relaxed) ||
+                           engine->total_queue_depth.load(std::memory_order_relaxed) < queue_high;
+                });
             }
             if (engine->io_stop.load(std::memory_order_relaxed)) {
                 return queued > 0 ? 1 : 0;

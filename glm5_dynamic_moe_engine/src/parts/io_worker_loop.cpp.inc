@@ -49,6 +49,20 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
     if (!engine) {
         return;
     }
+
+    // BUGFIX 27: Add StreamGuard to prevent CUDA stream leak ★★
+    // Old: device_stream_destroy_current only on normal exit paths
+    // New: RAII guard ensures cleanup on exception/abnormal termination
+    // Matches gpu_worker_loop pattern for consistency
+    struct StreamGuard {
+        glm5_pc_engine* e;
+        ~StreamGuard() {
+            if (e) {
+                device_stream_destroy_current(e);
+            }
+        }
+    } stream_guard{engine};
+
     glm5_io_path_t active_path = choose_active_io_path(engine);
     engine->io_atomic.active_path.store(static_cast<uint32_t>(active_path));
     uint32_t refresh_turn = 0;
@@ -102,6 +116,7 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
         }
         glm5_prefetch_task task{};
         if (!pop_stage_task(engine, engine->disk_stage, &task, &engine->disk_worker_target, worker_index)) {
+            stream_guard.e = nullptr;  // BUGFIX 27: Prevent double-destroy
             device_stream_destroy_current(engine);
             return;
         }
@@ -275,11 +290,14 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                 // Critical Fix 5: Check pinned_stage capacity BEFORE disk read
                 // Reading from disk then discovering pinned_stage is full wastes disk bandwidth.
                 // Check hard-cap before prefetch_tensor_disk_to_ram to avoid unnecessary I/O.
+                // BUGFIX 22: Snapshot pinned_depth once to avoid TOCTOU ★★
                 if (task.target_tier == GLM5_TIER_VRAM &&
                     engine->io_config.enable_multistage_pipeline && engine->staging) {
-                    const uint32_t pinned_depth_pre = engine->pinned_stage.depth.load(std::memory_order_relaxed);
+                    const uint32_t pinned_depth = engine->pinned_stage.depth.load(std::memory_order_relaxed);
                     const uint32_t pinned_hard_cap = engine->io_config.max_prefetch_queue;
-                    if (pinned_hard_cap > 0 && pinned_depth_pre >= pinned_hard_cap) {
+                    const uint32_t pinned_soft_cap = (pinned_hard_cap * 3u) / 4u;
+
+                    if (pinned_hard_cap > 0 && pinned_depth >= pinned_hard_cap) {
                         if (task.requeue_count > 0) {
                             std::this_thread::sleep_for(std::chrono::milliseconds(1));
                         }
@@ -287,22 +305,19 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                         terminal = 0;
                         finish_stage_task(engine, engine->disk_stage, ok, terminal);
                         if (worker_index >= engine->disk_worker_target.load()) {
+                            stream_guard.e = nullptr;  // BUGFIX 27: Prevent double-destroy
                             device_stream_destroy_current(engine);
                             return;
                         }
                         continue;
                     }
-                }
 
-                if (task.target_tier == GLM5_TIER_VRAM &&
-                    engine->io_config.enable_multistage_pipeline && engine->staging) {
-                    const uint32_t pinned_depth = engine->pinned_stage.depth.load(std::memory_order_relaxed);
-                    const uint32_t pinned_soft_cap = (engine->io_config.max_prefetch_queue * 3u) / 4u;
                     if (pinned_soft_cap > 0 && pinned_depth >= pinned_soft_cap) {
                         ok = preserve_requeue(task, GLM5_TRANSFER_STAGE_DISK_TO_RAM);
                         terminal = 0;
                         finish_stage_task(engine, engine->disk_stage, ok, terminal);
                         if (worker_index >= engine->disk_worker_target.load()) {
+                            stream_guard.e = nullptr;  // BUGFIX 27: Prevent double-destroy
                             device_stream_destroy_current(engine);
                             return;
                         }
@@ -320,6 +335,7 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                         terminal = 0;
                         finish_stage_task(engine, engine->disk_stage, ok, terminal);
                         if (worker_index >= engine->disk_worker_target.load()) {
+                            stream_guard.e = nullptr;  // BUGFIX 27: Prevent double-destroy
                             device_stream_destroy_current(engine);
                             return;
                         }
@@ -390,9 +406,9 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                         device_free_experts_batched(engine, freed, 8);
                     }
                 }
-                const uint64_t ram_used_snap = tier_used(engine, GLM5_TIER_RAM);
                 // PIPELINE FIX 2: Lower RAM preemptive eviction threshold 97%→90% (same as VRAM)
                 // PIPELINE FIX 12: Refresh RAM usage snapshot (same as VRAM)
+                // BUGFIX 21: Remove dead variable ram_used_snap ★
                 const uint64_t ram_used_fresh = tier_used(engine, GLM5_TIER_RAM);
                 const uint64_t ram_target = (ram_bud * 80ull) / 100ull;
                 if (ram_bud > 0 && ram_used_fresh > (ram_bud * 90ull) / 100ull && ram_used_fresh > ram_target) {
@@ -404,6 +420,7 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
         }
 
         if (worker_index >= engine->disk_worker_target.load()) {
+            stream_guard.e = nullptr;  // BUGFIX 27: Prevent double-destroy
             device_stream_destroy_current(engine);
             return;
         }

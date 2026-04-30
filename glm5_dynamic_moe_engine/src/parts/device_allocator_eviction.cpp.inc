@@ -61,8 +61,12 @@ static uint32_t device_collect_activation_victims_locked(
     // Fixed 128 limit causes eviction failure when heap has many stale entries.
     // Allow scanning up to half the heap size to find valid victims.
     const uint32_t stale_limit = std::max(128u, (uint32_t)e->activation_evict_heap.size() / 2u);
-    while (e->device_allocated_bytes.load(std::memory_order_relaxed) > projected_free &&
-           e->device_allocated_bytes.load(std::memory_order_relaxed) - projected_free + bytes > budget &&
+    // BUGFIX 20: Fix TOCTOU - snapshot device_allocated_bytes once ★★★
+    // Old: Two loads in while condition → underflow if freed between loads
+    // New: Single snapshot → prevents uint64 wraparound, accurate eviction
+    const uint64_t allocated_snap = e->device_allocated_bytes.load(std::memory_order_relaxed);
+    while (allocated_snap > projected_free &&
+           allocated_snap - projected_free + bytes > budget &&
            !e->activation_evict_heap.empty()) {
         const glm5_device_evict_candidate victim = e->activation_evict_heap.top();
         e->activation_evict_heap.pop();

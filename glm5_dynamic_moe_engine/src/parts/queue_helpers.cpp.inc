@@ -144,7 +144,13 @@ static void finish_stage_task(glm5_pc_engine* engine, glm5_stage_queue& stage, i
         engine->io_atomic.failed_requests.fetch_add(1);
     }
     stage.inflight.fetch_sub(1);
-    engine->io_done_cv.notify_one();
+    // BUGFIX 26: Only notify on terminal completion ★★
+    // Old: notify on every finish, including requeues → spurious wakeups
+    // New: notify only when count_completed=true → accurate completion signal
+    // Prevents premature "all done" detection in startup_warm and other waiters
+    if (count_completed) {
+        engine->io_done_cv.notify_one();
+    }
 }
 
 static bool stage_idle(glm5_stage_queue& stage) {

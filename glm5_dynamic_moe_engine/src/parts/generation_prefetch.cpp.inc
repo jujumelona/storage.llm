@@ -99,9 +99,11 @@ static int glm5_can_enqueue_attention_lookahead(glm5_pc_engine* engine, int32_t 
     if (bytes == 0) {
         return 1;
     }
-    const uint64_t used = std::max(
-        tier_used(engine, GLM5_TIER_VRAM),
-        engine->device_allocated_bytes.load(std::memory_order_relaxed));
+    // BUGFIX 23: Use expert VRAM only, not total device allocation ★★★
+    // Old: device_allocated_bytes includes fixed (KV cache, embeddings) → premature cutoff
+    // New: tier_used(VRAM) only counts expert weights → accurate threshold
+    // Fixed allocations don't compete with attention prefetch, only experts do
+    const uint64_t used = tier_used(engine, GLM5_TIER_VRAM);
     const uint64_t budget = engine->config.vram_budget_bytes;
     // PIPELINE FIX 19: Raise attention lookahead threshold from 83% to 85% ★★
     // Old: threshold = budget * 5/6 ≈ 83% → dead zone between 83%-90%
