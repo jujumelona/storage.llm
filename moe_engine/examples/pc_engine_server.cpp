@@ -85,6 +85,10 @@ struct server_runtime_state {
     std::string error_message;
     mutable std::mutex stage_mutex;
     std::string load_stage{"not_started"};
+    mutable std::mutex root_check_mutex;
+    std::string root_check_model_root;
+    moe_model_root_check_t root_check{};
+    int root_check_ready = 0;
 };
 
 #include "pc_server_runtime_config.inc"
@@ -1264,10 +1268,14 @@ static std::string make_health_json(
     const bool loading = runtime && runtime->model_ready.load(std::memory_order_acquire) == 0 &&
         runtime->model_failed.load(std::memory_order_acquire) == 0;
     const bool failed = runtime && runtime->model_failed.load(std::memory_order_acquire) != 0;
+    const bool loaded = !loading && !failed;
+    const bool generation_ready = loaded && forward.decode_loop_ready != 0;
     out << "{"
         << "\"status\":\"ok\","
         << "\"modelLoading\":" << (loading ? "true" : "false") << ","
-        << "\"modelReady\":" << (!loading && !failed ? "true" : "false") << ","
+        << "\"modelReady\":" << (loaded ? "true" : "false") << ","
+        << "\"modelLoaded\":" << (loaded ? "true" : "false") << ","
+        << "\"generationReady\":" << (generation_ready ? "true" : "false") << ","
         << "\"modelFailed\":" << (failed ? "true" : "false") << ","
         << "\"mode\":\"openclaw\","
         << "\"model\":\"" << json_escape(opts.model_id) << "\","
@@ -1358,7 +1366,8 @@ static std::string make_health_json(
         << "\"recommendedStagingBytes\":" << io_stats.recommended_staging_bytes;
     if (!opts.model_root.empty()) {
         moe_model_root_check_t root_check{};
-        if (moe_storage_validate_model_root(opts.model_root.c_str(), &root_check)) {
+        if (get_cached_model_root_check(runtime, opts.model_root, &root_check) ||
+            moe_storage_validate_model_root(opts.model_root.c_str(), &root_check)) {
             out << ",\"modelRoot\":\"" << json_escape(opts.model_root) << "\""
                 << ",\"modelRootValid\":" << (root_check.valid ? "true" : "false")
                 << ",\"modelRootExpectedParts\":" << root_check.expected_part_count
@@ -2021,6 +2030,36 @@ static void set_model_load_stage(server_runtime_state* runtime, const char* stag
     std::cerr << "[storagellm] load stage: " << stage << "\n" << std::flush;
 }
 
+static void cache_model_root_check(
+    server_runtime_state* runtime,
+    const std::string& model_root,
+    const moe_model_root_check_t& root_check
+) {
+    if (!runtime) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(runtime->root_check_mutex);
+    runtime->root_check_model_root = model_root;
+    runtime->root_check = root_check;
+    runtime->root_check_ready = 1;
+}
+
+static bool get_cached_model_root_check(
+    const server_runtime_state* runtime,
+    const std::string& model_root,
+    moe_model_root_check_t* out_check
+) {
+    if (!runtime || !out_check) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(runtime->root_check_mutex);
+    if (!runtime->root_check_ready || runtime->root_check_model_root != model_root) {
+        return false;
+    }
+    *out_check = runtime->root_check;
+    return true;
+}
+
 static bool cleanup_background_engine_if_shutdown(server_runtime_state* runtime) {
     if (!runtime || runtime->shutdown_requested.load(std::memory_order_acquire) == 0) {
         return false;
@@ -2248,6 +2287,13 @@ static int server_main(int argc, char** argv) {
     server_runtime_state runtime;
     runtime.initial_caps = caps;
     set_model_load_stage(&runtime, "queued");
+    moe_model_root_check_t startup_root_check{};
+    const bool startup_root_check_ok =
+        !opts.model_root.empty() &&
+        moe_storage_validate_model_root(opts.model_root.c_str(), &startup_root_check);
+    if (startup_root_check_ok) {
+        cache_model_root_check(&runtime, opts.model_root, startup_root_check);
+    }
     std::thread loader_thread(load_server_model_background, opts, io_config, &runtime);
 
     std::cout << "StorageLLM server listening on http://" << opts.host << ":" << opts.port << "/v1\n";
@@ -2261,15 +2307,12 @@ static int server_main(int argc, char** argv) {
               << " gpu=" << io_config.gpu_worker_threads
               << " direct_min=" << io_config.direct_upload_min_bytes
               << " staging=" << io_config.pinned_staging_bytes << "\n";
-    if (!opts.model_root.empty()) {
-        moe_model_root_check_t root_check{};
-        if (moe_storage_validate_model_root(opts.model_root.c_str(), &root_check)) {
-            std::cout << "Model root: valid=" << root_check.valid
-                      << " present=" << root_check.present_part_count
-                      << "/" << root_check.expected_part_count
-                      << " missing=" << root_check.missing_part_count
-                      << " size_mismatch=" << root_check.size_mismatch_count << "\n";
-        }
+    if (startup_root_check_ok) {
+        std::cout << "Model root: valid=" << startup_root_check.valid
+                  << " present=" << startup_root_check.present_part_count
+                  << "/" << startup_root_check.expected_part_count
+                  << " missing=" << startup_root_check.missing_part_count
+                  << " size_mismatch=" << startup_root_check.size_mismatch_count << "\n";
     }
     if (!opts.topology_path.empty()) {
         std::cout << "Topology: " << opts.topology_path << "\n";

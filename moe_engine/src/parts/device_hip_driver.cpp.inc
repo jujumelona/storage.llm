@@ -32,6 +32,7 @@ static int hip_driver_load(moe_hip_driver_api* api) {
     }
     api->hipInit = (moe_cu_init_fn)moe_find_shared_symbol(api->library, "hipInit");
     api->hipDeviceGet = (moe_cu_device_get_fn)moe_find_shared_symbol(api->library, "hipDeviceGet");
+    api->hipDeviceGetPCIBusId = (moe_cu_device_get_pci_bus_id_fn)moe_find_shared_symbol(api->library, "hipDeviceGetPCIBusId");
     api->hipCtxSetCurrent = (moe_cu_ctx_set_current_fn)moe_find_shared_symbol(api->library, "hipCtxSetCurrent");
     api->hipDevicePrimaryCtxRetain = (moe_cu_primary_ctx_retain_fn)moe_find_shared_symbol(api->library, "hipDevicePrimaryCtxRetain");
     api->hipDevicePrimaryCtxRelease = (moe_cu_primary_ctx_release_fn)moe_find_shared_symbol(api->library, "hipDevicePrimaryCtxRelease");
@@ -86,4 +87,32 @@ static uint64_t hip_driver_detect_free_memory_bytes(uint32_t device_id, uint64_t
         *total_out = static_cast<uint64_t>(total_b);
     }
     return static_cast<uint64_t>(free_b);
+}
+
+static int hip_driver_get_numa_node(uint32_t device_id) {
+    moe_hip_driver_api api{};
+    if (!hip_driver_load(&api) || api.hipInit(0) != 0) {
+        moe_close_shared_library(api.library);
+        return -1;
+    }
+    int numa_node = -1;
+    if (api.hipDeviceGet && api.hipDeviceGetPCIBusId) {
+        int dev = 0;
+        if (api.hipDeviceGet(&dev, static_cast<int>(device_id)) == 0) {
+            char pci_id[32] = {0};
+            if (api.hipDeviceGetPCIBusId(pci_id, sizeof(pci_id), dev) == 0) {
+#ifdef __linux__
+                char path[256];
+                snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", pci_id);
+                FILE* f = fopen(path, "r");
+                if (f) {
+                    if (fscanf(f, "%d", &numa_node) != 1) numa_node = -1;
+                    fclose(f);
+                }
+#endif
+            }
+        }
+    }
+    moe_close_shared_library(api.library);
+    return numa_node;
 }

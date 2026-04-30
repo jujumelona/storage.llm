@@ -54,6 +54,7 @@ static int cuda_driver_load(moe_cuda_driver_api* api) {
     }
     api->cuInit = (moe_cu_init_fn)moe_find_shared_symbol(api->library, "cuInit");
     api->cuDeviceGet = (moe_cu_device_get_fn)moe_find_shared_symbol(api->library, "cuDeviceGet");
+    api->cuDeviceGetPCIBusId = (moe_cu_device_get_pci_bus_id_fn)moe_find_shared_symbol(api->library, "cuDeviceGetPCIBusId");
     api->cuCtxSetCurrent = (moe_cu_ctx_set_current_fn)moe_find_shared_symbol(api->library, "cuCtxSetCurrent");
     api->cuDevicePrimaryCtxRetain = (moe_cu_primary_ctx_retain_fn)moe_find_shared_symbol(api->library, "cuDevicePrimaryCtxRetain");
     api->cuDevicePrimaryCtxRelease = (moe_cu_primary_ctx_release_fn)moe_find_shared_symbol(api->library, "cuDevicePrimaryCtxRelease");
@@ -108,4 +109,32 @@ static uint64_t cuda_driver_detect_free_memory_bytes(uint32_t device_id, uint64_
         *total_out = static_cast<uint64_t>(total_b);
     }
     return static_cast<uint64_t>(free_b);
+}
+
+static int cuda_driver_get_numa_node(uint32_t device_id) {
+    moe_cuda_driver_api api{};
+    if (!cuda_driver_load(&api) || api.cuInit(0) != 0) {
+        moe_close_shared_library(api.library);
+        return -1;
+    }
+    int numa_node = -1;
+    if (api.cuDeviceGet && api.cuDeviceGetPCIBusId) {
+        int dev = 0;
+        if (api.cuDeviceGet(&dev, static_cast<int>(device_id)) == 0) {
+            char pci_id[32] = {0};
+            if (api.cuDeviceGetPCIBusId(pci_id, sizeof(pci_id), dev) == 0) {
+#ifdef __linux__
+                char path[256];
+                snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", pci_id);
+                FILE* f = fopen(path, "r");
+                if (f) {
+                    if (fscanf(f, "%d", &numa_node) != 1) numa_node = -1;
+                    fclose(f);
+                }
+#endif
+            }
+        }
+    }
+    moe_close_shared_library(api.library);
+    return numa_node;
 }

@@ -49,7 +49,18 @@ int moe_pc_engine_generate_token_ids(
         !forward.lm_head_ready ||
         !forward.attention_ready ||
         !forward.sampler_ready) {
-        moe_generation_set_error(out_stats, "full generation path is not ready");
+        char reason[160]{};
+        std::snprintf(reason, sizeof(reason),
+            "generation not ready storage=%d tensors=%d experts=%d tokenizer=%d embed=%d lm=%d attn=%d sampler=%d",
+            forward.storage_state_valid,
+            forward.tensor_table_loaded,
+            forward.expert_triplet_available,
+            forward.tokenizer_ready,
+            forward.embedding_ready,
+            forward.lm_head_ready,
+            forward.attention_ready,
+            forward.sampler_ready);
+        moe_generation_set_error(out_stats, reason);
         return 0;
     }
 

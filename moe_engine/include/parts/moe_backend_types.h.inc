@@ -22,6 +22,7 @@ typedef struct {
     int supports_pinned_host;
     int supports_unified_memory;
     int supports_zero_copy_host;
+    int supports_zero_copy_mmap;
     int supports_fixed_read_staging;
     int supports_registered_io_buffers;
     int supports_backend_async_api;

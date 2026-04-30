@@ -1,4 +1,4 @@
-﻿static int prefetch_one_raw_span(
+static int prefetch_one_raw_span(
     moe_pc_engine* e,
     const moe_storage_raw_span_spec_t& s,
     uint8_t pool,
@@ -203,7 +203,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         // New: min(disk_workers * 2, 8) ??scales with worker count, caps at 8
         // Rationale: OS prefetcher can handle 8 concurrent MADV_WILLNEED hints efficiently
         {
-            const uint32_t max_lookahead = std::min(runtime_disk_workers(engine) * 2u, 8u);
+            const uint32_t max_lookahead = std::min(runtime_disk_workers(engine) * 4u, 16u);
             std::vector<int32_t> lookahead_indices;
             lookahead_indices.reserve(max_lookahead);
             {
@@ -387,14 +387,29 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 ok = prefetch_tensor_disk_to_ram(engine, rec);
                 if (ok && task.target_tier == moe_TIER_VRAM &&
                     engine->io_config.enable_multistage_pipeline && engine->staging) {
-                    moe_prefetch_task next = task;
-                    next.stage = moe_TRANSFER_STAGE_RAM_TO_PINNED;
-                    if (enqueue_stage_or_retry(engine, engine->pinned_stage, next)) {
-                        terminal = 0;
-                        engine->pinned_stage.cv.notify_one();
+                    if (active_path == moe_IO_PATH_ZERO_COPY_HOST) {
+                        moe_prefetch_task next = task;
+                        next.stage = moe_TRANSFER_STAGE_PINNED_TO_GPU;
+                        next.staging_slot = UINT32_MAX;
+                        next.staging_bytes = 0;
+                        next.staging_valid = 0;
+                        if (enqueue_stage_or_retry(engine, engine->gpu_stage, next)) {
+                            terminal = 0;
+                            engine->gpu_stage.cv.notify_one();
+                        } else {
+                            ok = preserve_requeue(next, moe_TRANSFER_STAGE_DISK_TO_RAM);
+                            terminal = 0;
+                        }
                     } else {
-                        ok = preserve_requeue(next, moe_TRANSFER_STAGE_RAM_TO_PINNED);
-                        terminal = 0;
+                        moe_prefetch_task next = task;
+                        next.stage = moe_TRANSFER_STAGE_RAM_TO_PINNED;
+                        if (enqueue_stage_or_retry(engine, engine->pinned_stage, next)) {
+                            terminal = 0;
+                            engine->pinned_stage.cv.notify_one();
+                        } else {
+                            ok = preserve_requeue(next, moe_TRANSFER_STAGE_RAM_TO_PINNED);
+                            terminal = 0;
+                        }
                     }
                 } else if (ok && task.target_tier == moe_TIER_VRAM &&
                     engine_has_device_upload_workers(engine)) {

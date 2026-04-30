@@ -70,6 +70,7 @@ static int device_free_expert_if_pending_evict_locked(
 }
 
 static uint32_t device_collect_activation_victims_locked(
+    std::unique_lock<std::mutex>& device_lock,
     moe_pc_engine* e,
     uint64_t bytes,
     std::vector<uint64_t>& keys
@@ -100,7 +101,7 @@ static uint32_t device_collect_activation_victims_locked(
         // 비율 체크 없이 바로 rebuild 하는 대신, 먼저 heap 대비 예상 active 비율 확인
         // heap이 active의 2배 이상일 때만 rebuild
         if (e->activation_evict_heap.size() > (uint32_t)e->device_allocations.size() * 2u) {
-            active_count = device_rebuild_activation_heap_locked(e);
+            active_count = device_rebuild_activation_heap_unlocked(e, device_lock);
         } else {
             // rebuild 없이 active_count는 맵 크기로 근사치 사용
             active_count = (uint32_t)e->device_allocations.size();
@@ -182,7 +183,7 @@ static void device_make_room_locked(
 
         std::vector<std::pair<int, int>> expert_victims;
         std::vector<uint64_t> activation_victims;
-        device_collect_activation_victims_locked(e, room_bytes, activation_victims);
+        device_collect_activation_victims_locked(device_lock, e, room_bytes, activation_victims);
         for (uint64_t key : activation_victims) {
             device_free_locked(e, key, &deferred_free_ptrs);
         }

@@ -27,7 +27,7 @@ static int read_file_range_to_buffer(
     return 1;
 }
 
-// BUGFIX 51: Issue 22 - Cache ifstream per worker thread ?�★
+// BUGFIX 51: Issue 22 - Cache ifstream per worker thread ?�★
 // Problem: prefetch_tensor_file_to_pinned opens/closes ifstream for every tensor.
 // 8 experts × 3 projections = 24 file opens per MoE layer. Same shard file reopened repeatedly.
 // Each open requires seekg(), and non-mmap path uses different OS cache than mmap path.

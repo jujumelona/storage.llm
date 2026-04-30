@@ -32,6 +32,7 @@ static void fill_cpu_backend_caps(moe_backend_caps_t* caps) {
     caps->supports_weight_mxfp4 = 0;
     caps->supports_unified_memory = 1;
     caps->supports_zero_copy_host = 1;
+    caps->supports_zero_copy_mmap = 1;
     caps->supports_pinned_host = 0;
     caps->supports_backend_async_api = 0;
     caps->compute_streams = std::min<uint32_t>(hw, 8u);
@@ -58,6 +59,7 @@ static void fill_gpu_backend_base(moe_backend_caps_t* caps) {
     caps->recommended_pinned_bytes = std::max<uint64_t>(512ull * 1024ull * 1024ull, cache_for_experts(12));
 }
 
+static int cuda_driver_get_numa_node(uint32_t device_id);
 static void fill_cuda_backend_caps(moe_backend_caps_t* caps) {
     caps->supports_cuda = compiled_cuda_available();
     caps->supports_pinned_host = 1;
@@ -82,6 +84,7 @@ static void fill_cuda_backend_caps(moe_backend_caps_t* caps) {
     }
 }
 
+static int hip_driver_get_numa_node(uint32_t device_id);
 static void fill_hip_backend_caps(moe_backend_caps_t* caps) {
     caps->supports_hip = compiled_hip_available();
     caps->supports_pinned_host = 1;
@@ -89,6 +92,7 @@ static void fill_hip_backend_caps(moe_backend_caps_t* caps) {
     caps->supports_backend_async_api = 1;
     caps->supports_directstorage = compiled_directstorage_available();
     caps->supports_gpu_direct_file_io = caps->supports_directstorage;
+    caps->preferred_numa_node = hip_driver_get_numa_node(caps->device_id);
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(48);
 }
 
@@ -96,6 +100,7 @@ static void fill_shared_memory_backend_caps(moe_backend_caps_t* caps) {
     caps->supports_pinned_host = 1;
     caps->supports_unified_memory = 1;
     caps->supports_zero_copy_host = 1;
+    caps->supports_zero_copy_mmap = 1;
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(48);
 }
 
@@ -121,6 +126,7 @@ static void fill_metal_backend_caps(moe_backend_caps_t* caps) {
     caps->supports_metal = compiled_metal_available();
     caps->supports_unified_memory = 1;
     caps->supports_zero_copy_host = 1;
+    caps->supports_zero_copy_mmap = 1;
     caps->supports_pinned_host = 0;
     caps->supports_backend_async_api = 1;
     caps->supports_gpu_direct_file_io = 0;
