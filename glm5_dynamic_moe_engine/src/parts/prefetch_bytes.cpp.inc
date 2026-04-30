@@ -122,10 +122,14 @@ static void release_staging_slot(glm5_pc_engine* engine, uint32_t slot_index) {
     if (engine && slot_index < engine->staging_slots.size()) {
         engine->staging_slots[slot_index].in_use.store(false, std::memory_order_release);
         engine->staging_free_slot_count.fetch_add(1, std::memory_order_release);
-        // Bug Fix: Remove empty mutex scope - predicate-based wait_for handles missed wakeups
-        // The predicate (staging_free_slot_count > 0) in acquire_staging_slot_internal
-        // already prevents missed wakeups. Empty lock scope only adds mutex contention.
-        engine->staging_slot_cv.notify_all();
+        // BUGFIX 37: Change notify_all to notify_one to prevent thundering herd ★★★
+        // Old: notify_all wakes all waiting pinned_workers when 1 slot freed
+        // New: notify_one wakes only 1 worker → others stay asleep until their turn
+        // Scenario: 4 pinned_workers timeout simultaneously, 1 slot freed → all 4 wake up
+        //           → 3 fail CAS and timeout again (5ms wasted × 3 workers)
+        // With notify_one: Only 1 worker wakes, acquires slot, others stay asleep
+        // Trade-off: None. Single slot = single consumer, notify_one is correct semantics
+        engine->staging_slot_cv.notify_one();
     }
 }
 

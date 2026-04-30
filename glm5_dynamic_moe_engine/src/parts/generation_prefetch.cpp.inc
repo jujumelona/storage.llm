@@ -2,6 +2,14 @@ static void glm5_enqueue_attention_prefetch(glm5_pc_engine* engine, int32_t laye
     if (!engine || layer < 0) {
         return;
     }
+
+    // BUGFIX 30: Use O(1) attention span index table instead of O(N) linear search ★★★
+    // Old: Loop through all spans (begin..end) for each kind, pointer comparison → O(N) per kind
+    // New: Direct table lookup glm5_storage_attention_span_index → O(1) per kind
+    // Eliminates 5 kinds × 79 layers × O(N) pointer comparisons per token generation
+    // Hot path optimization per ARCHITECTURE.md: "integer id and offset, no strings"
+
+    // kind_index mapping: 0=Q_A_PROJ, 1=Q_B_PROJ, 2=KV_A_PROJ_WITH_MQA, 3=KV_B_PROJ, 4=O_PROJ
     const glm5_raw_tensor_kind_t kinds[] = {
         GLM5_RAW_TENSOR_Q_A_PROJ,
         GLM5_RAW_TENSOR_Q_B_PROJ,
@@ -28,30 +36,21 @@ static void glm5_enqueue_attention_prefetch(glm5_pc_engine* engine, int32_t laye
         }
     }
 
-    for (glm5_raw_tensor_kind_t kind : kinds) {
-        glm5_raw_tensor_desc desc{};
-        const glm5_storage_raw_span_spec_t* span = nullptr;
-        if (!find_raw_tensor_desc_and_span(layer, kind, &desc, &span) || !span) {
+    for (uint32_t kind_idx = 0; kind_idx < sizeof(kinds) / sizeof(kinds[0]); ++kind_idx) {
+        const uint32_t si = glm5_storage_attention_span_index(layer, kind_idx);
+        if (si == 0xFFFFFFFFu) {
             continue;
         }
-        const uint32_t begin = glm5_storage_raw_span_find_first(layer);
-        const uint32_t end = glm5_storage_raw_span_find_end(layer);
-        for (uint32_t si = begin; si < end; ++si) {
-            if (glm5_storage_raw_span_at(si) != span) {
-                continue;
+        bool seen = false;
+        for (uint32_t qi = 0; qi < queued_count; ++qi) {
+            if (queued_spans[qi] == si) {
+                seen = true;
+                break;
             }
-            bool seen = false;
-            for (uint32_t qi = 0; qi < queued_count; ++qi) {
-                if (queued_spans[qi] == si) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen && queued_count < sizeof(queued_spans) / sizeof(queued_spans[0])) {
-                queued_spans[queued_count++] = si;
-                enqueue_raw_span_prefetch(engine, si, GLM5_DEVICE_POOL_ACTIVATION);
-            }
-            break;
+        }
+        if (!seen && queued_count < sizeof(queued_spans) / sizeof(queued_spans[0])) {
+            queued_spans[queued_count++] = si;
+            enqueue_raw_span_prefetch(engine, si, GLM5_DEVICE_POOL_ACTIVATION);
         }
     }
 }
@@ -60,32 +59,31 @@ static uint64_t glm5_attention_prefetch_bytes(int32_t layer) {
     if (layer < 0) {
         return 0;
     }
-    const glm5_raw_tensor_kind_t kinds[] = {
-        GLM5_RAW_TENSOR_Q_A_PROJ,
-        GLM5_RAW_TENSOR_Q_B_PROJ,
-        GLM5_RAW_TENSOR_KV_A_PROJ_WITH_MQA,
-        GLM5_RAW_TENSOR_KV_B_PROJ,
-        GLM5_RAW_TENSOR_O_PROJ
-    };
-    const glm5_storage_raw_span_spec_t* spans[sizeof(kinds) / sizeof(kinds[0])] = {};
-    uint32_t span_count = 0;
+
+    // BUGFIX 30: Use O(1) attention span index table ★★★
+    // Same optimization as glm5_enqueue_attention_prefetch
     uint64_t bytes = 0;
-    for (glm5_raw_tensor_kind_t kind : kinds) {
-        glm5_raw_tensor_desc desc{};
-        const glm5_storage_raw_span_spec_t* span = nullptr;
-        if (!find_raw_tensor_desc_and_span(layer, kind, &desc, &span) || !span) {
+    uint32_t seen_spans[5] = {};
+    uint32_t seen_count = 0;
+
+    for (uint32_t kind_idx = 0; kind_idx < 5; ++kind_idx) {
+        const uint32_t si = glm5_storage_attention_span_index(layer, kind_idx);
+        if (si == 0xFFFFFFFFu) {
             continue;
         }
         bool seen = false;
-        for (uint32_t i = 0; i < span_count; ++i) {
-            if (spans[i] == span) {
+        for (uint32_t i = 0; i < seen_count; ++i) {
+            if (seen_spans[i] == si) {
                 seen = true;
                 break;
             }
         }
-        if (!seen && span_count < sizeof(spans) / sizeof(spans[0])) {
-            spans[span_count++] = span;
-            bytes += span->bytes;
+        if (!seen && seen_count < 5) {
+            seen_spans[seen_count++] = si;
+            const glm5_storage_raw_span_spec_t* span = glm5_storage_raw_span_at(si);
+            if (span) {
+                bytes += span->bytes;
+            }
         }
     }
     return bytes;

@@ -50,7 +50,12 @@ static void proactive_eviction_worker_loop(glm5_pc_engine* engine) {
         return;
     }
     while (!engine->io_stop.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        // BUGFIX 35: Reduce sleep from 50ms to 5ms for faster eviction response ★★★
+        // Old: 50ms sleep → 5 tokens pass at 10ms/token before eviction starts
+        // New: 5ms sleep → responds within 1 token, prevents expert drops
+        // Trade-off: Slightly higher CPU usage (wakeup every 5ms vs 50ms)
+        // But eviction check is cheap (just atomic loads), and prevents allocation failures
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
         if (engine->io_stop.load(std::memory_order_relaxed)) {
             break;
         }
@@ -62,7 +67,12 @@ static void proactive_eviction_worker_loop(glm5_pc_engine* engine) {
             std::vector<std::pair<int, int>> freed;
             demote_cold_until(engine, GLM5_TIER_VRAM, vram_used - vram_target, freed);
             if (!freed.empty() && !engine->io_stop.load(std::memory_order_relaxed)) {
-                device_free_experts_batched(engine, freed, 8);
+                // BUGFIX 36: Reduce batch_size from 8 to 4 to lower mutex hold time ★★★
+                // Old: 8 × cuMemFree (100µs each) = 800µs device_mutex hold
+                // New: 4 × cuMemFree = 400µs device_mutex hold
+                // All device_copy_tensor calls wait on device_mutex → halving hold time improves throughput
+                // Trade-off: More batches needed for large evictions, but each batch blocks less
+                device_free_experts_batched(engine, freed, 4);
             }
         }
         const uint64_t ram_used = tier_used(engine, GLM5_TIER_RAM);
@@ -173,8 +183,12 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
         // PIPELINE FIX 11: Multi-task lookahead for multiple disk workers ★★
         // Old: Single lookahead → only helps 1 worker, others still hit page faults
         // New: Lookahead N tasks where N = disk_workers → all workers benefit
+        // BUGFIX 34: Increase lookahead cap for high disk worker counts ★★
+        // Old: min(disk_workers, 4) → workers 5+ still hit page faults
+        // New: min(disk_workers * 2, 8) → scales with worker count, caps at 8
+        // Rationale: OS prefetcher can handle 8 concurrent MADV_WILLNEED hints efficiently
         {
-            const uint32_t max_lookahead = std::min(runtime_disk_workers(engine), 4u);
+            const uint32_t max_lookahead = std::min(runtime_disk_workers(engine) * 2u, 8u);
             std::vector<int32_t> lookahead_indices;
             lookahead_indices.reserve(max_lookahead);
             {

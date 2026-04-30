@@ -182,7 +182,25 @@ int glm5_pc_engine_startup_warm_model(glm5_pc_engine_t* engine) {
                 return 0;
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // BUGFIX 28: Use io_done_cv.wait_for instead of sleep polling ★★★
+            // Old: sleep_for(100ms) → up to 100ms delay after loading completes
+            // New: io_done_cv.wait_for → immediate wakeup when IO finishes
+            // Reduces startup latency by up to 100ms per check iteration
+            std::unique_lock<std::mutex> lock(engine->done_mutex);
+            engine->io_done_cv.wait_for(lock, std::chrono::milliseconds(100), [&] {
+                const uint32_t depth = engine->total_queue_depth.load(std::memory_order_relaxed);
+                const uint32_t completed = engine->io_atomic.completed_requests.load();
+                const uint32_t failed = engine->io_atomic.failed_requests.load();
+                const uint32_t processed_completed = completed >= initial_completed ? completed - initial_completed : 0;
+                const uint32_t processed_failed = failed >= initial_failed ? failed - initial_failed : 0;
+                const uint32_t processed = processed_completed + processed_failed;
+                const bool all_idle =
+                    engine->disk_stage.inflight.load(std::memory_order_acquire) == 0 &&
+                    engine->pinned_stage.inflight.load(std::memory_order_acquire) == 0 &&
+                    engine->gpu_stage.inflight.load(std::memory_order_acquire) == 0;
+                return engine->io_stop.load(std::memory_order_relaxed) ||
+                       (depth == 0 && all_idle && processed >= queued);
+            });
         }
     }
 

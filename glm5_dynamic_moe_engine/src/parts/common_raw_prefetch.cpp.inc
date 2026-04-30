@@ -104,9 +104,18 @@ static uint64_t prefetch_raw_layer_roles(
             ++spans;
         }
     }
+    // BUGFIX 33: Separate queued vs transferred byte counters ★★★
+    // Old: Both enqueue_only and actual transfer incremented common_raw_prefetched_bytes
+    // New: enqueue_only → common_raw_queued_bytes, actual transfer → common_raw_prefetched_bytes
+    // Prevents stats confusion: "prefetched" now means actually in VRAM, "queued" means in pipeline
     if (bytes) {
-        e->common_raw_prefetched_bytes.fetch_add(bytes);
-        e->common_raw_prefetched_spans.fetch_add(spans);
+        if (enqueue_only) {
+            e->common_raw_queued_bytes.fetch_add(bytes);
+            e->common_raw_queued_spans.fetch_add(spans);
+        } else {
+            e->common_raw_prefetched_bytes.fetch_add(bytes);
+            e->common_raw_prefetched_spans.fetch_add(spans);
+        }
     }
     return bytes;
 }

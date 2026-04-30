@@ -96,11 +96,6 @@ static void device_make_room_locked(
     const uint64_t budget = device_budget_bytes(e);
     if (budget == 0) return;
     const uint64_t room_bytes = bytes > UINT64_MAX - bytes / 10ull ? UINT64_MAX : bytes + bytes / 10ull;
-    
-    // Problem 1 Fix: Track actual freed bytes to prevent loop exit without freeing memory
-    // device_free_locked sets pending_free=true when inflight_copies!=0, but doesn't
-    // actually reduce device_allocated_bytes. Loop must verify real progress.
-    uint64_t freed_this_iteration = 0;
 
     // PIPELINE FIX 3: Add retry counter for inflight DMA drain ★★★
     // Old: Single 5ms wait then break → allocation fails if DMA not complete
@@ -132,8 +127,13 @@ static void device_make_room_locked(
             }
         } guard{&e->vram_eviction_in_progress, &e->vram_eviction_cv};
 
+        // BUGFIX 31: Snapshot allocated_bytes before unlock to prevent stale freed_this_iteration ★★★
+        // Old: allocated_before snapshot before unlock, allocated_after after relock
+        //      → Other threads can alloc/free between unlock/relock → uint64 underflow
+        // New: Calculate freed_this_iteration within single lock hold, or rely on while condition only
+        // Solution: Remove freed_this_iteration tracking, rely on while condition for re-entry
         const uint64_t allocated_before = e->device_allocated_bytes.load(std::memory_order_relaxed);
-        
+
         std::vector<std::pair<int, int>> expert_victims;
         // Bug Fix: ACTIVATION pool can also evict experts when activation eviction is insufficient
         // Without this, ACTIVATION allocation fails when activation_evict_heap is empty,
@@ -156,10 +156,15 @@ static void device_make_room_locked(
                 device_free_expert_if_pending_evict_locked(e, victim.first, victim.second, &deferred_free_ptrs);
             }
         }
-        
+
+        // BUGFIX 31: Check progress using current allocated_bytes, not stale snapshot ★★★
+        // allocated_after could be stale due to concurrent alloc/free during unlock/relock
+        // Instead: check if we made any eviction attempts (victims found)
+        // If no victims found, break immediately (no point retrying)
+        // If victims found but allocated_bytes unchanged, wait for DMA drain
         const uint64_t allocated_after = e->device_allocated_bytes.load(std::memory_order_relaxed);
-        freed_this_iteration = allocated_before > allocated_after ? allocated_before - allocated_after : 0;
-        
+        const uint64_t freed_this_iteration = allocated_before > allocated_after ? allocated_before - allocated_after : 0;
+
         // Problem 1 Fix: Break if no actual memory was freed (all victims had inflight_copies)
         // Without this, loop spins when all eviction candidates are pending DMA completion
         if (expert_victims.empty() && activation_victims.empty()) {

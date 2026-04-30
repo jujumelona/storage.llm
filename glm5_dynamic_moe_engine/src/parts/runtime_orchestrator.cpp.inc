@@ -67,13 +67,24 @@ static void fill_orchestrator_plan(glm5_pc_engine* engine, const glm5_runtime_or
     float cpu = state ? state->cpu_load_pct : 0.0f;
     float gpu = state ? state->gpu_load_pct : 0.0f;
     if (!state && engine) {
+        // BUGFIX 41: Use cpu_row_active for accurate CPU load estimation ★★★
+        // Old: cpu_active = disk_stage.inflight + pinned_stage.inflight
+        //      → Counts workers blocked on GPU/queue as "CPU busy"
+        // New: Use cpu_row_active (actual matmul workers) + disk_stage.inflight
+        // Rationale: inflight counts "task popped from queue", not "CPU doing work"
+        //            pinned_worker blocked on staging slot = inflight but CPU idle
+        //            Only cpu_row_active and disk_stage.inflight do actual CPU work
+        // Impact: More accurate route_sparse_to_cpu decisions
         const uint32_t cpu_workers = std::max(
             1u,
             runtime_disk_workers(engine) + runtime_pinned_workers(engine));
         const uint32_t gpu_workers = std::max(1u, runtime_gpu_workers(engine));
-        const uint32_t cpu_active =
-            engine->disk_stage.inflight.load(std::memory_order_relaxed) +
-            engine->pinned_stage.inflight.load(std::memory_order_relaxed);
+
+        // Actual CPU work: disk I/O + CPU matmul (not pinned staging, which waits on GPU)
+        const uint32_t disk_active = engine->disk_stage.inflight.load(std::memory_order_relaxed);
+        const uint32_t cpu_matmul_active = engine->cpu_row_active.load(std::memory_order_relaxed);
+        const uint32_t cpu_active = disk_active + cpu_matmul_active;
+
         const uint32_t gpu_active = engine->gpu_stage.inflight.load(std::memory_order_relaxed);
         cpu = std::min(100.0f, 100.0f * (float)cpu_active / (float)cpu_workers);
         gpu = std::min(100.0f, 100.0f * (float)gpu_active / (float)gpu_workers);
@@ -178,6 +189,15 @@ int glm5_pc_engine_orchestrate_moe_step(glm5_pc_engine_t* engine, int current_la
         return 0;
     }
     fill_orchestrator_plan(engine, state, out_plan);
+
+    // BUGFIX 29: Release plan_lock before calling execute_prefetch_plan ★★★
+    // Old: plan_lock held during execute_prefetch_plan → enqueue_stage_or_retry → disk_stage.mtx
+    //      Creates lock order: prefetch_plan_mutex → disk_stage.mtx
+    //      io_worker_loop holds disk_stage.mtx → get_or_map_tensor_shard (potential deadlock)
+    // New: Release plan_lock after filling out_items, before execute_prefetch_plan
+    //      out_items is local snapshot, consistency maintained
+    //      prefetch_plan_clear_seen is idempotent, safe for concurrent access
+    uint32_t kept = 0;
     {
         std::lock_guard<std::mutex> plan_lock(engine->prefetch_plan_mutex);
         prefetch_plan_clear_seen(engine);
@@ -201,7 +221,6 @@ int glm5_pc_engine_orchestrate_moe_step(glm5_pc_engine_t* engine, int current_la
             }
             return 1;
         }
-        uint32_t kept = 0;
         for (uint32_t i = 0; selected_experts && i < selected_count; ++i) {
             orchestrator_append_item(engine, out_items, max_items, &kept, current_layer, selected_experts[i],
                 out_plan->selected_tier, GLM5_PREFETCH_REASON_ROUTER_SELECTED, 1000.0f);
@@ -220,7 +239,8 @@ int glm5_pc_engine_orchestrate_moe_step(glm5_pc_engine_t* engine, int current_la
         if (out_item_count) {
             *out_item_count = kept;
         }
-    }
+    }  // plan_lock released here, before execute_prefetch_plan
+
     // Bug #8: These two activation prefetch paths are mutually exclusive (early return).
     if (out_plan->planned_prefetch_count == 0) {
         prefetch_moe_activation_raw(engine, current_layer);

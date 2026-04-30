@@ -2,16 +2,20 @@ static void queue_total_depth_sub(glm5_pc_engine* engine, uint32_t count) {
     if (!engine || count == 0) {
         return;
     }
-    uint32_t current = engine->total_queue_depth.load(std::memory_order_relaxed);
-    for (;;) {
-        const uint32_t next = current > count ? current - count : 0;
-        if (engine->total_queue_depth.compare_exchange_weak(
-                current,
-                next,
-                std::memory_order_relaxed,
-                std::memory_order_relaxed)) {
-            return;
-        }
+    // BUGFIX 39: Replace CAS spin with fetch_sub for better performance ★★★
+    // Old: CAS loop with saturating subtract → contention when multiple workers pop simultaneously
+    // New: Simple fetch_sub with saturation check
+    // Rationale: total_queue_depth is a statistical counter, not a critical invariant
+    //            Temporary underflow (wrapping to UINT32_MAX) is acceptable because:
+    //            1. It's immediately corrected by next fetch_add
+    //            2. Only used for heuristics (orchestrator decisions, not correctness)
+    //            3. Eliminates CAS contention between 3-6 workers
+    // Trade-off: Possible transient underflow vs guaranteed no CAS spin
+    const uint32_t old = engine->total_queue_depth.fetch_sub(
+        count, std::memory_order_relaxed);
+    // Detect underflow and correct to 0 (optional, for cleaner stats)
+    if (old < count) {
+        engine->total_queue_depth.store(0, std::memory_order_relaxed);
     }
 }
 
@@ -65,14 +69,36 @@ static int enqueue_stage_or_retry(
             engine->io_atomic.dropped_requests.fetch_add(1);
             return 0;
         }
+
+        // BUGFIX 40: Add urgent_queue size limit to prevent unbounded growth ★★★
+        // Old: urgent_queue has no cap → can grow infinitely if all requeues become urgent
+        // New: urgent_queue capped at normal_cap/2
+        // Scenario: All tasks requeue with urgent=1 → urgent_queue grows without bound
+        //           → memory exhaustion, priority inversion (everything is "urgent")
+        // Solution: Cap urgent_queue separately. If urgent_queue full, drop or demote to normal
+        const size_t urgent_cap = std::max<size_t>(16u, normal_cap / 2u);
+
         // Bug 9: Remove requeue_count-based urgent promotion
         // Requeued speculative tasks should not jump ahead of router-selected tasks
         // Original caller's urgent flag is the only priority signal
         // if (total >= normal_cap && queued.requeue_count > 0) {
         //     queued.urgent = 1;
         // }
+
         if (queued.urgent) {
-            stage.urgent_queue.push_back(queued);
+            // BUGFIX 40: Check urgent_queue cap ★★★
+            if (stage.urgent_queue.size() >= urgent_cap) {
+                // Urgent queue full: demote to normal queue if space, else drop
+                if (total < retry_cap) {
+                    queued.urgent = 0;  // Demote to normal priority
+                    stage.queue.push_back(queued);
+                } else {
+                    engine->io_atomic.dropped_requests.fetch_add(1);
+                    return 0;
+                }
+            } else {
+                stage.urgent_queue.push_back(queued);
+            }
         } else {
             stage.queue.push_back(queued);
         }

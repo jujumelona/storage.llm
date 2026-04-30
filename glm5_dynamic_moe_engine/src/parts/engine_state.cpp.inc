@@ -39,19 +39,30 @@ struct glm5_pc_engine {
     glm5_stage_queue disk_stage;
     glm5_stage_queue pinned_stage;
     glm5_stage_queue gpu_stage;
+
+    // BUGFIX 32: Separate hot atomic variables into different cachelines ★★★
+    // Old: total_queue_depth, io_stop, worker_targets in consecutive memory → false sharing
+    // New: Group by access pattern, align each group to 64-byte cacheline
+    // Group 1: Read-mostly by all workers (io_stop + total_queue_depth)
+    alignas(64) std::atomic<bool> io_stop{false};
     std::atomic<uint32_t> total_queue_depth{0};
+
     std::vector<std::thread> io_workers;
     std::vector<std::thread> pinned_workers;
     std::vector<std::thread> gpu_workers;
     std::thread eviction_worker;
-    std::atomic<bool> io_stop{false};
-    std::atomic<uint32_t> disk_worker_target{0};
+
+    // BUGFIX 32: Group 2: Written by orchestrator, read by workers (worker targets)
+    alignas(64) std::atomic<uint32_t> disk_worker_target{0};
     std::atomic<uint32_t> pinned_worker_target{0};
     std::atomic<uint32_t> gpu_worker_target{0};
     std::atomic<uint32_t> runtime_prefetch_window_layers{0};
-    std::atomic<uint32_t> runtime_disk_worker_threads{0};
+
+    // BUGFIX 32: Group 3: Runtime worker counts (read by orchestrator, written by lifecycle)
+    alignas(64) std::atomic<uint32_t> runtime_disk_worker_threads{0};
     std::atomic<uint32_t> runtime_pinned_worker_threads{0};
     std::atomic<uint32_t> runtime_gpu_worker_threads{0};
+
     uint32_t worker_resize_pending_disk{0};
     uint32_t worker_resize_pending_pinned{0};
     uint32_t worker_resize_pending_gpu{0};
@@ -86,6 +97,12 @@ struct glm5_pc_engine {
     std::atomic<uint64_t> common_vram_reserved_bytes{0};
     std::atomic<uint64_t> common_raw_prefetched_bytes{0};
     std::atomic<uint64_t> common_raw_prefetched_spans{0};
+    // BUGFIX 33: Separate counter for queued vs actually transferred bytes ★★★
+    // Old: common_raw_prefetched_bytes mixed enqueue_only and actual transfer
+    // New: common_raw_queued_bytes tracks enqueue_only, prefetched_bytes tracks actual transfer
+    // Prevents stats confusion where "prefetched bytes" includes queued-but-not-transferred
+    std::atomic<uint64_t> common_raw_queued_bytes{0};
+    std::atomic<uint64_t> common_raw_queued_spans{0};
     std::atomic<uint64_t> device_allocated_bytes{0};
     std::atomic<uint64_t> device_allocation_count{0};
     std::atomic<uint64_t> device_fixed_bytes{0};

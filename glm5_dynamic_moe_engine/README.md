@@ -4,8 +4,7 @@ Clean runtime folder for the GLM-5.1 NVFP4 StorageLLM engine.
 
 The primary target is now the offload-native GGUF layout: normal `.gguf` files
 with StorageLLM execution metadata embedded under the `offload.*` GGUF KV
-namespace. The legacy JUJU layout remains supported for existing artifacts.
-Both layouts feed the same storage-first runtime:
+namespace. This layout feeds the storage-first runtime:
 
 ```text
 VRAM first -> RAM second -> DB/blob third
@@ -33,7 +32,7 @@ The preferred dedicated GGUF layout is:
 The engine scans GGUF metadata headers only. If a shard contains
 `offload.metadata_v2`, model-root validation uses the embedded
 `offload.file_count` / `offload.file_index` contract instead of the hardcoded
-JUJU part table. QKV settings come from these GGUF KV entries when present:
+legacy part table. QKV settings come from these GGUF KV entries when present:
 
 ```text
 offload.weight_quant_family
@@ -60,30 +59,6 @@ falls back to this GGUF header contract. `/health` then exposes
 format-selected QKV fields so the runtime state is visible without pretending a
 full executable tensor table was loaded.
 
-The legacy JUJU layout is still accepted:
-
-```text
-<model_root>/
-  tokenizer.json
-  tensors.csv
-  glm5_scale4.gsc4
-  parts/
-    glm5.1-storage-part01.juju
-    glm5.1-storage-part02.juju
-    ...
-    glm5.1-storage-part21.juju
-```
-
-`tokenizer.json`, `tensors.csv`, and `glm5_scale4.gsc4` are runtime metadata.
-They are not training artifacts and they are not regenerated during inference.
-For legacy public distribution, keep those metadata assets beside the JUJU
-parts.
-
-The primary runtime layout uses manifest-relative paths such as
-`parts/glm5.1-storage-part01.juju`. If a browser download folder contains the
-part files directly, passing that folder as `model_root` is also accepted. The
-runtime tries `<model_root>/parts/<file>` first and then `<model_root>/<file>`.
-
 ### Hugging Face Sources
 
 Hugging Face is the provisioning and distribution layer. It is not used as a
@@ -93,47 +68,22 @@ artifacts first, then pass the local folder as `model_root`.
 | Purpose | Repository |
 | --- | --- |
 | Official GLM-5.1 base model | <https://huggingface.co/zai-org/GLM-5.1> |
-| StorageLLM converted JUJU artifacts | <https://huggingface.co/storagejuju/GLM5.1-4q-storage> |
 | StorageLLM offload-native GGUF artifacts | <https://huggingface.co/storagejuju/GLM-5.1-GGUF-MXFP4-MOE-Offload> |
-| Direct browser download page | <https://huggingface.co/storagejuju/GLM5.1-4q-storage/tree/main> |
 | Hugging Face model download docs | <https://huggingface.co/docs/hub/models-downloading> |
 
 Provisioning example for downloading the ready-to-run model files:
-
-```text
-hf download storagejuju/GLM5.1-4q-storage --local-dir <model_root>
-glm5_pc_engine_server <model_root>
-```
-
-Dedicated GGUF provisioning:
 
 ```text
 hf download storagejuju/GLM-5.1-GGUF-MXFP4-MOE-Offload --local-dir <model_root>
 glm5_pc_engine_server <model_root>
 ```
 
-Individual files can also be downloaded through Hugging Face's direct resolve
-URL pattern:
-
-```text
-https://huggingface.co/storagejuju/GLM5.1-4q-storage/resolve/main/<relative-path>?download=true
-```
-
-For example, if the repo contains `parts/glm5.1-storage-part01.juju`, the direct
-file URL is:
-
-```text
-https://huggingface.co/storagejuju/GLM5.1-4q-storage/resolve/main/parts/glm5.1-storage-part01.juju?download=true
-```
-
-The expected StorageLLM Hugging Face repo must contain either the dedicated
-GGUF shards with embedded `offload.*` metadata or the legacy runtime assets:
-`tokenizer.json`, `tensors.csv`, `glm5_scale4.gsc4`, and the
-`glm5.1-storage-part*.juju` files. The official `zai-org/GLM-5.1` repo remains
+The expected StorageLLM Hugging Face repo must contain the dedicated GGUF shards
+with embedded `offload.*` metadata. The official `zai-org/GLM-5.1` repo remains
 the upstream model reference.
 
-When using the shared root `loader/`, GLM-specific codec extras are carried in
-generic aux slots:
+When using the shared root `loader/`, GLM-specific codec extras can be carried
+in generic aux slots:
 
 ```text
 aux0_block -> GLM5 scale4 codebook block
@@ -142,32 +92,6 @@ aux1_block -> GLM5 scale4 index block
 
 The GLM runtime keeps the slot interpretation model-local; the shared loader
 keeps only the generic aux names.
-
-Expected GLM-5.1 storage parts:
-
-| Part | Expected size |
-| --- | ---: |
-| `glm5.1-storage-part01.juju` | 23,643,820,557 |
-| `glm5.1-storage-part02.juju` | 19,369,187,509 |
-| `glm5.1-storage-part03.juju` | 23,176,814,429 |
-| `glm5.1-storage-part04.juju` | 21,367,618,930 |
-| `glm5.1-storage-part05.juju` | 19,194,858,195 |
-| `glm5.1-storage-part06.juju` | 23,175,639,236 |
-| `glm5.1-storage-part07.juju` | 21,379,413,903 |
-| `glm5.1-storage-part08.juju` | 19,198,789,856 |
-| `glm5.1-storage-part09.juju` | 23,199,229,089 |
-| `glm5.1-storage-part10.juju` | 21,380,594,405 |
-| `glm5.1-storage-part11.juju` | 19,207,047,118 |
-| `glm5.1-storage-part12.juju` | 23,185,076,178 |
-| `glm5.1-storage-part13.juju` | 21,374,696,840 |
-| `glm5.1-storage-part14.juju` | 19,198,790,663 |
-| `glm5.1-storage-part15.juju` | 23,179,571,825 |
-| `glm5.1-storage-part16.juju` | 21,513,876,253 |
-| `glm5.1-storage-part17.juju` | 19,454,346,168 |
-| `glm5.1-storage-part18.juju` | 23,524,768,312 |
-| `glm5.1-storage-part19.juju` | 21,713,995,761 |
-| `glm5.1-storage-part20.juju` | 16,166,004,403 |
-| `glm5.1-storage-part21.juju` | 41,264,048,735 |
 
 ## Public API
 
@@ -316,7 +240,7 @@ a slower operating mode rather than the target fast path.
 
 - `../engine_core/core/mmap_loader.*`: shared mmap file mapping.
 - `../engine_core/kv/kv_qkv.*`: default packed QKV cache quantization.
-- `../loader/*`: JUJU/manifest loading and path helpers.
+- `../loader/*`: manifest loading and path helpers.
 
 ## What This Folder Drops
 
@@ -563,7 +487,7 @@ Useful overrides:
 
 ```bash
 PROMPT_TOKENS=512 OUTPUT_TOKENS=256 NUM_PROMPTS=50 CONCURRENCY=1 bash benchmarks/run_openai_benchmarks.sh
-TOKENIZER=/teamspace/studios/this_studio/storagellm_bench/models/GLM5.1-4q-storage bash benchmarks/run_openai_benchmarks.sh
+TOKENIZER=/teamspace/studios/this_studio/storagellm_bench/models/GLM-5.1-GGUF-MXFP4-MOE-Offload bash benchmarks/run_openai_benchmarks.sh
 ```
 
 Results are written under

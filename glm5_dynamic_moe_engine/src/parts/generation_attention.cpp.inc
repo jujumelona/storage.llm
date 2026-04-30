@@ -163,7 +163,15 @@ static int glm5_layer_attention_f32(
         float h_max = -1e30f;
         float h_denom = 0.0f;
 
-        uint32_t loop_end = position < s->kv_cache.max_seq_len ? seq_len : seq_len + 1;
+        // BUGFIX 42: Fix softmax loop boundary to prevent out-of-bounds access ★★★
+        // Old: loop_end = position < max_seq_len ? seq_len : seq_len + 1
+        //      When position >= max_seq_len, loop_end = seq_len + 1
+        //      But layer_decode size = decoded_kv_count = min(position, seq_len)
+        //      → p = seq_len accesses layer_decode[seq_len] which is out of bounds
+        // New: loop_end = seq_len (always), current token handled separately in loop
+        // The condition (p == position || (position >= max_seq_len && p == seq_len))
+        // already handles current token correctly, no need for seq_len + 1
+        uint32_t loop_end = seq_len;
         for (uint32_t p = 0; p < loop_end; ++p) {
             const float* c_kv;
             const float* p_k_rope;

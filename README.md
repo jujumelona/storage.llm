@@ -11,7 +11,7 @@ This repository does not ship model weights.
 
 - `engine_core/core/` - shared mmap loader.
 - `engine_core/kv/` - default packed QKV cache implementation.
-- `loader/` - shared JUJU/manifest loader and path helpers.
+- `loader/` - shared manifest loader and path helpers.
 - `glm5_dynamic_moe_engine/` - model runtime folder; see its README for
   model-specific API, metadata, numeric helpers, planning, and examples.
 
@@ -40,7 +40,7 @@ engine_core/core/mmap_loader.cpp
 engine_core/kv/kv_qkv.cpp
 ```
 
-Add `loader/*.cpp` when using the shared manifest/JUJU loader from C++.
+Add `loader/*.cpp` when using the shared manifest loader from C++.
 Model-specific source lists belong in each model folder's README.
 
 ## Runtime Policy
@@ -62,8 +62,8 @@ only as a debug/fallback path when the loaded format does not forbid it.
 
 The GLM5.1 model runtime lives in `glm5_dynamic_moe_engine/`. Its README is the
 source of truth for model layout, the local OpenAI-compatible API, automatic
-runtime selection, the dedicated GGUF/JUJU layouts, QKV cache contract, and
-request shapes:
+runtime selection, the dedicated GGUF layout, QKV cache contract, and request
+shapes:
 
 ```text
 glm5_dynamic_moe_engine/README.md
@@ -74,7 +74,6 @@ path keeps the `.gguf` file extension and embeds StorageLLM offload metadata in
 `offload.*` GGUF KV entries:
 
 ```text
-https://huggingface.co/storagejuju/GLM5.1-4q-storage
 https://huggingface.co/storagejuju/GLM-5.1-GGUF-MXFP4-MOE-Offload
 ```
 
@@ -88,10 +87,10 @@ For a new GGUF variant, edit only the notebook's `CHANGE HERE` block. In the
 common case `SOURCE_HF_REPO_ID`, `SOURCE_SUBDIR`, and `TARGET_HF_OWNER` are
 enough; shard prefix/count are auto-discovered from Hugging Face.
 
-Download the converted StorageLLM artifact before starting the server:
+Download the converted StorageLLM GGUF artifact before starting the server:
 
 ```text
-hf download storagejuju/GLM5.1-4q-storage --local-dir <model_root>
+hf download storagejuju/GLM-5.1-GGUF-MXFP4-MOE-Offload --local-dir <model_root>
 ```
 
 The normal local API command is only the server binary plus the model root. The

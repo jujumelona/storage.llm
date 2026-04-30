@@ -24,22 +24,36 @@ struct alignas(64) glm5_io_atomic_stats {
     alignas(64) std::atomic<uint64_t> bytes_pinned_to_gpu{0};
     std::atomic<uint64_t> gpu_stage_done{0};
     std::atomic<uint64_t> bytes_sync_h2d_fallback{0};
-    std::atomic<uint64_t> device_alloc_failures{0};
-    std::atomic<uint64_t> device_copy_failures{0};
 
-    // --- Cache line 5: direct upload + topology ---
+    // BUGFIX 38: Separate hot error counters to prevent false sharing ★★★
+    // Old: device_alloc_failures and device_copy_failures in same cacheline as gpu_stage_done
+    // New: Each hot counter gets its own cacheline
+    // Rationale: Multiple io_workers update device_copy_failures simultaneously
+    //            → cacheline ping-pong with gpu_stage_done updates
+    // --- Cache line 5: device allocation failures (hot, written by all workers) ---
+    alignas(64) std::atomic<uint64_t> device_alloc_failures{0};
+
+    // --- Cache line 6: device copy failures (hot, written by all workers) ---
+    alignas(64) std::atomic<uint64_t> device_copy_failures{0};
+
+    // --- Cache line 7: direct upload + topology ---
     alignas(64) std::atomic<uint64_t> bytes_direct_to_gpu{0};
     std::atomic<uint64_t> direct_stage_done{0};
     std::atomic<uint64_t> topology_predictions{0};
     std::atomic<uint64_t> topology_updates{0};
 
-    // --- Cache line 6: status flags (read-mostly) ---
+    // BUGFIX 38: Separate staging slot contention counter ★★★
+    // Old: staging_slot_contention shared cacheline with status flags
+    // New: Own cacheline (updated by all pinned_workers on every acquire attempt)
+    // --- Cache line 8: staging slot contention (extremely hot) ---
+    alignas(64) std::atomic<uint64_t> staging_slot_contention{0};
+    std::atomic<uint64_t> staging_slot_waits{0};
+
+    // --- Cache line 9: status flags (read-mostly) ---
     alignas(64) std::atomic<uint32_t> active_path{0};
     std::atomic<uint32_t> pinned_host_active{0};
     std::atomic<uint32_t> directstorage_active{0};
     std::atomic<uint32_t> gpudirect_storage_active{0};
     std::atomic<uint32_t> bam_nvme_active{0};
     std::atomic<uint32_t> staging_slot_deficit{0};
-    std::atomic<uint64_t> staging_slot_waits{0};
-    std::atomic<uint64_t> staging_slot_contention{0};
 };

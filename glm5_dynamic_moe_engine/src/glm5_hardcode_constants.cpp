@@ -32,9 +32,9 @@ static const glm5_storage_constants_t kGlm5StorageConstants = {
     1990656ull,
     150994944ull,
     5737807872ull,
-    "storagejuju/GLM5.1-4q-storage",
-    ".juju",
-    "G51STOR1"
+    "storagejuju/GLM-5.1-GGUF-MXFP4-MOE-Offload",
+    ".gguf",
+    "GGUF"
 };
 
 const glm5_storage_constants_t* glm5_storage_constants(void) {

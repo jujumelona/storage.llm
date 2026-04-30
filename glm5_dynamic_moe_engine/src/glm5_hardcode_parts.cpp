@@ -1,5 +1,8 @@
 #include "glm5_pc_engine.h"
 
+// Legacy raw-span backing map. Current model provisioning should use GGUF
+// shards with offload.* metadata; this table is kept only for code paths that
+// still resolve hardcoded raw tensor spans by historical part id.
 static const glm5_storage_part_spec_t kGlm5Parts[] = {
     {1,"parts/glm5.1-storage-part01.juju",23643820557ull,8499,931,0,120,4036552192ull,19603062976ull,4036552192ull,1,4,1,5},
     {2,"parts/glm5.1-storage-part02.juju",19369187509ull,7806,861,0,57,1282371072ull,18083020992ull,1282371072ull,5,4,4,6},

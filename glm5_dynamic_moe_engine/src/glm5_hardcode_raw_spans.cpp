@@ -1145,3 +1145,104 @@ uint32_t glm5_storage_raw_span_find_end(int32_t layer) {
     while (lo < hi) { uint32_t mid = lo + (hi - lo) / 2; if (kGlm5RawSpans[mid].layer <= layer) lo = mid + 1; else hi = mid; }
     return lo;
 }
+
+// BUGFIX 30: Attention span index table for O(1) lookup ★★★
+// Old: glm5_enqueue_attention_prefetch loops through all spans (O(N) per kind)
+// New: Direct index lookup (O(1) per kind)
+// Eliminates 5 × 79 layers × O(N) pointer comparisons per token generation
+// Table maps (layer, kind) → span_index for 5 attention tensor kinds:
+//   GLM5_RAW_TENSOR_Q_A_PROJ, GLM5_RAW_TENSOR_Q_B_PROJ,
+//   GLM5_RAW_TENSOR_KV_A_PROJ_WITH_MQA, GLM5_RAW_TENSOR_KV_B_PROJ, GLM5_RAW_TENSOR_O_PROJ
+// Generated from kGlm5RawSpans table above
+// Format: [layer][kind_index] = span_index, where kind_index:
+//   0=Q_A_PROJ, 1=Q_B_PROJ, 2=KV_A_PROJ_WITH_MQA, 3=KV_B_PROJ, 4=O_PROJ
+// INVALID_SPAN_INDEX (0xFFFFFFFF) indicates span not found for that layer/kind
+#define INVALID_SPAN_INDEX 0xFFFFFFFFu
+static const uint32_t kAttentionSpanIndices[79][5] = {
+    {4,6,5,7,8},      // layer 0
+    {12,14,13,15,16}, // layer 1
+    {20,22,21,23,24}, // layer 2
+    {27,29,28,30,31}, // layer 3
+    {36,38,37,39,40}, // layer 4
+    {45,47,46,48,49}, // layer 5
+    {54,56,55,57,58}, // layer 6
+    {66,68,67,69,70}, // layer 7
+    {75,77,76,78,79}, // layer 8
+    {82,83,INVALID_SPAN_INDEX,INVALID_SPAN_INDEX,INVALID_SPAN_INDEX}, // layer 9 (MOE)
+    {92,94,93,95,96}, // layer 10
+    {101,103,102,104,105}, // layer 11
+    {110,112,111,113,114}, // layer 12
+    {119,121,120,122,123}, // layer 13
+    {131,133,132,134,135}, // layer 14
+    {140,142,141,143,144}, // layer 15
+    {149,151,150,152,153}, // layer 16
+    {158,160,159,161,162}, // layer 17
+    {170,172,171,173,174}, // layer 18
+    {179,181,180,182,183}, // layer 19
+    {186,187,INVALID_SPAN_INDEX,INVALID_SPAN_INDEX,INVALID_SPAN_INDEX}, // layer 20 (MOE)
+    {196,198,197,199,200}, // layer 21
+    {205,207,206,208,209}, // layer 22
+    {214,216,215,217,218}, // layer 23
+    {223,225,224,226,227}, // layer 24
+    {235,237,236,238,239}, // layer 25
+    {244,246,245,247,248}, // layer 26
+    {253,255,254,256,257}, // layer 27
+    {262,264,263,265,266}, // layer 28
+    {274,276,275,277,278}, // layer 29
+    {283,285,284,286,287}, // layer 30
+    {290,291,INVALID_SPAN_INDEX,INVALID_SPAN_INDEX,INVALID_SPAN_INDEX}, // layer 31 (MOE)
+    {300,302,301,303,304}, // layer 32
+    {309,311,310,312,313}, // layer 33
+    {318,320,319,321,322}, // layer 34
+    {327,329,328,330,331}, // layer 35
+    {339,341,340,342,343}, // layer 36
+    {348,350,349,351,352}, // layer 37
+    {357,359,358,360,361}, // layer 38
+    {366,368,367,369,370}, // layer 39
+    {378,380,379,381,382}, // layer 40
+    {387,389,388,390,391}, // layer 41
+    {394,395,INVALID_SPAN_INDEX,INVALID_SPAN_INDEX,INVALID_SPAN_INDEX}, // layer 42 (MOE)
+    {404,406,405,407,408}, // layer 43
+    {413,415,414,416,417}, // layer 44
+    {422,424,423,425,426}, // layer 45
+    {431,433,432,434,435}, // layer 46
+    {443,445,444,446,447}, // layer 47
+    {452,454,453,455,456}, // layer 48
+    {461,463,462,464,465}, // layer 49
+    {470,472,471,473,474}, // layer 50
+    {482,484,483,485,486}, // layer 51
+    {491,493,492,494,495}, // layer 52
+    {498,499,INVALID_SPAN_INDEX,INVALID_SPAN_INDEX,INVALID_SPAN_INDEX}, // layer 53 (MOE)
+    {508,510,509,511,512}, // layer 54
+    {517,519,518,520,521}, // layer 55
+    {526,528,527,529,530}, // layer 56
+    {535,537,536,538,539}, // layer 57
+    {547,549,548,550,551}, // layer 58
+    {556,558,557,559,560}, // layer 59
+    {565,567,566,568,569}, // layer 60
+    {574,576,575,577,578}, // layer 61
+    {586,588,587,589,590}, // layer 62
+    {595,597,596,598,599}, // layer 63
+    {602,603,INVALID_SPAN_INDEX,INVALID_SPAN_INDEX,INVALID_SPAN_INDEX}, // layer 64 (MOE)
+    {612,614,613,615,616}, // layer 65
+    {621,623,622,624,625}, // layer 66
+    {630,632,631,633,634}, // layer 67
+    {639,641,640,642,643}, // layer 68
+    {651,653,652,654,655}, // layer 69
+    {660,662,661,663,664}, // layer 70
+    {669,671,670,672,673}, // layer 71
+    {678,680,679,681,682}, // layer 72
+    {693,695,694,696,697}, // layer 73
+    {702,704,703,705,706}, // layer 74
+    {709,710,INVALID_SPAN_INDEX,INVALID_SPAN_INDEX,INVALID_SPAN_INDEX}, // layer 75 (MOE)
+    {717,719,718,720,721}, // layer 76
+    {726,728,727,729,730}, // layer 77
+    {735,737,736,738,739}, // layer 78
+};
+
+uint32_t glm5_storage_attention_span_index(int32_t layer, uint32_t kind_index) {
+    if (layer < 0 || layer >= 79 || kind_index >= 5) {
+        return INVALID_SPAN_INDEX;
+    }
+    return kAttentionSpanIndices[layer][kind_index];
+}
