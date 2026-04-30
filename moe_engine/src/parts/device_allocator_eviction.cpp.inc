@@ -242,7 +242,9 @@ static void device_make_room_locked(
             e->ram_eviction_cv.notify_all(); // BUGFIX 109: Use ram_eviction_cv
 
             device_lock.unlock();
-            uint32_t wait_ms = 1u << std::min(dma_drain_retries - 1, 2u); // 1, 2, 4, 4
+            const uint32_t retry_exp =
+                dma_drain_retries > 1 ? static_cast<uint32_t>(dma_drain_retries - 1) : 0u;
+            const uint32_t wait_ms = 1u << std::min<uint32_t>(retry_exp, 2u); // 1, 2, 4, 4
             std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
             device_lock.lock();
 

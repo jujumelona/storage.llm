@@ -135,6 +135,9 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
     uint64_t last_vram_room = initial_budget > initial_allocated ? initial_budget - initial_allocated : 0;
     uint32_t staging_turn = 0;
     std::deque<std::pair<moe_prefetch_task, moe_transfer_stage_t>> local_requeues;
+    const auto should_stop = [&]() {
+        return engine->io_stop.load(std::memory_order_relaxed);
+    };
     auto preserve_requeue = [&](const moe_prefetch_task& retry_task, moe_transfer_stage_t retry_stage) {
         if (!io_worker_requeue_disk_task(engine, retry_task, retry_stage, 3u, 1u)) {
             // Bug Fix: Cap local_requeues size to prevent unbounded growth

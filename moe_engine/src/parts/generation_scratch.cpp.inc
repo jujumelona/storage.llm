@@ -199,7 +199,7 @@ static void moe_decode_scratch_resize(
     s->expert_out_pool.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)hidden);
     moe_rope_table_resize(&s->rope_k_cos, &s->rope_k_sin, moe_MLA_K_ROPE_DIM, moe_ROPE_THETA);
     moe_rope_table_resize(&s->rope_q_cos, &s->rope_q_sin, moe_MLA_ROPE_DIM, moe_ROPE_THETA);
-    if (s->kv_cache.num_layers != c->num_hidden_layers || s->kv_cache.data.empty() ||
+    if (s->kv_cache.num_layers != c->num_hidden_layers || s->kv_cache.data == nullptr ||
         (pre_allocate_kv && s->kv_cache.max_seq_len < moe_MLA_MAX_SEQ_LEN)) {
         s->kv_cache.init(c->num_hidden_layers, pre_allocate_kv != 0);
         s->kv_decode_layers.clear();
