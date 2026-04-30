@@ -41,7 +41,8 @@ static int enqueue_tensor_prefetch(
         // Fallback: truly synchronous (no IO workers)
         engine->io_atomic.active_path.store(static_cast<uint32_t>(choose_active_io_path(engine)));
         const int ok = prefetch_tensor_record(engine, engine->tensors[tensor_index]);
-        if (ok && target_tier == GLM5_TIER_VRAM) {
+        if (ok && target_tier == GLM5_TIER_VRAM &&
+            engine_has_device_upload_workers(engine)) {
             const int gpu_ok = prefetch_tensor_pinned_to_gpu(engine, engine->tensors[tensor_index]);
             device_stream_destroy_current(engine);
             if (!gpu_ok) {

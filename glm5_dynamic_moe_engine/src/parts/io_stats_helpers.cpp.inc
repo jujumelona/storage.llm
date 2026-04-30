@@ -25,14 +25,12 @@ static void reset_io_stats_for_config(glm5_pc_engine* engine) {
     engine->io_atomic.staging_slot_contention.store(0);
     engine->io_atomic.topology_predictions.store(0);
     engine->io_atomic.topology_updates.store(0);
-    engine->io_atomic.active_path.store(static_cast<uint32_t>(choose_active_io_path(engine)));
+    const glm5_io_path_t active_path = choose_active_io_path(engine);
+    engine->io_atomic.active_path.store(static_cast<uint32_t>(active_path));
     engine->io_atomic.pinned_host_active.store(engine->staging_pinned ? 1u : 0u);
-    engine->io_atomic.directstorage_active.store(
-        engine->io_config.enable_directstorage && compiled_directstorage_available() ? 1u : 0u);
-    engine->io_atomic.gpudirect_storage_active.store(
-        engine->io_config.enable_gpudirect_storage && compiled_gpudirect_available() ? 1u : 0u);
-    engine->io_atomic.bam_nvme_active.store(
-        engine->io_config.enable_bam_nvme && compiled_bam_nvme_available() ? 1u : 0u);
+    engine->io_atomic.directstorage_active.store(active_path == GLM5_IO_PATH_DIRECTSTORAGE ? 1u : 0u);
+    engine->io_atomic.gpudirect_storage_active.store(active_path == GLM5_IO_PATH_GPUDIRECT_STORAGE ? 1u : 0u);
+    engine->io_atomic.bam_nvme_active.store(active_path == GLM5_IO_PATH_BAM_NVME ? 1u : 0u);
 }
 
 static void snapshot_io_stats(const glm5_pc_engine* engine, glm5_io_stats_t* out) {

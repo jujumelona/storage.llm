@@ -78,7 +78,7 @@ static int device_copy_tensor_from_host(
         return 0;
     }
     CUstream stream = device_tensor_stream_current(e);
-    const int async_copy = stream && e->cuda.cuMemcpyHtoDAsync;
+    const int async_copy = device_backend_async_h2d_available(e, stream, 1);
     const uint64_t key = device_key_tensor(r);
     CUdeviceptr dst = 0;
     if (!device_prepare_tensor_allocation(e, key, bytes, pool, async_copy, &dst)) {
@@ -86,12 +86,12 @@ static int device_copy_tensor_from_host(
     }
 
     const int ok = async_copy ?
-        e->cuda.cuMemcpyHtoDAsync(dst, host, (size_t)bytes, stream) == 0 :
-        (e->cuda.cuMemcpyHtoD && e->cuda.cuMemcpyHtoD(dst, host, (size_t)bytes) == 0);
+        device_backend_copy_h2d_async(e, dst, host, bytes, stream) :
+        device_backend_copy_h2d_sync(e, dst, host, bytes);
     if (!ok) {
         e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
-        if (async_copy && e->cuda.cuStreamSynchronize) {
-            e->cuda.cuStreamSynchronize(stream);
+        if (async_copy) {
+            device_backend_stream_sync(e, stream);
         }
         if (async_copy) {
             device_cancel_pending_copy(e, key);
@@ -140,8 +140,12 @@ static int device_copy_tensor(
     // Fix 55: Try staging fast-path — consolidate 3 ranges into pinned buffer
     // for single true-async DMA instead of 3 false-async non-pinned copies
     // Bug #9: GPU direct uses second half of slot pool (for_pinned = false)
+    // PIPELINE FIX 17: Use thread-local turn counter to reduce slot contention ★★
+    // Old: worker_index=0, turn=0 fixed → all workers compete for slot 0
+    // New: thread-local turn counter → workers spread across slot pool
+    static thread_local uint32_t tl_device_copy_turn = 0;
     const uint32_t slot_idx = (e->staging_slots.size() > 0 && bytes <= e->staging_slot_size)
-        ? acquire_staging_slot(e, 0u, 0u, false) : UINT32_MAX;
+        ? acquire_staging_slot(e, 0u, tl_device_copy_turn++, false) : UINT32_MAX;
 
     if (slot_idx != UINT32_MAX) {
         // Staging fast-path: memcpy ranges → pinned staging → single H2D async
@@ -151,30 +155,42 @@ static int device_copy_tensor(
             return 0;
         }
         uint8_t* staging_buf = slot.buf;
+        // PIPELINE FIX 16: Use AVX2 non-temporal copy instead of plain memcpy ★★★
+        // Old: plain memcpy → L1/L2 cache pollution, ~1.5-2x slower
+        // New: copy_mapped_range_to_staging_linear → AVX2 streaming stores
+        // Matches io_worker performance for mmap→pinned copies
         uint64_t offset = 0;
+        int copy_ok = 1;
         for (const auto& range : ranges) {
             if (!range[1]) continue;
             const uint8_t* src = static_cast<const uint8_t*>(mmap_get_ptr(shard, static_cast<size_t>(range[0])));
             if (!src) {
-                release_staging_slot(e, slot_idx);
-                return 0;
+                copy_ok = 0;
+                break;
             }
-            memcpy(staging_buf + offset, src, (size_t)range[1]);
-            offset += range[1];
+            const uint64_t copied = copy_mapped_range_to_staging_linear(e, src, range[1], slot_idx, &offset);
+            if (copied != range[1]) {
+                copy_ok = 0;
+                break;
+            }
         }
-        const int async_copy = stream && e->cuda.cuMemcpyHtoDAsync
-                             && e->staging_slots[slot_idx].pinned;
+        if (!copy_ok) {
+            release_staging_slot(e, slot_idx);
+            return 0;
+        }
+        const int async_copy = device_backend_async_h2d_available(
+            e, stream, e->staging_slots[slot_idx].pinned ? 1 : 0);
         if (!device_prepare_tensor_allocation(e, key, bytes, pool, async_copy, &dst)) {
             release_staging_slot(e, slot_idx);
             return 0;
         }
         int ok = 0;
         if (async_copy) {
-            ok = e->cuda.cuMemcpyHtoDAsync(dst, staging_buf, (size_t)bytes, stream) == 0;
+            ok = device_backend_copy_h2d_async(e, dst, staging_buf, bytes, stream);
             // Fix 63: Do NOT sync here — defer slot release to device_stream_sync_current
             // This enables true async DMA pipelining across batch
         } else {
-            ok = e->cuda.cuMemcpyHtoD && e->cuda.cuMemcpyHtoD(dst, staging_buf, (size_t)bytes) == 0;
+            ok = device_backend_copy_h2d_sync(e, dst, staging_buf, bytes);
         }
         if (ok && async_copy) {
             // Fix 63: Defer slot release — GPU still reading from staging buffer
@@ -213,7 +229,7 @@ static int device_copy_tensor(
             device_free_key(e, key);
             return 0;
         }
-        if (!e->cuda.cuMemcpyHtoD || e->cuda.cuMemcpyHtoD(cur, src, (size_t)range[1]) != 0) {
+        if (!device_backend_copy_h2d_sync(e, cur, src, range[1])) {
             e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
             device_free_key(e, key);
             return 0;

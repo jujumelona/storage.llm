@@ -9,13 +9,21 @@ debug.txt
 .codex_msvc_check/
 .glm5_model_lib_cache/
 .tmp_build/
+.tmp_*/
+/build/
 __pycache__/
 *.backup
 
 # Local conversion notebooks/scripts do not belong in this runtime repo.
 /tools/
 /glm51_runtime_colab/
+/colab/
 *.ipynb
+
+# Public generic Colab notebook template. Local conversion notebooks remain ignored.
+!/notebooks/
+!/notebooks/README.md
+!/notebooks/GGUF_Offload_Metadata_Patch_Stream.ipynb
 
 # Model/runtime artifacts belong in the external model repo, not this engine repo.
 /tokenizer.json
@@ -27,6 +35,12 @@ glm5_dynamic_moe_engine/model_profiles/*/tensors.csv
 
 # Local split/refactor scratch files. Only commit part files that are included
 # by the runtime entrypoint or explicitly documented as source.
+/Makefile
+/build_and_run.sh
+/convert_to_modular.sh
+/glm5_dynamic_moe_engine/src/device_module.cpp
+/glm5_dynamic_moe_engine/src/glm5_internal.h
+/glm5_dynamic_moe_engine/src/glm5_pch.h
 glm5_dynamic_moe_engine/src/parts/gen_*.cpp.inc
 glm5_dynamic_moe_engine/src/parts/raw_bf16_convert.cpp.inc
 glm5_dynamic_moe_engine/src/parts/raw_span_helpers.cpp.inc

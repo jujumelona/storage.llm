@@ -76,10 +76,14 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                 local_requeues.pop_front();
                 continue;
             }
-            // Bug Fix: Wait for queue space instead of spinning
-            // Without this, worker spins when queues are full, wasting CPU
-            std::unique_lock<std::mutex> lock(engine->disk_stage.mtx);
-            engine->disk_stage.pop_cv.wait_for(lock, std::chrono::milliseconds(2));
+            // PIPELINE FIX 10: Wait on correct CV based on requeue target ★★★
+            // Old: Always waited on disk_stage.pop_cv even when gpu_stage was full
+            // New: Wait on gpu_stage.pop_cv when target is GPU, disk_stage.pop_cv otherwise
+            // Eliminates 2ms polling delay when GPU stage is the actual bottleneck
+            glm5_stage_queue* target_stage = (pending.second == GLM5_TRANSFER_STAGE_PINNED_TO_GPU)
+                ? &engine->gpu_stage : &engine->disk_stage;
+            std::unique_lock<std::mutex> lock(target_stage->mtx);
+            target_stage->pop_cv.wait_for(lock, std::chrono::milliseconds(2));
             continue;
         }
         // Fix 10: GDS/mmap routing changes rarely — refresh every 10 tasks.
@@ -107,10 +111,18 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
         // immediately before memcpy, pages may not be in RAM yet → page fault blocks IO worker.
         // Solution: peek next task and touch its pages NOW, while processing current task.
         // By the time we process next task, its pages will likely be in RAM.
+        // PIPELINE FIX 11: Multi-task lookahead for multiple disk workers ★★
+        // Old: Single lookahead → only helps 1 worker, others still hit page faults
+        // New: Lookahead N tasks where N = disk_workers → all workers benefit
         {
-            glm5_prefetch_task lookahead_task{};
-            if (peek_stage_task(engine, engine->disk_stage, &lookahead_task)) {
-                // Only lookahead for tensor tasks, not raw_span tasks
+            const uint32_t n_workers = runtime_disk_workers(engine);
+            std::unique_lock<std::mutex> peek_lock(engine->disk_stage.mtx);
+            uint32_t peeked = 0;
+            const uint32_t max_lookahead = std::min(n_workers, 4u);  // Cap at 4 to limit lock time
+
+            // Peek urgent queue first, then normal queue
+            for (const auto& lookahead_task : engine->disk_stage.urgent_queue) {
+                if (peeked >= max_lookahead) break;
                 if (lookahead_task.tensor_index >= 0 &&
                     (size_t)lookahead_task.tensor_index < engine->tensors.size() &&
                     lookahead_task.raw_span_index < 0) {
@@ -120,6 +132,24 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                         const uint8_t* next_src = static_cast<const uint8_t*>(mmap_get_ptr(next_shard, 0));
                         if (next_src) {
                             touch_mapped_range(next_src, tensor_stream_bytes(next_rec));
+                            ++peeked;
+                        }
+                    }
+                }
+            }
+
+            for (const auto& lookahead_task : engine->disk_stage.queue) {
+                if (peeked >= max_lookahead) break;
+                if (lookahead_task.tensor_index >= 0 &&
+                    (size_t)lookahead_task.tensor_index < engine->tensors.size() &&
+                    lookahead_task.raw_span_index < 0) {
+                    const glm5_tensor_record& next_rec = engine->tensors[lookahead_task.tensor_index];
+                    mmap_context_t* next_shard = get_or_map_tensor_shard(engine, next_rec);
+                    if (next_shard) {
+                        const uint8_t* next_src = static_cast<const uint8_t*>(mmap_get_ptr(next_shard, 0));
+                        if (next_src) {
+                            touch_mapped_range(next_src, tensor_stream_bytes(next_rec));
+                            ++peeked;
                         }
                     }
                 }
@@ -164,6 +194,9 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
         } else if (task.tensor_index < engine->tensors.size()) {
             const glm5_tensor_record& rec = engine->tensors[task.tensor_index];
             if (task.stage == GLM5_TRANSFER_STAGE_RAM_TO_PINNED &&
+                engine_bypass_staging_pipeline(engine)) {
+                ok = prefetch_tensor_disk_to_ram(engine, rec);
+            } else if (task.stage == GLM5_TRANSFER_STAGE_RAM_TO_PINNED &&
                 engine->io_config.enable_multistage_pipeline && engine->staging) {
                 if (enqueue_stage_or_retry(engine, engine->pinned_stage, task)) {
                     ok = 1;
@@ -188,6 +221,57 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                     }
                 }
             } else {
+                bool staged_direct_to_gpu = false;
+                if (task.target_tier == GLM5_TIER_VRAM &&
+                    active_path == GLM5_IO_PATH_PINNED_HOST &&
+                    engine_has_device_upload_workers(engine) &&
+                    engine->backend_caps.supports_fixed_read_staging &&
+                    engine->io_config.enable_multistage_pipeline &&
+                    engine->staging &&
+                    engine->staging_pinned &&
+                    tensor_stream_bytes(rec) >= engine->io_config.direct_upload_min_bytes) {
+                    const uint32_t gpu_hard_cap = engine->io_config.max_prefetch_queue;
+                    const uint32_t gpu_depth_pre = engine->gpu_stage.depth.load(std::memory_order_relaxed);
+                    if (gpu_hard_cap > 0 && gpu_depth_pre >= gpu_hard_cap) {
+                        ok = preserve_requeue(task, GLM5_TRANSFER_STAGE_DISK_TO_RAM);
+                        terminal = 0;
+                        staged_direct_to_gpu = true;
+                    } else {
+                        const uint32_t slot = acquire_staging_slot(
+                            engine,
+                            worker_index,
+                            refresh_turn,
+                            true
+                        );
+                        if (slot != UINT32_MAX) {
+                            uint64_t staging_bytes = 0;
+                            if (prefetch_tensor_file_to_pinned(engine, rec, slot, &staging_bytes)) {
+                                glm5_prefetch_task next = task;
+                                next.stage = GLM5_TRANSFER_STAGE_PINNED_TO_GPU;
+                                next.staging_slot = slot;
+                                next.staging_bytes = staging_bytes;
+                                next.staging_valid = staging_bytes == tensor_stream_bytes(rec) ? 1 : 0;
+                                if (next.staging_valid &&
+                                    enqueue_stage_or_retry(engine, engine->gpu_stage, next)) {
+                                    ok = 1;
+                                    terminal = 0;
+                                    staged_direct_to_gpu = true;
+                                    engine->gpu_stage.cv.notify_one();
+                                } else {
+                                    release_staging_slot(engine, slot);
+                                    if (next.staging_valid) {
+                                        ok = preserve_requeue(task, GLM5_TRANSFER_STAGE_DISK_TO_RAM);
+                                        terminal = 0;
+                                        staged_direct_to_gpu = true;
+                                    }
+                                }
+                            } else {
+                                release_staging_slot(engine, slot);
+                            }
+                        }
+                    }
+                }
+                if (!staged_direct_to_gpu) {
                 // Critical Fix 5: Check pinned_stage capacity BEFORE disk read
                 // Reading from disk then discovering pinned_stage is full wastes disk bandwidth.
                 // Check hard-cap before prefetch_tensor_disk_to_ram to avoid unnecessary I/O.
@@ -250,7 +334,8 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                         ok = preserve_requeue(next, GLM5_TRANSFER_STAGE_RAM_TO_PINNED);
                         terminal = 0;
                     }
-                } else if (ok && task.target_tier == GLM5_TIER_VRAM) {
+                } else if (ok && task.target_tier == GLM5_TIER_VRAM &&
+                    engine_has_device_upload_workers(engine)) {
                     ok = prefetch_tensor_pinned_to_gpu(engine, rec, UINT32_MAX, 0, 1, 0);
                     if (ok == GLM5_DEVICE_COPY_BACKPRESSURE) {
                         // Bug #4: GPU full, re-enqueue to gpu_stage not disk_stage
@@ -262,6 +347,7 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                             engine->gpu_stage.cv.notify_one();
                         }
                     }
+                }
                 }
             }
         }
@@ -285,22 +371,34 @@ static void io_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                 // Bug Fix: TOCTOU uint64 underflow. tier_used() called twice without lock.
                 // If another thread evicts between calls, second tier_used() < target → underflow.
                 // Snapshot once, check both conditions before subtraction.
-                const uint64_t vram_used_snap = tier_used(engine, GLM5_TIER_VRAM);
-                const uint64_t vram_target = (vram_bud * 90ull) / 100ull;
-                if (vram_bud > 0 && vram_used_snap > (vram_bud * 97ull) / 100ull && vram_used_snap > vram_target) {
+                // PIPELINE FIX 2: Lower VRAM preemptive eviction threshold 97%→90% ★★★
+                // Old: 97% trigger → only 3% headroom → blocking eviction on hot path
+                // New: 90% trigger, evict to 80% → 10% headroom prevents token latency spikes
+                // Trade-off: More frequent eviction, slightly higher CPU usage, but eliminates
+                // synchronous eviction during token generation. GLM-5.1 top-k=8 router has high
+                // expert reuse, so hotness-based eviction rarely evicts hot experts.
+                // PIPELINE FIX 12: Refresh VRAM usage snapshot before eviction ★★
+                // Old: Stale snapshot → evict wrong amount (other workers changed VRAM usage)
+                // New: Fresh snapshot right before demote_cold_until → accurate eviction
+                const uint64_t vram_used_fresh = tier_used(engine, GLM5_TIER_VRAM);
+                const uint64_t vram_target = (vram_bud * 80ull) / 100ull;
+                if (vram_bud > 0 && vram_used_fresh > (vram_bud * 90ull) / 100ull && vram_used_fresh > vram_target) {
+                    const uint64_t to_free = vram_used_fresh - vram_target;
                     std::vector<std::pair<int, int>> freed;
-                    demote_cold_until(engine, GLM5_TIER_VRAM, vram_used_snap - vram_target, freed);
+                    demote_cold_until(engine, GLM5_TIER_VRAM, to_free, freed);
                     if (!freed.empty()) {
                         device_free_experts_batched(engine, freed, 8);
                     }
                 }
                 const uint64_t ram_used_snap = tier_used(engine, GLM5_TIER_RAM);
-                // Keep hot tiers resident by default. Evict only at near-full pressure so
-                // RAM/VRAM budgets are actually used before falling back to colder tiers.
-                const uint64_t ram_target = (ram_bud * 90ull) / 100ull;
-                if (ram_bud > 0 && ram_used_snap > (ram_bud * 97ull) / 100ull && ram_used_snap > ram_target) {
+                // PIPELINE FIX 2: Lower RAM preemptive eviction threshold 97%→90% (same as VRAM)
+                // PIPELINE FIX 12: Refresh RAM usage snapshot (same as VRAM)
+                const uint64_t ram_used_fresh = tier_used(engine, GLM5_TIER_RAM);
+                const uint64_t ram_target = (ram_bud * 80ull) / 100ull;
+                if (ram_bud > 0 && ram_used_fresh > (ram_bud * 90ull) / 100ull && ram_used_fresh > ram_target) {
+                    const uint64_t to_free = ram_used_fresh - ram_target;
                     std::vector<std::pair<int, int>> freed_dummy;
-                    demote_cold_until(engine, GLM5_TIER_RAM, ram_used_snap - ram_target, freed_dummy);
+                    demote_cold_until(engine, GLM5_TIER_RAM, to_free, freed_dummy);
                 }
             }
         }

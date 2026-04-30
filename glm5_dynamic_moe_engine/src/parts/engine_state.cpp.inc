@@ -56,6 +56,10 @@ struct glm5_pc_engine {
     uint32_t worker_resize_pending_gpu{0};
     int worker_resize_pending_direction{0};
     uint32_t worker_resize_streak{0};
+
+    // BUG 3 FIX: Prefetch window hysteresis (same pattern as worker resize) ★★
+    uint32_t prefetch_window_pending{0};
+    uint32_t prefetch_window_streak{0};
     uint8_t* staging = nullptr;
     uint64_t staging_size = 0;
     bool staging_pinned = false;
@@ -66,7 +70,11 @@ struct glm5_pc_engine {
     std::string topology_path;
     std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> topology_edges;
     std::mutex prefetch_plan_mutex;
-    std::unordered_set<uint64_t> prefetch_plan_seen_set;
+    // PIPELINE FIX 9: Replace unordered_set with generation counter ★★
+    // Old: prefetch_plan_seen_set cleared every orchestrate (O(bucket_count))
+    // New: generation counter + map (O(1) clear, bounded growth ~20k entries)
+    uint64_t prefetch_plan_generation{0};
+    std::unordered_map<uint64_t, uint64_t> prefetch_plan_seen_gen;  // key → generation
     alignas(64) std::atomic<uint64_t> vram_used_bytes{0};
     alignas(64) std::atomic<uint64_t> ram_used_bytes{0};
     alignas(64) std::atomic<uint64_t> db_used_bytes{0};
@@ -130,6 +138,20 @@ struct glm5_pc_engine {
     std::mutex forward_scratch_mutex;
     std::vector<float> lm_head_scores;
     std::atomic<int> model_root_valid{0};  // Fix 59: cache model root validation result
+    std::atomic<int> offload_gguf_valid{0};
+    std::atomic<uint32_t> offload_gguf_file_count{0};
+    std::atomic<uint64_t> offload_gguf_tensor_count{0};
+    std::atomic<uint64_t> offload_gguf_executable_tensor_count{0};
+    std::atomic<int> qkv_forced_by_format{0};
+    std::atomic<bool> offload_qkv_cfg_available{false};
+    qkv_config_t offload_qkv_cfg{};
+    std::atomic<uint32_t> offload_weight_quant_bits{0};
+    std::atomic<uint32_t> offload_weight_encoding{0};
+    std::atomic<uint32_t> offload_weight_block_size{0};
+    std::string offload_gguf_first_file;
+    std::string offload_gguf_metadata_json;
+    std::string offload_weight_quant_family;
+    std::string offload_weight_kernel_family;
     mutable std::atomic<int> tokenizer_valid{-1};
     mutable std::atomic<int> attention_projector_valid{-1};  // Fix 72: -1=unchecked, 0=no, 1=yes
     std::vector<std::thread> deferred_joins;  // Fix 44: engine-owned deferred worker joins
@@ -166,6 +188,11 @@ static uint32_t runtime_pinned_workers(const glm5_pc_engine* engine) {
     if (!engine) {
         return 1u;
     }
+    if (engine->backend_caps.supports_zero_copy_host ||
+        !engine->io_config.enable_pinned_host ||
+        !engine->io_config.enable_multistage_pipeline) {
+        return 0u;
+    }
     uint32_t workers = engine->runtime_pinned_worker_threads.load(std::memory_order_relaxed);
     if (workers == 0) {
         workers = engine->io_config.pinned_worker_threads;
@@ -176,6 +203,11 @@ static uint32_t runtime_pinned_workers(const glm5_pc_engine* engine) {
 static uint32_t runtime_gpu_workers(const glm5_pc_engine* engine) {
     if (!engine) {
         return 1u;
+    }
+    if (engine->backend_caps.supports_zero_copy_host ||
+        !engine->config.prefer_gpu ||
+        engine->backend_caps.backend != GLM5_BACKEND_CUDA) {
+        return 0u;
     }
     uint32_t workers = engine->runtime_gpu_worker_threads.load(std::memory_order_relaxed);
     if (workers == 0) {

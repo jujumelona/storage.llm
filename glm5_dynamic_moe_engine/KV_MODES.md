@@ -1,39 +1,44 @@
-# KV Modes
+# KV Contract
 
-Default stays plain KV. QKV is the explicit quantized KV mode.
+QKV is the normal StorageLLM KV cache contract.
 
-## 1. Plain KV
+The legacy `GLM5_KV_MODE_PLAIN` enum remains in the C ABI for debug and old
+callers, but the runtime default is `GLM5_KV_MODE_QKV`. Offload-native GGUF
+models that embed `offload.metadata_v2` and require
+`qkv_packed_cache_required` force QKV; after such a model root is loaded,
+attempting to switch back to plain KV is rejected.
 
-Default mode. This is the GLM runtime float K/V path. It is not backed by a
-separate root cache-manager subsystem.
-
-## 2. QKV
-
-QKV uses the implementation named by the code:
-
-- `../engine_core/kv/kv_qkv.h`
-- `../engine_core/kv/kv_qkv.cpp`
-
-Mode wiring:
+## Runtime Mapping
 
 ```text
-GLM5_KV_MODE_PLAIN -> qkv_set_mode(false)
-GLM5_KV_MODE_QKV   -> qkv_set_mode(true)
+default config      -> GLM5_KV_MODE_QKV
+offload-native GGUF -> force GLM5_KV_MODE_QKV
+legacy plain enum   -> debug/fallback only when the loaded format allows it
 ```
 
-The server/probe CLI flag is `--qkv`.
+`qkv_set_mode(true)` is now the default process state. The server and probe
+still accept `qkv` / `--qkv` as compatibility no-ops.
 
-`glm5_pc_engine_attention_decode_f32()` takes `const float*` K/V cache inputs.
-That path must stay plain float attention. It must not quantize the float input
-and immediately dequantize it again inside the attention loop.
+## Format Source Of Truth
 
-If QKV is wired into runtime cache storage, it needs a quantized-KV storage/read
-path and a separate attention entry point that accepts QKV state or packed QKV
-buffers. It should not be hidden inside the `_f32` API.
-
-Runtime rule:
+Dedicated GGUF files keep the `.gguf` container name and store the StorageLLM
+contract under `offload.*` KV entries:
 
 ```text
-default = plain KV
-optional = QKV
+offload.metadata_v2
+offload.qkv_k_bits
+offload.qkv_v_bits
+offload.qkv_group_size
+offload.qkv_page_size_tokens
+offload.qkv_sink_tokens
 ```
+
+The engine reads those keys from the GGUF metadata header without parsing tensor
+payloads. The contract configures the packed QKV cache and marks persistent
+plain KV storage as disabled for that model.
+
+Server startup accepts this as a metadata/header index when no legacy
+`tensors.csv` or binary tensor index is found. The stats surface keeps
+`offload_gguf_tensor_count` separate from `offload_gguf_executable_tensor_count`
+so header discovery is not confused with a fully materialized tensor execution
+table.

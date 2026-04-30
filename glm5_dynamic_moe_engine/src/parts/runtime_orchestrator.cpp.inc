@@ -38,7 +38,32 @@ static void fill_orchestrator_plan(glm5_pc_engine* engine, const glm5_runtime_or
             base_window = std::min(8u, base_window + 1u);
         }
     }
-    plan->prefetch_window_layers = base_window;
+    // BUG 3 FIX: Apply 5-streak hysteresis to prevent window oscillation ★★
+    // Without this, window toggles 2↔8 every orchestrate call when live_pressure
+    // hovers around total_workers*4, causing stalls (window=2) and waste (window=8).
+    // Use same pattern as worker_resize_hysteresis_ready for consistency.
+    if (engine) {
+        const uint32_t current_window = plan->prefetch_window_layers;
+        if (base_window != current_window) {
+            if (engine->prefetch_window_pending == base_window) {
+                ++engine->prefetch_window_streak;
+            } else {
+                engine->prefetch_window_pending = base_window;
+                engine->prefetch_window_streak = 1;
+            }
+            if (engine->prefetch_window_streak >= 5u) {
+                plan->prefetch_window_layers = base_window;
+                engine->prefetch_window_streak = 0;
+            } else {
+                // Keep current window until 5 consecutive same signals
+                plan->prefetch_window_layers = current_window;
+            }
+        } else {
+            engine->prefetch_window_streak = 0;
+        }
+    } else {
+        plan->prefetch_window_layers = base_window;
+    }
     float cpu = state ? state->cpu_load_pct : 0.0f;
     float gpu = state ? state->gpu_load_pct : 0.0f;
     if (!state && engine) {
@@ -66,7 +91,7 @@ static void fill_orchestrator_plan(glm5_pc_engine* engine, const glm5_runtime_or
     }
     plan->throttle_speculative = !plan->allow_gpu_dense || !plan->route_sparse_to_cpu || os_busy;
     plan->drop_speculative = policy == GLM5_EXECUTION_LOW_IMPACT && plan->throttle_speculative;
-    const bool gpu_cache_ready = caps_gpu_backend_available(engine->backend_caps) &&
+    const bool gpu_cache_ready = engine_has_device_upload_workers(engine) &&
         vram_expert_budget_bytes(engine) > 0 && plan->allow_gpu_dense;
     plan->selected_tier = gpu_cache_ready ? GLM5_TIER_VRAM : GLM5_TIER_RAM;
     plan->speculative_tier = plan->drop_speculative ? GLM5_TIER_DB :

@@ -52,7 +52,7 @@ static void apply_common_vram_reservation(glm5_pc_engine* engine) {
     }
     engine->common_vram_reserved_bytes.store(0);
     engine->vram_used_bytes.store(0);
-    if (!engine->config.prefer_gpu || !caps_gpu_backend_available(engine->backend_caps) ||
+    if (!engine->config.prefer_gpu || !engine_has_device_upload_workers(engine) ||
         !engine->io_config.enable_common_raw_vram_pin) {
         engine->common_vram_upload_complete.store(true, std::memory_order_release);
         return;

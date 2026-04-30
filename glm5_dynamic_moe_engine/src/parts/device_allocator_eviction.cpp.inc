@@ -97,7 +97,14 @@ static void device_make_room_locked(
     // device_free_locked sets pending_free=true when inflight_copies!=0, but doesn't
     // actually reduce device_allocated_bytes. Loop must verify real progress.
     uint64_t freed_this_iteration = 0;
-    
+
+    // PIPELINE FIX 3: Add retry counter for inflight DMA drain ★★★
+    // Old: Single 5ms wait then break → allocation fails if DMA not complete
+    // New: Retry up to 4 times (20ms total) → PCIe 4.0 x16 transfers 20MB in ~0.6ms
+    // Trade-off: Max 20ms delay in worst case, but prevents prefetch task drops
+    static constexpr int DMA_DRAIN_MAX_RETRIES = 4;
+    int dma_drain_retries = 0;
+
     while (e->device_allocated_bytes.load(std::memory_order_relaxed) + bytes > budget) {
         bool expected = false;
         if (!e->vram_eviction_in_progress.compare_exchange_strong(
@@ -155,8 +162,22 @@ static void device_make_room_locked(
             break;
         }
         if (freed_this_iteration == 0) {
-            // No actual bytes freed — all victims were inflight. Break to prevent infinite loop.
-            break;
+            // PIPELINE FIX 3: Retry up to 4 times before giving up
+            if (dma_drain_retries++ >= DMA_DRAIN_MAX_RETRIES) {
+                break;  // Give up after 4 retries (20ms total)
+            }
+            // BUG 2 FIX: Wait briefly for inflight DMA to complete before giving up ★★
+            // All victims have inflight_copies → device_allocated_bytes didn't decrease.
+            // If we break immediately, VRAM budget still exceeded → allocation fails.
+            // Wait 5ms for DMA completion, then re-check budget condition.
+            e->vram_eviction_in_progress.store(false, std::memory_order_release);
+            e->vram_eviction_cv.notify_all();
+            e->vram_eviction_cv.wait_for(device_lock, std::chrono::milliseconds(5));
+            // After wait, while condition re-evaluates. If DMA completed, budget satisfied → exit.
+            // Otherwise, continue to retry (up to DMA_DRAIN_MAX_RETRIES times).
+        } else {
+            // Reset retry counter on successful eviction
+            dma_drain_retries = 0;
         }
     }
 }

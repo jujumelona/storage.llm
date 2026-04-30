@@ -9,6 +9,11 @@ static uint32_t disk_worker_cap() {
 }
 
 static uint32_t pinned_worker_cap(const glm5_pc_engine* engine) {
+    if (!engine || engine_bypass_staging_pipeline(engine) ||
+        !engine->io_config.enable_pinned_host ||
+        !engine->backend_caps.supports_pinned_host) {
+        return 0;
+    }
     uint32_t cap = engine && engine->backend_caps.copy_streams ?
         engine->backend_caps.copy_streams * 2u : 2u;
     if (cap == 0) {
@@ -18,7 +23,11 @@ static uint32_t pinned_worker_cap(const glm5_pc_engine* engine) {
 }
 
 static uint32_t gpu_worker_cap(const glm5_pc_engine* engine) {
-    return engine && engine->backend_caps.copy_streams ? engine->backend_caps.copy_streams : 1u;
+    if (!engine || engine_bypass_staging_pipeline(engine) ||
+        !engine_has_device_upload_workers(engine)) {
+        return 0;
+    }
+    return engine->backend_caps.copy_streams ? engine->backend_caps.copy_streams : 1u;
 }
 
 static uint32_t clamp_to_cap(uint32_t value, uint32_t cap) {

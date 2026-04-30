@@ -1,7 +1,7 @@
 typedef enum {
-    // Default/original runtime path.
+    // Legacy/debug runtime path. Offload-native models can forbid this.
     GLM5_KV_MODE_PLAIN = 0,
-    // Feature flag only. Uses engine_core/kv/kv_qkv.*.
+    // Default packed QKV runtime path.
     GLM5_KV_MODE_QKV = 1
 } glm5_kv_mode_t;
 
@@ -23,7 +23,8 @@ typedef enum {
     GLM5_IO_PATH_PINNED_HOST = 1,
     GLM5_IO_PATH_DIRECTSTORAGE = 2,
     GLM5_IO_PATH_GPUDIRECT_STORAGE = 3,
-    GLM5_IO_PATH_BAM_NVME = 4
+    GLM5_IO_PATH_BAM_NVME = 4,
+    GLM5_IO_PATH_ZERO_COPY_HOST = 5
 } glm5_io_path_t;
 
 typedef enum {

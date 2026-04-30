@@ -1323,7 +1323,23 @@ static std::string make_health_json(
         << "\"generationToken\":" << stats.generation_token << ","
         << "\"generationLayer\":" << stats.generation_layer << ","
         << "\"generationPhase\":\"" << generation_phase_name(stats.generation_phase) << "\","
-        << "\"kvMode\":\"" << glm5_kv_mode_name(opts.engine_config.kv_mode) << "\","
+        << "\"kvMode\":\"" << glm5_kv_mode_name(stats.kv_mode) << "\","
+        << "\"offloadGgufValid\":" << (stats.offload_gguf_valid ? "true" : "false") << ","
+        << "\"offloadGgufFileCount\":" << stats.offload_gguf_file_count << ","
+        << "\"offloadGgufTensorHeaders\":" << stats.offload_gguf_tensor_count << ","
+        << "\"offloadGgufExecutableTensors\":" << stats.offload_gguf_executable_tensor_count << ","
+        << "\"qkvForcedByFormat\":" << (stats.qkv_forced_by_format ? "true" : "false") << ","
+        << "\"qkvKBits\":" << stats.qkv_k_bits << ","
+        << "\"qkvVBits\":" << stats.qkv_v_bits << ","
+        << "\"qkvGroupSize\":" << stats.qkv_group_size << ","
+        << "\"qkvPageSizeTokens\":" << stats.qkv_page_size_tokens << ","
+        << "\"qkvSinkTokens\":" << stats.qkv_sink_tokens << ","
+        << "\"weightQuantBits\":" << stats.weight_quant_bits << ","
+        << "\"weightQuantEncoding\":" << stats.weight_quant_encoding << ","
+        << "\"weightQuantBlockSize\":" << stats.weight_quant_block_size << ","
+        << "\"weightQuantFamily\":\"" << json_escape(stats.weight_quant_family) << "\","
+        << "\"weightKernelFamily\":\"" << json_escape(stats.weight_kernel_family) << "\","
+        << "\"offloadGgufFirstFile\":\"" << json_escape(stats.offload_gguf_first_file) << "\","
         << "\"recommendedVramCacheBytes\":" << caps.recommended_vram_cache_bytes << ","
         << "\"recommendedVramCommonBytes\":" << caps.recommended_vram_common_bytes << ","
         << "\"recommendedPinnedBytes\":" << caps.recommended_pinned_bytes << ","
@@ -2057,22 +2073,31 @@ static void load_server_model_background(
         return;
     }
     prepare_model_paths(&opts);
-    if (opts.table_path.empty()) {
-        fail_model_load_and_destroy(runtime, "missing tensor index under model root");
-        std::cerr << "Missing tensor index under model root\n";
-        return;
-    }
     {
         const char* root = opts.model_root.empty() ? nullptr : opts.model_root.c_str();
         const char* scale4 = opts.scale4_path.empty() ? nullptr : opts.scale4_path.c_str();
-        set_model_load_stage(runtime, "load_tensor_index");
-        std::cerr << "[storagellm] loading tensor index: " << opts.table_path << "\n" << std::flush;
-        if (!glm5_pc_engine_load_codec_table(engine, opts.table_path.c_str(), root, scale4)) {
-            fail_model_load_and_destroy(runtime, "failed to load tensor index: " + opts.table_path);
-            std::cerr << "Failed to load tensor index: " << opts.table_path << "\n";
-            return;
+        if (opts.table_path.empty()) {
+            set_model_load_stage(runtime, "load_offload_gguf_header");
+            std::cerr << "[storagellm] no tensor index found; trying offload GGUF header index\n" << std::flush;
+            if (!glm5_pc_engine_load_codec_table(engine, nullptr, root, scale4)) {
+                fail_model_load_and_destroy(
+                    runtime,
+                    "missing tensor index or offload GGUF metadata under model root"
+                );
+                std::cerr << "Missing tensor index or offload GGUF metadata under model root\n";
+                return;
+            }
+            std::cerr << "[storagellm] offload GGUF header index loaded\n" << std::flush;
+        } else {
+            set_model_load_stage(runtime, "load_tensor_index");
+            std::cerr << "[storagellm] loading tensor index: " << opts.table_path << "\n" << std::flush;
+            if (!glm5_pc_engine_load_codec_table(engine, opts.table_path.c_str(), root, scale4)) {
+                fail_model_load_and_destroy(runtime, "failed to load tensor index: " + opts.table_path);
+                std::cerr << "Failed to load tensor index: " << opts.table_path << "\n";
+                return;
+            }
+            std::cerr << "[storagellm] tensor index loaded\n" << std::flush;
         }
-        std::cerr << "[storagellm] tensor index loaded\n" << std::flush;
     }
     if (cleanup_background_engine_if_shutdown(runtime)) {
         return;
@@ -2102,11 +2127,11 @@ static void load_server_model_background(
 static void print_usage() {
     std::cout
         << "Usage:\n"
-        << "  glm5_pc_engine_server [model_root] [qkv]\n"
+        << "  glm5_pc_engine_server [model_root]\n"
         << "  glm5_pc_engine_server --model-root path\n"
         << "\n"
         << "Backend, platform, RAM, VRAM, and local API mode are detected automatically.\n"
-        << "Use qkv only when opting into the quantized KV path.\n"
+        << "QKV is the default KV cache path; qkv/--qkv is accepted for compatibility.\n"
         << "\n"
         << "Endpoints:\n"
         << "  GET  /health\n"

@@ -57,11 +57,8 @@ static void start_io_workers(glm5_pc_engine* engine) {
     for (uint32_t i = 0; i < workers; ++i) {
         engine->io_workers.emplace_back(io_worker_loop, engine, i);
     }
-    if (engine->io_config.enable_multistage_pipeline) {
+    if (engine->io_config.enable_multistage_pipeline && pinned_worker_cap(engine) > 0) {
         uint32_t pinned_workers = runtime_pinned_workers(engine);
-        if (pinned_workers == 0) {
-            pinned_workers = 1;
-        }
         pinned_workers = clamp_to_cap(pinned_workers, pinned_worker_cap(engine));
         engine->pinned_worker_target.store(pinned_workers);
         for (uint32_t i = 0; i < pinned_workers; ++i) {
@@ -69,11 +66,10 @@ static void start_io_workers(glm5_pc_engine* engine) {
         }
     }
 
-    if (engine->io_config.enable_multistage_pipeline || (engine->io_config.enable_pinned_host && engine->staging)) {
+    if ((engine->io_config.enable_multistage_pipeline ||
+            (engine->io_config.enable_pinned_host && engine->staging)) &&
+        gpu_worker_cap(engine) > 0) {
         uint32_t gpu_workers = runtime_gpu_workers(engine);
-        if (gpu_workers == 0) {
-            gpu_workers = 1;
-        }
         gpu_workers = clamp_to_cap(gpu_workers, gpu_worker_cap(engine));
         engine->gpu_worker_target.store(gpu_workers);
         for (uint32_t i = 0; i < gpu_workers; ++i) {

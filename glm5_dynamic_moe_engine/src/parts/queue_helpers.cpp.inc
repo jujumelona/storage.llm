@@ -55,7 +55,11 @@ static int enqueue_stage_or_retry(
         std::lock_guard<std::mutex> lock(stage.mtx);
         const size_t total = stage.queue.size() + stage.urgent_queue.size();
         const size_t normal_cap = engine->io_config.max_prefetch_queue;
-        const size_t retry_room = std::max<size_t>(64u, normal_cap / 2u);
+        // PIPELINE FIX 18: Reduce retry_cap from 1.5x to 1.25x ★★
+        // Old: retry_room = normal_cap/2 → queue can grow to 150%
+        // New: retry_room = normal_cap/4 → queue can grow to 125%
+        // Reduces queue inflation and makes dropped_requests metric more meaningful
+        const size_t retry_room = std::max<size_t>(32u, normal_cap / 4u);
         const size_t retry_cap = normal_cap + retry_room;
         if (total >= retry_cap) {
             engine->io_atomic.dropped_requests.fetch_add(1);
@@ -102,9 +106,13 @@ static bool pop_stage_task(
         stage.queue.pop_front();
     }
     stage.depth.store(static_cast<uint32_t>(stage.queue.size() + stage.urgent_queue.size()));
+    // PIPELINE FIX 6: Increment inflight BEFORE notify to prevent race condition ★★★
+    // Old order: notify → inflight++ → awakened thread sees inflight==0 → false "idle"
+    // New order: inflight++ → notify → awakened thread always sees inflight>=1
+    // Prevents premature "pipeline done" signal when tasks are still processing
+    stage.inflight.fetch_add(1);
     stage.pop_cv.notify_one();
     queue_total_depth_sub(engine, 1);
-    stage.inflight.fetch_add(1);
     return true;
 }
 

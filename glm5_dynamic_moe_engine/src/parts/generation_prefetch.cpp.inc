@@ -103,6 +103,11 @@ static int glm5_can_enqueue_attention_lookahead(glm5_pc_engine* engine, int32_t 
         tier_used(engine, GLM5_TIER_VRAM),
         engine->device_allocated_bytes.load(std::memory_order_relaxed));
     const uint64_t budget = engine->config.vram_budget_bytes;
-    const uint64_t threshold = budget - budget / 6u;
+    // PIPELINE FIX 19: Raise attention lookahead threshold from 83% to 85% ★★
+    // Old: threshold = budget * 5/6 ≈ 83% → dead zone between 83%-90%
+    // New: threshold = budget * 85/100 = 85% → aligns better with proactive eviction (90%)
+    // Prevents attention prefetch cutoff before expert eviction starts
+    // Dead zone reduced from 7% to 5%, improves attention prefetch opportunities
+    const uint64_t threshold = (budget * 85ull) / 100ull;
     return used < threshold && bytes <= threshold - used;
 }

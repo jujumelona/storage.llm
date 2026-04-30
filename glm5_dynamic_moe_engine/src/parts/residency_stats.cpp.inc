@@ -41,5 +41,43 @@ int glm5_pc_engine_get_stats(const glm5_pc_engine_t* engine, glm5_pc_engine_stat
     out_stats->generation_layer = engine->generation_layer.load(std::memory_order_relaxed);
     out_stats->generation_phase = engine->generation_phase.load(std::memory_order_relaxed);
     out_stats->kv_mode = engine->config.kv_mode;
+    out_stats->offload_gguf_valid = engine->offload_gguf_valid.load(std::memory_order_relaxed);
+    out_stats->offload_gguf_file_count = engine->offload_gguf_file_count.load(std::memory_order_relaxed);
+    out_stats->qkv_forced_by_format = engine->qkv_forced_by_format.load(std::memory_order_relaxed);
+    if (engine->offload_qkv_cfg_available.load(std::memory_order_acquire)) {
+        out_stats->qkv_k_bits = (uint32_t)std::max(0, engine->offload_qkv_cfg.k_bits);
+        out_stats->qkv_v_bits = (uint32_t)std::max(0, engine->offload_qkv_cfg.v_bits);
+        out_stats->qkv_group_size = engine->offload_qkv_cfg.group_size;
+        out_stats->qkv_page_size_tokens = engine->offload_qkv_cfg.page_size_tokens;
+        out_stats->qkv_sink_tokens = engine->offload_qkv_cfg.sink_tokens;
+    }
+    out_stats->weight_quant_bits = engine->offload_weight_quant_bits.load(std::memory_order_relaxed);
+    out_stats->weight_quant_encoding = engine->offload_weight_encoding.load(std::memory_order_relaxed);
+    out_stats->weight_quant_block_size = engine->offload_weight_block_size.load(std::memory_order_relaxed);
+    out_stats->offload_gguf_tensor_count =
+        engine->offload_gguf_tensor_count.load(std::memory_order_relaxed);
+    out_stats->offload_gguf_executable_tensor_count =
+        engine->offload_gguf_executable_tensor_count.load(std::memory_order_relaxed);
+    if (!engine->offload_gguf_first_file.empty()) {
+        std::strncpy(
+            out_stats->offload_gguf_first_file,
+            engine->offload_gguf_first_file.c_str(),
+            sizeof(out_stats->offload_gguf_first_file) - 1
+        );
+    }
+    if (!engine->offload_weight_quant_family.empty()) {
+        std::strncpy(
+            out_stats->weight_quant_family,
+            engine->offload_weight_quant_family.c_str(),
+            sizeof(out_stats->weight_quant_family) - 1
+        );
+    }
+    if (!engine->offload_weight_kernel_family.empty()) {
+        std::strncpy(
+            out_stats->weight_kernel_family,
+            engine->offload_weight_kernel_family.c_str(),
+            sizeof(out_stats->weight_kernel_family) - 1
+        );
+    }
     return 1;
 }

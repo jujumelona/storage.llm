@@ -30,18 +30,26 @@ int glm5_pc_engine_get_optimization_plan(
     const uint64_t recommended_staging = glm5_recommended_staging_bytes(engine);
     const uint64_t current_or_backend_staging =
         engine->staging_size ? engine->staging_size : caps.recommended_pinned_bytes;
-    out_plan->recommended_pinned_staging_bytes =
-        std::max(current_or_backend_staging, recommended_staging);
+    out_plan->recommended_pinned_staging_bytes = engine_bypass_staging_pipeline(engine) ?
+        0 : std::max(current_or_backend_staging, recommended_staging);
     out_plan->use_model_shape_constants = 1;
     out_plan->use_static_memory_pool = 1;
     out_plan->use_expert_prefetch = io.enable_lookahead_prefetch || io.enable_topology_prefetch;
     out_plan->use_vram_hot_cache = gpu_available && engine->config.vram_budget_bytes > 0;
-    out_plan->use_pinned_ram_cache = caps.supports_pinned_host && engine->staging_pinned;
+    out_plan->use_pinned_ram_cache =
+        caps.supports_pinned_host && engine->staging_pinned && !engine_bypass_staging_pipeline(engine);
     out_plan->use_storage_streaming = engine->config.allow_db_streaming;
-    out_plan->use_async_copy_stream = caps.supports_async_copy && io.enable_compute_io_overlap;
+    out_plan->use_async_copy_stream =
+        caps.supports_async_copy && caps.supports_backend_async_api && io.enable_compute_io_overlap;
     out_plan->use_direct_to_gpu_io = direct_to_gpu;
     out_plan->use_fused_fp4_dequant_matmul = gpu_available && caps.supports_fp4;
     out_plan->use_scale4_decode_fusion = gpu_available && caps.supports_scale4;
+    out_plan->use_quant_family_dispatch = 1;
+    out_plan->use_reference_weight_dequant =
+        caps.supports_weight_q2 || caps.supports_weight_q3 ||
+        caps.supports_weight_q4 || caps.supports_weight_q8;
+    out_plan->preferred_weight_bits = engine->offload_weight_quant_bits.load(std::memory_order_relaxed);
+    out_plan->preferred_weight_encoding = engine->offload_weight_encoding.load(std::memory_order_relaxed);
     out_plan->use_cuda_graphs = caps.backend == GLM5_BACKEND_CUDA && caps.supports_cuda;
     out_plan->use_metal_command_buffers = caps.backend == GLM5_BACKEND_METAL && caps.supports_metal;
     out_plan->use_paged_kv_cache = gpu_available;

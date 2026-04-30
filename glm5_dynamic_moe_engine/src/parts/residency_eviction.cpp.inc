@@ -150,16 +150,27 @@ static void demote_cold_until(glm5_pc_engine* engine, glm5_tier_t tier, uint64_t
         if (tier == GLM5_TIER_VRAM) {
             next_tier = GLM5_TIER_RAM;
             const uint64_t ram_budget = tier_budget(engine, GLM5_TIER_RAM);
-            while (ram_budget > 0 && tier_used(engine, GLM5_TIER_RAM) + victim.bytes > ram_budget) {
-                if (!demote_one_ram_to_db(engine)) {
-                    break;
-                }
+            // PIPELINE FIX 8: Use demote_cold_until for RAM eviction instead of loop ★★
+            // Old: O(N×M) mutex acquisitions in nested while loop
+            // New: Single demote_cold_until call with O(M) compact_evict_heap
+            // Reduces mutex contention and improves eviction performance
+            if (ram_budget > 0 && tier_used(engine, GLM5_TIER_RAM) + victim.bytes > ram_budget) {
+                std::vector<std::pair<int, int>> ignored;
+                demote_cold_until(engine, GLM5_TIER_RAM, victim.bytes, ignored);
             }
             if (ram_budget == 0 || tier_used(engine, GLM5_TIER_RAM) + victim.bytes > ram_budget) {
                 next_tier = GLM5_TIER_DB;
             }
         }
+        // PIPELINE FIX 7: Send to DB if RAM demotion fails ★★
+        // Old: continue → victim removed from heap but stays in VRAM, never evicted again
+        // New: Try DB demotion → ensures cold experts don't get stuck in VRAM
+        // Trade-off: Next access requires full Disk→RAM→VRAM path, but better than VRAM leak
         if (!demote_one_victim_to(engine, victim, tier, next_tier, to_free)) {
+            if (next_tier == GLM5_TIER_RAM) {
+                // RAM saturation prevented demotion → try DB directly
+                demote_one_victim_to(engine, victim, tier, GLM5_TIER_DB, to_free);
+            }
             continue;
         }
     }

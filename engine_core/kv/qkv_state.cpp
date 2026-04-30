@@ -19,6 +19,12 @@ int qkv_state_init(
     int dim = config->head_dim;
     int k_bits = config->k_bits;
     int v_bits = config->v_bits;
+    if (dim <= 0 || k_bits < 1 || k_bits > 4 || v_bits < 1 || v_bits > 4) {
+        return 0;
+    }
+    if (config->enable_qjl && (k_bits <= 1 || v_bits <= 1)) {
+        return 0;
+    }
 
     // Allocate main KV storage
     size_t k_packed_size = ((size_t)n_tokens * (size_t)dim * (size_t)k_bits + 7) / 8;

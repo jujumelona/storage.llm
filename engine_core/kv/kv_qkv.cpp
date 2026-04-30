@@ -17,8 +17,9 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// Global mode flag
-std::atomic<bool> g_qkv_mode_enabled{false};
+// Global mode flag. StorageLLM offload-native models use packed QKV by default;
+// legacy callers can still explicitly disable it for debug comparisons.
+std::atomic<bool> g_qkv_mode_enabled{true};
 
 // ============================================================
 // Public API - State Management
@@ -55,6 +56,9 @@ int qkv_quantize(
     const bool use_qjl = config->enable_qjl;
     const int k_mse_bits = use_qjl ? state->k_bits - 1 : state->k_bits;
     const int v_mse_bits = use_qjl ? state->v_bits - 1 : state->v_bits;
+    if (!qkv_bits_valid(k_mse_bits) || !qkv_bits_valid(v_mse_bits)) {
+        return 0;
+    }
 
     for (int t = 0; t < n_tokens; t++) {
         // ===== Quantize K =====
@@ -217,6 +221,9 @@ int qkv_dequantize(
 
     int dim = config->head_dim;
     bool use_qjl = config->enable_qjl && state->k_qjl && state->v_qjl;
+    if (use_qjl && (state->k_bits <= 1 || state->v_bits <= 1)) {
+        use_qjl = false;
+    }
 
     for (int t = 0; t < n_tokens; t++) {
         // Dequantize K

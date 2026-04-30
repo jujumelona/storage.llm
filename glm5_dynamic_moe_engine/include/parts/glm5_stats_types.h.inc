@@ -43,6 +43,22 @@ typedef struct {
     uint32_t generation_layer;
     uint32_t generation_phase;
     glm5_kv_mode_t kv_mode;
+    int offload_gguf_valid;
+    uint32_t offload_gguf_file_count;
+    uint32_t qkv_forced_by_format;
+    uint32_t qkv_k_bits;
+    uint32_t qkv_v_bits;
+    uint32_t qkv_group_size;
+    uint32_t qkv_page_size_tokens;
+    uint32_t qkv_sink_tokens;
+    uint32_t weight_quant_bits;
+    uint32_t weight_quant_encoding;
+    uint32_t weight_quant_block_size;
+    uint64_t offload_gguf_tensor_count;
+    uint64_t offload_gguf_executable_tensor_count;
+    char offload_gguf_first_file[260];
+    char weight_quant_family[64];
+    char weight_kernel_family[64];
 } glm5_pc_engine_stats_t;
 
 typedef struct {

@@ -10,7 +10,7 @@ This repository does not ship model weights.
 ## Layout
 
 - `engine_core/core/` - shared mmap loader.
-- `engine_core/kv/` - optional QKV implementation.
+- `engine_core/kv/` - default packed QKV cache implementation.
 - `loader/` - shared JUJU/manifest loader and path helpers.
 - `glm5_dynamic_moe_engine/` - model runtime folder; see its README for
   model-specific API, metadata, numeric helpers, planning, and examples.
@@ -55,25 +55,38 @@ If VRAM is limited, hot blocks can be promoted and cold blocks can be streamed
 from RAM or storage. CPU execution remains the correctness fallback. Backend
 selection and residency policy live in the model runtime folder.
 
-Plain KV append/cache/reuse is owned by the model runtime. QKV is the only
-shared optional quantized KV implementation and lives under
-`engine_core/kv/kv_qkv.*`.
+Packed QKV append/cache/reuse is the normal KV contract. Plain float KV is kept
+only as a debug/fallback path when the loaded format does not forbid it.
 
 ## GLM5.1 Runtime Usage
 
 The GLM5.1 model runtime lives in `glm5_dynamic_moe_engine/`. Its README is the
 source of truth for model layout, the local OpenAI-compatible API, automatic
-runtime selection, the optional QKV path, and request shapes:
+runtime selection, the dedicated GGUF/JUJU layouts, QKV cache contract, and
+request shapes:
 
 ```text
 glm5_dynamic_moe_engine/README.md
 ```
 
-Model weights are distributed separately on Hugging Face:
+Model weights are distributed separately on Hugging Face. The dedicated GGUF
+path keeps the `.gguf` file extension and embeds StorageLLM offload metadata in
+`offload.*` GGUF KV entries:
 
 ```text
 https://huggingface.co/storagejuju/GLM5.1-4q-storage
+https://huggingface.co/storagejuju/GLM-5.1-GGUF-MXFP4-MOE-Offload
 ```
+
+The reusable Colab patcher is tracked at:
+
+```text
+notebooks/GGUF_Offload_Metadata_Patch_Stream.ipynb
+```
+
+For a new GGUF variant, edit only the notebook's `CHANGE HERE` block. In the
+common case `SOURCE_HF_REPO_ID`, `SOURCE_SUBDIR`, and `TARGET_HF_OWNER` are
+enough; shard prefix/count are auto-discovered from Hugging Face.
 
 Download the converted StorageLLM artifact before starting the server:
 
@@ -90,11 +103,27 @@ caches from the machine:
 glm5_pc_engine_server <model_root>
 ```
 
-QKV is the only normal startup choice:
+QKV is now the default KV cache path. The old `qkv` selector is accepted as a
+compatibility no-op.
 
-```text
-glm5_pc_engine_server <model_root> qkv
-```
+For dedicated GGUF roots, the server does not require a separate `tensors.csv`
+index just to accept the model root. It reads the `offload.*` GGUF header
+contract first, forces packed QKV when the format requires it, and reports the
+header-derived shard/tensor status through `/health`.
+
+Dedicated GGUF variants also carry the source weight quantization family under
+`offload.weight_*` keys. The runtime treats `UD-IQ2_M`, `MXFP4`, `Q4`, `Q8`,
+and similar names as different kernel families; it no longer routes unknown
+2-bit or 3-bit data through the old FP4 path just because the row byte count is
+small. QKV cache bits and GGUF weight bits are separate contracts.
+
+Platform I/O is selected by capability, not by CUDA names in the format. CUDA
+uses pinned staging and backend-neutral async copy wrappers; CPU and
+host-visible Metal-style paths use `zero_copy_host` and skip pinned/GPU upload
+workers. DirectStorage, GPUDirect Storage, and io_uring registered-buffer paths
+are kept behind explicit capability flags until their real adapters are wired,
+so the engine does not silently route unsupported platforms through a fake CUDA
+path.
 
 Clients can use `http://127.0.0.1:8000/v1` directly. The checked-in
 `openclaw.storagellm.json` template points OpenClaw at that same local API.

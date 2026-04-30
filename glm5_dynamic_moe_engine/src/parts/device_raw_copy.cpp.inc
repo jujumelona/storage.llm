@@ -60,15 +60,16 @@ static int device_copy_raw_span(
         }
         std::memcpy(slot.buf, src, static_cast<size_t>(s.bytes));
 
-        const int async_copy = stream && e->cuda.cuMemcpyHtoDAsync && slot.pinned;
+        const int async_copy = device_backend_async_h2d_available(
+            e, stream, slot.pinned ? 1 : 0);
         CUdeviceptr dst = 0;
         if (!device_prepare_tensor_allocation(e, key, s.bytes, pool, async_copy, &dst)) {
             release_staging_slot(e, slot_idx);
             return 0;
         }
         const int ok = async_copy ?
-            e->cuda.cuMemcpyHtoDAsync(dst, slot.buf, (size_t)s.bytes, stream) == 0 :
-            (e->cuda.cuMemcpyHtoD && e->cuda.cuMemcpyHtoD(dst, slot.buf, (size_t)s.bytes) == 0);
+            device_backend_copy_h2d_async(e, dst, slot.buf, s.bytes, stream) :
+            device_backend_copy_h2d_sync(e, dst, slot.buf, s.bytes);
         if (ok && async_copy) {
             s_tl_tensor_pending_keys[e].push_back(key);
             s_tl_deferred_staging_slots[e].push_back(slot_idx);
@@ -95,7 +96,7 @@ static int device_copy_raw_span(
     if (!device_prepare_tensor_allocation(e, key, s.bytes, pool, 0, &dst)) {
         return 0;
     }
-    if (!e->cuda.cuMemcpyHtoD || e->cuda.cuMemcpyHtoD(dst, src, (size_t)s.bytes) != 0) {
+    if (!device_backend_copy_h2d_sync(e, dst, src, s.bytes)) {
         device_free_key(e, key);
         return 0;
     }

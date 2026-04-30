@@ -1,3 +1,99 @@
+static int read_file_range_to_buffer(
+    std::ifstream& input,
+    uint64_t file_offset,
+    uint8_t* dst,
+    uint64_t bytes
+) {
+    if (!input || !dst || bytes == 0 ||
+        file_offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+        return 0;
+    }
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(file_offset), std::ios::beg);
+    if (!input) {
+        return 0;
+    }
+    uint64_t copied = 0;
+    while (copied < bytes) {
+        const uint64_t remaining = bytes - copied;
+        const std::streamsize chunk = static_cast<std::streamsize>(
+            std::min<uint64_t>(remaining, 64ull * 1024ull * 1024ull));
+        input.read(reinterpret_cast<char*>(dst + copied), chunk);
+        if (input.gcount() != chunk) {
+            return 0;
+        }
+        copied += static_cast<uint64_t>(chunk);
+    }
+    return 1;
+}
+
+static int prefetch_tensor_file_to_pinned(
+    glm5_pc_engine* engine,
+    const glm5_tensor_record& rec,
+    uint32_t slot_index,
+    uint64_t* out_staging_bytes
+) {
+    if (out_staging_bytes) {
+        *out_staging_bytes = 0;
+    }
+    if (!engine ||
+        slot_index >= engine->staging_slots.size() ||
+        !engine->staging_slots[slot_index].buf) {
+        return 0;
+    }
+    const uint64_t total_bytes = tensor_stream_bytes(rec);
+    if (total_bytes == 0 || total_bytes > engine->staging_slots[slot_index].size) {
+        return 0;
+    }
+    const std::string path = rec.resolved_path_index < engine->tensor_paths.size()
+        ? engine->tensor_paths[rec.resolved_path_index] : std::string();
+    uint64_t file_size = 0;
+    if (path.empty() || !file_size_bytes(path, &file_size)) {
+        return 0;
+    }
+    std::ifstream input;
+    open_ifstream_path(input, path, std::ios::in | std::ios::binary);
+    if (!input) {
+        return 0;
+    }
+    const uint64_t ranges[][2] = {
+        {rec.info.weight_byte_offset, rec.info.weight_byte_length},
+        {rec.info.scale_byte_offset, rec.info.scale_byte_length},
+        {rec.info.scale2_byte_offset, rec.info.scale2_byte_length},
+    };
+    uint64_t staging_offset = 0;
+    for (const auto& range : ranges) {
+        const uint64_t offset = range[0];
+        const uint64_t length = range[1];
+        if (length == 0) {
+            continue;
+        }
+        if (offset > file_size || length > file_size - offset ||
+            staging_offset > total_bytes || length > total_bytes - staging_offset) {
+            return 0;
+        }
+        if (!read_file_range_to_buffer(
+                input,
+                offset,
+                engine->staging_slots[slot_index].buf + staging_offset,
+                length)) {
+            return 0;
+        }
+        staging_offset += length;
+    }
+    if (staging_offset != total_bytes) {
+        return 0;
+    }
+    if (out_staging_bytes) {
+        *out_staging_bytes = staging_offset;
+    }
+    engine->io_atomic.bytes_prefetched.fetch_add(staging_offset);
+    engine->io_atomic.bytes_disk_to_ram.fetch_add(staging_offset);
+    engine->io_atomic.disk_stage_done.fetch_add(1);
+    engine->io_atomic.pinned_stage_done.fetch_add(1);
+    return 1;
+}
+
 static int prefetch_tensor_ram_to_pinned(
     glm5_pc_engine* engine,
     const glm5_tensor_record& rec,

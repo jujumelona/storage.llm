@@ -22,6 +22,11 @@ static void touch_mapped_range(const uint8_t* src, uint64_t bytes) {
     if (!src || bytes == 0) {
         return;
     }
+    // PIPELINE FIX 1: Remove synchronous page scan loop ★★★
+    // Old code: 5,000 page accesses for 20MB tensor → io_worker blocks on page faults
+    // New code: OS async hint only → io_worker continues immediately
+    // Trade-off: Some page faults may occur at memcpy time, but MADV_WILLNEED
+    // usually completes before next task starts. Non-blocking is better.
 #ifdef _WIN32
     WIN32_MEMORY_RANGE_ENTRY entry;
     entry.VirtualAddress = const_cast<uint8_t*>(src);
@@ -30,13 +35,7 @@ static void touch_mapped_range(const uint8_t* src, uint64_t bytes) {
 #elif defined(__linux__)
     madvise(const_cast<uint8_t*>(src), (size_t)bytes, MADV_WILLNEED);
 #endif
-    volatile uint8_t sink = 0;
-    const uint64_t page = 4096;
-    for (uint64_t offset = 0; offset < bytes; offset += page) {
-        sink ^= src[offset];
-    }
-    sink ^= src[bytes - 1];
-    (void)sink;
+    // Removed: volatile uint8_t sink loop that caused blocking page faults
 }
 
 static uint32_t acquire_staging_slot_internal(glm5_pc_engine* engine, uint32_t start_idx, uint32_t count, uint32_t worker_index, uint32_t turn);

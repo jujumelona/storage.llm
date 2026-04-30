@@ -25,11 +25,18 @@ int glm5_pc_engine_set_model_root(
         std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
         engine->raw_tensor_cache.clear();
     }
+    glm5_engine_reset_qkv_cache(engine);
+    glm5_engine_clear_offload_gguf_contract(engine);
     engine->model_root = model_root ? model_root : "";
     glm5_model_root_check_t check{};
-    const int valid = !engine->model_root.empty() &&
-        glm5_storage_validate_model_root(engine->model_root.c_str(), &check) &&
-        check.valid;
+    int valid = 0;
+    if (!engine->model_root.empty()) {
+        if (glm5_engine_load_offload_gguf_contract(engine, engine->model_root, &check)) {
+            valid = check.valid;
+        } else {
+            valid = glm5_storage_validate_model_root(engine->model_root.c_str(), &check) && check.valid;
+        }
+    }
     engine->model_root_valid.store(valid ? 1 : 0, std::memory_order_relaxed);
     engine->tokenizer_valid.store(-1, std::memory_order_relaxed);
     engine->attention_projector_valid.store(-1, std::memory_order_relaxed);  // Fix 72: invalidate cache
@@ -213,7 +220,9 @@ int glm5_pc_engine_load_codec_table(
     const char* model_root,
     const char* scale4_path
 ) {
-    if (!engine || !csv_path) {
+    const bool offload_gguf_header_only =
+        !csv_path || !csv_path[0] || std::strcmp(csv_path, "__offload_gguf__") == 0;
+    if (!engine) {
         return 0;
     }
 
@@ -245,6 +254,8 @@ int glm5_pc_engine_load_codec_table(
         std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
         engine->raw_tensor_cache.clear();
     }
+    glm5_engine_reset_qkv_cache(engine);
+    glm5_engine_clear_offload_gguf_contract(engine);
     engine->tensors.clear();
     engine->tensor_paths.clear();
     engine->max_tensor_stream_bytes = 0;
@@ -254,9 +265,15 @@ int glm5_pc_engine_load_codec_table(
     tensor_slots_reset(engine);
     engine->model_root = model_root ? model_root : "";
     glm5_model_root_check_t root_check{};
-    const int root_valid = !engine->model_root.empty() &&
-        glm5_storage_validate_model_root(engine->model_root.c_str(), &root_check) &&
-        root_check.valid;
+    int root_valid = 0;
+    if (!engine->model_root.empty()) {
+        if (glm5_engine_load_offload_gguf_contract(engine, engine->model_root, &root_check)) {
+            root_valid = root_check.valid;
+        } else {
+            root_valid = glm5_storage_validate_model_root(engine->model_root.c_str(), &root_check) &&
+                root_check.valid;
+        }
+    }
     engine->model_root_valid.store(root_valid ? 1 : 0, std::memory_order_relaxed);
     engine->tokenizer_valid.store(-1, std::memory_order_relaxed);
     engine->attention_projector_valid.store(-1, std::memory_order_relaxed);
@@ -282,6 +299,20 @@ int glm5_pc_engine_load_codec_table(
         std::fprintf(stderr, "[storagellm] scale4 attached entries=%u\n",
             glm5_scale4_entry_count(engine->scale4));
         std::fflush(stderr);
+    }
+
+    if (offload_gguf_header_only) {
+        if (!root_valid || !engine->offload_gguf_valid.load(std::memory_order_relaxed)) {
+            return 0;
+        }
+        finish_tensor_index_load(engine);
+        std::fprintf(stderr,
+            "[storagellm] offload GGUF header index loaded: files=%u tensor_headers=%llu executable_tensors=%llu\n",
+            engine->offload_gguf_file_count.load(std::memory_order_relaxed),
+            (unsigned long long)engine->offload_gguf_tensor_count.load(std::memory_order_relaxed),
+            (unsigned long long)engine->offload_gguf_executable_tensor_count.load(std::memory_order_relaxed));
+        std::fflush(stderr);
+        return 1;
     }
 
     if (load_binary_tensor_index(engine, csv_path)) {

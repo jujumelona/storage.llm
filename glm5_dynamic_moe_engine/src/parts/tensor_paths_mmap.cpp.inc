@@ -37,12 +37,26 @@ static mmap_context_t* get_or_map_shard(glm5_pc_engine* engine, const std::strin
     }
     {
         std::unique_lock<std::shared_mutex> lock(engine->shard_mutex);
+        int retry_count = 0;
         while (true) {
             auto found = engine->shard_mmaps.find(path);
             if (found != engine->shard_mmaps.end()) {
                 if (found->second == (mmap_context_t*)1) {
                     auto cv = shard_mmap_cv_locked(engine, path);
-                    cv->wait(lock);
+                    // CRITICAL FIX: Add timeout to prevent infinite wait when IO workers fail
+                    // If another thread is loading this shard but IO workers are stuck,
+                    // we'll wait forever. Timeout after 100ms and try sync load as fallback.
+                    auto status = cv->wait_for(lock, std::chrono::milliseconds(100));
+                    if (status == std::cv_status::timeout) {
+                        ++retry_count;
+                        if (retry_count >= 3) {
+                            // After 300ms timeout, assume IO worker is stuck
+                            // Break out and try sync load ourselves
+                            fprintf(stderr, "[storageLLM WARNING] Shard load timeout for %s, attempting sync fallback\n",
+                                path.c_str());
+                            break;
+                        }
+                    }
                 } else {
                     auto cv_it = engine->shard_mmap_cvs.find(path);
                     if (cv_it != engine->shard_mmap_cvs.end() && cv_it->second) {

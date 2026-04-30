@@ -7,7 +7,10 @@ static thread_local std::unordered_map<glm5_pc_engine*, std::vector<uint32_t>> s
 static constexpr int GLM5_DEVICE_COPY_BACKPRESSURE = -2;
 
 static CUstream device_tensor_stream_current(glm5_pc_engine* e) {
-    if (!e || !e->cuda.cuStreamCreate) {
+    if (!e ||
+        !e->config.prefer_gpu ||
+        e->backend_caps.backend != GLM5_BACKEND_CUDA ||
+        !e->backend_caps.supports_backend_async_api) {
         return nullptr;
     }
     if (!device_set_current(e)) {
@@ -20,7 +23,7 @@ static CUstream device_tensor_stream_current(glm5_pc_engine* e) {
     CUstream stream = nullptr;
     // Fix 4: Use CU_STREAM_NON_BLOCKING (=1) to prevent implicit sync with default stream.
     // This allows multiple HtoD copy streams to run truly in parallel.
-    if (e->cuda.cuStreamCreate(&stream, 1u /* CU_STREAM_NON_BLOCKING */) != 0) {
+    if (!device_backend_stream_create(e, &stream, 1u /* CU_STREAM_NON_BLOCKING */)) {
         return nullptr;
     }
     s_tl_tensor_streams[e] = stream;
@@ -28,10 +31,10 @@ static CUstream device_tensor_stream_current(glm5_pc_engine* e) {
 }
 
 static void device_stream_sync_current(glm5_pc_engine* e) {
-    if (e && e->cuda.cuStreamSynchronize) {
+    if (e) {
         auto it = s_tl_tensor_streams.find(e);
         if (it != s_tl_tensor_streams.end() && it->second) {
-            e->cuda.cuStreamSynchronize(it->second);
+            device_backend_stream_sync(e, it->second);
         }
     }
     device_complete_pending_copies(e);
@@ -49,10 +52,10 @@ static void device_stream_sync_current(glm5_pc_engine* e) {
 
 static void device_stream_destroy_current(glm5_pc_engine* e) {
     device_stream_sync_current(e);
-    if (e && e->cuda.cuStreamDestroy) {
+    if (e) {
         auto it = s_tl_tensor_streams.find(e);
         if (it != s_tl_tensor_streams.end() && it->second) {
-            e->cuda.cuStreamDestroy(it->second);
+            device_backend_stream_destroy(e, it->second);
             s_tl_tensor_streams.erase(it);
         }
     }

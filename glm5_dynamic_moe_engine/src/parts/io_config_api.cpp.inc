@@ -52,12 +52,15 @@ int glm5_pc_engine_configure_io(glm5_pc_engine_t* engine, const glm5_io_config_t
         engine->io_config.direct_upload_min_bytes =
             storage ? storage->normal_bundle_min_bytes : 1;
     }
-    if (engine->backend_caps.backend == GLM5_BACKEND_METAL) {
+    if (engine_bypass_staging_pipeline(engine)) {
         engine->io_config.enable_directstorage = 0;
         engine->io_config.enable_gpudirect_storage = 0;
         engine->io_config.enable_bam_nvme = 0;
         engine->io_config.enable_pinned_host = 0;
+        engine->io_config.enable_multistage_pipeline = 0;
         engine->io_config.pinned_staging_bytes = 0;
+        engine->io_config.pinned_worker_threads = 0;
+        engine->io_config.gpu_worker_threads = 0;
     }
     if (engine->io_config.enable_pinned_host && engine->io_config.pinned_staging_bytes > 0) {
         const uint64_t requested_staging_bytes = engine->io_config.pinned_staging_bytes;
@@ -74,6 +77,20 @@ int glm5_pc_engine_configure_io(glm5_pc_engine_t* engine, const glm5_io_config_t
                 "[storagellm] pinned staging unavailable; continuing without pinned staging "
                 "(requested=%llu bytes)\n",
                 (unsigned long long)requested_staging_bytes);
+        }
+        // BUG 1 FIX: Non-pinned staging mistaken for pinned ★★★
+        // allocate_best_staging returns non-null + non-pinned when mlock fails.
+        // Without this check, enable_pinned_host=1 and enable_multistage_pipeline=1 remain set,
+        // causing pinned_worker threads to launch and use non-pinned memory for "async" DMA.
+        // CUDA driver internally copies non-pinned memory to temp pinned buffer → sync blocking.
+        // Result: entire pipeline blocks on every transfer with no stderr warning.
+        if (engine->staging && !engine->staging_pinned) {
+            // Memory allocated but not pinned → async DMA impossible, pipeline has no effect
+            engine->io_config.enable_pinned_host = 0;
+            engine->io_config.enable_multistage_pipeline = 0;
+            fprintf(stderr,
+                "[storagellm] staging allocated but not pinned; "
+                "disabling multistage pipeline (sync DMA fallback).\n");
         }
         if (engine->staging) {
             std::memset(engine->staging, 0, static_cast<size_t>(std::min<uint64_t>(engine->staging_size, 4096)));
@@ -106,4 +123,3 @@ int glm5_pc_engine_wait_io(glm5_pc_engine_t* engine) {
     });
     return 1;
 }
-

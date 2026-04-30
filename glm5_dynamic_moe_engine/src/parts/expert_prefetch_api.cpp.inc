@@ -85,10 +85,10 @@ int glm5_pc_engine_startup_warm_model(glm5_pc_engine_t* engine) {
             if (vram_limit > 0 && planned_vram + bytes <= vram_limit) {
                 target = GLM5_TIER_VRAM;
                 planned_vram += bytes;
-            } else if (ram_limit > 0 && planned_ram + bytes <= ram_limit) {
-                target = GLM5_TIER_RAM;
-                planned_ram += bytes;
             } else {
+                // Stop queuing once VRAM budget is reached.
+                // Do NOT queue RAM experts during startup_warm to prevent massive disk IO
+                // and 60-second timeouts. RAM experts will be page-faulted on demand.
                 return queued > 0 ? 1 : 0;
             }
 
@@ -126,6 +126,60 @@ int glm5_pc_engine_startup_warm_model(glm5_pc_engine_t* engine) {
     if (queued > 0) {
         engine->disk_stage.cv.notify_all();
     }
+
+    // CRITICAL FIX: Wait for actual loading to complete
+    // startup_warm only queues experts but doesn't wait for IO workers to load them.
+    // This causes "ready" state with 0 RAM/VRAM usage and hang on first token.
+    // Wait until queue is processed and experts are actually in memory.
+    if (queued > 0) {
+        fprintf(stderr, "[storagellm] startup warm: waiting for %u experts to load...\n", queued);
+        const auto start_time = std::chrono::steady_clock::now();
+        const uint32_t initial_completed = engine->io_atomic.completed_requests.load();
+        const uint32_t initial_failed = engine->io_atomic.failed_requests.load();
+
+        while (!engine->io_stop.load(std::memory_order_relaxed)) {
+            const uint32_t depth = engine->total_queue_depth.load(std::memory_order_relaxed);
+            const uint32_t completed = engine->io_atomic.completed_requests.load();
+            const uint32_t failed = engine->io_atomic.failed_requests.load();
+            const uint32_t processed_completed = completed >= initial_completed ? completed - initial_completed : 0;
+            const uint32_t processed_failed = failed >= initial_failed ? failed - initial_failed : 0;
+            const uint32_t processed = processed_completed + processed_failed;
+
+            // PIPELINE FIX 15: Check inflight counters to ensure all DMA completed ★★★
+            // Old: depth==0 only checks queue empty, not actual work completion
+            // New: Also check inflight==0 for all stages → ensures GPU DMA finished
+            // Prevents "ready" state while cuMemcpyHtoDAsync still in progress
+            const bool all_idle =
+                engine->disk_stage.inflight.load(std::memory_order_acquire) == 0 &&
+                engine->pinned_stage.inflight.load(std::memory_order_acquire) == 0 &&
+                engine->gpu_stage.inflight.load(std::memory_order_acquire) == 0;
+
+            // Check if all queued experts are processed
+            if (depth == 0 && all_idle && processed >= queued) {
+                fprintf(stderr, "[storagellm] startup warm: complete (processed=%u)\n", processed);
+                break;
+            }
+
+            // Progress report every 2 seconds
+            const auto elapsed = std::chrono::steady_clock::now() - start_time;
+            if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() % 2 == 0) {
+                fprintf(stderr, "[storagellm] startup warm: queue=%u completed=%u failed=%u ram=%llu vram=%llu\n",
+                    depth, processed, failed,
+                    (unsigned long long)tier_used(engine, GLM5_TIER_RAM),
+                    (unsigned long long)tier_used(engine, GLM5_TIER_VRAM));
+            }
+
+            // Timeout after 60 seconds
+            if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() > 60) {
+                fprintf(stderr, "[storageLLM ERROR] startup warm timeout after 60s (queue=%u completed=%u failed=%u)\n",
+                    depth, processed, failed);
+                return 0;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
     return queued > 0 ? 1 : 0;
 }
 

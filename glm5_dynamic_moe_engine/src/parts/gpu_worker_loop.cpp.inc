@@ -2,11 +2,12 @@ static void gpu_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
     if (!engine) {
         return;
     }
-    
+
     // Problem 6 Fix: RAII guard to prevent CUDA stream leak on abnormal termination
     // If gpu_worker exits via exception or forced termination (not normal pop_stage_task→false),
     // device_stream_destroy_current would not be called → stream leak.
     // This guard ensures cleanup regardless of exit path.
+    // BUG 4 FIX: Make 'e' mutable to prevent double-destroy on normal exit ★
     struct StreamGuard {
         glm5_pc_engine* e;
         ~StreamGuard() { 
@@ -19,11 +20,16 @@ static void gpu_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
     for (;;) {
         glm5_prefetch_task task{};
         if (!pop_stage_task(engine, engine->gpu_stage, &task, &engine->gpu_worker_target, worker_index)) {
+            stream_guard.e = nullptr;  // BUG 4 FIX: Prevent double-destroy
             device_stream_destroy_current(engine);
             return;
         }
 
-        constexpr uint32_t batch_max = 8;
+        // PIPELINE FIX 13: Reduce batch size from 8 to 4 ★★★
+        // Old: batch_max=8 → 40ms blocking if last task takes long → all 8 slots locked
+        // New: batch_max=4 → 20ms max blocking → halves slot contention
+        // Trade-off: More frequent cv wakeups, but staging slot availability improves
+        constexpr uint32_t batch_max = 4;
         glm5_prefetch_task batch[batch_max];
         int ok[batch_max] = {};
         int terminal[batch_max] = {};
@@ -67,6 +73,15 @@ static void gpu_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                     0
                 );
                 if (ok[i] == GLM5_DEVICE_COPY_BACKPRESSURE) {
+                    // PIPELINE FIX 4: Release staging slot immediately if no data ★★★
+                    // Old: Hold slot during 5ms wait → blocks pinned_worker/io_worker
+                    // New: Release slot if staging_valid==0 (no data yet) → unblock pipeline
+                    // Keep slot if staging_valid==1 (data already copied) → preserve work
+                    if (!batch[i].staging_valid && batch[i].staging_slot != UINT32_MAX) {
+                        release_staging_slot(engine, batch[i].staging_slot);
+                        batch[i].staging_slot = UINT32_MAX;
+                    }
+
                     // Bug 4 Fix: Preserve staging_slot when staging_valid==1 to avoid wasting RAM→pinned copy
                     // BACKPRESSURE means GPU is temporarily full. If staging data is valid, keep the slot
                     // and retry gpu_stage with 5ms wait. Only discard as last resort after retry fails.
@@ -86,21 +101,13 @@ static void gpu_worker_loop(glm5_pc_engine* engine, uint32_t worker_index) {
                             engine->gpu_stage.cv.notify_one();
                         } else {
                             // Last resort: discard staging slot after retry failed
-                            release_staging_slot(engine, batch[i].staging_slot);
-                            batch[i].staging_slot = UINT32_MAX;
-                            glm5_prefetch_task pinned_retry = batch[i];
-                            pinned_retry.stage = GLM5_TRANSFER_STAGE_RAM_TO_PINNED;
-                            pinned_retry.staging_slot = UINT32_MAX;
-                            pinned_retry.staging_bytes = 0;
-                            pinned_retry.staging_valid = 0;
-                            pinned_retry.urgent = 1;
-                            ok[i] = enqueue_stage_or_retry(engine, engine->pinned_stage, pinned_retry) ? 1 : 0;
-                            if (ok[i]) {
-                                terminal[i] = 0;
-                                engine->pinned_stage.cv.notify_one();
-                            } else {
-                                engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                            if (batch[i].staging_slot != UINT32_MAX) {
+                                release_staging_slot(engine, batch[i].staging_slot);
+                                batch[i].staging_slot = UINT32_MAX;
                             }
+                            engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                            ok[i] = 0;
+                            terminal[i] = 1; // Drop it, avoid ping-pong livelock
                         }
                     } else {
                         // No valid staging data, use shorter 2ms wait

@@ -3,6 +3,7 @@
 
 static void device_complete_pending_copies(glm5_pc_engine* e);
 
+#include "device_backend_async.cpp.inc"
 #include "device_tensor_copy_stream.cpp.inc"
 #include "device_tensor_copy_tracking.cpp.inc"
 #include "device_tensor_copy_alloc.cpp.inc"

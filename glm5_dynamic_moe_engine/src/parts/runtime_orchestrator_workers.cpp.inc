@@ -113,10 +113,12 @@ static void orchestrator_resize_workers(
     const uint32_t old_gpu = runtime_gpu_workers(engine);
 
     resize_disk_workers(engine, disk);
-    if (engine->io_config.enable_multistage_pipeline) {
+    if (engine->io_config.enable_multistage_pipeline || old_pinned > 0) {
         resize_pinned_workers(engine, pinned);
     }
-    if (engine->io_config.enable_multistage_pipeline || (engine->io_config.enable_pinned_host && engine->staging)) {
+    if (engine->io_config.enable_multistage_pipeline ||
+        (engine->io_config.enable_pinned_host && engine->staging) ||
+        old_gpu > 0) {
         resize_gpu_workers(engine, gpu);
     }
 

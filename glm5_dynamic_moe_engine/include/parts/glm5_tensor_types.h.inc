@@ -1,3 +1,18 @@
+typedef enum {
+    GLM5_WEIGHT_ENCODING_UNKNOWN = 0,
+    GLM5_WEIGHT_ENCODING_RAW_FP16 = 1,
+    GLM5_WEIGHT_ENCODING_RAW_FP32 = 2,
+    GLM5_WEIGHT_ENCODING_NVFP4 = 3,
+    GLM5_WEIGHT_ENCODING_MXFP4 = 4,
+    GLM5_WEIGHT_ENCODING_LINEAR_Q2 = 5,
+    GLM5_WEIGHT_ENCODING_LINEAR_Q3 = 6,
+    GLM5_WEIGHT_ENCODING_LINEAR_Q4 = 7,
+    GLM5_WEIGHT_ENCODING_LINEAR_Q8 = 8,
+    GLM5_WEIGHT_ENCODING_GGUF_IQ2 = 9,
+    GLM5_WEIGHT_ENCODING_GGUF_IQ3 = 10,
+    GLM5_WEIGHT_ENCODING_GGUF_IQ4 = 11
+} glm5_weight_encoding_t;
+
 typedef struct {
     uint32_t part;
     uint32_t shard;
@@ -15,6 +30,9 @@ typedef struct {
     uint64_t scale2_byte_offset;
     uint64_t scale2_byte_length;
     int has_scale4;
+    uint32_t weight_encoding;
+    uint32_t weight_bits;
+    uint32_t weight_block_size;
 } glm5_tensor_info_t;
 
 typedef struct {

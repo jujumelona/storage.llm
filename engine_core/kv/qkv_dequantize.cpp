@@ -29,6 +29,9 @@ int qkv_dequant_one(
 
     const int d = s->head_dim;
     const int mse_bits = use_qjl ? bits - 1 : bits;
+    if (!qkv_bits_valid(mse_bits)) {
+        return 0;
+    }
     const int stride = (d * mse_bits + 7) / 8;
     const int qstride = (d + 7) / 8;
 

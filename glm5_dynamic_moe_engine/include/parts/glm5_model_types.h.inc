@@ -30,6 +30,10 @@ typedef struct {
     int use_direct_to_gpu_io;
     int use_fused_fp4_dequant_matmul;
     int use_scale4_decode_fusion;
+    int use_quant_family_dispatch;
+    int use_reference_weight_dequant;
+    int preferred_weight_bits;
+    uint32_t preferred_weight_encoding;
     int use_cuda_graphs;
     int use_metal_command_buffers;
     int use_paged_kv_cache;

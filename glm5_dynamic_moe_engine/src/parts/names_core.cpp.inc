@@ -49,6 +49,8 @@ const char* glm5_io_path_name(glm5_io_path_t path) {
             return "gpudirect_storage";
         case GLM5_IO_PATH_BAM_NVME:
             return "bam_nvme";
+        case GLM5_IO_PATH_ZERO_COPY_HOST:
+            return "zero_copy_host";
         default:
             return "unknown";
     }

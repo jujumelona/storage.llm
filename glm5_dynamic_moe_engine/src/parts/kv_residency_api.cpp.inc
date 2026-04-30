@@ -5,6 +5,9 @@ int glm5_pc_engine_set_kv_mode(glm5_pc_engine_t* engine, glm5_kv_mode_t mode) {
     if (mode != GLM5_KV_MODE_PLAIN && mode != GLM5_KV_MODE_QKV) {
         return 0;
     }
+    if (engine->qkv_forced_by_format.load(std::memory_order_relaxed) && mode != GLM5_KV_MODE_QKV) {
+        return 0;
+    }
     engine->config.kv_mode = mode;
     qkv_set_mode(mode == GLM5_KV_MODE_QKV);
     return 1;

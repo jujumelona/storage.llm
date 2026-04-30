@@ -2,27 +2,38 @@ static uint64_t prefetch_plan_item_key(uint32_t layer, uint32_t expert) {
     return ((uint64_t)layer << 32) | (uint64_t)expert;
 }
 
+// PIPELINE FIX 9: Replace unordered_set::clear() with generation counter ★★
+// Old: O(bucket_count) clear every orchestrate call (79 layers × 256 experts)
+// New: O(1) generation increment, map grows bounded to ~20k entries max
+// Periodic cleanup when generation wraps to prevent unbounded growth
 static void prefetch_plan_clear_seen(glm5_pc_engine* engine) {
     if (!engine) {
         return;
     }
-    engine->prefetch_plan_seen_set.clear();
+    ++engine->prefetch_plan_generation;
+    // Periodic cleanup every 10000 generations to prevent map growth
+    // At 100 tokens/sec, this triggers every ~100 seconds
+    if (engine->prefetch_plan_generation % 10000 == 0) {
+        engine->prefetch_plan_seen_gen.clear();
+    }
 }
 
 static bool prefetch_plan_has_item(glm5_pc_engine* engine, int layer, int expert) {
     if (!engine || layer < 0 || expert < 0) {
         return false;
     }
-    return engine->prefetch_plan_seen_set.count(
-        prefetch_plan_item_key((uint32_t)layer, (uint32_t)expert)) > 0;
+    const uint64_t key = prefetch_plan_item_key((uint32_t)layer, (uint32_t)expert);
+    auto it = engine->prefetch_plan_seen_gen.find(key);
+    return it != engine->prefetch_plan_seen_gen.end() &&
+           it->second == engine->prefetch_plan_generation;
 }
 
 static void prefetch_plan_mark_seen(glm5_pc_engine* engine, int layer, int expert) {
     if (!engine || layer < 0 || expert < 0) {
         return;
     }
-    engine->prefetch_plan_seen_set.insert(
-        prefetch_plan_item_key((uint32_t)layer, (uint32_t)expert));
+    engine->prefetch_plan_seen_gen[prefetch_plan_item_key((uint32_t)layer, (uint32_t)expert)] =
+        engine->prefetch_plan_generation;
 }
 
 static void prefetch_plan_add_item(

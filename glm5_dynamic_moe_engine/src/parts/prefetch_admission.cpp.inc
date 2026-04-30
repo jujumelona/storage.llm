@@ -22,6 +22,14 @@ static int prefetch_under_queue_pressure(
          prefetch_stage_load(engine->gpu_stage) * 4u >= max_queue * 3u)) {
         return 1;
     }
+    // BUG 5 FIX: RAM target should also check pinned_stage load
+    // When VRAM targets congest pinned_stage, RAM targets can flood disk_stage
+    // and push it to 100%, even though RAM targets don't use pinned_stage directly.
+    // Reject RAM targets when pinned_stage is >75% to maintain pipeline balance.
+    if (item.target_tier == GLM5_TIER_RAM &&
+        prefetch_stage_load(engine->pinned_stage) * 4u >= max_queue * 3u) {
+        return 1;
+    }
     return 0;
 }
 

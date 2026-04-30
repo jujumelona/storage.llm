@@ -9,8 +9,8 @@
 // 2. Lloyd-Max Codebook - Optimal scalar quantizer for Beta distribution
 // 3. QJL (Quantized Johnson-Lindenstrauss) - Unbiased inner product via residual
 //
-// Mode: When QKV mode is OFF, use the plain/original KV manager path.
-//       When QKV mode is ON, use this implementation.
+// Mode: QKV is the normal StorageLLM KV cache contract. The plain float KV
+// path is retained only as a debug/fallback path for legacy callers.
 
 #include <stdint.h>
 #include <stddef.h>
@@ -65,6 +65,10 @@ typedef struct {
     // Problem 11 Fix: Engine IO thread count to prevent CPU over-subscription
     uint32_t engine_io_thread_count;  // disk+pinned+gpu workers from engine
     const int* outlier_channel_indices; // Bug 4: Allow custom outlier indices instead of hardcoded 0..n
+    uint32_t group_size;        // Offload GGUF qkv_cache_schema.group_size
+    uint32_t page_size_tokens;  // Offload GGUF qkv_cache_schema.page_size_tokens
+    uint32_t sink_tokens;       // Attention sink tokens kept hot by residency policy
+    bool plain_kv_persistent_storage; // Must stay false for offload-native GGUF
 } qkv_config_t;
 
 // Default configuration
@@ -84,6 +88,10 @@ static inline qkv_config_t qkv_config_default(int head_dim) {
     // Problem 11 Fix: Default to 0 (no adjustment)
     cfg.engine_io_thread_count = 0;
     cfg.outlier_channel_indices = nullptr;
+    cfg.group_size = 64;
+    cfg.page_size_tokens = 16;
+    cfg.sink_tokens = 4;
+    cfg.plain_kv_persistent_storage = false;
     return cfg;
 }
 

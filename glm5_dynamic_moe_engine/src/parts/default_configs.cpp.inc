@@ -4,7 +4,7 @@ glm5_pc_engine_config_t glm5_pc_default_config(void) {
     cfg.common_vram_reserve_bytes = 0;
     cfg.ram_budget_bytes = storagellm::default_ram_budget_bytes(60);
     cfg.db_budget_bytes = UINT64_MAX / 4;
-    cfg.kv_mode = GLM5_KV_MODE_PLAIN;
+    cfg.kv_mode = GLM5_KV_MODE_QKV;
     cfg.prefer_gpu = 1;
     cfg.allow_db_streaming = 1;
     cfg.preferred_backend = GLM5_BACKEND_AUTO;

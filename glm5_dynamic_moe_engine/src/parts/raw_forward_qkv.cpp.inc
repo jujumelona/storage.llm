@@ -22,6 +22,86 @@ static void glm5_qkv_ensure_head_storage_locked(glm5_pc_engine* engine, size_t h
     }
 }
 
+static void glm5_qkv_free_head_states_locked(glm5_pc_engine* engine) {
+    if (!engine) {
+        return;
+    }
+    for (size_t i = 0; i < engine->qkv_head_state_slots.size(); ++i) {
+        if (i < engine->qkv_head_state_valid.size() && engine->qkv_head_state_valid[i]) {
+            qkv_free(&engine->qkv_head_state_slots[i]);
+        }
+    }
+    engine->qkv_head_state_slots.clear();
+    engine->qkv_head_state_valid.clear();
+    engine->qkv_head_state_locks.clear();
+    engine->qkv_last_ctx = 0;
+}
+
+static qkv_config_t glm5_qkv_contract_config_for_head_dim(
+    const glm5_pc_engine* engine,
+    uint32_t head_dim
+) {
+    qkv_config_t cfg = qkv_config_default((int)head_dim);
+    if (engine && engine->offload_qkv_cfg_available.load(std::memory_order_acquire)) {
+        cfg = engine->offload_qkv_cfg;
+        cfg.head_dim = (int)head_dim;
+        if (cfg.outlier_channels < 0) {
+            cfg.outlier_channels = 0;
+        }
+        if (cfg.outlier_channels > (int)head_dim) {
+            cfg.outlier_channels = (int)head_dim;
+        }
+        if (cfg.group_size == 0) {
+            cfg.group_size = 64;
+        }
+        if (cfg.page_size_tokens == 0) {
+            cfg.page_size_tokens = 16;
+        }
+        if (cfg.sink_tokens == 0) {
+            cfg.sink_tokens = 4;
+        }
+    }
+    cfg.engine_io_thread_count =
+        runtime_disk_workers(engine) + runtime_pinned_workers(engine) + runtime_gpu_workers(engine);
+    return cfg;
+}
+
+static bool glm5_qkv_config_matches_contract(
+    const qkv_config_t& current,
+    const qkv_config_t& desired
+) {
+    return current.k_bits == desired.k_bits &&
+        current.v_bits == desired.v_bits &&
+        current.head_dim == desired.head_dim &&
+        current.enable_qjl == desired.enable_qjl &&
+        current.enable_rotation == desired.enable_rotation &&
+        current.rotation_seed == desired.rotation_seed &&
+        current.qjl_seed == desired.qjl_seed &&
+        current.outlier_channels == desired.outlier_channels &&
+        current.outlier_bits == desired.outlier_bits &&
+        current.normal_bits == desired.normal_bits &&
+        current.group_size == desired.group_size &&
+        current.page_size_tokens == desired.page_size_tokens &&
+        current.sink_tokens == desired.sink_tokens &&
+        current.plain_kv_persistent_storage == desired.plain_kv_persistent_storage;
+}
+
+static void glm5_qkv_apply_contract_config_locked(
+    glm5_pc_engine* engine,
+    uint32_t head_dim
+) {
+    if (!engine) {
+        return;
+    }
+    const qkv_config_t desired = glm5_qkv_contract_config_for_head_dim(engine, head_dim);
+    if (!engine->qkv_cfg_initialized.load(std::memory_order_acquire) ||
+        !glm5_qkv_config_matches_contract(engine->qkv_cfg, desired)) {
+        glm5_qkv_free_head_states_locked(engine);
+        engine->qkv_cfg = desired;
+        engine->qkv_cfg_initialized.store(true, std::memory_order_release);
+    }
+}
+
 static int glm5_qkv_prepare_head_states(
     glm5_pc_engine* engine,
     uint32_t head_count,
@@ -31,10 +111,7 @@ static int glm5_qkv_prepare_head_states(
         return 0;
     }
     std::lock_guard<std::mutex> lock(engine->qkv_mutex);
-    if (!engine->qkv_cfg_initialized.load(std::memory_order_acquire)) {
-        engine->qkv_cfg = qkv_config_default((int)head_dim);
-        engine->qkv_cfg_initialized.store(true, std::memory_order_release);
-    }
+    glm5_qkv_apply_contract_config_locked(engine, head_dim);
     glm5_qkv_ensure_head_storage_locked(engine, head_count);
     return 1;
 }
@@ -52,10 +129,7 @@ static qkv_state_t* glm5_qkv_ensure_head_state(
 
     {
         std::lock_guard<std::mutex> lock(engine->qkv_mutex);
-        if (!engine->qkv_cfg_initialized.load(std::memory_order_acquire)) {
-            engine->qkv_cfg = qkv_config_default((int)head_dim);
-            engine->qkv_cfg_initialized.store(true, std::memory_order_release);
-        }
+        glm5_qkv_apply_contract_config_locked(engine, head_dim);
         glm5_qkv_ensure_head_storage_locked(engine, (size_t)head + 1u);
         head_lock = engine->qkv_head_state_locks[head].get();
     }

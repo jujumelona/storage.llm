@@ -55,6 +55,13 @@ int glm5_pc_engine_execute_prefetch_plan(
             if (try_add_tier_usage(engine, GLM5_TIER_VRAM, items[i].bytes,
                                    tier_budget(engine, GLM5_TIER_VRAM))) {
                 admitted_tiers[i] = GLM5_TIER_VRAM;
+                // PIPELINE FIX 14: Subtract from batch_ram_reserved when upgrading to VRAM ★★
+                // Old: batch_ram_reserved still includes upgraded bytes → over-reserves RAM
+                // New: Subtract upgraded bytes → accurate RAM reservation for subsequent batches
+                // Prevents unnecessary DB demotion of later experts
+                if (batch_ram_reserved >= items[i].bytes) {
+                    batch_ram_reserved -= items[i].bytes;
+                }
             }
         }
     }

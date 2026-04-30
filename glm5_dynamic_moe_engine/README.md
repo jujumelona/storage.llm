@@ -2,8 +2,10 @@
 
 Clean runtime folder for the GLM-5.1 NVFP4 StorageLLM engine.
 
-The goal is not a generic Hugging Face loader. The goal is a fixed-layout
-runtime that can run from any available storage tier:
+The primary target is now the offload-native GGUF layout: normal `.gguf` files
+with StorageLLM execution metadata embedded under the `offload.*` GGUF KV
+namespace. The legacy JUJU layout remains supported for existing artifacts.
+Both layouts feed the same storage-first runtime:
 
 ```text
 VRAM first -> RAM second -> DB/blob third
@@ -16,7 +18,49 @@ streamed tile-by-tile, even if that is slow.
 ## Model Layout
 
 Place model files outside the repository and pass that folder as `model_root`.
-This GLM engine expects:
+The preferred dedicated GGUF layout is:
+
+```text
+<model_root>/
+  tokenizer.json
+  MXFP4_MOE/
+    GLM-5.1-MXFP4_MOE-00001-of-00011.gguf
+    GLM-5.1-MXFP4_MOE-00002-of-00011.gguf
+    ...
+    GLM-5.1-MXFP4_MOE-00011-of-00011.gguf
+```
+
+The engine scans GGUF metadata headers only. If a shard contains
+`offload.metadata_v2`, model-root validation uses the embedded
+`offload.file_count` / `offload.file_index` contract instead of the hardcoded
+JUJU part table. QKV settings come from these GGUF KV entries when present:
+
+```text
+offload.weight_quant_family
+offload.weight_kernel_family
+offload.weight_bits
+offload.weight_block_size
+offload.qkv_k_bits
+offload.qkv_v_bits
+offload.qkv_group_size
+offload.qkv_page_size_tokens
+offload.qkv_sink_tokens
+```
+
+Weight quantization is dispatched by family, not by bit count alone. `UD-IQ2_M`
+and other IQ formats need IQ-specific metadata and kernels; `MXFP4` must use an
+MXFP4 decode table, not the NVFP4 table. If the runtime sees an unknown family,
+it refuses the direct tensor dot fallback instead of silently decoding it as
+FP4. The packed QKV cache remains the default KV cache path and is independently
+configured by the `offload.qkv_*` fields.
+
+When no legacy tensor index is present, `glm5_pc_engine_server <model_root>`
+falls back to this GGUF header contract. `/health` then exposes
+`offloadGgufValid`, `offloadGgufFileCount`, `offloadGgufTensorHeaders`, and the
+format-selected QKV fields so the runtime state is visible without pretending a
+full executable tensor table was loaded.
+
+The legacy JUJU layout is still accepted:
 
 ```text
 <model_root>/
@@ -32,9 +76,8 @@ This GLM engine expects:
 
 `tokenizer.json`, `tensors.csv`, and `glm5_scale4.gsc4` are runtime metadata.
 They are not training artifacts and they are not regenerated during inference.
-For public model distribution, the preferred packaging is to upload those
-metadata assets beside the JUJU parts, or pack them into a metadata-only
-`glm5.1-storage-part22.juju` once the runtime loader support is enabled.
+For legacy public distribution, keep those metadata assets beside the JUJU
+parts.
 
 The primary runtime layout uses manifest-relative paths such as
 `parts/glm5.1-storage-part01.juju`. If a browser download folder contains the
@@ -51,6 +94,7 @@ artifacts first, then pass the local folder as `model_root`.
 | --- | --- |
 | Official GLM-5.1 base model | <https://huggingface.co/zai-org/GLM-5.1> |
 | StorageLLM converted JUJU artifacts | <https://huggingface.co/storagejuju/GLM5.1-4q-storage> |
+| StorageLLM offload-native GGUF artifacts | <https://huggingface.co/storagejuju/GLM-5.1-GGUF-MXFP4-MOE-Offload> |
 | Direct browser download page | <https://huggingface.co/storagejuju/GLM5.1-4q-storage/tree/main> |
 | Hugging Face model download docs | <https://huggingface.co/docs/hub/models-downloading> |
 
@@ -58,6 +102,13 @@ Provisioning example for downloading the ready-to-run model files:
 
 ```text
 hf download storagejuju/GLM5.1-4q-storage --local-dir <model_root>
+glm5_pc_engine_server <model_root>
+```
+
+Dedicated GGUF provisioning:
+
+```text
+hf download storagejuju/GLM-5.1-GGUF-MXFP4-MOE-Offload --local-dir <model_root>
 glm5_pc_engine_server <model_root>
 ```
 
@@ -75,11 +126,11 @@ file URL is:
 https://huggingface.co/storagejuju/GLM5.1-4q-storage/resolve/main/parts/glm5.1-storage-part01.juju?download=true
 ```
 
-The expected StorageLLM Hugging Face repo must contain the same runtime assets
-listed above: `tokenizer.json`, `tensors.csv`, `glm5_scale4.gsc4`, and the
+The expected StorageLLM Hugging Face repo must contain either the dedicated
+GGUF shards with embedded `offload.*` metadata or the legacy runtime assets:
+`tokenizer.json`, `tensors.csv`, `glm5_scale4.gsc4`, and the
 `glm5.1-storage-part*.juju` files. The official `zai-org/GLM-5.1` repo remains
-the upstream model reference; this runtime consumes the converted StorageLLM
-JUJU layout.
+the upstream model reference.
 
 When using the shared root `loader/`, GLM-specific codec extras are carried in
 generic aux slots:
@@ -264,7 +315,7 @@ a slower operating mode rather than the target fast path.
 ## What This Folder Uses From Root
 
 - `../engine_core/core/mmap_loader.*`: shared mmap file mapping.
-- `../engine_core/kv/kv_qkv.*`: optional QKV cache quantization.
+- `../engine_core/kv/kv_qkv.*`: default packed QKV cache quantization.
 - `../loader/*`: JUJU/manifest loading and path helpers.
 
 ## What This Folder Drops
@@ -279,26 +330,33 @@ a slower operating mode rather than the target fast path.
 
 ## KV Default
 
-Default KV mode is plain/original KV. QKV is explicit opt-in through the C API
-`GLM5_KV_MODE_QKV` or the server's positional `qkv` selector. Do not silently
-replace plain KV.
+Default KV mode is packed QKV. Dedicated GGUF files can force this through the
+embedded `engine_contract.qkv_packed_cache_required` flag, and the engine then
+rejects attempts to switch back to persistent plain KV. The plain enum remains
+in the C ABI only for legacy/debug roots that do not carry the offload-native
+contract.
 
 ## Backend Target
 
 The policy is backend-neutral:
 
 - NVIDIA Windows/Linux PC + CUDA: promote hot expert blocks into VRAM, use
-  pinned staging, async copy streams, and optional DirectStorage/GPUDirect
-  Storage hooks when compiled and available.
+  pinned staging, backend-neutral async copy wrappers, and optional
+  DirectStorage/GPUDirect Storage hooks only after the registered-buffer path
+  is actually implemented. Large tensor uploads can bypass the pinned worker by
+  reading the shard ranges directly into a pinned staging slot and queuing the
+  GPU copy stage.
 - AMD Windows/Linux PC + HIP/ROCm: same expert/cache API as CUDA, using HIP
-  kernels once compiled. Vulkan/OpenCL remain fallback routes.
+  kernels once compiled. Until the HIP async adapter is filled, the runtime does
+  not claim the CUDA stream path for HIP. Vulkan/OpenCL remain fallback routes.
 - Intel Windows/Linux PC + Level Zero/SYCL/oneAPI: same expert/cache API, using
-  unified/shared memory where available. DirectML/OpenCL/Vulkan remain fallback
-  routes.
+  unified/shared memory where available. Until a Level Zero async copy adapter
+  is filled, this path remains host-visible streaming plus CPU fallback.
 - MacBook / Apple Silicon + Metal: use unified memory and mmap/page-cache
-  streaming first. There is no CUDA pinned-host path; prefetch still operates
-  on `(layer, expert)` bundles, but the backend should map them into Metal
-  buffers or shared memory.
+  streaming first. The runtime now reports `zero_copy_host`, disables pinned
+  staging/GPU upload workers, and avoids pretending there is a CUDA pinned-host
+  path. A future Metal adapter can map the same `(layer, expert)` bundles into
+  shared Metal buffers.
 - CPU fallback: mmap/page-cache streaming path.
 - Vulkan/DirectML/OpenCL/WebGPU: vendor-neutral fallback APIs. Same residency
   decisions, backend adapter decides whether a block can be promoted or must
@@ -320,6 +378,11 @@ The C API exposes the GLM5 fast path directly:
     RAM cache, storage streaming, async copy, direct-to-GPU IO, fused FP4
     dequant+matmul target, scale4 fusion target, CUDA Graph target, Metal
     command-buffer target, paged KV target, and prefill/decode split.
+- Backend capability flags now distinguish `supports_backend_async_api`,
+  `supports_zero_copy_host`, `supports_fixed_read_staging`, and
+  `supports_registered_io_buffers`. This prevents DirectStorage/GDS/io_uring
+  style paths from being reported as active before a real registered-buffer
+  implementation exists.
 - `glm5_pc_group_tokens_by_expert(...)`
   - sorts router assignments by `(layer, expert)` and emits compact expert
     batches so the runtime can load an expert once and process all matching
@@ -382,11 +445,8 @@ auto-detected. The server binds `127.0.0.1:8000`, exposes `/v1`, chooses the
 available CPU/GPU/Metal-style runtime path, and sizes RAM/VRAM caches
 automatically.
 
-The only normal startup selector is QKV:
-
-```text
-glm5_pc_engine_server <model_root> qkv
-```
+QKV is already the normal startup path. The old `qkv` selector is accepted for
+compatibility but is no longer required.
 
 Check the server:
 
@@ -434,8 +494,8 @@ Copy or merge that JSON into OpenClaw's config file.
 | Local API server | default | Start the OpenAI-compatible HTTP server on `127.0.0.1:8000`. |
 | Backend and platform | automatic | Detect the best available local path and keep CPU correctness fallback. |
 | RAM/VRAM budgets | automatic | Size cache and staging budgets from detected hardware. |
-| Plain KV mode | default | Use the GLM runtime KV cache with bf16 backing storage and float decode scratch. |
-| QKV mode | `qkv` | Opt into the experimental quantized KV path. |
+| QKV cache | default | Use packed QKV cache settings from the format metadata when present. |
+| Plain KV mode | legacy/debug only | Available only when the loaded format does not require packed QKV. |
 | Storage streaming fallback | default when needed | Stream cold blocks from local model-root storage; correct but slower. |
 
 ### Server Surface
@@ -444,7 +504,6 @@ Normal startup has two forms:
 
 ```text
 glm5_pc_engine_server <model_root>
-glm5_pc_engine_server <model_root> qkv
 ```
 
 Other command-line flags are for integration harnesses and debugging only. They

@@ -104,7 +104,6 @@ static int probe_main(int argc, char** argv) {
     glm5_pc_engine_config_t cfg = glm5_pc_default_config();
     cfg.vram_budget_bytes = 128ull * 1024ull * 1024ull;
     cfg.ram_budget_bytes = 512ull * 1024ull * 1024ull;
-    cfg.kv_mode = GLM5_KV_MODE_PLAIN;
     const char* table_path = NULL;
     const char* model_root = NULL;
     const char* scale4_path = NULL;
@@ -216,11 +215,15 @@ static int probe_main(int argc, char** argv) {
     glm5_backend_caps_t caps;
     if (glm5_pc_engine_get_backend_caps(engine, &caps)) {
         printf(
-            "backend=%s platform=%s async_copy=%d pinned=%d unified=%d mmap=%d cuda=%d hip=%d level_zero=%d sycl=%d metal=%d vulkan=%d directml=%d opencl=%d webgpu=%d directstorage=%d gds=%d rec_vram=%llu common=%llu\n",
+            "backend=%s platform=%s async_copy=%d backend_async=%d pinned=%d zero_copy=%d fixed_read=%d registered_io=%d unified=%d mmap=%d cuda=%d hip=%d level_zero=%d sycl=%d metal=%d vulkan=%d directml=%d opencl=%d webgpu=%d directstorage=%d gds=%d rec_vram=%llu common=%llu\n",
             glm5_backend_name(caps.backend),
             glm5_platform_name(caps.platform),
             caps.supports_async_copy,
+            caps.supports_backend_async_api,
             caps.supports_pinned_host,
+            caps.supports_zero_copy_host,
+            caps.supports_fixed_read_staging,
+            caps.supports_registered_io_buffers,
             caps.supports_unified_memory,
             caps.supports_mmap,
             caps.supports_cuda,
@@ -363,8 +366,23 @@ static int probe_main(int argc, char** argv) {
     }
 
     printf(
-        "kv=%s vram=%llu common=%llu expert_vram=%llu device=%llu allocs=%llu device_mem=%llu/%llu device_pools=%llu/%llu/%llu/%llu model_lib=%d/%d/%d path=%s common_prefetch=%llu/%llu ram=%llu db=%llu experts=%llu tiers=%llu/%llu/%llu\n",
+        "kv=%s offload_gguf=%d files=%u tensor_headers=%llu executable_tensors=%llu qkv_forced=%u qkv_bits=%u/%u qkv_group=%u qkv_page=%u qkv_sink=%u weight=%s/%ub enc=%u kernel=%s first_gguf=%s vram=%llu common=%llu expert_vram=%llu device=%llu allocs=%llu device_mem=%llu/%llu device_pools=%llu/%llu/%llu/%llu model_lib=%d/%d/%d path=%s common_prefetch=%llu/%llu ram=%llu db=%llu experts=%llu tiers=%llu/%llu/%llu\n",
         glm5_kv_mode_name(stats.kv_mode),
+        stats.offload_gguf_valid,
+        stats.offload_gguf_file_count,
+        (unsigned long long)stats.offload_gguf_tensor_count,
+        (unsigned long long)stats.offload_gguf_executable_tensor_count,
+        stats.qkv_forced_by_format,
+        stats.qkv_k_bits,
+        stats.qkv_v_bits,
+        stats.qkv_group_size,
+        stats.qkv_page_size_tokens,
+        stats.qkv_sink_tokens,
+        stats.weight_quant_family,
+        stats.weight_quant_bits,
+        stats.weight_quant_encoding,
+        stats.weight_kernel_family,
+        stats.offload_gguf_first_file,
         (unsigned long long)stats.vram_used_bytes,
         (unsigned long long)stats.common_vram_reserved_bytes,
         (unsigned long long)stats.vram_expert_used_bytes,
@@ -471,6 +489,16 @@ static int probe_main(int argc, char** argv) {
                     (unsigned long long)io_stats.recommended_staging_bytes
                 );
             }
+        }
+    } else if (model_root) {
+        if (glm5_pc_engine_load_codec_table(engine, nullptr, model_root, scale4_path)) {
+            glm5_pc_engine_get_stats(engine, &stats);
+            printf(
+                "offload_gguf_header_tensors=%llu codec_tensors=%llu\n",
+                (unsigned long long)stats.offload_gguf_tensor_count,
+                (unsigned long long)glm5_pc_engine_tensor_count(engine)
+            );
+            print_forward_status("loaded", engine);
         }
     }
 

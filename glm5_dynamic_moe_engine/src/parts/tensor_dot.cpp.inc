@@ -24,14 +24,30 @@ static int glm5_dot_tensor_record_row(
     if (!packed) {
         return 0;
     }
-    if (weight_format == 1) {
+    if (weight_format == GLM5_WEIGHT_ENCODING_RAW_FP16) {
         *out_value = glm5_dot_raw_fp16_row(packed, x, rec->info.cols);
         return 1;
     }
-    if (weight_format == 2) {
+    if (weight_format == GLM5_WEIGHT_ENCODING_RAW_FP32) {
         *out_value = glm5_dot_raw_fp32_row(packed, x, rec->info.cols);
         return 1;
     }
-    *out_value = glm5_dot_fp4_row(*rec, shard, packed, x, engine, row);
-    return 1;
+    if (weight_format == GLM5_WEIGHT_ENCODING_NVFP4) {
+        *out_value = glm5_dot_fp4_row(*rec, shard, packed, x, engine, row);
+        return 1;
+    }
+    if (weight_format == GLM5_WEIGHT_ENCODING_LINEAR_Q2 ||
+        weight_format == GLM5_WEIGHT_ENCODING_LINEAR_Q3 ||
+        weight_format == GLM5_WEIGHT_ENCODING_LINEAR_Q4 ||
+        weight_format == GLM5_WEIGHT_ENCODING_LINEAR_Q8) {
+        *out_value = glm5_dot_linear_quant_row(
+            *rec,
+            shard,
+            packed,
+            x,
+            rec->weight_bits,
+            row);
+        return 1;
+    }
+    return 0;
 }

@@ -25,7 +25,7 @@ int qkv_attention_decode_impl(
 ) {
     if (!query || !s || !cfg || !output || !ctx || !hdim) return 0;
     const int d = (int)hdim, n = (int)ctx;
-    const bool qjl = cfg->enable_qjl && s->k_qjl && s->v_qjl;
+    const bool qjl = cfg->enable_qjl && s->k_bits > 1 && s->v_bits > 1 && s->k_qjl && s->v_qjl;
 
     // Use scratch buffers
     float* row = s->scratch_residual;
@@ -61,6 +61,7 @@ int qkv_attention_decode_impl(
     // Phase 1: K scores — dequant in rotated domain (no inverse rotation needed)
     // Paper Algorithm 2: For unbiased inner product, include QJL residual
     const int k_mse_bits = qjl ? s->k_bits - 1 : s->k_bits;
+    if (!qkv_bits_valid(k_mse_bits)) return 0;
     const float* k_centroids = qkv_codebook_for_bits(s, k_mse_bits);
     const int k_stride = (d * k_mse_bits + 7) / 8;
     const int k_qstride = (d + 7) / 8;

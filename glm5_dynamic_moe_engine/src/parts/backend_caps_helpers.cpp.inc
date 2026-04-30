@@ -24,10 +24,20 @@ static void fill_cpu_backend_caps(glm5_backend_caps_t* caps) {
     const uint32_t hw = caps_hw_threads();
     caps->supports_fp4 = 1;
     caps->supports_scale4 = 1;
+    caps->supports_weight_q2 = 1;
+    caps->supports_weight_q3 = 1;
+    caps->supports_weight_q4 = 1;
+    caps->supports_weight_q8 = 1;
+    caps->supports_weight_iq2 = 0;
+    caps->supports_weight_mxfp4 = 0;
+    caps->supports_unified_memory = 1;
+    caps->supports_zero_copy_host = 1;
+    caps->supports_pinned_host = 0;
+    caps->supports_backend_async_api = 0;
     caps->compute_streams = std::min<uint32_t>(hw, 8u);
     caps->copy_streams = 0;
     caps->prefetch_streams = std::min<uint32_t>(std::max<uint32_t>(hw / 2u, 1u), 8u);
-    caps->recommended_pinned_bytes = std::max<uint64_t>(256ull * 1024ull * 1024ull, cache_for_experts(8));
+    caps->recommended_pinned_bytes = 0;
 }
 
 static void fill_gpu_backend_base(glm5_backend_caps_t* caps) {
@@ -38,6 +48,12 @@ static void fill_gpu_backend_base(glm5_backend_caps_t* caps) {
     caps->supports_async_copy = 1;
     caps->supports_fp4 = compiled_nvfp4_device_kernels_available();
     caps->supports_scale4 = compiled_scale4_device_fusion_available();
+    caps->supports_weight_q2 = 0;
+    caps->supports_weight_q3 = 0;
+    caps->supports_weight_q4 = caps->supports_fp4;
+    caps->supports_weight_q8 = 0;
+    caps->supports_weight_iq2 = 0;
+    caps->supports_weight_mxfp4 = 0;
     caps->recommended_vram_common_bytes = working_common_cache_bytes();
     caps->recommended_pinned_bytes = std::max<uint64_t>(512ull * 1024ull * 1024ull, cache_for_experts(12));
 }
@@ -45,6 +61,9 @@ static void fill_gpu_backend_base(glm5_backend_caps_t* caps) {
 static void fill_cuda_backend_caps(glm5_backend_caps_t* caps) {
     caps->supports_cuda = compiled_cuda_available();
     caps->supports_pinned_host = 1;
+    caps->supports_fixed_read_staging = 1;
+    caps->supports_registered_io_buffers = 0;
+    caps->supports_backend_async_api = 1;
     caps->supports_directstorage = compiled_directstorage_available();
     caps->supports_gpudirect_storage = compiled_gpudirect_available();
     caps->supports_gpu_direct_file_io =
@@ -66,6 +85,8 @@ static void fill_cuda_backend_caps(glm5_backend_caps_t* caps) {
 static void fill_hip_backend_caps(glm5_backend_caps_t* caps) {
     caps->supports_hip = compiled_hip_available();
     caps->supports_pinned_host = 1;
+    caps->supports_fixed_read_staging = 1;
+    caps->supports_backend_async_api = 0;
     caps->supports_directstorage = compiled_directstorage_available();
     caps->supports_gpu_direct_file_io = caps->supports_directstorage;
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(48);
@@ -74,13 +95,16 @@ static void fill_hip_backend_caps(glm5_backend_caps_t* caps) {
 static void fill_shared_memory_backend_caps(glm5_backend_caps_t* caps) {
     caps->supports_pinned_host = 1;
     caps->supports_unified_memory = 1;
+    caps->supports_zero_copy_host = 1;
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(48);
 }
 
 static void fill_metal_backend_caps(glm5_backend_caps_t* caps) {
     caps->supports_metal = compiled_metal_available();
     caps->supports_unified_memory = 1;
+    caps->supports_zero_copy_host = 1;
     caps->supports_pinned_host = 0;
+    caps->supports_backend_async_api = 0;
     caps->supports_gpu_direct_file_io = 0;
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(32);
     caps->recommended_pinned_bytes = 0;
@@ -89,12 +113,15 @@ static void fill_metal_backend_caps(glm5_backend_caps_t* caps) {
 static void fill_basic_gpu_caps(glm5_backend_caps_t* caps, int available, int* feature_flag) {
     *feature_flag = available;
     caps->supports_pinned_host = 1;
+    caps->supports_fixed_read_staging = 1;
+    caps->supports_backend_async_api = 0;
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(32);
 }
 
 static void fill_webgpu_backend_caps(glm5_backend_caps_t* caps) {
     caps->supports_webgpu = compiled_webgpu_available();
     caps->supports_pinned_host = 0;
+    caps->supports_backend_async_api = 0;
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(16);
     caps->recommended_pinned_bytes = 0;
 }

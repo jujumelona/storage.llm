@@ -113,6 +113,55 @@ static float glm5_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32
 #endif
 }
 
+static uint32_t glm5_packed_lsb_code_at(const uint8_t* packed, uint32_t element_index, uint32_t bits) {
+    const uint64_t bit_offset = (uint64_t)element_index * bits;
+    const uint64_t byte_offset = bit_offset >> 3;
+    const uint32_t shift = (uint32_t)(bit_offset & 7u);
+    uint32_t window = packed[byte_offset];
+    if (shift + bits > 8u) {
+        window |= (uint32_t)packed[byte_offset + 1u] << 8u;
+    }
+    const uint32_t mask = (1u << bits) - 1u;
+    return (window >> shift) & mask;
+}
+
+static float glm5_dot_linear_quant_row(
+    const glm5_tensor_record& rec,
+    const mmap_context_t* shard,
+    const uint8_t* packed,
+    const float* x,
+    uint32_t bits,
+    uint32_t row
+) {
+    const uint32_t ngroups = rec.info.groups ? rec.info.groups : 1u;
+    const uint32_t group_size = rec.info.group_size ? rec.info.group_size : rec.info.cols;
+    float acc = 0.0f;
+    if (bits == 8u) {
+        for (uint32_t group = 0; group < ngroups; ++group) {
+            const float scale = glm5_raw_scale_at(rec, shard, row, group);
+            const uint32_t start = group * group_size;
+            const uint32_t limit = std::min<uint32_t>(start + group_size, rec.info.cols);
+            for (uint32_t col = start; col < limit; ++col) {
+                int8_t q = 0;
+                std::memcpy(&q, packed + col, sizeof(q));
+                acc += (float)q * scale * x[col];
+            }
+        }
+        return acc;
+    }
+    const float midpoint = ((float)((1u << bits) - 1u)) * 0.5f;
+    for (uint32_t group = 0; group < ngroups; ++group) {
+        const float scale = glm5_raw_scale_at(rec, shard, row, group);
+        const uint32_t start = group * group_size;
+        const uint32_t limit = std::min<uint32_t>(start + group_size, rec.info.cols);
+        for (uint32_t col = start; col < limit; ++col) {
+            const uint32_t code = glm5_packed_lsb_code_at(packed, col, bits);
+            acc += ((float)code - midpoint) * scale * x[col];
+        }
+    }
+    return acc;
+}
+
 static float glm5_dot_fp4_row(
     const glm5_tensor_record& rec,
     const mmap_context_t* shard,
