@@ -102,8 +102,8 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         }
         const uint64_t ram_used = tier_used(engine, moe_TIER_RAM);
         const uint64_t ram_target = (ram_bud * 80ull) / 100ull;
-        const uint64_t ram_threshold_90 = (ram_bud * 90ull) / 100ull;
-        if (ram_bud > 0 && ram_used > ram_threshold_90 && ram_used > ram_target) {
+        const uint64_t ram_threshold_85 = (ram_bud * 85ull) / 100ull;
+        if (ram_bud > 0 && ram_used > ram_threshold_85 && ram_used > ram_target) {
             std::vector<std::pair<int, int>> ignored;
             demote_cold_until(engine, moe_TIER_RAM, ram_used - ram_target, ignored);
         }
