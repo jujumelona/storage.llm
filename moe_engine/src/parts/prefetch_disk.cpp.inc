@@ -44,7 +44,7 @@
             if (!src) {
                 return 0;
             }
-            touch_mapped_range(e, src, length);
+            touch_mapped_range(engine, src, length);
             if (!hint_issued) {
                 engine->io_atomic.bytes_touch_fallback.fetch_add(length);
             }

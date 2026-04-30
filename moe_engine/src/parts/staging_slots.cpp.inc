@@ -357,6 +357,7 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
         slot.buf = engine->staging + slot_size * i;
         slot.size = i + 1 == slot_count ? engine->staging_size - slot_size * i : slot_size;
         slot.pinned = engine->staging_pinned;
+        slot.numa_allocated = engine->staging_numa_allocated;
 #if defined(__APPLE__) && defined(__MACH__)
         if (engine->backend_caps.backend == moe_BACKEND_METAL) {
             slot.metal_buffer = metal_zero_copy_map(nullptr, slot.buf, slot.size);

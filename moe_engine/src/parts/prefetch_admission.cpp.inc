@@ -26,13 +26,13 @@ static int prefetch_under_queue_pressure(
     // When VRAM targets congest pinned_stage, RAM targets can flood disk_stage
     // and push it to 100%, even though RAM targets don't use pinned_stage directly.
     // Reject RAM targets when pinned_stage is >75% to maintain pipeline balance.
-    // BUGFIX 25: Use realistic threshold based on worker count ?�★
+    // BUGFIX 25: Use realistic threshold based on worker count ?�★
     // Old: max_queue * 75% (9216) ??never reached with 1-2 pinned workers
     // New: pinned_workers * batch_max * 4 ??realistic congestion detection
     if (item.target_tier == moe_TIER_RAM) {
         const uint32_t pinned_workers = runtime_pinned_workers(engine);
-        constexpr uint32_t gpu_batch_max = 4;
-        const uint32_t pinned_pressure_threshold = std::max(32u, pinned_workers * gpu_batch_max * 8u);
+        const uint32_t dyn_batch_max = moe_gpu_stage_batch_max(engine);
+        const uint32_t pinned_pressure_threshold = std::max(32u, pinned_workers * dyn_batch_max * 8u);
         if (prefetch_stage_load(engine->pinned_stage) >= pinned_pressure_threshold) {
             return 1;
         }

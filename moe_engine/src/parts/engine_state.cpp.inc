@@ -78,6 +78,7 @@
     uint8_t* staging = nullptr;
     uint64_t staging_size = 0;
     bool staging_pinned = false;
+    bool staging_numa_allocated = false;
     std::vector<moe_staging_slot> staging_slots;
     uint64_t staging_slot_size = 0;
     std::mutex staging_slot_mutex;
@@ -117,6 +118,7 @@
     std::atomic<uint64_t> device_stream_bytes{0};
     std::atomic<uint64_t> device_total_bytes{0};
     std::atomic<uint64_t> device_free_bytes{0};
+    std::atomic<uint64_t> pending_ram_reservation{0};
     std::atomic<int64_t> last_mem_query_ms{0};  // Fix 41: per-engine cuMemGetInfo throttle
     std::atomic<int> device_allocator_ready{0};
     std::unordered_set<uint64_t> activation_keys;

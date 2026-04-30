@@ -59,6 +59,7 @@ struct moe_staging_slot {
     void* metal_buffer = nullptr; // BUGFIX 83: Issue 4 - Metal Zero-Copy path support
     uint64_t size = 0;
     bool pinned = false;
+    bool numa_allocated = false;
     std::atomic<bool> in_use{false};
 
     moe_staging_slot() = default;
@@ -69,11 +70,13 @@ struct moe_staging_slot {
         metal_buffer = other.metal_buffer;
         size = other.size;
         pinned = other.pinned;
+        numa_allocated = other.numa_allocated;
         in_use.store(other.in_use.load());
         other.buf = nullptr;
         other.metal_buffer = nullptr;
         other.size = 0;
         other.pinned = false;
+        other.numa_allocated = false;
         other.in_use.store(false);
     }
     moe_staging_slot& operator=(moe_staging_slot&& other) noexcept {
@@ -81,11 +84,13 @@ struct moe_staging_slot {
         metal_buffer = other.metal_buffer;
         size = other.size;
         pinned = other.pinned;
+        numa_allocated = other.numa_allocated;
         in_use.store(other.in_use.load());
         other.buf = nullptr;
         other.metal_buffer = nullptr;
         other.size = 0;
         other.pinned = false;
+        other.numa_allocated = false;
         other.in_use.store(false);
         return *this;
     }

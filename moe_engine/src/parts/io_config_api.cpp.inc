@@ -1,13 +1,15 @@
-int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* config) {
+﻿int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* config) {
     if (!engine) {
         return 0;
     }
     stop_io_workers(engine);
     reset_staging_slots(engine);
-    free_staging(engine->staging, engine->staging_size, engine->staging_pinned);
+    free_staging(engine->staging, engine->staging_size, engine->staging_pinned, engine->staging_numa_allocated);
     engine->staging = nullptr;
     engine->staging_size = 0;
     engine->staging_pinned = false;
+    engine->pending_ram_reservation.store(0, std::memory_order_relaxed);
+    engine->staging_numa_allocated = false;
 
     engine->io_config = config ? *config : moe_pc_default_io_config();
     if (engine->io_config.io_worker_threads > disk_worker_cap()) {
@@ -67,7 +69,8 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
         engine->staging = allocate_best_staging(engine,
             requested_staging_bytes,
             &engine->staging_size,
-            &engine->staging_pinned
+            &engine->staging_pinned,
+            &engine->staging_numa_allocated
         );
         if (!engine->staging) {
             engine->io_config.enable_pinned_host = 0;

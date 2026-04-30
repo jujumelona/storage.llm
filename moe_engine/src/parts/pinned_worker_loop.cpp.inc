@@ -16,11 +16,12 @@
                 staging_bytes = task.staging_bytes;
                 ok = 1;
             } else {
+                const uint64_t required_bytes = tensor_stream_bytes(engine->tensors[task.tensor_index]);
                 task.staging_slot = acquire_staging_slot(
                     engine,
                     worker_index,
                     pingpong++,
-                    task.bytes,
+                    required_bytes,
                     true,
                     false
                 );

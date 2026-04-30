@@ -316,6 +316,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                             engine,
                             worker_index,
                             staging_turn++,
+                            tensor_stream_bytes(rec),
                             false,
                             true
                         );

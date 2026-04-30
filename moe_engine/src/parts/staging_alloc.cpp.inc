@@ -1,4 +1,4 @@
-// TODO: Issue 11 - NUMA-aware pinned memory allocation ★
+﻿// TODO: Issue 11 - NUMA-aware pinned memory allocation ★
 // Problem: cuMemAllocHost/mlock doesn't specify NUMA node
 // On AMD Ryzen (multi-CCD), memory on wrong NUMA node → 20-30% DMA bandwidth loss
 // Cross-chiplet memory access adds latency, reduces PCIe throughput
@@ -17,9 +17,12 @@
 // Trade-off: Linux/Windows-specific code, libnuma dependency on Linux
 // Impact: 20-30% DMA bandwidth improvement on multi-CCD AMD systems
 // Status: Documented as TODO, not implemented (platform-specific)
-static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* pinned) {
+static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* pinned, bool* numa_allocated) {
     if (pinned) {
         *pinned = false;
+    }
+    if (numa_allocated) {
+        *numa_allocated = false;
     }
     if (bytes == 0) {
         return nullptr;
@@ -56,6 +59,9 @@ static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* 
 #ifdef HAVE_NUMA
     if (preferred_numa_node >= 0 && numa_available() >= 0) {
         ptr = numa_alloc_onnode(static_cast<size_t>(bytes), preferred_numa_node);
+        if (ptr && numa_allocated) {
+            *numa_allocated = true;
+        }
     }
 #endif
     if (!ptr) {
@@ -70,7 +76,7 @@ static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* 
 #endif
 }
 
-static void free_staging(uint8_t* ptr, uint64_t bytes, bool pinned) {
+static void free_staging(uint8_t* ptr, uint64_t bytes, bool pinned, bool numa_allocated) {
     if (!ptr) {
         return;
     }
@@ -85,9 +91,7 @@ static void free_staging(uint8_t* ptr, uint64_t bytes, bool pinned) {
     }
     // BUGFIX 81: Free NUMA-allocated memory correctly
 #ifdef HAVE_NUMA
-    // numa_alloc_onnode() requires numa_free(), not free()
-    // Check if this was NUMA-allocated (heuristic: if NUMA is available)
-    if (numa_available() >= 0) {
+    if (numa_allocated) {
         numa_free(ptr, static_cast<size_t>(bytes));
         return;
     }
@@ -96,7 +100,8 @@ static void free_staging(uint8_t* ptr, uint64_t bytes, bool pinned) {
 #endif
 }
 
-static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes, uint64_t* actual_bytes, bool* pinned) {
+static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes, uint64_t* actual_bytes, bool* pinned, bool* numa_allocated) {
+    if (numa_allocated) { *numa_allocated = false; }
     if (actual_bytes) {
         *actual_bytes = 0;
     }
@@ -116,7 +121,11 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
                 (unsigned long long)limit,
                 (unsigned long long)min_pinned);
             // Fallback: allocate non-pinned buffer
-            uint8_t* ptr = allocate_staging(e ? e->backend_caps.preferred_numa_node : -1, requested_bytes, nullptr);
+            uint8_t* ptr = allocate_staging(
+                e ? e->backend_caps.preferred_numa_node : -1,
+                requested_bytes,
+                nullptr,
+                numa_allocated);
             if (ptr) {
                 if (actual_bytes) {
                     *actual_bytes = requested_bytes;
@@ -139,13 +148,17 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
 #endif
     while (bytes >= min_pinned) {
         bool got_pinned = false;
-        uint8_t* ptr = allocate_staging(e ? e->backend_caps.preferred_numa_node : -1, bytes, &got_pinned);
+        bool got_numa = false;
+        uint8_t* ptr = allocate_staging(e ? e->backend_caps.preferred_numa_node : -1, bytes, &got_pinned, &got_numa);
         if (ptr && got_pinned) {
             if (actual_bytes) {
                 *actual_bytes = bytes;
             }
             if (pinned) {
                 *pinned = true;
+            }
+            if (numa_allocated) {
+                *numa_allocated = got_numa;
             }
             return ptr;
         }
@@ -154,7 +167,7 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
         // This ensures allocate_best_staging only returns pinned memory or NULL,
         // preventing silent sync DMA disguised as async.
         if (ptr) {
-            free_staging(ptr, bytes, false);
+            free_staging(ptr, bytes, false, got_numa);
         }
         bytes /= 2;
     }
@@ -169,7 +182,11 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
         (unsigned long long)(requested_bytes / (1024ull * 1024ull)));
 
     // Allocate non-pinned buffer as last resort
-    uint8_t* fallback_ptr = allocate_staging(e ? e->backend_caps.preferred_numa_node : -1, requested_bytes, nullptr);
+    uint8_t* fallback_ptr = allocate_staging(
+        e ? e->backend_caps.preferred_numa_node : -1,
+        requested_bytes,
+        nullptr,
+        numa_allocated);
     if (fallback_ptr) {
         if (actual_bytes) {
             *actual_bytes = requested_bytes;

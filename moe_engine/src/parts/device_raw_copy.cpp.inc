@@ -50,7 +50,7 @@ static int device_copy_raw_span(
     // Bug #10: QKV attention weights (raw spans) use pinned slot pool (for_pinned = true)
     // This prevents attention DMA from blocking MoE weight DMA in the GPU direct pool.
     const uint32_t slot_idx = (e->staging_slots.size() > 0 && s.bytes <= e->staging_slot_size)
-        ? acquire_staging_slot(e, 0u, s_raw_span_acquire_turn++, bytes, true) : UINT32_MAX;
+        ? acquire_staging_slot(e, 0u, s_raw_span_acquire_turn++, s.bytes, true) : UINT32_MAX;
 
     if (slot_idx != UINT32_MAX) {
         moe_staging_slot& slot = e->staging_slots[slot_idx];
