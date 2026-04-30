@@ -81,6 +81,10 @@ static int try_add_tier_usage(moe_pc_engine* engine, moe_tier_t tier, uint64_t b
     }
 
     // Slow path: CAS loop (but only when budget allows)
+    // BUGFIX 99: Issue 20 - Precompute percentage threshold ★
+    // Problem: (budget * 85ull) / 100ull computed on every successful CAS
+    // Solution: Precompute threshold once before loop
+    const uint64_t threshold_85 = budget > 0 ? (budget * 85ull) / 100ull : UINT64_MAX;
     for (;;) {
         // Re-check budget in loop (current may have changed)
         if (budget != 0 && (current > budget || bytes > budget - current)) {
@@ -92,10 +96,10 @@ static int try_add_tier_usage(moe_pc_engine* engine, moe_tier_t tier, uint64_t b
                 std::memory_order_relaxed,
                 std::memory_order_relaxed)) {
             // Trigger eviction if threshold exceeded
-            if (tier == moe_TIER_VRAM && budget > 0 && (current + bytes) > (budget * 85ull) / 100ull) {
+            if (tier == moe_TIER_VRAM && (current + bytes) > threshold_85) {
                 engine->vram_eviction_needed.store(true, std::memory_order_relaxed);
                 engine->vram_eviction_cv.notify_one();
-            } else if (tier == moe_TIER_RAM && budget > 0 && (current + bytes) > (budget * 85ull) / 100ull) {
+            } else if (tier == moe_TIER_RAM && (current + bytes) > threshold_85) {
                 engine->ram_eviction_needed.store(true, std::memory_order_relaxed);
                 engine->ram_eviction_cv.notify_one();
             }
