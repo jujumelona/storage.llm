@@ -5,7 +5,18 @@ int glm5_pc_engine_set_model_root(
     if (!engine) {
         return 0;
     }
-    glm5_pc_engine_wait_io(engine);
+    // BUGFIX 52: Issue 23 - Stop IO workers before shard cleanup ★★★
+    // Problem: wait_io only waits for queue to drain, but io_workers continue running.
+    // After shard_mmaps.clear(), io_worker can call get_or_map_tensor_shard with stale
+    // model_root, causing mmap of wrong files or crashes.
+    // Solution: stop_io_workers() terminates all workers, then clear shards, then restart.
+    // This ensures no worker accesses shards during cleanup.
+    // BUGFIX 55: Hold io_start_mutex to serialize with ensure_io_ready
+    {
+        std::lock_guard<std::mutex> io_lock(engine->io_start_mutex);
+        stop_io_workers(engine);
+    }
+
     {
         std::unique_lock<std::shared_mutex> lock(engine->shard_mutex);
         for (auto& item : engine->shard_mmaps) {
@@ -40,6 +51,10 @@ int glm5_pc_engine_set_model_root(
     engine->model_root_valid.store(valid ? 1 : 0, std::memory_order_relaxed);
     engine->tokenizer_valid.store(-1, std::memory_order_relaxed);
     engine->attention_projector_valid.store(-1, std::memory_order_relaxed);  // Fix 72: invalidate cache
+
+    // Restart IO workers with new model_root
+    start_io_workers(engine);
+
     return 1;
 }
 

@@ -26,7 +26,20 @@ static uint8_t weight_bits_for_encoding(uint8_t encoding) {
     }
 }
 
-static uint8_t infer_weight_format(const glm5_tensor_info_t& info) {
+// BUGFIX 50: Issue 21 - Weight format inference correctness bug ★★★
+// Problem: infer_weight_format returns NVFP4 for any 4-bit format (NVFP4, MXFP4, LINEAR_Q4)
+// because they all have identical byte counts. MXFP4 tensors get tagged as NVFP4, causing
+// wrong decode table in raw_forward_qkv. This is a critical correctness bug.
+// Solution: Accept optional weight_encoding hint from GGUF metadata. When available, use it
+// directly instead of byte-count inference. Set weight_format_inferred flag for fallback cases.
+static uint8_t infer_weight_format(const glm5_tensor_info_t& info, uint8_t gguf_encoding_hint) {
+    // Priority 1: Use GGUF metadata if available (offload_weight_encoding)
+    if (gguf_encoding_hint != GLM5_WEIGHT_ENCODING_UNKNOWN &&
+        gguf_encoding_hint != 0) {
+        return gguf_encoding_hint;
+    }
+
+    // Priority 2: Byte-count inference (ambiguous for 4-bit formats)
     const uint64_t elems = (uint64_t)info.rows * info.cols;
     if (elems == 0 || info.rows == 0) {
         return GLM5_WEIGHT_ENCODING_UNKNOWN;
@@ -46,6 +59,9 @@ static uint8_t infer_weight_format(const glm5_tensor_info_t& info) {
         return GLM5_WEIGHT_ENCODING_LINEAR_Q8;
     }
     if (info.weight_byte_length == q4_bytes) {
+        // AMBIGUOUS: Could be NVFP4, MXFP4, or LINEAR_Q4
+        // Default to NVFP4 for backward compatibility, but caller should check
+        // weight_format_inferred flag and validate with GGUF metadata
         return GLM5_WEIGHT_ENCODING_NVFP4;
     }
     if (info.weight_byte_length == q3_bytes) {
@@ -82,11 +98,13 @@ static uint8_t infer_scale_format(const glm5_tensor_info_t& info) {
     return info.scale_byte_length == count ? 3 : 0;
 }
 
-static void finalize_tensor_layout(glm5_tensor_record* rec) {
+static void finalize_tensor_layout(glm5_tensor_record* rec, uint8_t gguf_encoding_hint = GLM5_WEIGHT_ENCODING_UNKNOWN) {
     if (!rec) {
         return;
     }
-    rec->weight_format = infer_weight_format(rec->info);
+    rec->weight_format = infer_weight_format(rec->info, gguf_encoding_hint);
+    rec->weight_format_inferred = (gguf_encoding_hint == GLM5_WEIGHT_ENCODING_UNKNOWN ||
+                                    gguf_encoding_hint == 0) ? 1 : 0;
     rec->weight_row_bytes = infer_weight_row_bytes(rec->info, rec->weight_format);
     rec->weight_bits = weight_bits_for_encoding(rec->weight_format);
     rec->weight_block_size = rec->info.group_size > 0 && rec->info.group_size <= 255u ?

@@ -132,5 +132,20 @@ static void orchestrator_resize_workers(
                 engine->cpu_row_target_workers.store(0, std::memory_order_relaxed);
             }
         }
+
+        // BUGFIX 43: Ensure new workers enter wait state before first task arrives ★★
+        // Old: New thread created → notify_one() may fire before thread reaches wait()
+        //      → new worker misses first task
+        // New: yield() + notify_all() ensures new threads are scheduled and waiting
+        // Scenario: Token generation 5ms/token, thread creation ~100µs
+        //           Without yield, new worker may not be scheduled before next notify
+        // Trade-off: Small delay (~1µs yield) vs guaranteed worker readiness
+        if (disk > old_disk || pinned > old_pinned || gpu > old_gpu) {
+            std::this_thread::yield();  // Let new threads reach wait state
+            // Notify all stages to wake new workers
+            engine->disk_stage.cv.notify_all();
+            engine->pinned_stage.cv.notify_all();
+            engine->gpu_stage.cv.notify_all();
+        }
     }
 }

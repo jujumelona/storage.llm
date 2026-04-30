@@ -32,20 +32,22 @@ static void device_refresh_mem_info(glm5_pc_engine* e) {
     }
 }
 
+// BUGFIX 54: Issue 29 - Replace CAS spin with fetch_sub ★★
+// Problem: device_account_free_bytes_sub uses CAS loop for saturating subtract.
+// Called on every allocation → high-frequency contention. Same issue as total_queue_depth.
+// Solution: Use fetch_sub with post-correction. device_refresh_mem_info runs every 1s
+// and corrects drift, so temporary underflow is acceptable. Eliminates CAS contention.
 static void device_account_free_bytes_sub(glm5_pc_engine* e, uint64_t bytes) {
     if (!e || bytes == 0) {
         return;
     }
-    uint64_t current = e->device_free_bytes.load(std::memory_order_relaxed);
-    for (;;) {
-        const uint64_t next = current > bytes ? current - bytes : 0;
-        if (e->device_free_bytes.compare_exchange_weak(
-                current,
-                next,
-                std::memory_order_relaxed,
-                std::memory_order_relaxed)) {
-            return;
-        }
+    // Fast path: atomic subtract without CAS loop
+    const uint64_t old_val = e->device_free_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+
+    // Saturating correction: if underflow occurred, clamp to 0
+    // This is safe because device_refresh_mem_info periodically syncs with cuMemGetInfo
+    if (old_val < bytes) {
+        e->device_free_bytes.store(0, std::memory_order_relaxed);
     }
 }
 

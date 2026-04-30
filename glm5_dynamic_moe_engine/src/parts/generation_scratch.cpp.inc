@@ -14,7 +14,11 @@ struct glm5_decode_scratch {
     std::vector<float> attn;
     std::vector<float> attn_kv_a;
     std::vector<float> attn_kv_norm;
-    std::vector<float> attn_kv_b;      // kept for API compat; unused with absorption
+    // BUGFIX 53: Issue 24 - Removed attn_kv_b (dead allocation) ★
+    // Problem: attn_kv_b allocated hidden_size floats per scratch instance but never used.
+    // Comment said "kept for API compat; unused with absorption" but this is internal struct.
+    // Solution: Remove field entirely. No ABI impact (internal struct, not exposed in C API).
+    // Saves hidden_size * 4 bytes per decode scratch (6144 * 4 = 24KB per instance).
     std::vector<float> attn_value;
     std::vector<float> mlp;
     std::vector<float> shared;
@@ -170,7 +174,7 @@ static void glm5_decode_scratch_resize(
     s->attn.resize(hidden);
     s->attn_kv_a.resize(GLM5_MLA_KV_A_PROJ_DIM);
     s->attn_kv_norm.resize(GLM5_MLA_KV_COMPRESSED_DIM);
-    // attn_kv_b no longer allocated; KV absorption reads W_kv_b directly.
+    // BUGFIX 53: attn_kv_b removed (dead allocation)
     s->attn_value.resize(GLM5_MLA_V_TOTAL_DIM);
     s->mlp.resize(hidden);
     s->shared.resize(hidden);

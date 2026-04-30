@@ -1,3 +1,10 @@
+// BUGFIX 55: Issue 30 - Protect stop_io_workers with io_start_mutex ★★
+// Problem: stop_io_workers sets io_stop=false without holding io_start_mutex.
+// If ensure_io_ready (holds io_start_mutex) and set_model_root (calls stop_io_workers)
+// run concurrently, io_stop can flip while workers are being created, causing race.
+// Solution: Callers of stop_io_workers must hold io_start_mutex to serialize with
+// ensure_io_ready. This prevents concurrent worker start/stop.
+// Note: stop_io_workers itself doesn't take the mutex to allow flexible locking by callers.
 static void stop_io_workers(glm5_pc_engine* engine) {
     if (!engine) {
         return;

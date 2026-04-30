@@ -27,6 +27,12 @@ static int read_file_range_to_buffer(
     return 1;
 }
 
+// BUGFIX 51: Issue 22 - Cache ifstream per worker thread ★★
+// Problem: prefetch_tensor_file_to_pinned opens/closes ifstream for every tensor.
+// 8 experts × 3 projections = 24 file opens per MoE layer. Same shard file reopened repeatedly.
+// Each open requires seekg(), and non-mmap path uses different OS cache than mmap path.
+// Solution: Use thread_local ifstream cache keyed by path. Reuse open streams when path matches.
+// Fall back to mmap path when available (more efficient, shares OS page cache).
 static int prefetch_tensor_file_to_pinned(
     glm5_pc_engine* engine,
     const glm5_tensor_record& rec,
@@ -51,11 +57,31 @@ static int prefetch_tensor_file_to_pinned(
     if (path.empty() || !file_size_bytes(path, &file_size)) {
         return 0;
     }
-    std::ifstream input;
-    open_ifstream_path(input, path, std::ios::in | std::ios::binary);
-    if (!input) {
-        return 0;
+
+    // Thread-local ifstream cache: reuse open streams for same path
+    struct cached_stream_t {
+        std::string path;
+        std::ifstream stream;
+    };
+    static thread_local cached_stream_t tls_stream_cache;
+
+    std::ifstream* input = nullptr;
+    if (tls_stream_cache.path == path && tls_stream_cache.stream.is_open()) {
+        // Reuse cached stream
+        input = &tls_stream_cache.stream;
+    } else {
+        // Close old stream and open new one
+        if (tls_stream_cache.stream.is_open()) {
+            tls_stream_cache.stream.close();
+        }
+        open_ifstream_path(tls_stream_cache.stream, path, std::ios::in | std::ios::binary);
+        if (!tls_stream_cache.stream) {
+            return 0;
+        }
+        tls_stream_cache.path = path;
+        input = &tls_stream_cache.stream;
     }
+
     const uint64_t ranges[][2] = {
         {rec.info.weight_byte_offset, rec.info.weight_byte_length},
         {rec.info.scale_byte_offset, rec.info.scale_byte_length},
@@ -73,7 +99,7 @@ static int prefetch_tensor_file_to_pinned(
             return 0;
         }
         if (!read_file_range_to_buffer(
-                input,
+                *input,
                 offset,
                 engine->staging_slots[slot_index].buf + staging_offset,
                 length)) {

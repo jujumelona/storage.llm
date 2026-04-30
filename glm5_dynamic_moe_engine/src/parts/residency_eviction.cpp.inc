@@ -62,6 +62,15 @@ static int demote_one_victim_to(
     glm5_tier_t to,
     std::vector<std::pair<int, int>>& to_free
 ) {
+    // BUGFIX 49: Issue 16 - Lock order verification ★
+    // Lock order: heap_mutex → map_mutex (documented at file top)
+    // This function is called from demote_cold_until, which is called from
+    // prefetch_plan_execute Pass 1. Pass 1 collects to_free entries while
+    // holding map_mutex, but device_free_experts_batched is called AFTER
+    // Pass 1 completes and all locks are released.
+    // Lock order is safe: map_mutex → to_free.push_back (no device_mutex held)
+    // device_free_experts_batched acquires device_mutex → map_mutex AFTER Pass 1.
+    // No deadlock risk because device_mutex is never held during Pass 1.
     glm5_block_state evict_snap{};
     {
         std::lock_guard<std::mutex> map_lock(engine->map_mutex);
@@ -84,6 +93,8 @@ static int demote_one_victim_to(
             int layer = 0;
             int expert = 0;
             expert_dense_slot_decode(victim.slot, &layer, &expert);
+            // Safe: to_free.push_back while holding map_lock
+            // device_free_experts_batched called later without any locks held
             to_free.push_back({layer, expert});
             state.pending_evict = true;
         } else if (from == GLM5_TIER_RAM) {
