@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import bisect
 import struct
 import time
 from pathlib import Path
@@ -317,6 +318,319 @@ def sha256_file(path, chunk_size=16 * 1024 * 1024):
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def json_section_bytes(payload):
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def hash_remote_tensor_group(session, url, group, token=None, chunk_size=16 * 1024 * 1024):
+    digest = hashlib.sha256()
+    for tensor in group:
+        resp = fetch_range(
+            session,
+            url,
+            tensor["source_offset"],
+            tensor["source_offset"] + tensor["bytes"] - 1,
+            token=token,
+            stream=True,
+        )
+        try:
+            for chunk in resp.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    digest.update(chunk)
+        finally:
+            resp.close()
+    return digest.hexdigest()
+
+
+def build_juju_shard_plan_from_hf_url(
+    *,
+    source_url,
+    source_name,
+    source_path,
+    contract,
+    token=None,
+    source_repo_id="",
+    chunk_size=16 * 1024 * 1024,
+):
+    fixed_segments = []
+    source_segments = []
+    sections = []
+    section_sizes = {}
+    tensor_records = []
+
+    def add_fixed(offset, data):
+        if data:
+            fixed_segments.append({"offset": int(offset), "size": len(data), "data": data})
+
+    def add_json_section_at(pos, section_type, name, payload):
+        raw = json_section_bytes(payload)
+        pos = align_up(pos, 4096)
+        offset = pos
+        add_fixed(offset, raw)
+        entry = {
+            "type": section_type,
+            "name": name,
+            "offset": offset,
+            "size": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "mmap_friendly": 0,
+        }
+        sections.append(entry)
+        section_sizes[section_type] = section_sizes.get(section_type, 0) + len(raw)
+        return pos + len(raw)
+
+    with requests.Session() as session:
+        directory, total_bytes = read_remote_directory(session, source_url, token=token)
+        pos = JUJU_HEADER_BYTES
+        table_offset = pos
+        pos += 8 * JUJU_SECTION_ENTRY_BYTES
+        pos = align_up(pos, 4096)
+
+        meta = {
+            "format": "JUJU_SHARDED_CONTAINER_V1",
+            "source_format": "GGUF",
+            "source_role": "conversion_source_only",
+            "source_repo_id": source_repo_id,
+            "source_path": source_path,
+            "source_name": source_name,
+            "weight_file": juju_artifact_names(source_name)["weights"],
+            "index_file": juju_artifact_names(source_name)["index"],
+            "tensor_payload_layout": "4kb_aligned_tensor_sections",
+            "artifact_name_policy": "preserve_original_shard_stem_change_extension_only",
+            "gguf_directory": {
+                "version": directory["version"],
+                "tensor_count": directory["tensor_count"],
+                "kv_count": directory["kv_count"],
+                "alignment": directory["alignment"],
+                "data_start": directory["data_start"],
+                "source_bytes": total_bytes,
+            },
+            "contract": contract,
+        }
+        pos = add_json_section_at(pos, JUJU_SECTION_MODEL_META, "MODEL_META", meta)
+        pos = add_json_section_at(pos, JUJU_SECTION_QKV_POLICY, "QKV_POLICY", contract.get("qkv_cache_schema", {}))
+
+        for bucket in ("shared_weights", "hot_experts", "warm_experts", "cold_experts"):
+            group = [t for t in directory["tensors"] if t["bucket"] == bucket and t["bytes"] > 0]
+            if not group:
+                continue
+            pos = align_up(pos, 4096)
+            section_offset = pos
+            section_hash = hash_remote_tensor_group(session, source_url, group, token=token, chunk_size=chunk_size)
+            for tensor in group:
+                pos = align_up(pos, 4096)
+                tensor_offset = pos
+                source_segments.append({
+                    "offset": tensor_offset,
+                    "size": tensor["bytes"],
+                    "source_offset": tensor["source_offset"],
+                })
+                tensor_records.append({
+                    "name": tensor["name"],
+                    "bucket": bucket,
+                    "dims": tensor["dims"],
+                    "shape": tensor["shape"],
+                    "gguf_type": tensor["type"],
+                    "source_offset": tensor["source_offset"],
+                    "source_bytes": tensor["bytes"],
+                    "juju_offset": tensor_offset,
+                    "juju_bytes": tensor["bytes"],
+                    "alignment": 4096,
+                })
+                pos += tensor["bytes"]
+            size = pos - section_offset
+            section_type = section_type_for_bucket(bucket)
+            sections.append({
+                "type": section_type,
+                "name": bucket.upper()[:32],
+                "offset": section_offset,
+                "size": size,
+                "sha256": section_hash,
+                "prefetch_distance": 2 if bucket != "shared_weights" else 0,
+                "mmap_friendly": 1,
+            })
+            section_sizes[section_type] = section_sizes.get(section_type, 0) + size
+
+        idx = {
+            "format": "JUJU_IDX_JSON_V1",
+            "mutable_runtime_index": True,
+            "weight_file": juju_artifact_names(source_name)["weights"],
+            "source_repo_id": source_repo_id,
+            "source_path": source_path,
+            "tensor_count": len(tensor_records),
+            "tensors": tensor_records,
+            "sections": list(sections),
+        }
+        pos = add_json_section_at(pos, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
+        file_size_value = pos
+        if len(sections) > 8:
+            raise RuntimeError(f"too many JUJU sections: {len(sections)}")
+
+        table = b"".join(pack_section(entry) for entry in sections)
+        table = table + (b"\x00" * ((8 * JUJU_SECTION_ENTRY_BYTES) - len(table)))
+        header = make_header(contract, source_name, file_size_value, sections, section_sizes)
+        add_fixed(0, header)
+        add_fixed(table_offset, table)
+
+    idx["sections"] = sections
+    return {
+        "format": "juju_sharded_container_v1",
+        "source_url": source_url,
+        "source_name": source_name,
+        "source_path": source_path,
+        "source_repo_id": source_repo_id,
+        "bytes": file_size_value,
+        "source_bytes": total_bytes,
+        "tensor_count": len(tensor_records),
+        "section_count": len(sections),
+        "storage_mode": "remote_range_to_streamed_4kb_aligned_juju_sections",
+        "artifact_name_policy": "original_shard_stem_with_juju_extension",
+        "fixed_segments": fixed_segments,
+        "source_segments": source_segments,
+        "index_json": idx,
+        "chunk_size": int(chunk_size),
+        "token": token,
+    }
+
+
+class JujuVirtualFile(io.BufferedIOBase):
+    def __init__(self, plan):
+        super().__init__()
+        self._plan = plan
+        self._size = int(plan["bytes"])
+        self._pos = 0
+        self._session = requests.Session()
+        segments = []
+        for segment in plan["fixed_segments"]:
+            segments.append({
+                "kind": "fixed",
+                "offset": int(segment["offset"]),
+                "size": int(segment["size"]),
+                "data": segment["data"],
+            })
+        for segment in plan["source_segments"]:
+            segments.append({
+                "kind": "source",
+                "offset": int(segment["offset"]),
+                "size": int(segment["size"]),
+                "source_offset": int(segment["source_offset"]),
+            })
+        self._segments = sorted(segments, key=lambda item: item["offset"])
+        self._offsets = [item["offset"] for item in self._segments]
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        if whence == io.SEEK_SET:
+            pos = int(offset)
+        elif whence == io.SEEK_CUR:
+            pos = self._pos + int(offset)
+        elif whence == io.SEEK_END:
+            pos = self._size + int(offset)
+        else:
+            raise ValueError(f"unsupported whence: {whence}")
+        if pos < 0:
+            raise ValueError("negative seek position")
+        self._pos = min(pos, self._size)
+        return self._pos
+
+    def readinto(self, buffer):
+        data = self.read(len(buffer))
+        n = len(data)
+        buffer[:n] = data
+        return n
+
+    def read(self, size=-1):
+        if self.closed or self._pos >= self._size:
+            return b""
+        if size is None or size < 0:
+            end = self._size
+        else:
+            end = min(self._size, self._pos + int(size))
+        chunks = []
+        while self._pos < end:
+            idx = bisect.bisect_right(self._offsets, self._pos) - 1
+            segment = self._segments[idx] if idx >= 0 else None
+            if segment and self._pos < segment["offset"] + segment["size"]:
+                rel = self._pos - segment["offset"]
+                take = min(end - self._pos, segment["size"] - rel)
+                if segment["kind"] == "fixed":
+                    chunks.append(segment["data"][rel:rel + take])
+                else:
+                    start = segment["source_offset"] + rel
+                    resp = fetch_range(
+                        self._session,
+                        self._plan["source_url"],
+                        start,
+                        start + take - 1,
+                        token=self._plan.get("token"),
+                        stream=False,
+                    )
+                    try:
+                        chunks.append(resp.content)
+                    finally:
+                        resp.close()
+                self._pos += take
+                continue
+            next_offset = self._segments[idx + 1]["offset"] if idx + 1 < len(self._segments) else self._size
+            take = min(end - self._pos, next_offset - self._pos)
+            chunks.append(b"\x00" * take)
+            self._pos += take
+        return b"".join(chunks)
+
+    def close(self):
+        try:
+            self._session.close()
+        finally:
+            super().close()
+
+
+def prepare_juju_shard_upload_from_hf_url(
+    *,
+    source_url,
+    source_name,
+    source_path,
+    index_path,
+    contract,
+    token=None,
+    source_repo_id="",
+    chunk_size=16 * 1024 * 1024,
+):
+    index_path = Path(index_path)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    plan = build_juju_shard_plan_from_hf_url(
+        source_url=source_url,
+        source_name=source_name,
+        source_path=source_path,
+        contract=contract,
+        token=token,
+        source_repo_id=source_repo_id,
+        chunk_size=chunk_size,
+    )
+    index_path.write_text(json.dumps(plan["index_json"], ensure_ascii=False, indent=2), encoding="utf-8")
+    info = {
+        "format": plan["format"],
+        "path": f"<stream:{juju_artifact_names(source_name)['weights']}>",
+        "index_path": str(index_path),
+        "bytes": plan["bytes"],
+        "index_bytes": index_path.stat().st_size,
+        "index_sha256": sha256_file(index_path),
+        "source_bytes": plan["source_bytes"],
+        "tensor_count": plan["tensor_count"],
+        "section_count": plan["section_count"],
+        "storage_mode": plan["storage_mode"],
+        "artifact_name_policy": plan["artifact_name_policy"],
+    }
+    return info, JujuVirtualFile(plan)
 
 
 def write_juju_shard_from_hf_url(
