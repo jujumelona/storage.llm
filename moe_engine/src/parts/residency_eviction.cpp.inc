@@ -112,14 +112,7 @@ static int demote_one_victim_to(
     return 1;
 }
 
-static int demote_one_ram_to_db(moe_pc_engine* engine) {
-    moe_evict_candidate victim{};
-    if (!pop_valid_evict_candidate(engine, moe_TIER_RAM, &victim)) {
-        return 0;
-    }
-    std::vector<std::pair<int, int>> ignored;
-    return demote_one_victim_to(engine, victim, moe_TIER_RAM, moe_TIER_DB, ignored);
-}
+static void demote_cold_until(moe_pc_engine* engine, moe_tier_t tier, uint64_t needed, std::vector<std::pair<int, int>>& to_free);
 
 static int demote_one_vram_for_device_room(moe_pc_engine* engine, std::vector<std::pair<int, int>>& to_free) {
     moe_evict_candidate victim{};
@@ -128,10 +121,10 @@ static int demote_one_vram_for_device_room(moe_pc_engine* engine, std::vector<st
     }
     moe_tier_t next_tier = moe_TIER_RAM;
     const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
-    while (ram_budget > 0 && tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget) {
-        if (!demote_one_ram_to_db(engine)) {
-            break;
-        }
+    // Use demote_cold_until instead of an O(N) one-by-one RAM eviction loop.
+    if (ram_budget > 0 && tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget) {
+        std::vector<std::pair<int, int>> ignored;
+        demote_cold_until(engine, moe_TIER_RAM, victim.bytes, ignored);
     }
     if (ram_budget == 0 || tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget) {
         next_tier = moe_TIER_DB;
@@ -160,10 +153,7 @@ static void demote_cold_until(moe_pc_engine* engine, moe_tier_t tier, uint64_t n
         if (tier == moe_TIER_VRAM) {
             next_tier = moe_TIER_RAM;
             const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
-            // PIPELINE FIX 8: Use demote_cold_until for RAM eviction instead of loop ?…â˜…
-            // Old: O(NÃ—M) mutex acquisitions in nested while loop
-            // New: Single demote_cold_until call with O(M) compact_evict_heap
-            // Reduces mutex contention and improves eviction performance
+            // Use a single cold-demotion pass instead of nested one-by-one RAM evictions.
             if (ram_budget > 0 && tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget) {
                 std::vector<std::pair<int, int>> ignored;
                 demote_cold_until(engine, moe_TIER_RAM, victim.bytes, ignored);
@@ -172,13 +162,10 @@ static void demote_cold_until(moe_pc_engine* engine, moe_tier_t tier, uint64_t n
                 next_tier = moe_TIER_DB;
             }
         }
-        // PIPELINE FIX 7: Send to DB if RAM demotion fails ?…â˜…
-        // Old: continue ??victim removed from heap but stays in VRAM, never evicted again
-        // New: Try DB demotion ??ensures cold experts don't get stuck in VRAM
-        // Trade-off: Next access requires full Disk?’RAM?’VRAM path, but better than VRAM leak
+        // If RAM demotion fails, fall back to DB so cold experts do not stay pinned.
         if (!demote_one_victim_to(engine, victim, tier, next_tier, to_free)) {
             if (next_tier == moe_TIER_RAM) {
-                // RAM saturation prevented demotion ??try DB directly
+                // RAM saturation prevented demotion; try DB directly.
                 demote_one_victim_to(engine, victim, tier, moe_TIER_DB, to_free);
             }
             continue;
