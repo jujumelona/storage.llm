@@ -13,7 +13,7 @@ int moe_pc_engine_set_model_root(
     // BUGFIX 55: Hold io_start_mutex to serialize with ensure_io_ready
     {
         std::lock_guard<std::mutex> io_lock(engine->io_start_mutex);
-        stop_io_workers(engine);
+        stop_io_workers_locked(engine);
     }
 
     {
@@ -54,7 +54,10 @@ int moe_pc_engine_set_model_root(
     engine->attention_projector_valid.store(-1, std::memory_order_relaxed);  // Fix 72: invalidate cache
 
     // Restart IO workers with new model_root
-    start_io_workers(engine);
+    {
+        std::lock_guard<std::mutex> io_lock(engine->io_start_mutex);
+        start_io_workers(engine);
+    }
 
     return 1;
 }

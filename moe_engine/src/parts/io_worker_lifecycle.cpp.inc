@@ -5,7 +5,7 @@
 // Solution: Callers of stop_io_workers must hold io_start_mutex to serialize with
 // ensure_io_ready. This prevents concurrent worker start/stop.
 // Note: stop_io_workers itself doesn't take the mutex to allow flexible locking by callers.
-static void stop_io_workers(moe_pc_engine* engine) {
+static void stop_io_workers_locked(moe_pc_engine* engine) {
     if (!engine) {
         return;
     }
@@ -40,7 +40,7 @@ static void stop_io_workers(moe_pc_engine* engine) {
     }
     device_force_clear_pending_copies(engine);
     // Fix 71: force_blocking=true on shutdown to ensure all threads joined
-    flush_deferred_joins(engine, true);
+    flush_deferred_joins_locked(engine, true);
     engine->io_workers.clear();
     engine->pinned_workers.clear();
     engine->gpu_workers.clear();
@@ -54,6 +54,13 @@ static void stop_io_workers(moe_pc_engine* engine) {
     engine->io_done_cv.notify_all();
 }
 
+static void stop_io_workers(moe_pc_engine* engine) {
+    if (!engine) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(engine->io_start_mutex);
+    stop_io_workers_locked(engine);
+}
 static void start_io_workers(moe_pc_engine* engine) {
     if (!engine || !engine->io_config.enable_compute_io_overlap) {
         return;
