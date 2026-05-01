@@ -19,6 +19,11 @@ typedef struct {
     uint32_t dynamic_num_hidden_layers;
     uint32_t dynamic_hidden_size;
     uint32_t dynamic_vocab_size;
+    int graph_ir_ready;
+    int graph_ir_required;
+    uint32_t graph_ir_version;
+    uint64_t graph_ir_layer_count;
+    uint64_t graph_ir_op_count;
 } moe_forward_status_t;
 
 typedef enum {

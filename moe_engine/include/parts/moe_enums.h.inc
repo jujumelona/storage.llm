@@ -1,4 +1,4 @@
-typedef enum {
+﻿typedef enum {
     // Legacy/debug runtime path. Offload-native models can forbid this.
     moe_KV_MODE_PLAIN = 0,
     // Default packed QKV runtime path.
@@ -73,3 +73,4 @@ typedef enum {
     moe_EXECUTION_BALANCED = 1,
     moe_EXECUTION_LOW_IMPACT = 2
 } moe_execution_policy_t;
+

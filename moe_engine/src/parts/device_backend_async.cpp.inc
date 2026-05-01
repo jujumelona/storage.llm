@@ -1,6 +1,13 @@
 // Backend-neutral async copy facade.
 // Supports CUDA and HIP.
 
+static int device_backend_copy_h2d_sync(
+    moe_pc_engine* e,
+    CUdeviceptr dst,
+    const void* src,
+    uint64_t bytes
+);
+
 static int device_backend_is_cuda(const moe_pc_engine* e) {
     return e && e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.library;
 }
@@ -18,6 +25,13 @@ static int device_backend_stream_create(moe_pc_engine* e, CUstream* out_stream, 
     if (device_backend_is_hip(e) && e->hip.hipStreamCreate) {
         return e->hip.hipStreamCreate(out_stream, flags) == 0;
     }
+    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
+              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
+              e->backend_caps.backend == moe_BACKEND_SYCL)) {
+        // Return dummy handle to prevent fallback to sync
+        *out_stream = (void*)1;
+        return 1;
+    }
     return 0;
 }
 
@@ -29,6 +43,11 @@ static int device_backend_stream_sync(moe_pc_engine* e, CUstream stream) {
     if (device_backend_is_hip(e) && e->hip.hipStreamSynchronize) {
         return e->hip.hipStreamSynchronize(stream) == 0;
     }
+    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
+              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
+              e->backend_caps.backend == moe_BACKEND_SYCL)) {
+        return 1; // Simulated sync
+    }
     return 0;
 }
 
@@ -39,6 +58,7 @@ static void device_backend_stream_destroy(moe_pc_engine* e, CUstream stream) {
     } else if (device_backend_is_hip(e) && e->hip.hipStreamDestroy) {
         e->hip.hipStreamDestroy(stream);
     }
+    // Vulkan/LevelZero/SYCL dummy streams need no destroy
 }
 
 static int device_backend_event_create(moe_pc_engine* e, CUevent* out_event) {
@@ -51,6 +71,12 @@ static int device_backend_event_create(moe_pc_engine* e, CUevent* out_event) {
     if (device_backend_is_hip(e) && e->hip.hipEventCreate) {
         return e->hip.hipEventCreate(out_event, disable_timing) == 0;
     }
+    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
+              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
+              e->backend_caps.backend == moe_BACKEND_SYCL)) {
+        *out_event = (void*)1; // Dummy handle
+        return 1;
+    }
     return 0;
 }
 
@@ -62,6 +88,11 @@ static int device_backend_event_record(moe_pc_engine* e, CUevent event, CUstream
     if (device_backend_is_hip(e) && e->hip.hipEventRecord) {
         return e->hip.hipEventRecord(event, stream) == 0;
     }
+    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
+              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
+              e->backend_caps.backend == moe_BACKEND_SYCL)) {
+        return 1;
+    }
     return 0;
 }
 
@@ -72,6 +103,11 @@ static int device_backend_event_query(moe_pc_engine* e, CUevent event) {
     }
     if (device_backend_is_hip(e) && e->hip.hipEventQuery) {
         return e->hip.hipEventQuery(event) == 0;
+    }
+    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
+              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
+              e->backend_caps.backend == moe_BACKEND_SYCL)) {
+        return 1; // Always completed in dummy implementation
     }
     return 0;
 }
@@ -119,6 +155,11 @@ static int device_backend_event_sync(moe_pc_engine* e, CUevent event) {
         }
         return e->hip.hipEventQuery(event) == 0;
     }
+    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
+              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
+              e->backend_caps.backend == moe_BACKEND_SYCL)) {
+        return 1;
+    }
     return 0;
 }
 
@@ -138,6 +179,11 @@ static int device_backend_async_h2d_available(moe_pc_engine* e, CUstream stream,
     }
     if (device_backend_is_hip(e)) {
         return e->hip.hipMemcpyHtoDAsync != nullptr;
+    }
+    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
+              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
+              e->backend_caps.backend == moe_BACKEND_SYCL)) {
+        return 1; // Dummy driver returns true
     }
     return 0;
 }
@@ -162,6 +208,12 @@ static int device_backend_copy_h2d_async(
         // Since zero-copy maps the pointer, H2D copy is effectively a no-op here
         // as long as dst was allocated via metal_zero_copy_map.
         return 1;
+    }
+    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
+              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
+              e->backend_caps.backend == moe_BACKEND_SYCL)) {
+        // Dummy async copy -> fallback to sync for now
+        return device_backend_copy_h2d_sync(e, dst, src, bytes);
     }
     return 0;
 }

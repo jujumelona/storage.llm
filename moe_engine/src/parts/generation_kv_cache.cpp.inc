@@ -1,4 +1,4 @@
-// BUGFIX 72: Issue 10 - Optimize KV cache layout to [pos][layer][dim] ?�★
+﻿// BUGFIX 72: Issue 10 - Optimize KV cache layout to [pos][layer][dim] ?�★
 // Problem: Old layout [layer][pos][dim] requires 79 separate memcpy during realloc
 // Poor cache locality during attention decode (layers not contiguous)
 // Solution: Change to [pos][layer][dim] layout
@@ -54,10 +54,19 @@ struct moe_kv_cache {
     // Status: Documented, not implemented (requires architectural change)
     void ensure_capacity(uint32_t needed_pos) {
         if (needed_pos < max_seq_len) return;
+#ifdef _WIN32
+        // Windows: grow by smaller increments to bound copy cost
+        uint32_t new_cap = max_seq_len + 256;
+        while (new_cap <= needed_pos && new_cap < moe_MLA_MAX_SEQ_LEN) {
+            new_cap += 256;
+        }
+#else
+        // Linux: doubling is fine, mremap avoids copy
         uint32_t new_cap = max_seq_len > 0 ? max_seq_len : 1u;
         while (new_cap <= needed_pos && new_cap < moe_MLA_MAX_SEQ_LEN) {
             new_cap *= 2u;
         }
+#endif
         if (new_cap > moe_MLA_MAX_SEQ_LEN) new_cap = moe_MLA_MAX_SEQ_LEN;
         if (new_cap == max_seq_len) return;
         const size_t new_total = (size_t)new_cap * num_layers * moe_MLA_KV_ENTRY_DIM;
@@ -223,3 +232,4 @@ static int moe_generation_should_use_layer_first_prefill(
     }
     return 1;
 }
+

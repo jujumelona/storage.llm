@@ -72,6 +72,20 @@ int moe_pc_engine_get_stats(const moe_pc_engine_t* engine, moe_pc_engine_stats_t
         engine->offload_gguf_tensor_count.load(std::memory_order_relaxed);
     out_stats->offload_gguf_executable_tensor_count =
         engine->offload_gguf_executable_tensor_count.load(std::memory_order_relaxed);
+    out_stats->juju_idx_schema_version =
+        engine->juju_idx_schema_version.load(std::memory_order_relaxed);
+    out_stats->juju_split_group_count =
+        engine->juju_split_group_count.load(std::memory_order_relaxed);
+    out_stats->juju_split_missing_count =
+        engine->juju_split_missing_count.load(std::memory_order_relaxed);
+    out_stats->juju_runtime_hint_tensor_count =
+        engine->juju_runtime_hint_tensor_count.load(std::memory_order_relaxed);
+    out_stats->juju_priority_tensor_count =
+        engine->juju_priority_tensor_count.load(std::memory_order_relaxed);
+    out_stats->juju_fastmem_tensor_count =
+        engine->juju_fastmem_tensor_count.load(std::memory_order_relaxed);
+    out_stats->juju_slowmem_tensor_count =
+        engine->juju_slowmem_tensor_count.load(std::memory_order_relaxed);
     if (!engine->offload_gguf_first_file.empty()) {
         std::strncpy(
             out_stats->offload_gguf_first_file,

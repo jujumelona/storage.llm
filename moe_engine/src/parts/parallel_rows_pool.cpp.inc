@@ -59,7 +59,19 @@ static void cpu_row_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
 
 static void ensure_cpu_row_workers(moe_pc_engine* engine, uint32_t /*ignored*/) {
     if (!engine) return;
+    const unsigned int hw_raw = std::thread::hardware_concurrency();
+    const uint32_t hw = std::max(2u, hw_raw ? (uint32_t)hw_raw : 1u);
+    const uint32_t io_threads = runtime_disk_workers(engine) +
+         runtime_pinned_workers(engine) +
+         runtime_gpu_workers(engine);
+    const uint32_t dynamic_target = hw > io_threads + 1u ? hw - io_threads - 1u : 1u;
+
     uint32_t target = engine->cpu_row_target_workers.load(std::memory_order_relaxed);
+    if (target != 0 && target != dynamic_target) {
+        engine->cpu_row_target_workers.store(dynamic_target, std::memory_order_relaxed);
+        target = dynamic_target;
+    }
+
     if (target == 0) {
         // Existing workers were asked to retire by setting the target to zero.
         // Join them before recreating the pool; otherwise a later dispatch can
@@ -89,12 +101,7 @@ static void ensure_cpu_row_workers(moe_pc_engine* engine, uint32_t /*ignored*/) 
         }
         engine->cpu_row_done_generation = engine->cpu_row_generation;
         engine->cpu_active_workers.store(0, std::memory_order_relaxed);
-        const unsigned int hw_raw = std::thread::hardware_concurrency();
-        const uint32_t hw = std::max(2u, hw_raw ? (uint32_t)hw_raw : 1u);
-        const uint32_t io_threads = runtime_disk_workers(engine) +
-             runtime_pinned_workers(engine) +
-             runtime_gpu_workers(engine);
-        target = hw > io_threads + 1u ? hw - io_threads - 1u : 1u;
+        target = dynamic_target;
         engine->cpu_row_target_workers.store(target, std::memory_order_relaxed);
     }
 

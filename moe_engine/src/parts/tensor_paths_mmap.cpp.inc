@@ -263,7 +263,7 @@ static mmap_context_t* get_or_map_tensor_shard(moe_pc_engine* engine, const moe_
         return nullptr;
     }
     const uint32_t shard = rec.info.shard;
-    if (shard < 85u) {
+    if (shard < 256u) {
         mmap_context_t* cached = engine->source_mmaps[shard].load();
         if (cached) {
             return cached;
@@ -280,7 +280,7 @@ static mmap_context_t* get_or_map_tensor_shard(moe_pc_engine* engine, const moe_
     const std::string& path = (rec.resolved_path_index < engine->tensor_paths.size()) ?
         engine->tensor_paths[rec.resolved_path_index] : "";
     mmap_context_t* mapped = get_or_map_shard(engine, path);
-    if (mapped && shard < 85u) {
+    if (mapped && shard < 256u) {
         mmap_context_t* expected = nullptr;
         engine->source_mmaps[shard].compare_exchange_strong(expected, mapped);
     }

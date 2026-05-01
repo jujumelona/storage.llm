@@ -1,4 +1,4 @@
-static float policy_cpu_target(moe_execution_policy_t policy) {
+﻿static float policy_cpu_target(moe_execution_policy_t policy) {
     return policy == moe_EXECUTION_PERFORMANCE ? 92.0f : policy == moe_EXECUTION_LOW_IMPACT ? 45.0f : 70.0f;
 }
 
@@ -323,3 +323,47 @@ int moe_pc_engine_orchestrate_moe_step(moe_pc_engine_t* engine, int current_laye
     moe_pc_engine_apply_topology_updates(engine);
     return ok;
 }
+
+
+// Additional 2: PreScope Global Optimization Cross-Layer Scheduling
+#define MAX_PREFETCH_DEPTH 8
+struct prescope_plan_t {
+    float bw_budget_per_layer[MAX_PREFETCH_DEPTH];
+    uint32_t vram_slots[MAX_PREFETCH_DEPTH];
+    uint32_t int4_slots[MAX_PREFETCH_DEPTH];
+};
+
+static void prescope_compute_global_plan(
+    moe_pc_engine* engine,
+    int start_layer, uint32_t depth,
+    const std::vector<std::vector<int>>& predicted_experts,
+    prescope_plan_t* plan
+) {
+    if (!engine || !plan || depth == 0) return;
+    
+    // Stub: compute the maximum experts that can be loaded in full precision within compute time
+    // total_bw is DMA bandwidth GB/s (e.g., PCIe Gen4 x16 ~ 25GB/s)
+    const float total_bw = engine->backend_caps.dma_bandwidth_gbps; 
+    
+    // Fallback to 1ms if not profiled
+    const float compute_ms_per_layer = 1.0f; // engine->profile.avg_layer_compute_ms; 
+    
+    for (uint32_t d = 0; d < depth && d < MAX_PREFETCH_DEPTH; ++d) {
+        if (d >= predicted_experts.size()) break;
+        const uint32_t n_experts = (uint32_t)predicted_experts[d].size();
+        
+        const float expert_gb = engine->avg_expert_bytes / 1e9f;
+        const float full_transfer_ms = (n_experts * expert_gb) / total_bw * 1000.0f;
+        
+        if (full_transfer_ms <= compute_ms_per_layer) {
+            plan->vram_slots[d] = n_experts;
+            plan->int4_slots[d] = 0;
+        } else {
+            const float allowed_gb = (compute_ms_per_layer / 1000.0f) * total_bw;
+            const uint32_t full_capacity = (uint32_t)(allowed_gb / expert_gb);
+            plan->vram_slots[d] = std::min(n_experts, full_capacity);
+            plan->int4_slots[d] = n_experts - plan->vram_slots[d];
+        }
+    }
+}
+

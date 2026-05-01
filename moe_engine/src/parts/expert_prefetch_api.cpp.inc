@@ -1,3 +1,35 @@
+static moe_tier_t moe_hot_miss_preferred_tier(
+    moe_pc_engine_t* engine,
+    int layer,
+    int expert,
+    uint64_t bytes,
+    moe_tier_t preferred_tier
+) {
+    if (!engine || preferred_tier != moe_TIER_VRAM || bytes == 0 ||
+        engine->generation_phase.load(std::memory_order_relaxed) == moe_GEN_PHASE_PREFILL) {
+        return preferred_tier;
+    }
+    const size_t slot = expert_dense_slot(layer, expert);
+    if (slot >= engine->expert_states.size()) {
+        return preferred_tier;
+    }
+    {
+        std::lock_guard<std::mutex> lock(engine->map_mutex);
+        const moe_block_state& state = engine->expert_states[slot];
+        if (!state.active || state.tier != moe_TIER_RAM) {
+            return preferred_tier;
+        }
+    }
+    const float dma_gbps = engine->backend_caps.dma_bandwidth_gbps > 0.0f ?
+        engine->backend_caps.dma_bandwidth_gbps : 12.0f;
+    const float pcie_ms = (float)bytes / (dma_gbps * 1e9f / 1000.0f);
+    constexpr float cpu_gflops = 100.0f;
+    constexpr uint32_t token_count = 1u;
+    const float compute_gflops = ((float)bytes / 2.0f * 2.0f * (float)token_count) / 1e9f;
+    const float cpu_ms = (compute_gflops / cpu_gflops) * 1000.0f;
+    return cpu_ms < pcie_ms ? moe_TIER_RAM : preferred_tier;
+}
+
 static int moe_pc_engine_prefetch_expert_triplet_impl(
     moe_pc_engine_t* engine,
     int layer,
@@ -13,6 +45,13 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
     if (bytes == 0) {
         return 0;
     }
+    preferred_tier = juju_hint_target_tier(
+        engine,
+        layer,
+        expert,
+        preferred_tier,
+        notify_workers ? moe_PREFETCH_REASON_ROUTER_SELECTED : moe_PREFETCH_REASON_LOOKAHEAD);
+    preferred_tier = moe_hot_miss_preferred_tier(engine, layer, expert, bytes, preferred_tier);
     const int requested = moe_pc_engine_request_expert(engine, layer, expert, bytes, preferred_tier);
     if (!requested) {
         return 0;
@@ -277,15 +316,47 @@ int moe_pc_engine_prefetch_moe_lookahead(
             vram_expert_budget_bytes(engine) > 0 ? moe_TIER_VRAM : moe_TIER_RAM
         ) ? 1 : 0;
     }
-    if (engine->io_config.enable_lookahead_prefetch && next_layer_candidates && next_count > 0) {
-        ok_count += prefetch_expert_batch_raw(
-            engine,
-            current_layer + 1,
-            next_layer_candidates,
-            next_count,
-            moe_TIER_RAM
-        ) ? 1 : 0;
-        prefetch_moe_activation_raw(engine, current_layer + 1);
+    const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
+    if (phase != moe_GEN_PHASE_PREFILL &&
+        engine->io_config.enable_lookahead_prefetch &&
+        next_layer_candidates &&
+        next_count > 0) {
+        std::vector<int> ram_candidates;
+        std::vector<int> vram_candidates;
+        if (next_count <= 2u) {
+            ram_candidates.assign(next_layer_candidates, next_layer_candidates + next_count);
+        } else {
+            const uint32_t keep_count = std::max(1u, (next_count + 1u) / 2u);
+            const uint32_t vram_count = std::max(1u, (next_count * 30u + 99u) / 100u);
+            for (uint32_t i = 0; i < keep_count; ++i) {
+                if (i < vram_count) {
+                    vram_candidates.push_back(next_layer_candidates[i]);
+                } else {
+                    ram_candidates.push_back(next_layer_candidates[i]);
+                }
+            }
+        }
+        if (!vram_candidates.empty()) {
+            ok_count += prefetch_expert_batch_raw(
+                engine,
+                current_layer + 1,
+                vram_candidates.data(),
+                (uint32_t)vram_candidates.size(),
+                moe_TIER_VRAM
+            ) ? 1 : 0;
+        }
+        if (!ram_candidates.empty()) {
+            ok_count += prefetch_expert_batch_raw(
+                engine,
+                current_layer + 1,
+                ram_candidates.data(),
+                (uint32_t)ram_candidates.size(),
+                moe_TIER_RAM
+            ) ? 1 : 0;
+        }
+        if (!vram_candidates.empty() || !ram_candidates.empty()) {
+            prefetch_moe_activation_raw(engine, current_layer + 1);
+        }
     }
     return ok_count > 0 ? 1 : 0;
 }

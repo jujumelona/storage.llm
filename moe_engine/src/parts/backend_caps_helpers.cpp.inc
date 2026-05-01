@@ -22,6 +22,8 @@ static uint64_t moe_budget_from_free_device_memory(uint64_t free_bytes) {
 
 static void fill_cpu_backend_caps(moe_backend_caps_t* caps) {
     const uint32_t hw = caps_hw_threads();
+    caps->dma_bandwidth_gbps = 12.0;
+    caps->tflops_hint = 0.10;
     caps->supports_fp4 = 1;
     caps->supports_scale4 = 1;
     caps->supports_weight_q2 = 1;
@@ -43,6 +45,8 @@ static void fill_cpu_backend_caps(moe_backend_caps_t* caps) {
 
 static void fill_gpu_backend_base(moe_backend_caps_t* caps) {
     const uint32_t hw = caps_hw_threads();
+    caps->dma_bandwidth_gbps = 25.0;
+    caps->tflops_hint = 20.0;
     caps->compute_streams = hw >= 12u ? 2u : 1u;
     caps->copy_streams = hw >= 12u ? 2u : 1u;
     caps->prefetch_streams = hw >= 16u ? 3u : 2u;
@@ -65,7 +69,7 @@ static void fill_cuda_backend_caps(moe_backend_caps_t* caps) {
     caps->supports_cuda = compiled_cuda_available();
     caps->supports_pinned_host = 1;
     caps->supports_fixed_read_staging = 1;
-    caps->supports_registered_io_buffers = 0;
+    caps->supports_registered_io_buffers = 1; // Enabled IORing/io_uring
     caps->supports_backend_async_api = 1;
     caps->supports_directstorage = compiled_directstorage_available();
     caps->supports_gpudirect_storage = compiled_gpudirect_available();

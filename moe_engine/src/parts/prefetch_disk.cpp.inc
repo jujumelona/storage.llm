@@ -59,3 +59,40 @@
     engine->io_atomic.disk_stage_done.fetch_add(1);
     return 1;
 }
+
+// Optimization 5: Linux io_uring registered buffer
+#ifdef __linux__
+static bool init_io_uring(moe_pc_engine* engine) {
+    if (!engine) return false;
+    auto& state = engine->uring_state;
+    if (state.initialized) return true;
+    
+    // IORING_SETUP_SQPOLL for kernel-side polling (zero syscall)
+    if (io_uring_queue_init(128, &state.ring, IORING_SETUP_SQPOLL) < 0) {
+        return false;
+    }
+    
+    state.registered_iovecs.resize(engine->staging_slots.size());
+    for (size_t i = 0; i < engine->staging_slots.size(); ++i) {
+        state.registered_iovecs[i].iov_base = engine->staging_slots[i].buf; // Note: using .buf instead of ptr
+        state.registered_iovecs[i].iov_len  = engine->staging_slots[i].size;
+    }
+    
+    int ret = io_uring_register_buffers(&state.ring, state.registered_iovecs.data(), (unsigned)state.registered_iovecs.size());
+    if (ret < 0) {
+        io_uring_queue_exit(&state.ring);
+        return false;
+    }
+    state.initialized = true;
+    return true;
+}
+
+static void disk_read_to_staging_uring(moe_pc_engine* engine, int fd, uint64_t offset, uint32_t slot_idx, uint64_t bytes) {
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&engine->uring_state.ring);
+    if (!sqe) return;
+    // IORING_OP_READ_FIXED: read directly into registered buffer, bypassing kernel copy
+    io_uring_prep_read_fixed(sqe, fd, engine->staging_slots[slot_idx].buf, bytes, offset, (int)slot_idx);
+    sqe->user_data = slot_idx;
+    io_uring_submit(&engine->uring_state.ring);
+}
+#endif

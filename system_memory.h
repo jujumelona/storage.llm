@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <cstdint>
 
@@ -46,12 +46,12 @@ inline uint64_t available_ram_bytes() {
     }
     return 0;
 #elif defined(__APPLE__)
-    // BUGFIX 48: Issue 19 - macOS available RAM implementation ?�★
+    // BUGFIX 48: Issue 19 - macOS available RAM implementation ?�★
     // Problem: macOS path returned 0, causing moe_generation_should_preallocate_kv_cache
     // to always return false. KV cache never pre-allocates on macOS.
-    // Solution: Use host_statistics64 to get vm_statistics64_data_t, then calculate
-    // available bytes as (free_count + inactive_count) * PAGE_SIZE.
-    // Inactive pages can be reclaimed quickly, so they count as available.
+    // Solution: Use host_statistics64 to get vm_statistics64_data_t. Do not count
+    // inactive pages here; unified-memory GPU pressure can make them unavailable
+    // quickly enough to over-admit RAM/Metal work under heavy I/O.
     mach_port_t host_port = mach_host_self();
     vm_size_t page_size = 0;
     host_page_size(host_port, &page_size);
@@ -69,10 +69,7 @@ inline uint64_t available_ram_bytes() {
         return 0;
     }
 
-    // Available = free + inactive (inactive pages can be reclaimed)
-    // Don't include purgeable or speculative as they may not be immediately available
-    const uint64_t available_pages = static_cast<uint64_t>(vm_stat.free_count) +
-                                     static_cast<uint64_t>(vm_stat.inactive_count);
+    const uint64_t available_pages = static_cast<uint64_t>(vm_stat.free_count);
     return available_pages * static_cast<uint64_t>(page_size);
 #else
     return 0;
@@ -108,3 +105,4 @@ inline uint64_t current_process_rss_bytes() {
 }
 
 }  // namespace storagellm
+

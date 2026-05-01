@@ -64,7 +64,11 @@ static int enqueue_tensor_prefetch(
     moe_prefetch_task task{};
     task.tensor_index = tensor_index;
     task.target_tier = target_tier;
-    task.urgent = target_tier == moe_TIER_VRAM ? 1 : 0;
+    const moe_tensor_record& rec = engine->tensors[tensor_index];
+    task.urgent = (target_tier == moe_TIER_VRAM ||
+        rec.prefetch_priority >= 95 ||
+        rec.prefetch_class == moe_JUJU_PREFETCH_STARTUP_HOT ||
+        rec.prefetch_class == moe_JUJU_PREFETCH_ROUTER_HOT) ? 1 : 0;
     const int queued = (task.urgent || target_tier == moe_TIER_VRAM) ?
         enqueue_stage_or_retry(engine, engine->disk_stage, task) :
         enqueue_stage(engine, engine->disk_stage, task);

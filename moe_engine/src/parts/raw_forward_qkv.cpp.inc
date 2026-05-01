@@ -1,4 +1,4 @@
-// Raw forward - QKV attention integration
+﻿// Raw forward - QKV attention integration
 
 // GAP 1A: Quantize plain float K/V into persistent per-head qkv_state_t
 // Called once per head when context changes; state persists across decode calls
@@ -248,3 +248,18 @@ int moe_pc_engine_attention_decode_f32(
         return 1;
     });
 }
+
+// FATE Predictor: Save hidden state snapshot just before gate
+static void save_gate_input_snapshot(moe_pc_engine* engine, int layer, const float* hidden, uint32_t dim) {
+    if (!engine || layer < 0 || !hidden || dim == 0) return;
+    std::lock_guard<std::mutex> lock(engine->gate_snapshot_mutex);
+    const size_t layer_u = (size_t)layer;
+    if (engine->gate_input_snapshots.size() <= layer_u) {
+        engine->gate_input_snapshots.resize(layer_u + 1);
+        engine->gate_input_snapshot_epochs.resize(layer_u + 1, 0);
+    }
+    engine->gate_input_snapshots[layer_u].assign(hidden, hidden + dim);
+    engine->gate_input_snapshot_epochs[layer_u] =
+        engine->expert_touch_epoch.load(std::memory_order_relaxed);
+}
+

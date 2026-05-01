@@ -1,3 +1,73 @@
+﻿static void moe_save_gate_input_snapshot(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const float* hidden,
+    uint32_t hidden_size
+) {
+    if (!engine || !hidden || layer < 0 || hidden_size == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(engine->gate_snapshot_mutex);
+    const size_t slot = (size_t)layer;
+    if (engine->gate_input_snapshots.size() <= slot) {
+        engine->gate_input_snapshots.resize(slot + 1u);
+        engine->gate_input_snapshot_epochs.resize(slot + 1u, 0);
+    }
+    std::vector<float>& dst = engine->gate_input_snapshots[slot];
+    dst.assign(hidden, hidden + hidden_size);
+    engine->gate_input_snapshot_epochs[slot] =
+        engine->expert_touch_epoch.load(std::memory_order_relaxed);
+}
+
+static float moe_router_normalized_entropy(const std::vector<float>& probs) {
+    if (probs.size() <= 1u) {
+        return 0.0f;
+    }
+    double sum = 0.0;
+    for (float p : probs) {
+        if (p > 0.0f) {
+            sum += (double)p;
+        }
+    }
+    if (sum <= 0.0) {
+        return 0.0f;
+    }
+    double entropy = 0.0;
+    for (float p : probs) {
+        if (p <= 0.0f) {
+            continue;
+        }
+        const double q = (double)p / sum;
+        entropy -= q * std::log(q);
+    }
+    const double denom = std::log((double)probs.size());
+    if (denom <= 0.0) {
+        return 0.0f;
+    }
+    const double normalized = entropy / denom;
+    return (float)std::max(0.0, std::min(1.0, normalized));
+}
+
+static uint32_t moe_router_adaptive_top_k(
+    moe_pc_engine* engine,
+    uint32_t requested_top_k,
+    uint32_t experts,
+    float entropy
+) {
+    uint32_t top_k = requested_top_k;
+    if (entropy < 0.30f) {
+        top_k = std::max(1u, requested_top_k / 2u);
+    } else if (entropy >= 0.70f) {
+        top_k = std::min<uint32_t>(experts, 12u);
+    }
+    top_k = std::min(top_k, experts);
+    if (engine) {
+        engine->last_router_entropy_milli.store((uint32_t)(entropy * 1000.0f), std::memory_order_relaxed);
+        engine->adaptive_prefetch_depth.store(entropy > 0.70f ? 1u : 2u, std::memory_order_relaxed);
+    }
+    return top_k;
+}
+
 static int moe_router_topk_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -46,7 +116,8 @@ static int moe_router_topk_f32(
         v = sigmoid(v);
     }
 
-    top_k = std::min(top_k, experts);
+    const float router_entropy = moe_router_normalized_entropy(*scratch_logits);
+    top_k = moe_router_adaptive_top_k(engine, top_k, experts, router_entropy);
     scratch_order->resize(experts);
     uint32_t* order = scratch_order->data();
     for (uint32_t i = 0; i < experts; ++i) {
@@ -81,3 +152,5 @@ static int moe_router_topk_f32(
     }
     return 1;
 }
+
+

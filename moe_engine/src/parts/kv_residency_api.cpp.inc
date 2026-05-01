@@ -133,6 +133,13 @@ int moe_pc_engine_request_expert(
     const int result = [&]() {
         std::lock_guard<std::mutex> lock(engine->map_mutex);
         moe_block_state& state = engine->expert_states[slot];
+        
+        // BUGFIX: Verify state hasn't been changed by another thread during Phase 2
+        // Phase 1 guarantees this expert was set to moe_TIER_STREAM.
+        if (state.tier != moe_TIER_STREAM) {
+            return 0; // State was altered (e.g. evicted) while map_mutex was released
+        }
+
         moe_tier_t final_target = target;
         const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
         // Bug 1 Fix: RAM threshold matches prefetch_admitted_tier (93%). Critical Fix 4 raised

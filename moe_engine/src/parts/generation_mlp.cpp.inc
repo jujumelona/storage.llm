@@ -53,55 +53,56 @@ static int moe_layer_moe_mlp_f32(
         }
     }
 
+    moe_save_gate_input_snapshot(engine, layer, s->norm.data(), hidden_size);
     if (!moe_router_topk_f32(
             engine,
             layer,
             s->norm.data(),
             hidden_size,
             c->experts_per_moe_layer,
-            moe_MOE_TOP_EXPERTS,
+            moe_MOE_BASE_TOP_EXPERTS,
             &s->selected_experts,
             &s->selected_weights,
             &s->router_logits,
             &s->router_order)) {
         return 0;
     }
-
-    // Fix 1: Expert-level parallelism.
-    // Phase 1: Batch-request all experts upfront so prefetch can overlap.
-    const moe_tier_t target_tier = prefetch_plan_selected_tier(engine);
-    const size_t selected_count = std::min(s->selected_experts.size(), (size_t)moe_MOE_TOP_EXPERTS);
-    uint8_t stream_inflight[moe_MOE_TOP_EXPERTS] = {};
-    {
-        std::lock_guard<std::mutex> lock(engine->map_mutex);
-        for (size_t e = 0; e < selected_count; ++e) {
-            const int expert_id = s->selected_experts[e];
-            const size_t eslot = expert_dense_slot(layer, expert_id);
-            if (eslot < engine->expert_states.size()) {
-                const moe_block_state& state = engine->expert_states[eslot];
-                stream_inflight[e] = state.active && state.tier == moe_TIER_STREAM ? 1u : 0u;
-            }
+    moe_juju_update_co_activation(engine, layer, s->selected_experts);
+    const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
+    if (phase != moe_GEN_PHASE_PREFILL) {
+        const uint32_t depth = engine->adaptive_prefetch_depth.load(std::memory_order_relaxed);
+        const int predict_layer = layer + 1;
+        std::vector<int> predicted_experts = moe_juju_predict_co_activation(
+            engine,
+            predict_layer,
+            (int)std::min<uint32_t>(moe_MOE_TOP_EXPERTS, moe_MOE_BASE_TOP_EXPERTS * 2u)
+        );
+        if (depth == 0u) {
+            predicted_experts.clear();
         }
-    }
-    for (size_t e = 0; e < selected_count; ++e) {
-        const int expert_id = s->selected_experts[e];
-        if (stream_inflight[e]) {
-            continue;
-        }
-        moe_pc_engine_request_expert(engine, layer, expert_id,
-            expert_triplet_bytes(engine, layer, expert_id), target_tier);
-        enqueue_tensor_prefetch(engine, layer, expert_id, moe_PROJ_GATE, target_tier, 1);
-        enqueue_tensor_prefetch(engine, layer, expert_id, moe_PROJ_UP, target_tier, 1);
-        enqueue_tensor_prefetch(engine, layer, expert_id, moe_PROJ_DOWN, target_tier, 1);
-    }
-    if (engine->io_config.enable_compute_io_overlap) {
-        engine->disk_stage.cv.notify_all();
+        moe_pc_engine_prefetch_moe_lookahead(
+            engine,
+            layer,
+            s->selected_experts.data(),
+            (uint32_t)s->selected_experts.size(),
+            predicted_experts.empty() ? nullptr : predicted_experts.data(),
+            (uint32_t)predicted_experts.size()
+        );
+    } else {
+        moe_pc_engine_prefetch_moe_lookahead(
+            engine,
+            layer,
+            s->selected_experts.data(),
+            (uint32_t)s->selected_experts.size(),
+            nullptr,
+            0
+        );
     }
 
     // Phase 2: Run experts in parallel with per-expert scratch buffers.
     // Each expert gets its own gate/up/out buffers to prevent data races.
     const size_t num_selected = s->selected_experts.size();
-    // BUGFIX 66: Issue 10 - Add diagnostic for expert_work size mismatch ?�★
+    // BUGFIX 66: Issue 10 - Add diagnostic for expert_work size mismatch ?�★
     // Problem: If expert_work.size() < num_selected, return 0 silently
     // No log of which layer/expert failed, hard to debug
     // Solution: Log error with layer info before returning
@@ -214,3 +215,4 @@ static int moe_layer_moe_mlp_f32(
     }
     return 1;
 }
+

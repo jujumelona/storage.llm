@@ -1,8 +1,18 @@
-﻿struct moe_pc_engine {
+﻿#ifdef __linux__
+#include <liburing.h>
+struct io_uring_state_t {
+    struct io_uring ring;
+    std::vector<struct iovec> registered_iovecs;
+    bool initialized = false;
+};
+#endif
+
+struct moe_pc_engine {
     moe_pc_engine_config_t config{};
     moe_io_config_t io_config{};
     moe_io_atomic_stats io_atomic{};
     moe_backend_caps_t backend_caps{};
+    moe_io_ring_adapter ring_adapter{};
     std::vector<moe_block_state> expert_states;
     std::vector<moe_tensor_record> tensors;
     std::vector<std::string> tensor_paths;
@@ -10,15 +20,21 @@
     std::vector<moe_gguf_common_tensor_record> gguf_common_tensors;
     std::unordered_map<std::string, size_t> gguf_common_tensor_slots;
     std::vector<uint64_t> expert_bytes;
+    std::vector<uint16_t> expert_runtime_priorities;
+    std::vector<uint16_t> expert_prefetch_priorities;
+    std::vector<uint8_t> expert_residency_hints;
+    uint64_t avg_expert_bytes = 0;
     uint64_t max_tensor_stream_bytes = 0;
     std::unordered_map<std::string, mmap_context_t*> shard_mmaps;
     std::unordered_map<uint64_t, mmap_context_t*> shard_mmaps_by_id;
     std::unordered_set<mmap_context_t*> locked_mmaps;
-    std::atomic<mmap_context_t*> source_mmaps[85]{};
+    std::atomic<mmap_context_t*> source_mmaps[256]{};
     std::string model_root;
     moe_scale4_file_t* scale4 = nullptr;
     moe_cuda_driver_api cuda{};
     moe_hip_driver_api hip{};
+    moe_level_zero_driver_api ze{};
+    moe_vulkan_driver_api vk{};
     void* model_lib_handle = nullptr;
     std::string model_lib_cache_dir;
     std::string model_lib_path;
@@ -83,6 +99,9 @@
     bool staging_numa_allocated = false;
     std::vector<moe_staging_slot> staging_slots;
     uint64_t staging_slot_size = 0;
+#ifdef ENABLE_LOCKFREE_STAGING
+    std::atomic<uint64_t> staging_slot_free_mask{0};
+#endif
     std::mutex staging_slot_mutex;
     std::condition_variable staging_slot_cv;
     std::condition_variable staging_pinned_cv;
@@ -96,6 +115,16 @@
     // New: generation counter + map (O(1) clear, bounded growth ~20k entries)
     uint64_t prefetch_plan_generation{0};
     std::unordered_map<uint64_t, uint64_t> prefetch_plan_seen_gen;  // key ??generation
+
+    // Co-activation Speculative Prefetch statistics
+    // [layer][expert_n_minus_2][expert_n] -> frequency
+    std::vector<std::unordered_map<int, std::unordered_map<int, float>>> co_activation_stats;
+    std::vector<std::vector<int>> last_selected_experts; // History of selected experts per layer
+    std::mutex gate_snapshot_mutex;
+    std::vector<std::vector<float>> gate_input_snapshots;
+    std::vector<uint64_t> gate_input_snapshot_epochs;
+    std::atomic<uint32_t> adaptive_prefetch_depth{2};
+    std::atomic<uint32_t> last_router_entropy_milli{0};
     alignas(64) std::atomic<uint64_t> vram_used_bytes{0};
     alignas(64) std::atomic<uint64_t> ram_used_bytes{0};
     alignas(64) std::atomic<uint64_t> db_used_bytes{0};
@@ -122,6 +151,7 @@
     std::atomic<uint64_t> device_total_bytes{0};
     std::atomic<uint64_t> device_free_bytes{0};
     std::atomic<uint64_t> pending_ram_reservation{0};
+    std::atomic<uint64_t> pending_vram_reservation{0}; // Fix 15: VRAM double admission prevention
     std::atomic<int64_t> last_mem_query_ms{0};  // Fix 41: per-engine cuMemGetInfo throttle
     std::atomic<int> device_allocator_ready{0};
     std::unordered_set<uint64_t> activation_keys;
@@ -184,6 +214,19 @@
     std::atomic<int> juju_strategy_valid{0};
     moe_juju_execution_path_t juju_execution_path{moe_JUJU_EXEC_STORAGE_STREAMING};
     moe_juju_pipeline_config_t juju_pipeline_config{};
+    std::string offload_graph_ir_json;
+    std::atomic<int> offload_graph_ir_ready{0};
+    std::atomic<int> offload_graph_ir_required{0};
+    std::atomic<uint32_t> offload_graph_ir_version{0};
+    std::atomic<uint64_t> offload_graph_ir_op_count{0};
+    std::atomic<uint64_t> offload_graph_ir_layer_count{0};
+    std::atomic<uint32_t> juju_idx_schema_version{0};
+    std::atomic<uint32_t> juju_split_group_count{0};
+    std::atomic<uint32_t> juju_split_missing_count{0};
+    std::atomic<uint64_t> juju_runtime_hint_tensor_count{0};
+    std::atomic<uint64_t> juju_priority_tensor_count{0};
+    std::atomic<uint64_t> juju_fastmem_tensor_count{0};
+    std::atomic<uint64_t> juju_slowmem_tensor_count{0};
     std::string offload_gguf_first_file;
     std::string offload_gguf_metadata_json;
     std::string offload_weight_quant_family;

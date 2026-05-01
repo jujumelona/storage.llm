@@ -2,17 +2,25 @@ static uint64_t tier_used(const moe_pc_engine* engine, moe_tier_t tier) {
     if (!engine) {
         return 0;
     }
+    int64_t val = 0;
     switch (tier) {
         case moe_TIER_VRAM:
-            return engine->vram_used_bytes.load();
+            val = (int64_t)engine->vram_used_bytes.load();
+            break;
         case moe_TIER_RAM:
-            return engine->ram_used_bytes.load();
+            val = (int64_t)engine->ram_used_bytes.load();
+            break;
         case moe_TIER_DB:
-            return engine->db_used_bytes.load();
+            val = (int64_t)engine->db_used_bytes.load();
+            break;
         case moe_TIER_STREAM:
         default:
             return 0;
     }
+    // BUGFIX 115: Handle transient underflows from wait-free subtract gracefully
+    // If val is negative (due to concurrent fetch_add/fetch_sub interleaving),
+    // treat it as 0 to prevent 18 Exabytes spikes from triggering massive evictions.
+    return val < 0 ? 0 : (uint64_t)val;
 }
 
 static uint64_t tier_budget(const moe_pc_engine* engine, moe_tier_t tier) {

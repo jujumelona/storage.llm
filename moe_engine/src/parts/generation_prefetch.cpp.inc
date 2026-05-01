@@ -1,4 +1,4 @@
-static void moe_enqueue_attention_prefetch(moe_pc_engine* engine, int32_t layer) {
+﻿static void moe_enqueue_attention_prefetch(moe_pc_engine* engine, int32_t layer) {
     if (!engine || layer < 0) {
         return;
     }
@@ -99,6 +99,9 @@ static int moe_can_enqueue_attention_lookahead(moe_pc_engine* engine, int32_t la
     // Prevents attention prefetch cutoff before expert eviction starts
     // Dead zone reduced from 7% to 5%, improves attention prefetch opportunities
     // BUGFIX 99: Precompute percentage threshold
-    const uint64_t threshold = (budget * 87ull) / 100ull;
+    // Fix 5: Change threshold from 85% to 88% to reduce attention prefetch dead-zone
+    const uint64_t threshold = (budget * 88ull) / 100ull;
     return used < threshold && bytes <= threshold - used;
 }
+
+

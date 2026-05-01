@@ -1,4 +1,4 @@
-typedef struct {
+﻿typedef struct {
     uint64_t vram_budget_bytes;
     uint64_t ram_budget_bytes;
     uint64_t db_budget_bytes;
@@ -35,6 +35,7 @@ typedef struct {
     int enable_gpudirect_storage;
     int enable_bam_nvme;
     int enable_common_raw_vram_pin;
+    float int4_fallback_threshold;
 } moe_io_config_t;
 
 typedef struct {
@@ -60,3 +61,4 @@ typedef struct {
     int throttle_speculative;
     int drop_speculative;
 } moe_runtime_orchestrator_plan_t;
+

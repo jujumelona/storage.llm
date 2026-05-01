@@ -1,4 +1,4 @@
-#include <cassert>
+﻿#include <cassert>
 // BUGFIX 58/62: Issue 4A - Dynamic batch_max based on backend_caps ?�★
 // Problem: moe_gpu_stage_batch_max = 4 hardcoded
 // PCIe 5.0 x16: 4 too low (underutilizes bandwidth)
@@ -23,8 +23,12 @@ static void reset_staging_slots(moe_pc_engine* engine) {
         slot.buf = nullptr;
         slot.size = 0;
     }
+    engine->ring_adapter.cleanup();
     engine->staging_slots.clear();
     engine->staging_slot_size = 0;
+#ifdef ENABLE_LOCKFREE_STAGING
+    engine->staging_slot_free_mask.store(0, std::memory_order_release);
+#endif
     engine->staging_pinned_slot_count.store(0, std::memory_order_release);
     engine->staging_gpu_slot_count.store(0, std::memory_order_release);
     engine->staging_direct_slot_count.store(0, std::memory_order_release);
@@ -374,6 +378,14 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
         slot.in_use.store(false);
         engine->staging_slots.emplace_back(std::move(slot));
     }
+#ifdef ENABLE_LOCKFREE_STAGING
+    if (slot_count <= 64u) {
+        const uint64_t free_mask = slot_count == 64u ? UINT64_MAX : ((1ull << slot_count) - 1ull);
+        engine->staging_slot_free_mask.store(free_mask, std::memory_order_release);
+    } else {
+        engine->staging_slot_free_mask.store(0, std::memory_order_release);
+    }
+#endif
 
     // CRITICAL FIX: When staging is non-pinned, log warning about sync DMA performance impact
     if (!engine->staging_pinned && slot_count > 0) {
@@ -384,6 +396,25 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
             (unsigned long long)engine->staging_size);
     }
     engine->staging_free_slot_count.store(slot_count, std::memory_order_release);
+    
+    // Register staging slots with IORing/io_uring
+    if (engine->backend_caps.supports_registered_io_buffers && slot_count > 0 && engine->staging_pinned) {
+        const uint32_t queue_depth = std::max(64u, slot_count * 2);
+        if (engine->ring_adapter.init(queue_depth)) {
+            std::vector<void*> bufs(slot_count);
+            std::vector<size_t> lens(slot_count);
+            for (uint32_t i = 0; i < slot_count; ++i) {
+                bufs[i] = engine->staging_slots[i].buf;
+                lens[i] = engine->staging_slots[i].size;
+            }
+            if (engine->ring_adapter.register_buffers(bufs.data(), lens.data(), slot_count)) {
+                fprintf(stderr, "[storageLLM INFO] Successfully registered %u staging buffers with io_uring/IORing.\n", slot_count);
+            } else {
+                fprintf(stderr, "[storageLLM WARNING] Failed to register staging buffers with io_uring/IORing.\n");
+            }
+        }
+    }
+
     update_staging_slot_split_for_workers(engine);
     const uint32_t warning_slot_target = pinned_slot_target + gpu_slot_target + direct_slot_target;
     if (slot_count < warning_slot_target) {
@@ -396,3 +427,5 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
             (unsigned long long)min_slot);
     }
 }
+
+

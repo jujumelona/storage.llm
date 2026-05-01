@@ -30,7 +30,7 @@ static void print_forward_status(const char* label, moe_pc_engine_t* engine) {
         return;
     }
     printf(
-        "forward[%s] storage=%d tensors=%d expert_triplet=%d tokenizer=%d embed=%d lm_head=%d attn_proj=%d attn_decode=%d kv_cache=%d attention=%d sampler=%d decode_loop=%d chat=%d tensor_count=%llu adapter=%s adapter_exec=%d dynamic_shape=%d layers=%u hidden=%u vocab=%u\n",
+        "forward[%s] storage=%d tensors=%d expert_triplet=%d tokenizer=%d embed=%d lm_head=%d attn_proj=%d attn_decode=%d kv_cache=%d attention=%d sampler=%d decode_loop=%d chat=%d tensor_count=%llu adapter=%s adapter_exec=%d dynamic_shape=%d layers=%u hidden=%u vocab=%u graph_ir=%d required=%d graph_ver=%u graph_layers=%llu graph_ops=%llu\n",
         label,
         status.storage_state_valid,
         status.tensor_table_loaded,
@@ -51,7 +51,12 @@ static void print_forward_status(const char* label, moe_pc_engine_t* engine) {
         status.dynamic_shape_ready,
         status.dynamic_num_hidden_layers,
         status.dynamic_hidden_size,
-        status.dynamic_vocab_size
+        status.dynamic_vocab_size,
+        status.graph_ir_ready,
+        status.graph_ir_required,
+        status.graph_ir_version,
+        (unsigned long long)status.graph_ir_layer_count,
+        (unsigned long long)status.graph_ir_op_count
     );
 }
 
@@ -357,12 +362,19 @@ static int probe_main(int argc, char** argv) {
     }
 
     printf(
-        "kv=%s offload_gguf=%d files=%u tensor_headers=%llu executable_tensors=%llu qkv_forced=%u qkv_bits=%u/%u qkv_group=%u qkv_page=%u qkv_sink=%u weight=%s/%ub enc=%u kernel=%s first_gguf=%s vram=%llu common=%llu expert_vram=%llu device=%llu allocs=%llu device_mem=%llu/%llu device_pools=%llu/%llu/%llu/%llu model_lib=%d/%d/%d path=%s common_prefetch=%llu/%llu ram=%llu db=%llu experts=%llu tiers=%llu/%llu/%llu\n",
+        "kv=%s offload_gguf=%d files=%u tensor_headers=%llu executable_tensors=%llu juju_schema=%u split_groups=%u split_missing=%u hint_tensors=%llu priority_tensors=%llu fast_tensors=%llu slow_tensors=%llu qkv_forced=%u qkv_bits=%u/%u qkv_group=%u qkv_page=%u qkv_sink=%u weight=%s/%ub enc=%u kernel=%s first_gguf=%s vram=%llu common=%llu expert_vram=%llu device=%llu allocs=%llu device_mem=%llu/%llu device_pools=%llu/%llu/%llu/%llu model_lib=%d/%d/%d path=%s common_prefetch=%llu/%llu ram=%llu db=%llu experts=%llu tiers=%llu/%llu/%llu\n",
         moe_kv_mode_name(stats.kv_mode),
         stats.offload_gguf_valid,
         stats.offload_gguf_file_count,
         (unsigned long long)stats.offload_gguf_tensor_count,
         (unsigned long long)stats.offload_gguf_executable_tensor_count,
+        stats.juju_idx_schema_version,
+        stats.juju_split_group_count,
+        stats.juju_split_missing_count,
+        (unsigned long long)stats.juju_runtime_hint_tensor_count,
+        (unsigned long long)stats.juju_priority_tensor_count,
+        (unsigned long long)stats.juju_fastmem_tensor_count,
+        (unsigned long long)stats.juju_slowmem_tensor_count,
         stats.qkv_forced_by_format,
         stats.qkv_k_bits,
         stats.qkv_v_bits,
@@ -485,9 +497,13 @@ static int probe_main(int argc, char** argv) {
         if (moe_pc_engine_load_codec_table(engine, nullptr, model_root, scale4_path)) {
             moe_pc_engine_get_stats(engine, &stats);
             printf(
-                "offload_gguf_header_tensors=%llu codec_tensors=%llu\n",
+                "offload_gguf_header_tensors=%llu codec_tensors=%llu juju_schema=%u hint_tensors=%llu priority_tensors=%llu split_missing=%u\n",
                 (unsigned long long)stats.offload_gguf_tensor_count,
-                (unsigned long long)moe_pc_engine_tensor_count(engine)
+                (unsigned long long)moe_pc_engine_tensor_count(engine),
+                stats.juju_idx_schema_version,
+                (unsigned long long)stats.juju_runtime_hint_tensor_count,
+                (unsigned long long)stats.juju_priority_tensor_count,
+                stats.juju_split_missing_count
             );
             print_forward_status("loaded", engine);
         }

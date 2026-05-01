@@ -1,4 +1,4 @@
-﻿static uint64_t device_key_raw_span(const moe_storage_raw_span_spec_t& s, uint8_t pool) {
+static uint64_t device_key_raw_span(const moe_storage_raw_span_spec_t& s, uint8_t pool) {
     // Bug 11 Fix: Use deterministic structured key instead of 40-bit hash.
     // Hash collision probability ~0.003% with 7,900 spans causes silent data corruption.
     // New key: part_id (16b) | layer (16b) | offset>>12 (28b) = unique per span.
@@ -58,7 +58,11 @@ static int device_copy_raw_span(
             release_staging_slot(e, slot_idx);
             return 0;
         }
-        std::memcpy(slot.buf, src, static_cast<size_t>(s.bytes));
+        const uint64_t copied = copy_mapped_range_to_staging(e, src, s.bytes, slot_idx);
+        if (copied != s.bytes) {
+            release_staging_slot(e, slot_idx);
+            return 0;
+        }
 
         const int async_copy = device_backend_async_h2d_available(
             e, stream, slot.pinned ? 1 : 0);

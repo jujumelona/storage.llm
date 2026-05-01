@@ -86,6 +86,15 @@ static void finish_tensor_index_load(moe_pc_engine* engine) {
     if (!engine) {
         return;
     }
+    uint64_t expert_sum = 0;
+    uint64_t expert_count = 0;
+    for (uint64_t bytes : engine->expert_bytes) {
+        if (bytes) {
+            expert_sum += bytes;
+            ++expert_count;
+        }
+    }
+    engine->avg_expert_bytes = expert_count ? expert_sum / expert_count : engine->max_tensor_stream_bytes;
     if (engine->staging && engine->staging_size > 0) {
         configure_staging_slots(engine);
         engine->staging_slot_cv.notify_all();
@@ -506,6 +515,63 @@ static int load_gguf_tensor_directory_as_tensor_index(
     return 1;
 }
 
+static uint64_t moe_count_json_key_occurrences(const std::string& text, const char* key) {
+    if (!key || !key[0]) {
+        return 0;
+    }
+    uint64_t count = 0;
+    size_t pos = 0;
+    while ((pos = text.find(key, pos)) != std::string::npos) {
+        ++count;
+        pos += std::strlen(key);
+    }
+    return count;
+}
+
+static void moe_ingest_juju_graph_ir(moe_pc_engine* engine, const std::string& index_json) {
+    if (!engine || index_json.empty()) {
+        return;
+    }
+    uint64_t index_schema_version = 0;
+    if (moe_json_get_u64_local(index_json, "schema_version", &index_schema_version)) {
+        const uint32_t version = (uint32_t)std::min<uint64_t>(index_schema_version, UINT32_MAX);
+        uint32_t current = engine->juju_idx_schema_version.load(std::memory_order_relaxed);
+        while (version > current &&
+               !engine->juju_idx_schema_version.compare_exchange_weak(
+                   current, version, std::memory_order_relaxed)) {
+        }
+    }
+    uint64_t split_count = 0;
+    if (moe_json_get_u64_local(index_json, "split_count", &split_count) && split_count > 1) {
+        engine->juju_split_group_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (index_json.find("\"graph_ir\"") == std::string::npos ||
+        index_json.find("JUJU_GRAPH_IR_V1") == std::string::npos) {
+        return;
+    }
+    engine->offload_graph_ir_ready.store(1, std::memory_order_relaxed);
+    if (index_json.find("\"graph_ir_required\":true") != std::string::npos ||
+        index_json.find("\"graph_ir_required\": true") != std::string::npos) {
+        engine->offload_graph_ir_required.store(1, std::memory_order_relaxed);
+    }
+    uint64_t schema_version = 1;
+    size_t graph_pos = index_json.find("\"graph_ir\"");
+    if (graph_pos != std::string::npos) {
+        std::string graph_tail = index_json.substr(graph_pos);
+        moe_json_get_u64_local(graph_tail, "schema_version", &schema_version);
+        engine->offload_graph_ir_op_count.fetch_add(
+            moe_count_json_key_occurrences(graph_tail, "\"op\""),
+            std::memory_order_relaxed);
+        engine->offload_graph_ir_layer_count.fetch_add(
+            moe_count_json_key_occurrences(graph_tail, "\"layer\""),
+            std::memory_order_relaxed);
+        if (engine->offload_graph_ir_json.empty()) {
+            engine->offload_graph_ir_json = graph_tail.substr(0, std::min<size_t>(graph_tail.size(), 1u << 20));
+        }
+    }
+    engine->offload_graph_ir_version.store((uint32_t)std::min<uint64_t>(schema_version, UINT32_MAX), std::memory_order_relaxed);
+}
+
 static int load_juju_tensor_index_as_tensor_index(
     moe_pc_engine* engine,
     const std::string& root,
@@ -533,6 +599,7 @@ static int load_juju_tensor_index_as_tensor_index(
         if (!moe_read_juju_tensor_index_json(path, sections, file_bytes, &index_json)) {
             continue;
         }
+        moe_ingest_juju_graph_ir(engine, index_json);
         std::vector<moe_juju_tensor_json_entry_t> tensors;
         if (!moe_parse_juju_tensor_index_json(index_json, &tensors, nullptr, nullptr, nullptr) ||
             tensors.empty()) {
@@ -558,6 +625,21 @@ static int load_juju_tensor_index_as_tensor_index(
                 entry.juju_bytes > file_bytes - entry.juju_offset) {
                 continue;
             }
+            if (entry.runtime_priority != 50 || entry.prefetch_priority != 50 ||
+                entry.residency_hint != moe_JUJU_RESIDENCY_AUTO ||
+                entry.graph_role != moe_JUJU_ROLE_UNKNOWN ||
+                entry.prefetch_class != moe_JUJU_PREFETCH_AUTO) {
+                engine->juju_runtime_hint_tensor_count.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (entry.runtime_priority != 50 || entry.prefetch_priority != 50) {
+                engine->juju_priority_tensor_count.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (entry.residency_hint == moe_JUJU_RESIDENCY_FAST_MEM ||
+                entry.residency_hint == moe_JUJU_RESIDENCY_FAST_MEM_STREAMABLE) {
+                engine->juju_fastmem_tensor_count.fetch_add(1, std::memory_order_relaxed);
+            } else if (entry.residency_hint == moe_JUJU_RESIDENCY_SLOW_MEM) {
+                engine->juju_slowmem_tensor_count.fetch_add(1, std::memory_order_relaxed);
+            }
             if (moe_gguf_tensor_name_executable(entry.name)) {
                 moe_gguf_tensor_dir_entry_t common{};
                 common.name = entry.name;
@@ -569,6 +651,16 @@ static int load_juju_tensor_index_as_tensor_index(
                     common.shape[i] = entry.shape[i];
                 }
                 moe_register_gguf_common_tensor(engine, common, path_idx);
+                auto common_it = engine->gguf_common_tensor_slots.find(moe_lower_ascii_copy(entry.name));
+                if (common_it != engine->gguf_common_tensor_slots.end() &&
+                    common_it->second < engine->gguf_common_tensors.size()) {
+                    moe_gguf_common_tensor_record& common_rec = engine->gguf_common_tensors[common_it->second];
+                    common_rec.runtime_priority = entry.runtime_priority;
+                    common_rec.prefetch_priority = entry.prefetch_priority;
+                    common_rec.residency_hint = entry.residency_hint;
+                    common_rec.graph_role = entry.graph_role;
+                    common_rec.prefetch_class = entry.prefetch_class;
+                }
             }
             const std::string lower_name = moe_lower_ascii_copy(entry.name);
             const bool combined_gate_up =
@@ -615,6 +707,12 @@ static int load_juju_tensor_index_as_tensor_index(
                     rec.info.scale2_byte_offset = 0;
                     rec.info.scale2_byte_length = 0;
                     rec.resolved_path_index = path_idx;
+                    rec.runtime_priority = entry.runtime_priority;
+                    rec.prefetch_priority = entry.prefetch_priority;
+                    rec.residency_hint = entry.residency_hint;
+                    rec.graph_role = entry.graph_role;
+                    rec.prefetch_class = entry.prefetch_class;
+                    rec.juju_section_type = entry.juju_section_type;
                     finalize_tensor_layout(&rec, moe_weight_encoding_from_gguf_type(entry.gguf_type, contract));
                     const uint64_t stream_bytes = tensor_stream_bytes(rec);
                     if (stream_bytes > engine->max_tensor_stream_bytes) {
@@ -622,6 +720,13 @@ static int load_juju_tensor_index_as_tensor_index(
                     }
                     tensor_slots_set(engine, (int)rec.info.layer, (int)rec.info.expert, rec.info.proj, engine->tensors.size());
                     expert_bytes_add(engine, (int)rec.info.layer, (int)rec.info.expert, stream_bytes);
+                    expert_runtime_hints_update(
+                        engine,
+                        (int)rec.info.layer,
+                        (int)rec.info.expert,
+                        rec.runtime_priority,
+                        rec.prefetch_priority,
+                        rec.residency_hint);
                     engine->tensors.push_back(std::move(rec));
                     ++records;
                 }

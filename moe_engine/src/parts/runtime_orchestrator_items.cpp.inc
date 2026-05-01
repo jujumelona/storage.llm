@@ -23,6 +23,11 @@ static void orchestrator_append_item(
     if (bytes == 0) {
         return;
     }
+    tier = juju_hint_target_tier(engine, layer, expert, tier, reason);
+    priority = juju_hint_priority(engine, layer, expert, reason, priority);
+    if (tier == moe_TIER_DB && reason != moe_PREFETCH_REASON_ROUTER_SELECTED) {
+        return;
+    }
     moe_expert_prefetch_item_t item{};
     item.layer = (uint32_t)layer;
     item.expert = (uint32_t)expert;

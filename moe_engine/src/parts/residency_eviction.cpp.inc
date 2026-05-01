@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 // Mutex ordering convention:
 //   device_mutex -> map_mutex for device allocation cleanup.
 //   evict heap selection uses heap_mutex -> map_mutex and does not hold device_mutex.
@@ -38,7 +38,8 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
             const moe_block_state& state = engine->expert_states[victim.slot];
             if (state.active && !state.pending_evict && state.tier == tier &&
                 state.bytes == victim.bytes && state.hot_score == victim.hot_score &&
-                state.last_touch_epoch == victim.last_touch_epoch) {
+                state.last_touch_epoch == victim.last_touch_epoch &&
+                state.predicted_next_use_epoch == victim.predicted_next_use_epoch) {
                 *out = victim;
                 return 1;
             }
@@ -79,7 +80,8 @@ static int demote_one_victim_to(
         moe_block_state& state = engine->expert_states[victim.slot];
         if (!state.active || state.pending_evict || state.tier != from ||
             state.bytes != victim.bytes || state.hot_score != victim.hot_score ||
-            state.last_touch_epoch != victim.last_touch_epoch) {
+            state.last_touch_epoch != victim.last_touch_epoch ||
+            state.predicted_next_use_epoch != victim.predicted_next_use_epoch) {
             return 0;
         }
         if (to == moe_TIER_RAM &&
@@ -172,3 +174,5 @@ static void demote_cold_until(moe_pc_engine* engine, moe_tier_t tier, uint64_t n
         }
     }
 }
+
+

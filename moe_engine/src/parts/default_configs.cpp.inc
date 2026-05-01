@@ -42,6 +42,7 @@ moe_io_config_t moe_pc_default_io_config(void) {
     cfg.enable_gpudirect_storage = 1;
     cfg.enable_bam_nvme = 1;
     cfg.enable_common_raw_vram_pin = 1;
+    cfg.int4_fallback_threshold = 0.50f;
     return cfg;
 }
 

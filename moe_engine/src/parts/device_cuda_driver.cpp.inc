@@ -72,6 +72,16 @@ static int cuda_driver_load(moe_cuda_driver_api* api) {
     api->cuEventQuery = (moe_cu_event_query_fn)moe_find_shared_symbol(api->library, "cuEventQuery");
     api->cuEventSynchronize = (moe_cu_event_synchronize_fn)moe_find_shared_symbol(api->library, "cuEventSynchronize");
     api->cuEventDestroy = (moe_cu_event_destroy_fn)moe_find_cuda_symbol(api->library, "cuEventDestroy_v2", "cuEventDestroy");
+    
+    // CUDA Graph APIs
+    api->cuGraphCreate = (void* (*)(void**, unsigned int))moe_find_shared_symbol(api->library, "cuGraphCreate");
+    api->cuGraphDestroy = (void* (*)(void*))moe_find_shared_symbol(api->library, "cuGraphDestroy");
+    api->cuGraphAddKernelNode = (void* (*)(void**, void*, void**, size_t, void*))moe_find_shared_symbol(api->library, "cuGraphAddKernelNode");
+    api->cuGraphInstantiate = (void* (*)(void**, void*, void*, char*, size_t))moe_find_shared_symbol(api->library, "cuGraphInstantiate");
+    api->cuGraphLaunch = (void* (*)(void*, void*))moe_find_shared_symbol(api->library, "cuGraphLaunch");
+    api->cuGraphExecDestroy = (void* (*)(void*))moe_find_shared_symbol(api->library, "cuGraphExecDestroy");
+    api->cuStreamBeginCapture = (void* (*)(void*, int))moe_find_cuda_symbol(api->library, "cuStreamBeginCapture_v2", "cuStreamBeginCapture");
+    api->cuStreamEndCapture = (void* (*)(void*, void**))moe_find_shared_symbol(api->library, "cuStreamEndCapture");
     return api->cuInit && api->cuDeviceGet && api->cuCtxSetCurrent &&
         api->cuDevicePrimaryCtxRetain && api->cuDevicePrimaryCtxRelease &&
         api->cuMemAlloc && api->cuMemFree && api->cuMemcpyHtoD && api->cuMemGetInfo;

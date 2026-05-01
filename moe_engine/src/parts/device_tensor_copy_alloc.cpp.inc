@@ -84,12 +84,13 @@ static int device_prepare_tensor_allocation(
                 }
             }
         }
-        if (!a && device_budget_bytes(e) && e->device_allocated_bytes.load() + bytes > device_budget_bytes(e)) {
+        if (!a && !device_try_reserve_pending_vram(e, bytes)) {
             e->io_atomic.device_alloc_failures.fetch_add(1, std::memory_order_relaxed);
             e->io_atomic.staging_wraps.fetch_add(1);
             return 0;
         }
         if (!a) {
+            bool pending_vram_reserved = true;
             moe_device_allocation next;
             next.key = key;
             next.bytes = bytes;
@@ -108,6 +109,10 @@ static int device_prepare_tensor_allocation(
                 alloc_ok = (e->cuda.cuMemAlloc(&next.ptr, (size_t)bytes) == 0) ? 1 : 0;
             }
             if (!alloc_ok) {
+                if (pending_vram_reserved) {
+                    device_release_pending_vram_reservation(e, bytes);
+                    pending_vram_reserved = false;
+                }
                 e->io_atomic.device_alloc_failures.fetch_add(1, std::memory_order_relaxed);
                 lock.unlock();
                 device_refresh_mem_info(e);
@@ -115,6 +120,10 @@ static int device_prepare_tensor_allocation(
             }
             e->device_allocated_bytes.fetch_add(bytes);
             device_account_free_bytes_sub(e, bytes);
+            if (pending_vram_reserved) {
+                device_release_pending_vram_reservation(e, bytes);
+                pending_vram_reserved = false;
+            }
             e->device_allocation_count.fetch_add(1);
             if (auto* c = device_pool_counter(e, pool)) {
                 c->fetch_add(bytes);

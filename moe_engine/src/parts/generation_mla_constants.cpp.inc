@@ -22,4 +22,5 @@ static_assert(moe_MLA_Q_B_DIM == 16384u, "Moe q_b projection width mismatch");
 static_assert(moe_MLA_K_NOPE_TOTAL_DIM == 12288u, "Moe K_nope width mismatch");
 static_assert(moe_MLA_V_TOTAL_DIM == 16384u, "Moe V width mismatch");
 static constexpr float moe_ROPE_THETA = 500000.0f;
-static constexpr uint32_t moe_MOE_TOP_EXPERTS = 8u;
+static constexpr uint32_t moe_MOE_BASE_TOP_EXPERTS = 8u;
+static constexpr uint32_t moe_MOE_TOP_EXPERTS = 12u;

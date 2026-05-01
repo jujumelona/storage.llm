@@ -53,22 +53,6 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#endif
-
-#if defined(__AVX2__)
-#if defined(__FMA__) || defined(_MSC_VER)
-#define moe_HAVE_FMA_INTRINSICS 1
-#else
-#define moe_HAVE_FMA_INTRINSICS 0
-#endif
-
-static inline __m256 moe_madd_ps(__m256 a, __m256 b, __m256 c) {
-#if moe_HAVE_FMA_INTRINSICS
-    return _mm256_fmadd_ps(a, b, c);
-#else
     return _mm256_add_ps(_mm256_mul_ps(a, b), c);
 #endif
 }

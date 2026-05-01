@@ -1,4 +1,4 @@
-﻿// Device allocator initialization and shutdown
+// Device allocator initialization and shutdown
 
 static std::atomic<uint64_t>* device_pool_counter(moe_pc_engine* e, uint8_t pool) {
     if (!e) return nullptr;
@@ -16,6 +16,9 @@ static int device_allocator_init(moe_pc_engine* e) {
     if (e->backend_caps.backend != moe_BACKEND_CUDA && e->backend_caps.backend != moe_BACKEND_HIP && e->backend_caps.backend != moe_BACKEND_METAL && e->backend_caps.backend != moe_BACKEND_VULKAN && e->backend_caps.backend != moe_BACKEND_LEVEL_ZERO && e->backend_caps.backend != moe_BACKEND_SYCL) return 0;
     std::lock_guard<std::mutex> lock(e->device_mutex);
     if (e->device_allocator_ready.load() != 0) return e->device_allocator_ready.load() > 0;
+
+    // QKV State (~0.69 GiB) is now tracked via add_tier_usage dynamically,
+    // so we no longer pre-reserve it here to avoid double-counting.
 
     if (e->backend_caps.backend == moe_BACKEND_CUDA) {
         if (!cuda_driver_load(&e->cuda) || e->cuda.cuInit(0) != 0 ||
@@ -72,7 +75,20 @@ static int device_allocator_init(moe_pc_engine* e) {
             e->backend_caps.device_memory_bytes = e->backend_caps.system_memory_bytes > 0
                 ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
         }
-        e->device_free_bytes.store(e->backend_caps.device_memory_bytes);
+        
+        uint64_t free_mem = 0;
+        int exact_queried = 0;
+        if (e->backend_caps.backend == moe_BACKEND_VULKAN && e->vk.vkGetPhysicalDeviceMemoryProperties2 && e->vk.physicalDevice) {
+            // TODO: Call vkGetPhysicalDeviceMemoryProperties2 to populate free_mem
+        } else if (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO && e->ze.zeDeviceGetMemoryProperties && e->ze.device) {
+            // TODO: Call zeDeviceGetMemoryProperties to populate free_mem
+        }
+        
+        if (!exact_queried) {
+            // Use 85% as a conservative free memory estimate to avoid OOM
+            free_mem = (e->backend_caps.device_memory_bytes * 85ull) / 100ull;
+        }
+        e->device_free_bytes.store(free_mem);
         e->device_total_bytes.store(e->backend_caps.device_memory_bytes);
     }
     e->device_allocator_ready.store(1);

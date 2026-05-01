@@ -1,26 +1,6 @@
-// Device tensor copy stream management
+﻿// Device tensor copy stream management
 
-// TODO: Issue 7 - CUDA stream pool to avoid cuStreamCreate/Destroy on worker resize.
-// Problem: device_tensor_stream_current uses thread_local streams
-// - Worker resize ??thread exit ??cuStreamDestroy ??thread start ??cuStreamCreate
-// - cuStreamCreate takes 100µs-1ms (CUDA context modification)
-// - Frequent resizes during warm-up (5-streak hysteresis) ??cumulative ms delays
-//
-// Solution (Stream Pool Implementation):
-// - Pre-allocate stream pool at engine init (max_workers × copy_streams).
-// - Workers acquire from pool on start, release on exit (no create/destroy).
-// - Trade-off: Upfront cost (max_workers × cuStreamCreate) at init, but eliminates all resize latency.
-//
-// Implementation Plan:
-// 1. Add `stream_pool` to `moe_pc_engine` (std::vector<CUstream> + std::mutex).
-// 2. Initialize pool in engine startup: `max_workers × copy_streams` streams.
-// 3. Replace `device_tensor_stream_current()` with acquire/release pattern:
-//    - `device_stream_acquire(engine)`
-//    - `device_stream_release(engine, stream)`
-// 4. Update `gpu_worker_loop.cpp.inc` and `io_worker_loop.cpp.inc` to use new API instead of thread_local.
-// 5. Ensure safe teardown of all pooled streams during engine destruction.
-//
-// Status: Documented as TODO, not implemented (requires complex multi-file refactoring).
+// DONE: BUGFIX 77 - CUDA stream pool is already implemented below to avoid cuStreamCreate/Destroy on worker resize.
 
 struct moe_deferred_staging_copy {
     uint32_t slot = UINT32_MAX;
@@ -251,4 +231,24 @@ static void device_stream_pool_init(moe_pc_engine* e) {
         }
     }
     e->stream_pool_available.store(static_cast<uint32_t>(e->stream_pool.size()), std::memory_order_release);
+}
+
+// Fix 2: Thread-local cleanup function to prevent memory leak/dangling pointers
+extern "C" {
+void device_cleanup_thread_locals(moe_pc_engine* engine) {
+    if (!engine) return;
+    
+    auto it = s_tl_deferred_staging_copies.find(engine);
+    if (it != s_tl_deferred_staging_copies.end()) {
+        it->second.clear();
+        s_tl_deferred_staging_copies.erase(it);
+    }
+    
+    device_destroy_copy_event_pool(engine);
+    
+    auto pending_it = s_tl_tensor_pending_keys.find(engine);
+    if (pending_it != s_tl_tensor_pending_keys.end()) {
+        s_tl_tensor_pending_keys.erase(pending_it);
+    }
+}
 }

@@ -22,15 +22,22 @@ static inline float moe_dot_f32(const float* a, const float* b, uint32_t count) 
 #if defined(__AVX2__)
     __m256 acc0 = _mm256_setzero_ps();
     __m256 acc1 = _mm256_setzero_ps();
-    for (; i + 15u < count; i += 16u) {
-        const __m256 av0 = _mm256_loadu_ps(a + i);
-        const __m256 bv0 = _mm256_loadu_ps(b + i);
-        const __m256 av1 = _mm256_loadu_ps(a + i + 8u);
-        const __m256 bv1 = _mm256_loadu_ps(b + i + 8u);
-        acc0 = moe_madd_ps(av0, bv0, acc0);
-        acc1 = moe_madd_ps(av1, bv1, acc1);
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+    for (; i + 31u < count; i += 32u) {
+        acc0 = moe_madd_ps(_mm256_loadu_ps(a + i),       _mm256_loadu_ps(b + i),       acc0);
+        acc1 = moe_madd_ps(_mm256_loadu_ps(a + i + 8u),  _mm256_loadu_ps(b + i + 8u),  acc1);
+        acc2 = moe_madd_ps(_mm256_loadu_ps(a + i + 16u), _mm256_loadu_ps(b + i + 16u), acc2);
+        acc3 = moe_madd_ps(_mm256_loadu_ps(a + i + 24u), _mm256_loadu_ps(b + i + 24u), acc3);
     }
-    sum = moe_hsum256_ps(_mm256_add_ps(acc0, acc1));
+    for (; i + 15u < count; i += 16u) {
+        acc0 = moe_madd_ps(_mm256_loadu_ps(a + i),       _mm256_loadu_ps(b + i),       acc0);
+        acc1 = moe_madd_ps(_mm256_loadu_ps(a + i + 8u),  _mm256_loadu_ps(b + i + 8u),  acc1);
+    }
+    for (; i + 7u < count; i += 8u) {
+        acc0 = moe_madd_ps(_mm256_loadu_ps(a + i),       _mm256_loadu_ps(b + i),       acc0);
+    }
+    sum = moe_hsum256_ps(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)));
 #endif
     for (; i < count; ++i) {
         sum += a[i] * b[i];
@@ -57,11 +64,18 @@ static inline void moe_axpy_f32(float* dst, const float* src, float alpha, uint3
     uint32_t i = 0;
 #if defined(__AVX2__)
     const __m256 valpha = _mm256_set1_ps(alpha);
+    for (; i + 31u < count; i += 32u) {
+        _mm256_storeu_ps(dst + i,       moe_madd_ps(valpha, _mm256_loadu_ps(src + i),       _mm256_loadu_ps(dst + i)));
+        _mm256_storeu_ps(dst + i + 8u,  moe_madd_ps(valpha, _mm256_loadu_ps(src + i + 8u),  _mm256_loadu_ps(dst + i + 8u)));
+        _mm256_storeu_ps(dst + i + 16u, moe_madd_ps(valpha, _mm256_loadu_ps(src + i + 16u), _mm256_loadu_ps(dst + i + 16u)));
+        _mm256_storeu_ps(dst + i + 24u, moe_madd_ps(valpha, _mm256_loadu_ps(src + i + 24u), _mm256_loadu_ps(dst + i + 24u)));
+    }
+    for (; i + 15u < count; i += 16u) {
+        _mm256_storeu_ps(dst + i,       moe_madd_ps(valpha, _mm256_loadu_ps(src + i),       _mm256_loadu_ps(dst + i)));
+        _mm256_storeu_ps(dst + i + 8u,  moe_madd_ps(valpha, _mm256_loadu_ps(src + i + 8u),  _mm256_loadu_ps(dst + i + 8u)));
+    }
     for (; i + 7u < count; i += 8u) {
-        const __m256 s = _mm256_loadu_ps(src + i);
-        __m256 d = _mm256_loadu_ps(dst + i);
-        d = moe_madd_ps(valpha, s, d);
-        _mm256_storeu_ps(dst + i, d);
+        _mm256_storeu_ps(dst + i,       moe_madd_ps(valpha, _mm256_loadu_ps(src + i),       _mm256_loadu_ps(dst + i)));
     }
 #endif
     for (; i < count; ++i) {

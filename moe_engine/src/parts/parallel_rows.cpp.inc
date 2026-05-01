@@ -1,6 +1,9 @@
 static uint32_t row_hw_threads() {
-    const unsigned int hw = std::thread::hardware_concurrency();
-    return hw ? static_cast<uint32_t>(hw) : 1u;
+    static const uint32_t hw = []() -> uint32_t {
+        const unsigned int n = std::thread::hardware_concurrency();
+        return n ? static_cast<uint32_t>(n) : 1u;
+    }();
+    return hw;
 }
 
 static uint32_t auto_row_block(uint32_t rows, uint32_t workers) {

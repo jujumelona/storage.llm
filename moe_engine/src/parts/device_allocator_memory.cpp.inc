@@ -11,23 +11,69 @@
 // Helper to encapsulate VRAM budget accounting.
 // Do not modify engine->device_free_bytes directly.
 static void device_account_bytes_freed(moe_pc_engine* e, uint64_t bytes) {
-    if (e) e->device_free_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (!e) return;
+    if (e->backend_caps.backend == moe_BACKEND_METAL) return; // budget computed dynamically
+    e->device_free_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 static uint64_t device_budget_bytes(const moe_pc_engine* e) {
     if (!e) return 0;
     if (e->config.vram_budget_bytes) return e->config.vram_budget_bytes;
-    if (e->backend_caps.supports_unified_memory) {
+    if (e->backend_caps.supports_unified_memory &&
+        e->backend_caps.backend == moe_BACKEND_METAL) {
         const uint64_t sys = e->backend_caps.system_memory_bytes > 0
             ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
-        return (sys * 3ull) / 4ull; // 75% for Unified VRAM/RAM
+        const uint64_t budget = (sys * 60ull) / 100ull;
+        const uint64_t ram_used = e->ram_used_bytes.load(std::memory_order_relaxed);
+        return budget > ram_used ? budget - ram_used : 0;
     }
     const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
     const uint64_t free_b = e->device_free_bytes.load(std::memory_order_relaxed);
     if (allocated || free_b) {
-        return allocated > UINT64_MAX - free_b ? UINT64_MAX : allocated + free_b;
+        // BUGFIX 115: Handle transient underflows from wait-free saturating subtract
+        int64_t s_free = (int64_t)free_b;
+        if (s_free < 0) s_free = 0;
+        return allocated > UINT64_MAX - (uint64_t)s_free ? UINT64_MAX : allocated + (uint64_t)s_free;
     }
     return e->backend_caps.device_memory_bytes ? e->backend_caps.device_memory_bytes : e->backend_caps.recommended_vram_cache_bytes;
+}
+
+static int device_try_reserve_pending_vram(moe_pc_engine* e, uint64_t bytes) {
+    if (!e || bytes == 0) {
+        return 0;
+    }
+    const uint64_t budget = device_budget_bytes(e);
+    if (budget == 0) {
+        return 1;
+    }
+    uint64_t pending = e->pending_vram_reservation.load(std::memory_order_relaxed);
+    for (;;) {
+        const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
+        if (allocated > budget || bytes > budget - allocated) {
+            return 0;
+        }
+        const uint64_t remaining = budget - allocated;
+        if (pending > remaining || bytes > remaining - pending) {
+            return 0;
+        }
+        if (e->pending_vram_reservation.compare_exchange_weak(
+                pending,
+                pending + bytes,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return 1;
+        }
+    }
+}
+
+static void device_release_pending_vram_reservation(moe_pc_engine* e, uint64_t bytes) {
+    if (!e || bytes == 0) {
+        return;
+    }
+    const uint64_t old_val = e->pending_vram_reservation.fetch_sub(bytes, std::memory_order_relaxed);
+    if (old_val < bytes) {
+        e->pending_vram_reservation.fetch_add(bytes - old_val, std::memory_order_relaxed);
+    }
 }
 
 static void device_refresh_mem_info(moe_pc_engine* e) {
@@ -43,10 +89,35 @@ static void device_refresh_mem_info(moe_pc_engine* e) {
         return;
     }
     size_t free_b = 0, total_b = 0;
+    int mem_queried = 0;
     if (e && e->cuda.cuMemGetInfo && device_set_current(e) && e->cuda.cuMemGetInfo(&free_b, &total_b) == 0) {
-        // Bug 1: Do NOT overwrite device_free_bytes ??it's maintained by alloc/free counters
-        // Overwriting causes race with concurrent alloc/free, leading to budget miscalculation
-        // e->device_free_bytes.store((uint64_t)free_b);  // REMOVED
+        mem_queried = 1;
+    } else if (e && e->hip.hipMemGetInfo && device_set_current(e) && e->hip.hipMemGetInfo(&free_b, &total_b) == 0) {
+        mem_queried = 1;
+    } else if (e && e->backend_caps.backend == moe_BACKEND_VULKAN && e->vk.vkGetPhysicalDeviceMemoryProperties2 && e->vk.physicalDevice) {
+        // Call vkGetPhysicalDeviceMemoryProperties2 here when fully implemented
+        // uint64_t v_free = 0, v_total = 0;
+        // e->vk.vkGetPhysicalDeviceMemoryProperties2(e->vk.physicalDevice, &props);
+        // free_b = v_free; total_b = v_total; mem_queried = 1;
+    } else if (e && e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO && e->ze.zeDeviceGetMemoryProperties && e->ze.device) {
+        // Call zeDeviceGetMemoryProperties here when fully implemented
+        // uint32_t count = 1;
+        // e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &props);
+        // free_b = z_free; total_b = z_total; mem_queried = 1;
+    }
+    if (mem_queried) {
+        // Delta sync for device_free_bytes to recover from accounting drift
+        const uint64_t tracked_free = e->device_free_bytes.load(std::memory_order_relaxed);
+        const int64_t delta = (int64_t)free_b - (int64_t)tracked_free;
+        if (delta > 0) {
+            e->device_free_bytes.fetch_add((uint64_t)delta, std::memory_order_relaxed);
+        } else if (delta < 0) {
+            const uint64_t neg_delta = (uint64_t)(-delta);
+            const uint64_t old = e->device_free_bytes.fetch_sub(neg_delta, std::memory_order_relaxed);
+            if (old < neg_delta) {
+                e->device_free_bytes.fetch_add(neg_delta - old, std::memory_order_relaxed);
+            }
+        }
         e->device_total_bytes.store((uint64_t)total_b);
     }
 }
@@ -60,13 +131,20 @@ static void device_account_free_bytes_sub(moe_pc_engine* e, uint64_t bytes) {
     if (!e || bytes == 0) {
         return;
     }
+    if (e->backend_caps.backend == moe_BACKEND_METAL) return; // budget computed dynamically
+    
     // Fast path: atomic subtract without CAS loop
     const uint64_t old_val = e->device_free_bytes.fetch_sub(bytes, std::memory_order_relaxed);
 
-    // Saturating correction: if underflow occurred, clamp to 0
-    // This is safe because device_refresh_mem_info periodically syncs with cuMemGetInfo
+    // BUGFIX 115: Fix wait-free saturating subtract data race ??
+    // Problem: If old_val < bytes, store(0) overwrites any concurrent fetch_add,
+    // permanently leaking VRAM budget (memory leak in accounting).
+    // The previous author claimed device_refresh_mem_info corrects this, but they
+    // explicitly removed the cuMemGetInfo sync in Bug 1! So the corruption is permanent.
+    // Solution: Instead of store(0), add back the exact amount of over-subtraction.
+    // This preserves concurrent additions while correctly saturating at 0.
     if (old_val < bytes) {
-        e->device_free_bytes.store(0, std::memory_order_relaxed);
+        e->device_free_bytes.fetch_add(bytes - old_val, std::memory_order_relaxed);
     }
 }
 
@@ -170,3 +248,6 @@ static void device_free_pool(moe_pc_engine* e, uint8_t pool) {
     }
     device_free_deferred_ptrs(e, deferred_free_ptrs);
 }
+
+
+

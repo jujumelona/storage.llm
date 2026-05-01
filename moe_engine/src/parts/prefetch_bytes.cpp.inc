@@ -1,4 +1,4 @@
-static uint64_t tensor_stream_bytes(const moe_tensor_record& rec) {
+﻿static uint64_t tensor_stream_bytes(const moe_tensor_record& rec) {
     return rec.info.weight_byte_length + rec.info.scale_byte_length + rec.info.scale2_byte_length;
 }
 
@@ -52,14 +52,8 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
     WIN32_MEMORY_RANGE_ENTRY entry;
     entry.VirtualAddress = const_cast<uint8_t*>(src);
     entry.NumberOfBytes = (SIZE_T)bytes;
-    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, GetCurrentProcessId());
-    BOOL success = FALSE;
-    if (hProcess) {
-        success = PrefetchVirtualMemory(hProcess, 1, &entry, 0);
-        CloseHandle(hProcess);
-    } else {
-        success = PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
-    }
+    HANDLE s_self_process = GetCurrentProcess();
+    BOOL success = PrefetchVirtualMemory(s_self_process, 1, &entry, 0);
     if (!success && engine) {
         // Cast away const to update atomic metrics
         const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_touch_fallback.fetch_add(bytes, std::memory_order_relaxed);
@@ -71,6 +65,30 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
 }
 
 static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t start_idx, uint32_t count, uint32_t worker_index, uint32_t turn, uint64_t required_bytes);
+
+#ifdef ENABLE_LOCKFREE_STAGING
+static uint32_t moe_ctz64_portable(uint64_t value) {
+    uint32_t idx = 0;
+    while ((value & 1ull) == 0ull) {
+        value >>= 1;
+        ++idx;
+    }
+    return idx;
+}
+
+static uint64_t moe_staging_range_mask(uint32_t start_idx, uint32_t count, uint32_t total_count) {
+    if (count == 0 || start_idx >= total_count || start_idx >= 64u) {
+        return 0;
+    }
+    const uint32_t end_idx = std::min<uint32_t>(64u, std::min<uint32_t>(total_count, start_idx + count));
+    const uint32_t bits = end_idx - start_idx;
+    if (bits == 0) {
+        return 0;
+    }
+    const uint64_t span = bits == 64u ? UINT64_MAX : ((1ull << bits) - 1ull);
+    return span << start_idx;
+}
+#endif
 
 static uint32_t acquire_staging_slot(
     moe_pc_engine* engine,
@@ -129,6 +147,75 @@ static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t st
     // Upper layer handles failure (requeue or drop)
     uint32_t retry_count = 0;
     constexpr uint32_t MAX_RETRIES = 20;
+
+#ifdef ENABLE_LOCKFREE_STAGING
+    const uint32_t total_slots = static_cast<uint32_t>(engine->staging_slots.size());
+    const uint64_t range_mask = moe_staging_range_mask(start_idx, count, total_slots);
+    if (total_slots <= 64u && range_mask != 0) {
+        for (;;) {
+            uint64_t available = engine->staging_slot_free_mask.load(std::memory_order_acquire) & range_mask;
+            if (count > 1 && available != 0) {
+                const uint32_t pref_idx = start_idx + preferred;
+                if (pref_idx < total_slots) {
+                    const uint64_t pref_bit = 1ull << pref_idx;
+                    if ((available & pref_bit) != 0) {
+                        available = pref_bit | (available & ~pref_bit);
+                    }
+                }
+            }
+            while (available != 0) {
+                const uint32_t idx = moe_ctz64_portable(available);
+                const uint64_t bit = 1ull << idx;
+                uint64_t observed = engine->staging_slot_free_mask.load(std::memory_order_acquire);
+                while ((observed & bit) != 0) {
+                    const uint64_t next = observed & ~bit;
+                    if (engine->staging_slot_free_mask.compare_exchange_weak(
+                            observed,
+                            next,
+                            std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                        if (required_bytes > 0 && engine->staging_slots[idx].size < required_bytes) {
+                            engine->staging_slot_free_mask.fetch_or(bit, std::memory_order_release);
+                            available &= ~bit;
+                            goto try_next_lockfree_slot;
+                        }
+                        engine->staging_slots[idx].in_use.store(true, std::memory_order_release);
+                        engine->staging_free_slot_count.fetch_sub(1, std::memory_order_relaxed);
+                        return idx;
+                    }
+                }
+                available &= ~bit;
+try_next_lockfree_slot:
+                continue;
+            }
+            if (engine->io_stop.load()) {
+                return UINT32_MAX;
+            }
+            if (++retry_count >= MAX_RETRIES) {
+                engine->io_atomic.staging_slot_contention.fetch_add(1, std::memory_order_relaxed);
+                return UINT32_MAX;
+            }
+
+            // Fix 5: Use memory_order_relaxed in retry loop to avoid L3 cache sync overhead
+            std::condition_variable* target_cv = &engine->staging_slot_cv;
+            const uint32_t pinned_count = engine->staging_pinned_slot_count.load(std::memory_order_relaxed);
+            const uint32_t gpu_count = engine->staging_gpu_slot_count.load(std::memory_order_relaxed);
+            const uint32_t direct_start = pinned_count + gpu_count;
+            if (start_idx < pinned_count) {
+                target_cv = &engine->staging_pinned_cv;
+            } else if (start_idx >= pinned_count && start_idx < direct_start) {
+                target_cv = &engine->staging_gpu_cv;
+            } else {
+                target_cv = &engine->staging_direct_cv;
+            }
+            std::unique_lock<std::mutex> lock(engine->staging_slot_mutex);
+            target_cv->wait_for(
+                lock, std::chrono::milliseconds(5),
+                [&]() { return (engine->staging_slot_free_mask.load(std::memory_order_acquire) & range_mask) != 0; }
+            );
+        }
+    }
+#endif
 
     for (;;) {
         for (uint32_t probe = 0; probe < count; ++probe) {
@@ -194,6 +281,11 @@ static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t st
 static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
     if (engine && slot_index < engine->staging_slots.size()) {
         engine->staging_slots[slot_index].in_use.store(false, std::memory_order_release);
+#ifdef ENABLE_LOCKFREE_STAGING
+        if (engine->staging_slots.size() <= 64u) {
+            engine->staging_slot_free_mask.fetch_or(1ull << slot_index, std::memory_order_release);
+        }
+#endif
         engine->staging_free_slot_count.fetch_add(1, std::memory_order_release);
 
         // BUGFIX 68: Issue 5 - Notify only relevant CV based on slot type ★★
@@ -249,6 +341,10 @@ static uint64_t copy_mapped_range_to_staging(
             const uint8_t* s = static_cast<const uint8_t*>(src);
             size_t i = 0;
             for (; i + 127 < static_cast<size_t>(bytes); i += 128) {
+                if (i + 384 < static_cast<size_t>(bytes)) {
+                    _mm_prefetch(reinterpret_cast<const char*>(s + i + 256), _MM_HINT_NTA);
+                    _mm_prefetch(reinterpret_cast<const char*>(s + i + 320), _MM_HINT_NTA);
+                }
                 __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
                 __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 32));
                 __m256i v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 64));
@@ -303,6 +399,10 @@ static uint64_t copy_mapped_range_to_staging_linear(
             const uint8_t* s = static_cast<const uint8_t*>(src);
             size_t i = 0;
             for (; i + 127 < static_cast<size_t>(bytes); i += 128) {
+                if (i + 384 < static_cast<size_t>(bytes)) {
+                    _mm_prefetch(reinterpret_cast<const char*>(s + i + 256), _MM_HINT_NTA);
+                    _mm_prefetch(reinterpret_cast<const char*>(s + i + 320), _MM_HINT_NTA);
+                }
                 __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
                 __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 32));
                 __m256i v2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 64));
@@ -328,3 +428,15 @@ static uint64_t copy_mapped_range_to_staging_linear(
     *staging_offset += bytes;
     return bytes;
 }
+
+
+// Additional 1: HOBBIT - Mixed precision dynamic expert loading based on gate score importance
+// This is a stub integration point for the int4 fallback decoder.
+static int select_expert_precision(const moe_pc_engine* engine, int layer, int expert, float gate_score) {
+    // If score is below threshold, use int4 (return 4), else NVFP4/BF16 (return 16)
+    if (gate_score < engine->io_config.int4_fallback_threshold) {
+        return 4; // moe_CODEC_INT4 equiv
+    }
+    return 16; // moe_CODEC_NVFP4/BF16 equiv
+}
+

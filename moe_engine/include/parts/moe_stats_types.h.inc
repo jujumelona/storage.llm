@@ -69,6 +69,13 @@ typedef struct {
     double juju_tier2_to_tier1_ms;
     uint64_t offload_gguf_tensor_count;
     uint64_t offload_gguf_executable_tensor_count;
+    uint32_t juju_idx_schema_version;
+    uint32_t juju_split_group_count;
+    uint32_t juju_split_missing_count;
+    uint64_t juju_runtime_hint_tensor_count;
+    uint64_t juju_priority_tensor_count;
+    uint64_t juju_fastmem_tensor_count;
+    uint64_t juju_slowmem_tensor_count;
     char offload_gguf_first_file[260];
     char weight_quant_family[64];
     char weight_kernel_family[64];

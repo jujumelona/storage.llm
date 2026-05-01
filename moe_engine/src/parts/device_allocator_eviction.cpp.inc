@@ -1,4 +1,4 @@
-// Device memory eviction and room-making logic
+﻿// Device memory eviction and room-making logic
 
 static void device_free_expert_locked(
     moe_pc_engine* e,
@@ -254,3 +254,6 @@ static void device_make_room_locked(
         }
     }
 }
+
+
+

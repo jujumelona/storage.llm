@@ -2,17 +2,10 @@ static void queue_total_depth_sub(moe_pc_engine* engine, uint32_t count) {
     if (!engine || count == 0) {
         return;
     }
-    // BUGFIX 63: Issue 6 - Remove store(0) race condition ?�★??
-    // Old: fetch_sub + store(0) correction ??store(0) overwrites concurrent fetch_add
-    // Example: Worker A detects underflow, prepares store(0)
-    //          Worker B does fetch_add(1) ??counter = 1
-    //          Worker A executes store(0) ??counter = 0 (task lost!)
-    // New: Remove store(0) entirely. Temporary underflow is acceptable (comment already said so)
-    // Rationale: total_queue_depth is statistical counter for orchestrator heuristics
-    //            Transient underflow (wraps to UINT32_MAX) corrects on next fetch_add
-    //            store(0) causes worse problem: losing real tasks from counter
-    // Impact: Orchestrator sees accurate queue depth, prefetch_window_layers correct
-    engine->total_queue_depth.fetch_sub(count, std::memory_order_relaxed);
+    const uint32_t old_val = engine->total_queue_depth.fetch_sub(count, std::memory_order_relaxed);
+    if (old_val < count) {
+        engine->total_queue_depth.fetch_add(count - old_val, std::memory_order_relaxed);
+    }
 }
 
 static int enqueue_stage(

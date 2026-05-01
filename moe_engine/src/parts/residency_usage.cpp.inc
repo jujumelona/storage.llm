@@ -48,9 +48,12 @@ static void subtract_tier_usage(moe_pc_engine* engine, moe_tier_t tier, uint64_t
     // Temporary underflow acceptable, tier_used() reads are approximate anyway
     const uint64_t old_val = counter->fetch_sub(bytes, std::memory_order_relaxed);
 
-    // Saturating correction: if underflow occurred, clamp to 0
+    // BUGFIX 115: Fix wait-free saturating subtract data race ★★
+    // Problem: store(0) overwrites concurrent fetch_add, permanently leaking tier budget.
+    // Solution: Add back the exact over-subtracted amount instead of forcing to 0.
+    // This preserves concurrent additions while correctly saturating at 0.
     if (old_val < bytes) {
-        counter->store(0, std::memory_order_relaxed);
+        counter->fetch_add(bytes - old_val, std::memory_order_relaxed);
     }
 }
 
@@ -163,7 +166,9 @@ static void compact_evict_heap(moe_pc_engine* engine, int idx, bool force = fals
             }
             const moe_block_state& state = engine->expert_states[top.slot];
             if (state.active && state.tier == top.tier && state.bytes == top.bytes &&
-                state.hot_score == top.hot_score && state.last_touch_epoch == top.last_touch_epoch) {
+                state.hot_score == top.hot_score &&
+                state.last_touch_epoch == top.last_touch_epoch &&
+                state.predicted_next_use_epoch == top.predicted_next_use_epoch) {
                 valid.push_back(top);
             }
         }
@@ -191,6 +196,7 @@ static void push_evict_candidate(moe_pc_engine* engine, size_t slot, const moe_b
     candidate.bytes = state.bytes;
     candidate.hot_score = state.hot_score;
     candidate.last_touch_epoch = state.last_touch_epoch;
+    candidate.predicted_next_use_epoch = state.predicted_next_use_epoch;
 
     std::lock_guard<std::mutex> heap_lock(evict_heap_mutex(engine, idx));
     engine->evict_heaps[idx].push(candidate);
@@ -209,6 +215,7 @@ static void replace_evict_candidate(moe_pc_engine* engine, size_t slot, const mo
         candidate.bytes = state.bytes;
         candidate.hot_score = state.hot_score;
         candidate.last_touch_epoch = state.last_touch_epoch;
+        candidate.predicted_next_use_epoch = state.predicted_next_use_epoch;
 
         std::lock_guard<std::mutex> heap_lock(evict_heap_mutex(engine, target_idx));
         engine->evict_heaps[target_idx].push(candidate);
@@ -231,4 +238,12 @@ static void touch_expert_heat(moe_pc_engine* engine, moe_block_state* state, dou
     }
     state->hot_score += boost;
     state->last_touch_epoch = now;
+    const double heat = state->hot_score > 0.001 ? state->hot_score : 0.001;
+    uint64_t horizon = (uint64_t)(8192.0 / heat);
+    if (horizon < 1ull) {
+        horizon = 1ull;
+    } else if (horizon > (1ull << 30)) {
+        horizon = (1ull << 30);
+    }
+    state->predicted_next_use_epoch = now > UINT64_MAX - horizon ? UINT64_MAX : now + horizon;
 }

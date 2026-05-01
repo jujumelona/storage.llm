@@ -1,4 +1,4 @@
-struct moe_expert_work_t {
+﻿struct moe_expert_work_t {
     float* gate = nullptr;
     float* up = nullptr;
     float* out = nullptr;
@@ -207,3 +207,4 @@ static void moe_decode_scratch_resize(
         s->position = 0;
     }
 }
+

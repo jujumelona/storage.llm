@@ -49,6 +49,14 @@ struct moe_cuda_driver_api {
     moe_cu_event_query_fn cuEventQuery = nullptr;
     moe_cu_event_synchronize_fn cuEventSynchronize = nullptr;
     moe_cu_event_destroy_fn cuEventDestroy = nullptr;
+    void* (*cuGraphCreate)(void**, unsigned int) = nullptr;
+    void* (*cuGraphDestroy)(void*) = nullptr;
+    void* (*cuGraphAddKernelNode)(void**, void*, void**, size_t, void*) = nullptr;
+    void* (*cuGraphInstantiate)(void**, void*, void*, char*, size_t) = nullptr;
+    void* (*cuGraphLaunch)(void*, void*) = nullptr;
+    void* (*cuGraphExecDestroy)(void*) = nullptr;
+    void* (*cuStreamBeginCapture)(void*, int) = nullptr;
+    void* (*cuStreamEndCapture)(void*, void**) = nullptr;
 };
 
 struct moe_hip_driver_api {
@@ -74,6 +82,41 @@ struct moe_hip_driver_api {
     moe_cu_event_query_fn hipEventQuery = nullptr;
     moe_cu_event_synchronize_fn hipEventSynchronize = nullptr;
     moe_cu_event_destroy_fn hipEventDestroy = nullptr;
+};
+
+// Level Zero basic API hooks
+struct moe_level_zero_driver_api {
+    void* library = nullptr;
+    void* context = nullptr;
+    void* device = nullptr;
+    void* (*zeInit)(int, void*) = nullptr;
+    void* (*zeCommandQueueCreate)(void*, void*, void*, void**) = nullptr;
+    void* (*zeCommandQueueDestroy)(void*) = nullptr;
+    void* (*zeCommandQueueSynchronize)(void*, uint64_t) = nullptr;
+    void* (*zeEventCreate)(void*, void*, void**) = nullptr;
+    void* (*zeEventDestroy)(void*) = nullptr;
+    void* (*zeEventHostSynchronize)(void*, uint64_t) = nullptr;
+    void* (*zeEventQueryStatus)(void*) = nullptr;
+    void* (*zeCommandListAppendMemoryCopy)(void*, void*, const void*, size_t, void*, uint32_t, void**) = nullptr;
+    void* (*zeDeviceGetMemoryProperties)(void*, uint32_t*, void*) = nullptr;
+};
+
+// Vulkan basic API hooks
+struct moe_vulkan_driver_api {
+    void* library = nullptr;
+    void* instance = nullptr;
+    void* physicalDevice = nullptr;
+    void* device = nullptr;
+    void* (*vkCreateCommandPool)(void*, const void*, const void*, void**) = nullptr;
+    void* (*vkDestroyCommandPool)(void*, void*, const void*) = nullptr;
+    void* (*vkAllocateCommandBuffers)(void*, const void*, void**) = nullptr;
+    void* (*vkFreeCommandBuffers)(void*, void*, uint32_t, const void**) = nullptr;
+    void* (*vkQueueSubmit)(void*, uint32_t, const void*, void*) = nullptr;
+    void* (*vkQueueWaitIdle)(void*) = nullptr;
+    void* (*vkCreateEvent)(void*, const void*, const void*, void**) = nullptr;
+    void* (*vkDestroyEvent)(void*, void*, const void*) = nullptr;
+    void* (*vkGetEventStatus)(void*, void*) = nullptr;
+    void* (*vkGetPhysicalDeviceMemoryProperties2)(void*, void*) = nullptr;
 };
 
 struct moe_device_allocation {

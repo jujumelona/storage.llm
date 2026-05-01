@@ -1,4 +1,4 @@
-static int read_file_range_to_buffer(
+﻿static int read_file_range_to_buffer(
     std::ifstream& input,
     uint64_t file_offset,
     uint8_t* dst,
@@ -51,64 +51,90 @@ static int prefetch_tensor_file_to_pinned(
     if (total_bytes == 0 || total_bytes > engine->staging_slots[slot_index].size) {
         return 0;
     }
-    const std::string path = rec.resolved_path_index < engine->tensor_paths.size()
-        ? engine->tensor_paths[rec.resolved_path_index] : std::string();
-    uint64_t file_size = 0;
-    if (path.empty() || !file_size_bytes(path, &file_size)) {
-        return 0;
-    }
-
-    // Thread-local ifstream cache: reuse open streams for same path
-    struct cached_stream_t {
-        moe_pc_engine* engine;
-        std::string path;
-        std::ifstream stream;
-    };
-    static thread_local cached_stream_t tls_stream_cache;
-
-    std::ifstream* input = nullptr;
-    if (tls_stream_cache.engine == engine && tls_stream_cache.path == path && tls_stream_cache.stream.is_open()) {
-        // Reuse cached stream
-        input = &tls_stream_cache.stream;
-    } else {
-        // Close old stream and open new one
-        if (tls_stream_cache.stream.is_open()) {
-            tls_stream_cache.stream.close();
-        }
-        open_ifstream_path(tls_stream_cache.stream, path, std::ios::in | std::ios::binary);
-        if (!tls_stream_cache.stream) {
-            return 0;
-        }
-        tls_stream_cache.engine = engine;
-        tls_stream_cache.path = path;
-        input = &tls_stream_cache.stream;
-    }
+    mmap_context_t* shard = get_or_map_tensor_shard(engine, rec);
+    if (!shard) return 0;
+    uint64_t file_size = static_cast<uint64_t>(mmap_get_size(shard));
 
     const uint64_t ranges[][2] = {
         {rec.info.weight_byte_offset, rec.info.weight_byte_length},
         {rec.info.scale_byte_offset, rec.info.scale_byte_length},
         {rec.info.scale2_byte_offset, rec.info.scale2_byte_length},
     };
+
     uint64_t staging_offset = 0;
-    for (const auto& range : ranges) {
-        const uint64_t offset = range[0];
-        const uint64_t length = range[1];
-        if (length == 0) {
-            continue;
+    
+    // Check if we can use IORing/io_uring registered buffer I/O
+    if (engine->ring_adapter.initialized) {
+        int submits = 0;
+        for (const auto& range : ranges) {
+            const uint64_t offset = range[0];
+            const uint64_t length = range[1];
+            if (length == 0) continue;
+            if (offset > file_size || length > file_size - offset ||
+                staging_offset > total_bytes || length > total_bytes - staging_offset) {
+                return 0;
+            }
+#ifdef _WIN32
+            void* file_handle = shard->hFile;
+#else
+            void* file_handle = nullptr;
+#endif
+            if (engine->ring_adapter.prep_read_fixed(shard->fd, file_handle, 
+                engine->staging_slots[slot_index].buf + staging_offset, length, offset, slot_index, (void*)1)) {
+                submits++;
+            }
+            staging_offset += length;
         }
-        if (offset > file_size || length > file_size - offset ||
-            staging_offset > total_bytes || length > total_bytes - staging_offset) {
-            return 0;
+        
+        if (submits > 0) {
+            engine->ring_adapter.submit();
+            int completions = 0;
+            // Synchronous wait for this task's completions (could be fully async in future)
+            while (completions < submits) {
+                void* data = engine->ring_adapter.peek_completion();
+                if (data) completions++;
+                else std::this_thread::yield();
+            }
         }
-        if (!read_file_range_to_buffer(
-                *input,
-                offset,
-                engine->staging_slots[slot_index].buf + staging_offset,
-                length)) {
-            return 0;
+    } else {
+        // Fallback to thread-local ifstream cache
+        const std::string path = rec.resolved_path_index < engine->tensor_paths.size()
+            ? engine->tensor_paths[rec.resolved_path_index] : std::string();
+        
+        struct cached_stream_t {
+            moe_pc_engine* engine;
+            std::string path;
+            std::ifstream stream;
+        };
+        static thread_local cached_stream_t tls_stream_cache;
+
+        std::ifstream* input = nullptr;
+        if (tls_stream_cache.engine == engine && tls_stream_cache.path == path && tls_stream_cache.stream.is_open()) {
+            input = &tls_stream_cache.stream;
+        } else {
+            if (tls_stream_cache.stream.is_open()) tls_stream_cache.stream.close();
+            open_ifstream_path(tls_stream_cache.stream, path, std::ios::in | std::ios::binary);
+            if (!tls_stream_cache.stream) return 0;
+            tls_stream_cache.engine = engine;
+            tls_stream_cache.path = path;
+            input = &tls_stream_cache.stream;
         }
-        staging_offset += length;
+
+        for (const auto& range : ranges) {
+            const uint64_t offset = range[0];
+            const uint64_t length = range[1];
+            if (length == 0) continue;
+            if (offset > file_size || length > file_size - offset ||
+                staging_offset > total_bytes || length > total_bytes - staging_offset) {
+                return 0;
+            }
+            if (!read_file_range_to_buffer(*input, offset, engine->staging_slots[slot_index].buf + staging_offset, length)) {
+                return 0;
+            }
+            staging_offset += length;
+        }
     }
+
     if (staging_offset != total_bytes) {
         return 0;
     }
@@ -208,3 +234,5 @@ static int prefetch_tensor_ram_to_pinned(
     engine->io_atomic.pinned_stage_done.fetch_add(1);
     return 1;
 }
+
+

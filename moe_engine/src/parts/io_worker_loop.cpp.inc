@@ -1,4 +1,4 @@
-static int prefetch_one_raw_span(
+﻿static int prefetch_one_raw_span(
     moe_pc_engine* e,
     const moe_storage_raw_span_spec_t& s,
     uint8_t pool,
@@ -470,3 +470,4 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         }
     }
 }
+

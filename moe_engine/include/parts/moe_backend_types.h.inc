@@ -40,5 +40,6 @@ typedef struct {
     int supports_webgpu;
     int supports_gpu_direct_file_io;
     int preferred_numa_node;
+    double dma_bandwidth_gbps;
     double tflops_hint;
 } moe_backend_caps_t;

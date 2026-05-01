@@ -1,4 +1,4 @@
-int moe_pc_engine_execute_prefetch_plan(
+﻿int moe_pc_engine_execute_prefetch_plan(
     moe_pc_engine_t* engine,
     const moe_expert_prefetch_item_t* items,
     uint32_t item_count
@@ -39,9 +39,6 @@ int moe_pc_engine_execute_prefetch_plan(
             continue;
         }
         admitted_tiers[i] = prefetch_admitted_tier(engine, items[i], all_to_free[i]);
-        if (admitted_tiers[i] == moe_TIER_RAM) {
-            batch_ram_reserved += items[i].bytes;
-        }
     }
 
     // BUGFIX 60: Issue 3 - TOCTOU deferred free pattern ?�★
@@ -62,7 +59,7 @@ int moe_pc_engine_execute_prefetch_plan(
     // Set pending_free flags under map_mutex before actual free
     // This prevents IO workers from starting new DMA on these experts
     if (!flat_to_free.empty()) {
-        std::lock_guard<std::mutex> map_lock(engine->map_mutex);
+        std::lock_guard<std::mutex> lock(engine->map_mutex);
         for (const auto& victim : flat_to_free) {
             const size_t slot = expert_dense_slot(victim.first, victim.second);
             if (slot < engine->expert_states.size()) {
@@ -148,6 +145,8 @@ int moe_pc_engine_execute_prefetch_plan(
             !prefetch_is_router_selected(items[i]) &&
             items[i].bytes > 0) {
             prefetch_release_pending_ram_reservation(engine, items[i].bytes);
+        } else if (admitted_tiers[i] == moe_TIER_VRAM && items[i].bytes > 0) {
+            prefetch_release_pending_vram_reservation(engine, items[i].bytes);
         }
     }
     if (ok_count > 0) {
@@ -167,4 +166,6 @@ int moe_pc_engine_set_topology_path(moe_pc_engine_t* engine, const char* path) {
     engine->topology_path = path ? path : "";
     return 1;
 }
+
+
 

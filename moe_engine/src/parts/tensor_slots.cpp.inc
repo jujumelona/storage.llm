@@ -72,6 +72,9 @@ static void tensor_slots_reset(moe_pc_engine* engine) {
     }
     engine->tensor_slots.assign(tensor_slot_count(), tensor_slot_invalid());
     engine->expert_bytes.assign(expert_slot_count(), 0);
+    engine->expert_runtime_priorities.assign(expert_slot_count(), 0);
+    engine->expert_prefetch_priorities.assign(expert_slot_count(), 0);
+    engine->expert_residency_hints.assign(expert_slot_count(), moe_JUJU_RESIDENCY_AUTO);
 }
 
 static void tensor_slots_set(moe_pc_engine* engine, int layer, int expert, moe_projection_t proj, size_t index) {
@@ -94,6 +97,53 @@ static void expert_bytes_add(moe_pc_engine* engine, int layer, int expert, uint6
     if (engine && slot != tensor_slot_invalid() && slot < engine->expert_bytes.size()) {
         engine->expert_bytes[slot] += bytes;
     }
+}
+
+static void expert_runtime_hints_update(
+    moe_pc_engine* engine,
+    int layer,
+    int expert,
+    uint16_t runtime_priority,
+    uint16_t prefetch_priority,
+    uint8_t residency_hint
+) {
+    const size_t slot = expert_dense_slot(layer, expert);
+    if (!engine || slot == tensor_slot_invalid()) {
+        return;
+    }
+    if (slot < engine->expert_runtime_priorities.size()) {
+        engine->expert_runtime_priorities[slot] =
+            std::max<uint16_t>(engine->expert_runtime_priorities[slot], runtime_priority);
+    }
+    if (slot < engine->expert_prefetch_priorities.size()) {
+        engine->expert_prefetch_priorities[slot] =
+            std::max<uint16_t>(engine->expert_prefetch_priorities[slot], prefetch_priority);
+    }
+    if (slot < engine->expert_residency_hints.size() &&
+        residency_hint != moe_JUJU_RESIDENCY_AUTO) {
+        const uint8_t current = engine->expert_residency_hints[slot];
+        if (current == moe_JUJU_RESIDENCY_AUTO ||
+            residency_hint < current ||
+            residency_hint == moe_JUJU_RESIDENCY_FAST_MEM) {
+            engine->expert_residency_hints[slot] = residency_hint;
+        }
+    }
+}
+
+static uint16_t expert_prefetch_priority_hint(const moe_pc_engine* engine, int layer, int expert) {
+    const size_t slot = expert_dense_slot(layer, expert);
+    if (!engine || slot == tensor_slot_invalid() || slot >= engine->expert_prefetch_priorities.size()) {
+        return 0;
+    }
+    return engine->expert_prefetch_priorities[slot];
+}
+
+static uint8_t expert_residency_hint(const moe_pc_engine* engine, int layer, int expert) {
+    const size_t slot = expert_dense_slot(layer, expert);
+    if (!engine || slot == tensor_slot_invalid() || slot >= engine->expert_residency_hints.size()) {
+        return moe_JUJU_RESIDENCY_AUTO;
+    }
+    return engine->expert_residency_hints[slot];
 }
 
 static uint64_t expert_bytes_get(const moe_pc_engine* engine, int layer, int expert) {

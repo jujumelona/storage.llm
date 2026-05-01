@@ -1,4 +1,4 @@
-static void shrink_worker_tail(std::vector<std::thread>& workers, uint32_t target) {
+﻿static void shrink_worker_tail(std::vector<std::thread>& workers, uint32_t target) {
     for (size_t i = target; i < workers.size(); ++i) {
         if (workers[i].joinable()) {
             workers[i].join();
@@ -81,6 +81,7 @@ static void resize_disk_workers(moe_pc_engine* engine, uint32_t target) {
     if (engine->io_workers.size() > target) {
         engine->disk_stage.cv.notify_all();
         reap_dead_workers(engine, engine->io_workers, engine->disk_worker_target);
+        flush_deferred_joins(engine, false);
     }
     while (engine->io_workers.size() < target) {
         const uint32_t index = static_cast<uint32_t>(engine->io_workers.size());
@@ -93,6 +94,7 @@ static void resize_pinned_workers(moe_pc_engine* engine, uint32_t target) {
     if (engine->pinned_workers.size() > target) {
         engine->pinned_stage.cv.notify_all();
         reap_dead_workers(engine, engine->pinned_workers, engine->pinned_worker_target);
+        flush_deferred_joins(engine, false);
     }
     while (engine->pinned_workers.size() < target) {
         const uint32_t index = static_cast<uint32_t>(engine->pinned_workers.size());
@@ -105,6 +107,7 @@ static void resize_gpu_workers(moe_pc_engine* engine, uint32_t target) {
     if (engine->gpu_workers.size() > target) {
         engine->gpu_stage.cv.notify_all();
         reap_dead_workers(engine, engine->gpu_workers, engine->gpu_worker_target);
+        flush_deferred_joins(engine, false);
     }
     while (engine->gpu_workers.size() < target) {
         const uint32_t index = static_cast<uint32_t>(engine->gpu_workers.size());
@@ -164,3 +167,4 @@ static void orchestrator_resize_workers(
         }
     }
 }
+

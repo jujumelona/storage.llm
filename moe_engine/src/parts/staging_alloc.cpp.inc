@@ -1,4 +1,4 @@
-// BUGFIX 110: Issue 22 - Thread-safe warning flag ★
+﻿// BUGFIX 110: Issue 22 - Thread-safe warning flag ★
 // Problem: static bool warned is not thread-safe
 // Multiple threads can print warning simultaneously
 // Solution: Use atomic<bool> with exchange
@@ -142,6 +142,9 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
                 "Falling back to non-pinned staging (sync DMA only).\n",
                 (unsigned long long)limit,
                 (unsigned long long)min_pinned);
+            if (e) {
+                e->io_atomic.nonpinned_fallback_count.fetch_add(1, std::memory_order_relaxed);
+            }
             // Fallback: allocate non-pinned buffer
             uint8_t* ptr = allocate_staging(
                 e ? e->backend_caps.preferred_numa_node : -1,
@@ -198,6 +201,9 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
     // instead of NULL to prevent pipeline shutdown. Non-pinned staging allows sync DMA,
     // which is slower but functional. Returning NULL disables multistage pipeline entirely,
     // preventing model from loading at all.
+    if (e) {
+        e->io_atomic.nonpinned_fallback_count.fetch_add(1, std::memory_order_relaxed);
+    }
     fprintf(stderr, "[storageLLM WARNING] pinned staging allocation failed (mlock denied). "
         "Falling back to non-pinned staging (sync DMA only, slower but functional). "
         "Check 'ulimit -l' (must be >= %llu MB) for async DMA.\n",
@@ -223,5 +229,13 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
     fprintf(stderr, "[storageLLM FATAL] staging allocation failed completely (out of memory). "
         "Engine cannot function.\n");
     return nullptr;
+}
+
+
+// Optimization 3: MoEpic Adaptive Expert Split
+static uint64_t compute_split_bytes(const moe_pc_engine* engine, int layer, int expert, float split_ratio) {
+    if (!engine || split_ratio <= 0.0f) return 0;
+    const uint64_t full = expert_triplet_bytes(engine, layer, expert);
+    return (uint64_t)(full * split_ratio);
 }
 

@@ -1305,6 +1305,11 @@ static std::string make_health_json(
         << "\"dynamicNumHiddenLayers\":" << forward.dynamic_num_hidden_layers << ","
         << "\"dynamicHiddenSize\":" << forward.dynamic_hidden_size << ","
         << "\"dynamicVocabSize\":" << forward.dynamic_vocab_size << ","
+        << "\"graphIrReady\":" << (forward.graph_ir_ready ? "true" : "false") << ","
+        << "\"graphIrRequired\":" << (forward.graph_ir_required ? "true" : "false") << ","
+        << "\"graphIrVersion\":" << forward.graph_ir_version << ","
+        << "\"graphIrLayerCount\":" << forward.graph_ir_layer_count << ","
+        << "\"graphIrOpCount\":" << forward.graph_ir_op_count << ","
         << "\"storageStateValid\":" << (forward.storage_state_valid ? "true" : "false") << ","
         << "\"tensorTableLoaded\":" << (forward.tensor_table_loaded ? "true" : "false") << ","
         << "\"expertTripletAvailable\":" << (forward.expert_triplet_available ? "true" : "false") << ","
@@ -1335,6 +1340,13 @@ static std::string make_health_json(
         << "\"deviceActivationBytes\":" << stats.device_activation_bytes << ","
         << "\"deviceExpertBytes\":" << stats.device_expert_bytes << ","
         << "\"deviceStreamBytes\":" << stats.device_stream_bytes << ","
+        << "\"jujuIdxSchemaVersion\":" << stats.juju_idx_schema_version << ","
+        << "\"jujuSplitGroupCount\":" << stats.juju_split_group_count << ","
+        << "\"jujuSplitMissingCount\":" << stats.juju_split_missing_count << ","
+        << "\"jujuRuntimeHintTensorCount\":" << stats.juju_runtime_hint_tensor_count << ","
+        << "\"jujuPriorityTensorCount\":" << stats.juju_priority_tensor_count << ","
+        << "\"jujuFastMemTensorCount\":" << stats.juju_fastmem_tensor_count << ","
+        << "\"jujuSlowMemTensorCount\":" << stats.juju_slowmem_tensor_count << ","
         << "\"deviceTotalBytes\":" << stats.device_total_bytes << ","
         << "\"deviceFreeBytes\":" << stats.device_free_bytes << ","
         << "\"modelLibLoaded\":" << (stats.model_lib_loaded ? "true" : "false") << ","
@@ -1666,6 +1678,8 @@ static std::string make_chat_not_ready_json(const moe_forward_status_t& forward)
         << ", attention=" << (forward.attention_ready ? "ready" : "missing")
         << ", sampler=" << (forward.sampler_ready ? "ready" : "missing")
         << ", decodeLoop=" << (forward.decode_loop_ready ? "ready" : "missing")
+        << ", graphIr=" << (forward.graph_ir_ready ? "ready" : "missing")
+        << ", graphIrRequired=" << (forward.graph_ir_required ? "yes" : "no")
         << "\","
         << "\"type\":\"service_unavailable\","
         << "\"code\":\"runtime_status_not_ready\""

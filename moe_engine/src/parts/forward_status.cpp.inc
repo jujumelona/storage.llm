@@ -68,6 +68,11 @@ int moe_pc_engine_get_forward_status(
     out_status->forward_adapter_executable =
         engine->forward_adapter_executable.load(std::memory_order_relaxed);
     out_status->dynamic_shape_ready = engine->dynamic_shape_valid.load(std::memory_order_relaxed);
+    out_status->graph_ir_ready = engine->offload_graph_ir_ready.load(std::memory_order_relaxed);
+    out_status->graph_ir_required = engine->offload_graph_ir_required.load(std::memory_order_relaxed);
+    out_status->graph_ir_version = engine->offload_graph_ir_version.load(std::memory_order_relaxed);
+    out_status->graph_ir_layer_count = engine->offload_graph_ir_layer_count.load(std::memory_order_relaxed);
+    out_status->graph_ir_op_count = engine->offload_graph_ir_op_count.load(std::memory_order_relaxed);
     if (out_status->dynamic_shape_ready) {
         out_status->dynamic_num_hidden_layers = engine->dynamic_shape.num_hidden_layers;
         out_status->dynamic_hidden_size = engine->dynamic_shape.hidden_size;

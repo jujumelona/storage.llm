@@ -47,7 +47,6 @@ static uint64_t moe_rt_model_bytes_hint(const moe_offload_gguf_scan_t& scan) {
 
 static double moe_rt_compute_tflops_hint(const moe_backend_caps_t& caps) {
     if (caps.tflops_hint > 0.0) return caps.tflops_hint;
-    if (caps.tflops_hint > 0.0) return caps.tflops_hint;
     switch (caps.backend) {
     case moe_BACKEND_CUDA:
         return caps.supports_fp4 || caps.supports_scale4 ? 35.0 : 22.0;
@@ -264,7 +263,7 @@ static void moe_rt_apply_juju_io_flags(
     case moe_JUJU_EXEC_DIRECT_STORAGE_TO_COMPUTE:
         io->enable_multistage_pipeline = 1;
         io->enable_pinned_host = engine->backend_caps.supports_pinned_host ? 1 : 0;
-        io->enable_directstorage = engine->backend_caps.supports_directstorage ? 1 : 0;
+        io->enable_directstorage = 0; // TODO: DirectStorage 1.1 API not fully implemented yet
         io->enable_gpudirect_storage = engine->backend_caps.supports_gpudirect_storage ? 1 : 0;
         io->enable_bam_nvme = engine->backend_caps.supports_gpu_direct_file_io ? 1 : 0;
         break;
@@ -305,6 +304,65 @@ static void moe_rt_apply_juju_io_flags(
             io->enable_pinned_host = engine->backend_caps.supports_pinned_host ? 1 : 0;
         }
         break;
+    }
+}
+
+// Predict layer N experts based on layer N-2 selected experts using co-activation frequency
+static std::vector<int> moe_juju_predict_co_activation(moe_pc_engine* engine, int target_layer, int top_k) {
+    std::vector<int> predictions;
+    if (!engine || target_layer < 2) return predictions;
+    
+    int source_layer = target_layer - 2;
+    if (source_layer >= engine->last_selected_experts.size() || engine->last_selected_experts[source_layer].empty()) {
+        return predictions;
+    }
+    
+    if (target_layer >= engine->co_activation_stats.size()) {
+        return predictions;
+    }
+    
+    const auto& stats = engine->co_activation_stats[target_layer];
+    std::unordered_map<int, float> aggregated_scores;
+    
+    for (int src_expert : engine->last_selected_experts[source_layer]) {
+        auto it = stats.find(src_expert);
+        if (it != stats.end()) {
+            for (const auto& pair : it->second) {
+                aggregated_scores[pair.first] += pair.second;
+            }
+        }
+    }
+    
+    std::vector<std::pair<int, float>> sorted_scores(aggregated_scores.begin(), aggregated_scores.end());
+    std::sort(sorted_scores.begin(), sorted_scores.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+    });
+    
+    for (int i = 0; i < std::min((int)sorted_scores.size(), top_k); ++i) {
+        predictions.push_back(sorted_scores[i].first);
+    }
+    
+    return predictions;
+}
+
+static void moe_juju_update_co_activation(moe_pc_engine* engine, int current_layer, const std::vector<int>& selected) {
+    if (!engine) return;
+    
+    if (current_layer >= engine->last_selected_experts.size()) {
+        engine->last_selected_experts.resize(current_layer + 1);
+        engine->co_activation_stats.resize(current_layer + 1);
+    }
+    
+    engine->last_selected_experts[current_layer] = selected;
+    
+    int source_layer = current_layer - 2;
+    if (source_layer >= 0 && source_layer < engine->last_selected_experts.size() && !engine->last_selected_experts[source_layer].empty()) {
+        auto& stats = engine->co_activation_stats[current_layer];
+        for (int src_expert : engine->last_selected_experts[source_layer]) {
+            for (int tgt_expert : selected) {
+                stats[src_expert][tgt_expert]++;
+            }
+        }
     }
 }
 
@@ -390,3 +448,4 @@ static int moe_engine_apply_juju_strategy(
     std::fflush(stderr);
     return 1;
 }
+

@@ -1,4 +1,4 @@
-static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
+﻿static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
     if (!engine) {
         return;
     }
@@ -160,3 +160,4 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         }
     }
 }
+

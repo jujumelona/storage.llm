@@ -1,10 +1,38 @@
-struct moe_block_state {
+﻿struct moe_block_state {
     uint64_t bytes = 0;
     moe_tier_t tier = moe_TIER_DB;
     double hot_score = 0.0;
     uint64_t last_touch_epoch = 0;
+    uint64_t predicted_next_use_epoch = UINT64_MAX;
     bool active = false;
     bool pending_evict = false;
+};
+
+enum moe_juju_residency_hint_internal : uint8_t {
+    moe_JUJU_RESIDENCY_AUTO = 0,
+    moe_JUJU_RESIDENCY_FAST_MEM = 1,
+    moe_JUJU_RESIDENCY_FAST_MEM_STREAMABLE = 2,
+    moe_JUJU_RESIDENCY_SLOW_MEM = 3
+};
+
+enum moe_juju_graph_role_internal : uint8_t {
+    moe_JUJU_ROLE_UNKNOWN = 0,
+    moe_JUJU_ROLE_SHARED_CORE = 1,
+    moe_JUJU_ROLE_ATTENTION = 2,
+    moe_JUJU_ROLE_ROUTER = 3,
+    moe_JUJU_ROLE_EXPERT = 4,
+    moe_JUJU_ROLE_DENSE_FFN = 5,
+    moe_JUJU_ROLE_NORM = 6
+};
+
+enum moe_juju_prefetch_class_internal : uint8_t {
+    moe_JUJU_PREFETCH_AUTO = 0,
+    moe_JUJU_PREFETCH_STARTUP_HOT = 1,
+    moe_JUJU_PREFETCH_LAYER_HOT = 2,
+    moe_JUJU_PREFETCH_ROUTER_HOT = 3,
+    moe_JUJU_PREFETCH_LAYER_WARM = 4,
+    moe_JUJU_PREFETCH_EXPERT_STREAM = 5,
+    moe_JUJU_PREFETCH_STREAM = 6
 };
 
 struct moe_tensor_record {
@@ -19,6 +47,12 @@ struct moe_tensor_record {
     uint8_t scale_format = 0;
     uint8_t cpu_executable = 0;
     uint8_t gpu_executable = 0;
+    uint16_t runtime_priority = 50;
+    uint16_t prefetch_priority = 50;
+    uint8_t residency_hint = moe_JUJU_RESIDENCY_AUTO;
+    uint8_t graph_role = moe_JUJU_ROLE_UNKNOWN;
+    uint8_t prefetch_class = moe_JUJU_PREFETCH_AUTO;
+    uint8_t juju_section_type = 0;
 };
 
 enum moe_raw_scalar_encoding_t : uint8_t {
@@ -35,6 +69,11 @@ struct moe_gguf_common_tensor_record {
     uint32_t type = 0;
     uint64_t file_offset = 0;
     uint64_t bytes = 0;
+    uint16_t runtime_priority = 50;
+    uint16_t prefetch_priority = 50;
+    uint8_t residency_hint = moe_JUJU_RESIDENCY_AUTO;
+    uint8_t graph_role = moe_JUJU_ROLE_UNKNOWN;
+    uint8_t prefetch_class = moe_JUJU_PREFETCH_AUTO;
 };
 
 enum moe_forward_adapter_kind : uint32_t {
@@ -135,10 +174,14 @@ struct moe_evict_candidate {
     uint64_t bytes = 0;
     double hot_score = 0.0;
     uint64_t last_touch_epoch = 0;
+    uint64_t predicted_next_use_epoch = UINT64_MAX;
 };
 
 struct moe_evict_colder_first {
     bool operator()(const moe_evict_candidate& a, const moe_evict_candidate& b) const {
+        if (a.predicted_next_use_epoch != b.predicted_next_use_epoch) {
+            return a.predicted_next_use_epoch < b.predicted_next_use_epoch;
+        }
         if (a.hot_score != b.hot_score) {
             return a.hot_score > b.hot_score;
         }

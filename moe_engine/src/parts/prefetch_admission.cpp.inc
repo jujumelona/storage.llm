@@ -1,4 +1,4 @@
-static uint32_t prefetch_stage_load(const moe_stage_queue& stage) {
+﻿static uint32_t prefetch_stage_load(const moe_stage_queue& stage) {
     return stage.depth.load(std::memory_order_relaxed) + stage.inflight.load(std::memory_order_relaxed);
 }
 
@@ -32,7 +32,11 @@ static int prefetch_under_queue_pressure(
     if (item.target_tier == moe_TIER_RAM) {
         const uint32_t pinned_workers = runtime_pinned_workers(engine);
         const uint32_t dyn_batch_max = moe_gpu_stage_batch_max(engine);
-        const uint32_t pinned_pressure_threshold = std::max(32u, pinned_workers * dyn_batch_max * 8u);
+        // Fix 4: Scale pinned_pressure_threshold properly using max_prefetch_queue
+    const uint32_t pinned_pressure_threshold = std::min(
+        engine->io_config.max_prefetch_queue / 4u,
+        std::max(64u, pinned_workers * dyn_batch_max * 12u)
+    );
         if (prefetch_stage_load(engine->pinned_stage) >= pinned_pressure_threshold) {
             return 1;
         }
@@ -45,7 +49,7 @@ static moe_tier_t prefetch_admitted_tier(
     const moe_expert_prefetch_item_t& item,
     std::vector<std::pair<int, int>>& to_free
 ) {
-    if (!engine || prefetch_is_router_selected(item)) {
+    if (!engine) {
         return item.target_tier;
     }
     const bool waits_for_common_vram =
@@ -58,8 +62,32 @@ static moe_tier_t prefetch_admitted_tier(
     }
 
     moe_tier_t target = item.target_tier;
-    if (prefetch_under_queue_pressure(engine, item)) {
+    if (!prefetch_is_router_selected(item) && prefetch_under_queue_pressure(engine, item)) {
         target = moe_TIER_RAM;
+    }
+    if (target == moe_TIER_VRAM) {
+        const uint64_t vram_budget = tier_budget(engine, moe_TIER_VRAM);
+        if (vram_budget == 0 || item.bytes > vram_budget) {
+            target = moe_TIER_RAM;
+        } else {
+            uint64_t pending = engine->pending_vram_reservation.load(std::memory_order_relaxed);
+            for (;;) {
+                const uint64_t used = tier_used(engine, moe_TIER_VRAM);
+                if (used > vram_budget || item.bytes > vram_budget - used ||
+                    pending > vram_budget - used ||
+                    item.bytes > vram_budget - used - pending) {
+                    target = moe_TIER_RAM;
+                    break;
+                }
+                if (engine->pending_vram_reservation.compare_exchange_weak(
+                        pending,
+                        pending + item.bytes,
+                        std::memory_order_relaxed,
+                        std::memory_order_relaxed)) {
+                    break;
+                }
+            }
+        }
     }
     const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
     // Critical Fix 4: Raise RAM threshold from 87% to 93% to reduce hot-path eviction
@@ -80,12 +108,26 @@ static moe_tier_t prefetch_admitted_tier(
     return target;
 }
 
+static void prefetch_release_pending_vram_reservation(moe_pc_engine* engine, uint64_t bytes) {
+    if (!engine || bytes == 0) {
+        return;
+    }
+    const uint64_t old_val = engine->pending_vram_reservation.fetch_sub(bytes, std::memory_order_relaxed);
+    if (old_val < bytes) {
+        engine->pending_vram_reservation.fetch_add(bytes - old_val, std::memory_order_relaxed);
+    }
+}
+
 static void prefetch_release_pending_ram_reservation(moe_pc_engine* engine, uint64_t bytes) {
     if (!engine || bytes == 0) {
         return;
     }
     const uint64_t old_val = engine->pending_ram_reservation.fetch_sub(bytes, std::memory_order_relaxed);
     if (old_val < bytes) {
-        engine->pending_ram_reservation.store(0, std::memory_order_relaxed);
+        engine->pending_ram_reservation.fetch_add(bytes - old_val, std::memory_order_relaxed);
     }
 }
+
+
+
+
