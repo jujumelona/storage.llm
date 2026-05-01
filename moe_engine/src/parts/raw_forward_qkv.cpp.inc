@@ -252,7 +252,6 @@ int moe_pc_engine_attention_decode_f32(
 // FATE Predictor: Save hidden state snapshot just before gate
 static void save_gate_input_snapshot(moe_pc_engine* engine, int layer, const float* hidden, uint32_t dim) {
     if (!engine || layer < 0 || !hidden || dim == 0) return;
-    std::lock_guard<std::mutex> lock(engine->gate_snapshot_mutex);
     const size_t layer_u = (size_t)layer;
     if (engine->gate_input_snapshots.size() <= layer_u) {
         engine->gate_input_snapshots.resize(layer_u + 1);

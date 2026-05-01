@@ -1,4 +1,4 @@
-// BUGFIX 72: Issue 10 - Optimize KV cache layout to [pos][layer][dim] ?�★
+// BUGFIX 72: Issue 10 - Optimize KV cache layout to [pos][layer][dim] ★★
 // Problem: Old layout [layer][pos][dim] requires 79 separate memcpy during realloc
 // Poor cache locality during attention decode (layers not contiguous)
 // Solution: Change to [pos][layer][dim] layout
@@ -13,9 +13,19 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
     uint8_t* data = nullptr;
     float* scales = nullptr;
     float* zeros = nullptr;
+    // BUGFIX 165: Remove is_vram dead field ★
+    // Problem: is_vram field exists but never used (always false)
+    // ARCHITECTURE.md states "KV cache is RAM-only"
+    // VRAM KV cache not implemented, field misleading
+    // Solution: Remove dead field to clarify design
+    // Note: If VRAM KV cache needed in future, use engine_core/kv/ QKV cache
+    // bool is_vram = false;  // REMOVED - KV cache is RAM-only
+    moe_pc_engine_t* engine = nullptr;
     uint32_t num_layers = 0;
     uint32_t max_seq_len = 0;
     uint32_t seq_len = 0;
+    uint32_t entry_dim = moe_MLA_KV_ENTRY_DIM;
+    uint32_t seq_limit = moe_MLA_MAX_SEQ_LEN;
     uint64_t tracked_ram_bytes = 0;
 
     ~moe_kv_cache() {
@@ -29,7 +39,8 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
     moe_kv_cache(moe_kv_cache&& other) noexcept :
         data(other.data), scales(other.scales), zeros(other.zeros),
         num_layers(other.num_layers), max_seq_len(other.max_seq_len),
-        seq_len(other.seq_len), tracked_ram_bytes(other.tracked_ram_bytes) {
+        seq_len(other.seq_len), entry_dim(other.entry_dim), seq_limit(other.seq_limit),
+        tracked_ram_bytes(other.tracked_ram_bytes) {
         other.data = nullptr; other.scales = nullptr; other.zeros = nullptr;
     }
     moe_kv_cache& operator=(moe_kv_cache&& other) noexcept {
@@ -39,56 +50,83 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
             if (zeros) std::free(zeros);
             data = other.data; scales = other.scales; zeros = other.zeros;
             num_layers = other.num_layers; max_seq_len = other.max_seq_len;
-            seq_len = other.seq_len; tracked_ram_bytes = other.tracked_ram_bytes;
+            seq_len = other.seq_len; entry_dim = other.entry_dim; seq_limit = other.seq_limit;
+            tracked_ram_bytes = other.tracked_ram_bytes;
             other.data = nullptr; other.scales = nullptr; other.zeros = nullptr;
         }
         return *this;
     }
 
-    void init(uint32_t layers, bool pre_allocate = false) {
+    void init(uint32_t layers, uint32_t entry_dim_in, uint32_t seq_limit_in, bool pre_allocate = false) {
         num_layers = layers;
-        max_seq_len = pre_allocate ? moe_MLA_MAX_SEQ_LEN : moe_MLA_KV_INITIAL_CHUNK;
+        entry_dim = entry_dim_in ? entry_dim_in : moe_MLA_KV_ENTRY_DIM;
+        seq_limit = seq_limit_in ? seq_limit_in : moe_MLA_MAX_SEQ_LEN;
+        max_seq_len = pre_allocate ? seq_limit : std::min<uint32_t>(moe_MLA_KV_INITIAL_CHUNK, seq_limit);
+        if (max_seq_len == 0) {
+            max_seq_len = 1;
+        }
         seq_len = 0;
         if (data) std::free(data);
         if (scales) std::free(scales);
         if (zeros) std::free(zeros);
         const size_t total_entries = (size_t)max_seq_len * layers;
-        data = (uint8_t*)std::calloc(total_entries * moe_MLA_KV_ENTRY_DIM, sizeof(uint8_t));
+        data = (uint8_t*)std::calloc(total_entries * entry_dim, sizeof(uint8_t));
         scales = (float*)std::calloc(total_entries, sizeof(float));
         zeros = (float*)std::calloc(total_entries, sizeof(float));
+    }
+
+    void init(uint32_t layers, bool pre_allocate = false) {
+        init(layers, moe_MLA_KV_ENTRY_DIM, moe_MLA_MAX_SEQ_LEN, pre_allocate);
     }
 
     void ensure_capacity(uint32_t needed_pos) {
         if (needed_pos < max_seq_len) return;
         uint32_t new_cap = needed_pos + 1;
         new_cap = (new_cap + 4095u) & ~4095u;
-        if (new_cap > moe_MLA_MAX_SEQ_LEN) new_cap = moe_MLA_MAX_SEQ_LEN;
+        if (new_cap > seq_limit) new_cap = seq_limit;
         if (new_cap == max_seq_len) return;
 
         const size_t old_entries = (size_t)max_seq_len * num_layers;
         const size_t new_entries = (size_t)new_cap * num_layers;
 
-        uint8_t* new_data = (uint8_t*)std::realloc(data, new_entries * moe_MLA_KV_ENTRY_DIM);
+        // BUGFIX 158: Use realloc() instead of malloc+memcpy+free to reduce peak memory
+        // realloc() can expand in-place, avoiding 2x peak memory consumption
+        // Peak memory: malloc+memcpy = 2x, realloc in-place = 1x
+        uint8_t* new_data = (uint8_t*)std::realloc(data, new_entries * entry_dim);
         float* new_scales = (float*)std::realloc(scales, new_entries * sizeof(float));
         float* new_zeros = (float*)std::realloc(zeros, new_entries * sizeof(float));
 
         if (new_data && new_scales && new_zeros) {
-            std::memset(new_data + old_entries * moe_MLA_KV_ENTRY_DIM, 0, (new_entries - old_entries) * moe_MLA_KV_ENTRY_DIM);
+            // Initialize new entries to zero
+            std::memset(new_data + old_entries * entry_dim, 0, (new_entries - old_entries) * entry_dim);
             std::memset(new_scales + old_entries, 0, (new_entries - old_entries) * sizeof(float));
             std::memset(new_zeros + old_entries, 0, (new_entries - old_entries) * sizeof(float));
+
             data = new_data;
             scales = new_scales;
             zeros = new_zeros;
             max_seq_len = new_cap;
+
+            if (engine) {
+                int64_t delta = (int64_t)(new_entries - old_entries) * (entry_dim + sizeof(float) * 2);
+                if (delta > 0)
+                    engine->ram_used_bytes.fetch_add((uint64_t)delta, std::memory_order_relaxed);
+                else if (delta < 0)
+                    engine->ram_used_bytes.fetch_sub((uint64_t)(-delta), std::memory_order_relaxed);
+            }
+        } else {
+            // realloc failure: original pointers are still valid
+            // No need to free - realloc preserves original on failure
+            throw std::bad_alloc();
         }
     }
 
     // Asymmetric INT8 Quantization (Store)
     void store_entry(uint32_t layer, uint32_t pos, const float* src, uint32_t count) {
-        if (layer >= num_layers || pos >= max_seq_len || count > moe_MLA_KV_ENTRY_DIM) return;
+        if (layer >= num_layers || pos >= max_seq_len || count > entry_dim) return;
 
         const size_t entry_idx = (size_t)pos * num_layers + layer;
-        uint8_t* dst = data + entry_idx * moe_MLA_KV_ENTRY_DIM;
+        uint8_t* dst = data + entry_idx * entry_dim;
 
         // Find min and max
         float min_val = src[0];
@@ -139,10 +177,10 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
 
     // Asymmetric INT8 Dequantization (Load)
     void load_entry(uint32_t layer, uint32_t pos, float* dst, uint32_t count) const {
-        if (layer >= num_layers || pos >= max_seq_len || count > moe_MLA_KV_ENTRY_DIM) return;
+        if (layer >= num_layers || pos >= max_seq_len || count > entry_dim) return;
 
         const size_t entry_idx = (size_t)pos * num_layers + layer;
-        const uint8_t* src = data + entry_idx * moe_MLA_KV_ENTRY_DIM;
+        const uint8_t* src = data + entry_idx * entry_dim;
         const float scale = scales[entry_idx];
         const float zero = zeros[entry_idx];
 
@@ -164,12 +202,12 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
     }
 };
 
-static uint64_t moe_kv_cache_bytes(uint32_t layers, uint32_t seq_len) {
+static uint64_t moe_kv_cache_bytes(uint32_t layers, uint32_t seq_len, uint32_t entry_dim = moe_MLA_KV_ENTRY_DIM) {
     if (layers == 0 || seq_len == 0) {
         return 0;
     }
     // KV Asymmetric INT8: data (uint8_t) + scale (float) + zero (float)
-    constexpr uint64_t entry_bytes = (uint64_t)moe_MLA_KV_ENTRY_DIM * sizeof(uint8_t) + 2 * sizeof(float);
+    const uint64_t entry_bytes = (uint64_t)(entry_dim ? entry_dim : moe_MLA_KV_ENTRY_DIM) * sizeof(uint8_t) + 2 * sizeof(float);
     // BUGFIX 72: [pos][layer][dim] layout - order doesn't affect total size
     if ((uint64_t)seq_len > UINT64_MAX / (uint64_t)layers ||
         (uint64_t)seq_len * (uint64_t)layers > UINT64_MAX / entry_bytes) {
@@ -182,7 +220,7 @@ static uint64_t moe_kv_cache_allocated_bytes(const moe_kv_cache& cache) {
     if ((!cache.data)) {
         return 0;
     }
-    return moe_kv_cache_bytes(cache.num_layers, cache.max_seq_len);
+    return moe_kv_cache_bytes(cache.num_layers, cache.max_seq_len, cache.entry_dim);
 }
 
 static void moe_kv_cache_track_ram(moe_pc_engine* engine, moe_kv_cache* cache) {
@@ -215,8 +253,13 @@ struct moe_kv_cache_ram_scope {
     }
 };
 
-static int moe_generation_should_preallocate_kv_cache(const moe_pc_engine* engine, uint32_t layers) {
-    const uint64_t full_kv_bytes = moe_kv_cache_bytes(layers, moe_MLA_MAX_SEQ_LEN);
+static int moe_generation_should_preallocate_kv_cache(
+    const moe_pc_engine* engine,
+    uint32_t layers,
+    uint32_t entry_dim = moe_MLA_KV_ENTRY_DIM,
+    uint32_t max_seq_len = moe_MLA_MAX_SEQ_LEN
+) {
+    const uint64_t full_kv_bytes = moe_kv_cache_bytes(layers, max_seq_len, entry_dim);
     if (!engine || full_kv_bytes == 0 || full_kv_bytes == UINT64_MAX) {
         return 0;
     }
@@ -243,6 +286,13 @@ static int moe_generation_should_use_layer_first_prefill(
     uint32_t hidden_size
 ) {
     if (prefill_count <= 1u || hidden_size == 0) {
+        return 0;
+    }
+    if (engine &&
+        (moe_engine_graph_ir_mentions(engine, "post_ffw_norm") ||
+         moe_engine_graph_ir_mentions(engine, "layer_output_scale") ||
+         moe_engine_has_common_tensor_suffix(engine, 0, "post_ffw_norm.weight") ||
+         moe_engine_has_common_tensor_suffix(engine, 0, "layer_output_scale.weight"))) {
         return 0;
     }
     if ((uint64_t)prefill_count > UINT64_MAX / (uint64_t)hidden_size ||

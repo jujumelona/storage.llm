@@ -6,11 +6,23 @@ int moe_pc_engine_find_raw_tensor(
     moe_raw_tensor_kind_t kind,
     moe_raw_tensor_info_t* out_info
 ) {
-    (void)engine;
-    if (!out_info) {
+    if (!engine || !out_info) {
         return 0;
     }
     moe_raw_tensor_desc desc{};
+    if (const moe_gguf_common_tensor_record* rec =
+            find_common_raw_tensor_record(engine, layer, kind, &desc)) {
+        std::memset(out_info, 0, sizeof(*out_info));
+        out_info->layer = layer;
+        out_info->part = (uint32_t)rec->resolved_path_index + 1u;
+        out_info->offset = rec->file_offset;
+        out_info->bytes = rec->bytes;
+        out_info->rows = desc.rows;
+        out_info->cols = desc.cols;
+        out_info->bf16 =
+            moe_raw_scalar_encoding_from_common_tensor(*rec, desc.rows, desc.cols) == moe_RAW_SCALAR_BF16 ? 1 : 0;
+        return 1;
+    }
     const moe_storage_raw_span_spec_t* span = nullptr;
     if (!find_raw_tensor_desc_and_span(layer, kind, &desc, &span)) {
         return 0;
@@ -43,9 +55,12 @@ int moe_pc_engine_raw_linear_f32(
         raw.cols == 0 || input_count != raw.cols || output_count != raw.rows) {
         return 0;
     }
-    const uint64_t row_bytes = (uint64_t)raw.cols * 2ull;
+    const uint64_t raw_row_bytes = moe_raw_tensor_row_bytes(raw, raw.cols);
+    if (raw.bytes < raw_row_bytes * (uint64_t)raw.rows) {
+        return 0;
+    }
     return moe_parallel_rows(engine, raw.rows, 0, [&](uint32_t row) {
-        output[row] = moe_dot_bf16_row(raw.base + row_bytes * (uint64_t)row, input, input_count);
+        output[row] = moe_raw_tensor_dot_row(raw, row, input, input_count);
         return 1;
     });
 }
@@ -66,6 +81,10 @@ int moe_pc_engine_raw_rmsnorm_f32(
     moe_raw_tensor_cache_entry raw{};
     if (!get_cached_raw_tensor(engine, layer, kind, &raw) ||
         raw.cols != 0 || raw.rows != input_count) {
+        return 0;
+    }
+    const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
+    if (raw.bytes < (uint64_t)input_count * (uint64_t)elem) {
         return 0;
     }
     double ss = 0.0;
@@ -105,9 +124,8 @@ int moe_pc_engine_raw_rmsnorm_f32(
     }
     const float norm = 1.0f / std::sqrt((float)(ss / (double)input_count) + (eps > 0.0f ? eps : 1.0e-6f));
     return moe_parallel_rows(engine, input_count, 0, [&](uint32_t i) {
-        uint16_t w;
-        std::memcpy(&w, raw.base + (uint64_t)i * 2ull, sizeof(w));
-        output[i] = input[i] * norm * moe_raw_bf16_to_f32(w);
+        const float w = moe_raw_scalar_to_f32(raw.base + (uint64_t)i * (uint64_t)elem, raw.scalar_encoding);
+        output[i] = input[i] * norm * w;
         return 1;
     });
 }

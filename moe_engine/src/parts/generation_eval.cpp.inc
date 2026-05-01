@@ -7,7 +7,9 @@ int moe_pc_engine_eval_token_ids(
     if (out_stats) {
         std::memset(out_stats, 0, sizeof(*out_stats));
     }
-    const moe_storage_constants_t* c = moe_storage_constants();
+    const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
+    const moe_storage_constants_t* c = &runtime_c;
+    const moe_attn_config_t attn_cfg = moe_generation_attn_config(engine);
     if (!engine || !c || !input_token_ids || input_token_count < 2) {
         moe_eval_set_error(out_stats, "eval requires at least two input tokens");
         return 0;
@@ -18,12 +20,22 @@ int moe_pc_engine_eval_token_ids(
         forward.dynamic_shape_ready &&
         !forward.forward_adapter_executable) {
         char reason[192]{};
-        std::snprintf(reason, sizeof(reason),
-            "forward adapter not executable adapter=%s layers=%u hidden=%u vocab=%u",
-            moe_forward_adapter_name(forward.forward_adapter),
-            forward.dynamic_num_hidden_layers,
-            forward.dynamic_hidden_size,
-            forward.dynamic_vocab_size);
+        if (forward.graph_ir_ready) {
+            std::snprintf(reason, sizeof(reason),
+                "graph IR executor not executable graph_ver=%u layers=%u ops=%llu hidden=%u vocab=%u",
+                forward.graph_ir_version,
+                forward.dynamic_num_hidden_layers,
+                (unsigned long long)forward.graph_ir_op_count,
+                forward.dynamic_hidden_size,
+                forward.dynamic_vocab_size);
+        } else {
+            std::snprintf(reason, sizeof(reason),
+                "forward adapter not executable adapter=%s layers=%u hidden=%u vocab=%u",
+                moe_forward_adapter_name(forward.forward_adapter),
+                forward.dynamic_num_hidden_layers,
+                forward.dynamic_hidden_size,
+                forward.dynamic_vocab_size);
+        }
         moe_eval_set_error(out_stats, reason);
         return 0;
     }
@@ -37,7 +49,7 @@ int moe_pc_engine_eval_token_ids(
         moe_eval_set_error(out_stats, "full eval path is not ready");
         return 0;
     }
-    if (input_token_count > moe_MLA_MAX_SEQ_LEN) {
+    if (input_token_count > attn_cfg.max_seq_len) {
         moe_eval_set_error(out_stats, "input exceeds Moe MLA context length");
         return 0;
     }
@@ -52,8 +64,9 @@ int moe_pc_engine_eval_token_ids(
     moe_kv_cache_ram_scope kv_scope{engine, &scratch.kv_cache};
     moe_kv_decode_cache_ram_scope decode_cache_scope{engine, &scratch};
     const int pre_allocate_kv =
-        moe_generation_should_preallocate_kv_cache(engine, c->num_hidden_layers);
-    moe_decode_scratch_resize(&scratch, c, pre_allocate_kv);
+        moe_generation_should_preallocate_kv_cache(
+            engine, c->num_hidden_layers, moe_attn_kv_entry_dim(attn_cfg), attn_cfg.max_seq_len);
+    moe_decode_scratch_resize(&scratch, c, &attn_cfg, pre_allocate_kv);
     moe_kv_cache_track_ram(engine, &scratch.kv_cache);
     scratch.position = 0;
 

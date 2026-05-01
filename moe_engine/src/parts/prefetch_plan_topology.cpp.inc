@@ -13,6 +13,8 @@ static void prefetch_plan_topology_candidates(
         return;
     }
     out->reserve((size_t)count * (size_t)engine->io_config.topology_max_edges_per_source);
+    std::unordered_map<int, std::unordered_map<int, uint64_t>> aggregated_dst;
+
     for (uint32_t i = 0; i < count; ++i) {
         const uint64_t src_key = topology_key(layer, experts[i]);
         if (src_key == UINT64_MAX) {
@@ -24,7 +26,38 @@ static void prefetch_plan_topology_candidates(
             continue;
         }
         for (const auto& dst : src->second) {
-            out->emplace_back(dst.second, topology_key_layer(dst.first), topology_key_expert(dst.first));
+            aggregated_dst[topology_key_layer(dst.first)][topology_key_expert(dst.first)] += dst.second;
+        }
+    }
+
+    // ============================================================================
+    // Hierarchical Expert Grouping (HMoE / Lory 2024)
+    // ============================================================================
+    // Instead of 1:1 topological edges, we expand the destination experts to
+    // their full semantic domain (clusters). If an expert in domain D is a
+    // topological neighbor, all experts in domain D are prefetched.
+    // ============================================================================
+    for (const auto& layer_pair : aggregated_dst) {
+        const int dst_layer = layer_pair.first;
+        std::vector<int> explicit_experts;
+        for (const auto& exp_pair : layer_pair.second) {
+            explicit_experts.push_back(exp_pair.first);
+        }
+
+        std::vector<int> expanded_domain;
+        moe_expand_merged_experts(dst_layer, explicit_experts, expanded_domain);
+
+        for (int e : expanded_domain) {
+            uint64_t freq = 0;
+            auto it = layer_pair.second.find(e);
+            if (it != layer_pair.second.end()) {
+                freq = it->second;
+            } else {
+                // Domain member that wasn't an explicit topological neighbor.
+                // Give it a baseline priority derived from the domain's average or a small constant
+                freq = 1;
+            }
+            out->emplace_back(freq, dst_layer, e);
         }
     }
 }

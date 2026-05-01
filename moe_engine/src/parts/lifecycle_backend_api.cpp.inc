@@ -2,9 +2,9 @@ moe_pc_engine_t* moe_pc_engine_create(const moe_pc_engine_config_t* config) {
     auto* engine = new moe_pc_engine();
     engine->config = config ? *config : moe_pc_default_config();
     qkv_set_mode(engine->config.kv_mode == moe_KV_MODE_QKV);
-    engine->expert_states.assign(expert_slot_count(), moe_block_state{});
+    engine->expert_states.assign(expert_slot_count(engine), moe_block_state{});
     tensor_slots_reset(engine);
-    engine->tensors.reserve(tensor_record_capacity());
+    engine->tensors.reserve(tensor_record_capacity(engine));
     engine->shard_mmaps.reserve(105);
     engine->topology_edges.reserve(19456);
     engine->prefetch_plan_seen_gen.reserve(24576);

@@ -68,8 +68,26 @@ static int moe_read_gguf_tensor_infos(
     for (size_t i = 0; i < tensors->size(); ++i) {
         moe_gguf_tensor_dir_entry_t& entry = (*tensors)[i];
         const uint64_t next = (i + 1u < tensors->size()) ? (*tensors)[i + 1u].tensor_offset : payload_bytes;
-        entry.bytes = next > entry.tensor_offset ? next - entry.tensor_offset : 0;
+
+        // BUGFIX 131: Issue 34 - Overflow-safe offset validation ★★
+        // Problem: offset + length > file_size check can overflow if offset is near UINT64_MAX.
+        // Corrupted GGUF with offset = UINT64_MAX-1, length = 10 → offset + length wraps to 9.
+        // Check passes, then mmap pointer calculation → segfault.
+        // Solution: Use overflow-safe validation: offset > file_size || length > file_size - offset
+        // This pattern already exists in prefetch_pinned.cpp.inc.
+        if (entry.tensor_offset > payload_bytes) {
+            entry.bytes = 0;
+            entry.file_offset = base;
+            continue;
+        }
+        const uint64_t max_length = payload_bytes - entry.tensor_offset;
+        if (next > entry.tensor_offset && next - entry.tensor_offset <= max_length) {
+            entry.bytes = next - entry.tensor_offset;
+        } else {
+            entry.bytes = 0;
+        }
         entry.file_offset = base + entry.tensor_offset;
+
         if (moe_gguf_tensor_name_executable(entry.name)) {
             ++executable;
             if (entry.bytes > max_exec) {

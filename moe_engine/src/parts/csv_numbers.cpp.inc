@@ -30,7 +30,29 @@ static uint64_t parse_u64(const std::string& value) {
     if (value.empty()) {
         return 0;
     }
-    return static_cast<uint64_t>(std::strtoull(value.c_str(), nullptr, 10));
+    // BUGFIX 207: Add error handling for strtoull ★
+    // Problem: strtoull without error checking cannot distinguish "0" from parse error
+    // If value="abc", strtoull returns 0 (same as value="0")
+    // Solution: Check end pointer to verify parsing succeeded
+    char* end = nullptr;
+    errno = 0;  // Reset errno before call
+    const uint64_t result = std::strtoull(value.c_str(), &end, 10);
+
+    // Check for parsing errors:
+    // 1. end == value.c_str(): no digits parsed
+    // 2. errno == ERANGE: overflow (result == ULLONG_MAX)
+    // 3. *end != '\0': trailing non-digit characters (partial parse)
+    if (end == value.c_str() || errno == ERANGE) {
+        return 0;  // Parse error or overflow
+    }
+    // Allow trailing whitespace but not other characters
+    while (end && *end != '\0') {
+        if (*end != ' ' && *end != '\t' && *end != '\r' && *end != '\n') {
+            return 0;  // Invalid trailing characters
+        }
+        ++end;
+    }
+    return result;
 }
 
 static uint32_t parse_u32(const std::string& value) {

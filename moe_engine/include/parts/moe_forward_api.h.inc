@@ -19,6 +19,7 @@ typedef struct {
     uint32_t dynamic_num_hidden_layers;
     uint32_t dynamic_hidden_size;
     uint32_t dynamic_vocab_size;
+    uint32_t dynamic_max_seq_len;
     int graph_ir_ready;
     int graph_ir_required;
     uint32_t graph_ir_version;

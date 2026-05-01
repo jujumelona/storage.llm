@@ -60,7 +60,7 @@ static int device_free_expert_if_pending_evict_locked(
     if (!e || layer < 0 || expert < 0) {
         return 0;
     }
-    const size_t slot = expert_dense_slot(layer, expert);
+    const size_t slot = expert_dense_slot(e, layer, expert);
     if (slot == tensor_slot_invalid() || slot >= e->expert_states.size()) {
         return 0;
     }
@@ -213,8 +213,16 @@ static void device_make_room_locked(
             }
             device_lock.lock();
 
+            // BUGFIX 126: Issue 31 - Release device_mutex during cuMemFree ★★★
+            // Problem: device_free_expert_if_pending_evict_locked holds device_lock during cuMemFree.
+            // Large tensor (down_proj ~40MB) cuMemFree can take hundreds of ms.
+            // All GPU workers blocked on device_lock → entire pipeline frozen.
+            // Solution: Release lock before each free, reacquire after.
+            // pending_evict flag already set, so safe from concurrent access.
             for (auto& victim : expert_victims) {
+                device_lock.unlock();
                 device_free_expert_if_pending_evict_locked(e, victim.first, victim.second, &deferred_free_ptrs);
+                device_lock.lock();
             }
         }
 

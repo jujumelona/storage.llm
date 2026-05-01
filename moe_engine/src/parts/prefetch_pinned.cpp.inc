@@ -89,12 +89,37 @@ static int prefetch_tensor_file_to_pinned(
         if (submits > 0) {
             engine->ring_adapter.submit();
             int completions = 0;
-            // Synchronous wait for this task's completions (could be fully async in future)
+            // BUGFIX 121: Issue 26 - io_uring completion wait is spin-yield loop ★★
+            // Problem: yield() busy-wait consumes CPU while io_worker waits for I/O.
+            // Solution: Add wait_completion() to io_ring_adapter that uses io_uring_wait_cqe (Linux)
+            // or blocking wait (Windows). io_worker has no other work during this wait, so blocking is fine.
+            // Trade-off: None - blocking wait is correct behavior for synchronous I/O completion.
             while (completions < submits) {
                 void* data = engine->ring_adapter.peek_completion();
-                if (data) completions++;
-                else std::this_thread::yield();
+                if (data) {
+                    completions++;
+                } else {
+                    // Yield once, then block wait if still no completion
+                    std::this_thread::yield();
+                    if (completions < submits) {
+                        data = engine->ring_adapter.wait_completion();
+                        if (data) completions++;
+                    }
+                }
             }
+        }
+    } else if (shard && mmap_get_ptr(shard, 0)) {
+        // Fallback to mmap direct memcpy to avoid dual caching
+        for (const auto& range : ranges) {
+            const uint64_t offset = range[0];
+            const uint64_t length = range[1];
+            if (length == 0) continue;
+            if (offset > file_size || length > file_size - offset ||
+                staging_offset > total_bytes || length > total_bytes - staging_offset) {
+                return 0;
+            }
+            memcpy(engine->staging_slots[slot_index].buf + staging_offset, static_cast<const uint8_t*>(mmap_get_ptr(shard, static_cast<size_t>(offset))), static_cast<size_t>(length));
+            staging_offset += length;
         }
     } else {
         // Fallback to thread-local ifstream cache

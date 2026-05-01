@@ -15,9 +15,17 @@ static void moe_rope_inplace(
     const std::vector<float>& sin_table,
     float base = moe_ROPE_THETA
 ) {
+    // BUGFIX 224: Validate dim > 0 to prevent division by zero in frequency calculation ★★
+    // Problem: dim=0 causes division by zero in freq = 1.0f / std::pow(base, (float)i / (float)dim)
+    // Solution: Return early if dim == 0 or data == nullptr
+    // Impact: Prevents crash in RoPE application with invalid config
+    if (!data || dim == 0) {
+        return;
+    }
     const uint32_t half_dim = dim / 2u;
     const size_t row_offset = (size_t)position * (size_t)half_dim;
-    if (position < moe_MLA_ROPE_TABLE_LEN &&
+    const size_t table_len = half_dim ? cos_table.size() / half_dim : 0;
+    if ((size_t)position < table_len &&
         cos_table.size() >= row_offset + half_dim &&
         sin_table.size() >= row_offset + half_dim) {
         const float* cos_row = cos_table.data() + row_offset;

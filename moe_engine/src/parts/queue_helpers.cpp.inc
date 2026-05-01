@@ -25,7 +25,8 @@ static int enqueue_stage(
         const size_t urgent_sz = stage.urgent_queue.size();
         const size_t total = queue_sz + urgent_sz;
         if (total >= engine->io_config.max_prefetch_queue) {
-            engine->io_atomic.dropped_requests.fetch_add(1);
+            // BUGFIX 154: Add memory_order_relaxed for statistics counter
+            engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
             return 0;
         }
         // Fix 12: O(1) insertion via dual-deque
@@ -34,7 +35,8 @@ static int enqueue_stage(
         } else {
             stage.queue.push_back(task);
         }
-        stage.depth.store(static_cast<uint32_t>(queue_sz + urgent_sz + 1));  // +1 for just-added task
+        // BUGFIX 205: Add memory_order_relaxed for depth counter ★
+        stage.depth.store(static_cast<uint32_t>(queue_sz + urgent_sz + 1), std::memory_order_relaxed);  // +1 for just-added task
         engine->total_queue_depth.fetch_add(1, std::memory_order_relaxed);
     }
     return 1;
@@ -63,7 +65,8 @@ static int enqueue_stage_or_retry(
         const size_t retry_room = std::max<size_t>(32u, normal_cap / 4u);
         const size_t retry_cap = normal_cap + retry_room;
         if (total >= retry_cap) {
-            engine->io_atomic.dropped_requests.fetch_add(1);
+            // BUGFIX 154: Add memory_order_relaxed for statistics counter
+            engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
             return 0;
         }
 
@@ -88,7 +91,10 @@ static int enqueue_stage_or_retry(
                     queued.urgent = 0;  // Demote to normal priority
                     stage.queue.push_back(queued);
                 } else {
-                    engine->io_atomic.dropped_requests.fetch_add(1);
+                    // BUGFIX 201: Track urgent drops separately ★
+                    engine->io_atomic.urgent_dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                    // BUGFIX 154: Add memory_order_relaxed for statistics counter
+                    engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
                     return 0;
                 }
             } else {
@@ -109,7 +115,8 @@ static int enqueue_stage_or_retry(
         // Correct depth = (queue_sz + 1) + urgent_sz = queue_sz + urgent_sz + 1 ✓
         // Actually the formula is correct! But let's verify with actual sizes for clarity
         const size_t final_depth = stage.queue.size() + stage.urgent_queue.size();
-        stage.depth.store(static_cast<uint32_t>(final_depth));
+        // BUGFIX 205: Add memory_order_relaxed for depth counter ★
+        stage.depth.store(static_cast<uint32_t>(final_depth), std::memory_order_relaxed);
         engine->total_queue_depth.fetch_add(1, std::memory_order_relaxed);
     }
     return 1;
@@ -140,7 +147,8 @@ static bool pop_stage_task(
     }
     // BUGFIX 97: Cache size after pop
     const size_t new_depth = stage.queue.size() + stage.urgent_queue.size();
-    stage.depth.store(static_cast<uint32_t>(new_depth));
+    // BUGFIX 205: Add memory_order_relaxed for depth counter ★
+    stage.depth.store(static_cast<uint32_t>(new_depth), std::memory_order_relaxed);
     // PIPELINE FIX 6: Increment inflight BEFORE notify to prevent race condition ??�쁾??    // Old order: notify ??inflight++ ??awakened thread sees inflight==0 ??false "idle"
     // New order: inflight++ ??notify ??awakened thread always sees inflight>=1
     // Prevents premature "pipeline done" signal when tasks are still processing
@@ -173,9 +181,10 @@ static bool peek_stage_task(
 
 static void finish_stage_task(moe_pc_engine* engine, moe_stage_queue& stage, int ok, int count_completed) {
     if (ok && count_completed) {
-        engine->io_atomic.completed_requests.fetch_add(1);
+        // BUGFIX 154: Add memory_order_relaxed for statistics counters
+        engine->io_atomic.completed_requests.fetch_add(1, std::memory_order_relaxed);
     } else if (!ok) {
-        engine->io_atomic.failed_requests.fetch_add(1);
+        engine->io_atomic.failed_requests.fetch_add(1, std::memory_order_relaxed);
     }
     stage.inflight.fetch_sub(1);
     // BUGFIX 26: Only notify on terminal completion ??�쁾
@@ -197,14 +206,16 @@ static void clear_stage(moe_pc_engine* engine, moe_stage_queue& stage) {
     const uint32_t removed = static_cast<uint32_t>(stage.queue.size() + stage.urgent_queue.size());
     stage.queue.clear();
     stage.urgent_queue.clear();
-    stage.depth.store(0);
-    stage.inflight.store(0);
+    // BUGFIX 205: Add memory_order_relaxed for depth/inflight counters ★
+    stage.depth.store(0, std::memory_order_relaxed);
+    stage.inflight.store(0, std::memory_order_relaxed);
     queue_total_depth_sub(engine, removed);
 }
 
 static void record_dropped_request(moe_pc_engine* engine) {
     if (engine) {
-        engine->io_atomic.dropped_requests.fetch_add(1);
+        // BUGFIX 154: Add memory_order_relaxed for statistics counter
+        engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
     }
 }
 

@@ -1,6 +1,9 @@
 // Engine state management
 // QKV cache reset and contract clearing
 
+static void stop_io_workers(moe_pc_engine* engine);
+static void stop_cpu_row_workers(moe_pc_engine* engine);
+
 static void moe_engine_reset_qkv_cache(moe_pc_engine* engine) {
     if (!engine) {
         return;

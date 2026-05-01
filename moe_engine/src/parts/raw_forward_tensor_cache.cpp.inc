@@ -24,6 +24,24 @@ static int get_cached_raw_tensor(
         }
     }
     moe_raw_tensor_desc desc{};
+    if (const moe_gguf_common_tensor_record* rec =
+            find_common_raw_tensor_record(engine, layer, kind, &desc)) {
+        moe_raw_tensor_cache_entry entry{};
+        if (!map_common_tensor_record(engine, *rec, desc, &entry)) {
+            return 0;
+        }
+        {
+            std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+            auto found = engine->raw_tensor_cache.find(key);
+            if (found != engine->raw_tensor_cache.end() && found->second.base) {
+                *out_entry = found->second;
+                return 1;
+            }
+            engine->raw_tensor_cache[key] = entry;
+            *out_entry = entry;
+        }
+        return 1;
+    }
     const moe_storage_raw_span_spec_t* span = nullptr;
     if (!find_raw_tensor_desc_and_span(layer, kind, &desc, &span)) {
         return 0;
@@ -44,6 +62,9 @@ static int get_cached_raw_tensor(
     entry.bytes = desc.bytes;
     entry.rows = desc.rows;
     entry.cols = desc.cols;
+    entry.scalar_encoding = moe_RAW_SCALAR_BF16;
+    entry.weight_format = moe_WEIGHT_ENCODING_RAW_FP16;
+    entry.weight_row_bytes = desc.cols ? (uint64_t)desc.cols * 2ull : (uint64_t)desc.rows * 2ull;
     {
         std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
         auto found = engine->raw_tensor_cache.find(key);

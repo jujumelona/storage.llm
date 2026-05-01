@@ -24,3 +24,13 @@ static float moe_generation_silu(float x) {
     return x / (1.0f + std::exp(-x));
 #endif
 }
+
+static float moe_generation_gelu(float x) {
+    return 0.5f * x * (1.0f + std::erf(x * 0.70710678118654752440f));
+}
+
+static float moe_generation_gated_activation(const moe_pc_engine* engine, float gate, float up) {
+    return (moe_engine_prefers_gelu_activation(engine) ?
+        moe_generation_gelu(gate) :
+        moe_generation_silu(gate)) * up;
+}

@@ -182,7 +182,13 @@ static int load_binary_tensor_index(moe_pc_engine* engine, const char* index_pat
         uint16_t path_index = 0;
         uint16_t flags = 0;
         uint32_t rec_reserved = 0;
-        if (!tensor_index_read_u32(input, &rec.info.part) ||
+        if (!tensor_index_read_u64(input, &rec.info.weight_byte_offset) ||
+            !tensor_index_read_u64(input, &rec.info.weight_byte_length) ||
+            !tensor_index_read_u64(input, &rec.info.scale_byte_offset) ||
+            !tensor_index_read_u64(input, &rec.info.scale_byte_length) ||
+            !tensor_index_read_u64(input, &rec.info.scale2_byte_offset) ||
+            !tensor_index_read_u64(input, &rec.info.scale2_byte_length) ||
+            !tensor_index_read_u32(input, &rec.info.part) ||
             !tensor_index_read_u32(input, &rec.info.shard) ||
             !tensor_index_read_u32(input, &rec.info.layer) ||
             !tensor_index_read_u32(input, &rec.info.expert) ||
@@ -191,12 +197,6 @@ static int load_binary_tensor_index(moe_pc_engine* engine, const char* index_pat
             !tensor_index_read_u32(input, &rec.info.cols) ||
             !tensor_index_read_u32(input, &rec.info.groups) ||
             !tensor_index_read_u32(input, &rec.info.group_size) ||
-            !tensor_index_read_u64(input, &rec.info.weight_byte_offset) ||
-            !tensor_index_read_u64(input, &rec.info.weight_byte_length) ||
-            !tensor_index_read_u64(input, &rec.info.scale_byte_offset) ||
-            !tensor_index_read_u64(input, &rec.info.scale_byte_length) ||
-            !tensor_index_read_u64(input, &rec.info.scale2_byte_offset) ||
-            !tensor_index_read_u64(input, &rec.info.scale2_byte_length) ||
             !tensor_index_read_u16(input, &path_index) ||
             !tensor_index_read_u16(input, &flags) ||
             !tensor_index_read_u32(input, &rec_reserved) ||
@@ -238,12 +238,27 @@ static int moe_parse_layer_from_gguf_name(const std::string& name, uint32_t* lay
     if (!layer) {
         return 0;
     }
-    const char* needle = "blk.";
-    const size_t pos = name.find(needle);
+    const char* needles[] = {
+        "blk.",
+        "model.layers.",
+        "layers.",
+        "transformer.h.",
+        "h."
+    };
+    size_t pos = std::string::npos;
+    size_t needle_len = 0;
+    for (const char* needle : needles) {
+        const size_t next = name.find(needle);
+        if (next != std::string::npos &&
+            (pos == std::string::npos || next < pos)) {
+            pos = next;
+            needle_len = std::strlen(needle);
+        }
+    }
     if (pos == std::string::npos) {
         return 0;
     }
-    size_t p = pos + std::strlen(needle);
+    size_t p = pos + needle_len;
     uint64_t value = 0;
     bool any = false;
     while (p < name.size() && name[p] >= '0' && name[p] <= '9') {
@@ -282,6 +297,22 @@ static int moe_gguf_expert_projection(const std::string& name, moe_projection_t*
 }
 
 static uint8_t moe_weight_encoding_from_gguf_type(uint32_t type, const moe_offload_gguf_contract_t& contract) {
+    (void)contract;
+    if (type == 0u) {
+        return moe_WEIGHT_ENCODING_RAW_FP32;
+    }
+    if (type == 1u) {
+        return moe_WEIGHT_ENCODING_RAW_FP16;
+    }
+    if (type == 7u) {
+        return moe_WEIGHT_ENCODING_GGUF_Q5_1;
+    }
+    if (type == 8u) {
+        return moe_WEIGHT_ENCODING_GGUF_Q8_0;
+    }
+    if (type == 13u) {
+        return moe_WEIGHT_ENCODING_GGUF_Q5_K;
+    }
     if (type == 39u) {
         return moe_WEIGHT_ENCODING_MXFP4;
     }
@@ -293,9 +324,6 @@ static uint8_t moe_weight_encoding_from_gguf_type(uint32_t type, const moe_offlo
     }
     if (type == 20u || type == 23u || type == 12u) {
         return moe_WEIGHT_ENCODING_GGUF_IQ4;
-    }
-    if (contract.weight_encoding) {
-        return (uint8_t)std::min<uint32_t>(contract.weight_encoding, 255u);
     }
     return moe_WEIGHT_ENCODING_UNKNOWN;
 }
@@ -342,11 +370,6 @@ static void moe_dynamic_shape_note_tensor(
             }
         }
     }
-    if (key.find("ffn_gate_up_exps.weight") != std::string::npos) {
-        if (engine->dynamic_architecture.empty()) {
-            engine->dynamic_architecture = "gemma";
-        }
-    }
     if (next.hidden_size && next.vocab_size && next.num_hidden_layers) {
         next.projection_count = 3;
         engine->dynamic_shape = next;
@@ -356,19 +379,40 @@ static void moe_dynamic_shape_note_tensor(
     }
 }
 
+static int moe_graph_ir_executor_compiled(const moe_pc_engine* engine) {
+    if (!engine ||
+        !engine->offload_graph_ir_ready.load(std::memory_order_relaxed) ||
+        !engine->dynamic_shape_valid.load(std::memory_order_relaxed) ||
+        !engine->attn_config_valid.load(std::memory_order_relaxed) ||
+        engine->gguf_common_tensor_slots.empty()) {
+        return 0;
+    }
+    const moe_attn_config_t& cfg = engine->attn_config;
+    if (!cfg.num_heads || !cfg.num_kv_heads || !cfg.head_dim ||
+        cfg.num_kv_heads > cfg.num_heads) {
+        return 0;
+    }
+    return cfg.type == moe_ATTN_TYPE_MLA ||
+        cfg.type == moe_ATTN_TYPE_MHA ||
+        cfg.type == moe_ATTN_TYPE_GQA ||
+        cfg.type == moe_ATTN_TYPE_MQA;
+}
+
 static void moe_dynamic_shape_finalize_adapter(moe_pc_engine* engine) {
     if (!engine || !engine->dynamic_shape_valid.load(std::memory_order_relaxed)) {
         return;
     }
-    const std::string arch = moe_lower_ascii_copy(engine->dynamic_architecture);
     uint32_t adapter = moe_FORWARD_ADAPTER_GGUF_GENERIC;
     int executable = 0;
-    if (arch.find("glm") != std::string::npos) {
-        adapter = moe_FORWARD_ADAPTER_GLM_RAW;
+    if (engine->offload_graph_ir_ready.load(std::memory_order_relaxed)) {
+        adapter = moe_FORWARD_ADAPTER_GRAPH_IR;
+        executable = moe_graph_ir_executor_compiled(engine);
+    } else if (engine->attn_config_valid.load(std::memory_order_relaxed) &&
+               engine->attn_config.type == moe_ATTN_TYPE_MLA) {
+        adapter = moe_FORWARD_ADAPTER_GGUF_GENERIC;
         executable = 1;
-    } else if (arch.find("gemma") != std::string::npos ||
-               engine->gguf_common_tensor_slots.find("blk.0.ffn_gate_up_exps.weight") != engine->gguf_common_tensor_slots.end()) {
-        adapter = moe_FORWARD_ADAPTER_GGUF_GEMMA;
+    } else if (!engine->gguf_common_tensor_slots.empty()) {
+        adapter = moe_FORWARD_ADAPTER_GGUF_MOE;
         executable = 0;
     }
     engine->forward_adapter.store(adapter, std::memory_order_relaxed);
@@ -376,6 +420,402 @@ static void moe_dynamic_shape_finalize_adapter(moe_pc_engine* engine) {
     engine->attention_projector_valid.store(-1, std::memory_order_relaxed);
 }
 
+struct moe_juju_runtime_probe_t {
+    moe_model_shape_t shape{};
+    moe_attn_config_t attn{};
+    std::string architecture;
+    std::string model_id;
+    uint64_t q_proj_rows = 0;
+    uint64_t k_proj_rows = 0;
+    uint64_t v_proj_rows = 0;
+    uint64_t o_proj_cols = 0;
+    uint64_t q_norm_rows = 0;
+    uint64_t k_norm_rows = 0;
+    uint64_t q_a_rows = 0;
+    uint64_t q_b_rows = 0;
+    uint64_t q_b_cols = 0;
+    uint64_t kv_a_rows = 0;
+    uint64_t kv_b_rows = 0;
+    uint64_t kv_b_cols = 0;
+};
+
+static int moe_name_has(const std::string& text, const char* needle) {
+    return needle && needle[0] && text.find(needle) != std::string::npos;
+}
+
+static int moe_juju_name_is_mla_q_a(const std::string& lower) {
+    return moe_name_has(lower, "q_a") && !moe_name_has(lower, "norm");
+}
+
+static int moe_juju_name_is_mla_q_b(const std::string& lower) {
+    return moe_name_has(lower, "q_b") && !moe_name_has(lower, "norm");
+}
+
+static int moe_juju_name_is_mla_kv_a(const std::string& lower) {
+    return moe_name_has(lower, "kv_a") && !moe_name_has(lower, "norm");
+}
+
+static int moe_juju_name_is_mla_kv_b(const std::string& lower) {
+    return moe_name_has(lower, "kv_b") && !moe_name_has(lower, "norm");
+}
+
+static int moe_juju_name_is_attn_o(const std::string& lower) {
+    return moe_name_has(lower, "o_proj.weight") ||
+        moe_name_has(lower, "attn_o.weight") ||
+        moe_name_has(lower, "attn_output.weight") ||
+        moe_name_has(lower, "attention.wo.weight");
+}
+
+static int moe_juju_name_is_std_q(const std::string& lower) {
+    return !moe_juju_name_is_mla_q_a(lower) &&
+        !moe_juju_name_is_mla_q_b(lower) &&
+        (moe_name_has(lower, "q_proj.weight") ||
+         moe_name_has(lower, "attn_q.weight") ||
+         moe_name_has(lower, "attention.wq.weight"));
+}
+
+static int moe_juju_name_is_std_k(const std::string& lower) {
+    return !moe_juju_name_is_mla_kv_a(lower) &&
+        !moe_juju_name_is_mla_kv_b(lower) &&
+        (moe_name_has(lower, "k_proj.weight") ||
+         moe_name_has(lower, "attn_k.weight") ||
+         moe_name_has(lower, "attention.wk.weight"));
+}
+
+static int moe_juju_name_is_std_v(const std::string& lower) {
+    return !moe_juju_name_is_mla_kv_a(lower) &&
+        !moe_juju_name_is_mla_kv_b(lower) &&
+        (moe_name_has(lower, "v_proj.weight") ||
+         moe_name_has(lower, "attn_v.weight") ||
+         moe_name_has(lower, "attention.wv.weight"));
+}
+
+static int moe_juju_name_is_std_q_norm(const std::string& lower) {
+    return moe_name_has(lower, "attn_q_norm.weight") ||
+        moe_name_has(lower, "q_norm.weight") ||
+        moe_name_has(lower, "self_attn.q_norm.weight");
+}
+
+static int moe_juju_name_is_std_k_norm(const std::string& lower) {
+    return moe_name_has(lower, "attn_k_norm.weight") ||
+        moe_name_has(lower, "k_norm.weight") ||
+        moe_name_has(lower, "self_attn.k_norm.weight");
+}
+
+static void moe_juju_probe_note_header(
+    moe_juju_runtime_probe_t* probe,
+    const moe_juju_header_t& header
+) {
+    if (!probe) {
+        return;
+    }
+    if (header.layer_count) probe->shape.num_hidden_layers = header.layer_count;
+    if (header.expert_count_per_layer) probe->shape.experts_per_moe_layer = header.expert_count_per_layer;
+    if (header.hidden_dim) probe->shape.hidden_size = header.hidden_dim;
+    if (header.expert_dim) probe->shape.expert_intermediate_size = header.expert_dim;
+    if (header.expert_count_per_layer && !probe->shape.projection_count) {
+        probe->shape.projection_count = 3;
+    }
+}
+
+static void moe_juju_probe_note_index_json(
+    moe_juju_runtime_probe_t* probe,
+    const std::string& index_json
+) {
+    if (!probe || index_json.empty()) {
+        return;
+    }
+    uint64_t value = 0;
+    double double_value = 0.0;
+    std::string string_value;
+    if (moe_json_get_u64_local(index_json, "num_hidden_layers", &value) ||
+        moe_json_get_u64_local(index_json, "n_layers", &value)) {
+        probe->shape.num_hidden_layers = moe_u64_to_u32_clamped(value, probe->shape.num_hidden_layers);
+    }
+    if (moe_json_get_u64_local(index_json, "hidden_size", &value) ||
+        moe_json_get_u64_local(index_json, "hidden_dim", &value)) {
+        probe->shape.hidden_size = moe_u64_to_u32_clamped(value, probe->shape.hidden_size);
+    }
+    if (moe_json_get_u64_local(index_json, "vocab_size", &value)) {
+        probe->shape.vocab_size = moe_u64_to_u32_clamped(value, probe->shape.vocab_size);
+    }
+    if (moe_json_get_u64_local(index_json, "experts_per_moe_layer", &value) ||
+        moe_json_get_u64_local(index_json, "n_experts", &value)) {
+        probe->shape.experts_per_moe_layer = moe_u64_to_u32_clamped(value, probe->shape.experts_per_moe_layer);
+        probe->shape.projection_count = 3;
+    }
+    if (moe_json_get_u64_local(index_json, "expert_intermediate_size", &value) ||
+        moe_json_get_u64_local(index_json, "expert_intermediate_dim", &value)) {
+        probe->shape.expert_intermediate_size = moe_u64_to_u32_clamped(value, probe->shape.expert_intermediate_size);
+    }
+    if (moe_json_get_u64_local(index_json, "num_attention_heads", &value) ||
+        moe_json_get_u64_local(index_json, "n_heads", &value) ||
+        moe_json_get_u64_local(index_json, "head_count", &value)) {
+        probe->attn.num_heads = moe_u64_to_u32_clamped(value, probe->attn.num_heads);
+    }
+    if (moe_json_get_u64_local(index_json, "num_key_value_heads", &value) ||
+        moe_json_get_u64_local(index_json, "n_kv_heads", &value) ||
+        moe_json_get_u64_local(index_json, "head_count_kv", &value)) {
+        probe->attn.num_kv_heads = moe_u64_to_u32_clamped(value, probe->attn.num_kv_heads);
+    }
+    if (moe_json_get_u64_local(index_json, "head_dim", &value) ||
+        moe_json_get_u64_local(index_json, "key_length", &value)) {
+        probe->attn.head_dim = moe_u64_to_u32_clamped(value, probe->attn.head_dim);
+    }
+    if (moe_json_get_u64_local(index_json, "value_head_dim", &value) ||
+        moe_json_get_u64_local(index_json, "value_length", &value)) {
+        probe->attn.v_head_dim = moe_u64_to_u32_clamped(value, probe->attn.v_head_dim);
+    }
+    if (moe_json_get_u64_local(index_json, "kv_lora_rank", &value)) {
+        probe->attn.kv_lora_rank = moe_u64_to_u32_clamped(value, probe->attn.kv_lora_rank);
+    }
+    if (moe_json_get_u64_local(index_json, "q_lora_rank", &value)) {
+        probe->attn.q_lora_rank = moe_u64_to_u32_clamped(value, probe->attn.q_lora_rank);
+    }
+    if (moe_json_get_u64_local(index_json, "qk_nope_head_dim", &value)) {
+        probe->attn.qk_nope_head_dim = moe_u64_to_u32_clamped(value, probe->attn.qk_nope_head_dim);
+    }
+    if (moe_json_get_u64_local(index_json, "qk_rope_head_dim", &value)) {
+        probe->attn.qk_rope_head_dim = moe_u64_to_u32_clamped(value, probe->attn.qk_rope_head_dim);
+    }
+    if (moe_json_get_u64_local(index_json, "context_length", &value) ||
+        moe_json_get_u64_local(index_json, "max_position_embeddings", &value)) {
+        probe->attn.max_seq_len = moe_u64_to_u32_clamped(value, probe->attn.max_seq_len);
+    }
+    if (moe_json_get_double_local(index_json, "rope_theta", &double_value) ||
+        moe_json_get_double_local(index_json, "theta", &double_value)) {
+        probe->attn.rope_theta = (float)double_value;
+    }
+    if (moe_json_get_double_local(index_json, "rms_norm_eps", &double_value) ||
+        moe_json_get_double_local(index_json, "norm_eps", &double_value)) {
+        probe->attn.rms_norm_eps = (float)double_value;
+    }
+    if (probe->architecture.empty() &&
+        (moe_json_get_string_local(index_json, "declared_architecture", &string_value) ||
+         moe_json_get_string_local(index_json, "architecture", &string_value) ||
+         moe_json_get_string_local(index_json, "family", &string_value))) {
+        probe->architecture = string_value;
+    }
+    if (probe->model_id.empty() && moe_json_get_string_local(index_json, "model_id", &string_value)) {
+        probe->model_id = string_value;
+    }
+}
+
+static void moe_juju_probe_note_tensor(
+    moe_juju_runtime_probe_t* probe,
+    const moe_juju_tensor_json_entry_t& entry
+) {
+    if (!probe || entry.name.empty() || !entry.shape[0]) {
+        return;
+    }
+    const std::string lower = moe_lower_ascii_copy(entry.name);
+    if (entry.dims == 1) {
+        if (moe_juju_name_is_std_q_norm(lower)) {
+            probe->q_norm_rows = std::max<uint64_t>(probe->q_norm_rows, entry.shape[0]);
+        }
+        if (moe_juju_name_is_std_k_norm(lower)) {
+            probe->k_norm_rows = std::max<uint64_t>(probe->k_norm_rows, entry.shape[0]);
+        }
+        return;
+    }
+    if (entry.dims < 2 || !entry.shape[1]) {
+        return;
+    }
+    const uint64_t cols = entry.shape[0];
+    const uint64_t rows = entry.shape[1];
+    if (lower == "token_embd.weight") {
+        probe->shape.hidden_size = (uint32_t)std::min<uint64_t>(cols, UINT32_MAX);
+        probe->shape.vocab_size = (uint32_t)std::min<uint64_t>(rows, UINT32_MAX);
+    }
+    uint32_t layer = 0;
+    if (moe_parse_layer_from_gguf_name(lower, &layer)) {
+        probe->shape.num_hidden_layers = std::max<uint32_t>(probe->shape.num_hidden_layers, layer + 1u);
+        const bool expert_tensor =
+            lower.find("ffn_gate_up_exps.weight") != std::string::npos ||
+            lower.find("ffn_gate_exps.weight") != std::string::npos ||
+            lower.find("ffn_down_exps.weight") != std::string::npos ||
+            ((lower.find("gate_proj.weight") != std::string::npos ||
+              lower.find("up_proj.weight") != std::string::npos ||
+              lower.find("down_proj.weight") != std::string::npos) &&
+             entry.dims >= 3);
+        if (expert_tensor) {
+            if (probe->shape.first_moe_layer == 0 && probe->shape.last_moe_layer == 0) {
+                probe->shape.first_moe_layer = layer;
+            } else {
+                probe->shape.first_moe_layer = std::min<uint32_t>(probe->shape.first_moe_layer, layer);
+            }
+            probe->shape.last_moe_layer = std::max<uint32_t>(probe->shape.last_moe_layer, layer);
+            if (entry.dims >= 3 && entry.shape[2]) {
+                probe->shape.experts_per_moe_layer =
+                    std::max<uint32_t>(probe->shape.experts_per_moe_layer,
+                        (uint32_t)std::min<uint64_t>(entry.shape[2], UINT32_MAX));
+                probe->shape.projection_count = 3;
+            }
+            if (rows) {
+                const uint64_t expert_rows =
+                    lower.find("ffn_gate_up_exps.weight") != std::string::npos ? rows / 2ull : rows;
+                probe->shape.expert_intermediate_size =
+                    std::max<uint32_t>(probe->shape.expert_intermediate_size,
+                        (uint32_t)std::min<uint64_t>(expert_rows, UINT32_MAX));
+            }
+        }
+    }
+    if (moe_juju_name_is_mla_q_a(lower)) {
+        probe->q_a_rows = std::max<uint64_t>(probe->q_a_rows, rows);
+    } else if (moe_juju_name_is_mla_q_b(lower)) {
+        probe->q_b_rows = std::max<uint64_t>(probe->q_b_rows, rows);
+        probe->q_b_cols = std::max<uint64_t>(probe->q_b_cols, cols);
+    } else if (moe_juju_name_is_mla_kv_a(lower)) {
+        probe->kv_a_rows = std::max<uint64_t>(probe->kv_a_rows, rows);
+    } else if (moe_juju_name_is_mla_kv_b(lower)) {
+        probe->kv_b_rows = std::max<uint64_t>(probe->kv_b_rows, rows);
+        probe->kv_b_cols = std::max<uint64_t>(probe->kv_b_cols, cols);
+    } else if (moe_juju_name_is_std_q(lower)) {
+        probe->q_proj_rows = std::max<uint64_t>(probe->q_proj_rows, rows);
+    } else if (moe_juju_name_is_std_k(lower)) {
+        probe->k_proj_rows = std::max<uint64_t>(probe->k_proj_rows, rows);
+    } else if (moe_juju_name_is_std_v(lower)) {
+        probe->v_proj_rows = std::max<uint64_t>(probe->v_proj_rows, rows);
+    }
+    if (moe_juju_name_is_std_q_norm(lower)) {
+        probe->q_norm_rows = std::max<uint64_t>(probe->q_norm_rows, cols);
+    }
+    if (moe_juju_name_is_std_k_norm(lower)) {
+        probe->k_norm_rows = std::max<uint64_t>(probe->k_norm_rows, cols);
+    }
+    if (moe_juju_name_is_attn_o(lower)) {
+        probe->o_proj_cols = std::max<uint64_t>(probe->o_proj_cols, cols);
+    }
+}
+
+static void moe_juju_probe_finalize_attention(moe_juju_runtime_probe_t* probe) {
+    if (!probe) {
+        return;
+    }
+    moe_attn_config_t& cfg = probe->attn;
+    if (probe->kv_b_cols && probe->kv_a_rows > probe->kv_b_cols) {
+        cfg.type = moe_ATTN_TYPE_MLA;
+        cfg.kv_lora_rank = cfg.kv_lora_rank ? cfg.kv_lora_rank :
+            (uint32_t)std::min<uint64_t>(probe->kv_b_cols, UINT32_MAX);
+        cfg.qk_rope_head_dim = cfg.qk_rope_head_dim ? cfg.qk_rope_head_dim :
+            (uint32_t)std::min<uint64_t>(probe->kv_a_rows - probe->kv_b_cols, UINT32_MAX);
+        if (!cfg.q_lora_rank) {
+            cfg.q_lora_rank = (uint32_t)std::min<uint64_t>(
+                probe->q_b_cols ? probe->q_b_cols : probe->q_a_rows, UINT32_MAX);
+        }
+        if (!cfg.num_heads && cfg.head_dim && probe->q_b_rows >= cfg.head_dim) {
+            cfg.num_heads = (uint32_t)std::min<uint64_t>(probe->q_b_rows / cfg.head_dim, UINT32_MAX);
+        }
+        if (!cfg.head_dim && cfg.num_heads && probe->q_b_rows >= cfg.num_heads) {
+            cfg.head_dim = (uint32_t)std::min<uint64_t>(probe->q_b_rows / cfg.num_heads, UINT32_MAX);
+        }
+        if (!cfg.v_head_dim && cfg.num_heads && probe->o_proj_cols >= cfg.num_heads) {
+            cfg.v_head_dim = (uint32_t)std::min<uint64_t>(probe->o_proj_cols / cfg.num_heads, UINT32_MAX);
+        }
+        if (!cfg.qk_nope_head_dim && cfg.num_heads && cfg.v_head_dim &&
+            probe->kv_b_rows >= (uint64_t)cfg.num_heads * (uint64_t)cfg.v_head_dim) {
+            cfg.qk_nope_head_dim = (uint32_t)std::min<uint64_t>(
+                (probe->kv_b_rows / cfg.num_heads) - cfg.v_head_dim, UINT32_MAX);
+        }
+        if (!cfg.head_dim && cfg.qk_nope_head_dim && cfg.qk_rope_head_dim) {
+            cfg.head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
+        }
+        if (!cfg.num_kv_heads) {
+            cfg.num_kv_heads = cfg.num_heads;
+        }
+    } else {
+        const uint64_t norm_head_dim =
+            probe->q_norm_rows && probe->q_norm_rows == probe->k_norm_rows ?
+            probe->q_norm_rows : std::max<uint64_t>(probe->q_norm_rows, probe->k_norm_rows);
+        if (norm_head_dim &&
+            probe->q_proj_rows >= norm_head_dim &&
+            probe->k_proj_rows >= norm_head_dim &&
+            probe->q_proj_rows % norm_head_dim == 0 &&
+            probe->k_proj_rows % norm_head_dim == 0) {
+            cfg.head_dim = (uint32_t)std::min<uint64_t>(norm_head_dim, UINT32_MAX);
+            cfg.num_heads = (uint32_t)std::min<uint64_t>(probe->q_proj_rows / norm_head_dim, UINT32_MAX);
+            cfg.num_kv_heads = (uint32_t)std::min<uint64_t>(probe->k_proj_rows / norm_head_dim, UINT32_MAX);
+            if (probe->v_proj_rows >= cfg.num_kv_heads && cfg.num_kv_heads &&
+                probe->v_proj_rows % cfg.num_kv_heads == 0) {
+                cfg.v_head_dim = (uint32_t)std::min<uint64_t>(
+                    probe->v_proj_rows / cfg.num_kv_heads, UINT32_MAX);
+            }
+        }
+        if (!cfg.head_dim && cfg.num_heads && probe->q_proj_rows >= cfg.num_heads) {
+            cfg.head_dim = (uint32_t)std::min<uint64_t>(probe->q_proj_rows / cfg.num_heads, UINT32_MAX);
+        }
+        if (!cfg.num_heads && cfg.head_dim && probe->q_proj_rows >= cfg.head_dim) {
+            cfg.num_heads = (uint32_t)std::min<uint64_t>(probe->q_proj_rows / cfg.head_dim, UINT32_MAX);
+        }
+        if (!cfg.num_kv_heads && cfg.head_dim && probe->k_proj_rows >= cfg.head_dim) {
+            cfg.num_kv_heads = (uint32_t)std::min<uint64_t>(probe->k_proj_rows / cfg.head_dim, UINT32_MAX);
+        }
+        if (!cfg.v_head_dim && cfg.num_kv_heads && probe->v_proj_rows >= cfg.num_kv_heads) {
+            cfg.v_head_dim = (uint32_t)std::min<uint64_t>(probe->v_proj_rows / cfg.num_kv_heads, UINT32_MAX);
+        }
+        if (cfg.num_heads) {
+            if (!cfg.num_kv_heads) {
+                cfg.num_kv_heads = cfg.num_heads;
+            }
+            cfg.type = cfg.num_kv_heads == 1u ? moe_ATTN_TYPE_MQA :
+                (cfg.num_kv_heads < cfg.num_heads ? moe_ATTN_TYPE_GQA : moe_ATTN_TYPE_MHA);
+        }
+        if (cfg.head_dim && probe->q_proj_rows >= cfg.head_dim &&
+            probe->q_proj_rows % cfg.head_dim == 0 &&
+            cfg.num_heads * cfg.head_dim != probe->q_proj_rows) {
+            cfg.num_heads = (uint32_t)std::min<uint64_t>(probe->q_proj_rows / cfg.head_dim, UINT32_MAX);
+        }
+        if (cfg.head_dim && probe->k_proj_rows >= cfg.head_dim &&
+            probe->k_proj_rows % cfg.head_dim == 0) {
+            cfg.num_kv_heads = (uint32_t)std::min<uint64_t>(probe->k_proj_rows / cfg.head_dim, UINT32_MAX);
+        }
+        if (cfg.num_kv_heads && probe->v_proj_rows >= cfg.num_kv_heads &&
+            probe->v_proj_rows % cfg.num_kv_heads == 0) {
+            cfg.v_head_dim = (uint32_t)std::min<uint64_t>(
+                probe->v_proj_rows / cfg.num_kv_heads, UINT32_MAX);
+        }
+        if (cfg.num_heads) {
+            cfg.type = cfg.num_kv_heads == 1u ? moe_ATTN_TYPE_MQA :
+                (cfg.num_kv_heads < cfg.num_heads ? moe_ATTN_TYPE_GQA : moe_ATTN_TYPE_MHA);
+        }
+    }
+    if (!cfg.max_seq_len) cfg.max_seq_len = 8192u;
+    if (!cfg.rope_table_len || cfg.rope_table_len < cfg.max_seq_len) {
+        cfg.rope_table_len = std::max<uint32_t>(16384u, cfg.max_seq_len);
+    }
+    if (cfg.rope_theta <= 0.0f) cfg.rope_theta = 500000.0f;
+    if (cfg.rms_norm_eps <= 0.0f) cfg.rms_norm_eps = 1.0e-6f;
+}
+
+static void moe_juju_probe_apply(moe_pc_engine* engine, moe_juju_runtime_probe_t* probe) {
+    if (!engine || !probe) {
+        return;
+    }
+    moe_juju_probe_finalize_attention(probe);
+    if (probe->shape.experts_per_moe_layer && probe->shape.projection_count == 0) {
+        probe->shape.projection_count = 3;
+    }
+    if (probe->shape.experts_per_moe_layer && probe->shape.num_hidden_layers &&
+        probe->shape.first_moe_layer == 0 && probe->shape.last_moe_layer == 0) {
+        probe->shape.last_moe_layer = probe->shape.num_hidden_layers - 1u;
+    }
+    engine->dynamic_shape = probe->shape;
+    if (!probe->architecture.empty()) {
+        engine->dynamic_architecture = probe->architecture;
+    }
+    if (!probe->model_id.empty()) {
+        engine->dynamic_model_id = probe->model_id;
+    }
+    if (probe->shape.hidden_size && probe->shape.num_hidden_layers &&
+        (probe->shape.vocab_size || probe->shape.experts_per_moe_layer)) {
+        engine->dynamic_shape_valid.store(1, std::memory_order_relaxed);
+    }
+    if (probe->attn.type != moe_ATTN_TYPE_UNKNOWN &&
+        probe->attn.num_heads && probe->attn.head_dim) {
+        engine->attn_config = probe->attn;
+        engine->attn_config_valid.store(1, std::memory_order_relaxed);
+    }
+}
 
 static void moe_register_gguf_common_tensor(
     moe_pc_engine* engine,
@@ -417,6 +857,31 @@ static int load_gguf_tensor_directory_as_tensor_index(
         return 0;
     }
     std::sort(paths.begin(), paths.end());
+    moe_juju_runtime_probe_t probe{};
+    for (const std::string& path : paths) {
+        moe_juju_header_t header{};
+        std::vector<moe_juju_section_entry_t> sections;
+        uint64_t file_bytes = 0;
+        if (!moe_juju_read_table_local(path, &header, &sections, &file_bytes)) {
+            continue;
+        }
+        moe_juju_probe_note_header(&probe, header);
+        std::string index_json;
+        if (!moe_read_juju_tensor_index_json(path, sections, file_bytes, &index_json)) {
+            continue;
+        }
+        moe_juju_probe_note_index_json(&probe, index_json);
+        std::vector<moe_juju_tensor_json_entry_t> tensors;
+        if (moe_parse_juju_tensor_index_json(index_json, &tensors, nullptr, nullptr, nullptr)) {
+            for (const moe_juju_tensor_json_entry_t& entry : tensors) {
+                moe_juju_probe_note_tensor(&probe, entry);
+            }
+        }
+    }
+    moe_juju_probe_apply(engine, &probe);
+    engine->expert_states.assign(expert_slot_count(engine), moe_block_state{});
+    tensor_slots_reset(engine);
+    engine->tensors.reserve(tensor_record_capacity(engine));
     std::unordered_map<std::string, uint16_t> path_index_map;
     uint64_t records = 0;
     for (const std::string& path : paths) {
@@ -588,6 +1053,7 @@ static int load_juju_tensor_index_as_tensor_index(
     std::sort(paths.begin(), paths.end());
     std::unordered_map<std::string, uint16_t> path_index_map;
     uint64_t records = 0;
+    moe_juju_runtime_probe_t probe{};
     for (const std::string& path : paths) {
         moe_juju_header_t header{};
         std::vector<moe_juju_section_entry_t> sections;
@@ -595,15 +1061,20 @@ static int load_juju_tensor_index_as_tensor_index(
         if (!moe_juju_read_table_local(path, &header, &sections, &file_bytes)) {
             continue;
         }
+        moe_juju_probe_note_header(&probe, header);
         std::string index_json;
         if (!moe_read_juju_tensor_index_json(path, sections, file_bytes, &index_json)) {
             continue;
         }
+        moe_juju_probe_note_index_json(&probe, index_json);
         moe_ingest_juju_graph_ir(engine, index_json);
         std::vector<moe_juju_tensor_json_entry_t> tensors;
         if (!moe_parse_juju_tensor_index_json(index_json, &tensors, nullptr, nullptr, nullptr) ||
             tensors.empty()) {
             continue;
+        }
+        for (const moe_juju_tensor_json_entry_t& entry : tensors) {
+            moe_juju_probe_note_tensor(&probe, entry);
         }
         uint16_t path_idx = 0xFFFFu;
         auto pit = path_index_map.find(path);
@@ -736,6 +1207,7 @@ static int load_juju_tensor_index_as_tensor_index(
     if (!records) {
         return 0;
     }
+    moe_juju_probe_apply(engine, &probe);
     finish_tensor_index_load(engine);
     moe_dynamic_shape_finalize_adapter(engine);
     std::fprintf(stderr,
@@ -770,12 +1242,20 @@ int moe_pc_engine_load_codec_table(
         return 0;
     }
 
+    // BUGFIX 133: Stop generation before clearing tensor records ★★
+    // Problem: moe_pc_engine_wait_io() stops IO workers but not generation
+    // Generation thread can still access engine->tensors during clear()
+    // → iterator invalidation, use-after-free, segfault
+    // Solution: Set generation phase to IDLE before clearing tensors
+    // Ensures no generation thread accesses tensors during model reload
+    engine->generation_phase.store(moe_GEN_PHASE_IDLE, std::memory_order_release);
+
     moe_pc_engine_wait_io(engine);
     device_free_pool(engine, moe_DEVICE_POOL_FIXED);
     device_free_pool(engine, moe_DEVICE_POOL_EXPERT);
     device_free_pool(engine, moe_DEVICE_POOL_ACTIVATION);
     device_free_pool(engine, moe_DEVICE_POOL_STREAM);
-    engine->expert_states.assign(expert_slot_count(), moe_block_state{});
+    engine->expert_states.assign(expert_slot_count(engine), moe_block_state{});
     engine->ram_used_bytes.store(0);
     engine->db_used_bytes.store(0);
     apply_common_vram_reservation(engine);
@@ -807,7 +1287,7 @@ int moe_pc_engine_load_codec_table(
     engine->max_tensor_stream_bytes = 0;
     engine->common_raw_prefetched_bytes.store(0);
     engine->common_raw_prefetched_spans.store(0);
-    engine->tensors.reserve(tensor_record_capacity());
+    engine->tensors.reserve(tensor_record_capacity(engine));
     tensor_slots_reset(engine);
     engine->model_root = model_root ? model_root : "";
     moe_model_root_check_t root_check{};

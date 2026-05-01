@@ -209,6 +209,25 @@ struct moe_io_ring_adapter {
         return nullptr;
     }
 
+    // BUGFIX 121: Issue 26 - Add blocking wait_completion() for io_uring ★★
+    // Replaces spin-yield loop with kernel-level blocking wait.
+    void* wait_completion() {
+        if (!initialized) return nullptr;
+#if defined(__linux__) && MOE_HAVE_LIBURING
+        struct io_uring_cqe* cqe;
+        if (io_uring_wait_cqe(&ring, &cqe) == 0 && cqe) {
+            void* user_data = io_uring_cqe_get_data(cqe);
+            const int res = cqe->res;
+            io_uring_cqe_seen(&ring, cqe);
+            return res >= 0 ? user_data : nullptr;
+        }
+#elif defined(_WIN32)
+        // Windows IORing doesn't have blocking wait, fallback to peek
+        return peek_completion();
+#endif
+        return nullptr;
+    }
+
     void cleanup() {
         if (!initialized) return;
 #if defined(__linux__) && MOE_HAVE_LIBURING

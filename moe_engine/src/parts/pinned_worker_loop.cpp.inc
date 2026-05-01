@@ -1,7 +1,28 @@
-﻿static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
+static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
     if (!engine) {
         return;
     }
+
+    // BUGFIX 129: Add InflightGuard to prevent inflight count leaks ★★
+    // Problem: Worker terminates while task is popped → inflight stuck
+    // Solution: RAII guard ensures finish_stage_task on all exit paths
+    struct InflightGuard {
+        moe_pc_engine* e;
+        moe_stage_queue* stage;
+        bool finished = false;
+
+        ~InflightGuard() {
+            if (e && stage && !finished) {
+                // Abnormal exit - decrement inflight
+                finish_stage_task(e, *stage, 0, 1);
+            }
+        }
+
+        void mark_finished() {
+            finished = true;
+        }
+    } inflight_guard{engine, &engine->pinned_stage, false};
+
     uint32_t pingpong = 0;
     for (;;) {
         moe_prefetch_task task{};
@@ -47,16 +68,28 @@
                         terminal = 0;
                         engine->pinned_stage.cv.notify_one();
                     } else {
-                        // BUGFIX 64: Issue 8 - Track dropped_requests when enqueue fails ?�★
-                        // Problem: enqueue_stage_or_retry fails ??task silently lost
-                        // Only staging_slot_waits increments, dropped_requests stays 0
-                        // /health shows dropped_requests=0 but tasks are actually dropping
-                        // moe_layer_moe_mlp_f32 waits for expert that will never arrive
-                        // Solution: Increment dropped_requests on enqueue failure
-                        // Impact: Monitoring shows true drop rate, orchestrator feedback works
-                        engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                        // BUGFIX 64: Issue 8 - Track dropped_requests when enqueue fails
+                        // FIX 7: Requeue to disk_stage as urgent fallback instead of
+                        // silently dropping. Generation loop would otherwise block forever
+                        // waiting for an expert that will never arrive.
+                        if (task.requeue_count < 10u) {
+                            task.urgent = 1;
+                            task.stage = moe_TRANSFER_STAGE_DISK_TO_RAM;
+                            if (enqueue_stage_or_retry(engine, engine->disk_stage, task)) {
+                                engine->disk_stage.cv.notify_one();
+                                ok = 1;
+                                terminal = 0;
+                            } else {
+                                engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        } else {
+                            // Exceeded requeue limit — genuinely drop
+                            engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                        }
                     }
                     finish_stage_task(engine, engine->pinned_stage, ok, terminal);
+                    inflight_guard.mark_finished();  // BUGFIX 129: Mark as finished
+
                     if (worker_index >= engine->pinned_worker_target.load()) {
                         return;
                     }
@@ -122,6 +155,8 @@
         }
 
         finish_stage_task(engine, engine->pinned_stage, ok, terminal);
+        inflight_guard.mark_finished();  // BUGFIX 129: Mark as finished to prevent double-decrement
+
         if (worker_index >= engine->pinned_worker_target.load()) {
             return;
         }

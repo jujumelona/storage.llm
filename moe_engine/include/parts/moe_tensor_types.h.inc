@@ -10,10 +10,19 @@ typedef enum {
     moe_WEIGHT_ENCODING_LINEAR_Q8 = 8,
     moe_WEIGHT_ENCODING_GGUF_IQ2 = 9,
     moe_WEIGHT_ENCODING_GGUF_IQ3 = 10,
-    moe_WEIGHT_ENCODING_GGUF_IQ4 = 11
+    moe_WEIGHT_ENCODING_GGUF_IQ4 = 11,
+    moe_WEIGHT_ENCODING_GGUF_Q5_1 = 12,
+    moe_WEIGHT_ENCODING_GGUF_Q8_0 = 13,
+    moe_WEIGHT_ENCODING_GGUF_Q5_K = 14
 } moe_weight_encoding_t;
 
 typedef struct {
+    uint64_t weight_byte_offset;
+    uint64_t weight_byte_length;
+    uint64_t scale_byte_offset;
+    uint64_t scale_byte_length;
+    uint64_t scale2_byte_offset;
+    uint64_t scale2_byte_length;
     uint32_t part;
     uint32_t shard;
     uint32_t layer;
@@ -23,18 +32,11 @@ typedef struct {
     uint32_t cols;
     uint32_t groups;
     uint32_t group_size;
-    uint64_t weight_byte_offset;
-    uint64_t weight_byte_length;
-    uint64_t scale_byte_offset;
-    uint64_t scale_byte_length;
-    uint64_t scale2_byte_offset;
-    uint64_t scale2_byte_length;
     int has_scale4;
     uint32_t weight_encoding;
     uint32_t weight_bits;
     uint32_t weight_block_size;
 } moe_tensor_info_t;
-
 typedef struct {
     uint32_t token_index;
     uint32_t layer;

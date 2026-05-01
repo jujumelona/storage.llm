@@ -7,6 +7,7 @@ struct alignas(64) moe_io_atomic_stats {
     std::atomic<uint64_t> completed_requests{0};
     std::atomic<uint64_t> failed_requests{0};
     std::atomic<uint64_t> dropped_requests{0};
+    std::atomic<uint64_t> urgent_dropped_requests{0};  // BUGFIX 201: Separate urgent drop counter
     std::atomic<uint64_t> bytes_prefetched{0};
 
     // --- Cache line 2: disk worker counters ---

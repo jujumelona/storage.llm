@@ -18,48 +18,24 @@ static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int
     return bytes;
 }
 
-// TODO: Issue 8 - Windows PrefetchVirtualMemory ineffective.
-// Problem: PrefetchVirtualMemory on some Windows versions is no-op
-// GetCurrentProcess() handle doesn't work reliably for prefetch
-// Page faults still occur at DMA time, blocking IO workers
-// Solution options:
-// 1. FILE_FLAG_NO_BUFFERING + separate IO thread for async read
-// 2. CreateFile + ReadFileEx with overlapped I/O
-// 3. Use OpenProcess(PROCESS_ALL_ACCESS, FALSE, GetCurrentProcessId())
-// Status: Documented as TODO, requires Windows-specific testing
+// BUGFIX 120: Issue 25 - Windows PrefetchVirtualMemory is blocking, not async ★★★
+// Problem: PrefetchVirtualMemory is a hint, not a guarantee. When io_worker calls memcpy,
+// if pages aren't in RAM yet, page fault blocks the worker. This is the root cause of
+// "TODO: Issue 8" that was never fully resolved.
+// Solution: Remove PrefetchVirtualMemory entirely on Windows when DirectStorage is off.
+// Instead, prefetch_tensor_file_to_pinned should use ReadFile + OVERLAPPED for async I/O.
+// The mmap handle can be reopened as a file handle (shard->hFile already exists in mmap_context_t).
+// Trade-off: Requires managing file handles, but eliminates blocking page faults.
+// Status: PrefetchVirtualMemory removed. Async ReadFile path is in prefetch_pinned.cpp.inc.
 static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, uint64_t bytes) {
 #ifdef _WIN32
     if (engine && engine->io_config.enable_directstorage) {
-        return; // DirectStorage가 prefetch를 처리하므로 불필요
+        return; // DirectStorage handles prefetch internally
     }
-#endif
-    if (!src || bytes == 0) {
-        return;
-    }
-    // PIPELINE FIX 1: Remove synchronous page scan loop.
-    // Old code: 5,000 page accesses for 20MB tensor ??io_worker blocks on page faults
-    // New code: OS async hint only ??io_worker continues immediately
-    // Trade-off: Some page faults may occur at memcpy time, but MADV_WILLNEED
-    // usually completes before next task starts. Non-blocking is better.
-    // BUGFIX 78: Issue 8 - Windows PrefetchVirtualMemory ineffective.
-    // Problem: GetCurrentProcess() pseudo-handle doesn't always work with PrefetchVirtualMemory
-    // Solution: Use OpenProcess to get a real handle to the current process
-    // BUGFIX 82: Issue 4 - Skip Windows prefetch when DirectStorage enabled.
-    // DirectStorage handles prefetch internally, PrefetchVirtualMemory is redundant
-#ifdef _WIN32
-    // Note: DirectStorage check would go here if engine pointer was available
-    // For now, we keep the improved OpenProcess approach
-    WIN32_MEMORY_RANGE_ENTRY entry;
-    entry.VirtualAddress = const_cast<uint8_t*>(src);
-    entry.NumberOfBytes = (SIZE_T)bytes;
-    HANDLE s_self_process = OpenProcess(PROCESS_ALL_ACCESS, FALSE, GetCurrentProcessId());
-    if (s_self_process) {
-        BOOL success = PrefetchVirtualMemory(s_self_process, 1, &entry, 0);
-        CloseHandle(s_self_process);
-        if (!success && engine) {
-            const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_touch_fallback.fetch_add(bytes, std::memory_order_relaxed);
-        }
-    } else if (engine) {
+    // BUGFIX 120: PrefetchVirtualMemory removed - it's blocking, not async.
+    // Async ReadFile path in prefetch_tensor_file_to_pinned handles this properly.
+    // For mmap path, we accept page faults as unavoidable without kernel support.
+    if (engine) {
         const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_touch_fallback.fetch_add(bytes, std::memory_order_relaxed);
     }
 #elif defined(__linux__)
@@ -212,9 +188,15 @@ try_next_lockfree_slot:
             } else {
                 target_cv = &engine->staging_direct_cv;
             }
+            // BUGFIX 195: Reduce wait timeout to prevent GPU starvation ★★★
+            // Problem: 20 retries × 5ms = 100ms blocking
+            // During this time gpu_stage queue empties → GPU completely idle
+            // Solution: Reduce timeout 5ms → 1ms (20ms total max)
+            // Still allows reasonable wait but prevents long GPU starvation
+            // Impact: GPU idle time reduced from 100ms → 20ms worst case
             std::unique_lock<std::mutex> lock(engine->staging_slot_mutex);
             target_cv->wait_for(
-                lock, std::chrono::milliseconds(5),
+                lock, std::chrono::milliseconds(1),
                 [&]() { return (engine->staging_slot_free_mask.load(std::memory_order_acquire) & range_mask) != 0; }
             );
         }
@@ -266,10 +248,12 @@ try_next_lockfree_slot:
         }
 
         std::unique_lock<std::mutex> lock(engine->staging_slot_mutex);
+        // BUGFIX 195: Reduce wait timeout to prevent GPU starvation ★★★
         // Fix 4: Use predicate wait to eliminate polling delay.
-        // Wake immediately when a slot is freed, timeout after 5ms max.
+        // Wake immediately when a slot is freed, timeout after 1ms max (was 5ms).
+        // 20 retries × 1ms = 20ms total (was 100ms) → reduces GPU idle time
         const bool got_slot = target_cv->wait_for(
-            lock, std::chrono::milliseconds(5),
+            lock, std::chrono::milliseconds(1),
             [&]() { return engine->staging_free_slot_count.load(std::memory_order_acquire) > 0; }
         );
         if (!got_slot) {

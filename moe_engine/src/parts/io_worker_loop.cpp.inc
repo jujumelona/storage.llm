@@ -1,4 +1,4 @@
-﻿static int prefetch_one_raw_span(
+static int prefetch_one_raw_span(
     moe_pc_engine* e,
     const moe_storage_raw_span_spec_t& s,
     uint8_t pool,
@@ -76,6 +76,25 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         }
         const uint64_t vram_bud = tier_budget(engine, moe_TIER_VRAM);
         const uint64_t ram_bud = tier_budget(engine, moe_TIER_RAM);
+        const uint64_t ram_used = tier_used(engine, moe_TIER_RAM);
+
+        // BUGFIX 124: Issue 29 - Skip RAM eviction for Metal unified memory ★★
+        // Metal uses unified memory budget tracked in VRAM only (ram_budget_bytes = 0).
+        // RAM eviction would interfere with OS's native unified memory pressure management.
+        // Metal automatically pages out to backing store when needed.
+        const bool skip_ram_eviction = (engine->backend_caps.backend == moe_BACKEND_METAL &&
+                                        engine->backend_caps.supports_unified_memory);
+
+        if (!skip_ram_eviction) {
+            const uint64_t ram_target_pct  = engine->io_config.ram_eviction_threshold_pct  ? engine->io_config.ram_eviction_threshold_pct  : 80u;
+            const uint64_t ram_trigger_pct  = ram_target_pct + 5u <= 100u ? ram_target_pct + 5u : 100u;
+            const uint64_t ram_target = (ram_bud * ram_target_pct) / 100ull;
+            const uint64_t ram_threshold_85 = (ram_bud * ram_trigger_pct) / 100ull;
+            if (ram_bud > 0 && ram_used > ram_threshold_85 && ram_used > ram_target) {
+                std::vector<std::pair<int, int>> ignored;
+                demote_cold_until(engine, moe_TIER_RAM, ram_bud - ram_target, ignored);
+            }
+        }
         const uint64_t vram_used = tier_used(engine, moe_TIER_VRAM);
 
         // BUGFIX 57: Issue 2 - Lower proactive eviction trigger to 85% ★★
@@ -86,11 +105,13 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         // Ensures eviction starts BEFORE attention prefetch cutoff
         // Trade-off: More frequent eviction, but prevents attention stalls
         // BUGFIX 99: Precompute percentage thresholds
-        const uint64_t vram_target = (vram_bud * 75ull) / 100ull;
-        const uint64_t vram_threshold_85 = (vram_bud * 85ull) / 100ull;
+        const uint64_t vram_target_pct  = engine->io_config.vram_eviction_threshold_pct ? engine->io_config.vram_eviction_threshold_pct : 75u;
+        const uint64_t vram_trigger_pct  = vram_target_pct + 10u <= 100u ? vram_target_pct + 10u : 100u;
+        const uint64_t vram_target = (vram_bud * vram_target_pct) / 100ull;
+        const uint64_t vram_threshold_85 = (vram_bud * vram_trigger_pct) / 100ull;
         if (vram_bud > 0 && vram_used > vram_threshold_85 && vram_used > vram_target) {
             std::vector<std::pair<int, int>> freed;
-            demote_cold_until(engine, moe_TIER_VRAM, vram_used - vram_target, freed);
+            demote_cold_until(engine, moe_TIER_VRAM, vram_bud - vram_target, freed);
             if (!freed.empty() && !engine->io_stop.load(std::memory_order_relaxed)) {
                 // BUGFIX 36: Reduce batch_size from 8 to 4 to lower mutex hold time ?�★??
                 // Old: 8 × cuMemFree (100µs each) = 800µs device_mutex hold
@@ -100,13 +121,7 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
                 device_free_experts_batched(engine, freed, 4);
             }
         }
-        const uint64_t ram_used = tier_used(engine, moe_TIER_RAM);
-        const uint64_t ram_target = (ram_bud * 80ull) / 100ull;
-        const uint64_t ram_threshold_85 = (ram_bud * 85ull) / 100ull;
-        if (ram_bud > 0 && ram_used > ram_threshold_85 && ram_used > ram_target) {
-            std::vector<std::pair<int, int>> ignored;
-            demote_cold_until(engine, moe_TIER_RAM, ram_used - ram_target, ignored);
-        }
+
     }
 }
 
@@ -127,6 +142,27 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
             }
         }
     } stream_guard{engine};
+
+    // BUGFIX 129: Add InflightGuard to prevent inflight count leaks ★★
+    // Problem: Worker terminates (worker_index >= worker_target) while task is popped
+    // inflight incremented → worker exits → finish_stage_task never called → inflight stuck
+    // Solution: RAII guard ensures finish_stage_task on all exit paths
+    struct InflightGuard {
+        moe_pc_engine* e;
+        moe_stage_queue* stage;
+        bool finished = false;
+
+        ~InflightGuard() {
+            if (e && stage && !finished) {
+                // Abnormal exit - decrement inflight
+                finish_stage_task(e, *stage, 0, 1);
+            }
+        }
+
+        void mark_finished() {
+            finished = true;
+        }
+    } inflight_guard{engine, &engine->disk_stage, false};
 
     moe_io_path_t active_path = choose_active_io_path(engine);
     engine->io_atomic.active_path.store(static_cast<uint32_t>(active_path));
@@ -463,6 +499,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         }
 
         finish_stage_task(engine, engine->disk_stage, ok, terminal);
+        inflight_guard.mark_finished();  // BUGFIX 129: Mark as finished to prevent double-decrement
 
         if (worker_index >= engine->disk_worker_target.load()) {
             exit_worker();

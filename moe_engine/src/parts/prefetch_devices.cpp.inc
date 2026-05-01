@@ -2,7 +2,7 @@ static void demote_failed_device_expert(moe_pc_engine* engine, const moe_tensor_
     if (!engine) {
         return;
     }
-    const size_t slot = expert_dense_slot((int)rec.info.layer, (int)rec.info.expert);
+    const size_t slot = expert_dense_slot(engine, (int)rec.info.layer, (int)rec.info.expert);
     if (slot == tensor_slot_invalid() || slot >= engine->expert_states.size()) {
         return;
     }
@@ -22,8 +22,9 @@ static void demote_failed_device_expert(moe_pc_engine* engine, const moe_tensor_
         engine->vram_expert_count.fetch_sub(1);
         state.tier = tier_used(engine, moe_TIER_RAM) + state.bytes <= tier_budget(engine, moe_TIER_RAM) ?
             moe_TIER_RAM : moe_TIER_DB;
-        if (state.tier == moe_TIER_RAM) engine->ram_expert_count.fetch_add(1);
-        else if (state.tier == moe_TIER_DB) engine->db_expert_count.fetch_add(1);
+        // BUGFIX 153: Add memory_order_relaxed for statistics counters
+        if (state.tier == moe_TIER_RAM) engine->ram_expert_count.fetch_add(1, std::memory_order_relaxed);
+        else if (state.tier == moe_TIER_DB) engine->db_expert_count.fetch_add(1, std::memory_order_relaxed);
         add_tier_usage(engine, state.tier, state.bytes);
         state_copy = state;
     }
@@ -68,8 +69,9 @@ static int prefetch_tensor_pinned_to_gpu(
     if (sync_after) {
         device_stream_sync_current(engine);
     }
-    engine->io_atomic.bytes_pinned_to_gpu.fetch_add(bytes);
-    engine->io_atomic.gpu_stage_done.fetch_add(1);
+    // BUGFIX 153: Add memory_order_relaxed for statistics counters
+    engine->io_atomic.bytes_pinned_to_gpu.fetch_add(bytes, std::memory_order_relaxed);
+    engine->io_atomic.gpu_stage_done.fetch_add(1, std::memory_order_relaxed);
     return 1;
 }
 
@@ -91,8 +93,9 @@ static int prefetch_tensor_direct_to_gpu(moe_pc_engine* engine, const moe_tensor
         return 0;
     }
     device_stream_sync_current(engine);
-    engine->io_atomic.bytes_direct_to_gpu.fetch_add(bytes);
-    engine->io_atomic.direct_stage_done.fetch_add(1);
+    // BUGFIX 153: Add memory_order_relaxed for statistics counters
+    engine->io_atomic.bytes_direct_to_gpu.fetch_add(bytes, std::memory_order_relaxed);
+    engine->io_atomic.direct_stage_done.fetch_add(1, std::memory_order_relaxed);
     return 1;
 }
 

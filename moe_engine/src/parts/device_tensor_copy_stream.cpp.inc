@@ -147,13 +147,17 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
         if (copy.key != 0) {
             device_complete_pending_copy_key(e, copy.key);
         }
-        release_staging_slot(e, copy.slot);
+        // BUGFIX 193: Slot already released in device_copy_tensor_from_host ★★★
+        // Only release if slot is still valid (UINT32_MAX means already released)
+        if (copy.slot != UINT32_MAX) {
+            release_staging_slot(e, copy.slot);
+        }
         if (copy.event) {
             device_recycle_copy_event(e, copy.event);
         }
         // BUGFIX 67: Issue 2 - Use pop_front() instead of erase(begin()).
-        // Old: copies.erase(copies.begin()) ??O(n) on vector
-        // New: copies.pop_front() ??O(1) on deque
+        // Old: copies.erase(copies.begin()) → O(n) on vector
+        // New: copies.pop_front() → O(1) on deque
         copies.pop_front();
         ++released;
     }

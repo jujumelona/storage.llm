@@ -77,7 +77,8 @@ static void reap_dead_workers(moe_pc_engine* engine, std::vector<std::thread>& w
 }
 
 static void resize_disk_workers(moe_pc_engine* engine, uint32_t target) {
-    engine->disk_worker_target.store(target);
+    // BUGFIX 206: Add memory_order_relaxed for worker target ★
+    engine->disk_worker_target.store(target, std::memory_order_relaxed);
     if (engine->io_workers.size() > target) {
         engine->disk_stage.cv.notify_all();
         reap_dead_workers(engine, engine->io_workers, engine->disk_worker_target);
@@ -90,7 +91,8 @@ static void resize_disk_workers(moe_pc_engine* engine, uint32_t target) {
 }
 
 static void resize_pinned_workers(moe_pc_engine* engine, uint32_t target) {
-    engine->pinned_worker_target.store(target);
+    // BUGFIX 206: Add memory_order_relaxed for worker target ★
+    engine->pinned_worker_target.store(target, std::memory_order_relaxed);
     if (engine->pinned_workers.size() > target) {
         engine->pinned_stage.cv.notify_all();
         reap_dead_workers(engine, engine->pinned_workers, engine->pinned_worker_target);
@@ -103,7 +105,8 @@ static void resize_pinned_workers(moe_pc_engine* engine, uint32_t target) {
 }
 
 static void resize_gpu_workers(moe_pc_engine* engine, uint32_t target) {
-    engine->gpu_worker_target.store(target);
+    // BUGFIX 206: Add memory_order_relaxed for worker target ★
+    engine->gpu_worker_target.store(target, std::memory_order_relaxed);
     if (engine->gpu_workers.size() > target) {
         engine->gpu_stage.cv.notify_all();
         reap_dead_workers(engine, engine->gpu_workers, engine->gpu_worker_target);

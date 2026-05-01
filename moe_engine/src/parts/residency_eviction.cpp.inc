@@ -1,4 +1,4 @@
-﻿// ============================================================
+// ============================================================
 // Mutex ordering convention:
 //   device_mutex -> map_mutex for device allocation cleanup.
 //   evict heap selection uses heap_mutex -> map_mutex and does not hold device_mutex.
@@ -14,8 +14,12 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
         return 0;
     }
     const uint32_t heap_size = (uint32_t)engine->evict_heaps[idx].size();
-    // Bug 21 Fix: Reduce stale_limit from 128 to 64 to reduce map_mutex contention
-    const uint32_t stale_limit = std::max<uint32_t>(64u, std::min<uint32_t>(256u, heap_size / 8u));
+    // FIX 8: Increase stale_limit but never compact inline.
+    // compact_evict_heap grabs heap_mutex -> map_mutex -> heap_mutex which
+    // serializes GPU upload workers that also need map_mutex.
+    // Instead, just skip stale entries and let proactive_eviction_worker_loop
+    // compact the heap periodically (every 25ms cycle).
+    const uint32_t stale_limit = std::max<uint32_t>(128u, std::min<uint32_t>(512u, heap_size / 4u));
     uint32_t stale_count = 0;
     std::unique_lock<std::mutex> heap_lock(evict_heap_mutex(engine, idx));
     while (!engine->evict_heaps[idx].empty() && stale_count < stale_limit) {
@@ -24,17 +28,15 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
         engine->evict_heap_versions[idx].fetch_add(1, std::memory_order_release);
         if (victim.slot >= engine->expert_states.size()) {
             ++stale_count;
-            // Bug 21 Fix: Reduce compaction threshold from 128 to 64
-            if (stale_count >= 64u) {
-                heap_lock.unlock();
-                compact_evict_heap(engine, idx, true);
-                heap_lock.lock();
-                stale_count = 0;
-            }
-            continue;
+            continue;  // FIX 8: skip only, no inline compact
         }
         {
             std::lock_guard<std::mutex> map_lock(engine->map_mutex);
+            // BUGFIX 173: Re-check size after acquiring map_lock (TOCTOU prevention)
+            if (victim.slot >= engine->expert_states.size()) {
+                ++stale_count;
+                continue;
+            }
             const moe_block_state& state = engine->expert_states[victim.slot];
             if (state.active && !state.pending_evict && state.tier == tier &&
                 state.bytes == victim.bytes && state.hot_score == victim.hot_score &&
@@ -45,13 +47,10 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
             }
         }
         ++stale_count;
-        // Bug 21 Fix: Reduce compaction threshold from 128 to 64
-        if (stale_count >= 64u) {
-            heap_lock.unlock();
-            compact_evict_heap(engine, idx, true);
-            heap_lock.lock();
-            stale_count = 0;
-        }
+    }
+    // FIX 8: Signal deferred compact if we hit a lot of stale entries
+    if (stale_count >= 64u) {
+        engine->evict_heap_compact_needed.store(true, std::memory_order_relaxed);
     }
     return 0;
 }
@@ -93,7 +92,7 @@ static int demote_one_victim_to(
             engine->vram_expert_count.fetch_sub(1);
             int layer = 0;
             int expert = 0;
-            expert_dense_slot_decode(victim.slot, &layer, &expert);
+            expert_dense_slot_decode(engine, victim.slot, &layer, &expert);
             // Safe: to_free.push_back while holding map_lock
             // device_free_experts_batched called later without any locks held
             to_free.push_back({layer, expert});
@@ -104,9 +103,10 @@ static int demote_one_victim_to(
             engine->db_expert_count.fetch_sub(1);
         }
         state.tier = to;
-        if (to == moe_TIER_VRAM) engine->vram_expert_count.fetch_add(1);
-        else if (to == moe_TIER_RAM) engine->ram_expert_count.fetch_add(1);
-        else if (to == moe_TIER_DB) engine->db_expert_count.fetch_add(1);
+        // BUGFIX 152: Add memory_order_relaxed for statistics counters
+        if (to == moe_TIER_VRAM) engine->vram_expert_count.fetch_add(1, std::memory_order_relaxed);
+        else if (to == moe_TIER_RAM) engine->ram_expert_count.fetch_add(1, std::memory_order_relaxed);
+        else if (to == moe_TIER_DB) engine->db_expert_count.fetch_add(1, std::memory_order_relaxed);
         add_tier_usage(engine, to, state.bytes);
         evict_snap = state;
     }
@@ -146,7 +146,8 @@ static void demote_cold_until(moe_pc_engine* engine, moe_tier_t tier, uint64_t n
 
     compact_evict_heap(engine, idx);
 
-    while (tier_used(engine, tier) + needed > budget) {
+    int max_attempts = 1000;
+    while (tier_used(engine, tier) + needed > budget && max_attempts-- > 0) {
         moe_evict_candidate victim{};
         if (!pop_valid_evict_candidate(engine, tier, &victim)) {
             return;

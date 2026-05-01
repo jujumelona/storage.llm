@@ -295,6 +295,14 @@ int moe_pc_engine_orchestrate_moe_step(moe_pc_engine_t* engine, int current_laye
             if (!out_plan->throttle_speculative) {
                 orchestrator_append_topology(engine, current_layer, selected_experts, selected_count,
                     out_plan->speculative_tier, out_items, max_items, &kept);
+
+                std::vector<int> dejavu_predicted = moe_juju_predict_co_activation(engine, current_layer + 2, 4);
+                std::vector<int> dejavu_domain;
+                moe_expand_merged_experts(current_layer + 2, dejavu_predicted, dejavu_domain);
+                for (int e : dejavu_domain) {
+                    orchestrator_append_item(engine, out_items, max_items, &kept, current_layer + 2, e,
+                        moe_TIER_RAM, moe_PREFETCH_REASON_LOOKAHEAD, 80.0f);
+                }
             }
         }
         out_plan->planned_prefetch_count = kept;
@@ -363,7 +371,15 @@ static void prescope_compute_global_plan(
             plan->int4_slots[d] = 0;
         } else {
             const float allowed_gb = (compute_ms_per_layer / 1000.0f) * total_bw;
-            const uint32_t full_capacity = (uint32_t)(allowed_gb / expert_gb);
+            // BUGFIX 148: Check expert_gb > 0 before division to prevent division by zero
+            // Very small experts (< 1MB) can result in expert_gb = 0.0f
+            uint32_t full_capacity = 0;
+            if (expert_gb > 1e-6f) {
+                full_capacity = (uint32_t)(allowed_gb / expert_gb);
+            } else {
+                // Very small experts: assume we can fit all
+                full_capacity = n_experts;
+            }
             plan->vram_slots[d] = std::min(n_experts, full_capacity);
             plan->int4_slots[d] = n_experts - plan->vram_slots[d];
         }

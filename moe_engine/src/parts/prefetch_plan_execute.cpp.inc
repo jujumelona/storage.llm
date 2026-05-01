@@ -1,4 +1,4 @@
-﻿int moe_pc_engine_execute_prefetch_plan(
+int moe_pc_engine_execute_prefetch_plan(
     moe_pc_engine_t* engine,
     const moe_expert_prefetch_item_t* items,
     uint32_t item_count
@@ -15,7 +15,7 @@
     {
         std::lock_guard<std::mutex> lock(engine->map_mutex);
         for (uint32_t i = 0; i < item_count; ++i) {
-            const size_t slot = expert_dense_slot((int)items[i].layer, (int)items[i].expert);
+            const size_t slot = expert_dense_slot(engine, (int)items[i].layer, (int)items[i].expert);
             if (slot < engine->expert_states.size()) {
                 const moe_block_state& state = engine->expert_states[slot];
                 stream_inflight[i] = state.active && state.tier == moe_TIER_STREAM ? 1u : 0u;
@@ -61,7 +61,7 @@
     if (!flat_to_free.empty()) {
         std::lock_guard<std::mutex> lock(engine->map_mutex);
         for (const auto& victim : flat_to_free) {
-            const size_t slot = expert_dense_slot(victim.first, victim.second);
+            const size_t slot = expert_dense_slot(engine, victim.first, victim.second);
             if (slot < engine->expert_states.size()) {
                 moe_block_state& state = engine->expert_states[slot];
                 if (state.active && state.tier == moe_TIER_VRAM) {
@@ -88,10 +88,11 @@
             if (try_add_tier_usage(engine, moe_TIER_VRAM, items[i].bytes,
                                    tier_budget(engine, moe_TIER_VRAM))) {
                 admitted_tiers[i] = moe_TIER_VRAM;
-                // Prevent global RAM reservation leaks when upgrading RAM admission to VRAM.
-                // prefetch_admitted_tier adds to global pending_ram_reservation.
-                // If we change tier to VRAM, the cleanup loop at the end (which checks for RAM tier)
-                // will skip this item, leaking the reservation permanently.
+                // FIX 8: Release the RAM reservation since we are upgrading to VRAM.
+                // Do NOT add to pending_vram_reservation: try_add_tier_usage already
+                // committed directly to vram_used_bytes. Adding to pending here would
+                // cause a transient double-count between now and the cleanup loop,
+                // incorrectly blocking other router-selected experts from VRAM admission.
                 prefetch_release_pending_ram_reservation(engine, items[i].bytes);
                 if (batch_ram_reserved >= items[i].bytes) {
                     batch_ram_reserved -= items[i].bytes;
@@ -101,12 +102,39 @@
     }
 
     // Pass 2: Enqueue all items
+    // BUGFIX 127: Issue 32 - Re-check expert state between Pass 1 and Pass 2 ★★★
+    // Problem: Pass 1 releases map_mutex after admission decisions.
+    // Between Pass 1 and Pass 2, another worker can move same expert to different tier.
+    // Pass 1 decides "upload to VRAM" → Pass 2 finds it already in VRAM → duplicate upload.
+    // Solution: Re-acquire map_mutex at Pass 2 start, re-check tier and pending_evict.
+    // Skip if already in target tier, wait if pending_evict.
     int ok_count = 0;
     for (uint32_t i = 0; i < item_count; ++i) {
         if (stream_inflight[i]) {
             ++ok_count;
             continue;
         }
+
+        // BUGFIX 127: Re-check state before enqueue
+        bool skip_item = false;
+        {
+            std::lock_guard<std::mutex> lock(engine->map_mutex);
+            const size_t slot = expert_dense_slot(engine, (int)items[i].layer, (int)items[i].expert);
+            if (slot < engine->expert_states.size()) {
+                const moe_block_state& state = engine->expert_states[slot];
+                // Already in target tier → skip
+                if (state.active && state.tier == admitted_tiers[i]) {
+                    skip_item = true;
+                    ++ok_count;
+                }
+                // Pending eviction → skip (will be retried by eviction completion handler)
+                else if (state.pending_evict) {
+                    skip_item = true;
+                }
+            }
+        }
+        if (skip_item) continue;
+
         const int queued = moe_pc_engine_prefetch_expert_triplet_impl(
             engine,
             (int)items[i].layer,
@@ -123,7 +151,7 @@
             bool is_streaming = false;
             {
                 std::lock_guard<std::mutex> lock(engine->map_mutex);
-                const size_t slot = expert_dense_slot((int)items[i].layer, (int)items[i].expert);
+                const size_t slot = expert_dense_slot(engine, (int)items[i].layer, (int)items[i].expert);
                 if (slot < engine->expert_states.size()) {
                     const moe_block_state& state = engine->expert_states[slot];
                     is_streaming = state.active && state.tier == moe_TIER_STREAM;
@@ -142,10 +170,15 @@
             }
         }
         if (admitted_tiers[i] == moe_TIER_RAM &&
-            !prefetch_is_router_selected(items[i]) &&
             items[i].bytes > 0) {
             prefetch_release_pending_ram_reservation(engine, items[i].bytes);
-        } else if (admitted_tiers[i] == moe_TIER_VRAM && items[i].bytes > 0) {
+        } else if (admitted_tiers[i] == moe_TIER_VRAM
+                   && items[i].target_tier == moe_TIER_VRAM  // original VRAM target only
+                   && items[i].bytes > 0) {
+            // FIX 8: Only release pending_vram_reservation for items that were originally
+            // admitted as VRAM (via prefetch_admitted_tier which adds to pending).
+            // Items upgraded from RAM to VRAM in the loop above did NOT add to pending,
+            // so they must NOT release here.
             prefetch_release_pending_vram_reservation(engine, items[i].bytes);
         }
     }

@@ -16,6 +16,13 @@ static int device_backend_is_hip(const moe_pc_engine* e) {
     return e && e->backend_caps.backend == moe_BACKEND_HIP && e->hip.library;
 }
 
+// BUGFIX 125: Issue 30 - Vulkan/Level Zero/SYCL dummy async is actually sync ★★
+// Problem: device_backend_stream_create returns dummy handle (void*)1 for these backends.
+// Code thinks it has async streams, but device_backend_copy_h2d_async falls back to sync.
+// gpu_worker_loop tries double-buffering with dma_overlap_stream, but it's all synchronous.
+// Solution: Set supports_backend_async_api = false in device_types.cpp.inc for these backends.
+// This makes code explicitly use sync path, avoiding false async assumptions.
+// Trade-off: No change in actual behavior (already sync), but eliminates misleading code paths.
 static int device_backend_stream_create(moe_pc_engine* e, CUstream* out_stream, unsigned int flags) {
     if (out_stream) *out_stream = nullptr;
     if (!out_stream) return 0;
@@ -25,13 +32,8 @@ static int device_backend_stream_create(moe_pc_engine* e, CUstream* out_stream, 
     if (device_backend_is_hip(e) && e->hip.hipStreamCreate) {
         return e->hip.hipStreamCreate(out_stream, flags) == 0;
     }
-    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
-              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
-              e->backend_caps.backend == moe_BACKEND_SYCL)) {
-        // Return dummy handle to prevent fallback to sync
-        *out_stream = (void*)1;
-        return 1;
-    }
+    // BUGFIX 125: Removed dummy stream creation for Vulkan/Level Zero/SYCL.
+    // These backends should set supports_backend_async_api = false instead.
     return 0;
 }
 static int device_backend_stream_sync(moe_pc_engine* e, CUstream stream) {
@@ -42,11 +44,7 @@ static int device_backend_stream_sync(moe_pc_engine* e, CUstream stream) {
     if (device_backend_is_hip(e) && e->hip.hipStreamSynchronize) {
         return e->hip.hipStreamSynchronize(stream) == 0;
     }
-    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
-              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
-              e->backend_caps.backend == moe_BACKEND_SYCL)) {
-        return 1; // Simulated sync
-    }
+    // BUGFIX 125: Removed dummy sync for Vulkan/Level Zero/SYCL
     return 0;
 }
 static void device_backend_stream_destroy(moe_pc_engine* e, CUstream stream) {
@@ -69,12 +67,7 @@ static int device_backend_event_create(moe_pc_engine* e, CUevent* out_event) {
     if (device_backend_is_hip(e) && e->hip.hipEventCreate) {
         return e->hip.hipEventCreate(out_event, disable_timing) == 0;
     }
-    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
-              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
-              e->backend_caps.backend == moe_BACKEND_SYCL)) {
-        *out_event = (void*)1; // Dummy handle
-        return 1;
-    }
+    // BUGFIX 125: Removed dummy event for Vulkan/Level Zero/SYCL
     return 0;
 }
 
@@ -86,11 +79,7 @@ static int device_backend_event_record(moe_pc_engine* e, CUevent event, CUstream
     if (device_backend_is_hip(e) && e->hip.hipEventRecord) {
         return e->hip.hipEventRecord(event, stream) == 0;
     }
-    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
-              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
-              e->backend_caps.backend == moe_BACKEND_SYCL)) {
-        return 1;
-    }
+    // BUGFIX 125: Removed dummy record for Vulkan/Level Zero/SYCL
     return 0;
 }
 
@@ -102,11 +91,7 @@ static int device_backend_event_query(moe_pc_engine* e, CUevent event) {
     if (device_backend_is_hip(e) && e->hip.hipEventQuery) {
         return e->hip.hipEventQuery(event) == 0;
     }
-    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
-              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
-              e->backend_caps.backend == moe_BACKEND_SYCL)) {
-        return 1; // Always completed in dummy implementation
-    }
+    // BUGFIX 125: Removed dummy query for Vulkan/Level Zero/SYCL
     return 0;
 }
 
@@ -153,11 +138,7 @@ static int device_backend_event_sync(moe_pc_engine* e, CUevent event) {
         }
         return e->hip.hipEventQuery(event) == 0;
     }
-    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
-              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
-              e->backend_caps.backend == moe_BACKEND_SYCL)) {
-        return 1;
-    }
+    // BUGFIX 125: Removed dummy sync for Vulkan/Level Zero/SYCL
     return 0;
 }
 
@@ -181,10 +162,7 @@ static int device_backend_async_h2d_available(moe_pc_engine* e, CUstream stream,
     if (e && e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO) {
         return e->ze.zeCommandListAppendMemoryCopy != nullptr;
     }
-    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
-              e->backend_caps.backend == moe_BACKEND_SYCL)) {
-        return 1; // Dummy driver returns true
-    }
+    // BUGFIX 125: Removed dummy async for Vulkan/SYCL
     return 0;
 }
 
@@ -215,12 +193,7 @@ static int device_backend_copy_h2d_async(
         // Returning true (1) if zeCommandListAppendMemoryCopy succeeds (returns 0).
         return e->ze.zeCommandListAppendMemoryCopy(stream, (void*)dst, src, (size_t)bytes, nullptr, 0, nullptr) == 0;
     }
-
-    if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
-              e->backend_caps.backend == moe_BACKEND_SYCL)) {
-        // Dummy async copy -> fallback to sync for now
-        return device_backend_copy_h2d_sync(e, dst, src, bytes);
-    }
+    // BUGFIX 125: Removed dummy async copy for Vulkan/SYCL - should use sync path
     return 0;
 }
 

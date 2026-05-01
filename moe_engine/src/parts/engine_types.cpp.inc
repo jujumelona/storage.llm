@@ -5,6 +5,12 @@ struct moe_block_state {
     uint64_t last_touch_epoch = 0;
     uint64_t predicted_next_use_epoch = UINT64_MAX;
     uint16_t access_count = 0;  // ARC: frequency counter for T1/T2 classification
+    // BUGFIX 196: Add avg_gap_ema for better next-use prediction ★★
+    // Problem: predicted_next_use_epoch calculated from hot_score inverse
+    // Doesn't distinguish periodic vs irregular access patterns
+    // Solution: Track actual call interval EMA (exponential moving average)
+    // Impact: More accurate eviction decisions, better cache hit rate
+    uint64_t avg_gap_ema = 0;  // Average gap between accesses (epoch units)
     bool active = false;
     bool pending_evict = false;
 };
@@ -79,16 +85,18 @@ struct moe_gguf_common_tensor_record {
 
 enum moe_forward_adapter_kind : uint32_t {
     moe_FORWARD_ADAPTER_NONE = 0,
-    moe_FORWARD_ADAPTER_GLM_RAW = 1,
+    moe_FORWARD_ADAPTER_RAW_STATIC = 1,
     moe_FORWARD_ADAPTER_GGUF_GENERIC = 2,
-    moe_FORWARD_ADAPTER_GGUF_GEMMA = 3
+    moe_FORWARD_ADAPTER_GGUF_MOE = 3,
+    moe_FORWARD_ADAPTER_GRAPH_IR = 4
 };
 
 static const char* moe_forward_adapter_name(uint32_t adapter) {
     switch (adapter) {
-        case moe_FORWARD_ADAPTER_GLM_RAW: return "glm_raw";
+        case moe_FORWARD_ADAPTER_RAW_STATIC: return "raw_static";
         case moe_FORWARD_ADAPTER_GGUF_GENERIC: return "gguf_generic";
-        case moe_FORWARD_ADAPTER_GGUF_GEMMA: return "gguf_gemma";
+        case moe_FORWARD_ADAPTER_GGUF_MOE: return "gguf_moe";
+        case moe_FORWARD_ADAPTER_GRAPH_IR: return "graph_ir";
         default: return "none";
     }
 }
@@ -102,6 +110,8 @@ struct moe_raw_tensor_cache_entry {
     uint32_t rows = 0;
     uint32_t cols = 0;
     uint8_t scalar_encoding = moe_RAW_SCALAR_BF16;
+    uint8_t weight_format = moe_WEIGHT_ENCODING_RAW_FP16;
+    uint64_t weight_row_bytes = 0;
 };
 
 struct moe_prefetch_task {

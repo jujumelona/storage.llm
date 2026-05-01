@@ -22,10 +22,10 @@ static void reset_staging_slots(moe_pc_engine* engine) {
     // staging_slots.clear() invalidates iterators and pointers while workers may be accessing slots.
     // Solution: Set free_slot_count to 0 first to block new acquisitions, then wait for in-use slots.
     std::lock_guard<std::mutex> lock(engine->staging_slot_mutex);
-    
+
     // Step 1: Block new slot acquisitions
     engine->staging_free_slot_count.store(0, std::memory_order_release);
-    
+
     // Step 2: Wait for all slots to be released (in_use == false)
     // Timeout after 5 seconds to prevent deadlock if workers are stuck
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -42,12 +42,12 @@ static void reset_staging_slots(moe_pc_engine* engine) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
-    
+
     if (!all_released) {
         fprintf(stderr, "[storageLLM WARNING] reset_staging_slots: Some slots still in use after 5s timeout. "
                 "Proceeding with reset anyway - may cause use-after-free if workers access freed slots.\n");
     }
-    
+
     engine->ring_adapter.cleanup();
     for (auto& slot : engine->staging_slots) {
         slot.buf = nullptr;
@@ -61,7 +61,8 @@ static void reset_staging_slots(moe_pc_engine* engine) {
     engine->staging_pinned_slot_count.store(0, std::memory_order_release);
     engine->staging_gpu_slot_count.store(0, std::memory_order_release);
     engine->staging_direct_slot_count.store(0, std::memory_order_release);
-    engine->io_atomic.staging_slot_deficit.store(0);
+    // BUGFIX 204: Add memory_order_relaxed for statistics counter ★
+    engine->io_atomic.staging_slot_deficit.store(0, std::memory_order_relaxed);
     // BUGFIX 68: Issue 5 - Notify all 3 CVs on reset ??
     engine->staging_pinned_cv.notify_all();
     engine->staging_gpu_cv.notify_all();
@@ -114,7 +115,7 @@ static void moe_staging_slot_targets(
     uint32_t pinned_target = pinned_workers > 0 ? std::max(1u, pinned_workers * 2u) : 0u;
     uint32_t gpu_target = gpu_workers > 0 ? std::max(1u, gpu_workers * gpu_batch_eff) : 0u;
     uint32_t direct_target = moe_staging_direct_slot_target(engine, disk_workers);
-    
+
     if (engine && engine->backend_caps.backend == moe_BACKEND_METAL) {
         gpu_target = 0;
     }
@@ -207,7 +208,7 @@ static void moe_scale_staging_slot_counts(
             }
         }
     }
-    
+
     // BUGFIX: Guard against direct slots dropping to 0 due to rounding
     if (direct_target > 0 && direct == 0 && total_count >= 3) {
         direct = 1;
@@ -237,7 +238,21 @@ static uint32_t moe_staging_min_slot_count(const moe_pc_engine* engine) {
     uint32_t direct_target = 0;
     moe_staging_slot_targets(engine, &pinned_target, &gpu_target, &direct_target);
     const uint32_t total = pinned_target + gpu_target + direct_target;
-    return total > 0 ? std::max(4u, total) : 0u;
+
+    // BUGFIX 194: Add worker-based minimum to prevent structural slot shortage ★★★
+    // Problem: slot_count based only on target ratios, can be less than worker count
+    // → Workers spin-wait for slots, pipeline stalls
+    // Solution: Ensure min slots >= (disk + pinned + gpu) workers × 2
+    // × 2 factor allows one slot in-flight, one being filled
+    // Impact: Eliminates structural slot shortage, improves throughput
+    const uint32_t worker_based_min =
+        runtime_disk_workers(engine) +
+        runtime_pinned_workers(engine) +
+        runtime_gpu_workers(engine);
+    const uint32_t worker_min_with_margin = worker_based_min > 0 ? worker_based_min * 2u : 0u;
+
+    const uint32_t original_min = total > 0 ? std::max(4u, total) : 0u;
+    return std::max(original_min, worker_min_with_margin);
 }
 
 static uint32_t moe_staging_target_slot_count(const moe_pc_engine* engine) {
@@ -281,7 +296,7 @@ static void update_staging_slot_deficit(moe_pc_engine* engine) {
             deficit = min_slots - actual;
         }
     }
-    engine->io_atomic.staging_slot_deficit.store(deficit);
+    engine->io_atomic.staging_slot_deficit.store(deficit, std::memory_order_relaxed);  // BUGFIX 204: Add memory_order
     // Problem 5 Fix: Don't increment staging_wraps here ??that's for transient contention
     // staging_slot_deficit = structural shortage (config issue, tracked here)
     // staging_slot_contention = transient slot exhaustion (tracked in prefetch_bytes.cpp.inc)
@@ -405,7 +420,7 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
 #else
         slot.metal_buffer = nullptr;
 #endif
-        slot.in_use.store(false);
+        slot.in_use.store(false, std::memory_order_relaxed);  // BUGFIX 204: Add memory_order
         engine->staging_slots.emplace_back(std::move(slot));
     }
 #ifdef ENABLE_LOCKFREE_STAGING
@@ -426,7 +441,7 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
             (unsigned long long)engine->staging_size);
     }
     engine->staging_free_slot_count.store(slot_count, std::memory_order_release);
-    
+
     // Register staging slots with IORing/io_uring
     if (engine->backend_caps.supports_registered_io_buffers && slot_count > 0 && engine->staging_pinned) {
         const uint32_t queue_depth = std::max(64u, slot_count * 2);

@@ -1,4 +1,4 @@
-﻿static void moe_enqueue_attention_prefetch(moe_pc_engine* engine, int32_t layer) {
+static void moe_enqueue_attention_prefetch(moe_pc_engine* engine, int32_t layer) {
     if (!engine || layer < 0) {
         return;
     }
@@ -19,8 +19,9 @@
     uint32_t queued_spans[sizeof(kinds) / sizeof(kinds[0]) + 1u] = {};
     uint32_t queued_count = 0;
 
-    const moe_storage_constants_t* c = moe_storage_constants();
-    if (c && layer >= c->first_moe_layer && layer <= c->last_moe_layer) {
+    const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
+    const moe_storage_constants_t* c = &runtime_c;
+    if (layer >= (int32_t)c->first_moe_layer && layer <= (int32_t)c->last_moe_layer) {
         const uint32_t router_si = moe_storage_router_span_index(layer);
         if (router_si != 0xFFFFFFFFu) {
             queued_spans[queued_count++] = router_si;
@@ -88,19 +89,23 @@ static int moe_can_enqueue_attention_lookahead(moe_pc_engine* engine, int32_t la
     if (bytes == 0) {
         return 1;
     }
-    // BUGFIX 23: Use expert VRAM only, not total device allocation ?�★??    // Old: device_allocated_bytes includes fixed (KV cache, embeddings) ??premature cutoff
-    // New: tier_used(VRAM) only counts expert weights ??accurate threshold
+    // BUGFIX 23: Use expert VRAM only, not total device allocation ★★
+    // Old: device_allocated_bytes includes fixed (KV cache, embeddings) → premature cutoff
+    // New: tier_used(VRAM) only counts expert weights → accurate threshold
     // Fixed allocations don't compete with attention prefetch, only experts do
     const uint64_t used = tier_used(engine, moe_TIER_VRAM);
     const uint64_t budget = engine->config.vram_budget_bytes;
-    // PIPELINE FIX 19: Raise attention lookahead threshold from 83% to 85% ?�★
-    // Old: threshold = budget * 5/6 ??83% ??dead zone between 83%-90%
-    // New: threshold = budget * 85/100 = 85% ??aligns better with proactive eviction (90%)
-    // Prevents attention prefetch cutoff before expert eviction starts
-    // Dead zone reduced from 7% to 5%, improves attention prefetch opportunities
-    // BUGFIX 99: Precompute percentage threshold
-    // Fix 5: Change threshold from 85% to 88% to reduce attention prefetch dead-zone
-    const uint64_t threshold = (budget * 88ull) / 100ull;
+
+    // BUGFIX 132: Centralize attention prefetch threshold ★★
+    // Problem: Threshold scattered across multiple files (83%, 85%, 87%, 88%)
+    // Proactive eviction trigger at 85%, but attention cutoff was 88%
+    // → 3% dead zone where attention blocked but eviction not started yet
+    // Solution: Use config field with 85% default, aligns with proactive eviction
+    // Ensures eviction starts BEFORE attention prefetch cutoff
+    const uint32_t threshold_pct = engine->io_config.attention_prefetch_threshold_pct
+        ? engine->io_config.attention_prefetch_threshold_pct
+        : 85u;
+    const uint64_t threshold = (budget * (uint64_t)threshold_pct) / 100ull;
     return used < threshold && bytes <= threshold - used;
 }
 

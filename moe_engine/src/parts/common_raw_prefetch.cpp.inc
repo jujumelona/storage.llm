@@ -29,13 +29,13 @@ static int prefetch_one_raw_span(moe_pc_engine* e, const moe_storage_raw_span_sp
         return 1;
     }
     const moe_storage_part_spec_t* part = moe_storage_part_by_id(s.part);
-        mmap_context_t* mapped = part ? get_or_map_shard_partial_by_id(
-            e,
-            s.part,
-            resolve_model_file_path(e->model_root, part->path ? part->path : "", ""),
-            s.offset,
-            s.bytes
-        ) : nullptr;
+    mmap_context_t* mapped = part ? get_or_map_shard_partial_by_id(
+        e,
+        s.part,
+        resolve_model_file_path(e->model_root, part->path ? part->path : "", ""),
+        s.offset,
+        s.bytes
+    ) : nullptr;
     const uint64_t file_size = mapped ? (uint64_t)mmap_get_size(mapped) : 0;
     if (!mapped || !mmap_get_ptr(mapped, 0) || s.bytes > file_size) {
         return 0;
@@ -62,6 +62,18 @@ static int prefetch_one_raw_span(moe_pc_engine* e, const moe_storage_raw_span_sp
 static int enqueue_raw_span_prefetch(moe_pc_engine* e, uint32_t span_index, uint8_t pool) {
     if (!e) {
         return 0;
+    }
+    const moe_storage_raw_span_spec_t* s = moe_storage_raw_span_at(span_index);
+    if (!s) return 0;
+    const uint64_t layer = (uint64_t)((uint32_t)s->layer & 0xffffu);
+    const uint64_t part = (uint64_t)((uint32_t)s->part & 0xffffu);
+    const uint64_t key = (4ull << 60) | ((uint64_t)(pool & 0x0fu) << 56) | (part << 40) | (layer << 24) | ((s->offset >> 12) & 0x00ffffffull);
+    {
+        std::lock_guard<std::mutex> lock(e->device_mutex);
+        auto it = e->device_allocations.find(key);
+        if (it != e->device_allocations.end() && !it->second.pending_free) {
+            return 1; // BUGFIX: Already resident, skip enqueue!
+        }
     }
     if (!ensure_io_ready(e)) {
         return 0;
@@ -181,7 +193,7 @@ static void trigger_ram_expert_promotion(moe_pc_engine* e) {
             const uint32_t promote_count = std::min<uint32_t>(max_promote, (uint32_t)ram_experts.size());
             for (uint32_t i = 0; i < promote_count; ++i) {
                 int layer = 0, expert = 0;
-                expert_dense_slot_decode(ram_experts[i].first, &layer, &expert);
+                expert_dense_slot_decode(e, ram_experts[i].first, &layer, &expert);
                 const uint64_t bytes = expert_triplet_bytes(e, layer, expert);
                 if (bytes > 0) {
                     moe_pc_engine_request_expert(e, layer, expert, bytes, moe_TIER_VRAM);

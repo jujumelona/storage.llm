@@ -86,6 +86,7 @@ typedef struct {
     uint64_t completed_requests;
     uint64_t failed_requests;
     uint64_t dropped_requests;
+    uint64_t urgent_dropped_requests;  // BUGFIX 201: Separate urgent drop counter
     uint64_t bytes_prefetched;
     uint64_t bytes_disk_to_ram;
     uint64_t bytes_ram_to_pinned;

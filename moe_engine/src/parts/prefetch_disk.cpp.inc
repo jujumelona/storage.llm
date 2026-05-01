@@ -46,17 +46,19 @@
             }
             touch_mapped_range(engine, src, length);
             if (!hint_issued) {
-                engine->io_atomic.bytes_touch_fallback.fetch_add(length);
+                // BUGFIX 155: Add memory_order_relaxed for statistics counter
+                engine->io_atomic.bytes_touch_fallback.fetch_add(length, std::memory_order_relaxed);
             }
             prefetched += length;
         }
     }
 
-    engine->io_atomic.bytes_prefetched.fetch_add(prefetched);
+    // BUGFIX 155: Add memory_order_relaxed for statistics counters
+    engine->io_atomic.bytes_prefetched.fetch_add(prefetched, std::memory_order_relaxed);
     if (hint_issued) {
-        engine->io_atomic.bytes_disk_hint_issued.fetch_add(prefetched);
+        engine->io_atomic.bytes_disk_hint_issued.fetch_add(prefetched, std::memory_order_relaxed);
     }
-    engine->io_atomic.disk_stage_done.fetch_add(1);
+    engine->io_atomic.disk_stage_done.fetch_add(1, std::memory_order_relaxed);
     return 1;
 }
 

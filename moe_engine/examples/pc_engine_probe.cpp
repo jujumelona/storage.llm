@@ -16,9 +16,10 @@
 
 static const char* forward_adapter_name(uint32_t adapter) {
     switch (adapter) {
-        case 1: return "glm_raw";
+        case 1: return "raw_static";
         case 2: return "gguf_generic";
-        case 3: return "gguf_gemma";
+        case 3: return "gguf_moe";
+        case 4: return "graph_ir";
         default: return "none";
     }
 }

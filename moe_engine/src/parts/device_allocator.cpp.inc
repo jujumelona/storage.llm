@@ -7,6 +7,7 @@ static void device_free_locked(
     uint64_t key,
     std::vector<std::pair<CUdeviceptr, uint64_t>>* deferred_free_ptrs
 );
+static void device_refresh_mem_info(moe_pc_engine* e);
 
 #include "device_allocator_init.cpp.inc"
 #include "device_allocator_memory.cpp.inc"

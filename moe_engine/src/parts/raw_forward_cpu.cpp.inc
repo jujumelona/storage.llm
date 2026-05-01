@@ -16,7 +16,7 @@ static bool should_use_cpu_compute(const moe_pc_engine* engine, int layer, int e
     if (!engine) return false;
     
     // Check if expert is in RAM (not VRAM, not DB)
-    const size_t slot = expert_dense_slot(layer, expert);
+    const size_t slot = expert_dense_slot(engine, layer, expert);
     if (slot >= engine->expert_states.size()) return false;
     const moe_block_state& state = engine->expert_states[slot];
     if (state.tier != moe_TIER_RAM) return false;

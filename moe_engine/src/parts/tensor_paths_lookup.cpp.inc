@@ -26,5 +26,9 @@ static const moe_tensor_record* find_tensor_record(
     if (index == tensor_slot_invalid()) {
         return nullptr;
     }
+    // BUGFIX 175: Check index is within bounds before accessing vector
+    if (index >= engine->tensors.size()) {
+        return nullptr;
+    }
     return &engine->tensors[index];
 }

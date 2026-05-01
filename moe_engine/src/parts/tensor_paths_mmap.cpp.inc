@@ -152,13 +152,27 @@ static mmap_context_t* get_or_map_shard_partial(
     }
     {
         std::unique_lock<std::shared_mutex> lock(engine->shard_mutex);
+        int retry_count = 0;  // BUGFIX 202: Add retry counter for partial mmap timeout
         while (true) {
             auto found = engine->shard_mmaps.find(key);
             if (found != engine->shard_mmaps.end()) {
                 // BUGFIX 172: Use is_mmap_sentinel() for safe sentinel check
                 if (is_mmap_sentinel(found->second)) {
                     auto cv = shard_mmap_cv_locked(engine, key);
-                    cv->wait_for(lock, std::chrono::milliseconds(300));
+                    // BUGFIX 202: Match timeout pattern with get_or_map_shard ★
+                    // Problem: get_or_map_shard uses 100ms × 3 retries = 300ms total
+                    //          get_or_map_shard_partial uses 300ms × infinite loop = infinite wait
+                    // Solution: Use 100ms timeout with 3-retry limit (consistent with full mmap)
+                    auto status = cv->wait_for(lock, std::chrono::milliseconds(100));
+                    if (status == std::cv_status::timeout) {
+                        ++retry_count;
+                        if (retry_count >= 3) {
+                            // After 300ms timeout, assume IO worker is stuck
+                            fprintf(stderr, "[storageLLM WARNING] Partial shard load timeout for %s, attempting sync fallback\n",
+                                key.c_str());
+                            break;
+                        }
+                    }
                 } else {
                     auto cv_it = engine->shard_mmap_cvs.find(key);
                     if (cv_it != engine->shard_mmap_cvs.end() && cv_it->second) {
@@ -273,8 +287,12 @@ static void reset_source_mmap_slots(moe_pc_engine* engine) {
     if (!engine) {
         return;
     }
+    // BUGFIX 203: Add memory_order_relaxed for atomic store ★
+    // Problem: item.store(nullptr) without memory_order → defaults to seq_cst
+    // seq_cst is expensive (full memory barrier) and unnecessary here
+    // Solution: Use memory_order_relaxed (reset is not synchronization point)
     for (auto& item : engine->source_mmaps) {
-        item.store(nullptr);
+        item.store(nullptr, std::memory_order_relaxed);
     }
 }
 
@@ -284,7 +302,8 @@ static mmap_context_t* get_or_map_tensor_shard(moe_pc_engine* engine, const moe_
     }
     const uint32_t shard = rec.info.shard;
     if (shard < 256u) {
-        mmap_context_t* cached = engine->source_mmaps[shard].load();
+        // BUGFIX 203: Add memory_order_relaxed for atomic load ★
+        mmap_context_t* cached = engine->source_mmaps[shard].load(std::memory_order_relaxed);
         if (cached) {
             return cached;
         }

@@ -29,7 +29,7 @@ int moe_pc_engine_request_expert(
     if (!engine || layer < 0 || expert < 0 || bytes == 0) {
         return 0;
     }
-    const size_t slot = expert_dense_slot(layer, expert);
+    const size_t slot = expert_dense_slot(engine, layer, expert);
     if (slot == tensor_slot_invalid() || slot >= engine->expert_states.size()) {
         return 0;
     }
@@ -183,7 +183,7 @@ int moe_pc_engine_request_expert(
             }
             // Bug 7: Rollback demoted experts in to_free list
             for (auto& pair : to_free) {
-                const size_t victim_slot = expert_dense_slot(pair.first, pair.second);
+                const size_t victim_slot = expert_dense_slot(engine, pair.first, pair.second);
                 if (victim_slot < engine->expert_states.size()) {
                     moe_block_state& victim_state = engine->expert_states[victim_slot];
                     // Restore to VRAM (they were demoted from VRAM to RAM/DB in Phase 2)

@@ -57,6 +57,8 @@ static int device_allocator_init(moe_pc_engine* e) {
     // 32GB Mac -> 32GB VRAM budget -> OS pressure and excessive expert caching.
     // Also: if (false) block is dead code from refactoring
     // Solution: Reserve 25% for OS, remove dead code
+    // BUGFIX 124: Issue 29 - Metal unified memory budget integration ★★
+    // Set RAM budget to 0 for Metal, all tracking in VRAM budget (unified memory).
     } else if (e->backend_caps.backend == moe_BACKEND_METAL) {
         // Apple Silicon unified memory: reserve 25% for OS
         const uint64_t sys = e->backend_caps.system_memory_bytes > 0
@@ -67,6 +69,8 @@ static int device_allocator_init(moe_pc_engine* e) {
         }
         e->device_free_bytes.store(e->backend_caps.device_memory_bytes);
         e->device_total_bytes.store(e->backend_caps.device_memory_bytes);
+        // BUGFIX 124: Disable RAM budget for Metal - unified memory tracked in VRAM budget only
+        e->config.ram_budget_bytes = 0;
     } else if (e->backend_caps.backend == moe_BACKEND_VULKAN ||
                e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
                e->backend_caps.backend == moe_BACKEND_SYCL) {
@@ -77,29 +81,91 @@ static int device_allocator_init(moe_pc_engine* e) {
         }
 
         uint64_t free_mem = 0;
+        uint64_t total_mem = e->backend_caps.device_memory_bytes;
         int exact_queried = 0;
 
-        // BUGFIX 115: Implement actual VRAM query for Vulkan and Level Zero
+        // BUGFIX 200: Implement actual VRAM query for Vulkan and Level Zero ★
+        // Problem: Vulkan/Level Zero use 85% estimate, never query actual VRAM
+        // device_refresh_mem_info has query code but only runs on failure (hot path excluded)
+        // Solution: Query at init time to set accurate device_free_bytes baseline
         if (e->backend_caps.backend == moe_BACKEND_VULKAN && e->vk.vkGetPhysicalDeviceMemoryProperties2 && e->vk.physicalDevice) {
             // Vulkan: Query memory budget using VK_EXT_memory_budget
-            // VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
-            // budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
-            // VkPhysicalDeviceMemoryProperties2 props{};
-            // props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
-            // props.pNext = &budget;
-            // e->vk.vkGetPhysicalDeviceMemoryProperties2(e->vk.physicalDevice, &props);
-            // Sum budget.heapBudget[i] for device-local heaps to get free_mem
-            // exact_queried = 1;
-            // TODO: Requires VK_EXT_memory_budget extension and proper struct definitions
+            struct VkPhysicalDeviceMemoryBudgetPropertiesEXT_local {
+                uint32_t sType;
+                void* pNext;
+                uint64_t heapUsage[16];
+                uint64_t heapBudget[16];
+            } budget{};
+            budget.sType = 1000237000; // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT
+            struct VkMemoryHeap_local {
+                uint64_t size;
+                uint32_t flags;
+            };
+            struct VkPhysicalDeviceMemoryProperties_local {
+                uint32_t memoryTypeCount;
+                struct { uint32_t propertyFlags; uint32_t heapIndex; } memoryTypes[32];
+                uint32_t memoryHeapCount;
+                VkMemoryHeap_local memoryHeaps[16];
+            };
+            struct VkPhysicalDeviceMemoryProperties2_local {
+                uint32_t sType;
+                void* pNext;
+                VkPhysicalDeviceMemoryProperties_local memoryProperties;
+            } props{};
+            props.sType = 1000059006; // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2
+            props.pNext = &budget;
+            e->vk.vkGetPhysicalDeviceMemoryProperties2(e->vk.physicalDevice, &props);
+            uint64_t calc_free = 0;
+            uint64_t calc_total = 0;
+            for (uint32_t i = 0; i < props.memoryProperties.memoryHeapCount; ++i) {
+                if (props.memoryProperties.memoryHeaps[i].flags & 1) { // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+                    calc_total += props.memoryProperties.memoryHeaps[i].size;
+                    if (budget.heapBudget[i] > 0) {
+                        calc_free += (budget.heapBudget[i] > budget.heapUsage[i]) ? (budget.heapBudget[i] - budget.heapUsage[i]) : 0;
+                    } else {
+                        // Fallback to 85% if VK_EXT_memory_budget is missing
+                        calc_free += (props.memoryProperties.memoryHeaps[i].size * 85) / 100;
+                    }
+                }
+            }
+            if (calc_total > 0) {
+                free_mem = calc_free;
+                total_mem = calc_total;
+                exact_queried = 1;
+            }
         } else if (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO && e->ze.zeDeviceGetMemoryProperties && e->ze.device) {
             // Level Zero: Query memory properties
-            // ze_device_memory_properties_t mem_props{};
-            // mem_props.stype = ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES;
-            // uint32_t count = 1;
-            // e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &mem_props);
-            // free_mem = mem_props.totalSize; // May need zeDeviceGetMemoryAccessProperties for free estimate
-            // exact_queried = 1;
-            // TODO: Requires proper Level Zero API integration
+            struct ze_device_memory_properties_t_local {
+                uint32_t stype;
+                void* pNext;
+                uint32_t flags;
+                uint32_t maxClockRate;
+                uint32_t maxBusWidth;
+                uint64_t totalSize;
+                char name[256];
+            };
+            struct ze_device_memory_ext_properties_t_local {
+                uint32_t stype;
+                void* pNext;
+                uint32_t type;
+                uint64_t physicalSize;
+                uint64_t allocatedSize;
+            } ext_props{};
+            ext_props.stype = 0x0001000B; // ZE_STRUCTURE_TYPE_DEVICE_MEMORY_EXT_PROPERTIES
+            ze_device_memory_properties_t_local mem_props{};
+            mem_props.stype = 0x1; // ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES
+            mem_props.pNext = &ext_props;
+            uint32_t count = 1;
+            if (e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &mem_props) == 0) {
+                total_mem = mem_props.totalSize;
+                if (ext_props.allocatedSize > 0) {
+                    free_mem = (mem_props.totalSize > ext_props.allocatedSize) ? (mem_props.totalSize - ext_props.allocatedSize) : mem_props.totalSize;
+                } else {
+                    // Fallback to 85% if allocatedSize not populated
+                    free_mem = (mem_props.totalSize * 85) / 100;
+                }
+                exact_queried = 1;
+            }
         }
         
         if (!exact_queried) {
@@ -107,8 +173,9 @@ static int device_allocator_init(moe_pc_engine* e) {
             free_mem = (e->backend_caps.device_memory_bytes * 85ull) / 100ull;
         }
         e->device_free_bytes.store(free_mem);
-        e->device_total_bytes.store(e->backend_caps.device_memory_bytes);
+        e->device_total_bytes.store(total_mem);
     }
+    device_refresh_mem_info(e);
     e->device_allocator_ready.store(1);
     // Stream pool init moved to engine start
     return 1;

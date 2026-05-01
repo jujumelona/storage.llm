@@ -89,15 +89,19 @@ static int try_add_tier_usage(moe_pc_engine* engine, moe_tier_t tier, uint64_t b
     // Solution: Precompute threshold once before loop
     const uint64_t threshold_85 = budget > 0 ? (budget * 85ull) / 100ull : UINT64_MAX;
     for (;;) {
+        // BUGFIX 161: Strict budget check BEFORE CAS to prevent TOCTOU
         // Re-check budget in loop (current may have changed)
+        // Use strict inequality to prevent any possibility of exceeding budget
         if (budget != 0 && (current > budget || bytes > budget - current)) {
             return 0;
         }
+
+        // CAS attempt - current is re-loaded on failure
         if (counter->compare_exchange_weak(
                 current,
                 current + bytes,
-                std::memory_order_relaxed,
-                std::memory_order_relaxed)) {
+                std::memory_order_acq_rel,  // BUGFIX 161: Use acq_rel for proper synchronization
+                std::memory_order_acquire)) {  // BUGFIX 161: Use acquire on failure
             // Trigger eviction if threshold exceeded
             if (tier == moe_TIER_VRAM && (current + bytes) > threshold_85) {
                 engine->vram_eviction_needed.store(true, std::memory_order_relaxed);
@@ -111,6 +115,7 @@ static int try_add_tier_usage(moe_pc_engine* engine, moe_tier_t tier, uint64_t b
             }
             return 1;
         }
+        // CAS failed - current is updated with latest value, loop continues
     }
 }
 
@@ -235,6 +240,14 @@ static void touch_expert_heat(moe_pc_engine* engine, moe_block_state* state, dou
         state->access_count + 1u : UINT16_MAX;
 
     if (gap > 0) {
+        // BUGFIX 196: Update avg_gap_ema for better prediction ★★
+        // EMA with alpha=0.25 (weight 3:1 for old:new)
+        if (state->avg_gap_ema > 0) {
+            state->avg_gap_ema = (state->avg_gap_ema * 3 + gap) / 4;
+        } else {
+            state->avg_gap_ema = gap;  // First gap
+        }
+
         // ARC-adaptive decay: T2 (frequent, >=3 hits) decays slower than T1
         const bool is_frequent = state->access_count >= 3u;
         const int decay_shift_base = is_frequent ? 16 : 12;
@@ -251,12 +264,27 @@ static void touch_expert_heat(moe_pc_engine* engine, moe_block_state* state, dou
     state->hot_score += boost * freq_mult;
     state->last_touch_epoch = now;
 
-    const double heat = state->hot_score > 0.001 ? state->hot_score : 0.001;
-    uint64_t horizon = (uint64_t)(8192.0 / heat);
-    // Frequent experts: predict sooner re-use
-    if (state->access_count >= 3u) {
-        horizon = horizon > 1ull ? horizon / 2ull : 1ull;
+    // BUGFIX 196: Use avg_gap_ema for horizon prediction ★★
+    // Old: horizon = 8192.0 / heat (inverse of hot_score)
+    // New: Use actual measured gap EMA when available
+    // More accurate for periodic access patterns
+    uint64_t horizon = 0;
+    if (state->avg_gap_ema > 0) {
+        horizon = state->avg_gap_ema;
+        // Frequent experts: predict sooner re-use (reduce horizon by 25%)
+        if (state->access_count >= 3u) {
+            horizon = (horizon * 3) / 4;
+        }
+    } else {
+        // Fallback to hot_score-based prediction for new experts
+        const double heat = state->hot_score > 0.001 ? state->hot_score : 0.001;
+        horizon = (uint64_t)(8192.0 / heat);
+        // Frequent experts: predict sooner re-use
+        if (state->access_count >= 3u) {
+            horizon = horizon > 1ull ? horizon / 2ull : 1ull;
+        }
     }
+
     if (horizon < 1ull) {
         horizon = 1ull;
     } else if (horizon > (1ull << 30)) {
@@ -265,7 +293,19 @@ static void touch_expert_heat(moe_pc_engine* engine, moe_block_state* state, dou
     state->predicted_next_use_epoch = now > UINT64_MAX - horizon ? UINT64_MAX : now + horizon;
 }
 
+// BUGFIX 197: Preserve access_count on VRAM→RAM demotion ★★
+// Problem: Memory pressure forces VRAM→RAM, but access_count reset to 0
+// Hot expert treated as T1 (first-time) when re-promoted → fast decay
+// Solution: Only reset on RAM→DISK demotion (actual cold data)
 // ARC: reset access_count on demotion so re-admitted experts start in T1
-static void moe_arc_reset_on_demotion(moe_block_state* state) {
-    if (state) state->access_count = 0;
+static void moe_arc_reset_on_demotion(moe_block_state* state, moe_tier_t from, moe_tier_t to) {
+    if (!state) return;
+    // BUGFIX 197: Only reset for RAM→DISK, preserve for VRAM→RAM
+    if (from == moe_TIER_VRAM && to == moe_TIER_RAM) {
+        // Memory pressure demotion - keep access_count
+        // Expert likely to be re-promoted soon
+    } else {
+        // Actual cold data demotion - reset to T1
+        state->access_count = 0;
+    }
 }

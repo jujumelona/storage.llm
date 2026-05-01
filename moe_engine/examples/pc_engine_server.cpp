@@ -1264,9 +1264,10 @@ static bool get_cached_model_root_check(
 
 static const char* forward_adapter_name(uint32_t adapter) {
     switch (adapter) {
-        case 1: return "glm_raw";
+        case 1: return "raw_static";
         case 2: return "gguf_generic";
-        case 3: return "gguf_gemma";
+        case 3: return "gguf_moe";
+        case 4: return "graph_ir";
         default: return "none";
     }
 }
@@ -1451,9 +1452,10 @@ static std::string make_models_json(const server_options& opts) {
     return out.str();
 }
 
-static std::string make_openclaw_config_json(const server_options& opts) {
+static std::string make_openclaw_config_json(const server_options& opts, const moe_forward_status_t& forward) {
     const std::string base_url = "http://" + opts.host + ":" + std::to_string(opts.port) + "/v1";
     const std::string model_ref = "storagellm/" + opts.model_id;
+    uint32_t ctx_window = forward.dynamic_max_seq_len > 0 ? forward.dynamic_max_seq_len : 131072;
     std::ostringstream out;
     out << "{\n"
         << "  \"agents\": {\n"
@@ -1477,7 +1479,7 @@ static std::string make_openclaw_config_json(const server_options& opts) {
         << "            \"name\": \"" << json_escape(opts.model_id) << "\",\n"
         << "            \"reasoning\": false,\n"
         << "            \"input\": [\"text\"],\n"
-        << "            \"contextWindow\": 131072,\n"
+        << "            \"contextWindow\": " << ctx_window << ",\n"
         << "            \"maxTokens\": 4096,\n"
         << "            \"cost\": { \"input\": 0, \"output\": 0, \"cacheRead\": 0, \"cacheWrite\": 0 },\n"
         << "            \"compat\": { \"requiresStringContent\": true, \"supportsTools\": false }\n"
@@ -1490,11 +1492,11 @@ static std::string make_openclaw_config_json(const server_options& opts) {
     return out.str();
 }
 
-static bool write_openclaw_config_file(const server_options& opts) {
+static bool write_openclaw_config_file(const server_options& opts, const moe_forward_status_t& forward) {
     if (opts.openclaw_config_path.empty()) {
         return true;
     }
-    return write_text_file_utf8(opts.openclaw_config_path, make_openclaw_config_json(opts));
+    return write_text_file_utf8(opts.openclaw_config_path, make_openclaw_config_json(opts, forward));
 }
 
 static std::string generation_status_text(
@@ -1856,7 +1858,11 @@ static std::string route_request(
         return make_response(200, "application/json", make_models_json(opts));
     }
     if (req.method == "GET" && req.path == "/openclaw/config") {
-        return make_response(200, "application/json", make_openclaw_config_json(opts));
+        moe_forward_status_t forward{};
+        if (engine && (!runtime || runtime->model_ready.load(std::memory_order_acquire) != 0)) {
+            moe_pc_engine_get_forward_status(engine, &forward);
+        }
+        return make_response(200, "application/json", make_openclaw_config_json(opts, forward));
     }
     auto load_backend_caps = [&]() {
         moe_backend_caps_t caps{};
@@ -2299,7 +2305,8 @@ static int server_main(int argc, char** argv) {
         return 1;
     }
     apply_detected_budgets(&opts, caps);
-    if (!write_openclaw_config_file(opts)) {
+    moe_forward_status_t empty_forward{};
+    if (!write_openclaw_config_file(opts, empty_forward)) {
         network_cleanup();
         std::cerr << "Failed to write OpenClaw config: " << opts.openclaw_config_path << "\n";
         return 1;

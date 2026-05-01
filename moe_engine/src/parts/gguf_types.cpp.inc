@@ -83,8 +83,12 @@ static int moe_gguf_skip_value(std::ifstream& input, uint32_t type) {
             return 1;
         }
         uint64_t item_size = 0;
-        if (!moe_gguf_fixed_type_size(item_type, &item_size) ||
-            item_count > UINT64_MAX / item_size) {
+        // BUGFIX 150: Check item_size validity before using it in division
+        // Prevents division by zero if moe_gguf_fixed_type_size fails
+        if (!moe_gguf_fixed_type_size(item_type, &item_size)) {
+            return 0;
+        }
+        if (item_size == 0 || item_count > UINT64_MAX / item_size) {
             return 0;
         }
         return moe_gguf_skip_bytes(input, item_count * item_size);

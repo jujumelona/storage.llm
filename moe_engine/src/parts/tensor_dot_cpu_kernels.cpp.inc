@@ -125,6 +125,116 @@ static uint32_t moe_packed_lsb_code_at(const uint8_t* packed, uint32_t element_i
     return (window >> shift) & mask;
 }
 
+static float moe_dot_gguf_q8_0_row(
+    const uint8_t* packed,
+    const float* x,
+    uint32_t cols
+) {
+    if (!packed || !x) {
+        return 0.0f;
+    }
+    float acc = 0.0f;
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 34u;
+    for (uint32_t start = 0; start < cols; start += block_cols) {
+        uint16_t d16 = 0;
+        std::memcpy(&d16, packed, sizeof(d16));
+        const float d = moe_raw_fp16_to_f32(d16);
+        const int8_t* q = reinterpret_cast<const int8_t*>(packed + 2u);
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
+        for (uint32_t i = 0; i < limit; ++i) {
+            acc += d * (float)q[i] * x[start + i];
+        }
+        packed += block_bytes;
+    }
+    return acc;
+}
+static float moe_e8m0_to_f32_half(uint8_t v) {
+    uint32_t bits = v ? ((uint32_t)v << 23u) : 0x00400000u;
+    float out = 0.0f;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static float moe_mxfp4_value_from_code(uint8_t code) {
+    static constexpr float kMxfp4Table[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+    };
+    return kMxfp4Table[code & 0x0fu];
+}
+
+static uint8_t moe_mxfp4_code_at(const uint8_t* qs, uint32_t index) {
+    // BUGFIX 217: Fix incorrect index masking for mxfp4 block access
+    // Problem: index & 15u masks to 0-15, but mxfp4 blocks have 32 elements (16 bytes)
+    //          This causes reading wrong byte for indices 16-31
+    // Solution: Use index >> 1 for byte offset, index & 1 for nibble selection
+    // Impact: Fixes data corruption in mxfp4 quantized weights
+    const uint8_t byte = qs[index >> 1];
+    return (index & 1u) ? (byte >> 4) : (byte & 0x0fu);
+}
+
+static float moe_dot_gguf_mxfp4_row(
+    const uint8_t* packed,
+    const float* x,
+    uint32_t cols
+) {
+    if (!packed || !x) {
+        return 0.0f;
+    }
+    float acc = 0.0f;
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 17u;
+    for (uint32_t start = 0; start < cols; start += block_cols) {
+        const float scale = moe_e8m0_to_f32_half(packed[0]);
+        const uint8_t* qs = packed + 1u;
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
+        for (uint32_t i = 0; i < limit; ++i) {
+            acc += moe_mxfp4_value_from_code(moe_mxfp4_code_at(qs, i)) * scale * x[start + i];
+        }
+        packed += block_bytes;
+    }
+    return acc;
+}
+
+static float moe_dot_gguf_q5_1_row(
+    const uint8_t* packed,
+    const float* x,
+    uint32_t cols
+) {
+    if (!packed || !x) {
+        return 0.0f;
+    }
+    float acc = 0.0f;
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 24u;
+    for (uint32_t start = 0; start < cols; start += block_cols) {
+        uint16_t d16 = 0;
+        uint16_t m16 = 0;
+        uint32_t qh = 0;
+        std::memcpy(&d16, packed, sizeof(d16));
+        std::memcpy(&m16, packed + 2u, sizeof(m16));
+        std::memcpy(&qh, packed + 4u, sizeof(qh));
+        const float d = moe_raw_fp16_to_f32(d16);
+        const float m = moe_raw_fp16_to_f32(m16);
+        const uint8_t* qs = packed + 8u;
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
+        for (uint32_t i = 0; i < limit; ++i) {
+            // BUGFIX 218: Fix incorrect index masking for q5_1 block access
+            // Problem: i & 15u masks to 0-15, but q5_1 blocks have 32 elements (16 bytes)
+            //          This causes reading wrong byte for indices 16-31
+            // Solution: Use i >> 1 for byte offset, i & 1 for nibble selection
+            // Impact: Fixes data corruption in q5_1 quantized weights
+            const uint8_t byte = qs[i >> 1];
+            const uint32_t low = (i & 1u) ? (byte >> 4) : (byte & 0x0fu);
+            const uint32_t high = (qh >> i) & 1u;
+            const float w = d * (float)(low | (high << 4u)) + m;
+            acc += w * x[start + i];
+        }
+        packed += block_bytes;
+    }
+    return acc;
+}
 static float moe_dot_linear_quant_row(
     const moe_tensor_record& rec,
     const mmap_context_t* shard,
@@ -162,10 +272,10 @@ static float moe_dot_linear_quant_row(
     return acc;
 }
 
-// BUGFIX 46: Issue 10 - AVX2 vectorized bf16?’f32 AXPY for Q-side absorption ?…â˜…??
+// BUGFIX 46: Issue 10 - AVX2 vectorized bf16?ï¿½f32 AXPY for Q-side absorption ?ï¿½â˜…??
 // Problem: moe_axpy_bf16_row_f32 called 12,288 times per token (64 heads Ã— 192 nope_dim)
 // in scalar loop. Each call processes 512 elements (cdim). Total: 6.3M scalar ops/token.
-// Solution: AVX2 path processes 8 bf16?’f32 conversions + FMA per iteration.
+// Solution: AVX2 path processes 8 bf16?ï¿½f32 conversions + FMA per iteration.
 // Pattern: _mm256_cvtepu16_epi32 + _mm256_slli_epi32(16) + _mm256_fmadd_ps
 // Symmetric to store_entry AVX2 path (inverse direction).
 static void moe_axpy_bf16_row_f32_unused(float* y, const uint8_t* packed_bf16, float alpha, uint32_t cols) {

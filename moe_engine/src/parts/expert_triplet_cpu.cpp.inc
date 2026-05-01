@@ -34,25 +34,19 @@ int moe_pc_engine_run_expert_triplet_f32(
     if (!engine || !hidden || !scratch_gate || !scratch_up || !out_hidden) {
         return 0;
     }
-    const moe_storage_constants_t* storage = moe_storage_constants();
-    const uint32_t hidden_size = storage && storage->hidden_size ? storage->hidden_size : 6144u;
+    const moe_storage_constants_t storage = moe_engine_storage_constants_or_static(engine);
+    const uint32_t hidden_size = storage.hidden_size;
     const uint32_t intermediate_size =
-        storage && storage->expert_intermediate_size ? storage->expert_intermediate_size : 2048u;
+        storage.expert_intermediate_size;
     if (hidden_count != hidden_size || out_count != hidden_size || intermediate_count != intermediate_size) {
         return 0;
     }
-    const moe_projection_shape_spec_t* gate_shape = moe_storage_projection_shape(moe_PROJ_GATE);
-    const moe_projection_shape_spec_t* up_shape = moe_storage_projection_shape(moe_PROJ_UP);
-    const moe_projection_shape_spec_t* down_shape = moe_storage_projection_shape(moe_PROJ_DOWN);
-    if (!gate_shape || !up_shape || !down_shape) {
-        return 0;
-    }
     const moe_tensor_record* gate = require_expert_projection(
-        engine, layer, expert, moe_PROJ_GATE, gate_shape->rows, gate_shape->cols);
+        engine, layer, expert, moe_PROJ_GATE, intermediate_size, hidden_size);
     const moe_tensor_record* up = require_expert_projection(
-        engine, layer, expert, moe_PROJ_UP, up_shape->rows, up_shape->cols);
+        engine, layer, expert, moe_PROJ_UP, intermediate_size, hidden_size);
     const moe_tensor_record* down = require_expert_projection(
-        engine, layer, expert, moe_PROJ_DOWN, down_shape->rows, down_shape->cols);
+        engine, layer, expert, moe_PROJ_DOWN, hidden_size, intermediate_size);
     if (!gate || !up || !down) {
         return 0;
     }

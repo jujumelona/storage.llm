@@ -20,7 +20,6 @@ struct moe_pc_engine {
     std::vector<moe_gguf_common_tensor_record> gguf_common_tensors;
     std::unordered_map<std::string, size_t> gguf_common_tensor_slots;
     std::vector<uint64_t> expert_bytes;
-    std::vector<uint16_t> expert_runtime_priorities;
     std::vector<uint16_t> expert_prefetch_priorities;
     std::vector<uint8_t> expert_residency_hints;
     uint64_t avg_expert_bytes = 0;
@@ -53,7 +52,10 @@ struct moe_pc_engine {
     std::unordered_map<uint64_t, moe_device_allocation> device_allocations;
     mutable std::shared_mutex topology_mutex;
     mutable std::mutex topology_queue_mutex;
-    std::vector<std::pair<uint64_t, uint64_t>> topology_update_queue;
+    // BUGFIX 166: Use std::deque instead of std::vector to prevent iterator invalidation
+    // std::vector::emplace_back() can trigger reallocation → all iterators invalidated
+    // std::deque never invalidates iterators on push_back (except end())
+    std::deque<std::pair<uint64_t, uint64_t>> topology_update_queue;
     mutable std::mutex done_mutex;
     std::condition_variable io_done_cv;
     moe_stage_queue disk_stage;
@@ -119,10 +121,13 @@ struct moe_pc_engine {
     // Co-activation Speculative Prefetch statistics
     // [layer][expert_n_minus_2][expert_n] -> frequency
     std::vector<std::unordered_map<int, std::unordered_map<int, float>>> co_activation_stats;
-    std::vector<std::vector<int>> last_selected_experts; // History of selected experts per layer
+    std::vector<std::vector<int>> last_selected_experts;
+    moe_paged_kv_manager_t paged_kv_manager;
+    moe_continuous_batch_scheduler_t batch_scheduler; // History of selected experts per layer
     std::mutex gate_snapshot_mutex;
     std::vector<std::vector<float>> gate_input_snapshots;
     std::vector<uint64_t> gate_input_snapshot_epochs;
+    std::mutex gate_input_snapshot_mutex;
     std::atomic<uint32_t> adaptive_prefetch_depth{2};
     std::atomic<uint32_t> last_router_entropy_milli{0};
     alignas(64) std::atomic<uint64_t> vram_used_bytes{0};
@@ -164,6 +169,7 @@ struct moe_pc_engine {
     std::priority_queue<moe_evict_candidate, std::vector<moe_evict_candidate>, moe_evict_colder_first> evict_heaps[3];
     std::mutex heap_mutexes[3];  // Per-tier evict heap locks: VRAM, RAM, DB.
     std::atomic<uint64_t> evict_heap_versions[3]{};
+    std::atomic<bool> evict_heap_compact_needed{false};
     std::mutex heap_mutex_abi_compat_unused;  // DEAD LOCK: do not use. Use heap_mutexes[0/1/2] via evict_heap_mutex(); ABI layout only.
     std::atomic<bool> vram_eviction_in_progress{false};
     std::mutex vram_eviction_mutex;
@@ -235,6 +241,8 @@ struct moe_pc_engine {
     std::string dynamic_architecture;
     std::string dynamic_model_id;
     std::atomic<int> dynamic_shape_valid{0};
+    moe_attn_config_t attn_config{};
+    std::atomic<int> attn_config_valid{0};
     std::atomic<uint32_t> forward_adapter{moe_FORWARD_ADAPTER_NONE};
     std::atomic<int> forward_adapter_executable{0};
     mutable std::atomic<int> tokenizer_valid{-1};
@@ -261,6 +269,60 @@ struct moe_pc_engine {
     std::mutex stream_pool_mutex;
     std::atomic<uint32_t> stream_pool_available{0};
 };
+
+static moe_model_shape_t moe_engine_model_shape_or_static(const moe_pc_engine* engine) {
+    moe_model_shape_t shape{};
+    const moe_storage_constants_t* storage = moe_storage_constants();
+    if (storage) {
+        shape.num_hidden_layers = storage->num_hidden_layers;
+        shape.first_moe_layer = storage->first_moe_layer;
+        shape.last_moe_layer = storage->last_moe_layer;
+        shape.experts_per_moe_layer = storage->experts_per_moe_layer;
+        shape.hidden_size = storage->hidden_size;
+        shape.expert_intermediate_size = storage->expert_intermediate_size;
+        shape.vocab_size = storage->vocab_size;
+        shape.projection_count = storage->expert_projection_count;
+    }
+    if (engine) {
+        const moe_model_shape_t& dynamic = engine->dynamic_shape;
+        if (dynamic.num_hidden_layers) shape.num_hidden_layers = dynamic.num_hidden_layers;
+        if (dynamic.first_moe_layer || dynamic.last_moe_layer) shape.first_moe_layer = dynamic.first_moe_layer;
+        if (dynamic.last_moe_layer) shape.last_moe_layer = dynamic.last_moe_layer;
+        if (dynamic.experts_per_moe_layer) shape.experts_per_moe_layer = dynamic.experts_per_moe_layer;
+        if (dynamic.hidden_size) shape.hidden_size = dynamic.hidden_size;
+        if (dynamic.expert_intermediate_size) shape.expert_intermediate_size = dynamic.expert_intermediate_size;
+        if (dynamic.vocab_size) shape.vocab_size = dynamic.vocab_size;
+        if (dynamic.projection_count) shape.projection_count = dynamic.projection_count;
+        if (shape.experts_per_moe_layer && shape.num_hidden_layers &&
+            shape.first_moe_layer == 0 && shape.last_moe_layer == 0) {
+            shape.last_moe_layer = shape.num_hidden_layers - 1u;
+        }
+    }
+    return shape;
+}
+
+static moe_storage_constants_t moe_engine_storage_constants_or_static(const moe_pc_engine* engine) {
+    moe_storage_constants_t out{};
+    const moe_storage_constants_t* storage = moe_storage_constants();
+    if (storage) {
+        out = *storage;
+    }
+    const moe_model_shape_t shape = moe_engine_model_shape_or_static(engine);
+    if (shape.num_hidden_layers) out.num_hidden_layers = shape.num_hidden_layers;
+    if (shape.first_moe_layer || shape.last_moe_layer) out.first_moe_layer = shape.first_moe_layer;
+    if (shape.last_moe_layer) out.last_moe_layer = shape.last_moe_layer;
+    if (shape.experts_per_moe_layer) out.experts_per_moe_layer = shape.experts_per_moe_layer;
+    if (shape.hidden_size) out.hidden_size = shape.hidden_size;
+    if (shape.expert_intermediate_size) out.expert_intermediate_size = shape.expert_intermediate_size;
+    if (shape.vocab_size) out.vocab_size = shape.vocab_size;
+    if (shape.projection_count) out.expert_projection_count = shape.projection_count;
+    if (out.num_hidden_layers && out.experts_per_moe_layer &&
+        out.last_moe_layer >= out.first_moe_layer) {
+        out.total_expert_count =
+            (out.last_moe_layer - out.first_moe_layer + 1u) * out.experts_per_moe_layer;
+    }
+    return out;
+}
 
 static uint32_t runtime_disk_workers(const moe_pc_engine* engine) {
     if (!engine) {

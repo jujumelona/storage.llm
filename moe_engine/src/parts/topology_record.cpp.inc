@@ -1,6 +1,6 @@
 void moe_pc_engine_apply_topology_updates(moe_pc_engine_t* engine) {
     if (!engine) return;
-    std::vector<std::pair<uint64_t, uint64_t>> updates;
+    std::deque<std::pair<uint64_t, uint64_t>> updates;
     {
         std::lock_guard<std::mutex> qlock(engine->topology_queue_mutex);
         updates.swap(engine->topology_update_queue);

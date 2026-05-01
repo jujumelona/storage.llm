@@ -1,5 +1,29 @@
 // Raw forward - LM head operations
 
+static int moe_map_lm_head_tensor(
+    moe_pc_engine* engine,
+    const moe_storage_constants_t* c,
+    moe_raw_tensor_cache_entry* out
+) {
+    if (!engine || !c || !out) {
+        return 0;
+    }
+    static const char* const lm_head_names[] = {
+        "output.weight",
+        "lm_head.weight",
+        "token_embd.weight",
+        "model.embed_tokens.weight",
+        "embed_tokens.weight"
+    };
+    moe_raw_tensor_desc desc{};
+    const moe_gguf_common_tensor_record* rec =
+        find_common_tensor_by_names(engine, lm_head_names, sizeof(lm_head_names) / sizeof(lm_head_names[0]), &desc);
+    if (!rec || desc.cols != c->hidden_size || desc.rows < c->vocab_size) {
+        return 0;
+    }
+    return map_common_tensor_record(engine, *rec, desc, out);
+}
+
 int moe_pc_engine_lm_head_top1_f32(
     moe_pc_engine_t* engine,
     const float* hidden,
@@ -7,24 +31,47 @@ int moe_pc_engine_lm_head_top1_f32(
     uint32_t* out_token_id,
     float* out_logit
 ) {
-    const moe_storage_constants_t* c = moe_storage_constants();
+    const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
+    const moe_storage_constants_t* c = &runtime_c;
     if (!engine || !c || !hidden || !out_token_id || !out_logit ||
         hidden_count != c->hidden_size || c->vocab_size == 0) {
         return 0;
     }
-    const int32_t lm_head_layer = (int32_t)c->num_hidden_layers + 1;
-    const moe_storage_raw_span_spec_t* span = find_raw_role_span(lm_head_layer, moe_RAW_ROLE_LM_HEAD);
-    mmap_context_t* mapped = map_raw_span_part(engine, span);
-    if (!raw_span_bounds_ok(span, mapped)) {
-        return 0;
+    moe_raw_tensor_cache_entry common{};
+    const uint8_t* base = nullptr;
+    uint64_t bytes = 0;
+    uint8_t encoding = moe_RAW_SCALAR_BF16;
+    uint8_t weight_format = moe_WEIGHT_ENCODING_RAW_FP16;
+    uint64_t weight_row_bytes = 0;
+    if (moe_map_lm_head_tensor(engine, c, &common)) {
+        base = common.base;
+        bytes = common.bytes;
+        encoding = common.scalar_encoding;
+        weight_format = common.weight_format;
+        weight_row_bytes = common.weight_row_bytes;
+    } else {
+        const int32_t lm_head_layer = (int32_t)c->num_hidden_layers + 1;
+        const moe_storage_raw_span_spec_t* span = find_raw_role_span(lm_head_layer, moe_RAW_ROLE_LM_HEAD);
+        mmap_context_t* mapped = map_raw_span_part(engine, span);
+        if (!raw_span_bounds_ok(span, mapped)) {
+            return 0;
+        }
+        base = raw_span_ptr(span, mapped, 0, span->bytes);
+        bytes = span->bytes;
+        if (!base) {
+            return 0;
+        }
     }
-    const uint64_t row_bytes = (uint64_t)c->hidden_size * 2ull;
-    if (span->bytes < row_bytes * (uint64_t)c->vocab_size) {
-        return 0;
-    }
-
-    const uint8_t* base = raw_span_ptr(span, mapped, 0, row_bytes * (uint64_t)c->vocab_size);
-    if (!base) {
+    moe_raw_tensor_cache_entry raw{};
+    raw.base = base;
+    raw.bytes = bytes;
+    raw.rows = c->vocab_size;
+    raw.cols = c->hidden_size;
+    raw.scalar_encoding = encoding;
+    raw.weight_format = weight_format;
+    raw.weight_row_bytes = weight_row_bytes;
+    const uint64_t row_bytes = moe_raw_tensor_row_bytes(raw, c->hidden_size);
+    if (bytes < row_bytes * (uint64_t)c->vocab_size) {
         return 0;
     }
 
@@ -51,8 +98,7 @@ int moe_pc_engine_lm_head_top1_f32(
         float local_max = -std::numeric_limits<float>::infinity();
 
         for (uint32_t t = start; t < end; ++t) {
-            const uint8_t* row = base + row_bytes * (uint64_t)t;
-            float s = moe_dot_bf16_row(row, hidden, hidden_count);
+            float s = moe_apply_final_logit_softcap(engine, moe_raw_tensor_dot_row(raw, t, hidden, hidden_count));
             if (s > local_max) {
                 local_max = s;
                 local_best = t;
@@ -89,24 +135,47 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     float* out_logsumexp,
     float* out_logprob
 ) {
-    const moe_storage_constants_t* c = moe_storage_constants();
+    const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
+    const moe_storage_constants_t* c = &runtime_c;
     if (!engine || !c || !hidden || !out_target_logit || !out_logsumexp || !out_logprob ||
         hidden_count != c->hidden_size || c->vocab_size == 0 || target_token_id >= c->vocab_size) {
         return 0;
     }
-    const int32_t lm_head_layer = (int32_t)c->num_hidden_layers + 1;
-    const moe_storage_raw_span_spec_t* span = find_raw_role_span(lm_head_layer, moe_RAW_ROLE_LM_HEAD);
-    mmap_context_t* mapped = map_raw_span_part(engine, span);
-    if (!raw_span_bounds_ok(span, mapped)) {
-        return 0;
+    moe_raw_tensor_cache_entry common{};
+    const uint8_t* base = nullptr;
+    uint64_t bytes = 0;
+    uint8_t encoding = moe_RAW_SCALAR_BF16;
+    uint8_t weight_format = moe_WEIGHT_ENCODING_RAW_FP16;
+    uint64_t weight_row_bytes = 0;
+    if (moe_map_lm_head_tensor(engine, c, &common)) {
+        base = common.base;
+        bytes = common.bytes;
+        encoding = common.scalar_encoding;
+        weight_format = common.weight_format;
+        weight_row_bytes = common.weight_row_bytes;
+    } else {
+        const int32_t lm_head_layer = (int32_t)c->num_hidden_layers + 1;
+        const moe_storage_raw_span_spec_t* span = find_raw_role_span(lm_head_layer, moe_RAW_ROLE_LM_HEAD);
+        mmap_context_t* mapped = map_raw_span_part(engine, span);
+        if (!raw_span_bounds_ok(span, mapped)) {
+            return 0;
+        }
+        base = raw_span_ptr(span, mapped, 0, span->bytes);
+        bytes = span->bytes;
+        if (!base) {
+            return 0;
+        }
     }
-    const uint64_t row_bytes = (uint64_t)c->hidden_size * 2ull;
-    if (span->bytes < row_bytes * (uint64_t)c->vocab_size) {
-        return 0;
-    }
-
-    const uint8_t* base = raw_span_ptr(span, mapped, 0, row_bytes * (uint64_t)c->vocab_size);
-    if (!base) {
+    moe_raw_tensor_cache_entry raw{};
+    raw.base = base;
+    raw.bytes = bytes;
+    raw.rows = c->vocab_size;
+    raw.cols = c->hidden_size;
+    raw.scalar_encoding = encoding;
+    raw.weight_format = weight_format;
+    raw.weight_row_bytes = weight_row_bytes;
+    const uint64_t row_bytes = moe_raw_tensor_row_bytes(raw, c->hidden_size);
+    if (bytes < row_bytes * (uint64_t)c->vocab_size) {
         return 0;
     }
 
@@ -133,8 +202,7 @@ int moe_pc_engine_lm_head_token_logprob_f32(
         int has_target = 0;
 
         for (uint32_t t = start; t < end; ++t) {
-            const uint8_t* row = base + row_bytes * (uint64_t)t;
-            const float score = moe_dot_bf16_row(row, hidden, hidden_count);
+            const float score = moe_apply_final_logit_softcap(engine, moe_raw_tensor_dot_row(raw, t, hidden, hidden_count));
             if (score <= local_max) {
                 local_sum += std::exp((double)score - (double)local_max);
             } else if (std::isfinite(local_max)) {

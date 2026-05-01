@@ -1,4 +1,4 @@
-﻿typedef struct {
+typedef struct {
     uint64_t vram_budget_bytes;
     uint64_t ram_budget_bytes;
     uint64_t db_budget_bytes;
@@ -13,6 +13,30 @@
     const char* model_lib_compile_command;
     int enable_model_lib_jit;
 } moe_pc_engine_config_t;
+
+typedef enum {
+    moe_ATTN_TYPE_UNKNOWN = 0,
+    moe_ATTN_TYPE_MHA = 1,
+    moe_ATTN_TYPE_GQA = 2,
+    moe_ATTN_TYPE_MQA = 3,
+    moe_ATTN_TYPE_MLA = 4
+} moe_attn_type_t;
+
+typedef struct {
+    moe_attn_type_t type;
+    uint32_t num_heads;
+    uint32_t num_kv_heads;
+    uint32_t head_dim;
+    uint32_t v_head_dim;
+    uint32_t kv_lora_rank;
+    uint32_t qk_nope_head_dim;
+    uint32_t qk_rope_head_dim;
+    uint32_t q_lora_rank;
+    uint32_t max_seq_len;
+    uint32_t rope_table_len;
+    float rope_theta;
+    float rms_norm_eps;
+} moe_attn_config_t;
 
 typedef struct {
     uint32_t io_worker_threads;
@@ -36,6 +60,10 @@ typedef struct {
     int enable_bam_nvme;
     int enable_common_raw_vram_pin;
     float int4_fallback_threshold;
+    uint8_t vram_eviction_threshold_pct;
+    uint8_t ram_eviction_threshold_pct;
+    uint8_t attention_prefetch_threshold_pct;
+    uint8_t metal_memory_budget_pct;  // BUGFIX 199: Metal VRAM budget percentage (default 60, safe range 60-85)
 } moe_io_config_t;
 
 typedef struct {
@@ -61,4 +89,3 @@ typedef struct {
     int throttle_speculative;
     int drop_speculative;
 } moe_runtime_orchestrator_plan_t;
-

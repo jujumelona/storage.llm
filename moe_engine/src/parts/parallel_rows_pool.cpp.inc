@@ -61,10 +61,12 @@ static void ensure_cpu_row_workers(moe_pc_engine* engine, uint32_t /*ignored*/) 
     if (!engine) return;
     const unsigned int hw_raw = std::thread::hardware_concurrency();
     const uint32_t hw = std::max(2u, hw_raw ? (uint32_t)hw_raw : 1u);
-    const uint32_t io_threads = runtime_disk_workers(engine) +
-         runtime_pinned_workers(engine) +
-         runtime_gpu_workers(engine);
-    const uint32_t dynamic_target = hw > io_threads + 1u ? hw - io_threads - 1u : 1u;
+    const uint32_t disk_w = runtime_disk_workers(engine);
+    const uint32_t pinned_w = runtime_pinned_workers(engine);
+    const uint32_t gpu_w = engine->backend_caps.copy_streams > 0 ? 0 : runtime_gpu_workers(engine);
+    const uint32_t io_threads = disk_w + pinned_w + gpu_w;
+    const uint32_t io_penalty = io_threads / 2u;
+    const uint32_t dynamic_target = hw > io_penalty + 1u ? hw - io_penalty - 1u : 1u;
 
     uint32_t target = engine->cpu_row_target_workers.load(std::memory_order_relaxed);
     if (target != 0 && target != dynamic_target) {
@@ -144,11 +146,20 @@ static void stop_cpu_row_workers(moe_pc_engine* engine) {
         }
     }
     engine->cpu_row_workers.clear();
-    // Fix 6: Join deferred zombie threads from hot-path resize
-    for (std::thread& t : engine->deferred_joins) {
-        if (t.joinable()) {
-            t.join();
+
+    // BUGFIX 167: Protect deferred_joins.clear() with io_start_mutex ★★
+    // Problem: deferred_joins accessed without mutex in stop_cpu_row_workers
+    // Other threads (reap_dead_workers, flush_deferred_joins) use io_start_mutex
+    // → data race on std::vector operations
+    // Solution: Acquire io_start_mutex before clearing deferred_joins
+    {
+        std::lock_guard<std::mutex> join_lock(engine->io_start_mutex);
+        // Fix 6: Join deferred zombie threads from hot-path resize
+        for (std::thread& t : engine->deferred_joins) {
+            if (t.joinable()) {
+                t.join();
+            }
         }
+        engine->deferred_joins.clear();
     }
-    engine->deferred_joins.clear();
 }

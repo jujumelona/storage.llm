@@ -1,3 +1,410 @@
+static int moe_apply_rmsnorm_weight_entry_f32(
+    const moe_raw_tensor_cache_entry& raw,
+    const float* input,
+    uint32_t count,
+    float* output,
+    float eps
+) {
+    // BUGFIX 214: Division by zero clarification (same pattern as BUGFIX 208)
+    // Problem: count == 0 check exists but no comment explaining division safety
+    // Solution: Add explicit comment for code clarity
+    if (!raw.base || !input || !output || count == 0 || raw.cols != 0 || raw.rows != count) {
+        return 0;
+    }
+    const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
+    if (raw.bytes < (uint64_t)count * (uint64_t)elem) {
+        return 0;
+    }
+    double ss = 0.0;
+    for (uint32_t i = 0; i < count; ++i) {
+        ss += (double)input[i] * (double)input[i];
+    }
+    // Safe: count > 0 guaranteed by check above
+    const float norm = 1.0f / std::sqrt((float)(ss / (double)count) + (eps > 0.0f ? eps : 1.0e-6f));
+    for (uint32_t i = 0; i < count; ++i) {
+        const float w = moe_raw_scalar_to_f32(raw.base + (uint64_t)i * (uint64_t)elem, raw.scalar_encoding);
+        output[i] = input[i] * norm * w;
+    }
+    return 1;
+}
+
+static int moe_apply_optional_head_rmsnorm_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    moe_raw_tensor_kind_t kind,
+    float* values,
+    uint32_t head_count,
+    uint32_t head_dim,
+    float eps
+) {
+    if (!engine || !values || head_count == 0 || head_dim == 0) {
+        return 0;
+    }
+    moe_raw_tensor_cache_entry raw{};
+    if (!get_cached_raw_tensor(engine, layer, kind, &raw)) {
+        return 1;
+    }
+    if (raw.rows != head_dim || raw.cols != 0) {
+        return 0;
+    }
+    std::vector<float> tmp(head_dim);
+    for (uint32_t h = 0; h < head_count; ++h) {
+        float* head = values + (uint64_t)h * (uint64_t)head_dim;
+        if (!moe_apply_rmsnorm_weight_entry_f32(raw, head, head_dim, tmp.data(), eps)) {
+            return 0;
+        }
+        std::memcpy(head, tmp.data(), (size_t)head_dim * sizeof(float));
+    }
+    return 1;
+}
+
+static int moe_apply_unweighted_head_rmsnorm_f32(
+    float* values,
+    uint32_t head_count,
+    uint32_t head_dim,
+    float eps
+) {
+    // BUGFIX 215: Division by zero clarification
+    // Problem: head_dim == 0 check exists but no comment explaining division safety
+    // Solution: Add explicit comment for code clarity
+    if (!values || head_count == 0 || head_dim == 0) {
+        return 0;
+    }
+    const float norm_eps = eps > 0.0f ? eps : 1.0e-6f;
+    for (uint32_t h = 0; h < head_count; ++h) {
+        float* head = values + (uint64_t)h * (uint64_t)head_dim;
+        double ss = 0.0;
+        for (uint32_t i = 0; i < head_dim; ++i) {
+            ss += (double)head[i] * (double)head[i];
+        }
+        // Safe: head_dim > 0 guaranteed by check above
+        const float norm = 1.0f / std::sqrt((float)(ss / (double)head_dim) + norm_eps);
+        for (uint32_t i = 0; i < head_dim; ++i) {
+            head[i] *= norm;
+        }
+    }
+    return 1;
+}
+
+static int moe_layer_uses_unweighted_v_norm(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    if (moe_engine_graph_ir_mentions(engine, "attn_v_norm") ||
+        moe_engine_graph_ir_mentions(engine, "value_norm") ||
+        moe_engine_graph_ir_mentions(engine, "v_norm")) {
+        return 1;
+    }
+    if (moe_engine_has_common_tensor_suffix(engine, layer, "attn_v_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "value_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "v_norm.weight")) {
+        return 1;
+    }
+    return moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale") &&
+        (moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm.weight") ||
+         moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_1.weight") ||
+         moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_2.weight") ||
+         moe_engine_has_common_tensor_suffix(engine, layer, "layer_output_scale.weight")) ? 1 : 0;
+}
+
+static int moe_standard_kv_cache_ensure(
+    moe_pc_engine* engine,
+    moe_decode_scratch* s,
+    uint32_t position,
+    uint32_t kv_entry_dim
+) {
+    if (!engine || !s || kv_entry_dim == 0) {
+        return 0;
+    }
+    if (position < s->kv_cache.max_seq_len) {
+        return 1;
+    }
+    try {
+        s->kv_cache.ensure_capacity(position);
+        moe_kv_cache_track_ram(engine, &s->kv_cache);
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (...) {
+        return 0;
+    }
+    return position < s->kv_cache.max_seq_len ? 1 : 0;
+}
+
+static int moe_layer_standard_attention_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    moe_decode_scratch* s,
+    float* hidden,
+    uint32_t hidden_size,
+    uint32_t position,
+    const moe_attn_config_t& cfg,
+    const float* norm_input = nullptr,
+    int add_residual = 1
+) {
+    uint32_t num_heads = cfg.num_heads;
+    uint32_t num_kv_heads = cfg.num_kv_heads;
+    uint32_t head_dim = cfg.head_dim;
+    uint32_t v_head_dim = cfg.v_head_dim ? cfg.v_head_dim : cfg.head_dim;
+    moe_raw_tensor_cache_entry q_shape{};
+    moe_raw_tensor_cache_entry k_shape{};
+    moe_raw_tensor_cache_entry v_shape{};
+    moe_raw_tensor_cache_entry o_shape{};
+    moe_raw_tensor_cache_entry q_norm_shape{};
+    moe_raw_tensor_cache_entry k_norm_shape{};
+    const int has_q = get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_Q_A_PROJ, &q_shape);
+    const int has_k = get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_KV_A_PROJ_WITH_MQA, &k_shape);
+    const int has_v = get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_KV_B_PROJ, &v_shape);
+    const int has_o = get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_O_PROJ, &o_shape);
+    const int has_q_norm = get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_Q_A_LAYER_NORM, &q_norm_shape);
+    const int has_k_norm = get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_KV_A_LAYER_NORM, &k_norm_shape);
+    if (!has_q || !has_k || !has_o) {
+        std::fprintf(stderr, "[storagellm attn] missing q/k/o layer=%d q=%d k=%d v=%d o=%d\n",
+            layer, has_q, has_k, has_v, has_o);
+        return 0;
+    }
+    if (has_q_norm && has_k_norm &&
+        q_norm_shape.rows && q_norm_shape.rows == k_norm_shape.rows &&
+        q_shape.rows % q_norm_shape.rows == 0 &&
+        k_shape.rows % q_norm_shape.rows == 0) {
+        head_dim = q_norm_shape.rows;
+    } else if (head_dim == 0 && num_heads && q_shape.rows % num_heads == 0) {
+        head_dim = q_shape.rows / num_heads;
+    }
+    if (head_dim && q_shape.rows % head_dim == 0) {
+        num_heads = q_shape.rows / head_dim;
+    }
+    if (head_dim && k_shape.rows % head_dim == 0) {
+        num_kv_heads = k_shape.rows / head_dim;
+    }
+    if (has_v && num_kv_heads && v_shape.rows % num_kv_heads == 0) {
+        v_head_dim = v_shape.rows / num_kv_heads;
+    } else if (num_heads && o_shape.cols % num_heads == 0) {
+        v_head_dim = o_shape.cols / num_heads;
+    }
+    const uint32_t q_dim = q_shape.rows;
+    const uint32_t k_dim = k_shape.rows;
+    const uint32_t kv_v_dim = has_v ? v_shape.rows : num_kv_heads * v_head_dim;
+    const uint32_t v_total_dim = o_shape.cols ? o_shape.cols : num_heads * v_head_dim;
+    const uint32_t kv_entry_dim = k_dim + kv_v_dim;
+    const uint32_t rope_dim = std::min<uint32_t>(cfg.qk_rope_head_dim ? cfg.qk_rope_head_dim : head_dim, head_dim);
+    if (!engine || !s || !hidden || hidden_size == 0 ||
+        num_heads == 0 || num_kv_heads == 0 || num_kv_heads > num_heads ||
+        head_dim == 0 || v_head_dim == 0 || q_dim == 0 || k_dim == 0 ||
+        kv_v_dim == 0 || v_total_dim == 0 || kv_entry_dim == 0 ||
+        o_shape.rows != hidden_size || v_total_dim != num_heads * v_head_dim ||
+        (!has_v && kv_v_dim != k_dim)) {
+        std::fprintf(stderr,
+            "[storagellm attn] invalid standard cfg layer=%d hidden=%u heads=%u kv_heads=%u head_dim=%u v_head_dim=%u q_dim=%u k_dim=%u v_dim=%u o=%ux%u has_v=%d\n",
+            layer, hidden_size, num_heads, num_kv_heads, head_dim, v_head_dim, q_dim, k_dim, kv_v_dim,
+            o_shape.rows, o_shape.cols, has_v);
+        return 0;
+    }
+    const float* attn_input = norm_input;
+    if (!attn_input) {
+        if (!moe_pc_engine_raw_rmsnorm_f32(
+                engine, layer, moe_RAW_TENSOR_INPUT_LAYER_NORM,
+                hidden, hidden_size, s->norm.data(), hidden_size, cfg.rms_norm_eps)) {
+            std::fprintf(stderr, "[storagellm attn] input rmsnorm failed layer=%d hidden=%u\n", layer, hidden_size);
+            return 0;
+        }
+        attn_input = s->norm.data();
+    }
+
+    // BUGFIX 164: Parallelize Q, K, V projections ★★
+    // Problem: Q, K, V projections run serially, leaving CPU cores idle
+    // Standard attention: Q (7168), K (1024), V (1024) - Q is 7x larger
+    // Solution: Fuse Q/K/V into single moe_parallel_rows dispatch
+    // Same pattern as BUGFIX 82 for MLA attention
+    // Impact: Better CPU utilization, reduced latency
+    moe_raw_tensor_cache_entry q_raw{};
+    moe_raw_tensor_cache_entry k_raw{};
+    moe_raw_tensor_cache_entry v_raw{};
+    const int has_q_raw = get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_Q_A_PROJ, &q_raw);
+    const int has_k_raw = get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_KV_A_PROJ_WITH_MQA, &k_raw);
+    const int has_v_raw = has_v ? get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_KV_B_PROJ, &v_raw) : 0;
+
+    if (has_q_raw && has_k_raw && q_raw.cols == hidden_size && k_raw.cols == hidden_size &&
+        (!has_v || (has_v_raw && v_raw.cols == hidden_size))) {
+        // BUGFIX 216: Add scratch buffer size validation before parallel Q/K/V
+        // Problem: s->q_b, s->attn_kv_a, s->attn_value used without size check
+        // Solution: Validate buffer sizes before parallel dispatch
+        // Impact: Prevents buffer overflow, improves diagnostics
+        if (s->q_b.size() < q_dim || s->attn_kv_a.size() < k_dim ||
+            (has_v && s->attn_value.size() < kv_v_dim)) {
+            std::fprintf(stderr, "[storagellm attn] scratch buffer size mismatch: "
+                "layer=%d, need q_b=%u attn_kv_a=%u attn_value=%u, "
+                "have q_b=%zu attn_kv_a=%zu attn_value=%zu\n",
+                layer, q_dim, k_dim, kv_v_dim,
+                s->q_b.size(), s->attn_kv_a.size(), s->attn_value.size());
+            return 0;
+        }
+
+        // Parallel path: fuse Q/K/V projections
+        const uint32_t total_rows = q_dim + k_dim + (has_v ? kv_v_dim : 0);
+        if (!moe_parallel_rows(engine, total_rows, 0, [&](uint32_t row) {
+            if (row < q_dim) {
+                // Q projection
+                s->q_b[row] = moe_dot_bf16_row(q_raw.base + row * hidden_size * 2, attn_input, hidden_size);
+            } else if (row < q_dim + k_dim) {
+                // K projection
+                const uint32_t k_row = row - q_dim;
+                s->attn_kv_a[k_row] = moe_dot_bf16_row(k_raw.base + k_row * hidden_size * 2, attn_input, hidden_size);
+            } else if (has_v) {
+                // V projection
+                const uint32_t v_row = row - q_dim - k_dim;
+                s->attn_value[v_row] = moe_dot_bf16_row(v_raw.base + v_row * hidden_size * 2, attn_input, hidden_size);
+            }
+            return 1;
+        })) {
+            std::fprintf(stderr, "[storagellm attn] parallel Q/K/V projection failed layer=%d\n", layer);
+            return 0;
+        }
+        if (!has_v) {
+            std::memcpy(s->attn_value.data(), s->attn_kv_a.data(), (size_t)kv_v_dim * sizeof(float));
+        }
+    } else {
+        // Fallback: serial projections (original path)
+        if (!moe_pc_engine_raw_linear_f32(
+                engine, layer, moe_RAW_TENSOR_Q_A_PROJ,
+                attn_input, hidden_size, s->q_b.data(), q_dim)) {
+            std::fprintf(stderr, "[storagellm attn] q proj failed layer=%d in=%u out=%u heads=%u kv_heads=%u head_dim=%u v_head_dim=%u type=%d\n",
+                layer, hidden_size, q_dim, num_heads, num_kv_heads, head_dim, v_head_dim, (int)cfg.type);
+            return 0;
+        }
+        if (!moe_pc_engine_raw_linear_f32(
+                engine, layer, moe_RAW_TENSOR_KV_A_PROJ_WITH_MQA,
+                attn_input, hidden_size, s->attn_kv_a.data(), k_dim)) {
+            std::fprintf(stderr, "[storagellm attn] k proj failed layer=%d in=%u out=%u\n", layer, hidden_size, k_dim);
+            return 0;
+        }
+        if (has_v) {
+            if (!moe_pc_engine_raw_linear_f32(
+                engine, layer, moe_RAW_TENSOR_KV_B_PROJ,
+                attn_input, hidden_size, s->attn_value.data(), kv_v_dim)) {
+                std::fprintf(stderr, "[storagellm attn] v proj failed layer=%d in=%u out=%u\n", layer, hidden_size, kv_v_dim);
+                return 0;
+            }
+        } else {
+            std::memcpy(s->attn_value.data(), s->attn_kv_a.data(), (size_t)kv_v_dim * sizeof(float));
+        }
+    }
+    if (!moe_apply_optional_head_rmsnorm_f32(
+            engine, layer, moe_RAW_TENSOR_Q_A_LAYER_NORM,
+            s->q_b.data(), num_heads, head_dim, cfg.rms_norm_eps) ||
+        !moe_apply_optional_head_rmsnorm_f32(
+            engine, layer, moe_RAW_TENSOR_KV_A_LAYER_NORM,
+            s->attn_kv_a.data(), num_kv_heads, head_dim, cfg.rms_norm_eps)) {
+        std::fprintf(stderr, "[storagellm attn] q/k norm failed layer=%d heads=%u kv_heads=%u head_dim=%u\n",
+            layer, num_heads, num_kv_heads, head_dim);
+        return 0;
+    }
+    if (has_v && moe_layer_uses_unweighted_v_norm(engine, layer) &&
+        !moe_apply_unweighted_head_rmsnorm_f32(
+            s->attn_value.data(), num_kv_heads, v_head_dim, cfg.rms_norm_eps)) {
+        std::fprintf(stderr, "[storagellm attn] v norm failed layer=%d kv_heads=%u v_head_dim=%u\n",
+            layer, num_kv_heads, v_head_dim);
+        return 0;
+    }
+    if (rope_dim >= 2u) {
+        for (uint32_t h = 0; h < num_heads; ++h) {
+            moe_rope_inplace(
+                s->q_b.data() + (uint64_t)h * head_dim,
+                rope_dim,
+                position,
+                s->rope_q_cos,
+                s->rope_q_sin,
+                cfg.rope_theta);
+        }
+        for (uint32_t h = 0; h < num_kv_heads; ++h) {
+            moe_rope_inplace(
+                s->attn_kv_a.data() + (uint64_t)h * head_dim,
+                rope_dim,
+                position,
+                s->rope_k_cos,
+                s->rope_k_sin,
+                cfg.rope_theta);
+        }
+    }
+    if (!moe_standard_kv_cache_ensure(engine, s, position, kv_entry_dim)) {
+        std::fprintf(stderr, "[storagellm attn] kv ensure failed layer=%d pos=%u entry=%u\n", layer, position, kv_entry_dim);
+        return 0;
+    }
+    if (s->kv_entry.size() < kv_entry_dim) {
+        s->kv_entry.resize(kv_entry_dim);
+    }
+    std::memcpy(s->kv_entry.data(), s->attn_kv_a.data(), (size_t)k_dim * sizeof(float));
+    std::memcpy(s->kv_entry.data() + k_dim, s->attn_value.data(), (size_t)kv_v_dim * sizeof(float));
+    s->kv_cache.store_entry((uint32_t)layer, position, s->kv_entry.data(), kv_entry_dim);
+    s->kv_cache.seq_len = std::min(position + 1u, s->kv_cache.max_seq_len);
+    const uint32_t seq_len = std::min(position + 1u, s->kv_cache.max_seq_len);
+
+    float* layer_decode = nullptr;
+    uint32_t decode_start = 0;
+    if (position > 0 &&
+        !moe_kv_decode_layer_cache_prepare(
+            engine, s, (uint32_t)layer, position, &layer_decode, &decode_start)) {
+        std::fprintf(stderr, "[storagellm attn] kv decode cache failed layer=%d pos=%u entry=%u\n", layer, position, kv_entry_dim);
+        return 0;
+    }
+    if (position > 0) {
+        for (uint32_t p = decode_start; p < position && p < seq_len; ++p) {
+            s->kv_cache.load_entry((uint32_t)layer, p, layer_decode + (size_t)p * kv_entry_dim, kv_entry_dim);
+        }
+        if (s->kv_decoded_up_to.size() > (size_t)layer) {
+            s->kv_decoded_up_to[(uint32_t)layer] =
+                std::max(s->kv_decoded_up_to[(uint32_t)layer], std::min(position, seq_len));
+        }
+    }
+
+    const float scale = 1.0f / std::sqrt((float)head_dim);
+    std::fill(s->attn_value.begin(), s->attn_value.begin() + v_total_dim, 0.0f);
+    if (!moe_parallel_rows(engine, num_heads, 0, [&](uint32_t h) {
+        const uint32_t kv_h = (uint32_t)(((uint64_t)h * (uint64_t)num_kv_heads) / (uint64_t)num_heads);
+        const float* q = s->q_b.data() + (uint64_t)h * head_dim;
+        float* out_h = s->attn_value.data() + (uint64_t)h * v_head_dim;
+        float max_score = -std::numeric_limits<float>::infinity();
+        float denom = 0.0f;
+        for (uint32_t p = 0; p < seq_len; ++p) {
+            const float* entry = p == position ? s->kv_entry.data() :
+                layer_decode + (size_t)p * kv_entry_dim;
+            const float* k = entry + (uint64_t)kv_h * head_dim;
+            float score = moe_dot_f32(q, k, head_dim) * scale;
+            if (score > max_score) {
+                const float rescale = std::exp(max_score - score);
+                denom *= rescale;
+                moe_scale_f32(out_h, rescale, v_head_dim);
+                max_score = score;
+            }
+            const float w = std::exp(score - max_score);
+            denom += w;
+            const float* v = entry + k_dim + (uint64_t)kv_h * v_head_dim;
+            moe_axpy_f32(out_h, v, w, v_head_dim);
+        }
+        if (denom > 0.0f) {
+            moe_scale_f32(out_h, 1.0f / denom, v_head_dim);
+        }
+        return 1;
+    })) {
+        return 0;
+    }
+
+    if (!moe_pc_engine_raw_linear_f32(
+            engine, layer, moe_RAW_TENSOR_O_PROJ,
+            s->attn_value.data(), v_total_dim, s->attn.data(), hidden_size)) {
+        std::fprintf(stderr, "[storagellm attn] o proj failed layer=%d in=%u out=%u\n", layer, v_total_dim, hidden_size);
+        return 0;
+    }
+    if (add_residual) {
+        for (uint32_t i = 0; i < hidden_size; ++i) {
+            hidden[i] += s->attn[i];
+        }
+    }
+    return 1;
+}
+
 static int moe_layer_attention_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -6,18 +413,33 @@ static int moe_layer_attention_f32(
     uint32_t hidden_size,
     uint32_t position
 ) {
-    constexpr uint32_t cdim = moe_MLA_KV_COMPRESSED_DIM; // 512
-    constexpr uint32_t num_heads = moe_MLA_NUM_HEADS;     // 64
-    constexpr uint32_t head_dim = moe_MLA_HEAD_DIM;       // 256
-    constexpr uint32_t nope_dim = moe_MLA_NOPE_DIM;       // 192
-    constexpr uint32_t rope_dim = moe_MLA_ROPE_DIM;       // 64
-    constexpr uint32_t v_head_dim = moe_MLA_V_HEAD_DIM;   // 256
-    constexpr uint64_t kv_b_row_bytes = cdim * 2ull;       // bf16
+    const moe_attn_config_t cfg = moe_generation_attn_config(engine);
+    if (cfg.type != moe_ATTN_TYPE_MLA) {
+        return moe_layer_standard_attention_f32(engine, layer, s, hidden, hidden_size, position, cfg);
+    }
+    const uint32_t cdim = cfg.kv_lora_rank;
+    const uint32_t num_heads = cfg.num_heads;
+    const uint32_t head_dim = cfg.head_dim;
+    const uint32_t nope_dim = cfg.qk_nope_head_dim;
+    const uint32_t rope_dim = cfg.qk_rope_head_dim;
+    const uint32_t v_head_dim = cfg.v_head_dim;
+    const uint32_t q_lora_rank = cfg.q_lora_rank;
+    const uint32_t kv_a_dim = moe_attn_kv_a_proj_dim(cfg);
+    const uint32_t kv_entry_dim = moe_attn_kv_entry_dim(cfg);
+    const uint32_t q_b_dim = moe_attn_q_b_dim(cfg);
+    const uint32_t k_nope_total_dim = moe_attn_k_nope_total_dim(cfg);
+    const uint32_t v_total_dim = moe_attn_v_total_dim(cfg);
+    const uint64_t kv_b_row_bytes = (uint64_t)cdim * 2ull; // bf16
+    if (cdim == 0 || num_heads == 0 || head_dim == 0 || nope_dim + rope_dim != head_dim ||
+        v_head_dim == 0 || q_lora_rank == 0 || kv_a_dim == 0 || kv_entry_dim == 0 ||
+        q_b_dim == 0 || k_nope_total_dim == 0 || v_total_dim == 0) {
+        return 0;
+    }
 
     // --- Pre-attention RMSNorm ---
     if (!moe_pc_engine_raw_rmsnorm_f32(
             engine, layer, moe_RAW_TENSOR_INPUT_LAYER_NORM,
-            hidden, hidden_size, s->norm.data(), hidden_size, 1.0e-6f)) {
+            hidden, hidden_size, s->norm.data(), hidden_size, cfg.rms_norm_eps)) {
         return 0;
     }
 
@@ -30,11 +452,15 @@ static int moe_layer_attention_f32(
         !get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_Q_A_PROJ, &q_a_raw)) {
         return 0;
     }
-    if (!moe_parallel_rows(engine, 2048u + moe_MLA_KV_A_PROJ_DIM, 0, [&](uint32_t row) {
-        if (row < 2048u) {
+    if (q_a_raw.rows < q_lora_rank || q_a_raw.cols != hidden_size ||
+        kv_a_raw.rows < kv_a_dim || kv_a_raw.cols != hidden_size) {
+        return 0;
+    }
+    if (!moe_parallel_rows(engine, q_lora_rank + kv_a_dim, 0, [&](uint32_t row) {
+        if (row < q_lora_rank) {
             s->q_a[row] = moe_dot_bf16_row(q_a_raw.base + row * hidden_size * 2, s->norm.data(), hidden_size);
         } else {
-            const uint32_t kv_row = row - 2048u;
+            const uint32_t kv_row = row - q_lora_rank;
             s->attn_kv_a[kv_row] = moe_dot_bf16_row(kv_a_raw.base + kv_row * hidden_size * 2, s->norm.data(), hidden_size);
         }
         return 1;
@@ -44,7 +470,7 @@ static int moe_layer_attention_f32(
 
     if (!moe_pc_engine_raw_rmsnorm_f32(
             engine, layer, moe_RAW_TENSOR_KV_A_LAYER_NORM,
-            s->attn_kv_a.data(), cdim, s->attn_kv_norm.data(), cdim, 1.0e-6f)) {
+            s->attn_kv_a.data(), cdim, s->attn_kv_norm.data(), cdim, cfg.rms_norm_eps)) {
         return 0;
     }
     float* k_rope = s->attn_kv_a.data() + cdim;
@@ -52,16 +478,16 @@ static int moe_layer_attention_f32(
     // --- Q path: q_a_norm -> q_b_proj ---
     if (!moe_pc_engine_raw_rmsnorm_f32(
             engine, layer, moe_RAW_TENSOR_Q_A_LAYER_NORM,
-            s->q_a.data(), 2048u, s->q_a_norm.data(), 2048u, 1.0e-6f) ||
+            s->q_a.data(), q_lora_rank, s->q_a_norm.data(), q_lora_rank, cfg.rms_norm_eps) ||
         !moe_pc_engine_raw_linear_f32(
             engine, layer, moe_RAW_TENSOR_Q_B_PROJ,
-            s->q_a_norm.data(), 2048u, s->q_b.data(), moe_MLA_Q_B_DIM)) {
+            s->q_a_norm.data(), q_lora_rank, s->q_b.data(), q_b_dim)) {
         return 0;
     }
 
     // Apply K RoPE before storing the current KV entry. Q RoPE is fused below
     // with Q-side absorption and historical KV decode in one barrier.
-    moe_rope_inplace(k_rope, moe_MLA_K_ROPE_DIM, position, s->rope_k_cos, s->rope_k_sin);
+    moe_rope_inplace(k_rope, rope_dim, position, s->rope_k_cos, s->rope_k_sin, cfg.rope_theta);
 
     // BUGFIX 45: Issue 11 - Proactive KV cache pre-allocation ?★??
     // Problem: ensure_capacity triggers demote_cold_until in critical path every time
@@ -69,16 +495,16 @@ static int moe_layer_attention_f32(
     // Solution: Pre-allocate full KV cache when RAM budget allows, eliminating
     // reallocation and eviction from the hot path entirely.
     // Background pre-allocation at 75% threshold prevents late-stage realloc spikes.
-    const uint32_t seq_len_threshold = (moe_MLA_MAX_SEQ_LEN * 3u) / 4u;
+    const uint32_t seq_len_threshold = (cfg.max_seq_len * 3u) / 4u;
     const bool should_preallocate_now =
-        s->kv_cache.max_seq_len < moe_MLA_MAX_SEQ_LEN &&
+        s->kv_cache.max_seq_len < cfg.max_seq_len &&
         position >= seq_len_threshold &&
-        moe_generation_should_preallocate_kv_cache(engine, s->kv_cache.num_layers);
+        moe_generation_should_preallocate_kv_cache(engine, s->kv_cache.num_layers, kv_entry_dim, cfg.max_seq_len);
 
     if (should_preallocate_now) {
         // Pre-allocate to max capacity to avoid future reallocations
-        const uint64_t old_bytes = moe_kv_cache_bytes(s->kv_cache.num_layers, s->kv_cache.max_seq_len);
-        const uint64_t new_bytes = moe_kv_cache_bytes(s->kv_cache.num_layers, moe_MLA_MAX_SEQ_LEN);
+        const uint64_t old_bytes = moe_kv_cache_bytes(s->kv_cache.num_layers, s->kv_cache.max_seq_len, kv_entry_dim);
+        const uint64_t new_bytes = moe_kv_cache_bytes(s->kv_cache.num_layers, cfg.max_seq_len, kv_entry_dim);
         // BUGFIX 108: Fix double-counting of old_bytes in KV cache reallocation
         // Old: realloc_peak = old_bytes + new_bytes. Since ram_used already includes old_bytes,
         //      checking ram_used + realloc_peak > ram_budget double-counted old_bytes,
@@ -96,19 +522,19 @@ static int moe_layer_attention_f32(
                 }
             }
         }
-        s->kv_cache.ensure_capacity(moe_MLA_MAX_SEQ_LEN - 1u);
+        s->kv_cache.ensure_capacity(cfg.max_seq_len - 1u);
         moe_kv_cache_track_ram(engine, &s->kv_cache);
     } else if (position >= s->kv_cache.max_seq_len) {
         // Fallback: incremental growth when pre-allocation not possible
         uint32_t new_cap = s->kv_cache.max_seq_len > 0 ? s->kv_cache.max_seq_len : 1u;
-        while (new_cap <= position && new_cap < moe_MLA_MAX_SEQ_LEN) {
+        while (new_cap <= position && new_cap < cfg.max_seq_len) {
             new_cap *= 2u;
         }
-        if (new_cap > moe_MLA_MAX_SEQ_LEN) {
-            new_cap = moe_MLA_MAX_SEQ_LEN;
+        if (new_cap > cfg.max_seq_len) {
+            new_cap = cfg.max_seq_len;
         }
-        const uint64_t old_bytes = moe_kv_cache_bytes(s->kv_cache.num_layers, s->kv_cache.max_seq_len);
-        const uint64_t new_bytes = moe_kv_cache_bytes(s->kv_cache.num_layers, new_cap);
+        const uint64_t old_bytes = moe_kv_cache_bytes(s->kv_cache.num_layers, s->kv_cache.max_seq_len, kv_entry_dim);
+        const uint64_t new_bytes = moe_kv_cache_bytes(s->kv_cache.num_layers, new_cap, kv_entry_dim);
         // BUGFIX 108: Fix double-counting of old_bytes in KV cache reallocation
         // Old: realloc_peak = old_bytes + new_bytes. Since ram_used already includes old_bytes,
         //      checking ram_used + realloc_peak > ram_budget double-counted old_bytes,
@@ -157,10 +583,12 @@ static int moe_layer_attention_f32(
     }
     if (position < s->kv_cache.max_seq_len) {
         // Build float32 entry, then store as bf16
-        float kv_entry[moe_MLA_KV_ENTRY_DIM];
-        std::memcpy(kv_entry, s->attn_kv_norm.data(), cdim * sizeof(float));
-        std::memcpy(kv_entry + cdim, k_rope, moe_MLA_K_ROPE_DIM * sizeof(float));
-        s->kv_cache.store_entry((uint32_t)layer, position, kv_entry, moe_MLA_KV_ENTRY_DIM);
+        if (s->kv_entry.size() < kv_entry_dim) {
+            s->kv_entry.resize(kv_entry_dim);
+        }
+        std::memcpy(s->kv_entry.data(), s->attn_kv_norm.data(), cdim * sizeof(float));
+        std::memcpy(s->kv_entry.data() + cdim, k_rope, rope_dim * sizeof(float));
+        s->kv_cache.store_entry((uint32_t)layer, position, s->kv_entry.data(), kv_entry_dim);
     }
     s->kv_cache.seq_len = std::min(position + 1u, s->kv_cache.max_seq_len);
     const uint32_t seq_len = std::min(position + 1u, s->kv_cache.max_seq_len);
@@ -168,7 +596,7 @@ static int moe_layer_attention_f32(
     // --- Cached W_kv_b for KV absorption ---
     moe_raw_tensor_cache_entry kv_b_raw{};
     if (!get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_KV_B_PROJ, &kv_b_raw) ||
-        kv_b_raw.cols != cdim || kv_b_raw.rows < (moe_MLA_K_NOPE_TOTAL_DIM + moe_MLA_V_TOTAL_DIM)) {
+        kv_b_raw.cols != cdim || kv_b_raw.rows < (k_nope_total_dim + v_total_dim)) {
         return 0;
     }
     const uint8_t* kv_b_base = kv_b_raw.base;
@@ -178,7 +606,7 @@ static int moe_layer_attention_f32(
     // Run them in one flat dispatch to avoid three separate row-worker barriers.
     std::fill(s->q_absorbed.begin(), s->q_absorbed.end(), 0.0f);
     const uint32_t decoded_kv_count = position < seq_len ? position : seq_len;
-    std::vector<float>* layer_decode = nullptr;
+    float* layer_decode = nullptr;
     uint32_t decode_start = 0;
     if (decoded_kv_count > 0 &&
         !moe_kv_decode_layer_cache_prepare(
@@ -207,8 +635,8 @@ static int moe_layer_attention_f32(
                 }
             } else {
                 const uint32_t p = decode_start + (row - num_heads);
-                float* decode = layer_decode->data() + (size_t)p * moe_MLA_KV_ENTRY_DIM;
-                s->kv_cache.load_entry((uint32_t)layer, p, decode, moe_MLA_KV_ENTRY_DIM);
+                float* decode = layer_decode + (size_t)p * kv_entry_dim;
+                s->kv_cache.load_entry((uint32_t)layer, p, decode, kv_entry_dim);
             }
             return 1;
         })) {
@@ -262,13 +690,13 @@ static int moe_layer_attention_f32(
                 c_kv = s->attn_kv_norm.data();
                 p_k_rope = k_rope;
             } else {
-                const float* decode = layer_decode->data() + (size_t)p * moe_MLA_KV_ENTRY_DIM;
+                const float* decode = layer_decode + (size_t)p * kv_entry_dim;
                 c_kv = decode;
                 p_k_rope = decode + cdim;
             }
 
             float score = moe_dot_f32(qa_h, c_kv, cdim);
-            score += moe_dot_f32(q_rope_h, p_k_rope, std::min(rope_dim, moe_MLA_K_ROPE_DIM));
+            score += moe_dot_f32(q_rope_h, p_k_rope, rope_dim);
             score *= scale;
 
             if (score > h_max) {
@@ -293,7 +721,7 @@ static int moe_layer_attention_f32(
     });
 
     // --- V-side absorption: head-parallel expansion ---
-    const uint8_t* kv_b_v_base = kv_b_base + kv_b_row_bytes * moe_MLA_K_NOPE_TOTAL_DIM;
+    const uint8_t* kv_b_v_base = kv_b_base + kv_b_row_bytes * k_nope_total_dim;
     moe_parallel_rows(engine, num_heads, 0, [&](uint32_t h) {
         float* out_h = s->attn_value.data() + h * v_head_dim;
         const float* cw_h = s->c_weighted.data() + h * cdim;
@@ -307,7 +735,7 @@ static int moe_layer_attention_f32(
     // --- O projection: attention value width -> hidden_size ---
     if (!moe_pc_engine_raw_linear_f32(
             engine, layer, moe_RAW_TENSOR_O_PROJ,
-            s->attn_value.data(), moe_MLA_V_TOTAL_DIM, s->attn.data(), hidden_size)) {
+            s->attn_value.data(), v_total_dim, s->attn.data(), hidden_size)) {
         return 0;
     }
     for (uint32_t i = 0; i < hidden_size; ++i) {

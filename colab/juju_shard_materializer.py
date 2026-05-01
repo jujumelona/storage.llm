@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import threading
 import bisect
 import os
 import struct
@@ -188,7 +189,7 @@ def parse_gguf_directory(prefix, total_bytes):
     order = sorted(range(len(tensors)), key=lambda i: tensors[i]["relative_offset"])
     for pos, idx in enumerate(order):
         cur = tensors[idx]["relative_offset"]
-        nxt = tensors[order[pos + 1]]["relative_offset"] if pos + 1 < len(order) else total_bytes - data_start
+        nxt = tensors[order[pos + 1]]["relative_offset"] if pos + 1 < len(order) else min(total_bytes - data_start, cur + tensors[idx].get("dims", 1) * 8)
         tensors[idx]["source_offset"] = data_start + cur
         tensors[idx]["bytes"] = max(0, nxt - cur)
         tensors[idx]["bucket"] = tensor_bucket(tensors[idx]["name"])
@@ -214,11 +215,13 @@ def read_remote_directory(session, url, token=None, initial_range_bytes=8 * 1024
         except EOFError:
             if size >= total:
                 raise
+            if size >= 256 * 1024 * 1024:
+                raise RuntimeError(f"Max fetch exceeded: {size}")
             size = min(size * 2, total)
 
 
-def juju_estimated_tensor_payload_bytes(tensors):
-    total = JUJU_SPLIT_METADATA_RESERVE_BYTES
+def juju_estimated_tensor_payload_bytes(tensors, is_first_shard=True):
+    total = JUJU_SPLIT_METADATA_RESERVE_BYTES if is_first_shard else 32 * 1024 * 1024
     for tensor in tensors:
         total = align_up(total, 4096)
         total += int(tensor.get("bytes") or 0)
@@ -229,8 +232,9 @@ def plan_juju_tensor_splits(directory, max_file_bytes=None):
     limit = int(max_file_bytes or juju_upload_file_limit_bytes())
     if limit >= HF_INDIVIDUAL_FILE_LIMIT_BYTES:
         limit = HF_INDIVIDUAL_FILE_LIMIT_BYTES - (256 * 1024 * 1024)
-    payload_limit = limit - JUJU_SPLIT_METADATA_RESERVE_BYTES
-    if payload_limit <= 0:
+    payload_limit_first = limit - JUJU_SPLIT_METADATA_RESERVE_BYTES
+    payload_limit_sub = limit - 32 * 1024 * 1024
+    if payload_limit_first <= 0:
         raise ValueError("JUJU upload file limit is too small after metadata reserve")
 
     tensors = [
@@ -253,12 +257,13 @@ def plan_juju_tensor_splits(directory, max_file_bytes=None):
     for tensor in tensors:
         tensor_bytes = int(tensor["bytes"])
         aligned_tensor_bytes = align_up(tensor_bytes, 4096)
-        if aligned_tensor_bytes > payload_limit:
+        current_limit = payload_limit_first if len(groups) == 0 else payload_limit_sub
+        if aligned_tensor_bytes > current_limit:
             raise RuntimeError(
                 f"single tensor exceeds upload-safe JUJU split limit: {tensor['name']} "
                 f"bytes={tensor_bytes} limit={payload_limit}"
             )
-        if current and current_bytes + aligned_tensor_bytes > payload_limit:
+        if current and current_bytes + aligned_tensor_bytes > current_limit:
             groups.append(current)
             current = []
             current_bytes = 0
@@ -276,7 +281,7 @@ def plan_juju_tensor_splits(directory, max_file_bytes=None):
             "split_count": split_count,
             "tensor_names": [tensor["name"] for tensor in group],
             "tensor_bytes": sum(int(tensor["bytes"]) for tensor in group),
-            "estimated_file_bytes": juju_estimated_tensor_payload_bytes(group),
+            "estimated_file_bytes": juju_estimated_tensor_payload_bytes(group, is_first_shard=(idx == 1)),
             "max_file_bytes": limit,
         })
     return planned
@@ -285,6 +290,8 @@ def plan_juju_tensor_splits(directory, max_file_bytes=None):
 def tensor_bucket(name):
     lower = str(name).lower()
     if "shared_expert" in lower or "shared.expert" in lower:
+        return "shared_weights"
+    if "attn" in lower or "attention" in lower:
         return "shared_weights"
     if (
         "expert" in lower or
@@ -484,7 +491,7 @@ def tensor_runtime_priority(name, bucket, size):
         prefetch = 85
         residency = "FAST_MEM"
         prefetch_class = "layer_hot"
-    if int(size or 0) > 512 * 1024 * 1024 and residency == "FAST_MEM":
+    if int(size or 0) > 512 * 1024 * 1024 and residency == "FAST_MEM" and role != "attention":
         residency = "FAST_MEM_STREAMABLE"
     return {
         "graph_role": role,
@@ -498,8 +505,10 @@ def tensor_runtime_priority(name, bucket, size):
 def infer_juju_graph_family(contract, tensors):
     text = json.dumps(contract, ensure_ascii=False).lower()
     names = {str(t.get("name") or "").lower() for t in tensors}
-    if "gemma" in text or any("ffn_gate_up_exps.weight" in n for n in names):
+    if "gemma" in text:
         return "gemma_moe"
+    if any("ffn_gate_up_exps.weight" in n for n in names):
+        return "combined_gate_up_moe"
     if "qwen" in text:
         return "qwen"
     if "llama" in text or "mistral" in text:
@@ -536,8 +545,8 @@ def build_layer_graph_ir(layer, tensors):
         {"op": "hidden_snapshot", "name": "fate_gate_input_snapshot", "inputs": ["ffn_norm"], "target": "engine_state.gate_input_snapshots[layer]", "required": False},
         {"op": "linear", "name": "moe_router", "inputs": ["ffn_norm"], "weights": bind("ffn_gate_inp.weight", "router.weight"), "scale": bind("ffn_gate_inp.scale"), "output": "expert_scores", "required": False},
         {"op": "topk", "name": "expert_select", "inputs": ["expert_scores"], "config_key": "adaptive_seq_topk_entropy", "required": False},
-        {"op": "moe_expert_mlp", "name": "moe_experts", "inputs": ["ffn_norm", "selected_experts"], "weights": bind("ffn_gate_up_exps.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"), "required": False},
-        {"op": "dense_mlp", "name": "dense_ffn_fallback", "inputs": ["ffn_norm"], "weights": bind("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"), "required": False},
+        {"op": "moe_expert_mlp", "name": "moe_experts", "inputs": ["ffn_norm", "selected_experts"], "weights": bind("ffn_gate_up_exps.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"), "required": bool(3 <= int(layer) <= 78)},
+        {"op": "dense_mlp", "name": "dense_ffn_fallback", "inputs": ["ffn_norm"], "weights": bind("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"), "required": not bool(3 <= int(layer) <= 78)},
         {"op": "residual", "name": "ffn_residual", "inputs": ["hidden", "ffn_out"], "required": True},
         {"op": "scale", "name": "layer_output_scale", "inputs": ["hidden"], "weights": bind("layer_output_scale.weight"), "required": False},
     ]
@@ -879,7 +888,9 @@ def build_juju_shard_plan_from_hf_url(
             "contract": contract,
         }
         pos = add_json_section_at(pos, JUJU_SECTION_MODEL_META, "MODEL_META", meta)
-        pos = add_json_section_at(pos, JUJU_SECTION_QKV_POLICY, "QKV_POLICY", contract.get("qkv_cache_schema", {}))
+        qkv_schema = contract.get("qkv_cache_schema")
+        if qkv_schema:
+            pos = add_json_section_at(pos, JUJU_SECTION_QKV_POLICY, "QKV_POLICY", qkv_schema)
 
         for bucket in ("shared_weights", "hot_experts", "warm_experts", "cold_experts"):
             group = [t for t in active_tensors if t["bucket"] == bucket and t["bytes"] > 0]
@@ -992,6 +1003,7 @@ def build_juju_shard_plan_from_hf_url(
 class JujuVirtualFile(io.BufferedIOBase):
     def __init__(self, plan):
         super().__init__()
+        self._lock = threading.RLock()
         self._plan = plan
         self._size = int(plan["bytes"])
         self._pos = 0
@@ -1025,53 +1037,57 @@ class JujuVirtualFile(io.BufferedIOBase):
         return True
 
     def tell(self):
-        return self._pos
+        with self._lock:
+            return self._pos
 
     def seek(self, offset, whence=io.SEEK_SET):
-        if whence == io.SEEK_SET:
+        with self._lock:
+            if whence == io.SEEK_SET:
             pos = int(offset)
         elif whence == io.SEEK_CUR:
             pos = self._pos + int(offset)
         elif whence == io.SEEK_END:
             pos = self._size + int(offset)
         else:
-            raise ValueError(f"unsupported whence: {whence}")
-        if pos < 0:
-            raise ValueError("negative seek position")
-        self._pos = min(pos, self._size)
-        return self._pos
+                raise ValueError(f"unsupported whence: {whence}")
+            if pos < 0:
+                raise ValueError("negative seek position")
+            self._pos = min(pos, self._size)
+            return self._pos
 
     def readinto(self, buffer):
-        data = self.read(len(buffer))
-        n = len(data)
-        buffer[:n] = data
-        return n
+        with self._lock:
+            data = self.read(len(buffer))
+            n = len(data)
+            buffer[:n] = data
+            return n
 
     def read(self, size=-1):
-        if self.closed or self._pos >= self._size:
+        with self._lock:
+            if self.closed or self._pos >= self._size:
             return b""
-        if size is None or size < 0:
-            end = min(self._size, self._pos + self._remote_chunk)
-        else:
-            end = min(self._size, self._pos + int(size))
-        chunks = []
-        while self._pos < end:
-            idx = bisect.bisect_right(self._offsets, self._pos) - 1
-            segment = self._segments[idx] if idx >= 0 else None
-            if segment and self._pos < segment["offset"] + segment["size"]:
-                rel = self._pos - segment["offset"]
-                take = min(end - self._pos, segment["size"] - rel)
-                if segment["kind"] == "fixed":
-                    chunks.append(segment["data"][rel:rel + take])
-                else:
-                    chunks.append(self._read_source_segment(segment, rel, take))
+            if size is None or size < 0:
+                end = min(self._size, self._pos + self._remote_chunk)
+            else:
+                end = min(self._size, self._pos + int(size))
+            chunks = []
+            while self._pos < end:
+                idx = bisect.bisect_right(self._offsets, self._pos) - 1
+                segment = self._segments[idx] if idx >= 0 else None
+                if segment and self._pos < segment["offset"] + segment["size"]:
+                    rel = self._pos - segment["offset"]
+                    take = min(end - self._pos, segment["size"] - rel)
+                    if segment["kind"] == "fixed":
+                        chunks.append(segment["data"][rel:rel + take])
+                    else:
+                        chunks.append(self._read_source_segment(segment, rel, take))
+                    self._pos += take
+                    continue
+                next_offset = self._segments[idx + 1]["offset"] if idx + 1 < len(self._segments) else self._size
+                take = min(end - self._pos, next_offset - self._pos)
+                chunks.append(b"\x00" * take)
                 self._pos += take
-                continue
-            next_offset = self._segments[idx + 1]["offset"] if idx + 1 < len(self._segments) else self._size
-            take = min(end - self._pos, next_offset - self._pos)
-            chunks.append(b"\x00" * take)
-            self._pos += take
-        return b"".join(chunks)
+            return b"".join(chunks)
 
     def _read_source_segment(self, segment, rel, size):
         out = []
@@ -1312,7 +1328,9 @@ def write_juju_shard_from_hf_url(
                 "contract": contract,
             }
             add_json_section(out, JUJU_SECTION_MODEL_META, "MODEL_META", meta)
-            add_json_section(out, JUJU_SECTION_QKV_POLICY, "QKV_POLICY", contract.get("qkv_cache_schema", {}))
+            qkv_schema = contract.get("qkv_cache_schema")
+            if qkv_schema:
+                add_json_section(out, JUJU_SECTION_QKV_POLICY, "QKV_POLICY", qkv_schema)
 
             for bucket in ("shared_weights", "hot_experts", "warm_experts", "cold_experts"):
                 group = [t for t in active_tensors if t["bucket"] == bucket and t["bytes"] > 0]

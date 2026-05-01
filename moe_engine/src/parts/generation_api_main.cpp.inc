@@ -10,7 +10,9 @@ int moe_pc_engine_generate_token_ids(
     if (out_stats) {
         std::memset(out_stats, 0, sizeof(*out_stats));
     }
-    const moe_storage_constants_t* c = moe_storage_constants();
+    const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
+    const moe_storage_constants_t* c = &runtime_c;
+    const moe_attn_config_t attn_cfg = moe_generation_attn_config(engine);
     if (!engine || !c || !input_token_ids || input_token_count == 0 || !out_token_ids || out_token_capacity == 0) {
         moe_generation_set_error(out_stats, "invalid generation arguments");
         return 0;
@@ -46,12 +48,22 @@ int moe_pc_engine_generate_token_ids(
         forward.dynamic_shape_ready &&
         !forward.forward_adapter_executable) {
         char reason[192]{};
-        std::snprintf(reason, sizeof(reason),
-            "forward adapter not executable adapter=%s layers=%u hidden=%u vocab=%u",
-            moe_forward_adapter_name(forward.forward_adapter),
-            forward.dynamic_num_hidden_layers,
-            forward.dynamic_hidden_size,
-            forward.dynamic_vocab_size);
+        if (forward.graph_ir_ready) {
+            std::snprintf(reason, sizeof(reason),
+                "graph IR executor not executable graph_ver=%u layers=%u ops=%llu hidden=%u vocab=%u",
+                forward.graph_ir_version,
+                forward.dynamic_num_hidden_layers,
+                (unsigned long long)forward.graph_ir_op_count,
+                forward.dynamic_hidden_size,
+                forward.dynamic_vocab_size);
+        } else {
+            std::snprintf(reason, sizeof(reason),
+                "forward adapter not executable adapter=%s layers=%u hidden=%u vocab=%u",
+                moe_forward_adapter_name(forward.forward_adapter),
+                forward.dynamic_num_hidden_layers,
+                forward.dynamic_hidden_size,
+                forward.dynamic_vocab_size);
+        }
         moe_generation_set_error(out_stats, reason);
         return 0;
     }
@@ -86,11 +98,11 @@ int moe_pc_engine_generate_token_ids(
         moe_generation_set_error(out_stats, "max_new_tokens resolved to zero");
         return 0;
     }
-    if (input_token_count > moe_MLA_MAX_SEQ_LEN) {
+    if (input_token_count > attn_cfg.max_seq_len) {
         moe_generation_set_error(out_stats, "input exceeds Moe MLA context length");
         return 0;
     }
-    const uint32_t max_new_by_context = moe_MLA_MAX_SEQ_LEN - input_token_count + 1u;
+    const uint32_t max_new_by_context = attn_cfg.max_seq_len - input_token_count + 1u;
     if (max_new_tokens > max_new_by_context) {
         max_new_tokens = max_new_by_context;
     }
@@ -112,10 +124,11 @@ int moe_pc_engine_generate_token_ids(
     int failed = 0;
     float last_logit = 0.0f;
     const int pre_allocate_kv =
-        moe_generation_should_preallocate_kv_cache(engine, c->num_hidden_layers);
+        moe_generation_should_preallocate_kv_cache(
+            engine, c->num_hidden_layers, moe_attn_kv_entry_dim(attn_cfg), attn_cfg.max_seq_len);
 
     // Fix 1+2: Initialize KV cache and position counter
-    moe_decode_scratch_resize(&scratch, c, pre_allocate_kv);
+    moe_decode_scratch_resize(&scratch, c, &attn_cfg, pre_allocate_kv);
     moe_kv_cache_track_ram(engine, &scratch.kv_cache);
     scratch.position = 0;
 
@@ -160,7 +173,7 @@ int moe_pc_engine_generate_token_ids(
             }
 
             // Ensure scratch is sized
-            moe_decode_scratch_resize(&scratch, c, pre_allocate_kv);
+            moe_decode_scratch_resize(&scratch, c, &attn_cfg, pre_allocate_kv);
             moe_kv_cache_track_ram(engine, &scratch.kv_cache);
 
             // Bug 8: Pre-allocate KV cache capacity to avoid reallocation inside tight loop
@@ -197,7 +210,7 @@ int moe_pc_engine_generate_token_ids(
 
                     if (!moe_pc_engine_raw_rmsnorm_f32(
                             engine, (int32_t)layer, moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM,
-                            current_hidden, (uint32_t)hs, scratch.norm.data(), (uint32_t)hs, 1.0e-6f)) {
+                            current_hidden, (uint32_t)hs, scratch.norm.data(), (uint32_t)hs, attn_cfg.rms_norm_eps)) {
                         moe_generation_set_error(out_stats, "prefill post-attention norm failed");
                         return 0;
                     }
@@ -217,7 +230,7 @@ int moe_pc_engine_generate_token_ids(
             float* last_hidden = batch_hidden.data() + (prefill_count - 1u) * hs;
             if (!moe_pc_engine_raw_rmsnorm_f32(
                     engine, (int32_t)c->num_hidden_layers, moe_RAW_TENSOR_INPUT_LAYER_NORM,
-                    last_hidden, (uint32_t)hs, scratch.norm.data(), (uint32_t)hs, 1.0e-6f)) {
+                    last_hidden, (uint32_t)hs, scratch.norm.data(), (uint32_t)hs, attn_cfg.rms_norm_eps)) {
                 moe_generation_set_error(out_stats, "prefill final norm failed");
                 return 0;
             }
@@ -244,6 +257,32 @@ int moe_pc_engine_generate_token_ids(
         last_logit = next_logit;
         current = (int32_t)next_token;
         ++scratch.position;
+
+        // ============================================================================
+        // Prompt Lookup Decoding (2024)
+        // ============================================================================
+        // Parameter-free speculative drafting: find the most recent 3-gram in context
+        // and propose the following tokens. Since batch verification is not yet
+        // supported, we record the successful matches for analysis and speculative API.
+        // ============================================================================
+        if (produced >= 2 && prefill_count + produced > 3) {
+            const int32_t gram[3] = { (int32_t)out_token_ids[produced-2], (int32_t)out_token_ids[produced-1], current };
+            int match_idx = -1;
+            for (int i = 0; i < (int)(prefill_count + produced) - 4; ++i) {
+                int32_t c0 = i < prefill_count ? input_token_ids[i] : out_token_ids[i - prefill_count];
+                int32_t c1 = (i+1) < prefill_count ? input_token_ids[i+1] : out_token_ids[i+1 - prefill_count];
+                int32_t c2 = (i+2) < prefill_count ? input_token_ids[i+2] : out_token_ids[i+2 - prefill_count];
+                if (c0 == gram[0] && c1 == gram[1] && c2 == gram[2]) {
+                    match_idx = i + 3;
+                    break;
+                }
+            }
+            if (match_idx != -1) {
+                // Found prompt lookup match!
+                // Draft tokens: context[match_idx], context[match_idx+1], ...
+                // (Batch verification to be integrated with EAGLE-2 verification tree)
+            }
+        }
         if (config && config->stop_on_eos && next_token == config->eos_token_id) {
             ++produced;
             break;

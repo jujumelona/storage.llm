@@ -9,7 +9,7 @@ static moe_tier_t moe_hot_miss_preferred_tier(
         engine->generation_phase.load(std::memory_order_relaxed) == moe_GEN_PHASE_PREFILL) {
         return preferred_tier;
     }
-    const size_t slot = expert_dense_slot(layer, expert);
+    const size_t slot = expert_dense_slot(engine, layer, expert);
     if (slot >= engine->expert_states.size()) {
         return preferred_tier;
     }
@@ -95,8 +95,9 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
     if (!ensure_io_ready(engine)) {
         return 0;
     }
-    const moe_storage_constants_t* c = moe_storage_constants();
-    if (!c || c->experts_per_moe_layer == 0) {
+    const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
+    const moe_storage_constants_t* c = &runtime_c;
+    if (c->experts_per_moe_layer == 0) {
         return 0;
     }
     // BUGFIX 99: Precompute percentage thresholds
@@ -265,7 +266,7 @@ static int prefetch_expert_batch_raw(
     {
         std::lock_guard<std::mutex> lock(engine->map_mutex);
         for (uint32_t i = 0; i < expert_count; ++i) {
-            const size_t slot = expert_dense_slot(layer, experts[i]);
+            const size_t slot = expert_dense_slot(engine, layer, experts[i]);
             if (slot < engine->expert_states.size()) {
                 const moe_block_state& state = engine->expert_states[slot];
                 stream_inflight[i] = state.active && state.tier == moe_TIER_STREAM ? 1u : 0u;
@@ -360,3 +361,10 @@ int moe_pc_engine_prefetch_moe_lookahead(
     }
     return ok_count > 0 ? 1 : 0;
 }
+
+// ============================================================================
+// EAGLE-2 Draft Verification (ICML 2025)
+// ============================================================================
+// Speculative decoding draft verification structure. Batch verification requires
+// parallel forward pass over the drafted tree. Currently pending batch API.
+// ============================================================================

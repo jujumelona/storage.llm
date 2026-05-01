@@ -20,7 +20,11 @@ static uint8_t weight_bits_for_encoding(uint8_t encoding) {
         case moe_WEIGHT_ENCODING_GGUF_IQ2:
             return 2;
         case moe_WEIGHT_ENCODING_LINEAR_Q8:
+        case moe_WEIGHT_ENCODING_GGUF_Q8_0:
             return 8;
+        case moe_WEIGHT_ENCODING_GGUF_Q5_1:
+        case moe_WEIGHT_ENCODING_GGUF_Q5_K:
+            return 5;
         default:
             return 0;
     }
@@ -79,6 +83,17 @@ static uint64_t infer_weight_row_bytes(const moe_tensor_info_t& info, uint8_t fo
     if (format == moe_WEIGHT_ENCODING_RAW_FP32) {
         return (uint64_t)info.cols * 4ull;
     }
+    if (format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
+        return ((uint64_t)info.cols + 31ull) / 32ull * 34ull;
+    }
+    if (format == moe_WEIGHT_ENCODING_GGUF_Q5_1 ||
+        format == moe_WEIGHT_ENCODING_GGUF_Q5_K ||
+        format == moe_WEIGHT_ENCODING_MXFP4 ||
+        format == moe_WEIGHT_ENCODING_GGUF_IQ2 ||
+        format == moe_WEIGHT_ENCODING_GGUF_IQ3 ||
+        format == moe_WEIGHT_ENCODING_GGUF_IQ4) {
+        return info.rows ? info.weight_byte_length / (uint64_t)info.rows : 0;
+    }
     const uint8_t bits = weight_bits_for_encoding(format);
     return bits ? packed_bits_row_bytes(info.cols, bits) : 0;
 }
@@ -105,6 +120,10 @@ static void finalize_tensor_layout(moe_tensor_record* rec, uint8_t gguf_encoding
     rec->weight_format_inferred = (gguf_encoding_hint == moe_WEIGHT_ENCODING_UNKNOWN ||
                                     gguf_encoding_hint == 0) ? 1 : 0;
     rec->weight_row_bytes = infer_weight_row_bytes(rec->info, rec->weight_format);
+    if ((!rec->weight_row_bytes || rec->weight_row_bytes * (uint64_t)rec->info.rows > rec->info.weight_byte_length) &&
+        rec->info.rows && rec->info.weight_byte_length % (uint64_t)rec->info.rows == 0) {
+        rec->weight_row_bytes = rec->info.weight_byte_length / (uint64_t)rec->info.rows;
+    }
     rec->weight_bits = weight_bits_for_encoding(rec->weight_format);
     rec->weight_block_size = rec->info.group_size > 0 && rec->info.group_size <= 255u ?
         (uint8_t)rec->info.group_size : 0;
@@ -113,10 +132,13 @@ static void finalize_tensor_layout(moe_tensor_record* rec, uint8_t gguf_encoding
         rec->weight_format == moe_WEIGHT_ENCODING_RAW_FP16 ||
         rec->weight_format == moe_WEIGHT_ENCODING_RAW_FP32 ||
         rec->weight_format == moe_WEIGHT_ENCODING_NVFP4 ||
+        rec->weight_format == moe_WEIGHT_ENCODING_MXFP4 ||
+        rec->weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1 ||
         rec->weight_format == moe_WEIGHT_ENCODING_LINEAR_Q2 ||
         rec->weight_format == moe_WEIGHT_ENCODING_LINEAR_Q3 ||
         rec->weight_format == moe_WEIGHT_ENCODING_LINEAR_Q4 ||
-        rec->weight_format == moe_WEIGHT_ENCODING_LINEAR_Q8;
+        rec->weight_format == moe_WEIGHT_ENCODING_LINEAR_Q8 ||
+        rec->weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0;
     rec->gpu_executable = 0;
     rec->info.weight_encoding = rec->weight_format;
     rec->info.weight_bits = rec->weight_bits;

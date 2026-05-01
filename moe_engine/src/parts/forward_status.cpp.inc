@@ -78,6 +78,9 @@ int moe_pc_engine_get_forward_status(
         out_status->dynamic_hidden_size = engine->dynamic_shape.hidden_size;
         out_status->dynamic_vocab_size = engine->dynamic_shape.vocab_size;
     }
+    if (engine->attn_config_valid.load(std::memory_order_relaxed)) {
+        out_status->dynamic_max_seq_len = engine->attn_config.max_seq_len;
+    }
     out_status->tensor_table_loaded = out_status->tensor_count > 0;
     out_status->expert_triplet_available =
         out_status->storage_state_valid &&

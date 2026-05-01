@@ -1,4 +1,4 @@
-﻿static uint32_t caps_hw_threads() {
+static uint32_t caps_hw_threads() {
     const unsigned int hw = std::thread::hardware_concurrency();
     return hw ? static_cast<uint32_t>(hw) : 1u;
 }
@@ -78,12 +78,28 @@ static void fill_cuda_backend_caps(moe_backend_caps_t* caps) {
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(64);
     uint64_t total_bytes = 0;
     const uint64_t free_bytes = cuda_driver_detect_free_memory_bytes(caps->device_id, &total_bytes);
+
+    // BUGFIX 130: Issue 33 - Validate VRAM query for driver bugs (WSL2/old drivers) ★★
+    // Problem: cuDeviceTotalMem() on some old drivers (CUDA 11.x) or WSL2 returns
+    // virtual address space size instead of physical VRAM.
+    // device_memory_bytes set too high → over-admit experts → OOM.
+    // Solution: Validate free vs total ratio. If free < 10% of total, likely driver bug.
+    // Use recommended_vram_cache_bytes as fallback.
     if (free_bytes > 0) {
-        caps->device_memory_bytes = free_bytes;
-        caps->recommended_vram_cache_bytes = std::max<uint64_t>(
-            caps->recommended_vram_cache_bytes,
-            moe_budget_from_free_device_memory(free_bytes)
-        );
+        // Sanity check: free should be at least 10% of total
+        if (total_bytes > 0 && free_bytes < total_bytes / 10) {
+            fprintf(stderr, "[storageLLM WARNING] VRAM query suspicious (free=%llu MB, total=%llu MB). "
+                    "Likely driver bug (WSL2/old CUDA). Using fallback budget.\n",
+                    (unsigned long long)(free_bytes / (1024*1024)),
+                    (unsigned long long)(total_bytes / (1024*1024)));
+            caps->device_memory_bytes = caps->recommended_vram_cache_bytes;
+        } else {
+            caps->device_memory_bytes = free_bytes;
+            caps->recommended_vram_cache_bytes = std::max<uint64_t>(
+                caps->recommended_vram_cache_bytes,
+                moe_budget_from_free_device_memory(free_bytes)
+            );
+        }
     } else if (total_bytes > 0) {
         caps->device_memory_bytes = total_bytes;
     }
@@ -98,8 +114,41 @@ static void fill_hip_backend_caps(moe_backend_caps_t* caps) {
     caps->supports_backend_async_api = 1;
     caps->supports_directstorage = compiled_directstorage_available();
     caps->supports_gpu_direct_file_io = caps->supports_directstorage;
-    caps->preferred_numa_node = hip_driver_get_numa_node(caps->device_id);
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(48);
+
+    uint64_t total_bytes = 0;
+    const uint64_t free_bytes = hip_driver_detect_free_memory_bytes(caps->device_id, &total_bytes);
+
+    // BUGFIX 130: Same validation for HIP
+    if (free_bytes > 0) {
+        if (total_bytes > 0 && free_bytes < total_bytes / 10) {
+            fprintf(stderr, "[storageLLM WARNING] HIP VRAM query suspicious (free=%llu MB, total=%llu MB). "
+                    "Using fallback budget.\n",
+                    (unsigned long long)(free_bytes / (1024*1024)),
+                    (unsigned long long)(total_bytes / (1024*1024)));
+            caps->device_memory_bytes = caps->recommended_vram_cache_bytes;
+        } else {
+            caps->device_memory_bytes = free_bytes;
+            caps->recommended_vram_cache_bytes = std::max<uint64_t>(
+                caps->recommended_vram_cache_bytes,
+                moe_budget_from_free_device_memory(free_bytes)
+            );
+        }
+    } else if (total_bytes > 0) {
+        caps->device_memory_bytes = total_bytes;
+    }
+
+    // ============================================================================
+    // AMD MI300X / MI300A Unified Memory Support
+    // ============================================================================
+    // Enable zero-copy unified memory pathways to bypass PCIe bottlenecks on MI300.
+    // ============================================================================
+    if (total_bytes >= 120ull * 1024ull * 1024ull * 1024ull) {
+        caps->supports_unified_memory = 1;
+        caps->supports_zero_copy_host = 1;
+        caps->tflops_hint = 163.0;
+        caps->dma_bandwidth_gbps = 800.0;
+    }
 }
 
 static void fill_shared_memory_backend_caps(moe_backend_caps_t* caps) {

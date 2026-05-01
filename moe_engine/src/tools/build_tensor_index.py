@@ -78,6 +78,12 @@ def main(argv):
                 kidx = 0xFFFFFFFF
                 flags = 0
             records.append((
+                u64(row, "weight_byte_offset"),
+                u64(row, "weight_byte_length"),
+                u64(row, "scale_byte_offset"),
+                u64(row, "scale_byte_length"),
+                u64(row, "scale2_byte_offset"),
+                u64(row, "scale2_byte_length"),
                 u32(row, "part"),
                 u32(row, "shard"),
                 u32(row, "layer"),
@@ -87,12 +93,6 @@ def main(argv):
                 u32(row, "cols"),
                 u32(row, "groups"),
                 u32(row, "group_size"),
-                u64(row, "weight_byte_offset"),
-                u64(row, "weight_byte_length"),
-                u64(row, "scale_byte_offset"),
-                u64(row, "scale_byte_length"),
-                u64(row, "scale2_byte_offset"),
-                u64(row, "scale2_byte_length"),
                 idx,
                 flags,
                 kidx,
@@ -115,7 +115,7 @@ def main(argv):
             out.write(struct.pack("<H", len(data)))
             out.write(data)
         for rec in records:
-            out.write(struct.pack("<IIIIIIIIIQQQQQQHHI", *rec))
+            out.write(struct.pack("<QQQQQQIIIIIIIIIHHI", *rec))
     os.replace(tmp_path, out_path)
     print(f"wrote {out_path} tensors={len(records)} paths={len(paths)} scale4_keys={len(keys)}")
     return 0

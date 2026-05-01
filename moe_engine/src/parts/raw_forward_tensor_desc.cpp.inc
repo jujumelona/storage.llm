@@ -10,6 +10,371 @@ struct moe_raw_tensor_desc {
     uint32_t cols;
 };
 
+static uint8_t moe_raw_scalar_encoding_from_common_tensor(
+    const moe_gguf_common_tensor_record& rec,
+    uint32_t rows,
+    uint32_t cols
+) {
+    const uint64_t elems = (uint64_t)rows * (uint64_t)(cols ? cols : 1u);
+    if (elems && rec.bytes == elems * 4ull) {
+        return moe_RAW_SCALAR_F32;
+    }
+    if (elems && rec.bytes == elems * 2ull) {
+        return rec.type == 1u ? moe_RAW_SCALAR_F16 : moe_RAW_SCALAR_BF16;
+    }
+    if (rec.type == 0u) {
+        return moe_RAW_SCALAR_F32;
+    }
+    if (rec.type == 1u) {
+        return moe_RAW_SCALAR_F16;
+    }
+    if (rec.type == 32u) {
+        return moe_RAW_SCALAR_BF16;
+    }
+    return moe_RAW_SCALAR_BF16;
+}
+
+static int moe_common_tensor_record_to_raw_desc(
+    const moe_gguf_common_tensor_record& rec,
+    moe_raw_tensor_desc* out_desc
+) {
+    if (!out_desc || rec.bytes == 0 || rec.dims == 0 || rec.shape[0] == 0) {
+        return 0;
+    }
+    moe_raw_tensor_desc desc{};
+    desc.rel_offset = 0;
+    desc.bytes = rec.bytes;
+    if (rec.dims == 1) {
+        desc.rows = (uint32_t)std::min<uint64_t>(rec.shape[0], UINT32_MAX);
+        desc.cols = 0;
+    } else {
+        if (!rec.shape[1]) {
+            return 0;
+        }
+        desc.cols = (uint32_t)std::min<uint64_t>(rec.shape[0], UINT32_MAX);
+        desc.rows = (uint32_t)std::min<uint64_t>(rec.shape[1], UINT32_MAX);
+    }
+    if (!desc.rows) {
+        return 0;
+    }
+    *out_desc = desc;
+    return 1;
+}
+
+static const moe_gguf_common_tensor_record* moe_common_tensor_find(
+    const moe_pc_engine* engine,
+    const std::string& name
+) {
+    if (!engine || name.empty()) {
+        return nullptr;
+    }
+    const std::string key = moe_lower_ascii_copy(name);
+    auto it = engine->gguf_common_tensor_slots.find(key);
+    if (it == engine->gguf_common_tensor_slots.end() ||
+        it->second >= engine->gguf_common_tensors.size()) {
+        return nullptr;
+    }
+    return &engine->gguf_common_tensors[it->second];
+}
+
+static void moe_push_layer_tensor_candidate(
+    std::vector<std::string>* out,
+    int32_t layer,
+    const char* suffix
+) {
+    if (!out || layer < 0 || !suffix || !suffix[0]) {
+        return;
+    }
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "blk.%d.%s", (int)layer, suffix);
+    out->push_back(buf);
+    std::snprintf(buf, sizeof(buf), "model.layers.%d.%s", (int)layer, suffix);
+    out->push_back(buf);
+    std::snprintf(buf, sizeof(buf), "layers.%d.%s", (int)layer, suffix);
+    out->push_back(buf);
+    std::snprintf(buf, sizeof(buf), "transformer.h.%d.%s", (int)layer, suffix);
+    out->push_back(buf);
+    std::snprintf(buf, sizeof(buf), "h.%d.%s", (int)layer, suffix);
+    out->push_back(buf);
+}
+
+static void moe_push_layer_tensor_candidates(
+    std::vector<std::string>* out,
+    int32_t layer,
+    const char* const* suffixes,
+    size_t suffix_count
+) {
+    if (!out || !suffixes) {
+        return;
+    }
+    for (size_t i = 0; i < suffix_count; ++i) {
+        moe_push_layer_tensor_candidate(out, layer, suffixes[i]);
+    }
+}
+
+static void moe_raw_tensor_kind_common_names(
+    int32_t layer,
+    moe_raw_tensor_kind_t kind,
+    std::vector<std::string>* out
+) {
+    if (!out) {
+        return;
+    }
+    out->clear();
+    switch (kind) {
+        case moe_RAW_TENSOR_INPUT_LAYER_NORM: {
+            static const char* const suffixes[] = {
+                "attn_norm.weight",
+                "pre_attention_norm.weight",
+                "input_layernorm.weight",
+                "input_layer_norm.weight",
+                "attention_norm.weight",
+                "self_attn_layer_norm.weight",
+                "ln_1.weight"
+            };
+            moe_push_layer_tensor_candidates(out, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+            out->push_back("output_norm.weight");
+            out->push_back("model.norm.weight");
+            out->push_back("norm.weight");
+            out->push_back("transformer.ln_f.weight");
+            break;
+        }
+        case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM: {
+            static const char* const suffixes[] = {
+                "post_attention_norm.weight",
+                "post_attention_layernorm.weight",
+                "post_attention_layer_norm.weight",
+                "post_attn_norm.weight",
+                "ffn_norm.weight",
+                "mlp_norm.weight",
+                "post_attention_layernorm.weight",
+                "pre_ffw_norm.weight",
+                "ln_2.weight"
+            };
+            moe_push_layer_tensor_candidates(out, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+            break;
+        }
+        case moe_RAW_TENSOR_Q_A_LAYER_NORM: {
+            static const char* const suffixes[] = {
+                "attn_q_norm.weight",
+                "q_norm.weight",
+                "attn_q_a_norm.weight",
+                "q_a_norm.weight",
+                "q_a_layernorm.weight",
+                "self_attn.q_norm.weight",
+                "self_attn.q_a_norm.weight",
+                "self_attn.q_a_layernorm.weight"
+            };
+            moe_push_layer_tensor_candidates(out, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+            break;
+        }
+        case moe_RAW_TENSOR_KV_A_LAYER_NORM: {
+            static const char* const suffixes[] = {
+                "attn_k_norm.weight",
+                "k_norm.weight",
+                "attn_kv_a_norm.weight",
+                "kv_a_norm.weight",
+                "kv_a_layernorm.weight",
+                "self_attn.k_norm.weight",
+                "self_attn.kv_a_norm.weight",
+                "self_attn.kv_a_layernorm.weight"
+            };
+            moe_push_layer_tensor_candidates(out, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+            break;
+        }
+        case moe_RAW_TENSOR_Q_A_PROJ: {
+            static const char* const suffixes[] = {
+                "attn_q.weight",
+                "q_proj.weight",
+                "q_projection.weight",
+                "query_proj.weight",
+                "self_attn.q_proj.weight",
+                "attention.wq.weight",
+                "attn_q_a.weight",
+                "attn_q_a_proj.weight",
+                "q_a_proj.weight",
+                "self_attn.q_a_proj.weight"
+            };
+            moe_push_layer_tensor_candidates(out, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+            break;
+        }
+        case moe_RAW_TENSOR_Q_B_PROJ: {
+            static const char* const suffixes[] = {
+                "attn_q_b.weight",
+                "attn_q_b_proj.weight",
+                "q_b_proj.weight",
+                "self_attn.q_b_proj.weight"
+            };
+            moe_push_layer_tensor_candidates(out, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+            break;
+        }
+        case moe_RAW_TENSOR_KV_A_PROJ_WITH_MQA: {
+            static const char* const suffixes[] = {
+                "attn_k.weight",
+                "k_proj.weight",
+                "k_projection.weight",
+                "key_proj.weight",
+                "self_attn.k_proj.weight",
+                "attention.wk.weight",
+                "attn_kv_a_mqa.weight",
+                "attn_kv_a_proj_with_mqa.weight",
+                "kv_a_proj_with_mqa.weight",
+                "kv_a_proj.weight",
+                "self_attn.kv_a_proj_with_mqa.weight",
+                "self_attn.kv_a_proj.weight"
+            };
+            moe_push_layer_tensor_candidates(out, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+            break;
+        }
+        case moe_RAW_TENSOR_KV_B_PROJ: {
+            static const char* const suffixes[] = {
+                "attn_v.weight",
+                "v_proj.weight",
+                "v_projection.weight",
+                "value_proj.weight",
+                "self_attn.v_proj.weight",
+                "attention.wv.weight",
+                "attn_kv_b.weight",
+                "attn_kv_b_proj.weight",
+                "kv_b_proj.weight",
+                "self_attn.kv_b_proj.weight"
+            };
+            moe_push_layer_tensor_candidates(out, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+            break;
+        }
+        case moe_RAW_TENSOR_O_PROJ: {
+            static const char* const suffixes[] = {
+                "attn_output.weight",
+                "attn_o.weight",
+                "o_proj.weight",
+                "out_proj.weight",
+                "dense.weight",
+                "self_attn.o_proj.weight",
+                "attention.wo.weight"
+            };
+            moe_push_layer_tensor_candidates(out, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+static const moe_gguf_common_tensor_record* moe_common_tensor_find_first(
+    const moe_pc_engine* engine,
+    const std::vector<std::string>& names
+) {
+    for (const std::string& name : names) {
+        if (const moe_gguf_common_tensor_record* rec = moe_common_tensor_find(engine, name)) {
+            return rec;
+        }
+    }
+    return nullptr;
+}
+
+static const moe_gguf_common_tensor_record* find_common_raw_tensor_record(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    moe_raw_tensor_kind_t kind,
+    moe_raw_tensor_desc* out_desc
+) {
+    std::vector<std::string> names;
+    moe_raw_tensor_kind_common_names(layer, kind, &names);
+    const moe_gguf_common_tensor_record* rec = moe_common_tensor_find_first(engine, names);
+    if (!rec) {
+        return nullptr;
+    }
+    moe_raw_tensor_desc desc{};
+    if (!moe_common_tensor_record_to_raw_desc(*rec, &desc)) {
+        return nullptr;
+    }
+    if (out_desc) {
+        *out_desc = desc;
+    }
+    return rec;
+}
+
+static const moe_gguf_common_tensor_record* find_common_tensor_by_names(
+    const moe_pc_engine* engine,
+    const char* const* names,
+    size_t name_count,
+    moe_raw_tensor_desc* out_desc
+) {
+    if (!names) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < name_count; ++i) {
+        if (const moe_gguf_common_tensor_record* rec = moe_common_tensor_find(engine, names[i])) {
+            moe_raw_tensor_desc desc{};
+            if (!moe_common_tensor_record_to_raw_desc(*rec, &desc)) {
+                continue;
+            }
+            if (out_desc) {
+                *out_desc = desc;
+            }
+            return rec;
+        }
+    }
+    return nullptr;
+}
+
+static int common_tensor_backing_file_ready(
+    const moe_pc_engine* engine,
+    const moe_gguf_common_tensor_record* rec
+) {
+    if (!engine || !rec || rec->resolved_path_index >= engine->tensor_paths.size() || rec->bytes == 0) {
+        return 0;
+    }
+    uint64_t file_bytes = 0;
+    const std::string& path = engine->tensor_paths[rec->resolved_path_index];
+    return file_size_bytes(path, &file_bytes) &&
+        rec->file_offset <= file_bytes &&
+        rec->bytes <= file_bytes - rec->file_offset ? 1 : 0;
+}
+
+static int map_common_tensor_record(
+    moe_pc_engine* engine,
+    const moe_gguf_common_tensor_record& rec,
+    const moe_raw_tensor_desc& desc,
+    moe_raw_tensor_cache_entry* out_entry
+) {
+    if (!engine || !out_entry || rec.resolved_path_index >= engine->tensor_paths.size() ||
+        rec.bytes == 0 || desc.bytes == 0) {
+        return 0;
+    }
+    const std::string& path = engine->tensor_paths[rec.resolved_path_index];
+    mmap_context_t* mapped = get_or_map_shard_partial(engine, path, rec.file_offset, rec.bytes);
+    if (!mapped || !mmap_get_ptr(mapped, 0) || rec.bytes > (uint64_t)mmap_get_size(mapped)) {
+        return 0;
+    }
+    moe_raw_tensor_cache_entry entry{};
+    entry.span = nullptr;
+    entry.mapped = mapped;
+    entry.base = static_cast<const uint8_t*>(mmap_get_ptr(mapped, 0));
+    entry.rel_offset = 0;
+    entry.bytes = rec.bytes;
+    entry.rows = desc.rows;
+    entry.cols = desc.cols;
+    entry.scalar_encoding = moe_raw_scalar_encoding_from_common_tensor(rec, desc.rows, desc.cols);
+    entry.weight_format = moe_weight_encoding_from_gguf_type(rec.type, moe_offload_gguf_contract_t{});
+    if (entry.weight_format == moe_WEIGHT_ENCODING_UNKNOWN) {
+        entry.weight_format =
+            entry.scalar_encoding == moe_RAW_SCALAR_F32 ? moe_WEIGHT_ENCODING_RAW_FP32 : moe_WEIGHT_ENCODING_RAW_FP16;
+    }
+    moe_tensor_info_t info{};
+    info.rows = desc.rows;
+    info.cols = desc.cols;
+    info.weight_byte_length = rec.bytes;
+    entry.weight_row_bytes = infer_weight_row_bytes(info, entry.weight_format);
+    if ((!entry.weight_row_bytes ||
+         entry.weight_row_bytes * (uint64_t)entry.rows > entry.bytes) &&
+        entry.rows && entry.bytes % (uint64_t)entry.rows == 0) {
+        entry.weight_row_bytes = entry.bytes / (uint64_t)entry.rows;
+    }
+    *out_entry = entry;
+    return 1;
+}
+
 static int raw_tensor_desc_for_kind(moe_raw_tensor_kind_t kind, moe_raw_tensor_desc* out) {
     if (!out) {
         return 0;

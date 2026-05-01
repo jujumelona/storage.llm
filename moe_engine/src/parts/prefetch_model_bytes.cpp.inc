@@ -7,9 +7,9 @@ static uint64_t hardcoded_expert_bundle_bytes(int layer) {
 }
 
 static uint64_t expert_triplet_or_hardcoded_bytes(const moe_pc_engine* engine, int layer, int expert) {
-    const moe_storage_constants_t* c = moe_storage_constants();
-    if (!c || layer < (int)c->first_moe_layer || layer > (int)c->last_moe_layer ||
-        expert < 0 || expert >= (int)c->experts_per_moe_layer) {
+    const moe_storage_constants_t c = moe_engine_storage_constants_or_static(engine);
+    if (layer < (int)c.first_moe_layer || layer > (int)c.last_moe_layer ||
+        expert < 0 || expert >= (int)c.experts_per_moe_layer) {
         return 0;
     }
     const uint64_t bytes = expert_triplet_bytes(engine, layer, expert);

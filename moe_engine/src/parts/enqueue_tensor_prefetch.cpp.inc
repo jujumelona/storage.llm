@@ -16,7 +16,7 @@ static int enqueue_tensor_prefetch(
     // Bug #19: Skip if expert is already in STREAM state (transfer in-flight from another thread)
     // thread_local seen_set only deduplicates within one thread; STREAM catches cross-thread dupes
     if (!stream_state_prechecked && expert >= 0) {
-        const size_t eslot = expert_dense_slot(layer, expert);
+        const size_t eslot = expert_dense_slot(engine, layer, expert);
         std::lock_guard<std::mutex> lock(engine->map_mutex);
         if (eslot < engine->expert_states.size() && engine->expert_states[eslot].active &&
             engine->expert_states[eslot].tier == moe_TIER_STREAM) {
