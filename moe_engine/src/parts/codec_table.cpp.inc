@@ -1067,6 +1067,32 @@ static int load_juju_tensor_index_as_tensor_index(
             continue;
         }
         moe_juju_probe_note_index_json(&probe, index_json);
+        std::vector<moe_juju_tensor_json_entry_t> tensors;
+        if (!moe_parse_juju_tensor_index_json(index_json, &tensors, nullptr, nullptr, nullptr)) {
+            continue;
+        }
+        for (const moe_juju_tensor_json_entry_t& entry : tensors) {
+            moe_juju_probe_note_tensor(&probe, entry);
+        }
+    }
+    moe_juju_probe_apply(engine, &probe);
+    engine->expert_states.assign(expert_slot_count(engine), moe_block_state{});
+    tensor_slots_reset(engine);
+    engine->tensors.reserve(tensor_record_capacity(engine));
+    probe = moe_juju_runtime_probe_t{};
+    for (const std::string& path : paths) {
+        moe_juju_header_t header{};
+        std::vector<moe_juju_section_entry_t> sections;
+        uint64_t file_bytes = 0;
+        if (!moe_juju_read_table_local(path, &header, &sections, &file_bytes)) {
+            continue;
+        }
+        moe_juju_probe_note_header(&probe, header);
+        std::string index_json;
+        if (!moe_read_juju_tensor_index_json(path, sections, file_bytes, &index_json)) {
+            continue;
+        }
+        moe_juju_probe_note_index_json(&probe, index_json);
         moe_ingest_juju_graph_ir(engine, index_json);
         std::vector<moe_juju_tensor_json_entry_t> tensors;
         if (!moe_parse_juju_tensor_index_json(index_json, &tensors, nullptr, nullptr, nullptr) ||
