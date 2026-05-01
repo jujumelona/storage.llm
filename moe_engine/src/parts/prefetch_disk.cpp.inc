@@ -60,8 +60,10 @@
     return 1;
 }
 
-// Optimization 5: Linux io_uring registered buffer
-#ifdef __linux__
+// Optimization 5: Linux io_uring registered buffer.
+// The active path uses moe_io_ring_adapter. Keep this legacy path opt-in so
+// liburing-less Lightning images still build.
+#if defined(__linux__) && defined(MOE_HAVE_LIBURING) && MOE_HAVE_LIBURING && defined(MOE_ENABLE_LEGACY_URING_STATE)
 static bool init_io_uring(moe_pc_engine* engine) {
     if (!engine) return false;
     auto& state = engine->uring_state;

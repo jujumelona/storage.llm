@@ -1,4 +1,4 @@
-﻿#ifdef __linux__
+﻿#if defined(__linux__) && defined(MOE_HAVE_LIBURING) && MOE_HAVE_LIBURING && defined(MOE_ENABLE_LEGACY_URING_STATE)
 #include <liburing.h>
 struct io_uring_state_t {
     struct io_uring ring;
