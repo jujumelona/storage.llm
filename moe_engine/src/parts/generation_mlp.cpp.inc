@@ -526,7 +526,7 @@ static int moe_layer_moe_mlp_f32(
     const moe_storage_constants_t* c
 ) {
     const uint32_t hidden_size = c->hidden_size;
-    const uint32_t expert_intermediate = c->expert_intermediate_size;
+    const uint32_t configured_expert_intermediate = c->expert_intermediate_size;
     const moe_attn_config_t attn_cfg = moe_generation_attn_config(engine);
     std::fill(s->mlp.begin(), s->mlp.end(), 0.0f);
 
@@ -538,15 +538,15 @@ static int moe_layer_moe_mlp_f32(
     }
 
     const uint64_t shared_bytes =
-        2ull * (uint64_t)expert_intermediate * (uint64_t)hidden_size * 2ull +
-        (uint64_t)hidden_size * (uint64_t)expert_intermediate * 2ull;
+        2ull * (uint64_t)configured_expert_intermediate * (uint64_t)hidden_size * 2ull +
+        (uint64_t)hidden_size * (uint64_t)configured_expert_intermediate * 2ull;
     const moe_storage_raw_span_spec_t* shared = find_raw_role_span_bytes(layer, moe_RAW_ROLE_SHARED, shared_bytes, 0);
     int shared_ok = 0;
     if (moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
         shared_ok = 1;
     } else if (shared &&
         moe_raw_mlp_span_f32(
-            engine, shared, shared_input, hidden_size, expert_intermediate,
+            engine, shared, shared_input, hidden_size, configured_expert_intermediate,
             s->gate.data(), s->up.data(), s->shared.data())) {
         shared_ok = 1;
     }
@@ -687,24 +687,11 @@ static int moe_layer_moe_mlp_f32(
             num_selected, s->expert_work.size(), layer);
         s->expert_work.resize(num_selected);
     }
-    const size_t needed_gate = num_selected * (size_t)expert_intermediate;
-    const size_t needed_up = needed_gate;
-    const size_t needed_out = num_selected * (size_t)hidden_size;
-    if (s->expert_gate_pool.size() < needed_gate) {
-        s->expert_gate_pool.resize(needed_gate);
-    }
-    if (s->expert_up_pool.size() < needed_up) {
-        s->expert_up_pool.resize(needed_up);
-    }
-    if (s->expert_out_pool.size() < needed_out) {
-        s->expert_out_pool.resize(needed_out);
-    }
     moe_expert_work_t* work = s->expert_work.data();
     for (size_t e = 0; e < num_selected; ++e) {
-        work[e].gate = s->expert_gate_pool.data() + e * (size_t)expert_intermediate;
-        work[e].up = s->expert_up_pool.data() + e * (size_t)expert_intermediate;
-        work[e].out = s->expert_out_pool.data() + e * (size_t)hidden_size;
-        std::fill(work[e].out, work[e].out + hidden_size, 0.0f);
+        work[e].gate = nullptr;
+        work[e].up = nullptr;
+        work[e].out = nullptr;
         work[e].weight = s->selected_weights[e];
         work[e].expert_id = s->selected_experts[e];
         work[e].ok = 0;
@@ -714,33 +701,12 @@ static int moe_layer_moe_mlp_f32(
     // Instead of 8 sequential run_expert_triplet_f32 calls (each taking the full
     // pool via cpu_row_active), we pre-map all shards, then dispatch ALL experts'
     // rows in one parallel_rows call. This eliminates cpu_row_active serialization.
-    uint32_t gate_rows = expert_intermediate;
-    uint32_t gate_cols = hidden_size;
-    uint32_t up_rows = expert_intermediate;
-    uint32_t up_cols = hidden_size;
-    uint32_t down_rows = hidden_size;
-    uint32_t down_cols = expert_intermediate;
-    if (!gate_rows || !gate_cols || !up_rows || !up_cols || !down_rows || !down_cols) {
-        const moe_projection_shape_spec_t* gate_shape = moe_storage_projection_shape(moe_PROJ_GATE);
-        const moe_projection_shape_spec_t* up_shape = moe_storage_projection_shape(moe_PROJ_UP);
-        const moe_projection_shape_spec_t* down_shape = moe_storage_projection_shape(moe_PROJ_DOWN);
-        if (!gate_shape || !up_shape || !down_shape) {
-            std::fprintf(stderr, "[storagellm mlp] missing projection shape layer=%d gate=%p up=%p down=%p\n",
-                layer, (const void*)gate_shape, (const void*)up_shape, (const void*)down_shape);
-            return 0;
-        }
-        gate_rows = gate_shape->rows;
-        gate_cols = gate_shape->cols;
-        up_rows = up_shape->rows;
-        up_cols = up_shape->cols;
-        down_rows = down_shape->rows;
-        down_cols = down_shape->cols;
-    }
-    if (!gate_rows || !gate_cols || !up_rows || !up_cols || !down_rows || !down_cols) {
-        std::fprintf(stderr, "[storagellm mlp] invalid projection shape layer=%d hidden=%u intermediate=%u\n",
-            layer, hidden_size, expert_intermediate);
-        return 0;
-    }
+    uint32_t gate_rows = 0;
+    uint32_t gate_cols = 0;
+    uint32_t up_rows = 0;
+    uint32_t up_cols = 0;
+    uint32_t down_rows = 0;
+    uint32_t down_cols = 0;
 
     // Pre-map all expert weight shards (these are cached, so fast for hot experts)
     struct expert_shards_t {
@@ -791,20 +757,44 @@ static int moe_layer_moe_mlp_f32(
             }
             continue;
         }
-        if (shards[e].gate_rec->info.rows != gate_rows || shards[e].gate_rec->info.cols != gate_cols ||
-            shards[e].up_rec->info.rows != up_rows || shards[e].up_rec->info.cols != up_cols ||
-            shards[e].down_rec->info.rows != down_rows || shards[e].down_rec->info.cols != down_cols) {
+        const uint32_t cand_gate_rows = shards[e].gate_rec->info.rows;
+        const uint32_t cand_gate_cols = shards[e].gate_rec->info.cols;
+        const uint32_t cand_up_rows = shards[e].up_rec->info.rows;
+        const uint32_t cand_up_cols = shards[e].up_rec->info.cols;
+        const uint32_t cand_down_rows = shards[e].down_rec->info.rows;
+        const uint32_t cand_down_cols = shards[e].down_rec->info.cols;
+        const int record_shape_ok =
+            cand_gate_rows != 0 &&
+            cand_gate_rows == cand_up_rows &&
+            cand_gate_rows == cand_down_cols &&
+            cand_gate_cols == hidden_size &&
+            cand_up_cols == hidden_size &&
+            cand_down_rows == hidden_size;
+        const int matches_canonical =
+            !gate_rows ||
+            (cand_gate_rows == gate_rows && cand_gate_cols == gate_cols &&
+             cand_up_rows == up_rows && cand_up_cols == up_cols &&
+             cand_down_rows == down_rows && cand_down_cols == down_cols);
+        if (!record_shape_ok || !matches_canonical) {
             ++shape_mismatch_experts;
             if (first_bad_expert < 0) {
                 first_bad_expert = work[e].expert_id;
-                first_gate_rows = shards[e].gate_rec->info.rows;
-                first_gate_cols = shards[e].gate_rec->info.cols;
-                first_up_rows = shards[e].up_rec->info.rows;
-                first_up_cols = shards[e].up_rec->info.cols;
-                first_down_rows = shards[e].down_rec->info.rows;
-                first_down_cols = shards[e].down_rec->info.cols;
+                first_gate_rows = cand_gate_rows;
+                first_gate_cols = cand_gate_cols;
+                first_up_rows = cand_up_rows;
+                first_up_cols = cand_up_cols;
+                first_down_rows = cand_down_rows;
+                first_down_cols = cand_down_cols;
             }
             continue;
+        }
+        if (!gate_rows) {
+            gate_rows = cand_gate_rows;
+            gate_cols = cand_gate_cols;
+            up_rows = cand_up_rows;
+            up_cols = cand_up_cols;
+            down_rows = cand_down_rows;
+            down_cols = cand_down_cols;
         }
         shards[e].gate_shard = get_or_map_tensor_shard(engine, *shards[e].gate_rec);
         shards[e].up_shard = get_or_map_tensor_shard(engine, *shards[e].up_rec);
@@ -829,16 +819,47 @@ static int moe_layer_moe_mlp_f32(
         mapped_experts += expert_ok[e].load(std::memory_order_acquire) ? 1u : 0u;
     }
     if (mapped_experts == 0) {
+        const uint32_t expected_intermediate = gate_rows ? gate_rows : configured_expert_intermediate;
+        const uint32_t expected_gate_cols = gate_cols ? gate_cols : hidden_size;
+        const uint32_t expected_up_cols = up_cols ? up_cols : hidden_size;
+        const uint32_t expected_down_rows = down_rows ? down_rows : hidden_size;
+        const uint32_t expected_down_cols = down_cols ? down_cols : configured_expert_intermediate;
         std::fprintf(stderr,
             "[storagellm mlp] no selected expert shards mapped layer=%d selected=%zu first=%d missing=%u shape_mismatch=%u map_failed=%u expected gate=%ux%u up=%ux%u down=%ux%u first_bad=%d got gate=%ux%u up=%ux%u down=%ux%u\n",
             layer, num_selected, work[0].expert_id,
             missing_experts, shape_mismatch_experts, map_failed_experts,
-            gate_rows, gate_cols, up_rows, up_cols, down_rows, down_cols,
+            expected_intermediate, expected_gate_cols,
+            expected_intermediate, expected_up_cols,
+            expected_down_rows, expected_down_cols,
             first_bad_expert,
             first_gate_rows, first_gate_cols,
             first_up_rows, first_up_cols,
             first_down_rows, first_down_cols);
         return 0;
+    }
+    const uint32_t expert_intermediate = gate_rows;
+    if (expert_intermediate == 0) {
+        std::fprintf(stderr, "[storagellm mlp] invalid intermediate size layer=%d intermediate=%u\n",
+            layer, expert_intermediate);
+        return 0;
+    }
+    const size_t needed_gate = num_selected * (size_t)expert_intermediate;
+    const size_t needed_up = needed_gate;
+    const size_t needed_out = num_selected * (size_t)hidden_size;
+    if (s->expert_gate_pool.size() < needed_gate) {
+        s->expert_gate_pool.resize(needed_gate);
+    }
+    if (s->expert_up_pool.size() < needed_up) {
+        s->expert_up_pool.resize(needed_up);
+    }
+    if (s->expert_out_pool.size() < needed_out) {
+        s->expert_out_pool.resize(needed_out);
+    }
+    for (size_t e = 0; e < num_selected; ++e) {
+        work[e].gate = s->expert_gate_pool.data() + e * (size_t)expert_intermediate;
+        work[e].up = s->expert_up_pool.data() + e * (size_t)expert_intermediate;
+        work[e].out = s->expert_out_pool.data() + e * (size_t)hidden_size;
+        std::fill(work[e].out, work[e].out + hidden_size, 0.0f);
     }
 
     // Phase 2a: Flat dispatch: gate+up+SiLU for all experts simultaneously.
@@ -860,6 +881,14 @@ static int moe_layer_moe_mlp_f32(
     const int gate_up_ok = moe_parallel_rows(engine, total_gate_rows, 0, [&](uint32_t flat_row) {
         const uint32_t e = flat_row / expert_intermediate;
         const uint32_t r = flat_row % expert_intermediate;
+        // Guard row-to-expert decoding before indexing per-expert arrays.
+        // BUGFIX 290: Add bounds check for e index ★
+        // Problem: e can exceed num_selected if flat_row is corrupted or overflow occurs
+        // Accessing expert_ok[e], work[e], shards[e] with invalid e causes out-of-bounds access
+        // Solution: Check e < num_selected before any array access
+        if (e >= num_selected) {
+            return 0;
+        }
         if (!expert_ok[e].load(std::memory_order_acquire)) return 1;
         if (!moe_dot_tensor_record_row(engine, shards[e].gate_rec, shards[e].gate_shard, r, expert_input, hidden_size, &work[e].gate[r])) { expert_ok[e].store(0, std::memory_order_release); return 1; }
         if (!moe_dot_tensor_record_row(engine, shards[e].up_rec, shards[e].up_shard, r, expert_input, hidden_size, &work[e].up[r])) { expert_ok[e].store(0, std::memory_order_release); return 1; }
@@ -878,6 +907,10 @@ static int moe_layer_moe_mlp_f32(
     const int down_ok = moe_parallel_rows(engine, total_down_rows, 0, [&](uint32_t flat_row) {
         const uint32_t e = flat_row / hidden_size;
         const uint32_t r = flat_row % hidden_size;
+        // Guard row-to-expert decoding before indexing per-expert arrays.
+        if (e >= num_selected) {
+            return 0;
+        }
         if (!expert_ok[e].load(std::memory_order_acquire)) return 1;
         if (!moe_dot_tensor_record_row(engine, shards[e].down_rec, shards[e].down_shard,
                 r, work[e].gate, expert_intermediate, &work[e].out[r])) {

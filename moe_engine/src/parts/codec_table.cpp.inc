@@ -349,6 +349,7 @@ static void moe_dynamic_shape_note_tensor(
         }
         if (key.find("ffn_gate_up_exps.weight") != std::string::npos ||
             key.find("ffn_gate_exps.weight") != std::string::npos ||
+            key.find("ffn_up_exps.weight") != std::string::npos ||
             key.find("ffn_down_exps.weight") != std::string::npos) {
             if (next.first_moe_layer == 0 && next.last_moe_layer == 0) {
                 next.first_moe_layer = layer;
@@ -363,10 +364,18 @@ static void moe_dynamic_shape_note_tensor(
                     std::max<uint32_t>(next.experts_per_moe_layer,
                         (uint32_t)std::min<uint64_t>(shape[2], UINT32_MAX));
             }
-            if (dims >= 2 && shape[1]) {
+            uint64_t expert_intermediate = 0;
+            if (key.find("ffn_gate_up_exps.weight") != std::string::npos) {
+                expert_intermediate = (dims >= 2 && shape[1] >= 2) ? shape[1] / 2ull : 0ull;
+            } else if (key.find("ffn_down_exps.weight") != std::string::npos) {
+                expert_intermediate = (dims >= 1) ? shape[0] : 0ull;
+            } else if (key.find("ffn_gate_exps.weight") != std::string::npos ||
+                       key.find("ffn_up_exps.weight") != std::string::npos) {
+                expert_intermediate = (dims >= 2) ? shape[1] : 0ull;
+            }
+            if (expert_intermediate) {
                 next.expert_intermediate_size =
-                    std::max<uint32_t>(next.expert_intermediate_size,
-                        (uint32_t)std::min<uint64_t>(shape[1], UINT32_MAX));
+                    (uint32_t)std::min<uint64_t>(expert_intermediate, UINT32_MAX);
             }
         }
     }
@@ -633,6 +642,7 @@ static void moe_juju_probe_note_tensor(
         const bool expert_tensor =
             lower.find("ffn_gate_up_exps.weight") != std::string::npos ||
             lower.find("ffn_gate_exps.weight") != std::string::npos ||
+            lower.find("ffn_up_exps.weight") != std::string::npos ||
             lower.find("ffn_down_exps.weight") != std::string::npos ||
             ((lower.find("gate_proj.weight") != std::string::npos ||
               lower.find("up_proj.weight") != std::string::npos ||
@@ -651,12 +661,30 @@ static void moe_juju_probe_note_tensor(
                         (uint32_t)std::min<uint64_t>(entry.shape[2], UINT32_MAX));
                 probe->shape.projection_count = 3;
             }
-            if (rows) {
-                const uint64_t expert_rows =
-                    lower.find("ffn_gate_up_exps.weight") != std::string::npos ? rows / 2ull : rows;
+            uint64_t expert_intermediate = 0;
+            if (lower.find("ffn_gate_up_exps.weight") != std::string::npos) {
+                expert_intermediate = rows >= 2 ? rows / 2ull : 0ull;
+            } else if (lower.find("ffn_down_exps.weight") != std::string::npos ||
+                       lower.find("down_proj.weight") != std::string::npos ||
+                       lower.find("feed_forward.w2.weight") != std::string::npos ||
+                       lower.find("ffn.w2.weight") != std::string::npos ||
+                       lower.find("w2.weight") != std::string::npos) {
+                expert_intermediate = cols;
+            } else if (lower.find("ffn_gate_exps.weight") != std::string::npos ||
+                       lower.find("ffn_up_exps.weight") != std::string::npos ||
+                       lower.find("gate_proj.weight") != std::string::npos ||
+                       lower.find("up_proj.weight") != std::string::npos ||
+                       lower.find("feed_forward.w1.weight") != std::string::npos ||
+                       lower.find("feed_forward.w3.weight") != std::string::npos ||
+                       lower.find("ffn.w1.weight") != std::string::npos ||
+                       lower.find("ffn.w3.weight") != std::string::npos ||
+                       lower.find("w1.weight") != std::string::npos ||
+                       lower.find("w3.weight") != std::string::npos) {
+                expert_intermediate = rows;
+            }
+            if (expert_intermediate) {
                 probe->shape.expert_intermediate_size =
-                    std::max<uint32_t>(probe->shape.expert_intermediate_size,
-                        (uint32_t)std::min<uint64_t>(expert_rows, UINT32_MAX));
+                    (uint32_t)std::min<uint64_t>(expert_intermediate, UINT32_MAX);
             }
         }
     }
