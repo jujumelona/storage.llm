@@ -156,12 +156,16 @@ static float moe_e8m0_to_f32_half(uint8_t v) {
     return out;
 }
 
-static float moe_mxfp4_value_from_code(uint8_t code) {
+static const float* moe_mxfp4_value_table() {
     static constexpr float kMxfp4Table[16] = {
         0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
         -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
     };
-    return kMxfp4Table[code & 0x0fu];
+    return kMxfp4Table;
+}
+
+static float moe_mxfp4_value_from_code(uint8_t code) {
+    return moe_mxfp4_value_table()[code & 0x0fu];
 }
 
 static uint8_t moe_mxfp4_code_at(const uint8_t* qs, uint32_t index) {
@@ -185,13 +189,38 @@ static float moe_dot_gguf_mxfp4_row(
     float acc = 0.0f;
     const uint32_t block_cols = 32u;
     const uint32_t block_bytes = 17u;
-    for (uint32_t start = 0; start < cols; start += block_cols) {
+    const float* table = moe_mxfp4_value_table();
+    uint32_t start = 0;
+    const uint32_t full_cols = cols & ~(block_cols - 1u);
+    for (; start < full_cols; start += block_cols) {
         const float scale = moe_e8m0_to_f32_half(packed[0]);
         const uint8_t* qs = packed + 1u;
-        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
-        for (uint32_t i = 0; i < limit; ++i) {
-            acc += moe_mxfp4_value_from_code(moe_mxfp4_code_at(qs, i)) * scale * x[start + i];
+        const float* xb = x + start;
+        float even = 0.0f;
+        float odd = 0.0f;
+        for (uint32_t j = 0; j < 16u; ++j) {
+            const uint8_t byte = qs[j];
+            even += table[byte & 0x0fu] * xb[j * 2u];
+            odd += table[byte >> 4] * xb[j * 2u + 1u];
         }
+        acc += (even + odd) * scale;
+        packed += block_bytes;
+    }
+    if (start < cols) {
+        const float scale = moe_e8m0_to_f32_half(packed[0]);
+        const uint8_t* qs = packed + 1u;
+        const uint32_t limit = cols - start;
+        float block_acc = 0.0f;
+        uint32_t i = 0;
+        for (; i + 1u < limit; i += 2u) {
+            const uint8_t byte = qs[i >> 1];
+            block_acc += table[byte & 0x0fu] * x[start + i];
+            block_acc += table[byte >> 4] * x[start + i + 1u];
+        }
+        if (i < limit) {
+            block_acc += table[qs[i >> 1] & 0x0fu] * x[start + i];
+        }
+        acc += block_acc * scale;
         packed += block_bytes;
     }
     return acc;
