@@ -77,7 +77,22 @@ static int moe_raw_tensor_scalar_at_f32(
 
 static uint64_t moe_raw_tensor_scalar_count(const moe_raw_tensor_cache_entry& raw) {
     const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
-    return elem ? raw.bytes / (uint64_t)elem : 0;
+    if (!elem) {
+        return 0;
+    }
+    uint64_t logical_count = 0;
+    if (raw.cols) {
+        if (raw.rows > UINT64_MAX / (uint64_t)raw.cols) {
+            return raw.bytes / (uint64_t)elem;
+        }
+        logical_count = (uint64_t)raw.rows * (uint64_t)raw.cols;
+    } else {
+        logical_count = raw.rows;
+    }
+    if (logical_count && logical_count <= raw.bytes / (uint64_t)elem) {
+        return logical_count;
+    }
+    return raw.bytes / (uint64_t)elem;
 }
 
 static int moe_apply_rmsnorm_common_weight_f32(
