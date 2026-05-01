@@ -714,12 +714,31 @@ static int moe_layer_moe_mlp_f32(
     // Instead of 8 sequential run_expert_triplet_f32 calls (each taking the full
     // pool via cpu_row_active), we pre-map all shards, then dispatch ALL experts'
     // rows in one parallel_rows call. This eliminates cpu_row_active serialization.
-    const moe_projection_shape_spec_t* gate_shape = moe_storage_projection_shape(moe_PROJ_GATE);
-    const moe_projection_shape_spec_t* up_shape = moe_storage_projection_shape(moe_PROJ_UP);
-    const moe_projection_shape_spec_t* down_shape = moe_storage_projection_shape(moe_PROJ_DOWN);
-    if (!gate_shape || !up_shape || !down_shape) {
-        std::fprintf(stderr, "[storagellm mlp] missing projection shape layer=%d gate=%p up=%p down=%p\n",
-            layer, (const void*)gate_shape, (const void*)up_shape, (const void*)down_shape);
+    uint32_t gate_rows = expert_intermediate;
+    uint32_t gate_cols = hidden_size;
+    uint32_t up_rows = expert_intermediate;
+    uint32_t up_cols = hidden_size;
+    uint32_t down_rows = hidden_size;
+    uint32_t down_cols = expert_intermediate;
+    if (!gate_rows || !gate_cols || !up_rows || !up_cols || !down_rows || !down_cols) {
+        const moe_projection_shape_spec_t* gate_shape = moe_storage_projection_shape(moe_PROJ_GATE);
+        const moe_projection_shape_spec_t* up_shape = moe_storage_projection_shape(moe_PROJ_UP);
+        const moe_projection_shape_spec_t* down_shape = moe_storage_projection_shape(moe_PROJ_DOWN);
+        if (!gate_shape || !up_shape || !down_shape) {
+            std::fprintf(stderr, "[storagellm mlp] missing projection shape layer=%d gate=%p up=%p down=%p\n",
+                layer, (const void*)gate_shape, (const void*)up_shape, (const void*)down_shape);
+            return 0;
+        }
+        gate_rows = gate_shape->rows;
+        gate_cols = gate_shape->cols;
+        up_rows = up_shape->rows;
+        up_cols = up_shape->cols;
+        down_rows = down_shape->rows;
+        down_cols = down_shape->cols;
+    }
+    if (!gate_rows || !gate_cols || !up_rows || !up_cols || !down_rows || !down_cols) {
+        std::fprintf(stderr, "[storagellm mlp] invalid projection shape layer=%d hidden=%u intermediate=%u\n",
+            layer, hidden_size, expert_intermediate);
         return 0;
     }
 
@@ -749,9 +768,9 @@ static int moe_layer_moe_mlp_f32(
         if (!shards[e].gate_rec || !shards[e].up_rec || !shards[e].down_rec) {
             continue;
         }
-        if (shards[e].gate_rec->info.rows != gate_shape->rows || shards[e].gate_rec->info.cols != gate_shape->cols ||
-            shards[e].up_rec->info.rows != up_shape->rows || shards[e].up_rec->info.cols != up_shape->cols ||
-            shards[e].down_rec->info.rows != down_shape->rows || shards[e].down_rec->info.cols != down_shape->cols) {
+        if (shards[e].gate_rec->info.rows != gate_rows || shards[e].gate_rec->info.cols != gate_cols ||
+            shards[e].up_rec->info.rows != up_rows || shards[e].up_rec->info.cols != up_cols ||
+            shards[e].down_rec->info.rows != down_rows || shards[e].down_rec->info.cols != down_cols) {
             continue;
         }
         shards[e].gate_shard = get_or_map_tensor_shard(engine, *shards[e].gate_rec);
