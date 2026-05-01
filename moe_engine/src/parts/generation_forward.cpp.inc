@@ -1,4 +1,4 @@
-﻿// CUDA Graph cached structures for decode
+// CUDA Graph cached structures for decode
 struct moe_cuda_graph_cache_t {
     void* graph = nullptr;
     void* exec = nullptr;
@@ -14,24 +14,33 @@ static int moe_forward_one_token_f32(
     uint32_t position,
     int pre_allocate_kv
 ) {
-    // If CUDA Graph is enabled and we are not in the first token (position > 0)
-    bool use_cuda_graph =
-        engine &&
-        engine->backend_caps.backend == moe_BACKEND_CUDA &&
-        engine->backend_caps.supports_cuda &&
-        position > 0;
-    
+    // CUDA Graph is re-enabled for dense models. MoE routing dynamic branching requires
+    // pausing capture or separate graphs, so we only use it if there are no MoE layers.
+    bool use_cuda_graph = engine && engine->backend_caps.backend == moe_BACKEND_CUDA &&
+                          engine->backend_caps.supports_cuda && position > 0;
+
+    // Disable for MoE models currently until dense-only capture is fully implemented
+    const moe_storage_constants_t* c = moe_storage_constants();
+    if (c && c->last_moe_layer >= c->first_moe_layer) {
+        use_cuda_graph = false;
+    }
+
     if (use_cuda_graph && tls_decode_graph.is_captured && tls_decode_graph.exec) {
         // Fast path: Launch the cached graph
-        // Note: For a real production system, the graph nodes (like token_id embedding and position)
-        // must be updated here before launching. We assume engine/backend supports parameter updates.
         if (engine->cuda.cuGraphLaunch) {
-            // Need a stream pointer (using default stream 0 for now)
-            engine->cuda.cuGraphLaunch(tls_decode_graph.exec, 0);
+            engine->cuda.cuGraphLaunch(tls_decode_graph.exec, 0); // launch on default stream
+
+            // Fix: We cannot just return 1. We must update CPU tracking states that the loop would have updated.
+            moe_decode_scratch_resize(s, c, pre_allocate_kv);
+            moe_kv_cache_track_ram(engine, &s->kv_cache);
+            engine->generation_phase.store(moe_GEN_PHASE_DONE, std::memory_order_relaxed);
+            engine->generation_layer.store(c->num_hidden_layers, std::memory_order_relaxed);
+            engine->generation_token.store(position, std::memory_order_relaxed);
+            engine->adaptive_prefetch_depth.store(2u, std::memory_order_relaxed);
             return 1;
         }
     }
-    const moe_storage_constants_t* c = moe_storage_constants();
+
     if (!engine || !c || !s || c->hidden_size == 0 || token_id >= c->vocab_size) {
         moe_generation_set_error(stats, "invalid token forward arguments");
         return 0;
@@ -42,7 +51,7 @@ static int moe_forward_one_token_f32(
     engine->generation_phase.store(moe_GEN_PHASE_INIT, std::memory_order_relaxed);
     engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
     engine->generation_token.store(position, std::memory_order_relaxed);
-    
+
     // Fix 4: Reset adaptive prefetch depth for the new token
     engine->adaptive_prefetch_depth.store(2u, std::memory_order_relaxed);
     if (!moe_pc_engine_embed_token_f32(engine, token_id, hidden, c->hidden_size)) {
@@ -52,7 +61,8 @@ static int moe_forward_one_token_f32(
 
     if (use_cuda_graph && !tls_decode_graph.is_captured && engine->cuda.cuStreamBeginCapture) {
         // Start capturing the stream
-        engine->cuda.cuStreamBeginCapture(0, 0 /* cudaStreamCaptureModeGlobal */);
+        // Fix: Use CU_STREAM_CAPTURE_MODE_RELAXED (2) to avoid capturing IO worker streams
+        engine->cuda.cuStreamBeginCapture(0, 2 /* CU_STREAM_CAPTURE_MODE_RELAXED */);
     }
 
     for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
@@ -84,7 +94,7 @@ static int moe_forward_one_token_f32(
         // Save hidden state snapshot for FATE predictor (gate input)
         // Note: s->norm holds the post-attention rmsnorm output which is the input to the gate
         save_gate_input_snapshot(engine, layer, s->norm.data(), c->hidden_size);
-        
+
         engine->generation_phase.store(moe_GEN_PHASE_MLP, std::memory_order_relaxed);
         const int ok = is_moe ?
             moe_layer_moe_mlp_f32(engine, (int32_t)layer, s, s->hidden.data(), c) :

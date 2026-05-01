@@ -1,4 +1,4 @@
-﻿static uint64_t moe_rt_align_4k(uint64_t value) {
+static uint64_t moe_rt_align_4k(uint64_t value) {
     return moe_juju_align_up(value, 4096ull);
 }
 
@@ -363,6 +363,68 @@ static void moe_juju_update_co_activation(moe_pc_engine* engine, int current_lay
                 stats[src_expert][tgt_expert]++;
             }
         }
+    }
+}
+
+// ============================================================================
+// Expert Co-activation Merging (MC-MoE 2024, EvoMoE)
+// Union-find groups experts with >80% co-activation into logical clusters.
+// Prefetch pipeline loads entire cluster when any member is selected.
+// ============================================================================
+struct moe_expert_merge_map {
+    std::vector<std::vector<int>> merge_groups;   // [layer][expert] → group_id
+    std::vector<std::unordered_map<int, std::vector<int>>> group_members; // [layer][group] → experts
+    bool valid = false;
+};
+static moe_expert_merge_map s_expert_merge_map;
+
+static void moe_build_expert_merge_map(moe_pc_engine* engine) {
+    if (!engine) return;
+    s_expert_merge_map.valid = false;
+    const moe_storage_constants_t* c = moe_storage_constants();
+    if (!c || c->experts_per_moe_layer == 0) return;
+    const uint32_t nL = c->num_hidden_layers, nE = c->experts_per_moe_layer;
+    s_expert_merge_map.merge_groups.resize(nL);
+    s_expert_merge_map.group_members.resize(nL);
+    for (uint32_t L = c->first_moe_layer; L <= c->last_moe_layer && L < nL; ++L) {
+        auto& grp = s_expert_merge_map.merge_groups[L];
+        auto& mem = s_expert_merge_map.group_members[L];
+        grp.assign(nE, -1); mem.clear();
+        if (L >= engine->co_activation_stats.size()) {
+            for (uint32_t e = 0; e < nE; ++e) { grp[e]=(int)e; mem[(int)e]={(int)e}; }
+            continue;
+        }
+        std::vector<int> par(nE);
+        for (uint32_t i = 0; i < nE; ++i) par[i]=(int)i;
+        std::function<int(int)> find=[&](int x)->int{while(par[x]!=x){par[x]=par[par[x]];x=par[x];}return x;};
+        for (const auto& [src,tgts] : engine->co_activation_stats[L]) {
+            float tot=0; for (const auto& [t,c2]:tgts) tot+=c2;
+            if (tot<10.f) continue;
+            for (const auto& [t,c2]:tgts) {
+                if (src!=t && c2/tot>0.80f && src>=0 && t>=0 && (uint32_t)src<nE && (uint32_t)t<nE) {
+                    int a=find(src),b=find(t); if(a!=b) par[a]=b;
+                }
+            }
+        }
+        std::unordered_map<int,int> r2g; int ng=0;
+        for (uint32_t e=0;e<nE;++e){
+            int r=find((int)e); auto it=r2g.find(r);
+            if(it==r2g.end()){r2g[r]=ng;grp[e]=ng;mem[ng].push_back((int)e);++ng;}
+            else{grp[e]=it->second;mem[it->second].push_back((int)e);}
+        }
+    }
+    s_expert_merge_map.valid = true;
+}
+
+static void moe_expand_merged_experts(int layer, const std::vector<int>& sel, std::vector<int>& out) {
+    out = sel;
+    if (!s_expert_merge_map.valid || layer<0 || (size_t)layer>=s_expert_merge_map.group_members.size()) return;
+    const auto& mem = s_expert_merge_map.group_members[layer];
+    std::unordered_set<int> seen(sel.begin(), sel.end());
+    for (int e : sel) {
+        if ((size_t)e >= s_expert_merge_map.merge_groups[layer].size()) continue;
+        auto it = mem.find(s_expert_merge_map.merge_groups[layer][e]);
+        if (it != mem.end()) for (int m : it->second) if (seen.insert(m).second) out.push_back(m);
     }
 }
 

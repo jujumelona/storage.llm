@@ -82,6 +82,36 @@ static int cuda_driver_load(moe_cuda_driver_api* api) {
     api->cuGraphExecDestroy = (void* (*)(void*))moe_find_shared_symbol(api->library, "cuGraphExecDestroy");
     api->cuStreamBeginCapture = (void* (*)(void*, int))moe_find_cuda_symbol(api->library, "cuStreamBeginCapture_v2", "cuStreamBeginCapture");
     api->cuStreamEndCapture = (void* (*)(void*, void**))moe_find_shared_symbol(api->library, "cuStreamEndCapture");
+
+    // cuMemHostRegister — needed for io_uring registered buffer integration
+    api->cuMemHostRegister = (int (*)(void*, size_t, unsigned int))moe_find_cuda_symbol(api->library, "cuMemHostRegister_v2", "cuMemHostRegister");
+    api->cuMemHostUnregister = (int (*)(void*))moe_find_shared_symbol(api->library, "cuMemHostUnregister");
+
+    // GPUDirect Storage (cuFile) — load from separate GDS library
+    // cuFile enables NVMe → GPU DMA, bypassing CPU staging entirely.
+    // Not available on all systems; graceful fallback to staged pipeline.
+#ifdef _WIN32
+    api->cufile_library = (void*)LoadLibraryA("cufile.dll");
+#else
+    api->cufile_library = dlopen("libcufile.so.0", RTLD_LAZY | RTLD_LOCAL);
+    if (!api->cufile_library) {
+        api->cufile_library = dlopen("libcufile.so", RTLD_LAZY | RTLD_LOCAL);
+    }
+#endif
+    if (api->cufile_library) {
+        api->cuFileDriverOpen = (int (*)())moe_find_shared_symbol(api->cufile_library, "cuFileDriverOpen");
+        api->cuFileDriverClose = (void (*)())moe_find_shared_symbol(api->cufile_library, "cuFileDriverClose");
+        api->cuFileHandleRegister = (void* (*)(void*, void*))moe_find_shared_symbol(api->cufile_library, "cuFileHandleRegister");
+        api->cuFileHandleDeregister = (void (*)(void*))moe_find_shared_symbol(api->cufile_library, "cuFileHandleDeregister");
+        api->cuFileBufRegister = (int (*)(void*, size_t, int))moe_find_shared_symbol(api->cufile_library, "cuFileBufRegister");
+        api->cuFileBufDeregister = (int (*)(void*))moe_find_shared_symbol(api->cufile_library, "cuFileBufDeregister");
+        api->cuFileRead = (moe_cufile_read_fn)moe_find_shared_symbol(api->cufile_library, "cuFileRead");
+        api->cufile_available = api->cuFileDriverOpen && api->cuFileRead && api->cuFileBufRegister;
+        if (api->cufile_available) {
+            std::fprintf(stderr, "[storageLLM INFO] GPUDirect Storage (cuFile) API loaded successfully.\n");
+        }
+    }
+
     return api->cuInit && api->cuDeviceGet && api->cuCtxSetCurrent &&
         api->cuDevicePrimaryCtxRetain && api->cuDevicePrimaryCtxRelease &&
         api->cuMemAlloc && api->cuMemFree && api->cuMemcpyHtoD && api->cuMemGetInfo;

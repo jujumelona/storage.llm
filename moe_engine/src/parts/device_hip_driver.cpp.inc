@@ -1,4 +1,4 @@
-static void* moe_open_hip_driver_library() {
+﻿static void* moe_open_hip_driver_library() {
 #ifdef _WIN32
     return (void*)LoadLibraryA("amdhip64.dll");
 #else
@@ -32,6 +32,7 @@ static int hip_driver_load(moe_hip_driver_api* api) {
     }
     api->hipInit = (moe_cu_init_fn)moe_find_shared_symbol(api->library, "hipInit");
     api->hipDeviceGet = (moe_cu_device_get_fn)moe_find_shared_symbol(api->library, "hipDeviceGet");
+    api->hipDeviceGetAttribute = (moe_hip_device_get_attribute_fn)moe_find_shared_symbol(api->library, "hipDeviceGetAttribute");
     api->hipDeviceGetPCIBusId = (moe_cu_device_get_pci_bus_id_fn)moe_find_shared_symbol(api->library, "hipDeviceGetPCIBusId");
     api->hipCtxSetCurrent = (moe_cu_ctx_set_current_fn)moe_find_shared_symbol(api->library, "hipCtxSetCurrent");
     api->hipDevicePrimaryCtxRetain = (moe_cu_primary_ctx_retain_fn)moe_find_shared_symbol(api->library, "hipDevicePrimaryCtxRetain");
@@ -115,4 +116,25 @@ static int hip_driver_get_numa_node(uint32_t device_id) {
     }
     moe_close_shared_library(api.library);
     return numa_node;
+}
+
+
+static int hip_driver_get_async_engines(uint32_t device_id) {
+    moe_hip_driver_api api{};
+    if (!hip_driver_load(&api) || api.hipInit(0) != 0) {
+        moe_close_shared_library(api.library);
+        return 1; // fallback
+    }
+    int async_engines = 1;
+    if (api.hipDeviceGetAttribute) {
+        int dev = 0;
+        if (api.hipDeviceGet && api.hipDeviceGet(&dev, static_cast<int>(device_id)) == 0) {
+            // hipDeviceAttributeConcurrentAsyncEngines is 43 in HIP
+            if (api.hipDeviceGetAttribute(&async_engines, 43, dev) != 0) {
+                async_engines = 1;
+            }
+        }
+    }
+    moe_close_shared_library(api.library);
+    return std::max<int>(1, async_engines);
 }

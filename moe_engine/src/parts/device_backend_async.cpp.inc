@@ -1,4 +1,4 @@
-// Backend-neutral async copy facade.
+﻿// Backend-neutral async copy facade.
 // Supports CUDA and HIP.
 
 static int device_backend_copy_h2d_sync(
@@ -34,7 +34,6 @@ static int device_backend_stream_create(moe_pc_engine* e, CUstream* out_stream, 
     }
     return 0;
 }
-
 static int device_backend_stream_sync(moe_pc_engine* e, CUstream stream) {
     if (!stream) return 1;
     if (device_backend_is_cuda(e) && e->cuda.cuStreamSynchronize) {
@@ -50,7 +49,6 @@ static int device_backend_stream_sync(moe_pc_engine* e, CUstream stream) {
     }
     return 0;
 }
-
 static void device_backend_stream_destroy(moe_pc_engine* e, CUstream stream) {
     if (!stream) return;
     if (device_backend_is_cuda(e) && e->cuda.cuStreamDestroy) {
@@ -180,8 +178,10 @@ static int device_backend_async_h2d_available(moe_pc_engine* e, CUstream stream,
     if (device_backend_is_hip(e)) {
         return e->hip.hipMemcpyHtoDAsync != nullptr;
     }
+    if (e && e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO) {
+        return e->ze.zeCommandListAppendMemoryCopy != nullptr;
+    }
     if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
-              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
               e->backend_caps.backend == moe_BACKEND_SYCL)) {
         return 1; // Dummy driver returns true
     }
@@ -209,8 +209,14 @@ static int device_backend_copy_h2d_async(
         // as long as dst was allocated via metal_zero_copy_map.
         return 1;
     }
+    // Fix 22: Add Level Zero async copy path
+    if (e && e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO && e->ze.zeCommandListAppendMemoryCopy) {
+        // In Level Zero, the stream handle is mapped to a zeCommandList for copy operations.
+        // Returning true (1) if zeCommandListAppendMemoryCopy succeeds (returns 0).
+        return e->ze.zeCommandListAppendMemoryCopy(stream, (void*)dst, src, (size_t)bytes, nullptr, 0, nullptr) == 0;
+    }
+
     if (e && (e->backend_caps.backend == moe_BACKEND_VULKAN || 
-              e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO || 
               e->backend_caps.backend == moe_BACKEND_SYCL)) {
         // Dummy async copy -> fallback to sync for now
         return device_backend_copy_h2d_sync(e, dst, src, bytes);

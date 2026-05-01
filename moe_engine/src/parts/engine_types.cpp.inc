@@ -1,9 +1,10 @@
-﻿struct moe_block_state {
+struct moe_block_state {
     uint64_t bytes = 0;
     moe_tier_t tier = moe_TIER_DB;
     double hot_score = 0.0;
     uint64_t last_touch_epoch = 0;
     uint64_t predicted_next_use_epoch = UINT64_MAX;
+    uint16_t access_count = 0;  // ARC: frequency counter for T1/T2 classification
     bool active = false;
     bool pending_evict = false;
 };

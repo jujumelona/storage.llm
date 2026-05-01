@@ -95,15 +95,22 @@ static void device_refresh_mem_info(moe_pc_engine* e) {
     } else if (e && e->hip.hipMemGetInfo && device_set_current(e) && e->hip.hipMemGetInfo(&free_b, &total_b) == 0) {
         mem_queried = 1;
     } else if (e && e->backend_caps.backend == moe_BACKEND_VULKAN && e->vk.vkGetPhysicalDeviceMemoryProperties2 && e->vk.physicalDevice) {
-        // Call vkGetPhysicalDeviceMemoryProperties2 here when fully implemented
-        // uint64_t v_free = 0, v_total = 0;
+        // BUGFIX 115: Vulkan memory query (when fully implemented)
+        // VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+        // budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+        // VkPhysicalDeviceMemoryProperties2 props{};
+        // props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+        // props.pNext = &budget;
         // e->vk.vkGetPhysicalDeviceMemoryProperties2(e->vk.physicalDevice, &props);
-        // free_b = v_free; total_b = v_total; mem_queried = 1;
+        // Sum budget.heapBudget[i] for device-local heaps
+        // free_b = calculated_free; total_b = calculated_total; mem_queried = 1;
     } else if (e && e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO && e->ze.zeDeviceGetMemoryProperties && e->ze.device) {
-        // Call zeDeviceGetMemoryProperties here when fully implemented
+        // BUGFIX 115: Level Zero memory query (when fully implemented)
+        // ze_device_memory_properties_t mem_props{};
+        // mem_props.stype = ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES;
         // uint32_t count = 1;
-        // e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &props);
-        // free_b = z_free; total_b = z_total; mem_queried = 1;
+        // e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &mem_props);
+        // free_b = mem_props.totalSize; total_b = mem_props.totalSize; mem_queried = 1;
     }
     if (mem_queried) {
         // Delta sync for device_free_bytes to recover from accounting drift

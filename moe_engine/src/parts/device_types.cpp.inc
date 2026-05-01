@@ -25,6 +25,8 @@ typedef int (*moe_cu_event_record_fn)(void*, void*);
 typedef int (*moe_cu_event_query_fn)(void*);
 typedef int (*moe_cu_event_synchronize_fn)(void*);
 typedef int (*moe_cu_event_destroy_fn)(void*);
+typedef long long (*moe_cufile_read_fn)(void*, void*, size_t, int64_t, int64_t);
+typedef int (*moe_hip_device_get_attribute_fn)(int*, int, int);
 
 struct moe_cuda_driver_api {
     void* library = nullptr;
@@ -57,6 +59,24 @@ struct moe_cuda_driver_api {
     void* (*cuGraphExecDestroy)(void*) = nullptr;
     void* (*cuStreamBeginCapture)(void*, int) = nullptr;
     void* (*cuStreamEndCapture)(void*, void**) = nullptr;
+
+    // GPUDirect Storage (cuFile) API — NVMe → GPU zero-copy DMA
+    // Research: GPUDirect Storage (NVIDIA, 2023-25)
+    // Eliminates CPU memcpy in the disk → pinned → GPU path by reading
+    // directly from NVMe into GPU memory via RDMA engine.
+    void* cufile_library = nullptr;
+    int (*cuFileDriverOpen)() = nullptr;
+    void (*cuFileDriverClose)() = nullptr;
+    void* (*cuFileHandleRegister)(void*, void*) = nullptr;     // (CUfileHandle_t*, CUfileDescr_t*)
+    void (*cuFileHandleDeregister)(void*) = nullptr;           // (CUfileHandle_t)
+    int (*cuFileBufRegister)(void*, size_t, int) = nullptr;    // (devPtr, size, flags)
+    int (*cuFileBufDeregister)(void*) = nullptr;               // (devPtr)
+    moe_cufile_read_fn cuFileRead = nullptr;  // (handle, devPtr, size, file_off, buf_off)
+    bool cufile_available = false;
+
+    // cuMemHostRegister — for io_uring registered buffer integration
+    int (*cuMemHostRegister)(void*, size_t, unsigned int) = nullptr;
+    int (*cuMemHostUnregister)(void*) = nullptr;
 };
 
 struct moe_hip_driver_api {
@@ -65,6 +85,7 @@ struct moe_hip_driver_api {
     int device = 0;
     moe_cu_init_fn hipInit = nullptr;
     moe_cu_device_get_fn hipDeviceGet = nullptr;
+    moe_hip_device_get_attribute_fn hipDeviceGetAttribute = nullptr;
     moe_cu_device_get_pci_bus_id_fn hipDeviceGetPCIBusId = nullptr;
     moe_cu_ctx_set_current_fn hipCtxSetCurrent = nullptr;
     moe_cu_primary_ctx_retain_fn hipDevicePrimaryCtxRetain = nullptr;

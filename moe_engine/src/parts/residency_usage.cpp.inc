@@ -229,21 +229,43 @@ static void touch_expert_heat(moe_pc_engine* engine, moe_block_state* state, dou
     }
     const uint64_t now = engine->expert_touch_epoch.fetch_add(1) + 1;
     const uint64_t gap = state->last_touch_epoch ? now - state->last_touch_epoch : 0;
+
+    // ARC frequency tracking (Megiddo & Modha 2003, adapted for MoE)
+    state->access_count = (state->access_count < UINT16_MAX) ?
+        state->access_count + 1u : UINT16_MAX;
+
     if (gap > 0) {
-        // Fix 54: >>14 (gap/16384) instead of >>10 (gap/1024) to prevent
-        // premature eviction of recently-touched experts in high-touch MoE
-        const int shift = (int)(gap >> 14);
+        // ARC-adaptive decay: T2 (frequent, >=3 hits) decays slower than T1
+        const bool is_frequent = state->access_count >= 3u;
+        const int decay_shift_base = is_frequent ? 16 : 12;
+        const int shift = (int)(gap >> decay_shift_base);
         const double factor = shift >= 52 ? 0.0 : std::ldexp(1.0, -shift);
         state->hot_score *= factor;
     }
-    state->hot_score += boost;
+
+    // Frequency-weighted boost: heavy hitters get higher heat
+    const double freq_mult =
+        state->access_count >= 5u ? 2.0 :
+        state->access_count >= 3u ? 1.5 :
+        state->access_count >= 2u ? 1.2 : 1.0;
+    state->hot_score += boost * freq_mult;
     state->last_touch_epoch = now;
+
     const double heat = state->hot_score > 0.001 ? state->hot_score : 0.001;
     uint64_t horizon = (uint64_t)(8192.0 / heat);
+    // Frequent experts: predict sooner re-use
+    if (state->access_count >= 3u) {
+        horizon = horizon > 1ull ? horizon / 2ull : 1ull;
+    }
     if (horizon < 1ull) {
         horizon = 1ull;
     } else if (horizon > (1ull << 30)) {
         horizon = (1ull << 30);
     }
     state->predicted_next_use_epoch = now > UINT64_MAX - horizon ? UINT64_MAX : now + horizon;
+}
+
+// ARC: reset access_count on demotion so re-admitted experts start in T1
+static void moe_arc_reset_on_demotion(moe_block_state* state) {
+    if (state) state->access_count = 0;
 }

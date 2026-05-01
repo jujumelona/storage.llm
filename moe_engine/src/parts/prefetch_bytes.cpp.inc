@@ -1,4 +1,4 @@
-﻿static uint64_t tensor_stream_bytes(const moe_tensor_record& rec) {
+static uint64_t tensor_stream_bytes(const moe_tensor_record& rec) {
     return rec.info.weight_byte_length + rec.info.scale_byte_length + rec.info.scale2_byte_length;
 }
 
@@ -52,10 +52,14 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
     WIN32_MEMORY_RANGE_ENTRY entry;
     entry.VirtualAddress = const_cast<uint8_t*>(src);
     entry.NumberOfBytes = (SIZE_T)bytes;
-    HANDLE s_self_process = GetCurrentProcess();
-    BOOL success = PrefetchVirtualMemory(s_self_process, 1, &entry, 0);
-    if (!success && engine) {
-        // Cast away const to update atomic metrics
+    HANDLE s_self_process = OpenProcess(PROCESS_ALL_ACCESS, FALSE, GetCurrentProcessId());
+    if (s_self_process) {
+        BOOL success = PrefetchVirtualMemory(s_self_process, 1, &entry, 0);
+        CloseHandle(s_self_process);
+        if (!success && engine) {
+            const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_touch_fallback.fetch_add(bytes, std::memory_order_relaxed);
+        }
+    } else if (engine) {
         const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_touch_fallback.fetch_add(bytes, std::memory_order_relaxed);
     }
 #elif defined(__linux__)

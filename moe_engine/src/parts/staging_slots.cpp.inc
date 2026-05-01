@@ -1,4 +1,4 @@
-﻿#include <cassert>
+#include <cassert>
 // BUGFIX 58/62: Issue 4A - Dynamic batch_max based on backend_caps ?�★
 // Problem: moe_gpu_stage_batch_max = 4 hardcoded
 // PCIe 5.0 x16: 4 too low (underutilizes bandwidth)
@@ -190,6 +190,17 @@ static void moe_scale_staging_slot_counts(
             }
         }
     }
+    
+    // BUGFIX: Guard against direct slots dropping to 0 due to rounding
+    if (direct_target > 0 && direct == 0 && total_count >= 3) {
+        direct = 1;
+        if (gpu > 0) {
+            gpu -= 1;
+        } else if (pinned > 0) {
+            pinned -= 1;
+        }
+    }
+
     #ifndef NDEBUG
     assert(pinned + gpu + direct <= total_count);
 #endif
@@ -410,7 +421,13 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
             if (engine->ring_adapter.register_buffers(bufs.data(), lens.data(), slot_count)) {
                 fprintf(stderr, "[storageLLM INFO] Successfully registered %u staging buffers with io_uring/IORing.\n", slot_count);
             } else {
-                fprintf(stderr, "[storageLLM WARNING] Failed to register staging buffers with io_uring/IORing.\n");
+                // BUGFIX 119: Cleanup ring_adapter on register_buffers failure
+                // If init() succeeded but register_buffers() failed, ring_adapter is in
+                // initialized state but buffers are not registered. This causes
+                // "buffer not registered" errors when io_uring path is attempted.
+                // Solution: Call cleanup() to disable io_uring path entirely.
+                fprintf(stderr, "[storageLLM WARNING] Failed to register staging buffers with io_uring/IORing. Disabling io_uring path.\n");
+                engine->ring_adapter.cleanup();
             }
         }
     }
@@ -427,5 +444,4 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
             (unsigned long long)min_slot);
     }
 }
-
 

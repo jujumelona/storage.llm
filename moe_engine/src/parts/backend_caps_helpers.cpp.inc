@@ -1,4 +1,4 @@
-static uint32_t caps_hw_threads() {
+﻿static uint32_t caps_hw_threads() {
     const unsigned int hw = std::thread::hardware_concurrency();
     return hw ? static_cast<uint32_t>(hw) : 1u;
 }

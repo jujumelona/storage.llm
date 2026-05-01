@@ -1,4 +1,4 @@
-﻿static int read_file_range_to_buffer(
+static int read_file_range_to_buffer(
     std::ifstream& input,
     uint64_t file_offset,
     uint8_t* dst,
@@ -80,7 +80,7 @@ static int prefetch_tensor_file_to_pinned(
             void* file_handle = nullptr;
 #endif
             if (engine->ring_adapter.prep_read_fixed(shard->fd, file_handle, 
-                engine->staging_slots[slot_index].buf + staging_offset, length, offset, slot_index, (void*)1)) {
+                engine->staging_slots[slot_index].buf + staging_offset, length, offset, slot_index, (void*)1, staging_offset)) {
                 submits++;
             }
             staging_offset += length;

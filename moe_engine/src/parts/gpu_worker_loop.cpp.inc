@@ -1,4 +1,4 @@
-﻿static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
+static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
     if (!engine) {
         return;
     }
@@ -57,6 +57,23 @@
                 engine->gpu_stage.queue.size() + engine->gpu_stage.urgent_queue.size());
             engine->gpu_stage.depth.store(new_depth);
             queue_total_depth_sub(engine, extra_popped);
+        }
+
+        // Double-buffering: acquire secondary DMA stream for compute/transfer overlap
+        // Research: Splitwise (2024), FlashInfer (2024)
+        // While expert[i] computes on the primary stream, expert[i+1]'s
+        // DMA can overlap on the secondary stream. This hides transfer
+        // latency behind compute for consecutive expert execution.
+        CUstream dma_overlap_stream = nullptr;
+        if (batch_count > 1 && engine->stream_pool_available.load(std::memory_order_acquire) > 0) {
+            std::lock_guard<std::mutex> lock(engine->stream_pool_mutex);
+            if (!engine->stream_pool.empty()) {
+                dma_overlap_stream = engine->stream_pool.back();
+                engine->stream_pool.pop_back();
+                engine->stream_pool_available.store(
+                    static_cast<uint32_t>(engine->stream_pool.size()),
+                    std::memory_order_release);
+            }
         }
 
         for (uint32_t i = 0; i < batch_count; ++i) {
@@ -136,6 +153,18 @@
         }
 
         device_drain_deferred_staging_copies(engine, true);
+
+        // Return double-buffering DMA stream to pool after batch completes
+        if (dma_overlap_stream) {
+            // Sync the DMA stream before returning to ensure all transfers complete
+            device_backend_stream_sync(engine, dma_overlap_stream);
+            std::lock_guard<std::mutex> lock(engine->stream_pool_mutex);
+            engine->stream_pool.push_back(dma_overlap_stream);
+            engine->stream_pool_available.store(
+                static_cast<uint32_t>(engine->stream_pool.size()),
+                std::memory_order_release);
+            dma_overlap_stream = nullptr;
+        }
 
         // Successful async copies release their staging slot through per-copy events.
         // Failed copies never registered an event, so they are safe to release here.

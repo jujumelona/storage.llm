@@ -35,6 +35,8 @@ static int device_prepare_tensor_allocation(
             device_free_deferred_ptrs(e, deferred_free_ptrs);
             device_refresh_mem_info(e);
             lock.lock();
+            // BUGFIX 116: Clear deferred_free_ptrs after first free to prevent double-free
+            deferred_free_ptrs.clear();
             it = e->device_allocations.find(key);
             if (it != e->device_allocations.end() && it->second.pending_free) {
                 return 0;
