@@ -37,6 +37,22 @@ struct moe_gguf_common_tensor_record {
     uint64_t bytes = 0;
 };
 
+enum moe_forward_adapter_kind : uint32_t {
+    moe_FORWARD_ADAPTER_NONE = 0,
+    moe_FORWARD_ADAPTER_GLM_RAW = 1,
+    moe_FORWARD_ADAPTER_GGUF_GENERIC = 2,
+    moe_FORWARD_ADAPTER_GGUF_GEMMA = 3
+};
+
+static const char* moe_forward_adapter_name(uint32_t adapter) {
+    switch (adapter) {
+        case moe_FORWARD_ADAPTER_GLM_RAW: return "glm_raw";
+        case moe_FORWARD_ADAPTER_GGUF_GENERIC: return "gguf_generic";
+        case moe_FORWARD_ADAPTER_GGUF_GEMMA: return "gguf_gemma";
+        default: return "none";
+    }
+}
+
 struct moe_raw_tensor_cache_entry {
     const moe_storage_raw_span_spec_t* span = nullptr;
     mmap_context_t* mapped = nullptr;

@@ -188,6 +188,12 @@
     std::string offload_gguf_metadata_json;
     std::string offload_weight_quant_family;
     std::string offload_weight_kernel_family;
+    moe_model_shape_t dynamic_shape{};
+    std::string dynamic_architecture;
+    std::string dynamic_model_id;
+    std::atomic<int> dynamic_shape_valid{0};
+    std::atomic<uint32_t> forward_adapter{moe_FORWARD_ADAPTER_NONE};
+    std::atomic<int> forward_adapter_executable{0};
     mutable std::atomic<int> tokenizer_valid{-1};
     mutable std::atomic<int> attention_projector_valid{-1};  // Fix 72: -1=unchecked, 0=no, 1=yes
     std::vector<std::thread> deferred_joins;  // Fix 44: engine-owned deferred worker joins

@@ -1262,6 +1262,15 @@ static bool get_cached_model_root_check(
     moe_model_root_check_t* out_check
 );
 
+static const char* forward_adapter_name(uint32_t adapter) {
+    switch (adapter) {
+        case 1: return "glm_raw";
+        case 2: return "gguf_generic";
+        case 3: return "gguf_gemma";
+        default: return "none";
+    }
+}
+
 static std::string make_health_json(
     const server_options& opts,
     const moe_backend_caps_t& caps,
@@ -1288,7 +1297,14 @@ static std::string make_health_json(
         << "\"base_url\":\"http://" << json_escape(opts.host) << ":" << opts.port << "/v1\","
         << "\"backend\":\"" << moe_backend_name(caps.backend) << "\","
         << "\"platform\":\"" << moe_platform_name(caps.platform) << "\","
-        << "\"forwardPath\":\"cpu_mmap_raw\","
+        << "\"forwardPath\":\"" << forward_adapter_name(forward.forward_adapter) << "\","
+        << "\"forwardAdapter\":\"" << forward_adapter_name(forward.forward_adapter) << "\","
+        << "\"forwardAdapterId\":" << forward.forward_adapter << ","
+        << "\"forwardAdapterExecutable\":" << (forward.forward_adapter_executable ? "true" : "false") << ","
+        << "\"dynamicShapeReady\":" << (forward.dynamic_shape_ready ? "true" : "false") << ","
+        << "\"dynamicNumHiddenLayers\":" << forward.dynamic_num_hidden_layers << ","
+        << "\"dynamicHiddenSize\":" << forward.dynamic_hidden_size << ","
+        << "\"dynamicVocabSize\":" << forward.dynamic_vocab_size << ","
         << "\"storageStateValid\":" << (forward.storage_state_valid ? "true" : "false") << ","
         << "\"tensorTableLoaded\":" << (forward.tensor_table_loaded ? "true" : "false") << ","
         << "\"expertTripletAvailable\":" << (forward.expert_triplet_available ? "true" : "false") << ","

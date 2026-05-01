@@ -1906,6 +1906,12 @@ static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {
     engine->offload_gguf_metadata_json.clear();
     engine->offload_weight_quant_family.clear();
     engine->offload_weight_kernel_family.clear();
+    engine->dynamic_shape = moe_model_shape_t{};
+    engine->dynamic_architecture.clear();
+    engine->dynamic_model_id.clear();
+    engine->dynamic_shape_valid.store(0, std::memory_order_relaxed);
+    engine->forward_adapter.store(moe_FORWARD_ADAPTER_NONE, std::memory_order_relaxed);
+    engine->forward_adapter_executable.store(0, std::memory_order_relaxed);
 }
 
 static int moe_engine_load_offload_gguf_contract(
@@ -1929,6 +1935,9 @@ static int moe_engine_load_offload_gguf_contract(
     engine->offload_gguf_executable_tensor_count.store(scan.executable_tensor_count, std::memory_order_relaxed);
     engine->offload_gguf_first_file = primary.path;
     engine->offload_gguf_metadata_json = primary.metadata_json;
+    engine->dynamic_architecture = primary.contract.architecture;
+    engine->dynamic_model_id = primary.contract.model_id.empty() ?
+        primary.contract.model_name : primary.contract.model_id;
     engine->offload_weight_quant_bits.store(primary.contract.weight_bits, std::memory_order_relaxed);
     engine->offload_weight_encoding.store(primary.contract.weight_encoding, std::memory_order_relaxed);
     engine->offload_weight_block_size.store(primary.contract.weight_block_size, std::memory_order_relaxed);

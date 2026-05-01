@@ -64,6 +64,15 @@ int moe_pc_engine_get_forward_status(
         out_status->storage_state_valid = 0;
     }
     out_status->tensor_count = moe_pc_engine_tensor_count(engine);
+    out_status->forward_adapter = engine->forward_adapter.load(std::memory_order_relaxed);
+    out_status->forward_adapter_executable =
+        engine->forward_adapter_executable.load(std::memory_order_relaxed);
+    out_status->dynamic_shape_ready = engine->dynamic_shape_valid.load(std::memory_order_relaxed);
+    if (out_status->dynamic_shape_ready) {
+        out_status->dynamic_num_hidden_layers = engine->dynamic_shape.num_hidden_layers;
+        out_status->dynamic_hidden_size = engine->dynamic_shape.hidden_size;
+        out_status->dynamic_vocab_size = engine->dynamic_shape.vocab_size;
+    }
     out_status->tensor_table_loaded = out_status->tensor_count > 0;
     out_status->expert_triplet_available =
         out_status->storage_state_valid &&

@@ -41,7 +41,21 @@ int moe_pc_engine_generate_token_ids(
         }
     } generation_scope(engine);
     moe_forward_status_t forward{};
-    if (!moe_pc_engine_get_forward_status(engine, &forward) ||
+    const int forward_status_ok = moe_pc_engine_get_forward_status(engine, &forward);
+    if (forward_status_ok &&
+        forward.dynamic_shape_ready &&
+        !forward.forward_adapter_executable) {
+        char reason[192]{};
+        std::snprintf(reason, sizeof(reason),
+            "forward adapter not executable adapter=%s layers=%u hidden=%u vocab=%u",
+            moe_forward_adapter_name(forward.forward_adapter),
+            forward.dynamic_num_hidden_layers,
+            forward.dynamic_hidden_size,
+            forward.dynamic_vocab_size);
+        moe_generation_set_error(out_stats, reason);
+        return 0;
+    }
+    if (!forward_status_ok ||
         !forward.storage_state_valid ||
         !forward.tensor_table_loaded ||
         !forward.expert_triplet_available ||

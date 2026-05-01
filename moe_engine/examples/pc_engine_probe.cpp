@@ -14,6 +14,15 @@
 #include <windows.h>
 #endif
 
+static const char* forward_adapter_name(uint32_t adapter) {
+    switch (adapter) {
+        case 1: return "glm_raw";
+        case 2: return "gguf_generic";
+        case 3: return "gguf_gemma";
+        default: return "none";
+    }
+}
+
 static void print_forward_status(const char* label, moe_pc_engine_t* engine) {
     moe_forward_status_t status;
     if (!moe_pc_engine_get_forward_status(engine, &status)) {
@@ -21,7 +30,7 @@ static void print_forward_status(const char* label, moe_pc_engine_t* engine) {
         return;
     }
     printf(
-        "forward[%s] storage=%d tensors=%d expert_triplet=%d tokenizer=%d embed=%d lm_head=%d attn_proj=%d attn_decode=%d kv_cache=%d attention=%d sampler=%d decode_loop=%d chat=%d tensor_count=%llu\n",
+        "forward[%s] storage=%d tensors=%d expert_triplet=%d tokenizer=%d embed=%d lm_head=%d attn_proj=%d attn_decode=%d kv_cache=%d attention=%d sampler=%d decode_loop=%d chat=%d tensor_count=%llu adapter=%s adapter_exec=%d dynamic_shape=%d layers=%u hidden=%u vocab=%u\n",
         label,
         status.storage_state_valid,
         status.tensor_table_loaded,
@@ -36,7 +45,13 @@ static void print_forward_status(const char* label, moe_pc_engine_t* engine) {
         status.sampler_ready,
         status.decode_loop_ready,
         status.chat_graph_ready,
-        (unsigned long long)status.tensor_count
+        (unsigned long long)status.tensor_count,
+        forward_adapter_name(status.forward_adapter),
+        status.forward_adapter_executable,
+        status.dynamic_shape_ready,
+        status.dynamic_num_hidden_layers,
+        status.dynamic_hidden_size,
+        status.dynamic_vocab_size
     );
 }
 

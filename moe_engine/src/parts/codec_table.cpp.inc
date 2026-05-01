@@ -291,6 +291,82 @@ static uint8_t moe_weight_encoding_from_gguf_type(uint32_t type, const moe_offlo
     return moe_WEIGHT_ENCODING_UNKNOWN;
 }
 
+static void moe_dynamic_shape_note_tensor(
+    moe_pc_engine* engine,
+    const std::string& key,
+    uint32_t dims,
+    const uint64_t* shape
+) {
+    if (!engine || key.empty() || !shape) {
+        return;
+    }
+    moe_model_shape_t next = engine->dynamic_shape;
+    if (key == "token_embd.weight" && dims >= 2 && shape[0] && shape[1]) {
+        next.hidden_size = (uint32_t)std::min<uint64_t>(shape[0], UINT32_MAX);
+        next.vocab_size = (uint32_t)std::min<uint64_t>(shape[1], UINT32_MAX);
+    }
+    uint32_t layer = 0;
+    if (moe_parse_layer_from_gguf_name(key, &layer)) {
+        if (layer + 1u > next.num_hidden_layers) {
+            next.num_hidden_layers = layer + 1u;
+        }
+        if (key.find("ffn_gate_up_exps.weight") != std::string::npos ||
+            key.find("ffn_gate_exps.weight") != std::string::npos ||
+            key.find("ffn_down_exps.weight") != std::string::npos) {
+            if (next.first_moe_layer == 0 && next.last_moe_layer == 0) {
+                next.first_moe_layer = layer;
+            } else if (layer < next.first_moe_layer) {
+                next.first_moe_layer = layer;
+            }
+            if (layer > next.last_moe_layer) {
+                next.last_moe_layer = layer;
+            }
+            if (dims >= 3 && shape[2]) {
+                next.experts_per_moe_layer =
+                    std::max<uint32_t>(next.experts_per_moe_layer,
+                        (uint32_t)std::min<uint64_t>(shape[2], UINT32_MAX));
+            }
+            if (dims >= 2 && shape[1]) {
+                next.expert_intermediate_size =
+                    std::max<uint32_t>(next.expert_intermediate_size,
+                        (uint32_t)std::min<uint64_t>(shape[1], UINT32_MAX));
+            }
+        }
+    }
+    if (key.find("ffn_gate_up_exps.weight") != std::string::npos) {
+        if (engine->dynamic_architecture.empty()) {
+            engine->dynamic_architecture = "gemma";
+        }
+    }
+    if (next.hidden_size && next.vocab_size && next.num_hidden_layers) {
+        next.projection_count = 3;
+        engine->dynamic_shape = next;
+        engine->dynamic_shape_valid.store(1, std::memory_order_relaxed);
+    } else {
+        engine->dynamic_shape = next;
+    }
+}
+
+static void moe_dynamic_shape_finalize_adapter(moe_pc_engine* engine) {
+    if (!engine || !engine->dynamic_shape_valid.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const std::string arch = moe_lower_ascii_copy(engine->dynamic_architecture);
+    uint32_t adapter = moe_FORWARD_ADAPTER_GGUF_GENERIC;
+    int executable = 0;
+    if (arch.find("glm") != std::string::npos) {
+        adapter = moe_FORWARD_ADAPTER_GLM_RAW;
+        executable = 1;
+    } else if (arch.find("gemma") != std::string::npos ||
+               engine->gguf_common_tensor_slots.find("blk.0.ffn_gate_up_exps.weight") != engine->gguf_common_tensor_slots.end()) {
+        adapter = moe_FORWARD_ADAPTER_GGUF_GEMMA;
+        executable = 0;
+    }
+    engine->forward_adapter.store(adapter, std::memory_order_relaxed);
+    engine->forward_adapter_executable.store(executable, std::memory_order_relaxed);
+    engine->attention_projector_valid.store(-1, std::memory_order_relaxed);
+}
+
 
 static void moe_register_gguf_common_tensor(
     moe_pc_engine* engine,
@@ -316,6 +392,7 @@ static void moe_register_gguf_common_tensor(
     rec.bytes = entry.bytes;
     engine->gguf_common_tensor_slots.emplace(rec.name, engine->gguf_common_tensors.size());
     engine->gguf_common_tensors.push_back(std::move(rec));
+    moe_dynamic_shape_note_tensor(engine, key, entry.dims, entry.shape);
 }
 static int load_gguf_tensor_directory_as_tensor_index(
     moe_pc_engine* engine,
@@ -419,6 +496,7 @@ static int load_gguf_tensor_directory_as_tensor_index(
         return 0;
     }
     finish_tensor_index_load(engine);
+    moe_dynamic_shape_finalize_adapter(engine);
     std::fprintf(stderr,
         "[storagellm] GGUF tensor directory indexed: records=%llu paths=%zu max_stream=%llu\n",
         (unsigned long long)records,
@@ -554,6 +632,7 @@ static int load_juju_tensor_index_as_tensor_index(
         return 0;
     }
     finish_tensor_index_load(engine);
+    moe_dynamic_shape_finalize_adapter(engine);
     std::fprintf(stderr,
         "[storagellm] JUJU tensor index loaded: records=%llu paths=%zu max_stream=%llu\n",
         (unsigned long long)records,

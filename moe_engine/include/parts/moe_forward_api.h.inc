@@ -13,6 +13,12 @@ typedef struct {
     int decode_loop_ready;
     int chat_graph_ready;
     uint64_t tensor_count;
+    uint32_t forward_adapter;
+    int forward_adapter_executable;
+    int dynamic_shape_ready;
+    uint32_t dynamic_num_hidden_layers;
+    uint32_t dynamic_hidden_size;
+    uint32_t dynamic_vocab_size;
 } moe_forward_status_t;
 
 typedef enum {
