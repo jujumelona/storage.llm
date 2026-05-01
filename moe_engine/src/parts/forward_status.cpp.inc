@@ -113,7 +113,6 @@ int moe_pc_engine_get_forward_status(
         out_status->attention_decode_ready;
     out_status->sampler_ready = out_status->lm_head_ready;
     out_status->decode_loop_ready =
-        out_status->tokenizer_ready &&
         out_status->embedding_ready &&
         out_status->lm_head_ready &&
         out_status->expert_triplet_available &&

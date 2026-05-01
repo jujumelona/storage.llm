@@ -33,6 +33,22 @@ struct moe_continuous_batch_scheduler_t {
     uint32_t max_running_requests = 16;
     uint32_t max_tokens_per_iteration = 512;
 
+    // BUGFIX 229: Add destructor to clean up pending requests ★★
+    // Problem: Requests in waiting_queue and running_queue never freed on scheduler destruction
+    // Solution: Delete all pending requests in destructor
+    // Impact: Prevents memory leak on engine shutdown
+    ~moe_continuous_batch_scheduler_t() {
+        std::lock_guard<std::mutex> lock(mtx);
+        while (!waiting_queue.empty()) {
+            delete waiting_queue.front();
+            waiting_queue.pop();
+        }
+        for (auto* req : running_queue) {
+            delete req;
+        }
+        running_queue.clear();
+    }
+
     void add_request(moe_batch_request_t* req) {
         std::lock_guard<std::mutex> lock(mtx);
         waiting_queue.push(req);
@@ -46,11 +62,16 @@ struct moe_continuous_batch_scheduler_t {
         std::lock_guard<std::mutex> lock(mtx);
 
         // 1. Evict finished requests
+        // BUGFIX 229: Delete finished requests to prevent memory leak ★★
+        // Problem: erase() removes from vector but doesn't free memory allocated by new
+        // Solution: Call delete before erase to free the moe_batch_request_t object
+        // Impact: Prevents memory leak (sizeof(moe_batch_request_t) + vectors) per request
         for (auto it = running_queue.begin(); it != running_queue.end(); ) {
             if ((*it)->phase == moe_REQ_FINISHED) {
                 for (uint32_t block_id : (*it)->kv_block_table) {
                     kv_manager->free_block(block_id);
                 }
+                delete *it;  // BUGFIX 229: Free the request object
                 it = running_queue.erase(it);
             } else {
                 ++it;

@@ -70,6 +70,33 @@ struct moe_paged_kv_manager_t {
         }
     }
 
+    // BUGFIX 228: Add cleanup method to free allocated memory ★★
+    // Problem: malloc'd memory in init() never freed → memory leak on manager destruction
+    // Solution: Add cleanup() method to free all allocated blocks
+    // Impact: Prevents memory leak (block_size * layers * 512 + 2*sizeof(float)) per block
+    void cleanup() {
+        for (auto& block : blocks) {
+            if (block.compressed_data) {
+                std::free(block.compressed_data);
+                block.compressed_data = nullptr;
+            }
+            if (block.scales) {
+                std::free(block.scales);
+                block.scales = nullptr;
+            }
+            if (block.zeros) {
+                std::free(block.zeros);
+                block.zeros = nullptr;
+            }
+        }
+        blocks.clear();
+        free_blocks.clear();
+    }
+
+    ~moe_paged_kv_manager_t() {
+        cleanup();
+    }
+
     int allocate_block() {
         std::lock_guard<std::mutex> lock(mtx);
         if (free_blocks.empty()) return -1;
