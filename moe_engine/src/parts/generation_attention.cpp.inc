@@ -247,15 +247,15 @@ static int moe_layer_standard_attention_f32(
         if (!moe_parallel_rows(engine, total_rows, 0, [&](uint32_t row) {
             if (row < q_dim) {
                 // Q projection
-                s->q_b[row] = moe_dot_bf16_row(q_raw.base + row * hidden_size * 2, attn_input, hidden_size);
+                s->q_b[row] = moe_raw_tensor_dot_row(q_raw, row, attn_input, hidden_size);
             } else if (row < q_dim + k_dim) {
                 // K projection
                 const uint32_t k_row = row - q_dim;
-                s->attn_kv_a[k_row] = moe_dot_bf16_row(k_raw.base + k_row * hidden_size * 2, attn_input, hidden_size);
+                s->attn_kv_a[k_row] = moe_raw_tensor_dot_row(k_raw, k_row, attn_input, hidden_size);
             } else if (has_v) {
                 // V projection
                 const uint32_t v_row = row - q_dim - k_dim;
-                s->attn_value[v_row] = moe_dot_bf16_row(v_raw.base + v_row * hidden_size * 2, attn_input, hidden_size);
+                s->attn_value[v_row] = moe_raw_tensor_dot_row(v_raw, v_row, attn_input, hidden_size);
             }
             return 1;
         })) {
@@ -458,10 +458,10 @@ static int moe_layer_attention_f32(
     }
     if (!moe_parallel_rows(engine, q_lora_rank + kv_a_dim, 0, [&](uint32_t row) {
         if (row < q_lora_rank) {
-            s->q_a[row] = moe_dot_bf16_row(q_a_raw.base + row * hidden_size * 2, s->norm.data(), hidden_size);
+            s->q_a[row] = moe_raw_tensor_dot_row(q_a_raw, row, s->norm.data(), hidden_size);
         } else {
             const uint32_t kv_row = row - q_lora_rank;
-            s->attn_kv_a[kv_row] = moe_dot_bf16_row(kv_a_raw.base + kv_row * hidden_size * 2, s->norm.data(), hidden_size);
+            s->attn_kv_a[kv_row] = moe_raw_tensor_dot_row(kv_a_raw, kv_row, s->norm.data(), hidden_size);
         }
         return 1;
     })) {
