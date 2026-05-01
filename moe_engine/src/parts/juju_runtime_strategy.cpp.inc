@@ -263,7 +263,10 @@ static void moe_rt_apply_juju_io_flags(
     case moe_JUJU_EXEC_DIRECT_STORAGE_TO_COMPUTE:
         io->enable_multistage_pipeline = 1;
         io->enable_pinned_host = engine->backend_caps.supports_pinned_host ? 1 : 0;
-        io->enable_directstorage = 0; // TODO: DirectStorage 1.1 API not fully implemented yet
+        // BUGFIX 157: Enable DirectStorage when backend supports it
+        // DirectStorage 1.0/1.1 API is implemented in prefetch_bytes.cpp.inc
+        // Only enable if backend explicitly reports support to avoid fallback overhead
+        io->enable_directstorage = engine->backend_caps.supports_directstorage ? 1 : 0;
         io->enable_gpudirect_storage = engine->backend_caps.supports_gpudirect_storage ? 1 : 0;
         io->enable_bam_nvme = engine->backend_caps.supports_gpu_direct_file_io ? 1 : 0;
         break;
@@ -381,8 +384,9 @@ static moe_expert_merge_map s_expert_merge_map;
 static void moe_build_expert_merge_map(moe_pc_engine* engine) {
     if (!engine) return;
     s_expert_merge_map.valid = false;
-    const moe_storage_constants_t* c = moe_storage_constants();
-    if (!c || c->experts_per_moe_layer == 0) return;
+    const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
+    const moe_storage_constants_t* c = &runtime_c;
+    if (c->experts_per_moe_layer == 0) return;
     const uint32_t nL = c->num_hidden_layers, nE = c->experts_per_moe_layer;
     s_expert_merge_map.merge_groups.resize(nL);
     s_expert_merge_map.group_members.resize(nL);

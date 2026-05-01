@@ -22,6 +22,19 @@ static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {
     if (!engine) {
         return;
     }
+    // BUGFIX 170: Stop workers before clearing state to prevent use-after-free
+    // Problem: IO workers and CPU workers may be accessing expert_states, tensors, etc.
+    // while clear() invalidates them. This causes iterator invalidation and crashes.
+    // Solution: Stop all workers first, then clear state, then restart workers if needed.
+    // Note: Caller (set_model_root) will restart workers after loading new model.
+    
+    // Stop IO workers (disk, pinned, gpu workers)
+    stop_io_workers(engine);
+    
+    // Stop CPU row workers (parallel computation threads)
+    stop_cpu_row_workers(engine);
+    
+    // Now safe to clear all state
     engine->offload_gguf_valid.store(0, std::memory_order_relaxed);
     engine->offload_gguf_file_count.store(0, std::memory_order_relaxed);
     engine->offload_gguf_tensor_count.store(0, std::memory_order_relaxed);
@@ -57,6 +70,8 @@ static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {
     engine->dynamic_architecture.clear();
     engine->dynamic_model_id.clear();
     engine->dynamic_shape_valid.store(0, std::memory_order_relaxed);
+    engine->attn_config = moe_attn_config_t{};
+    engine->attn_config_valid.store(0, std::memory_order_relaxed);
     moe_engine_reset_qkv_cache(engine);
     engine->forward_adapter.store(moe_FORWARD_ADAPTER_NONE, std::memory_order_relaxed);
     engine->forward_adapter_executable.store(0, std::memory_order_relaxed);

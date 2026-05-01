@@ -1,5 +1,18 @@
 // Memory-mapped shard management
 
+// BUGFIX 172: Sentinel value safety
+// Problem: (mmap_context_t*)1 is used as "loading in progress" marker
+// If code dereferences it without checking, segfault occurs
+// Solution: Provide helper function to check sentinel and enforce its use
+
+static inline bool is_mmap_sentinel(mmap_context_t* ptr) {
+    return ptr == (mmap_context_t*)1;
+}
+
+static inline bool is_mmap_valid(mmap_context_t* ptr) {
+    return ptr != nullptr && !is_mmap_sentinel(ptr);
+}
+
 static std::shared_ptr<std::condition_variable_any> shard_mmap_cv_locked(
     moe_pc_engine* engine,
     const std::string& key
@@ -40,7 +53,8 @@ static mmap_context_t* get_or_map_shard(moe_pc_engine* engine, const std::string
     {
         std::shared_lock<std::shared_mutex> lock(engine->shard_mutex);
         auto found = engine->shard_mmaps.find(path);
-        if (found != engine->shard_mmaps.end() && found->second != (mmap_context_t*)1) {
+        // BUGFIX 172: Use is_mmap_valid() to safely check sentinel
+        if (found != engine->shard_mmaps.end() && is_mmap_valid(found->second)) {
             return found->second;
         }
     }
@@ -50,7 +64,8 @@ static mmap_context_t* get_or_map_shard(moe_pc_engine* engine, const std::string
         while (true) {
             auto found = engine->shard_mmaps.find(path);
             if (found != engine->shard_mmaps.end()) {
-                if (found->second == (mmap_context_t*)1) {
+                // BUGFIX 172: Use is_mmap_sentinel() for safe sentinel check
+                if (is_mmap_sentinel(found->second)) {
                     auto cv = shard_mmap_cv_locked(engine, path);
                     // CRITICAL FIX: Add timeout to prevent infinite wait when IO workers fail
                     // If another thread is loading this shard but IO workers are stuck,
@@ -130,7 +145,8 @@ static mmap_context_t* get_or_map_shard_partial(
     {
         std::shared_lock<std::shared_mutex> lock(engine->shard_mutex);
         auto found = engine->shard_mmaps.find(key);
-        if (found != engine->shard_mmaps.end() && found->second != (mmap_context_t*)1) {
+        // BUGFIX 172: Use is_mmap_valid() for safe sentinel check
+        if (found != engine->shard_mmaps.end() && is_mmap_valid(found->second)) {
             return found->second;
         }
     }
@@ -139,7 +155,8 @@ static mmap_context_t* get_or_map_shard_partial(
         while (true) {
             auto found = engine->shard_mmaps.find(key);
             if (found != engine->shard_mmaps.end()) {
-                if (found->second == (mmap_context_t*)1) {
+                // BUGFIX 172: Use is_mmap_sentinel() for safe sentinel check
+                if (is_mmap_sentinel(found->second)) {
                     auto cv = shard_mmap_cv_locked(engine, key);
                     cv->wait_for(lock, std::chrono::milliseconds(300));
                 } else {
@@ -208,7 +225,8 @@ static mmap_context_t* get_or_map_shard_partial_by_id(
     {
         std::shared_lock<std::shared_mutex> lock(engine->shard_mutex);
         auto found = engine->shard_mmaps_by_id.find(id_key);
-        if (found != engine->shard_mmaps_by_id.end() && found->second != (mmap_context_t*)1) {
+        // BUGFIX 172: Use is_mmap_valid() for safe sentinel check
+        if (found != engine->shard_mmaps_by_id.end() && is_mmap_valid(found->second)) {
             return found->second;
         }
     }
@@ -221,14 +239,16 @@ static mmap_context_t* get_or_map_shard_partial_by_id(
 }
 
 static void unload_mapped_shard(mmap_context_t* ctx) {
-    if (ctx && ctx != (mmap_context_t*)1) {
+    // BUGFIX 172: Use is_mmap_valid() to safely check sentinel before unloading
+    if (is_mmap_valid(ctx)) {
         mmap_unlock(ctx);
         mmap_unload(ctx);
     }
 }
 
 static void lock_mapped_shard_once(moe_pc_engine* engine, mmap_context_t* ctx) {
-    if (!engine || !ctx || ctx == (mmap_context_t*)1) {
+    // BUGFIX 172: Use is_mmap_valid() to safely check sentinel before locking
+    if (!engine || !is_mmap_valid(ctx)) {
         return;
     }
     {
@@ -273,7 +293,8 @@ static mmap_context_t* get_or_map_tensor_shard(moe_pc_engine* engine, const moe_
     {
         std::shared_lock<std::shared_mutex> lock(engine->shard_mutex);
         auto found = engine->shard_mmaps_by_id.find(id_key);
-        if (found != engine->shard_mmaps_by_id.end() && found->second != (mmap_context_t*)1) {
+        // BUGFIX 172: Use is_mmap_valid() for safe sentinel check
+        if (found != engine->shard_mmaps_by_id.end() && is_mmap_valid(found->second)) {
             return found->second;
         }
     }

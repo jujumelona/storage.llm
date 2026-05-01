@@ -18,12 +18,41 @@ static void reset_staging_slots(moe_pc_engine* engine) {
     if (!engine) {
         return;
     }
+    // BUGFIX 168: Prevent concurrent access during clear()
+    // staging_slots.clear() invalidates iterators and pointers while workers may be accessing slots.
+    // Solution: Set free_slot_count to 0 first to block new acquisitions, then wait for in-use slots.
     std::lock_guard<std::mutex> lock(engine->staging_slot_mutex);
+    
+    // Step 1: Block new slot acquisitions
+    engine->staging_free_slot_count.store(0, std::memory_order_release);
+    
+    // Step 2: Wait for all slots to be released (in_use == false)
+    // Timeout after 5 seconds to prevent deadlock if workers are stuck
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool all_released = false;
+    while (!all_released && std::chrono::steady_clock::now() < deadline) {
+        all_released = true;
+        for (const auto& slot : engine->staging_slots) {
+            if (slot.in_use.load(std::memory_order_acquire)) {
+                all_released = false;
+                break;
+            }
+        }
+        if (!all_released) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    
+    if (!all_released) {
+        fprintf(stderr, "[storageLLM WARNING] reset_staging_slots: Some slots still in use after 5s timeout. "
+                "Proceeding with reset anyway - may cause use-after-free if workers access freed slots.\n");
+    }
+    
+    engine->ring_adapter.cleanup();
     for (auto& slot : engine->staging_slots) {
         slot.buf = nullptr;
         slot.size = 0;
     }
-    engine->ring_adapter.cleanup();
     engine->staging_slots.clear();
     engine->staging_slot_size = 0;
 #ifdef ENABLE_LOCKFREE_STAGING
@@ -82,9 +111,14 @@ static void moe_staging_slot_targets(
         gpu_workers = 1;
     }
     const uint32_t gpu_batch_eff = moe_gpu_stage_batch_max(engine);
-    const uint32_t pinned_target = pinned_workers > 0 ? std::max(1u, pinned_workers * 2u) : 0u;
-    const uint32_t gpu_target = gpu_workers > 0 ? std::max(1u, gpu_workers * gpu_batch_eff) : 0u;
-    const uint32_t direct_target = moe_staging_direct_slot_target(engine, disk_workers);
+    uint32_t pinned_target = pinned_workers > 0 ? std::max(1u, pinned_workers * 2u) : 0u;
+    uint32_t gpu_target = gpu_workers > 0 ? std::max(1u, gpu_workers * gpu_batch_eff) : 0u;
+    uint32_t direct_target = moe_staging_direct_slot_target(engine, disk_workers);
+    
+    if (engine && engine->backend_caps.backend == moe_BACKEND_METAL) {
+        gpu_target = 0;
+    }
+
     if (pinned_out) *pinned_out = pinned_target;
     if (gpu_out) *gpu_out = gpu_target;
     if (direct_out) *direct_out = direct_target;
@@ -130,33 +164,16 @@ static void moe_scale_staging_slot_counts(
             // Step 2: Distribute remainder based on fractional parts
             uint32_t allocated = pinned + gpu + direct;
             if (allocated < total_count) {
-                const double pinned_frac = pinned_exact - pinned;
-                const double gpu_frac = gpu_exact - gpu;
-                const double direct_frac = direct_exact - direct;
-
                 uint32_t remainder = total_count - allocated;
-                while (remainder > 0) {
-                    // Give to slot with largest fractional part
-                    if (direct_frac >= pinned_frac && direct_frac >= gpu_frac && direct_target > 0) {
-                        ++direct;
-                        --remainder;
-                        if (remainder == 0) break;
-                    }
-                    if (gpu_frac >= pinned_frac && gpu_target > 0) {
-                        ++gpu;
-                        --remainder;
-                        if (remainder == 0) break;
-                    }
-                    if (pinned_target > 0) {
-                        ++pinned;
-                        --remainder;
-                        if (remainder == 0) break;
-                    }
-                    // Fallback if all targets are 0 (shouldn't happen)
-                    if (pinned_target == 0 && gpu_target == 0 && direct_target == 0) {
-                        ++gpu;
-                        --remainder;
-                    }
+                struct entry { double frac; uint32_t* target; uint32_t tgt; };
+                entry entries[] = {
+                    {pinned_exact - pinned, &pinned, pinned_target},
+                    {gpu_exact - gpu, &gpu, gpu_target},
+                    {direct_exact - direct, &direct, direct_target}
+                };
+                std::sort(entries, entries+3, [](auto& a, auto& b){ return a.frac > b.frac; });
+                for (uint32_t i = 0; i < remainder && i < 3; ++i) {
+                    if (entries[i].tgt > 0) ++(*entries[i].target);
                 }
             }
 
@@ -334,7 +351,8 @@ static void configure_staging_slots(moe_pc_engine* engine) {
         slot_count = 1;
     }
     const uint64_t min_slot = moe_staging_min_slot_bytes(engine);
-    if (engine->staging_size >= min_slot && max_slot_target > slot_count) {
+    // BUGFIX 145: Check min_slot > 0 before division to prevent division by zero
+    if (min_slot > 0 && engine->staging_size >= min_slot && max_slot_target > slot_count) {
         const uint32_t byte_limited_slots = static_cast<uint32_t>(engine->staging_size / min_slot);
         if (byte_limited_slots > slot_count) {
             slot_count = std::min(max_slot_target, byte_limited_slots);
@@ -350,7 +368,8 @@ static void configure_staging_slots(moe_pc_engine* engine) {
     }
 
     uint64_t slot_size = engine->staging_size / slot_count;
-    if (slot_size < min_slot && engine->staging_size >= min_slot) {
+    // BUGFIX 145: Check min_slot > 0 before division
+    if (min_slot > 0 && slot_size < min_slot && engine->staging_size >= min_slot) {
         slot_count = static_cast<uint32_t>(engine->staging_size / min_slot);
         if (slot_count == 0) slot_count = 1;
         slot_size = engine->staging_size / slot_count;
