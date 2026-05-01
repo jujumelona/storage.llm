@@ -119,6 +119,9 @@ static uint32_t acquire_staging_slot(
 }
 
 static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t start_idx, uint32_t count, uint32_t worker_index, uint32_t turn, uint64_t required_bytes) {
+    if (count == 0) {
+        return UINT32_MAX;
+    }
     const uint32_t preferred = count > 1 ? (worker_index * 2u + turn) % count : 0u;
     // BUGFIX 83: Issue 5 - Limit staging slot acquire retries ★★★
     // Problem: Infinite loop when staging_free_slot_count=0

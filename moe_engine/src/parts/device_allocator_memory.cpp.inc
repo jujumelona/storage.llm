@@ -38,9 +38,13 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
         const uint64_t sys = e->backend_caps.system_memory_bytes > 0
             ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
         // BUGFIX 199: Use configurable percentage (default 60)
+        // BUGFIX 232: Ensure pct is never 0 to prevent zero budget
         const uint64_t pct = (e->io_config.metal_memory_budget_pct > 0 && e->io_config.metal_memory_budget_pct <= 100)
             ? e->io_config.metal_memory_budget_pct : 60ull;
         const uint64_t budget = (sys * pct) / 100ull;
+        if (budget == 0) {
+            return (sys * 60ull) / 100ull; // Fallback to 60% if calculation results in 0
+        }
         return budget;
     }
     const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);

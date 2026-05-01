@@ -55,47 +55,47 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
         return 1;
     }
 
-    std::unique_lock<std::mutex> lock(engine->cpu_row_mutex);
-    engine->cpu_row_done_cv.wait(lock, [&] { return engine->cpu_row_done_generation == engine->cpu_row_generation; });
-    lock.unlock();
-    ensure_cpu_row_workers(engine, 0);
-    lock.lock();
-    engine->cpu_row_ctx = &fn;
-    engine->cpu_row_fn = [](void* ctx, uint32_t row) { return (*static_cast<RowFn*>(ctx))(row); };
-    engine->cpu_row_count = row_count;
-    engine->cpu_block_rows = block_rows;
-    engine->cpu_next_row.store(0);
-    engine->cpu_rows_ok.store(1, std::memory_order_release);
-    engine->cpu_active_workers.store(static_cast<uint32_t>(engine->cpu_row_workers.size()));
-    const uint64_t generation = engine->cpu_row_generation + 1;
-    engine->cpu_row_generation = generation;
-    lock.unlock();
-    engine->cpu_row_cv.notify_all();
-
-    // Fix 27: Use acquire ordering to see worker failures promptly
-    while (engine->cpu_rows_ok.load(std::memory_order_acquire)) {
-        const uint32_t start = engine->cpu_next_row.fetch_add(block_rows);
-        if (start >= row_count) {
-            break;
-        }
-        uint32_t end = start + block_rows;
-        if (end > row_count) {
-            end = row_count;
-        }
-        for (uint32_t row = start; row < end && engine->cpu_rows_ok.load(std::memory_order_acquire); ++row) {
-            if (!fn(row)) {
-                engine->cpu_rows_ok.store(0, std::memory_order_release);
+    // Persistent row workers can be retired asynchronously by the runtime
+    // orchestrator. A stale joinable worker counted in cpu_active_workers can
+    // leave the caller blocked on cpu_row_done_cv forever. Use a per-dispatch
+    // fork/join batch here: it keeps row-level CPU parallelism, has no retained
+    // worker liveness contract, and nested calls still fall back above.
+    std::atomic<uint32_t> next_row{0};
+    std::atomic<int> ok{1};
+    auto run_rows = [&]() {
+        while (ok.load(std::memory_order_acquire)) {
+            const uint32_t start = next_row.fetch_add(block_rows, std::memory_order_relaxed);
+            if (start >= row_count) {
                 break;
             }
+            uint32_t end = start + block_rows;
+            if (end > row_count) {
+                end = row_count;
+            }
+            for (uint32_t row = start; row < end && ok.load(std::memory_order_acquire); ++row) {
+                if (!fn(row)) {
+                    ok.store(0, std::memory_order_release);
+                    break;
+                }
+            }
+        }
+    };
+
+    std::vector<std::thread> local_workers;
+    local_workers.reserve(workers > 1 ? workers - 1u : 0u);
+    try {
+        for (uint32_t i = 1; i < workers; ++i) {
+            local_workers.emplace_back(run_rows);
+        }
+        run_rows();
+    } catch (...) {
+        ok.store(0, std::memory_order_release);
+    }
+    for (std::thread& worker : local_workers) {
+        if (worker.joinable()) {
+            worker.join();
         }
     }
-
-    lock.lock();
-    engine->cpu_row_done_cv.wait(lock, [&] { return engine->cpu_row_done_generation == generation; });
-    engine->cpu_row_fn = nullptr;
-    const int ok = engine->cpu_rows_ok.load(std::memory_order_acquire);
     engine->cpu_row_active.fetch_sub(1, std::memory_order_release);  // Bug #7: Decrement counter
-    lock.unlock();
-    engine->cpu_row_done_cv.notify_all();
-    return ok;
+    return ok.load(std::memory_order_acquire);
 }
