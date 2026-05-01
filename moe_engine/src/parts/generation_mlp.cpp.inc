@@ -761,22 +761,65 @@ static int moe_layer_moe_mlp_f32(
     for (size_t e = 0; e < num_selected; ++e) {
         expert_ok[e].store(0, std::memory_order_relaxed);
     }
+    uint32_t missing_experts = 0;
+    uint32_t shape_mismatch_experts = 0;
+    uint32_t map_failed_experts = 0;
+    int first_bad_expert = -1;
+    uint32_t first_gate_rows = 0, first_gate_cols = 0;
+    uint32_t first_up_rows = 0, first_up_cols = 0;
+    uint32_t first_down_rows = 0, first_down_cols = 0;
     for (size_t e = 0; e < num_selected; ++e) {
         shards[e].gate_rec = find_tensor_record(engine, layer, work[e].expert_id, moe_PROJ_GATE);
         shards[e].up_rec = find_tensor_record(engine, layer, work[e].expert_id, moe_PROJ_UP);
         shards[e].down_rec = find_tensor_record(engine, layer, work[e].expert_id, moe_PROJ_DOWN);
         if (!shards[e].gate_rec || !shards[e].up_rec || !shards[e].down_rec) {
+            ++missing_experts;
+            if (first_bad_expert < 0) {
+                first_bad_expert = work[e].expert_id;
+                if (shards[e].gate_rec) {
+                    first_gate_rows = shards[e].gate_rec->info.rows;
+                    first_gate_cols = shards[e].gate_rec->info.cols;
+                }
+                if (shards[e].up_rec) {
+                    first_up_rows = shards[e].up_rec->info.rows;
+                    first_up_cols = shards[e].up_rec->info.cols;
+                }
+                if (shards[e].down_rec) {
+                    first_down_rows = shards[e].down_rec->info.rows;
+                    first_down_cols = shards[e].down_rec->info.cols;
+                }
+            }
             continue;
         }
         if (shards[e].gate_rec->info.rows != gate_rows || shards[e].gate_rec->info.cols != gate_cols ||
             shards[e].up_rec->info.rows != up_rows || shards[e].up_rec->info.cols != up_cols ||
             shards[e].down_rec->info.rows != down_rows || shards[e].down_rec->info.cols != down_cols) {
+            ++shape_mismatch_experts;
+            if (first_bad_expert < 0) {
+                first_bad_expert = work[e].expert_id;
+                first_gate_rows = shards[e].gate_rec->info.rows;
+                first_gate_cols = shards[e].gate_rec->info.cols;
+                first_up_rows = shards[e].up_rec->info.rows;
+                first_up_cols = shards[e].up_rec->info.cols;
+                first_down_rows = shards[e].down_rec->info.rows;
+                first_down_cols = shards[e].down_rec->info.cols;
+            }
             continue;
         }
         shards[e].gate_shard = get_or_map_tensor_shard(engine, *shards[e].gate_rec);
         shards[e].up_shard = get_or_map_tensor_shard(engine, *shards[e].up_rec);
         shards[e].down_shard = get_or_map_tensor_shard(engine, *shards[e].down_rec);
         if (!shards[e].gate_shard || !shards[e].up_shard || !shards[e].down_shard) {
+            ++map_failed_experts;
+            if (first_bad_expert < 0) {
+                first_bad_expert = work[e].expert_id;
+                first_gate_rows = shards[e].gate_rec->info.rows;
+                first_gate_cols = shards[e].gate_rec->info.cols;
+                first_up_rows = shards[e].up_rec->info.rows;
+                first_up_cols = shards[e].up_rec->info.cols;
+                first_down_rows = shards[e].down_rec->info.rows;
+                first_down_cols = shards[e].down_rec->info.cols;
+            }
             continue;
         }
         expert_ok[e].store(1, std::memory_order_release);
@@ -787,14 +830,28 @@ static int moe_layer_moe_mlp_f32(
     }
     if (mapped_experts == 0) {
         std::fprintf(stderr,
-            "[storagellm mlp] no selected expert shards mapped layer=%d selected=%zu first=%d\n",
-            layer, num_selected, work[0].expert_id);
+            "[storagellm mlp] no selected expert shards mapped layer=%d selected=%zu first=%d missing=%u shape_mismatch=%u map_failed=%u expected gate=%ux%u up=%ux%u down=%ux%u first_bad=%d got gate=%ux%u up=%ux%u down=%ux%u\n",
+            layer, num_selected, work[0].expert_id,
+            missing_experts, shape_mismatch_experts, map_failed_experts,
+            gate_rows, gate_cols, up_rows, up_cols, down_rows, down_cols,
+            first_bad_expert,
+            first_gate_rows, first_gate_cols,
+            first_up_rows, first_up_cols,
+            first_down_rows, first_down_cols);
         return 0;
     }
 
     // Phase 2a: Flat dispatch: gate+up+SiLU for all experts simultaneously.
     // Total rows = num_selected * intermediate_size, row i maps to expert e and row r.
-    if (expert_intermediate == 0 || num_selected > (size_t)UINT32_MAX / (size_t)expert_intermediate) {
+    // BUGFIX 262: Check expert_intermediate > 0 BEFORE multiplication ★
+    // Problem: Checked after total_gate_rows calculation, but division by zero still occurs in lambda
+    // Solution: Check expert_intermediate > 0 before any calculation
+    if (expert_intermediate == 0) {
+        std::fprintf(stderr, "[storagellm mlp] invalid intermediate size layer=%d intermediate=%u\n",
+            layer, expert_intermediate);
+        return 0;
+    }
+    if (num_selected > (size_t)UINT32_MAX / (size_t)expert_intermediate) {
         std::fprintf(stderr, "[storagellm mlp] invalid gate rows layer=%d selected=%zu intermediate=%u\n",
             layer, num_selected, expert_intermediate);
         return 0;
