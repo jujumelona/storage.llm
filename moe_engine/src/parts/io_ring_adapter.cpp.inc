@@ -1,7 +1,17 @@
 ﻿#pragma once
 
 #ifdef __linux__
+#if defined(__has_include)
+#if __has_include(<liburing.h>)
+#define MOE_HAVE_LIBURING 1
 #include <liburing.h>
+#else
+#define MOE_HAVE_LIBURING 0
+#endif
+#else
+#define MOE_HAVE_LIBURING 1
+#include <liburing.h>
+#endif
 #include <unistd.h>
 #include <sys/mman.h>
 #elif defined(_WIN32)
@@ -79,7 +89,7 @@ static const moe_win_ioring_api_t* moe_win_ioring_api() {
 #endif
 
 struct moe_io_ring_adapter {
-#ifdef __linux__
+#if defined(__linux__) && MOE_HAVE_LIBURING
     struct io_uring ring;
     bool initialized = false;
 #elif defined(_WIN32)
@@ -90,7 +100,7 @@ struct moe_io_ring_adapter {
 #endif
 
     int init(uint32_t queue_depth) {
-#ifdef __linux__
+#if defined(__linux__) && MOE_HAVE_LIBURING
         if (io_uring_queue_init(queue_depth, &ring, 0) == 0) {
             initialized = true;
             return 1;
@@ -113,7 +123,7 @@ struct moe_io_ring_adapter {
 
     int register_buffers(void* buffers[], size_t lengths[], uint32_t count) {
         if (!initialized) return 0;
-#ifdef __linux__
+#if defined(__linux__) && MOE_HAVE_LIBURING
         std::vector<struct iovec> iovecs(count);
         for (uint32_t i = 0; i < count; ++i) {
             iovecs[i].iov_base = buffers[i];
@@ -138,7 +148,7 @@ struct moe_io_ring_adapter {
     // Fix 6: Added buf_offset to prevent Windows IORing data corruption
     int prep_read_fixed(int fd, void* file_handle, void* buf, size_t len, uint64_t offset, uint32_t buf_index, void* user_data, uint64_t buf_offset = 0) {
         if (!initialized) return 0;
-#ifdef __linux__
+#if defined(__linux__) && MOE_HAVE_LIBURING
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
         if (!sqe) return 0;
         io_uring_prep_read_fixed(sqe, fd, buf, len, offset, buf_index);
@@ -160,7 +170,7 @@ struct moe_io_ring_adapter {
 
     int submit() {
         if (!initialized) return 0;
-#ifdef __linux__
+#if defined(__linux__) && MOE_HAVE_LIBURING
         return io_uring_submit(&ring);
 #elif defined(_WIN32)
         const moe_win_ioring_api_t* api = moe_win_ioring_api();
@@ -177,7 +187,7 @@ struct moe_io_ring_adapter {
     // Fix 7: CQE error code missing check
     void* peek_completion() {
         if (!initialized) return nullptr;
-#ifdef __linux__
+#if defined(__linux__) && MOE_HAVE_LIBURING
         struct io_uring_cqe* cqe;
         if (io_uring_peek_cqe(&ring, &cqe) == 0 && cqe) {
             void* user_data = io_uring_cqe_get_data(cqe);
@@ -201,7 +211,7 @@ struct moe_io_ring_adapter {
 
     void cleanup() {
         if (!initialized) return;
-#ifdef __linux__
+#if defined(__linux__) && MOE_HAVE_LIBURING
         io_uring_queue_exit(&ring);
 #elif defined(_WIN32)
         const moe_win_ioring_api_t* api = moe_win_ioring_api();

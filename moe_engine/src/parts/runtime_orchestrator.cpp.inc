@@ -340,21 +340,24 @@ static void prescope_compute_global_plan(
     prescope_plan_t* plan
 ) {
     if (!engine || !plan || depth == 0) return;
-    
+
     // Stub: compute the maximum experts that can be loaded in full precision within compute time
     // total_bw is DMA bandwidth GB/s (e.g., PCIe Gen4 x16 ~ 25GB/s)
-    const float total_bw = engine->backend_caps.dma_bandwidth_gbps; 
-    
+    const float total_bw = engine->backend_caps.dma_bandwidth_gbps;
+
     // Fallback to 1ms if not profiled
-    const float compute_ms_per_layer = 1.0f; // engine->profile.avg_layer_compute_ms; 
-    
+    const float compute_ms_per_layer = 1.0f; // engine->profile.avg_layer_compute_ms;
+
     for (uint32_t d = 0; d < depth && d < MAX_PREFETCH_DEPTH; ++d) {
         if (d >= predicted_experts.size()) break;
         const uint32_t n_experts = (uint32_t)predicted_experts[d].size();
-        
-        const float expert_gb = engine->avg_expert_bytes / 1e9f;
+
+        // Fix 16: Prevent divide-by-zero UB by ensuring avg_expert_bytes has a fallback
+        const uint64_t safe_avg_bytes = engine->avg_expert_bytes > 0 ? engine->avg_expert_bytes :
+            (engine->max_tensor_stream_bytes > 0 ? engine->max_tensor_stream_bytes : 20ull * 1024ull * 1024ull);
+        const float expert_gb = safe_avg_bytes / 1e9f;
         const float full_transfer_ms = (n_experts * expert_gb) / total_bw * 1000.0f;
-        
+
         if (full_transfer_ms <= compute_ms_per_layer) {
             plan->vram_slots[d] = n_experts;
             plan->int4_slots[d] = 0;
