@@ -117,8 +117,12 @@ static int moe_forward_one_token_f32(
             const int ok = is_moe ?
                 moe_layer_moe_mlp_f32(engine, (int32_t)layer, s, s->hidden.data(), c) :
                 moe_layer_dense_mlp_f32(engine, (int32_t)layer, s, s->hidden.data(), c->hidden_size);
-            if (!ok || !moe_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
+            if (!ok) {
                 moe_generation_set_error(stats, "mlp/moe block failed");
+                return 0;
+            }
+            if (!moe_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
+                moe_generation_set_error(stats, "layer output scale failed");
                 return 0;
             }
             continue;

@@ -562,6 +562,12 @@ static int moe_layer_moe_mlp_f32(
             &s->selected_weights,
             &s->router_logits,
             &s->router_order)) {
+        std::fprintf(stderr,
+            "[storagellm mlp] router top-k failed layer=%d hidden=%u experts=%u topk=%u\n",
+            layer,
+            hidden_size,
+            c->experts_per_moe_layer,
+            moe_router_top_k_from_metadata(engine, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer));
         return 0;
     }
     moe_juju_update_co_activation(engine, layer, s->selected_experts);
@@ -650,6 +656,12 @@ static int moe_layer_moe_mlp_f32(
     // Phase 2: Run experts in parallel with per-expert scratch buffers.
     // Each expert gets its own gate/up/out buffers to prevent data races.
     const size_t num_selected = s->selected_experts.size();
+    if (num_selected == 0 || s->selected_weights.size() != num_selected) {
+        std::fprintf(stderr,
+            "[storagellm mlp] router produced invalid selection layer=%d selected=%zu weights=%zu\n",
+            layer, num_selected, s->selected_weights.size());
+        return 0;
+    }
     // BUGFIX 210: Auto-resize expert_work if undersized (extends BUGFIX 66)
     // Problem: BUGFIX 66 added logging but still returns 0, causing generation failure
     // Solution: Auto-resize expert_work to num_selected if undersized
@@ -659,6 +671,18 @@ static int moe_layer_moe_mlp_f32(
             "need %zu, have %zu, layer %d. Auto-resizing scratch buffer.\n",
             num_selected, s->expert_work.size(), layer);
         s->expert_work.resize(num_selected);
+    }
+    const size_t needed_gate = num_selected * (size_t)expert_intermediate;
+    const size_t needed_up = needed_gate;
+    const size_t needed_out = num_selected * (size_t)hidden_size;
+    if (s->expert_gate_pool.size() < needed_gate) {
+        s->expert_gate_pool.resize(needed_gate);
+    }
+    if (s->expert_up_pool.size() < needed_up) {
+        s->expert_up_pool.resize(needed_up);
+    }
+    if (s->expert_out_pool.size() < needed_out) {
+        s->expert_out_pool.resize(needed_out);
     }
     moe_expert_work_t* work = s->expert_work.data();
     for (size_t e = 0; e < num_selected; ++e) {
@@ -678,7 +702,11 @@ static int moe_layer_moe_mlp_f32(
     const moe_projection_shape_spec_t* gate_shape = moe_storage_projection_shape(moe_PROJ_GATE);
     const moe_projection_shape_spec_t* up_shape = moe_storage_projection_shape(moe_PROJ_UP);
     const moe_projection_shape_spec_t* down_shape = moe_storage_projection_shape(moe_PROJ_DOWN);
-    if (!gate_shape || !up_shape || !down_shape) return 0;
+    if (!gate_shape || !up_shape || !down_shape) {
+        std::fprintf(stderr, "[storagellm mlp] missing projection shape layer=%d gate=%p up=%p down=%p\n",
+            layer, (const void*)gate_shape, (const void*)up_shape, (const void*)down_shape);
+        return 0;
+    }
 
     // Pre-map all expert weight shards (these are cached, so fast for hot experts)
     struct expert_shards_t {
@@ -719,9 +747,24 @@ static int moe_layer_moe_mlp_f32(
         }
         expert_ok[e].store(1, std::memory_order_release);
     }
+    uint32_t mapped_experts = 0;
+    for (size_t e = 0; e < num_selected; ++e) {
+        mapped_experts += expert_ok[e].load(std::memory_order_acquire) ? 1u : 0u;
+    }
+    if (mapped_experts == 0) {
+        std::fprintf(stderr,
+            "[storagellm mlp] no selected expert shards mapped layer=%d selected=%zu first=%d\n",
+            layer, num_selected, work[0].expert_id);
+        return 0;
+    }
 
     // Phase 2a: Flat dispatch: gate+up+SiLU for all experts simultaneously.
     // Total rows = num_selected * intermediate_size, row i maps to expert e and row r.
+    if (expert_intermediate == 0 || num_selected > (size_t)UINT32_MAX / (size_t)expert_intermediate) {
+        std::fprintf(stderr, "[storagellm mlp] invalid gate rows layer=%d selected=%zu intermediate=%u\n",
+            layer, num_selected, expert_intermediate);
+        return 0;
+    }
     const uint32_t total_gate_rows = (uint32_t)num_selected * expert_intermediate;
     const int gate_up_ok = moe_parallel_rows(engine, total_gate_rows, 0, [&](uint32_t flat_row) {
         const uint32_t e = flat_row / expert_intermediate;
@@ -735,6 +778,11 @@ static int moe_layer_moe_mlp_f32(
     if (!gate_up_ok) return 0;
 
     // Phase 2b: Flat dispatch: down_proj for all experts simultaneously.
+    if (hidden_size == 0 || num_selected > (size_t)UINT32_MAX / (size_t)hidden_size) {
+        std::fprintf(stderr, "[storagellm mlp] invalid down rows layer=%d selected=%zu hidden=%u\n",
+            layer, num_selected, hidden_size);
+        return 0;
+    }
     const uint32_t total_down_rows = (uint32_t)num_selected * hidden_size;
     const int down_ok = moe_parallel_rows(engine, total_down_rows, 0, [&](uint32_t flat_row) {
         const uint32_t e = flat_row / hidden_size;
@@ -761,6 +809,8 @@ static int moe_layer_moe_mlp_f32(
         if (!moe_layer_apply_expert_down_scale_f32(
                 engine, layer, work[e].expert_id, c->experts_per_moe_layer,
                 work[e].out, hidden_size)) {
+            std::fprintf(stderr, "[storagellm mlp] expert down scale failed layer=%d expert=%d\n",
+                layer, work[e].expert_id);
             return 0;
         }
         moe_axpy_f32(s->mlp.data(), work[e].out, work[e].weight, hidden_size);
