@@ -427,8 +427,13 @@ static void moe_dynamic_shape_note_tensor(
             key.find("ffn_gate_exps.weight") != std::string::npos ||
             key.find("ffn_up_exps.weight") != std::string::npos ||
             key.find("ffn_down_exps.weight") != std::string::npos) {
-            if (next.first_moe_layer == 0 && next.last_moe_layer == 0) {
+            const bool had_moe_tensor =
+                next.first_moe_layer != 0 ||
+                next.last_moe_layer != 0 ||
+                next.expert_intermediate_size != 0;
+            if (!had_moe_tensor) {
                 next.first_moe_layer = layer;
+                next.last_moe_layer = layer;
             } else if (layer < next.first_moe_layer) {
                 next.first_moe_layer = layer;
             }
@@ -522,6 +527,7 @@ struct moe_juju_runtime_probe_t {
     uint64_t kv_a_rows = 0;
     uint64_t kv_b_rows = 0;
     uint64_t kv_b_cols = 0;
+    bool saw_moe_tensor = false;
 };
 
 static int moe_name_has(const std::string& text, const char* needle) {
@@ -726,8 +732,10 @@ static void moe_juju_probe_note_tensor(
               lower.find("down_proj.weight") != std::string::npos) &&
              entry.dims >= 3);
         if (expert_tensor) {
-            if (probe->shape.first_moe_layer == 0 && probe->shape.last_moe_layer == 0) {
+            if (!probe->saw_moe_tensor) {
                 probe->shape.first_moe_layer = layer;
+                probe->shape.last_moe_layer = layer;
+                probe->saw_moe_tensor = true;
             } else {
                 probe->shape.first_moe_layer = std::min<uint32_t>(probe->shape.first_moe_layer, layer);
             }
