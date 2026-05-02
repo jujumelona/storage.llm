@@ -554,13 +554,9 @@ static float moe_mxfp4_value_from_code(uint8_t code) {
 }
 
 static uint8_t moe_mxfp4_code_at(const uint8_t* qs, uint32_t index) {
-    // BUGFIX 217: Fix incorrect index masking for mxfp4 block access
-    // Problem: index & 15u masks to 0-15, but mxfp4 blocks have 32 elements (16 bytes)
-    //          This causes reading wrong byte for indices 16-31
-    // Solution: Use index >> 1 for byte offset, index & 1 for nibble selection
-    // Impact: Fixes data corruption in mxfp4 quantized weights
-    const uint8_t byte = qs[index >> 1];
-    return (index & 1u) ? (byte >> 4) : (byte & 0x0fu);
+    const uint32_t half = 16u;
+    const uint8_t byte = qs[(index < half) ? index : (index - half)];
+    return (index < half) ? (byte & 0x0fu) : (byte >> 4);
 }
 
 static float moe_dot_gguf_mxfp4_row(
@@ -581,14 +577,14 @@ static float moe_dot_gguf_mxfp4_row(
         const float scale = moe_e8m0_to_f32_half(packed[0]);
         const uint8_t* qs = packed + 1u;
         const float* xb = x + start;
-        float even = 0.0f;
-        float odd = 0.0f;
+        float low = 0.0f;
+        float high = 0.0f;
 #if defined(__AVX2__) && defined(__FMA__)
         // BUGFIX 705: AVX2 vectorized MXFP4 dot product ★★★
         // 16-entry FP32 table (64B) always in L1. Gather throughput ~5cy on Haswell+.
         const __m256i lo_mask = _mm256_set1_epi32(0x0F);
-        __m256 vacc_even = _mm256_setzero_ps();
-        __m256 vacc_odd  = _mm256_setzero_ps();
+        __m256 vacc_low = _mm256_setzero_ps();
+        __m256 vacc_high = _mm256_setzero_ps();
         for (uint32_t j = 0; j < 16u; j += 8u) {
             __m128i raw8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + j));
             __m256i bytes8 = _mm256_cvtepu8_epi32(raw8);
@@ -596,25 +592,25 @@ static float moe_dot_gguf_mxfp4_row(
             __m256 lo_vals = _mm256_i32gather_ps(table, lo_idx, 4);
             __m256i hi_idx = _mm256_srli_epi32(bytes8, 4);
             __m256 hi_vals = _mm256_i32gather_ps(table, hi_idx, 4);
-            const __m256i eidx = _mm256_set_epi32(
-                (int)(j*2u+14u),(int)(j*2u+12u),(int)(j*2u+10u),(int)(j*2u+8u),
-                (int)(j*2u+6u),(int)(j*2u+4u),(int)(j*2u+2u),(int)(j*2u+0u));
-            const __m256i oidx = _mm256_set_epi32(
-                (int)(j*2u+15u),(int)(j*2u+13u),(int)(j*2u+11u),(int)(j*2u+9u),
-                (int)(j*2u+7u),(int)(j*2u+5u),(int)(j*2u+3u),(int)(j*2u+1u));
-            vacc_even = _mm256_fmadd_ps(lo_vals, _mm256_i32gather_ps(xb, eidx, 4), vacc_even);
-            vacc_odd  = _mm256_fmadd_ps(hi_vals, _mm256_i32gather_ps(xb, oidx, 4), vacc_odd);
+            const __m256i low_idx = _mm256_set_epi32(
+                (int)(j+7u),(int)(j+6u),(int)(j+5u),(int)(j+4u),
+                (int)(j+3u),(int)(j+2u),(int)(j+1u),(int)(j+0u));
+            const __m256i high_idx = _mm256_set_epi32(
+                (int)(j+23u),(int)(j+22u),(int)(j+21u),(int)(j+20u),
+                (int)(j+19u),(int)(j+18u),(int)(j+17u),(int)(j+16u));
+            vacc_low = _mm256_fmadd_ps(lo_vals, _mm256_i32gather_ps(xb, low_idx, 4), vacc_low);
+            vacc_high = _mm256_fmadd_ps(hi_vals, _mm256_i32gather_ps(xb, high_idx, 4), vacc_high);
         }
-        even = moe_dot_hsum256_ps(vacc_even);
-        odd  = moe_dot_hsum256_ps(vacc_odd);
+        low = moe_dot_hsum256_ps(vacc_low);
+        high = moe_dot_hsum256_ps(vacc_high);
 #else
         for (uint32_t j = 0; j < 16u; ++j) {
             const uint8_t byte = qs[j];
-            even += table[byte & 0x0fu] * xb[j * 2u];
-            odd += table[byte >> 4] * xb[j * 2u + 1u];
+            low += table[byte & 0x0fu] * xb[j];
+            high += table[byte >> 4] * xb[j + 16u];
         }
 #endif
-        acc += (even + odd) * scale;
+        acc += (low + high) * scale;
         packed += block_bytes;
     }
     if (start < cols) {
@@ -622,14 +618,8 @@ static float moe_dot_gguf_mxfp4_row(
         const uint8_t* qs = packed + 1u;
         const uint32_t limit = cols - start;
         float block_acc = 0.0f;
-        uint32_t i = 0;
-        for (; i + 1u < limit; i += 2u) {
-            const uint8_t byte = qs[i >> 1];
-            block_acc += table[byte & 0x0fu] * x[start + i];
-            block_acc += table[byte >> 4] * x[start + i + 1u];
-        }
-        if (i < limit) {
-            block_acc += table[qs[i >> 1] & 0x0fu] * x[start + i];
+        for (uint32_t i = 0; i < limit; ++i) {
+            block_acc += table[moe_mxfp4_code_at(qs, i)] * x[start + i];
         }
         acc += block_acc * scale;
         packed += block_bytes;
