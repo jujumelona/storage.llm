@@ -14,7 +14,8 @@ int moe_pc_engine_plan_moe_prefetch(
     }
 
     std::vector<moe_expert_prefetch_item_t> items;
-    std::lock_guard<std::mutex> plan_lock(engine->prefetch_plan_mutex);
+    // prefetch_plan_clear_seen/add_* lock the generation map internally.
+    // Do not hold prefetch_plan_mutex around them; the helpers re-enter it.
     prefetch_plan_clear_seen(engine);
     // BUGFIX 577: Check reserve size for overflow ★
     // Problem: selected_count + next_count + topology_max_candidates can overflow

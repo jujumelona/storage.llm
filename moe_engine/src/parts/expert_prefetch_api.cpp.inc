@@ -307,7 +307,8 @@ int moe_pc_engine_prefetch_moe_lookahead(
     if (!engine || current_layer < 0) {
         return 0;
     }
-    std::lock_guard<std::mutex> plan_lock(engine->prefetch_plan_mutex);
+    // prefetch_plan_clear_seen and duplicate checks lock internally.
+    // Holding the same mutex here deadlocks through prefetch plan helpers.
     prefetch_plan_clear_seen(engine);
 
     int ok_count = 0;

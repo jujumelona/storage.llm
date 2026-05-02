@@ -273,55 +273,54 @@ int moe_pc_engine_orchestrate_moe_step(moe_pc_engine_t* engine, int current_laye
     prefetch_plan_clear_seen(engine);
 
     uint32_t kept = 0;
-    {
-        std::lock_guard<std::mutex> plan_lock(engine->prefetch_plan_mutex);
-        engine->runtime_prefetch_window_layers.store(out_plan->prefetch_window_layers, std::memory_order_relaxed);
-        if (runtime_disk_workers(engine) != out_plan->disk_workers ||
-            runtime_pinned_workers(engine) != out_plan->pinned_workers ||
-            runtime_gpu_workers(engine) != out_plan->gpu_workers) {
-            if (worker_resize_hysteresis_ready(engine, out_plan)) {
-                orchestrator_resize_workers(engine, out_plan);
-            }
+    // The prefetch-plan helper functions already protect their generation map.
+    // Holding prefetch_plan_mutex here deadlocks when append helpers re-enter it.
+    engine->runtime_prefetch_window_layers.store(out_plan->prefetch_window_layers, std::memory_order_relaxed);
+    if (runtime_disk_workers(engine) != out_plan->disk_workers ||
+        runtime_pinned_workers(engine) != out_plan->pinned_workers ||
+        runtime_gpu_workers(engine) != out_plan->gpu_workers) {
+        if (worker_resize_hysteresis_ready(engine, out_plan)) {
+            orchestrator_resize_workers(engine, out_plan);
         }
-        for (uint32_t i = 0; selected_experts && i < selected_count; ++i) {
-            out_plan->selected_expert_bytes += orchestrator_expert_bytes(engine, current_layer, selected_experts[i]);
-        }
-        if (!out_items || max_items == 0) {
-            if (out_item_count) *out_item_count = 0;
-            prefetch_moe_activation_raw(engine, current_layer);
-            prefetch_moe_shared_compute_raw(engine, current_layer);
-            if (!out_plan->drop_speculative) {
-                prefetch_moe_activation_raw(engine, current_layer + 1);
-            }
-            return 1;
-        }
-        for (uint32_t i = 0; selected_experts && i < selected_count; ++i) {
-            orchestrator_append_item(engine, out_items, max_items, &kept, current_layer, selected_experts[i],
-                out_plan->selected_tier, moe_PREFETCH_REASON_ROUTER_SELECTED, 1000.0f);
-        }
+    }
+    for (uint32_t i = 0; selected_experts && i < selected_count; ++i) {
+        out_plan->selected_expert_bytes += orchestrator_expert_bytes(engine, current_layer, selected_experts[i]);
+    }
+    if (!out_items || max_items == 0) {
+        if (out_item_count) *out_item_count = 0;
+        prefetch_moe_activation_raw(engine, current_layer);
+        prefetch_moe_shared_compute_raw(engine, current_layer);
         if (!out_plan->drop_speculative) {
-            for (uint32_t i = 0; next_layer_candidates && i < next_count; ++i) {
-                orchestrator_append_item(engine, out_items, max_items, &kept, current_layer + 1, next_layer_candidates[i],
-                    out_plan->speculative_tier, moe_PREFETCH_REASON_LOOKAHEAD, 100.0f);
-            }
-            if (!out_plan->throttle_speculative) {
-                orchestrator_append_topology(engine, current_layer, selected_experts, selected_count,
-                    out_plan->speculative_tier, out_items, max_items, &kept);
+            prefetch_moe_activation_raw(engine, current_layer + 1);
+        }
+        return 1;
+    }
+    for (uint32_t i = 0; selected_experts && i < selected_count; ++i) {
+        orchestrator_append_item(engine, out_items, max_items, &kept, current_layer, selected_experts[i],
+            out_plan->selected_tier, moe_PREFETCH_REASON_ROUTER_SELECTED, 1000.0f);
+    }
+    if (!out_plan->drop_speculative) {
+        for (uint32_t i = 0; next_layer_candidates && i < next_count; ++i) {
+            orchestrator_append_item(engine, out_items, max_items, &kept, current_layer + 1, next_layer_candidates[i],
+                out_plan->speculative_tier, moe_PREFETCH_REASON_LOOKAHEAD, 100.0f);
+        }
+        if (!out_plan->throttle_speculative) {
+            orchestrator_append_topology(engine, current_layer, selected_experts, selected_count,
+                out_plan->speculative_tier, out_items, max_items, &kept);
 
-                std::vector<int> dejavu_predicted = moe_juju_predict_co_activation(engine, current_layer + 2, 4);
-                std::vector<int> dejavu_domain;
-                moe_expand_merged_experts(engine, current_layer + 2, dejavu_predicted, dejavu_domain);
-                for (int e : dejavu_domain) {
-                    orchestrator_append_item(engine, out_items, max_items, &kept, current_layer + 2, e,
-                        moe_TIER_RAM, moe_PREFETCH_REASON_LOOKAHEAD, 80.0f);
-                }
+            std::vector<int> dejavu_predicted = moe_juju_predict_co_activation(engine, current_layer + 2, 4);
+            std::vector<int> dejavu_domain;
+            moe_expand_merged_experts(engine, current_layer + 2, dejavu_predicted, dejavu_domain);
+            for (int e : dejavu_domain) {
+                orchestrator_append_item(engine, out_items, max_items, &kept, current_layer + 2, e,
+                    moe_TIER_RAM, moe_PREFETCH_REASON_LOOKAHEAD, 80.0f);
             }
         }
-        out_plan->planned_prefetch_count = kept;
-        if (out_item_count) {
-            *out_item_count = kept;
-        }
-    }  // plan_lock released here, before execute_prefetch_plan
+    }
+    out_plan->planned_prefetch_count = kept;
+    if (out_item_count) {
+        *out_item_count = kept;
+    }
 
     // Bug #8: These two activation prefetch paths are mutually exclusive (early return).
     if (out_plan->planned_prefetch_count == 0) {
