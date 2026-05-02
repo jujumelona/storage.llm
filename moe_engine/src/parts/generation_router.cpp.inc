@@ -275,15 +275,23 @@ static int moe_router_uses_sigmoid_scores(const moe_pc_engine* engine) {
     if (!engine || engine->offload_gguf_metadata_json.empty()) {
         return 0;
     }
+    const int cached = engine->cached_router_use_sigmoid.load(std::memory_order_acquire);
+    if (cached >= 0) {
+        return cached;
+    }
+    int use_sigmoid = 0;
     std::string score_func;
     if ((moe_json_get_string_local(engine->offload_gguf_metadata_json, "scoring_func", &score_func) ||
          moe_json_get_string_local(engine->offload_gguf_metadata_json, "score_func", &score_func) ||
          moe_json_get_string_local(engine->offload_gguf_metadata_json, "router_score_func", &score_func)) &&
         moe_lower_ascii_copy(score_func) == "sigmoid") {
-        return 1;
+        use_sigmoid = 1;
+    } else if (moe_engine_metadata_mentions(engine, "routed_scaling_factor") ||
+        moe_engine_metadata_mentions(engine, "route_scale")) {
+        use_sigmoid = 1;
     }
-    return moe_engine_metadata_mentions(engine, "routed_scaling_factor") ||
-        moe_engine_metadata_mentions(engine, "route_scale") ? 1 : 0;
+    engine->cached_router_use_sigmoid.store(use_sigmoid, std::memory_order_release);
+    return use_sigmoid;
 }
 
 static uint32_t moe_router_top_k_from_metadata(
@@ -291,17 +299,27 @@ static uint32_t moe_router_top_k_from_metadata(
     uint32_t fallback,
     uint32_t experts
 ) {
-    uint64_t value = 0;
-    if (engine && !engine->offload_gguf_metadata_json.empty() &&
-        (moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_experts_per_tok", &value) ||
-         moe_json_get_u64_local(engine->offload_gguf_metadata_json, "n_experts_per_tok", &value) ||
-         moe_json_get_u64_local(engine->offload_gguf_metadata_json, "moe_top_k", &value) ||
-         moe_json_get_u64_local(engine->offload_gguf_metadata_json, "top_k_experts", &value) ||
-         moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_selected_experts", &value) ||
-         moe_json_get_u64_local(engine->offload_gguf_metadata_json, "topk", &value) ||
-         moe_json_get_u64_local(engine->offload_gguf_metadata_json, "top_k", &value)) &&
-        value > 0) {
-        return (uint32_t)std::min<uint64_t>(value, experts ? experts : value);
+    int cached = engine ? engine->cached_router_top_k_hint.load(std::memory_order_acquire) : -1;
+    if (cached < 0) {
+        uint64_t value = 0;
+        cached = 0;
+        if (engine && !engine->offload_gguf_metadata_json.empty() &&
+            (moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_experts_per_tok", &value) ||
+             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "n_experts_per_tok", &value) ||
+             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "moe_top_k", &value) ||
+             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "top_k_experts", &value) ||
+             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_selected_experts", &value) ||
+             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "topk", &value) ||
+             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "top_k", &value)) &&
+            value > 0) {
+            cached = (int)std::min<uint64_t>(value, (uint64_t)INT32_MAX);
+        }
+        if (engine) {
+            engine->cached_router_top_k_hint.store(cached, std::memory_order_release);
+        }
+    }
+    if (cached > 0) {
+        return (uint32_t)std::min<uint32_t>((uint32_t)cached, experts ? experts : (uint32_t)cached);
     }
     return std::min(fallback, experts ? experts : fallback);
 }
@@ -326,33 +344,51 @@ static int moe_router_metadata_u32(
 }
 
 static float moe_router_routed_scaling_factor(const moe_pc_engine* engine) {
+    if (!engine) {
+        return 1.0f;
+    }
+    const uint32_t cached_bits = engine->cached_router_route_scale_bits.load(std::memory_order_acquire);
+    if (cached_bits != 0u) {
+        return moe_f32_from_bits(cached_bits);
+    }
     double value = 1.0;
-    if (engine && !engine->offload_gguf_metadata_json.empty() &&
+    if (!engine->offload_gguf_metadata_json.empty() &&
         (moe_json_get_double_local(engine->offload_gguf_metadata_json, "routed_scaling_factor", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "route_scale", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "moe_routed_scaling_factor", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "moe_route_scale", &value)) &&
         value > 0.0) {
-        return (float)value;
+        const float scale = (float)value;
+        engine->cached_router_route_scale_bits.store(moe_f32_bits(scale), std::memory_order_release);
+        return scale;
     }
+    engine->cached_router_route_scale_bits.store(moe_f32_bits(1.0f), std::memory_order_release);
     return 1.0f;
 }
 
 static int moe_router_norm_topk_prob(const moe_pc_engine* engine, int use_sigmoid) {
+    if (!engine) {
+        return use_sigmoid ? 1 : 0;
+    }
+    const int cached = engine->cached_router_norm_topk_prob.load(std::memory_order_acquire);
+    if (cached >= 0) {
+        return cached;
+    }
     int value = 0;
-    if (engine && !engine->offload_gguf_metadata_json.empty() &&
+    int result = use_sigmoid ? 1 : 0;
+    if (!engine->offload_gguf_metadata_json.empty() &&
         (moe_json_get_bool_local(engine->offload_gguf_metadata_json, "norm_topk_prob", &value) ||
          moe_json_get_bool_local(engine->offload_gguf_metadata_json, "normalize_topk_prob", &value) ||
          moe_json_get_bool_local(engine->offload_gguf_metadata_json, "moe_normalize_topk_prob", &value) ||
          moe_json_get_bool_local(engine->offload_gguf_metadata_json, "moe_normalize_expert_weights", &value) ||
          moe_json_get_bool_local(engine->offload_gguf_metadata_json, "router_normalize_topk_prob", &value) ||
          moe_json_get_bool_local(engine->offload_gguf_metadata_json, "routed_norm_topk_prob", &value))) {
-        return value ? 1 : 0;
+        result = value ? 1 : 0;
+    } else if (!use_sigmoid && moe_engine_uses_hybrid_local_global_attention(engine)) {
+        result = 1;
     }
-    if (!use_sigmoid && moe_engine_uses_hybrid_local_global_attention(engine)) {
-        return 1;
-    }
-    return use_sigmoid ? 1 : 0;
+    engine->cached_router_norm_topk_prob.store(result, std::memory_order_release);
+    return result;
 }
 
 static void moe_router_apply_group_limit(
@@ -369,10 +405,24 @@ static void moe_router_apply_group_limit(
     static const char* const limited_keys[] = {
         "topk_group", "n_limited_groups", "num_limited_groups", "moe_topk_group", "routed_topk_group"
     };
-    uint32_t groups = 0;
-    uint32_t limited_groups = 0;
-    if (!moe_router_metadata_u32(engine, group_keys, sizeof(group_keys) / sizeof(group_keys[0]), &groups) ||
-        !moe_router_metadata_u32(engine, limited_keys, sizeof(limited_keys) / sizeof(limited_keys[0]), &limited_groups) ||
+    int cached_groups = engine->cached_router_group_count.load(std::memory_order_acquire);
+    if (cached_groups < 0) {
+        uint32_t parsed = 0;
+        cached_groups = moe_router_metadata_u32(
+            engine, group_keys, sizeof(group_keys) / sizeof(group_keys[0]), &parsed) ? (int)parsed : 0;
+        engine->cached_router_group_count.store(cached_groups, std::memory_order_release);
+    }
+    int cached_limited = engine->cached_router_limited_group_count.load(std::memory_order_acquire);
+    if (cached_limited < 0) {
+        uint32_t parsed = 0;
+        cached_limited = moe_router_metadata_u32(
+            engine, limited_keys, sizeof(limited_keys) / sizeof(limited_keys[0]), &parsed) ? (int)parsed : 0;
+        engine->cached_router_limited_group_count.store(cached_limited, std::memory_order_release);
+    }
+    const uint32_t groups = cached_groups > 0 ? (uint32_t)cached_groups : 0u;
+    const uint32_t limited_groups = cached_limited > 0 ? (uint32_t)cached_limited : 0u;
+    if (groups == 0 ||
+        limited_groups == 0 ||
         groups <= 1 || limited_groups == 0 || limited_groups >= groups || experts % groups != 0) {
         return;
     }
@@ -502,7 +552,8 @@ static int moe_router_topk_f32(
         out_weights->push_back(w);
         denom += w;
     }
-    if (moe_router_norm_topk_prob(engine, use_sigmoid)) {
+    const int norm_topk = moe_router_norm_topk_prob(engine, use_sigmoid);
+    if (norm_topk) {
         if (denom <= 0.0f) {
             denom = 1e-8f;
         }
@@ -516,6 +567,12 @@ static int moe_router_topk_f32(
             w *= scale;
         }
     }
+    moe_profile_log(
+        "router_topk",
+        "layer=%d experts=%u top_k=%u use_sigmoid=%d norm_topk=%d entropy=%.3f scale=%.6g first_expert=%d first_weight=%.6g",
+        layer, experts, top_k, use_sigmoid, norm_topk, (double)router_entropy, (double)scale,
+        out_experts->empty() ? -1 : (*out_experts)[0],
+        out_weights->empty() ? 0.0 : (double)(*out_weights)[0]);
     return 1;
 }
 

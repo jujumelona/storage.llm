@@ -1,27 +1,71 @@
+static void moe_forward_trace_vec(
+    const char* stage,
+    uint32_t position,
+    uint32_t layer,
+    const float* values,
+    uint32_t count
+) {
+    if (!moe_profile_enabled() || !values || count == 0) {
+        return;
+    }
+    double ss = 0.0;
+    double mean_abs = 0.0;
+    float max_abs = 0.0f;
+    for (uint32_t i = 0; i < count; ++i) {
+        const float v = values[i];
+        const float av = std::fabs(v);
+        ss += (double)v * (double)v;
+        mean_abs += (double)av;
+        if (av > max_abs) {
+            max_abs = av;
+        }
+    }
+    moe_profile_log(
+        "forward_vec",
+        "position=%u layer=%u stage=%s count=%u rms=%.6g mean_abs=%.6g max_abs=%.6g first4=[%.6g,%.6g,%.6g,%.6g]",
+        position, layer, stage ? stage : "",
+        count,
+        std::sqrt(ss / (double)count),
+        mean_abs / (double)count,
+        (double)max_abs,
+        count > 0 ? (double)values[0] : 0.0,
+        count > 1 ? (double)values[1] : 0.0,
+        count > 2 ? (double)values[2] : 0.0,
+        count > 3 ? (double)values[3] : 0.0);
+}
+
 static float moe_forward_embedding_scale_value(const moe_pc_engine* engine, uint32_t hidden_size) {
     // BUGFIX 500: hidden_size 범위 체크 강화
     if (!engine || hidden_size == 0 || hidden_size > 100000) {
         return 1.0f;
     }
+    const uint32_t cached_hidden = engine->cached_embedding_scale_hidden.load(std::memory_order_acquire);
+    const uint32_t cached_bits = engine->cached_embedding_scale_bits.load(std::memory_order_acquire);
+    if (cached_hidden == hidden_size && cached_bits != 0u) {
+        return moe_f32_from_bits(cached_bits);
+    }
     double value = 0.0;
+    float scale = 1.0f;
     if (!engine->offload_gguf_metadata_json.empty() &&
         (moe_json_get_double_local(engine->offload_gguf_metadata_json, "embedding_scale", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "embed_scale", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "scale_emb", &value)) &&
         value > 0.0) {
-        return (float)value;
+        scale = (float)value;
     }
-    if (moe_engine_graph_ir_mentions(engine, "sqrt_hidden_size") ||
+    else if (moe_engine_graph_ir_mentions(engine, "sqrt_hidden_size") ||
         moe_engine_graph_ir_mentions(engine, "scale_embedding") ||
         moe_engine_metadata_mentions(engine, "sqrt_hidden_size") ||
         moe_engine_metadata_mentions(engine, "scale_embedding")) {
-        return std::sqrt((float)hidden_size);
+        scale = std::sqrt((float)hidden_size);
     }
-    if (moe_engine_has_common_tensor_suffix(engine, 0, "layer_output_scale.weight") &&
+    else if (moe_engine_has_common_tensor_suffix(engine, 0, "layer_output_scale.weight") &&
         moe_engine_has_common_tensor_suffix(engine, 0, "ffn_gate_inp.scale")) {
-        return std::sqrt((float)hidden_size);
+        scale = std::sqrt((float)hidden_size);
     }
-    return 1.0f;
+    engine->cached_embedding_scale_hidden.store(hidden_size, std::memory_order_release);
+    engine->cached_embedding_scale_bits.store(moe_f32_bits(scale), std::memory_order_release);
+    return scale;
 }
 
 // CUDA Graph cached structures for decode
@@ -87,6 +131,7 @@ static int moe_forward_one_token_f32(
         "position=%u token=%u hidden=%u scale=%.6g ms=%.3f",
         position, token_id, c->hidden_size, (double)embedding_scale,
         moe_profile_elapsed_ms(embed_start_us));
+    moe_forward_trace_vec("embed", position, 0xffffffffu, hidden, c->hidden_size);
 
     for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
         const uint64_t layer_start_us = moe_profile_now_us();
@@ -146,6 +191,7 @@ static int moe_forward_one_token_f32(
                 "forward_split_residual",
                 "position=%u layer=%u ms=%.3f",
                 position, layer, moe_profile_elapsed_ms(split_residual_start_us));
+            moe_forward_trace_vec("after_attention", position, layer, hidden, c->hidden_size);
             const double attention_ms = moe_profile_elapsed_ms(attn_start_us);
             const int is_moe = layer >= c->first_moe_layer && layer <= c->last_moe_layer;
             if (layer + 1u < c->num_hidden_layers &&
@@ -168,10 +214,12 @@ static int moe_forward_one_token_f32(
                 return 0;
             }
             const double mlp_ms = moe_profile_elapsed_ms(mlp_start_us);
+            moe_forward_trace_vec("after_mlp", position, layer, hidden, c->hidden_size);
             if (!moe_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
                 moe_generation_set_error(stats, "layer output scale failed");
                 return 0;
             }
+            moe_forward_trace_vec("after_output_scale", position, layer, hidden, c->hidden_size);
             moe_profile_log(
                 "forward_layer",
                 "position=%u layer=%u split=1 is_moe=%d attention_ms=%.3f mlp_ms=%.3f total_ms=%.3f",
@@ -183,6 +231,7 @@ static int moe_forward_one_token_f32(
             moe_generation_set_error(stats, "attention block failed");
             return 0;
         }
+        moe_forward_trace_vec("after_attention", position, layer, hidden, c->hidden_size);
         if (!moe_pc_engine_raw_rmsnorm_f32(
                 engine, (int32_t)layer, moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM,
                 hidden, c->hidden_size, s->norm.data(), c->hidden_size, layer_attn_cfg.rms_norm_eps)) {
@@ -213,6 +262,7 @@ static int moe_forward_one_token_f32(
             moe_generation_set_error(stats, "mlp/moe block failed");
             return 0;
         }
+        moe_forward_trace_vec("after_mlp", position, layer, hidden, c->hidden_size);
         moe_profile_log(
             "forward_layer",
             "position=%u layer=%u split=0 is_moe=%d attention_ms=%.3f mlp_ms=%.3f total_ms=%.3f",
@@ -228,6 +278,7 @@ static int moe_forward_one_token_f32(
         return 0;
     }
     s->hidden.swap(s->norm);
+    moe_forward_trace_vec("final_norm", position, c->num_hidden_layers, s->hidden.data(), c->hidden_size);
     moe_profile_log(
         "forward_token_end",
         "position=%u token=%u final_norm_ms=%.3f total_ms=%.3f",

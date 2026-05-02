@@ -7,6 +7,42 @@ static float moe_raw_bf16_to_f32(uint16_t v) {
     return out;
 }
 
+static uint32_t moe_f32_bits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static float moe_f32_from_bits(uint32_t bits) {
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static int moe_ascii_contains_ci(const std::string& haystack, const char* needle) {
+    if (!needle || !needle[0]) {
+        return 0;
+    }
+    const size_t n = std::strlen(needle);
+    if (n == 0 || haystack.size() < n) {
+        return 0;
+    }
+    for (size_t i = 0; i + n <= haystack.size(); ++i) {
+        size_t j = 0;
+        for (; j < n; ++j) {
+            const unsigned char a = static_cast<unsigned char>(haystack[i + j]);
+            const unsigned char b = static_cast<unsigned char>(needle[j]);
+            if (std::tolower(a) != std::tolower(b)) {
+                break;
+            }
+        }
+        if (j == n) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static uint32_t moe_raw_scalar_size(uint8_t encoding) {
     return encoding == moe_RAW_SCALAR_F32 ? 4u : 2u;
 }
@@ -206,35 +242,36 @@ static int moe_engine_graph_ir_mentions(const moe_pc_engine* engine, const char*
     if (!engine || !needle || !needle[0] || engine->offload_graph_ir_json.empty()) {
         return 0;
     }
-    const std::string haystack = moe_lower_ascii_copy(engine->offload_graph_ir_json);
-    const std::string target = moe_lower_ascii_copy(std::string(needle));
-    return haystack.find(target) != std::string::npos ? 1 : 0;
+    return moe_ascii_contains_ci(engine->offload_graph_ir_json, needle);
 }
 
 static int moe_engine_metadata_mentions(const moe_pc_engine* engine, const char* needle) {
     if (!engine || !needle || !needle[0] || engine->offload_gguf_metadata_json.empty()) {
         return 0;
     }
-    const std::string haystack = moe_lower_ascii_copy(engine->offload_gguf_metadata_json);
-    const std::string target = moe_lower_ascii_copy(std::string(needle));
-    return haystack.find(target) != std::string::npos ? 1 : 0;
+    return moe_ascii_contains_ci(engine->offload_gguf_metadata_json, needle);
 }
 
 static int moe_engine_gelu_activation_mode(const moe_pc_engine* engine) {
     if (!engine) {
         return 0;
     }
+    const int cached = engine->cached_gelu_activation_mode.load(std::memory_order_acquire);
+    if (cached >= 0) {
+        return cached;
+    }
+    int mode = 0;
     if (moe_engine_graph_ir_mentions(engine, "gelu_pytorch_tanh") ||
         moe_engine_graph_ir_mentions(engine, "gelu_tanh") ||
         moe_engine_metadata_mentions(engine, "gelu_pytorch_tanh") ||
         moe_engine_metadata_mentions(engine, "gelu_tanh")) {
-        return 2;
-    }
-    if (moe_engine_graph_ir_mentions(engine, "gelu") ||
+        mode = 2;
+    } else if (moe_engine_graph_ir_mentions(engine, "gelu") ||
         moe_engine_metadata_mentions(engine, "gelu")) {
-        return 1;
+        mode = 1;
     }
-    return 0;
+    engine->cached_gelu_activation_mode.store(mode, std::memory_order_release);
+    return mode;
 }
 
 static int moe_engine_prefers_gelu_activation(const moe_pc_engine* engine) {

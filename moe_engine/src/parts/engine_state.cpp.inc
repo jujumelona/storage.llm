@@ -143,6 +143,15 @@ struct moe_pc_engine {
     std::mutex gate_input_snapshot_mutex;
     std::atomic<uint32_t> adaptive_prefetch_depth{2};
     std::atomic<uint32_t> last_router_entropy_milli{0};
+    mutable std::atomic<int> cached_gelu_activation_mode{-1};
+    mutable std::atomic<int> cached_router_use_sigmoid{-1};
+    mutable std::atomic<int> cached_router_norm_topk_prob{-1};
+    mutable std::atomic<int> cached_router_top_k_hint{-1};
+    mutable std::atomic<int> cached_router_group_count{-1};
+    mutable std::atomic<int> cached_router_limited_group_count{-1};
+    mutable std::atomic<uint32_t> cached_router_route_scale_bits{0};
+    mutable std::atomic<uint32_t> cached_embedding_scale_hidden{0};
+    mutable std::atomic<uint32_t> cached_embedding_scale_bits{0};
     alignas(64) std::atomic<uint64_t> vram_used_bytes{0};
     alignas(64) std::atomic<uint64_t> ram_used_bytes{0};
     alignas(64) std::atomic<uint64_t> db_used_bytes{0};

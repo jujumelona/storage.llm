@@ -58,6 +58,15 @@ static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {
     engine->offload_graph_ir_version.store(0, std::memory_order_relaxed);
     engine->offload_graph_ir_op_count.store(0, std::memory_order_relaxed);
     engine->offload_graph_ir_layer_count.store(0, std::memory_order_relaxed);
+    engine->cached_gelu_activation_mode.store(-1, std::memory_order_relaxed);
+    engine->cached_router_use_sigmoid.store(-1, std::memory_order_relaxed);
+    engine->cached_router_norm_topk_prob.store(-1, std::memory_order_relaxed);
+    engine->cached_router_top_k_hint.store(-1, std::memory_order_relaxed);
+    engine->cached_router_group_count.store(-1, std::memory_order_relaxed);
+    engine->cached_router_limited_group_count.store(-1, std::memory_order_relaxed);
+    engine->cached_router_route_scale_bits.store(0, std::memory_order_relaxed);
+    engine->cached_embedding_scale_hidden.store(0, std::memory_order_relaxed);
+    engine->cached_embedding_scale_bits.store(0, std::memory_order_relaxed);
     engine->juju_idx_schema_version.store(0, std::memory_order_relaxed);
     engine->juju_split_group_count.store(0, std::memory_order_relaxed);
     engine->juju_split_missing_count.store(0, std::memory_order_relaxed);
