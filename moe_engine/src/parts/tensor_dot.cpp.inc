@@ -1,9 +1,16 @@
 static int moe_dot_weight_format_supported(int weight_format) {
     return weight_format == moe_WEIGHT_ENCODING_RAW_FP16 ||
+        weight_format == moe_WEIGHT_ENCODING_RAW_BF16 ||
         weight_format == moe_WEIGHT_ENCODING_RAW_FP32 ||
         weight_format == moe_WEIGHT_ENCODING_NVFP4 ||
         weight_format == moe_WEIGHT_ENCODING_MXFP4 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_1 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_0 ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_1 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_NL ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_XS ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1 ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q2_K ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q3_K ||
@@ -11,7 +18,12 @@ static int moe_dot_weight_format_supported(int weight_format) {
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q6_K ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XS ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_S ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_S ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_S ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_M ||
         weight_format == moe_WEIGHT_ENCODING_LINEAR_Q2 ||
         weight_format == moe_WEIGHT_ENCODING_LINEAR_Q3 ||
         weight_format == moe_WEIGHT_ENCODING_LINEAR_Q4 ||
@@ -51,6 +63,10 @@ static int moe_dot_tensor_record_row(
         *out_value = moe_dot_raw_fp16_row(packed, x, rec->info.cols);
         return 1;
     }
+    if (weight_format == moe_WEIGHT_ENCODING_RAW_BF16) {
+        *out_value = moe_dot_raw_bf16_row(packed, x, rec->info.cols);
+        return 1;
+    }
     if (weight_format == moe_WEIGHT_ENCODING_RAW_FP32) {
         *out_value = moe_dot_raw_fp32_row(packed, x, rec->info.cols);
         return 1;
@@ -63,8 +79,32 @@ static int moe_dot_tensor_record_row(
         *out_value = moe_dot_gguf_mxfp4_row(packed, x, rec->info.cols);
         return 1;
     }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0) {
+        *out_value = moe_dot_gguf_q4_0_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_1) {
+        *out_value = moe_dot_gguf_q4_1_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_0) {
+        *out_value = moe_dot_gguf_q5_0_row(packed, x, rec->info.cols);
+        return 1;
+    }
     if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
         *out_value = moe_dot_gguf_q8_0_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_1) {
+        *out_value = moe_dot_gguf_q8_1_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_NL) {
+        *out_value = moe_dot_gguf_iq4_nl_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_XS) {
+        *out_value = moe_dot_gguf_iq4_xs_row(packed, x, rec->info.cols);
         return 1;
     }
     if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
@@ -95,8 +135,28 @@ static int moe_dot_tensor_record_row(
         *out_value = moe_dot_gguf_iq2_xxs_row(packed, x, rec->info.cols);
         return 1;
     }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XS) {
+        *out_value = moe_dot_gguf_iq2_xs_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_S) {
+        *out_value = moe_dot_gguf_iq2_s_row(packed, x, rec->info.cols);
+        return 1;
+    }
     if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS) {
         *out_value = moe_dot_gguf_iq3_xxs_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_S) {
+        *out_value = moe_dot_gguf_iq3_s_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_S) {
+        *out_value = moe_dot_gguf_iq1_s_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_M) {
+        *out_value = moe_dot_gguf_iq1_m_row(packed, x, rec->info.cols);
         return 1;
     }
     if (weight_format == moe_WEIGHT_ENCODING_LINEAR_Q2 ||
@@ -170,6 +230,9 @@ static int moe_dot_tensor_record_row_batch(
         if (weight_format == moe_WEIGHT_ENCODING_RAW_FP16) {
             out_values[b] = moe_dot_raw_fp16_row(packed, batch_x[b], rec->info.cols);
         }
+        else if (weight_format == moe_WEIGHT_ENCODING_RAW_BF16) {
+            out_values[b] = moe_dot_raw_bf16_row(packed, batch_x[b], rec->info.cols);
+        }
         else if (weight_format == moe_WEIGHT_ENCODING_RAW_FP32) {
             out_values[b] = moe_dot_raw_fp32_row(packed, batch_x[b], rec->info.cols);
         }
@@ -179,8 +242,26 @@ static int moe_dot_tensor_record_row_batch(
         else if (weight_format == moe_WEIGHT_ENCODING_MXFP4) {
             out_values[b] = moe_dot_gguf_mxfp4_row(packed, batch_x[b], rec->info.cols);
         }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0) {
+            out_values[b] = moe_dot_gguf_q4_0_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_1) {
+            out_values[b] = moe_dot_gguf_q4_1_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_0) {
+            out_values[b] = moe_dot_gguf_q5_0_row(packed, batch_x[b], rec->info.cols);
+        }
         else if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
             out_values[b] = moe_dot_gguf_q8_0_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_1) {
+            out_values[b] = moe_dot_gguf_q8_1_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_NL) {
+            out_values[b] = moe_dot_gguf_iq4_nl_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_XS) {
+            out_values[b] = moe_dot_gguf_iq4_xs_row(packed, batch_x[b], rec->info.cols);
         }
         else if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
             out_values[b] = moe_dot_gguf_q5_1_row(packed, batch_x[b], rec->info.cols);
@@ -203,8 +284,23 @@ static int moe_dot_tensor_record_row_batch(
         else if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS) {
             out_values[b] = moe_dot_gguf_iq2_xxs_row(packed, batch_x[b], rec->info.cols);
         }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XS) {
+            out_values[b] = moe_dot_gguf_iq2_xs_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_S) {
+            out_values[b] = moe_dot_gguf_iq2_s_row(packed, batch_x[b], rec->info.cols);
+        }
         else if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS) {
             out_values[b] = moe_dot_gguf_iq3_xxs_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_S) {
+            out_values[b] = moe_dot_gguf_iq3_s_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_S) {
+            out_values[b] = moe_dot_gguf_iq1_s_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_M) {
+            out_values[b] = moe_dot_gguf_iq1_m_row(packed, batch_x[b], rec->info.cols);
         }
         else if (weight_format == moe_WEIGHT_ENCODING_LINEAR_Q2 ||
                  weight_format == moe_WEIGHT_ENCODING_LINEAR_Q3 ||

@@ -53,6 +53,8 @@ struct moe_cpu_row_pool_t {
     std::function<void()> work_fn;   // shared work function for all workers
     std::atomic<uint32_t> pending{0};
     std::atomic<bool> shutdown{false};
+    uint64_t generation = 0;
+    uint32_t active_count = 0;
     bool initialized{false};
 
     void init(uint32_t count) {
@@ -60,19 +62,23 @@ struct moe_cpu_row_pool_t {
         initialized = true;
         threads.reserve(count);
         for (uint32_t i = 0; i < count; ++i) {
-            threads.emplace_back([this]() {
+            threads.emplace_back([this, i]() {
                 moe_cpu_enable_fast_fp_mode();
+                uint64_t seen_generation = 0;
                 for (;;) {
                     std::function<void()> fn;
                     {
                         std::unique_lock<std::mutex> lk(mtx);
-                        dispatch_cv.wait(lk, [this]() {
+                        dispatch_cv.wait(lk, [this, &seen_generation]() {
                             return shutdown.load(std::memory_order_relaxed) ||
-                                   pending.load(std::memory_order_relaxed) > 0;
+                                   generation != seen_generation;
                         });
-                        if (shutdown.load(std::memory_order_relaxed) &&
-                            pending.load(std::memory_order_relaxed) == 0) {
+                        if (shutdown.load(std::memory_order_relaxed)) {
                             return;
+                        }
+                        seen_generation = generation;
+                        if (i >= active_count) {
+                            continue;
                         }
                         fn = work_fn;
                     }
@@ -89,7 +95,9 @@ struct moe_cpu_row_pool_t {
         {
             std::lock_guard<std::mutex> lk(mtx);
             work_fn = std::move(fn);
-            pending.store(count, std::memory_order_release);
+            active_count = std::min<uint32_t>(count, static_cast<uint32_t>(threads.size()));
+            ++generation;
+            pending.store(active_count, std::memory_order_release);
         }
         dispatch_cv.notify_all();
     }

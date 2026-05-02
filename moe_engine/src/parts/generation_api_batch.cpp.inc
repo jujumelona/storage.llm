@@ -34,43 +34,17 @@ int moe_pc_engine_submit_request(
 }
 
 int moe_pc_engine_step_batch(moe_pc_engine_t* engine) {
-    if (!engine) return 0;
+    // BUGFIX 문제5: Continuous Batching not implemented ★★
+    // Problem: API is public but only has scaffold code with "Future Implementation" comments
+    // Actual batched forward pass (moe_layer_attention_batched_f32, moe_layer_moe_mlp_batched_f32) is missing
+    // Users may call this expecting batched inference but get sequential processing instead
+    // Solution: Return error code to indicate not implemented
+    // Long-term: Implement batched GEMM on top of tensor_dot_cpu_kernels.cpp.inc
+    if (!engine) return MOE_ERR_INVALID_ARGUMENT;
 
-    std::lock_guard<std::mutex> lock(engine->generation_api_mutex);
-
-    std::vector<moe_batch_request_t*> prefill_batch;
-    std::vector<moe_batch_request_t*> decode_batch;
-
-    // 1. Scheduler admits new requests and prepares batches
-    engine->batch_scheduler.schedule_next_iteration(&engine->paged_kv_manager, prefill_batch, decode_batch);
-
-    // 2. Disaggregated Prefill Phase
-    // (Here we would launch a batched forward pass over all prefill_batch tokens)
-    if (!prefill_batch.empty()) {
-        std::fprintf(stderr, "[storageLLM BATCH] Running Disaggregated Prefill for %zu requests\n", prefill_batch.size());
-        for (auto* req : prefill_batch) {
-            req->phase = moe_REQ_DECODE; // Move to decode phase next iteration
-            req->processed_tokens = (uint32_t)req->prompt_tokens.size();
-        }
-    }
-
-    // 3. Decode Phase
-    // (Here we would launch a batched forward pass over all decode_batch tokens)
-    if (!decode_batch.empty()) {
-        std::fprintf(stderr, "[storageLLM BATCH] Running Continuous Decode for %zu requests\n", decode_batch.size());
-        for (auto* req : decode_batch) {
-            // Simulated token generation for demo
-            req->generated_tokens.push_back(0);
-            req->processed_tokens++;
-
-            // Randomly finish
-            if (req->generated_tokens.size() > 50) {
-                req->phase = moe_REQ_FINISHED;
-            }
-        }
-    }
-
-    return prefill_batch.empty() && decode_batch.empty() ? 0 : 1;
+    fprintf(stderr, "[storageLLM ERROR] moe_pc_engine_step_batch is not implemented. "
+            "Use moe_pc_engine_step for single-request inference.\n");
+    return MOE_ERR_NOT_IMPLEMENTED;
 }
 
 // ============================================================================

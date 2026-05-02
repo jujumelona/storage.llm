@@ -4,12 +4,24 @@ static int moe_forward_tokenizer_asset_ready(const moe_pc_engine* engine) {
     }
     static const char* kTokenizerFiles[] = {
         "tokenizer.json",
-        "tokenizer.model"
+        "tokenizer.model",
+        "sentencepiece.bpe.model",
+        "vocab.json",
+        "merges.txt"
     };
-    for (const char* file : kTokenizerFiles) {
-        uint64_t bytes = 0;
-        if (file_size_bytes(resolve_model_file_path(engine->model_root, file, ""), &bytes) && bytes > 0) {
-            return 1;
+    static const char* kTokenizerDirs[] = {
+        "",
+        "tokenizer"
+    };
+    for (const char* dir : kTokenizerDirs) {
+        for (const char* file : kTokenizerFiles) {
+            const std::string rel = dir && dir[0] ?
+                storagellm::path_join(std::string(dir), std::string(file)) :
+                std::string(file);
+            uint64_t bytes = 0;
+            if (file_size_bytes(resolve_model_file_path(engine->model_root, rel, ""), &bytes) && bytes > 0) {
+                return 1;
+            }
         }
     }
     return 0;

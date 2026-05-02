@@ -750,6 +750,35 @@ static int moe_layer_moe_mlp_f32(
         return 0;
     }
     moe_juju_update_co_activation(engine, layer, s->selected_experts);
+
+    // BUGFIX 문제10: Update heat for actually used experts ★★
+    // Problem: touch_expert_heat only called during tier transitions, not during actual use
+    // Solution: Touch heat for each selected expert after router selection
+    // This ensures frequently-used experts maintain high heat scores
+    for (int expert_id : s->selected_experts) {
+        const size_t slot = expert_dense_slot(engine, layer, expert_id);
+        if (slot == tensor_slot_invalid() || slot >= engine->expert_states.size()) {
+            continue;
+        }
+
+        moe_block_state* state_ptr = nullptr;
+        moe_tier_t tier = moe_TIER_DB;
+        {
+            std::lock_guard<std::mutex> lock(engine->map_mutex);
+            if (slot < engine->expert_states.size() && engine->expert_states[slot].active) {
+                state_ptr = &engine->expert_states[slot];
+                tier = state_ptr->tier;
+            }
+        }
+
+        if (state_ptr) {
+            // Boost based on current tier (higher for VRAM experts)
+            const double boost = tier == moe_TIER_VRAM ? 4.0 :
+                                tier == moe_TIER_RAM ? 1.0 : 0.25;
+            touch_expert_heat(engine, state_ptr, boost);
+        }
+    }
+
     moe_profile_log(
         "mlp_moe_router",
         "layer=%d selected=%zu weights=%zu logits=%zu ms=%.3f",
@@ -1022,6 +1051,12 @@ static int moe_layer_moe_mlp_f32(
         layer, num_selected, mapped_experts, missing_experts, shape_mismatch_experts, map_failed_experts,
         gate_rows, gate_cols, up_rows, up_cols, down_rows, down_cols,
         moe_profile_elapsed_ms(map_start_us));
+
+    // BUGFIX 문제10: Handle partial expert failures with weight renormalization ★★
+    // Problem: If any expert is missing, entire layer fails (return 0)
+    // Impact: 1 missing expert out of 8 causes full token generation failure
+    // Solution: Renormalize weights for available experts and continue
+    // Only fail if ALL experts are missing
     if (mapped_experts == 0) {
         const uint32_t expected_intermediate = gate_rows ? gate_rows : configured_expert_intermediate;
         const uint32_t expected_gate_cols = gate_cols ? gate_cols : hidden_size;
@@ -1040,6 +1075,33 @@ static int moe_layer_moe_mlp_f32(
             first_up_rows, first_up_cols,
             first_down_rows, first_down_cols);
         return 0;
+    }
+
+    // BUGFIX 문제10: Renormalize weights when some experts are missing ★★
+    // If some experts failed to map, zero their weights and renormalize remaining
+    if (missing_experts > 0 || shape_mismatch_experts > 0 || map_failed_experts > 0) {
+        float weight_sum = 0.0f;
+        for (size_t e = 0; e < num_selected; ++e) {
+            if (expert_ok[e].load(std::memory_order_acquire)) {
+                weight_sum += work[e].weight;
+            }
+        }
+        // Renormalize available expert weights to sum to original total
+        if (weight_sum > 1e-9f) {
+            const float scale = 1.0f / weight_sum;
+            for (size_t e = 0; e < num_selected; ++e) {
+                if (expert_ok[e].load(std::memory_order_acquire)) {
+                    work[e].weight *= scale;
+                } else {
+                    work[e].weight = 0.0f;
+                }
+            }
+            std::fprintf(stderr,
+                "[storagellm mlp] renormalized weights layer=%d selected=%zu mapped=%u missing=%u weight_sum=%.6f scale=%.6f\n",
+                layer, num_selected, mapped_experts,
+                missing_experts + shape_mismatch_experts + map_failed_experts,
+                weight_sum, scale);
+        }
     }
     const uint32_t expert_intermediate = gate_rows;
     if (expert_intermediate == 0) {

@@ -36,6 +36,10 @@ static int moe_copy_embedding_row_f32(
     }
     const uint8_t* row = base + row_offset;
     if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_1 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_1 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_0 ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1 ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q2_K ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q3_K ||
@@ -43,7 +47,14 @@ static int moe_copy_embedding_row_f32(
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q6_K ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XS ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_S ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_S ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_NL ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_XS ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_S ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_M ||
         weight_format == moe_WEIGHT_ENCODING_MXFP4) {
         return moe_raw_tensor_copy_row_f32(raw, token_id, out_hidden, c->hidden_size);
     }

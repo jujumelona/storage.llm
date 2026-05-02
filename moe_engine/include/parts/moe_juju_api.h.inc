@@ -1,4 +1,5 @@
 #define MOE_JUJU_HEADER_BYTES 4096u
+#define MOE_JUJU_SECTION_ENTRY_WIRE_BYTES 96u
 #define MOE_JUJU_MAX_TASK_TYPES 8u
 #define MOE_JUJU_MAX_BUDDIES 8u
 #define MOE_JUJU_MAX_PREFETCH_HINTS 16u
@@ -214,4 +215,5 @@ const char* moe_juju_section_type_name(uint32_t type);
 
 #ifdef __cplusplus
 static_assert(sizeof(moe_juju_header_t) == MOE_JUJU_HEADER_BYTES, "JUJU header must stay 4096 bytes");
+static_assert(sizeof(moe_juju_section_entry_t) == MOE_JUJU_SECTION_ENTRY_WIRE_BYTES, "JUJU section entry must stay 96 bytes");
 #endif

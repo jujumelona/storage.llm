@@ -433,23 +433,62 @@ static void configure_staging_slots(moe_pc_engine* engine) {
     }
     // Fix 66: gpu_workers need slots too (deferred release until stream sync)
     const uint32_t min_slots = moe_staging_min_slot_count(engine);
+
+    // BUGFIX 문제1: Enforce worker-based minimum with memory budget adjustment ★★★
+    // Problem: Memory budget can force slot_count below worker count → structural shortage
+    // Old: slot_count = staging_size / slot_size, can be < worker_count
+    // New: Ensure slot_count >= max(min_slots, worker_count * 1.5)
+    // If memory insufficient, reduce slot_size (strip padding) or warn user
+    const uint32_t worker_count = runtime_disk_workers(engine) +
+                                   runtime_pinned_workers(engine) +
+                                   runtime_gpu_workers(engine);
+    const uint32_t worker_based_min = worker_count > 0 ?
+        std::max(worker_count, (worker_count * 3u) / 2u) : 0u;
+    const uint32_t enforced_min_slots = std::max(min_slots, worker_based_min);
+
     // BUGFIX 586: Check min_slots > 0 and staging_size / min_slots doesn't overflow ★
     // Problem: staging_size / min_slots can overflow or be invalid
     // Solution: Check min_slots > 0 before division
-    if (min_slots > 0 && slot_count < min_slots && engine->staging_size / min_slots >= min_slot) {
-        slot_count = min_slots;
-        slot_size = engine->staging_size / slot_count;
-    } else if (min_slots > 0 && slot_count < min_slots) {
-        // BUGFIX: Allow stripping 4MB padding if it helps us meet min_slots
-        uint64_t reduced_slot_size = engine->staging_size / min_slots;
+    if (enforced_min_slots > 0 && slot_count < enforced_min_slots) {
+        // Try to meet enforced minimum by reducing slot size
+        const uint64_t reduced_slot_size = engine->staging_size / enforced_min_slots;
+
         if (reduced_slot_size >= engine->max_tensor_stream_bytes) {
-            slot_count = min_slots;
+            // Can meet minimum by stripping padding
+            slot_count = enforced_min_slots;
             slot_size = reduced_slot_size;
+            fprintf(stderr, "[storageLLM INFO] Adjusted slot_count to %u (worker-based minimum) "
+                    "by reducing slot_size to %llu bytes\n",
+                    slot_count, (unsigned long long)slot_size);
+        } else if (engine->staging_size / enforced_min_slots >= min_slot) {
+            // Can meet minimum with original min_slot calculation
+            slot_count = enforced_min_slots;
+            slot_size = engine->staging_size / slot_count;
+            fprintf(stderr, "[storageLLM INFO] Adjusted slot_count to %u (worker-based minimum)\n",
+                    slot_count);
         } else {
-            fprintf(stderr, "[storageLLM WARNING] staging_size too small for min_slots=%u. "
-                    "Increase staging_size to at least %llu bytes.\n",
-                    min_slots,
-                    (unsigned long long)min_slots * moe_staging_min_slot_bytes(engine));
+            // Memory budget insufficient - need to increase staging_size
+            const uint64_t required_staging = enforced_min_slots * moe_staging_min_slot_bytes(engine);
+            fprintf(stderr,
+                "[storageLLM ERROR] Staging memory budget insufficient for worker count!\n"
+                "  Workers: %u (disk=%u, pinned=%u, gpu=%u)\n"
+                "  Required minimum slots: %u\n"
+                "  Current staging_size: %llu bytes\n"
+                "  Required staging_size: %llu bytes\n"
+                "  Increase staging_size or reduce worker threads to prevent pipeline stalls.\n",
+                worker_count,
+                runtime_disk_workers(engine),
+                runtime_pinned_workers(engine),
+                runtime_gpu_workers(engine),
+                enforced_min_slots,
+                (unsigned long long)engine->staging_size,
+                (unsigned long long)required_staging);
+
+            // Use what we can, but warn about structural shortage
+            if (slot_count < min_slots && engine->staging_size / min_slots >= engine->max_tensor_stream_bytes) {
+                slot_count = min_slots;
+                slot_size = engine->staging_size / slot_count;
+            }
         }
     }
     if (slot_size == 0) {

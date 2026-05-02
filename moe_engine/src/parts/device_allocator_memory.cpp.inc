@@ -65,60 +65,12 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
 // Trade-off: CAS contention possible, but VRAM allocation is infrequent (expert triplet granularity).
 // Max 8 GPU workers, so contention is low. Eliminates underflow bug permanently.
 
-// BUGFIX 198: Dead code - DO NOT CALL ★
-// This function is ONLY called from device_tensor_copy_alloc.cpp.inc line 89.
-// pending_vram_reservation is ALSO managed by prefetch_admission.cpp.inc CAS loop.
-// Two independent reservation systems sharing the same atomic → double-counting risk.
-// If this function is called elsewhere, VRAM budget will be over-reserved.
-// Status: Currently used in one location. If removed from there, mark [[deprecated]].
-[[deprecated("use prefetch_admission CAS")]]
-static int device_try_reserve_pending_vram(moe_pc_engine* e, uint64_t bytes) {
-    // BUGFIX: Prevent usage at compile time
-    // static_assert(false, "use prefetch_admission CAS");
-    if (!e || bytes == 0) {
-        return 0;
-    }
-    const uint64_t budget = device_budget_bytes(e);
-    if (budget == 0) {
-        return 1;
-    }
-    // CAS loop: atomically reserve only if budget allows
-    uint64_t cur = e->pending_vram_reservation.load(std::memory_order_relaxed);
-    do {
-        const uint64_t alloc_now = e->device_allocated_bytes.load(std::memory_order_acquire);
-        if (alloc_now + cur + bytes > budget) {
-            return 0; // Would exceed budget
-        }
-    } while (!e->pending_vram_reservation.compare_exchange_weak(
-        cur, cur + bytes,
-        std::memory_order_acq_rel, std::memory_order_relaxed));
-    return 1;
-}
-
-[[deprecated("use prefetch_admission CAS")]]
-static void device_release_pending_vram_reservation(moe_pc_engine* e, uint64_t bytes) {
-    if (!e || bytes == 0) {
-        return;
-    }
-    uint64_t expected = e->pending_vram_reservation.load(std::memory_order_relaxed);
-    while (true) {
-        if (expected < bytes) {
-            if (e->pending_vram_reservation.compare_exchange_weak(
-                    expected, 0,
-                    std::memory_order_relaxed,
-                    std::memory_order_relaxed)) {
-                break;
-            }
-        } else {
-            if (e->pending_vram_reservation.compare_exchange_weak(
-                    expected, expected - bytes,
-                    std::memory_order_relaxed,
-                    std::memory_order_relaxed)) {
-                break;
-            }
-        }
-    }
-}
+// BUGFIX 문제6: Removed deprecated reservation functions ★★
+// Problem: device_try_reserve_pending_vram() and device_release_pending_vram_reservation()
+// marked [[deprecated]] but still linked. They share pending_vram_reservation atomic with
+// prefetch_admission.cpp.inc CAS loop, risking double-counting if accidentally called.
+// Solution: Completely removed both functions. Only call site (device_tensor_copy_alloc.cpp.inc:91)
+// was already commented out. prefetch_admission.cpp.inc CAS loop is the sole reservation mechanism.
 
 static void device_refresh_mem_info(moe_pc_engine* e) {
     if (!e) return;

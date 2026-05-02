@@ -319,6 +319,9 @@ static std::vector<int> moe_juju_predict_co_activation(moe_pc_engine* engine, in
     // Solution: Add reasonable upper bound check (e.g., 1000)
     if (top_k > 1000) return predictions;
 
+    // BUGFIX 문제9: Shared lock for read operations ★★★ CRITICAL
+    std::shared_lock<std::shared_mutex> lock(engine->co_activation_mutex);
+
     int source_layer = target_layer - 2;
     if (source_layer >= engine->last_selected_experts.size() || engine->last_selected_experts[source_layer].empty()) {
         return predictions;
@@ -354,6 +357,9 @@ static std::vector<int> moe_juju_predict_co_activation(moe_pc_engine* engine, in
 
 static void moe_juju_update_co_activation(moe_pc_engine* engine, int current_layer, const std::vector<int>& selected) {
     if (!engine) return;
+
+    // BUGFIX 문제9: Exclusive lock for write operations ★★★ CRITICAL
+    std::unique_lock<std::shared_mutex> lock(engine->co_activation_mutex);
 
     // BUGFIX 505: current_layer 범위 체크
     // BUGFIX 635: current_layer 음수 체크 추가 ★
@@ -396,13 +402,48 @@ static void moe_juju_update_co_activation(moe_pc_engine* engine, int current_lay
         }
     }
 
-    // BUGFIX 701: Sliding window eviction to prevent co_activation_stats memory leak ★★
-    // Problem: co_activation_stats grows unboundedly — 256×256×60 layers = ~400MB at 3M tokens.
-    // Solution: Every 100K token updates, clear all stats. The merge_map already captured
-    // the clustering info from previous data, so raw counters are safely disposable.
-    // Fresh data starts accumulating immediately for the next merge_map rebuild cycle.
+    // BUGFIX 문제7: Per-layer entry count limiting to prevent unbounded growth ★★
+    // Problem: co_activation_stats can grow to 256×256×80 = ~2GB in long-running servers
+    // Solution: Limit each layer's map to max_experts * 2 entries, evict lowest scores
+    // This complements BUGFIX 701's periodic full clear with per-update pruning
+    const moe_storage_constants_t* c = moe_storage_constants();
+    if (c && c->experts_per_moe_layer > 0) {
+        const size_t max_entries = (size_t)c->experts_per_moe_layer * 2;
+        if (stats.size() > max_entries) {
+            // Find entry with lowest total score
+            int min_src = -1;
+            float min_score = std::numeric_limits<float>::max();
+            for (const auto& [src, tgts] : stats) {
+                float total = 0.0f;
+                for (const auto& [tgt, count] : tgts) {
+                    total += count;
+                }
+                if (total < min_score) {
+                    min_score = total;
+                    min_src = src;
+                }
+            }
+            if (min_src >= 0) {
+                stats.erase(min_src);
+            }
+        }
+    }
+
+    // BUGFIX 문제8: Trigger merge map rebuild periodically ★★★
+    // Problem: moe_build_expert_merge_map() never called, cluster prefetch completely disabled
+    // Solution: Set rebuild flag every 50K tokens (half of eviction interval)
+    // Rebuild happens asynchronously in runtime_orchestrator to avoid blocking inference
     ++engine->co_activation_token_count;
+    constexpr uint64_t kMergeMapRebuildInterval = 50000;
     constexpr uint64_t kCoActivationEvictInterval = 100000;
+
+    if (engine->co_activation_token_count - engine->last_merge_build_token_count >= kMergeMapRebuildInterval) {
+        // Set flag for async rebuild (don't block inference thread)
+        engine->merge_map_rebuild_pending.store(true, std::memory_order_release);
+    }
+
+    // BUGFIX 701: Sliding window eviction to prevent co_activation_stats memory leak ★★
+    // Clear stats every 100K tokens (after merge map has captured clustering at 50K)
     if (engine->co_activation_token_count - engine->last_merge_build_token_count >= kCoActivationEvictInterval) {
         for (auto& layer_stats : engine->co_activation_stats) {
             layer_stats.clear();

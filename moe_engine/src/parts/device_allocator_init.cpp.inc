@@ -12,6 +12,8 @@ static std::atomic<uint64_t>* device_pool_counter(moe_pc_engine* e, uint8_t pool
     // Problem: Invalid pool returns stream_bytes, causing wrong accounting
     // Solution: Return nullptr for invalid pool
     if (pool == moe_DEVICE_POOL_STREAM) return &e->device_stream_bytes;
+    // BUGFIX 문제4: Add KV cache pool counter ★★★
+    if (pool == moe_DEVICE_POOL_KV_CACHE) return &e->device_kv_cache_bytes;
     return nullptr;
 }
 

@@ -331,11 +331,11 @@ static void fill_vulkan_backend_caps(moe_backend_caps_t* caps) {
                             free_b = calc_free;
                         } else {
                             vk_budget_supported = 0;
-                            // BUGFIX 715: Vulkan VRAM 85% heuristic fallback ★★★
-                            // Problem: When getProps2 (budget extension) is not available,
-                            // we defaulted to recommended_vram_cache_bytes.
-                            // Solution: Use vkGetPhysicalDeviceMemoryProperties to get the
-                            // DEVICE_LOCAL heap size, and assume 85% is available for use.
+                            // BUGFIX 문제C: Conservative Vulkan VRAM estimation without budget extension ★★★
+                            // Problem: 85% heuristic overestimates when other Vulkan apps use VRAM
+                            // Old: heap_total * 85% (ignores already allocated memory)
+                            // Solution: Subtract engine's own allocations and use 80% of remainder
+                            // If engine allocation unknown, use conservative 50%
                             typedef void (*pfn_vkGetPhysicalDeviceMemoryProperties)(void*, void*);
                             pfn_vkGetPhysicalDeviceMemoryProperties getProps =
                                 (pfn_vkGetPhysicalDeviceMemoryProperties)getProc(instance, "vkGetPhysicalDeviceMemoryProperties");
@@ -347,15 +347,24 @@ static void fill_vulkan_backend_caps(moe_backend_caps_t* caps) {
                                 } props{};
                                 getProps(phys_dev, &props);
 
-                                uint64_t calc_total = 0;
+                                uint64_t heap_total = 0;
                                 uint32_t heap_count = props.memoryHeapCount;
                                 if (heap_count > 16) heap_count = 16;
                                 for (uint32_t i = 0; i < heap_count; ++i) {
                                     if (props.memoryHeaps[i].flags & 1) { // DEVICE_LOCAL
-                                        calc_total += props.memoryHeaps[i].size;
+                                        heap_total += props.memoryHeaps[i].size;
                                     }
                                 }
-                                free_b = (calc_total * 75ull) / 100ull;
+
+                                // Conservative estimate: subtract known allocations
+                                const uint64_t already_allocated = caps->engine_vram_allocated_bytes;
+                                if (heap_total > already_allocated) {
+                                    // 80% of remaining after subtracting our allocations
+                                    free_b = ((heap_total - already_allocated) * 80ull) / 100ull;
+                                } else {
+                                    // Unknown state - use very conservative 50%
+                                    free_b = (heap_total * 50ull) / 100ull;
+                                }
                             }
                         }
                     }

@@ -4,16 +4,61 @@
 static uint32_t moe_weight_encoding_from_family(const std::string& family) {
     const std::string value = moe_lower_ascii_copy(family);
     if (value.find("iq2") != std::string::npos || value.find("ud-iq2") != std::string::npos) {
+        if (value.find("iq2_xs") != std::string::npos) {
+            return moe_WEIGHT_ENCODING_GGUF_IQ2_XS;
+        }
+        if (value.find("iq2_s") != std::string::npos) {
+            return moe_WEIGHT_ENCODING_GGUF_IQ2_S;
+        }
         return moe_WEIGHT_ENCODING_GGUF_IQ2;
     }
+    if (value.find("iq1") != std::string::npos) {
+        if (value.find("iq1_s") != std::string::npos) {
+            return moe_WEIGHT_ENCODING_GGUF_IQ1_S;
+        }
+        if (value.find("iq1_m") != std::string::npos) {
+            return moe_WEIGHT_ENCODING_GGUF_IQ1_M;
+        }
+        return moe_WEIGHT_ENCODING_GGUF_IQ1;
+    }
     if (value.find("iq3") != std::string::npos) {
+        if (value.find("iq3_s") != std::string::npos) {
+            return moe_WEIGHT_ENCODING_GGUF_IQ3_S;
+        }
         return moe_WEIGHT_ENCODING_GGUF_IQ3;
     }
     if (value.find("iq4") != std::string::npos) {
+        if (value.find("iq4_nl") != std::string::npos) {
+            return moe_WEIGHT_ENCODING_GGUF_IQ4_NL;
+        }
+        if (value.find("iq4_xs") != std::string::npos) {
+            return moe_WEIGHT_ENCODING_GGUF_IQ4_XS;
+        }
         return moe_WEIGHT_ENCODING_GGUF_IQ4;
     }
     if (value.find("mxfp4") != std::string::npos) {
         return moe_WEIGHT_ENCODING_MXFP4;
+    }
+    if (value.find("bf16") != std::string::npos || value.find("bfloat16") != std::string::npos) {
+        return moe_WEIGHT_ENCODING_RAW_BF16;
+    }
+    if (value.find("q5_0") != std::string::npos) {
+        return moe_WEIGHT_ENCODING_GGUF_Q5_0;
+    }
+    if (value.find("q5_1") != std::string::npos) {
+        return moe_WEIGHT_ENCODING_GGUF_Q5_1;
+    }
+    if (value.find("q4_0") != std::string::npos) {
+        return moe_WEIGHT_ENCODING_GGUF_Q4_0;
+    }
+    if (value.find("q4_1") != std::string::npos) {
+        return moe_WEIGHT_ENCODING_GGUF_Q4_1;
+    }
+    if (value.find("q8_1") != std::string::npos) {
+        return moe_WEIGHT_ENCODING_GGUF_Q8_1;
+    }
+    if (value.find("q8_0") != std::string::npos) {
+        return moe_WEIGHT_ENCODING_GGUF_Q8_0;
     }
     if (value.find("nvfp4") != std::string::npos || value.find("fp4") != std::string::npos) {
         return moe_WEIGHT_ENCODING_NVFP4;
@@ -105,6 +150,7 @@ struct moe_gguf_tensor_dir_entry_t {
     uint64_t shape[4]{};
     uint32_t dims = 0;
     uint32_t type = 0;
+    uint8_t weight_encoding = moe_WEIGHT_ENCODING_UNKNOWN;
     uint64_t tensor_offset = 0;
     uint64_t file_offset = 0;
     uint64_t bytes = 0;

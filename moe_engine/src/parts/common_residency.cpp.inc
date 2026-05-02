@@ -42,8 +42,40 @@ static uint64_t vram_expert_budget_bytes(const moe_pc_engine* engine) {
         return 0;
     }
     const uint64_t common = engine->common_vram_reserved_bytes.load();
-    return engine->config.vram_budget_bytes > common ?
-        engine->config.vram_budget_bytes - common : 0;
+    const uint64_t kv_budget = engine->vram_kv_budget_bytes.load(std::memory_order_relaxed);
+    const uint64_t reserved = common + kv_budget;
+    return engine->config.vram_budget_bytes > reserved ?
+        engine->config.vram_budget_bytes - reserved : 0;
+}
+
+// BUGFIX 문제4: Initialize KV VRAM budget ★★★
+// Splits VRAM budget between experts and KV cache
+// Default: 80% experts, 20% KV (configurable via vram_kv_ratio)
+static void init_kv_vram_budget(moe_pc_engine* engine) {
+    if (!engine || engine->config.vram_budget_bytes == 0) {
+        engine->vram_kv_budget_bytes.store(0, std::memory_order_relaxed);
+        return;
+    }
+
+    // Default: 20% of VRAM for KV cache
+    // Can be overridden by config.vram_kv_ratio (0.0 to 1.0)
+    float kv_ratio = 0.20f;  // TODO: Make configurable
+
+    // For small VRAM (<24GB), reduce KV ratio to 10-15%
+    if (engine->config.vram_budget_bytes < 24ull * 1024ull * 1024ull * 1024ull) {
+        kv_ratio = 0.10f;
+    }
+
+    const uint64_t kv_budget = (uint64_t)(engine->config.vram_budget_bytes * kv_ratio);
+    engine->vram_kv_budget_bytes.store(kv_budget, std::memory_order_relaxed);
+    engine->vram_kv_used_bytes.store(0, std::memory_order_relaxed);
+
+    fprintf(stderr,
+        "[storageLLM INFO] VRAM budget split: Total=%llu MB, KV=%llu MB (%.0f%%), Experts=%llu MB\n",
+        (unsigned long long)(engine->config.vram_budget_bytes / (1024*1024)),
+        (unsigned long long)(kv_budget / (1024*1024)),
+        kv_ratio * 100.0f,
+        (unsigned long long)((engine->config.vram_budget_bytes - kv_budget) / (1024*1024)));
 }
 
 static void apply_common_vram_reservation(moe_pc_engine* engine) {
@@ -56,6 +88,10 @@ static void apply_common_vram_reservation(moe_pc_engine* engine) {
     // Impact: 40-200x performance improvement in VRAM reservation setup
     engine->common_vram_reserved_bytes.store(0, std::memory_order_relaxed);
     engine->vram_used_bytes.store(0, std::memory_order_relaxed);
+
+    // BUGFIX 문제4: Initialize KV VRAM budget
+    init_kv_vram_budget(engine);
+
     if (!engine->config.prefer_gpu || !engine_has_device_upload_workers(engine) ||
         !engine->io_config.enable_common_raw_vram_pin) {
         engine->common_vram_upload_complete.store(true, std::memory_order_release);

@@ -13,13 +13,20 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
     uint8_t* data = nullptr;
     float* scales = nullptr;
     float* zeros = nullptr;
-    // BUGFIX 165: Remove is_vram dead field ★
-    // Problem: is_vram field exists but never used (always false)
-    // ARCHITECTURE.md states "KV cache is RAM-only"
-    // VRAM KV cache not implemented, field misleading
-    // Solution: Remove dead field to clarify design
-    // Note: If VRAM KV cache needed in future, use engine_core/kv/ QKV cache
-    // bool is_vram = false;  // REMOVED - KV cache is RAM-only
+
+    // BUGFIX 문제4: Add VRAM tier support for hot KV blocks ★★★
+    // Problem: KV cache is RAM-only, causing PCIe bottleneck for long contexts
+    // Solution: Add tier field and VRAM pointers for hot KV blocks
+    // Short-term: Use pinned memory for frequently accessed blocks
+    // Long-term: Promote hot blocks to VRAM with LRU eviction
+    moe_tier_t tier = moe_TIER_RAM;  // RAM, VRAM, or PINNED
+    void* vram_data = nullptr;       // VRAM allocation if tier == VRAM
+    void* vram_scales = nullptr;
+    void* vram_zeros = nullptr;
+    bool use_pinned_memory = false;  // Use pinned RAM for faster PCIe transfer
+    uint64_t last_access_epoch = 0;  // For LRU tracking
+    uint32_t access_count = 0;       // For frequency tracking
+
     moe_pc_engine_t* engine = nullptr;
     uint32_t num_layers = 0;
     uint32_t max_seq_len = 0;

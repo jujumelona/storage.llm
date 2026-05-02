@@ -74,6 +74,7 @@ struct moe_gguf_common_tensor_record {
     uint32_t dims = 0;
     uint64_t shape[4]{};
     uint32_t type = 0;
+    uint8_t weight_encoding = moe_WEIGHT_ENCODING_UNKNOWN;
     uint64_t file_offset = 0;
     uint64_t bytes = 0;
     uint16_t runtime_priority = 50;

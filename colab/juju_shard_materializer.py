@@ -4,6 +4,7 @@ import json
 import threading
 import bisect
 import os
+import re
 import struct
 import time
 from pathlib import Path
@@ -50,6 +51,23 @@ JUJU_SECTION_QKV_POLICY = 0x0021
 HF_INDIVIDUAL_FILE_LIMIT_BYTES = 50 * 1024 * 1024 * 1024
 DEFAULT_JUJU_UPLOAD_FILE_LIMIT_BYTES = 45 * 1024 * 1024 * 1024
 JUJU_SPLIT_METADATA_RESERVE_BYTES = 512 * 1024 * 1024
+JUJU_FORMAT_CONTRACT_VERSION = 2
+JUJU_BINARY_WIRE_ID = "JUJU_V1_HEADER4096_SECTION96_ABS_OFFSETS"
+JUJU_TOKENIZER_FILES = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "chat_template.jinja",
+    "added_tokens.json",
+    "tokenizer.model",
+    "vocab.json",
+    "merges.txt",
+    "sentencepiece.bpe.model",
+    "generation_config.json",
+    "config.json",
+]
+JUJU_REQUIRED_TOKENIZER_FILES = ["tokenizer.json"]
+JUJU_REQUIRED_TOKENIZER_ANY_OF = ["tokenizer.json", "tokenizer.model", "sentencepiece.bpe.model"]
 
 
 def juju_artifact_names(source_name):
@@ -189,7 +207,7 @@ def parse_gguf_directory(prefix, total_bytes):
     order = sorted(range(len(tensors)), key=lambda i: tensors[i]["relative_offset"])
     for pos, idx in enumerate(order):
         cur = tensors[idx]["relative_offset"]
-        nxt = tensors[order[pos + 1]]["relative_offset"] if pos + 1 < len(order) else min(total_bytes - data_start, cur + tensors[idx].get("dims", 1) * 8)
+        nxt = tensors[order[pos + 1]]["relative_offset"] if pos + 1 < len(order) else total_bytes - data_start
         tensors[idx]["source_offset"] = data_start + cur
         tensors[idx]["bytes"] = max(0, nxt - cur)
         tensors[idx]["bucket"] = tensor_bucket(tensors[idx]["name"])
@@ -261,7 +279,7 @@ def plan_juju_tensor_splits(directory, max_file_bytes=None):
         if aligned_tensor_bytes > current_limit:
             raise RuntimeError(
                 f"single tensor exceeds upload-safe JUJU split limit: {tensor['name']} "
-                f"bytes={tensor_bytes} limit={payload_limit}"
+                f"bytes={tensor_bytes} limit={current_limit}"
             )
         if current and current_bytes + aligned_tensor_bytes > current_limit:
             groups.append(current)
@@ -293,16 +311,15 @@ def tensor_bucket(name):
         return "shared_weights"
     if "attn" in lower or "attention" in lower:
         return "shared_weights"
-    if (
-        "expert" in lower or
+    expert_name = (
         "_exps" in lower or
+        "ffn_gate_up_exps" in lower or
         "ffn_gate_exps" in lower or
         "ffn_up_exps" in lower or
         "ffn_down_exps" in lower or
-        "gate_proj" in lower or
-        "up_proj" in lower or
-        "down_proj" in lower
-    ):
+        re.search(r"(?:^|[.])(experts?|expert)[.]", lower) is not None
+    )
+    if expert_name:
         return "cold_experts"
     return "shared_weights"
 
@@ -334,6 +351,8 @@ def pack_section(entry):
         bytes.fromhex(entry.get("sha256", "0" * 64))[:16].ljust(16, b"\x00"),
         fixed_bytes(entry.get("name", ""), 32),
     )
+    if len(payload) > JUJU_SECTION_ENTRY_BYTES:
+        raise ValueError(f"JUJU section entry is too large: {len(payload)} > {JUJU_SECTION_ENTRY_BYTES}")
     return payload + (b"\x00" * (JUJU_SECTION_ENTRY_BYTES - len(payload)))
 
 
@@ -370,7 +389,555 @@ def u32(value):
         return 0
 
 
-def make_header(contract, source_name, file_size_value, sections, section_sizes):
+def contract_value(contract, *keys, default=None):
+    for key in keys:
+        cur = contract
+        ok = True
+        for part in str(key).split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                ok = False
+                break
+        if ok and cur is not None:
+            return cur
+    return default
+
+
+def mb_from_bytes(value):
+    try:
+        n = int(value or 0)
+    except Exception:
+        return 0
+    if n <= 0:
+        return 0
+    return max(1, n // (1024 * 1024))
+
+
+def juju_arch_type(contract, source_name):
+    text = " ".join(
+        str(x or "")
+        for x in (
+            contract.get("architecture"),
+            contract_value(contract, "arch_meta.architecture"),
+            contract.get("model_id"),
+            contract.get("model_name"),
+            source_name,
+        )
+    ).lower()
+    if "glm" in text:
+        return 1
+    if "gemma" in text:
+        return 2
+    if "qwen" in text:
+        return 3
+    if "llama" in text:
+        return 4
+    if "mistral" in text:
+        return 5
+    return 0
+
+
+def juju_weight_bits(contract):
+    return u32(contract_value(
+        contract,
+        "source_weight_bits",
+        "weight_bits",
+        "weight_quant_schema.bits",
+        "weight_quant_schema.weight_bits",
+        default=0,
+    ))
+
+
+def juju_weight_encoding(contract):
+    explicit = contract_value(contract, "source_weight_encoding", "weight_encoding", "weight_quant_schema.encoding", default=0)
+    if explicit:
+        return u32(explicit)
+    family = str(contract_value(
+        contract,
+        "source_weight_quant_family",
+        "weight_quant_family",
+        "weight_quant_schema.family",
+        default="",
+    ) or "").lower()
+    if "iq2_xxs" in family:
+        return 19
+    if "iq3_xxs" in family:
+        return 20
+    if "iq1_s" in family:
+        return 32
+    if "iq1_m" in family:
+        return 33
+    if "iq2_xs" in family:
+        return 29
+    if "iq2_s" in family:
+        return 30
+    if "iq3_s" in family:
+        return 31
+    if "iq4_nl" in family:
+        return 27
+    if "iq4_xs" in family:
+        return 28
+    if "bf16" in family or "bfloat16" in family:
+        return 21
+    if "q5_0" in family:
+        return 24
+    if "q5_1" in family:
+        return 12
+    if "q4_0" in family:
+        return 22
+    if "q4_1" in family:
+        return 23
+    if "q8_1" in family:
+        return 25
+    if "q8_0" in family:
+        return 13
+    if "iq2" in family or "ud-iq2" in family:
+        return 9
+    if "iq3" in family:
+        return 10
+    if "iq4" in family:
+        return 11
+    if "mxfp4" in family:
+        return 4
+    if "nvfp4" in family or "fp4" in family:
+        return 3
+    if "q8" in family:
+        return 8
+    if "q4" in family:
+        return 7
+    if "q3" in family:
+        return 6
+    if "q2" in family:
+        return 5
+    return 0
+
+
+def weight_encoding_from_gguf_type(tensor_type, contract=None):
+    t = u32(tensor_type)
+    mapping = {
+        0: 2,
+        1: 1,
+        2: 22,
+        3: 23,
+        6: 24,
+        7: 12,
+        8: 13,
+        9: 25,
+        10: 15,
+        11: 16,
+        12: 17,
+        13: 14,
+        14: 18,
+        16: 19,
+        18: 20,
+        19: 32,
+        17: 29,
+        22: 30,
+        29: 33,
+        21: 31,
+        20: 27,
+        23: 28,
+        30: 21,
+        39: 4,
+    }
+    enc = mapping.get(t, 0)
+    if enc:
+        return enc
+    return juju_weight_encoding(contract or {})
+
+
+def gguf_type_name(tensor_type):
+    names = {
+        0: "F32",
+        1: "F16",
+        2: "Q4_0",
+        3: "Q4_1",
+        6: "Q5_0",
+        7: "Q5_1",
+        8: "Q8_0",
+        9: "Q8_1",
+        10: "Q2_K",
+        11: "Q3_K",
+        12: "Q4_K",
+        13: "Q5_K",
+        14: "Q6_K",
+        15: "Q8_K",
+        16: "IQ2_XXS",
+        17: "IQ2_XS",
+        18: "IQ3_XXS",
+        19: "IQ1_S",
+        20: "IQ4_NL",
+        21: "IQ3_S",
+        22: "IQ2_S",
+        23: "IQ4_XS",
+        24: "I8",
+        25: "I16",
+        26: "I32",
+        27: "I64",
+        28: "F64",
+        29: "IQ1_M",
+        30: "BF16",
+        34: "TQ1_0",
+        35: "TQ2_0",
+        39: "MXFP4",
+    }
+    return names.get(u32(tensor_type), f"GGUF_TYPE_{u32(tensor_type)}")
+
+
+def quant_family_from_gguf_type(tensor_type, contract=None):
+    t = u32(tensor_type)
+    explicit = contract_value(contract or {}, "source_weight_quant_family", "weight_quant_family", "weight_quant_schema.family", default="")
+    if explicit:
+        return str(explicit)
+    if t in {0, 1, 24, 25, 26, 27, 28, 30}:
+        return "raw_scalar_or_integer"
+    if t in {2, 3, 6, 7, 8, 9}:
+        return "legacy_ggml_quant"
+    if t in {10, 11, 12, 13, 14, 15}:
+        return "k_quant"
+    if t in {16, 17, 18, 19, 20, 21, 22, 23, 29}:
+        return "importance_quant"
+    if t in {34, 35}:
+        return "ternary_quant"
+    if t == 39:
+        return "mxfp4"
+    return "unknown_preserved_source_type"
+
+
+def kernel_key_from_gguf_type(tensor_type, contract=None):
+    return f"{quant_family_from_gguf_type(tensor_type, contract)}:{gguf_type_name(tensor_type)}"
+
+
+def juju_qkv_policy(contract):
+    if contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract"):
+        return 1
+    if contract_value(contract, "qkv_packed_cache_required", default=False):
+        return 1
+    return 0
+
+
+def juju_format_extension_contract(contract):
+    return {
+        "contract_version": JUJU_FORMAT_CONTRACT_VERSION,
+        "binary_wire_id": JUJU_BINARY_WIRE_ID,
+        "binary_wire_frozen": True,
+        "header_bytes": JUJU_HEADER_BYTES,
+        "section_entry_bytes": JUJU_SECTION_ENTRY_BYTES,
+        "section_table_offset": JUJU_HEADER_BYTES,
+        "offset_unit": "absolute_file_byte_offset",
+        "length_unit": "exact_payload_byte_length",
+        "alignment_bytes": 4096,
+        "endianness": "little",
+        "tensor_payload_layout": "source_bytes_preserved_without_requantization",
+        "json_sections_are_extension_surface": True,
+        "additive_json_fields_allowed": True,
+        "unknown_json_field_policy": "engine_ignore_if_not_required",
+        "unknown_required_feature_policy": "fail_closed",
+        "engine_update_without_repack": [
+            "new_cpu_quant_kernel",
+            "new_gpu_quant_kernel",
+            "new_attention_kernel",
+            "new_qkv_cache_backend",
+            "new_prefetch_scheduler",
+            "new_residency_policy",
+            "new_graph_ir_executor",
+            "new_adapter_runtime",
+            "new_tokenizer_loader_policy",
+            "new_sampler",
+            "new_validation_probe",
+        ],
+        "repack_required_only_for": [
+            "model_weights_changed",
+            "tensor_payload_bytes_changed",
+            "tensor_order_or_offsets_changed",
+            "new_required_tokenizer_asset_contents",
+            "new_section_compression_requiring_reencoded_payload",
+            "file_checksum_or_payload_corruption",
+        ],
+        "reserved_extension_namespaces": [
+            "MODEL_META.format_extension_contract",
+            "MODEL_META.kernel_registry_contract",
+            "MODEL_META.adapter_registry_contract",
+            "MODEL_META.validation_contract",
+            "TENSOR_INDEX.tensors[].extension",
+            "TENSOR_INDEX.tensors[].kernel_contract",
+            "GRAPH_IR.runtime_policy",
+            "GRAPH_IR.execution_plan",
+            "GRAPH_IR.priority_tables",
+            "GRAPH_IR.performance_research_slots",
+        ],
+        "compatibility_rule": "binary_header_and_section_table_remain_stable; add new behavior through JSON sections and engine code",
+    }
+
+
+def juju_kernel_registry_contract(contract):
+    return {
+        "selection_key_order": ["weight_encoding", "gguf_type", "gguf_type_name", "quant_family", "kernel_key"],
+        "required_behavior": "engine_must_execute_or_fail_closed_never_silent_zero",
+        "source_type_preserved": True,
+        "supported_source_families_declared": [
+            "raw_fp32",
+            "raw_fp16",
+            "bf16",
+            "legacy_q4_q5_q8",
+            "k_quant_q2_q3_q4_q5_q6_q8",
+            "iq1_iq2_iq3_iq4",
+            "ternary_tq",
+            "mxfp4",
+            "vendor_dynamic_quant",
+        ],
+        "row_layout_rule": "preserve_source_quant_block_layout_until_kernel_decode",
+        "mixed_quant_per_tensor_allowed": True,
+        "per_tensor_weight_encoding_required": True,
+        "per_tensor_source_type_required": True,
+        "contract_weight_encoding": juju_weight_encoding(contract),
+        "contract_weight_bits": juju_weight_bits(contract),
+    }
+
+
+def juju_tokenizer_contract():
+    return {
+        "tokenizer_files": list(JUJU_TOKENIZER_FILES),
+        "required_files": list(JUJU_REQUIRED_TOKENIZER_FILES),
+        "required_any_of": list(JUJU_REQUIRED_TOKENIZER_ANY_OF),
+        "target_subdirs": ["", "tokenizer"],
+        "chat_template_source": "tokenizer_config_or_model_card",
+        "missing_tokenizer_behavior": "fail_text_api_if_required_tokenizer_missing",
+        "input_ids_api_allowed_without_tokenizer": True,
+    }
+
+
+def juju_adapter_registry_contract():
+    return {
+        "adapter_metadata_slots_reserved": True,
+        "supported_adapter_classes": [
+            "lora",
+            "qlora",
+            "dora",
+            "ia3",
+            "prompt_tuning",
+            "prefix_tuning",
+            "runtime_delta_weight",
+            "router_override",
+            "expert_bias_or_scale",
+        ],
+        "storage_policy": "adapters_external_or_json_declared; base_tensor_payload_not_repacked",
+        "merge_policy": "engine_runtime_merge_or_sidecar_cache",
+        "compatibility_key_fields": ["target_tensor", "rank", "alpha", "dtype", "quant_compatibility"],
+    }
+
+
+def juju_validation_contract():
+    return {
+        "load_time_checks": [
+            "magic",
+            "header_size",
+            "section_table_size",
+            "section_offsets",
+            "tensor_offsets",
+            "tensor_lengths",
+            "tensor_sha256_if_present",
+            "tokenizer_required_any_of",
+            "kernel_support_for_all_required_tensors",
+        ],
+        "correctness_checks": [
+            "no_required_tensor_silent_zero",
+            "dense_mlp_not_classified_as_expert_stream",
+            "all_required_graph_ops_bound",
+            "logits_finite",
+            "ppl_probe_supported",
+        ],
+        "failure_policy": "fail_closed_with_actionable_error",
+    }
+
+
+def juju_research_offload_contract():
+    return {
+        "goal": "maximize_moe_offload_without_repacking_base_model",
+        "phase_aware_execution": {
+            "prefill": {
+                "expected_pattern": "many_experts_active",
+                "required_slots": [
+                    "separate_prefill_scheduler",
+                    "non_moe_compute_overlap_window",
+                    "bounded_expert_residency",
+                    "bulk_prefetch_stream",
+                    "token_reordering_optional",
+                ],
+            },
+            "decode": {
+                "expected_pattern": "few_experts_active_per_token",
+                "required_slots": [
+                    "layer_level_expert_predictor",
+                    "cross_layer_gate_predictor",
+                    "activation_trace_predictor",
+                    "semantic_prompt_hint_predictor",
+                    "speculative_expert_prefetch",
+                    "cache_hit_rate_feedback",
+                ],
+            },
+        },
+        "expert_cache_policy_inputs": [
+            "layer_id",
+            "expert_id",
+            "token_position",
+            "sequence_id",
+            "router_topk",
+            "router_score",
+            "router_entropy",
+            "local_routing_consistency",
+            "previous_layer_experts",
+            "previous_token_experts",
+            "expert_hit_rate",
+            "expert_load_latency_us",
+            "expert_compute_latency_us",
+            "pcie_bandwidth_bytes_per_s",
+            "disk_bandwidth_bytes_per_s",
+            "gpu_free_bytes",
+            "cpu_free_bytes",
+            "pinned_staging_bytes",
+        ],
+        "bottleneck_breaker_slots": {
+            "critical_path_io": [
+                "prefetch_before_router_consumer",
+                "overlap_dma_with_attention_or_dense_compute",
+                "two_stream_copy_compute_pipeline",
+                "bounded_retry_queue",
+                "io_priority_by_graph_role",
+            ],
+            "expert_cache_miss": [
+                "proactive_cache",
+                "activation_aware_cache",
+                "fine_grained_expert_segments",
+                "semantic_hint_cache_seed",
+                "local_routing_consistency_score",
+            ],
+            "gpu_memory_pressure": [
+                "hot_shared_residency",
+                "expert_lru_or_score_eviction",
+                "prefill_decode_different_budget",
+                "qkv_page_eviction",
+                "compressed_kv_cache",
+            ],
+            "token_scheduling": [
+                "dynamic_token_ordering",
+                "expert_batching",
+                "router_entropy_adaptive_topk",
+                "decode_microbatch_policy",
+            ],
+            "storage_path": [
+                "mmap_tensor_spans",
+                "direct_io_alignment",
+                "pinned_cpu_stage",
+                "async_read_ahead",
+                "checksum_after_stream",
+            ],
+        },
+        "research_method_slots": {
+            "moe_infinity": ["sequence_level_activation_trace", "activation_aware_prefetch", "activation_aware_cache"],
+            "promoe": ["proactive_expert_cache", "intermediate_result_prediction"],
+            "fmoe": ["fine_grained_expert_offload", "expert_selection_patterns", "semantic_prompt_hints"],
+            "duoserve_moe": ["prefill_decode_split", "dual_phase_expert_prefetch", "cache_scheduling"],
+            "expertflow": ["adaptive_expert_scheduling", "memory_coordination", "dynamic_token_ordering"],
+            "fate_cross_layer_gate": ["cross_layer_expert_prediction", "prediction_confidence"],
+            "local_routing_consistency": ["routing_locality_metric", "offload_suitability_score"],
+            "moe_speq": ["speculative_quantized_decode", "proactive_expert_prefetch"],
+            "flexgen": ["gpu_cpu_disk_placement", "offload_policy_search", "weight_and_cache_compression"],
+        },
+        "kv_cache_research_slots": {
+            "paged_attention": ["page_size_tokens", "block_table", "fragmentation_control"],
+            "vattention": ["virtual_memory_backed_kv", "demand_paging_policy"],
+            "infinigen": ["essential_kv_prefetch", "cpu_kv_pool", "counter_based_eviction"],
+            "kivi": ["key_per_channel_quant", "value_per_token_quant", "residual_window"],
+            "kvquant": ["sub_4bit_kv_quant", "outlier_aware_quant"],
+            "turboquant": ["polarquant", "qjl_residual_correction", "online_vector_quantization"],
+        },
+        "metrics_required": [
+            "expert_hit_rate",
+            "expert_miss_latency_us",
+            "tokens_per_second",
+            "time_to_first_token_ms",
+            "inter_token_latency_ms",
+            "gpu_resident_expert_bytes",
+            "cpu_resident_expert_bytes",
+            "disk_read_bytes",
+            "pcie_copy_bytes",
+            "kv_cache_bytes",
+            "prefetch_waste_ratio",
+            "prediction_accuracy",
+            "logits_finite_rate",
+            "ppl_probe",
+        ],
+    }
+
+
+def juju_contract_metadata(contract, source_name, source_repo_id):
+    arch = dict(contract.get("arch_meta") or {})
+    qkv = dict(contract.get("qkv_cache_schema") or {})
+    model_id = contract.get("model_id") or contract.get("source_model_id") or source_repo_id
+    model_name = contract.get("model_name") or model_id or Path(source_name).stem
+    out = {
+        "format_version": 1,
+        "backend_neutral": True,
+        "model_id": model_id,
+        "model_name": model_name,
+        "architecture": contract.get("architecture") or arch.get("architecture") or "",
+        "source_weight_bits": juju_weight_bits(contract),
+        "source_weight_encoding": juju_weight_encoding(contract),
+        "source_weight_quant_family": contract.get("source_weight_quant_family") or contract.get("weight_quant_family") or contract_value(contract, "weight_quant_schema.family", default=""),
+        "source_weight_kernel_family": contract.get("source_weight_kernel_family") or contract.get("weight_kernel_family") or contract_value(contract, "weight_quant_schema.kernel_family", default=""),
+        "source_weight_block_size": u32(contract_value(contract, "source_weight_block_size", "weight_block_size", "weight_quant_schema.block_size", default=0)),
+        "qkv_packed_cache_required": bool(qkv),
+        "persistent_plain_kv_cache_allowed": not bool(qkv),
+        "final_model_structure_contract": contract.get("final_model_structure_contract", {}),
+        "pipeline_budget_contract": contract.get("pipeline_budget_contract", {}),
+        "execution_path_contract": contract.get("execution_path_contract", {}),
+        "expert_segmentation_contract": contract.get("expert_segmentation_contract", {}),
+        "chunk_io_contract": contract.get("chunk_io_contract", {}),
+        "universal_tier_contract": contract.get("universal_tier_contract", {}),
+        "qkv_policy_contract": contract.get("qkv_policy_contract", qkv),
+        "format_extension_contract": juju_format_extension_contract(contract),
+        "kernel_registry_contract": juju_kernel_registry_contract(contract),
+        "tokenizer_contract": juju_tokenizer_contract(),
+        "adapter_registry_contract": juju_adapter_registry_contract(),
+        "validation_contract": juju_validation_contract(),
+        "research_offload_contract": juju_research_offload_contract(),
+        "runtime_adapter_contract": {
+            "weight_source": "juju_tensor_index",
+            "offset_unit": "absolute_file_byte_offset",
+            "row_layout": "source_quant_row_layout_preserved",
+            "section_entry_bytes": JUJU_SECTION_ENTRY_BYTES,
+            "header_bytes": JUJU_HEADER_BYTES,
+            "alignment": 4096,
+            "fail_closed": True,
+        },
+        "performance_contract": {
+            "startup_prefetch_roles": ["shared_core", "router", "attention", "norm"],
+            "streaming_roles": ["expert", "dense_ffn"],
+            "direct_io_alignment": 4096,
+            "mmap_friendly_sections": True,
+            "split_large_uploads": True,
+            "tokenizer_required_at_repo_root": True,
+        },
+    }
+    for src, dst in (
+        ("k_bits", "k_bits"),
+        ("v_bits", "v_bits"),
+        ("group_size", "group_size"),
+        ("page_size_tokens", "page_size_tokens"),
+        ("sink_tokens", "sink_tokens"),
+        ("rotation_seed", "rotation_seed"),
+        ("qjl_seed", "qjl_seed"),
+        ("enable_qjl", "enable_qjl"),
+        ("enable_rotation", "enable_rotation"),
+    ):
+        if src in qkv:
+            out[dst] = qkv[src]
+    return out
+
+
+def make_header(contract, source_name, file_size_value, sections, section_sizes, index_checksum=0):
     header = bytearray(JUJU_HEADER_BYTES)
     header[0:8] = b"JUJU\x00\x01\x00\x00"
     struct.pack_into("<I", header, 8, 1)
@@ -383,6 +950,7 @@ def make_header(contract, source_name, file_size_value, sections, section_sizes)
     struct.pack_into("<Q", header, 56, section_sizes.get(JUJU_SECTION_HOT_EXPERTS, 0))
     struct.pack_into("<Q", header, 64, section_sizes.get(JUJU_SECTION_WARM_EXPERTS, 0))
     struct.pack_into("<Q", header, 72, section_sizes.get(JUJU_SECTION_COLD_EXPERTS, 0))
+    struct.pack_into("<Q", header, 80, int(index_checksum or 0) & 0xFFFFFFFFFFFFFFFF)
     model_name = contract.get("model_name") or contract.get("model_id") or Path(source_name).stem
     header[88:152] = fixed_bytes(model_name, 64)
     arch = contract.get("arch_meta") or {}
@@ -393,11 +961,14 @@ def make_header(contract, source_name, file_size_value, sections, section_sizes)
     struct.pack_into("<I", header, 168, u32(arch.get("routed_experts_per_token") or arch.get("top_k")))
     struct.pack_into("<I", header, 172, u32(arch.get("hidden_dim") or arch.get("hidden_size")))
     struct.pack_into("<I", header, 176, u32(arch.get("expert_intermediate_dim") or arch.get("expert_intermediate_size")))
-    struct.pack_into("<I", header, 180, u32(contract.get("source_weight_bits")))
-    struct.pack_into("<I", header, 188, 2)
-    struct.pack_into("<I", header, 192, 1)
-    struct.pack_into("<I", header, 196, 4096)
-    struct.pack_into("<I", header, 200, 8)
+    struct.pack_into("<I", header, 180, juju_weight_bits(contract))
+    struct.pack_into("<I", header, 184, juju_arch_type(contract, source_name))
+    struct.pack_into("<I", header, 188, u32(contract_value(contract, "segment_policy", "expert_segmentation_contract.segment_policy", default=2)))
+    struct.pack_into("<I", header, 192, juju_qkv_policy(contract))
+    struct.pack_into("<I", header, 196, u32(contract_value(contract, "preferred_segment_bytes", "chunk_io_contract.preferred_segment_bytes", default=4096)))
+    struct.pack_into("<I", header, 200, u32(contract_value(contract, "max_segments_per_expert", "expert_segmentation_contract.max_segments_per_expert", default=8)))
+    struct.pack_into("<I", header, 204, u32(contract_value(contract, "recommended_vram_mb", default=mb_from_bytes(contract_value(contract, "recommended_vram_bytes", "pipeline_budget_contract.recommended_vram_bytes", default=0)))))
+    struct.pack_into("<I", header, 208, u32(contract_value(contract, "recommended_ram_mb", default=mb_from_bytes(contract_value(contract, "recommended_ram_bytes", "pipeline_budget_contract.recommended_ram_bytes", default=0)))))
     return bytes(header)
 
 
@@ -530,6 +1101,9 @@ def build_layer_graph_ir(layer, tensors):
                 out.append(name)
         return out
 
+    moe_weights = bind("ffn_gate_up_exps.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight")
+    dense_weights = bind("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight")
+
     ops = [
         {"op": "rms_norm", "name": "attention_input_norm", "inputs": ["hidden"], "weights": bind("attn_norm.weight", "input_layernorm.weight"), "required": False},
         {"op": "linear", "name": "q_projection", "inputs": ["attention_norm"], "weights": bind("attn_q.weight", "attention.wq.weight"), "output": "q", "required": False},
@@ -545,8 +1119,8 @@ def build_layer_graph_ir(layer, tensors):
         {"op": "hidden_snapshot", "name": "fate_gate_input_snapshot", "inputs": ["ffn_norm"], "target": "engine_state.gate_input_snapshots[layer]", "required": False},
         {"op": "linear", "name": "moe_router", "inputs": ["ffn_norm"], "weights": bind("ffn_gate_inp.weight", "router.weight"), "scale": bind("ffn_gate_inp.scale"), "output": "expert_scores", "required": False},
         {"op": "topk", "name": "expert_select", "inputs": ["expert_scores"], "config_key": "adaptive_seq_topk_entropy", "required": False},
-        {"op": "moe_expert_mlp", "name": "moe_experts", "inputs": ["ffn_norm", "selected_experts"], "weights": bind("ffn_gate_up_exps.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"), "required": bool(3 <= int(layer) <= 78)},
-        {"op": "dense_mlp", "name": "dense_ffn_fallback", "inputs": ["ffn_norm"], "weights": bind("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"), "required": not bool(3 <= int(layer) <= 78)},
+        {"op": "moe_expert_mlp", "name": "moe_experts", "inputs": ["ffn_norm", "selected_experts"], "weights": moe_weights, "required": bool(moe_weights)},
+        {"op": "dense_mlp", "name": "dense_ffn_fallback", "inputs": ["ffn_norm"], "weights": dense_weights, "required": bool(dense_weights)},
         {"op": "residual", "name": "ffn_residual", "inputs": ["hidden", "ffn_out"], "required": True},
         {"op": "scale", "name": "layer_output_scale", "inputs": ["hidden"], "weights": bind("layer_output_scale.weight"), "required": False},
     ]
@@ -574,6 +1148,14 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
         {"match": "expert tensors", "priority": 65, "residency": "SLOW_MEM", "prefetch": "expert_stream"},
         {"match": "large FAST_MEM tensors", "priority": "keep but streamable", "residency": "FAST_MEM_STREAMABLE", "prefetch": "bounded"},
     ]
+    role_counts = {}
+    bucket_counts = {}
+    encoding_counts = {}
+    for rec in tensor_records:
+        role_counts[str(rec.get("graph_role") or "unknown")] = role_counts.get(str(rec.get("graph_role") or "unknown"), 0) + 1
+        bucket_counts[str(rec.get("bucket") or "unknown")] = bucket_counts.get(str(rec.get("bucket") or "unknown"), 0) + 1
+        encoding_key = str(rec.get("weight_encoding") or rec.get("gguf_type") or 0)
+        encoding_counts[encoding_key] = encoding_counts.get(encoding_key, 0) + 1
     return {
         "format": "JUJU_GRAPH_IR_V1",
         "schema_version": 1,
@@ -587,6 +1169,11 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             "weight_file": weight_file,
             "index_file": index_file,
         },
+        "format_extension_contract": juju_format_extension_contract(contract),
+        "kernel_registry_contract": juju_kernel_registry_contract(contract),
+        "adapter_registry_contract": juju_adapter_registry_contract(),
+        "validation_contract": juju_validation_contract(),
+        "research_offload_contract": juju_research_offload_contract(),
         "architecture": {
             "family": infer_juju_graph_family(contract, tensor_records),
             "declared_architecture": contract.get("architecture") or arch.get("architecture") or "",
@@ -606,17 +1193,16 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                 "scaling": arch.get("rope_scaling"),
             },
         },
-        "tokenizer_contract": {
-            "tokenizer_files": ["tokenizer.json", "tokenizer.model"],
-            "chat_template_source": "tokenizer_config_or_model_card",
-            "missing_tokenizer_behavior": "text_api_returns_tokenizer_unavailable_input_ids_still_allowed",
-        },
+        "tokenizer_contract": juju_tokenizer_contract(),
         "quantization": {
             "weight": contract.get("weight_quant_schema", {}),
             "qkv_cache": contract.get("qkv_cache_schema", {}),
-            "source_weight_bits": contract.get("source_weight_bits"),
+            "source_weight_bits": juju_weight_bits(contract),
+            "source_weight_encoding": juju_weight_encoding(contract),
             "source_weight_family": contract.get("source_weight_quant_family"),
             "source_weight_kernel_family": contract.get("source_weight_kernel_family"),
+            "tensor_weight_encoding_counts": encoding_counts,
+            "kernel_requirement": "engine_must_support_every_tensor_weight_encoding_or_fail_closed",
         },
         "tensor_bindings": {
             "token_embedding": token_embd,
@@ -626,6 +1212,25 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             "rope_freqs": _juju_first_tensor(tensor_records, "rope_freqs.weight"),
             "layer_tensor_prefix": "blk.{layer}.",
             "shape_map": shape_map,
+        },
+        "tensor_index_contract": {
+            "binary_schema_version": 3,
+            "offsets": "absolute_file_offsets",
+            "lengths": "exact_payload_bytes",
+            "alignment_bytes": 4096,
+            "weight_encoding_field": "weight_encoding",
+            "gguf_type_field": "gguf_type",
+            "binary_required_fields": ["gguf_type", "weight_encoding"],
+            "gguf_type_name_field": "gguf_type_name",
+            "quant_family_field": "quant_family",
+            "kernel_key_field": "kernel_key",
+            "kernel_contract_field": "kernel_contract",
+            "row_layout_field": "row_layout",
+            "role_counts": role_counts,
+            "bucket_counts": bucket_counts,
+            "sections_embedded_in_header_table": True,
+            "paired_idx_required": True,
+            "external_adapter_required": False,
         },
         "ops": [
             {"op": "input_tokens", "output": "token_ids", "required": True},
@@ -641,11 +1246,20 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             "unknown_op": "fail_closed",
             "unknown_tensor": "fail_closed_for_required_optional_skip",
             "kv_cache": "quantized_qkv_cache_required" if contract.get("qkv_cache_schema") else "runtime_default",
+            "model_load": "eager_validate_header_sections_idx_tokenizer_and_kernel_support",
+            "weight_decode": "juju_weight_encoding_and_gguf_type_exact_dispatch",
             "residency_policy": contract.get("residency_policy", {}),
             "prefetch_plan_hints": contract.get("prefetch_plan_hints", {}),
             "kernel_hints": contract.get("kernel_hints", {}),
             "execution_hints": contract.get("execution_hints", {}),
             "memory_management_hints": contract.get("memory_management_hints", {}),
+            "adapter_contract": {
+                "dense_mlp_uses_shared_path": True,
+                "expert_mlp_uses_streaming_path": True,
+                "required_quant_decode": "all_tensor_index_weight_encodings",
+                "prefetch_must_respect_graph_role": True,
+                "tokenizer_assets_must_exist": True,
+            },
             "hard_defaults": {
                 "vram_double_admission_guard": {"enabled": True, "counter": "pending_vram_reservation"},
                 "macos_available_ram": {"count_inactive_pages": False},
@@ -673,6 +1287,19 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                     "capture": "gate_input_before_router",
                     "storage": "engine_state.gate_input_snapshots[layer]",
                 },
+            },
+        },
+        "execution_plan": {
+            "input": ["tokenizer_assets", "token_ids"],
+            "prefill": ["embedding", "layer_loop", "kv_write", "logits"],
+            "decode": ["next_token_embedding", "layer_loop", "kv_read_write", "logits"],
+            "offload_units": ["shared_tensor", "expert_tensor", "dense_ffn_tensor", "qkv_page"],
+            "io_policy": {
+                "read_unit": "tensor_span",
+                "alignment": 4096,
+                "mmap": True,
+                "stream_large_slow_mem_tensors": True,
+                "protect_fastmem_roles": ["shared_core", "attention", "router", "norm"],
             },
         },
         "priority_tables": {
@@ -886,6 +1513,7 @@ def build_juju_shard_plan_from_hf_url(
                 "source_bytes": total_bytes,
             },
             "contract": contract,
+            **juju_contract_metadata(contract, source_name, source_repo_id),
         }
         pos = add_json_section_at(pos, JUJU_SECTION_MODEL_META, "MODEL_META", meta)
         qkv_schema = contract.get("qkv_cache_schema")
@@ -913,11 +1541,22 @@ def build_juju_shard_plan_from_hf_url(
                     "dims": tensor["dims"],
                     "shape": tensor["shape"],
                     "gguf_type": tensor["type"],
+                    "gguf_type_name": gguf_type_name(tensor["type"]),
+                    "weight_encoding": weight_encoding_from_gguf_type(tensor["type"], contract),
+                    "quant_family": quant_family_from_gguf_type(tensor["type"], contract),
+                    "kernel_key": kernel_key_from_gguf_type(tensor["type"], contract),
+                    "row_layout": "source_gguf_quant_block_layout_preserved",
                     "source_offset": tensor["source_offset"],
                     "source_bytes": tensor["bytes"],
                     "juju_offset": tensor_offset,
                     "juju_bytes": tensor["bytes"],
                     "alignment": 4096,
+                    "kernel_contract": {
+                        "must_have_dot_kernel": True,
+                        "must_not_return_silent_zero": True,
+                        "decode_key": kernel_key_from_gguf_type(tensor["type"], contract),
+                        "source_type_preserved": True,
+                    },
                     **runtime_priority,
                 })
                 pos += tensor["bytes"]
@@ -964,13 +1603,14 @@ def build_juju_shard_plan_from_hf_url(
             "sections": list(sections),
         }
         pos = add_json_section_at(pos, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
+        index_checksum = int(sections[-1].get("sha256", "0" * 64)[:16], 16) if sections else 0
         file_size_value = pos
         if len(sections) > 8:
             raise RuntimeError(f"too many JUJU sections: {len(sections)}")
 
         table = b"".join(pack_section(entry) for entry in sections)
         table = table + (b"\x00" * ((8 * JUJU_SECTION_ENTRY_BYTES) - len(table)))
-        header = make_header(contract, artifact_source_name, file_size_value, sections, section_sizes)
+        header = make_header(contract, artifact_source_name, file_size_value, sections, section_sizes, index_checksum=index_checksum)
         add_fixed(0, header)
         add_fixed(table_offset, table)
 
@@ -1043,12 +1683,12 @@ class JujuVirtualFile(io.BufferedIOBase):
     def seek(self, offset, whence=io.SEEK_SET):
         with self._lock:
             if whence == io.SEEK_SET:
-            pos = int(offset)
-        elif whence == io.SEEK_CUR:
-            pos = self._pos + int(offset)
-        elif whence == io.SEEK_END:
-            pos = self._size + int(offset)
-        else:
+                pos = int(offset)
+            elif whence == io.SEEK_CUR:
+                pos = self._pos + int(offset)
+            elif whence == io.SEEK_END:
+                pos = self._size + int(offset)
+            else:
                 raise ValueError(f"unsupported whence: {whence}")
             if pos < 0:
                 raise ValueError("negative seek position")
@@ -1065,7 +1705,7 @@ class JujuVirtualFile(io.BufferedIOBase):
     def read(self, size=-1):
         with self._lock:
             if self.closed or self._pos >= self._size:
-            return b""
+                return b""
             if size is None or size < 0:
                 end = min(self._size, self._pos + self._remote_chunk)
             else:
@@ -1326,6 +1966,7 @@ def write_juju_shard_from_hf_url(
                     "source_bytes": total_bytes,
                 },
                 "contract": contract,
+                **juju_contract_metadata(contract, source_name, source_repo_id),
             }
             add_json_section(out, JUJU_SECTION_MODEL_META, "MODEL_META", meta)
             qkv_schema = contract.get("qkv_cache_schema")
@@ -1359,11 +2000,22 @@ def write_juju_shard_from_hf_url(
                         "dims": tensor["dims"],
                         "shape": tensor["shape"],
                         "gguf_type": tensor["type"],
+                        "gguf_type_name": gguf_type_name(tensor["type"]),
+                        "weight_encoding": weight_encoding_from_gguf_type(tensor["type"], contract),
+                        "quant_family": quant_family_from_gguf_type(tensor["type"], contract),
+                        "kernel_key": kernel_key_from_gguf_type(tensor["type"], contract),
+                        "row_layout": "source_gguf_quant_block_layout_preserved",
                         "source_offset": tensor["source_offset"],
                         "source_bytes": tensor["bytes"],
                         "juju_offset": tensor_offset,
                         "juju_bytes": tensor["bytes"],
                         "alignment": 4096,
+                        "kernel_contract": {
+                            "must_have_dot_kernel": True,
+                            "must_not_return_silent_zero": True,
+                            "decode_key": kernel_key_from_gguf_type(tensor["type"], contract),
+                            "source_type_preserved": True,
+                        },
                         **runtime_priority,
                     })
                 size = out.tell() - offset
@@ -1409,6 +2061,7 @@ def write_juju_shard_from_hf_url(
                 "sections": sections,
             }
             add_json_section(out, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
+            index_checksum = int(sections[-1].get("sha256", "0" * 64)[:16], 16) if sections else 0
             file_size_value = out.tell()
             if len(sections) > 8:
                 raise RuntimeError(f"too many JUJU sections: {len(sections)}")
@@ -1416,7 +2069,7 @@ def write_juju_shard_from_hf_url(
             for entry in sections:
                 out.write(pack_section(entry))
             out.seek(0)
-            out.write(make_header(contract, artifact_source_name, file_size_value, sections, section_sizes))
+            out.write(make_header(contract, artifact_source_name, file_size_value, sections, section_sizes, index_checksum=index_checksum))
 
     index_path.write_text(json.dumps(idx, ensure_ascii=False, indent=2), encoding="utf-8")
     return {

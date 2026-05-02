@@ -1,4 +1,4 @@
-﻿static uint64_t prefetch_plan_item_key(uint32_t layer, uint32_t expert) {
+static uint64_t prefetch_plan_item_key(uint32_t layer, uint32_t expert) {
     return ((uint64_t)layer << 32) | (uint64_t)expert;
 }
 
@@ -13,6 +13,10 @@ static void prefetch_plan_clear_seen(moe_pc_engine* engine) {
     if (!engine) {
         return;
     }
+
+    // BUGFIX 문제11: Protect with mutex
+    std::lock_guard<std::mutex> lock(engine->prefetch_plan_mutex);
+
     ++engine->prefetch_plan_generation;
     // Periodic cleanup: every 10000 generations OR when map exceeds 50k entries
     // At 100 tokens/sec, generation cleanup triggers every ~100 seconds
@@ -30,6 +34,10 @@ static bool prefetch_plan_has_item(moe_pc_engine* engine, int layer, int expert)
     if (!engine || layer < 0 || expert < 0) {
         return false;
     }
+
+    // BUGFIX 문제11: Protect with mutex
+    std::lock_guard<std::mutex> lock(engine->prefetch_plan_mutex);
+
     const uint64_t key = prefetch_plan_item_key((uint32_t)layer, (uint32_t)expert);
     auto it = engine->prefetch_plan_seen_gen.find(key);
     return it != engine->prefetch_plan_seen_gen.end() &&
@@ -40,6 +48,10 @@ static void prefetch_plan_mark_seen(moe_pc_engine* engine, int layer, int expert
     if (!engine || layer < 0 || expert < 0) {
         return;
     }
+
+    // BUGFIX 문제11: Protect with mutex
+    std::lock_guard<std::mutex> lock(engine->prefetch_plan_mutex);
+
     engine->prefetch_plan_seen_gen[prefetch_plan_item_key((uint32_t)layer, (uint32_t)expert)] =
         engine->prefetch_plan_generation;
 }

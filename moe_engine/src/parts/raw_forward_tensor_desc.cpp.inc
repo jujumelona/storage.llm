@@ -28,7 +28,7 @@ static uint8_t moe_raw_scalar_encoding_from_common_tensor(
     if (rec.type == 1u) {
         return moe_RAW_SCALAR_F16;
     }
-    if (rec.type == 32u) {
+    if (rec.type == 30u || rec.type == 32u) {
         return moe_RAW_SCALAR_BF16;
     }
     return moe_RAW_SCALAR_BF16;
@@ -356,10 +356,11 @@ static int map_common_tensor_record(
     entry.rows = desc.rows;
     entry.cols = desc.cols;
     entry.scalar_encoding = moe_raw_scalar_encoding_from_common_tensor(rec, desc.rows, desc.cols);
-    entry.weight_format = moe_weight_encoding_from_gguf_type(rec.type, moe_offload_gguf_contract_t{});
+    entry.weight_format = rec.weight_encoding != moe_WEIGHT_ENCODING_UNKNOWN ?
+        rec.weight_encoding : moe_weight_encoding_from_gguf_type(rec.type, moe_offload_gguf_contract_t{});
     if (entry.weight_format == moe_WEIGHT_ENCODING_UNKNOWN) {
-        entry.weight_format =
-            entry.scalar_encoding == moe_RAW_SCALAR_F32 ? moe_WEIGHT_ENCODING_RAW_FP32 : moe_WEIGHT_ENCODING_RAW_FP16;
+        entry.weight_format = entry.scalar_encoding == moe_RAW_SCALAR_F32 ? moe_WEIGHT_ENCODING_RAW_FP32 :
+            (entry.scalar_encoding == moe_RAW_SCALAR_F16 ? moe_WEIGHT_ENCODING_RAW_FP16 : moe_WEIGHT_ENCODING_RAW_BF16);
     }
     moe_tensor_info_t info{};
     info.rows = desc.rows;

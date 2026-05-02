@@ -10,6 +10,8 @@ struct moe_juju_tensor_json_entry_t {
     uint64_t shape[4]{};
     uint32_t dims = 0;
     uint32_t gguf_type = 0;
+    uint8_t has_gguf_type = 0;
+    uint8_t weight_encoding = moe_WEIGHT_ENCODING_UNKNOWN;
     uint64_t juju_offset = 0;
     uint64_t juju_bytes = 0;
     uint16_t runtime_priority = 50;
@@ -144,9 +146,13 @@ static int moe_juju_read_table_local(
     if (!moe_juju_read_header(path.c_str(), header)) {
         return 0;
     }
-    const uint64_t declared_bytes = header->file_size ? header->file_size : actual_bytes;
-    if (declared_bytes > actual_bytes || header->section_count == 0 ||
+    const uint64_t declared_bytes = header->file_size;
+    const uint64_t table_bytes = (uint64_t)header->section_count * sizeof(moe_juju_section_entry_t);
+    if (declared_bytes == 0 || declared_bytes > actual_bytes || header->section_count == 0 ||
+        header->header_size != MOE_JUJU_HEADER_BYTES ||
+        header->section_table_offset < MOE_JUJU_HEADER_BYTES ||
         header->section_table_offset > declared_bytes ||
+        header->section_table_size != table_bytes ||
         header->section_table_size > declared_bytes - header->section_table_offset) {
         return 0;
     }
@@ -169,7 +175,11 @@ static int moe_juju_read_table_local(
         // BUGFIX 329: Check entry.offset + entry.size doesn't overflow ★
         // Problem: entry.offset + entry.size can overflow uint64_t
         // Solution: Check entry.size <= declared_bytes - entry.offset
-        if (entry.offset > declared_bytes || entry.size > declared_bytes - entry.offset) {
+        const uint64_t table_end = header->section_table_offset + header->section_table_size;
+        if (entry.type == 0 ||
+            entry.offset < table_end ||
+            entry.offset > declared_bytes ||
+            entry.size > declared_bytes - entry.offset) {
             entries->clear();
             return 0;
         }
@@ -277,6 +287,12 @@ static int moe_parse_juju_tensor_index_json(
         }
         if (moe_json_get_u64_slice(json, obj_begin, obj_end, "gguf_type", &value)) {
             rec.gguf_type = moe_u64_to_u32_clamped(value, 0);
+            rec.has_gguf_type = 1;
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "weight_encoding", &value) ||
+            moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_weight_encoding", &value) ||
+            moe_json_get_u64_slice(json, obj_begin, obj_end, "source_weight_encoding", &value)) {
+            rec.weight_encoding = (uint8_t)std::min<uint64_t>(value, 255ull);
         }
         if (moe_json_get_u64_slice(json, obj_begin, obj_end, "runtime_priority", &value)) {
             rec.runtime_priority = (uint16_t)std::min<uint64_t>(value, 1000ull);

@@ -141,6 +141,44 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
             }
         }
 
+        // BUGFIX 문제B: Adaptive queue depth adjustment ★★
+        // Problem: Static queue depth caps don't adapt to runtime bottlenecks
+        // pinned_stage saturation → disk_stage should reduce cap
+        // gpu_stage idle → pinned_stage can increase cap
+        // Solution: Periodically adjust caps based on queue utilization
+        // Trade-off: Increased pinned cap uses more staging memory
+        {
+            const uint32_t disk_depth = engine->disk_stage.depth.load(std::memory_order_relaxed);
+            const uint32_t pin_depth = engine->pinned_stage.depth.load(std::memory_order_relaxed);
+            const uint32_t gpu_depth = engine->gpu_stage.depth.load(std::memory_order_relaxed);
+            const uint32_t base = engine->io_config.max_prefetch_queue;
+
+            // pinned_stage saturated → reduce disk_stage cap to prevent overflow
+            if (pin_depth > engine->pinned_stage_depth_cap * 9 / 10) {
+                const uint32_t new_disk_cap = std::max(
+                    engine->disk_stage_depth_cap * 3 / 4,
+                    std::max(512u, base / 4)  // Never go below 512 or base/4
+                );
+                if (new_disk_cap != engine->disk_stage_depth_cap) {
+                    engine->disk_stage_depth_cap = new_disk_cap;
+                }
+            }
+
+            // gpu_stage idle AND pinned_stage underutilized → increase pinned cap
+            if (gpu_depth < 4 && pin_depth < engine->pinned_stage_depth_cap * 3 / 10) {
+                const uint32_t max_pin_cap = std::min(base * 2,
+                    (uint32_t)(engine->staging_size / (1024 * 1024)));  // Limit by staging memory
+                const uint32_t new_pin_cap = std::min(
+                    engine->pinned_stage_depth_cap * 5 / 4,
+                    max_pin_cap
+                );
+                if (new_pin_cap != engine->pinned_stage_depth_cap &&
+                    new_pin_cap <= max_pin_cap) {
+                    engine->pinned_stage_depth_cap = new_pin_cap;
+                }
+            }
+        }
+
     }
 }
 

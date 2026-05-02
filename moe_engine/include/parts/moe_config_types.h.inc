@@ -12,6 +12,7 @@ typedef struct {
     const char* model_lib_path;
     const char* model_lib_compile_command;
     int enable_model_lib_jit;
+    float vram_kv_ratio;  // BUGFIX 문제F: KV/expert VRAM split ratio (0.0=auto, 0.1-0.3 recommended) ★★
 } moe_pc_engine_config_t;
 
 typedef enum {

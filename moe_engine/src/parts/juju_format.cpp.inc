@@ -22,20 +22,23 @@ int moe_juju_header_valid(const moe_juju_header_t* header) {
         header->magic[2] != 'J' || header->magic[3] != 'U') {
         return 0;
     }
-    if (header->header_size != 0 && header->header_size != MOE_JUJU_HEADER_BYTES) {
+    if (header->header_size != MOE_JUJU_HEADER_BYTES) {
         return 0;
     }
     if (header->version_major == 0) {
         return 0;
     }
-    if (header->section_count > 65536u) {
+    if (header->section_count == 0 || header->section_count > 65536u) {
         return 0;
     }
-    if (header->file_size && header->section_table_offset >= header->file_size) {
+    const uint64_t table_bytes = (uint64_t)header->section_count * (uint64_t)sizeof(moe_juju_section_entry_t);
+    if (header->section_table_size != table_bytes) {
         return 0;
     }
-    if (header->section_table_size &&
-        header->section_table_size < (uint64_t)header->section_count * sizeof(moe_juju_section_entry_t)) {
+    if (header->file_size < MOE_JUJU_HEADER_BYTES ||
+        header->section_table_offset < MOE_JUJU_HEADER_BYTES ||
+        header->section_table_offset > header->file_size ||
+        header->section_table_size > header->file_size - header->section_table_offset) {
         return 0;
     }
     return 1;
@@ -86,7 +89,9 @@ int moe_juju_read_section_table(
         return 0;
     }
     const uint64_t bytes = (uint64_t)header->section_count * sizeof(moe_juju_section_entry_t);
-    if (header->section_table_size && bytes > header->section_table_size) {
+    if (bytes == 0 || bytes != header->section_table_size ||
+        header->section_table_offset > (uint64_t)std::numeric_limits<std::streamoff>::max() ||
+        bytes > (uint64_t)std::numeric_limits<std::streamsize>::max()) {
         return 0;
     }
     std::ifstream in;

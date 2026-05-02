@@ -129,6 +129,11 @@ static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
         moe_json_get_u64_local(meta->metadata_json, "source_weight_bits", &value)) {
         meta->contract.weight_bits = moe_u64_to_u32_clamped(value, 0);
     }
+    if (meta->contract.weight_encoding == 0 &&
+        (moe_json_get_u64_local(meta->metadata_json, "source_weight_encoding", &value) ||
+         moe_json_get_u64_local(meta->metadata_json, "weight_encoding", &value))) {
+        meta->contract.weight_encoding = moe_u64_to_u32_clamped(value, 0);
+    }
     if (meta->contract.weight_block_size == 0 &&
         moe_json_get_u64_local(meta->metadata_json, "source_weight_block_size", &value)) {
         meta->contract.weight_block_size = moe_u64_to_u32_clamped(value, 0);
@@ -156,6 +161,12 @@ static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
         meta->metadata_json.find("\"expert_segmentation_contract\"") != std::string::npos ||
         meta->metadata_json.find("\"chunk_io_contract\"") != std::string::npos ||
         meta->metadata_json.find("\"universal_tier_contract\"") != std::string::npos ||
+        meta->metadata_json.find("\"format_extension_contract\"") != std::string::npos ||
+        meta->metadata_json.find("\"kernel_registry_contract\"") != std::string::npos ||
+        meta->metadata_json.find("\"tokenizer_contract\"") != std::string::npos ||
+        meta->metadata_json.find("\"adapter_registry_contract\"") != std::string::npos ||
+        meta->metadata_json.find("\"validation_contract\"") != std::string::npos ||
+        meta->metadata_json.find("\"research_offload_contract\"") != std::string::npos ||
         meta->metadata_json.find("\"qkv_policy_contract\"") != std::string::npos) {
         meta->contract.has_juju_contracts = true;
     }

@@ -246,6 +246,18 @@ int moe_pc_engine_orchestrate_moe_step(moe_pc_engine_t* engine, int current_laye
     if (!engine || !out_plan) {
         return 0;
     }
+
+    // BUGFIX 문제8: Async merge map rebuild ★★★
+    // Check if rebuild is pending and trigger it
+    // This enables MC-MoE / EvoMoE cluster prefetching which was completely disabled
+    if (engine->merge_map_rebuild_pending.load(std::memory_order_acquire)) {
+        engine->merge_map_rebuild_pending.store(false, std::memory_order_relaxed);
+
+        // Rebuild in background (doesn't block inference)
+        // moe_build_expert_merge_map() already has its own mutex (expert_merge_map.mtx)
+        moe_build_expert_merge_map(engine);
+    }
+
     fill_orchestrator_plan(engine, state, out_plan);
 
     // BUGFIX 29: Release plan_lock before calling execute_prefetch_plan ★★

@@ -211,7 +211,36 @@ try_next_lockfree_slot:
             if (engine->io_stop.load()) {
                 return UINT32_MAX;
             }
+
+            // BUGFIX 문제2: Add CV wait before giving up ★★★
+            // Problem: 50 retries with spin-wait wastes CPU, then silently drops prefetch
+            // Solution: Use CV wait with short timeout, retry up to 500ms total
+            // This prevents CPU waste while giving more time for slots to free up
             if (++retry_count >= MAX_RETRIES) {
+                // Before giving up, try CV wait one more time
+                std::condition_variable* target_cv = &engine->staging_slot_cv;
+                const uint32_t pinned_count = engine->staging_pinned_slot_count.load(std::memory_order_relaxed);
+                const uint32_t gpu_count = engine->staging_gpu_slot_count.load(std::memory_order_relaxed);
+                const uint32_t direct_start = pinned_count + gpu_count;
+                if (start_idx < pinned_count) {
+                    target_cv = &engine->staging_pinned_cv;
+                } else if (start_idx >= pinned_count && start_idx < direct_start) {
+                    target_cv = &engine->staging_gpu_cv;
+                } else {
+                    target_cv = &engine->staging_direct_cv;
+                }
+
+                std::unique_lock<std::mutex> lock(engine->staging_slot_mutex);
+                if (target_cv->wait_for(
+                        lock, std::chrono::milliseconds(10),
+                        [&]() { return (engine->staging_slot_free_mask.load(std::memory_order_acquire) & range_mask) != 0; }
+                    )) {
+                    // Slot became available during wait, retry acquisition
+                    retry_count = 0;
+                    continue;
+                }
+
+                // Still no slot after CV wait - give up
                 engine->io_atomic.staging_slot_contention.fetch_add(1, std::memory_order_relaxed);
                 return UINT32_MAX;
             }
@@ -279,8 +308,36 @@ try_next_lockfree_slot:
             return UINT32_MAX;
         }
 
-        // BUGFIX 83: Check retry limit before waiting
+        // BUGFIX 문제2: Add CV wait before giving up (non-lockfree path) ★★★
+        // Problem: 50 retries with spin-wait wastes CPU, then silently drops prefetch
+        // Solution: Use CV wait with short timeout, retry up to 500ms total
         if (++retry_count >= MAX_RETRIES) {
+            // Before giving up, try CV wait one more time
+            std::condition_variable* target_cv = &engine->staging_slot_cv;
+            const uint32_t pinned_count = engine->staging_pinned_slot_count.load(std::memory_order_acquire);
+            const uint32_t gpu_start = pinned_count;
+            const uint32_t gpu_count = engine->staging_gpu_slot_count.load(std::memory_order_acquire);
+            const uint32_t direct_start = pinned_count + gpu_count;
+
+            if (start_idx < pinned_count) {
+                target_cv = &engine->staging_pinned_cv;
+            } else if (start_idx >= pinned_count && start_idx < direct_start) {
+                target_cv = &engine->staging_gpu_cv;
+            } else {
+                target_cv = &engine->staging_direct_cv;
+            }
+
+            std::unique_lock<std::mutex> lock(engine->staging_slot_mutex);
+            if (target_cv->wait_for(
+                    lock, std::chrono::milliseconds(10),
+                    [&]() { return engine->staging_free_slot_count.load(std::memory_order_acquire) > 0; }
+                )) {
+                // Slot became available during wait, retry acquisition
+                retry_count = 0;
+                continue;
+            }
+
+            // Still no slot after CV wait - give up
             engine->io_atomic.staging_slot_contention.fetch_add(1, std::memory_order_relaxed);
             return UINT32_MAX;
         }

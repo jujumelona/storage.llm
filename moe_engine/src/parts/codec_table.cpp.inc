@@ -177,12 +177,14 @@ static int load_binary_tensor_index(moe_pc_engine* engine, const char* index_pat
     uint32_t tensor_count = 0;
     uint32_t reserved = 0;
     if (!tensor_index_read_exact(input, magic, sizeof(magic)) ||
-        (std::memcmp(magic, "SLTIDX1", 7) != 0 && std::memcmp(magic, "SLTIDX2", 7) != 0) ||
+        (std::memcmp(magic, "SLTIDX1", 7) != 0 &&
+         std::memcmp(magic, "SLTIDX2", 7) != 0 &&
+         std::memcmp(magic, "SLTIDX3", 7) != 0) ||
         !tensor_index_read_u32(input, &version) ||
         !tensor_index_read_u32(input, &path_count) ||
         !tensor_index_read_u32(input, &tensor_count) ||
         !tensor_index_read_u32(input, &reserved) ||
-        (version != 1 && version != 2) ||
+        (version != 1 && version != 2 && version != 3) ||
         path_count == 0 ||
         path_count > 4096 ||
         tensor_count == 0 ||
@@ -240,6 +242,8 @@ static int load_binary_tensor_index(moe_pc_engine* engine, const char* index_pat
         uint16_t path_index = 0;
         uint16_t flags = 0;
         uint32_t rec_reserved = 0;
+        uint32_t rec_gguf_type = 0xFFFFFFFFu;
+        uint32_t rec_weight_encoding = moe_WEIGHT_ENCODING_UNKNOWN;
         if (!tensor_index_read_u64(input, &rec.info.weight_byte_offset) ||
             !tensor_index_read_u64(input, &rec.info.weight_byte_length) ||
             !tensor_index_read_u64(input, &rec.info.scale_byte_offset) ||
@@ -262,6 +266,12 @@ static int load_binary_tensor_index(moe_pc_engine* engine, const char* index_pat
             path_index >= engine->tensor_paths.size()) {
             return 0;
         }
+        if (version >= 3) {
+            if (!tensor_index_read_u32(input, &rec_gguf_type) ||
+                !tensor_index_read_u32(input, &rec_weight_encoding)) {
+                return 0;
+            }
+        }
         rec.info.proj = static_cast<moe_projection_t>(proj);
         rec.resolved_path_index = path_index;
         rec.scale4_entry = nullptr;
@@ -270,7 +280,24 @@ static int load_binary_tensor_index(moe_pc_engine* engine, const char* index_pat
             rec.scale4_entry = moe_scale4_find(engine->scale4, scale4_keys[rec_reserved].c_str());
             rec.info.has_scale4 = rec.scale4_entry ? 1 : 0;
         }
-        finalize_tensor_layout(&rec);
+        if (version < 3) {
+            const uint64_t q4_bytes =
+                (uint64_t)rec.info.rows * packed_bits_row_bytes(rec.info.cols, 4);
+            if (q4_bytes != 0 && rec.info.weight_byte_length == q4_bytes) {
+                std::fprintf(stderr,
+                    "[storagellm] stale tensor index has ambiguous 4-bit weights without encoding hints, falling back: %s\n",
+                    index_path);
+                std::fflush(stderr);
+                return 0;
+            }
+        }
+        const uint8_t rec_encoding =
+            rec_weight_encoding != moe_WEIGHT_ENCODING_UNKNOWN ?
+            (uint8_t)std::min<uint32_t>(rec_weight_encoding, 255u) :
+            (rec_gguf_type != 0xFFFFFFFFu ?
+                moe_weight_encoding_from_gguf_type(rec_gguf_type, moe_offload_gguf_contract_t{}) :
+                moe_WEIGHT_ENCODING_UNKNOWN);
+        finalize_tensor_layout(&rec, rec_encoding);
         const uint64_t stream_bytes = tensor_stream_bytes(rec);
         if (stream_bytes > engine->max_tensor_stream_bytes) {
             engine->max_tensor_stream_bytes = stream_bytes;
@@ -362,11 +389,23 @@ static uint8_t moe_weight_encoding_from_gguf_type(uint32_t type, const moe_offlo
     if (type == 1u) {
         return moe_WEIGHT_ENCODING_RAW_FP16;
     }
+    if (type == 2u) {
+        return moe_WEIGHT_ENCODING_GGUF_Q4_0;
+    }
+    if (type == 3u) {
+        return moe_WEIGHT_ENCODING_GGUF_Q4_1;
+    }
+    if (type == 6u) {
+        return moe_WEIGHT_ENCODING_GGUF_Q5_0;
+    }
     if (type == 7u) {
         return moe_WEIGHT_ENCODING_GGUF_Q5_1;
     }
     if (type == 8u) {
         return moe_WEIGHT_ENCODING_GGUF_Q8_0;
+    }
+    if (type == 9u) {
+        return moe_WEIGHT_ENCODING_GGUF_Q8_1;
     }
     if (type == 10u) {
         return moe_WEIGHT_ENCODING_GGUF_Q2_K;
@@ -392,14 +431,48 @@ static uint8_t moe_weight_encoding_from_gguf_type(uint32_t type, const moe_offlo
     if (type == 18u) {
         return moe_WEIGHT_ENCODING_GGUF_IQ3_XXS;
     }
-    if (type == 17u || type == 22u) {
-        return moe_WEIGHT_ENCODING_GGUF_IQ2;
+    if (type == 19u) {
+        return moe_WEIGHT_ENCODING_GGUF_IQ1_S;
+    }
+    if (type == 17u) {
+        return moe_WEIGHT_ENCODING_GGUF_IQ2_XS;
+    }
+    if (type == 22u) {
+        return moe_WEIGHT_ENCODING_GGUF_IQ2_S;
+    }
+    if (type == 29u) {
+        return moe_WEIGHT_ENCODING_GGUF_IQ1_M;
     }
     if (type == 21u) {
-        return moe_WEIGHT_ENCODING_GGUF_IQ3;
+        return moe_WEIGHT_ENCODING_GGUF_IQ3_S;
     }
-    if (type == 20u || type == 23u) {
-        return moe_WEIGHT_ENCODING_GGUF_IQ4;
+    if (type == 20u) {
+        return moe_WEIGHT_ENCODING_GGUF_IQ4_NL;
+    }
+    if (type == 23u) {
+        return moe_WEIGHT_ENCODING_GGUF_IQ4_XS;
+    }
+    if (type == 30u) {
+        return moe_WEIGHT_ENCODING_RAW_BF16;
+    }
+    return moe_WEIGHT_ENCODING_UNKNOWN;
+}
+
+static uint8_t moe_weight_encoding_from_juju_entry(
+    const moe_juju_tensor_json_entry_t& entry,
+    const moe_offload_gguf_contract_t& contract
+) {
+    if (entry.has_gguf_type) {
+        const uint8_t by_type = moe_weight_encoding_from_gguf_type(entry.gguf_type, contract);
+        if (by_type != moe_WEIGHT_ENCODING_UNKNOWN) {
+            return by_type;
+        }
+    }
+    if (entry.weight_encoding != moe_WEIGHT_ENCODING_UNKNOWN) {
+        return entry.weight_encoding;
+    }
+    if (contract.weight_encoding != moe_WEIGHT_ENCODING_UNKNOWN) {
+        return (uint8_t)std::min<uint32_t>(contract.weight_encoding, 255u);
     }
     return moe_WEIGHT_ENCODING_UNKNOWN;
 }
@@ -950,6 +1023,8 @@ static void moe_register_gguf_common_tensor(
         rec.shape[i] = entry.shape[i];
     }
     rec.type = entry.type;
+    rec.weight_encoding = entry.weight_encoding != moe_WEIGHT_ENCODING_UNKNOWN ?
+        entry.weight_encoding : moe_weight_encoding_from_gguf_type(entry.type, moe_offload_gguf_contract_t{});
     rec.file_offset = entry.file_offset;
     rec.bytes = entry.bytes;
     engine->gguf_common_tensor_slots.emplace(rec.name, engine->gguf_common_tensors.size());
@@ -1268,6 +1343,7 @@ static int load_juju_tensor_index_as_tensor_index(
                 common.name = entry.name;
                 common.dims = entry.dims;
                 common.type = entry.gguf_type;
+                common.weight_encoding = moe_weight_encoding_from_juju_entry(entry, contract);
                 common.file_offset = entry.juju_offset;
                 common.bytes = entry.juju_bytes;
                 for (uint32_t i = 0; i < std::min<uint32_t>(entry.dims, 4u); ++i) {
@@ -1336,7 +1412,22 @@ static int load_juju_tensor_index_as_tensor_index(
                     rec.graph_role = entry.graph_role;
                     rec.prefetch_class = entry.prefetch_class;
                     rec.juju_section_type = entry.juju_section_type;
-                    finalize_tensor_layout(&rec, moe_weight_encoding_from_gguf_type(entry.gguf_type, contract));
+                    const uint8_t rec_encoding = moe_weight_encoding_from_juju_entry(entry, contract);
+                    finalize_tensor_layout(&rec, rec_encoding);
+                    if (rec.weight_format == moe_WEIGHT_ENCODING_UNKNOWN ||
+                        rec.weight_row_bytes == 0 ||
+                        (!rec.cpu_executable && !rec.gpu_executable)) {
+                        std::fprintf(stderr,
+                            "[storagellm] unsupported JUJU tensor kernel: name=%s encoding=%u gguf_type=%u layer=%u expert=%u proj=%u bytes=%llu\n",
+                            entry.name.c_str(),
+                            (unsigned)rec_encoding,
+                            (unsigned)entry.gguf_type,
+                            (unsigned)rec.info.layer,
+                            (unsigned)rec.info.expert,
+                            (unsigned)rec.info.proj,
+                            (unsigned long long)rec.info.weight_byte_length);
+                        return 0;
+                    }
                     const uint64_t stream_bytes = tensor_stream_bytes(rec);
                     if (stream_bytes > engine->max_tensor_stream_bytes) {
                         engine->max_tensor_stream_bytes = stream_bytes;

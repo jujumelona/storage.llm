@@ -255,6 +255,18 @@ static uint64_t moe_raw_tensor_row_bytes(
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
         return ((uint64_t)cols + 31ull) / 32ull * 34ull;
     }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_1) {
+        return ((uint64_t)cols + 31ull) / 32ull * 36ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0) {
+        return ((uint64_t)cols + 31ull) / 32ull * 18ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_1) {
+        return ((uint64_t)cols + 31ull) / 32ull * 20ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_0) {
+        return ((uint64_t)cols + 31ull) / 32ull * 22ull;
+    }
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
         return ((uint64_t)cols + 31ull) / 32ull * 24ull;
     }
@@ -279,8 +291,29 @@ static uint64_t moe_raw_tensor_row_bytes(
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS) {
         return ((uint64_t)cols + 255ull) / 256ull * 66ull;
     }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XS) {
+        return ((uint64_t)cols + 255ull) / 256ull * 74ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_S) {
+        return ((uint64_t)cols + 255ull) / 256ull * 82ull;
+    }
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS) {
         return ((uint64_t)cols + 255ull) / 256ull * 98ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_S) {
+        return ((uint64_t)cols + 255ull) / 256ull * 110ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_NL) {
+        return ((uint64_t)cols + 31ull) / 32ull * 18ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_XS) {
+        return ((uint64_t)cols + 255ull) / 256ull * 136ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_S) {
+        return ((uint64_t)cols + 255ull) / 256ull * 50ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_M) {
+        return ((uint64_t)cols + 255ull) / 256ull * 56ull;
     }
     const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
     return (uint64_t)cols * (uint64_t)elem;
@@ -304,6 +337,18 @@ static float moe_raw_tensor_dot_row(
     const uint8_t* row_ptr = raw.base + (uint64_t)row * row_bytes;
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
         return moe_dot_gguf_q8_0_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_1) {
+        return moe_dot_gguf_q8_1_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0) {
+        return moe_dot_gguf_q4_0_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_1) {
+        return moe_dot_gguf_q4_1_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_0) {
+        return moe_dot_gguf_q5_0_row(row_ptr, hidden, hidden_count);
     }
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
         return moe_dot_gguf_q5_1_row(row_ptr, hidden, hidden_count);
@@ -329,11 +374,33 @@ static float moe_raw_tensor_dot_row(
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS) {
         return moe_dot_gguf_iq2_xxs_row(row_ptr, hidden, hidden_count);
     }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XS) {
+        return moe_dot_gguf_iq2_xs_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_S) {
+        return moe_dot_gguf_iq2_s_row(row_ptr, hidden, hidden_count);
+    }
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS) {
         return moe_dot_gguf_iq3_xxs_row(row_ptr, hidden, hidden_count);
     }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_S) {
+        return moe_dot_gguf_iq3_s_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_NL) {
+        return moe_dot_gguf_iq4_nl_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_XS) {
+        return moe_dot_gguf_iq4_xs_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_S) {
+        return moe_dot_gguf_iq1_s_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_M) {
+        return moe_dot_gguf_iq1_m_row(row_ptr, hidden, hidden_count);
+    }
     if (raw.weight_format != moe_WEIGHT_ENCODING_UNKNOWN &&
         raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP16 &&
+        raw.weight_format != moe_WEIGHT_ENCODING_RAW_BF16 &&
         raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP32) {
         return 0.0f;
     }
@@ -382,6 +449,94 @@ static int moe_raw_tensor_copy_row_f32(
         }
         return 1;
     }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_1) {
+        const uint32_t block_cols = 32u;
+        const uint32_t block_bytes = 36u;
+        uint32_t dst = 0;
+        const uint8_t* block = row_ptr;
+        while (dst < out_count) {
+            uint16_t d16 = 0;
+            std::memcpy(&d16, block, sizeof(d16));
+            const float d = moe_raw_fp16_to_f32(d16);
+            const int8_t* q = reinterpret_cast<const int8_t*>(block + 4u);
+            const uint32_t limit = std::min<uint32_t>(block_cols, out_count - dst);
+            for (uint32_t i = 0; i < limit; ++i) {
+                out[dst + i] = d * (float)q[i];
+            }
+            dst += limit;
+            block += block_bytes;
+        }
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0) {
+        const uint32_t block_cols = 32u;
+        const uint32_t block_bytes = 18u;
+        uint32_t dst = 0;
+        const uint8_t* block = row_ptr;
+        while (dst < out_count) {
+            uint16_t d16 = 0;
+            std::memcpy(&d16, block, sizeof(d16));
+            const float d = moe_raw_fp16_to_f32(d16);
+            const uint8_t* qs = block + 2u;
+            const uint32_t limit = std::min<uint32_t>(block_cols, out_count - dst);
+            for (uint32_t i = 0; i < limit; ++i) {
+                const uint8_t byte = qs[i & 15u];
+                const uint8_t q = (i < 16u) ? (byte & 0x0fu) : (byte >> 4);
+                out[dst + i] = d * (float)((int)q - 8);
+            }
+            dst += limit;
+            block += block_bytes;
+        }
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_1) {
+        const uint32_t block_cols = 32u;
+        const uint32_t block_bytes = 20u;
+        uint32_t dst = 0;
+        const uint8_t* block = row_ptr;
+        while (dst < out_count) {
+            uint16_t d16 = 0;
+            uint16_t m16 = 0;
+            std::memcpy(&d16, block, sizeof(d16));
+            std::memcpy(&m16, block + 2u, sizeof(m16));
+            const float d = moe_raw_fp16_to_f32(d16);
+            const float m = moe_raw_fp16_to_f32(m16);
+            const uint8_t* qs = block + 4u;
+            const uint32_t limit = std::min<uint32_t>(block_cols, out_count - dst);
+            for (uint32_t i = 0; i < limit; ++i) {
+                const uint8_t byte = qs[i & 15u];
+                const uint8_t q = (i < 16u) ? (byte & 0x0fu) : (byte >> 4);
+                out[dst + i] = d * (float)q + m;
+            }
+            dst += limit;
+            block += block_bytes;
+        }
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_0) {
+        const uint32_t block_cols = 32u;
+        const uint32_t block_bytes = 22u;
+        uint32_t dst = 0;
+        const uint8_t* block = row_ptr;
+        while (dst < out_count) {
+            uint16_t d16 = 0;
+            uint32_t qh = 0;
+            std::memcpy(&d16, block, sizeof(d16));
+            std::memcpy(&qh, block + 2u, sizeof(qh));
+            const float d = moe_raw_fp16_to_f32(d16);
+            const uint8_t* qs = block + 6u;
+            const uint32_t limit = std::min<uint32_t>(block_cols, out_count - dst);
+            for (uint32_t i = 0; i < limit; ++i) {
+                const uint8_t byte = qs[i & 15u];
+                const uint32_t low = (i < 16u) ? (byte & 0x0fu) : (byte >> 4);
+                const uint32_t high = (qh >> i) & 1u;
+                out[dst + i] = d * (float)((int)(low | (high << 4u)) - 16);
+            }
+            dst += limit;
+            block += block_bytes;
+        }
+        return 1;
+    }
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
         const uint32_t block_cols = 32u;
         const uint32_t block_bytes = 24u;
@@ -399,8 +554,8 @@ static int moe_raw_tensor_copy_row_f32(
             const uint8_t* qs = block + 8u;
             const uint32_t limit = std::min<uint32_t>(block_cols, out_count - dst);
             for (uint32_t i = 0; i < limit; ++i) {
-                const uint8_t byte = qs[i >> 1];
-                const uint32_t low = (i & 1u) ? (byte >> 4) : (byte & 0x0fu);
+                const uint8_t byte = qs[i & 15u];
+                const uint32_t low = (i < 16u) ? (byte & 0x0fu) : (byte >> 4);
                 const uint32_t high = (qh >> i) & 1u;
                 out[dst + i] = d * (float)(low | (high << 4u)) + m;
             }
@@ -450,12 +605,41 @@ static int moe_raw_tensor_copy_row_f32(
         moe_dequant_gguf_iq2_xxs_row(row_ptr, out, out_count);
         return 1;
     }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XS) {
+        moe_dequant_gguf_iq2_xs_row(row_ptr, out, out_count);
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_S) {
+        moe_dequant_gguf_iq2_s_row(row_ptr, out, out_count);
+        return 1;
+    }
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS) {
         moe_dequant_gguf_iq3_xxs_row(row_ptr, out, out_count);
         return 1;
     }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_S) {
+        moe_dequant_gguf_iq3_s_row(row_ptr, out, out_count);
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_NL) {
+        moe_dequant_gguf_iq4_nl_row(row_ptr, out, out_count);
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_XS) {
+        moe_dequant_gguf_iq4_xs_row(row_ptr, out, out_count);
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_S) {
+        moe_dequant_gguf_iq1_s_row(row_ptr, out, out_count);
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_M) {
+        moe_dequant_gguf_iq1_m_row(row_ptr, out, out_count);
+        return 1;
+    }
     if (raw.weight_format != moe_WEIGHT_ENCODING_UNKNOWN &&
         raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP16 &&
+        raw.weight_format != moe_WEIGHT_ENCODING_RAW_BF16 &&
         raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP32) {
         return 0;
     }

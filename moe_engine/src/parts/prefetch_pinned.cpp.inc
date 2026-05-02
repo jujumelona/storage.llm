@@ -74,15 +74,77 @@ static int prefetch_tensor_file_to_pinned(
         return 0;
     }
     if (total_bytes > engine->staging_slots[slot_index].size) {
-        // BUGFIX: Log warning for oversized tensor that will silently never prefetch
+        // BUGFIX 문제3: Dynamic slot reallocation for oversized tensors ★★★
+        // Problem: Oversized tensors silently fail forever, causing blocking sync loads
+        // Solution: Attempt dynamic reallocation if tensor exceeds slot size
         engine->io_atomic.staging_slot_contention.fetch_add(1, std::memory_order_relaxed);
-        static std::atomic<uint32_t> s_oversize_warn_count{0};
-        if (s_oversize_warn_count.fetch_add(1, std::memory_order_relaxed) < 5) {
-            fprintf(stderr, "[storageLLM WARNING] tensor %llu bytes exceeds slot size %llu, skipping prefetch\n",
+
+        static std::atomic<uint64_t> s_last_warn_time_ms{0};
+        static std::atomic<uint32_t> s_realloc_attempt_count{0};
+        const uint64_t now_ms = moe_profile_now_us() / 1000;
+        const uint64_t last_warn = s_last_warn_time_ms.load(std::memory_order_relaxed);
+
+        // Check if we should attempt reallocation
+        const uint32_t realloc_attempts = s_realloc_attempt_count.load(std::memory_order_relaxed);
+        const bool should_try_realloc = (realloc_attempts < 3) &&
+                                        (total_bytes <= engine->staging_size / 2);
+
+        if (should_try_realloc) {
+            // Attempt to trigger slot reallocation
+            s_realloc_attempt_count.fetch_add(1, std::memory_order_relaxed);
+
+            // Update max_tensor_stream_bytes if this tensor is larger
+            uint64_t current_max = engine->max_tensor_stream_bytes;
+            while (total_bytes > current_max) {
+                if (engine->max_tensor_stream_bytes.compare_exchange_weak(
+                        current_max, total_bytes,
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    break;
+                }
+            }
+
+            fprintf(stderr,
+                "[storageLLM WARNING] Tensor %llu bytes exceeds slot size %llu\n"
+                "  Attempting dynamic slot reallocation (attempt %u/3)...\n"
+                "  This will pause prefetch for ~5 seconds.\n",
                 (unsigned long long)total_bytes,
-                (unsigned long long)engine->staging_slots[slot_index].size);
+                (unsigned long long)engine->staging_slots[slot_index].size,
+                realloc_attempts + 1);
+
+            // Trigger slot reconfiguration
+            configure_staging_slots(engine);
+
+            // Check if reallocation succeeded
+            if (slot_index < engine->staging_slots.size() &&
+                total_bytes <= engine->staging_slots[slot_index].size) {
+                fprintf(stderr,
+                    "[storageLLM INFO] Slot reallocation succeeded. New slot size: %llu bytes\n",
+                    (unsigned long long)engine->staging_slots[slot_index].size);
+                // Retry the prefetch with new slot size - fall through
+            } else {
+                fprintf(stderr,
+                    "[storageLLM ERROR] Slot reallocation failed. Tensor still too large.\n"
+                    "  Increase staging_size to at least %llu bytes.\n",
+                    (unsigned long long)(total_bytes * 4));
+                return 0;
+            }
+        } else {
+            // Already tried reallocation 3 times or tensor too large
+            if (now_ms - last_warn > 1000) {
+                if (s_last_warn_time_ms.compare_exchange_weak(last_warn, now_ms, std::memory_order_relaxed)) {
+                    fprintf(stderr,
+                        "[storageLLM ERROR] Tensor %llu bytes exceeds slot size %llu\n"
+                        "  Dynamic reallocation %s\n"
+                        "  This tensor will use blocking sync load (severe performance impact).\n"
+                        "  Increase staging_size to at least %llu bytes and restart.\n",
+                        (unsigned long long)total_bytes,
+                        (unsigned long long)engine->staging_slots[slot_index].size,
+                        should_try_realloc ? "in progress" : "failed after 3 attempts",
+                        (unsigned long long)(total_bytes * 4));
+                }
+            }
+            return 0;
         }
-        return 0;
     }
     mmap_context_t* shard = get_or_map_tensor_shard(engine, rec);
     if (!shard) return 0;
@@ -95,7 +157,7 @@ static int prefetch_tensor_file_to_pinned(
     };
 
     uint64_t staging_offset = 0;
-    
+
     // Check if we can use IORing/io_uring registered buffer I/O
     if (engine->ring_adapter.initialized) {
         int submits = 0;
@@ -115,13 +177,13 @@ static int prefetch_tensor_file_to_pinned(
 #else
             void* file_handle = nullptr;
 #endif
-            if (engine->ring_adapter.prep_read_fixed(shard->fd, file_handle, 
+            if (engine->ring_adapter.prep_read_fixed(shard->fd, file_handle,
                 engine->staging_slots[slot_index].buf + staging_offset, length, offset, slot_index, (void*)1, staging_offset)) {
                 submits++;
             }
             staging_offset += length;
         }
-        
+
         if (submits > 0) {
             engine->ring_adapter.submit();
             int completions = 0;
@@ -209,7 +271,7 @@ static int prefetch_tensor_file_to_pinned(
         // Fallback to thread-local ifstream cache
         const std::string ifstream_path = rec.resolved_path_index < engine->tensor_paths.size()
             ? engine->tensor_paths[rec.resolved_path_index] : std::string();
-        
+
         struct cached_stream_t {
             moe_pc_engine* engine;
             std::string path;

@@ -154,5 +154,6 @@ enum {
     moe_DEVICE_POOL_FIXED = 0,
     moe_DEVICE_POOL_ACTIVATION = 1,
     moe_DEVICE_POOL_EXPERT = 2,
-    moe_DEVICE_POOL_STREAM = 3
+    moe_DEVICE_POOL_STREAM = 3,
+    moe_DEVICE_POOL_KV_CACHE = 4  // BUGFIX 문제4: Add KV cache pool ★★★
 };

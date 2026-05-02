@@ -61,6 +61,31 @@ static float moe_dot_raw_fp16_row(const uint8_t* packed, const float* x, uint32_
         acc += moe_raw_fp16_to_f32(fp16[col]) * x[col];
     }
     return acc;
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    // BUGFIX 문제9: ARM NEON SIMD for Apple Silicon / ARM64 ★★★
+    // Problem: Only AVX-512/AVX2 paths existed, ARM fell back to scalar loop
+    // Impact: 8x slower on Apple Silicon M2/M3 despite Metal zero-copy
+    // Solution: Add NEON intrinsics for FP16 dot product
+    #include <arm_neon.h>
+    const uint16_t* fp16 = reinterpret_cast<const uint16_t*>(packed);
+    float32x4_t acc0 = vdupq_n_f32(0.f);
+    float32x4_t acc1 = vdupq_n_f32(0.f);
+    uint32_t col = 0;
+    for (; col + 7u < cols; col += 8u) {
+        float16x8_t h = vld1q_f16(reinterpret_cast<const __fp16*>(fp16 + col));
+        float32x4_t lo = vcvt_f32_f16(vget_low_f16(h));
+        float32x4_t hi = vcvt_f32_f16(vget_high_f16(h));
+        float32x4_t x0 = vld1q_f32(x + col);
+        float32x4_t x1 = vld1q_f32(x + col + 4u);
+        acc0 = vfmaq_f32(acc0, lo, x0);
+        acc1 = vfmaq_f32(acc1, hi, x1);
+    }
+    acc0 = vaddq_f32(acc0, acc1);
+    float acc = vaddvq_f32(acc0);
+    for (; col < cols; ++col) {
+        acc += moe_raw_fp16_to_f32(fp16[col]) * x[col];
+    }
+    return acc;
 #else
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     uint32_t col = 0;
@@ -143,6 +168,30 @@ static float moe_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32_
         acc += fp32[col] * x[col];
     }
     return acc;
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    // BUGFIX 문제9: ARM NEON SIMD for Apple Silicon / ARM64 ★★★
+    // Problem: Only AVX-512/AVX2 paths existed, ARM fell back to scalar loop
+    // Impact: 8x slower on Apple Silicon for FP32 operations
+    // Solution: Add NEON intrinsics for FP32 dot product
+    #include <arm_neon.h>
+    const float* fp32 = reinterpret_cast<const float*>(packed);
+    float32x4_t acc0 = vdupq_n_f32(0.f);
+    float32x4_t acc1 = vdupq_n_f32(0.f);
+    uint32_t col = 0;
+    for (; col + 7u < cols; col += 8u) {
+        float32x4_t f0 = vld1q_f32(fp32 + col);
+        float32x4_t f1 = vld1q_f32(fp32 + col + 4u);
+        float32x4_t x0 = vld1q_f32(x + col);
+        float32x4_t x1 = vld1q_f32(x + col + 4u);
+        acc0 = vfmaq_f32(acc0, f0, x0);
+        acc1 = vfmaq_f32(acc1, f1, x1);
+    }
+    acc0 = vaddq_f32(acc0, acc1);
+    float acc = vaddvq_f32(acc0);
+    for (; col < cols; ++col) {
+        acc += fp32[col] * x[col];
+    }
+    return acc;
 #else
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     uint32_t col = 0;
@@ -165,6 +214,26 @@ static float moe_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32_
     }
     return acc;
 #endif
+}
+
+static inline float moe_tensor_bf16_to_f32(uint16_t v) {
+    const uint32_t bits = (uint32_t)v << 16u;
+    float out = 0.0f;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static float moe_dot_raw_bf16_row(const uint8_t* packed, const float* x, uint32_t cols) {
+    if (!packed || !x) {
+        return 0.0f;
+    }
+    float acc = 0.0f;
+    for (uint32_t i = 0; i < cols; ++i) {
+        uint16_t v = 0;
+        std::memcpy(&v, packed + (uint64_t)i * 2ull, sizeof(v));
+        acc += moe_tensor_bf16_to_f32(v) * x[i];
+    }
+    return acc;
 }
 
 static uint32_t moe_packed_lsb_code_at(const uint8_t* packed, uint32_t element_index, uint32_t bits) {
@@ -279,6 +348,191 @@ static float moe_dot_gguf_q8_0_row(
         packed += block_bytes;
     }
     return acc;
+}
+
+static float moe_dot_gguf_q8_1_row(
+    const uint8_t* packed,
+    const float* x,
+    uint32_t cols
+) {
+    if (!packed || !x) {
+        return 0.0f;
+    }
+    float acc = 0.0f;
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 36u;
+    for (uint32_t start = 0; start < cols; start += block_cols) {
+        uint16_t d16 = 0;
+        std::memcpy(&d16, packed, sizeof(d16));
+        const float d = moe_raw_fp16_to_f32(d16);
+        const int8_t* q = reinterpret_cast<const int8_t*>(packed + 4u);
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
+        for (uint32_t i = 0; i < limit; ++i) {
+            acc += d * (float)q[i] * x[start + i];
+        }
+        packed += block_bytes;
+    }
+    return acc;
+}
+
+static float moe_dot_gguf_q4_0_row(
+    const uint8_t* packed,
+    const float* x,
+    uint32_t cols
+) {
+    if (!packed || !x) {
+        return 0.0f;
+    }
+    float acc = 0.0f;
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 18u;
+    for (uint32_t start = 0; start < cols; start += block_cols) {
+        uint16_t d16 = 0;
+        std::memcpy(&d16, packed, sizeof(d16));
+        const float d = moe_raw_fp16_to_f32(d16);
+        const uint8_t* qs = packed + 2u;
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
+        for (uint32_t i = 0; i < limit; ++i) {
+            const uint8_t byte = qs[i & 15u];
+            const uint8_t q = (i < 16u) ? (byte & 0x0fu) : (byte >> 4);
+            acc += d * ((float)((int)q - 8)) * x[start + i];
+        }
+        packed += block_bytes;
+    }
+    return acc;
+}
+
+static float moe_dot_gguf_q4_1_row(
+    const uint8_t* packed,
+    const float* x,
+    uint32_t cols
+) {
+    if (!packed || !x) {
+        return 0.0f;
+    }
+    float acc = 0.0f;
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 20u;
+    for (uint32_t start = 0; start < cols; start += block_cols) {
+        uint16_t d16 = 0;
+        uint16_t m16 = 0;
+        std::memcpy(&d16, packed, sizeof(d16));
+        std::memcpy(&m16, packed + 2u, sizeof(m16));
+        const float d = moe_raw_fp16_to_f32(d16);
+        const float m = moe_raw_fp16_to_f32(m16);
+        const uint8_t* qs = packed + 4u;
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
+        for (uint32_t i = 0; i < limit; ++i) {
+            const uint8_t byte = qs[i & 15u];
+            const uint8_t q = (i < 16u) ? (byte & 0x0fu) : (byte >> 4);
+            acc += (d * (float)q + m) * x[start + i];
+        }
+        packed += block_bytes;
+    }
+    return acc;
+}
+
+static float moe_dot_gguf_q5_0_row(
+    const uint8_t* packed,
+    const float* x,
+    uint32_t cols
+) {
+    if (!packed || !x) {
+        return 0.0f;
+    }
+    float acc = 0.0f;
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 22u;
+    for (uint32_t start = 0; start < cols; start += block_cols) {
+        uint16_t d16 = 0;
+        uint32_t qh = 0;
+        std::memcpy(&d16, packed, sizeof(d16));
+        std::memcpy(&qh, packed + 2u, sizeof(qh));
+        const float d = moe_raw_fp16_to_f32(d16);
+        const uint8_t* qs = packed + 6u;
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
+        for (uint32_t i = 0; i < limit; ++i) {
+            const uint8_t byte = qs[i & 15u];
+            const uint32_t low = (i < 16u) ? (byte & 0x0fu) : (byte >> 4);
+            const uint32_t high = (qh >> i) & 1u;
+            acc += d * ((float)((int)(low | (high << 4u)) - 16)) * x[start + i];
+        }
+        packed += block_bytes;
+    }
+    return acc;
+}
+
+static const int8_t* moe_iq4nl_value_table() {
+    static constexpr int8_t kValues[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+           1,   13,  25,  38,  53,  69,  89, 113,
+    };
+    return kValues;
+}
+
+static float moe_gguf_iq4_nl_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    float acc = 0.0f;
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 18u;
+    const int8_t* values = moe_iq4nl_value_table();
+    for (uint32_t start = 0; start < cols; start += block_cols) {
+        const float d = moe_load_f16le(packed);
+        const uint8_t* qs = packed + 2u;
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
+        for (uint32_t i = 0; i < limit; ++i) {
+            const uint8_t byte = qs[i & 15u];
+            const uint8_t code = (i < 16u) ? (byte & 0x0fu) : (byte >> 4);
+            const float v = d * (float)values[code];
+            moe_accum_or_store(v, x, out, start + i, cols, &acc);
+        }
+        packed += block_bytes;
+    }
+    return acc;
+}
+
+static float moe_dot_gguf_iq4_nl_row(const uint8_t* packed, const float* x, uint32_t cols) {
+    return moe_gguf_iq4_nl_row_impl(packed, x, nullptr, cols);
+}
+
+static void moe_dequant_gguf_iq4_nl_row(const uint8_t* packed, float* out, uint32_t cols) {
+    (void)moe_gguf_iq4_nl_row_impl(packed, nullptr, out, cols);
+}
+
+static float moe_gguf_iq4_xs_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    float acc = 0.0f;
+    const uint32_t block_cols = 256u;
+    const uint32_t block_bytes = 136u;
+    const int8_t* values = moe_iq4nl_value_table();
+    for (uint32_t base = 0; base < cols; base += block_cols) {
+        const float d = moe_load_f16le(packed);
+        const uint16_t scales_h = moe_load_u16le(packed + 2u);
+        const uint8_t* scales_l = packed + 4u;
+        const uint8_t* qs = packed + 8u;
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - base);
+        for (uint32_t ib = 0; ib < 8u && ib * 32u < limit; ++ib) {
+            const uint32_t scale_l = (scales_l[ib / 2u] >> (4u * (ib & 1u))) & 0x0fu;
+            const uint32_t scale_h = (scales_h >> (2u * ib)) & 0x03u;
+            const float dl = d * (float)((int)(scale_l | (scale_h << 4u)) - 32);
+            const uint8_t* block_qs = qs + ib * 16u;
+            const uint32_t local_limit = std::min<uint32_t>(32u, limit - ib * 32u);
+            for (uint32_t j = 0; j < local_limit; ++j) {
+                const uint8_t byte = block_qs[j & 15u];
+                const uint8_t code = (j < 16u) ? (byte & 0x0fu) : (byte >> 4);
+                const float v = dl * (float)values[code];
+                moe_accum_or_store(v, x, out, base + ib * 32u + j, cols, &acc);
+            }
+        }
+        packed += block_bytes;
+    }
+    return acc;
+}
+
+static float moe_dot_gguf_iq4_xs_row(const uint8_t* packed, const float* x, uint32_t cols) {
+    return moe_gguf_iq4_xs_row_impl(packed, x, nullptr, cols);
+}
+
+static void moe_dequant_gguf_iq4_xs_row(const uint8_t* packed, float* out, uint32_t cols) {
+    (void)moe_gguf_iq4_xs_row_impl(packed, nullptr, out, cols);
 }
 static float moe_e8m0_to_f32_half(uint8_t v) {
     uint32_t bits = v ? ((uint32_t)v << 23u) : 0x00400000u;
@@ -405,55 +659,13 @@ static float moe_dot_gguf_q5_1_row(
         const float m = moe_raw_fp16_to_f32(m16);
         const uint8_t* qs = packed + 8u;
         const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
-#if defined(__AVX2__)
-        __m256 vacc = _mm256_setzero_ps();
-        uint32_t i = 0;
-        for (; i + 7u < limit; i += 8u) {
-            const uint8_t b0 = qs[(i + 0u) >> 1];
-            const uint8_t b1 = qs[(i + 1u) >> 1];
-            const uint8_t b2 = qs[(i + 2u) >> 1];
-            const uint8_t b3 = qs[(i + 3u) >> 1];
-            const uint8_t b4 = qs[(i + 4u) >> 1];
-            const uint8_t b5 = qs[(i + 5u) >> 1];
-            const uint8_t b6 = qs[(i + 6u) >> 1];
-            const uint8_t b7 = qs[(i + 7u) >> 1];
-            const uint32_t q0 = (((i + 0u) & 1u) ? (b0 >> 4) : (b0 & 0x0fu)) | (((qh >> (i + 0u)) & 1u) << 4);
-            const uint32_t q1 = (((i + 1u) & 1u) ? (b1 >> 4) : (b1 & 0x0fu)) | (((qh >> (i + 1u)) & 1u) << 4);
-            const uint32_t q2 = (((i + 2u) & 1u) ? (b2 >> 4) : (b2 & 0x0fu)) | (((qh >> (i + 2u)) & 1u) << 4);
-            const uint32_t q3 = (((i + 3u) & 1u) ? (b3 >> 4) : (b3 & 0x0fu)) | (((qh >> (i + 3u)) & 1u) << 4);
-            const uint32_t q4 = (((i + 4u) & 1u) ? (b4 >> 4) : (b4 & 0x0fu)) | (((qh >> (i + 4u)) & 1u) << 4);
-            const uint32_t q5 = (((i + 5u) & 1u) ? (b5 >> 4) : (b5 & 0x0fu)) | (((qh >> (i + 5u)) & 1u) << 4);
-            const uint32_t q6 = (((i + 6u) & 1u) ? (b6 >> 4) : (b6 & 0x0fu)) | (((qh >> (i + 6u)) & 1u) << 4);
-            const uint32_t q7 = (((i + 7u) & 1u) ? (b7 >> 4) : (b7 & 0x0fu)) | (((qh >> (i + 7u)) & 1u) << 4);
-            const __m256 w = _mm256_set_ps(
-                d * (float)q7 + m, d * (float)q6 + m,
-                d * (float)q5 + m, d * (float)q4 + m,
-                d * (float)q3 + m, d * (float)q2 + m,
-                d * (float)q1 + m, d * (float)q0 + m);
-            vacc = moe_madd_ps(w, _mm256_loadu_ps(x + start + i), vacc);
-        }
-        acc += moe_dot_hsum256_ps(vacc);
-        for (; i < limit; ++i) {
-            const uint8_t byte = qs[i >> 1];
-            const uint32_t low = (i & 1u) ? (byte >> 4) : (byte & 0x0fu);
-            const uint32_t high = (qh >> i) & 1u;
-            const float w = d * (float)(low | (high << 4u)) + m;
-            acc += w * x[start + i];
-        }
-#else
         for (uint32_t i = 0; i < limit; ++i) {
-            // BUGFIX 218: Fix incorrect index masking for q5_1 block access
-            // Problem: i & 15u masks to 0-15, but q5_1 blocks have 32 elements (16 bytes)
-            //          This causes reading wrong byte for indices 16-31
-            // Solution: Use i >> 1 for byte offset, i & 1 for nibble selection
-            // Impact: Fixes data corruption in q5_1 quantized weights
-            const uint8_t byte = qs[i >> 1];
-            const uint32_t low = (i & 1u) ? (byte >> 4) : (byte & 0x0fu);
+            const uint8_t byte = qs[i & 15u];
+            const uint32_t low = (i < 16u) ? (byte & 0x0fu) : (byte >> 4);
             const uint32_t high = (qh >> i) & 1u;
             const float w = d * (float)(low | (high << 4u)) + m;
             acc += w * x[start + i];
         }
-#endif
         packed += block_bytes;
     }
     return acc;
@@ -678,6 +890,167 @@ static float moe_gguf_iq3_xxs_row_impl(const uint8_t* packed, const float* x, fl
     return acc;
 }
 
+static float moe_gguf_iq2_xs_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    float acc = 0.0f;
+    for (uint32_t base = 0; base < cols; base += 256u, packed += 74u) {
+        const float d = moe_load_f16le(packed);
+        const uint8_t* qs = packed + 2u;
+        const uint8_t* scales = packed + 66u;
+        for (uint32_t ib32 = 0; ib32 < 8u; ++ib32) {
+            const float db0 = d * (0.5f + (float)(scales[ib32] & 0x0fu)) * 0.25f;
+            const float db1 = d * (0.5f + (float)(scales[ib32] >> 4)) * 0.25f;
+            for (uint32_t l = 0; l < 4u; ++l) {
+                const uint16_t qv = moe_load_u16le(qs + (4u * ib32 + l) * 2u);
+                const uint8_t* grid = reinterpret_cast<const uint8_t*>(&moe_iq2xs_grid[qv & 511u]);
+                const uint8_t signs = moe_iq2xs_signs[qv >> 9];
+                const float db = (l < 2u) ? db0 : db1;
+                for (uint32_t j = 0; j < 8u; ++j) {
+                    const float sign = (signs & moe_iq2xs_mask[j]) ? -1.0f : 1.0f;
+                    moe_accum_or_store(db * (float)grid[j] * sign, x, out, base + ib32 * 32u + l * 8u + j, cols, &acc);
+                }
+            }
+        }
+    }
+    return acc;
+}
+
+static float moe_gguf_iq2_s_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    float acc = 0.0f;
+    for (uint32_t base = 0; base < cols; base += 256u, packed += 82u) {
+        const float d = moe_load_f16le(packed);
+        const uint8_t* qs = packed + 2u;
+        const uint8_t* qh = packed + 66u;
+        const uint8_t* scales = packed + 74u;
+        const uint8_t* signs = qs + 32u;
+        for (uint32_t ib32 = 0; ib32 < 8u; ++ib32) {
+            const float db0 = d * (0.5f + (float)(scales[ib32] & 0x0fu)) * 0.25f;
+            const float db1 = d * (0.5f + (float)(scales[ib32] >> 4)) * 0.25f;
+            for (uint32_t l = 0; l < 4u; ++l) {
+                const uint32_t grid_index = (uint32_t)qs[l] | (((uint32_t)qh[ib32] << (8u - 2u * l)) & 0x300u);
+                const uint8_t* grid = reinterpret_cast<const uint8_t*>(&moe_iq2s_grid[grid_index]);
+                const float db = (l < 2u) ? db0 : db1;
+                for (uint32_t j = 0; j < 8u; ++j) {
+                    const float sign = (signs[l] & moe_iq2xs_mask[j]) ? -1.0f : 1.0f;
+                    moe_accum_or_store(db * (float)grid[j] * sign, x, out, base + ib32 * 32u + l * 8u + j, cols, &acc);
+                }
+            }
+            qs += 4u;
+            signs += 4u;
+        }
+    }
+    return acc;
+}
+
+static float moe_gguf_iq3_s_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    float acc = 0.0f;
+    for (uint32_t base = 0; base < cols; base += 256u, packed += 110u) {
+        const float d = moe_load_f16le(packed);
+        const uint8_t* qs = packed + 2u;
+        const uint8_t* qh = packed + 66u;
+        const uint8_t* signs = packed + 74u;
+        const uint8_t* scales = packed + 106u;
+        for (uint32_t ib32 = 0; ib32 < 8u; ib32 += 2u) {
+            const float db1 = d * (float)(1u + 2u * (uint32_t)(scales[ib32 / 2u] & 0x0fu));
+            const float db2 = d * (float)(1u + 2u * (uint32_t)(scales[ib32 / 2u] >> 4));
+            for (uint32_t l = 0; l < 4u; ++l) {
+                const uint8_t* grid1 = reinterpret_cast<const uint8_t*>(&moe_iq3s_grid[(uint32_t)qs[2u * l + 0u] | (((uint32_t)qh[0] << (8u - 2u * l)) & 256u)]);
+                const uint8_t* grid2 = reinterpret_cast<const uint8_t*>(&moe_iq3s_grid[(uint32_t)qs[2u * l + 1u] | (((uint32_t)qh[0] << (7u - 2u * l)) & 256u)]);
+                for (uint32_t j = 0; j < 4u; ++j) {
+                    const float sign1 = (signs[l] & moe_iq2xs_mask[j]) ? -1.0f : 1.0f;
+                    const float sign2 = (signs[l] & moe_iq2xs_mask[j + 4u]) ? -1.0f : 1.0f;
+                    moe_accum_or_store(db1 * (float)grid1[j] * sign1, x, out, base + ib32 * 32u + l * 8u + j, cols, &acc);
+                    moe_accum_or_store(db1 * (float)grid2[j] * sign2, x, out, base + ib32 * 32u + l * 8u + 4u + j, cols, &acc);
+                }
+            }
+            qs += 8u;
+            signs += 4u;
+            for (uint32_t l = 0; l < 4u; ++l) {
+                const uint8_t* grid1 = reinterpret_cast<const uint8_t*>(&moe_iq3s_grid[(uint32_t)qs[2u * l + 0u] | (((uint32_t)qh[1] << (8u - 2u * l)) & 256u)]);
+                const uint8_t* grid2 = reinterpret_cast<const uint8_t*>(&moe_iq3s_grid[(uint32_t)qs[2u * l + 1u] | (((uint32_t)qh[1] << (7u - 2u * l)) & 256u)]);
+                for (uint32_t j = 0; j < 4u; ++j) {
+                    const float sign1 = (signs[l] & moe_iq2xs_mask[j]) ? -1.0f : 1.0f;
+                    const float sign2 = (signs[l] & moe_iq2xs_mask[j + 4u]) ? -1.0f : 1.0f;
+                    moe_accum_or_store(db2 * (float)grid1[j] * sign1, x, out, base + (ib32 + 1u) * 32u + l * 8u + j, cols, &acc);
+                    moe_accum_or_store(db2 * (float)grid2[j] * sign2, x, out, base + (ib32 + 1u) * 32u + l * 8u + 4u + j, cols, &acc);
+                }
+            }
+            qs += 8u;
+            signs += 4u;
+            qh += 2u;
+        }
+    }
+    return acc;
+}
+
+static float moe_gguf_iq1_s_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    float acc = 0.0f;
+    constexpr float delta_value = 0.125f;
+    for (uint32_t base = 0; base < cols; base += 256u, packed += 50u) {
+        const float d = moe_load_f16le(packed);
+        const uint8_t* qs = packed + 2u;
+        const uint8_t* qh = packed + 34u;
+        for (uint32_t ib = 0; ib < 8u; ++ib) {
+            const uint16_t h = moe_load_u16le(qh + ib * 2u);
+            const float dl = d * (float)(2u * ((h >> 12) & 7u) + 1u);
+            const float delta = (h & 0x8000u) ? -delta_value : delta_value;
+            for (uint32_t l = 0; l < 4u; ++l) {
+                const uint32_t idx = (uint32_t)qs[l] | (((uint32_t)(h >> (3u * l)) & 7u) << 8u);
+                const int8_t* grid = reinterpret_cast<const int8_t*>(&moe_iq1s_grid[idx]);
+                for (uint32_t j = 0; j < 8u; ++j) {
+                    moe_accum_or_store(dl * ((float)grid[j] + delta), x, out, base + ib * 32u + l * 8u + j, cols, &acc);
+                }
+            }
+            qs += 4u;
+        }
+    }
+    return acc;
+}
+
+static float moe_gguf_iq1_m_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    float acc = 0.0f;
+    constexpr float delta_value = 0.125f;
+    for (uint32_t base = 0; base < cols; base += 256u, packed += 56u) {
+        const uint8_t* qs = packed;
+        const uint8_t* qh = packed + 32u;
+        const uint8_t* scales = packed + 48u;
+        const uint16_t scale_u16 =
+            (uint16_t)((moe_load_u16le(scales + 0u) >> 12) |
+                       ((moe_load_u16le(scales + 2u) >> 8) & 0x00f0u) |
+                       ((moe_load_u16le(scales + 4u) >> 4) & 0x0f00u) |
+                       (moe_load_u16le(scales + 6u) & 0xf000u));
+        const float d = moe_raw_fp16_to_f32(scale_u16);
+        for (uint32_t ib = 0; ib < 8u; ++ib) {
+            const uint16_t s = moe_load_u16le(scales + (ib / 2u) * 2u);
+            const float dl1 = d * (float)(2u * ((s >> (6u * (ib & 1u) + 0u)) & 0x7u) + 1u);
+            const float dl2 = d * (float)(2u * ((s >> (6u * (ib & 1u) + 3u)) & 0x7u) + 1u);
+            const uint32_t idx0 = (uint32_t)qs[0] | (((uint32_t)qh[0] << 8u) & 0x700u);
+            const uint32_t idx1 = (uint32_t)qs[1] | (((uint32_t)qh[0] << 4u) & 0x700u);
+            const uint32_t idx2 = (uint32_t)qs[2] | (((uint32_t)qh[1] << 8u) & 0x700u);
+            const uint32_t idx3 = (uint32_t)qs[3] | (((uint32_t)qh[1] << 4u) & 0x700u);
+            const float delta0 = (qh[0] & 0x08u) ? -delta_value : delta_value;
+            const float delta1 = (qh[0] & 0x80u) ? -delta_value : delta_value;
+            const float delta2 = (qh[1] & 0x08u) ? -delta_value : delta_value;
+            const float delta3 = (qh[1] & 0x80u) ? -delta_value : delta_value;
+            const int8_t* grids[4] = {
+                reinterpret_cast<const int8_t*>(&moe_iq1s_grid[idx0]),
+                reinterpret_cast<const int8_t*>(&moe_iq1s_grid[idx1]),
+                reinterpret_cast<const int8_t*>(&moe_iq1s_grid[idx2]),
+                reinterpret_cast<const int8_t*>(&moe_iq1s_grid[idx3])
+            };
+            const float dls[4] = { dl1, dl1, dl2, dl2 };
+            const float deltas[4] = { delta0, delta1, delta2, delta3 };
+            for (uint32_t l = 0; l < 4u; ++l) {
+                for (uint32_t j = 0; j < 8u; ++j) {
+                    moe_accum_or_store(dls[l] * ((float)grids[l][j] + deltas[l]), x, out, base + ib * 32u + l * 8u + j, cols, &acc);
+                }
+            }
+            qs += 4u;
+            qh += 2u;
+        }
+    }
+    return acc;
+}
+
 static float moe_dot_gguf_q2_k_row(const uint8_t* packed, const float* x, uint32_t cols) {
     return moe_gguf_q2_k_row_impl(packed, x, nullptr, cols);
 }
@@ -702,8 +1075,28 @@ static float moe_dot_gguf_iq2_xxs_row(const uint8_t* packed, const float* x, uin
     return moe_gguf_iq2_xxs_row_impl(packed, x, nullptr, cols);
 }
 
+static float moe_dot_gguf_iq2_xs_row(const uint8_t* packed, const float* x, uint32_t cols) {
+    return moe_gguf_iq2_xs_row_impl(packed, x, nullptr, cols);
+}
+
+static float moe_dot_gguf_iq2_s_row(const uint8_t* packed, const float* x, uint32_t cols) {
+    return moe_gguf_iq2_s_row_impl(packed, x, nullptr, cols);
+}
+
 static float moe_dot_gguf_iq3_xxs_row(const uint8_t* packed, const float* x, uint32_t cols) {
     return moe_gguf_iq3_xxs_row_impl(packed, x, nullptr, cols);
+}
+
+static float moe_dot_gguf_iq3_s_row(const uint8_t* packed, const float* x, uint32_t cols) {
+    return moe_gguf_iq3_s_row_impl(packed, x, nullptr, cols);
+}
+
+static float moe_dot_gguf_iq1_s_row(const uint8_t* packed, const float* x, uint32_t cols) {
+    return moe_gguf_iq1_s_row_impl(packed, x, nullptr, cols);
+}
+
+static float moe_dot_gguf_iq1_m_row(const uint8_t* packed, const float* x, uint32_t cols) {
+    return moe_gguf_iq1_m_row_impl(packed, x, nullptr, cols);
 }
 
 static void moe_dequant_gguf_q2_k_row(const uint8_t* packed, float* out, uint32_t cols) {
@@ -730,8 +1123,28 @@ static void moe_dequant_gguf_iq2_xxs_row(const uint8_t* packed, float* out, uint
     (void)moe_gguf_iq2_xxs_row_impl(packed, nullptr, out, cols);
 }
 
+static void moe_dequant_gguf_iq2_xs_row(const uint8_t* packed, float* out, uint32_t cols) {
+    (void)moe_gguf_iq2_xs_row_impl(packed, nullptr, out, cols);
+}
+
+static void moe_dequant_gguf_iq2_s_row(const uint8_t* packed, float* out, uint32_t cols) {
+    (void)moe_gguf_iq2_s_row_impl(packed, nullptr, out, cols);
+}
+
 static void moe_dequant_gguf_iq3_xxs_row(const uint8_t* packed, float* out, uint32_t cols) {
     (void)moe_gguf_iq3_xxs_row_impl(packed, nullptr, out, cols);
+}
+
+static void moe_dequant_gguf_iq3_s_row(const uint8_t* packed, float* out, uint32_t cols) {
+    (void)moe_gguf_iq3_s_row_impl(packed, nullptr, out, cols);
+}
+
+static void moe_dequant_gguf_iq1_s_row(const uint8_t* packed, float* out, uint32_t cols) {
+    (void)moe_gguf_iq1_s_row_impl(packed, nullptr, out, cols);
+}
+
+static void moe_dequant_gguf_iq1_m_row(const uint8_t* packed, float* out, uint32_t cols) {
+    (void)moe_gguf_iq1_m_row_impl(packed, nullptr, out, cols);
 }
 
 static float moe_dot_linear_q8_group(

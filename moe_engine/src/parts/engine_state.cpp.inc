@@ -123,6 +123,8 @@ struct moe_pc_engine {
 
     // Co-activation Speculative Prefetch statistics
     // [layer][expert_n_minus_2][expert_n] -> frequency
+    // BUGFIX 문제9: Add mutex to protect co_activation data structures ★★★ CRITICAL
+    std::shared_mutex co_activation_mutex;
     std::vector<std::unordered_map<int, std::unordered_map<int, float>>> co_activation_stats;
     std::vector<std::vector<int>> last_selected_experts;
     // BUGFIX 701: Sliding window token counters to bound co_activation_stats memory ★★
@@ -144,6 +146,17 @@ struct moe_pc_engine {
     alignas(64) std::atomic<uint64_t> vram_used_bytes{0};
     alignas(64) std::atomic<uint64_t> ram_used_bytes{0};
     alignas(64) std::atomic<uint64_t> db_used_bytes{0};
+
+    // BUGFIX 문제4: Add KV cache VRAM budget tracking ★★★
+    // Problem: VRAM budget shared between experts and KV, no separation
+    // Solution: Split VRAM budget into expert and KV portions
+    // Default: 80% experts, 20% KV (configurable)
+    alignas(64) std::atomic<uint64_t> vram_kv_used_bytes{0};
+    std::atomic<uint64_t> vram_kv_budget_bytes{0};  // Set during init
+
+    // BUGFIX 문제8: Merge map rebuild trigger ★★★
+    std::atomic<bool> merge_map_rebuild_pending{false};
+
     std::atomic<uint32_t> vram_expert_count{0};
     std::atomic<uint32_t> ram_expert_count{0};
     std::atomic<uint32_t> db_expert_count{0};
@@ -164,6 +177,7 @@ struct moe_pc_engine {
     std::atomic<uint64_t> device_activation_count{0};
     std::atomic<uint64_t> device_expert_bytes{0};
     std::atomic<uint64_t> device_stream_bytes{0};
+    std::atomic<uint64_t> device_kv_cache_bytes{0};  // BUGFIX 문제4: KV cache pool counter ★★★
     std::atomic<uint64_t> device_total_bytes{0};
     std::atomic<uint64_t> device_free_bytes{0};
     std::atomic<uint64_t> pending_ram_reservation{0};
