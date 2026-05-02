@@ -32,6 +32,15 @@ bool json_find_member_object(const JsonSlice& slice, const char* key, JsonSlice*
         return false;
     }
     const std::string needle = std::string("\"") + key + "\"";
+
+    // BUGFIX 542: Check needle length doesn't overflow ★
+    // Problem: key can be very long causing string allocation failure
+    // Solution: Check key length before creating needle
+    const size_t key_len = std::strlen(key);
+    if (key_len > 10000) {
+        return false;
+    }
+
     size_t pos = slice.begin;
     while ((pos = slice.text->find(needle, pos)) != std::string::npos && pos < slice.end) {
         const size_t after_key = pos + needle.size();

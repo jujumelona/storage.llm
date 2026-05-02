@@ -19,9 +19,15 @@ int moe_pc_engine_generate_token_ids(
     }
     struct generation_scope_t {
         moe_pc_engine_t* engine = nullptr;
+        std::unique_lock<std::mutex> api_lock;
         int ok = 0;
+        uint64_t id = 0;
+        uint64_t start_us = 0;
         explicit generation_scope_t(moe_pc_engine_t* e) : engine(e) {
             if (!engine) return;
+            api_lock = std::unique_lock<std::mutex>(engine->generation_api_mutex);
+            id = moe_profile_next_generation_id();
+            start_us = moe_profile_now_us();
             engine->generation_started.fetch_add(1, std::memory_order_relaxed);
             engine->generation_active.fetch_add(1, std::memory_order_relaxed);
             engine->generation_token.store(0, std::memory_order_relaxed);
@@ -36,10 +42,30 @@ int moe_pc_engine_generate_token_ids(
             } else {
                 engine->generation_failed.fetch_add(1, std::memory_order_relaxed);
             }
-            engine->generation_active.fetch_sub(1, std::memory_order_relaxed);
+            // BUGFIX 619: Check generation_active > 0 before fetch_sub to prevent underflow ★
+            // Problem: If generation_active is 0, fetch_sub causes underflow
+            // Solution: Only decrement if > 0
+            uint32_t current = engine->generation_active.load(std::memory_order_acquire);
+            while (current > 0) {
+                if (engine->generation_active.compare_exchange_weak(
+                        current, current - 1,
+                        std::memory_order_release,
+                        std::memory_order_acquire)) {
+                    break;
+                }
+            }
             if (engine->generation_active.load(std::memory_order_relaxed) == 0) {
                 engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
             }
+            moe_profile_log(
+                "generation_end",
+                "id=%llu ok=%d active=%u layer=%u phase=%u ms=%.3f",
+                (unsigned long long)id,
+                ok,
+                engine->generation_active.load(std::memory_order_relaxed),
+                engine->generation_layer.load(std::memory_order_relaxed),
+                engine->generation_phase.load(std::memory_order_relaxed),
+                moe_profile_elapsed_ms(start_us));
         }
     } generation_scope(engine);
     moe_forward_status_t forward{};
@@ -137,7 +163,19 @@ int moe_pc_engine_generate_token_ids(
     // Attention remains O(N^2), but weights stay hotter across prompt tokens.
     // Memory is N*hidden_size*4 bytes, about 14.7 MiB for N=512 and hidden=7168.
     const uint32_t prefill_count = input_token_count - 1u;
+    moe_profile_log(
+        "generation_begin",
+        "id=%llu input_tokens=%u prefill=%u max_new=%u hidden=%u layers=%u first_moe=%u last_moe=%u",
+        (unsigned long long)generation_scope.id,
+        input_token_count,
+        prefill_count,
+        max_new_tokens,
+        c->hidden_size,
+        c->num_hidden_layers,
+        c->first_moe_layer,
+        c->last_moe_layer);
     if (prefill_count > 0) {
+        const uint64_t prefill_start_us = moe_profile_now_us();
         engine->generation_phase.store(moe_GEN_PHASE_PREFILL, std::memory_order_relaxed);
         // Validate all prompt tokens first
         for (uint32_t i = 0; i < prefill_count; ++i) {
@@ -149,11 +187,20 @@ int moe_pc_engine_generate_token_ids(
 
         if (!moe_generation_should_use_layer_first_prefill(engine, prefill_count, c->hidden_size)) {
             for (uint32_t i = 0; i < prefill_count; ++i) {
+                const uint64_t prefill_token_start_us = moe_profile_now_us();
                 if (!moe_forward_one_token_f32(
                         engine, (uint32_t)input_token_ids[i], &scratch, out_stats,
                         scratch.position, pre_allocate_kv)) {
                     return 0;
                 }
+                moe_profile_log(
+                    "prefill_token",
+                    "id=%llu index=%u token=%d position=%u ms=%.3f",
+                    (unsigned long long)generation_scope.id,
+                    i,
+                    input_token_ids[i],
+                    scratch.position,
+                    moe_profile_elapsed_ms(prefill_token_start_us));
                 ++scratch.position;
                 engine->generation_token.store(scratch.position, std::memory_order_relaxed);
             }
@@ -163,6 +210,7 @@ int moe_pc_engine_generate_token_ids(
             std::vector<float> batch_hidden(prefill_count * hs);
 
             // Phase 1: Embed all tokens in parallel
+            const uint64_t batch_embed_start_us = moe_profile_now_us();
             for (uint32_t i = 0; i < prefill_count; ++i) {
                 if (!moe_pc_engine_embed_token_f32(
                         engine, (uint32_t)input_token_ids[i],
@@ -171,6 +219,13 @@ int moe_pc_engine_generate_token_ids(
                     return 0;
                 }
             }
+            moe_profile_log(
+                "prefill_batch_embed",
+                "id=%llu tokens=%u hidden=%u ms=%.3f",
+                (unsigned long long)generation_scope.id,
+                prefill_count,
+                c->hidden_size,
+                moe_profile_elapsed_ms(batch_embed_start_us));
 
             // Ensure scratch is sized
             moe_decode_scratch_resize(&scratch, c, &attn_cfg, pre_allocate_kv);
@@ -186,6 +241,7 @@ int moe_pc_engine_generate_token_ids(
 
             // Phase 2: layer-first, process all prompt tokens per layer.
             for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
+                const uint64_t prefill_layer_start_us = moe_profile_now_us();
                 engine->generation_layer.store(layer, std::memory_order_relaxed);
                 // Lookahead prefetch: load layer+2 attention spans into VRAM/page cache
                 if (layer + 2u < c->num_hidden_layers &&
@@ -199,6 +255,7 @@ int moe_pc_engine_generate_token_ids(
                 }
 
                 for (uint32_t t = 0; t < prefill_count; ++t) {
+                    const uint64_t prefill_step_start_us = moe_profile_now_us();
                     float* current_hidden = batch_hidden.data() + t * hs;
                     engine->generation_token.store(t, std::memory_order_relaxed);
 
@@ -224,7 +281,22 @@ int moe_pc_engine_generate_token_ids(
                         moe_generation_set_error(out_stats, "prefill mlp failed");
                         return 0;
                     }
+                    moe_profile_log(
+                        "prefill_layer_token",
+                        "id=%llu layer=%u token_index=%u is_moe=%d ms=%.3f",
+                        (unsigned long long)generation_scope.id,
+                        layer,
+                        t,
+                        is_moe,
+                        moe_profile_elapsed_ms(prefill_step_start_us));
                 }
+                moe_profile_log(
+                    "prefill_layer",
+                    "id=%llu layer=%u tokens=%u ms=%.3f",
+                    (unsigned long long)generation_scope.id,
+                    layer,
+                    prefill_count,
+                    moe_profile_elapsed_ms(prefill_layer_start_us));
             }
 
             float* last_hidden = batch_hidden.data() + (prefill_count - 1u) * hs;
@@ -237,15 +309,31 @@ int moe_pc_engine_generate_token_ids(
             std::memcpy(scratch.hidden.data(), scratch.norm.data(), hs * sizeof(float));
             scratch.position = prefill_count;
         }
+        moe_profile_log(
+            "prefill_end",
+            "id=%llu tokens=%u ms=%.3f",
+            (unsigned long long)generation_scope.id,
+            prefill_count,
+            moe_profile_elapsed_ms(prefill_start_us));
     }
     // Decode: generate new tokens
     for (; produced < max_new_tokens; ++produced) {
+        const uint64_t decode_start_us = moe_profile_now_us();
         engine->generation_token.store(prefill_count + produced, std::memory_order_relaxed);
         if (!moe_forward_one_token_f32(
                 engine, (uint32_t)current, &scratch, out_stats, scratch.position, pre_allocate_kv)) {
             failed = 1;
             break;
         }
+        moe_profile_log(
+            "decode_forward",
+            "id=%llu step=%u position=%u input_token=%d ms=%.3f",
+            (unsigned long long)generation_scope.id,
+            produced,
+            scratch.position,
+            current,
+            moe_profile_elapsed_ms(decode_start_us));
+        const uint64_t lm_head_start_us = moe_profile_now_us();
         uint32_t next_token = 0;
         float next_logit = 0.0f;
         if (!moe_pc_engine_lm_head_top1_f32(engine, scratch.hidden.data(), c->hidden_size, &next_token, &next_logit)) {
@@ -257,6 +345,15 @@ int moe_pc_engine_generate_token_ids(
         last_logit = next_logit;
         current = (int32_t)next_token;
         ++scratch.position;
+        moe_profile_log(
+            "decode_sample",
+            "id=%llu step=%u next_token=%u logit=%.6g lm_head_ms=%.3f step_total_ms=%.3f",
+            (unsigned long long)generation_scope.id,
+            produced,
+            next_token,
+            (double)next_logit,
+            moe_profile_elapsed_ms(lm_head_start_us),
+            moe_profile_elapsed_ms(decode_start_us));
 
         // ============================================================================
         // Prompt Lookup Decoding (2024)

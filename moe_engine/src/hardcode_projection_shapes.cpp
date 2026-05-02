@@ -7,7 +7,8 @@ static const moe_projection_shape_spec_t kMoeProjectionShapes[] = {
 };
 
 const moe_projection_shape_spec_t* moe_storage_projection_shape(moe_projection_t proj) {
-    if ((uint32_t)proj >= 3) {
+    // BUGFIX 448: proj 범위 체크 강화
+    if ((uint32_t)proj >= 3 || proj < 0) {
         return 0;
     }
     return &kMoeProjectionShapes[(uint32_t)proj];

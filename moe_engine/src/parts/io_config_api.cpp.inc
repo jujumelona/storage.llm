@@ -20,6 +20,25 @@
     } else if (engine->io_config.max_prefetch_queue < 4096) {
         engine->io_config.max_prefetch_queue = 4096;
     }
+
+    // BUGFIX 645: 큐 깊이 불균형 수정 - 단계별 독립 큐 깊이 설정 ★★★
+    // Problem: disk_stage, pinned_stage, gpu_stage가 동일한 max_prefetch_queue 공유
+    // disk는 mmap으로 빠르게 채워지고, pinned는 memcpy로 느린데 같은 cap 사용
+    // pinned 포화 시 disk도 함께 막힘
+    // Solution: 각 단계별 독립 큐 깊이 설정
+    // - disk_stage: 절반 (빠른 mmap, 선행 거리 짧아도 OK)
+    // - pinned_stage: 기본값 (병목 단계)
+    // - gpu_stage: 1.5배 (DMA 병렬성 활용)
+    const uint32_t base_queue = engine->io_config.max_prefetch_queue;
+    engine->disk_stage_depth_cap = base_queue / 2;
+    if (engine->disk_stage_depth_cap < 2048) {
+        engine->disk_stage_depth_cap = 2048;  // 최소값 보장
+    }
+    engine->pinned_stage_depth_cap = base_queue;
+    engine->gpu_stage_depth_cap = (base_queue * 3) / 2;
+    if (engine->gpu_stage_depth_cap > 16384) {
+        engine->gpu_stage_depth_cap = 16384;  // 메모리 과다 사용 방지
+    }
     if (engine->io_config.topology_max_candidates == 0) {
         engine->io_config.topology_max_candidates = 1;
     }

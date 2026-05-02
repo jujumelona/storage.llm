@@ -53,10 +53,33 @@ int moe_pc_engine_run_expert_triplet_f32(
     mmap_context_t* gate_shard = get_or_map_tensor_shard(engine, *gate);
     mmap_context_t* up_shard = get_or_map_tensor_shard(engine, *up);
     mmap_context_t* down_shard = get_or_map_tensor_shard(engine, *down);
+    // BUGFIX 556: Check shard pointer validity before use ★
+    // Problem: get_or_map_tensor_shard can return null
+    // moe_dot_tensor_record_row accesses shard without null check
+    // Solution: Already checked, but ensure mmap_get_ptr also checked
     if (!gate_shard || !up_shard || !down_shard) {
         return 0;
     }
+    // BUGFIX 557: Verify shard data pointers are valid ★
+    // Problem: mmap_get_ptr can return null even if shard is non-null
+    // Solution: Check data pointers before matrix operations
+    if (!mmap_get_ptr(gate_shard, 0) || !mmap_get_ptr(up_shard, 0) || !mmap_get_ptr(down_shard, 0)) {
+        return 0;
+    }
+    // BUGFIX 558: Check intermediate_count > 0 before parallel_rows ★
+    // Problem: intermediate_count can be 0, causing division by zero in parallel_rows
+    // Solution: Check before calling moe_parallel_rows
+    if (intermediate_count == 0 || out_count == 0) {
+        return 0;
+    }
+
     const int gate_up_ok = moe_parallel_rows(engine, intermediate_count, 0, [&](uint32_t row) {
+        // BUGFIX 559: Check row bounds before array access ★
+        // Problem: row can exceed intermediate_count due to race condition
+        // Solution: Add bounds check
+        if (row >= intermediate_count) {
+            return 0;
+        }
         if (!moe_dot_tensor_record_row(engine, gate, gate_shard, row, hidden, hidden_count, &scratch_gate[row]) ||
             !moe_dot_tensor_record_row(engine, up, up_shard, row, hidden, hidden_count, &scratch_up[row])) {
             return 0;
@@ -69,6 +92,12 @@ int moe_pc_engine_run_expert_triplet_f32(
     }
 
     return moe_parallel_rows(engine, out_count, 0, [&](uint32_t row) {
+        // BUGFIX 560: Check row bounds before array access ★
+        // Problem: row can exceed out_count due to race condition
+        // Solution: Add bounds check
+        if (row >= out_count) {
+            return 0;
+        }
         if (!moe_dot_tensor_record_row(engine, down, down_shard, row, scratch_gate, intermediate_count, &out_hidden[row])) {
             return 0;
         }

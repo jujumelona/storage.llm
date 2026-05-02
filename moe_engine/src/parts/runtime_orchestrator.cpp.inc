@@ -1,4 +1,4 @@
-﻿static float policy_cpu_target(moe_execution_policy_t policy) {
+static float policy_cpu_target(moe_execution_policy_t policy) {
     return policy == moe_EXECUTION_PERFORMANCE ? 92.0f : policy == moe_EXECUTION_LOW_IMPACT ? 45.0f : 70.0f;
 }
 
@@ -298,7 +298,7 @@ int moe_pc_engine_orchestrate_moe_step(moe_pc_engine_t* engine, int current_laye
 
                 std::vector<int> dejavu_predicted = moe_juju_predict_co_activation(engine, current_layer + 2, 4);
                 std::vector<int> dejavu_domain;
-                moe_expand_merged_experts(current_layer + 2, dejavu_predicted, dejavu_domain);
+                moe_expand_merged_experts(engine, current_layer + 2, dejavu_predicted, dejavu_domain);
                 for (int e : dejavu_domain) {
                     orchestrator_append_item(engine, out_items, max_items, &kept, current_layer + 2, e,
                         moe_TIER_RAM, moe_PREFETCH_REASON_LOOKAHEAD, 80.0f);
@@ -349,6 +349,21 @@ static void prescope_compute_global_plan(
 ) {
     if (!engine || !plan || depth == 0) return;
 
+    // BUGFIX 266: Clamp depth to predicted_experts size to prevent out-of-bounds ★★
+    // Problem: Loop checks d < depth && d < MAX_PREFETCH_DEPTH, but if depth > predicted_experts.size()
+    // then predicted_experts[d] access is out-of-bounds before the break check
+    // Solution: Clamp depth to predicted_experts.size() before loop
+    depth = std::min(depth, (uint32_t)predicted_experts.size());
+    depth = std::min(depth, (uint32_t)MAX_PREFETCH_DEPTH);
+
+    // BUGFIX 281: Additional safety check - return early if predicted_experts is empty ★
+    // Problem: Even after clamping, if predicted_experts is empty, depth becomes 0
+    // but loop condition d < depth would still be checked with uninitialized data
+    // Solution: Early return if no predictions available
+    if (predicted_experts.empty() || depth == 0) {
+        return;
+    }
+
     // Stub: compute the maximum experts that can be loaded in full precision within compute time
     // total_bw is DMA bandwidth GB/s (e.g., PCIe Gen4 x16 ~ 25GB/s)
     const float total_bw = engine->backend_caps.dma_bandwidth_gbps;
@@ -356,14 +371,23 @@ static void prescope_compute_global_plan(
     // Fallback to 1ms if not profiled
     const float compute_ms_per_layer = 1.0f; // engine->profile.avg_layer_compute_ms;
 
-    for (uint32_t d = 0; d < depth && d < MAX_PREFETCH_DEPTH; ++d) {
-        if (d >= predicted_experts.size()) break;
+    for (uint32_t d = 0; d < depth; ++d) {
+        // BUGFIX 281: Double-check bounds before access (defense in depth) ★
+        if (d >= predicted_experts.size()) {
+            break;
+        }
         const uint32_t n_experts = (uint32_t)predicted_experts[d].size();
 
         // Fix 16: Prevent divide-by-zero UB by ensuring avg_expert_bytes has a fallback
         const uint64_t safe_avg_bytes = engine->avg_expert_bytes > 0 ? engine->avg_expert_bytes :
             (engine->max_tensor_stream_bytes > 0 ? engine->max_tensor_stream_bytes : 20ull * 1024ull * 1024ull);
         const float expert_gb = safe_avg_bytes / 1e9f;
+        // BUGFIX 639: Check total_bw > 0 before division ★
+        // Problem: total_bw can be 0 causing division by zero
+        // Solution: Check total_bw > 0 before division
+        if (total_bw <= 0.0f) {
+            continue;
+        }
         const float full_transfer_ms = (n_experts * expert_gb) / total_bw * 1000.0f;
 
         if (full_transfer_ms <= compute_ms_per_layer) {

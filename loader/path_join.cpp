@@ -20,6 +20,14 @@ std::string path_join(const std::string& root, const std::string& rel) {
     if (root.empty() || path_is_absolute(rel)) {
         return rel;
     }
+
+    // BUGFIX 543: Check combined path length to prevent overflow ★
+    // Problem: root + rel can exceed filesystem limits causing errors
+    // Solution: Check combined length before concatenation
+    if (root.size() + rel.size() + 1 > 4096) {
+        return rel;  // Return rel as fallback
+    }
+
     const char last = root[root.size() - 1];
     if (last == '/' || last == '\\') {
         return root + rel;

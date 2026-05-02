@@ -12,7 +12,17 @@ static void prefetch_plan_topology_candidates(
     if (!engine || !engine->io_config.enable_topology_prefetch || !experts) {
         return;
     }
-    out->reserve((size_t)count * (size_t)engine->io_config.topology_max_edges_per_source);
+    // BUGFIX 552: Check for overflow in reserve calculation ★
+    // Problem: count * topology_max_edges_per_source can overflow size_t
+    // If count = 1000 and max_edges = 10000000, multiplication overflows
+    // Solution: Check for overflow before reserve
+    const size_t max_edges = (size_t)engine->io_config.topology_max_edges_per_source;
+    if (count > 0 && max_edges > SIZE_MAX / count) {
+        // Overflow would occur, use smaller reserve
+        out->reserve(10000);
+    } else {
+        out->reserve((size_t)count * max_edges);
+    }
     std::unordered_map<int, std::unordered_map<int, uint64_t>> aggregated_dst;
 
     for (uint32_t i = 0; i < count; ++i) {
@@ -45,7 +55,7 @@ static void prefetch_plan_topology_candidates(
         }
 
         std::vector<int> expanded_domain;
-        moe_expand_merged_experts(dst_layer, explicit_experts, expanded_domain);
+        moe_expand_merged_experts(engine, dst_layer, explicit_experts, expanded_domain);
 
         for (int e : expanded_domain) {
             uint64_t freq = 0;

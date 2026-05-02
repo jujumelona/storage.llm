@@ -1,5 +1,6 @@
 static float moe_forward_embedding_scale_value(const moe_pc_engine* engine, uint32_t hidden_size) {
-    if (!engine || hidden_size == 0) {
+    // BUGFIX 500: hidden_size 범위 체크 강화
+    if (!engine || hidden_size == 0 || hidden_size > 100000) {
         return 1.0f;
     }
     double value = 0.0;
@@ -46,6 +47,11 @@ static int moe_forward_one_token_f32(
         moe_generation_set_error(stats, "invalid token forward arguments");
         return 0;
     }
+    const uint64_t token_start_us = moe_profile_now_us();
+    moe_profile_log(
+        "forward_token_begin",
+        "position=%u token=%u layers=%u hidden=%u vocab=%u prealloc_kv=%d",
+        position, token_id, c->num_hidden_layers, c->hidden_size, c->vocab_size, pre_allocate_kv);
     moe_decode_scratch_resize(s, c, &attn_cfg, pre_allocate_kv, engine);
     moe_kv_cache_track_ram(engine, &s->kv_cache);  // ensure_capacity delta tracking
     float* hidden = s->hidden.data();
@@ -57,10 +63,17 @@ static int moe_forward_one_token_f32(
     engine->adaptive_prefetch_depth.store(2u, std::memory_order_relaxed);
 
     // Fix 10: Safely resize co_activation structures here (single-threaded forward loop)
-    if (position == 0 && engine->co_activation_stats.size() < c->num_hidden_layers) {
+    // BUGFIX 499: num_hidden_layers 범위 체크
+    // BUGFIX 597: Check position == 0 before resize ★
+    // Problem: Resize happens every token, causing memory allocation overhead
+    // Solution: Only resize on first token (position == 0)
+    if (position == 0 && c->num_hidden_layers > 0 &&
+        c->num_hidden_layers < 10000 &&
+        engine->co_activation_stats.size() < c->num_hidden_layers) {
         engine->co_activation_stats.resize(c->num_hidden_layers);
         engine->last_selected_experts.resize(c->num_hidden_layers);
     }
+    const uint64_t embed_start_us = moe_profile_now_us();
     if (!moe_pc_engine_embed_token_f32(engine, token_id, hidden, c->hidden_size)) {
         moe_generation_set_error(stats, "failed to read token embedding");
         return 0;
@@ -69,8 +82,14 @@ static int moe_forward_one_token_f32(
     if (embedding_scale != 1.0f) {
         moe_scale_f32(hidden, embedding_scale, c->hidden_size);
     }
+    moe_profile_log(
+        "forward_embed",
+        "position=%u token=%u hidden=%u scale=%.6g ms=%.3f",
+        position, token_id, c->hidden_size, (double)embedding_scale,
+        moe_profile_elapsed_ms(embed_start_us));
 
     for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
+        const uint64_t layer_start_us = moe_profile_now_us();
         // Pipeline Fix 2: Removed layer+2 lookahead to eliminate duplicate attention prefetch
         // layer+2 prefetch here + layer+1 prefetch after attention = same layer queued twice.
         // layer+1 prefetch alone provides sufficient DMA overlap during MLP compute.
@@ -79,29 +98,33 @@ static int moe_forward_one_token_f32(
         const int split_post_norm_block =
             attn_cfg.type != moe_ATTN_TYPE_MLA &&
             moe_layer_uses_split_post_norm_block(engine, (int32_t)layer);
+        const moe_attn_config_t layer_attn_cfg =
+            moe_generation_layer_attn_config(engine, (int32_t)layer);
         if (split_post_norm_block) {
+            const uint64_t attn_start_us = moe_profile_now_us();
             std::memcpy(s->residual.data(), hidden, (size_t)c->hidden_size * sizeof(float));
             if (!moe_pc_engine_raw_rmsnorm_f32(
                     engine, (int32_t)layer, moe_RAW_TENSOR_INPUT_LAYER_NORM,
-                    hidden, c->hidden_size, s->norm.data(), c->hidden_size, attn_cfg.rms_norm_eps)) {
+                    hidden, c->hidden_size, s->norm.data(), c->hidden_size, layer_attn_cfg.rms_norm_eps)) {
                 moe_generation_set_error(stats, "input rmsnorm failed");
                 return 0;
             }
             if (!moe_layer_standard_attention_f32(
                     engine, (int32_t)layer, s, hidden, c->hidden_size, position,
-                    attn_cfg, s->norm.data(), 0)) {
+                    layer_attn_cfg, s->norm.data(), 0)) {
                 moe_generation_set_error(stats, "attention block failed");
                 return 0;
             }
             const float* attn_residual = s->attn.data();
             if (moe_layer_post_attention_output_norm_f32(
                     engine, (int32_t)layer, s->attn.data(), c->hidden_size,
-                    s->norm.data(), attn_cfg.rms_norm_eps)) {
+                    s->norm.data(), layer_attn_cfg.rms_norm_eps)) {
                 attn_residual = s->norm.data();
             }
             for (uint32_t i = 0; i < c->hidden_size; ++i) {
                 hidden[i] = s->residual[i] + attn_residual[i];
             }
+            const double attention_ms = moe_profile_elapsed_ms(attn_start_us);
             const int is_moe = layer >= c->first_moe_layer && layer <= c->last_moe_layer;
             if (layer + 1u < c->num_hidden_layers &&
                 moe_can_enqueue_attention_lookahead(engine, (int32_t)(layer + 1u))) {
@@ -109,11 +132,12 @@ static int moe_forward_one_token_f32(
             }
             if (!moe_layer_ffn_norm_f32(
                     engine, (int32_t)layer, hidden, c->hidden_size,
-                    s->norm.data(), attn_cfg.rms_norm_eps)) {
+                    s->norm.data(), layer_attn_cfg.rms_norm_eps)) {
                 std::memcpy(s->norm.data(), hidden, (size_t)c->hidden_size * sizeof(float));
             }
             save_gate_input_snapshot(engine, layer, s->norm.data(), c->hidden_size);
             engine->generation_phase.store(moe_GEN_PHASE_MLP, std::memory_order_relaxed);
+            const uint64_t mlp_start_us = moe_profile_now_us();
             const int ok = is_moe ?
                 moe_layer_moe_mlp_f32(engine, (int32_t)layer, s, s->hidden.data(), c) :
                 moe_layer_dense_mlp_f32(engine, (int32_t)layer, s, s->hidden.data(), c->hidden_size);
@@ -121,22 +145,29 @@ static int moe_forward_one_token_f32(
                 moe_generation_set_error(stats, "mlp/moe block failed");
                 return 0;
             }
+            const double mlp_ms = moe_profile_elapsed_ms(mlp_start_us);
             if (!moe_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
                 moe_generation_set_error(stats, "layer output scale failed");
                 return 0;
             }
+            moe_profile_log(
+                "forward_layer",
+                "position=%u layer=%u split=1 is_moe=%d attention_ms=%.3f mlp_ms=%.3f total_ms=%.3f",
+                position, layer, is_moe, attention_ms, mlp_ms, moe_profile_elapsed_ms(layer_start_us));
             continue;
         }
+        const uint64_t attn_start_us = moe_profile_now_us();
         if (!moe_layer_attention_f32(engine, (int32_t)layer, s, s->hidden.data(), c->hidden_size, position)) {
             moe_generation_set_error(stats, "attention block failed");
             return 0;
         }
         if (!moe_pc_engine_raw_rmsnorm_f32(
                 engine, (int32_t)layer, moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM,
-                hidden, c->hidden_size, s->norm.data(), c->hidden_size, attn_cfg.rms_norm_eps)) {
+                hidden, c->hidden_size, s->norm.data(), c->hidden_size, layer_attn_cfg.rms_norm_eps)) {
             moe_generation_set_error(stats, "post-attention rmsnorm failed");
             return 0;
         }
+        const double attention_ms = moe_profile_elapsed_ms(attn_start_us);
         const int is_moe = layer >= c->first_moe_layer && layer <= c->last_moe_layer;
 
         // Next-layer attention VRAM prefetch: enqueue layer+1 attention spans
@@ -152,6 +183,7 @@ static int moe_forward_one_token_f32(
         save_gate_input_snapshot(engine, layer, s->norm.data(), c->hidden_size);
 
         engine->generation_phase.store(moe_GEN_PHASE_MLP, std::memory_order_relaxed);
+        const uint64_t mlp_start_us = moe_profile_now_us();
         const int ok = is_moe ?
             moe_layer_moe_mlp_f32(engine, (int32_t)layer, s, s->hidden.data(), c) :
             moe_layer_dense_mlp_f32(engine, (int32_t)layer, s, s->hidden.data(), c->hidden_size);
@@ -159,8 +191,14 @@ static int moe_forward_one_token_f32(
             moe_generation_set_error(stats, "mlp/moe block failed");
             return 0;
         }
+        moe_profile_log(
+            "forward_layer",
+            "position=%u layer=%u split=0 is_moe=%d attention_ms=%.3f mlp_ms=%.3f total_ms=%.3f",
+            position, layer, is_moe, attention_ms,
+            moe_profile_elapsed_ms(mlp_start_us), moe_profile_elapsed_ms(layer_start_us));
     }
 
+    const uint64_t final_norm_start_us = moe_profile_now_us();
     if (!moe_pc_engine_raw_rmsnorm_f32(
             engine, (int32_t)c->num_hidden_layers, moe_RAW_TENSOR_INPUT_LAYER_NORM,
             hidden, c->hidden_size, s->norm.data(), c->hidden_size, attn_cfg.rms_norm_eps)) {
@@ -168,6 +206,11 @@ static int moe_forward_one_token_f32(
         return 0;
     }
     s->hidden.swap(s->norm);
+    moe_profile_log(
+        "forward_token_end",
+        "position=%u token=%u final_norm_ms=%.3f total_ms=%.3f",
+        position, token_id, moe_profile_elapsed_ms(final_norm_start_us),
+        moe_profile_elapsed_ms(token_start_us));
 
     return 1;
 }

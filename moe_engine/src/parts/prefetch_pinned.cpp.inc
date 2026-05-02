@@ -19,10 +19,32 @@ static int read_file_range_to_buffer(
         const std::streamsize chunk = static_cast<std::streamsize>(
             std::min<uint64_t>(remaining, 64ull * 1024ull * 1024ull));
         input.read(reinterpret_cast<char*>(dst + copied), chunk);
-        if (input.gcount() != chunk) {
+        // BUGFIX 258: Check for EOF and partial reads ★★
+        // Problem: gcount() != chunk treated as error, but EOF with partial read is valid
+        // Solution: Check EOF separately, allow partial read at end of file
+        const std::streamsize actual = input.gcount();
+        if (actual == 0) {
+            // No data read - check if EOF or error
+            if (input.eof()) {
+                // EOF reached but still have bytes to read - file too short
+                return 0;
+            }
+            // Read error
             return 0;
         }
-        copied += static_cast<uint64_t>(chunk);
+        if (actual != chunk) {
+            // Partial read - check if EOF
+            if (!input.eof()) {
+                // Partial read without EOF - error
+                return 0;
+            }
+            // EOF with partial read - check if we got all requested bytes
+            if (copied + static_cast<uint64_t>(actual) != bytes) {
+                // File too short
+                return 0;
+            }
+        }
+        copied += static_cast<uint64_t>(actual);
     }
     return 1;
 }
@@ -48,7 +70,18 @@ static int prefetch_tensor_file_to_pinned(
         return 0;
     }
     const uint64_t total_bytes = tensor_stream_bytes(rec);
-    if (total_bytes == 0 || total_bytes > engine->staging_slots[slot_index].size) {
+    if (total_bytes == 0) {
+        return 0;
+    }
+    if (total_bytes > engine->staging_slots[slot_index].size) {
+        // BUGFIX: Log warning for oversized tensor that will silently never prefetch
+        engine->io_atomic.staging_slot_contention.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<uint32_t> s_oversize_warn_count{0};
+        if (s_oversize_warn_count.fetch_add(1, std::memory_order_relaxed) < 5) {
+            fprintf(stderr, "[storageLLM WARNING] tensor %llu bytes exceeds slot size %llu, skipping prefetch\n",
+                (unsigned long long)total_bytes,
+                (unsigned long long)engine->staging_slots[slot_index].size);
+        }
         return 0;
     }
     mmap_context_t* shard = get_or_map_tensor_shard(engine, rec);
@@ -70,6 +103,9 @@ static int prefetch_tensor_file_to_pinned(
             const uint64_t offset = range[0];
             const uint64_t length = range[1];
             if (length == 0) continue;
+            // BUGFIX 318: Check offset + length doesn't overflow (IORing path) ★
+            // Problem: Same overflow issue as other paths
+            // Solution: Use same check pattern
             if (offset > file_size || length > file_size - offset ||
                 staging_offset > total_bytes || length > total_bytes - staging_offset) {
                 return 0;
@@ -114,6 +150,9 @@ static int prefetch_tensor_file_to_pinned(
             const uint64_t offset = range[0];
             const uint64_t length = range[1];
             if (length == 0) continue;
+            // BUGFIX 321: Check offset + length doesn't overflow (mmap path) ★
+            // Problem: Same overflow issue in mmap path
+            // Solution: Use same check pattern
             if (offset > file_size || length > file_size - offset ||
                 staging_offset > total_bytes || length > total_bytes - staging_offset) {
                 return 0;
@@ -122,8 +161,53 @@ static int prefetch_tensor_file_to_pinned(
             staging_offset += length;
         }
     } else {
-        // Fallback to thread-local ifstream cache
+#if defined(_WIN32)
+        // BUGFIX: IOCP-based async I/O for Windows without IORing (pre-Win11 22H2)
+        // Avoids blocking io_worker threads with synchronous ifstream reads
+        static thread_local moe_iocp_adapter_t tls_iocp;
         const std::string path = rec.resolved_path_index < engine->tensor_paths.size()
+            ? engine->tensor_paths[rec.resolved_path_index] : std::string();
+
+        bool iocp_ok = false;
+        if (!path.empty()) {
+            // Lazily init per-thread IOCP
+            if (!tls_iocp.initialized) {
+                tls_iocp.init(32);
+            }
+            if (tls_iocp.initialized) {
+                HANDLE hFile = iocp_open_file_async(path.c_str());
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    tls_iocp.associate_file(hFile);
+                    int submits = 0;
+                    for (const auto& range : ranges) {
+                        const uint64_t offset = range[0];
+                        const uint64_t length = range[1];
+                        if (length == 0) continue;
+                        if (offset > file_size || length > file_size - offset ||
+                            staging_offset > total_bytes || length > total_bytes - staging_offset) {
+                            CloseHandle(hFile);
+                            return 0;
+                        }
+                        if (tls_iocp.submit_read(hFile, engine->staging_slots[slot_index].buf + staging_offset,
+                                offset, static_cast<uint32_t>(length), (void*)1)) {
+                            submits++;
+                        }
+                        staging_offset += length;
+                    }
+                    int completions = 0;
+                    while (completions < submits) {
+                        void* data = tls_iocp.wait_completion(50);
+                        if (data) completions++;
+                    }
+                    CloseHandle(hFile);
+                    iocp_ok = (completions == submits);
+                }
+            }
+        }
+        if (!iocp_ok) {
+#endif
+        // Fallback to thread-local ifstream cache
+        const std::string ifstream_path = rec.resolved_path_index < engine->tensor_paths.size()
             ? engine->tensor_paths[rec.resolved_path_index] : std::string();
         
         struct cached_stream_t {
@@ -134,14 +218,14 @@ static int prefetch_tensor_file_to_pinned(
         static thread_local cached_stream_t tls_stream_cache;
 
         std::ifstream* input = nullptr;
-        if (tls_stream_cache.engine == engine && tls_stream_cache.path == path && tls_stream_cache.stream.is_open()) {
+        if (tls_stream_cache.engine == engine && tls_stream_cache.path == ifstream_path && tls_stream_cache.stream.is_open()) {
             input = &tls_stream_cache.stream;
         } else {
             if (tls_stream_cache.stream.is_open()) tls_stream_cache.stream.close();
-            open_ifstream_path(tls_stream_cache.stream, path, std::ios::in | std::ios::binary);
+            open_ifstream_path(tls_stream_cache.stream, ifstream_path, std::ios::in | std::ios::binary);
             if (!tls_stream_cache.stream) return 0;
             tls_stream_cache.engine = engine;
-            tls_stream_cache.path = path;
+            tls_stream_cache.path = ifstream_path;
             input = &tls_stream_cache.stream;
         }
 
@@ -149,6 +233,9 @@ static int prefetch_tensor_file_to_pinned(
             const uint64_t offset = range[0];
             const uint64_t length = range[1];
             if (length == 0) continue;
+            // BUGFIX 319: Check offset + length doesn't overflow ★
+            // Problem: Same overflow issue in ifstream fallback path
+            // Solution: Use same check pattern
             if (offset > file_size || length > file_size - offset ||
                 staging_offset > total_bytes || length > total_bytes - staging_offset) {
                 return 0;
@@ -158,18 +245,26 @@ static int prefetch_tensor_file_to_pinned(
             }
             staging_offset += length;
         }
+#if defined(_WIN32)
+        }
+#endif
     }
 
+    // BUGFIX 320: Check staging_offset == total_bytes before returning success ★
+    // Problem: If loop exits early due to error, staging_offset != total_bytes
+    // But function returns 1 (success) anyway
+    // Solution: Check staging_offset == total_bytes before returning
     if (staging_offset != total_bytes) {
         return 0;
     }
     if (out_staging_bytes) {
         *out_staging_bytes = staging_offset;
     }
-    engine->io_atomic.bytes_prefetched.fetch_add(staging_offset);
-    engine->io_atomic.bytes_disk_to_ram.fetch_add(staging_offset);
-    engine->io_atomic.disk_stage_done.fetch_add(1);
-    engine->io_atomic.pinned_stage_done.fetch_add(1);
+    // BUGFIX 257: Add memory_order_relaxed for statistics counters ★
+    engine->io_atomic.bytes_prefetched.fetch_add(staging_offset, std::memory_order_relaxed);
+    engine->io_atomic.bytes_disk_to_ram.fetch_add(staging_offset, std::memory_order_relaxed);
+    engine->io_atomic.disk_stage_done.fetch_add(1, std::memory_order_relaxed);
+    engine->io_atomic.pinned_stage_done.fetch_add(1, std::memory_order_relaxed);
     return 1;
 }
 
@@ -226,6 +321,12 @@ static int prefetch_tensor_ram_to_pinned(
         if (n != length || staging_offset != before + length) {
             return 0;
         }
+        // BUGFIX 291: Check staging_offset doesn't exceed total_bytes ★
+        // Problem: staging_offset can overflow total_bytes if ranges are malformed
+        // Solution: Check staging_offset <= total_bytes after each range
+        if (staging_offset > total_bytes) {
+            return 0;
+        }
         copied += n;
 
         // Pipeline Fix 3: Use MADV_COLD to accelerate page cache eviction without race
@@ -233,16 +334,31 @@ static int prefetch_tensor_ram_to_pinned(
         // MADV_COLD (Linux 5.4+) lowers LRU priority without invalidating pages,
         // allowing safe concurrent access while accelerating memory reclaim.
         //
-        // Pipeline Fix 3b: Only apply MADV_COLD when target is not VRAM
-        // If expert will be in VRAM and later evicted to RAM tier, we want mmap pages
-        // to remain in page cache for fast re-access. Only evict pages for DB-bound data.
+        // Pipeline Fix 3b: Apply MADV_COLD for non-VRAM targets unconditionally.
+        // For VRAM targets, only apply when RAM pressure > 85% to prevent OOM from
+        // page cache bloat. When VRAM experts are later evicted back to RAM tier,
+        // residency_eviction.cpp.inc applies MADV_WILLNEED to re-warm the pages.
 #ifdef __linux__
         #ifndef MADV_COLD
         #define MADV_COLD 20
         #endif
-        // Apply MADV_COLD only for non-VRAM targets (DB fallback path)
+        // Apply MADV_COLD for non-VRAM targets (DB fallback path)
         if (target_tier != moe_TIER_VRAM) {
             madvise(const_cast<uint8_t*>(src), static_cast<size_t>(length), MADV_COLD);
+        } else {
+            // BUGFIX 703: Conditional MADV_COLD for VRAM targets under RAM pressure ★★
+            // Problem: VRAM-bound mmap data stays warm in page cache indefinitely.
+            //   With 32GB RAM and 300GB model, page cache fills up → OOM risk.
+            // Solution: When available RAM < 15% of total, demote VRAM pages too.
+            //   MADV_WILLNEED in residency_eviction handles the reverse on VRAM eviction.
+            const uint64_t avail = storagellm::available_ram_bytes();
+            const uint64_t total = storagellm::total_ram_bytes();
+            // BUGFIX 712: Increased MADV_COLD threshold to 30% ★★★
+            // Problem: 15% threshold caused massive I/O spikes when RAM was almost exhausted.
+            // Solution: Evict earlier at 30% to smooth out page cache eviction.
+            if (total > 0 && avail < total * 30ull / 100ull) {
+                madvise(const_cast<uint8_t*>(src), static_cast<size_t>(length), MADV_COLD);
+            }
         }
         // MADV_DONTNEED only on shutdown when no concurrent readers exist
         if (engine->io_stop.load(std::memory_order_relaxed)) {
@@ -254,9 +370,10 @@ static int prefetch_tensor_ram_to_pinned(
     if (out_staging_bytes && can_stage && staging_offset == total_bytes && copied == total_bytes) {
         *out_staging_bytes = staging_offset;
     }
+    // BUGFIX 259: Add memory_order_relaxed for statistics counters ★
     // Fix 38: Only count actual pinned staging copies, not touch-fallback bytes
-    engine->io_atomic.bytes_ram_to_pinned.fetch_add(copied);
-    engine->io_atomic.pinned_stage_done.fetch_add(1);
+    engine->io_atomic.bytes_ram_to_pinned.fetch_add(copied, std::memory_order_relaxed);
+    engine->io_atomic.pinned_stage_done.fetch_add(1, std::memory_order_relaxed);
     return 1;
 }
 

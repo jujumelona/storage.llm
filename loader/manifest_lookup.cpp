@@ -48,6 +48,10 @@ static bool parse_expert_entry(
 
 bool ManifestLookup::load(const char* manifest_path) {
     expert_cache_.clear();
+    // BUGFIX 454: manifest_path null 체크
+    if (!manifest_path) {
+        return false;
+    }
     if (!read_text_file(manifest_path, &text_)) {
         return false;
     }
@@ -55,16 +59,32 @@ bool ManifestLookup::load(const char* manifest_path) {
     while ((pos = text_.find("\"L", pos)) != std::string::npos) {
         const size_t key_begin = pos + 2;
         char* endptr = nullptr;
-        const uint32_t layer = static_cast<uint32_t>(
-            std::strtoul(text_.c_str() + key_begin, &endptr, 10));
+        // BUGFIX 455: strtoul 결과 범위 체크
+        unsigned long layer_ul = std::strtoul(text_.c_str() + key_begin, &endptr, 10);
+        if (layer_ul > UINT32_MAX) {
+            ++pos;
+            continue;
+        }
+        const uint32_t layer = static_cast<uint32_t>(layer_ul);
         if (!endptr || endptr[0] != '.' || endptr[1] != 'E') {
             ++pos;
             continue;
         }
         char* expert_end = nullptr;
-        const uint32_t expert = static_cast<uint32_t>(
-            std::strtoul(endptr + 2, &expert_end, 10));
+        // BUGFIX 456: strtoul 결과 범위 체크
+        unsigned long expert_ul = std::strtoul(endptr + 2, &expert_end, 10);
+        if (expert_ul > UINT32_MAX) {
+            ++pos;
+            continue;
+        }
+        const uint32_t expert = static_cast<uint32_t>(expert_ul);
         if (!expert_end || expert_end[0] != '"') {
+            ++pos;
+            continue;
+        }
+        // BUGFIX 457: expert_end - text_.c_str() overflow 체크
+        if (expert_end < text_.c_str() ||
+            static_cast<size_t>(expert_end - text_.c_str()) > text_.size()) {
             ++pos;
             continue;
         }

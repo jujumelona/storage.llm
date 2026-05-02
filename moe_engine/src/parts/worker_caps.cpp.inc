@@ -14,6 +14,9 @@ static uint32_t pinned_worker_cap(const moe_pc_engine* engine) {
         !engine->backend_caps.supports_pinned_host) {
         return 0;
     }
+    // BUGFIX 332: Check copy_streams > 0 before multiplication ★
+    // Problem: copy_streams can be 0, causing cap to be 0
+    // Solution: Use max(1, copy_streams) to ensure cap >= 1
     uint32_t cap = engine && engine->backend_caps.copy_streams ?
         engine->backend_caps.copy_streams * 2u : 2u;
     if (cap == 0) {
@@ -27,6 +30,9 @@ static uint32_t gpu_worker_cap(const moe_pc_engine* engine) {
         !engine_has_device_upload_workers(engine)) {
         return 0;
     }
+    // BUGFIX 333: Ensure minimum of 1 worker even if copy_streams is 0 ★
+    // Problem: copy_streams can be 0, returning 0 workers
+    // Solution: Return max(1, copy_streams)
     return engine->backend_caps.copy_streams ? engine->backend_caps.copy_streams : 1u;
 }
 

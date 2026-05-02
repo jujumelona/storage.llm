@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #ifdef __linux__
 #if defined(__has_include)
@@ -222,8 +222,13 @@ struct moe_io_ring_adapter {
             return res >= 0 ? user_data : nullptr;
         }
 #elif defined(_WIN32)
-        // Windows IORing doesn't have blocking wait, fallback to peek
-        return peek_completion();
+        // BUGFIX 718: Prevent Windows spin-wait by adding Sleep
+        void* result = peek_completion();
+        if (!result) {
+            ::Sleep(1);
+            result = peek_completion();
+        }
+        return result;
 #endif
         return nullptr;
     }

@@ -45,8 +45,14 @@ static uint64_t parse_u64(const std::string& value) {
     if (end == value.c_str() || errno == ERANGE) {
         return 0;  // Parse error or overflow
     }
+    // BUGFIX 293: Check end pointer is not null before dereferencing ★
+    // Problem: If strtoull fails, end could be null
+    // Solution: Check end != nullptr before accessing *end
+    if (!end) {
+        return 0;
+    }
     // Allow trailing whitespace but not other characters
-    while (end && *end != '\0') {
+    while (*end != '\0') {
         if (*end != ' ' && *end != '\t' && *end != '\r' && *end != '\n') {
             return 0;  // Invalid trailing characters
         }
@@ -96,12 +102,20 @@ static uint64_t parse_csv_u64_col_fast(const std::string& line, size_t target) {
     }
     uint64_t value = 0;
     const size_t end = begin + len;
+    // BUGFIX 294: Check for overflow in manual parsing loop ★
+    // Problem: value * 10 can overflow uint64_t without detection
+    // Solution: Check if value would overflow before multiplication
     for (size_t i = begin; i < end; ++i) {
         const char ch = line[i];
         if (ch < '0' || ch > '9') {
             break;
         }
-        value = value * 10ull + (uint64_t)(ch - '0');
+        const uint64_t digit = (uint64_t)(ch - '0');
+        // Check for overflow: value * 10 + digit > UINT64_MAX
+        if (value > (UINT64_MAX - digit) / 10) {
+            return 0;  // Overflow would occur
+        }
+        value = value * 10ull + digit;
     }
     return value;
 }

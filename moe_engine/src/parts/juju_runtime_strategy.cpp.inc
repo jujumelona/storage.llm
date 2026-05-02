@@ -310,23 +310,27 @@ static void moe_rt_apply_juju_io_flags(
     }
 }
 
-// Predict layer N experts based on layer N-2 selected experts using co-activation frequency
 static std::vector<int> moe_juju_predict_co_activation(moe_pc_engine* engine, int target_layer, int top_k) {
     std::vector<int> predictions;
     if (!engine || target_layer < 2) return predictions;
-    
+    // BUGFIX 520: Check top_k upper bound to prevent overflow ★
+    // Problem: top_k can be arbitrarily large from caller
+    // Loop can run billions of iterations
+    // Solution: Add reasonable upper bound check (e.g., 1000)
+    if (top_k > 1000) return predictions;
+
     int source_layer = target_layer - 2;
     if (source_layer >= engine->last_selected_experts.size() || engine->last_selected_experts[source_layer].empty()) {
         return predictions;
     }
-    
+
     if (target_layer >= engine->co_activation_stats.size()) {
         return predictions;
     }
-    
+
     const auto& stats = engine->co_activation_stats[target_layer];
     std::unordered_map<int, float> aggregated_scores;
-    
+
     for (int src_expert : engine->last_selected_experts[source_layer]) {
         auto it = stats.find(src_expert);
         if (it != stats.end()) {
@@ -335,37 +339,75 @@ static std::vector<int> moe_juju_predict_co_activation(moe_pc_engine* engine, in
             }
         }
     }
-    
+
     std::vector<std::pair<int, float>> sorted_scores(aggregated_scores.begin(), aggregated_scores.end());
     std::sort(sorted_scores.begin(), sorted_scores.end(), [](const auto& a, const auto& b) {
         return a.second > b.second;
     });
-    
+
     for (int i = 0; i < std::min((int)sorted_scores.size(), top_k); ++i) {
         predictions.push_back(sorted_scores[i].first);
     }
-    
+
     return predictions;
 }
 
 static void moe_juju_update_co_activation(moe_pc_engine* engine, int current_layer, const std::vector<int>& selected) {
     if (!engine) return;
-    
-    if (current_layer >= engine->last_selected_experts.size()) {
+
+    // BUGFIX 505: current_layer 범위 체크
+    // BUGFIX 635: current_layer 음수 체크 추가 ★
+    // Problem: current_layer가 음수일 때 resize 호출 전 체크 없음
+    // Solution: current_layer < 0 체크 추가
+    if (current_layer < 0) return;
+    if (current_layer >= engine->last_selected_experts.size() && current_layer < 10000) {
         engine->last_selected_experts.resize(current_layer + 1);
         engine->co_activation_stats.resize(current_layer + 1);
     }
-    
+
+    // BUGFIX 636: current_layer 범위 재확인 ★
+    // Problem: resize 후에도 current_layer가 범위 내인지 확인 필요
+    // Solution: 인덱스 접근 전 범위 체크
+    if (current_layer >= engine->last_selected_experts.size()) return;
+
+    // BUGFIX 636: current_layer 범위 재확인 ★
+    // Problem: resize 후에도 current_layer가 범위 내인지 확인 필요
+    // Solution: 인덱스 접근 전 범위 체크
+    if (current_layer >= engine->last_selected_experts.size()) return;
+
     engine->last_selected_experts[current_layer] = selected;
-    
+
     int source_layer = current_layer - 2;
-    if (source_layer >= 0 && source_layer < engine->last_selected_experts.size() && !engine->last_selected_experts[source_layer].empty()) {
-        auto& stats = engine->co_activation_stats[current_layer];
-        for (int src_expert : engine->last_selected_experts[source_layer]) {
-            for (int tgt_expert : selected) {
-                stats[src_expert][tgt_expert]++;
-            }
+    // BUGFIX 637: source_layer 범위 체크 강화 ★
+    // Problem: source_layer가 음수일 때 >= 0 체크만으로 불충분
+    // Solution: 명시적으로 음수 체크 및 범위 체크
+    if (source_layer < 0 || source_layer >= engine->last_selected_experts.size()) return;
+    if (engine->last_selected_experts[source_layer].empty()) return;
+
+    // BUGFIX 638: co_activation_stats 범위 체크 ★
+    // Problem: current_layer가 co_activation_stats 범위를 벗어날 수 있음
+    // Solution: 접근 전 범위 체크
+    if (current_layer >= engine->co_activation_stats.size()) return;
+
+    auto& stats = engine->co_activation_stats[current_layer];
+    for (int src_expert : engine->last_selected_experts[source_layer]) {
+        for (int tgt_expert : selected) {
+            stats[src_expert][tgt_expert]++;
         }
+    }
+
+    // BUGFIX 701: Sliding window eviction to prevent co_activation_stats memory leak ★★
+    // Problem: co_activation_stats grows unboundedly — 256×256×60 layers = ~400MB at 3M tokens.
+    // Solution: Every 100K token updates, clear all stats. The merge_map already captured
+    // the clustering info from previous data, so raw counters are safely disposable.
+    // Fresh data starts accumulating immediately for the next merge_map rebuild cycle.
+    ++engine->co_activation_token_count;
+    constexpr uint64_t kCoActivationEvictInterval = 100000;
+    if (engine->co_activation_token_count - engine->last_merge_build_token_count >= kCoActivationEvictInterval) {
+        for (auto& layer_stats : engine->co_activation_stats) {
+            layer_stats.clear();
+        }
+        engine->last_merge_build_token_count = engine->co_activation_token_count;
     }
 }
 
@@ -374,25 +416,19 @@ static void moe_juju_update_co_activation(moe_pc_engine* engine, int current_lay
 // Union-find groups experts with >80% co-activation into logical clusters.
 // Prefetch pipeline loads entire cluster when any member is selected.
 // ============================================================================
-struct moe_expert_merge_map {
-    std::vector<std::vector<int>> merge_groups;   // [layer][expert] → group_id
-    std::vector<std::unordered_map<int, std::vector<int>>> group_members; // [layer][group] → experts
-    bool valid = false;
-};
-static moe_expert_merge_map s_expert_merge_map;
-
 static void moe_build_expert_merge_map(moe_pc_engine* engine) {
     if (!engine) return;
-    s_expert_merge_map.valid = false;
+    std::unique_lock<std::shared_mutex> lock(engine->expert_merge_map.mtx);
+    engine->expert_merge_map.valid = false;
     const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
     const moe_storage_constants_t* c = &runtime_c;
     if (c->experts_per_moe_layer == 0) return;
     const uint32_t nL = c->num_hidden_layers, nE = c->experts_per_moe_layer;
-    s_expert_merge_map.merge_groups.resize(nL);
-    s_expert_merge_map.group_members.resize(nL);
+    engine->expert_merge_map.merge_groups.resize(nL);
+    engine->expert_merge_map.group_members.resize(nL);
     for (uint32_t L = c->first_moe_layer; L <= c->last_moe_layer && L < nL; ++L) {
-        auto& grp = s_expert_merge_map.merge_groups[L];
-        auto& mem = s_expert_merge_map.group_members[L];
+        auto& grp = engine->expert_merge_map.merge_groups[L];
+        auto& mem = engine->expert_merge_map.group_members[L];
         grp.assign(nE, -1); mem.clear();
         if (L >= engine->co_activation_stats.size()) {
             for (uint32_t e = 0; e < nE; ++e) { grp[e]=(int)e; mem[(int)e]={(int)e}; }
@@ -417,18 +453,45 @@ static void moe_build_expert_merge_map(moe_pc_engine* engine) {
             else{grp[e]=it->second;mem[it->second].push_back((int)e);}
         }
     }
-    s_expert_merge_map.valid = true;
+    engine->expert_merge_map.valid = true;
+
+    // BUGFIX 701: Clear stats after merge map rebuild ★★
+    // merge_map now holds the clustered grouping info. Raw counters are no longer needed.
+    // Clearing here ensures the next rebuild cycle uses only fresh post-rebuild data,
+    // implementing a true sliding window that prevents unbounded memory growth.
+    for (auto& layer_stats : engine->co_activation_stats) {
+        layer_stats.clear();
+    }
+    engine->last_merge_build_token_count = engine->co_activation_token_count;
 }
 
-static void moe_expand_merged_experts(int layer, const std::vector<int>& sel, std::vector<int>& out) {
+static void moe_expand_merged_experts(moe_pc_engine* engine, int layer, const std::vector<int>& sel, std::vector<int>& out) {
     out = sel;
-    if (!s_expert_merge_map.valid || layer<0 || (size_t)layer>=s_expert_merge_map.group_members.size()) return;
-    const auto& mem = s_expert_merge_map.group_members[layer];
+    if (!engine) return;
+    std::shared_lock<std::shared_mutex> lock(engine->expert_merge_map.mtx);
+    // BUGFIX 277: Add comprehensive bounds checking ★★
+    // Problem: layer index checked once, but merge_groups[layer] accessed again without check
+    // If layer is valid but e is out of bounds, undefined behavior occurs
+    // Solution: Check both layer and expert indices before every access
+    if (!engine->expert_merge_map.valid || layer < 0 ||
+        (size_t)layer >= engine->expert_merge_map.group_members.size() ||
+        (size_t)layer >= engine->expert_merge_map.merge_groups.size()) {
+        return;
+    }
+    const auto& mem = engine->expert_merge_map.group_members[layer];
+    const auto& grp = engine->expert_merge_map.merge_groups[layer];
     std::unordered_set<int> seen(sel.begin(), sel.end());
     for (int e : sel) {
-        if ((size_t)e >= s_expert_merge_map.merge_groups[layer].size()) continue;
-        auto it = mem.find(s_expert_merge_map.merge_groups[layer][e]);
-        if (it != mem.end()) for (int m : it->second) if (seen.insert(m).second) out.push_back(m);
+        // BUGFIX 277: Check expert index before accessing merge_groups
+        if (e < 0 || (size_t)e >= grp.size()) continue;
+        auto it = mem.find(grp[e]);
+        if (it != mem.end()) {
+            for (int m : it->second) {
+                if (seen.insert(m).second) {
+                    out.push_back(m);
+                }
+            }
+        }
     }
 }
 
@@ -514,4 +577,3 @@ static int moe_engine_apply_juju_strategy(
     std::fflush(stderr);
     return 1;
 }
-

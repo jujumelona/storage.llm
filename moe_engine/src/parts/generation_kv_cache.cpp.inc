@@ -73,6 +73,15 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
         data = (uint8_t*)std::calloc(total_entries * entry_dim, sizeof(uint8_t));
         scales = (float*)std::calloc(total_entries, sizeof(float));
         zeros = (float*)std::calloc(total_entries, sizeof(float));
+        // BUGFIX 633: Check calloc failure ★
+        if (!data || !scales || !zeros) {
+            if (data) std::free(data);
+            if (scales) std::free(scales);
+            if (zeros) std::free(zeros);
+            data = nullptr;
+            scales = nullptr;
+            zeros = nullptr;
+        }
     }
 
     void init(uint32_t layers, bool pre_allocate = false) {
@@ -92,6 +101,14 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
         // BUGFIX 158: Use realloc() instead of malloc+memcpy+free to reduce peak memory
         // realloc() can expand in-place, avoiding 2x peak memory consumption
         // Peak memory: malloc+memcpy = 2x, realloc in-place = 1x
+        // BUGFIX 299: Check for overflow in realloc size calculation ★★
+        // Problem: new_entries * entry_dim can overflow size_t
+        // Causes realloc to allocate wrong size or fail silently
+        // Solution: Check multiplication overflow before realloc
+        if (new_entries > SIZE_MAX / entry_dim ||
+            new_entries > SIZE_MAX / sizeof(float)) {
+            throw std::bad_alloc();
+        }
         uint8_t* new_data = (uint8_t*)std::realloc(data, new_entries * entry_dim);
         float* new_scales = (float*)std::realloc(scales, new_entries * sizeof(float));
         float* new_zeros = (float*)std::realloc(zeros, new_entries * sizeof(float));
@@ -109,10 +126,24 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
 
             if (engine) {
                 int64_t delta = (int64_t)(new_entries - old_entries) * (entry_dim + sizeof(float) * 2);
-                if (delta > 0)
+                if (delta > 0) {
                     engine->ram_used_bytes.fetch_add((uint64_t)delta, std::memory_order_relaxed);
-                else if (delta < 0)
-                    engine->ram_used_bytes.fetch_sub((uint64_t)(-delta), std::memory_order_relaxed);
+                } else if (delta < 0) {
+                    // BUGFIX 617: Check ram_used_bytes > 0 before fetch_sub to prevent underflow ★
+                    // Problem: If ram_used_bytes is 0, fetch_sub causes underflow
+                    // Solution: Only decrement if > 0
+                    uint64_t to_sub = (uint64_t)(-delta);
+                    uint64_t current = engine->ram_used_bytes.load(std::memory_order_acquire);
+                    while (current > 0) {
+                        uint64_t new_val = current > to_sub ? current - to_sub : 0;
+                        if (engine->ram_used_bytes.compare_exchange_weak(
+                                current, new_val,
+                                std::memory_order_release,
+                                std::memory_order_acquire)) {
+                            break;
+                        }
+                    }
+                }
             }
         } else {
             // realloc failure: original pointers are still valid
@@ -123,7 +154,11 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
 
     // Asymmetric INT8 Quantization (Store)
     void store_entry(uint32_t layer, uint32_t pos, const float* src, uint32_t count) {
-        if (layer >= num_layers || pos >= max_seq_len || count > entry_dim) return;
+        // BUGFIX 297: Add null pointer check for src ★
+        // Problem: src can be null if caller passes invalid pointer
+        // Dereferencing null src causes crash
+        // Solution: Check src before use
+        if (!src || layer >= num_layers || pos >= max_seq_len || count > entry_dim) return;
 
         const size_t entry_idx = (size_t)pos * num_layers + layer;
         uint8_t* dst = data + entry_idx * entry_dim;
@@ -177,7 +212,11 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
 
     // Asymmetric INT8 Dequantization (Load)
     void load_entry(uint32_t layer, uint32_t pos, float* dst, uint32_t count) const {
-        if (layer >= num_layers || pos >= max_seq_len || count > entry_dim) return;
+        // BUGFIX 298: Add null pointer check for dst ★
+        // Problem: dst can be null if caller passes invalid pointer
+        // Writing to null dst causes crash
+        // Solution: Check dst before use
+        if (!dst || layer >= num_layers || pos >= max_seq_len || count > entry_dim) return;
 
         const size_t entry_idx = (size_t)pos * num_layers + layer;
         const uint8_t* src = data + entry_idx * entry_dim;

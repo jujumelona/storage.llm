@@ -27,8 +27,17 @@ static const std::string& codec_col(const std::vector<std::string>& row, size_t 
 
 static int codec_header_supported(const std::string& line) {
     const std::vector<std::string> header = split_csv_line(line);
-    return header.size() >= moe_CODEC_COL_REQUIRED &&
-        header[moe_CODEC_COL_PART] == "part" &&
+    // BUGFIX 477: header.size() 범위 체크 강화
+    if (header.size() < moe_CODEC_COL_REQUIRED) return 0;
+    // BUGFIX 478: 각 컬럼 인덱스 범위 체크
+    if (moe_CODEC_COL_PART >= header.size() ||
+        moe_CODEC_COL_SHARD_FILE >= header.size() ||
+        moe_CODEC_COL_WEIGHT_KEY >= header.size() ||
+        moe_CODEC_COL_WEIGHT_OFFSET >= header.size() ||
+        moe_CODEC_COL_SCALE2_LENGTH >= header.size()) {
+        return 0;
+    }
+    return header[moe_CODEC_COL_PART] == "part" &&
         header[moe_CODEC_COL_SHARD_FILE] == "shard_file" &&
         header[moe_CODEC_COL_WEIGHT_KEY] == "weight_key" &&
         header[moe_CODEC_COL_WEIGHT_OFFSET] == "weight_byte_offset" &&

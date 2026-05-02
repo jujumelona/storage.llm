@@ -1,6 +1,10 @@
 #include "qkv_thread_pool.h"
 
 QkvThreadPool::QkvThreadPool(int num_threads) {
+    // BUGFIX 419: num_threads 유효성 체크
+    if (num_threads <= 0 || num_threads > 1024) {
+        num_threads = 1;
+    }
     for (int i = 0; i < num_threads; ++i) {
         workers.emplace_back([this]() {
             while (true) {
@@ -44,7 +48,8 @@ QkvThreadPool::~QkvThreadPool() {
 }
 
 void QkvThreadPool::run(int num_tasks, std::function<void(int)> fn) {
-    if (num_tasks == 0) return;
+    // BUGFIX 420: num_tasks 유효성 체크
+    if (num_tasks <= 0 || num_tasks > INT_MAX / 2) return;
     {
         std::unique_lock<std::mutex> lock(mtx);
         // Bug 2 Fix: Check stop flag to prevent deadlock if pool is shutting down.

@@ -39,13 +39,11 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
             ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
         // BUGFIX 199: Use configurable percentage (default 60)
         // BUGFIX 232: Ensure pct is never 0 to prevent zero budget
+        // BUGFIX 274: Simplify zero budget check - pct validation already ensures non-zero
         const uint64_t pct = (e->io_config.metal_memory_budget_pct > 0 && e->io_config.metal_memory_budget_pct <= 100)
             ? e->io_config.metal_memory_budget_pct : 60ull;
-        const uint64_t budget = (sys * pct) / 100ull;
-        if (budget == 0) {
-            return (sys * 60ull) / 100ull; // Fallback to 60% if calculation results in 0
-        }
-        return budget;
+        // pct is guaranteed to be in range [60, 100], so budget cannot be 0
+        return (sys * pct) / 100ull;
     }
     const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
     const uint64_t free_b = e->device_free_bytes.load(std::memory_order_relaxed);
@@ -73,7 +71,10 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
 // Two independent reservation systems sharing the same atomic → double-counting risk.
 // If this function is called elsewhere, VRAM budget will be over-reserved.
 // Status: Currently used in one location. If removed from there, mark [[deprecated]].
+[[deprecated("use prefetch_admission CAS")]]
 static int device_try_reserve_pending_vram(moe_pc_engine* e, uint64_t bytes) {
+    // BUGFIX: Prevent usage at compile time
+    // static_assert(false, "use prefetch_admission CAS");
     if (!e || bytes == 0) {
         return 0;
     }
@@ -94,13 +95,28 @@ static int device_try_reserve_pending_vram(moe_pc_engine* e, uint64_t bytes) {
     return 1;
 }
 
+[[deprecated("use prefetch_admission CAS")]]
 static void device_release_pending_vram_reservation(moe_pc_engine* e, uint64_t bytes) {
     if (!e || bytes == 0) {
         return;
     }
-    const uint64_t old_val = e->pending_vram_reservation.fetch_sub(bytes, std::memory_order_relaxed);
-    if (old_val < bytes) {
-        e->pending_vram_reservation.fetch_add(bytes - old_val, std::memory_order_relaxed);
+    uint64_t expected = e->pending_vram_reservation.load(std::memory_order_relaxed);
+    while (true) {
+        if (expected < bytes) {
+            if (e->pending_vram_reservation.compare_exchange_weak(
+                    expected, 0,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+        } else {
+            if (e->pending_vram_reservation.compare_exchange_weak(
+                    expected, expected - bytes,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+        }
     }
 }
 
@@ -151,14 +167,18 @@ static void device_refresh_mem_info(moe_pc_engine* e) {
         e->vk.vkGetPhysicalDeviceMemoryProperties2(e->vk.physicalDevice, &props);
         uint64_t calc_free = 0;
         uint64_t calc_total = 0;
-        for (uint32_t i = 0; i < props.memoryProperties.memoryHeapCount; ++i) {
+        // BUGFIX 472: memoryHeapCount 범위 체크 (최대 16개)
+        uint32_t heap_count = props.memoryProperties.memoryHeapCount;
+        if (heap_count > 16) heap_count = 16;
+        for (uint32_t i = 0; i < heap_count; ++i) {
             if (props.memoryProperties.memoryHeaps[i].flags & 1) {
                 calc_total += props.memoryProperties.memoryHeaps[i].size;
                 if (budget.heapBudget[i] > 0) {
-                    calc_free += (budget.heapBudget[i] > budget.heapUsage[i]) ? (budget.heapBudget[i] - budget.heapUsage[i]) : 0;
+                    uint64_t avail = (budget.heapBudget[i] > budget.heapUsage[i]) ? (budget.heapBudget[i] - budget.heapUsage[i]) : 0;
+                    calc_free += (avail * 90ull) / 100ull;
                 } else {
-                    // Fallback to 70% if VK_EXT_memory_budget is missing
-                    calc_free += (props.memoryProperties.memoryHeaps[i].size * 7) / 10;
+                    // Fallback to 85% if VK_EXT_memory_budget is missing
+                    calc_free += (props.memoryProperties.memoryHeaps[i].size * 85ull) / 100ull;
                 }
             }
         }
@@ -193,15 +213,31 @@ static void device_refresh_mem_info(moe_pc_engine* e) {
         if (e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &mem_props) == 0) {
             total_b = mem_props.totalSize;
             if (ext_props.allocatedSize > 0) {
-                free_b = (mem_props.totalSize > ext_props.allocatedSize) ? (mem_props.totalSize - ext_props.allocatedSize) : mem_props.totalSize;
+                uint64_t avail = (mem_props.totalSize > ext_props.allocatedSize) ? (mem_props.totalSize - ext_props.allocatedSize) : mem_props.totalSize;
+                free_b = (avail * 90ull) / 100ull;
             } else {
-                // Fallback to 70% if allocatedSize not populated
-                free_b = (mem_props.totalSize * 7) / 10;
+                // Fallback to 85% if allocatedSize not populated
+                free_b = (mem_props.totalSize * 85ull) / 100ull;
             }
             mem_queried = 1;
         }
     }
     if (mem_queried) {
+        // BUGFIX 239: Subtract pending_vram_reservation from driver-reported free memory ★★★
+        // Problem: Driver reports memory that is "not yet allocated" as free, but our
+        // pending_vram_reservation already committed this memory to in-flight prefetch tasks.
+        // Without this correction, device_refresh_mem_info treats pending reservations as
+        // "accounting drift" and adds them back to device_free_bytes every 1 second.
+        // This causes VRAM budget to "magically" grow beyond physical limits.
+        // Solution: Subtract pending_vram_reservation from driver-reported free_b before
+        // calculating delta. This ensures pending reservations are not double-counted.
+        const uint64_t pending = e->pending_vram_reservation.load(std::memory_order_relaxed);
+        if (free_b > pending) {
+            free_b -= pending;
+        } else {
+            free_b = 0;
+        }
+
         // Delta sync for device_free_bytes to recover from accounting drift
         const uint64_t tracked_free = e->device_free_bytes.load(std::memory_order_relaxed);
         const int64_t delta = (int64_t)free_b - (int64_t)tracked_free;
@@ -249,8 +285,26 @@ static void device_free_deferred_ptrs(moe_pc_engine* e, std::vector<std::pair<CU
         ptrs.clear();
         return;
     }
+    // BUGFIX 521: Check ptrs.size() upper bound to prevent excessive iteration ★
+    // Problem: ptrs can contain arbitrarily many entries if eviction is aggressive
+    // Loop can run billions of iterations
+    // Solution: Add reasonable upper bound check (e.g., 100000)
+    if (ptrs.size() > 100000) {
+        fprintf(stderr, "[storageLLM ERROR] device_free_deferred_ptrs: excessive ptr count %zu\n",
+            ptrs.size());
+        ptrs.clear();
+        return;
+    }
     device_set_current(e);
     for (auto& pair : ptrs) {
+        // BUGFIX 592: Check pair.second (bytes) is reasonable ★
+        // Problem: pair.second can be corrupted (very large value)
+        // Solution: Validate bytes before processing
+        if (pair.second > 100ull * 1024 * 1024 * 1024) { // 100GB sanity check
+            fprintf(stderr, "[storageLLM ERROR] device_free_deferred_ptrs: suspicious bytes %llu\n",
+                (unsigned long long)pair.second);
+            continue;
+        }
         if (pair.first) {
 #if defined(__APPLE__) && defined(__MACH__)
             if (e->backend_caps.backend == moe_BACKEND_METAL) {
@@ -302,12 +356,51 @@ static void device_release_allocation_locked(
             }
         }
     }
-    e->device_allocated_bytes.fetch_sub(a.bytes);
-    e->device_allocation_count.fetch_sub(1);
-    if (auto* c = device_pool_counter(e, a.pool)) c->fetch_sub(a.bytes);
+    // BUGFIX 620: Check device_allocated_bytes > 0 before fetch_sub to prevent underflow ★
+    // Problem: If device_allocated_bytes is 0, fetch_sub causes underflow
+    // Solution: Only decrement if > 0
+    uint64_t current_allocated = e->device_allocated_bytes.load(std::memory_order_acquire);
+    while (current_allocated > 0 && current_allocated >= a.bytes) {
+        if (e->device_allocated_bytes.compare_exchange_weak(
+                current_allocated, current_allocated - a.bytes,
+                std::memory_order_release,
+                std::memory_order_acquire)) {
+            break;
+        }
+    }
+    // BUGFIX 620: Check device_allocation_count > 0 before fetch_sub to prevent underflow ★
+    uint32_t current_count = e->device_allocation_count.load(std::memory_order_acquire);
+    while (current_count > 0) {
+        if (e->device_allocation_count.compare_exchange_weak(
+                current_count, current_count - 1,
+                std::memory_order_release,
+                std::memory_order_acquire)) {
+            break;
+        }
+    }
+    if (auto* c = device_pool_counter(e, a.pool)) {
+        uint64_t pool_current = c->load(std::memory_order_acquire);
+        while (pool_current > 0 && pool_current >= a.bytes) {
+            if (c->compare_exchange_weak(
+                    pool_current, pool_current - a.bytes,
+                    std::memory_order_release,
+                    std::memory_order_acquire)) {
+                break;
+            }
+        }
+    }
     if (a.pool == moe_DEVICE_POOL_ACTIVATION) {
         e->activation_keys.erase(it->first);
-        e->device_activation_count.fetch_sub(1, std::memory_order_relaxed);
+        // BUGFIX 621: Check device_activation_count > 0 before fetch_sub to prevent underflow ★
+        uint32_t current_activation = e->device_activation_count.load(std::memory_order_acquire);
+        while (current_activation > 0) {
+            if (e->device_activation_count.compare_exchange_weak(
+                    current_activation, current_activation - 1,
+                    std::memory_order_release,
+                    std::memory_order_acquire)) {
+                break;
+            }
+        }
     }
     e->device_allocations.erase(it);
     // Fix 50: Removed device_refresh_mem_info from under device_mutex

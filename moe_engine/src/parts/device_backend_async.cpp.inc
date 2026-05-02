@@ -185,6 +185,13 @@ static int device_backend_copy_h2d_async(
         // The implementation resides in metal_zero_copy_map (metal_adapter.mm).
         // Since zero-copy maps the pointer, H2D copy is effectively a no-op here
         // as long as dst was allocated via metal_zero_copy_map.
+        // BUGFIX 249: Validate dst pointer before claiming success ★★
+        // Problem: Returns success without verifying dst is valid Metal allocation
+        // If dst is invalid pointer, caller assumes copy succeeded but data is corrupted
+        // Solution: Basic validation - dst must be non-null and aligned
+        if (!dst || (dst & 0xF)) {
+            return 0;
+        }
         return 1;
     }
     // Fix 22: Add Level Zero async copy path

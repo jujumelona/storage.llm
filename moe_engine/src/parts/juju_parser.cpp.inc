@@ -92,6 +92,10 @@ static int moe_read_binary_range_to_string(
     uint64_t file_bytes,
     std::string* out
 ) {
+    // BUGFIX 326: Check offset + bytes doesn't overflow before comparison ★
+    // Problem: offset + bytes can overflow uint64_t if values are malformed
+    // Causes offset > file_bytes check to pass incorrectly
+    // Solution: Check bytes <= file_bytes - offset instead
     if (!out || path.empty() || bytes == 0 || bytes > 256ull * 1024ull * 1024ull ||
         offset > file_bytes || bytes > file_bytes - offset) {
         return 0;
@@ -101,12 +105,22 @@ static int moe_read_binary_range_to_string(
     if (!input) {
         return 0;
     }
+    // BUGFIX 327: Check offset fits in streamoff before seekg ★
+    // Problem: offset can exceed std::streamoff max value
+    // seekg with out-of-range offset causes undefined behavior
+    // Solution: Check offset <= streamoff max before seekg
+    if (offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+        return 0;
+    }
     input.seekg((std::streamoff)offset, std::ios::beg);
     if (!input) {
         return 0;
     }
     std::string data((size_t)bytes, '\0');
     input.read(&data[0], (std::streamsize)data.size());
+    // BUGFIX 328: Check gcount() matches requested bytes ★
+    // Problem: Partial read not detected, returns incomplete data
+    // Solution: Check gcount() == bytes before returning success
     if ((uint64_t)input.gcount() != bytes) {
         return 0;
     }
@@ -152,6 +166,9 @@ static int moe_juju_read_table_local(
         if (entry.size == 0) {
             continue;
         }
+        // BUGFIX 329: Check entry.offset + entry.size doesn't overflow ★
+        // Problem: entry.offset + entry.size can overflow uint64_t
+        // Solution: Check entry.size <= declared_bytes - entry.offset
         if (entry.offset > declared_bytes || entry.size > declared_bytes - entry.offset) {
             entries->clear();
             return 0;
@@ -191,6 +208,9 @@ static int moe_read_text_file_local(const std::string& path, std::string* out) {
     }
     out->clear();
     uint64_t bytes = 0;
+    // BUGFIX 330: Check file_size_bytes success before using bytes ★
+    // Problem: If file_size_bytes fails, bytes remains 0 but function continues
+    // Solution: Return 0 immediately if file_size_bytes fails
     if (!file_size_bytes(path, &bytes) || bytes == 0 || bytes > 256ull * 1024ull * 1024ull) {
         return 0;
     }
@@ -247,6 +267,12 @@ static int moe_parse_juju_tensor_index_json(
         if (!moe_json_get_string_slice(json, obj_begin, obj_end, "name", &rec.name) ||
             !moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_offset", &rec.juju_offset) ||
             !moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_bytes", &rec.juju_bytes)) {
+            continue;
+        }
+        // BUGFIX 331: Check juju_bytes > 0 to prevent zero-size tensors ★
+        // Problem: juju_bytes can be 0, causing issues in tensor loading
+        // Solution: Skip tensors with juju_bytes == 0
+        if (rec.juju_bytes == 0) {
             continue;
         }
         if (moe_json_get_u64_slice(json, obj_begin, obj_end, "gguf_type", &value)) {

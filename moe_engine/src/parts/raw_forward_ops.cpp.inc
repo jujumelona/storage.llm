@@ -93,7 +93,9 @@ int moe_pc_engine_raw_rmsnorm_f32(
     // Use double precision accumulator for better accuracy with large hidden_size
     __m256d sum0 = _mm256_setzero_pd();
     __m256d sum1 = _mm256_setzero_pd();
-    // Fix: Process 16 elements at a time to avoid OOB read on x1
+    // BUGFIX 276: Process 16 elements per iteration to match x0 (8) + x1 (8) loads
+    // This prevents out-of-bounds read on x1 when input_count is not multiple of 16
+    // Example: input_count=12 → without this check, x1 would read [8..15] → OOB at [12..15]
     for (; i + 15 < input_count; i += 16) {
         __m256 x0 = _mm256_loadu_ps(input + i);
         __m256 x1 = _mm256_loadu_ps(input + i + 8);

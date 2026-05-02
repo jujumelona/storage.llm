@@ -74,7 +74,12 @@ int qkv_state_init(
     int dim = config->head_dim;
     int k_bits = config->k_bits;
     int v_bits = config->v_bits;
-    if (dim <= 0 || k_bits < 1 || k_bits > 4 || v_bits < 1 || v_bits > 4) {
+    // BUGFIX 404: dim 범위 체크 강화
+    if (dim <= 0 || dim > 16384 || k_bits < 1 || k_bits > 4 || v_bits < 1 || v_bits > 4) {
+        return 0;
+    }
+    // BUGFIX 405: n_tokens 범위 체크
+    if (n_tokens > INT_MAX / dim) {
         return 0;
     }
     if (config->enable_qjl && (k_bits <= 1 || v_bits <= 1)) {
@@ -82,7 +87,15 @@ int qkv_state_init(
     }
 
     // Allocate main KV storage
+    // BUGFIX 406: k_packed_size overflow 방지
+    if ((size_t)n_tokens > SIZE_MAX / ((size_t)dim * (size_t)k_bits)) {
+        return 0;
+    }
     size_t k_packed_size = ((size_t)n_tokens * (size_t)dim * (size_t)k_bits + 7) / 8;
+    // BUGFIX 407: v_packed_size overflow 방지
+    if ((size_t)n_tokens > SIZE_MAX / ((size_t)dim * (size_t)v_bits)) {
+        return 0;
+    }
     size_t v_packed_size = ((size_t)n_tokens * (size_t)dim * (size_t)v_bits + 7) / 8;
 
     state->k_idx = (uint8_t*)calloc(k_packed_size, 1);
@@ -97,6 +110,11 @@ int qkv_state_init(
 
     // Allocate QJL residual storage
     if (config->enable_qjl) {
+        // BUGFIX 408: QJL 할당 크기 overflow 방지
+        if ((size_t)n_tokens > SIZE_MAX / (size_t)dim) {
+            qkv_state_free(state);
+            return 0;
+        }
         state->k_qjl = (uint8_t*)calloc(((size_t)n_tokens * (size_t)dim + 7) / 8, 1);
         state->k_residual_norms = (float*)malloc((size_t)n_tokens * sizeof(float));
         state->v_qjl = (uint8_t*)calloc(((size_t)n_tokens * (size_t)dim + 7) / 8, 1);
@@ -111,7 +129,12 @@ int qkv_state_init(
 
     if (config->enable_rotation) {
         auto matrix = qkv_cached_rotation(dim, config->rotation_seed);
-        state->rotation_matrix = matrix && !matrix->empty() ? matrix->data() : nullptr;
+        // BUGFIX 409: matrix 유효성 체크 강화
+        if (!matrix || matrix->empty() || matrix->size() != (size_t)dim * (size_t)dim) {
+            qkv_state_free(state);
+            return 0;
+        }
+        state->rotation_matrix = matrix->data();
         if (!state->rotation_matrix) {
             qkv_state_free(state);
             return 0;
@@ -121,7 +144,12 @@ int qkv_state_init(
     if (config->enable_qjl) {
         state->qjl_signs_matrix = NULL;
         auto matrix = qkv_cached_qjl(dim, config->qjl_seed);
-        state->qjl_matrix = matrix && !matrix->empty() ? matrix->data() : nullptr;
+        // BUGFIX 410: matrix 유효성 체크 강화
+        if (!matrix || matrix->empty() || matrix->size() != (size_t)dim * (size_t)dim) {
+            qkv_state_free(state);
+            return 0;
+        }
+        state->qjl_matrix = matrix->data();
         if (!state->qjl_matrix) {
             qkv_state_free(state);
             return 0;
@@ -175,7 +203,14 @@ int qkv_state_init(
         int out_bits = config->outlier_bits;
         int norm_bits = config->normal_bits;
 
+        // BUGFIX 411: bits 범위 체크
         if (out_bits < 1 || out_bits > 4 || norm_bits < 1 || norm_bits > 4) {
+            qkv_state_free(state);
+            return 0;
+        }
+
+        // BUGFIX 412: n_out, n_norm 범위 체크
+        if (n_out <= 0 || n_norm <= 0 || n_out >= dim) {
             qkv_state_free(state);
             return 0;
         }
@@ -186,6 +221,15 @@ int qkv_state_init(
         state->k_is_outlier = (uint8_t*)calloc((size_t)dim, 1);
         state->v_is_outlier = (uint8_t*)calloc((size_t)dim, 1);
 
+        // BUGFIX 413: outlier 할당 크기 overflow 방지
+        if ((size_t)n_tokens > SIZE_MAX / ((size_t)n_out * (size_t)out_bits)) {
+            qkv_state_free(state);
+            return 0;
+        }
+        if ((size_t)n_tokens > SIZE_MAX / ((size_t)n_norm * (size_t)norm_bits)) {
+            qkv_state_free(state);
+            return 0;
+        }
         size_t k_out_size = ((size_t)n_tokens * (size_t)n_out * (size_t)out_bits + 7) / 8;
         size_t k_norm_size = ((size_t)n_tokens * (size_t)n_norm * (size_t)norm_bits + 7) / 8;
         size_t v_out_size = ((size_t)n_tokens * (size_t)n_out * (size_t)out_bits + 7) / 8;
@@ -213,6 +257,11 @@ int qkv_state_init(
         const int* src = config->outlier_channel_indices;
         for (int i = 0; i < n_out; i++) {
             int ch = src ? src[i] : i;
+            // BUGFIX 414: ch 범위 체크
+            if (ch < 0 || ch >= dim) {
+                qkv_state_free(state);
+                return 0;
+            }
             state->outlier_indices[i] = ch;
             state->k_outlier_indices[i] = ch;
             state->v_outlier_indices[i] = ch;
@@ -232,11 +281,26 @@ int qkv_state_init(
     //           Old: QKV pool=9, cpu_row=N → 6+9+N threads compete
     //           New: QKV pool=8, cpu_row=N → better balance
     const unsigned hw_raw = std::thread::hardware_concurrency();
+    // BUGFIX 415: engine_io_thread_count 음수 체크
     const int io_threads = config->engine_io_thread_count > 0
         ? (int)config->engine_io_thread_count : 0;
     const int available = std::max(1, (int)(hw_raw ? hw_raw : 4) - io_threads - 2);
     const int workers = std::min(available, 8);
+    // BUGFIX 416: work_stride overflow 방지
     const int work_stride = std::max(dim, std::max(config->outlier_channels, dim - config->outlier_channels));
+    if (work_stride <= 0 || workers <= 0) {
+        qkv_state_free(state);
+        return 0;
+    }
+    // BUGFIX 417: work buffer 할당 크기 overflow 방지
+    if ((size_t)workers > SIZE_MAX / ((size_t)work_stride * sizeof(int))) {
+        qkv_state_free(state);
+        return 0;
+    }
+    if ((size_t)workers > SIZE_MAX / ((size_t)dim * sizeof(float))) {
+        qkv_state_free(state);
+        return 0;
+    }
     state->work_codes_buf = (int*)malloc((size_t)workers * (size_t)work_stride * sizeof(int));
     state->work_qjl_buf = (float*)malloc((size_t)workers * (size_t)dim * sizeof(float));
     if (!state->work_codes_buf || !state->work_qjl_buf) {
@@ -245,7 +309,18 @@ int qkv_state_init(
     }
     state->work_buf_stride = work_stride;
     state->work_buf_workers = workers;
-    state->thread_pool = new QkvThreadPool(workers);
+    // BUGFIX 418: thread_pool 생성 실패 체크
+    try {
+        state->thread_pool = new QkvThreadPool(workers);
+    } catch (...) {
+        state->thread_pool = nullptr;
+        qkv_state_free(state);
+        return 0;
+    }
+    if (!state->thread_pool) {
+        qkv_state_free(state);
+        return 0;
+    }
     state->computed_workers = workers;
 
     state->n_tokens = n_tokens;

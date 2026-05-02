@@ -29,6 +29,18 @@ struct moe_paged_kv_manager_t {
     std::mutex mtx;
 
     void init(uint32_t capacity_tokens, uint32_t b_size, uint32_t layers, uint32_t sink_tokens = 4) {
+        // BUGFIX 514: Check b_size > 0 to prevent division by zero ★
+        // Problem: max_blocks = capacity_tokens / block_size crashes if b_size == 0
+        // Solution: Check b_size > 0 before division
+        if (b_size == 0) {
+            return;
+        }
+        // BUGFIX 515: Check layers upper bound to prevent overflow ★
+        // Problem: block_size * layers * 512 can overflow in malloc
+        // Solution: Add reasonable upper bound check (e.g., 1000 layers)
+        if (layers > 1000) {
+            return;
+        }
         block_size = b_size;
         max_blocks = capacity_tokens / block_size;
         sink_token_count = sink_tokens; // BUGFIX 128: Store sink token count
@@ -102,13 +114,31 @@ struct moe_paged_kv_manager_t {
         if (free_blocks.empty()) return -1;
         uint32_t id = free_blocks.back();
         free_blocks.pop_back();
+        // BUGFIX 300: Check id bounds before accessing blocks array ★
+        // Problem: free_blocks can contain invalid id due to corruption
+        // Accessing blocks[id] with invalid id causes out-of-bounds access
+        // Solution: Validate id before use
+        if (id >= max_blocks) {
+            return -1;
+        }
         blocks[id].num_tokens = 0;
         return id;
     }
 
     void free_block(uint32_t id) {
         std::lock_guard<std::mutex> lock(mtx);
-        if (id < max_blocks) free_blocks.push_back(id);
+        // BUGFIX 301: Prevent double-free by checking if block already in free_blocks ★★
+        // Problem: Caller can call free_block(id) twice
+        // Causes id to be added to free_blocks twice
+        // Next allocate_block() can return same id twice → data corruption
+        // Solution: Check if id already in free_blocks before adding
+        if (id >= max_blocks) return;
+        for (uint32_t free_id : free_blocks) {
+            if (free_id == id) {
+                return; // Already free
+            }
+        }
+        free_blocks.push_back(id);
     }
     
     // BUGFIX 128: Evict oldest non-pinned block when cache is full
@@ -147,9 +177,22 @@ struct moe_paged_kv_manager_t {
         }
         
         if (evict_candidate >= 0) {
-            // Clear the block and add to free list
-            blocks[evict_candidate].num_tokens = 0;
-            free_blocks.push_back(evict_candidate);
+            // BUGFIX 302: Check if block already in free_blocks before adding ★
+            // Problem: evict_lru_block can be called multiple times
+            // Can add same block to free_blocks multiple times
+            // Solution: Check before adding (same as free_block)
+            bool already_free = false;
+            for (uint32_t free_id : free_blocks) {
+                if (free_id == (uint32_t)evict_candidate) {
+                    already_free = true;
+                    break;
+                }
+            }
+            if (!already_free) {
+                // Clear the block and add to free list
+                blocks[evict_candidate].num_tokens = 0;
+                free_blocks.push_back(evict_candidate);
+            }
         }
         
         return evict_candidate;

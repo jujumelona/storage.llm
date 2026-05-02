@@ -48,12 +48,22 @@ static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t st
 
 #ifdef ENABLE_LOCKFREE_STAGING
 static uint32_t moe_ctz64_portable(uint64_t value) {
+    // BUGFIX: Use hardware intrinsics instead of software loop on hot path
+#if defined(_MSC_VER)
+    unsigned long idx;
+    _BitScanForward64(&idx, value);
+    return (uint32_t)idx;
+#elif defined(__GNUC__) || defined(__clang__)
+    return (uint32_t)__builtin_ctzll(value);
+#else
+    // Genuine portable fallback
     uint32_t idx = 0;
     while ((value & 1ull) == 0ull) {
         value >>= 1;
         ++idx;
     }
     return idx;
+#endif
 }
 
 static uint64_t moe_staging_range_mask(uint32_t start_idx, uint32_t count, uint32_t total_count) {
@@ -129,10 +139,20 @@ static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t st
     // Solution: Max 20 retries (100ms total), then return UINT32_MAX
     // Upper layer handles failure (requeue or drop)
     uint32_t retry_count = 0;
-    constexpr uint32_t MAX_RETRIES = 20;
+    // BUGFIX 714: Increase MAX_RETRIES to 50 ★★★
+    // Problem: 20 retries is too short during heavy load, causing valid
+    // prefetch requests to be dropped unnecessarily.
+    // Solution: Increase to 50 to give more time for staging slots to free up.
+    constexpr uint32_t MAX_RETRIES = 50;
 
 #ifdef ENABLE_LOCKFREE_STAGING
     const uint32_t total_slots = static_cast<uint32_t>(engine->staging_slots.size());
+    // BUGFIX 593: Check total_slots > 0 before range_mask ★
+    // Problem: total_slots can be 0
+    // Solution: Check before calling moe_staging_range_mask
+    if (total_slots == 0) {
+        return UINT32_MAX;
+    }
     const uint64_t range_mask = moe_staging_range_mask(start_idx, count, total_slots);
     if (total_slots <= 64u && range_mask != 0) {
         for (;;) {
@@ -163,7 +183,22 @@ static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t st
                             goto try_next_lockfree_slot;
                         }
                         engine->staging_slots[idx].in_use.store(true, std::memory_order_release);
-                        engine->staging_free_slot_count.fetch_sub(1, std::memory_order_relaxed);
+                        // BUGFIX: Wait on per-slot DMA fence before reusing buffer
+                        if (engine->staging_slots[idx].last_copy_event) {
+                            device_backend_event_sync(engine, engine->staging_slots[idx].last_copy_event);
+                        }
+                        // BUGFIX 622: Check staging_free_slot_count > 0 before fetch_sub to prevent underflow ★
+                        // Problem: If staging_free_slot_count is 0, fetch_sub causes underflow
+                        // Solution: Only decrement if > 0
+                        uint32_t current = engine->staging_free_slot_count.load(std::memory_order_acquire);
+                        while (current > 0) {
+                            if (engine->staging_free_slot_count.compare_exchange_weak(
+                                    current, current - 1,
+                                    std::memory_order_release,
+                                    std::memory_order_acquire)) {
+                                break;
+                            }
+                        }
                         return idx;
                     }
                 }
@@ -219,7 +254,22 @@ try_next_lockfree_slot:
                     engine->staging_slots[idx].in_use.store(false, std::memory_order_release);
                     continue;
                 }
-                engine->staging_free_slot_count.fetch_sub(1, std::memory_order_relaxed);
+                // BUGFIX: Wait on per-slot DMA fence before reusing buffer
+                if (engine->staging_slots[idx].last_copy_event) {
+                    device_backend_event_sync(engine, engine->staging_slots[idx].last_copy_event);
+                }
+                // BUGFIX 622: Check staging_free_slot_count > 0 before fetch_sub to prevent underflow ★
+                // Problem: If staging_free_slot_count is 0, fetch_sub causes underflow
+                // Solution: Only decrement if > 0
+                uint32_t current = engine->staging_free_slot_count.load(std::memory_order_acquire);
+                while (current > 0) {
+                    if (engine->staging_free_slot_count.compare_exchange_weak(
+                            current, current - 1,
+                            std::memory_order_release,
+                            std::memory_order_acquire)) {
+                        break;
+                    }
+                }
                 return idx;
             }
         }
@@ -270,6 +320,12 @@ try_next_lockfree_slot:
 // Problem: Same atomic variables loaded twice in short time
 // Solution: Load once and reuse values
 static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
+    // BUGFIX 594: Check engine pointer and slot_index bounds ★
+    // Problem: engine can be null, slot_index can be out of bounds
+    // Solution: Check both before accessing
+    if (!engine || slot_index >= engine->staging_slots.size()) {
+        return;
+    }
     if (engine && slot_index < engine->staging_slots.size()) {
         engine->staging_slots[slot_index].in_use.store(false, std::memory_order_release);
 #ifdef ENABLE_LOCKFREE_STAGING
@@ -296,8 +352,10 @@ static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
             engine->staging_direct_cv.notify_one();
         }
 
-        // Also notify general CV for backward compatibility
-        engine->staging_slot_cv.notify_one();
+        // BUGFIX 706: Removed staging_slot_cv.notify_one() ★
+        // All acquire_staging_slot paths now use type-specific CVs (staging_pinned_cv,
+        // staging_gpu_cv, staging_direct_cv). No code path waits on staging_slot_cv.
+        // The extra notify caused unnecessary context switches.
     }
 }
 
@@ -327,6 +385,10 @@ static uint64_t copy_mapped_range_to_staging(
 
     if (bytes >= 1024ull * 1024ull) {
 #if defined(__AVX2__)
+        // BUGFIX 707: Relaxed alignment — only dst needs 32B alignment for stream stores ★★
+        // _mm256_loadu_si256 handles unaligned src safely. mmap offsets are rarely 32B-aligned,
+        // so requiring src alignment caused fallback to memcpy in most cases.
+        // Staging buffers are allocated via cudaHostAlloc/posix_memalign → always 32B-aligned.
         if (reinterpret_cast<uintptr_t>(slot.buf) % 32 == 0) {
             uint8_t* d = static_cast<uint8_t*>(slot.buf);
             const uint8_t* s = static_cast<const uint8_t*>(src);
@@ -377,7 +439,9 @@ static uint64_t copy_mapped_range_to_staging_linear(
         return 0;
     }
     moe_staging_slot& slot = engine->staging_slots[slot_index];
-    if (!slot.buf || *staging_offset > slot.size || bytes > slot.size - *staging_offset) {
+    // BUGFIX 497: *staging_offset + bytes overflow 체크
+    if (!slot.buf || *staging_offset > slot.size || bytes > slot.size - *staging_offset ||
+        (*staging_offset > 0 && bytes > UINT64_MAX - *staging_offset)) {
         // Problem 5 Fix: This is also transient contention
         engine->io_atomic.staging_slot_contention.fetch_add(1);
         engine->io_atomic.staging_wraps.fetch_add(1);
@@ -385,6 +449,8 @@ static uint64_t copy_mapped_range_to_staging_linear(
     }
     if (bytes >= 1024ull * 1024ull) {
 #if defined(__AVX2__)
+        // BUGFIX 707: Relaxed alignment — only dst needs 32B alignment for stream stores ★★
+        // _mm256_loadu_si256 handles unaligned src. Staging dst is pinned → 32B aligned.
         if (reinterpret_cast<uintptr_t>(slot.buf + *staging_offset) % 32 == 0) {
             uint8_t* d = static_cast<uint8_t*>(slot.buf + *staging_offset);
             const uint8_t* s = static_cast<const uint8_t*>(src);
@@ -423,6 +489,11 @@ static uint64_t copy_mapped_range_to_staging_linear(
 
 // Additional 1: HOBBIT - Mixed precision dynamic expert loading based on gate score importance
 // This is a stub integration point for the int4 fallback decoder.
+// BUGFIX 279: Mark as unused to prevent compiler warnings ★
+// Problem: Function defined but never called → compiler warning
+// Solution: Add [[maybe_unused]] attribute or comment as future integration point
+// Status: Reserved for future HOBBIT integration, not currently used
+[[maybe_unused]]
 static int select_expert_precision(const moe_pc_engine* engine, int layer, int expert, float gate_score) {
     // If score is below threshold, use int4 (return 4), else NVFP4/BF16 (return 16)
     if (gate_score < engine->io_config.int4_fallback_threshold) {

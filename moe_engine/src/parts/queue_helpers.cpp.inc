@@ -1,10 +1,31 @@
+// BUGFIX 288: Fix underflow recovery with CAS loop (same pattern as BUGFIX 256) ★
+// Problem: fetch_sub then fetch_add for recovery is not atomic
+// If old_val < count, underflow already occurred. Another thread may have
+// modified total_queue_depth between fetch_sub and fetch_add.
+// Solution: Use CAS loop to atomically prevent underflow
 static void queue_total_depth_sub(moe_pc_engine* engine, uint32_t count) {
     if (!engine || count == 0) {
         return;
     }
-    const uint32_t old_val = engine->total_queue_depth.fetch_sub(count, std::memory_order_relaxed);
-    if (old_val < count) {
-        engine->total_queue_depth.fetch_add(count - old_val, std::memory_order_relaxed);
+    uint32_t expected = engine->total_queue_depth.load(std::memory_order_relaxed);
+    while (true) {
+        if (expected < count) {
+            // Underflow would occur - clamp to 0
+            if (engine->total_queue_depth.compare_exchange_weak(
+                    expected, 0,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+        } else {
+            // Normal case - subtract count
+            if (engine->total_queue_depth.compare_exchange_weak(
+                    expected, expected - count,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+        }
     }
 }
 
@@ -24,7 +45,18 @@ static int enqueue_stage(
         const size_t queue_sz = stage.queue.size();
         const size_t urgent_sz = stage.urgent_queue.size();
         const size_t total = queue_sz + urgent_sz;
-        if (total >= engine->io_config.max_prefetch_queue) {
+
+        // BUGFIX 645: 단계별 큐 깊이 cap 적용 ★★★
+        uint32_t stage_cap = engine->io_config.max_prefetch_queue;
+        if (&stage == &engine->disk_stage) {
+            stage_cap = engine->disk_stage_depth_cap;
+        } else if (&stage == &engine->pinned_stage) {
+            stage_cap = engine->pinned_stage_depth_cap;
+        } else if (&stage == &engine->gpu_stage) {
+            stage_cap = engine->gpu_stage_depth_cap;
+        }
+
+        if (total >= stage_cap) {
             // BUGFIX 154: Add memory_order_relaxed for statistics counter
             engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
             return 0;
@@ -57,7 +89,17 @@ static int enqueue_stage_or_retry(
         const size_t queue_sz = stage.queue.size();
         const size_t urgent_sz = stage.urgent_queue.size();
         const size_t total = queue_sz + urgent_sz;
-        const size_t normal_cap = engine->io_config.max_prefetch_queue;
+
+        // BUGFIX 645: 단계별 큐 깊이 cap 적용 ★★★
+        size_t normal_cap = engine->io_config.max_prefetch_queue;
+        if (&stage == &engine->disk_stage) {
+            normal_cap = engine->disk_stage_depth_cap;
+        } else if (&stage == &engine->pinned_stage) {
+            normal_cap = engine->pinned_stage_depth_cap;
+        } else if (&stage == &engine->gpu_stage) {
+            normal_cap = engine->gpu_stage_depth_cap;
+        }
+
         // PIPELINE FIX 18: Reduce retry_cap from 1.5x to 1.25x ??�쁾
         // Old: retry_room = normal_cap/2 ??queue can grow to 150%
         // New: retry_room = normal_cap/4 ??queue can grow to 125%
@@ -130,20 +172,43 @@ static bool pop_stage_task(
     uint32_t worker_index
 ) {
     std::unique_lock<std::mutex> lock(stage.mtx);
-    stage.cv.wait(lock, [&] {
-        const bool retiring = worker_target && worker_index >= worker_target->load();
-        return engine->io_stop.load() || retiring || !stage.queue.empty() || !stage.urgent_queue.empty();
-    });
+    // BUGFIX 709: GPU Worker periodic drain during empty queue ★★★
+    // Problem: When queue is empty, gpu_worker blocks indefinitely in cv.wait.
+    // If there are pending deferred copies (event completions), their slots are
+    // locked until the next task arrives and wakes the worker, causing staging
+    // memory leaks/starvation.
+    // Solution: Use wait_for(2ms) and periodically drain while waiting.
+    if (&stage == &engine->gpu_stage) {
+        while (!stage.cv.wait_for(lock, std::chrono::milliseconds(2), [&] {
+            const bool retiring = worker_target && worker_index >= worker_target->load();
+            return engine->io_stop.load() || retiring || !stage.queue.empty() || !stage.urgent_queue.empty();
+        })) {
+            lock.unlock();
+            device_drain_deferred_staging_copies(engine, false);
+            lock.lock();
+        }
+    } else {
+        stage.cv.wait(lock, [&] {
+            const bool retiring = worker_target && worker_index >= worker_target->load();
+            return engine->io_stop.load() || retiring || !stage.queue.empty() || !stage.urgent_queue.empty();
+        });
+    }
     if (engine->io_stop.load() || (worker_target && worker_index >= worker_target->load())) {
         return false;
     }
-    // Pop urgent first
-    if (!stage.urgent_queue.empty()) {
+    // BUGFIX: Prevent urgent_queue from indefinitely starving normal queue
+    static thread_local uint32_t tl_normal_turn = 0;
+    const bool force_normal = (++tl_normal_turn % 8 == 0) && !stage.queue.empty();
+
+    if (!stage.urgent_queue.empty() && !force_normal) {
         *out_task = stage.urgent_queue.front();
         stage.urgent_queue.pop_front();
-    } else {
+    } else if (!stage.queue.empty()) {
         *out_task = stage.queue.front();
         stage.queue.pop_front();
+    } else if (!stage.urgent_queue.empty()) {
+        *out_task = stage.urgent_queue.front();
+        stage.urgent_queue.pop_front();
     }
     // BUGFIX 97: Cache size after pop
     const size_t new_depth = stage.queue.size() + stage.urgent_queue.size();
@@ -186,7 +251,18 @@ static void finish_stage_task(moe_pc_engine* engine, moe_stage_queue& stage, int
     } else if (!ok) {
         engine->io_atomic.failed_requests.fetch_add(1, std::memory_order_relaxed);
     }
-    stage.inflight.fetch_sub(1);
+    // BUGFIX 616: Check stage.inflight > 0 before fetch_sub to prevent underflow ★
+    // Problem: If stage.inflight is 0, fetch_sub causes underflow
+    // Solution: Only decrement if > 0
+    uint32_t current = stage.inflight.load(std::memory_order_acquire);
+    while (current > 0) {
+        if (stage.inflight.compare_exchange_weak(
+                current, current - 1,
+                std::memory_order_release,
+                std::memory_order_acquire)) {
+            break;
+        }
+    }
     // BUGFIX 26: Only notify on terminal completion ??�쁾
     // Old: notify on every finish, including requeues ??spurious wakeups
     // New: notify only when count_completed=true ??accurate completion signal
@@ -235,4 +311,3 @@ static int should_use_direct_device_path(
     }
     return tensor_stream_bytes(rec) >= engine->io_config.direct_upload_min_bytes ? 1 : 0;
 }
-

@@ -28,24 +28,58 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         // PIPELINE FIX 13: Reduce batch size from 8 to 4 ?�★??
         // Update (Issue 2): Use dynamic batch max (up to 8)
         const uint32_t batch_max_dyn = moe_gpu_stage_batch_max(engine);
-        constexpr uint32_t batch_capacity = 8;
+        constexpr uint32_t batch_capacity = 32;
         moe_prefetch_task batch[batch_capacity];
         int ok[batch_capacity] = {};
         int terminal[batch_capacity] = {};
         uint32_t batch_count = 0;
         batch[batch_count++] = task;
 
+        uint64_t batch_bytes = 0;
+        if (task.tensor_index >= 0 && (size_t)task.tensor_index < engine->tensors.size()) {
+            batch_bytes += tensor_stream_bytes(engine->tensors[task.tensor_index]);
+        }
+
         {
             std::unique_lock<std::mutex> lock(engine->gpu_stage.mtx);
             uint32_t extra_popped = 0;
-            while (batch_count < batch_max_dyn && !engine->gpu_stage.urgent_queue.empty()) {
+            const uint64_t byte_limit = engine->backend_caps.copy_stream_bytes_limit > 0 ? engine->backend_caps.copy_stream_bytes_limit : 512ull * 1024ull * 1024ull;
+
+            // BUGFIX: Check byte_limit BEFORE count to ensure byte-based throttling works
+            while (!engine->gpu_stage.urgent_queue.empty()) {
+                if (batch_count >= batch_capacity || batch_count >= batch_max_dyn) {
+                    break;
+                }
+                const auto& next_task = engine->gpu_stage.urgent_queue.front();
+                uint64_t next_bytes = 0;
+                if (next_task.tensor_index >= 0 && (size_t)next_task.tensor_index < engine->tensors.size()) {
+                    next_bytes = tensor_stream_bytes(engine->tensors[next_task.tensor_index]);
+                }
+                if (batch_bytes + next_bytes > byte_limit && batch_count > 0) {
+                    break;
+                }
+                batch_bytes += next_bytes;
+
                 batch[batch_count] = engine->gpu_stage.urgent_queue.front();
                 engine->gpu_stage.urgent_queue.pop_front();
                 engine->gpu_stage.inflight.fetch_add(1);
                 ++batch_count;
                 ++extra_popped;
             }
-            while (batch_count < batch_max_dyn && !engine->gpu_stage.queue.empty()) {
+            while (!engine->gpu_stage.queue.empty()) {
+                if (batch_count >= batch_capacity || batch_count >= batch_max_dyn) {
+                    break;
+                }
+                const auto& next_task = engine->gpu_stage.queue.front();
+                uint64_t next_bytes = 0;
+                if (next_task.tensor_index >= 0 && (size_t)next_task.tensor_index < engine->tensors.size()) {
+                    next_bytes = tensor_stream_bytes(engine->tensors[next_task.tensor_index]);
+                }
+                if (batch_bytes + next_bytes > byte_limit && batch_count > 0) {
+                    break;
+                }
+                batch_bytes += next_bytes;
+
                 batch[batch_count] = engine->gpu_stage.queue.front();
                 engine->gpu_stage.queue.pop_front();
                 engine->gpu_stage.inflight.fetch_add(1);
@@ -82,6 +116,21 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 const moe_storage_raw_span_spec_t* span = moe_storage_raw_span_at((uint32_t)batch[i].raw_span_index);
                 ok[i] = span ? prefetch_one_raw_span(engine, *span, batch[i].raw_pool, 1) : 0;
             } else if (batch[i].tensor_index < engine->tensors.size()) {
+                // BUGFIX 325: Add explicit bounds check for tensor_index in gpu_worker ★
+                // Problem: batch[i].tensor_index can be negative
+                // Solution: Check >= 0 before accessing tensors array
+                if (batch[i].tensor_index < 0) {
+                    ok[i] = 0;
+                    continue;
+                }
+                // BUGFIX 580: Check tensor_stream_bytes before prefetch ★
+                // Problem: tensor_stream_bytes can return 0
+                // Solution: Skip if bytes == 0
+                const uint64_t tensor_bytes = tensor_stream_bytes(engine->tensors[batch[i].tensor_index]);
+                if (tensor_bytes == 0) {
+                    ok[i] = 0;
+                    continue;
+                }
                 ok[i] = prefetch_tensor_pinned_to_gpu(
                     engine,
                     engine->tensors[batch[i].tensor_index],
@@ -118,10 +167,25 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                             terminal[i] = 0;
                             engine->gpu_stage.cv.notify_one();
                         } else {
+                            // BUGFIX 238: Release pending_vram_reservation on task drop ★★★
+                            // Problem: When GPU backpressure causes task drop, staging_slot is released
+                            // but pending_vram_reservation is NOT. Over time, "ghost reservations" accumulate
+                            // and available VRAM converges to 0, blocking all prefetch.
+                            // Solution: Release VRAM reservation when dropping task.
                             // Last resort: discard staging slot after retry failed
                             if (batch[i].staging_slot != UINT32_MAX) {
                                 release_staging_slot(engine, batch[i].staging_slot);
                                 batch[i].staging_slot = UINT32_MAX;
+                            }
+                            // Release VRAM reservation for dropped task
+                            // BUGFIX 581: Check tensor_index bounds before accessing ★
+                            // Problem: tensor_index can be out of bounds
+                            // Solution: Check before access
+                            if (batch[i].tensor_index >= 0 && (size_t)batch[i].tensor_index < engine->tensors.size()) {
+                                const uint64_t bytes = tensor_stream_bytes(engine->tensors[batch[i].tensor_index]);
+                                if (bytes > 0) {
+                                    prefetch_release_pending_vram_reservation(engine, bytes);
+                                }
                             }
                             engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
                             ok[i] = 0;
@@ -138,9 +202,20 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                             terminal[i] = 0;
                             engine->gpu_stage.cv.notify_one();
                         } else {
+                            // BUGFIX 238: Release pending_vram_reservation on task drop ★★★
                             if (batch[i].staging_slot != UINT32_MAX) {
                                 release_staging_slot(engine, batch[i].staging_slot);
                                 batch[i].staging_slot = UINT32_MAX;
+                            }
+                            // Release VRAM reservation for dropped task
+                            // BUGFIX 582: Check tensor_index bounds before accessing ★
+                            // Problem: tensor_index can be out of bounds
+                            // Solution: Check before access
+                            if (batch[i].tensor_index >= 0 && (size_t)batch[i].tensor_index < engine->tensors.size()) {
+                                const uint64_t bytes = tensor_stream_bytes(engine->tensors[batch[i].tensor_index]);
+                                if (bytes > 0) {
+                                    prefetch_release_pending_vram_reservation(engine, bytes);
+                                }
                             }
                             engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
                             ok[i] = 0;
@@ -172,6 +247,24 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
             if (batch[i].staging_slot != UINT32_MAX && !ok[i]) {
                 // Copy failed before async enqueue ??slot was NOT deferred, safe to release
                 release_staging_slot(engine, batch[i].staging_slot);
+            } else if (ok[i] == 1 && batch[i].tensor_index >= 0 && (size_t)batch[i].tensor_index < engine->tensors.size()) {
+#ifdef __linux__
+                mmap_context_t* shard = get_or_map_tensor_shard(engine, engine->tensors[batch[i].tensor_index]);
+                if (shard) {
+                    const auto& rec = engine->tensors[batch[i].tensor_index];
+                    const uint64_t ranges[][2] = {
+                        {rec.info.weight_byte_offset, rec.info.weight_byte_length},
+                        {rec.info.scale_byte_offset, rec.info.scale_byte_length},
+                        {rec.info.scale2_byte_offset, rec.info.scale2_byte_length},
+                    };
+                    for (const auto& range : ranges) {
+                        if (range[1] > 0) {
+                            void* ptr = mmap_get_ptr(shard, static_cast<size_t>(range[0]));
+                            if (ptr) madvise(ptr, static_cast<size_t>(range[1]), MADV_COLD);
+                        }
+                    }
+                }
+#endif
             }
         }
         for (uint32_t i = 0; i < batch_count; ++i) {

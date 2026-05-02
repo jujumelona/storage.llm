@@ -1,4 +1,4 @@
-﻿// Bug #18: Separate hot counters by worker type to eliminate false sharing
+// Bug #18: Separate hot counters by worker type to eliminate false sharing
 // Each worker type gets its own cache line (alignas(64))
 
 struct alignas(64) moe_io_atomic_stats {
@@ -36,6 +36,7 @@ struct alignas(64) moe_io_atomic_stats {
     // --- Cache line 6: device copy failures (hot, written by all workers) ---
     alignas(64) std::atomic<uint64_t> device_copy_failures{0};
     std::atomic<uint64_t> nonpinned_fallback_count{0};
+    std::atomic<uint64_t> eviction_depth_exceeded{0}; // BUGFIX: Track deep recursion eviction failures
 
     // --- Cache line 7: direct upload + topology ---
     alignas(64) std::atomic<uint64_t> bytes_direct_to_gpu{0};

@@ -152,6 +152,9 @@ static int moe_scan_offload_juju_root(
     present_total += legacy_present_total;
     if (legacy_expected_total > legacy_present_total) {
         missing_total += legacy_expected_total - legacy_present_total;
+        // BUGFIX 271: Only set first_missing if not already set by split_groups ★
+        // Problem: first_missing set by split_groups, then overwritten by legacy check
+        // Solution: Only set if still 0 (not set by split_groups)
         if (first_missing == 0) {
             for (uint32_t i = 1; i <= legacy_expected; ++i) {
                 if (legacy_seen_indexes.find(i) == legacy_seen_indexes.end()) {

@@ -41,6 +41,13 @@ static mmap_context_t* get_or_map_shard(moe_pc_engine* engine, const std::string
     if (!engine || path.empty()) {
         return nullptr;
     }
+    // BUGFIX 523: Check path length to prevent excessive memory usage ★
+    // Problem: path can be arbitrarily long from malformed config
+    // Used as map key, can cause excessive memory allocation
+    // Solution: Add reasonable upper bound check (e.g., 4096)
+    if (path.size() > 4096) {
+        return nullptr;
+    }
     // BUGFIX 92: Issue 16 - Optimize shard_mmaps lookup with double-checked locking ★★
     // Problem: Every tensor load acquires shared_lock on shard_mutex
     // High contention when many workers load tensors simultaneously
@@ -129,7 +136,21 @@ static mmap_context_t* get_or_map_shard_partial(
     uint64_t offset,
     uint64_t bytes
 ) {
-    if (!engine || path.empty() || bytes == 0 || offset > (uint64_t)SIZE_MAX || bytes > (uint64_t)SIZE_MAX) {
+    // BUGFIX 250: Add overflow check for offset + bytes ★★
+    // Problem: Checks offset and bytes individually against SIZE_MAX
+    // but doesn't check if offset + bytes overflows
+    // Solution: Check for addition overflow before proceeding
+    // BUGFIX 496: bytes가 0일 때 overflow 체크 불필요
+    if (!engine || path.empty() || bytes == 0 ||
+        offset > (uint64_t)SIZE_MAX || bytes > (uint64_t)SIZE_MAX ||
+        (bytes > 0 && offset > UINT64_MAX - bytes)) {  // overflow check only if bytes > 0
+        return nullptr;
+    }
+    // BUGFIX 522: Check path length to prevent buffer overflow ★
+    // Problem: path.c_str() can be arbitrarily long
+    // snprintf with 512-byte buffer can truncate path
+    // Solution: Check path length before snprintf
+    if (path.size() > 400) {  // Leave room for "#partial:..." suffix
         return nullptr;
     }
     // BUGFIX 91: Issue 15 - Optimize partial mmap key generation ★
@@ -218,7 +239,16 @@ static uint64_t shard_numeric_key(uint32_t part, uint32_t shard) {
 }
 
 static uint64_t shard_partial_numeric_key(uint32_t part, uint64_t offset, uint64_t bytes) {
-    uint64_t x = ((uint64_t)part << 48) ^ (offset << 7) ^ (bytes >> 3);
+    // BUGFIX 644: Check shift overflow ★
+    // Problem: offset << 7 can overflow if offset is large
+    // Solution: Check offset before shift
+    uint64_t offset_shifted = 0;
+    if (offset <= (UINT64_MAX >> 7)) {
+        offset_shifted = offset << 7;
+    } else {
+        offset_shifted = UINT64_MAX;
+    }
+    uint64_t x = ((uint64_t)part << 48) ^ offset_shifted ^ (bytes >> 3);
     x ^= x >> 33;
     x *= 0xff51afd7ed558ccdull;
     x ^= x >> 33;

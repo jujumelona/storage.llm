@@ -6,6 +6,8 @@ static uint64_t fixed_output_core_bytes() {
 static uint64_t max_raw_role_layer_bytes(uint32_t roles) {
     const moe_storage_constants_t* storage = moe_storage_constants();
     const int32_t max_layer = storage ? (int32_t)storage->num_hidden_layers + 1 : 80;
+    // BUGFIX 473: max_layer 범위 체크 (음수 및 overflow 방지)
+    if (max_layer < 0 || max_layer > 10000) return 0;
     std::vector<uint64_t> layer_bytes((size_t)max_layer + 2u, 0);
     const uint32_t count = moe_storage_raw_span_count();
     for (uint32_t i = 0; i < count; ++i) {
@@ -13,7 +15,10 @@ static uint64_t max_raw_role_layer_bytes(uint32_t roles) {
         if (!s || (s->role & roles) == 0 || s->layer < -1 || s->layer > max_layer) {
             continue;
         }
-        layer_bytes[s->layer + 1] += s->bytes;
+        // BUGFIX 474: s->layer + 1 범위 체크
+        size_t idx = (size_t)(s->layer + 1);
+        if (idx >= layer_bytes.size()) continue;
+        layer_bytes[idx] += s->bytes;
     }
     uint64_t best = 0;
     for (uint64_t bytes : layer_bytes) {

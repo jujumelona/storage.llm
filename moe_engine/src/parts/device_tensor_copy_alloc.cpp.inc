@@ -86,13 +86,22 @@ static int device_prepare_tensor_allocation(
                 }
             }
         }
-        if (!a && !device_try_reserve_pending_vram(e, bytes)) {
-            e->io_atomic.device_alloc_failures.fetch_add(1, std::memory_order_relaxed);
-            e->io_atomic.staging_wraps.fetch_add(1);
-            return 0;
-        }
+        // BUGFIX 243: Remove VRAM double-counting ★★★
+        // Problem: prefetch_admitted_tier already reserved VRAM via pending_vram_reservation CAS loop.
+        // Calling device_try_reserve_pending_vram here AGAIN causes double-counting:
+        // Same expert reserves VRAM twice → budget depletes 2x faster → false "VRAM full" errors.
+        // Solution: Remove device_try_reserve_pending_vram call entirely. Admission layer already reserved.
+        // Trade-off: Relies on admission layer to always reserve before calling this function.
+        // This is guaranteed by prefetch_plan_execute.cpp.inc Pass 1 admission logic.
+        // Note: BUGFIX 198 already flagged this as "Dead code - DO NOT CALL".
+        // Original code:
+        //   if (!a && !device_try_reserve_pending_vram(e, bytes)) {
+        //       e->io_atomic.device_alloc_failures.fetch_add(1, std::memory_order_relaxed);
+        //       e->io_atomic.staging_wraps.fetch_add(1);
+        //       return 0;
+        //   }
+        // Removed to prevent double-counting.
         if (!a) {
-            bool pending_vram_reserved = true;
             moe_device_allocation next;
             next.key = key;
             next.bytes = bytes;
@@ -111,10 +120,8 @@ static int device_prepare_tensor_allocation(
                 alloc_ok = (e->cuda.cuMemAlloc(&next.ptr, (size_t)bytes) == 0) ? 1 : 0;
             }
             if (!alloc_ok) {
-                if (pending_vram_reserved) {
-                    device_release_pending_vram_reservation(e, bytes);
-                    pending_vram_reserved = false;
-                }
+                // NOTE: pending_vram_reservation은 prefetch_plan_execute의 Pass 2에서
+                // 이미 해제됨. 여기서 별도 해제 불필요 (BUGFIX 243 참고)
                 e->io_atomic.device_alloc_failures.fetch_add(1, std::memory_order_relaxed);
                 lock.unlock();
                 device_refresh_mem_info(e);
@@ -122,10 +129,6 @@ static int device_prepare_tensor_allocation(
             }
             e->device_allocated_bytes.fetch_add(bytes);
             device_account_free_bytes_sub(e, bytes);
-            if (pending_vram_reserved) {
-                device_release_pending_vram_reservation(e, bytes);
-                pending_vram_reserved = false;
-            }
             e->device_allocation_count.fetch_add(1);
             if (auto* c = device_pool_counter(e, pool)) {
                 c->fetch_add(bytes);

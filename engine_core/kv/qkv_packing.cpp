@@ -2,8 +2,13 @@
 #include <string.h>
 
 void qkv_pack_indices(const int* indices, uint8_t* packed, int n, int bits) {
+    // BUGFIX 394: 파라미터 유효성 체크
+    if (!indices || !packed || n <= 0 || bits <= 0 || bits > 4) return;
+
     if (bits == 1) {
         // Bug ②: 1-bit packing — 8 indices per byte
+        // BUGFIX 395: n + 7 overflow 방지
+        if (n > INT_MAX - 7) return;
         memset(packed, 0, (n + 7) / 8);
         for (int i = 0; i < n; i++) {
             if (indices[i] & 1) packed[i / 8] |= (1 << (i % 8));
@@ -21,6 +26,8 @@ void qkv_pack_indices(const int* indices, uint8_t* packed, int n, int bits) {
         // Bug 3 Fix: Use LSB-first packing (consistent with 1/2/4-bit)
         // This prevents future inline optimization bugs where someone assumes
         // LSB-first for all bit widths.
+        // BUGFIX 396: n * 3 overflow 방지
+        if (n > INT_MAX / 3) return;
         memset(packed, 0, (n * 3 + 7) / 8);
         for (int i = 0; i < n; i++) {
             int bit_offset = i * 3;
@@ -45,6 +52,9 @@ void qkv_pack_indices(const int* indices, uint8_t* packed, int n, int bits) {
 }
 
 void qkv_unpack_indices(const uint8_t* packed, int* indices, int n, int bits) {
+    // BUGFIX 397: 파라미터 유효성 체크
+    if (!packed || !indices || n <= 0 || bits <= 0 || bits > 4) return;
+
     if (bits == 1) {
         // Bug ②: 1-bit unpacking
         for (int i = 0; i < n; i++) {
@@ -78,6 +88,9 @@ void qkv_unpack_indices(const uint8_t* packed, int* indices, int n, int bits) {
 }
 
 void qkv_pack_signs(const float* signs, uint8_t* packed, int n) {
+    // BUGFIX 398: 파라미터 유효성 체크
+    if (!signs || !packed || n <= 0) return;
+
     for (int i = 0; i < n; i += 8) {
         uint8_t byte = 0;
         for (int j = 0; j < 8 && (i + j) < n; j++) {
@@ -90,6 +103,9 @@ void qkv_pack_signs(const float* signs, uint8_t* packed, int n) {
 }
 
 void qkv_unpack_signs(const uint8_t* packed, float* signs, int n) {
+    // BUGFIX 399: 파라미터 유효성 체크
+    if (!packed || !signs || n <= 0) return;
+
     for (int i = 0; i < n; i++) {
         int byte_idx = i / 8;
         int bit_offset = i % 8;

@@ -101,20 +101,26 @@ static int device_copy_tensor_from_host(
         return 0;
     }
 
-    // BUGFIX 193: Release staging slot immediately after async copy starts ★★★
-    // Problem: Slot released in callback after GPU copy completes
-    // → io_worker ↔ pinned_worker ↔ gpu_worker all spin-wait for slots
-    // → Pipeline stalls, throughput drops
-    // Solution: Release slot right after cuMemcpyAsync succeeds
-    // GPU DMA already started, staging buffer no longer needed by CPU
-    // Event-based completion tracking ensures correctness
-    // Impact: Slot available ~100-500µs earlier, eliminates spin-wait
+    // BUGFIX: Immediate staging slot release after cuMemcpyAsync submission
+    // Old: Slot held until CUevent fires in device_drain_deferred_staging_copies
+    // New: Record per-slot fence event, release slot immediately, acquirer waits on fence
+    // DMA engine still reads staging buffer, but next acquirer calls cuStreamWaitEvent
+    // to ensure the previous DMA completes before overwriting the buffer.
     if (async_copy) {
-        if (staging_slot != UINT32_MAX) {
-            // Defer only key completion, not slot release
-            device_defer_staging_copy(e, UINT32_MAX, key, stream);
-            // Release slot immediately - DMA already in flight
+        if (staging_slot != UINT32_MAX && staging_slot < e->staging_slots.size()) {
+            auto& slot = e->staging_slots[staging_slot];
+            // Record fence event on the slot itself
+            if (!slot.last_copy_event) {
+                slot.last_copy_event = device_take_copy_event(e);
+            }
+            if (slot.last_copy_event) {
+                device_backend_event_record(e, slot.last_copy_event, stream);
+                slot.last_copy_stream = stream;
+            }
+            // Release slot immediately — acquirer will wait on last_copy_event
             release_staging_slot(e, staging_slot);
+            // Defer only the key completion tracking, no slot to release later
+            device_defer_staging_copy(e, UINT32_MAX, key, stream);
         } else {
             s_tl_tensor_pending_keys[e].push_back(key);
         }
@@ -213,9 +219,9 @@ static int device_copy_tensor(
             ok = device_backend_copy_h2d_sync(e, dst, staging_buf, bytes);
         }
         if (ok && async_copy) {
-            // BUGFIX 193: Defer only key, release slot immediately
-            device_defer_staging_copy(e, UINT32_MAX, key, stream);
-            release_staging_slot(e, slot_idx);
+            // slot도 defer에 포함시켜 event 완료 후 해제
+            device_defer_staging_copy(e, slot_idx, key, stream);
+            // staging_slot을 여기서 해제하지 않음
         } else {
             release_staging_slot(e, slot_idx);
         }
@@ -248,6 +254,14 @@ static int device_copy_tensor(
         if (!range[1]) continue;
         const void* src = mmap_get_ptr(shard, static_cast<size_t>(range[0]));
         if (!src) {
+            device_free_key(e, key);
+            return 0;
+        }
+        // BUGFIX 289: Check cur + range[1] doesn't overflow before copy ★
+        // Problem: cur += range[1] can overflow CUdeviceptr if ranges are malformed
+        // Solution: Check that cur + range[1] stays within dst + bytes bounds
+        if (range[1] > bytes || cur - dst > bytes - range[1]) {
+            e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
             device_free_key(e, key);
             return 0;
         }

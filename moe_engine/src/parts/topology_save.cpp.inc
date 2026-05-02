@@ -32,12 +32,24 @@ int moe_pc_engine_save_topology(moe_pc_engine_t* engine, const char* path) {
         return 0;
     }
     output << "src_layer,src_expert,dst_layer,dst_expert,count\n";
+    // BUGFIX 265: Check stream state after writing ★
+    // Problem: Write operations can fail (disk full, permissions, etc.) but not checked
+    // Solution: Check output.good() after header write
+    if (!output.good()) {
+        return 0;
+    }
     for (const auto& row : rows) {
         output << std::get<0>(row) << ','
                << std::get<1>(row) << ','
                << std::get<2>(row) << ','
                << std::get<3>(row) << ','
                << std::get<4>(row) << '\n';
+        // Check periodically to fail fast on write errors
+        if (!output.good()) {
+            return 0;
+        }
     }
-    return 1;
+    // Final check before returning success
+    output.flush();
+    return output.good() ? 1 : 0;
 }

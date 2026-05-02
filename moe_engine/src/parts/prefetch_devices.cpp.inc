@@ -19,7 +19,12 @@ static void demote_failed_device_expert(moe_pc_engine* engine, const moe_tensor_
             return;
         }
         subtract_tier_usage(engine, moe_TIER_VRAM, state.bytes);
-        engine->vram_expert_count.fetch_sub(1);
+        // BUGFIX 608: Check vram_expert_count > 0 before fetch_sub ★
+        // Problem: vram_expert_count can underflow if fetch_sub called when count is 0
+        // Solution: Check before decrement
+        if (engine->vram_expert_count.load(std::memory_order_relaxed) > 0) {
+            engine->vram_expert_count.fetch_sub(1);
+        }
         state.tier = tier_used(engine, moe_TIER_RAM) + state.bytes <= tier_budget(engine, moe_TIER_RAM) ?
             moe_TIER_RAM : moe_TIER_DB;
         // BUGFIX 153: Add memory_order_relaxed for statistics counters

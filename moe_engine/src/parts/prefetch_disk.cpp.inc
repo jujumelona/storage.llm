@@ -25,6 +25,10 @@
         if (length == 0) {
             continue;
         }
+        // BUGFIX 316: Check offset + length doesn't overflow before comparison ★
+        // Problem: offset + length can overflow uint64_t if ranges are malformed
+        // Causes offset > file_size check to pass incorrectly
+        // Solution: Check length <= file_size - offset instead
         if (offset > file_size || length > file_size - offset) {
             return 0;
         }
@@ -33,7 +37,7 @@
             hint_issued = true;
         }
     }
-    // Bug #5: Removed fixed 100µs sleep ??touch_mapped_range guarantees pages regardless.
+    // Bug #5: Removed fixed 100µs sleep → touch_mapped_range guarantees pages regardless.
     // NVMe responds in <10µs (wasted wait), HDD needs 4-10ms (insufficient wait).
     // Synchronously touch pages to guarantee data residency in RAM
     for (const auto& range : ranges) {
@@ -41,6 +45,10 @@
         const uint64_t length = range[1];
         if (length > 0) {
             const uint8_t* src = static_cast<const uint8_t*>(mmap_get_ptr(shard, static_cast<size_t>(offset)));
+            // BUGFIX 317: Check src validity before using ★
+            // Problem: mmap_get_ptr can return null if offset is invalid
+            // Dereferencing null src in touch_mapped_range causes crash
+            // Solution: Check src before use
             if (!src) {
                 return 0;
             }
@@ -70,18 +78,26 @@ static bool init_io_uring(moe_pc_engine* engine) {
     if (!engine) return false;
     auto& state = engine->uring_state;
     if (state.initialized) return true;
-    
+
     // IORING_SETUP_SQPOLL for kernel-side polling (zero syscall)
     if (io_uring_queue_init(128, &state.ring, IORING_SETUP_SQPOLL) < 0) {
         return false;
     }
-    
+
+    // BUGFIX 531: Check staging_slots.size() before resize to prevent overflow ★
+    // Problem: staging_slots.size() can be very large (> 100000) causing memory allocation failure
+    // Solution: Validate size is reasonable before resize
+    if (engine->staging_slots.size() > 100000) {
+        io_uring_queue_exit(&state.ring);
+        return false;
+    }
+
     state.registered_iovecs.resize(engine->staging_slots.size());
     for (size_t i = 0; i < engine->staging_slots.size(); ++i) {
         state.registered_iovecs[i].iov_base = engine->staging_slots[i].buf; // Note: using .buf instead of ptr
         state.registered_iovecs[i].iov_len  = engine->staging_slots[i].size;
     }
-    
+
     int ret = io_uring_register_buffers(&state.ring, state.registered_iovecs.data(), (unsigned)state.registered_iovecs.size());
     if (ret < 0) {
         io_uring_queue_exit(&state.ring);
@@ -92,6 +108,13 @@ static bool init_io_uring(moe_pc_engine* engine) {
 }
 
 static void disk_read_to_staging_uring(moe_pc_engine* engine, int fd, uint64_t offset, uint32_t slot_idx, uint64_t bytes) {
+    // BUGFIX 532: Check engine and slot_idx validity before use ★
+    // Problem: No validation of engine or slot_idx before array access
+    // Solution: Check engine and slot_idx < staging_slots.size()
+    if (!engine || slot_idx >= engine->staging_slots.size()) {
+        return;
+    }
+
     struct io_uring_sqe* sqe = io_uring_get_sqe(&engine->uring_state.ring);
     if (!sqe) return;
     // IORING_OP_READ_FIXED: read directly into registered buffer, bypassing kernel copy

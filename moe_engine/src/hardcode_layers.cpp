@@ -87,5 +87,8 @@ uint32_t moe_storage_layer_count(void) {
 }
 
 const moe_storage_layer_spec_t* moe_storage_layer_at(uint32_t layer) {
-    return layer < moe_storage_layer_count() ? &kMoeLayers[layer] : 0;
+    // BUGFIX 445: layer 범위 체크 강화
+    uint32_t count = moe_storage_layer_count();
+    if (layer >= count || count == 0) return 0;
+    return &kMoeLayers[layer];
 }

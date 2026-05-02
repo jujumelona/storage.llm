@@ -179,8 +179,12 @@ int moe_juju_compute_pipeline_config(
     );
     const uint32_t io_threads = (uint32_t)juju_clamp_u64((uint64_t)prefetch_depth * 2ull, 1ull, 16ull);
     out_config->prefetch_depth = prefetch_depth;
-    out_config->tier0_expert_count = tier0->capacity_bytes / expert_bytes;
-    out_config->tier1_expert_count = tier1 ? tier1->capacity_bytes / expert_bytes : 0;
+    // BUGFIX 550: Check for division by zero before computing tier capacity ★
+    // Problem: expert_bytes can be 0 (checked at function start) but tier capacity calculation doesn't check
+    // If expert_bytes somehow becomes 0 after check (race condition), division by zero occurs
+    // Solution: Add defensive check before division
+    out_config->tier0_expert_count = (expert_bytes > 0) ? tier0->capacity_bytes / expert_bytes : 0;
+    out_config->tier1_expert_count = (tier1 && expert_bytes > 0) ? tier1->capacity_bytes / expert_bytes : 0;
     out_config->io_threads = io_threads;
     out_config->block_size = block_size;
     out_config->segment_bytes = segment_bytes;

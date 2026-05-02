@@ -89,7 +89,12 @@ static int demote_one_victim_to(
         }
         subtract_tier_usage(engine, from, state.bytes);
         if (from == moe_TIER_VRAM) {
-            engine->vram_expert_count.fetch_sub(1);
+            // BUGFIX 605: Check vram_expert_count > 0 before fetch_sub ★
+            // Problem: vram_expert_count can underflow if fetch_sub called when count is 0
+            // Solution: Check before decrement
+            if (engine->vram_expert_count.load(std::memory_order_relaxed) > 0) {
+                engine->vram_expert_count.fetch_sub(1);
+            }
             int layer = 0;
             int expert = 0;
             expert_dense_slot_decode(engine, victim.slot, &layer, &expert);
@@ -97,10 +102,44 @@ static int demote_one_victim_to(
             // device_free_experts_batched called later without any locks held
             to_free.push_back({layer, expert});
             state.pending_evict = true;
+#ifdef __linux__
+            if (to == moe_TIER_RAM) {
+                const moe_projection_t projs[3] = {moe_PROJ_GATE, moe_PROJ_UP, moe_PROJ_DOWN};
+                for (moe_projection_t proj : projs) {
+                    const moe_tensor_record* r = find_tensor_record(engine, layer, expert, proj);
+                    if (r) {
+                        mmap_context_t* shard = get_or_map_tensor_shard(engine, *r);
+                        if (shard) {
+                            const uint64_t ranges[][2] = {
+                                {r->info.weight_byte_offset, r->info.weight_byte_length},
+                                {r->info.scale_byte_offset, r->info.scale_byte_length},
+                                {r->info.scale2_byte_offset, r->info.scale2_byte_length},
+                            };
+                            for (const auto& range : ranges) {
+                                if (range[1] > 0) {
+                                    void* ptr = mmap_get_ptr(shard, static_cast<size_t>(range[0]));
+                                    if (ptr) madvise(ptr, static_cast<size_t>(range[1]), MADV_WILLNEED);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+#endif
         } else if (from == moe_TIER_RAM) {
-            engine->ram_expert_count.fetch_sub(1);
+            // BUGFIX 606: Check ram_expert_count > 0 before fetch_sub ★
+            // Problem: ram_expert_count can underflow if fetch_sub called when count is 0
+            // Solution: Check before decrement
+            if (engine->ram_expert_count.load(std::memory_order_relaxed) > 0) {
+                engine->ram_expert_count.fetch_sub(1);
+            }
         } else if (from == moe_TIER_DB) {
-            engine->db_expert_count.fetch_sub(1);
+            // BUGFIX 607: Check db_expert_count > 0 before fetch_sub ★
+            // Problem: db_expert_count can underflow if fetch_sub called when count is 0
+            // Solution: Check before decrement
+            if (engine->db_expert_count.load(std::memory_order_relaxed) > 0) {
+                engine->db_expert_count.fetch_sub(1);
+            }
         }
         state.tier = to;
         // BUGFIX 152: Add memory_order_relaxed for statistics counters
@@ -116,6 +155,7 @@ static int demote_one_victim_to(
 
 static void demote_cold_until(moe_pc_engine* engine, moe_tier_t tier, uint64_t needed, std::vector<std::pair<int, int>>& to_free);
 
+// BUGFIX 273: Update to use new demote_cold_until wrapper
 static int demote_one_vram_for_device_room(moe_pc_engine* engine, std::vector<std::pair<int, int>>& to_free) {
     moe_evict_candidate victim{};
     if (!pop_valid_evict_candidate(engine, moe_TIER_VRAM, &victim)) {
@@ -124,6 +164,7 @@ static int demote_one_vram_for_device_room(moe_pc_engine* engine, std::vector<st
     moe_tier_t next_tier = moe_TIER_RAM;
     const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
     // Use demote_cold_until instead of an O(N) one-by-one RAM eviction loop.
+    // BUGFIX 273: demote_cold_until now has recursion depth protection
     if (ram_budget > 0 && tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget) {
         std::vector<std::pair<int, int>> ignored;
         demote_cold_until(engine, moe_TIER_RAM, victim.bytes, ignored);
@@ -134,13 +175,28 @@ static int demote_one_vram_for_device_room(moe_pc_engine* engine, std::vector<st
     return demote_one_victim_to(engine, victim, moe_TIER_VRAM, next_tier, to_free);
 }
 
-static void demote_cold_until(moe_pc_engine* engine, moe_tier_t tier, uint64_t needed, std::vector<std::pair<int, int>>& to_free) {
+// BUGFIX 272: Prevent stack overflow from unbounded recursion ★★★
+// Problem: demote_cold_until recursively calls itself for RAM eviction.
+// Worst case: VRAM eviction needs 1GB, RAM full → evicts 100 × 10MB experts.
+// Each RAM eviction can trigger another recursion if RAM is saturated.
+// No recursion depth limit → stack overflow possible.
+// Solution: Add recursion_depth parameter with max depth of 2.
+// VRAM → RAM (depth 1) → DB (depth 2, no further recursion).
+// Trade-off: Depth 2 prevents RAM → RAM recursion, may leave some RAM unevicted.
+// This is acceptable because DB tier can always absorb evicted data.
+static void demote_cold_until_impl(moe_pc_engine* engine, moe_tier_t tier, uint64_t needed, std::vector<std::pair<int, int>>& to_free, int recursion_depth) {
     if (!engine) {
         return;
     }
     const uint64_t budget = tier_budget(engine, tier);
     const int idx = tier_heap_index(tier);
     if (idx < 0 || budget == 0 || (tier != moe_TIER_VRAM && tier != moe_TIER_RAM)) {
+        return;
+    }
+    // BUGFIX 272: Prevent unbounded recursion
+    if (recursion_depth > 2) {
+        // BUGFIX 717: Track silent failures from recursion limit
+        engine->io_atomic.eviction_depth_exceeded.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
@@ -159,7 +215,7 @@ static void demote_cold_until(moe_pc_engine* engine, moe_tier_t tier, uint64_t n
             // Use a single cold-demotion pass instead of nested one-by-one RAM evictions.
             if (ram_budget > 0 && tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget) {
                 std::vector<std::pair<int, int>> ignored;
-                demote_cold_until(engine, moe_TIER_RAM, victim.bytes, ignored);
+                demote_cold_until_impl(engine, moe_TIER_RAM, victim.bytes, ignored, recursion_depth + 1);
             }
             if (ram_budget == 0 || tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget) {
                 next_tier = moe_TIER_DB;
@@ -174,6 +230,10 @@ static void demote_cold_until(moe_pc_engine* engine, moe_tier_t tier, uint64_t n
             continue;
         }
     }
+}
+
+static void demote_cold_until(moe_pc_engine* engine, moe_tier_t tier, uint64_t needed, std::vector<std::pair<int, int>>& to_free) {
+    demote_cold_until_impl(engine, tier, needed, to_free, 0);
 }
 
 

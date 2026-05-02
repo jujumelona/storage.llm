@@ -22,6 +22,12 @@ static int device_copy_raw_span(
     if (!e || s.bytes == 0 || !device_allocator_init(e) || !device_set_current(e)) {
         return 0;
     }
+    // BUGFIX 595: Check s.bytes upper bound ★
+    // Problem: s.bytes can be corrupted (very large value)
+    // Solution: Validate before processing
+    if (s.bytes > 10ull * 1024 * 1024 * 1024) { // 10GB sanity check for raw span
+        return 0;
+    }
     const moe_storage_part_spec_t* part = moe_storage_part_by_id(s.part);
     if (!part || !part->path || e->model_root.empty()) {
         return 0;
@@ -36,7 +42,15 @@ static int device_copy_raw_span(
     if (!mapped || !mmap_get_ptr(mapped, 0)) {
         return 0;
     }
-    const uint64_t file_size = (uint64_t)mmap_get_size(mapped);
+    // BUGFIX 263: Check for negative mmap_get_size return value ★★
+    // Problem: mmap_get_size returns ssize_t (can be negative on error)
+    // Casting to uint64_t converts negative to very large positive
+    // Solution: Check for negative before casting
+    const ssize_t file_size_signed = mmap_get_size(mapped);
+    if (file_size_signed < 0) {
+        return 0;
+    }
+    const uint64_t file_size = (uint64_t)file_size_signed;
     if (s.bytes > file_size) {
         return 0;
     }
@@ -46,10 +60,13 @@ static int device_copy_raw_span(
     if (!src) {
         return 0;
     }
+    // BUGFIX 596: Check staging_slot_size > 0 before comparison ★
+    // Problem: staging_slot_size can be 0
+    // Solution: Check before comparison
     CUstream stream = device_tensor_stream_current(e);
     // Bug #10: QKV attention weights (raw spans) use pinned slot pool (for_pinned = true)
     // This prevents attention DMA from blocking MoE weight DMA in the GPU direct pool.
-    const uint32_t slot_idx = (e->staging_slots.size() > 0 && s.bytes <= e->staging_slot_size)
+    const uint32_t slot_idx = (e->staging_slots.size() > 0 && e->staging_slot_size > 0 && s.bytes <= e->staging_slot_size)
         ? acquire_staging_slot(e, 0u, s_raw_span_acquire_turn++, s.bytes, true) : UINT32_MAX;
 
     if (slot_idx != UINT32_MAX) {

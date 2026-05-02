@@ -28,7 +28,7 @@ moe_io_config_t moe_pc_default_io_config(void) {
     cfg.topology_max_candidates = 2;
     cfg.topology_max_edges_per_source = 32;
     cfg.disk_worker_threads = cfg.io_worker_threads;
-    cfg.pinned_worker_threads = 1;
+    cfg.pinned_worker_threads = hw >= 16 ? 2u : 1u;
     cfg.gpu_worker_threads = hw >= 16 ? 2u : 1u;
     cfg.pinned_staging_bytes = std::max<uint64_t>(512ull * 1024ull * 1024ull, normal_max * 8ull);
     cfg.direct_upload_min_bytes = normal_min;

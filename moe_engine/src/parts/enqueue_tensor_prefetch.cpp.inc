@@ -73,6 +73,11 @@ static int enqueue_tensor_prefetch(
         enqueue_stage_or_retry(engine, engine->disk_stage, task) :
         enqueue_stage(engine, engine->disk_stage, task);
     if (!queued) {
+        // BUGFIX 237: Track prefetch admission failures
+        // Problem: enqueue failure returns 0 without updating statistics
+        // Impact: /health monitoring shows incorrect hit rate (failures not counted)
+        // Solution: Increment failed_requests counter on enqueue failure
+        engine->io_atomic.failed_requests.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
     // Fix: Only count queued_requests after successful enqueue

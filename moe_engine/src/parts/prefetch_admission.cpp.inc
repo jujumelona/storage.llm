@@ -1,4 +1,4 @@
-﻿static uint32_t prefetch_stage_load(const moe_stage_queue& stage) {
+static uint32_t prefetch_stage_load(const moe_stage_queue& stage) {
     return stage.depth.load(std::memory_order_relaxed) + stage.inflight.load(std::memory_order_relaxed);
 }
 
@@ -10,18 +10,16 @@ static int prefetch_under_queue_pressure(
     const moe_pc_engine* engine,
     const moe_expert_prefetch_item_t& item
 ) {
-    if (!engine || engine->io_config.max_prefetch_queue == 0) {
+    if (!engine) {
         return 0;
     }
-    const uint32_t max_queue = engine->io_config.max_prefetch_queue;
-    if (prefetch_stage_load(engine->disk_stage) * 4u >= max_queue * 3u) {
-        return 1;
-    }
+    if (engine->disk_stage_depth_cap > 0 &&
+        prefetch_stage_load(engine->disk_stage) * 4u >= engine->disk_stage_depth_cap * 3u) { return 1; }
     if (item.target_tier == moe_TIER_VRAM &&
-        (prefetch_stage_load(engine->pinned_stage) * 4u >= max_queue * 3u ||
-         prefetch_stage_load(engine->gpu_stage) * 4u >= max_queue * 3u)) {
-        return 1;
-    }
+        ((engine->pinned_stage_depth_cap > 0 &&
+          prefetch_stage_load(engine->pinned_stage) * 4u >= engine->pinned_stage_depth_cap * 3u) ||
+         (engine->gpu_stage_depth_cap > 0 &&
+          prefetch_stage_load(engine->gpu_stage) * 4u >= engine->gpu_stage_depth_cap * 3u))) { return 1; }
     // BUG 5 FIX: RAM target should also check pinned_stage load
     // When VRAM targets congest pinned_stage, RAM targets can flood disk_stage
     // and push it to 100%, even though RAM targets don't use pinned_stage directly.
@@ -108,23 +106,61 @@ static moe_tier_t prefetch_admitted_tier(
     return target;
 }
 
+// BUGFIX 256: Fix underflow recovery with CAS loop ★★
+// Problem: fetch_sub then fetch_add for recovery is not atomic
+// If old_val < bytes, underflow already occurred. Another thread may have
+// modified pending_vram_reservation between fetch_sub and fetch_add.
+// Solution: Use CAS loop to atomically prevent underflow
 static void prefetch_release_pending_vram_reservation(moe_pc_engine* engine, uint64_t bytes) {
     if (!engine || bytes == 0) {
         return;
     }
-    const uint64_t old_val = engine->pending_vram_reservation.fetch_sub(bytes, std::memory_order_relaxed);
-    if (old_val < bytes) {
-        engine->pending_vram_reservation.fetch_add(bytes - old_val, std::memory_order_relaxed);
+    uint64_t expected = engine->pending_vram_reservation.load(std::memory_order_relaxed);
+    while (true) {
+        if (expected < bytes) {
+            // Underflow would occur - clamp to 0
+            if (engine->pending_vram_reservation.compare_exchange_weak(
+                    expected, 0,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+        } else {
+            // Normal case - subtract bytes
+            if (engine->pending_vram_reservation.compare_exchange_weak(
+                    expected, expected - bytes,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+        }
     }
 }
 
+// BUGFIX 256: Apply same fix to RAM reservation
 static void prefetch_release_pending_ram_reservation(moe_pc_engine* engine, uint64_t bytes) {
     if (!engine || bytes == 0) {
         return;
     }
-    const uint64_t old_val = engine->pending_ram_reservation.fetch_sub(bytes, std::memory_order_relaxed);
-    if (old_val < bytes) {
-        engine->pending_ram_reservation.fetch_add(bytes - old_val, std::memory_order_relaxed);
+    uint64_t expected = engine->pending_ram_reservation.load(std::memory_order_relaxed);
+    while (true) {
+        if (expected < bytes) {
+            // Underflow would occur - clamp to 0
+            if (engine->pending_ram_reservation.compare_exchange_weak(
+                    expected, 0,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+        } else {
+            // Normal case - subtract bytes
+            if (engine->pending_ram_reservation.compare_exchange_weak(
+                    expected, expected - bytes,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+        }
     }
 }
 

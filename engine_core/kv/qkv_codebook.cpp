@@ -9,6 +9,8 @@
 // Beta distribution PDF: f(x) proportional to (1 - x^2)^((d - 3) / 2)
 // For large d, converges to N(0, 1/d)
 static double beta_pdf(double x, int d) {
+    // BUGFIX 365: d가 0 이하일 때 방지
+    if (d <= 0) return 0.0;
     if (x <= -1.0 || x >= 1.0) return 0.0;
     // For large d, use Gaussian approximation
     double variance = 1.0 / (double)d;
@@ -24,10 +26,19 @@ static void lloyd_max_codebook(
     int dim,
     int max_iters
 ) {
+    // BUGFIX 366: 파라미터 유효성 체크
+    if (!centroids || !thresholds || n_levels <= 0 || dim <= 0 || max_iters <= 0) {
+        return;
+    }
     // Fix 1: Initialize centroids within N(0, 1/d) distribution range
     double sigma = 1.0 / sqrt((double)dim);
     for (int i = 0; i < n_levels; i++) {
-        centroids[i] = (float)((-3.5 + 7.0 * (double)i / (double)(n_levels - 1)) * sigma);
+        // BUGFIX 367: n_levels가 1일 때 division by zero 방지
+        if (n_levels <= 1) {
+            centroids[i] = 0.0f;
+        } else {
+            centroids[i] = (float)((-3.5 + 7.0 * (double)i / (double)(n_levels - 1)) * sigma);
+        }
     }
 
     // Lloyd-Max iteration
@@ -72,6 +83,10 @@ void qkv_compute_lloyd_max_codebook(
     int bits,
     int dim
 ) {
+    // BUGFIX 368: 파라미터 유효성 체크
+    if (!centroids || !thresholds || bits <= 0 || bits > 8 || dim <= 0) {
+        return;
+    }
     int n_levels = 1 << bits;
 
     // For 2-bit, paper gives explicit values
@@ -99,6 +114,10 @@ int qkv_find_nearest_centroid(
     const float* thresholds,
     int n_levels
 ) {
+    // BUGFIX 369: 파라미터 유효성 체크
+    if (!centroids || !thresholds || n_levels <= 0) {
+        return 0;
+    }
     // Binary search through thresholds
     int lo = 0, hi = n_levels;
     while (lo < hi) {

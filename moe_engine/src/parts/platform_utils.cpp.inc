@@ -13,6 +13,20 @@ static void copy_check_path(char* out, size_t out_size, const std::string& path)
     out[out_size - 1] = '\0';
 }
 
+static void moe_platform_init_limits() {
+#ifndef _WIN32
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        if (rl.rlim_max == RLIM_INFINITY || rl.rlim_max > 65535) {
+            rl.rlim_cur = rl.rlim_max == RLIM_INFINITY ? 65535 : rl.rlim_max;
+        } else {
+            rl.rlim_cur = rl.rlim_max;
+        }
+        setrlimit(RLIMIT_NOFILE, &rl);
+    }
+#endif
+}
+
 #ifdef _WIN32
 static std::string moe_wide_to_utf8(const wchar_t* value) {
     if (!value || !value[0]) {

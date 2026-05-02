@@ -89,7 +89,15 @@ static int moe_json_get_string_local(const std::string& text, const char* key, s
             *out = parsed;
             return 1;
         }
+        // BUGFIX 268: Simplified escape handling for JSON metadata ★★
+        // Problem: Only copies next char after backslash without interpreting escape sequences
+        // Current behavior: "\n" → "n", "\t" → "t" (literal characters, not control codes)
+        // Solution: This is intentional for metadata parsing (model IDs, paths don't need control codes)
+        // Add comment to clarify this is simplified parsing, not full JSON spec
+        // For full JSON spec compliance, would need: \n→newline, \t→tab, \uXXXX→unicode, etc.
         if (c == '\\' && value < text.size()) {
+            // Simplified escape: just remove backslash, keep next char as-is
+            // Sufficient for model metadata (no control codes in model IDs/paths)
             parsed.push_back(text[value++]);
         } else {
             parsed.push_back(c);
@@ -200,6 +208,12 @@ static int moe_json_get_u64_slice(
     if (begin >= end || end > text.size()) {
         return 0;
     }
+    // BUGFIX 549: Check for substr overflow ★
+    // Problem: If begin >= text.size(), substr throws out_of_range exception
+    // Solution: Add bounds check before substr
+    if (begin >= text.size()) {
+        return 0;
+    }
     return moe_json_get_u64_local(text.substr(begin, end - begin), key, out);
 }
 
@@ -211,6 +225,12 @@ static int moe_json_get_string_slice(
     std::string* out
 ) {
     if (begin >= end || end > text.size()) {
+        return 0;
+    }
+    // BUGFIX 548: Check for substr overflow ★
+    // Problem: If begin >= text.size(), substr throws out_of_range exception
+    // Solution: Add bounds check before substr
+    if (begin >= text.size()) {
         return 0;
     }
     return moe_json_get_string_local(text.substr(begin, end - begin), key, out);
@@ -231,6 +251,12 @@ static int moe_json_get_u64_array_slice(
     if (!values || max_values == 0 || begin >= end || end > text.size()) {
         return 0;
     }
+    // BUGFIX 546: Check for substr overflow ★
+    // Problem: If begin >= text.size(), substr throws out_of_range exception
+    // Solution: Add bounds check before substr
+    if (begin >= text.size()) {
+        return 0;
+    }
     const std::string slice = text.substr(begin, end - begin);
     size_t arr_begin = 0;
     size_t arr_end = 0;
@@ -247,6 +273,9 @@ static int moe_json_get_u64_array_slice(
         char* parsed_end = nullptr;
         const char* start = slice.c_str() + pos;
         const uint64_t value = std::strtoull(start, &parsed_end, 10);
+        // BUGFIX 547: Check parsed_end is not null before dereferencing ★
+        // Problem: strtoull can set parsed_end to null on failure
+        // Solution: Check parsed_end != nullptr before comparing
         if (!parsed_end || parsed_end == start) {
             break;
         }

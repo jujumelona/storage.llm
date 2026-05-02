@@ -171,7 +171,13 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
         }
     }
 #endif
-    while (bytes >= min_pinned) {
+    // BUGFIX 253: Add iteration limit to prevent excessive retries ★★
+    // Problem: bytes /= 2 loop can iterate many times for large initial values
+    // Example: 16GB → 8GB → 4GB → ... → 1MB = 14 iterations
+    // Solution: Limit to 10 iterations (covers 1024x reduction)
+    uint32_t retry_count = 0;
+    constexpr uint32_t MAX_PINNED_RETRIES = 10;
+    while (bytes >= min_pinned && retry_count < MAX_PINNED_RETRIES) {
         bool got_pinned = false;
         bool got_numa = false;
         uint8_t* ptr = allocate_staging(e ? e->backend_caps.preferred_numa_node : -1, bytes, &got_pinned, &got_numa);
@@ -195,6 +201,7 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
             free_staging(ptr, bytes, false, got_numa);
         }
         bytes /= 2;
+        ++retry_count;
     }
 
     // CRITICAL FIX: When pinned allocation fails completely, return non-pinned fallback

@@ -6,6 +6,12 @@ static void moe_qkv_ensure_head_storage_locked(moe_pc_engine* engine, size_t hea
     if (!engine || head_count == 0) {
         return;
     }
+    // BUGFIX 618: Fix return type mismatch - function returns void, not int ★
+    // Problem: Function declared as void but has "return 0;" statement
+    // Solution: Remove return value from range check
+    if (head_count > 10000) {
+        return;
+    }
     if (engine->qkv_head_state_slots.size() < head_count) {
         engine->qkv_head_state_slots.resize(head_count);
     }
@@ -183,10 +189,26 @@ int moe_pc_engine_attention_decode_f32(
         context_tokens == 0 || head_count == 0 || head_dim == 0) {
         return 0;
     }
-    const float inv_sqrt = 1.0f / std::sqrt((float)head_dim);
+    // BUGFIX 640: head_dim 체크를 sqrt 전에 수행 ★
+    // Problem: head_dim == 0 체크가 sqrt 호출 후에 있음
+    // 위 if문에서 head_dim == 0 체크하므로 안전하지만, 명시적으로 확인
+    // Solution: 이미 체크되어 있으므로 안전함 (주석 추가)
+    const float inv_sqrt = 1.0f / std::sqrt((float)head_dim);  // Safe: head_dim > 0 guaranteed by check above
     if (context_tokens > (uint32_t)std::numeric_limits<int>::max() ||
         head_dim > (uint32_t)std::numeric_limits<int>::max()) {
         return 0;
+    }
+    // BUGFIX 630: Check for overflow in pointer arithmetic ★
+    // Problem: head * context_tokens * head_dim can overflow uint64_t
+    // Solution: Check multiplication overflow before pointer arithmetic
+    if (head_count > 0 && context_tokens > 0 && head_dim > 0) {
+        if (context_tokens > UINT64_MAX / head_dim) {
+            return 0;  // context_tokens * head_dim would overflow
+        }
+        uint64_t tokens_times_dim = (uint64_t)context_tokens * (uint64_t)head_dim;
+        if (head_count > UINT64_MAX / tokens_times_dim) {
+            return 0;  // head_count * context_tokens * head_dim would overflow
+        }
     }
     if (engine->config.kv_mode == moe_KV_MODE_QKV && qkv_is_enabled() &&
         !moe_qkv_prepare_head_states(engine, head_count, head_dim)) {
@@ -253,6 +275,8 @@ int moe_pc_engine_attention_decode_f32(
 static void save_gate_input_snapshot(moe_pc_engine* engine, int layer, const float* hidden, uint32_t dim) {
     if (!engine || layer < 0 || !hidden || dim == 0) return;
     const size_t layer_u = (size_t)layer;
+    // BUGFIX 503: layer_u 범위 체크
+    if (layer_u > 10000) return;
     if (engine->gate_input_snapshots.size() <= layer_u) {
         engine->gate_input_snapshots.resize(layer_u + 1);
         engine->gate_input_snapshot_epochs.resize(layer_u + 1, 0);

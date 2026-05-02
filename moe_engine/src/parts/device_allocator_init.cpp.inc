@@ -2,10 +2,17 @@
 
 static std::atomic<uint64_t>* device_pool_counter(moe_pc_engine* e, uint8_t pool) {
     if (!e) return nullptr;
+    // BUGFIX 590: Check pool value range ★
+    // Problem: pool can be out of range
+    // Solution: Validate pool before use
     if (pool == moe_DEVICE_POOL_FIXED) return &e->device_fixed_bytes;
     if (pool == moe_DEVICE_POOL_ACTIVATION) return &e->device_activation_bytes;
     if (pool == moe_DEVICE_POOL_EXPERT) return &e->device_expert_bytes;
-    return &e->device_stream_bytes;
+    // BUGFIX 591: Return nullptr for invalid pool instead of stream_bytes ★
+    // Problem: Invalid pool returns stream_bytes, causing wrong accounting
+    // Solution: Return nullptr for invalid pool
+    if (pool == moe_DEVICE_POOL_STREAM) return &e->device_stream_bytes;
+    return nullptr;
 }
 
 static void device_stream_pool_init(moe_pc_engine* e);
@@ -117,14 +124,18 @@ static int device_allocator_init(moe_pc_engine* e) {
             e->vk.vkGetPhysicalDeviceMemoryProperties2(e->vk.physicalDevice, &props);
             uint64_t calc_free = 0;
             uint64_t calc_total = 0;
-            for (uint32_t i = 0; i < props.memoryProperties.memoryHeapCount; ++i) {
+            // BUGFIX 466: memoryHeapCount 범위 체크 (최대 16개)
+            uint32_t heap_count = props.memoryProperties.memoryHeapCount;
+            if (heap_count > 16) heap_count = 16;
+            for (uint32_t i = 0; i < heap_count; ++i) {
                 if (props.memoryProperties.memoryHeaps[i].flags & 1) { // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
                     calc_total += props.memoryProperties.memoryHeaps[i].size;
                     if (budget.heapBudget[i] > 0) {
-                        calc_free += (budget.heapBudget[i] > budget.heapUsage[i]) ? (budget.heapBudget[i] - budget.heapUsage[i]) : 0;
+                        uint64_t avail = (budget.heapBudget[i] > budget.heapUsage[i]) ? (budget.heapBudget[i] - budget.heapUsage[i]) : 0;
+                        calc_free += (avail * 90ull) / 100ull;
                     } else {
                         // Fallback to 85% if VK_EXT_memory_budget is missing
-                        calc_free += (props.memoryProperties.memoryHeaps[i].size * 85) / 100;
+                        calc_free += (props.memoryProperties.memoryHeaps[i].size * 85ull) / 100ull;
                     }
                 }
             }
@@ -159,10 +170,11 @@ static int device_allocator_init(moe_pc_engine* e) {
             if (e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &mem_props) == 0) {
                 total_mem = mem_props.totalSize;
                 if (ext_props.allocatedSize > 0) {
-                    free_mem = (mem_props.totalSize > ext_props.allocatedSize) ? (mem_props.totalSize - ext_props.allocatedSize) : mem_props.totalSize;
+                    uint64_t avail = (mem_props.totalSize > ext_props.allocatedSize) ? (mem_props.totalSize - ext_props.allocatedSize) : mem_props.totalSize;
+                    free_mem = (avail * 90ull) / 100ull;
                 } else {
                     // Fallback to 85% if allocatedSize not populated
-                    free_mem = (mem_props.totalSize * 85) / 100;
+                    free_mem = (mem_props.totalSize * 85ull) / 100ull;
                 }
                 exact_queried = 1;
             }

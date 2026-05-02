@@ -27,10 +27,17 @@ static int moe_read_gguf_tensor_infos(
     uint64_t* executable_count,
     uint64_t* max_executable_bytes
 ) {
+    // BUGFIX 270: Clarify tensor_count validation thresholds ★
+    // Problem: Checks tensor_count > 10M but reserves min(tensor_count, 1M)
+    // Solution: Add comment explaining the difference
+    // 10M limit: sanity check for corrupted files (prevents multi-GB allocation)
+    // 1M reserve: memory optimization (most models have <100K tensors)
     if (!tensors || tensor_count > 10000000ull) {
         return 0;
     }
     tensors->clear();
+    // Reserve up to 1M entries to avoid excessive memory for typical models
+    // Most models have <100K tensors, so 1M is generous headroom
     tensors->reserve((size_t)std::min<uint64_t>(tensor_count, 1000000ull));
     for (uint64_t i = 0; i < tensor_count; ++i) {
         moe_gguf_tensor_dir_entry_t entry{};

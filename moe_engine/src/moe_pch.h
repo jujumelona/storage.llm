@@ -1,5 +1,6 @@
 #pragma once
 // Precompiled header for fast compilation
+#define ENABLE_LOCKFREE_STAGING 1
 
 // Standard library
 #include <algorithm>

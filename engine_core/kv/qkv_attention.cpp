@@ -23,7 +23,9 @@ int qkv_attention_decode_impl(
     uint32_t hdim,
     float* output
 ) {
-    if (!query || !s || !cfg || !output || !ctx || !hdim) return 0;
+    // BUGFIX 349: 모든 포인터 null 체크 및 파라미터 유효성 체크
+    if (!query || !s || !cfg || !output || ctx == 0 || hdim == 0) return 0;
+    if (hdim > 16384) return 0;  // 비정상적으로 큰 차원 방지
     const int d = (int)hdim, n = (int)ctx;
     const bool qjl = cfg->enable_qjl && s->k_bits > 1 && s->v_bits > 1 && s->k_qjl && s->v_qjl;
 
@@ -31,7 +33,8 @@ int qkv_attention_decode_impl(
     float* row = s->scratch_residual;
     if (!row || s->head_dim != d) return 0;
 
-    if (n > s->n_tokens) return 0;
+    // BUGFIX 350: n_tokens 범위 체크
+    if (n > s->n_tokens || n < 0) return 0;
     float* att = s->scratch_attention;
     if (!att) return 0;
 
@@ -42,30 +45,38 @@ int qkv_attention_decode_impl(
     if (cfg->enable_rotation && s->rotation_matrix) {
         float* rq = s->scratch_rotated_q;
         if (!rq) return 0;
+        // BUGFIX 351: rotation_matrix 범위 체크
         for (int i = 0; i < d; i++) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += s->rotation_matrix[i * d + j] * query[j];
+                size_t idx = (size_t)i * (size_t)d + (size_t)j;
+                sum += s->rotation_matrix[idx] * query[j];
             }
             rq[i] = sum;
         }
         q_eff = rq;
     }
 
+    // BUGFIX 352: d가 0일 때 division by zero 방지
+    if (d <= 0) return 0;
     const float sc = 1.0f / sqrtf((float)d);
 
     // Bug 2 Fix: Use pre-computed worker limit instead of OS call
     const int max_workers = s->computed_workers > 0 ? s->computed_workers : 1;
-    const int workers = std::max(1, std::min<int>(max_workers, n / 512));
+    // BUGFIX 353: workers 계산 시 division by zero 방지
+    const int workers = (n >= 512) ? std::max(1, std::min<int>(max_workers, n / 512)) : 1;
 
     // Phase 1: K scores — dequant in rotated domain (no inverse rotation needed)
     // Paper Algorithm 2: For unbiased inner product, include QJL residual
     const int k_mse_bits = qjl ? s->k_bits - 1 : s->k_bits;
     if (!qkv_bits_valid(k_mse_bits)) return 0;
     const float* k_centroids = qkv_codebook_for_bits(s, k_mse_bits);
+    // BUGFIX 354: k_stride overflow 방지
+    if (d > INT_MAX / k_mse_bits) return 0;
     const int k_stride = (d * k_mse_bits + 7) / 8;
     const int k_qstride = (d + 7) / 8;
     // Bug 1 Fix: Correct QJL scale factor from paper Algorithm 2: sqrt(π/(2d))
+    // BUGFIX 355: d가 0일 때 division by zero 방지 (이미 위에서 체크했지만 명시적으로)
     const float qjl_scale = sqrtf((float)M_PI / (2.0f * (float)d));
     const bool k_split = qkv_outlier_split_ready(s, cfg, QKV_TARGET_KEY);
     const bool use_qjl_key_residual = qjl && s->k_qjl && s->qjl_matrix;
@@ -76,10 +87,12 @@ int qkv_attention_decode_impl(
     // Precompute S * q_eff for QJL residual
     if (use_qjl_key_residual) {
         if (!s_q_precomputed || !qjl_z) return 0;
+        // BUGFIX 356: qjl_matrix 범위 체크
         for (int i = 0; i < d; i++) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += s->qjl_matrix[i * d + j] * q_eff[j];
+                size_t idx = (size_t)i * (size_t)d + (size_t)j;
+                sum += s->qjl_matrix[idx] * q_eff[j];
             }
             s_q_precomputed[i] = sum;
         }
@@ -91,6 +104,12 @@ int qkv_attention_decode_impl(
         const int norm_bits = cfg->normal_bits;
         const int n_outliers = cfg->outlier_channels;
         const int n_normal = d - n_outliers;
+        // BUGFIX 357: overflow 방지
+        if (n_outliers < 0 || n_outliers > d || n_normal < 0) return 0;
+        // BUGFIX 487: out_bits/norm_bits 범위 체크
+        if (out_bits < 1 || out_bits > 4 || norm_bits < 1 || norm_bits > 4) return 0;
+        // BUGFIX 488: packed_size overflow 방지
+        if (n_outliers > INT_MAX / out_bits || n_normal > INT_MAX / norm_bits) return 0;
         const int out_packed_size = k_split ? (n_outliers * out_bits + 7) / 8 : 0;
         const int norm_packed_size = k_split ? (n_normal * norm_bits + 7) / 8 : 0;
         const int* outlier_channels = k_split ? qkv_outlier_indices_for_target_const(s, QKV_TARGET_KEY) : nullptr;
@@ -101,16 +120,28 @@ int qkv_attention_decode_impl(
         const uint8_t* is_outlier = k_split ? qkv_is_outlier_for_target_const(s, QKV_TARGET_KEY) : nullptr;
 
         const int local_stride = std::max(d, std::max(n_outliers, n_normal));
+        // BUGFIX 358: work buffer 유효성 체크 강화
         if (!s->work_codes_buf || !s->work_qjl_buf ||
-            s->work_buf_workers < workers || s->work_buf_stride < local_stride) {
+            s->work_buf_workers < workers || s->work_buf_stride < local_stride ||
+            workers <= 0 || local_stride <= 0) {
             return 0;
         }
 
         auto score_range = [&](int begin, int end, int w, int* ok_flag) {
+            // BUGFIX 359: work buffer 인덱스 overflow 방지
+            if (w < 0 || w >= workers) {
+                *ok_flag = 0;
+                return;
+            }
             int* local_codes = s->work_codes_buf + (size_t)w * (size_t)s->work_buf_stride;
             float* local_qjl = s->work_qjl_buf + (size_t)w * (size_t)d;
 
             for (int t = begin; t < end && *ok_flag; t++) {
+                // BUGFIX 360: t 범위 체크
+                if (t < 0 || t >= n) {
+                    *ok_flag = 0;
+                    return;
+                }
                 float norm_k = s->k_norms[t];
                 float dot = 0.0f;
 
@@ -225,17 +256,26 @@ int qkv_attention_decode_impl(
     }
 
     // Softmax
+    // BUGFIX 361: n이 0일 때 방지 (이미 위에서 체크했지만 명시적으로)
+    if (n <= 0) return 0;
     float mx = att[0];
     for (int t = 1; t < n; t++) if (att[t] > mx) mx = att[t];
     float se = 0;
     for (int t = 0; t < n; t++) { att[t] = expf(att[t] - mx); se += att[t]; }
-    if (se > 0) {
+    // BUGFIX 362: softmax sum이 0일 때 division by zero 방지
+    if (se > 1e-10f) {
         float iv = 1.0f / se;
         for (int t = 0; t < n; t++) att[t] *= iv;
+    } else {
+        // Uniform distribution fallback
+        float uniform = 1.0f / (float)n;
+        for (int t = 0; t < n; t++) att[t] = uniform;
     }
 
     // Phase 2: V weighted sum — need full dequant (with inverse rotation)
     if (n >= 1024) {
+        // BUGFIX 363: workers 유효성 체크
+        if (workers <= 0 || workers > 1024) return 0;
         std::vector<float> partial((size_t)workers * (size_t)d, 0.0f);
         std::vector<int> ok_flags((size_t)workers, 1);
 
@@ -249,6 +289,8 @@ int qkv_attention_decode_impl(
         std::vector<int> work_indices((size_t)workers * (size_t)d);
 
         auto v_task = [&](int w) {
+            // BUGFIX 364: w 범위 체크
+            if (w < 0 || w >= workers) return;
             const int begin = (int)(((int64_t)n * w) / workers);
             const int end = (int)(((int64_t)n * (w + 1)) / workers);
             qkv_state_t local = *s;

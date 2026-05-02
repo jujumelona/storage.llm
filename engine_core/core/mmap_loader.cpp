@@ -62,6 +62,10 @@ static void mmap_discard_pages(mmap_context_t*, void*, size_t) {}
 int mmap_file(mmap_context_t* ctx, const char* path) {
     if (!ctx || !path) return 0;
 
+    // BUGFIX 421: path 길이 체크
+    size_t path_len = strlen(path);
+    if (path_len == 0 || path_len > 32767) return 0;
+
     memset(ctx, 0, sizeof(mmap_context_t));
 
 #ifdef _WIN32
@@ -349,7 +353,12 @@ void mmap_unload(mmap_context_t* ctx) {
 // ============================================================
 
 void* mmap_get_ptr(const mmap_context_t* ctx, size_t offset) {
+    // BUGFIX 422: ctx와 addr null 체크 강화
     if (!ctx || !ctx->addr || offset >= ctx->size) {
+        return NULL;
+    }
+    // BUGFIX 423: offset overflow 방지
+    if (offset > SIZE_MAX - (size_t)ctx->addr) {
         return NULL;
     }
     return (char*)ctx->addr + offset;
@@ -363,7 +372,12 @@ size_t mmap_get_size(const mmap_context_t* ctx) {
 mmap_context_t* mmap_load_partial(const char* path, size_t offset, size_t length) {
     mmap_context_t* ctx = (mmap_context_t*)malloc(sizeof(mmap_context_t));
     if (!ctx) return NULL;
+    // BUGFIX 424: path null 체크 및 길이 체크
     if (!path || length == 0) { free(ctx); return NULL; }
+    size_t path_len = strlen(path);
+    if (path_len == 0 || path_len > 32767) { free(ctx); return NULL; }
+    // BUGFIX 425: offset + length overflow 방지
+    if (offset > SIZE_MAX - length) { free(ctx); return NULL; }
     memset(ctx, 0, sizeof(mmap_context_t));
 
 #ifdef _WIN32
@@ -375,8 +389,12 @@ mmap_context_t* mmap_load_partial(const char* path, size_t offset, size_t length
     GetSystemInfo(&sysInfo);
     DWORD allocGranularity = sysInfo.dwAllocationGranularity;
 
+    // BUGFIX 426: allocGranularity가 0일 때 division by zero 방지
+    if (allocGranularity == 0) allocGranularity = 65536;
     size_t aligned_offset = (offset / allocGranularity) * allocGranularity;
     size_t offset_diff = offset - aligned_offset;
+    // BUGFIX 427: map_length overflow 방지
+    if (length > SIZE_MAX - offset_diff) { CloseHandle(ctx->hFile); free(ctx); return NULL; }
     size_t map_length = length + offset_diff;
 
     ctx->hMap = CreateFileMappingW(ctx->hFile, NULL, PAGE_READONLY, 0, 0, NULL);
@@ -404,6 +422,8 @@ mmap_context_t* mmap_load_partial(const char* path, size_t offset, size_t length
     long page_size = sysconf(_SC_PAGESIZE);
     // Fix: Validate sysconf return value to prevent UB
     if (page_size <= 0) page_size = 4096;
+    // BUGFIX 428: page_size가 0일 때 division by zero 방지 (이미 위에서 체크했지만 명시적으로)
+    if (page_size <= 0) { close(ctx->fd); free(ctx); return NULL; }
     size_t aligned_offset = (offset / (size_t)page_size) * (size_t)page_size;
     size_t offset_diff = offset - aligned_offset;
 
@@ -412,7 +432,12 @@ mmap_context_t* mmap_load_partial(const char* path, size_t offset, size_t length
     size_t map_length = length + offset_diff;
 
     // Fix: Verify map_length doesn't exceed file size
-    if ((size_t)st.st_size < aligned_offset || map_length > (size_t)st.st_size - aligned_offset) {
+    // BUGFIX 429: aligned_offset overflow 체크
+    if ((size_t)st.st_size < aligned_offset) {
+        close(ctx->fd); free(ctx); return NULL;
+    }
+    // BUGFIX 430: map_length 범위 체크 강화
+    if (map_length > (size_t)st.st_size - aligned_offset || map_length == 0) {
         close(ctx->fd); free(ctx); return NULL;
     }
 
@@ -467,8 +492,11 @@ int mmap_unlock(mmap_context_t* ctx) {
 
 // Prefetch helpers
 void mmap_prefetch(mmap_context_t* ctx, size_t offset, size_t length) {
+    // BUGFIX 431: ctx와 addr null 체크
     if (!ctx || !ctx->addr) return;
+    // BUGFIX 432: offset와 length 유효성 체크 강화
     if (offset >= ctx->size || length == 0) return;
+    if (length > ctx->size) length = ctx->size;
 
 #ifndef _WIN32
     // POSIX: MADV_WILLNEED
@@ -477,19 +505,27 @@ void mmap_prefetch(mmap_context_t* ctx, size_t offset, size_t length) {
     if (length > ctx->size - offset) {
         length = ctx->size - offset;
     }
+    // BUGFIX 433: offset overflow 방지
+    if (offset > SIZE_MAX - (size_t)ctx->addr) return;
     char* addr = (char*)ctx->addr + offset;
     size_t end = offset + length; // Now safe from overflow
     if (end > ctx->size) end = ctx->size;
 
+    // BUGFIX 434: end - offset underflow 방지
+    if (end < offset) return;
     madvise(addr, end - offset, MADV_WILLNEED);
 #else
     // Critical Fix 2: Prevent integer overflow (Windows path)
     if (length > ctx->size - offset) {
         length = ctx->size - offset;
     }
+    // BUGFIX 435: offset overflow 방지
+    if (offset > SIZE_MAX - (size_t)ctx->addr) return;
     char* addr = (char*)ctx->addr + offset;
     size_t end = offset + length;
     if (end > ctx->size) end = ctx->size;
+    // BUGFIX 436: end - offset underflow 방지
+    if (end < offset) return;
     size_t prefetch_len = end - offset;
 
     typedef BOOL (WINAPI *PrefetchVirtualMemoryFn)(
@@ -509,9 +545,12 @@ void mmap_prefetch(mmap_context_t* ctx, size_t offset, size_t length) {
         }
     }
     // Fallback for older Windows versions.
-    volatile char dummy = addr[0];
-    dummy ^= addr[prefetch_len - 1];
-    (void)dummy;
+    // BUGFIX 437: prefetch_len이 0일 때 배열 접근 방지
+    if (prefetch_len > 0) {
+        volatile char dummy = addr[0];
+        dummy ^= addr[prefetch_len - 1];
+        (void)dummy;
+    }
 #endif
 }
 

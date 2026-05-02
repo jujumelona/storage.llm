@@ -16,7 +16,11 @@ static moe_dir_iterator_t* moe_open_directory(const std::string& path) {
         return nullptr;
     }
     
-    moe_dir_iterator_t* it = new moe_dir_iterator_t{};
+    // BUGFIX 632: Check new allocation failure ★
+    moe_dir_iterator_t* it = new (std::nothrow) moe_dir_iterator_t{};
+    if (!it) {
+        return nullptr;
+    }
     it->handle = FindFirstFileW(wide_pattern.c_str(), &it->data);
     it->first = true;
     it->valid = (it->handle != INVALID_HANDLE_VALUE);
@@ -72,7 +76,12 @@ static moe_dir_iterator_t* moe_open_directory(const std::string& path) {
         return nullptr;
     }
     
-    moe_dir_iterator_t* it = new moe_dir_iterator_t{};
+    // BUGFIX 632: Check new allocation failure ★
+    moe_dir_iterator_t* it = new (std::nothrow) moe_dir_iterator_t{};
+    if (!it) {
+        closedir(dir);
+        return nullptr;
+    }
     it->dir = dir;
     return it;
 }

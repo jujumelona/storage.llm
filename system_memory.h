@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <cstdint>
 
@@ -71,6 +71,28 @@ inline uint64_t available_ram_bytes() {
 
     const uint64_t available_pages = static_cast<uint64_t>(vm_stat.free_count);
     return available_pages * static_cast<uint64_t>(page_size);
+#else
+    return 0;
+#endif
+}
+
+inline uint64_t total_ram_bytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) ? static_cast<uint64_t>(status.ullTotalPhys) : 0;
+#elif defined(__linux__)
+    struct sysinfo info {};
+    if (sysinfo(&info) == 0) {
+        return static_cast<uint64_t>(info.totalram) * static_cast<uint64_t>(info.mem_unit);
+    }
+    return 0;
+#elif defined(__APPLE__)
+    int mib[2] = {CTL_HW, HW_MEMSIZE};
+    uint64_t physical_memory = 0;
+    size_t length = sizeof(physical_memory);
+    sysctl(mib, 2, &physical_memory, &length, NULL, 0);
+    return physical_memory;
 #else
     return 0;
 #endif

@@ -145,6 +145,16 @@ int moe_pc_engine_eval_token_ids(
     moe_eval_stats_t* out_stats
 );
 
+// Continuous Batching API
+int moe_pc_engine_submit_request(
+    moe_pc_engine_t* engine,
+    uint64_t request_id,
+    const int32_t* prompt_tokens,
+    uint32_t token_count
+);
+
+int moe_pc_engine_step_batch(moe_pc_engine_t* engine);
+
 int moe_pc_engine_find_raw_tensor(
     moe_pc_engine_t* engine,
     int32_t layer,

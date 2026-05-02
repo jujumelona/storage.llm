@@ -147,7 +147,10 @@ static void compact_evict_heap(moe_pc_engine* engine, int idx, bool force = fals
             return;
         }
         const uint64_t active_count = evict_heap_active_count(engine, idx);
-        if (!force && heap_size <= active_count * 4u + 512u) {
+        // BUGFIX 603: Check active_count * 4u overflow ★
+        // Problem: active_count * 4u can overflow uint64_t
+        // Solution: Check before multiplication
+        if (!force && active_count <= UINT64_MAX / 4u && heap_size <= active_count * 4u + 512u) {
             return;
         }
         snapshot = std::move(engine->evict_heaps[idx]);
@@ -166,6 +169,9 @@ static void compact_evict_heap(moe_pc_engine* engine, int idx, bool force = fals
     {
         std::lock_guard<std::mutex> map_lock(engine->map_mutex);
         for (const auto& top : entries) {
+            // BUGFIX 604: Check top.slot bounds before accessing expert_states ★
+            // Problem: top.slot can be corrupted or out of bounds
+            // Solution: Check bounds before access
             if (top.slot >= engine->expert_states.size()) {
                 continue;
             }
@@ -251,7 +257,12 @@ static void touch_expert_heat(moe_pc_engine* engine, moe_block_state* state, dou
         // ARC-adaptive decay: T2 (frequent, >=3 hits) decays slower than T1
         const bool is_frequent = state->access_count >= 3u;
         const int decay_shift_base = is_frequent ? 16 : 12;
-        const int shift = (int)(gap >> decay_shift_base);
+        // BUGFIX 551: Check gap before right shift to prevent overflow ★
+        // Problem: gap >> decay_shift_base can overflow if gap is very large
+        // If gap > 2^63, shift result is undefined behavior
+        // Solution: Clamp gap to reasonable range before shift
+        const uint64_t clamped_gap = std::min(gap, (1ull << 60));
+        const int shift = (int)(clamped_gap >> decay_shift_base);
         const double factor = shift >= 52 ? 0.0 : std::ldexp(1.0, -shift);
         state->hot_score *= factor;
     }

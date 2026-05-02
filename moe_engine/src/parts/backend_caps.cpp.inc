@@ -14,6 +14,12 @@ static void fill_backend_caps(
     const moe_backend_t backend = choose_backend(preferred, platform);
     out_caps->backend = backend;
     out_caps->platform = platform;
+    // BUGFIX 246: Document device_id hardcoded to 0 (multi-GPU not supported) ★★
+    // Problem: device_id always set to 0, cannot use GPU 1, 2, 3 in multi-GPU systems
+    // Root cause: moe_pc_engine_config_t has no device_id field
+    // Impact: Multi-GPU systems can only use first GPU, wasting resources
+    // Solution: Would require API change to add device_id to config struct
+    // For now, document limitation. Future: Add device_id to moe_pc_engine_config_t
     out_caps->device_id = 0;
     out_caps->supports_mmap = 1;
     out_caps->system_memory_bytes = storagellm::available_ram_bytes();
@@ -30,14 +36,14 @@ static void fill_backend_caps(
         fill_hip_backend_caps(out_caps);
     } else if (backend == moe_BACKEND_LEVEL_ZERO) {
         out_caps->supports_level_zero = compiled_level_zero_available();
-        fill_shared_memory_backend_caps(out_caps);
+        fill_levelzero_backend_caps(out_caps);
     } else if (backend == moe_BACKEND_SYCL) {
         out_caps->supports_sycl = compiled_sycl_available();
         fill_shared_memory_backend_caps(out_caps);
     } else if (backend == moe_BACKEND_METAL) {
         fill_metal_backend_caps(out_caps);
     } else if (backend == moe_BACKEND_VULKAN) {
-        fill_basic_gpu_caps(out_caps, compiled_vulkan_available(), &out_caps->supports_vulkan);
+        fill_vulkan_backend_caps(out_caps);
     } else if (backend == moe_BACKEND_DIRECTML) {
         fill_basic_gpu_caps(out_caps, compiled_directml_available(), &out_caps->supports_directml);
     } else if (backend == moe_BACKEND_OPENCL) {

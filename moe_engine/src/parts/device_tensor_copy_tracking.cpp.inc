@@ -87,14 +87,15 @@ static void device_cancel_pending_copy(moe_pc_engine* e, uint64_t key) {
     if (!e) {
         return;
     }
+    // BUGFIX 280: Remove redundant outer braces ★
+    // Problem: Unnecessary nested scope block serves no purpose
+    // Solution: Remove outer braces for cleaner code
+    std::vector<std::pair<CUdeviceptr, uint64_t>> deferred_free_ptrs;
     {
-            std::vector<std::pair<CUdeviceptr, uint64_t>> deferred_free_ptrs;
-        {
-            std::lock_guard<std::mutex> lock(e->device_mutex);
-            device_complete_copy_locked(e, key, &deferred_free_ptrs);
-        }
-        device_free_deferred_ptrs(e, deferred_free_ptrs);
+        std::lock_guard<std::mutex> lock(e->device_mutex);
+        device_complete_copy_locked(e, key, &deferred_free_ptrs);
     }
+    device_free_deferred_ptrs(e, deferred_free_ptrs);
 }
 
 static void device_free_key(moe_pc_engine* e, uint64_t key) {

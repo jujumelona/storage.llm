@@ -49,10 +49,22 @@ static void cpu_row_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 }
             }
         }
-        if (engine->cpu_active_workers.fetch_sub(1) == 1) {
-            std::lock_guard<std::mutex> lock(engine->cpu_row_mutex);
-            engine->cpu_row_done_generation = seen;
-            engine->cpu_row_done_cv.notify_one();
+        // BUGFIX 615: Check cpu_active_workers > 0 before fetch_sub to prevent underflow ★
+        // Problem: If cpu_active_workers is 0, fetch_sub causes underflow
+        // Solution: Only decrement if > 0
+        uint32_t current = engine->cpu_active_workers.load(std::memory_order_acquire);
+        while (current > 0) {
+            if (engine->cpu_active_workers.compare_exchange_weak(
+                    current, current - 1,
+                    std::memory_order_release,
+                    std::memory_order_acquire)) {
+                if (current == 1) {  // Was 1, now 0 - last worker
+                    std::lock_guard<std::mutex> lock(engine->cpu_row_mutex);
+                    engine->cpu_row_done_generation = seen;
+                    engine->cpu_row_done_cv.notify_one();
+                }
+                break;
+            }
         }
     }
 }
@@ -66,7 +78,14 @@ static void ensure_cpu_row_workers(moe_pc_engine* engine, uint32_t /*ignored*/) 
     const uint32_t gpu_w = engine->backend_caps.copy_streams > 0 ? 0 : runtime_gpu_workers(engine);
     const uint32_t io_threads = disk_w + pinned_w + gpu_w;
     const uint32_t io_penalty = io_threads / 2u;
-    const uint32_t dynamic_target = hw > io_penalty + 1u ? hw - io_penalty - 1u : 1u;
+    uint32_t dynamic_target = hw > io_penalty + 1u ? hw - io_penalty - 1u : 1u;
+
+    // BUGFIX 540: Clamp dynamic_target to prevent excessive thread creation ★
+    // Problem: dynamic_target can be very large if hw is large (> 256)
+    // Solution: Clamp to reasonable maximum (128 threads for CPU row workers)
+    if (dynamic_target > 128) {
+        dynamic_target = 128;
+    }
 
     uint32_t target = engine->cpu_row_target_workers.load(std::memory_order_relaxed);
     if (target != 0 && target != dynamic_target) {

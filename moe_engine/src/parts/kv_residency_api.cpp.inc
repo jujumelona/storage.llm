@@ -72,9 +72,16 @@ int moe_pc_engine_request_expert(
                 return 1;  // early exit ??already at good tier
             }
             subtract_tier_usage(engine, state.tier, state.bytes);
-            if (state.tier == moe_TIER_VRAM) engine->vram_expert_count.fetch_sub(1);
-            else if (state.tier == moe_TIER_RAM) engine->ram_expert_count.fetch_sub(1);
-            else if (state.tier == moe_TIER_DB) engine->db_expert_count.fetch_sub(1);
+            // BUGFIX 609-611: Check expert counts > 0 before fetch_sub ★
+            // Problem: Expert counts can underflow if fetch_sub called when count is 0
+            // Solution: Check before decrement
+            if (state.tier == moe_TIER_VRAM && engine->vram_expert_count.load(std::memory_order_relaxed) > 0) {
+                engine->vram_expert_count.fetch_sub(1);
+            } else if (state.tier == moe_TIER_RAM && engine->ram_expert_count.load(std::memory_order_relaxed) > 0) {
+                engine->ram_expert_count.fetch_sub(1);
+            } else if (state.tier == moe_TIER_DB && engine->db_expert_count.load(std::memory_order_relaxed) > 0) {
+                engine->db_expert_count.fetch_sub(1);
+            }
         }
 
         state.bytes = bytes;
@@ -193,7 +200,12 @@ int moe_pc_engine_request_expert(
                             victim_state.tier = moe_TIER_VRAM;
                             victim_state.pending_evict = false;
                             add_tier_usage(engine, moe_TIER_VRAM, victim_state.bytes);
-                            engine->ram_expert_count.fetch_sub(1);
+                            // BUGFIX 612: Check ram_expert_count > 0 before fetch_sub ★
+                            // Problem: ram_expert_count can underflow
+                            // Solution: Check before decrement
+                            if (engine->ram_expert_count.load(std::memory_order_relaxed) > 0) {
+                                engine->ram_expert_count.fetch_sub(1);
+                            }
                             engine->vram_expert_count.fetch_add(1);
                             rollback_evict_updates.push_back({victim_slot, victim_state});
                         } else if (victim_state.tier == moe_TIER_DB) {
@@ -201,7 +213,12 @@ int moe_pc_engine_request_expert(
                             victim_state.tier = moe_TIER_VRAM;
                             victim_state.pending_evict = false;
                             add_tier_usage(engine, moe_TIER_VRAM, victim_state.bytes);
-                            engine->db_expert_count.fetch_sub(1);
+                            // BUGFIX 613: Check db_expert_count > 0 before fetch_sub ★
+                            // Problem: db_expert_count can underflow
+                            // Solution: Check before decrement
+                            if (engine->db_expert_count.load(std::memory_order_relaxed) > 0) {
+                                engine->db_expert_count.fetch_sub(1);
+                            }
                             engine->vram_expert_count.fetch_add(1);
                             rollback_evict_updates.push_back({victim_slot, victim_state});
                         } else if (victim_state.tier == moe_TIER_VRAM) {

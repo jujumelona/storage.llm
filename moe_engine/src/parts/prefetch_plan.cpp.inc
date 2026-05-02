@@ -16,8 +16,16 @@ int moe_pc_engine_plan_moe_prefetch(
     std::vector<moe_expert_prefetch_item_t> items;
     std::lock_guard<std::mutex> plan_lock(engine->prefetch_plan_mutex);
     prefetch_plan_clear_seen(engine);
-    items.reserve((size_t)selected_count + (size_t)next_count +
-        (size_t)engine->io_config.topology_max_candidates);
+    // BUGFIX 577: Check reserve size for overflow ★
+    // Problem: selected_count + next_count + topology_max_candidates can overflow
+    // Solution: Check before reserve
+    const size_t reserve_size = (size_t)selected_count + (size_t)next_count +
+        (size_t)engine->io_config.topology_max_candidates;
+    if (reserve_size > SIZE_MAX / sizeof(moe_expert_prefetch_item_t)) {
+        *out_item_count = 0;
+        return 0;
+    }
+    items.reserve(reserve_size);
     prefetch_plan_add_selected(engine, items, current_layer, selected_experts, selected_count);
     prefetch_plan_add_lookahead(engine, items, current_layer + 1, next_layer_candidates, next_count);
     prefetch_plan_add_topology(engine, items, current_layer, selected_experts, selected_count);

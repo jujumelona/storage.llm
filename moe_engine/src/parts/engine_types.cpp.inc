@@ -144,6 +144,10 @@ struct moe_staging_slot {
     bool pinned = false;
     bool numa_allocated = false;
     std::atomic<bool> in_use{false};
+    // BUGFIX: Per-slot DMA fence for immediate release after cuMemcpyAsync
+    // Acquirer must cuStreamWaitEvent on this before writing to buf
+    CUevent last_copy_event = nullptr;
+    CUstream last_copy_stream = nullptr;
 
     moe_staging_slot() = default;
     moe_staging_slot(const moe_staging_slot&) = delete;
@@ -155,12 +159,16 @@ struct moe_staging_slot {
         pinned = other.pinned;
         numa_allocated = other.numa_allocated;
         in_use.store(other.in_use.load());
+        last_copy_event = other.last_copy_event;
+        last_copy_stream = other.last_copy_stream;
         other.buf = nullptr;
         other.metal_buffer = nullptr;
         other.size = 0;
         other.pinned = false;
         other.numa_allocated = false;
         other.in_use.store(false);
+        other.last_copy_event = nullptr;
+        other.last_copy_stream = nullptr;
     }
     moe_staging_slot& operator=(moe_staging_slot&& other) noexcept {
         buf = other.buf;
@@ -169,12 +177,16 @@ struct moe_staging_slot {
         pinned = other.pinned;
         numa_allocated = other.numa_allocated;
         in_use.store(other.in_use.load());
+        last_copy_event = other.last_copy_event;
+        last_copy_stream = other.last_copy_stream;
         other.buf = nullptr;
         other.metal_buffer = nullptr;
         other.size = 0;
         other.pinned = false;
         other.numa_allocated = false;
         other.in_use.store(false);
+        other.last_copy_event = nullptr;
+        other.last_copy_stream = nullptr;
         return *this;
     }
 };
@@ -210,4 +222,11 @@ struct moe_device_evict_colder_first {
     bool operator()(const moe_device_evict_candidate& a, const moe_device_evict_candidate& b) const {
         return a.last_touch_epoch > b.last_touch_epoch;
     }
+};
+
+struct moe_expert_merge_map {
+    std::shared_mutex mtx;
+    std::vector<std::vector<int>> merge_groups;   // [layer][expert] → group_id
+    std::vector<std::unordered_map<int, std::vector<int>>> group_members; // [layer][group] → experts
+    bool valid = false;
 };

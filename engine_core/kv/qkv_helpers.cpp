@@ -2,16 +2,21 @@
 #include <stddef.h>
 
 bool qkv_bits_valid(int bits) {
+    // BUGFIX 383: bits 범위 체크 강화
     return bits >= 1 && bits <= 4;
 }
 
 const float* qkv_codebook_for_bits(const qkv_state_t* state, int bits) {
+    // BUGFIX 384: state null 체크
+    if (!state) return NULL;
     return (bits == 1) ? state->codebook_1bit :
            (bits == 2) ? state->codebook_2bit :
            (bits == 3) ? state->codebook_3bit : state->codebook_4bit;
 }
 
 const float* qkv_thresholds_for_bits(const qkv_state_t* state, int bits) {
+    // BUGFIX 385: state null 체크
+    if (!state) return NULL;
     return (bits == 1) ? state->thresholds_1bit :
            (bits == 2) ? state->thresholds_2bit :
            (bits == 3) ? state->thresholds_3bit : state->thresholds_4bit;

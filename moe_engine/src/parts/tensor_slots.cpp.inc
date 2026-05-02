@@ -26,7 +26,17 @@ static void tensor_slot_params(
 static size_t tensor_slot_count(const moe_pc_engine* engine = nullptr) {
     uint32_t layers = 79u, experts = 256u, projs = 3u;
     tensor_slot_params(engine, &layers, &experts, &projs);
-    return (size_t)layers * (size_t)experts * (size_t)projs;
+    // BUGFIX 334: Check for overflow in multiplication ★
+    // Problem: layers * experts * projs can overflow size_t
+    // Solution: Check each multiplication step for overflow
+    if (layers > SIZE_MAX / experts) {
+        return SIZE_MAX;  // Overflow would occur
+    }
+    const size_t layer_expert = (size_t)layers * (size_t)experts;
+    if (layer_expert > SIZE_MAX / projs) {
+        return SIZE_MAX;  // Overflow would occur
+    }
+    return layer_expert * (size_t)projs;
 }
 
 static size_t tensor_record_capacity(const moe_pc_engine* engine = nullptr) {
@@ -41,6 +51,12 @@ static size_t expert_slot_count(const moe_pc_engine* engine = nullptr) {
     uint32_t layers = 79u, experts = 256u, projs = 3u;
     (void)projs;
     tensor_slot_params(engine, &layers, &experts, nullptr);
+    // BUGFIX 335: Check for overflow in multiplication ★
+    // Problem: layers * experts can overflow size_t
+    // Solution: Check multiplication for overflow
+    if (layers > SIZE_MAX / experts) {
+        return SIZE_MAX;  // Overflow would occur
+    }
     return (size_t)layers * (size_t)experts;
 }
 

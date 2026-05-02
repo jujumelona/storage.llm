@@ -1,4 +1,4 @@
-﻿#if defined(__linux__) && defined(MOE_HAVE_LIBURING) && MOE_HAVE_LIBURING && defined(MOE_ENABLE_LEGACY_URING_STATE)
+#if defined(__linux__) && defined(MOE_HAVE_LIBURING) && MOE_HAVE_LIBURING && defined(MOE_ENABLE_LEGACY_URING_STATE)
 #include <liburing.h>
 struct io_uring_state_t {
     struct io_uring ring;
@@ -10,6 +10,9 @@ struct io_uring_state_t {
 struct moe_pc_engine {
     moe_pc_engine_config_t config{};
     moe_io_config_t io_config{};
+    uint32_t disk_stage_depth_cap{2048};
+    uint32_t pinned_stage_depth_cap{4096};
+    uint32_t gpu_stage_depth_cap{6144};
     moe_io_atomic_stats io_atomic{};
     moe_backend_caps_t backend_caps{};
     moe_io_ring_adapter ring_adapter{};
@@ -122,8 +125,16 @@ struct moe_pc_engine {
     // [layer][expert_n_minus_2][expert_n] -> frequency
     std::vector<std::unordered_map<int, std::unordered_map<int, float>>> co_activation_stats;
     std::vector<std::vector<int>> last_selected_experts;
+    // BUGFIX 701: Sliding window token counters to bound co_activation_stats memory ★★
+    // co_activation_token_count: total update calls since last stats reset
+    // last_merge_build_token_count: snapshot at last moe_build_expert_merge_map
+    // Stats are cleared after merge map rebuild so only post-rebuild data accumulates.
+    uint64_t co_activation_token_count{0};
+    uint64_t last_merge_build_token_count{0};
     moe_paged_kv_manager_t paged_kv_manager;
     moe_continuous_batch_scheduler_t batch_scheduler; // History of selected experts per layer
+    std::mutex generation_api_mutex; // BUGFIX: Mutex to separate generation paths and protect KV manager
+    moe_expert_merge_map expert_merge_map; // BUGFIX: Move merge map from global static to per-engine instance
     std::mutex gate_snapshot_mutex;
     std::vector<std::vector<float>> gate_input_snapshots;
     std::vector<uint64_t> gate_input_snapshot_epochs;
@@ -358,7 +369,8 @@ static uint32_t runtime_gpu_workers(const moe_pc_engine* engine) {
     }
     if (engine->backend_caps.supports_zero_copy_host ||
         !engine->config.prefer_gpu ||
-        engine->backend_caps.backend != moe_BACKEND_CUDA) {
+        (engine->backend_caps.backend != moe_BACKEND_CUDA &&
+         engine->backend_caps.backend != moe_BACKEND_HIP)) {
         return 0u;
     }
     uint32_t workers = engine->runtime_gpu_worker_threads.load(std::memory_order_relaxed);

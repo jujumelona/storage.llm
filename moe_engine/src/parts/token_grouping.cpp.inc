@@ -14,6 +14,7 @@ int moe_pc_group_tokens_by_expert(
     }
 
     if (assignment_count == 1) {
+        // BUGFIX 489: out_sorted_assignments null 체크
         if (out_sorted_assignments) {
             out_sorted_assignments[0] = assignments[0];
         }
@@ -27,7 +28,7 @@ int moe_pc_group_tokens_by_expert(
         return 1;
     }
 
-    // Bug #17: Sort directly into caller-owned buffer ??no heap allocation per call
+    // Bug #17: Sort directly into caller-owned buffer – no heap allocation per call
     // If out_sorted_assignments is provided, copy+sort in-place; else use temp vector
     moe_token_expert_assignment_t* sort_buf = out_sorted_assignments;
     std::vector<moe_token_expert_assignment_t> fallback;
@@ -35,6 +36,12 @@ int moe_pc_group_tokens_by_expert(
         fallback.assign(assignments, assignments + assignment_count);
         sort_buf = fallback.data();
     } else {
+        // BUGFIX 641: Check assignment_count overflow before memcpy ★
+        // Problem: assignment_count * sizeof(...) can overflow size_t
+        // Solution: Check overflow before memcpy
+        if (assignment_count > SIZE_MAX / sizeof(moe_token_expert_assignment_t)) {
+            return;
+        }
         std::memcpy(sort_buf, assignments, sizeof(moe_token_expert_assignment_t) * assignment_count);
     }
     std::sort(sort_buf, sort_buf + assignment_count, [](const auto& a, const auto& b) {
@@ -53,13 +60,18 @@ int moe_pc_group_tokens_by_expert(
         const uint32_t layer = sort_buf[start].layer;
         const uint32_t expert = sort_buf[start].expert;
         uint32_t end = start + 1;
+        // BUGFIX 490: end 범위 체크
         while (end < assignment_count && sort_buf[end].layer == layer && sort_buf[end].expert == expert) {
             ++end;
         }
+        // BUGFIX 491: batch_count overflow 방지
+        if (batch_count >= UINT32_MAX) break;
         if (out_batches && batch_count < max_batches) {
             out_batches[batch_count].layer = layer;
             out_batches[batch_count].expert = expert;
             out_batches[batch_count].first_sorted_index = start;
+            // BUGFIX 492: end - start overflow 방지
+            if (end < start) break;
             out_batches[batch_count].token_count = end - start;
         }
         ++batch_count;

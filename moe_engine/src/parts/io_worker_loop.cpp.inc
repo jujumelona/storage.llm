@@ -28,6 +28,13 @@ static int io_worker_requeue_disk_task(
         if (retry.requeue_count < UINT8_MAX) {
             ++retry.requeue_count;
         }
+        // BUGFIX 711: Respect disk_stage_depth_cap in requeue path ★★★
+        if (engine->disk_stage_depth_cap > 0 &&
+            engine->disk_stage.depth.load(std::memory_order_relaxed) >= engine->disk_stage_depth_cap) {
+            // Queue full - wait
+            std::this_thread::yield();
+            continue;
+        }
         const int ok = enqueue_stage_or_retry(engine, engine->disk_stage, retry) ? 1 : 0;
         if (ok) {
             engine->disk_stage.cv.notify_one();
@@ -73,28 +80,9 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         }
         if (engine->io_stop.load(std::memory_order_relaxed)) {
             break;
-        }
-        const uint64_t vram_bud = tier_budget(engine, moe_TIER_VRAM);
+         const uint64_t vram_bud = tier_budget(engine, moe_TIER_VRAM);
         const uint64_t ram_bud = tier_budget(engine, moe_TIER_RAM);
-        const uint64_t ram_used = tier_used(engine, moe_TIER_RAM);
-
-        // BUGFIX 124: Issue 29 - Skip RAM eviction for Metal unified memory ★★
-        // Metal uses unified memory budget tracked in VRAM only (ram_budget_bytes = 0).
-        // RAM eviction would interfere with OS's native unified memory pressure management.
-        // Metal automatically pages out to backing store when needed.
-        const bool skip_ram_eviction = (engine->backend_caps.backend == moe_BACKEND_METAL &&
-                                        engine->backend_caps.supports_unified_memory);
-
-        if (!skip_ram_eviction) {
-            const uint64_t ram_target_pct  = engine->io_config.ram_eviction_threshold_pct  ? engine->io_config.ram_eviction_threshold_pct  : 80u;
-            const uint64_t ram_trigger_pct  = ram_target_pct + 5u <= 100u ? ram_target_pct + 5u : 100u;
-            const uint64_t ram_target = (ram_bud * ram_target_pct) / 100ull;
-            const uint64_t ram_threshold_85 = (ram_bud * ram_trigger_pct) / 100ull;
-            if (ram_bud > 0 && ram_used > ram_threshold_85 && ram_used > ram_target) {
-                std::vector<std::pair<int, int>> ignored;
-                demote_cold_until(engine, moe_TIER_RAM, ram_bud - ram_target, ignored);
-            }
-        }
+        const uint64_t ram_used = tier_budget(engine, moe_TIER_RAM) > 0 ? tier_used(engine, moe_TIER_RAM) : 0;
         const uint64_t vram_used = tier_used(engine, moe_TIER_VRAM);
 
         // BUGFIX 57: Issue 2 - Lower proactive eviction trigger to 85% ★★
@@ -113,12 +101,42 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
             std::vector<std::pair<int, int>> freed;
             demote_cold_until(engine, moe_TIER_VRAM, vram_bud - vram_target, freed);
             if (!freed.empty() && !engine->io_stop.load(std::memory_order_relaxed)) {
-                // BUGFIX 36: Reduce batch_size from 8 to 4 to lower mutex hold time ?�★??
+                // BUGFIX 36: Reduce batch_size from 8 to 4 to lower mutex hold time ?★??
                 // Old: 8 × cuMemFree (100µs each) = 800µs device_mutex hold
                 // New: 4 × cuMemFree = 400µs device_mutex hold
                 // All device_copy_tensor calls wait on device_mutex ??halving hold time improves throughput
                 // Trade-off: More batches needed for large evictions, but each batch blocks less
                 device_free_experts_batched(engine, freed, 4);
+            }
+        }
+
+        // BUGFIX 124: Issue 29 - Skip RAM eviction for Metal unified memory ★★
+        // Metal uses unified memory budget tracked in VRAM only (ram_budget_bytes = 0).
+        // RAM eviction would interfere with OS's native unified memory pressure management.
+        // Metal automatically pages out to backing store when needed.
+        const bool skip_ram_eviction = (engine->backend_caps.backend == moe_BACKEND_METAL &&
+                                        engine->backend_caps.supports_unified_memory);
+
+        if (!skip_ram_eviction) {
+            const uint64_t ram_target_pct  = engine->io_config.ram_eviction_threshold_pct  ? engine->io_config.ram_eviction_threshold_pct  : 80u;
+            const uint64_t ram_trigger_pct  = ram_target_pct + 5u <= 100u ? ram_target_pct + 5u : 100u;
+            const uint64_t ram_target = (ram_bud * ram_target_pct) / 100ull;
+            const uint64_t ram_threshold_85 = (ram_bud * ram_trigger_pct) / 100ull;
+            if (ram_bud > 0 && ram_used > ram_threshold_85 && ram_used > ram_target) {
+                std::vector<std::pair<int, int>> ignored;
+                demote_cold_until(engine, moe_TIER_RAM, ram_bud - ram_target, ignored);
+            }
+        }
+
+        // BUGFIX 235: Check and compact eviction heaps if needed
+        // Problem: pop_valid_evict_candidate sets evict_heap_compact_needed flag when stale ratio high,
+        // but proactive_eviction_worker_loop never checks this flag to actually compact the heap
+        // Solution: Check flag and compact all heaps periodically
+        // Impact: Prevents heap from accumulating stale entries
+        if (engine->evict_heap_compact_needed.load(std::memory_order_relaxed)) {
+            engine->evict_heap_compact_needed.store(false, std::memory_order_relaxed);
+            for (int idx = 0; idx < 3; ++idx) {
+                compact_evict_heap(engine, idx);
             }
         }
 
@@ -147,22 +165,31 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
     // Problem: Worker terminates (worker_index >= worker_target) while task is popped
     // inflight incremented → worker exits → finish_stage_task never called → inflight stuck
     // Solution: RAII guard ensures finish_stage_task on all exit paths
+    // BUGFIX 251: Guard must be activated AFTER pop_stage_task succeeds ★★★
+    // Problem: Guard created before pop_stage_task → if pop fails, inflight not incremented
+    // but destructor tries to decrement → underflow
+    // Solution: Create guard inactive, activate only after successful pop
     struct InflightGuard {
         moe_pc_engine* e;
         moe_stage_queue* stage;
+        bool active = false;
         bool finished = false;
 
         ~InflightGuard() {
-            if (e && stage && !finished) {
+            if (e && stage && active && !finished) {
                 // Abnormal exit - decrement inflight
                 finish_stage_task(e, *stage, 0, 1);
             }
         }
 
+        void activate() {
+            active = true;
+        }
+
         void mark_finished() {
             finished = true;
         }
-    } inflight_guard{engine, &engine->disk_stage, false};
+    } inflight_guard{engine, &engine->disk_stage};
 
     moe_io_path_t active_path = choose_active_io_path(engine);
     engine->io_atomic.active_path.store(static_cast<uint32_t>(active_path));
@@ -178,7 +205,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         if (!io_worker_requeue_disk_task(engine, retry_task, retry_stage, 3u, 1u)) {
             // Bug Fix: Cap local_requeues size to prevent unbounded growth
             // When both disk_stage and gpu_stage are full, local_requeues grows indefinitely
-            const uint32_t cap = std::max(8u, engine->io_config.max_prefetch_queue / 2u);
+            const uint32_t cap = std::max(8u, engine->disk_stage_depth_cap);
             if (local_requeues.size() < cap) {
                 local_requeues.emplace_back(retry_task, retry_stage);
             } else {
@@ -258,6 +285,8 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
             exit_worker();
             return;
         }
+        // BUGFIX 251: Activate guard only after successful pop
+        inflight_guard.activate();
 
         // Bug 2 Fix: Lookahead touch_mapped_range to prevent blocking page faults
         // touch_mapped_range (MADV_WILLNEED/PrefetchVirtualMemory) is async. If we call it
@@ -291,15 +320,26 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 collect_indices(engine->disk_stage.queue);
             }
             for (int32_t tensor_index : lookahead_indices) {
+                // BUGFIX 322: Check tensor_index bounds before accessing tensors array ★
+                // Problem: tensor_index can be corrupted or out of bounds
+                // Accessing engine->tensors[tensor_index] with invalid index causes crash
+                // Solution: Check bounds before access
                 if (tensor_index < 0 || (size_t)tensor_index >= engine->tensors.size()) {
                     continue;
                 }
                 const moe_tensor_record& next_rec = engine->tensors[tensor_index];
                 mmap_context_t* next_shard = get_or_map_tensor_shard(engine, next_rec);
+                // BUGFIX 323: Check next_shard validity before accessing ★
+                // Problem: get_or_map_tensor_shard can return null
+                // Solution: Check next_shard before use
                 if (next_shard) {
                     const uint8_t* next_src = static_cast<const uint8_t*>(mmap_get_ptr(next_shard, 0));
-                    if (next_src) {
-                        touch_mapped_range(engine, next_src, tensor_stream_bytes(next_rec));
+                    // BUGFIX 565: Check tensor_stream_bytes before touch_mapped_range ★
+                    // Problem: tensor_stream_bytes can return 0, causing invalid touch
+                    // Solution: Check size > 0 before touch
+                    const uint64_t touch_size = tensor_stream_bytes(next_rec);
+                    if (next_src && touch_size > 0) {
+                        touch_mapped_range(engine, next_src, touch_size);
                     }
                 }
             }
@@ -336,7 +376,14 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 }
             }
         } else if (task.tensor_index < engine->tensors.size()) {
-            const moe_tensor_record& rec = engine->tensors[task.tensor_index];
+            // BUGFIX 324: Add explicit bounds check for tensor_index ★
+            // Problem: task.tensor_index can be negative or out of bounds
+            // Accessing engine->tensors[task.tensor_index] with invalid index causes crash
+            // Solution: Check task.tensor_index >= 0 before use
+            if (task.tensor_index < 0) {
+                ok = 0;
+            } else {
+                const moe_tensor_record& rec = engine->tensors[task.tensor_index];
             if (task.stage == moe_TRANSFER_STAGE_RAM_TO_PINNED &&
                 engine_bypass_staging_pipeline(engine)) {
                 ok = prefetch_tensor_disk_to_ram(engine, rec);
@@ -374,18 +421,26 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                     engine->staging &&
                     engine->staging_pinned &&
                     tensor_stream_bytes(rec) >= engine->io_config.direct_upload_min_bytes) {
-                    const uint32_t gpu_hard_cap = engine->io_config.max_prefetch_queue;
+                    const uint32_t gpu_hard_cap = engine->gpu_stage_depth_cap;
                     const uint32_t gpu_depth_pre = engine->gpu_stage.depth.load(std::memory_order_relaxed);
                     if (gpu_hard_cap > 0 && gpu_depth_pre >= gpu_hard_cap) {
                         ok = preserve_requeue(task, moe_TRANSFER_STAGE_DISK_TO_RAM);
                         terminal = 0;
                         staged_direct_to_gpu = true;
                     } else {
+                        // BUGFIX 566: Check tensor_stream_bytes before acquire_staging_slot ★
+                        // Problem: tensor_stream_bytes can return 0, causing invalid slot allocation
+                        // Solution: Check size > 0 before acquiring slot
+                        const uint64_t stream_bytes = tensor_stream_bytes(rec);
+                        if (stream_bytes == 0) {
+                            ok = 0;
+                            staged_direct_to_gpu = true;
+                        } else {
                         const uint32_t slot = acquire_staging_slot(
                             engine,
                             worker_index,
                             staging_turn++,
-                            tensor_stream_bytes(rec),
+                            stream_bytes,
                             false,
                             true
                         );
@@ -415,6 +470,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                                 release_staging_slot(engine, slot);
                             }
                         }
+                        }  // BUGFIX 566: Close if (stream_bytes > 0) block
                     }
                 }
                 if (!staged_direct_to_gpu) {
@@ -425,7 +481,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 if (task.target_tier == moe_TIER_VRAM &&
                     engine->io_config.enable_multistage_pipeline && engine->staging) {
                     const uint32_t pinned_depth = engine->pinned_stage.depth.load(std::memory_order_relaxed);
-                    const uint32_t pinned_hard_cap = engine->io_config.max_prefetch_queue;
+                    const uint32_t pinned_hard_cap = engine->pinned_stage_depth_cap;
                     const uint32_t pinned_soft_cap = (pinned_hard_cap * 3u) / 4u;
 
                     if (pinned_hard_cap > 0 && pinned_depth >= pinned_hard_cap) {
@@ -435,6 +491,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                         ok = preserve_requeue(task, moe_TRANSFER_STAGE_DISK_TO_RAM);
                         terminal = 0;
                         finish_stage_task(engine, engine->disk_stage, ok, terminal);
+                        inflight_guard.mark_finished();  // BUGFIX 285: Mark as finished before continue ★
                         if (worker_index >= engine->disk_worker_target.load()) {
                             exit_worker();
                             return;
@@ -446,6 +503,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                         ok = preserve_requeue(task, moe_TRANSFER_STAGE_DISK_TO_RAM);
                         terminal = 0;
                         finish_stage_task(engine, engine->disk_stage, ok, terminal);
+                        inflight_guard.mark_finished();  // BUGFIX 285: Mark as finished before continue ★
                         if (worker_index >= engine->disk_worker_target.load()) {
                             exit_worker();
                             return;
@@ -497,8 +555,6 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 }
             }
         }
-
-        finish_stage_task(engine, engine->disk_stage, ok, terminal);
         inflight_guard.mark_finished();  // BUGFIX 129: Mark as finished to prevent double-decrement
 
         if (worker_index >= engine->disk_worker_target.load()) {

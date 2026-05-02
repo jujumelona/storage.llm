@@ -6,22 +6,30 @@ static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
     // BUGFIX 129: Add InflightGuard to prevent inflight count leaks ★★
     // Problem: Worker terminates while task is popped → inflight stuck
     // Solution: RAII guard ensures finish_stage_task on all exit paths
+    // BUGFIX 255: Guard must be activated AFTER pop_stage_task succeeds ★★★
+    // Problem: Same as BUGFIX 251 - guard created before pop → underflow on pop failure
+    // Solution: Create guard inactive, activate only after successful pop
     struct InflightGuard {
         moe_pc_engine* e;
         moe_stage_queue* stage;
+        bool active = false;
         bool finished = false;
 
         ~InflightGuard() {
-            if (e && stage && !finished) {
+            if (e && stage && active && !finished) {
                 // Abnormal exit - decrement inflight
                 finish_stage_task(e, *stage, 0, 1);
             }
         }
 
+        void activate() {
+            active = true;
+        }
+
         void mark_finished() {
             finished = true;
         }
-    } inflight_guard{engine, &engine->pinned_stage, false};
+    } inflight_guard{engine, &engine->pinned_stage};
 
     uint32_t pingpong = 0;
     for (;;) {
@@ -29,15 +37,33 @@ static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         if (!pop_stage_task(engine, engine->pinned_stage, &task, &engine->pinned_worker_target, worker_index)) {
             return;
         }
+        // BUGFIX 255: Activate guard only after successful pop
+        inflight_guard.activate();
         int ok = 0;
         int terminal = 1;
-        if (task.tensor_index < engine->tensors.size()) {
+        // BUGFIX 567: Check tensor_index >= 0 before size comparison ★
+        // Problem: task.tensor_index can be negative
+        // Comparison with size_t causes wraparound
+        // Solution: Check >= 0 first
+        if (task.tensor_index >= 0 && (size_t)task.tensor_index < engine->tensors.size()) {
             uint64_t staging_bytes = 0;
             if (task.staging_valid && task.staging_slot != UINT32_MAX) {
                 staging_bytes = task.staging_bytes;
                 ok = 1;
             } else {
                 const uint64_t required_bytes = tensor_stream_bytes(engine->tensors[task.tensor_index]);
+                // BUGFIX 568: Check required_bytes > 0 before acquire_staging_slot ★
+                // Problem: tensor_stream_bytes can return 0
+                // Solution: Check before allocation
+                if (required_bytes == 0) {
+                    ok = 0;
+                    finish_stage_task(engine, engine->pinned_stage, ok, terminal);
+                    inflight_guard.mark_finished();
+                    if (worker_index >= engine->pinned_worker_target.load()) {
+                        return;
+                    }
+                    continue;
+                }
                 task.staging_slot = acquire_staging_slot(
                     engine,
                     worker_index,
@@ -84,7 +110,20 @@ static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                             }
                         } else {
                             // Exceeded requeue limit — genuinely drop
-                            engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                            // BUGFIX: Downgrade to RAM tier to prevent permanent stall
+                            const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
+                            if (ram_budget > 0 && tier_used(engine, moe_TIER_RAM) < (ram_budget * 9 / 10)) {
+                                task.target_tier = moe_TIER_RAM;
+                                task.urgent = 1;
+                                task.requeue_count = 0;
+                                if (enqueue_stage_or_retry(engine, engine->disk_stage, task)) {
+                                    engine->disk_stage.cv.notify_one();
+                                } else {
+                                    engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                                }
+                            } else {
+                                engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                            }
                         }
                     }
                     finish_stage_task(engine, engine->pinned_stage, ok, terminal);
@@ -136,12 +175,15 @@ static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                     if (!queued_retry && next.staging_valid && next.staging_slot != UINT32_MAX) {
                         const moe_tensor_record& rec = engine->tensors[task.tensor_index];
                         const int sync_ok = prefetch_tensor_pinned_to_gpu(
-                            engine, rec, next.staging_slot, 0, 1, 1);
+                            engine, rec, next.staging_slot, next.staging_bytes, 1, 1);
                         if (sync_ok) {
                             ok = 1;
                             queued_retry = true;
+                            // sync_ok=1이면 device_copy_tensor_from_host 내부에서 이미 release됨
+                            // next.staging_slot을 UINT32_MAX로 무효화
+                            next.staging_slot = UINT32_MAX;
                         }
-                        release_staging_slot(engine, next.staging_slot);
+                        release_staging_slot(engine, next.staging_slot); // UINT32_MAX면 내부에서 skip됨
                     } else if (!queued_retry) {
                         ok = 0;
                         if (next.staging_slot != UINT32_MAX) {

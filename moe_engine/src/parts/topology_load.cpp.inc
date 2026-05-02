@@ -28,12 +28,36 @@ int moe_pc_engine_load_topology(moe_pc_engine_t* engine, const char* path) {
         if (row.size() < 5) {
             continue;
         }
-        const int src_layer = std::atoi(row[0].c_str());
-        const int src_expert = std::atoi(row[1].c_str());
-        const int dst_layer = std::atoi(row[2].c_str());
-        const int dst_expert = std::atoi(row[3].c_str());
+        // BUGFIX 303: Check for integer overflow in atoi ★
+        // Problem: atoi returns 0 on overflow, can't distinguish from valid 0
+        // Negative values from overflow can pass validation
+        // Solution: Use strtol with error checking
+        char* end = nullptr;
+        const long src_layer_l = std::strtol(row[0].c_str(), &end, 10);
+        // BUGFIX 545: Check end pointer is not null before dereferencing ★
+        // Problem: strtol can set end to null on failure
+        // Solution: Check end != nullptr before comparing
+        if (!end || end == row[0].c_str() || src_layer_l < 0 || src_layer_l > INT_MAX) {
+            continue;
+        }
+        const long src_expert_l = std::strtol(row[1].c_str(), &end, 10);
+        if (!end || end == row[1].c_str() || src_expert_l < 0 || src_expert_l > INT_MAX) {
+            continue;
+        }
+        const long dst_layer_l = std::strtol(row[2].c_str(), &end, 10);
+        if (!end || end == row[2].c_str() || dst_layer_l < 0 || dst_layer_l > INT_MAX) {
+            continue;
+        }
+        const long dst_expert_l = std::strtol(row[3].c_str(), &end, 10);
+        if (!end || end == row[3].c_str() || dst_expert_l < 0 || dst_expert_l > INT_MAX) {
+            continue;
+        }
+        const int src_layer = (int)src_layer_l;
+        const int src_expert = (int)src_expert_l;
+        const int dst_layer = (int)dst_layer_l;
+        const int dst_expert = (int)dst_expert_l;
         const uint64_t count = parse_u64(row[4]);
-        if (src_layer < 0 || src_expert < 0 || dst_layer < 0 || dst_expert < 0 || count == 0) {
+        if (count == 0) {
             continue;
         }
         const uint64_t src_key = topology_key(src_layer, src_expert);
@@ -44,6 +68,13 @@ int moe_pc_engine_load_topology(moe_pc_engine_t* engine, const char* path) {
         loaded[src_key][dst_key] += count;
     }
     for (auto& src : loaded) {
+        // BUGFIX 304: Check for empty src.second before accessing ★
+        // Problem: If src.second is empty, min_key remains 0 (uninitialized)
+        // erase(0) can remove wrong entry or cause undefined behavior
+        // Solution: Skip if empty
+        if (src.second.empty()) {
+            continue;
+        }
         while (src.second.size() > engine->io_config.topology_max_edges_per_source) {
             uint64_t min_count = UINT64_MAX;
             uint64_t min_key = 0;
@@ -52,6 +83,13 @@ int moe_pc_engine_load_topology(moe_pc_engine_t* engine, const char* path) {
                     min_count = e.second;
                     min_key = e.first;
                 }
+            }
+            // BUGFIX 305: Check if min_key was actually found ★
+            // Problem: If all entries have count == UINT64_MAX, min_key stays 0
+            // erase(0) removes wrong entry
+            // Solution: Check min_count was updated
+            if (min_count == UINT64_MAX) {
+                break; // No valid minimum found
             }
             src.second.erase(min_key);
         }

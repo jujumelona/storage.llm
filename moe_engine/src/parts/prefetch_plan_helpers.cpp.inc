@@ -103,12 +103,21 @@ static void prefetch_plan_add_item(
     moe_prefetch_reason_t reason,
     float priority
 ) {
-    if (layer < 0 || expert < 0 || prefetch_plan_has_item(engine, layer, expert)) {
+    // BUGFIX 572: Check engine pointer before use ★
+    // Problem: engine can be null
+    // Solution: Check at start
+    if (!engine || layer < 0 || expert < 0 || prefetch_plan_has_item(engine, layer, expert)) {
         return;
     }
     const uint64_t bytes = expert_triplet_or_hardcoded_bytes(engine, layer, expert);
     if (bytes == 0) {
         return;
+    }
+    // BUGFIX 573: Check priority is finite ★
+    // Problem: priority can be NaN or infinity
+    // Solution: Clamp to valid range
+    if (!std::isfinite(priority)) {
+        priority = 0.0f;
     }
     tier = juju_hint_target_tier(engine, layer, expert, tier, reason);
     priority = juju_hint_priority(engine, layer, expert, reason, priority);
@@ -185,14 +194,28 @@ static void prefetch_plan_add_lookahead_scored(
     const float* scores,
     uint32_t count
 ) {
-    if (!candidates || !scores || count == 0) return;
+    // BUGFIX 574: Check engine pointer ★
+    // Problem: engine can be null
+    // Solution: Check at start
+    if (!engine || !candidates || !scores || count == 0) return;
 
     std::vector<float> sorted_scores(scores, scores + count);
     std::sort(sorted_scores.begin(), sorted_scores.end());
-    const float p70 = sorted_scores[(size_t)(count * 0.70f)];
-    const float p50 = sorted_scores[(size_t)(count * 0.50f)];
+    // BUGFIX 575: Check count > 0 before percentile calculation ★
+    // Problem: count * 0.70f can overflow or be 0
+    // Solution: Clamp indices
+    const size_t idx70 = count > 1 ? (size_t)(count * 0.70f) : 0;
+    const size_t idx50 = count > 1 ? (size_t)(count * 0.50f) : 0;
+    const float p70 = sorted_scores[std::min(idx70, sorted_scores.size() - 1)];
+    const float p50 = sorted_scores[std::min(idx50, sorted_scores.size() - 1)];
 
     for (uint32_t i = 0; i < count; ++i) {
+        // BUGFIX 576: Check score is finite before comparison ★
+        // Problem: scores[i] can be NaN or infinity
+        // Solution: Skip invalid scores
+        if (!std::isfinite(scores[i])) {
+            continue;
+        }
         moe_tier_t target_tier;
         if (scores[i] >= p70) target_tier = moe_TIER_VRAM;
         else if (scores[i] >= p50) target_tier = moe_TIER_RAM;

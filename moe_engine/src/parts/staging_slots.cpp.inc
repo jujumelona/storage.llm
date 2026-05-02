@@ -9,9 +9,10 @@ static uint32_t moe_gpu_stage_batch_max(const moe_pc_engine* engine) {
     if (!engine || engine->backend_caps.copy_streams <= 0) {
         return 4;  // Fallback for CPU-only or uninitialized
     }
-    // Cap at min(copy_streams, 8) to prevent excessive queue depth
-    // Most PCIe controllers handle 4-8 concurrent DMA efficiently
-    return std::min(8u, (uint32_t)engine->backend_caps.copy_streams);
+    // BUGFIX: Increase cap from 8 to 16 to let byte_limit control actual batch size
+    // For small experts (e.g. 512KB NVFP4), old cap of 8 prevented byte_limit from working
+    // Most PCIe controllers handle 8-16 concurrent DMA efficiently
+    return std::min(16u, (uint32_t)engine->backend_caps.copy_streams);
 }
 
 static void reset_staging_slots(moe_pc_engine* engine) {
@@ -43,9 +44,19 @@ static void reset_staging_slots(moe_pc_engine* engine) {
         }
     }
 
+    // BUGFIX 252: Do NOT proceed with clear() if slots still in use ★★★
+    // Problem: Timeout warning printed but clear() still called → use-after-free
+    // Workers still accessing slots when memory is freed → crash
+    // Solution: Return early on timeout, leave slots intact
+    // Trade-off: Staging slots leak, but prevents crash
     if (!all_released) {
-        fprintf(stderr, "[storageLLM WARNING] reset_staging_slots: Some slots still in use after 5s timeout. "
-                "Proceeding with reset anyway - may cause use-after-free if workers access freed slots.\n");
+        fprintf(stderr, "[storageLLM ERROR] reset_staging_slots: Some slots still in use after 5s timeout. "
+                "Cannot safely reset - aborting reset to prevent use-after-free. "
+                "Staging slots will leak until engine shutdown.\n");
+        // Restore free_slot_count to allow continued operation
+        engine->staging_free_slot_count.store(static_cast<uint32_t>(engine->staging_slots.size()),
+                                              std::memory_order_release);
+        return;
     }
 
     engine->ring_adapter.cleanup();
@@ -141,11 +152,25 @@ static void moe_scale_staging_slot_counts(
     uint32_t* gpu_out,
     uint32_t* direct_out
 ) {
+    // BUGFIX 544: Check output pointers before use ★
+    // Problem: pinned_out, gpu_out, direct_out can be null
+    // Function writes to them without checking, causing null pointer dereference
+    // Solution: Return early if any output pointer is null
+    if (!pinned_out || !gpu_out || !direct_out) {
+        return;
+    }
+
     uint32_t pinned = 0;
     uint32_t gpu = 0;
     uint32_t direct = 0;
     const uint64_t desired_total =
         (uint64_t)pinned_target + (uint64_t)gpu_target + (uint64_t)direct_target;
+
+    // BUGFIX 282: Add explicit check for desired_total > 0 before division ★
+    // Problem: While outer if checks desired_total > 0, the division happens in else branch
+    // If desired_total somehow becomes 0 between check and division (race condition or compiler optimization)
+    // division by zero occurs
+    // Solution: Add defensive check right before division operations
     if (total_count > 0 && desired_total > 0) {
         if (desired_total <= total_count) {
             pinned = pinned_target;
@@ -154,6 +179,14 @@ static void moe_scale_staging_slot_counts(
         } else {
             // Largest remainder method for fair distribution
             // Step 1: Allocate integer parts
+            // BUGFIX 282: Recheck desired_total > 0 for defense in depth ★
+            if (desired_total == 0) {
+                // Should never happen, but prevents UB
+                if (pinned_out) *pinned_out = 0;
+                if (gpu_out) *gpu_out = 0;
+                if (direct_out) *direct_out = 0;
+                return;
+            }
             const double pinned_exact = ((double)total_count * pinned_target) / (double)desired_total;
             const double gpu_exact = ((double)total_count * gpu_target) / (double)desired_total;
             const double direct_exact = ((double)total_count * direct_target) / (double)desired_total;
@@ -367,14 +400,20 @@ static void configure_staging_slots(moe_pc_engine* engine) {
     }
     const uint64_t min_slot = moe_staging_min_slot_bytes(engine);
     // BUGFIX 145: Check min_slot > 0 before division to prevent division by zero
-    if (min_slot > 0 && engine->staging_size >= min_slot && max_slot_target > slot_count) {
+    // BUGFIX 583: Also check staging_size > 0 ★
+    // Problem: staging_size can be 0
+    // Solution: Check both before division
+    if (min_slot > 0 && engine->staging_size > 0 && engine->staging_size >= min_slot && max_slot_target > slot_count) {
         const uint32_t byte_limited_slots = static_cast<uint32_t>(engine->staging_size / min_slot);
         if (byte_limited_slots > slot_count) {
             slot_count = std::min(max_slot_target, byte_limited_slots);
         }
     }
     const uint32_t max_by_bytes = min_slot > 0 ? static_cast<uint32_t>(engine->staging_size / min_slot) : slot_count;
-    if (slot_count > max_by_bytes) {
+    // BUGFIX 584: Check slot_count > 0 before comparison ★
+    // Problem: slot_count can be 0
+    // Solution: Check before comparison
+    if (slot_count > 0 && slot_count > max_by_bytes) {
         slot_count = max_by_bytes > 0 ? max_by_bytes : 1u;
     }
     if (slot_count == 0) {
@@ -384,16 +423,34 @@ static void configure_staging_slots(moe_pc_engine* engine) {
 
     uint64_t slot_size = engine->staging_size / slot_count;
     // BUGFIX 145: Check min_slot > 0 before division
-    if (min_slot > 0 && slot_size < min_slot && engine->staging_size >= min_slot) {
+    // BUGFIX 585: Also check slot_size > 0 and staging_size > 0 ★
+    // Problem: slot_size can be 0 if staging_size < slot_count
+    // Solution: Check all conditions
+    if (min_slot > 0 && slot_size > 0 && slot_size < min_slot && engine->staging_size > 0 && engine->staging_size >= min_slot) {
         slot_count = static_cast<uint32_t>(engine->staging_size / min_slot);
         if (slot_count == 0) slot_count = 1;
         slot_size = engine->staging_size / slot_count;
     }
     // Fix 66: gpu_workers need slots too (deferred release until stream sync)
     const uint32_t min_slots = moe_staging_min_slot_count(engine);
-    if (slot_count < min_slots && engine->staging_size / min_slots >= min_slot) {
+    // BUGFIX 586: Check min_slots > 0 and staging_size / min_slots doesn't overflow ★
+    // Problem: staging_size / min_slots can overflow or be invalid
+    // Solution: Check min_slots > 0 before division
+    if (min_slots > 0 && slot_count < min_slots && engine->staging_size / min_slots >= min_slot) {
         slot_count = min_slots;
         slot_size = engine->staging_size / slot_count;
+    } else if (min_slots > 0 && slot_count < min_slots) {
+        // BUGFIX: Allow stripping 4MB padding if it helps us meet min_slots
+        uint64_t reduced_slot_size = engine->staging_size / min_slots;
+        if (reduced_slot_size >= engine->max_tensor_stream_bytes) {
+            slot_count = min_slots;
+            slot_size = reduced_slot_size;
+        } else {
+            fprintf(stderr, "[storageLLM WARNING] staging_size too small for min_slots=%u. "
+                    "Increase staging_size to at least %llu bytes.\n",
+                    min_slots,
+                    (unsigned long long)min_slots * moe_staging_min_slot_bytes(engine));
+        }
     }
     if (slot_size == 0) {
         update_staging_slot_deficit(engine);
@@ -408,7 +465,16 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
     for (uint32_t i = 0; i < slot_count; ++i) {
         moe_staging_slot slot;
         slot.buf = engine->staging + slot_size * i;
-        slot.size = i + 1 == slot_count ? engine->staging_size - slot_size * i : slot_size;
+        // BUGFIX 587: Check slot_size * i doesn't overflow ★
+        // Problem: slot_size * i can overflow
+        // Solution: Check before calculation
+        const uint64_t offset = (uint64_t)slot_size * i;
+        if (offset > engine->staging_size) {
+            fprintf(stderr, "[storageLLM ERROR] Staging slot offset overflow at slot %u\n", i);
+            break;
+        }
+        slot.buf = engine->staging + offset;
+        slot.size = i + 1 == slot_count ? engine->staging_size - offset : slot_size;
         slot.pinned = engine->staging_pinned;
         slot.numa_allocated = engine->staging_numa_allocated;
 #if defined(__APPLE__) && defined(__MACH__)
@@ -478,4 +544,3 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
             (unsigned long long)min_slot);
     }
 }
-

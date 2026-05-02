@@ -77,6 +77,13 @@ static void reap_dead_workers(moe_pc_engine* engine, std::vector<std::thread>& w
 }
 
 static void resize_disk_workers(moe_pc_engine* engine, uint32_t target) {
+    // BUGFIX 533: Check target range before resize to prevent excessive thread creation ★
+    // Problem: target can be very large (> 1000) causing thread creation failure
+    // Solution: Clamp target to reasonable maximum (256 threads)
+    if (target > 256) {
+        target = 256;
+    }
+
     // BUGFIX 206: Add memory_order_relaxed for worker target ★
     engine->disk_worker_target.store(target, std::memory_order_relaxed);
     if (engine->io_workers.size() > target) {
@@ -91,6 +98,13 @@ static void resize_disk_workers(moe_pc_engine* engine, uint32_t target) {
 }
 
 static void resize_pinned_workers(moe_pc_engine* engine, uint32_t target) {
+    // BUGFIX 534: Check target range before resize to prevent excessive thread creation ★
+    // Problem: target can be very large (> 1000) causing thread creation failure
+    // Solution: Clamp target to reasonable maximum (256 threads)
+    if (target > 256) {
+        target = 256;
+    }
+
     // BUGFIX 206: Add memory_order_relaxed for worker target ★
     engine->pinned_worker_target.store(target, std::memory_order_relaxed);
     if (engine->pinned_workers.size() > target) {
@@ -105,6 +119,13 @@ static void resize_pinned_workers(moe_pc_engine* engine, uint32_t target) {
 }
 
 static void resize_gpu_workers(moe_pc_engine* engine, uint32_t target) {
+    // BUGFIX 535: Check target range before resize to prevent excessive thread creation ★
+    // Problem: target can be very large (> 1000) causing thread creation failure
+    // Solution: Clamp target to reasonable maximum (256 threads)
+    if (target > 256) {
+        target = 256;
+    }
+
     // BUGFIX 206: Add memory_order_relaxed for worker target ★
     engine->gpu_worker_target.store(target, std::memory_order_relaxed);
     if (engine->gpu_workers.size() > target) {
@@ -170,4 +191,3 @@ static void orchestrator_resize_workers(
         }
     }
 }
-
