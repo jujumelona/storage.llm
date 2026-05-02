@@ -110,6 +110,24 @@ static int moe_layer_uses_unweighted_v_norm(
          moe_engine_has_common_tensor_suffix(engine, layer, "layer_output_scale.weight")) ? 1 : 0;
 }
 
+static float moe_standard_attention_score_scale(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    uint32_t head_dim
+) {
+    if (head_dim == 0) {
+        return 1.0f;
+    }
+    if (moe_engine_uses_gemma4_attention(engine) &&
+        (moe_engine_has_common_tensor_suffix(engine, layer, "attn_q_norm.weight") ||
+         moe_engine_has_common_tensor_suffix(engine, layer, "q_norm.weight")) &&
+        (moe_engine_has_common_tensor_suffix(engine, layer, "attn_k_norm.weight") ||
+         moe_engine_has_common_tensor_suffix(engine, layer, "k_norm.weight"))) {
+        return 1.0f;
+    }
+    return 1.0f / std::sqrt((float)head_dim);
+}
+
 static int moe_standard_kv_cache_ensure(
     moe_pc_engine* engine,
     moe_decode_scratch* s,
@@ -190,6 +208,24 @@ static int moe_layer_standard_attention_f32(
     const uint32_t v_total_dim = o_shape.cols ? o_shape.cols : num_heads * v_head_dim;
     const uint32_t kv_entry_dim = k_dim + kv_v_dim;
     const uint32_t rope_dim = std::min<uint32_t>(cfg.qk_rope_head_dim ? cfg.qk_rope_head_dim : head_dim, head_dim);
+    const int use_dynamic_rope = moe_engine_uses_gemma4_attention(engine);
+    moe_profile_log(
+        "attn_standard_cfg",
+        "layer=%d pos=%u heads=%u kv_heads=%u head_dim=%u v_head_dim=%u q_dim=%u k_dim=%u kv_v_dim=%u v_total=%u rope_dim=%u theta=%.6g has_v=%d dynamic_rope=%d",
+        layer,
+        position,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        v_head_dim,
+        q_dim,
+        k_dim,
+        kv_v_dim,
+        v_total_dim,
+        rope_dim,
+        (double)cfg.rope_theta,
+        has_v,
+        use_dynamic_rope);
     if (!engine || !s || !hidden || hidden_size == 0 ||
         num_heads == 0 || num_kv_heads == 0 || num_kv_heads > num_heads ||
         head_dim == 0 || v_head_dim == 0 || q_dim == 0 || k_dim == 0 ||
@@ -309,13 +345,18 @@ static int moe_layer_standard_attention_f32(
         return 0;
     }
     if (rope_dim >= 2u) {
+        static const std::vector<float> empty_rope_table;
+        const std::vector<float>& q_cos = use_dynamic_rope ? empty_rope_table : s->rope_q_cos;
+        const std::vector<float>& q_sin = use_dynamic_rope ? empty_rope_table : s->rope_q_sin;
+        const std::vector<float>& k_cos = use_dynamic_rope ? empty_rope_table : s->rope_k_cos;
+        const std::vector<float>& k_sin = use_dynamic_rope ? empty_rope_table : s->rope_k_sin;
         for (uint32_t h = 0; h < num_heads; ++h) {
             moe_rope_inplace(
                 s->q_b.data() + (uint64_t)h * head_dim,
                 rope_dim,
                 position,
-                s->rope_q_cos,
-                s->rope_q_sin,
+                q_cos,
+                q_sin,
                 cfg.rope_theta);
         }
         for (uint32_t h = 0; h < num_kv_heads; ++h) {
@@ -323,8 +364,8 @@ static int moe_layer_standard_attention_f32(
                 s->attn_kv_a.data() + (uint64_t)h * head_dim,
                 rope_dim,
                 position,
-                s->rope_k_cos,
-                s->rope_k_sin,
+                k_cos,
+                k_sin,
                 cfg.rope_theta);
         }
     }
@@ -359,7 +400,7 @@ static int moe_layer_standard_attention_f32(
         }
     }
 
-    const float scale = 1.0f / std::sqrt((float)head_dim);
+    const float scale = moe_standard_attention_score_scale(engine, layer, head_dim);
     std::fill(s->attn_value.begin(), s->attn_value.begin() + v_total_dim, 0.0f);
     if (!moe_parallel_rows(engine, num_heads, 0, [&](uint32_t h) {
         const uint32_t kv_h = (uint32_t)(((uint64_t)h * (uint64_t)num_kv_heads) / (uint64_t)num_heads);
@@ -413,7 +454,7 @@ static int moe_layer_attention_f32(
     uint32_t hidden_size,
     uint32_t position
 ) {
-    const moe_attn_config_t cfg = moe_generation_attn_config(engine);
+    const moe_attn_config_t cfg = moe_generation_layer_attn_config(engine, layer);
     if (cfg.type != moe_ATTN_TYPE_MLA) {
         return moe_layer_standard_attention_f32(engine, layer, s, hidden, hidden_size, position, cfg);
     }
@@ -627,6 +668,10 @@ static int moe_layer_attention_f32(
                     s->rope_q_sin
                 );
                 float* qa_h = s->q_absorbed.data() + h * cdim;
+                // BUGFIX 292: Check h * cdim doesn't overflow before accessing ★
+                if ((uint64_t)h * (uint64_t)cdim > s->q_absorbed.size()) {
+                    return 0;
+                }
                 for (uint32_t d = 0; d < nope_dim; ++d) {
                     const float qv = s->q_b[h * head_dim + d];
                     if (std::abs(qv) < 1e-12f) continue;

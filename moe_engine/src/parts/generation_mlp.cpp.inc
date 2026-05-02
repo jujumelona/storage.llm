@@ -376,6 +376,28 @@ static int moe_layer_shared_expert_gate_f32(
     return 1;
 }
 
+static int moe_layer_router_uses_residual_input(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    return moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale") &&
+        moe_engine_has_common_tensor_suffix(engine, layer, "pre_ffw_norm_2.weight") ? 1 : 0;
+}
+
+static int moe_layer_has_expert_branch_post_norm(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    return moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_2.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_post_norm_2.weight");
+}
+
 static int moe_layer_apply_expert_down_scale_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -674,12 +696,14 @@ static int moe_layer_moe_mlp_f32(
         "layer=%d ok=%d has_raw_span=%d ms=%.3f",
         layer, shared_ok, shared ? 1 : 0, moe_profile_elapsed_ms(shared_start_us));
 
-    moe_save_gate_input_snapshot(engine, layer, expert_input, hidden_size);
+    const float* router_input = moe_layer_router_uses_residual_input(engine, layer) ?
+        hidden : expert_input;
+    moe_save_gate_input_snapshot(engine, layer, router_input, hidden_size);
     const uint64_t router_start_us = moe_profile_now_us();
     if (!moe_router_topk_f32(
             engine,
             layer,
-            expert_input,
+            router_input,
             hidden_size,
             c->experts_per_moe_layer,
             moe_router_top_k_from_metadata(engine, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer),
@@ -1119,14 +1143,16 @@ static int moe_layer_moe_mlp_f32(
         work[e].ok = expert_ok[e].load(std::memory_order_acquire);
     }
 
-    // Phase 3: Accumulate weighted expert outputs into mlp.
+    // Phase 3: Accumulate weighted expert outputs into the routed branch, then
+    // apply the branch post-norm once. Gemma4-style MoE blocks normalize the
+    // weighted routed branch, not each expert independently.
     const uint64_t accumulate_start_us = moe_profile_now_us();
+    const int routed_branch_post_norm = moe_layer_has_expert_branch_post_norm(engine, layer);
+    if (routed_branch_post_norm) {
+        std::fill(s->residual.begin(), s->residual.end(), 0.0f);
+    }
     for (size_t e = 0; e < num_selected; ++e) {
         if (!work[e].ok) continue;
-        if (moe_layer_post_ffw_norm2_f32(
-                engine, layer, work[e].out, hidden_size, s->residual.data(), attn_cfg.rms_norm_eps)) {
-            std::memcpy(work[e].out, s->residual.data(), (size_t)hidden_size * sizeof(float));
-        }
         if (!moe_layer_apply_expert_down_scale_f32(
                 engine, layer, work[e].expert_id, c->experts_per_moe_layer,
                 work[e].out, hidden_size)) {
@@ -1134,7 +1160,20 @@ static int moe_layer_moe_mlp_f32(
                 layer, work[e].expert_id);
             return 0;
         }
-        moe_axpy_f32(s->mlp.data(), work[e].out, work[e].weight, hidden_size);
+        moe_axpy_f32(
+            routed_branch_post_norm ? s->residual.data() : s->mlp.data(),
+            work[e].out,
+            work[e].weight,
+            hidden_size);
+    }
+    if (routed_branch_post_norm) {
+        const float* routed_out = s->residual.data();
+        if (moe_layer_post_ffw_norm2_f32(
+                engine, layer, s->residual.data(), hidden_size,
+                s->expert.data(), attn_cfg.rms_norm_eps)) {
+            routed_out = s->expert.data();
+        }
+        moe_axpy_f32(s->mlp.data(), routed_out, 1.0f, hidden_size);
     }
     const double accumulate_ms = moe_profile_elapsed_ms(accumulate_start_us);
 
