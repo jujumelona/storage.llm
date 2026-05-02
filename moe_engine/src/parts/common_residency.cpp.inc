@@ -57,15 +57,20 @@ static void init_kv_vram_budget(moe_pc_engine* engine) {
         return;
     }
 
-    // Default: 20% of VRAM for KV cache
-    // Can be overridden by config.vram_kv_ratio (0.0 to 1.0)
+    // Default: 20% of VRAM for KV cache.
+    // vram_kv_ratio == 0 means auto; any positive value is explicit.
     float kv_ratio = engine->config.vram_kv_ratio;
 
     // Auto-detect if not configured (0.0 means auto)
-    if (kv_ratio <= 0.0f || kv_ratio >= 1.0f) {
+    if (kv_ratio <= 0.0f) {
         // For small VRAM (<24GB), use 10%; otherwise 20%
         kv_ratio = (engine->config.vram_budget_bytes < 24ull * 1024ull * 1024ull * 1024ull)
                    ? 0.10f : 0.20f;
+    } else if (kv_ratio > 1.0f) {
+        fprintf(stderr,
+            "[storageLLM WARNING] vram_kv_ratio=%.2f exceeds 1.0, clamping to full KV allocation\n",
+            kv_ratio);
+        kv_ratio = 1.0f;
     }
 
     // BUGFIX 문제F: Warn if user sets excessive KV ratio ★★
@@ -73,7 +78,7 @@ static void init_kv_vram_budget(moe_pc_engine* engine) {
     if (engine->config.vram_kv_ratio > 0.5f) {
         fprintf(stderr,
             "[storageLLM WARNING] vram_kv_ratio=%.2f exceeds 0.5, expert prefetch will be severely limited. "
-            "Recommended range: 0.1-0.3\n",
+            "Recommended range: 0.1-0.3; 1.0 explicitly reserves all VRAM for KV.\n",
             engine->config.vram_kv_ratio);
     }
 
@@ -86,7 +91,8 @@ static void init_kv_vram_budget(moe_pc_engine* engine) {
         (unsigned long long)(engine->config.vram_budget_bytes / (1024*1024)),
         (unsigned long long)(kv_budget / (1024*1024)),
         kv_ratio * 100.0f,
-        (unsigned long long)((engine->config.vram_budget_bytes - kv_budget) / (1024*1024)));
+        (unsigned long long)((engine->config.vram_budget_bytes > kv_budget ?
+            engine->config.vram_budget_bytes - kv_budget : 0) / (1024*1024)));
 }
 
 static void apply_common_vram_reservation(moe_pc_engine* engine) {

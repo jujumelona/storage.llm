@@ -20,6 +20,26 @@
     } else if (engine->io_config.max_prefetch_queue < 4096) {
         engine->io_config.max_prefetch_queue = 4096;
     }
+    if (engine->io_config.metal_memory_budget_pct != 0 &&
+        (engine->io_config.metal_memory_budget_pct < 50 ||
+         engine->io_config.metal_memory_budget_pct > 90)) {
+        fprintf(stderr,
+            "[storageLLM WARNING] metal_memory_budget_pct=%u out of safe range [50,90], using default 60\n",
+            (unsigned)engine->io_config.metal_memory_budget_pct);
+        engine->io_config.metal_memory_budget_pct = 60;
+    }
+    if (engine->io_config.vulkan_memory_headroom_pct > 90) {
+        fprintf(stderr,
+            "[storageLLM WARNING] vulkan_memory_headroom_pct=%u out of range [0,90], using default 10\n",
+            (unsigned)engine->io_config.vulkan_memory_headroom_pct);
+        engine->io_config.vulkan_memory_headroom_pct = 10;
+    }
+    if (engine->io_config.level_zero_memory_headroom_pct > 90) {
+        fprintf(stderr,
+            "[storageLLM WARNING] level_zero_memory_headroom_pct=%u out of range [0,90], using default 10\n",
+            (unsigned)engine->io_config.level_zero_memory_headroom_pct);
+        engine->io_config.level_zero_memory_headroom_pct = 10;
+    }
 
     // BUGFIX 645: 큐 깊이 불균형 수정 - 단계별 독립 큐 깊이 설정 ★★★
     // Problem: disk_stage, pinned_stage, gpu_stage가 동일한 max_prefetch_queue 공유

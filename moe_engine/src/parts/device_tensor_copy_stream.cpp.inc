@@ -5,6 +5,7 @@
 struct moe_deferred_staging_copy {
     uint32_t slot = UINT32_MAX;
     uint64_t key = 0;
+    uint64_t bytes_for_vram_release = 0;  // BUGFIX 문제1: Track VRAM reservation to release at completion
     CUevent event = nullptr;
     bool event_recorded = false;
 };
@@ -84,13 +85,14 @@ static void device_destroy_copy_event_pool(moe_pc_engine* e) {
     s_tl_copy_event_pool.erase(it);
 }
 
-static void device_defer_staging_copy(moe_pc_engine* e, uint32_t slot, uint64_t key, CUstream stream) {
+static void device_defer_staging_copy(moe_pc_engine* e, uint32_t slot, uint64_t key, uint64_t vram_bytes, CUstream stream) {
     if (!e || slot == UINT32_MAX) {
         return;
     }
     moe_deferred_staging_copy copy{};
     copy.slot = slot;
     copy.key = key;
+    copy.bytes_for_vram_release = vram_bytes;  // BUGFIX 문제1: Track bytes for VRAM reservation release
     copy.event = device_take_copy_event(e);
     if (copy.event) {
         copy.event_recorded = device_backend_event_record(e, copy.event, stream) ? true : false;

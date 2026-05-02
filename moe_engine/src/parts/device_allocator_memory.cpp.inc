@@ -26,7 +26,7 @@ static void device_account_bytes_freed(moe_pc_engine* e, uint64_t bytes) {
 
 // BUGFIX 199: Metal VRAM budget configurable ★
 // Problem: 60% hardcoded → M3 Max 128GB wastes 25GB (60%=76.8GB vs 80%=102.4GB)
-// Solution: Use io_config.metal_memory_budget_pct (default 60, safe range 60-85)
+// Solution: Use io_config.metal_memory_budget_pct (default 60, safe range 50-90)
 // Trade-off: >85% risks macOS memory pressure → swapping or app termination
 static uint64_t device_budget_bytes(const moe_pc_engine* e) {
     if (!e) return 0;
@@ -40,9 +40,15 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
         // BUGFIX 199: Use configurable percentage (default 60)
         // BUGFIX 232: Ensure pct is never 0 to prevent zero budget
         // BUGFIX 274: Simplify zero budget check - pct validation already ensures non-zero
-        const uint64_t pct = (e->io_config.metal_memory_budget_pct > 0 && e->io_config.metal_memory_budget_pct <= 100)
-            ? e->io_config.metal_memory_budget_pct : 60ull;
-        // pct is guaranteed to be in range [60, 100], so budget cannot be 0
+        uint64_t pct = e->io_config.metal_memory_budget_pct;
+        if (pct < 50 || pct > 90) {
+            if (pct != 0) {
+                fprintf(stderr,
+                    "[storageLLM WARNING] metal_memory_budget_pct=%llu out of safe range [50,90], clamping\n",
+                    (unsigned long long)pct);
+            }
+            pct = 60ull;
+        }
         return (sys * pct) / 100ull;
     }
     const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
@@ -55,6 +61,13 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
         return allocated > UINT64_MAX - (uint64_t)s_free ? UINT64_MAX : allocated + (uint64_t)s_free;
     }
     return e->backend_caps.device_memory_bytes ? e->backend_caps.device_memory_bytes : e->backend_caps.recommended_vram_cache_bytes;
+}
+
+static uint64_t device_memory_headroom_pct(uint8_t configured) {
+    if (configured == 0 || configured > 90) {
+        return 10ull;
+    }
+    return configured;
 }
 
 // BUGFIX 122: Issue 27 - pending VRAM reservation TOCTOU race ★★★
@@ -72,13 +85,14 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
 // Solution: Completely removed both functions. Only call site (device_tensor_copy_alloc.cpp.inc:91)
 // was already commented out. prefetch_admission.cpp.inc CAS loop is the sole reservation mechanism.
 
-static void device_refresh_mem_info(moe_pc_engine* e) {
+static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
     if (!e) return;
     // Diagnostics/failure-path refresh only. Hot paths maintain device_free_bytes directly.
     const auto now = std::chrono::steady_clock::now();
     int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     int64_t last = e->last_mem_query_ms.load(std::memory_order_relaxed);
-    if (now_ms - last < 1000) {
+    const int64_t throttle_ms = retry_path ? 100 : 1000;
+    if (now_ms - last < throttle_ms) {
         return;
     }
     if (!e->last_mem_query_ms.compare_exchange_strong(last, now_ms)) {
@@ -127,10 +141,11 @@ static void device_refresh_mem_info(moe_pc_engine* e) {
                 calc_total += props.memoryProperties.memoryHeaps[i].size;
                 if (budget.heapBudget[i] > 0) {
                     uint64_t avail = (budget.heapBudget[i] > budget.heapUsage[i]) ? (budget.heapBudget[i] - budget.heapUsage[i]) : 0;
-                    calc_free += (avail * 90ull) / 100ull;
+                    const uint64_t keep_free_pct = 100ull - device_memory_headroom_pct(e->io_config.vulkan_memory_headroom_pct);
+                    calc_free += (avail * keep_free_pct) / 100ull;
                 } else {
-                    // Fallback to 85% if VK_EXT_memory_budget is missing
-                    calc_free += (props.memoryProperties.memoryHeaps[i].size * 85ull) / 100ull;
+                    const uint64_t keep_free_pct = 100ull - device_memory_headroom_pct(e->io_config.vulkan_memory_headroom_pct);
+                    calc_free += (props.memoryProperties.memoryHeaps[i].size * keep_free_pct) / 100ull;
                 }
             }
         }
@@ -166,10 +181,11 @@ static void device_refresh_mem_info(moe_pc_engine* e) {
             total_b = mem_props.totalSize;
             if (ext_props.allocatedSize > 0) {
                 uint64_t avail = (mem_props.totalSize > ext_props.allocatedSize) ? (mem_props.totalSize - ext_props.allocatedSize) : mem_props.totalSize;
-                free_b = (avail * 90ull) / 100ull;
+                const uint64_t keep_free_pct = 100ull - device_memory_headroom_pct(e->io_config.level_zero_memory_headroom_pct);
+                free_b = (avail * keep_free_pct) / 100ull;
             } else {
-                // Fallback to 85% if allocatedSize not populated
-                free_b = (mem_props.totalSize * 85ull) / 100ull;
+                const uint64_t keep_free_pct = 100ull - device_memory_headroom_pct(e->io_config.level_zero_memory_headroom_pct);
+                free_b = (mem_props.totalSize * keep_free_pct) / 100ull;
             }
             mem_queried = 1;
         }

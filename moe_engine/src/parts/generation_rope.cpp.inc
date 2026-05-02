@@ -329,6 +329,32 @@ static int moe_standard_rope_uses_rotate_half(
     return cfg.type != moe_ATTN_TYPE_MLA ? 1 : 0;
 }
 
+struct moe_rope_layout_cache_entry {
+    const moe_pc_engine* engine = nullptr;
+    int type = 0;
+    int rotate_half = 0;
+};
+
+static int moe_standard_rope_uses_rotate_half_cached(
+    const moe_pc_engine* engine,
+    const moe_attn_config_t& cfg
+) {
+    static thread_local std::vector<moe_rope_layout_cache_entry> cache;
+    for (const moe_rope_layout_cache_entry& entry : cache) {
+        if (entry.engine == engine && entry.type == (int)cfg.type) {
+            return entry.rotate_half;
+        }
+    }
+    const int rotate_half = moe_standard_rope_uses_rotate_half(engine, cfg);
+    if (cache.size() < 16u) {
+        try {
+            cache.push_back(moe_rope_layout_cache_entry{engine, (int)cfg.type, rotate_half});
+        } catch (...) {
+        }
+    }
+    return rotate_half;
+}
+
 static void moe_standard_rope_apply_inplace(
     const moe_pc_engine* engine,
     const moe_attn_config_t& cfg,
@@ -340,7 +366,7 @@ static void moe_standard_rope_apply_inplace(
     float base
 ) {
     moe_standard_rope_apply_inplace_with_layout(
-        moe_standard_rope_uses_rotate_half(engine, cfg),
+        moe_standard_rope_uses_rotate_half_cached(engine, cfg),
         data,
         dim,
         position,

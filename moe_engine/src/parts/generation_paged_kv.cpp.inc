@@ -8,6 +8,9 @@
 #include <vector>
 #include <mutex>
 #include <cstdint>
+#include <atomic>
+#include <functional>
+#include <queue>
 
 #ifndef MOE_GENERATION_PAGED_KV_TYPES_DEFINED
 #define MOE_GENERATION_PAGED_KV_TYPES_DEFINED
@@ -38,6 +41,11 @@ struct moe_paged_kv_manager_t {
     std::vector<uint32_t> free_blocks;
     std::vector<bool> is_free;  // BUGFIX 문제7: O(1) duplicate check bitmap
     std::vector<moe_paged_kv_block_t> blocks;
+    std::atomic<uint32_t> free_count{0};
+    std::priority_queue<
+        std::pair<uint64_t, uint32_t>,
+        std::vector<std::pair<uint64_t, uint32_t>>,
+        std::greater<std::pair<uint64_t, uint32_t>>> lru_heap;
     std::mutex mtx;
 
     void init(uint32_t capacity_tokens, uint32_t b_size, uint32_t layers, uint32_t sink_tokens = 4) {
@@ -59,6 +67,8 @@ struct moe_paged_kv_manager_t {
         blocks.resize(max_blocks);
         is_free.resize(max_blocks, false);  // BUGFIX 문제7: Initialize bitmap
         free_blocks.reserve(max_blocks);
+        free_count.store(0, std::memory_order_relaxed);
+        lru_heap = {};
 
         // BUGFIX 128: Calculate how many blocks contain sink tokens
         const uint32_t sink_blocks = (sink_token_count + block_size - 1) / block_size;
@@ -92,6 +102,7 @@ struct moe_paged_kv_manager_t {
             }
 
             free_blocks.push_back(i);
+            free_count.fetch_add(1, std::memory_order_relaxed);
             is_free[i] = true;  // BUGFIX 문제7: Mark as free in bitmap
         }
     }
@@ -117,6 +128,8 @@ struct moe_paged_kv_manager_t {
         }
         blocks.clear();
         free_blocks.clear();
+        free_count.store(0, std::memory_order_relaxed);
+        lru_heap = {};
         is_free.clear();  // BUGFIX 문제7: Clear bitmap
     }
 
@@ -126,19 +139,26 @@ struct moe_paged_kv_manager_t {
 
     int allocate_block() {
         std::lock_guard<std::mutex> lock(mtx);
-        if (free_blocks.empty()) return -1;
-        uint32_t id = free_blocks.back();
-        free_blocks.pop_back();
-        // BUGFIX 300: Check id bounds before accessing blocks array ★
-        // Problem: free_blocks can contain invalid id due to corruption
-        // Accessing blocks[id] with invalid id causes out-of-bounds access
-        // Solution: Validate id before use
-        if (id >= max_blocks) {
-            return -1;
+        while (!free_blocks.empty()) {
+            uint32_t id = free_blocks.back();
+            free_blocks.pop_back();
+            if (id >= max_blocks || !is_free[id]) {
+                continue;
+            }
+            blocks[id].num_tokens = 0;
+            is_free[id] = false;
+            uint32_t current = free_count.load(std::memory_order_relaxed);
+            while (current > 0 &&
+                   !free_count.compare_exchange_weak(
+                       current, current - 1u,
+                       std::memory_order_relaxed,
+                       std::memory_order_relaxed)) {}
+            lru_heap.push({blocks[id].last_access_epoch, id});
+            return id;
         }
-        blocks[id].num_tokens = 0;
-        is_free[id] = false;  // BUGFIX 문제7: Mark as allocated
-        return id;
+        free_count.store(0, std::memory_order_relaxed);
+        return -1;
+        // BUGFIX 300: Check id bounds before accessing blocks array ★
     }
 
     void free_block(uint32_t id) {
@@ -156,12 +176,31 @@ struct moe_paged_kv_manager_t {
 
         is_free[id] = true;
         free_blocks.push_back(id);
+        free_count.fetch_add(1, std::memory_order_relaxed);
     }
 
     // BUGFIX 128: Evict oldest non-pinned block when cache is full
     // Returns -1 if no evictable blocks available (all pinned or in use)
     int evict_lru_block() {
         std::lock_guard<std::mutex> lock(mtx);
+        while (!lru_heap.empty()) {
+            const auto entry = lru_heap.top();
+            lru_heap.pop();
+            const uint32_t id = entry.second;
+            if (id >= max_blocks || is_free[id] || blocks[id].pinned || blocks[id].num_tokens == 0) {
+                continue;
+            }
+            if (blocks[id].last_access_epoch != entry.first) {
+                lru_heap.push({blocks[id].last_access_epoch, id});
+                continue;
+            }
+            blocks[id].num_tokens = 0;
+            is_free[id] = true;
+            free_blocks.push_back(id);
+            free_count.fetch_add(1, std::memory_order_relaxed);
+            return (int)id;
+        }
+        return -1;
 
         // Find oldest non-pinned block with tokens
         int evict_candidate = -1;
@@ -204,6 +243,9 @@ struct moe_paged_kv_manager_t {
 
 #ifndef MOE_GENERATION_PAGED_KV_TYPES_ONLY
 
+static void device_account_bytes_freed(moe_pc_engine* e, uint64_t bytes);
+static void device_account_free_bytes_sub(moe_pc_engine* e, uint64_t bytes);
+
 static uint32_t evict_cold_kv_blocks(
     moe_pc_engine* engine,
     moe_paged_kv_manager_t* manager,
@@ -213,6 +255,30 @@ static uint32_t evict_cold_kv_blocks(
 static uint32_t moe_paged_kv_layer_count(const moe_pc_engine* engine) {
     const moe_model_shape_t shape = moe_engine_model_shape_or_static(engine);
     return shape.num_hidden_layers ? shape.num_hidden_layers : 80u;
+}
+
+static void moe_free_kv_vram_allocations(
+    moe_pc_engine* engine,
+    CUdeviceptr data,
+    CUdeviceptr scales,
+    CUdeviceptr zeros,
+    uint64_t accounted_bytes
+) {
+    if (!engine) {
+        return;
+    }
+    if (engine->backend_caps.backend == moe_BACKEND_HIP && engine->hip.hipFree) {
+        if (data) engine->hip.hipFree(data);
+        if (scales) engine->hip.hipFree(scales);
+        if (zeros) engine->hip.hipFree(zeros);
+    } else if (engine->backend_caps.backend == moe_BACKEND_CUDA && engine->cuda.cuMemFree) {
+        if (data) engine->cuda.cuMemFree(data);
+        if (scales) engine->cuda.cuMemFree(scales);
+        if (zeros) engine->cuda.cuMemFree(zeros);
+    }
+    if (accounted_bytes) {
+        device_account_bytes_freed(engine, accounted_bytes);
+    }
 }
 
 
@@ -229,11 +295,21 @@ static int promote_kv_block_to_vram(
         return 0;
     }
 
-    moe_paged_kv_block_t& block = manager->blocks[block_id];
-
-    // Already in VRAM
-    if (block.tier == moe_TIER_VRAM && block.vram_data) {
-        return 1;
+    uint8_t* host_data = nullptr;
+    float* host_scales = nullptr;
+    float* host_zeros = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(manager->mtx);
+        if (block_id >= manager->max_blocks || manager->is_free[block_id]) {
+            return 0;
+        }
+        moe_paged_kv_block_t& block = manager->blocks[block_id];
+        if (block.tier == moe_TIER_VRAM && block.vram_data) {
+            return 1;
+        }
+        host_data = block.compressed_data;
+        host_scales = block.scales;
+        host_zeros = block.zeros;
     }
 
     // Calculate block size (assuming layers from engine config)
@@ -341,74 +417,80 @@ static int promote_kv_block_to_vram(
 
     // Copy data to VRAM
     int res = 0;
-    if (block.compressed_data && vram_data_ptr) {
+    device_account_free_bytes_sub(engine, total_size);
+    int device_accounted = 1;
+
+    if (host_data && vram_data_ptr) {
         if (engine->backend_caps.backend == moe_BACKEND_HIP) {
-            res = engine->hip.hipMemcpyHtoD(vram_data_ptr, block.compressed_data, data_size);
+            res = engine->hip.hipMemcpyHtoD(vram_data_ptr, host_data, data_size);
         } else if (engine->backend_caps.backend == moe_BACKEND_CUDA) {
-            res = engine->cuda.cuMemcpyHtoD(vram_data_ptr, block.compressed_data, data_size);
+            res = engine->cuda.cuMemcpyHtoD(vram_data_ptr, host_data, data_size);
         }
         if (res != 0) {
-            if (engine->backend_caps.backend == moe_BACKEND_HIP) {
-                engine->hip.hipFree(vram_data_ptr);
-                if (vram_scales_ptr) engine->hip.hipFree(vram_scales_ptr);
-                if (vram_zeros_ptr) engine->hip.hipFree(vram_zeros_ptr);
-            } else if (engine->backend_caps.backend == moe_BACKEND_CUDA) {
-                engine->cuda.cuMemFree(vram_data_ptr);
-                if (vram_scales_ptr) engine->cuda.cuMemFree(vram_scales_ptr);
-                if (vram_zeros_ptr) engine->cuda.cuMemFree(vram_zeros_ptr);
-            }
+            moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr,
+                device_accounted ? total_size : 0);
             engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
             return 0;
         }
     }
 
-    if (block.scales && vram_scales_ptr) {
+    if (host_scales && vram_scales_ptr) {
         if (engine->backend_caps.backend == moe_BACKEND_HIP) {
-            res = engine->hip.hipMemcpyHtoD(vram_scales_ptr, block.scales, scales_size);
+            res = engine->hip.hipMemcpyHtoD(vram_scales_ptr, host_scales, scales_size);
         } else if (engine->backend_caps.backend == moe_BACKEND_CUDA) {
-            res = engine->cuda.cuMemcpyHtoD(vram_scales_ptr, block.scales, scales_size);
+            res = engine->cuda.cuMemcpyHtoD(vram_scales_ptr, host_scales, scales_size);
         }
         if (res != 0) {
-            if (engine->backend_caps.backend == moe_BACKEND_HIP) {
-                engine->hip.hipFree(vram_data_ptr);
-                engine->hip.hipFree(vram_scales_ptr);
-                if (vram_zeros_ptr) engine->hip.hipFree(vram_zeros_ptr);
-            } else if (engine->backend_caps.backend == moe_BACKEND_CUDA) {
-                engine->cuda.cuMemFree(vram_data_ptr);
-                engine->cuda.cuMemFree(vram_scales_ptr);
-                if (vram_zeros_ptr) engine->cuda.cuMemFree(vram_zeros_ptr);
-            }
+            moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr,
+                device_accounted ? total_size : 0);
             engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
             return 0;
         }
     }
 
-    if (block.zeros && vram_zeros_ptr) {
+    if (host_zeros && vram_zeros_ptr) {
         if (engine->backend_caps.backend == moe_BACKEND_HIP) {
-            res = engine->hip.hipMemcpyHtoD(vram_zeros_ptr, block.zeros, zeros_size);
+            res = engine->hip.hipMemcpyHtoD(vram_zeros_ptr, host_zeros, zeros_size);
         } else if (engine->backend_caps.backend == moe_BACKEND_CUDA) {
-            res = engine->cuda.cuMemcpyHtoD(vram_zeros_ptr, block.zeros, zeros_size);
+            res = engine->cuda.cuMemcpyHtoD(vram_zeros_ptr, host_zeros, zeros_size);
         }
         if (res != 0) {
-            if (engine->backend_caps.backend == moe_BACKEND_HIP) {
-                engine->hip.hipFree(vram_data_ptr);
-                engine->hip.hipFree(vram_scales_ptr);
-                engine->hip.hipFree(vram_zeros_ptr);
-            } else if (engine->backend_caps.backend == moe_BACKEND_CUDA) {
-                engine->cuda.cuMemFree(vram_data_ptr);
-                engine->cuda.cuMemFree(vram_scales_ptr);
-                engine->cuda.cuMemFree(vram_zeros_ptr);
-            }
+            moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr,
+                device_accounted ? total_size : 0);
             engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
             return 0;
         }
     }
 
     // Update block state
-    block.vram_data = (void*)vram_data_ptr;
-    block.vram_scales = (void*)vram_scales_ptr;
-    block.vram_zeros = (void*)vram_zeros_ptr;
-    block.tier = moe_TIER_VRAM;
+    {
+        std::lock_guard<std::mutex> lock(manager->mtx);
+        if (block_id >= manager->max_blocks || manager->is_free[block_id]) {
+            moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr,
+                device_accounted ? total_size : 0);
+            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            return 0;
+        }
+        moe_paged_kv_block_t& block = manager->blocks[block_id];
+        if (block.tier == moe_TIER_VRAM && block.vram_data) {
+            moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr,
+                device_accounted ? total_size : 0);
+            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            return 1;
+        }
+        if (block.compressed_data != host_data ||
+            block.scales != host_scales ||
+            block.zeros != host_zeros) {
+            moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr,
+                device_accounted ? total_size : 0);
+            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            return 0;
+        }
+        block.vram_data = (void*)vram_data_ptr;
+        block.vram_scales = (void*)vram_scales_ptr;
+        block.vram_zeros = (void*)vram_zeros_ptr;
+        block.tier = moe_TIER_VRAM;
+    }
 
     // Update device pool counter
     engine->device_kv_cache_bytes.fetch_add(total_size, std::memory_order_relaxed);
@@ -508,6 +590,7 @@ static uint32_t evict_cold_kv_blocks(
             }
             block.vram_zeros = nullptr;
         }
+        device_account_bytes_freed(engine, block_size);
 
         // Demote to RAM
         block.tier = moe_TIER_RAM;

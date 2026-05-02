@@ -477,7 +477,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                             ok = 0;
                             staged_direct_to_gpu = true;
                         } else {
-                        const uint32_t slot = acquire_staging_slot(
+                        uint32_t slot = acquire_staging_slot(
                             engine,
                             worker_index,
                             staging_turn++,
@@ -487,7 +487,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                         );
                         if (slot != UINT32_MAX) {
                             uint64_t staging_bytes = 0;
-                            if (prefetch_tensor_file_to_pinned(engine, rec, slot, &staging_bytes)) {
+                            if (prefetch_tensor_file_to_pinned(engine, rec, &slot, &staging_bytes)) {
                                 moe_prefetch_task next = task;
                                 next.stage = moe_TRANSFER_STAGE_PINNED_TO_GPU;
                                 next.staging_slot = slot;

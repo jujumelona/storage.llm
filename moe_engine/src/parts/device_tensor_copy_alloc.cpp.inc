@@ -124,7 +124,7 @@ static int device_prepare_tensor_allocation(
                 // 이미 해제됨. 여기서 별도 해제 불필요 (BUGFIX 243 참고)
                 e->io_atomic.device_alloc_failures.fetch_add(1, std::memory_order_relaxed);
                 lock.unlock();
-                device_refresh_mem_info(e);
+                device_refresh_mem_info(e, 1);
                 return 0;
             }
             e->device_allocated_bytes.fetch_add(bytes);

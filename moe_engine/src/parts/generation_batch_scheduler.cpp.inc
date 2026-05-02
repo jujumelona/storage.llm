@@ -134,7 +134,7 @@ struct moe_continuous_batch_scheduler_t {
 
                 uint32_t needed_blocks = (static_cast<uint32_t>(req->prompt_tokens.size()) + kv_manager->block_size - 1) / kv_manager->block_size;
 
-                if (kv_manager->free_blocks.size() >= needed_blocks) {
+                if (kv_manager->free_count.load(std::memory_order_acquire) >= needed_blocks) {
                     // Enough KV blocks available — admit this request
                     req->phase = moe_REQ_PREFILL;
                     req->skip_count = 0;

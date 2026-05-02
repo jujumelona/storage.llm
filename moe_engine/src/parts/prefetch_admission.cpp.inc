@@ -75,6 +75,7 @@ static moe_tier_t prefetch_admitted_tier(
                     pending > vram_budget - used ||
                     item.bytes > vram_budget - used - pending) {
                     target = moe_TIER_RAM;
+                    device_refresh_mem_info(engine, 1);
                     break;
                 }
                 if (engine->pending_vram_reservation.compare_exchange_weak(
@@ -95,12 +96,21 @@ static moe_tier_t prefetch_admitted_tier(
     // route to DB when RAM is critically full.
     if (target == moe_TIER_RAM && ram_budget > 0) {
         // BUGFIX 99: Precompute percentage threshold
+        const uint64_t ram_threshold_85 = (ram_budget * 85ull) / 100ull;
         const uint64_t ram_threshold_93 = (ram_budget * 93ull) / 100ull;
-        if (tier_used(engine, moe_TIER_RAM) + engine->pending_ram_reservation.load(std::memory_order_relaxed) + item.bytes > ram_threshold_93) {
+        const uint64_t ram_used_with_pending =
+            tier_used(engine, moe_TIER_RAM) +
+            engine->pending_ram_reservation.load(std::memory_order_relaxed) +
+            item.bytes;
+        if (ram_used_with_pending > ram_threshold_93) {
             // Route to DB instead of synchronous eviction
             target = moe_TIER_DB;
         } else {
             engine->pending_ram_reservation.fetch_add(item.bytes, std::memory_order_relaxed);
+            if (ram_used_with_pending > ram_threshold_85) {
+                engine->ram_eviction_needed.store(true, std::memory_order_release);
+                engine->vram_eviction_cv.notify_one();
+            }
         }
     }
     return target;

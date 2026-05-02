@@ -43,6 +43,9 @@ moe_io_config_t moe_pc_default_io_config(void) {
     cfg.enable_bam_nvme = 1;
     cfg.enable_common_raw_vram_pin = 1;
     cfg.int4_fallback_threshold = 0.50f;
+    cfg.metal_memory_budget_pct = 60;
+    cfg.vulkan_memory_headroom_pct = 10;
+    cfg.level_zero_memory_headroom_pct = 10;
     return cfg;
 }
 

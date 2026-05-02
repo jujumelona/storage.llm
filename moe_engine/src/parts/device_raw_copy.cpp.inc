@@ -43,14 +43,7 @@ static int device_copy_raw_span(
         return 0;
     }
     // BUGFIX 263: Check for negative mmap_get_size return value ★★
-    // Problem: mmap_get_size returns ssize_t (can be negative on error)
-    // Casting to uint64_t converts negative to very large positive
-    // Solution: Check for negative before casting
-    const ssize_t file_size_signed = mmap_get_size(mapped);
-    if (file_size_signed < 0) {
-        return 0;
-    }
-    const uint64_t file_size = (uint64_t)file_size_signed;
+    const uint64_t file_size = static_cast<uint64_t>(mmap_get_size(mapped));
     if (s.bytes > file_size) {
         return 0;
     }
@@ -92,7 +85,7 @@ static int device_copy_raw_span(
             device_backend_copy_h2d_async(e, dst, slot.buf, s.bytes, stream) :
             device_backend_copy_h2d_sync(e, dst, slot.buf, s.bytes);
         if (ok && async_copy) {
-            device_defer_staging_copy(e, slot_idx, key, stream);
+            device_defer_staging_copy(e, slot_idx, key, s.bytes, stream);  // BUGFIX 문제1: Track bytes for VRAM
         } else {
             release_staging_slot(e, slot_idx);
         }

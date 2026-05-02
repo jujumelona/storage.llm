@@ -182,9 +182,9 @@ static uint64_t prefetch_common_tensor_records_to_ram(moe_pc_engine* e, uint64_t
         }
         const std::string& path = e->tensor_paths[rec.resolved_path_index];
         mmap_context_t* mapped = get_or_map_shard_partial(e, path, rec.file_offset, rec.bytes);
-        const ssize_t mapped_size_signed = mapped ? mmap_get_size(mapped) : -1;
-        if (!mapped || mapped_size_signed < 0 || !mmap_get_ptr(mapped, 0) ||
-            rec.bytes > (uint64_t)mapped_size_signed) {
+        const uint64_t mapped_size = mapped ? static_cast<uint64_t>(mmap_get_size(mapped)) : 0;
+        if (!mapped || !mmap_get_ptr(mapped, 0) ||
+            rec.bytes > mapped_size) {
             continue;
         }
         bool hint_issued = false;

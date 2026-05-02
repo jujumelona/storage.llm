@@ -45,10 +45,22 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
     moe_kv_cache& operator=(const moe_kv_cache&) = delete;
     moe_kv_cache(moe_kv_cache&& other) noexcept :
         data(other.data), scales(other.scales), zeros(other.zeros),
+        tier(other.tier), vram_data(other.vram_data),
+        vram_scales(other.vram_scales), vram_zeros(other.vram_zeros),
+        use_pinned_memory(other.use_pinned_memory),
+        last_access_epoch(other.last_access_epoch),
+        access_count(other.access_count),
+        engine(other.engine),
         num_layers(other.num_layers), max_seq_len(other.max_seq_len),
         seq_len(other.seq_len), entry_dim(other.entry_dim), seq_limit(other.seq_limit),
         tracked_ram_bytes(other.tracked_ram_bytes) {
         other.data = nullptr; other.scales = nullptr; other.zeros = nullptr;
+        other.vram_data = nullptr; other.vram_scales = nullptr; other.vram_zeros = nullptr;
+        other.engine = nullptr;
+        other.tier = moe_TIER_RAM;
+        other.use_pinned_memory = false;
+        other.last_access_epoch = 0;
+        other.access_count = 0;
     }
     moe_kv_cache& operator=(moe_kv_cache&& other) noexcept {
         if (this != &other) {
@@ -56,10 +68,24 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
             if (scales) std::free(scales);
             if (zeros) std::free(zeros);
             data = other.data; scales = other.scales; zeros = other.zeros;
+            tier = other.tier;
+            vram_data = other.vram_data;
+            vram_scales = other.vram_scales;
+            vram_zeros = other.vram_zeros;
+            use_pinned_memory = other.use_pinned_memory;
+            last_access_epoch = other.last_access_epoch;
+            access_count = other.access_count;
+            engine = other.engine;
             num_layers = other.num_layers; max_seq_len = other.max_seq_len;
             seq_len = other.seq_len; entry_dim = other.entry_dim; seq_limit = other.seq_limit;
             tracked_ram_bytes = other.tracked_ram_bytes;
             other.data = nullptr; other.scales = nullptr; other.zeros = nullptr;
+            other.vram_data = nullptr; other.vram_scales = nullptr; other.vram_zeros = nullptr;
+            other.engine = nullptr;
+            other.tier = moe_TIER_RAM;
+            other.use_pinned_memory = false;
+            other.last_access_epoch = 0;
+            other.access_count = 0;
         }
         return *this;
     }
@@ -95,12 +121,12 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
         init(layers, moe_MLA_KV_ENTRY_DIM, moe_MLA_MAX_SEQ_LEN, pre_allocate);
     }
 
-    void ensure_capacity(uint32_t needed_pos) {
-        if (needed_pos < max_seq_len) return;
+    int ensure_capacity(uint32_t needed_pos) {
+        if (needed_pos < max_seq_len) return 1;
         uint32_t new_cap = needed_pos + 1;
         new_cap = (new_cap + 4095u) & ~4095u;
         if (new_cap > seq_limit) new_cap = seq_limit;
-        if (new_cap == max_seq_len) return;
+        if (new_cap == max_seq_len) return needed_pos < max_seq_len ? 1 : 0;
 
         const size_t old_entries = (size_t)max_seq_len * num_layers;
         const size_t new_entries = (size_t)new_cap * num_layers;
@@ -114,11 +140,23 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
         // Solution: Check multiplication overflow before realloc
         if (new_entries > SIZE_MAX / entry_dim ||
             new_entries > SIZE_MAX / sizeof(float)) {
-            throw std::bad_alloc();
+            return 0;
         }
         uint8_t* new_data = (uint8_t*)std::realloc(data, new_entries * entry_dim);
+        if (!new_data) {
+            return 0;
+        }
+        data = new_data;
         float* new_scales = (float*)std::realloc(scales, new_entries * sizeof(float));
+        if (!new_scales) {
+            return 0;
+        }
+        scales = new_scales;
         float* new_zeros = (float*)std::realloc(zeros, new_entries * sizeof(float));
+        if (!new_zeros) {
+            return 0;
+        }
+        zeros = new_zeros;
 
         if (new_data && new_scales && new_zeros) {
             // Initialize new entries to zero
@@ -155,8 +193,9 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
         } else {
             // realloc failure: original pointers are still valid
             // No need to free - realloc preserves original on failure
-            throw std::bad_alloc();
+            return 0;
         }
+        return needed_pos < max_seq_len ? 1 : 0;
     }
 
     // Asymmetric INT8 Quantization (Store)

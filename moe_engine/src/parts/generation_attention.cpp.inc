@@ -188,14 +188,10 @@ static int moe_standard_kv_cache_ensure(
     if (position < s->kv_cache.max_seq_len) {
         return 1;
     }
-    try {
-        s->kv_cache.ensure_capacity(position);
-        moe_kv_cache_track_ram(engine, &s->kv_cache);
-    } catch (const std::bad_alloc&) {
-        return 0;
-    } catch (...) {
+    if (!s->kv_cache.ensure_capacity(position)) {
         return 0;
     }
+    moe_kv_cache_track_ram(engine, &s->kv_cache);
     return position < s->kv_cache.max_seq_len ? 1 : 0;
 }
 
@@ -436,7 +432,7 @@ static int moe_layer_standard_attention_f32(
         const std::vector<float>& q_sin = use_dynamic_rope ? empty_rope_table : s->rope_q_sin;
         const std::vector<float>& k_cos = use_dynamic_rope ? empty_rope_table : s->rope_k_cos;
         const std::vector<float>& k_sin = use_dynamic_rope ? empty_rope_table : s->rope_k_sin;
-        const int rope_rotate_half = moe_standard_rope_uses_rotate_half(engine, cfg);
+        const int rope_rotate_half = moe_standard_rope_uses_rotate_half_cached(engine, cfg);
         for (uint32_t h = 0; h < num_heads; ++h) {
             moe_standard_rope_apply_inplace_with_layout(
                 rope_rotate_half,
@@ -685,7 +681,10 @@ static int moe_layer_attention_f32(
                 }
             }
         }
-        s->kv_cache.ensure_capacity(cfg.max_seq_len - 1u);
+        if (!s->kv_cache.ensure_capacity(cfg.max_seq_len - 1u)) {
+            fprintf(stderr, "[storageLLM ERROR] KV cache pre-allocation failed at layer %d. RAM exhausted. Aborting generation.\n", layer);
+            return 0;
+        }
         moe_kv_cache_track_ram(engine, &s->kv_cache);
     } else if (position >= s->kv_cache.max_seq_len) {
         // Fallback: incremental growth when pre-allocation not possible
@@ -716,23 +715,15 @@ static int moe_layer_attention_f32(
             }
         }
         // BUGFIX 65: Issue 9 - Handle ensure_capacity failure ?★??
-        // Problem: ensure_capacity can throw std::bad_alloc if RAM exhausted
-        // Exception crosses C API boundary ??undefined behavior
-        // Or demote succeeds but another thread allocates ??capacity fails ??KV entry lost
-        // Solution: Try-catch around ensure_capacity, return 0 on failure
+        // Problem: KV growth can fail when RAM is exhausted or another thread allocates first.
+        // Solution: return 0 on allocation failure instead of letting generation continue.
         // Impact: Explicit error handling instead of silent data corruption
-        try {
-            s->kv_cache.ensure_capacity(position);
-            moe_kv_cache_track_ram(engine, &s->kv_cache);
-        } catch (const std::bad_alloc&) {
+        if (!s->kv_cache.ensure_capacity(position)) {
             fprintf(stderr, "[storageLLM ERROR] KV cache allocation failed at position %u, "
                 "layer %d. RAM exhausted. Aborting generation.\n", position, layer);
             return 0;
-        } catch (...) {
-            fprintf(stderr, "[storageLLM ERROR] KV cache allocation failed at position %u, "
-                "layer %d. Unknown exception. Aborting generation.\n", position, layer);
-            return 0;
         }
+        moe_kv_cache_track_ram(engine, &s->kv_cache);
     }
     // BUGFIX 65: Issue 9 - Verify capacity before store ?★??
     // Problem: If ensure_capacity failed silently, position >= max_seq_len

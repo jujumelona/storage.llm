@@ -120,7 +120,7 @@ static int device_copy_tensor_from_host(
             // Release slot immediately — acquirer will wait on last_copy_event
             release_staging_slot(e, staging_slot);
             // Defer only the key completion tracking, no slot to release later
-            device_defer_staging_copy(e, UINT32_MAX, key, stream);
+            device_defer_staging_copy(e, UINT32_MAX, key, 0, stream);  // 0 bytes - not VRAM target
         } else {
             s_tl_tensor_pending_keys[e].push_back(key);
         }
@@ -220,7 +220,8 @@ static int device_copy_tensor(
         }
         if (ok && async_copy) {
             // slot도 defer에 포함시켜 event 완료 후 해제
-            device_defer_staging_copy(e, slot_idx, key, stream);
+            // BUGFIX 문제1: Pass bytes for VRAM reservation release at completion
+            device_defer_staging_copy(e, slot_idx, key, bytes, stream);
             // staging_slot을 여기서 해제하지 않음
         } else {
             release_staging_slot(e, slot_idx);

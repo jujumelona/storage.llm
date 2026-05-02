@@ -235,7 +235,10 @@ int moe_pc_engine_generate_token_ids(
             // Without pre-allocation, ensure_capacity() inside moe_layer_attention_f32 triggers
             // ~176MB reallocation at t=1024, ~353MB at t=2048, blocking GPU prefetch pipeline
             if (!pre_allocate_kv && prefill_count > scratch.kv_cache.max_seq_len) {
-                scratch.kv_cache.ensure_capacity(prefill_count - 1);
+                if (!scratch.kv_cache.ensure_capacity(prefill_count - 1)) {
+                    moe_generation_set_error(out_stats, "prefill KV cache allocation failed");
+                    return 0;
+                }
                 moe_kv_cache_track_ram(engine, &scratch.kv_cache);
             }
 

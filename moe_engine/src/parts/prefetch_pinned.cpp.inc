@@ -58,12 +58,13 @@ static int read_file_range_to_buffer(
 static int prefetch_tensor_file_to_pinned(
     moe_pc_engine* engine,
     const moe_tensor_record& rec,
-    uint32_t slot_index,
+    uint32_t* io_slot_index,
     uint64_t* out_staging_bytes
 ) {
     if (out_staging_bytes) {
         *out_staging_bytes = 0;
     }
+    uint32_t slot_index = io_slot_index ? *io_slot_index : UINT32_MAX;
     if (!engine ||
         slot_index >= engine->staging_slots.size() ||
         !engine->staging_slots[slot_index].buf) {
@@ -106,8 +107,28 @@ static int prefetch_tensor_file_to_pinned(
                 (unsigned long long)engine->staging_slots[slot_index].size,
                 realloc_attempts + 1);
 
+            release_staging_slot(engine, slot_index);
+            if (io_slot_index) {
+                *io_slot_index = UINT32_MAX;
+            }
+
             // Trigger slot reconfiguration
             configure_staging_slots(engine);
+            slot_index = acquire_staging_slot(
+                engine,
+                0u,
+                realloc_attempts + 1u,
+                total_bytes,
+                true,
+                false);
+            if (slot_index == UINT32_MAX) {
+                fprintf(stderr,
+                    "[storageLLM ERROR] Slot reallocation failed. Could not reacquire staging slot.\n");
+                return 0;
+            }
+            if (io_slot_index) {
+                *io_slot_index = slot_index;
+            }
 
             // Check if reallocation succeeded
             if (slot_index < engine->staging_slots.size() &&

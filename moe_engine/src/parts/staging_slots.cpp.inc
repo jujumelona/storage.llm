@@ -128,7 +128,9 @@ static void moe_staging_slot_targets(
     uint32_t direct_target = moe_staging_direct_slot_target(engine, disk_workers);
 
     if (engine && engine->backend_caps.backend == moe_BACKEND_METAL) {
+        pinned_target = 0;
         gpu_target = 0;
+        direct_target = disk_workers > 0 ? std::max(1u, disk_workers) : 1u;
     }
 
     if (pinned_out) *pinned_out = pinned_target;
