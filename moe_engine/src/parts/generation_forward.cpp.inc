@@ -103,27 +103,49 @@ static int moe_forward_one_token_f32(
         if (split_post_norm_block) {
             const uint64_t attn_start_us = moe_profile_now_us();
             std::memcpy(s->residual.data(), hidden, (size_t)c->hidden_size * sizeof(float));
+            const uint64_t split_input_norm_start_us = moe_profile_now_us();
             if (!moe_pc_engine_raw_rmsnorm_f32(
                     engine, (int32_t)layer, moe_RAW_TENSOR_INPUT_LAYER_NORM,
                     hidden, c->hidden_size, s->norm.data(), c->hidden_size, layer_attn_cfg.rms_norm_eps)) {
                 moe_generation_set_error(stats, "input rmsnorm failed");
                 return 0;
             }
+            moe_profile_log(
+                "forward_split_input_norm",
+                "position=%u layer=%u ms=%.3f",
+                position, layer, moe_profile_elapsed_ms(split_input_norm_start_us));
+            const uint64_t split_standard_attn_start_us = moe_profile_now_us();
             if (!moe_layer_standard_attention_f32(
                     engine, (int32_t)layer, s, hidden, c->hidden_size, position,
                     layer_attn_cfg, s->norm.data(), 0)) {
                 moe_generation_set_error(stats, "attention block failed");
                 return 0;
             }
+            moe_profile_log(
+                "forward_split_standard_attention",
+                "position=%u layer=%u ms=%.3f",
+                position, layer, moe_profile_elapsed_ms(split_standard_attn_start_us));
+            const uint64_t split_post_norm_start_us = moe_profile_now_us();
             const float* attn_residual = s->attn.data();
-            if (moe_layer_post_attention_output_norm_f32(
+            const int post_norm_used = moe_layer_post_attention_output_norm_f32(
                     engine, (int32_t)layer, s->attn.data(), c->hidden_size,
-                    s->norm.data(), layer_attn_cfg.rms_norm_eps)) {
+                    s->norm.data(), layer_attn_cfg.rms_norm_eps);
+            if (post_norm_used) {
                 attn_residual = s->norm.data();
             }
+            moe_profile_log(
+                "forward_split_post_attention_norm",
+                "position=%u layer=%u used=%d ms=%.3f",
+                position, layer, post_norm_used,
+                moe_profile_elapsed_ms(split_post_norm_start_us));
+            const uint64_t split_residual_start_us = moe_profile_now_us();
             for (uint32_t i = 0; i < c->hidden_size; ++i) {
                 hidden[i] = s->residual[i] + attn_residual[i];
             }
+            moe_profile_log(
+                "forward_split_residual",
+                "position=%u layer=%u ms=%.3f",
+                position, layer, moe_profile_elapsed_ms(split_residual_start_us));
             const double attention_ms = moe_profile_elapsed_ms(attn_start_us);
             const int is_moe = layer >= c->first_moe_layer && layer <= c->last_moe_layer;
             if (layer + 1u < c->num_hidden_layers &&

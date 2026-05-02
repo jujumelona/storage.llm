@@ -71,6 +71,7 @@ int moe_pc_engine_eval_token_ids(
     // Problem: moe_decode_scratch declared but not initialized before use
     // scratch.kv_cache, scratch.hidden, etc. contain garbage values
     // Solution: Zero-initialize before using
+    const uint64_t eval_start_us = moe_profile_now_us();
     moe_decode_scratch scratch;
     moe_kv_cache_ram_scope kv_scope{engine, &scratch.kv_cache};
     moe_kv_decode_cache_ram_scope decode_cache_scope{engine, &scratch};
@@ -209,5 +210,14 @@ int moe_pc_engine_eval_token_ids(
         out_stats->mean_nll = mean_nll;
         out_stats->perplexity = ppl;
     }
+    moe_profile_log(
+        "eval_done",
+        "input_tokens=%u evaluated=%u nll=%.9g mean_nll=%.9g ppl=%.9g total_ms=%.3f",
+        input_token_count,
+        evaluated,
+        nll,
+        mean_nll,
+        ppl,
+        moe_profile_elapsed_ms(eval_start_us));
     return 1;
 }
