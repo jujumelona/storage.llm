@@ -19,6 +19,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -375,12 +376,14 @@ struct server_tokenizer {
     std::unordered_map<std::string, uint32_t> text_to_id;
     std::unordered_map<std::string, uint32_t> piece_to_id;
     std::unordered_map<std::string, uint32_t> bpe_rank;
+    std::vector<std::pair<std::string, std::string>> normalizer_replacements;
     std::unordered_set<uint32_t> special_ids;
     size_t max_piece_bytes = 0;
     uint32_t eos_token_id = 0;
     uint32_t unk_token_id = 0;
     bool has_eos = false;
     bool has_unk = false;
+    bool byte_fallback = false;
     std::string error;
 };
 
@@ -706,6 +709,32 @@ static bool json_read_string_in_range(
     return parse_json_string_at(text, quote, out, nullptr);
 }
 
+static bool json_read_bool_in_range(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    bool* out
+) {
+    if (!key || !out || begin >= end || end > text.size()) return false;
+    const std::string needle = std::string("\"") + key + "\"";
+    const size_t pos = text.find(needle, begin);
+    if (pos == std::string::npos || pos >= end) return false;
+    size_t p = text.find(':', pos + needle.size());
+    if (p == std::string::npos || p >= end) return false;
+    ++p;
+    while (p < end && std::isspace(static_cast<unsigned char>(text[p]))) ++p;
+    if (p + 4 <= end && text.compare(p, 4, "true") == 0) {
+        *out = true;
+        return true;
+    }
+    if (p + 5 <= end && text.compare(p, 5, "false") == 0) {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
 static std::string bpe_pair_key(const std::string& a, const std::string& b) {
     std::string key;
     key.reserve(a.size() + b.size() + 1u);
@@ -713,6 +742,161 @@ static std::string bpe_pair_key(const std::string& a, const std::string& b) {
     key.push_back('\x1f');
     key += b;
     return key;
+}
+
+static bool tokenizer_load_replace_normalizer_object(
+    server_tokenizer* tok,
+    const std::string& json,
+    size_t obj_begin,
+    size_t obj_end
+) {
+    if (!tok || obj_begin >= obj_end || obj_end > json.size()) return false;
+    std::string type;
+    if (!json_read_string_in_range(json, obj_begin, obj_end, "type", &type) || type != "Replace") {
+        return false;
+    }
+
+    size_t pattern_begin = 0;
+    size_t pattern_end = 0;
+    std::string pattern;
+    std::string content;
+    if (!json_find_key_object_range(json, "pattern", obj_begin, &pattern_begin, &pattern_end) ||
+        pattern_begin >= obj_end || pattern_end > obj_end ||
+        !json_read_string_in_range(json, pattern_begin, pattern_end, "String", &pattern) ||
+        !json_read_string_in_range(json, obj_begin, obj_end, "content", &content) ||
+        pattern.empty()) {
+        return false;
+    }
+    tok->normalizer_replacements.emplace_back(pattern, content);
+    return true;
+}
+
+static void tokenizer_load_normalizer_config(server_tokenizer* tok, const std::string& json) {
+    if (!tok) return;
+    size_t norm_begin = 0;
+    size_t norm_end = 0;
+    if (!json_find_key_object_range(json, "normalizer", 0, &norm_begin, &norm_end)) {
+        return;
+    }
+
+    tokenizer_load_replace_normalizer_object(tok, json, norm_begin, norm_end);
+
+    size_t seq_begin = 0;
+    size_t seq_end = 0;
+    if (!json_find_key_array_range(json, "normalizers", norm_begin, &seq_begin, &seq_end) ||
+        seq_begin >= norm_end || seq_end > norm_end) {
+        return;
+    }
+    size_t p = seq_begin + 1;
+    while (p < seq_end) {
+        const size_t obj_begin = json.find('{', p);
+        if (obj_begin == std::string::npos || obj_begin >= seq_end) break;
+        const size_t obj_end = json_find_matching(json, obj_begin, '{', '}');
+        if (obj_end == std::string::npos || obj_end > seq_end) break;
+        tokenizer_load_replace_normalizer_object(tok, json, obj_begin, obj_end);
+        p = obj_end + 1;
+    }
+}
+
+static std::string replace_all_non_overlapping(
+    const std::string& text,
+    const std::string& from,
+    const std::string& to
+) {
+    if (from.empty()) return text;
+    std::string out;
+    out.reserve(text.size());
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t found = text.find(from, pos);
+        if (found == std::string::npos) {
+            out.append(text, pos, text.size() - pos);
+            break;
+        }
+        out.append(text, pos, found - pos);
+        out += to;
+        pos = found + from.size();
+    }
+    return out;
+}
+
+static std::string tokenizer_normalize_text(const server_tokenizer& tok, const std::string& text) {
+    std::string normalized = text;
+    for (const auto& replacement : tok.normalizer_replacements) {
+        normalized = replace_all_non_overlapping(normalized, replacement.first, replacement.second);
+    }
+    return normalized;
+}
+
+static bool tokenizer_emit_byte_fallback_piece(
+    const server_tokenizer& tok,
+    const std::string& piece,
+    std::vector<int32_t>* out_ids
+) {
+    if (!tok.byte_fallback || !out_ids) return false;
+    char token[8];
+    std::vector<int32_t> fallback_ids;
+    fallback_ids.reserve(piece.size());
+    for (unsigned char ch : piece) {
+        std::snprintf(token, sizeof(token), "<0x%02X>", static_cast<unsigned int>(ch));
+        auto it = tok.piece_to_id.find(token);
+        if (it == tok.piece_to_id.end()) {
+            return false;
+        }
+        fallback_ids.push_back(static_cast<int32_t>(it->second));
+    }
+    out_ids->insert(out_ids->end(), fallback_ids.begin(), fallback_ids.end());
+    return true;
+}
+
+static bool tokenizer_encode_bpe_piece(
+    const server_tokenizer& tok,
+    const std::string& encoded,
+    std::vector<int32_t>* out_ids
+) {
+    if (!out_ids || encoded.empty()) return false;
+    std::vector<std::string> word;
+    size_t p = 0;
+    std::string sym;
+    while (utf8_next_symbol(encoded, &p, &sym)) {
+        word.push_back(sym);
+    }
+    if (word.empty()) return false;
+
+    while (word.size() > 1u) {
+        uint32_t best_rank = UINT32_MAX;
+        size_t best_index = SIZE_MAX;
+        for (size_t i = 0; i + 1u < word.size(); ++i) {
+            auto it = tok.bpe_rank.find(bpe_pair_key(word[i], word[i + 1u]));
+            if (it != tok.bpe_rank.end() && it->second < best_rank) {
+                best_rank = it->second;
+                best_index = i;
+            }
+        }
+        if (best_index == SIZE_MAX) break;
+        std::vector<std::string> merged;
+        merged.reserve(word.size() - 1u);
+        for (size_t i = 0; i < word.size();) {
+            if (i == best_index && i + 1u < word.size()) {
+                merged.push_back(word[i] + word[i + 1u]);
+                i += 2u;
+            } else {
+                merged.push_back(word[i]);
+                ++i;
+            }
+        }
+        word.swap(merged);
+    }
+
+    for (const std::string& piece : word) {
+        auto it = tok.piece_to_id.find(piece);
+        if (it != tok.piece_to_id.end()) {
+            out_ids->push_back(static_cast<int32_t>(it->second));
+        } else if (!tokenizer_emit_byte_fallback_piece(tok, piece, out_ids)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void tokenizer_add_piece(server_tokenizer* tok, const std::string& raw_piece, uint32_t id) {
@@ -744,12 +928,8 @@ static void tokenizer_add_piece(server_tokenizer* tok, const std::string& raw_pi
 
 static bool load_tokenizer_vocab(server_tokenizer* tok, const std::string& json) {
     if (!tok) return false;
-    tok->byte_level =
-        json.find("\"ByteLevel\"") != std::string::npos ||
-        json.find("\\u0120") != std::string::npos ||
-        json.find("\\u010A") != std::string::npos ||
-        json.find("\xC4\xA0") != std::string::npos ||
-        json.find("\xC4\x8A") != std::string::npos;
+    tok->byte_level = json.find("\"ByteLevel\"") != std::string::npos;
+    tokenizer_load_normalizer_config(tok, json);
 
     size_t model_begin = 0;
     size_t model_end = json.size();
@@ -758,6 +938,7 @@ static bool load_tokenizer_vocab(server_tokenizer* tok, const std::string& json)
     if (json_find_key_object_range(json, "model", 0, &tmp_begin, &tmp_end)) {
         model_begin = tmp_begin;
         model_end = tmp_end;
+        (void)json_read_bool_in_range(json, model_begin, model_end, "byte_fallback", &tok->byte_fallback);
     }
 
     size_t lbrace = 0;
@@ -905,49 +1086,14 @@ static bool tokenizer_encode_greedy(const server_tokenizer& tok, const std::stri
 
     if (tok.byte_level && tok.has_merges) {
         bool ok = true;
-        const std::vector<std::string> pretokens = bytelevel_pretokenize_text(text);
+        const std::string normalized_text = tokenizer_normalize_text(tok, text);
+        const std::vector<std::string> pretokens = bytelevel_pretokenize_text(normalized_text);
         for (const std::string& pretoken : pretokens) {
-            std::vector<std::string> word;
             const std::string encoded = byte_level_encode_text(pretoken);
-            size_t p = 0;
-            std::string sym;
-            while (utf8_next_symbol(encoded, &p, &sym)) {
-                word.push_back(sym);
+            if (!tokenizer_encode_bpe_piece(tok, encoded, out_ids)) {
+                ok = false;
+                break;
             }
-            while (word.size() > 1u) {
-                uint32_t best_rank = UINT32_MAX;
-                size_t best_index = SIZE_MAX;
-                for (size_t i = 0; i + 1u < word.size(); ++i) {
-                    auto it = tok.bpe_rank.find(bpe_pair_key(word[i], word[i + 1u]));
-                    if (it != tok.bpe_rank.end() && it->second < best_rank) {
-                        best_rank = it->second;
-                        best_index = i;
-                    }
-                }
-                if (best_index == SIZE_MAX) break;
-                std::vector<std::string> merged;
-                merged.reserve(word.size() - 1u);
-                for (size_t i = 0; i < word.size();) {
-                    if (i == best_index && i + 1u < word.size()) {
-                        merged.push_back(word[i] + word[i + 1u]);
-                        i += 2u;
-                    } else {
-                        merged.push_back(word[i]);
-                        ++i;
-                    }
-                }
-                word.swap(merged);
-            }
-            for (const std::string& piece : word) {
-                auto it = tok.piece_to_id.find(piece);
-                if (it != tok.piece_to_id.end()) {
-                    out_ids->push_back((int32_t)it->second);
-                } else {
-                    ok = false;
-                    break;
-                }
-            }
-            if (!ok) break;
         }
         if (ok && !out_ids->empty()) {
             return true;
@@ -955,7 +1101,16 @@ static bool tokenizer_encode_greedy(const server_tokenizer& tok, const std::stri
         out_ids->clear();
     }
 
-    const std::string encoded_text = tok.byte_level ? byte_level_encode_text(text) : text;
+    if (!tok.byte_level && tok.has_merges) {
+        const std::string normalized_text = tokenizer_normalize_text(tok, text);
+        if (tokenizer_encode_bpe_piece(tok, normalized_text, out_ids) && !out_ids->empty()) {
+            return true;
+        }
+        out_ids->clear();
+    }
+
+    const std::string normalized_text = tokenizer_normalize_text(tok, text);
+    const std::string encoded_text = tok.byte_level ? byte_level_encode_text(normalized_text) : normalized_text;
     size_t pos = 0;
     while (pos < encoded_text.size()) {
         const size_t max_len = std::min(tok.max_piece_bytes ? tok.max_piece_bytes : encoded_text.size(), encoded_text.size() - pos);
