@@ -135,9 +135,10 @@ static float moe_standard_attention_score_scale(
     int32_t layer,
     uint32_t head_dim
 ) {
-    (void)engine;
-    (void)layer;
     if (head_dim == 0) {
+        return 1.0f;
+    }
+    if (moe_layer_has_gemma4_qk_norm_layout(engine, layer)) {
         return 1.0f;
     }
     return 1.0f / std::sqrt((float)head_dim);
