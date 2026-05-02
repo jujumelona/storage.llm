@@ -40,7 +40,7 @@ int moe_pc_group_tokens_by_expert(
         // Problem: assignment_count * sizeof(...) can overflow size_t
         // Solution: Check overflow before memcpy
         if (assignment_count > SIZE_MAX / sizeof(moe_token_expert_assignment_t)) {
-            return;
+            return 0;
         }
         std::memcpy(sort_buf, assignments, sizeof(moe_token_expert_assignment_t) * assignment_count);
     }

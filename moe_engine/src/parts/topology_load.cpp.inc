@@ -1,3 +1,5 @@
+#include <climits>
+
 int moe_pc_engine_load_topology(moe_pc_engine_t* engine, const char* path) {
     if (!engine) {
         return 0;

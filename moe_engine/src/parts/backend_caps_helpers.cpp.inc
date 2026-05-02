@@ -61,6 +61,7 @@ static void fill_gpu_backend_base(moe_backend_caps_t* caps) {
     caps->compute_streams = hw >= 12u ? 2u : 1u;
     caps->copy_streams = hw >= 12u ? 2u : 1u;
     caps->prefetch_streams = hw >= 16u ? 3u : 2u;
+    caps->copy_stream_bytes_limit = 512ull * 1024ull * 1024ull;
     caps->supports_async_copy = 1;
     caps->supports_fp4 = compiled_nvfp4_device_kernels_available();
     caps->supports_scale4 = compiled_scale4_device_fusion_available();

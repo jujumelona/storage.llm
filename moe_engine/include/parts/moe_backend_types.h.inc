@@ -42,4 +42,5 @@ typedef struct {
     int preferred_numa_node;
     double dma_bandwidth_gbps;
     double tflops_hint;
+    uint64_t copy_stream_bytes_limit;
 } moe_backend_caps_t;

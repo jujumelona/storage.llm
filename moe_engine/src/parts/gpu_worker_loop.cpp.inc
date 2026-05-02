@@ -1,3 +1,5 @@
+static void prefetch_release_pending_vram_reservation(moe_pc_engine* engine, uint64_t bytes);
+
 static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
     if (!engine) {
         return;
