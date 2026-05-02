@@ -349,7 +349,7 @@ static int moe_router_norm_topk_prob(const moe_pc_engine* engine, int use_sigmoi
          moe_json_get_bool_local(engine->offload_gguf_metadata_json, "routed_norm_topk_prob", &value))) {
         return value ? 1 : 0;
     }
-    if (!use_sigmoid && moe_engine_uses_gemma4_attention(engine)) {
+    if (!use_sigmoid && moe_engine_uses_hybrid_local_global_attention(engine)) {
         return 1;
     }
     return use_sigmoid ? 1 : 0;

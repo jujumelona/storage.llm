@@ -52,3 +52,171 @@ static void moe_rope_inplace(
         data[i + 1] = x0 * sin_t + x1 * cos_t;
     }
 }
+
+static void moe_rope_rotate_half_inplace(
+    float* data,
+    uint32_t dim,
+    uint32_t position,
+    const std::vector<float>& cos_table,
+    const std::vector<float>& sin_table,
+    float base = moe_ROPE_THETA
+) {
+    if (!data || dim < 2) {
+        return;
+    }
+    const uint32_t half_dim = dim / 2u;
+    const size_t row_offset = (size_t)position * (size_t)half_dim;
+    const size_t table_len = half_dim ? cos_table.size() / half_dim : 0;
+    if ((size_t)position < table_len &&
+        cos_table.size() >= row_offset + half_dim &&
+        sin_table.size() >= row_offset + half_dim) {
+        const float* cos_row = cos_table.data() + row_offset;
+        const float* sin_row = sin_table.data() + row_offset;
+        for (uint32_t j = 0; j < half_dim; ++j) {
+            const float cos_t = cos_row[j];
+            const float sin_t = sin_row[j];
+            const float x0 = data[j];
+            const float x1 = data[j + half_dim];
+            data[j] = x0 * cos_t - x1 * sin_t;
+            data[j + half_dim] = x1 * cos_t + x0 * sin_t;
+        }
+        return;
+    }
+    for (uint32_t j = 0; j < half_dim; ++j) {
+        const uint32_t i = j * 2u;
+        const float freq = 1.0f / std::pow(base, (float)i / (float)dim);
+        const float theta = (float)position * freq;
+        const float cos_t = std::cos(theta);
+        const float sin_t = std::sin(theta);
+        const float x0 = data[j];
+        const float x1 = data[j + half_dim];
+        data[j] = x0 * cos_t - x1 * sin_t;
+        data[j + half_dim] = x1 * cos_t + x0 * sin_t;
+    }
+}
+
+static int moe_rope_bool_metadata(
+    const moe_pc_engine* engine,
+    const char* const* keys,
+    size_t key_count,
+    int* out_value
+) {
+    if (!engine || !out_value || engine->offload_gguf_metadata_json.empty()) {
+        return 0;
+    }
+    for (size_t i = 0; i < key_count; ++i) {
+        int value = 0;
+        if (keys[i] && moe_json_get_bool_local(engine->offload_gguf_metadata_json, keys[i], &value)) {
+            *out_value = value ? 1 : 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_rope_string_metadata_mentions(
+    const moe_pc_engine* engine,
+    const char* const* keys,
+    size_t key_count,
+    const char* const* needles,
+    size_t needle_count
+) {
+    if (!engine || engine->offload_gguf_metadata_json.empty()) {
+        return 0;
+    }
+    for (size_t i = 0; i < key_count; ++i) {
+        std::string value;
+        if (!keys[i] || !moe_json_get_string_local(engine->offload_gguf_metadata_json, keys[i], &value)) {
+            continue;
+        }
+        value = moe_lower_ascii_copy(value);
+        for (size_t n = 0; n < needle_count; ++n) {
+            if (needles[n] && value.find(needles[n]) != std::string::npos) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int moe_standard_rope_uses_rotate_half(
+    const moe_pc_engine* engine,
+    const moe_attn_config_t& cfg
+) {
+    static const char* const interleaved_bool_keys[] = {
+        "rope_interleaved",
+        "rotary_interleaved",
+        "rotary_emb_interleaved",
+        "interleaved_rope",
+        "use_interleaved_rope"
+    };
+    int interleaved = 0;
+    if (moe_rope_bool_metadata(
+            engine, interleaved_bool_keys,
+            sizeof(interleaved_bool_keys) / sizeof(interleaved_bool_keys[0]),
+            &interleaved)) {
+        return interleaved ? 0 : 1;
+    }
+
+    static const char* const layout_keys[] = {
+        "rope_layout",
+        "rotary_layout",
+        "rope_type",
+        "rotary_type",
+        "position_embedding_type"
+    };
+    static const char* const rotate_half_names[] = {
+        "rotate_half",
+        "half_split",
+        "split_half"
+    };
+    static const char* const adjacent_names[] = {
+        "interleaved",
+        "adjacent",
+        "pairwise",
+        "pair"
+    };
+    if (moe_rope_string_metadata_mentions(
+            engine, layout_keys, sizeof(layout_keys) / sizeof(layout_keys[0]),
+            adjacent_names, sizeof(adjacent_names) / sizeof(adjacent_names[0])) ||
+        moe_engine_graph_ir_mentions(engine, "rope_interleaved") ||
+        moe_engine_graph_ir_mentions(engine, "rotary_interleaved") ||
+        moe_engine_graph_ir_mentions(engine, "adjacent_rope") ||
+        moe_engine_graph_ir_mentions(engine, "pairwise_rope")) {
+        return 0;
+    }
+    if (moe_rope_string_metadata_mentions(
+            engine, layout_keys, sizeof(layout_keys) / sizeof(layout_keys[0]),
+            rotate_half_names, sizeof(rotate_half_names) / sizeof(rotate_half_names[0])) ||
+        moe_engine_graph_ir_mentions(engine, "rotate_half") ||
+        moe_engine_graph_ir_mentions(engine, "half_split_rope") ||
+        moe_engine_graph_ir_mentions(engine, "split_half_rope")) {
+        return 1;
+    }
+
+    if (engine &&
+        !engine->offload_gguf_metadata_json.empty() &&
+        (moe_engine_metadata_mentions(engine, "partial_rotary_factor") ||
+         moe_engine_metadata_mentions(engine, "rope_scaling"))) {
+        return 1;
+    }
+
+    return cfg.type != moe_ATTN_TYPE_MLA ? 1 : 0;
+}
+
+static void moe_standard_rope_apply_inplace(
+    const moe_pc_engine* engine,
+    const moe_attn_config_t& cfg,
+    float* data,
+    uint32_t dim,
+    uint32_t position,
+    const std::vector<float>& cos_table,
+    const std::vector<float>& sin_table,
+    float base
+) {
+    if (moe_standard_rope_uses_rotate_half(engine, cfg)) {
+        moe_rope_rotate_half_inplace(data, dim, position, cos_table, sin_table, base);
+    } else {
+        moe_rope_inplace(data, dim, position, cos_table, sin_table, base);
+    }
+}

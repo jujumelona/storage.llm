@@ -90,24 +90,87 @@ static moe_attn_config_t moe_generation_attn_config(const moe_pc_engine* engine)
     return cfg;
 }
 
-static int moe_engine_uses_gemma4_attention(const moe_pc_engine* engine) {
+static int moe_engine_uses_hybrid_local_global_attention(const moe_pc_engine* engine) {
     if (!engine) {
         return 0;
     }
-    const std::string arch = moe_lower_ascii_copy(engine->dynamic_architecture);
-    const std::string model = moe_lower_ascii_copy(engine->dynamic_model_id);
-    if (arch.find("gemma4") != std::string::npos ||
-        arch.find("gemma-4") != std::string::npos ||
-        model.find("gemma4") != std::string::npos ||
-        model.find("gemma-4") != std::string::npos) {
+    if (moe_engine_graph_ir_mentions(engine, "hybrid_local_global_attention") ||
+        moe_engine_graph_ir_mentions(engine, "local_global_attention") ||
+        moe_engine_graph_ir_mentions(engine, "global_attention") ||
+        moe_engine_graph_ir_mentions(engine, "sliding_window_attention")) {
         return 1;
     }
-    return moe_engine_metadata_mentions(engine, "gemma4") ||
-        moe_engine_metadata_mentions(engine, "gemma-4") ? 1 : 0;
+    if (moe_engine_metadata_mentions(engine, "num_global_key_value_heads") ||
+        moe_engine_metadata_mentions(engine, "global_head_dim") ||
+        moe_engine_metadata_mentions(engine, "sliding_window_pattern") ||
+        moe_engine_metadata_mentions(engine, "attention_chunk_size") ||
+        moe_engine_metadata_mentions(engine, "rope_local_base_freq") ||
+        moe_engine_metadata_mentions(engine, "rope_global_base_freq")) {
+        return 1;
+    }
+    const int has_q_norm =
+        moe_engine_has_common_tensor_suffix(engine, 0, "attn_q_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, 0, "q_norm.weight");
+    const int has_k_norm =
+        moe_engine_has_common_tensor_suffix(engine, 0, "attn_k_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, 0, "k_norm.weight");
+    const int has_scaled_blocks =
+        moe_engine_has_common_tensor_suffix(engine, 0, "post_attention_norm.weight") &&
+        moe_engine_has_common_tensor_suffix(engine, 0, "post_ffw_norm.weight") &&
+        moe_engine_has_common_tensor_suffix(engine, 0, "layer_output_scale.weight");
+    return has_q_norm && has_k_norm && has_scaled_blocks ? 1 : 0;
 }
 
-static int moe_gemma4_layer_is_full_attention(int32_t layer) {
-    return layer >= 0 && (layer % 6) == 5 ? 1 : 0;
+static uint32_t moe_hybrid_attention_period_from_metadata(
+    const moe_pc_engine* engine,
+    uint32_t fallback
+) {
+    if (!engine || engine->offload_gguf_metadata_json.empty()) {
+        return fallback;
+    }
+    uint64_t value = 0;
+    if ((moe_json_get_u64_local(engine->offload_gguf_metadata_json, "full_attention_interval", &value) ||
+         moe_json_get_u64_local(engine->offload_gguf_metadata_json, "global_attention_interval", &value) ||
+         moe_json_get_u64_local(engine->offload_gguf_metadata_json, "sliding_window_pattern", &value) ||
+         moe_json_get_u64_local(engine->offload_gguf_metadata_json, "attention_pattern_interval", &value) ||
+         moe_json_get_u64_local(engine->offload_gguf_metadata_json, "local_global_attention_period", &value)) &&
+        value > 0) {
+        return (uint32_t)std::min<uint64_t>(value, UINT32_MAX);
+    }
+    return fallback;
+}
+
+static uint32_t moe_hybrid_attention_offset_from_metadata(
+    const moe_pc_engine* engine,
+    uint32_t fallback
+) {
+    if (!engine || engine->offload_gguf_metadata_json.empty()) {
+        return fallback;
+    }
+    uint64_t value = 0;
+    if ((moe_json_get_u64_local(engine->offload_gguf_metadata_json, "full_attention_offset", &value) ||
+         moe_json_get_u64_local(engine->offload_gguf_metadata_json, "global_attention_offset", &value) ||
+         moe_json_get_u64_local(engine->offload_gguf_metadata_json, "local_global_attention_offset", &value)) &&
+        value <= UINT32_MAX) {
+        return (uint32_t)value;
+    }
+    return fallback;
+}
+
+static int moe_hybrid_layer_is_full_attention(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (layer < 0) {
+        return 0;
+    }
+    const uint32_t period = moe_hybrid_attention_period_from_metadata(engine, 6u);
+    if (period == 0) {
+        return 0;
+    }
+    const uint32_t fallback_offset = period > 0 ? period - 1u : 0u;
+    const uint32_t offset = moe_hybrid_attention_offset_from_metadata(engine, fallback_offset) % period;
+    return ((uint32_t)layer % period) == offset ? 1 : 0;
 }
 
 static moe_attn_config_t moe_generation_layer_attn_config(
@@ -115,7 +178,7 @@ static moe_attn_config_t moe_generation_layer_attn_config(
     int32_t layer
 ) {
     moe_attn_config_t cfg = moe_generation_attn_config(engine);
-    if (!engine || cfg.type == moe_ATTN_TYPE_MLA || !moe_engine_uses_gemma4_attention(engine)) {
+    if (!engine || cfg.type == moe_ATTN_TYPE_MLA || !moe_engine_uses_hybrid_local_global_attention(engine)) {
         return cfg;
     }
 
@@ -139,7 +202,7 @@ static moe_attn_config_t moe_generation_layer_attn_config(
 
     cfg.num_heads = base_num_heads ? base_num_heads : cfg.num_heads;
     cfg.v_head_dim = 0;
-    if (moe_gemma4_layer_is_full_attention(layer)) {
+    if (moe_hybrid_layer_is_full_attention(engine, layer)) {
         cfg.head_dim = global_head_dim ? global_head_dim : cfg.head_dim;
         cfg.num_kv_heads = global_num_kv_heads ? global_num_kv_heads : cfg.num_kv_heads;
         const float partial =
