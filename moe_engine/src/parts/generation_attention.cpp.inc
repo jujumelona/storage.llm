@@ -110,6 +110,26 @@ static int moe_layer_uses_unweighted_v_norm(
          moe_engine_has_common_tensor_suffix(engine, layer, "layer_output_scale.weight")) ? 1 : 0;
 }
 
+static int moe_layer_has_gemma4_qk_norm_layout(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    const int has_q_norm =
+        moe_engine_has_common_tensor_suffix(engine, layer, "attn_q_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "q_norm.weight");
+    const int has_k_norm =
+        moe_engine_has_common_tensor_suffix(engine, layer, "attn_k_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "k_norm.weight");
+    const int has_gemma4_block_norms =
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_norm.weight") &&
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm.weight") &&
+        moe_engine_has_common_tensor_suffix(engine, layer, "layer_output_scale.weight");
+    return has_q_norm && has_k_norm && has_gemma4_block_norms;
+}
+
 static float moe_standard_attention_score_scale(
     const moe_pc_engine* engine,
     int32_t layer,
@@ -118,14 +138,42 @@ static float moe_standard_attention_score_scale(
     if (head_dim == 0) {
         return 1.0f;
     }
-    if (moe_engine_uses_gemma4_attention(engine) &&
-        (moe_engine_has_common_tensor_suffix(engine, layer, "attn_q_norm.weight") ||
-         moe_engine_has_common_tensor_suffix(engine, layer, "q_norm.weight")) &&
-        (moe_engine_has_common_tensor_suffix(engine, layer, "attn_k_norm.weight") ||
-         moe_engine_has_common_tensor_suffix(engine, layer, "k_norm.weight"))) {
+    if (moe_layer_has_gemma4_qk_norm_layout(engine, layer)) {
         return 1.0f;
     }
     return 1.0f / std::sqrt((float)head_dim);
+}
+
+static void moe_standard_attention_rope_params(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    int has_v,
+    uint32_t num_heads,
+    uint32_t num_kv_heads,
+    uint32_t head_dim,
+    uint32_t* io_rope_dim,
+    float* io_rope_theta
+) {
+    if (!io_rope_dim || !io_rope_theta || head_dim == 0) {
+        return;
+    }
+    if (!moe_layer_has_gemma4_qk_norm_layout(engine, layer)) {
+        return;
+    }
+    const int full_attention_layout =
+        !has_v ||
+        (head_dim > 256u) ||
+        (num_heads > 0 && num_kv_heads > 0 && num_kv_heads * 4u <= num_heads);
+    if (full_attention_layout) {
+        uint32_t partial_dim = (uint32_t)std::round((float)head_dim * 0.25f);
+        if (partial_dim < 2u) partial_dim = 2u;
+        if (partial_dim > head_dim) partial_dim = head_dim;
+        *io_rope_dim = partial_dim;
+        *io_rope_theta = 1000000.0f;
+    } else {
+        *io_rope_dim = head_dim;
+        *io_rope_theta = 10000.0f;
+    }
 }
 
 static int moe_standard_kv_cache_ensure(
@@ -207,7 +255,10 @@ static int moe_layer_standard_attention_f32(
     const uint32_t kv_v_dim = has_v ? v_shape.rows : num_kv_heads * v_head_dim;
     const uint32_t v_total_dim = o_shape.cols ? o_shape.cols : num_heads * v_head_dim;
     const uint32_t kv_entry_dim = k_dim + kv_v_dim;
-    const uint32_t rope_dim = std::min<uint32_t>(cfg.qk_rope_head_dim ? cfg.qk_rope_head_dim : head_dim, head_dim);
+    uint32_t rope_dim = std::min<uint32_t>(cfg.qk_rope_head_dim ? cfg.qk_rope_head_dim : head_dim, head_dim);
+    float rope_theta = cfg.rope_theta;
+    moe_standard_attention_rope_params(
+        engine, layer, has_v, num_heads, num_kv_heads, head_dim, &rope_dim, &rope_theta);
     const int use_dynamic_rope = moe_engine_uses_gemma4_attention(engine);
     moe_profile_log(
         "attn_standard_cfg",
@@ -223,7 +274,7 @@ static int moe_layer_standard_attention_f32(
         kv_v_dim,
         v_total_dim,
         rope_dim,
-        (double)cfg.rope_theta,
+        (double)rope_theta,
         has_v,
         use_dynamic_rope);
     if (!engine || !s || !hidden || hidden_size == 0 ||
@@ -357,7 +408,7 @@ static int moe_layer_standard_attention_f32(
                 position,
                 q_cos,
                 q_sin,
-                cfg.rope_theta);
+                rope_theta);
         }
         for (uint32_t h = 0; h < num_kv_heads; ++h) {
             moe_rope_inplace(
@@ -366,7 +417,7 @@ static int moe_layer_standard_attention_f32(
                 position,
                 k_cos,
                 k_sin,
-                cfg.rope_theta);
+                rope_theta);
         }
     }
     if (!moe_standard_kv_cache_ensure(engine, s, position, kv_entry_dim)) {
