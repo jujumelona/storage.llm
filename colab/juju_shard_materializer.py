@@ -60,13 +60,19 @@ JUJU_TOKENIZER_FILES = [
     "chat_template.jinja",
     "added_tokens.json",
     "tokenizer.model",
+    "sentencepiece.bpe.model",
     "vocab.json",
     "merges.txt",
-    "sentencepiece.bpe.model",
     "generation_config.json",
     "config.json",
+    "processor_config.json",
+    "preprocessor_config.json",
+    "image_processor_config.json",
+    "feature_extractor.json",
+    "video_preprocessor_config.json",
+    "audio_config.json",
 ]
-JUJU_REQUIRED_TOKENIZER_FILES = ["tokenizer.json"]
+JUJU_REQUIRED_TOKENIZER_FILES = ["config.json"]
 JUJU_REQUIRED_TOKENIZER_ANY_OF = ["tokenizer.json", "tokenizer.model", "sentencepiece.bpe.model"]
 
 
