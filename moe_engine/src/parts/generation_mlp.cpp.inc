@@ -155,8 +155,32 @@ static int moe_layer_rmsnorm_suffixes_f32(
     float eps
 ) {
     moe_raw_tensor_cache_entry raw{};
-    return moe_map_layer_common_tensor(engine, layer, suffixes, suffix_count, &raw) &&
-        moe_apply_rmsnorm_common_weight_f32(raw, input, hidden_size, output, eps);
+    const int mapped = moe_map_layer_common_tensor(engine, layer, suffixes, suffix_count, &raw);
+    moe_profile_log(
+        "rmsnorm_common_map",
+        "layer=%d suffix0=%s mapped=%d rows=%u cols=%u bytes=%llu hidden=%u input=%p output=%p",
+        layer,
+        (suffixes && suffix_count > 0 && suffixes[0]) ? suffixes[0] : "",
+        mapped,
+        raw.rows,
+        raw.cols,
+        (unsigned long long)raw.bytes,
+        hidden_size,
+        (const void*)input,
+        (void*)output);
+    if (!mapped) {
+        return 0;
+    }
+    const int ok = moe_apply_rmsnorm_common_weight_f32(raw, input, hidden_size, output, eps);
+    moe_profile_log(
+        "rmsnorm_common_apply",
+        "layer=%d suffix0=%s ok=%d hidden=%u scalar=%u",
+        layer,
+        (suffixes && suffix_count > 0 && suffixes[0]) ? suffixes[0] : "",
+        ok,
+        hidden_size,
+        (unsigned)raw.scalar_encoding);
+    return ok;
 }
 
 static int moe_layer_ffn_norm_f32(
@@ -630,16 +654,46 @@ static int moe_layer_moe_mlp_f32(
         "layer=%d hidden=%u configured_intermediate=%u experts=%u first_moe=%u last_moe=%u",
         layer, hidden_size, configured_expert_intermediate,
         c->experts_per_moe_layer, c->first_moe_layer, c->last_moe_layer);
-    std::fill(s->mlp.begin(), s->mlp.end(), 0.0f);
+    moe_profile_log(
+        "mlp_moe_scratch",
+        "layer=%d hidden=%u mlp=%zu shared=%zu expert=%zu norm=%zu residual=%zu",
+        layer,
+        hidden_size,
+        s ? s->mlp.size() : 0u,
+        s ? s->shared.size() : 0u,
+        s ? s->expert.size() : 0u,
+        s ? s->norm.size() : 0u,
+        s ? s->residual.size() : 0u);
+    if (!s || s->mlp.size() < hidden_size || s->shared.size() < hidden_size ||
+        s->expert.size() < hidden_size || s->norm.size() < hidden_size ||
+        s->residual.size() < hidden_size) {
+        std::fprintf(stderr,
+            "[storagellm mlp] scratch too small layer=%d hidden=%u mlp=%zu shared=%zu expert=%zu norm=%zu residual=%zu\n",
+            layer,
+            hidden_size,
+            s ? s->mlp.size() : 0u,
+            s ? s->shared.size() : 0u,
+            s ? s->expert.size() : 0u,
+            s ? s->norm.size() : 0u,
+            s ? s->residual.size() : 0u);
+        return 0;
+    }
+    std::fill(s->mlp.begin(), s->mlp.begin() + hidden_size, 0.0f);
+    moe_profile_log("mlp_moe_zero", "layer=%d hidden=%u", layer, hidden_size);
 
     const uint64_t norm_start_us = moe_profile_now_us();
     const float* shared_input = s->norm.data();
     const float* expert_input = s->norm.data();
-    if (moe_layer_moe_norm_f32(
-            engine, layer, hidden, hidden_size, s->expert.data(), attn_cfg.rms_norm_eps)) {
+    moe_profile_log(
+        "mlp_moe_norm_begin",
+        "layer=%d hidden=%u hidden_ptr=%p expert_ptr=%p",
+        layer, hidden_size, (void*)hidden, (void*)s->expert.data());
+    const int moe_norm_ok = moe_layer_moe_norm_f32(
+        engine, layer, hidden, hidden_size, s->expert.data(), attn_cfg.rms_norm_eps);
+    if (moe_norm_ok) {
         expert_input = s->expert.data();
     }
-    moe_profile_log("mlp_moe_norm", "layer=%d ms=%.3f", layer, moe_profile_elapsed_ms(norm_start_us));
+    moe_profile_log("mlp_moe_norm", "layer=%d ok=%d ms=%.3f", layer, moe_norm_ok, moe_profile_elapsed_ms(norm_start_us));
 
     const uint64_t shared_bytes =
         2ull * (uint64_t)configured_expert_intermediate * (uint64_t)hidden_size * 2ull +
