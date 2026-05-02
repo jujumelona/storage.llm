@@ -71,6 +71,29 @@ int moe_pc_engine_eval_token_ids(
     // Problem: moe_decode_scratch declared but not initialized before use
     // scratch.kv_cache, scratch.hidden, etc. contain garbage values
     // Solution: Zero-initialize before using
+    char eval_ids_preview[256]{};
+    size_t eval_ids_offset = 0;
+    const uint32_t eval_ids_limit = std::min<uint32_t>(input_token_count, 16u);
+    for (uint32_t i = 0; i < eval_ids_limit && eval_ids_offset < sizeof(eval_ids_preview); ++i) {
+        const int written = std::snprintf(
+            eval_ids_preview + eval_ids_offset,
+            sizeof(eval_ids_preview) - eval_ids_offset,
+            "%s%d",
+            i ? "," : "",
+            input_token_ids[i]);
+        if (written <= 0) {
+            break;
+        }
+        eval_ids_offset += std::min<size_t>(
+            (size_t)written,
+            sizeof(eval_ids_preview) - eval_ids_offset);
+    }
+    moe_profile_log(
+        "eval_input_ids",
+        "input_tokens=%u preview=[%s]%s",
+        input_token_count,
+        eval_ids_preview,
+        input_token_count > eval_ids_limit ? " truncated=1" : "");
     const uint64_t eval_start_us = moe_profile_now_us();
     moe_decode_scratch scratch;
     moe_kv_cache_ram_scope kv_scope{engine, &scratch.kv_cache};

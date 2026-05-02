@@ -436,10 +436,10 @@ static int moe_layer_standard_attention_f32(
         const std::vector<float>& q_sin = use_dynamic_rope ? empty_rope_table : s->rope_q_sin;
         const std::vector<float>& k_cos = use_dynamic_rope ? empty_rope_table : s->rope_k_cos;
         const std::vector<float>& k_sin = use_dynamic_rope ? empty_rope_table : s->rope_k_sin;
+        const int rope_rotate_half = moe_standard_rope_uses_rotate_half(engine, cfg);
         for (uint32_t h = 0; h < num_heads; ++h) {
-            moe_standard_rope_apply_inplace(
-                engine,
-                cfg,
+            moe_standard_rope_apply_inplace_with_layout(
+                rope_rotate_half,
                 s->q_b.data() + (uint64_t)h * head_dim,
                 rope_dim,
                 position,
@@ -448,9 +448,8 @@ static int moe_layer_standard_attention_f32(
                 rope_theta);
         }
         for (uint32_t h = 0; h < num_kv_heads; ++h) {
-            moe_standard_rope_apply_inplace(
-                engine,
-                cfg,
+            moe_standard_rope_apply_inplace_with_layout(
+                rope_rotate_half,
                 s->attn_kv_a.data() + (uint64_t)h * head_dim,
                 rope_dim,
                 position,
