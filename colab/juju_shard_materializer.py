@@ -95,6 +95,16 @@ def juju_upload_file_limit_bytes():
     return value
 
 
+def juju_target_tensor_splits():
+    raw = str(os.environ.get("JUJU_TARGET_TENSOR_SPLITS", "")).strip()
+    if not raw:
+        return 0
+    value = int(raw)
+    if value < 0:
+        raise ValueError("JUJU_TARGET_TENSOR_SPLITS must be non-negative")
+    return value
+
+
 def juju_split_source_name(source_name, split_index, split_count):
     path = Path(source_name)
     suffix = path.suffix or ".gguf"
@@ -252,6 +262,64 @@ def juju_estimated_tensor_payload_bytes(tensors, is_first_shard=True):
     return total
 
 
+def juju_aligned_tensor_bytes(tensor):
+    return align_up(int(tensor.get("bytes") or 0), 4096)
+
+
+def juju_groups_fit_upload_limits(groups, payload_limit_first, payload_limit_sub):
+    for idx, group in enumerate(groups):
+        limit = payload_limit_first if idx == 0 else payload_limit_sub
+        if sum(juju_aligned_tensor_bytes(tensor) for tensor in group) > limit:
+            return False
+    return True
+
+
+def balance_juju_tensor_groups(tensors, split_count):
+    tensors = list(tensors)
+    split_count = min(max(1, int(split_count)), len(tensors))
+    if split_count <= 1:
+        return [tensors]
+    total = sum(juju_aligned_tensor_bytes(tensor) for tensor in tensors)
+    target = max(1, (total + split_count - 1) // split_count)
+    groups = []
+    current = []
+    current_bytes = 0
+    remaining_groups = split_count
+    for idx, tensor in enumerate(tensors):
+        tensor_bytes = juju_aligned_tensor_bytes(tensor)
+        remaining_tensors = len(tensors) - idx
+        if (
+            current
+            and len(groups) < split_count - 1
+            and current_bytes + tensor_bytes > target
+            and remaining_tensors >= remaining_groups
+        ):
+            groups.append(current)
+            current = []
+            current_bytes = 0
+            remaining_groups -= 1
+        current.append(tensor)
+        current_bytes += tensor_bytes
+    if current:
+        groups.append(current)
+
+    while len(groups) < split_count:
+        split_at = max(range(len(groups)), key=lambda i: len(groups[i]))
+        group = groups[split_at]
+        if len(group) <= 1:
+            break
+        half_bytes = sum(juju_aligned_tensor_bytes(tensor) for tensor in group) // 2
+        running = 0
+        cut = 1
+        for idx, tensor in enumerate(group[:-1], start=1):
+            running += juju_aligned_tensor_bytes(tensor)
+            cut = idx
+            if running >= half_bytes:
+                break
+        groups[split_at:split_at + 1] = [group[:cut], group[cut:]]
+    return groups
+
+
 def plan_juju_tensor_splits(directory, max_file_bytes=None):
     limit = int(max_file_bytes or juju_upload_file_limit_bytes())
     if limit >= HF_INDIVIDUAL_FILE_LIMIT_BYTES:
@@ -280,7 +348,7 @@ def plan_juju_tensor_splits(directory, max_file_bytes=None):
     current_bytes = 0
     for tensor in tensors:
         tensor_bytes = int(tensor["bytes"])
-        aligned_tensor_bytes = align_up(tensor_bytes, 4096)
+        aligned_tensor_bytes = juju_aligned_tensor_bytes(tensor)
         current_limit = payload_limit_first if len(groups) == 0 else payload_limit_sub
         if aligned_tensor_bytes > current_limit:
             raise RuntimeError(
@@ -296,6 +364,14 @@ def plan_juju_tensor_splits(directory, max_file_bytes=None):
     if current:
         groups.append(current)
 
+    split_strategy = "limit_tensor_groups"
+    target_split_count = juju_target_tensor_splits()
+    if target_split_count > 1 and len(groups) > 1:
+        balanced_groups = balance_juju_tensor_groups(tensors, max(target_split_count, len(groups)))
+        if juju_groups_fit_upload_limits(balanced_groups, payload_limit_first, payload_limit_sub):
+            groups = balanced_groups
+            split_strategy = "balanced_tensor_groups"
+
     split_count = len(groups)
     planned = []
     for idx, group in enumerate(groups, start=1):
@@ -303,6 +379,8 @@ def plan_juju_tensor_splits(directory, max_file_bytes=None):
             "enabled": split_count > 1,
             "split_index": idx,
             "split_count": split_count,
+            "split_strategy": split_strategy,
+            "target_split_count": target_split_count,
             "tensor_names": [tensor["name"] for tensor in group],
             "tensor_bytes": sum(int(tensor["bytes"]) for tensor in group),
             "estimated_file_bytes": juju_estimated_tensor_payload_bytes(group, is_first_shard=(idx == 1)),
@@ -1862,6 +1940,8 @@ def prepare_juju_shard_upload_parts_from_hf_url(
             "tensor_bytes": int(split["tensor_bytes"]),
             "estimated_file_bytes": int(split.get("estimated_file_bytes") or 0),
             "max_file_bytes": int(split["max_file_bytes"]),
+            "split_strategy": str(split.get("split_strategy") or "limit_tensor_groups"),
+            "target_split_count": int(split.get("target_split_count") or 0),
         }
         info, stream = prepare_juju_shard_upload_from_hf_url(
             source_url=source_url,
@@ -2140,6 +2220,8 @@ def write_juju_shard_parts_from_hf_url(
             "tensor_bytes": int(split["tensor_bytes"]),
             "estimated_file_bytes": int(split.get("estimated_file_bytes") or 0),
             "max_file_bytes": int(split["max_file_bytes"]),
+            "split_strategy": str(split.get("split_strategy") or "limit_tensor_groups"),
+            "target_split_count": int(split.get("target_split_count") or 0),
         }
         info = write_juju_shard_from_hf_url(
             source_url=source_url,
