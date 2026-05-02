@@ -90,6 +90,73 @@ static moe_attn_config_t moe_generation_attn_config(const moe_pc_engine* engine)
     return cfg;
 }
 
+static int moe_engine_uses_gemma4_attention(const moe_pc_engine* engine) {
+    if (!engine) {
+        return 0;
+    }
+    const std::string arch = moe_lower_ascii_copy(engine->dynamic_architecture);
+    const std::string model = moe_lower_ascii_copy(engine->dynamic_model_id);
+    if (arch.find("gemma4") != std::string::npos ||
+        arch.find("gemma-4") != std::string::npos ||
+        model.find("gemma4") != std::string::npos ||
+        model.find("gemma-4") != std::string::npos) {
+        return 1;
+    }
+    return moe_engine_metadata_mentions(engine, "gemma4") ||
+        moe_engine_metadata_mentions(engine, "gemma-4") ? 1 : 0;
+}
+
+static int moe_gemma4_layer_is_full_attention(int32_t layer) {
+    return layer >= 0 && (layer % 6) == 5 ? 1 : 0;
+}
+
+static moe_attn_config_t moe_generation_layer_attn_config(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    moe_attn_config_t cfg = moe_generation_attn_config(engine);
+    if (!engine || cfg.type == moe_ATTN_TYPE_MLA || !moe_engine_uses_gemma4_attention(engine)) {
+        return cfg;
+    }
+
+    uint64_t value = 0;
+    double dvalue = 0.0;
+    const uint32_t base_num_heads =
+        moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_attention_heads", &value) && value > 0 ?
+        (uint32_t)std::min<uint64_t>(value, UINT32_MAX) : cfg.num_heads;
+    const uint32_t base_num_kv_heads =
+        moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_key_value_heads", &value) && value > 0 ?
+        (uint32_t)std::min<uint64_t>(value, UINT32_MAX) : cfg.num_kv_heads;
+    const uint32_t base_head_dim =
+        moe_json_get_u64_local(engine->offload_gguf_metadata_json, "head_dim", &value) && value > 0 ?
+        (uint32_t)std::min<uint64_t>(value, UINT32_MAX) : (cfg.head_dim ? cfg.head_dim : 256u);
+    const uint32_t global_head_dim =
+        moe_json_get_u64_local(engine->offload_gguf_metadata_json, "global_head_dim", &value) && value > 0 ?
+        (uint32_t)std::min<uint64_t>(value, UINT32_MAX) : std::max<uint32_t>(base_head_dim, cfg.head_dim);
+    const uint32_t global_num_kv_heads =
+        moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_global_key_value_heads", &value) && value > 0 ?
+        (uint32_t)std::min<uint64_t>(value, UINT32_MAX) : std::max<uint32_t>(1u, base_num_kv_heads / 4u);
+
+    cfg.num_heads = base_num_heads ? base_num_heads : cfg.num_heads;
+    cfg.v_head_dim = 0;
+    if (moe_gemma4_layer_is_full_attention(layer)) {
+        cfg.head_dim = global_head_dim ? global_head_dim : cfg.head_dim;
+        cfg.num_kv_heads = global_num_kv_heads ? global_num_kv_heads : cfg.num_kv_heads;
+        const float partial =
+            moe_json_get_double_local(engine->offload_gguf_metadata_json, "partial_rotary_factor", &dvalue) &&
+            dvalue > 0.0 && dvalue <= 1.0 ? (float)dvalue : 0.25f;
+        cfg.qk_rope_head_dim = std::max<uint32_t>(2u, (uint32_t)std::round((float)cfg.head_dim * partial));
+        cfg.rope_theta = 1000000.0f;
+    } else {
+        cfg.head_dim = base_head_dim ? base_head_dim : cfg.head_dim;
+        cfg.num_kv_heads = base_num_kv_heads ? base_num_kv_heads : cfg.num_kv_heads;
+        cfg.qk_rope_head_dim = cfg.head_dim;
+        cfg.rope_theta = 10000.0f;
+    }
+    cfg.v_head_dim = cfg.head_dim;
+    return cfg;
+}
+
 static uint32_t moe_attn_q_b_dim(const moe_attn_config_t& cfg) {
     return cfg.num_heads * cfg.head_dim;
 }
