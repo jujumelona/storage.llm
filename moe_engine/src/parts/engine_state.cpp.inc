@@ -282,6 +282,7 @@ struct moe_pc_engine {
     std::unordered_map<uint64_t, moe_raw_tensor_cache_entry> raw_tensor_cache;
 
     // GAP 1A: Persistent per-head quantized KV cache
+    // KV cache quantization based on TurboQuant (Google Research, arXiv:2504.19874)
     // Key = head_index, value = qkv_state_t with quantized K/V for that head
     std::mutex qkv_mutex;  // protects qkv_cfg and head-state vector growth
     std::vector<qkv_state_t> qkv_head_state_slots;

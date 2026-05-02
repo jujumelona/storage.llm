@@ -1,5 +1,18 @@
-# GGUF Offload MoE Engine
+# StorageLLM: MoE-Native Entropy Decoding Engine
 
+## 🎯 Project Goal
+**"AI 모델의 1/100 스케일 구현을 위한 엔트로피 기반 디코딩 아키텍처 수립"**
+**"Establishing an entropy-based decoding architecture for 1/100 scale AI model implementation"**
+
+### 💡 Key Approach
+1. **Entropy Rethinking:** Beyond simple quantization, we optimize information density by redefining weight (W) entropy.
+2. **Decoder-Centric Logic:** A high-efficiency decoder reinterprets compressed data in real-time to restore inference performance.
+3. **Extreme Efficiency:** Achieves a 99% reduction in model capacity compared to SOTA models while maintaining core domain performance.
+4. **MoE-Exclusive:** This engine is specifically designed for Mixture-of-Experts structures, leveraging sparsity for high-performance storage offloading.
+
+---
+
+## Overview
 Clean runtime folder for StorageLLM GGUF offload MoE engines.
 
 The primary target is now the offload-native GGUF layout: normal `.gguf` files
