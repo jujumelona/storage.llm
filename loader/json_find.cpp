@@ -1,5 +1,7 @@
 #include "json_scan.h"
 
+#include <cstring>
+
 namespace storagellm {
 
 static bool find_object_after(const std::string& text, size_t pos, JsonSlice* out) {

@@ -1,5 +1,7 @@
 #include "qkv_thread_pool.h"
 
+#include <climits>
+
 QkvThreadPool::QkvThreadPool(int num_threads) {
     // BUGFIX 419: num_threads 유효성 체크
     if (num_threads <= 0 || num_threads > 1024) {

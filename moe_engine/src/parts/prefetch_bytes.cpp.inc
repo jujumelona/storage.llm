@@ -2,6 +2,8 @@ static uint64_t tensor_stream_bytes(const moe_tensor_record& rec) {
     return rec.info.weight_byte_length + rec.info.scale_byte_length + rec.info.scale2_byte_length;
 }
 
+static int device_backend_event_sync(moe_pc_engine* e, CUevent event);
+
 static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int expert) {
     const uint64_t cached = expert_bytes_get(engine, layer, expert);
     if (cached) {
@@ -501,4 +503,3 @@ static int select_expert_precision(const moe_pc_engine* engine, int layer, int e
     }
     return 16; // moe_CODEC_NVFP4/BF16 equiv
 }
-

@@ -369,7 +369,7 @@ static void device_release_allocation_locked(
         }
     }
     // BUGFIX 620: Check device_allocation_count > 0 before fetch_sub to prevent underflow ★
-    uint32_t current_count = e->device_allocation_count.load(std::memory_order_acquire);
+    uint64_t current_count = e->device_allocation_count.load(std::memory_order_acquire);
     while (current_count > 0) {
         if (e->device_allocation_count.compare_exchange_weak(
                 current_count, current_count - 1,
@@ -392,7 +392,7 @@ static void device_release_allocation_locked(
     if (a.pool == moe_DEVICE_POOL_ACTIVATION) {
         e->activation_keys.erase(it->first);
         // BUGFIX 621: Check device_activation_count > 0 before fetch_sub to prevent underflow ★
-        uint32_t current_activation = e->device_activation_count.load(std::memory_order_acquire);
+        uint64_t current_activation = e->device_activation_count.load(std::memory_order_acquire);
         while (current_activation > 0) {
             if (e->device_activation_count.compare_exchange_weak(
                     current_activation, current_activation - 1,

@@ -261,7 +261,7 @@ static void touch_expert_heat(moe_pc_engine* engine, moe_block_state* state, dou
         // Problem: gap >> decay_shift_base can overflow if gap is very large
         // If gap > 2^63, shift result is undefined behavior
         // Solution: Clamp gap to reasonable range before shift
-        const uint64_t clamped_gap = std::min(gap, (1ull << 60));
+        const uint64_t clamped_gap = std::min<uint64_t>(gap, (uint64_t{1} << 60));
         const int shift = (int)(clamped_gap >> decay_shift_base);
         const double factor = shift >= 52 ? 0.0 : std::ldexp(1.0, -shift);
         state->hot_score *= factor;

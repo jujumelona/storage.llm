@@ -80,7 +80,8 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         }
         if (engine->io_stop.load(std::memory_order_relaxed)) {
             break;
-         const uint64_t vram_bud = tier_budget(engine, moe_TIER_VRAM);
+        }
+        const uint64_t vram_bud = tier_budget(engine, moe_TIER_VRAM);
         const uint64_t ram_bud = tier_budget(engine, moe_TIER_RAM);
         const uint64_t ram_used = tier_budget(engine, moe_TIER_RAM) > 0 ? tier_used(engine, moe_TIER_RAM) : 0;
         const uint64_t vram_used = tier_used(engine, moe_TIER_VRAM);

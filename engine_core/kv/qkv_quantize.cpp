@@ -4,6 +4,7 @@
 #include "qkv_packing.h"
 #include <string.h>
 #include <math.h>
+#include <climits>
 
 int qkv_quantize_vector_with_state(
     const qkv_state_t* state,

@@ -1,5 +1,6 @@
 #include "qkv_packing.h"
 #include <string.h>
+#include <climits>
 
 void qkv_pack_indices(const int* indices, uint8_t* packed, int n, int bits) {
     // BUGFIX 394: 파라미터 유효성 체크

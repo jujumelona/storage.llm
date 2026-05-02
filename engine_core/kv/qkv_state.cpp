@@ -10,6 +10,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <climits>
 
 static uint64_t qkv_cache_key(int dim, uint64_t tag) {
     uint64_t x = tag ^ ((uint64_t)(uint32_t)dim * 0x9e3779b97f4a7c15ull);

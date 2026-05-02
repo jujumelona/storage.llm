@@ -392,12 +392,12 @@ static void fill_levelzero_backend_caps(moe_backend_caps_t* caps) {
 #endif
 
     if (lib) {
-        typedef int (*pfn_zeInit)(int, void*);
+        typedef int (*pfn_zeInit)(uint32_t);
         typedef int (*pfn_zeDriverGet)(uint32_t*, void**);
         typedef int (*pfn_zeDeviceGet)(void*, uint32_t*, void**);
         typedef int (*pfn_zeContextCreate)(void*, const void*, void**);
         typedef int (*pfn_zeContextDestroy)(void*);
-        typedef int (*pfn_zeMemAllocDevice)(void*, const void*, size_t, size_t, void**);
+        typedef int (*pfn_zeMemAllocDevice)(void*, const void*, size_t, size_t, void*, void**);
         typedef int (*pfn_zeMemGetAllocProperties)(void*, const void*, void*, void**);
         typedef int (*pfn_zeMemFree)(void*, void*);
 
@@ -417,7 +417,7 @@ static void fill_levelzero_backend_caps(moe_backend_caps_t* caps) {
         pfn_zeMemFree zeMemFree = (pfn_zeMemFree)get_sym("zeMemFree");
 
         if (zeInit && zeDriverGet && zeDeviceGet && zeContextCreate && zeMemAllocDevice && zeMemGetAllocProperties && zeMemFree) {
-            if (zeInit(0, nullptr) == 0) {
+            if (zeInit(0) == 0) {
                 uint32_t driver_count = 1;
                 void* driver = nullptr;
                 if (zeDriverGet(&driver_count, &driver) == 0 && driver) {
