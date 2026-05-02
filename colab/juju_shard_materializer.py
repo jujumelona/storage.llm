@@ -83,10 +83,20 @@ JUJU_TOKENIZER_FILES = [
     "added_tokens.json",
     "tokenizer.model",
     "sentencepiece.bpe.model",
+    "tiktoken.model",
     "vocab.json",
     "merges.txt",
+    "tokenization_kimi.py",
+    "tool_declaration_ts.py",
     "generation_config.json",
     "config.json",
+    "configuration_deepseek.py",
+    "configuration_kimi_k25.py",
+    "modeling_deepseek.py",
+    "modeling_kimi_k25.py",
+    "kimi_k25_processor.py",
+    "kimi_k25_vision_processing.py",
+    "media_utils.py",
     "processor_config.json",
     "preprocessor_config.json",
     "image_processor_config.json",
@@ -95,7 +105,7 @@ JUJU_TOKENIZER_FILES = [
     "audio_config.json",
 ]
 JUJU_REQUIRED_TOKENIZER_FILES = ["config.json"]
-JUJU_REQUIRED_TOKENIZER_ANY_OF = ["tokenizer.json", "tokenizer.model", "sentencepiece.bpe.model"]
+JUJU_REQUIRED_TOKENIZER_ANY_OF = ["tokenizer.json", "tokenizer.model", "sentencepiece.bpe.model", "tiktoken.model", "vocab.json"]
 
 
 def juju_artifact_names(source_name):
