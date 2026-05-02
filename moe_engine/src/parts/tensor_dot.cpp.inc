@@ -30,6 +30,24 @@ static int moe_dot_weight_format_supported(int weight_format) {
         weight_format == moe_WEIGHT_ENCODING_LINEAR_Q8;
 }
 
+static void moe_trace_tensor_dot_unsupported(const moe_tensor_record* rec, int weight_format) {
+    static std::atomic<uint32_t> logged{0};
+    const uint32_t n = logged.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 32u) {
+        return;
+    }
+    moe_profile_log(
+        "tensor_dot_unsupported",
+        "format=%d layer=%u expert=%u proj=%u rows=%u cols=%u row_bytes=%llu",
+        weight_format,
+        rec ? rec->info.layer : 0u,
+        rec ? rec->info.expert : 0u,
+        rec ? (uint32_t)rec->info.proj : 0u,
+        rec ? rec->info.rows : 0u,
+        rec ? rec->info.cols : 0u,
+        rec ? (unsigned long long)rec->weight_row_bytes : 0ull);
+}
+
 static int moe_dot_tensor_record_row(
     moe_pc_engine_t* engine,
     const moe_tensor_record* rec,
@@ -48,6 +66,7 @@ static int moe_dot_tensor_record_row(
     }
     const int weight_format = tensor_weight_format(*rec);
     if (!moe_dot_weight_format_supported(weight_format)) {
+        moe_trace_tensor_dot_unsupported(rec, weight_format);
         return 0;
     }
     const uint64_t row_offset = rec->info.weight_byte_offset + (uint64_t)row * rec->weight_row_bytes;
@@ -205,6 +224,7 @@ static int moe_dot_tensor_record_row_batch(
 
     const int weight_format = tensor_weight_format(*rec);
     if (!moe_dot_weight_format_supported(weight_format)) {
+        moe_trace_tensor_dot_unsupported(rec, weight_format);
         return 0;
     }
     const uint64_t row_offset = rec->info.weight_byte_offset + (uint64_t)row * rec->weight_row_bytes;

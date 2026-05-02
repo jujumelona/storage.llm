@@ -25,6 +25,23 @@ static float moe_raw_scalar_to_f32(const uint8_t* ptr, uint8_t encoding) {
     return encoding == moe_RAW_SCALAR_F16 ? moe_raw_fp16_to_f32(v) : moe_raw_bf16_to_f32(v);
 }
 
+static void moe_trace_raw_dot_unsupported(const moe_raw_tensor_cache_entry& raw) {
+    static std::atomic<uint32_t> logged{0};
+    const uint32_t n = logged.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 32u) {
+        return;
+    }
+    moe_profile_log(
+        "raw_dot_unsupported",
+        "format=%u scalar=%u rows=%u cols=%u bytes=%llu row_bytes=%llu",
+        (uint32_t)raw.weight_format,
+        (uint32_t)raw.scalar_encoding,
+        raw.rows,
+        raw.cols,
+        (unsigned long long)raw.bytes,
+        (unsigned long long)raw.weight_row_bytes);
+}
+
 static const moe_storage_raw_span_spec_t* find_raw_role_span(int32_t layer, uint32_t role) {
     const uint32_t begin = moe_storage_raw_span_find_first(layer);
     const uint32_t end = moe_storage_raw_span_find_end(layer);
@@ -402,6 +419,7 @@ static float moe_raw_tensor_dot_row(
         raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP16 &&
         raw.weight_format != moe_WEIGHT_ENCODING_RAW_BF16 &&
         raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP32) {
+        moe_trace_raw_dot_unsupported(raw);
         return 0.0f;
     }
     return moe_dot_raw_row(row_ptr, raw.scalar_encoding, hidden, hidden_count);
@@ -641,6 +659,7 @@ static int moe_raw_tensor_copy_row_f32(
         raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP16 &&
         raw.weight_format != moe_WEIGHT_ENCODING_RAW_BF16 &&
         raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP32) {
+        moe_trace_raw_dot_unsupported(raw);
         return 0;
     }
     const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);

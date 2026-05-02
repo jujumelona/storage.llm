@@ -147,6 +147,7 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
         if (copy.key != 0) {
             device_complete_pending_copy_key(e, copy.key);
         }
+
         // BUGFIX 193: Slot already released in device_copy_tensor_from_host ★★★
         // Only release if slot is still valid (UINT32_MAX means already released)
         if (copy.slot != UINT32_MAX) {

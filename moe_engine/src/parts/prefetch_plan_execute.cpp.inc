@@ -30,6 +30,7 @@ int moe_pc_engine_execute_prefetch_plan(
     // from happening item_count times in a tight loop.
 
     std::vector<moe_tier_t> admitted_tiers(item_count, moe_TIER_DB);
+    std::vector<uint8_t> vram_pending_reserved(item_count, 0u);
     std::vector<std::vector<std::pair<int, int>>> all_to_free(item_count);
 
     // Pass 1: Admission and eviction decisions
@@ -42,6 +43,8 @@ int moe_pc_engine_execute_prefetch_plan(
             continue;
         }
         admitted_tiers[i] = prefetch_admitted_tier(engine, items[i], all_to_free[i]);
+        vram_pending_reserved[i] =
+            (admitted_tiers[i] == moe_TIER_VRAM && items[i].target_tier == moe_TIER_VRAM) ? 1u : 0u;
     }
 
     // BUGFIX 60: Issue 3 - TOCTOU deferred free pattern ?�★
@@ -139,7 +142,7 @@ int moe_pc_engine_execute_prefetch_plan(
             // condition `&& items[i].target_tier == moe_TIER_VRAM`. If admitted_tiers[i]
             // is VRAM, VRAM reservation was taken, regardless of the original target.
             // Solution: Release based solely on admitted_tiers.
-            if (admitted_tiers[i] == moe_TIER_VRAM && items[i].bytes > 0) {
+            if (vram_pending_reserved[i] && items[i].bytes > 0) {
                 prefetch_release_pending_vram_reservation(engine, items[i].bytes);
             } else if (admitted_tiers[i] == moe_TIER_RAM && items[i].bytes > 0) {
                 prefetch_release_pending_ram_reservation(engine, items[i].bytes);
@@ -182,24 +185,14 @@ int moe_pc_engine_execute_prefetch_plan(
             }
         }
         // BUGFIX 275: Fix budget release logic for tier transitions ★★
-        // Problem: Items upgraded from RAM to VRAM in Pass 1 have their RAM reservation
-        // released in the upgrade loop, but VRAM reservation is NOT added to pending.
-        // Pass 2 should NOT release VRAM reservation for upgraded items.
-        // Solution: Track which items were upgraded and skip VRAM release for them.
-        // Only release RAM reservation if item stayed in RAM tier.
-        // Only release VRAM reservation if item was originally admitted to VRAM.
+        // Release only reservations actually taken by prefetch_admitted_tier.
+        // RAM->VRAM upgrades commit directly to tier usage, so they must not
+        // subtract pending_vram_reservation that belongs to another item.
         if (admitted_tiers[i] == moe_TIER_RAM && items[i].bytes > 0) {
             // Item stayed in RAM tier → release RAM reservation
             prefetch_release_pending_ram_reservation(engine, items[i].bytes);
-        } else if (admitted_tiers[i] == moe_TIER_VRAM && items[i].bytes > 0) {
-            // Item in VRAM tier → only release if originally admitted to VRAM
-            // Items upgraded from RAM already released RAM reservation in upgrade loop
-            // and did NOT add to pending_vram_reservation, so skip release
-            if (items[i].target_tier == moe_TIER_VRAM) {
-                // Original VRAM target → release pending_vram_reservation
-                prefetch_release_pending_vram_reservation(engine, items[i].bytes);
-            }
-            // Else: upgraded from RAM → no release needed (already handled in upgrade loop)
+        } else if (vram_pending_reserved[i] && items[i].bytes > 0) {
+            prefetch_release_pending_vram_reservation(engine, items[i].bytes);
         }
     }
     if (ok_count > 0) {
