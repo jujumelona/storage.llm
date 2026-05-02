@@ -555,6 +555,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 }
                 }
             }
+            }
         }
         inflight_guard.mark_finished();  // BUGFIX 129: Mark as finished to prevent double-decrement
 
