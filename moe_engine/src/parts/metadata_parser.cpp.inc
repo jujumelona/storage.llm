@@ -138,6 +138,9 @@ static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
         moe_json_get_u64_local(meta->metadata_json, "source_weight_block_size", &value)) {
         meta->contract.weight_block_size = moe_u64_to_u32_clamped(value, 0);
     }
+    if (moe_json_get_u64_local(meta->metadata_json, "modality_flags", &value)) {
+        meta->contract.modality_flags = moe_u64_to_u32_clamped(value, moe_JUJU_MODALITY_TEXT);
+    }
     if (meta->contract.optimization_catalog_count == 0 &&
         (moe_json_get_u64_local(meta->metadata_json, "actual_count", &value) ||
          moe_json_get_u64_local(meta->metadata_json, "format_maximization_target_count", &value))) {
@@ -167,6 +170,7 @@ static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
         meta->metadata_json.find("\"adapter_registry_contract\"") != std::string::npos ||
         meta->metadata_json.find("\"validation_contract\"") != std::string::npos ||
         meta->metadata_json.find("\"research_offload_contract\"") != std::string::npos ||
+        meta->metadata_json.find("\"multimodal_contract\"") != std::string::npos ||
         meta->metadata_json.find("\"qkv_policy_contract\"") != std::string::npos) {
         meta->contract.has_juju_contracts = true;
     }

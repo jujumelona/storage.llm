@@ -269,6 +269,16 @@ const char* moe_juju_section_type_name(uint32_t type) {
         return "LAYER_ORDER_INDEX";
     case moe_JUJU_SECTION_QKV_POLICY:
         return "QKV_POLICY";
+    case moe_JUJU_SECTION_VISION_ENCODER:
+        return "VISION_ENCODER";
+    case moe_JUJU_SECTION_VISION_PROJ:
+        return "VISION_PROJ";
+    case moe_JUJU_SECTION_AUDIO_ENCODER:
+        return "AUDIO_ENCODER";
+    case moe_JUJU_SECTION_VIDEO_ENCODER:
+        return "VIDEO_ENCODER";
+    case moe_JUJU_SECTION_DOCUMENT_ENCODER:
+        return "DOCUMENT_ENCODER";
     case moe_JUJU_SECTION_CUSTOM:
         return "CUSTOM";
     default:

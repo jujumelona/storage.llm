@@ -41,6 +41,7 @@ GGUF_TYPE_SIZE = {
 
 JUJU_HEADER_BYTES = 4096
 JUJU_SECTION_ENTRY_BYTES = 96
+JUJU_SECTION_TABLE_RESERVED_ENTRIES = 32
 JUJU_SECTION_MODEL_META = 0x0001
 JUJU_SECTION_SHARED_WEIGHTS = 0x0010
 JUJU_SECTION_HOT_EXPERTS = 0x0011
@@ -48,6 +49,27 @@ JUJU_SECTION_WARM_EXPERTS = 0x0012
 JUJU_SECTION_COLD_EXPERTS = 0x0013
 JUJU_SECTION_LAYER_ORDER_INDEX = 0x0020
 JUJU_SECTION_QKV_POLICY = 0x0021
+JUJU_SECTION_VISION_ENCODER = 0x0030
+JUJU_SECTION_VISION_PROJ = 0x0031
+JUJU_SECTION_AUDIO_ENCODER = 0x0040
+JUJU_SECTION_VIDEO_ENCODER = 0x0050
+JUJU_SECTION_DOCUMENT_ENCODER = 0x0060
+JUJU_MODALITY_TEXT = 0x01
+JUJU_MODALITY_IMAGE = 0x02
+JUJU_MODALITY_AUDIO = 0x04
+JUJU_MODALITY_VIDEO = 0x08
+JUJU_MODALITY_DOCUMENT = 0x10
+JUJU_TENSOR_BUCKET_ORDER = (
+    "shared_weights",
+    "hot_experts",
+    "warm_experts",
+    "cold_experts",
+    "vision_encoder",
+    "vision_projector",
+    "audio_encoder",
+    "video_encoder",
+    "document_encoder",
+)
 HF_INDIVIDUAL_FILE_LIMIT_BYTES = 50 * 1024 * 1024 * 1024
 DEFAULT_JUJU_UPLOAD_FILE_LIMIT_BYTES = 45 * 1024 * 1024 * 1024
 JUJU_SPLIT_METADATA_RESERVE_BYTES = 512 * 1024 * 1024
@@ -391,6 +413,41 @@ def plan_juju_tensor_splits(directory, max_file_bytes=None):
 
 def tensor_bucket(name):
     lower = str(name).lower()
+    if any(k in lower for k in (
+        "mm_projector",
+        "multi_modal_projector",
+        "vision_projector",
+        "image_projector",
+    )):
+        return "vision_projector"
+    if any(k in lower for k in (
+        "vision_model.",
+        "vit.",
+        "visual_encoder.",
+        "image_encoder.",
+        "moonvit.",
+        "siglip.",
+    )):
+        return "vision_encoder"
+    if any(k in lower for k in (
+        "audio_model.",
+        "whisper.",
+        "audio_encoder.",
+    )):
+        return "audio_encoder"
+    if any(k in lower for k in (
+        "video_model.",
+        "video_encoder.",
+        "temporal_encoder.",
+        "timesformer.",
+    )):
+        return "video_encoder"
+    if any(k in lower for k in (
+        "document_encoder.",
+        "pdf_encoder.",
+        "ocr_encoder.",
+    )):
+        return "document_encoder"
     if "shared_expert" in lower or "shared.expert" in lower:
         return "shared_weights"
     if "attn" in lower or "attention" in lower:
@@ -415,7 +472,123 @@ def section_type_for_bucket(bucket):
         return JUJU_SECTION_HOT_EXPERTS
     if bucket == "warm_experts":
         return JUJU_SECTION_WARM_EXPERTS
+    if bucket == "vision_encoder":
+        return JUJU_SECTION_VISION_ENCODER
+    if bucket == "vision_projector":
+        return JUJU_SECTION_VISION_PROJ
+    if bucket == "audio_encoder":
+        return JUJU_SECTION_AUDIO_ENCODER
+    if bucket == "video_encoder":
+        return JUJU_SECTION_VIDEO_ENCODER
+    if bucket == "document_encoder":
+        return JUJU_SECTION_DOCUMENT_ENCODER
     return JUJU_SECTION_COLD_EXPERTS
+
+
+def _juju_json_dict(value):
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", errors="ignore")
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def juju_metadata_files_from_contract(contract):
+    files = {}
+    for key in (
+        "hf_metadata_files",
+        "runtime_metadata_files",
+        "runtime_assets",
+        "runtime_asset_files",
+        "tokenizer_assets",
+    ):
+        raw = contract.get(key)
+        if isinstance(raw, dict):
+            for name, value in raw.items():
+                files[str(name)] = value
+        elif isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    name = item.get("path") or item.get("name") or item.get("file")
+                    if name:
+                        files[str(name)] = item.get("content", item.get("json", item.get("raw", item)))
+                elif isinstance(item, str):
+                    files[item] = {}
+    return files
+
+
+def detect_vision_config(hf_metadata_files):
+    cfg = {}
+    raw = (
+        hf_metadata_files.get("image_processor_config.json") or
+        hf_metadata_files.get("preprocessor_config.json") or
+        hf_metadata_files.get("processor_config.json") or
+        hf_metadata_files.get("tokenizer/image_processor_config.json")
+    )
+    data = _juju_json_dict(raw)
+    if data:
+        cfg["image_token_id"] = u32(data.get("image_token_id") or data.get("image_token_index"))
+        cfg["patch_size"] = u32(data.get("patch_size") or data.get("vision_patch_size") or 14)
+        cfg["encoder_hidden_dim"] = u32(data.get("hidden_size") or data.get("encoder_hidden_dim"))
+    return cfg
+
+
+def juju_modality_flags_from_buckets(buckets, hf_metadata_files=None):
+    flags = JUJU_MODALITY_TEXT
+    bucket_set = set(buckets or [])
+    if bucket_set.intersection({"vision_encoder", "vision_projector"}):
+        flags |= JUJU_MODALITY_IMAGE
+    if "audio_encoder" in bucket_set:
+        flags |= JUJU_MODALITY_AUDIO
+    if "video_encoder" in bucket_set:
+        flags |= JUJU_MODALITY_VIDEO
+    if "document_encoder" in bucket_set:
+        flags |= JUJU_MODALITY_DOCUMENT
+    for name in (hf_metadata_files or {}).keys():
+        lower = str(name).lower()
+        if "image_processor_config.json" in lower or "preprocessor_config.json" in lower or "processor_config.json" in lower:
+            flags |= JUJU_MODALITY_IMAGE
+        if "audio_config.json" in lower:
+            flags |= JUJU_MODALITY_AUDIO
+        if "video_preprocessor_config.json" in lower or "video_config.json" in lower:
+            flags |= JUJU_MODALITY_VIDEO
+        if "document" in lower or "pdf" in lower or "ocr" in lower:
+            flags |= JUJU_MODALITY_DOCUMENT
+    return flags
+
+
+def juju_modality_metadata(contract, tensors):
+    metadata_files = juju_metadata_files_from_contract(contract)
+    buckets = [t.get("bucket", "") for t in tensors or []]
+    flags = juju_modality_flags_from_buckets(buckets, metadata_files)
+    return {
+        "modality_flags": flags,
+        "modalities": {
+            "text": bool(flags & JUJU_MODALITY_TEXT),
+            "image": bool(flags & JUJU_MODALITY_IMAGE),
+            "audio": bool(flags & JUJU_MODALITY_AUDIO),
+            "video": bool(flags & JUJU_MODALITY_VIDEO),
+            "document": bool(flags & JUJU_MODALITY_DOCUMENT),
+        },
+        "vision_config": detect_vision_config(metadata_files),
+        "section_types": {
+            "vision_encoder": JUJU_SECTION_VISION_ENCODER,
+            "vision_projector": JUJU_SECTION_VISION_PROJ,
+            "audio_encoder": JUJU_SECTION_AUDIO_ENCODER,
+            "video_encoder": JUJU_SECTION_VIDEO_ENCODER,
+            "document_encoder": JUJU_SECTION_DOCUMENT_ENCODER,
+        },
+        "section_policy": "write_only_nonempty_modality_sections",
+    }
 
 
 def pack_section(entry):
@@ -708,6 +881,7 @@ def juju_format_extension_contract(contract):
         "binary_wire_frozen": True,
         "header_bytes": JUJU_HEADER_BYTES,
         "section_entry_bytes": JUJU_SECTION_ENTRY_BYTES,
+        "section_table_reserved_entries": JUJU_SECTION_TABLE_RESERVED_ENTRIES,
         "section_table_offset": JUJU_HEADER_BYTES,
         "offset_unit": "absolute_file_byte_offset",
         "length_unit": "exact_payload_byte_length",
@@ -730,6 +904,7 @@ def juju_format_extension_contract(contract):
             "new_tokenizer_loader_policy",
             "new_sampler",
             "new_validation_probe",
+            "new_multimodal_executor",
         ],
         "repack_required_only_for": [
             "model_weights_changed",
@@ -750,7 +925,23 @@ def juju_format_extension_contract(contract):
             "GRAPH_IR.execution_plan",
             "GRAPH_IR.priority_tables",
             "GRAPH_IR.performance_research_slots",
+            "MODEL_META.multimodal_contract",
+            "MODEL_META.modality_flags",
         ],
+        "reserved_section_types": {
+            "vision_encoder": JUJU_SECTION_VISION_ENCODER,
+            "vision_projector": JUJU_SECTION_VISION_PROJ,
+            "audio_encoder": JUJU_SECTION_AUDIO_ENCODER,
+            "video_encoder": JUJU_SECTION_VIDEO_ENCODER,
+            "document_encoder": JUJU_SECTION_DOCUMENT_ENCODER,
+        },
+        "modality_flags": {
+            "text": JUJU_MODALITY_TEXT,
+            "image": JUJU_MODALITY_IMAGE,
+            "audio": JUJU_MODALITY_AUDIO,
+            "video": JUJU_MODALITY_VIDEO,
+            "document": JUJU_MODALITY_DOCUMENT,
+        },
         "compatibility_rule": "binary_header_and_section_table_remain_stable; add new behavior through JSON sections and engine code",
     }
 
@@ -992,6 +1183,7 @@ def juju_contract_metadata(contract, source_name, source_repo_id):
             "offset_unit": "absolute_file_byte_offset",
             "row_layout": "source_quant_row_layout_preserved",
             "section_entry_bytes": JUJU_SECTION_ENTRY_BYTES,
+            "section_table_reserved_entries": JUJU_SECTION_TABLE_RESERVED_ENTRIES,
             "header_bytes": JUJU_HEADER_BYTES,
             "alignment": 4096,
             "fail_closed": True,
@@ -1021,7 +1213,7 @@ def juju_contract_metadata(contract, source_name, source_repo_id):
     return out
 
 
-def make_header(contract, source_name, file_size_value, sections, section_sizes, index_checksum=0):
+def make_header(contract, source_name, file_size_value, sections, section_sizes, index_checksum=0, modality_flags=JUJU_MODALITY_TEXT):
     header = bytearray(JUJU_HEADER_BYTES)
     header[0:8] = b"JUJU\x00\x01\x00\x00"
     struct.pack_into("<I", header, 8, 1)
@@ -1053,6 +1245,7 @@ def make_header(contract, source_name, file_size_value, sections, section_sizes,
     struct.pack_into("<I", header, 200, u32(contract_value(contract, "max_segments_per_expert", "expert_segmentation_contract.max_segments_per_expert", default=8)))
     struct.pack_into("<I", header, 204, u32(contract_value(contract, "recommended_vram_mb", default=mb_from_bytes(contract_value(contract, "recommended_vram_bytes", "pipeline_budget_contract.recommended_vram_bytes", default=0)))))
     struct.pack_into("<I", header, 208, u32(contract_value(contract, "recommended_ram_mb", default=mb_from_bytes(contract_value(contract, "recommended_ram_bytes", "pipeline_budget_contract.recommended_ram_bytes", default=0)))))
+    struct.pack_into("<I", header, 212, u32(modality_flags))
     return bytes(header)
 
 
@@ -1110,7 +1303,13 @@ def tensor_runtime_priority(name, bucket, size):
     prefetch = 50
     residency = "SLOW_MEM"
     prefetch_class = "stream"
-    if lower in {"token_embd.weight", "output.weight", "output_norm.weight", "rope_freqs.weight"}:
+    if bucket in {"vision_encoder", "vision_projector", "audio_encoder", "video_encoder", "document_encoder"}:
+        role = bucket
+        priority = 45
+        prefetch = 20
+        residency = "SLOW_MEM"
+        prefetch_class = "stream"
+    elif lower in {"token_embd.weight", "output.weight", "output_norm.weight", "rope_freqs.weight"}:
         role = "shared_core"
         priority = 100
         prefetch = 100
@@ -1377,7 +1576,7 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             "input": ["tokenizer_assets", "token_ids"],
             "prefill": ["embedding", "layer_loop", "kv_write", "logits"],
             "decode": ["next_token_embedding", "layer_loop", "kv_read_write", "logits"],
-            "offload_units": ["shared_tensor", "expert_tensor", "dense_ffn_tensor", "qkv_page"],
+            "offload_units": ["shared_tensor", "expert_tensor", "dense_ffn_tensor", "qkv_page", "vision_tensor", "audio_tensor", "video_tensor", "document_tensor"],
             "io_policy": {
                 "read_unit": "tensor_span",
                 "alignment": 4096,
@@ -1420,6 +1619,11 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                 "hot_experts": "FAST_MEM",
                 "warm_experts": "FAST_MEM_STREAMABLE",
                 "cold_experts": "SLOW_MEM",
+                "vision_encoder": "SLOW_MEM",
+                "vision_projector": "SLOW_MEM",
+                "audio_encoder": "SLOW_MEM",
+                "video_encoder": "SLOW_MEM",
+                "document_encoder": "SLOW_MEM",
             },
             "admission_priority": {
                 "router": 100,
@@ -1447,7 +1651,7 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             "eviction": {
                 "policy": "least_stale_predicted_next_use_max_heap",
                 "protect_roles": ["router", "attention", "norm", "token_embedding", "lm_head"],
-                "demote_order": ["cold_experts", "warm_experts", "large_shared_streamable"],
+                "demote_order": ["video_encoder", "document_encoder", "audio_encoder", "vision_encoder", "cold_experts", "warm_experts", "large_shared_streamable"],
                 "primary_key": "predicted_next_use_epoch",
                 "tie_breakers": ["hot_score", "last_touch_epoch"],
                 "rollback_required": True,
@@ -1567,9 +1771,11 @@ def build_juju_shard_plan_from_hf_url(
             "artifact_source_name": artifact_source_name,
             "tensor_count": len(active_tensors),
         }
+        modality_meta = juju_modality_metadata(contract, active_tensors)
+        modality_flags = int(modality_meta["modality_flags"])
         pos = JUJU_HEADER_BYTES
         table_offset = pos
-        pos += 8 * JUJU_SECTION_ENTRY_BYTES
+        pos += JUJU_SECTION_TABLE_RESERVED_ENTRIES * JUJU_SECTION_ENTRY_BYTES
         pos = align_up(pos, 4096)
 
         meta = {
@@ -1597,6 +1803,8 @@ def build_juju_shard_plan_from_hf_url(
                 "source_bytes": total_bytes,
             },
             "contract": contract,
+            "modality_flags": modality_flags,
+            "multimodal_contract": modality_meta,
             **juju_contract_metadata(contract, source_name, source_repo_id),
         }
         pos = add_json_section_at(pos, JUJU_SECTION_MODEL_META, "MODEL_META", meta)
@@ -1604,7 +1812,7 @@ def build_juju_shard_plan_from_hf_url(
         if qkv_schema:
             pos = add_json_section_at(pos, JUJU_SECTION_QKV_POLICY, "QKV_POLICY", qkv_schema)
 
-        for bucket in ("shared_weights", "hot_experts", "warm_experts", "cold_experts"):
+        for bucket in JUJU_TENSOR_BUCKET_ORDER:
             group = [t for t in active_tensors if t["bucket"] == bucket and t["bytes"] > 0]
             if not group:
                 continue
@@ -1677,6 +1885,8 @@ def build_juju_shard_plan_from_hf_url(
             "source_name": source_name,
             "artifact_source_name": artifact_source_name,
             "split": split_meta,
+            "modality_flags": modality_flags,
+            "multimodal_contract": modality_meta,
             "graph_ir_format": graph_ir["format"],
             "graph_ir_required": True,
             "graph_ir": graph_ir,
@@ -1689,12 +1899,13 @@ def build_juju_shard_plan_from_hf_url(
         pos = add_json_section_at(pos, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
         index_checksum = int(sections[-1].get("sha256", "0" * 64)[:16], 16) if sections else 0
         file_size_value = pos
-        if len(sections) > 8:
+        if len(sections) > JUJU_SECTION_TABLE_RESERVED_ENTRIES:
             raise RuntimeError(f"too many JUJU sections: {len(sections)}")
 
         table = b"".join(pack_section(entry) for entry in sections)
-        table = table + (b"\x00" * ((8 * JUJU_SECTION_ENTRY_BYTES) - len(table)))
-        header = make_header(contract, artifact_source_name, file_size_value, sections, section_sizes, index_checksum=index_checksum)
+        table_capacity = JUJU_SECTION_TABLE_RESERVED_ENTRIES * JUJU_SECTION_ENTRY_BYTES
+        table = table + (b"\x00" * (table_capacity - len(table)))
+        header = make_header(contract, artifact_source_name, file_size_value, sections, section_sizes, index_checksum=index_checksum, modality_flags=modality_flags)
         add_fixed(0, header)
         add_fixed(table_offset, table)
 
@@ -2021,10 +2232,12 @@ def write_juju_shard_from_hf_url(
             "artifact_source_name": artifact_source_name,
             "tensor_count": len(active_tensors),
         }
+        modality_meta = juju_modality_metadata(contract, active_tensors)
+        modality_flags = int(modality_meta["modality_flags"])
         with output_path.open("wb") as out:
             out.write(b"\x00" * JUJU_HEADER_BYTES)
             table_offset = out.tell()
-            out.write(b"\x00" * (8 * JUJU_SECTION_ENTRY_BYTES))
+            out.write(b"\x00" * (JUJU_SECTION_TABLE_RESERVED_ENTRIES * JUJU_SECTION_ENTRY_BYTES))
             write_padding(out, 4096)
 
             meta = {
@@ -2052,6 +2265,8 @@ def write_juju_shard_from_hf_url(
                     "source_bytes": total_bytes,
                 },
                 "contract": contract,
+                "modality_flags": modality_flags,
+                "multimodal_contract": modality_meta,
                 **juju_contract_metadata(contract, source_name, source_repo_id),
             }
             add_json_section(out, JUJU_SECTION_MODEL_META, "MODEL_META", meta)
@@ -2059,7 +2274,7 @@ def write_juju_shard_from_hf_url(
             if qkv_schema:
                 add_json_section(out, JUJU_SECTION_QKV_POLICY, "QKV_POLICY", qkv_schema)
 
-            for bucket in ("shared_weights", "hot_experts", "warm_experts", "cold_experts"):
+            for bucket in JUJU_TENSOR_BUCKET_ORDER:
                 group = [t for t in active_tensors if t["bucket"] == bucket and t["bytes"] > 0]
                 if not group:
                     continue
@@ -2137,6 +2352,8 @@ def write_juju_shard_from_hf_url(
                 "source_name": source_name,
                 "artifact_source_name": artifact_source_name,
                 "split": split_meta,
+                "modality_flags": modality_flags,
+                "multimodal_contract": modality_meta,
                 "graph_ir_format": graph_ir["format"],
                 "graph_ir_required": True,
                 "graph_ir": graph_ir,
@@ -2149,13 +2366,13 @@ def write_juju_shard_from_hf_url(
             add_json_section(out, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
             index_checksum = int(sections[-1].get("sha256", "0" * 64)[:16], 16) if sections else 0
             file_size_value = out.tell()
-            if len(sections) > 8:
+            if len(sections) > JUJU_SECTION_TABLE_RESERVED_ENTRIES:
                 raise RuntimeError(f"too many JUJU sections: {len(sections)}")
             out.seek(table_offset)
             for entry in sections:
                 out.write(pack_section(entry))
             out.seek(0)
-            out.write(make_header(contract, artifact_source_name, file_size_value, sections, section_sizes, index_checksum=index_checksum))
+            out.write(make_header(contract, artifact_source_name, file_size_value, sections, section_sizes, index_checksum=index_checksum, modality_flags=modality_flags))
 
     index_path.write_text(json.dumps(idx, ensure_ascii=False, indent=2), encoding="utf-8")
     return {

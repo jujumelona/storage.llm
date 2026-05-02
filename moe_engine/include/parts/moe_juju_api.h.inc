@@ -16,8 +16,21 @@ typedef enum {
     moe_JUJU_SECTION_COLD_EXPERTS = 0x0013u,
     moe_JUJU_SECTION_LAYER_ORDER_INDEX = 0x0020u,
     moe_JUJU_SECTION_QKV_POLICY = 0x0021u,
+    moe_JUJU_SECTION_VISION_ENCODER = 0x0030u,
+    moe_JUJU_SECTION_VISION_PROJ = 0x0031u,
+    moe_JUJU_SECTION_AUDIO_ENCODER = 0x0040u,
+    moe_JUJU_SECTION_VIDEO_ENCODER = 0x0050u,
+    moe_JUJU_SECTION_DOCUMENT_ENCODER = 0x0060u,
     moe_JUJU_SECTION_CUSTOM = 0xFF00u
 } moe_juju_section_type_t;
+
+typedef enum {
+    moe_JUJU_MODALITY_TEXT = 0x01u,
+    moe_JUJU_MODALITY_IMAGE = 0x02u,
+    moe_JUJU_MODALITY_AUDIO = 0x04u,
+    moe_JUJU_MODALITY_VIDEO = 0x08u,
+    moe_JUJU_MODALITY_DOCUMENT = 0x10u
+} moe_juju_modality_flags_t;
 
 typedef enum {
     moe_JUJU_TIER_ROLE_COMPUTE_MEM = 0,
@@ -94,7 +107,7 @@ typedef struct {
     uint32_t max_segments_per_expert;
     uint32_t recommended_vram_mb;
     uint32_t recommended_ram_mb;
-    uint32_t reserved_u32;
+    uint32_t modality_flags;
     uint8_t file_hash[32];
     uint8_t header_hash[32];
     uint8_t reserved[3816];

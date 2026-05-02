@@ -302,7 +302,19 @@ static int moe_parse_juju_tensor_index_json(
         }
         if (moe_json_get_string_slice(json, obj_begin, obj_end, "bucket", &rec.bucket)) {
             const std::string bucket = moe_lower_ascii_copy(rec.bucket);
-            if (bucket.find("shared") != std::string::npos) {
+            if (bucket.find("vision_projector") != std::string::npos || bucket.find("vision_proj") != std::string::npos ||
+                bucket.find("image_projector") != std::string::npos || bucket.find("mm_projector") != std::string::npos) {
+                rec.juju_section_type = (uint8_t)moe_JUJU_SECTION_VISION_PROJ;
+            } else if (bucket.find("vision") != std::string::npos || bucket.find("image") != std::string::npos) {
+                rec.juju_section_type = (uint8_t)moe_JUJU_SECTION_VISION_ENCODER;
+            } else if (bucket.find("audio") != std::string::npos) {
+                rec.juju_section_type = (uint8_t)moe_JUJU_SECTION_AUDIO_ENCODER;
+            } else if (bucket.find("video") != std::string::npos) {
+                rec.juju_section_type = (uint8_t)moe_JUJU_SECTION_VIDEO_ENCODER;
+            } else if (bucket.find("document") != std::string::npos || bucket.find("pdf") != std::string::npos ||
+                       bucket.find("ocr") != std::string::npos) {
+                rec.juju_section_type = (uint8_t)moe_JUJU_SECTION_DOCUMENT_ENCODER;
+            } else if (bucket.find("shared") != std::string::npos) {
                 rec.juju_section_type = (uint8_t)moe_JUJU_SECTION_SHARED_WEIGHTS;
             } else if (bucket.find("hot") != std::string::npos) {
                 rec.juju_section_type = (uint8_t)moe_JUJU_SECTION_HOT_EXPERTS;

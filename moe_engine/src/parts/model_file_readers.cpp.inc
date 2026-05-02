@@ -26,6 +26,7 @@ static int moe_read_offload_juju_file(
     out->contract.qkv_required = header.qkv_policy != 0;
     out->contract.plain_kv_persistent_allowed = !out->contract.qkv_required;
     out->contract.weight_bits = header.quant_type;
+    out->contract.modality_flags = header.modality_flags ? header.modality_flags : moe_JUJU_MODALITY_TEXT;
     if (header.model_name[0]) {
         size_t model_name_len = 0;
         while (model_name_len < sizeof(header.model_name) && header.model_name[model_name_len]) {

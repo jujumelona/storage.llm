@@ -91,6 +91,7 @@ struct moe_offload_gguf_contract_t {
     uint32_t weight_bits = 0;
     uint32_t weight_encoding = 0;
     uint32_t weight_block_size = 0;
+    uint32_t modality_flags = moe_JUJU_MODALITY_TEXT;
     uint32_t optimization_catalog_count = 0;
     double reference_moe_compute_ms = 0.0;
     double reference_ram_to_gpu_ms = 0.0;
