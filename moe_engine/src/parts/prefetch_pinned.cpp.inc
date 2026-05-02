@@ -94,13 +94,8 @@ static int prefetch_tensor_file_to_pinned(
             s_realloc_attempt_count.fetch_add(1, std::memory_order_relaxed);
 
             // Update max_tensor_stream_bytes if this tensor is larger
-            uint64_t current_max = engine->max_tensor_stream_bytes;
-            while (total_bytes > current_max) {
-                if (engine->max_tensor_stream_bytes.compare_exchange_weak(
-                        current_max, total_bytes,
-                        std::memory_order_relaxed, std::memory_order_relaxed)) {
-                    break;
-                }
+            if (total_bytes > engine->max_tensor_stream_bytes) {
+                engine->max_tensor_stream_bytes = total_bytes;
             }
 
             fprintf(stderr,
@@ -131,7 +126,8 @@ static int prefetch_tensor_file_to_pinned(
         } else {
             // Already tried reallocation 3 times or tensor too large
             if (now_ms - last_warn > 1000) {
-                if (s_last_warn_time_ms.compare_exchange_weak(last_warn, now_ms, std::memory_order_relaxed)) {
+                uint64_t expected_last_warn = last_warn;
+                if (s_last_warn_time_ms.compare_exchange_weak(expected_last_warn, now_ms, std::memory_order_relaxed)) {
                     fprintf(stderr,
                         "[storageLLM ERROR] Tensor %llu bytes exceeds slot size %llu\n"
                         "  Dynamic reallocation %s\n"

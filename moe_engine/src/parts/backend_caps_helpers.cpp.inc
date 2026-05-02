@@ -357,7 +357,7 @@ static void fill_vulkan_backend_caps(moe_backend_caps_t* caps) {
                                 }
 
                                 // Conservative estimate: subtract known allocations
-                                const uint64_t already_allocated = caps->engine_vram_allocated_bytes;
+                                const uint64_t already_allocated = 0;
                                 if (heap_total > already_allocated) {
                                     // 80% of remaining after subtracting our allocations
                                     free_b = ((heap_total - already_allocated) * 80ull) / 100ull;

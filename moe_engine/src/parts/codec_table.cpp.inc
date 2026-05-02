@@ -140,6 +140,11 @@ static int tensor_index_read_u64(std::ifstream& input, uint64_t* out) {
     return out && tensor_index_read_exact(input, out, sizeof(*out));
 }
 
+static uint8_t moe_weight_encoding_from_gguf_type(
+    uint32_t type,
+    const moe_offload_gguf_contract_t& contract
+);
+
 static void finish_tensor_index_load(moe_pc_engine* engine) {
     if (!engine) {
         return;

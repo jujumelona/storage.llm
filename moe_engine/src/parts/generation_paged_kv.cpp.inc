@@ -9,6 +9,9 @@
 #include <mutex>
 #include <cstdint>
 
+#ifndef MOE_GENERATION_PAGED_KV_TYPES_DEFINED
+#define MOE_GENERATION_PAGED_KV_TYPES_DEFINED
+
 struct moe_paged_kv_block_t {
     uint32_t block_id;
     uint32_t num_tokens;
@@ -196,6 +199,16 @@ struct moe_paged_kv_manager_t {
         return evict_candidate;
     }
 };
+
+#endif // MOE_GENERATION_PAGED_KV_TYPES_DEFINED
+
+#ifndef MOE_GENERATION_PAGED_KV_TYPES_ONLY
+
+static uint32_t evict_cold_kv_blocks(
+    moe_pc_engine* engine,
+    moe_paged_kv_manager_t* manager,
+    uint64_t bytes_needed
+);
 
 
 // BUGFIX 문제4: KV block VRAM promotion/eviction ★★★
@@ -559,3 +572,5 @@ static int enable_kv_pinned_memory(
 
     return pinned_count > 0 ? 1 : 0;
 }
+
+#endif // MOE_GENERATION_PAGED_KV_TYPES_ONLY

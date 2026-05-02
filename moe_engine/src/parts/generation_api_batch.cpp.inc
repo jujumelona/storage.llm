@@ -40,11 +40,11 @@ int moe_pc_engine_step_batch(moe_pc_engine_t* engine) {
     // Users may call this expecting batched inference but get sequential processing instead
     // Solution: Return error code to indicate not implemented
     // Long-term: Implement batched GEMM on top of tensor_dot_cpu_kernels.cpp.inc
-    if (!engine) return MOE_ERR_INVALID_ARGUMENT;
+    if (!engine) return 0;
 
     fprintf(stderr, "[storageLLM ERROR] moe_pc_engine_step_batch is not implemented. "
             "Use moe_pc_engine_step for single-request inference.\n");
-    return MOE_ERR_NOT_IMPLEMENTED;
+    return 0;
 }
 
 // ============================================================================

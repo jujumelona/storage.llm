@@ -76,9 +76,12 @@ static inline __m256 moe_madd_ps(__m256 a, __m256 b, __m256 c) {
 #include "parts/io_atomic_stats_state.cpp.inc"
 #include "parts/device_types.cpp.inc"
 #include "parts/engine_types.cpp.inc"
+#define MOE_GENERATION_PAGED_KV_TYPES_ONLY 1
 #include "parts/generation_paged_kv.cpp.inc"
+#undef MOE_GENERATION_PAGED_KV_TYPES_ONLY
 #include "parts/generation_batch_scheduler.cpp.inc"
 #include "parts/engine_state.cpp.inc"
+#include "parts/generation_paged_kv.cpp.inc"
 #include "parts/csv_numbers.cpp.inc"
 #include "parts/projection_parse.cpp.inc"
 #include "parts/tensor_slots.cpp.inc"
@@ -129,6 +132,7 @@ static inline __m256 moe_madd_ps(__m256 a, __m256 b, __m256 c) {
 #include "parts/prefetch_model_bytes.cpp.inc"
 #include "parts/prefetch_disk.cpp.inc"
 #include "parts/io_iocp_adapter.cpp.inc"
+#include "parts/profile_trace.cpp.inc"
 #include "parts/prefetch_pinned.cpp.inc"
 #include "parts/prefetch_devices.cpp.inc"
 #include "parts/queue_helpers.cpp.inc"
@@ -139,7 +143,6 @@ static inline __m256 moe_madd_ps(__m256 a, __m256 b, __m256 c) {
 #include "parts/io_worker_lifecycle.cpp.inc"
 #include "parts/enqueue_tensor_prefetch.cpp.inc"
 #include "parts/default_configs.cpp.inc"
-#include "parts/profile_trace.cpp.inc"
 #include "parts/parallel_rows_pool.cpp.inc"
 #include "parts/parallel_rows.cpp.inc"
 #include "parts/lifecycle_backend_api.cpp.inc"
