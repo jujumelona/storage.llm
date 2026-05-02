@@ -301,6 +301,8 @@ static int probe_main(int argc, char** argv) {
             raw_info.bf16
         );
     }
+    fprintf(stderr, "[probe] before prepare_moe_activation\n");
+    fflush(stderr);
     const int selected_experts[2] = {0, 1};
     const int next_candidates[2] = {2, 3};
     moe_runtime_orchestrator_state_t orch_state{};
@@ -312,6 +314,10 @@ static int probe_main(int argc, char** argv) {
     moe_expert_prefetch_item_t orch_items[16];
     uint32_t orch_count = 0;
     moe_pc_engine_prepare_moe_activation(engine, 3);
+    fprintf(stderr, "[probe] after prepare_moe_activation\n");
+    fflush(stderr);
+    fprintf(stderr, "[probe] before orchestrate_moe_step\n");
+    fflush(stderr);
     if (moe_pc_engine_orchestrate_moe_step(
         engine, 3, selected_experts, 2, next_candidates, 2,
         &orch_state, &orch_plan, orch_items, 16, &orch_count)) {
@@ -329,6 +335,10 @@ static int probe_main(int argc, char** argv) {
             orch_plan.drop_speculative
         );
     }
+    fprintf(stderr, "[probe] after orchestrate_moe_step\n");
+    fflush(stderr);
+    fprintf(stderr, "[probe] before optimization_plan\n");
+    fflush(stderr);
     moe_runtime_optimization_plan_t plan;
     if (moe_pc_engine_get_optimization_plan(engine, moe_PHASE_BOTH, &plan)) {
         printf(
@@ -353,14 +363,24 @@ static int probe_main(int argc, char** argv) {
         );
     }
 
+    fprintf(stderr, "[probe] before request_expert L10E0\n");
+    fflush(stderr);
     moe_pc_engine_request_expert(engine, 10, 0, 80ull * 1024ull * 1024ull, moe_TIER_VRAM);
+    fprintf(stderr, "[probe] before request_expert L10E1\n");
+    fflush(stderr);
     moe_pc_engine_request_expert(engine, 10, 1, 80ull * 1024ull * 1024ull, moe_TIER_VRAM);
+    fprintf(stderr, "[probe] after request_expert\n");
+    fflush(stderr);
 
     moe_pc_engine_stats_t stats;
+    fprintf(stderr, "[probe] before get_stats\n");
+    fflush(stderr);
     if (!moe_pc_engine_get_stats(engine, &stats)) {
         moe_pc_engine_destroy(engine);
         return 2;
     }
+    fprintf(stderr, "[probe] after get_stats\n");
+    fflush(stderr);
 
     printf(
         "kv=%s offload_gguf=%d files=%u tensor_headers=%llu executable_tensors=%llu juju_schema=%u split_groups=%u split_missing=%u hint_tensors=%llu priority_tensors=%llu fast_tensors=%llu slow_tensors=%llu qkv_forced=%u qkv_bits=%u/%u qkv_group=%u qkv_page=%u qkv_sink=%u weight=%s/%ub enc=%u kernel=%s first_gguf=%s vram=%llu common=%llu expert_vram=%llu device=%llu allocs=%llu device_mem=%llu/%llu device_pools=%llu/%llu/%llu/%llu model_lib=%d/%d/%d path=%s common_prefetch=%llu/%llu ram=%llu db=%llu experts=%llu tiers=%llu/%llu/%llu\n",
@@ -414,11 +434,15 @@ static int probe_main(int argc, char** argv) {
     print_forward_status("initial", engine);
 
     if (table_path) {
+        fprintf(stderr, "[probe] before explicit codec load\n");
+        fflush(stderr);
         if (!moe_pc_engine_load_codec_table(engine, table_path, model_root, scale4_path)) {
             fprintf(stderr, "failed to load codec table: %s\n", table_path);
             moe_pc_engine_destroy(engine);
             return 3;
         }
+        fprintf(stderr, "[probe] after explicit codec load\n");
+        fflush(stderr);
         printf("codec_tensors=%llu\n", (unsigned long long)moe_pc_engine_tensor_count(engine));
         print_forward_status("loaded", engine);
 
@@ -495,7 +519,11 @@ static int probe_main(int argc, char** argv) {
             }
         }
     } else if (model_root) {
+        fprintf(stderr, "[probe] before model-root codec load\n");
+        fflush(stderr);
         if (moe_pc_engine_load_codec_table(engine, nullptr, model_root, scale4_path)) {
+            fprintf(stderr, "[probe] after model-root codec load\n");
+            fflush(stderr);
             moe_pc_engine_get_stats(engine, &stats);
             printf(
                 "offload_gguf_header_tensors=%llu codec_tensors=%llu juju_schema=%u hint_tensors=%llu priority_tensors=%llu split_missing=%u\n",
@@ -510,7 +538,11 @@ static int probe_main(int argc, char** argv) {
         }
     }
 
+    fprintf(stderr, "[probe] before destroy\n");
+    fflush(stderr);
     moe_pc_engine_destroy(engine);
+    fprintf(stderr, "[probe] after destroy\n");
+    fflush(stderr);
     return 0;
 }
 
