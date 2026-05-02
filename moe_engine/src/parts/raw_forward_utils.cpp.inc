@@ -194,27 +194,6 @@ static int moe_engine_graph_ir_mentions(const moe_pc_engine* engine, const char*
     return haystack.find(target) != std::string::npos ? 1 : 0;
 }
 
-static std::string moe_compact_lower_ascii_copy(const std::string& text) {
-    std::string out;
-    out.reserve(text.size());
-    for (unsigned char ch : text) {
-        if (std::isspace(ch)) {
-            continue;
-        }
-        out.push_back((char)std::tolower(ch));
-    }
-    return out;
-}
-
-static int moe_engine_graph_ir_compact_mentions(const moe_pc_engine* engine, const char* needle) {
-    if (!engine || !needle || !needle[0] || engine->offload_graph_ir_json.empty()) {
-        return 0;
-    }
-    const std::string haystack = moe_compact_lower_ascii_copy(engine->offload_graph_ir_json);
-    const std::string target = moe_compact_lower_ascii_copy(std::string(needle));
-    return haystack.find(target) != std::string::npos ? 1 : 0;
-}
-
 static int moe_engine_metadata_mentions(const moe_pc_engine* engine, const char* needle) {
     if (!engine || !needle || !needle[0] || engine->offload_gguf_metadata_json.empty()) {
         return 0;
