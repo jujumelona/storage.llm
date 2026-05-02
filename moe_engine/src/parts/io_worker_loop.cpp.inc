@@ -185,10 +185,12 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
 
         void activate() {
             active = true;
+            finished = false;
         }
 
         void mark_finished() {
             finished = true;
+            active = false;
         }
     } inflight_guard{engine, &engine->disk_stage};
 
@@ -557,6 +559,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
             }
             }
         }
+        finish_stage_task(engine, engine->disk_stage, ok, terminal);
         inflight_guard.mark_finished();  // BUGFIX 129: Mark as finished to prevent double-decrement
 
         if (worker_index >= engine->disk_worker_target.load()) {

@@ -24,10 +24,12 @@ static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
 
         void activate() {
             active = true;
+            finished = false;
         }
 
         void mark_finished() {
             finished = true;
+            active = false;
         }
     } inflight_guard{engine, &engine->pinned_stage};
 
