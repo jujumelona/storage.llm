@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cmath>
@@ -85,6 +86,9 @@ struct server_runtime_state {
     std::string error_message;
     mutable std::mutex stage_mutex;
     std::string load_stage{"not_started"};
+    std::chrono::steady_clock::time_point load_started_at{};
+    std::chrono::steady_clock::time_point last_stage_at{};
+    bool load_clock_started = false;
     mutable std::mutex root_check_mutex;
     std::string root_check_model_root;
     moe_model_root_check_t root_check{};
@@ -167,6 +171,14 @@ static std::string json_escape(const std::string& value) {
 static int64_t unix_time_seconds() {
     using namespace std::chrono;
     return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
+}
+
+static double elapsed_ms_since(std::chrono::steady_clock::time_point start) {
+    if (start == std::chrono::steady_clock::time_point{}) {
+        return 0.0;
+    }
+    return (double)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count() / 1000.0;
 }
 
 static std::string lower_ascii(std::string value) {
@@ -671,6 +683,8 @@ static bool json_read_u32_in_range(
     char* parse_end = nullptr;
     const unsigned long value = std::strtoul(text.c_str() + colon + 1, &parse_end, 10);
     if (!parse_end || parse_end == text.c_str() + colon + 1) return false;
+    // BUGFIX 458: strtoul 결과 범위 체크
+    if (value > UINT32_MAX) return false;
     *out = static_cast<uint32_t>(value);
     return true;
 }
@@ -779,7 +793,12 @@ static bool load_tokenizer_vocab(server_tokenizer* tok, const std::string& json)
         while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
         char* end = nullptr;
         const long id_long = std::strtol(json.c_str() + p, &end, 10);
-        if (!end || end == json.c_str() + p || id_long < 0) {
+        // BUGFIX 459: strtol 결과 범위 체크
+        if (!end || end == json.c_str() + p || id_long < 0 || id_long > UINT32_MAX) {
+            continue;
+        }
+        // BUGFIX 460: end - json.c_str() overflow 체크
+        if (end < json.c_str() || static_cast<size_t>(end - json.c_str()) > json.size()) {
             continue;
         }
         p = (size_t)(end - json.c_str());
@@ -1043,6 +1062,7 @@ static server_generation_result run_server_generation(
     const server_options& opts,
     const std::string& body
 ) {
+    const auto request_start = std::chrono::steady_clock::now();
     server_generation_result result;
     std::vector<int> request_ids = storagellm::json_read_int_array(body, "input_ids");
     std::vector<int32_t> input_ids;
@@ -1058,20 +1078,33 @@ static server_generation_result run_server_generation(
             result.http_status = 400;
             result.error_code = "invalid_request_error";
             result.error_message = "OpenAI request must include messages/content, prompt, input, or input_ids";
+            std::cerr << "[storagellm request] reject reason=missing_input ms="
+                      << elapsed_ms_since(request_start) << "\n" << std::flush;
             return result;
         }
         if (!tok.loaded) {
             result.http_status = 503;
             result.error_code = "tokenizer_unavailable";
             result.error_message = tok.error.empty() ? "tokenizer.json is not loaded" : tok.error;
+            std::cerr << "[storagellm request] reject reason=tokenizer_unavailable ms="
+                      << elapsed_ms_since(request_start) << " error=" << result.error_message
+                      << "\n" << std::flush;
             return result;
         }
+        const auto tokenize_start = std::chrono::steady_clock::now();
         if (!tokenizer_encode_greedy(tok, text, &input_ids)) {
             result.http_status = 422;
             result.error_code = "tokenization_failed";
             result.error_message = "tokenizer vocab could not encode the request text";
+            std::cerr << "[storagellm request] reject reason=tokenization_failed input_chars="
+                      << text.size() << " ms=" << elapsed_ms_since(request_start)
+                      << "\n" << std::flush;
             return result;
         }
+        std::cerr << "[storagellm request] tokenize input_chars=" << text.size()
+                  << " tokens=" << input_ids.size()
+                  << " ms=" << elapsed_ms_since(tokenize_start)
+                  << "\n" << std::flush;
     }
 
     int max_tokens = 128;
@@ -1092,9 +1125,17 @@ static server_generation_result run_server_generation(
     cfg.eos_token_id = tok.eos_token_id;
     moe_generation_stats_t stats{};
     int generated = 0;
+    std::cerr << "[storagellm request] generation begin input_tokens=" << input_ids.size()
+              << " max_tokens=" << max_tokens
+              << " body_bytes=" << body.size()
+              << "\n" << std::flush;
+    const auto generation_start = std::chrono::steady_clock::now();
     if (engine_mutex) {
         std::lock_guard<std::mutex> lock(*engine_mutex);
+        const auto prefetch_start = std::chrono::steady_clock::now();
         server_orchestrate_request_prefetch(engine, opts, body);
+        std::cerr << "[storagellm request] prefetch_orchestrate ms="
+                  << elapsed_ms_since(prefetch_start) << "\n" << std::flush;
         generated = moe_pc_engine_generate_token_ids(
             engine,
             input_ids.data(),
@@ -1115,10 +1156,17 @@ static server_generation_result run_server_generation(
             &stats
         );
     }
+    const double generation_ms = elapsed_ms_since(generation_start);
     if (!generated) {
         result.http_status = 503;
         result.error_code = "generation_not_ready";
         result.error_message = stats.error[0] ? stats.error : "generation failed";
+        std::cerr << "[storagellm request] generation failed input_tokens=" << input_ids.size()
+                  << " max_tokens=" << max_tokens
+                  << " generation_ms=" << generation_ms
+                  << " total_ms=" << elapsed_ms_since(request_start)
+                  << " error=" << result.error_message
+                  << "\n" << std::flush;
         return result;
     }
     out_ids.resize(stats.completion_tokens);
@@ -1126,7 +1174,14 @@ static server_generation_result run_server_generation(
     result.prompt_tokens = stats.prompt_tokens;
     result.completion_tokens = stats.completion_tokens;
     result.finish_reason = stats.finish_reason == 1u ? "length" : "stop";
+    const auto decode_text_start = std::chrono::steady_clock::now();
     result.text = tok.loaded ? tokenizer_decode_ids(tok, out_ids) : tokenizer_decode_ids(server_tokenizer{}, out_ids);
+    std::cerr << "[storagellm request] generation ok prompt_tokens=" << result.prompt_tokens
+              << " completion_tokens=" << result.completion_tokens
+              << " generation_ms=" << generation_ms
+              << " decode_text_ms=" << elapsed_ms_since(decode_text_start)
+              << " total_ms=" << elapsed_ms_since(request_start)
+              << "\n" << std::flush;
     return result;
 }
 
@@ -1816,7 +1871,15 @@ static bool parse_http_request(socket_handle_t client, http_request* out_req) {
             value.erase(value.begin());
         }
         if (name == "content-length") {
-            content_length = static_cast<size_t>(std::strtoull(value.c_str(), nullptr, 10));
+            // BUGFIX 461: strtoull errno 체크 및 범위 검증
+            errno = 0;
+            char* endptr = nullptr;
+            unsigned long long ull_value = std::strtoull(value.c_str(), &endptr, 10);
+            if (errno == ERANGE || !endptr || endptr == value.c_str() || ull_value > SIZE_MAX) {
+                content_length = 0;
+            } else {
+                content_length = static_cast<size_t>(ull_value);
+            }
         }
     }
 
@@ -2065,11 +2128,27 @@ static void set_model_load_stage(server_runtime_state* runtime, const char* stag
     if (!runtime || !stage) {
         return;
     }
+    double total_ms = 0.0;
+    double previous_stage_ms = 0.0;
     {
         std::lock_guard<std::mutex> lock(runtime->stage_mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (!runtime->load_clock_started) {
+            runtime->load_started_at = now;
+            runtime->last_stage_at = now;
+            runtime->load_clock_started = true;
+        }
+        total_ms = (double)std::chrono::duration_cast<std::chrono::microseconds>(
+            now - runtime->load_started_at).count() / 1000.0;
+        previous_stage_ms = (double)std::chrono::duration_cast<std::chrono::microseconds>(
+            now - runtime->last_stage_at).count() / 1000.0;
+        runtime->last_stage_at = now;
         runtime->load_stage = stage;
     }
-    std::cerr << "[storagellm] load stage: " << stage << "\n" << std::flush;
+    std::cerr << "[storagellm] load stage: " << stage
+              << " total_ms=" << total_ms
+              << " previous_stage_ms=" << previous_stage_ms
+              << "\n" << std::flush;
 }
 
 static void cache_model_root_check(
@@ -2191,19 +2270,17 @@ static void load_server_model_background(
     if (cleanup_background_engine_if_shutdown(runtime)) {
         return;
     }
-    set_model_load_stage(runtime, "ready");
-    runtime->model_ready.store(1, std::memory_order_release);
     print_optimization_plan(engine);
     set_model_load_stage(runtime, "startup_warm");
     std::cerr << "[storagellm] startup warm begin\n" << std::flush;
     const int warm_started = moe_pc_engine_startup_warm_model(engine);
     std::cerr << "[storagellm] startup warm " << (warm_started ? "queued" : "skipped") << "\n" << std::flush;
     set_model_load_stage(runtime, "ready");
-    if (opts.engine_config.prefer_gpu && io_config.enable_common_raw_vram_pin) {
-        set_model_load_stage(runtime, "warm_common_raw");
-        moe_pc_engine_prefetch_common_raw(engine);
-        set_model_load_stage(runtime, "ready");
-    }
+    set_model_load_stage(runtime, "warm_common_raw");
+    const int common_warm = moe_pc_engine_prefetch_common_raw(engine);
+    std::cerr << "[storagellm] common raw warm " << (common_warm ? "done" : "skipped") << "\n" << std::flush;
+    set_model_load_stage(runtime, "ready");
+    runtime->model_ready.store(1, std::memory_order_release);
 }
 
 static void print_usage() {
@@ -2454,4 +2531,3 @@ int main(int argc, char** argv) {
     return server_main(argc, argv);
 }
 #endif
-

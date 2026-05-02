@@ -1,3 +1,60 @@
+static int moe_read_model_root_text_file(
+    const std::string& root,
+    const char* file_name,
+    uint64_t max_bytes,
+    std::string* out
+) {
+    if (out) {
+        out->clear();
+    }
+    if (!out || root.empty() || !file_name || !file_name[0]) {
+        return 0;
+    }
+    const std::string path = storagellm::path_join(root, file_name);
+    uint64_t bytes = 0;
+    if (!file_size_bytes(path, &bytes) || bytes == 0 || bytes > max_bytes) {
+        return 0;
+    }
+    std::ifstream input;
+    open_ifstream_path(input, path, std::ios::in | std::ios::binary);
+    if (!input) {
+        return 0;
+    }
+    std::string data((size_t)bytes, '\0');
+    input.read(&data[0], (std::streamsize)data.size());
+    if ((uint64_t)input.gcount() != bytes) {
+        return 0;
+    }
+    *out = std::move(data);
+    return 1;
+}
+
+static int moe_read_model_config_json(
+    const std::string& root,
+    std::string* out
+) {
+    return moe_read_model_root_text_file(root, "config.json", 64ull * 1024ull * 1024ull, out);
+}
+
+static void moe_append_model_config_metadata(
+    moe_pc_engine* engine,
+    const std::string& root
+) {
+    if (!engine || root.empty() ||
+        engine->offload_gguf_metadata_json.find("__storagellm_external_config_json__") != std::string::npos) {
+        return;
+    }
+    std::string config_json;
+    if (!moe_read_model_config_json(root, &config_json) || config_json.empty()) {
+        return;
+    }
+    if (!engine->offload_gguf_metadata_json.empty()) {
+        engine->offload_gguf_metadata_json.push_back('\n');
+    }
+    engine->offload_gguf_metadata_json += "{\"__storagellm_external_config_json__\":true}\n";
+    engine->offload_gguf_metadata_json += config_json;
+}
+
 int moe_pc_engine_set_model_root(
     moe_pc_engine_t* engine,
     const char* model_root
@@ -45,6 +102,7 @@ int moe_pc_engine_set_model_root(
     if (!engine->model_root.empty()) {
         if (moe_engine_load_offload_gguf_contract(engine, engine->model_root, &check)) {
             valid = check.valid;
+            moe_append_model_config_metadata(engine, engine->model_root);
         } else {
             valid = moe_storage_validate_model_root(engine->model_root.c_str(), &check) && check.valid;
         }
@@ -310,19 +368,37 @@ static uint8_t moe_weight_encoding_from_gguf_type(uint32_t type, const moe_offlo
     if (type == 8u) {
         return moe_WEIGHT_ENCODING_GGUF_Q8_0;
     }
+    if (type == 10u) {
+        return moe_WEIGHT_ENCODING_GGUF_Q2_K;
+    }
+    if (type == 11u) {
+        return moe_WEIGHT_ENCODING_GGUF_Q3_K;
+    }
+    if (type == 12u) {
+        return moe_WEIGHT_ENCODING_GGUF_Q4_K;
+    }
     if (type == 13u) {
         return moe_WEIGHT_ENCODING_GGUF_Q5_K;
+    }
+    if (type == 14u) {
+        return moe_WEIGHT_ENCODING_GGUF_Q6_K;
     }
     if (type == 39u) {
         return moe_WEIGHT_ENCODING_MXFP4;
     }
-    if (type == 16u || type == 17u || type == 22u) {
+    if (type == 16u) {
+        return moe_WEIGHT_ENCODING_GGUF_IQ2_XXS;
+    }
+    if (type == 18u) {
+        return moe_WEIGHT_ENCODING_GGUF_IQ3_XXS;
+    }
+    if (type == 17u || type == 22u) {
         return moe_WEIGHT_ENCODING_GGUF_IQ2;
     }
-    if (type == 18u || type == 21u) {
+    if (type == 21u) {
         return moe_WEIGHT_ENCODING_GGUF_IQ3;
     }
-    if (type == 20u || type == 23u || type == 12u) {
+    if (type == 20u || type == 23u) {
         return moe_WEIGHT_ENCODING_GGUF_IQ4;
     }
     return moe_WEIGHT_ENCODING_UNKNOWN;
@@ -602,6 +678,7 @@ static void moe_juju_probe_note_index_json(
     if (probe->architecture.empty() &&
         (moe_json_get_string_local(index_json, "declared_architecture", &string_value) ||
          moe_json_get_string_local(index_json, "architecture", &string_value) ||
+         moe_json_get_string_local(index_json, "model_type", &string_value) ||
          moe_json_get_string_local(index_json, "family", &string_value))) {
         probe->architecture = string_value;
     }
@@ -886,6 +963,11 @@ static int load_gguf_tensor_directory_as_tensor_index(
     }
     std::sort(paths.begin(), paths.end());
     moe_juju_runtime_probe_t probe{};
+    std::string model_config_json;
+    const int has_model_config_json = moe_read_model_config_json(root, &model_config_json);
+    if (has_model_config_json) {
+        moe_juju_probe_note_index_json(&probe, model_config_json);
+    }
     for (const std::string& path : paths) {
         moe_juju_header_t header{};
         std::vector<moe_juju_section_entry_t> sections;
@@ -1082,6 +1164,11 @@ static int load_juju_tensor_index_as_tensor_index(
     std::unordered_map<std::string, uint16_t> path_index_map;
     uint64_t records = 0;
     moe_juju_runtime_probe_t probe{};
+    std::string model_config_json;
+    const int has_model_config_json = moe_read_model_config_json(root, &model_config_json);
+    if (has_model_config_json) {
+        moe_juju_probe_note_index_json(&probe, model_config_json);
+    }
     for (const std::string& path : paths) {
         moe_juju_header_t header{};
         std::vector<moe_juju_section_entry_t> sections;
@@ -1108,6 +1195,9 @@ static int load_juju_tensor_index_as_tensor_index(
     tensor_slots_reset(engine);
     engine->tensors.reserve(tensor_record_capacity(engine));
     probe = moe_juju_runtime_probe_t{};
+    if (has_model_config_json) {
+        moe_juju_probe_note_index_json(&probe, model_config_json);
+    }
     for (const std::string& path : paths) {
         moe_juju_header_t header{};
         std::vector<moe_juju_section_entry_t> sections;
@@ -1349,6 +1439,7 @@ int moe_pc_engine_load_codec_table(
     if (!engine->model_root.empty()) {
         if (moe_engine_load_offload_gguf_contract(engine, engine->model_root, &root_check)) {
             root_valid = root_check.valid;
+            moe_append_model_config_metadata(engine, engine->model_root);
         } else {
             root_valid = moe_storage_validate_model_root(engine->model_root.c_str(), &root_check) &&
                 root_check.valid;

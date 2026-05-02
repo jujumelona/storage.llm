@@ -1,5 +1,12 @@
 // Raw forward - LM head operations
 
+static inline float moe_apply_final_logit_softcap_cached(float cap, float score) {
+    if (!(cap > 0.0f) || !std::isfinite(score)) {
+        return score;
+    }
+    return std::tanh(score / cap) * cap;
+}
+
 static int moe_map_lm_head_tensor(
     moe_pc_engine* engine,
     const moe_storage_constants_t* c,
@@ -74,11 +81,25 @@ int moe_pc_engine_lm_head_top1_f32(
     if (bytes < row_bytes * (uint64_t)c->vocab_size) {
         return 0;
     }
+    const float logit_softcap = moe_final_logit_softcap_value(engine);
+    const uint64_t total_start_us = moe_profile_now_us();
+    moe_profile_log(
+        "lm_head_top1_begin",
+        "vocab=%u hidden=%u fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.6g",
+        c->vocab_size,
+        c->hidden_size,
+        (unsigned)raw.weight_format,
+        (unsigned)raw.scalar_encoding,
+        (unsigned long long)row_bytes,
+        (unsigned long long)bytes,
+        (double)logit_softcap);
 
     engine->generation_phase.store(moe_GEN_PHASE_LM_HEAD, std::memory_order_relaxed);
     engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
 
-    const uint32_t chunk_size = 1024;
+    static const unsigned int hw_raw = std::thread::hardware_concurrency();
+    static const unsigned int hw_threads = hw_raw > 0 ? hw_raw : 4u;
+    const uint32_t chunk_size = std::max(64u, (c->vocab_size + hw_threads * 8 - 1) / (hw_threads * 8));
     const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
 
     struct chunk_result_t {
@@ -91,24 +112,28 @@ int moe_pc_engine_lm_head_top1_f32(
     // exactly one thread (via cpu_next_row.fetch_add()), no mutex needed.
     std::vector<chunk_result_t> chunk_results(num_chunks);
 
-    if (!moe_parallel_rows(engine, num_chunks, 0, [&](uint32_t chunk) {
-        const uint32_t start = chunk * chunk_size;
-        const uint32_t end = std::min(start + chunk_size, c->vocab_size);
-        uint32_t local_best = start;
-        float local_max = -std::numeric_limits<float>::infinity();
+    {
+        moe_profile_parallel_label_scope rows_label("lm_head_top1");
+        if (!moe_parallel_rows(engine, num_chunks, 0, [&](uint32_t chunk) {
+            const uint32_t start = chunk * chunk_size;
+            const uint32_t end = std::min(start + chunk_size, c->vocab_size);
+            uint32_t local_best = start;
+            float local_max = -std::numeric_limits<float>::infinity();
 
-        for (uint32_t t = start; t < end; ++t) {
-            float s = moe_apply_final_logit_softcap(engine, moe_raw_tensor_dot_row(raw, t, hidden, hidden_count));
-            if (s > local_max) {
-                local_max = s;
-                local_best = t;
+            for (uint32_t t = start; t < end; ++t) {
+                const float s = moe_apply_final_logit_softcap_cached(
+                    logit_softcap, moe_raw_tensor_dot_row(raw, t, hidden, hidden_count));
+                if (s > local_max) {
+                    local_max = s;
+                    local_best = t;
+                }
             }
-        }
 
-        chunk_results[chunk] = {local_best, local_max};
-        return 1;
-    })) {
-        return 0;
+            chunk_results[chunk] = {local_best, local_max};
+            return 1;
+        })) {
+            return 0;
+        }
     }
 
     // Single-thread final reduce over chunk_results
@@ -123,6 +148,13 @@ int moe_pc_engine_lm_head_top1_f32(
 
     *out_token_id = best_token;
     *out_logit = best_score;
+    moe_profile_log(
+        "lm_head_top1_end",
+        "best=%u score=%.6g chunks=%u total_ms=%.3f",
+        best_token,
+        (double)best_score,
+        num_chunks,
+        moe_profile_elapsed_ms(total_start_us));
     return 1;
 }
 
@@ -178,59 +210,92 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     if (bytes < row_bytes * (uint64_t)c->vocab_size) {
         return 0;
     }
+    const float logit_softcap = moe_final_logit_softcap_value(engine);
+    const uint64_t total_start_us = moe_profile_now_us();
+    moe_profile_log(
+        "lm_head_logprob_begin",
+        "target=%u vocab=%u hidden=%u fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.6g",
+        target_token_id,
+        c->vocab_size,
+        c->hidden_size,
+        (unsigned)raw.weight_format,
+        (unsigned)raw.scalar_encoding,
+        (unsigned long long)row_bytes,
+        (unsigned long long)bytes,
+        (double)logit_softcap);
 
     engine->generation_phase.store(moe_GEN_PHASE_LM_HEAD, std::memory_order_relaxed);
     engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
 
-    const uint32_t chunk_size = 1024;
+    static const unsigned int hw_raw_2 = std::thread::hardware_concurrency();
+    static const unsigned int hw_threads_2 = hw_raw_2 > 0 ? hw_raw_2 : 4u;
+    const uint32_t chunk_size = std::max(64u, (c->vocab_size + hw_threads_2 * 8 - 1) / (hw_threads_2 * 8));
     const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
 
     struct chunk_logsum_t {
         float max_score;
         double exp_sum;
         float target_score;
+        uint32_t best_token;
+        float best_score;
         int has_target;
     };
     std::vector<chunk_logsum_t> chunk_results(num_chunks);
 
-    if (!moe_parallel_rows(engine, num_chunks, 0, [&](uint32_t chunk) {
-        const uint32_t start = chunk * chunk_size;
-        const uint32_t end = std::min(start + chunk_size, c->vocab_size);
-        float local_max = -std::numeric_limits<float>::infinity();
-        double local_sum = 0.0;
-        float target_score = 0.0f;
-        int has_target = 0;
+    {
+        moe_profile_parallel_label_scope rows_label("lm_head_logprob");
+        if (!moe_parallel_rows(engine, num_chunks, 0, [&](uint32_t chunk) {
+            const uint32_t start = chunk * chunk_size;
+            const uint32_t end = std::min(start + chunk_size, c->vocab_size);
+            float local_max = -std::numeric_limits<float>::infinity();
+            double local_sum = 0.0;
+            float target_score = 0.0f;
+            uint32_t local_best_token = start;
+            float local_best_score = -std::numeric_limits<float>::infinity();
+            int has_target = 0;
 
-        for (uint32_t t = start; t < end; ++t) {
-            const float score = moe_apply_final_logit_softcap(engine, moe_raw_tensor_dot_row(raw, t, hidden, hidden_count));
-            if (score <= local_max) {
-                local_sum += std::exp((double)score - (double)local_max);
-            } else if (std::isfinite(local_max)) {
-                local_sum = local_sum * std::exp((double)local_max - (double)score) + 1.0;
-                local_max = score;
-            } else {
-                local_max = score;
-                local_sum = 1.0;
+            for (uint32_t t = start; t < end; ++t) {
+                const float score = moe_apply_final_logit_softcap_cached(
+                    logit_softcap, moe_raw_tensor_dot_row(raw, t, hidden, hidden_count));
+                if (score > local_best_score) {
+                    local_best_score = score;
+                    local_best_token = t;
+                }
+                if (score <= local_max) {
+                    local_sum += std::exp((double)score - (double)local_max);
+                } else if (std::isfinite(local_max)) {
+                    local_sum = local_sum * std::exp((double)local_max - (double)score) + 1.0;
+                    local_max = score;
+                } else {
+                    local_max = score;
+                    local_sum = 1.0;
+                }
+                if (t == target_token_id) {
+                    target_score = score;
+                    has_target = 1;
+                }
             }
-            if (t == target_token_id) {
-                target_score = score;
-                has_target = 1;
-            }
+
+            chunk_results[chunk] = {local_max, local_sum, target_score, local_best_token, local_best_score, has_target};
+            return 1;
+        })) {
+            return 0;
         }
-
-        chunk_results[chunk] = {local_max, local_sum, target_score, has_target};
-        return 1;
-    })) {
-        return 0;
     }
 
     float global_max = -std::numeric_limits<float>::infinity();
     double exp_sum = 0.0;
     float target_score = 0.0f;
+    uint32_t best_token = 0;
+    float best_score = -std::numeric_limits<float>::infinity();
     int found_target = 0;
     for (uint32_t i = 0; i < num_chunks; ++i) {
         if (!(chunk_results[i].exp_sum > 0.0) || !std::isfinite(chunk_results[i].max_score)) {
             continue;
+        }
+        if (chunk_results[i].best_score > best_score) {
+            best_score = chunk_results[i].best_score;
+            best_token = chunk_results[i].best_token;
         }
         if (chunk_results[i].max_score <= global_max) {
             exp_sum += chunk_results[i].exp_sum *
@@ -252,12 +317,34 @@ int moe_pc_engine_lm_head_token_logprob_f32(
         return 0;
     }
 
+    // BUGFIX 284: Add defensive check for exp_sum before log() ★
+    // Problem: While loop checks chunk_results[i].exp_sum > 0.0, the accumulated exp_sum
+    // can still become 0.0 due to floating point underflow in exp() operations
+    // Solution: Check exp_sum > 0.0 and isfinite before log()
+    // Impact: Prevents log(0) = -inf and subsequent NaN propagation
     if (!(exp_sum > 0.0) || !std::isfinite(exp_sum)) {
         return 0;
     }
 
     const double logsumexp = (double)global_max + std::log(exp_sum);
     const double logprob = (double)target_score - logsumexp;
+    moe_profile_log(
+        "lm_head_logprob_end",
+        "target=%u target_score=%.6g best=%u best_score=%.6g global_max=%.6g logsumexp=%.6g logprob=%.6g softcap=%.6g",
+        target_token_id,
+        (double)target_score,
+        best_token,
+        (double)best_score,
+        (double)global_max,
+        logsumexp,
+        logprob,
+        (double)logit_softcap);
+    moe_profile_log(
+        "lm_head_logprob_time",
+        "target=%u chunks=%u total_ms=%.3f",
+        target_token_id,
+        num_chunks,
+        moe_profile_elapsed_ms(total_start_us));
     *out_target_logit = target_score;
     *out_logsumexp = (float)logsumexp;
     *out_logprob = (float)logprob;

@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <condition_variable>
 #include <cctype>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -36,7 +37,7 @@
 #include <utility>
 #include <vector>
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(__SSE__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
 #endif
 
@@ -137,6 +138,7 @@ static inline __m256 moe_madd_ps(__m256 a, __m256 b, __m256 c) {
 #include "parts/io_worker_lifecycle.cpp.inc"
 #include "parts/enqueue_tensor_prefetch.cpp.inc"
 #include "parts/default_configs.cpp.inc"
+#include "parts/profile_trace.cpp.inc"
 #include "parts/parallel_rows_pool.cpp.inc"
 #include "parts/parallel_rows.cpp.inc"
 #include "parts/lifecycle_backend_api.cpp.inc"
@@ -162,6 +164,7 @@ static inline __m256 moe_madd_ps(__m256 a, __m256 b, __m256 c) {
 #include "parts/tensor_fp16.cpp.inc"
 #include "parts/tensor_scale_lookup.cpp.inc"
 #include "parts/tensor_query.cpp.inc"
+#include "parts/gguf_iq_tables.cpp.inc"
 #include "parts/tensor_dot_cpu_kernels.cpp.inc"
 #include "parts/tensor_dot.cpp.inc"
 #include "parts/raw_forward_cpu.cpp.inc"

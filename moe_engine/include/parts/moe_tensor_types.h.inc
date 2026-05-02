@@ -13,7 +13,13 @@ typedef enum {
     moe_WEIGHT_ENCODING_GGUF_IQ4 = 11,
     moe_WEIGHT_ENCODING_GGUF_Q5_1 = 12,
     moe_WEIGHT_ENCODING_GGUF_Q8_0 = 13,
-    moe_WEIGHT_ENCODING_GGUF_Q5_K = 14
+    moe_WEIGHT_ENCODING_GGUF_Q5_K = 14,
+    moe_WEIGHT_ENCODING_GGUF_Q2_K = 15,
+    moe_WEIGHT_ENCODING_GGUF_Q3_K = 16,
+    moe_WEIGHT_ENCODING_GGUF_Q4_K = 17,
+    moe_WEIGHT_ENCODING_GGUF_Q6_K = 18,
+    moe_WEIGHT_ENCODING_GGUF_IQ2_XXS = 19,
+    moe_WEIGHT_ENCODING_GGUF_IQ3_XXS = 20
 } moe_weight_encoding_t;
 
 typedef struct {

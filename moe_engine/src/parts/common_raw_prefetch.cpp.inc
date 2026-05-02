@@ -102,6 +102,8 @@ static uint64_t prefetch_raw_layer_roles(
     uint64_t spans = 0;
     const uint32_t begin = moe_storage_raw_span_find_first(layer);
     const uint32_t end = moe_storage_raw_span_find_end(layer);
+    // BUGFIX 475: begin/end 범위 체크
+    if (begin > end) return 0;
     for (uint32_t i = begin; i < end; ++i) {
         const moe_storage_raw_span_spec_t* s = moe_storage_raw_span_at(i);
         if (!s || (s->role & roles) == 0 || bytes >= budget || s->bytes > budget - bytes ||
@@ -112,6 +114,8 @@ static uint64_t prefetch_raw_layer_roles(
             enqueue_raw_span_prefetch(e, i, pool) :
             prefetch_one_raw_span(e, *s, pool, 1);
         if (ok) {
+            // BUGFIX 476: bytes overflow 체크
+            if (bytes > UINT64_MAX - s->bytes) break;
             bytes += s->bytes;
             ++spans;
         }
@@ -131,19 +135,132 @@ static uint64_t prefetch_raw_layer_roles(
     return bytes;
 }
 
+static int common_tensor_is_startup_core(const moe_gguf_common_tensor_record& rec) {
+    if (rec.prefetch_class == moe_JUJU_PREFETCH_STARTUP_HOT ||
+        rec.graph_role == moe_JUJU_ROLE_NORM) {
+        return 1;
+    }
+    const std::string name = moe_lower_ascii_copy(rec.name);
+    return name == "output.weight" ||
+        name == "lm_head.weight" ||
+        name == "token_embd.weight" ||
+        name == "model.embed_tokens.weight" ||
+        name == "embed_tokens.weight" ||
+        name == "output_norm.weight" ||
+        name == "final_norm.weight" ||
+        name == "model.norm.weight" ||
+        name == "rope_freqs.weight";
+}
+
+static int common_tensor_seen(
+    const std::vector<std::pair<uint16_t, uint64_t>>& seen,
+    const moe_gguf_common_tensor_record& rec
+) {
+    for (const auto& item : seen) {
+        if (item.first == rec.resolved_path_index && item.second == rec.file_offset) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uint64_t prefetch_common_tensor_records_to_ram(moe_pc_engine* e, uint64_t budget) {
+    if (!e || budget == 0 || e->gguf_common_tensors.empty()) {
+        return 0;
+    }
+    uint64_t bytes = 0;
+    uint64_t spans = 0;
+    std::vector<std::pair<uint16_t, uint64_t>> seen;
+    for (const moe_gguf_common_tensor_record& rec : e->gguf_common_tensors) {
+        if (!common_tensor_is_startup_core(rec) ||
+            rec.bytes == 0 ||
+            bytes >= budget ||
+            rec.bytes > budget - bytes ||
+            rec.resolved_path_index >= e->tensor_paths.size() ||
+            common_tensor_seen(seen, rec)) {
+            continue;
+        }
+        const std::string& path = e->tensor_paths[rec.resolved_path_index];
+        mmap_context_t* mapped = get_or_map_shard_partial(e, path, rec.file_offset, rec.bytes);
+        const ssize_t mapped_size_signed = mapped ? mmap_get_size(mapped) : -1;
+        if (!mapped || mapped_size_signed < 0 || !mmap_get_ptr(mapped, 0) ||
+            rec.bytes > (uint64_t)mapped_size_signed) {
+            continue;
+        }
+        bool hint_issued = false;
+        if (e->io_config.enable_mmap_prefetch) {
+            mmap_prefetch(mapped, 0, (size_t)rec.bytes);
+            hint_issued = true;
+        }
+        const uint8_t* src = static_cast<const uint8_t*>(mmap_get_ptr(mapped, 0));
+        if (!src) {
+            continue;
+        }
+        touch_mapped_range(e, src, rec.bytes);
+        if (!hint_issued) {
+            e->io_atomic.bytes_touch_fallback.fetch_add(rec.bytes);
+        }
+        e->io_atomic.bytes_prefetched.fetch_add(rec.bytes);
+        e->io_atomic.bytes_disk_to_ram.fetch_add(rec.bytes);
+        e->io_atomic.disk_stage_done.fetch_add(1);
+        seen.push_back({rec.resolved_path_index, rec.file_offset});
+        bytes += rec.bytes;
+        ++spans;
+    }
+    if (bytes) {
+        e->common_raw_prefetched_bytes.fetch_add(bytes);
+        e->common_raw_prefetched_spans.fetch_add(spans);
+    }
+    return bytes;
+}
+
 static void trigger_ram_expert_promotion(moe_pc_engine* e);
 static int prefetch_fixed_core_raw(moe_pc_engine* e) {
     uint64_t budget = e ? e->common_vram_reserved_bytes.load() : 0;
     uint64_t bytes = 0;
-    if (!e || !e->io_config.enable_common_raw_vram_pin || budget == 0) {
+    if (!e) {
+        return 0;
+    }
+    const moe_storage_constants_t runtime_storage = moe_engine_storage_constants_or_static(e);
+    const moe_storage_constants_t* storage = &runtime_storage;
+    const int32_t norm_layer = storage ? (int32_t)storage->num_hidden_layers : 79;
+    const int32_t lm_head_layer = norm_layer + 1;
+    if (!e->io_config.enable_common_raw_vram_pin || budget == 0) {
+        const uint64_t ram_budget = tier_budget(e, moe_TIER_RAM);
+        const uint64_t ram_used = tier_used(e, moe_TIER_RAM);
+        uint64_t ram_room = ram_budget > ram_used ? ram_budget - ram_used : 0;
+        if (ram_room > 0) {
+            const uint64_t available = storagellm::available_ram_bytes();
+            const uint64_t reserve = 512ull * 1024ull * 1024ull;
+            if (available > reserve) {
+                ram_room = std::min<uint64_t>(ram_room, available - reserve);
+            }
+        }
+        if (ram_room > 0) {
+            std::fprintf(stderr, "[storagellm] common raw RAM warm start: budget=%llu\n",
+                (unsigned long long)ram_room);
+            std::fflush(stderr);
+            bytes += prefetch_raw_layer_roles(e, norm_layer, moe_RAW_ROLE_NORM, moe_DEVICE_POOL_FIXED, ram_room - bytes);
+            if (bytes < ram_room) {
+                bytes += prefetch_raw_layer_roles(e, lm_head_layer, moe_RAW_ROLE_LM_HEAD, moe_DEVICE_POOL_FIXED, ram_room - bytes);
+            }
+            if (bytes == 0 && ram_room > 0) {
+                bytes += prefetch_raw_layer_roles(e, -1, moe_RAW_ROLE_EMBED, moe_DEVICE_POOL_FIXED, ram_room);
+            }
+            if (bytes < ram_room) {
+                bytes += prefetch_common_tensor_records_to_ram(e, ram_room - bytes);
+            }
+            std::fprintf(stderr, "[storagellm] common raw RAM warm done: bytes=%llu ram_used=%llu budget=%llu\n",
+                (unsigned long long)bytes,
+                (unsigned long long)tier_used(e, moe_TIER_RAM),
+                (unsigned long long)ram_budget);
+            std::fflush(stderr);
+        }
         if (e) {
             trigger_ram_expert_promotion(e);
         }
-        return 0;
+        return bytes > 0 ? 1 : 0;
     }
-    const moe_storage_constants_t* storage = moe_storage_constants();
-    const int32_t norm_layer = storage ? (int32_t)storage->num_hidden_layers : 79;
-    const int32_t lm_head_layer = norm_layer + 1;
     std::fprintf(stderr, "[storagellm] common raw device pin start: budget=%llu\n",
         (unsigned long long)budget);
     std::fflush(stderr);

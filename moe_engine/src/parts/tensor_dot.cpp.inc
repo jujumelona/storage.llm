@@ -1,3 +1,23 @@
+static int moe_dot_weight_format_supported(int weight_format) {
+    return weight_format == moe_WEIGHT_ENCODING_RAW_FP16 ||
+        weight_format == moe_WEIGHT_ENCODING_RAW_FP32 ||
+        weight_format == moe_WEIGHT_ENCODING_NVFP4 ||
+        weight_format == moe_WEIGHT_ENCODING_MXFP4 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q2_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q3_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q6_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS ||
+        weight_format == moe_WEIGHT_ENCODING_LINEAR_Q2 ||
+        weight_format == moe_WEIGHT_ENCODING_LINEAR_Q3 ||
+        weight_format == moe_WEIGHT_ENCODING_LINEAR_Q4 ||
+        weight_format == moe_WEIGHT_ENCODING_LINEAR_Q8;
+}
+
 static int moe_dot_tensor_record_row(
     moe_pc_engine_t* engine,
     const moe_tensor_record* rec,
@@ -15,6 +35,9 @@ static int moe_dot_tensor_record_row(
         return 0;
     }
     const int weight_format = tensor_weight_format(*rec);
+    if (!moe_dot_weight_format_supported(weight_format)) {
+        return 0;
+    }
     const uint64_t row_offset = rec->info.weight_byte_offset + (uint64_t)row * rec->weight_row_bytes;
     const uint64_t shard_size = (uint64_t)mmap_get_size(shard);
     if (row_offset > shard_size || rec->weight_row_bytes > shard_size - row_offset) {
@@ -46,6 +69,34 @@ static int moe_dot_tensor_record_row(
     }
     if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
         *out_value = moe_dot_gguf_q5_1_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q2_K) {
+        *out_value = moe_dot_gguf_q2_k_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q3_K) {
+        *out_value = moe_dot_gguf_q3_k_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_K) {
+        *out_value = moe_dot_gguf_q4_k_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
+        *out_value = moe_dot_gguf_q5_k_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q6_K) {
+        *out_value = moe_dot_gguf_q6_k_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS) {
+        *out_value = moe_dot_gguf_iq2_xxs_row(packed, x, rec->info.cols);
+        return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS) {
+        *out_value = moe_dot_gguf_iq3_xxs_row(packed, x, rec->info.cols);
         return 1;
     }
     if (weight_format == moe_WEIGHT_ENCODING_LINEAR_Q2 ||
@@ -93,6 +144,9 @@ static int moe_dot_tensor_record_row_batch(
     // overcomes the memory-bandwidth bottleneck of single-token decode.
 
     const int weight_format = tensor_weight_format(*rec);
+    if (!moe_dot_weight_format_supported(weight_format)) {
+        return 0;
+    }
     const uint64_t row_offset = rec->info.weight_byte_offset + (uint64_t)row * rec->weight_row_bytes;
     const uint64_t shard_size = (uint64_t)mmap_get_size(shard);
     if (row_offset > shard_size || rec->weight_row_bytes > shard_size - row_offset) {
@@ -104,6 +158,15 @@ static int moe_dot_tensor_record_row_batch(
     // TODO: A fully optimized SIMD SGEMM kernel would interleave the token vectors
     // to maximize register usage. For now, we reuse the L1 cache for the packed weights.
     for (uint32_t b = 0; b < batch_size; ++b) {
+        // BUGFIX 283: Check batch_x[b] for null before dereferencing ★
+        // Problem: batch_x array is checked for null, but individual batch_x[b] pointers are not
+        // If caller passes array with null elements, segfault occurs
+        // Solution: Skip null pointers and set output to 0.0f
+        if (!batch_x[b]) {
+            out_values[b] = 0.0f;
+            continue;
+        }
+
         if (weight_format == moe_WEIGHT_ENCODING_RAW_FP16) {
             out_values[b] = moe_dot_raw_fp16_row(packed, batch_x[b], rec->info.cols);
         }
@@ -122,8 +185,35 @@ static int moe_dot_tensor_record_row_batch(
         else if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
             out_values[b] = moe_dot_gguf_q5_1_row(packed, batch_x[b], rec->info.cols);
         }
-        else {
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q2_K) {
+            out_values[b] = moe_dot_gguf_q2_k_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q3_K) {
+            out_values[b] = moe_dot_gguf_q3_k_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_K) {
+            out_values[b] = moe_dot_gguf_q4_k_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
+            out_values[b] = moe_dot_gguf_q5_k_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q6_K) {
+            out_values[b] = moe_dot_gguf_q6_k_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS) {
+            out_values[b] = moe_dot_gguf_iq2_xxs_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS) {
+            out_values[b] = moe_dot_gguf_iq3_xxs_row(packed, batch_x[b], rec->info.cols);
+        }
+        else if (weight_format == moe_WEIGHT_ENCODING_LINEAR_Q2 ||
+                 weight_format == moe_WEIGHT_ENCODING_LINEAR_Q3 ||
+                 weight_format == moe_WEIGHT_ENCODING_LINEAR_Q4 ||
+                 weight_format == moe_WEIGHT_ENCODING_LINEAR_Q8) {
             out_values[b] = moe_dot_linear_quant_row(*rec, shard, packed, batch_x[b], rec->weight_bits, row);
+        }
+        else {
+            return 0;
         }
     }
     return 1;

@@ -103,6 +103,14 @@ static int moe_kv_decode_layer_cache_prepare(
     }
     const uint32_t entry_dim = s->kv_cache.entry_dim ? s->kv_cache.entry_dim : moe_MLA_KV_ENTRY_DIM;
     const size_t total_needed = (size_t)s->kv_cache.num_layers * s->kv_cache.max_seq_len * entry_dim;
+
+    // BUGFIX 537: Check total_needed before resize to prevent overflow ★
+    // Problem: num_layers * max_seq_len * entry_dim can overflow causing huge allocation
+    // Solution: Check total_needed < 10000000000 (10GB reasonable max)
+    if (total_needed > 10000000000ULL) {
+        return 0;
+    }
+
     if (s->kv_decode_flat.size() < total_needed) {
         s->kv_decode_flat.resize(total_needed);
         s->kv_decoded_up_to.assign(s->kv_cache.num_layers, 0u);
@@ -130,8 +138,30 @@ static void moe_rope_table_resize(
     if (!cos_table || !sin_table || dim == 0 || dim < 2) {
         return;
     }
+    static const uint32_t rope_precompute_cap = []() -> uint32_t {
+        const char* env = std::getenv("STORAGELLM_ROPE_PRECOMPUTE");
+        if (env && env[0]) {
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(env, &end, 10);
+            if (end != env && parsed > 0ul) {
+                return parsed > 1048576ul ? 1048576u : (uint32_t)parsed;
+            }
+        }
+        return 4096u;
+    }();
+    if (table_len > rope_precompute_cap) {
+        table_len = rope_precompute_cap;
+    }
     const uint32_t half_dim = dim / 2u;
     const size_t needed = (size_t)table_len * (size_t)half_dim;
+
+    // BUGFIX 536: Check needed size before resize to prevent overflow ★
+    // Problem: table_len * half_dim can overflow size_t causing huge allocation
+    // Solution: Check needed < 100000000 (reasonable max for RoPE table)
+    if (needed > 100000000) {
+        return;
+    }
+
     if (cos_table->size() == needed && sin_table->size() == needed) {
         return;
     }
@@ -160,6 +190,14 @@ static void moe_decode_scratch_resize(
     int pre_allocate_kv,
     moe_pc_engine* engine = nullptr
 ) {
+    // BUGFIX 538: Validate input parameters before use ★
+    // Problem: c can have invalid values causing overflow in resize operations
+    // Solution: Check ranges before use
+    if (!s || !c || c->hidden_size > 100000 || c->expert_intermediate_size > 100000 ||
+        c->experts_per_moe_layer > 10000 || c->num_hidden_layers > 1000) {
+        return;
+    }
+
     const uint32_t hidden = c->hidden_size;
     const uint32_t expert_intermediate = c->expert_intermediate_size;
     const moe_attn_config_t cfg = attn_cfg ? *attn_cfg : moe_legacy_mla_attn_config();
@@ -168,6 +206,16 @@ static void moe_decode_scratch_resize(
     const uint32_t kv_entry_dim = moe_attn_kv_entry_dim(cfg);
     const uint32_t q_b_dim = moe_attn_q_b_dim(cfg);
     const uint32_t v_total_dim = moe_attn_v_total_dim(cfg);
+
+    // BUGFIX 539: Check computed dimensions before resize ★
+    // Problem: Computed dimensions can overflow causing huge allocations
+    // Solution: Validate all computed dimensions
+    if (kv_a_dim > 100000 || kv_entry_dim > 100000 || q_b_dim > 100000 ||
+        v_total_dim > 100000 || q_lora_rank > 100000 || cfg.kv_lora_rank > 100000 ||
+        cfg.num_heads > 1000) {
+        return;
+    }
+
     s->hidden.resize(hidden);
     s->residual.resize(hidden);
     s->norm.resize(hidden);

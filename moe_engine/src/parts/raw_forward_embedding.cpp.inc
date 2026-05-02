@@ -10,6 +10,10 @@ static int moe_copy_embedding_row_f32(
     uint32_t token_id,
     float* out_hidden
 ) {
+    // BUGFIX 314: Add null check for c before accessing members ★
+    // Problem: c can be null if caller passes invalid pointer
+    // Accessing c->vocab_size with null c causes crash
+    // Solution: Check c before use
     if (!c || !base || !out_hidden || token_id >= c->vocab_size) {
         return 0;
     }
@@ -23,12 +27,23 @@ static int moe_copy_embedding_row_f32(
     raw.weight_row_bytes = weight_row_bytes;
     const uint64_t row_bytes = moe_raw_tensor_row_bytes(raw, c->hidden_size);
     const uint64_t row_offset = row_bytes * (uint64_t)token_id;
-    if (row_offset > bytes || row_bytes > bytes - row_offset) {
+    // BUGFIX 315: Check row_bytes > 0 before using in offset calculation ★
+    // Problem: If row_bytes is 0 (invalid encoding), row_offset is 0 for all tokens
+    // All tokens map to same memory location → wrong embeddings
+    // Solution: Check row_bytes > 0 before proceeding
+    if (row_bytes == 0 || row_offset > bytes || row_bytes > bytes - row_offset) {
         return 0;
     }
     const uint8_t* row = base + row_offset;
     if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0 ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q2_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q3_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q6_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS ||
         weight_format == moe_WEIGHT_ENCODING_MXFP4) {
         return moe_raw_tensor_copy_row_f32(raw, token_id, out_hidden, c->hidden_size);
     }

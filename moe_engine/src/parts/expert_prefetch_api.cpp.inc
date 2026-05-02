@@ -112,7 +112,8 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
         engine->io_config.max_prefetch_queue : 4096u;
     const uint32_t queue_high = queue_cap > 32u ? queue_cap - 32u : queue_cap;
 
-    for (uint32_t layer = c->first_moe_layer; layer <= c->last_moe_layer; ++layer) {
+    bool budget_full = false;
+    for (uint32_t layer = c->first_moe_layer; layer <= c->last_moe_layer && !budget_full; ++layer) {
         for (uint32_t expert = 0; expert < c->experts_per_moe_layer; ++expert) {
             const uint64_t bytes = expert_triplet_or_hardcoded_bytes(
                 engine,
@@ -126,11 +127,15 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
             if (vram_limit > 0 && planned_vram + bytes <= vram_limit) {
                 target = moe_TIER_VRAM;
                 planned_vram += bytes;
+            } else if (ram_limit > 0 && planned_ram + bytes <= ram_limit) {
+                target = moe_TIER_RAM;
+                planned_ram += bytes;
             } else {
-                // Stop queuing once VRAM budget is reached.
-                // Do NOT queue RAM experts during startup_warm to prevent massive disk IO
-                // and 60-second timeouts. RAM experts will be page-faulted on demand.
-                return queued > 0 ? 1 : 0;
+                // Stop once the active compute tiers are full. CPU-only roots have
+                // no VRAM budget, so RAM warm is the primary way to avoid first-token
+                // cold page-fault storms.
+                budget_full = true;
+                break;
             }
 
             // BUGFIX 95: Cache atomic loads in throttle loop

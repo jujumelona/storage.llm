@@ -12,12 +12,17 @@ static uint8_t weight_bits_for_encoding(uint8_t encoding) {
         case moe_WEIGHT_ENCODING_MXFP4:
         case moe_WEIGHT_ENCODING_LINEAR_Q4:
         case moe_WEIGHT_ENCODING_GGUF_IQ4:
+        case moe_WEIGHT_ENCODING_GGUF_Q4_K:
             return 4;
         case moe_WEIGHT_ENCODING_LINEAR_Q3:
         case moe_WEIGHT_ENCODING_GGUF_IQ3:
+        case moe_WEIGHT_ENCODING_GGUF_IQ3_XXS:
+        case moe_WEIGHT_ENCODING_GGUF_Q3_K:
             return 3;
         case moe_WEIGHT_ENCODING_LINEAR_Q2:
         case moe_WEIGHT_ENCODING_GGUF_IQ2:
+        case moe_WEIGHT_ENCODING_GGUF_IQ2_XXS:
+        case moe_WEIGHT_ENCODING_GGUF_Q2_K:
             return 2;
         case moe_WEIGHT_ENCODING_LINEAR_Q8:
         case moe_WEIGHT_ENCODING_GGUF_Q8_0:
@@ -25,6 +30,8 @@ static uint8_t weight_bits_for_encoding(uint8_t encoding) {
         case moe_WEIGHT_ENCODING_GGUF_Q5_1:
         case moe_WEIGHT_ENCODING_GGUF_Q5_K:
             return 5;
+        case moe_WEIGHT_ENCODING_GGUF_Q6_K:
+            return 6;
         default:
             return 0;
     }
@@ -88,9 +95,15 @@ static uint64_t infer_weight_row_bytes(const moe_tensor_info_t& info, uint8_t fo
     }
     if (format == moe_WEIGHT_ENCODING_GGUF_Q5_1 ||
         format == moe_WEIGHT_ENCODING_GGUF_Q5_K ||
+        format == moe_WEIGHT_ENCODING_GGUF_Q2_K ||
+        format == moe_WEIGHT_ENCODING_GGUF_Q3_K ||
+        format == moe_WEIGHT_ENCODING_GGUF_Q4_K ||
+        format == moe_WEIGHT_ENCODING_GGUF_Q6_K ||
         format == moe_WEIGHT_ENCODING_MXFP4 ||
         format == moe_WEIGHT_ENCODING_GGUF_IQ2 ||
+        format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS ||
         format == moe_WEIGHT_ENCODING_GGUF_IQ3 ||
+        format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS ||
         format == moe_WEIGHT_ENCODING_GGUF_IQ4) {
         return info.rows ? info.weight_byte_length / (uint64_t)info.rows : 0;
     }
@@ -134,6 +147,13 @@ static void finalize_tensor_layout(moe_tensor_record* rec, uint8_t gguf_encoding
         rec->weight_format == moe_WEIGHT_ENCODING_NVFP4 ||
         rec->weight_format == moe_WEIGHT_ENCODING_MXFP4 ||
         rec->weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1 ||
+        rec->weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K ||
+        rec->weight_format == moe_WEIGHT_ENCODING_GGUF_Q2_K ||
+        rec->weight_format == moe_WEIGHT_ENCODING_GGUF_Q3_K ||
+        rec->weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_K ||
+        rec->weight_format == moe_WEIGHT_ENCODING_GGUF_Q6_K ||
+        rec->weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS ||
+        rec->weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS ||
         rec->weight_format == moe_WEIGHT_ENCODING_LINEAR_Q2 ||
         rec->weight_format == moe_WEIGHT_ENCODING_LINEAR_Q3 ||
         rec->weight_format == moe_WEIGHT_ENCODING_LINEAR_Q4 ||

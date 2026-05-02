@@ -45,14 +45,34 @@ static int moe_common_linear_f32(
         raw.cols != input_count || raw.rows != output_count) {
         return 0;
     }
+    // BUGFIX 506: Check raw.base validity before computing row_bytes ★
+    // Problem: raw.base can be null if tensor mapping failed
+    // moe_raw_tensor_row_bytes may dereference raw.base internally
+    // Solution: Check raw.base before use
+    if (!raw.base) {
+        return 0;
+    }
     const uint64_t row_bytes = moe_raw_tensor_row_bytes(raw, raw.cols);
     if (row_bytes == 0 || raw.bytes < row_bytes * (uint64_t)raw.rows) {
         return 0;
     }
+    moe_profile_parallel_label_scope rows_label("common_linear");
     return moe_parallel_rows(engine, raw.rows, 0, [&](uint32_t row) {
         output[row] = moe_raw_tensor_dot_row(raw, row, input, input_count);
         return 1;
     });
+}
+
+static inline float moe_generation_gelu_tanh(float x) {
+    const float k = 0.7978845608028654f;
+    return 0.5f * x * (1.0f + std::tanh(k * (x + 0.044715f * x * x * x)));
+}
+
+static inline float moe_generation_gated_activation_cached(int activation_mode, float gate, float up) {
+    if (activation_mode == 2) {
+        return moe_generation_gelu_tanh(gate) * up;
+    }
+    return (activation_mode == 1 ? moe_generation_gelu(gate) : moe_generation_silu(gate)) * up;
 }
 
 static int moe_raw_tensor_scalar_at_f32(
@@ -282,6 +302,13 @@ static int moe_layer_output_scale_f32(
     if (!engine || !hidden || hidden_size == 0) {
         return 0;
     }
+    // BUGFIX 507: Check hidden_size upper bound to prevent overflow ★
+    // Problem: hidden_size can be arbitrarily large from config
+    // Loop for (i = 0; i < hidden_size; ++i) can run billions of iterations
+    // Solution: Add reasonable upper bound check (e.g., 100000)
+    if (hidden_size > 100000) {
+        return 0;
+    }
     static const char* const suffixes[] = {
         "layer_output_scale.weight",
         "layer_scalar.weight",
@@ -358,6 +385,20 @@ static int moe_layer_apply_expert_down_scale_f32(
     uint32_t hidden_size
 ) {
     if (!engine || !values || expert_id < 0 || hidden_size == 0) {
+        return 0;
+    }
+    // BUGFIX 508: Check hidden_size upper bound to prevent overflow ★
+    // Problem: hidden_size can be arbitrarily large from config
+    // Loop for (i = 0; i < hidden_size; ++i) can run billions of iterations
+    // Solution: Add reasonable upper bound check (e.g., 100000)
+    if (hidden_size > 100000) {
+        return 0;
+    }
+    // BUGFIX 509: Check experts upper bound to prevent overflow ★
+    // Problem: experts can be arbitrarily large from config
+    // expert_id < experts check can pass with huge experts value
+    // Solution: Add reasonable upper bound check (e.g., 10000)
+    if (experts > 10000) {
         return 0;
     }
     static const char* const suffixes[] = {
@@ -449,6 +490,9 @@ static int moe_layer_common_dense_mlp_f32(
         "ffn.w2.weight",
         "w2.weight"
     };
+    const uint64_t total_start_us = moe_profile_now_us();
+    const uint64_t map_start_us = moe_profile_now_us();
+    moe_profile_log("mlp_dense_begin", "layer=%d hidden=%u", layer, hidden_size);
     moe_raw_tensor_cache_entry gate{};
     moe_raw_tensor_cache_entry up{};
     moe_raw_tensor_cache_entry down{};
@@ -458,7 +502,14 @@ static int moe_layer_common_dense_mlp_f32(
         return 0;
     }
     const uint32_t intermediate = gate.rows;
-    if (intermediate == 0 || up.rows != intermediate ||
+    // BUGFIX 510: Check intermediate upper bound to prevent overflow ★
+    // Problem: intermediate can be arbitrarily large from tensor shape
+    // Used in scratch buffer resize and parallel_rows loop
+    // Solution: Add reasonable upper bound check (e.g., 100000)
+    if (intermediate == 0 || intermediate > 100000) {
+        return 0;
+    }
+    if (up.rows != intermediate ||
         gate.cols != hidden_size || up.cols != hidden_size ||
         down.rows != hidden_size || down.cols != intermediate) {
         return 0;
@@ -473,17 +524,46 @@ static int moe_layer_common_dense_mlp_f32(
             s->gate.size(), s->up.size(), s->shared.size());
         return 0;
     }
-    if (!moe_parallel_rows(engine, intermediate, 0, [&](uint32_t row) {
-        const float g = moe_raw_tensor_dot_row(gate, row, input, hidden_size);
-        const float u = moe_raw_tensor_dot_row(up, row, input, hidden_size);
-        s->gate[row] = moe_generation_gated_activation(engine, g, u);
-        return 1;
-    })) {
-        return 0;
+    const uint64_t gate_row_bytes = gate.base ? moe_raw_tensor_row_bytes(gate, gate.cols) : 0;
+    const uint64_t up_row_bytes = up.base ? moe_raw_tensor_row_bytes(up, up.cols) : 0;
+    const uint64_t down_row_bytes = down.base ? moe_raw_tensor_row_bytes(down, down.cols) : 0;
+    moe_profile_log(
+        "mlp_dense_map",
+        "layer=%d intermediate=%u gate=%ux%u up=%ux%u down=%ux%u "
+        "gate_fmt=%u gate_scalar=%u gate_row_bytes=%llu gate_weight_row_bytes=%llu gate_bytes=%llu "
+        "up_fmt=%u up_scalar=%u up_row_bytes=%llu up_weight_row_bytes=%llu up_bytes=%llu "
+        "down_fmt=%u down_scalar=%u down_row_bytes=%llu down_weight_row_bytes=%llu down_bytes=%llu ms=%.3f",
+        layer, intermediate, gate.rows, gate.cols, up.rows, up.cols, down.rows, down.cols,
+        (unsigned)gate.weight_format, (unsigned)gate.scalar_encoding,
+        (unsigned long long)gate_row_bytes, (unsigned long long)gate.weight_row_bytes, (unsigned long long)gate.bytes,
+        (unsigned)up.weight_format, (unsigned)up.scalar_encoding,
+        (unsigned long long)up_row_bytes, (unsigned long long)up.weight_row_bytes, (unsigned long long)up.bytes,
+        (unsigned)down.weight_format, (unsigned)down.scalar_encoding,
+        (unsigned long long)down_row_bytes, (unsigned long long)down.weight_row_bytes, (unsigned long long)down.bytes,
+        moe_profile_elapsed_ms(map_start_us));
+    const uint64_t gate_up_start_us = moe_profile_now_us();
+    const int activation_mode = moe_engine_gelu_activation_mode(engine);
+    {
+        moe_profile_parallel_label_scope rows_label("dense_mlp_gate_up");
+        if (!moe_parallel_rows(engine, intermediate, 0, [&](uint32_t row) {
+            const float g = moe_raw_tensor_dot_row(gate, row, input, hidden_size);
+            const float u = moe_raw_tensor_dot_row(up, row, input, hidden_size);
+            s->gate[row] = moe_generation_gated_activation_cached(activation_mode, g, u);
+            return 1;
+        })) {
+            return 0;
+        }
     }
+    const double gate_up_ms = moe_profile_elapsed_ms(gate_up_start_us);
+    const uint64_t down_start_us = moe_profile_now_us();
     if (!moe_common_linear_f32(engine, down, s->gate.data(), intermediate, out_hidden, hidden_size)) {
         return 0;
     }
+    moe_profile_log(
+        "mlp_dense_end",
+        "layer=%d intermediate=%u hidden=%u gate_up_ms=%.3f down_ms=%.3f total_ms=%.3f",
+        layer, intermediate, hidden_size, gate_up_ms,
+        moe_profile_elapsed_ms(down_start_us), moe_profile_elapsed_ms(total_start_us));
     return 1;
 }
 
@@ -494,8 +574,15 @@ static int moe_layer_dense_mlp_f32(
     float* hidden,
     uint32_t hidden_size
 ) {
+    const uint64_t total_start_us = moe_profile_now_us();
     if (moe_layer_common_dense_mlp_f32(engine, layer, s, s->norm.data(), hidden_size, s->mlp.data())) {
-        return moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
+        const uint64_t residual_start_us = moe_profile_now_us();
+        const int ok = moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
+        moe_profile_log(
+            "mlp_dense_residual",
+            "layer=%d ok=%d residual_ms=%.3f total_ms=%.3f",
+            layer, ok, moe_profile_elapsed_ms(residual_start_us), moe_profile_elapsed_ms(total_start_us));
+        return ok;
     }
     const uint32_t dense_intermediate = 12288u;
     const uint64_t bytes =
@@ -510,12 +597,21 @@ static int moe_layer_dense_mlp_f32(
     if (!span) {
         return 0;
     }
+    moe_profile_log("mlp_dense_fallback_begin", "layer=%d hidden=%u intermediate=%u", layer, hidden_size, dense_intermediate);
+    const uint64_t raw_span_start_us = moe_profile_now_us();
     if (!moe_raw_mlp_span_f32(
             engine, span, s->norm.data(), hidden_size, dense_intermediate,
             s->gate.data(), s->up.data(), s->mlp.data())) {
         return 0;
     }
-    return moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
+    const uint64_t residual_start_us = moe_profile_now_us();
+    const int ok = moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
+    moe_profile_log(
+        "mlp_dense_fallback_end",
+        "layer=%d ok=%d raw_span_ms=%.3f residual_ms=%.3f total_ms=%.3f",
+        layer, ok, moe_profile_elapsed_ms(raw_span_start_us),
+        moe_profile_elapsed_ms(residual_start_us), moe_profile_elapsed_ms(total_start_us));
+    return ok;
 }
 
 static int moe_layer_moe_mlp_f32(
@@ -525,23 +621,32 @@ static int moe_layer_moe_mlp_f32(
     float* hidden,
     const moe_storage_constants_t* c
 ) {
+    const uint64_t total_start_us = moe_profile_now_us();
     const uint32_t hidden_size = c->hidden_size;
     const uint32_t configured_expert_intermediate = c->expert_intermediate_size;
     const moe_attn_config_t attn_cfg = moe_generation_attn_config(engine);
+    moe_profile_log(
+        "mlp_moe_begin",
+        "layer=%d hidden=%u configured_intermediate=%u experts=%u first_moe=%u last_moe=%u",
+        layer, hidden_size, configured_expert_intermediate,
+        c->experts_per_moe_layer, c->first_moe_layer, c->last_moe_layer);
     std::fill(s->mlp.begin(), s->mlp.end(), 0.0f);
 
+    const uint64_t norm_start_us = moe_profile_now_us();
     const float* shared_input = s->norm.data();
     const float* expert_input = s->norm.data();
     if (moe_layer_moe_norm_f32(
             engine, layer, hidden, hidden_size, s->expert.data(), attn_cfg.rms_norm_eps)) {
         expert_input = s->expert.data();
     }
+    moe_profile_log("mlp_moe_norm", "layer=%d ms=%.3f", layer, moe_profile_elapsed_ms(norm_start_us));
 
     const uint64_t shared_bytes =
         2ull * (uint64_t)configured_expert_intermediate * (uint64_t)hidden_size * 2ull +
         (uint64_t)hidden_size * (uint64_t)configured_expert_intermediate * 2ull;
     const moe_storage_raw_span_spec_t* shared = find_raw_role_span_bytes(layer, moe_RAW_ROLE_SHARED, shared_bytes, 0);
     int shared_ok = 0;
+    const uint64_t shared_start_us = moe_profile_now_us();
     if (moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
         shared_ok = 1;
     } else if (shared &&
@@ -564,8 +669,13 @@ static int moe_layer_moe_mlp_f32(
             s->mlp[i] += shared_out[i] * shared_gate;
         }
     }
+    moe_profile_log(
+        "mlp_moe_shared",
+        "layer=%d ok=%d has_raw_span=%d ms=%.3f",
+        layer, shared_ok, shared ? 1 : 0, moe_profile_elapsed_ms(shared_start_us));
 
     moe_save_gate_input_snapshot(engine, layer, expert_input, hidden_size);
+    const uint64_t router_start_us = moe_profile_now_us();
     if (!moe_router_topk_f32(
             engine,
             layer,
@@ -586,7 +696,13 @@ static int moe_layer_moe_mlp_f32(
         return 0;
     }
     moe_juju_update_co_activation(engine, layer, s->selected_experts);
+    moe_profile_log(
+        "mlp_moe_router",
+        "layer=%d selected=%zu weights=%zu logits=%zu ms=%.3f",
+        layer, s->selected_experts.size(), s->selected_weights.size(),
+        s->router_logits.size(), moe_profile_elapsed_ms(router_start_us));
     const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
+    const uint64_t prefetch_start_us = moe_profile_now_us();
     if (phase != moe_GEN_PHASE_PREFILL) {
         const uint32_t depth = engine->adaptive_prefetch_depth.load(std::memory_order_relaxed);
 
@@ -666,6 +782,12 @@ static int moe_layer_moe_mlp_f32(
             0
         );
     }
+    moe_profile_log(
+        "mlp_moe_prefetch",
+        "layer=%d phase=%u adaptive_depth=%u ms=%.3f",
+        layer, phase,
+        engine ? engine->adaptive_prefetch_depth.load(std::memory_order_relaxed) : 0u,
+        moe_profile_elapsed_ms(prefetch_start_us));
 
 
     // Phase 2: Run experts in parallel with per-expert scratch buffers.
@@ -675,6 +797,16 @@ static int moe_layer_moe_mlp_f32(
         std::fprintf(stderr,
             "[storagellm mlp] router produced invalid selection layer=%d selected=%zu weights=%zu\n",
             layer, num_selected, s->selected_weights.size());
+        return 0;
+    }
+    // BUGFIX 511: Check num_selected upper bound before resize ★
+    // Problem: num_selected can be arbitrarily large if router is corrupted
+    // Resizing to huge num_selected causes memory exhaustion
+    // Solution: Add reasonable upper bound check (e.g., 1000)
+    if (num_selected > 1000) {
+        std::fprintf(stderr,
+            "[storagellm mlp] router produced excessive selection layer=%d selected=%zu\n",
+            layer, num_selected);
         return 0;
     }
     // BUGFIX 210: Auto-resize expert_work if undersized (extends BUGFIX 66)
@@ -687,7 +819,14 @@ static int moe_layer_moe_mlp_f32(
             num_selected, s->expert_work.size(), layer);
         s->expert_work.resize(num_selected);
     }
+    // BUGFIX 623: Check expert_work not empty before data() call ★
+    // Problem: If num_selected is 0, expert_work can be empty, data() returns nullptr
+    // Solution: Check empty before data() call
+    if (s->expert_work.empty()) {
+        return 1;  // No experts to process
+    }
     moe_expert_work_t* work = s->expert_work.data();
+    const uint64_t work_init_start_us = moe_profile_now_us();
     for (size_t e = 0; e < num_selected; ++e) {
         work[e].gate = nullptr;
         work[e].up = nullptr;
@@ -696,6 +835,10 @@ static int moe_layer_moe_mlp_f32(
         work[e].expert_id = s->selected_experts[e];
         work[e].ok = 0;
     }
+    moe_profile_log(
+        "mlp_moe_work_init",
+        "layer=%d selected=%zu ms=%.3f",
+        layer, num_selected, moe_profile_elapsed_ms(work_init_start_us));
 
     // Fix 2: Flat row-parallel expert dispatch.
     // Instead of 8 sequential run_expert_triplet_f32 calls (each taking the full
@@ -734,6 +877,7 @@ static int moe_layer_moe_mlp_f32(
     uint32_t first_gate_rows = 0, first_gate_cols = 0;
     uint32_t first_up_rows = 0, first_up_cols = 0;
     uint32_t first_down_rows = 0, first_down_cols = 0;
+    const uint64_t map_start_us = moe_profile_now_us();
     for (size_t e = 0; e < num_selected; ++e) {
         shards[e].gate_rec = find_tensor_record(engine, layer, work[e].expert_id, moe_PROJ_GATE);
         shards[e].up_rec = find_tensor_record(engine, layer, work[e].expert_id, moe_PROJ_UP);
@@ -818,6 +962,12 @@ static int moe_layer_moe_mlp_f32(
     for (size_t e = 0; e < num_selected; ++e) {
         mapped_experts += expert_ok[e].load(std::memory_order_acquire) ? 1u : 0u;
     }
+    moe_profile_log(
+        "mlp_moe_map",
+        "layer=%d selected=%zu mapped=%u missing=%u shape_mismatch=%u map_failed=%u gate=%ux%u up=%ux%u down=%ux%u ms=%.3f",
+        layer, num_selected, mapped_experts, missing_experts, shape_mismatch_experts, map_failed_experts,
+        gate_rows, gate_cols, up_rows, up_cols, down_rows, down_cols,
+        moe_profile_elapsed_ms(map_start_us));
     if (mapped_experts == 0) {
         const uint32_t expected_intermediate = gate_rows ? gate_rows : configured_expert_intermediate;
         const uint32_t expected_gate_cols = gate_cols ? gate_cols : hidden_size;
@@ -843,9 +993,31 @@ static int moe_layer_moe_mlp_f32(
             layer, expert_intermediate);
         return 0;
     }
+    // BUGFIX 512: Check expert_intermediate upper bound before resize ★
+    // Problem: expert_intermediate can be arbitrarily large from tensor shape
+    // num_selected * expert_intermediate can overflow size_t
+    // Resizing to huge size causes memory exhaustion
+    // Solution: Add reasonable upper bound check (e.g., 100000)
+    if (expert_intermediate > 100000) {
+        std::fprintf(stderr, "[storagellm mlp] invalid intermediate size layer=%d intermediate=%u\n",
+            layer, expert_intermediate);
+        return 0;
+    }
     const size_t needed_gate = num_selected * (size_t)expert_intermediate;
     const size_t needed_up = needed_gate;
     const size_t needed_out = num_selected * (size_t)hidden_size;
+    // BUGFIX 513: Check resize sizes for overflow ★
+    // Problem: needed_gate, needed_up, needed_out can overflow size_t
+    // Causes vector resize to fail or allocate wrong size
+    // Solution: Check for overflow before resize
+    if (needed_gate > SIZE_MAX / sizeof(float) ||
+        needed_up > SIZE_MAX / sizeof(float) ||
+        needed_out > SIZE_MAX / sizeof(float)) {
+        std::fprintf(stderr, "[storagellm mlp] expert pool size overflow layer=%d selected=%zu intermediate=%u\n",
+            layer, num_selected, expert_intermediate);
+        return 0;
+    }
+    const uint64_t alloc_start_us = moe_profile_now_us();
     if (s->expert_gate_pool.size() < needed_gate) {
         s->expert_gate_pool.resize(needed_gate);
     }
@@ -861,6 +1033,11 @@ static int moe_layer_moe_mlp_f32(
         work[e].out = s->expert_out_pool.data() + e * (size_t)hidden_size;
         std::fill(work[e].out, work[e].out + hidden_size, 0.0f);
     }
+    moe_profile_log(
+        "mlp_moe_alloc",
+        "layer=%d selected=%zu intermediate=%u hidden=%u gate_floats=%zu out_floats=%zu ms=%.3f",
+        layer, num_selected, expert_intermediate, hidden_size,
+        needed_gate, needed_out, moe_profile_elapsed_ms(alloc_start_us));
 
     // Phase 2a: Flat dispatch: gate+up+SiLU for all experts simultaneously.
     // Total rows = num_selected * intermediate_size, row i maps to expert e and row r.
@@ -878,6 +1055,9 @@ static int moe_layer_moe_mlp_f32(
         return 0;
     }
     const uint32_t total_gate_rows = (uint32_t)num_selected * expert_intermediate;
+    const uint64_t gate_up_start_us = moe_profile_now_us();
+    const int activation_mode = moe_engine_gelu_activation_mode(engine);
+    moe_profile_parallel_label_scope gate_up_rows_label("moe_mlp_gate_up");
     const int gate_up_ok = moe_parallel_rows(engine, total_gate_rows, 0, [&](uint32_t flat_row) {
         const uint32_t e = flat_row / expert_intermediate;
         const uint32_t r = flat_row % expert_intermediate;
@@ -892,9 +1072,14 @@ static int moe_layer_moe_mlp_f32(
         if (!expert_ok[e].load(std::memory_order_acquire)) return 1;
         if (!moe_dot_tensor_record_row(engine, shards[e].gate_rec, shards[e].gate_shard, r, expert_input, hidden_size, &work[e].gate[r])) { expert_ok[e].store(0, std::memory_order_release); return 1; }
         if (!moe_dot_tensor_record_row(engine, shards[e].up_rec, shards[e].up_shard, r, expert_input, hidden_size, &work[e].up[r])) { expert_ok[e].store(0, std::memory_order_release); return 1; }
-        work[e].gate[r] = moe_generation_gated_activation(engine, work[e].gate[r], work[e].up[r]);
+        work[e].gate[r] = moe_generation_gated_activation_cached(activation_mode, work[e].gate[r], work[e].up[r]);
         return 1;
     });
+    moe_profile_log(
+        "mlp_moe_gate_up",
+        "layer=%d ok=%d selected=%zu rows=%u hidden=%u intermediate=%u ms=%.3f",
+        layer, gate_up_ok, num_selected, total_gate_rows, hidden_size, expert_intermediate,
+        moe_profile_elapsed_ms(gate_up_start_us));
     if (!gate_up_ok) return 0;
 
     // Phase 2b: Flat dispatch: down_proj for all experts simultaneously.
@@ -904,10 +1089,16 @@ static int moe_layer_moe_mlp_f32(
         return 0;
     }
     const uint32_t total_down_rows = (uint32_t)num_selected * hidden_size;
+    const uint64_t down_start_us = moe_profile_now_us();
+    moe_profile_parallel_label_scope down_rows_label("moe_mlp_down");
     const int down_ok = moe_parallel_rows(engine, total_down_rows, 0, [&](uint32_t flat_row) {
         const uint32_t e = flat_row / hidden_size;
         const uint32_t r = flat_row % hidden_size;
         // Guard row-to-expert decoding before indexing per-expert arrays.
+        // BUGFIX 312: Add bounds check for e index (same as gate_up phase) ★
+        // Problem: e can exceed num_selected if flat_row is corrupted
+        // Accessing expert_ok[e], work[e], shards[e] with invalid e causes out-of-bounds access
+        // Solution: Check e < num_selected before any array access
         if (e >= num_selected) {
             return 0;
         }
@@ -918,12 +1109,18 @@ static int moe_layer_moe_mlp_f32(
         }
         return 1;
     });
+    moe_profile_log(
+        "mlp_moe_down",
+        "layer=%d ok=%d selected=%zu rows=%u hidden=%u intermediate=%u ms=%.3f",
+        layer, down_ok, num_selected, total_down_rows, hidden_size, expert_intermediate,
+        moe_profile_elapsed_ms(down_start_us));
     if (!down_ok) return 0;
     for (size_t e = 0; e < num_selected; ++e) {
         work[e].ok = expert_ok[e].load(std::memory_order_acquire);
     }
 
     // Phase 3: Accumulate weighted expert outputs into mlp.
+    const uint64_t accumulate_start_us = moe_profile_now_us();
     for (size_t e = 0; e < num_selected; ++e) {
         if (!work[e].ok) continue;
         if (moe_layer_post_ffw_norm2_f32(
@@ -939,7 +1136,15 @@ static int moe_layer_moe_mlp_f32(
         }
         moe_axpy_f32(s->mlp.data(), work[e].out, work[e].weight, hidden_size);
     }
+    const double accumulate_ms = moe_profile_elapsed_ms(accumulate_start_us);
 
-    return moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
+    const uint64_t residual_start_us = moe_profile_now_us();
+    const int residual_ok = moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
+    moe_profile_log(
+        "mlp_moe_end",
+        "layer=%d ok=%d selected=%zu mapped=%u hidden=%u intermediate=%u accumulate_ms=%.3f residual_ms=%.3f total_ms=%.3f",
+        layer, residual_ok, num_selected, mapped_experts, hidden_size, expert_intermediate,
+        accumulate_ms, moe_profile_elapsed_ms(residual_start_us), moe_profile_elapsed_ms(total_start_us));
+    return residual_ok;
 }
 

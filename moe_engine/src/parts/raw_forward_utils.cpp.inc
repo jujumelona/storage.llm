@@ -66,7 +66,10 @@ static const uint8_t* raw_span_ptr(
         return nullptr;
     }
     const uint64_t mapped_size = (uint64_t)mmap_get_size(mapped);
-    if (rel_offset > mapped_size || bytes > mapped_size - rel_offset || rel_offset > (uint64_t)SIZE_MAX) {
+    // BUGFIX 495: rel_offset + bytes overflow 체크
+    if (rel_offset > mapped_size || bytes > mapped_size - rel_offset ||
+        rel_offset > (uint64_t)SIZE_MAX ||
+        (bytes > 0 && rel_offset > UINT64_MAX - bytes)) {
         return nullptr;
     }
     return static_cast<const uint8_t*>(mmap_get_ptr(mapped, (size_t)rel_offset));
@@ -143,6 +146,13 @@ static float moe_dot_raw_row(
     const float* hidden,
     uint32_t hidden_count
 ) {
+    // BUGFIX 529: Check hidden_count upper bound to prevent excessive iteration ★
+    // Problem: hidden_count can be arbitrarily large from config
+    // Loop can run billions of iterations
+    // Solution: Add reasonable upper bound check (e.g., 100000)
+    if (!row || !hidden || hidden_count > 100000) {
+        return 0.0f;
+    }
     if (encoding == moe_RAW_SCALAR_BF16) {
         return moe_dot_bf16_row(row, hidden, hidden_count);
     }
@@ -193,15 +203,25 @@ static int moe_engine_metadata_mentions(const moe_pc_engine* engine, const char*
     return haystack.find(target) != std::string::npos ? 1 : 0;
 }
 
-static int moe_engine_prefers_gelu_activation(const moe_pc_engine* engine) {
+static int moe_engine_gelu_activation_mode(const moe_pc_engine* engine) {
     if (!engine) {
         return 0;
+    }
+    if (moe_engine_graph_ir_mentions(engine, "gelu_pytorch_tanh") ||
+        moe_engine_graph_ir_mentions(engine, "gelu_tanh") ||
+        moe_engine_metadata_mentions(engine, "gelu_pytorch_tanh") ||
+        moe_engine_metadata_mentions(engine, "gelu_tanh")) {
+        return 2;
     }
     if (moe_engine_graph_ir_mentions(engine, "gelu") ||
         moe_engine_metadata_mentions(engine, "gelu")) {
         return 1;
     }
     return 0;
+}
+
+static int moe_engine_prefers_gelu_activation(const moe_pc_engine* engine) {
+    return moe_engine_gelu_activation_mode(engine) != 0 ? 1 : 0;
 }
 
 static float moe_final_logit_softcap_value(const moe_pc_engine* engine) {
@@ -241,6 +261,27 @@ static uint64_t moe_raw_tensor_row_bytes(
     if (raw.weight_format == moe_WEIGHT_ENCODING_MXFP4) {
         return ((uint64_t)cols + 31ull) / 32ull * 17ull;
     }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q2_K) {
+        return ((uint64_t)cols + 255ull) / 256ull * 84ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q3_K) {
+        return ((uint64_t)cols + 255ull) / 256ull * 110ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_K) {
+        return ((uint64_t)cols + 255ull) / 256ull * 144ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
+        return ((uint64_t)cols + 255ull) / 256ull * 176ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q6_K) {
+        return ((uint64_t)cols + 255ull) / 256ull * 210ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS) {
+        return ((uint64_t)cols + 255ull) / 256ull * 66ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS) {
+        return ((uint64_t)cols + 255ull) / 256ull * 98ull;
+    }
     const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
     return (uint64_t)cols * (uint64_t)elem;
 }
@@ -253,7 +294,9 @@ static float moe_raw_tensor_dot_row(
 ) {
     const uint32_t stride_cols = raw.cols ? raw.cols : hidden_count;
     const uint64_t row_bytes = moe_raw_tensor_row_bytes(raw, stride_cols);
+    // BUGFIX 494: row * row_bytes overflow 체크
     if (!raw.base || !hidden || row >= raw.rows || row_bytes == 0 ||
+        row > UINT64_MAX / row_bytes ||
         (uint64_t)row * row_bytes > raw.bytes ||
         row_bytes > raw.bytes - (uint64_t)row * row_bytes) {
         return 0.0f;
@@ -268,6 +311,32 @@ static float moe_raw_tensor_dot_row(
     if (raw.weight_format == moe_WEIGHT_ENCODING_MXFP4) {
         return moe_dot_gguf_mxfp4_row(row_ptr, hidden, hidden_count);
     }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q2_K) {
+        return moe_dot_gguf_q2_k_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q3_K) {
+        return moe_dot_gguf_q3_k_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_K) {
+        return moe_dot_gguf_q4_k_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
+        return moe_dot_gguf_q5_k_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q6_K) {
+        return moe_dot_gguf_q6_k_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS) {
+        return moe_dot_gguf_iq2_xxs_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS) {
+        return moe_dot_gguf_iq3_xxs_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format != moe_WEIGHT_ENCODING_UNKNOWN &&
+        raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP16 &&
+        raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP32) {
+        return 0.0f;
+    }
     return moe_dot_raw_row(row_ptr, raw.scalar_encoding, hidden, hidden_count);
 }
 
@@ -277,9 +346,18 @@ static int moe_raw_tensor_copy_row_f32(
     float* out,
     uint32_t out_count
 ) {
+    // BUGFIX 530: Check out_count upper bound to prevent excessive iteration ★
+    // Problem: out_count can be arbitrarily large from config
+    // Loop can run billions of iterations
+    // Solution: Add reasonable upper bound check (e.g., 100000)
+    if (!out || out_count > 100000) {
+        return 0;
+    }
     const uint32_t stride_cols = raw.cols ? raw.cols : out_count;
     const uint64_t row_bytes = moe_raw_tensor_row_bytes(raw, stride_cols);
+    // BUGFIX 493: row * row_bytes overflow 체크
     if (!raw.base || !out || row >= raw.rows || row_bytes == 0 ||
+        row > UINT64_MAX / row_bytes ||
         (uint64_t)row * row_bytes > raw.bytes ||
         row_bytes > raw.bytes - (uint64_t)row * row_bytes) {
         return 0;
@@ -321,8 +399,8 @@ static int moe_raw_tensor_copy_row_f32(
             const uint8_t* qs = block + 8u;
             const uint32_t limit = std::min<uint32_t>(block_cols, out_count - dst);
             for (uint32_t i = 0; i < limit; ++i) {
-                const uint8_t byte = qs[i & 15u];
-                const uint32_t low = i < 16u ? (byte & 0x0fu) : (byte >> 4);
+                const uint8_t byte = qs[i >> 1];
+                const uint32_t low = (i & 1u) ? (byte >> 4) : (byte & 0x0fu);
                 const uint32_t high = (qh >> i) & 1u;
                 out[dst + i] = d * (float)(low | (high << 4u)) + m;
             }
@@ -347,6 +425,39 @@ static int moe_raw_tensor_copy_row_f32(
             block += block_bytes;
         }
         return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q2_K) {
+        moe_dequant_gguf_q2_k_row(row_ptr, out, out_count);
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q3_K) {
+        moe_dequant_gguf_q3_k_row(row_ptr, out, out_count);
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_K) {
+        moe_dequant_gguf_q4_k_row(row_ptr, out, out_count);
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
+        moe_dequant_gguf_q5_k_row(row_ptr, out, out_count);
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q6_K) {
+        moe_dequant_gguf_q6_k_row(row_ptr, out, out_count);
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS) {
+        moe_dequant_gguf_iq2_xxs_row(row_ptr, out, out_count);
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS) {
+        moe_dequant_gguf_iq3_xxs_row(row_ptr, out, out_count);
+        return 1;
+    }
+    if (raw.weight_format != moe_WEIGHT_ENCODING_UNKNOWN &&
+        raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP16 &&
+        raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP32) {
+        return 0;
     }
     const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
     for (uint32_t i = 0; i < out_count; ++i) {
