@@ -210,6 +210,11 @@ static uint32_t evict_cold_kv_blocks(
     uint64_t bytes_needed
 );
 
+static uint32_t moe_paged_kv_layer_count(const moe_pc_engine* engine) {
+    const moe_model_shape_t shape = moe_engine_model_shape_or_static(engine);
+    return shape.num_hidden_layers ? shape.num_hidden_layers : 80u;
+}
+
 
 // BUGFIX 문제4: KV block VRAM promotion/eviction ★★★
 // Promotes hot KV blocks to VRAM for faster attention computation
@@ -232,7 +237,7 @@ static int promote_kv_block_to_vram(
     }
 
     // Calculate block size (assuming layers from engine config)
-    const uint32_t layers = engine->config.num_layers ? engine->config.num_layers : 80;
+    const uint32_t layers = moe_paged_kv_layer_count(engine);
     const uint64_t data_size = (uint64_t)manager->block_size * layers * 512;
     const uint64_t scales_size = (uint64_t)manager->block_size * layers * sizeof(float);
     const uint64_t zeros_size = (uint64_t)manager->block_size * layers * sizeof(float);
@@ -335,14 +340,14 @@ static int promote_kv_block_to_vram(
     }
 
     // Copy data to VRAM
-    CUresult res = CUDA_SUCCESS;
+    int res = 0;
     if (block.compressed_data && vram_data_ptr) {
         if (engine->backend_caps.backend == moe_BACKEND_HIP) {
             res = engine->hip.hipMemcpyHtoD(vram_data_ptr, block.compressed_data, data_size);
         } else if (engine->backend_caps.backend == moe_BACKEND_CUDA) {
             res = engine->cuda.cuMemcpyHtoD(vram_data_ptr, block.compressed_data, data_size);
         }
-        if (res != CUDA_SUCCESS) {
+        if (res != 0) {
             if (engine->backend_caps.backend == moe_BACKEND_HIP) {
                 engine->hip.hipFree(vram_data_ptr);
                 if (vram_scales_ptr) engine->hip.hipFree(vram_scales_ptr);
@@ -363,7 +368,7 @@ static int promote_kv_block_to_vram(
         } else if (engine->backend_caps.backend == moe_BACKEND_CUDA) {
             res = engine->cuda.cuMemcpyHtoD(vram_scales_ptr, block.scales, scales_size);
         }
-        if (res != CUDA_SUCCESS) {
+        if (res != 0) {
             if (engine->backend_caps.backend == moe_BACKEND_HIP) {
                 engine->hip.hipFree(vram_data_ptr);
                 engine->hip.hipFree(vram_scales_ptr);
@@ -384,7 +389,7 @@ static int promote_kv_block_to_vram(
         } else if (engine->backend_caps.backend == moe_BACKEND_CUDA) {
             res = engine->cuda.cuMemcpyHtoD(vram_zeros_ptr, block.zeros, zeros_size);
         }
-        if (res != CUDA_SUCCESS) {
+        if (res != 0) {
             if (engine->backend_caps.backend == moe_BACKEND_HIP) {
                 engine->hip.hipFree(vram_data_ptr);
                 engine->hip.hipFree(vram_scales_ptr);
@@ -437,7 +442,7 @@ static uint32_t evict_cold_kv_blocks(
     }
 
     const uint64_t now = engine->expert_touch_epoch.load(std::memory_order_relaxed);
-    const uint32_t layers = engine->config.num_layers ? engine->config.num_layers : 80;
+    const uint32_t layers = moe_paged_kv_layer_count(engine);
     const uint64_t block_size = (uint64_t)manager->block_size * layers * (512 + 2 * sizeof(float));
 
     std::vector<std::pair<uint32_t, float>> candidates;
@@ -535,7 +540,7 @@ static int enable_kv_pinned_memory(
     // This uses mlock() on Linux or VirtualLock() on Windows
 
     uint32_t pinned_count = 0;
-    const uint32_t layers = engine->config.num_layers ? engine->config.num_layers : 80;
+    const uint32_t layers = moe_paged_kv_layer_count(engine);
     const size_t data_size = (size_t)manager->block_size * layers * 512;
     const size_t scales_size = (size_t)manager->block_size * layers * sizeof(float);
     const size_t zeros_size = (size_t)manager->block_size * layers * sizeof(float);
