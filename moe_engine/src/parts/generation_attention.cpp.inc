@@ -152,9 +152,6 @@ static float moe_standard_attention_score_scale(
     if (query_pre_attn_scalar > 0.0f && std::isfinite(query_pre_attn_scalar)) {
         return 1.0f / std::sqrt(query_pre_attn_scalar);
     }
-    if (moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
-        return 1.0f;
-    }
     return 1.0f / std::sqrt((float)head_dim);
 }
 
