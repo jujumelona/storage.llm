@@ -1,17 +1,9 @@
 # JUJU Offload Colab
 
-Use `GGUF_Offload_Patch_01.ipynb`, `GGUF_Offload_Patch_02.ipynb`, and
-`GGUF_Offload_Patch_03.ipynb` as the practical Colab run notebooks. Use
-`GGUF_Offload_Metadata_Patch_Stream.ipynb` as the generic metadata/contract
-template for public reuse.
-
-The numbered notebooks keep model-specific source URLs inside the notebook and
-now include the physical JUJU shard materializer directly, so each can be
-uploaded to Colab by itself:
-
-- `GGUF_Offload_Patch_01.ipynb`
-- `GGUF_Offload_Patch_02.ipynb`
-- `GGUF_Offload_Patch_03.ipynb`
+Use `GGUF_Offload_Metadata_Patch_Stream.ipynb` as the single generic Colab
+notebook. Model-specific source URLs and Hub targets should be supplied through
+the notebook configuration or environment variables, not committed as separate
+model notebooks.
 
 The model build path is GGUF source -> JUJU shard artifact. Colab disk use stays
 bounded by processing one source shard at a time, uploading
