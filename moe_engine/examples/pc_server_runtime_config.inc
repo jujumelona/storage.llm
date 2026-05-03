@@ -1,6 +1,9 @@
 static uint64_t server_auto_ram_budget_bytes() {
     const uint64_t available = storagellm::available_ram_bytes();
-    const uint64_t reserve = 2ull * 1024ull * 1024ull * 1024ull;
+    const uint64_t gib = 1024ull * 1024ull * 1024ull;
+    const uint64_t reserve =
+        available >= 64ull * gib ? 3ull * gib :
+        available >= 32ull * gib ? 2ull * gib : 1ull * gib;
     if (available > reserve * 2ull) {
         return available - reserve;
     }

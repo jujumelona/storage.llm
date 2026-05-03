@@ -68,8 +68,10 @@ int moe_pc_engine_request_expert(
                     add_tier_usage(engine, state.tier, bytes);
                 }
                 touch_expert_heat(engine, &state, boost);
-                push_evict_candidate(engine, slot, state);
-                return 1;  // early exit ??already at good tier
+                moe_block_state state_snap = state;
+                lock.unlock();
+                replace_evict_candidate(engine, slot, state_snap);
+                return 1;  // early exit: already at good tier
             }
             subtract_tier_usage(engine, state.tier, state.bytes);
             // BUGFIX 609-611: Check expert counts > 0 before fetch_sub ★
