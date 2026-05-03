@@ -58,10 +58,13 @@ struct moe_cpu_row_pool_t {
     bool initialized{false};
 
     void init(uint32_t count) {
-        if (initialized || count == 0) return;
+        if (count == 0) return;
+        std::lock_guard<std::mutex> lk(mtx);
         initialized = true;
+        const uint32_t start = static_cast<uint32_t>(threads.size());
+        if (start >= count) return;
         threads.reserve(count);
-        for (uint32_t i = 0; i < count; ++i) {
+        for (uint32_t i = start; i < count; ++i) {
             threads.emplace_back([this, i]() {
                 moe_cpu_enable_fast_fp_mode();
                 uint64_t seen_generation = 0;
@@ -213,9 +216,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     };
 
     auto& pool = moe_get_cpu_row_pool();
-    if (!pool.initialized) {
-        pool.init(workers > 1 ? workers - 1 : 0);
-    }
+    pool.init(workers > 1 ? workers - 1 : 0);
 
     const uint32_t pool_workers = std::min(workers - 1u,
         static_cast<uint32_t>(pool.threads.size()));
@@ -260,7 +261,8 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     const int final_ok = ok.load(std::memory_order_acquire);
     moe_profile_log(
         "parallel_rows",
-        "label=%s rows=%u block=%u workers=%u mode=pool ok=%d ms=%.3f",
-        trace_label, row_count, block_rows, workers, final_ok, moe_profile_elapsed_ms(trace_start_us));
+        "label=%s rows=%u block=%u workers=%u pool_workers=%u mode=pool ok=%d ms=%.3f",
+        trace_label, row_count, block_rows, workers, pool_workers, final_ok,
+        moe_profile_elapsed_ms(trace_start_us));
     return final_ok;
 }
