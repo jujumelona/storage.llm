@@ -681,18 +681,21 @@ static int moe_layer_common_dense_mlp_f32(
     const uint64_t gate_row_bytes = gate.base ? moe_raw_tensor_row_bytes(gate, gate.cols) : 0;
     const uint64_t up_row_bytes = up.base ? moe_raw_tensor_row_bytes(up, up.cols) : 0;
     const uint64_t down_row_bytes = down.base ? moe_raw_tensor_row_bytes(down, down.cols) : 0;
+    const uint8_t gate_effective_format = moe_effective_weight_format_for_row_bytes(gate, gate.cols);
+    const uint8_t up_effective_format = moe_effective_weight_format_for_row_bytes(up, up.cols);
+    const uint8_t down_effective_format = moe_effective_weight_format_for_row_bytes(down, down.cols);
     moe_profile_log(
         "mlp_dense_map",
         "layer=%d intermediate=%u gate=%ux%u up=%ux%u down=%ux%u "
-        "gate_fmt=%u gate_scalar=%u gate_row_bytes=%llu gate_weight_row_bytes=%llu gate_bytes=%llu "
-        "up_fmt=%u up_scalar=%u up_row_bytes=%llu up_weight_row_bytes=%llu up_bytes=%llu "
-        "down_fmt=%u down_scalar=%u down_row_bytes=%llu down_weight_row_bytes=%llu down_bytes=%llu ms=%.3f",
+        "gate_fmt=%u gate_eff_fmt=%u gate_scalar=%u gate_row_bytes=%llu gate_weight_row_bytes=%llu gate_bytes=%llu "
+        "up_fmt=%u up_eff_fmt=%u up_scalar=%u up_row_bytes=%llu up_weight_row_bytes=%llu up_bytes=%llu "
+        "down_fmt=%u down_eff_fmt=%u down_scalar=%u down_row_bytes=%llu down_weight_row_bytes=%llu down_bytes=%llu ms=%.3f",
         layer, intermediate, gate.rows, gate.cols, up.rows, up.cols, down.rows, down.cols,
-        (unsigned)gate.weight_format, (unsigned)gate.scalar_encoding,
+        (unsigned)gate.weight_format, (unsigned)gate_effective_format, (unsigned)gate.scalar_encoding,
         (unsigned long long)gate_row_bytes, (unsigned long long)gate.weight_row_bytes, (unsigned long long)gate.bytes,
-        (unsigned)up.weight_format, (unsigned)up.scalar_encoding,
+        (unsigned)up.weight_format, (unsigned)up_effective_format, (unsigned)up.scalar_encoding,
         (unsigned long long)up_row_bytes, (unsigned long long)up.weight_row_bytes, (unsigned long long)up.bytes,
-        (unsigned)down.weight_format, (unsigned)down.scalar_encoding,
+        (unsigned)down.weight_format, (unsigned)down_effective_format, (unsigned)down.scalar_encoding,
         (unsigned long long)down_row_bytes, (unsigned long long)down.weight_row_bytes, (unsigned long long)down.bytes,
         moe_profile_elapsed_ms(map_start_us));
     const uint64_t gate_up_start_us = moe_profile_now_us();
@@ -1179,14 +1182,29 @@ static int moe_layer_moe_mlp_f32(
         expert_ok[e].store(1, std::memory_order_release);
     }
     uint32_t mapped_experts = 0;
+    uint8_t gate_effective_format = 0;
+    uint8_t up_effective_format = 0;
+    uint8_t down_effective_format = 0;
     for (size_t e = 0; e < num_selected; ++e) {
-        mapped_experts += expert_ok[e].load(std::memory_order_acquire) ? 1u : 0u;
+        if (expert_ok[e].load(std::memory_order_acquire)) {
+            ++mapped_experts;
+            if (!gate_effective_format && shards[e].gate_rec && shards[e].up_rec && shards[e].down_rec) {
+                gate_effective_format = (uint8_t)moe_effective_tensor_weight_format_for_row_bytes(
+                    shards[e].gate_rec, tensor_weight_format(*shards[e].gate_rec));
+                up_effective_format = (uint8_t)moe_effective_tensor_weight_format_for_row_bytes(
+                    shards[e].up_rec, tensor_weight_format(*shards[e].up_rec));
+                down_effective_format = (uint8_t)moe_effective_tensor_weight_format_for_row_bytes(
+                    shards[e].down_rec, tensor_weight_format(*shards[e].down_rec));
+            }
+        }
     }
     moe_profile_log(
         "mlp_moe_map",
-        "layer=%d selected=%zu mapped=%u missing=%u shape_mismatch=%u map_failed=%u gate=%ux%u up=%ux%u down=%ux%u ms=%.3f",
+        "layer=%d selected=%zu mapped=%u missing=%u shape_mismatch=%u map_failed=%u gate=%ux%u gate_eff_fmt=%u up=%ux%u up_eff_fmt=%u down=%ux%u down_eff_fmt=%u ms=%.3f",
         layer, num_selected, mapped_experts, missing_experts, shape_mismatch_experts, map_failed_experts,
-        gate_rows, gate_cols, up_rows, up_cols, down_rows, down_cols,
+        gate_rows, gate_cols, (unsigned)gate_effective_format,
+        up_rows, up_cols, (unsigned)up_effective_format,
+        down_rows, down_cols, (unsigned)down_effective_format,
         moe_profile_elapsed_ms(map_start_us));
 
     // BUGFIX 문제10: Handle partial expert failures with weight renormalization ★★

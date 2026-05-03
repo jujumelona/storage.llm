@@ -49,6 +49,135 @@ static void moe_trace_tensor_dot_unsupported(const moe_tensor_record* rec, int w
         rec ? (unsigned long long)rec->weight_row_bytes : 0ull);
 }
 
+static uint64_t moe_tensor_weight_format_row_bytes_for_cols(
+    uint8_t weight_format,
+    uint32_t cols
+) {
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
+        return ((uint64_t)cols + 31ull) / 32ull * 34ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_1) {
+        return ((uint64_t)cols + 31ull) / 32ull * 36ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_K) {
+        return ((uint64_t)cols + 255ull) / 256ull * 292ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0) {
+        return ((uint64_t)cols + 31ull) / 32ull * 18ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_1) {
+        return ((uint64_t)cols + 31ull) / 32ull * 20ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_0) {
+        return ((uint64_t)cols + 31ull) / 32ull * 22ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
+        return ((uint64_t)cols + 31ull) / 32ull * 24ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_MXFP4) {
+        return ((uint64_t)cols + 31ull) / 32ull * 17ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q2_K) {
+        return ((uint64_t)cols + 255ull) / 256ull * 84ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q3_K) {
+        return ((uint64_t)cols + 255ull) / 256ull * 110ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_K) {
+        return ((uint64_t)cols + 255ull) / 256ull * 144ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
+        return ((uint64_t)cols + 255ull) / 256ull * 176ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q6_K) {
+        return ((uint64_t)cols + 255ull) / 256ull * 210ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS) {
+        return ((uint64_t)cols + 255ull) / 256ull * 66ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XS) {
+        return ((uint64_t)cols + 255ull) / 256ull * 74ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_S) {
+        return ((uint64_t)cols + 255ull) / 256ull * 82ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS) {
+        return ((uint64_t)cols + 255ull) / 256ull * 98ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_S) {
+        return ((uint64_t)cols + 255ull) / 256ull * 110ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_NL) {
+        return ((uint64_t)cols + 31ull) / 32ull * 18ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_XS) {
+        return ((uint64_t)cols + 255ull) / 256ull * 136ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_S) {
+        return ((uint64_t)cols + 255ull) / 256ull * 50ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_M) {
+        return ((uint64_t)cols + 255ull) / 256ull * 56ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_TQ1_0) {
+        return ((uint64_t)cols + 255ull) / 256ull * 54ull;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_TQ2_0) {
+        return ((uint64_t)cols + 255ull) / 256ull * 66ull;
+    }
+    return 0;
+}
+
+static int moe_effective_tensor_weight_format_for_row_bytes(
+    const moe_tensor_record* rec,
+    int weight_format
+) {
+    if (!rec || !rec->weight_row_bytes ||
+        weight_format != moe_WEIGHT_ENCODING_MXFP4) {
+        return weight_format;
+    }
+    if (rec->weight_row_bytes == moe_tensor_weight_format_row_bytes_for_cols((uint8_t)weight_format, rec->info.cols)) {
+        return weight_format;
+    }
+    static const uint8_t candidates[] = {
+        moe_WEIGHT_ENCODING_GGUF_Q8_0,
+        moe_WEIGHT_ENCODING_GGUF_Q8_1,
+        moe_WEIGHT_ENCODING_GGUF_Q8_K,
+        moe_WEIGHT_ENCODING_GGUF_Q4_0,
+        moe_WEIGHT_ENCODING_GGUF_Q4_1,
+        moe_WEIGHT_ENCODING_GGUF_Q5_0,
+        moe_WEIGHT_ENCODING_GGUF_Q5_1,
+        moe_WEIGHT_ENCODING_GGUF_Q2_K,
+        moe_WEIGHT_ENCODING_GGUF_Q3_K,
+        moe_WEIGHT_ENCODING_GGUF_Q4_K,
+        moe_WEIGHT_ENCODING_GGUF_Q5_K,
+        moe_WEIGHT_ENCODING_GGUF_Q6_K,
+        moe_WEIGHT_ENCODING_GGUF_IQ2_XXS,
+        moe_WEIGHT_ENCODING_GGUF_IQ2_XS,
+        moe_WEIGHT_ENCODING_GGUF_IQ2_S,
+        moe_WEIGHT_ENCODING_GGUF_IQ3_XXS,
+        moe_WEIGHT_ENCODING_GGUF_IQ3_S,
+        moe_WEIGHT_ENCODING_GGUF_IQ4_NL,
+        moe_WEIGHT_ENCODING_GGUF_IQ4_XS,
+        moe_WEIGHT_ENCODING_GGUF_IQ1_S,
+        moe_WEIGHT_ENCODING_GGUF_IQ1_M,
+        moe_WEIGHT_ENCODING_GGUF_TQ1_0,
+        moe_WEIGHT_ENCODING_GGUF_TQ2_0
+    };
+    int match = weight_format;
+    uint32_t matches = 0;
+    for (uint8_t candidate : candidates) {
+        if (rec->weight_row_bytes == moe_tensor_weight_format_row_bytes_for_cols(candidate, rec->info.cols)) {
+            match = (int)candidate;
+            ++matches;
+        }
+    }
+    if (matches == 1u) {
+        return match;
+    }
+    return weight_format;
+}
+
 static int moe_dot_tensor_record_row(
     moe_pc_engine_t* engine,
     const moe_tensor_record* rec,
@@ -65,7 +194,8 @@ static int moe_dot_tensor_record_row(
     if (!shard || !mmap_get_ptr(shard, 0)) {
         return 0;
     }
-    const int weight_format = tensor_weight_format(*rec);
+    const int declared_weight_format = tensor_weight_format(*rec);
+    const int weight_format = moe_effective_tensor_weight_format_for_row_bytes(rec, declared_weight_format);
     if (!moe_dot_weight_format_supported(weight_format)) {
         moe_trace_tensor_dot_unsupported(rec, weight_format);
         return 0;
@@ -227,7 +357,8 @@ static int moe_dot_tensor_record_row_batch(
     // This massively increases arithmetic intensity (FLOPs/byte) and
     // overcomes the memory-bandwidth bottleneck of single-token decode.
 
-    const int weight_format = tensor_weight_format(*rec);
+    const int declared_weight_format = tensor_weight_format(*rec);
+    const int weight_format = moe_effective_tensor_weight_format_for_row_bytes(rec, declared_weight_format);
     if (!moe_dot_weight_format_supported(weight_format)) {
         moe_trace_tensor_dot_unsupported(rec, weight_format);
         return 0;

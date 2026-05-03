@@ -101,12 +101,14 @@ int moe_pc_engine_lm_head_top1_f32(
     }
     const float logit_softcap = moe_final_logit_softcap_value(engine);
     const uint64_t total_start_us = moe_profile_now_us();
+    const uint8_t effective_weight_format = moe_effective_weight_format_for_row_bytes(raw, c->hidden_size);
     moe_profile_log(
         "lm_head_top1_begin",
-        "vocab=%u hidden=%u fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.6g",
+        "vocab=%u hidden=%u fmt=%u eff_fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.6g",
         c->vocab_size,
         c->hidden_size,
         (unsigned)raw.weight_format,
+        (unsigned)effective_weight_format,
         (unsigned)raw.scalar_encoding,
         (unsigned long long)row_bytes,
         (unsigned long long)bytes,
@@ -309,13 +311,15 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     }
     const float logit_softcap = moe_final_logit_softcap_value(engine);
     const uint64_t total_start_us = moe_profile_now_us();
+    const uint8_t effective_weight_format = moe_effective_weight_format_for_row_bytes(raw, c->hidden_size);
     moe_profile_log(
         "lm_head_logprob_begin",
-        "target=%u vocab=%u hidden=%u fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.6g",
+        "target=%u vocab=%u hidden=%u fmt=%u eff_fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.6g",
         target_token_id,
         c->vocab_size,
         c->hidden_size,
         (unsigned)raw.weight_format,
+        (unsigned)effective_weight_format,
         (unsigned)raw.scalar_encoding,
         (unsigned long long)row_bytes,
         (unsigned long long)bytes,
