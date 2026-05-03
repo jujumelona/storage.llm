@@ -76,9 +76,9 @@ int qkv_attention_decode_impl(
     if (d > INT_MAX / k_mse_bits) return 0;
     const int k_stride = (d * k_mse_bits + 7) / 8;
     const int k_qstride = (d + 7) / 8;
-    // Bug 1 Fix: Correct QJL scale factor from paper Algorithm 2: sqrt(π/(2d))
     // BUGFIX 355: d가 0일 때 division by zero 방지 (이미 위에서 체크했지만 명시적으로)
-    // QJL residual uses the mean of d Gaussian rows: sqrt(pi/2) / d.
+    // Paper Definition 1 / Algorithm 2: QJL inverse is sqrt(pi/2) / d * S^T z.
+    // The stored gamma is the normalized residual norm, so att[t] applies norm_k once.
     const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)d;
     const bool k_split = qkv_outlier_split_ready(s, cfg, QKV_TARGET_KEY);
     const bool use_qjl_key_residual = qjl && s->k_qjl && s->qjl_matrix;

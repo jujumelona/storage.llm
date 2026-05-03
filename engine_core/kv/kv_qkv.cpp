@@ -105,28 +105,31 @@ int qkv_quantize(
                 y_tilde[i] = centroids[indices[i]];
             }
 
-            // Apply inverse rotation
+            // Apply inverse rotation in the normalized domain. Algorithm 2 is
+            // defined for x in S^{d-1}; norms[t] is applied only at dequant.
             if (config->enable_rotation && state->rotation_matrix) {
                 for (int i = 0; i < dim; i++) {
                     float sum = 0.0f;
                     for (int j = 0; j < dim; j++) {
                         sum += state->rotation_matrix[j * dim + i] * y_tilde[j];
                     }
-                    x_mse[i] = sum * state->k_norms[t];
+                    x_mse[i] = sum;
                 }
             } else {
                 for (int i = 0; i < dim; i++) {
-                    x_mse[i] = y_tilde[i] * state->k_norms[t];
+                    x_mse[i] = y_tilde[i];
                 }
             }
 
-            // Step 2: Compute residual r = x - x_mse
+            // Step 2: Compute residual r = x_unit - x_mse
             float* residual = state->scratch_residual;
             if (!residual) return 0;
 
+            const float k_norm = state->k_norms[t];
+            const float k_inv_norm = (k_norm > 1e-12f) ? (1.0f / k_norm) : 0.0f;
             float r_norm_sq = 0.0f;
             for (int i = 0; i < dim; i++) {
-                residual[i] = key_data[t * dim + i] - x_mse[i];
+                residual[i] = (k_inv_norm > 0.0f ? key_data[t * dim + i] * k_inv_norm : 0.0f) - x_mse[i];
                 r_norm_sq += residual[i] * residual[i];
             }
             state->k_residual_norms[t] = sqrtf(r_norm_sq);
@@ -189,20 +192,22 @@ int qkv_quantize(
                     for (int j = 0; j < dim; j++) {
                         sum += state->rotation_matrix[j * dim + i] * y_tilde[j];
                     }
-                    x_mse[i] = sum * state->v_norms[t];
+                    x_mse[i] = sum;
                 }
             } else {
                 for (int i = 0; i < dim; i++) {
-                    x_mse[i] = y_tilde[i] * state->v_norms[t];
+                    x_mse[i] = y_tilde[i];
                 }
             }
 
             float* residual = state->scratch_residual;
             if (!residual) return 0;
 
+            const float v_norm = state->v_norms[t];
+            const float v_inv_norm = (v_norm > 1e-12f) ? (1.0f / v_norm) : 0.0f;
             float r_norm_sq = 0.0f;
             for (int i = 0; i < dim; i++) {
-                residual[i] = value_data[t * dim + i] - x_mse[i];
+                residual[i] = (v_inv_norm > 0.0f ? value_data[t * dim + i] * v_inv_norm : 0.0f) - x_mse[i];
                 r_norm_sq += residual[i] * residual[i];
             }
             state->v_residual_norms[t] = sqrtf(r_norm_sq);

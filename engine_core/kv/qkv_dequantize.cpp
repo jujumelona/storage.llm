@@ -11,7 +11,7 @@
 #endif
 
 // Paper Algorithm 2: TurboQuant_prod dequantization
-// x_hat = Pi^T * y_hat_mse + sqrt(pi/2d) * ||r|| * S^T * sign(S*r)
+// x_hat = Pi^T * y_hat_mse + sqrt(pi/2) / d * ||r|| * S^T * sign(S*r)
 int qkv_dequant_one(
     const qkv_state_t* s,
     const qkv_config_t* cfg,
@@ -90,7 +90,7 @@ int qkv_dequant_one(
     }
 
     // Step 4: Add QJL residual if enabled (Paper Algorithm 2)
-    // residual = sqrt(pi/2d) * ||r|| * S^T * sign(S*r)
+    // residual = sqrt(pi/2) / d * ||r|| * S^T * sign(S*r)
     if (use_qjl && qjl && residual_norms && s->qjl_matrix) {
         const float r_norm = residual_norms[token_idx];
         if (r_norm > 1e-10f) {
@@ -118,7 +118,7 @@ int qkv_dequant_one(
                 s_t_qjl[i] = sum;
             }
 
-            // Add residual: x_hat = x_tilde + scale * ||r|| * S^T * z
+            // Add normalized residual: x_hat = x_tilde + scale * ||r|| * S^T * z
             // BUGFIX 376: d가 0일 때 division by zero 방지
             if (d <= 0) return 0;
             const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)d;
