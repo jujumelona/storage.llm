@@ -81,14 +81,11 @@ static int prefetch_tensor_file_to_pinned(
         engine->io_atomic.staging_slot_contention.fetch_add(1, std::memory_order_relaxed);
 
         static std::atomic<uint64_t> s_last_warn_time_ms{0};
-        static std::atomic<uint32_t> s_realloc_attempt_count{0};
         const uint64_t now_ms = moe_profile_now_us() / 1000;
         const uint64_t last_warn = s_last_warn_time_ms.load(std::memory_order_relaxed);
 
         // Check if we should attempt reallocation
-        const uint32_t realloc_attempts = s_realloc_attempt_count.load(std::memory_order_relaxed);
-        const bool should_try_realloc = (realloc_attempts < 3) &&
-                                        (total_bytes <= engine->staging_size / 2);
+        const bool should_try_realloc = total_bytes <= engine->staging_size / 2;
 
         if (should_try_realloc) {
             // BUGFIX Issue 2-3: Fix race condition in dynamic slot reallocation ★★★
@@ -97,8 +94,6 @@ static int prefetch_tensor_file_to_pinned(
             // Solution: New sequence "acquire new → if success, release old" prevents race.
             // Trade-off: Temporarily uses one extra slot worth of memory during reallocation.
 
-            s_realloc_attempt_count.fetch_add(1, std::memory_order_relaxed);
-
             // Update max_tensor_stream_bytes if this tensor is larger
             if (total_bytes > engine->max_tensor_stream_bytes) {
                 engine->max_tensor_stream_bytes = total_bytes;
@@ -106,44 +101,42 @@ static int prefetch_tensor_file_to_pinned(
 
             fprintf(stderr,
                 "[storageLLM WARNING] Tensor %llu bytes exceeds slot size %llu\n"
-                "  Attempting dynamic slot reallocation (attempt %u/3)...\n"
+                "  Attempting dynamic slot reallocation...\n"
                 "  This will pause prefetch for ~5 seconds.\n",
                 (unsigned long long)total_bytes,
-                (unsigned long long)engine->staging_slots[slot_index].size,
-                realloc_attempts + 1);
+                (unsigned long long)engine->staging_slots[slot_index].size);
 
-            // Step 1: Try to acquire a new larger slot BEFORE releasing the old one
+            // Step 1: Try to allocate a new larger buffer BEFORE releasing the old one
             // This prevents other workers from accessing memory being freed
-            const uint32_t old_slot_index = slot_index;
-
-            // Trigger slot reconfiguration to create larger slots
-            configure_staging_slots(engine);
-
-            // Step 2: Acquire new slot with required size
-            const uint32_t new_slot_index = acquire_staging_slot(
-                engine,
-                0u,
-                realloc_attempts + 1u,
+            bool got_pinned = engine->staging_pinned;
+            bool got_numa = engine->staging_numa_allocated;
+            uint8_t* new_buf = allocate_staging(
+                engine->backend_caps.preferred_numa_node,
                 total_bytes,
-                true,
-                false);
+                &got_pinned,
+                &got_numa);
 
-            if (new_slot_index == UINT32_MAX) {
+            if (!new_buf) {
                 // Allocation failed - keep using old slot (graceful degradation)
                 fprintf(stderr,
-                    "[storageLLM ERROR] Slot reallocation failed. Could not acquire new staging slot.\n"
+                    "[storageLLM ERROR] Buffer reallocation failed. Could not allocate %llu bytes.\n"
                     "  Keeping old slot. Increase staging_size to at least %llu bytes.\n",
+                    (unsigned long long)total_bytes,
                     (unsigned long long)(total_bytes * 4));
                 return 0;
             }
 
-            // Step 3: New slot acquired successfully - now safe to release old slot
-            release_staging_slot(engine, old_slot_index);
-            slot_index = new_slot_index;
-
-            if (io_slot_index) {
-                *io_slot_index = new_slot_index;
+            // Step 2: New buffer acquired successfully - now safe to release old buffer
+            moe_staging_slot& slot = engine->staging_slots[slot_index];
+            if (slot.buf) {
+                free_staging(slot.buf, slot.size, slot.pinned, slot.numa_allocated);
             }
+
+            // Assign new buffer to current slot
+            slot.buf = new_buf;
+            slot.size = total_bytes;
+            slot.pinned = got_pinned;
+            slot.numa_allocated = got_numa;
 
             // Check if reallocation succeeded
             if (slot_index < engine->staging_slots.size() &&
@@ -171,7 +164,7 @@ static int prefetch_tensor_file_to_pinned(
                         "  Increase staging_size to at least %llu bytes and restart.\n",
                         (unsigned long long)total_bytes,
                         (unsigned long long)engine->staging_slots[slot_index].size,
-                        should_try_realloc ? "in progress" : "failed after 3 attempts",
+                        should_try_realloc ? "in progress" : "skipped because tensor exceeds half of staging_size",
                         (unsigned long long)(total_bytes * 4));
                 }
             }
@@ -307,12 +300,16 @@ static int prefetch_tensor_file_to_pinned(
         struct cached_stream_t {
             moe_pc_engine* engine;
             std::string path;
+            uint64_t generation;
             std::ifstream stream;
         };
         static thread_local cached_stream_t tls_stream_cache;
 
         std::ifstream* input = nullptr;
-        if (tls_stream_cache.engine == engine && tls_stream_cache.path == ifstream_path && tls_stream_cache.stream.is_open()) {
+        if (tls_stream_cache.engine == engine &&
+            tls_stream_cache.path == ifstream_path &&
+            tls_stream_cache.generation == engine->staging_generation.load(std::memory_order_relaxed) &&
+            tls_stream_cache.stream.is_open()) {
             input = &tls_stream_cache.stream;
         } else {
             if (tls_stream_cache.stream.is_open()) tls_stream_cache.stream.close();
@@ -320,6 +317,7 @@ static int prefetch_tensor_file_to_pinned(
             if (!tls_stream_cache.stream) return 0;
             tls_stream_cache.engine = engine;
             tls_stream_cache.path = ifstream_path;
+            tls_stream_cache.generation = engine->staging_generation.load(std::memory_order_relaxed);
             input = &tls_stream_cache.stream;
         }
 
@@ -468,6 +466,86 @@ static int prefetch_tensor_ram_to_pinned(
     // Fix 38: Only count actual pinned staging copies, not touch-fallback bytes
     engine->io_atomic.bytes_ram_to_pinned.fetch_add(copied, std::memory_order_relaxed);
     engine->io_atomic.pinned_stage_done.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
+static int prefetch_tensor_ram_to_pinned_at(
+    moe_pc_engine* engine,
+    const moe_tensor_record& rec,
+    uint32_t slot_index,
+    uint64_t* inout_staging_offset,
+    uint64_t* out_tensor_bytes,
+    moe_tier_t target_tier = moe_TIER_VRAM
+) {
+    if (out_tensor_bytes) {
+        *out_tensor_bytes = 0;
+    }
+    if (!engine || !inout_staging_offset) {
+        return 0;
+    }
+    mmap_context_t* shard = get_or_map_tensor_shard(engine, rec);
+    if (!shard || !mmap_get_ptr(shard, 0)) {
+        return 0;
+    }
+    const uint64_t total_bytes = tensor_stream_bytes(rec);
+    if (total_bytes == 0 ||
+        slot_index >= engine->staging_slots.size() ||
+        !engine->staging_slots[slot_index].buf ||
+        *inout_staging_offset > engine->staging_slots[slot_index].size ||
+        total_bytes > engine->staging_slots[slot_index].size - *inout_staging_offset) {
+        engine->io_atomic.staging_slot_contention.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+
+    const uint64_t file_size = static_cast<uint64_t>(mmap_get_size(shard));
+    const uint64_t ranges[][2] = {
+        {rec.info.weight_byte_offset, rec.info.weight_byte_length},
+        {rec.info.scale_byte_offset, rec.info.scale_byte_length},
+        {rec.info.scale2_byte_offset, rec.info.scale2_byte_length},
+    };
+
+    uint64_t staging_offset = *inout_staging_offset;
+    uint64_t copied = 0;
+    for (const auto& range : ranges) {
+        const uint64_t offset = range[0];
+        const uint64_t length = range[1];
+        if (length == 0) {
+            continue;
+        }
+        if (offset > file_size || length > file_size - offset) {
+            return 0;
+        }
+        const uint8_t* src = static_cast<const uint8_t*>(
+            mmap_get_ptr(shard, static_cast<size_t>(offset)));
+        if (!src) {
+            return 0;
+        }
+        const uint64_t before = staging_offset;
+        const uint64_t n = copy_mapped_range_to_staging_linear(
+            engine, src, length, slot_index, &staging_offset);
+        if (n != length || staging_offset != before + length) {
+            return 0;
+        }
+        copied += n;
+#ifdef __linux__
+        if (target_tier != moe_TIER_VRAM) {
+            #ifndef MADV_COLD
+            #define MADV_COLD 20
+            #endif
+            madvise(const_cast<uint8_t*>(src), static_cast<size_t>(length), MADV_COLD);
+        }
+#else
+        (void)target_tier;
+#endif
+    }
+    if (copied != total_bytes) {
+        return 0;
+    }
+    *inout_staging_offset = staging_offset;
+    if (out_tensor_bytes) {
+        *out_tensor_bytes = copied;
+    }
+    engine->io_atomic.bytes_ram_to_pinned.fetch_add(copied, std::memory_order_relaxed);
     return 1;
 }
 

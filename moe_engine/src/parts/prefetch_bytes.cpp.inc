@@ -32,18 +32,52 @@ static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int
 static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, uint64_t bytes) {
 #ifdef _WIN32
     if (engine && engine->io_config.enable_directstorage) {
-        return; // DirectStorage handles prefetch internally
+        return;
     }
-    // BUGFIX 120: PrefetchVirtualMemory removed - it's blocking, not async.
-    // Async ReadFile path in prefetch_tensor_file_to_pinned handles this properly.
-    // For mmap path, we accept page faults as unavoidable without kernel support.
     if (engine) {
         const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_touch_fallback.fetch_add(bytes, std::memory_order_relaxed);
     }
 #elif defined(__linux__)
     madvise(const_cast<uint8_t*>(src), (size_t)bytes, MADV_WILLNEED);
 #endif
-    // Removed: volatile uint8_t sink loop that caused blocking page faults
+}
+
+// Fix 20: Coalesce adjacent madvise calls to reduce kernel syscall overhead
+static void touch_mapped_ranges(const moe_pc_engine* engine, const std::vector<std::pair<const uint8_t*, uint64_t>>& ranges) {
+    if (ranges.empty()) return;
+#ifdef _WIN32
+    if (engine && engine->io_config.enable_directstorage) {
+        return;
+    }
+    uint64_t total_bytes = 0;
+    for (const auto& r : ranges) total_bytes += r.second;
+    if (engine) {
+        const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_touch_fallback.fetch_add(total_bytes, std::memory_order_relaxed);
+    }
+#elif defined(__linux__)
+    if (ranges.empty()) return;
+    const size_t PAGE_SIZE = 4096;
+    const uint8_t* current_start = ranges[0].first;
+    uint64_t current_len = ranges[0].second;
+
+    for (size_t i = 1; i < ranges.size(); ++i) {
+        const uint8_t* next_start = ranges[i].first;
+        uint64_t next_len = ranges[i].second;
+
+        // Check if next span is adjacent or within the same page
+        if (next_start >= current_start && next_start <= current_start + current_len + PAGE_SIZE) {
+            uint64_t diff = (next_start + next_len) - current_start;
+            if (diff > current_len) {
+                current_len = diff;
+            }
+        } else {
+            madvise(const_cast<uint8_t*>(current_start), (size_t)current_len, MADV_WILLNEED);
+            current_start = next_start;
+            current_len = next_len;
+        }
+    }
+    madvise(const_cast<uint8_t*>(current_start), (size_t)current_len, MADV_WILLNEED);
+#endif
 }
 
 static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t start_idx, uint32_t count, uint32_t worker_index, uint32_t turn, uint64_t required_bytes);

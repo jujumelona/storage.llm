@@ -49,7 +49,8 @@ static float moe_forward_embedding_scale_value(const moe_pc_engine* engine, uint
     if (!engine->offload_gguf_metadata_json.empty() &&
         (moe_json_get_double_local(engine->offload_gguf_metadata_json, "embedding_scale", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "embed_scale", &value) ||
-         moe_json_get_double_local(engine->offload_gguf_metadata_json, "scale_emb", &value)) &&
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "scale_emb", &value) ||
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "scale_embedding", &value)) &&
         value > 0.0) {
         scale = (float)value;
     }

@@ -1,6 +1,5 @@
 static uint32_t caps_hw_threads() {
-    const unsigned int hw = std::thread::hardware_concurrency();
-    return hw ? static_cast<uint32_t>(hw) : 1u;
+    return moe_cpu_thread_count_hint();
 }
 
 static uint64_t normal_bundle_max_or(uint64_t fallback) {
@@ -31,6 +30,110 @@ static uint64_t moe_budget_from_free_device_memory(uint64_t free_bytes) {
     return (free_bytes * 9ull) / 10ull;
 }
 
+static uint32_t moe_copy_streams_for_pcie_bandwidth(double gb_per_sec, uint32_t hw) {
+    if (gb_per_sec >= 48.0 || hw >= 32u) {
+        return 8u;
+    }
+    if (gb_per_sec >= 24.0 || hw >= 16u) {
+        return 4u;
+    }
+    return 2u;
+}
+
+static void moe_set_copy_stream_budget(moe_backend_caps_t* caps, uint32_t streams, uint64_t per_stream_bytes) {
+    if (!caps) {
+        return;
+    }
+    streams = std::max<uint32_t>(streams, 1u);
+    caps->copy_streams = streams;
+    caps->prefetch_streams = streams + 1u;
+    caps->copy_stream_bytes_limit = (uint64_t)streams * per_stream_bytes;
+}
+
+#ifdef __linux__
+static double moe_pcie_effective_gb_per_lane(double gt_per_sec) {
+    if (gt_per_sec >= 64.0) return 7.877;
+    if (gt_per_sec >= 32.0) return 3.938;
+    if (gt_per_sec >= 16.0) return 1.969;
+    if (gt_per_sec >= 8.0) return 0.985;
+    if (gt_per_sec >= 5.0) return 0.500;
+    return 0.250;
+}
+
+static int moe_cuda_pcie_link_bandwidth_gbps(uint32_t device_id, double* out_gb_per_sec) {
+    if (out_gb_per_sec) {
+        *out_gb_per_sec = 0.0;
+    }
+    moe_cuda_driver_api api{};
+    if (!cuda_driver_load(&api) || api.cuInit(0) != 0) {
+        moe_close_shared_library(api.library);
+        return 0;
+    }
+    int ok = 0;
+    if (api.cuDeviceGet && api.cuDeviceGetPCIBusId) {
+        int dev = 0;
+        if (api.cuDeviceGet(&dev, static_cast<int>(device_id)) == 0) {
+            char pci_id[32] = {0};
+            if (api.cuDeviceGetPCIBusId(pci_id, sizeof(pci_id), dev) == 0) {
+                char speed_path[256];
+                char width_path[256];
+                snprintf(speed_path, sizeof(speed_path), "/sys/bus/pci/devices/%s/current_link_speed", pci_id);
+                snprintf(width_path, sizeof(width_path), "/sys/bus/pci/devices/%s/current_link_width", pci_id);
+                double gt_per_sec = 0.0;
+                int width = 0;
+                FILE* f = fopen(speed_path, "r");
+                if (f) {
+                    if (fscanf(f, "%lf", &gt_per_sec) != 1) {
+                        gt_per_sec = 0.0;
+                    }
+                    fclose(f);
+                }
+                f = fopen(width_path, "r");
+                if (f) {
+                    if (fscanf(f, "%d", &width) != 1) {
+                        width = 0;
+                    }
+                    fclose(f);
+                }
+                if (gt_per_sec > 0.0 && width > 0) {
+                    if (out_gb_per_sec) {
+                        *out_gb_per_sec = moe_pcie_effective_gb_per_lane(gt_per_sec) * (double)width;
+                    }
+                    ok = 1;
+                }
+            }
+        }
+    }
+    moe_close_shared_library(api.library);
+    return ok;
+}
+#endif
+
+static double moe_cuda_estimated_compute_tflops(uint32_t device_id, int fp4_path) {
+    moe_cuda_driver_api api{};
+    if (!cuda_driver_load(&api) || api.cuInit(0) != 0 || !api.cuDeviceGetAttribute) {
+        moe_close_shared_library(api.library);
+        return 0.0;
+    }
+    double out = 0.0;
+    int dev = 0;
+    if (api.cuDeviceGet && api.cuDeviceGet(&dev, static_cast<int>(device_id)) == 0) {
+        int sm_count = 0;
+        int clock_khz = 0;
+        constexpr int CU_DEVICE_ATTRIBUTE_CLOCK_RATE = 13;
+        constexpr int CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16;
+        if (api.cuDeviceGetAttribute(&sm_count, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev) == 0 &&
+            api.cuDeviceGetAttribute(&clock_khz, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, dev) == 0 &&
+            sm_count > 0 && clock_khz > 0) {
+            const double clock_ghz = (double)clock_khz / 1000000.0;
+            const double fp16_tflops = ((double)sm_count * clock_ghz * 256.0) / 1000.0;
+            out = fp4_path ? fp16_tflops * 2.0 : fp16_tflops;
+        }
+    }
+    moe_close_shared_library(api.library);
+    return out;
+}
+
 static void fill_cpu_backend_caps(moe_backend_caps_t* caps) {
     const uint32_t hw = caps_hw_threads();
     caps->dma_bandwidth_gbps = 12.0;
@@ -59,9 +162,10 @@ static void fill_gpu_backend_base(moe_backend_caps_t* caps) {
     caps->dma_bandwidth_gbps = 25.0;
     caps->tflops_hint = 20.0;
     caps->compute_streams = hw >= 12u ? 2u : 1u;
-    caps->copy_streams = hw >= 12u ? 2u : 1u;
-    caps->prefetch_streams = hw >= 16u ? 3u : 2u;
-    caps->copy_stream_bytes_limit = 512ull * 1024ull * 1024ull;
+    moe_set_copy_stream_budget(
+        caps,
+        moe_copy_streams_for_pcie_bandwidth(0.0, hw),
+        64ull * 1024ull * 1024ull);
     caps->supports_async_copy = 1;
     caps->supports_fp4 = compiled_nvfp4_device_kernels_available();
     caps->supports_scale4 = compiled_scale4_device_fusion_available();
@@ -88,6 +192,21 @@ static void fill_cuda_backend_caps(moe_backend_caps_t* caps) {
     caps->supports_gpu_direct_file_io =
         caps->supports_directstorage || caps->supports_gpudirect_storage || compiled_bam_nvme_available();
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(64);
+    const int fp4_path = caps->supports_fp4 || caps->supports_scale4;
+    const double estimated_tflops = moe_cuda_estimated_compute_tflops(caps->device_id, fp4_path);
+    caps->tflops_hint = std::max<double>(
+        estimated_tflops,
+        fp4_path ? 150.0 : 80.0);
+#ifdef __linux__
+    double pcie_gb_per_sec = 0.0;
+    if (moe_cuda_pcie_link_bandwidth_gbps(caps->device_id, &pcie_gb_per_sec) && pcie_gb_per_sec > 0.0) {
+        caps->dma_bandwidth_gbps = pcie_gb_per_sec;
+        moe_set_copy_stream_budget(
+            caps,
+            moe_copy_streams_for_pcie_bandwidth(pcie_gb_per_sec, caps_hw_threads()),
+            64ull * 1024ull * 1024ull);
+    }
+#endif
     uint64_t total_bytes = 0;
     const uint64_t free_bytes = cuda_driver_detect_free_memory_bytes(caps->device_id, &total_bytes);
 
@@ -132,7 +251,8 @@ static void fill_hip_backend_caps(moe_backend_caps_t* caps) {
     caps->supports_backend_async_api = 1;
     caps->supports_directstorage = compiled_directstorage_available();
     caps->supports_gpu_direct_file_io = caps->supports_directstorage;
-    caps->recommended_vram_cache_bytes = cache_with_common_for_experts(48);
+    caps->recommended_vram_cache_bytes = cache_with_common_for_experts(64);
+    caps->tflops_hint = std::max<double>(caps->tflops_hint, 60.0);
 
     uint64_t total_bytes = 0;
     const uint64_t free_bytes = hip_driver_detect_free_memory_bytes(caps->device_id, &total_bytes);
@@ -169,8 +289,14 @@ static void fill_hip_backend_caps(moe_backend_caps_t* caps) {
     if (total_bytes >= 120ull * 1024ull * 1024ull * 1024ull) {
         caps->supports_unified_memory = 1;
         caps->supports_zero_copy_host = 1;
+        caps->supports_zero_copy_mmap = 1;
         caps->tflops_hint = 163.0;
         caps->dma_bandwidth_gbps = 800.0;
+        moe_set_copy_stream_budget(
+            caps,
+            16u,
+            128ull * 1024ull * 1024ull);
+        caps->recommended_pinned_bytes = 0;
     }
 }
 
@@ -185,7 +311,7 @@ static void fill_shared_memory_backend_caps(moe_backend_caps_t* caps) {
         caps->supports_zero_copy_host = 0;
         caps->supports_zero_copy_mmap = 0;
     }
-    caps->recommended_vram_cache_bytes = cache_with_common_for_experts(48);
+    caps->recommended_vram_cache_bytes = cache_with_common_for_experts(64);
 }
 
 // TODO: Issue 4 - Metal zero-copy optimization with MTLBuffer.
@@ -215,12 +341,15 @@ static void fill_metal_backend_caps(moe_backend_caps_t* caps) {
     // Solution: Bind zero_copy flags to the unified_memory flag.
     caps->supports_zero_copy_host = caps->supports_unified_memory;
     caps->supports_zero_copy_mmap = caps->supports_unified_memory;
-    caps->supports_pinned_host = 0;
+    caps->supports_pinned_host = 1;
+    caps->supports_fixed_read_staging = 1;
     caps->supports_backend_async_api = 1;
     caps->supports_gpu_direct_file_io = 0;
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(32);
     caps->tflops_hint = 14.0;
-    caps->recommended_pinned_bytes = 0;
+    caps->recommended_pinned_bytes = 64ull * 1024ull * 1024ull;
+    caps->copy_streams = std::max<uint32_t>(caps->copy_streams, 1u);
+    caps->prefetch_streams = std::max<uint32_t>(caps->prefetch_streams, 2u);
 }
 
 static void fill_basic_gpu_caps(moe_backend_caps_t* caps, int available, int* feature_flag) {
@@ -389,8 +518,16 @@ static void fill_vulkan_backend_caps(moe_backend_caps_t* caps) {
 }
 
 static void fill_levelzero_backend_caps(moe_backend_caps_t* caps) {
-    fill_shared_memory_backend_caps(caps);
+    caps->supports_pinned_host = 1;
+    caps->supports_fixed_read_staging = 1;
+    caps->supports_registered_io_buffers = 1;
+    caps->supports_backend_async_api = 0;
+    caps->supports_unified_memory = 0;
+    caps->supports_zero_copy_host = 0;
+    caps->supports_zero_copy_mmap = 0;
+    caps->recommended_vram_cache_bytes = cache_with_common_for_experts(64);
     uint64_t free_b = 0;
+    int integrated_gpu = 0;
     static int ze_budget_supported = -1;
 
     void* lib = nullptr;
@@ -410,6 +547,7 @@ static void fill_levelzero_backend_caps(moe_backend_caps_t* caps) {
         typedef int (*pfn_zeMemAllocDevice)(void*, const void*, size_t, size_t, void*, void**);
         typedef int (*pfn_zeMemGetAllocProperties)(void*, const void*, void*, void**);
         typedef int (*pfn_zeMemFree)(void*, void*);
+        typedef int (*pfn_zeDeviceGetProperties)(void*, void*);
 
 #ifdef _WIN32
         auto get_sym = [&](const char* n) { return (void*)GetProcAddress((HMODULE)lib, n); };
@@ -425,6 +563,8 @@ static void fill_levelzero_backend_caps(moe_backend_caps_t* caps) {
         pfn_zeMemAllocDevice zeMemAllocDevice = (pfn_zeMemAllocDevice)get_sym("zeMemAllocDevice");
         pfn_zeMemGetAllocProperties zeMemGetAllocProperties = (pfn_zeMemGetAllocProperties)get_sym("zeMemGetAllocProperties");
         pfn_zeMemFree zeMemFree = (pfn_zeMemFree)get_sym("zeMemFree");
+        pfn_zeDeviceGetProperties zeDeviceGetProperties =
+            (pfn_zeDeviceGetProperties)get_sym("zeDeviceGetProperties");
 
         if (zeInit && zeDriverGet && zeDeviceGet && zeContextCreate && zeMemAllocDevice && zeMemGetAllocProperties && zeMemFree) {
             if (zeInit(0) == 0) {
@@ -435,6 +575,24 @@ static void fill_levelzero_backend_caps(moe_backend_caps_t* caps) {
                     void* dev = nullptr;
                     if (zeDeviceGet(driver, &device_count, &dev) == 0 && dev) {
                         ze_budget_supported = 1;
+                        if (zeDeviceGetProperties) {
+                            struct ze_device_properties_local {
+                                uint32_t stype; void* pNext; uint32_t type;
+                                uint32_t vendorId; uint32_t deviceId; uint32_t flags;
+                                uint32_t subdeviceId; uint32_t coreClockRate;
+                                uint64_t maxMemAllocSize;
+                                uint32_t maxHardwareContexts; uint32_t maxCommandQueuePriority;
+                                uint32_t numThreadsPerEU; uint32_t physicalEUSimdWidth;
+                                uint32_t numEUsPerSubslice; uint32_t numSubslicesPerSlice;
+                                uint32_t numSlices; uint64_t timerResolution;
+                                uint32_t timestampValidBits; uint32_t kernelTimestampValidBits;
+                                uint8_t uuid[16]; char name[256];
+                            } props{};
+                            props.stype = 0x00010003; // ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES
+                            if (zeDeviceGetProperties(dev, &props) == 0 && (props.flags & 1u)) {
+                                integrated_gpu = 1;
+                            }
+                        }
 
                         // BUGFIX: Use zeDeviceGetMemoryProperties to query actual VRAM size
                         typedef int (*pfn_zeDeviceGetMemoryProperties)(void*, uint32_t*, void*);
@@ -507,6 +665,24 @@ static void fill_levelzero_backend_caps(moe_backend_caps_t* caps) {
     } else {
         caps->device_memory_bytes = caps->recommended_vram_cache_bytes;
     }
+    if (integrated_gpu) {
+        caps->supports_unified_memory = 1;
+        caps->supports_zero_copy_host = 1;
+        caps->supports_zero_copy_mmap = 1;
+        caps->recommended_pinned_bytes = 0;
+    }
+}
+
+static void fill_sycl_backend_caps(moe_backend_caps_t* caps) {
+    caps->supports_sycl = compiled_sycl_available();
+    caps->supports_pinned_host = 1;
+    caps->supports_fixed_read_staging = 1;
+    caps->supports_registered_io_buffers = 1;
+    caps->supports_backend_async_api = 0;
+    caps->supports_unified_memory = 0;
+    caps->supports_zero_copy_host = 0;
+    caps->supports_zero_copy_mmap = 0;
+    caps->recommended_vram_cache_bytes = cache_with_common_for_experts(64);
 }
 
 static void fill_webgpu_backend_caps(moe_backend_caps_t* caps) {

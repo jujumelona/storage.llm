@@ -61,8 +61,18 @@ static void subtract_tier_usage(moe_pc_engine* engine, moe_tier_t tier, uint64_t
 static constexpr size_t EVICT_HEAP_COMPACTION_NUMERATOR = 3;
 static constexpr size_t EVICT_HEAP_COMPACTION_DENOMINATOR = 2;
 
+#include <cassert>
+
 static std::mutex& evict_heap_mutex(moe_pc_engine* engine, int idx) {
     const int safe_idx = (idx >= 0 && idx < 3) ? idx : 0;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    assert(&engine->heap_mutexes[safe_idx] != &engine->heap_mutex_abi_compat_unused);
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     return engine->heap_mutexes[safe_idx];
 }
 

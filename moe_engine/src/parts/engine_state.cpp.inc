@@ -7,7 +7,14 @@ struct io_uring_state_t {
 };
 #endif
 
+static constexpr uint32_t moe_SOURCE_MMAP_FAST_SLOTS = 1024u;
+static constexpr size_t moe_GATE_SNAPSHOT_MAX_LAYER = 10000u;
+static constexpr size_t moe_GATE_SNAPSHOT_EPOCH_SLOTS = (moe_GATE_SNAPSHOT_MAX_LAYER + 1u) * 2u;
+
+static std::atomic<uint64_t> g_moe_engine_generation{0};
+
 struct moe_pc_engine {
+    uint64_t engine_generation = 0;
     moe_pc_engine_config_t config{};
     moe_io_config_t io_config{};
     uint32_t disk_stage_depth_cap{2048};
@@ -30,7 +37,7 @@ struct moe_pc_engine {
     std::unordered_map<std::string, mmap_context_t*> shard_mmaps;
     std::unordered_map<uint64_t, mmap_context_t*> shard_mmaps_by_id;
     std::unordered_set<mmap_context_t*> locked_mmaps;
-    std::atomic<mmap_context_t*> source_mmaps[256]{};
+    std::atomic<mmap_context_t*> source_mmaps[moe_SOURCE_MMAP_FAST_SLOTS]{};
     std::string model_root;
     moe_scale4_file_t* scale4 = nullptr;
     moe_cuda_driver_api cuda{};
@@ -109,6 +116,7 @@ struct moe_pc_engine {
 #endif
     std::mutex staging_slot_mutex;
     std::condition_variable staging_slot_cv;
+    std::atomic<uint64_t> staging_generation{0};
     std::condition_variable staging_pinned_cv;
     std::condition_variable staging_gpu_cv;
     std::condition_variable staging_direct_cv;
@@ -126,6 +134,7 @@ struct moe_pc_engine {
     // BUGFIX 문제9: Add mutex to protect co_activation data structures ★★★ CRITICAL
     std::shared_mutex co_activation_mutex;
     std::vector<std::unordered_map<int, std::unordered_map<int, float>>> co_activation_stats;
+    std::vector<std::unordered_map<int, std::unordered_map<int, float>>> co_activation_stats_snapshot;
     std::vector<std::vector<int>> last_selected_experts;
     // BUGFIX 701: Sliding window token counters to bound co_activation_stats memory ★★
     // co_activation_token_count: total update calls since last stats reset
@@ -139,7 +148,7 @@ struct moe_pc_engine {
     moe_expert_merge_map expert_merge_map; // BUGFIX: Move merge map from global static to per-engine instance
     std::mutex gate_snapshot_mutex;
     std::vector<std::vector<float>> gate_input_snapshots;
-    std::vector<uint64_t> gate_input_snapshot_epochs;
+    std::atomic<uint64_t> gate_input_snapshot_epochs[moe_GATE_SNAPSHOT_EPOCH_SLOTS]{};
     std::mutex gate_input_snapshot_mutex;
     std::atomic<uint32_t> adaptive_prefetch_depth{2};
     std::atomic<uint32_t> last_router_entropy_milli{0};
@@ -204,6 +213,7 @@ struct moe_pc_engine {
     std::mutex heap_mutexes[3];  // Per-tier evict heap locks: VRAM, RAM, DB.
     std::atomic<uint64_t> evict_heap_versions[3]{};
     std::atomic<bool> evict_heap_compact_needed{false};
+    [[deprecated("DO NOT USE: causes deadlock. Use heap_mutexes[0/1/2] via evict_heap_mutex()")]]
     std::mutex heap_mutex_abi_compat_unused;  // DEAD LOCK: do not use. Use heap_mutexes[0/1/2] via evict_heap_mutex(); ABI layout only.
     std::atomic<bool> vram_eviction_in_progress{false};
     std::mutex vram_eviction_mutex;

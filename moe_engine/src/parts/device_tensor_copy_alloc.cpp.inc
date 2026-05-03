@@ -108,9 +108,9 @@ static int device_prepare_tensor_allocation(
             next.pool = pool;
             int alloc_ok = 0;
 #if defined(__APPLE__) && defined(__MACH__)
-            if (e->backend_caps.backend == moe_BACKEND_METAL && host_ptr) {
-                extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t bytes);
-                next.ptr = (CUdeviceptr)metal_zero_copy_map(e, const_cast<void*>(host_ptr), bytes);
+            if (e->backend_caps.backend == moe_BACKEND_METAL) {
+                extern "C" void* metal_buffer_alloc(void* device_handle, uint64_t bytes);
+                next.ptr = (CUdeviceptr)metal_buffer_alloc(nullptr, bytes);
                 alloc_ok = (next.ptr != 0) ? 1 : 0;
             } else
 #endif

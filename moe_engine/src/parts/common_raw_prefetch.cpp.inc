@@ -1,4 +1,4 @@
-﻿static constexpr uint32_t moe_RAW_ROLE_ROUTER = 1u;
+static constexpr uint32_t moe_RAW_ROLE_ROUTER = 1u;
 static constexpr uint32_t moe_RAW_ROLE_ATTENTION = 2u;
 static constexpr uint32_t moe_RAW_ROLE_NORM = 4u;
 static constexpr uint32_t moe_RAW_ROLE_SHARED = 8u;
@@ -49,7 +49,8 @@ static int prefetch_one_raw_span(moe_pc_engine* e, const moe_storage_raw_span_sp
     if (!src) {
         return 0;
     }
-    touch_mapped_range(e, src, s.bytes);
+    // Fix 20: touch_mapped_range is now batched in the caller (prefetch_raw_layer_roles)
+    // touch_mapped_range(e, src, s.bytes);
     if (!hint_issued) {
         e->io_atomic.bytes_touch_fallback.fetch_add(s.bytes);
     }
@@ -104,6 +105,7 @@ static uint64_t prefetch_raw_layer_roles(
     const uint32_t end = moe_storage_raw_span_find_end(layer);
     // BUGFIX 475: begin/end 범위 체크
     if (begin > end) return 0;
+    std::vector<std::pair<const uint8_t*, uint64_t>> ranges_to_touch;
     for (uint32_t i = begin; i < end; ++i) {
         const moe_storage_raw_span_spec_t* s = moe_storage_raw_span_at(i);
         if (!s || (s->role & roles) == 0 || bytes >= budget || s->bytes > budget - bytes ||
@@ -114,11 +116,24 @@ static uint64_t prefetch_raw_layer_roles(
             enqueue_raw_span_prefetch(e, i, pool) :
             prefetch_one_raw_span(e, *s, pool, 1);
         if (ok) {
+            if (!enqueue_only && !e->io_config.enable_mmap_prefetch) {
+                const moe_storage_part_spec_t* part = moe_storage_part_by_id(s->part);
+                mmap_context_t* mapped = part ? get_or_map_shard_partial_by_id(
+                    e, s->part, resolve_model_file_path(e->model_root, part->path ? part->path : "", ""), s->offset, s->bytes) : nullptr;
+                if (mapped) {
+                    const uint8_t* src = static_cast<const uint8_t*>(mmap_get_ptr(mapped, 0));
+                    if (src) ranges_to_touch.push_back({src, s->bytes});
+                }
+            }
             // BUGFIX 476: bytes overflow 체크
             if (bytes > UINT64_MAX - s->bytes) break;
             bytes += s->bytes;
             ++spans;
         }
+    }
+    if (!ranges_to_touch.empty()) {
+        std::sort(ranges_to_touch.begin(), ranges_to_touch.end());
+        touch_mapped_ranges(e, ranges_to_touch);
     }
     // BUGFIX 33: Separate queued vs transferred byte counters ?�★??    // Old: Both enqueue_only and actual transfer incremented common_raw_prefetched_bytes
     // New: enqueue_only ??common_raw_queued_bytes, actual transfer ??common_raw_prefetched_bytes
@@ -171,6 +186,7 @@ static uint64_t prefetch_common_tensor_records_to_ram(moe_pc_engine* e, uint64_t
     uint64_t bytes = 0;
     uint64_t spans = 0;
     std::vector<std::pair<uint16_t, uint64_t>> seen;
+    std::vector<std::pair<const uint8_t*, uint64_t>> ranges_to_touch_gguf;
     for (const moe_gguf_common_tensor_record& rec : e->gguf_common_tensors) {
         if (!common_tensor_is_startup_core(rec) ||
             rec.bytes == 0 ||
@@ -196,7 +212,7 @@ static uint64_t prefetch_common_tensor_records_to_ram(moe_pc_engine* e, uint64_t
         if (!src) {
             continue;
         }
-        touch_mapped_range(e, src, rec.bytes);
+        ranges_to_touch_gguf.push_back({src, rec.bytes});
         if (!hint_issued) {
             e->io_atomic.bytes_touch_fallback.fetch_add(rec.bytes);
         }
@@ -206,6 +222,10 @@ static uint64_t prefetch_common_tensor_records_to_ram(moe_pc_engine* e, uint64_t
         seen.push_back({rec.resolved_path_index, rec.file_offset});
         bytes += rec.bytes;
         ++spans;
+    }
+    if (!ranges_to_touch_gguf.empty()) {
+        std::sort(ranges_to_touch_gguf.begin(), ranges_to_touch_gguf.end());
+        touch_mapped_ranges(e, ranges_to_touch_gguf);
     }
     if (bytes) {
         e->common_raw_prefetched_bytes.fetch_add(bytes);

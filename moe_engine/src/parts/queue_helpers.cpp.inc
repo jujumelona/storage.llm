@@ -83,6 +83,7 @@ static int enqueue_stage_or_retry(
         return 0;
     }
     moe_prefetch_task queued = task;
+    size_t final_depth_after = 0;  // Fix 30: declared outside lock scope
     {
         std::lock_guard<std::mutex> lock(stage.mtx);
         // BUGFIX 97: Cache queue size calculations
@@ -145,22 +146,13 @@ static int enqueue_stage_or_retry(
         } else {
             stage.queue.push_back(queued);
         }
-        // BUGFIX 113: Issue 25 - Fix depth calculation after conditional enqueue ★★★
-        // Problem: stage.depth.store(queue_sz + urgent_sz + 1) assumes task always added
-        // But if urgent queue full and demoted to normal, depth calculation is wrong
-        // queue_sz and urgent_sz are OLD sizes before push_back
-        // After demotion: normal queue grows by 1, urgent stays same
-        // Correct depth = (queue_sz + 1) + urgent_sz = queue_sz + urgent_sz + 1 ✓
-        // After urgent add: normal stays same, urgent grows by 1
-        // Correct depth = queue_sz + (urgent_sz + 1) = queue_sz + urgent_sz + 1 ✓
-        // After normal add: normal grows by 1, urgent stays same
-        // Correct depth = (queue_sz + 1) + urgent_sz = queue_sz + urgent_sz + 1 ✓
-        // Actually the formula is correct! But let's verify with actual sizes for clarity
-        const size_t final_depth = stage.queue.size() + stage.urgent_queue.size();
-        // BUGFIX 205: Add memory_order_relaxed for depth counter ★
-        stage.depth.store(static_cast<uint32_t>(final_depth), std::memory_order_relaxed);
-        engine->total_queue_depth.fetch_add(1, std::memory_order_relaxed);
+        // Fix 30: Compute depth inside lock, but update atomics outside
+        final_depth_after = stage.queue.size() + stage.urgent_queue.size();
     }
+    // Fix 30: Atomic counter updates moved outside lock to reduce contention
+    // stage.depth and total_queue_depth are atomics — safe without lock
+    stage.depth.store(static_cast<uint32_t>(final_depth_after), std::memory_order_relaxed);
+    engine->total_queue_depth.fetch_add(1, std::memory_order_relaxed);
     return 1;
 }
 
@@ -185,6 +177,7 @@ static bool pop_stage_task(
         })) {
             lock.unlock();
             device_drain_deferred_staging_copies(engine, false);
+            device_refresh_mem_info(engine, 0);
             lock.lock();
         }
     } else {

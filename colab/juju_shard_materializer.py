@@ -12,7 +12,7 @@ from pathlib import Path
 import requests
 
 
-STRICT_GGUF_EXACT_BYTES = os.environ.get("STRICT_GGUF_EXACT_BYTES", "0") != "0"
+STRICT_GGUF_EXACT_BYTES = os.environ.get("STRICT_GGUF_EXACT_BYTES", "1") != "0"
 
 GGUF_TYPE_UINT8 = 0
 GGUF_TYPE_INT8 = 1
@@ -1220,6 +1220,8 @@ def juju_weight_encoding(contract):
         "weight_quant_schema.family",
         default="",
     ) or "").lower()
+    if any(key in family for key in ("iq2_m", "iq2-m", "ud_iq2_m", "ud-iq2_m", "ud-iq2-m")):
+        return 0
     if "iq2_xxs" in family:
         return 19
     if "iq3_xxs" in family:
@@ -1304,13 +1306,12 @@ def weight_encoding_from_gguf_type(tensor_type, contract=None):
         20: 27,
         23: 28,
         30: 21,
-        31: 22,
-        32: 22,
-        33: 22,
         34: 35,
         35: 36,
         39: 4,
     }
+    if t in {31, 32, 33}:
+        return 0
     enc = mapping.get(t, 0)
     if enc:
         return enc

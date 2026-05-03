@@ -1,7 +1,7 @@
 // ============================================================
 // Mutex ordering convention:
 //   device_mutex -> map_mutex for device allocation cleanup.
-//   evict heap selection uses heap_mutex -> map_mutex and does not hold device_mutex.
+//   eviction paths that touch both structures use heap_mutex -> map_mutex.
 //   request_expert uses map_mutex, releases it, then updates eviction heaps.
 // ============================================================
 
@@ -26,8 +26,12 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
     // Solution: When compact_needed flag is set, scan up to heap_size/2 (wider scan)
     // Otherwise use conservative limit to avoid overhead
     const uint32_t stale_limit = engine->evict_heap_compact_needed.load(std::memory_order_relaxed)
-        ? std::min(heap_size, heap_size / 2u)
+        ? (heap_size > 0 ? std::min(heap_size, std::max(1u, heap_size / 2u)) : 0u)
         : std::max<uint32_t>(128u, std::min<uint32_t>(512u, heap_size / 4u));
+    if (stale_limit == 0) {
+        engine->evict_heap_compact_needed.store(false, std::memory_order_relaxed);
+        return 0;  // heap 자체가 비어있음, 정상 종료
+    }
     uint32_t stale_count = 0;
     std::unique_lock<std::mutex> heap_lock(evict_heap_mutex(engine, idx));
     while (!engine->evict_heaps[idx].empty() && stale_count < stale_limit) {
@@ -82,6 +86,11 @@ static int demote_one_victim_to(
     // device_free_experts_batched acquires device_mutex ??map_mutex AFTER Pass 1.
     // No deadlock risk because device_mutex is never held during Pass 1.
     moe_block_state evict_snap{};
+    const int from_idx = tier_heap_index(from);
+    std::unique_lock<std::mutex> heap_order_lock;
+    if (from_idx >= 0) {
+        heap_order_lock = std::unique_lock<std::mutex>(evict_heap_mutex(engine, from_idx));
+    }
     {
         std::lock_guard<std::mutex> map_lock(engine->map_mutex);
         if (victim.slot >= engine->expert_states.size()) {
@@ -94,7 +103,10 @@ static int demote_one_victim_to(
             state.predicted_next_use_epoch != victim.predicted_next_use_epoch) {
             return 0;
         }
-        if (to == moe_TIER_RAM &&
+        const bool metal_unified =
+            engine->backend_caps.backend == moe_BACKEND_METAL &&
+            engine->backend_caps.supports_unified_memory;
+        if (to == moe_TIER_RAM && !metal_unified &&
             tier_used(engine, moe_TIER_RAM) + state.bytes > tier_budget(engine, moe_TIER_RAM)) {
             return 0;
         }
@@ -160,6 +172,9 @@ static int demote_one_victim_to(
         add_tier_usage(engine, to, state.bytes);
         evict_snap = state;
     }
+    if (heap_order_lock.owns_lock()) {
+        heap_order_lock.unlock();
+    }
     replace_evict_candidate(engine, victim.slot, evict_snap);
     return 1;
 }
@@ -173,14 +188,17 @@ static int demote_one_vram_for_device_room(moe_pc_engine* engine, std::vector<st
         return 0;
     }
     moe_tier_t next_tier = moe_TIER_RAM;
+    const bool metal_unified =
+        engine->backend_caps.backend == moe_BACKEND_METAL &&
+        engine->backend_caps.supports_unified_memory;
     const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
     // Use demote_cold_until instead of an O(N) one-by-one RAM eviction loop.
     // BUGFIX 273: demote_cold_until now has recursion depth protection
-    if (ram_budget > 0 && tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget) {
+    if (!metal_unified && ram_budget > 0 && tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget) {
         std::vector<std::pair<int, int>> ignored;
         demote_cold_until(engine, moe_TIER_RAM, victim.bytes, ignored);
     }
-    if (ram_budget == 0 || tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget) {
+    if (!metal_unified && (ram_budget == 0 || tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget)) {
         next_tier = moe_TIER_DB;
     }
     return demote_one_victim_to(engine, victim, moe_TIER_VRAM, next_tier, to_free);
@@ -222,13 +240,16 @@ static void demote_cold_until_impl(moe_pc_engine* engine, moe_tier_t tier, uint6
         moe_tier_t next_tier = moe_TIER_DB;
         if (tier == moe_TIER_VRAM) {
             next_tier = moe_TIER_RAM;
+            const bool metal_unified =
+                engine->backend_caps.backend == moe_BACKEND_METAL &&
+                engine->backend_caps.supports_unified_memory;
             const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
             // Use a single cold-demotion pass instead of nested one-by-one RAM evictions.
-            if (ram_budget > 0 && tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget) {
+            if (!metal_unified && ram_budget > 0 && tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget) {
                 std::vector<std::pair<int, int>> ignored;
                 demote_cold_until_impl(engine, moe_TIER_RAM, victim.bytes, ignored, recursion_depth + 1);
             }
-            if (ram_budget == 0 || tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget) {
+            if (!metal_unified && (ram_budget == 0 || tier_used(engine, moe_TIER_RAM) + victim.bytes > ram_budget)) {
                 next_tier = moe_TIER_DB;
             }
         }

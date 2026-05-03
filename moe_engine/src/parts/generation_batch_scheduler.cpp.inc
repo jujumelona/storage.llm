@@ -82,33 +82,24 @@ struct moe_continuous_batch_scheduler_t {
         std::lock_guard<std::mutex> lock(mtx);
 
         // 1. Evict finished requests
-        // BUGFIX 229: Delete finished requests to prevent memory leak ★★
-        // Problem: erase() removes from vector but doesn't free memory allocated by new
-        // Solution: Call delete before erase to free the moe_batch_request_t object
-        // Impact: Prevents memory leak (sizeof(moe_batch_request_t) + vectors) per request
-        for (auto it = running_queue.begin(); it != running_queue.end(); ) {
-            // BUGFIX 310: Check iterator validity before dereferencing ★
-            // Problem: *it can be null if corruption occurs
-            // Solution: Skip null entries
-            if (!(*it)) {
-                it = running_queue.erase(it);
-                continue;
-            }
-            if ((*it)->phase == moe_REQ_FINISHED) {
-                // BUGFIX 311: Check kv_manager before freeing blocks ★
-                // Problem: kv_manager can be null, causes crash in free_block
-                // Solution: Only free blocks if kv_manager valid
+        // Fix 26: O(n) single-pass sweep instead of O(n²) repeated vector::erase
+        // First: free resources for finished/null requests
+        for (auto*& req : running_queue) {
+            if (!req) continue;
+            if (req->phase == moe_REQ_FINISHED) {
                 if (kv_manager) {
-                    for (uint32_t block_id : (*it)->kv_block_table) {
+                    for (uint32_t block_id : req->kv_block_table) {
                         kv_manager->free_block(block_id);
                     }
                 }
-                delete *it;  // BUGFIX 229: Free the request object
-                it = running_queue.erase(it);
-            } else {
-                ++it;
+                delete req;
+                req = nullptr;  // Mark for removal
             }
         }
+        // Second: compact with erase-remove idiom (single memmove)
+        running_queue.erase(
+            std::remove(running_queue.begin(), running_queue.end(), nullptr),
+            running_queue.end());
 
         // 2. Admit new requests (Iteration-level scheduling)
         // BUGFIX 702: Skip-based scheduling to eliminate head-of-line blocking ★★
@@ -134,7 +125,8 @@ struct moe_continuous_batch_scheduler_t {
 
                 uint32_t needed_blocks = (static_cast<uint32_t>(req->prompt_tokens.size()) + kv_manager->block_size - 1) / kv_manager->block_size;
 
-                if (kv_manager->free_count.load(std::memory_order_acquire) >= needed_blocks) {
+                // free_count is only a lock-free hint; the free-list is authoritative.
+                if (kv_manager->available_free_blocks() >= needed_blocks) {
                     // Enough KV blocks available — admit this request
                     req->phase = moe_REQ_PREFILL;
                     req->skip_count = 0;

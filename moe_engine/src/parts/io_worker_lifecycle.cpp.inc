@@ -20,6 +20,12 @@ static void stop_io_workers_locked(moe_pc_engine* engine) {
     engine->pinned_stage.pop_cv.notify_all();
     engine->gpu_stage.pop_cv.notify_all();
     engine->staging_slot_cv.notify_all();
+
+    // Fix: Clear stages BEFORE joining to prevent workers getting stuck
+    clear_stage(engine, engine->disk_stage);
+    clear_stage(engine, engine->pinned_stage);
+    clear_stage(engine, engine->gpu_stage);
+
     for (std::thread& worker : engine->io_workers) {
         if (worker.joinable()) {
             worker.join();
@@ -44,11 +50,6 @@ static void stop_io_workers_locked(moe_pc_engine* engine) {
     engine->io_workers.clear();
     engine->pinned_workers.clear();
     engine->gpu_workers.clear();
-    // Fix: Clear stages BEFORE setting io_stop = false to prevent race condition
-    // where new tasks are enqueued and immediately cleared
-    clear_stage(engine, engine->disk_stage);
-    clear_stage(engine, engine->pinned_stage);
-    clear_stage(engine, engine->gpu_stage);
     engine->total_queue_depth.store(0, std::memory_order_relaxed);
     engine->io_stop.store(false);
     engine->io_done_cv.notify_all();

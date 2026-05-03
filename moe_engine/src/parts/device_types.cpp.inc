@@ -8,14 +8,17 @@ typedef void* CUevent;
 
 typedef int (*moe_cu_init_fn)(unsigned int);
 typedef int (*moe_cu_device_get_fn)(int*, int);
+typedef int (*moe_cu_device_get_attribute_fn)(int*, int, int);
 typedef int (*moe_cu_device_get_pci_bus_id_fn)(char*, int, int);
 typedef int (*moe_cu_ctx_set_current_fn)(void*);
+typedef int (*moe_cu_ctx_synchronize_fn)();
 typedef int (*moe_cu_primary_ctx_retain_fn)(void**, int);
 typedef int (*moe_cu_primary_ctx_release_fn)(int);
 typedef int (*moe_cu_mem_alloc_fn)(uint64_t*, size_t);
 typedef int (*moe_cu_mem_free_fn)(uint64_t);
 typedef int (*moe_cu_memcpy_htod_fn)(uint64_t, const void*, size_t);
 typedef int (*moe_cu_memcpy_htod_async_fn)(uint64_t, const void*, size_t, void*);
+typedef int (*moe_cu_memcpy_dtod_fn)(uint64_t, uint64_t, size_t);
 typedef int (*moe_cu_mem_get_info_fn)(size_t*, size_t*);
 typedef int (*moe_cu_stream_create_fn)(void**, unsigned int);
 typedef int (*moe_cu_stream_synchronize_fn)(void*);
@@ -25,6 +28,10 @@ typedef int (*moe_cu_event_record_fn)(void*, void*);
 typedef int (*moe_cu_event_query_fn)(void*);
 typedef int (*moe_cu_event_synchronize_fn)(void*);
 typedef int (*moe_cu_event_destroy_fn)(void*);
+struct moe_cufile_error_t {
+    int err;
+    int cu_err;
+};
 typedef long long (*moe_cufile_read_fn)(void*, void*, size_t, int64_t, int64_t);
 typedef int (*moe_hip_device_get_attribute_fn)(int*, int, int);
 
@@ -34,14 +41,17 @@ struct moe_cuda_driver_api {
     int device = 0;
     moe_cu_init_fn cuInit = nullptr;
     moe_cu_device_get_fn cuDeviceGet = nullptr;
+    moe_cu_device_get_attribute_fn cuDeviceGetAttribute = nullptr;
     moe_cu_device_get_pci_bus_id_fn cuDeviceGetPCIBusId = nullptr;
     moe_cu_ctx_set_current_fn cuCtxSetCurrent = nullptr;
+    moe_cu_ctx_synchronize_fn cuCtxSynchronize = nullptr;
     moe_cu_primary_ctx_retain_fn cuDevicePrimaryCtxRetain = nullptr;
     moe_cu_primary_ctx_release_fn cuDevicePrimaryCtxRelease = nullptr;
     moe_cu_mem_alloc_fn cuMemAlloc = nullptr;
     moe_cu_mem_free_fn cuMemFree = nullptr;
     moe_cu_memcpy_htod_fn cuMemcpyHtoD = nullptr;
     moe_cu_memcpy_htod_async_fn cuMemcpyHtoDAsync = nullptr;
+    moe_cu_memcpy_dtod_fn cuMemcpyDtoD = nullptr;
     moe_cu_mem_get_info_fn cuMemGetInfo = nullptr;
     moe_cu_stream_create_fn cuStreamCreate = nullptr;
     moe_cu_stream_synchronize_fn cuStreamSynchronize = nullptr;
@@ -65,12 +75,12 @@ struct moe_cuda_driver_api {
     // Eliminates CPU memcpy in the disk → pinned → GPU path by reading
     // directly from NVMe into GPU memory via RDMA engine.
     void* cufile_library = nullptr;
-    int (*cuFileDriverOpen)() = nullptr;
+    moe_cufile_error_t (*cuFileDriverOpen)() = nullptr;
     void (*cuFileDriverClose)() = nullptr;
-    void* (*cuFileHandleRegister)(void*, void*) = nullptr;     // (CUfileHandle_t*, CUfileDescr_t*)
+    moe_cufile_error_t (*cuFileHandleRegister)(void**, const void*) = nullptr; // (CUfileHandle_t*, CUfileDescr_t*)
     void (*cuFileHandleDeregister)(void*) = nullptr;           // (CUfileHandle_t)
-    int (*cuFileBufRegister)(void*, size_t, int) = nullptr;    // (devPtr, size, flags)
-    int (*cuFileBufDeregister)(void*) = nullptr;               // (devPtr)
+    moe_cufile_error_t (*cuFileBufRegister)(void*, size_t, int) = nullptr; // (devPtr, size, flags)
+    moe_cufile_error_t (*cuFileBufDeregister)(void*) = nullptr;            // (devPtr)
     moe_cufile_read_fn cuFileRead = nullptr;  // (handle, devPtr, size, file_off, buf_off)
     bool cufile_available = false;
 
@@ -88,12 +98,14 @@ struct moe_hip_driver_api {
     moe_hip_device_get_attribute_fn hipDeviceGetAttribute = nullptr;
     moe_cu_device_get_pci_bus_id_fn hipDeviceGetPCIBusId = nullptr;
     moe_cu_ctx_set_current_fn hipCtxSetCurrent = nullptr;
+    moe_cu_ctx_synchronize_fn hipDeviceSynchronize = nullptr;
     moe_cu_primary_ctx_retain_fn hipDevicePrimaryCtxRetain = nullptr;
     moe_cu_primary_ctx_release_fn hipDevicePrimaryCtxRelease = nullptr;
     moe_cu_mem_alloc_fn hipMalloc = nullptr;
     moe_cu_mem_free_fn hipFree = nullptr;
     moe_cu_memcpy_htod_fn hipMemcpyHtoD = nullptr;
     moe_cu_memcpy_htod_async_fn hipMemcpyHtoDAsync = nullptr;
+    moe_cu_memcpy_dtod_fn hipMemcpyDtoD = nullptr;
     moe_cu_mem_get_info_fn hipMemGetInfo = nullptr;
     moe_cu_stream_create_fn hipStreamCreate = nullptr;
     moe_cu_stream_synchronize_fn hipStreamSynchronize = nullptr;

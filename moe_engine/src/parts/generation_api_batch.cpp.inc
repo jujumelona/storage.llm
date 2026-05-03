@@ -16,6 +16,13 @@ int moe_pc_engine_submit_request(
     uint32_t token_count
 ) {
     if (!engine || !prompt_tokens || token_count == 0) return 0;
+#if !MOE_ENABLE_PAGED_KV
+    (void)request_id;
+    std::fprintf(stderr,
+        "[storageLLM ERROR] continuous batching / paged KV is disabled at compile time. "
+        "Define MOE_ENABLE_PAGED_KV=1 only after the paged forward path is connected.\n");
+    return 0;
+#else
 
     // BUGFIX 634: Check new allocation failure ★
     moe_batch_request_t* req = new (std::nothrow) moe_batch_request_t();
@@ -31,6 +38,7 @@ int moe_pc_engine_submit_request(
     std::fprintf(stderr, "[storageLLM INFO] Request %llu submitted for continuous batching (tokens: %u)\n",
                  (unsigned long long)request_id, token_count);
     return 1;
+#endif
 }
 
 int moe_pc_engine_step_batch(moe_pc_engine_t* engine) {

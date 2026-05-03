@@ -4,6 +4,13 @@
 static uint32_t moe_weight_encoding_from_family(const std::string& family) {
     const std::string value = moe_lower_ascii_copy(family);
     if (value.find("iq2") != std::string::npos || value.find("ud-iq2") != std::string::npos) {
+        if (value.find("iq2_m") != std::string::npos ||
+            value.find("iq2-m") != std::string::npos ||
+            value.find("ud_iq2_m") != std::string::npos ||
+            value.find("ud-iq2_m") != std::string::npos ||
+            value.find("ud-iq2-m") != std::string::npos) {
+            return moe_WEIGHT_ENCODING_UNKNOWN;
+        }
         if (value.find("iq2_xs") != std::string::npos) {
             return moe_WEIGHT_ENCODING_GGUF_IQ2_XS;
         }

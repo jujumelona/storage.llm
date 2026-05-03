@@ -26,44 +26,61 @@ int moe_pc_engine_execute_prefetch_plan(
     // Problem 5 Fix: Split into two passes to reduce per-item mutex chaining.
     // Pass 1: Admission + eviction decisions (heap_mutex + map_mutex per item).
     // Pass 2: Enqueue all items (map_mutex once per item).
-    // This prevents worst-case heap_mutex ??(map_mutex × n evictions) ??device_mutex ??map_mutex
+    // This prevents worst-case heap_mutex → map_mutex × n evictions → device_mutex → map_mutex
     // from happening item_count times in a tight loop.
 
     std::vector<moe_tier_t> admitted_tiers(item_count, moe_TIER_DB);
     std::vector<uint8_t> vram_pending_reserved(item_count, 0u);
     std::vector<std::vector<std::pair<int, int>>> all_to_free(item_count);
 
-    // Pass 1: Admission and eviction decisions
-    // BUGFIX 240: Remove dead code batch_ram_reserved ★
-    // Problem: batch_ram_reserved is declared and decremented but never incremented.
-    // This is dead code that serves no purpose and confuses readers.
-    // Solution: Remove the variable entirely.
+    // Fix 37: Snapshot stage loads once before admission loop
+    // Eliminates 6 atomic reads per item (hundreds of items → thousands of reads)
+    // Stale snapshots are acceptable: queue pressure changes on 10s of ms timescale
+    const uint32_t snap_disk_load = prefetch_stage_load(engine->disk_stage);
+    const uint32_t snap_pinned_load = prefetch_stage_load(engine->pinned_stage);
+    const uint32_t snap_gpu_load = prefetch_stage_load(engine->gpu_stage);
+
     for (uint32_t i = 0; i < item_count; ++i) {
         if (stream_inflight[i]) {
             continue;
         }
-        admitted_tiers[i] = prefetch_admitted_tier(engine, items[i], all_to_free[i]);
+        // Use snapshot-based pressure check instead of per-item atomic reads
+        bool under_pressure = false;
+        if (engine->disk_stage_depth_cap > 0 &&
+            snap_disk_load * 4u >= engine->disk_stage_depth_cap * 3u) {
+            under_pressure = true;
+        } else if (items[i].target_tier == moe_TIER_VRAM &&
+            ((engine->pinned_stage_depth_cap > 0 &&
+              snap_pinned_load * 4u >= engine->pinned_stage_depth_cap * 3u) ||
+             (engine->gpu_stage_depth_cap > 0 &&
+              snap_gpu_load * 4u >= engine->gpu_stage_depth_cap * 3u))) {
+            under_pressure = true;
+        } else if (items[i].target_tier == moe_TIER_RAM) {
+            const uint32_t pinned_workers = runtime_pinned_workers(engine);
+            const uint32_t dyn_batch_max = moe_gpu_stage_batch_max(engine);
+            const uint32_t pinned_threshold = std::min(
+                engine->io_config.max_prefetch_queue / 4u,
+                std::max(64u, pinned_workers * dyn_batch_max * 12u));
+            if (snap_pinned_load >= pinned_threshold) {
+                under_pressure = true;
+            }
+        }
+        moe_expert_prefetch_item_t adjusted_item = items[i];
+        if (under_pressure && !prefetch_is_router_selected(items[i])) {
+            adjusted_item.target_tier = moe_TIER_RAM;
+        }
+        admitted_tiers[i] = prefetch_admitted_tier(engine, adjusted_item, all_to_free[i]);
         vram_pending_reserved[i] =
             (admitted_tiers[i] == moe_TIER_VRAM && items[i].target_tier == moe_TIER_VRAM) ? 1u : 0u;
     }
 
-    // BUGFIX 60: Issue 3 - TOCTOU deferred free pattern ?�★
-    // Problem: Pass 1 collects to_free with map_mutex, releases lock,
-    // then device_free_experts_batched. Between these, IO worker can start DMA
-    // on same expert ??inflight_copies != 0 ??free fails or crashes.
-    // Solution: Set pending_free flag in Pass 1 under map_mutex.
-    // device_free_experts_batched checks pending_free, skips if inflight.
-    // DMA completion handler (device_copy_complete) checks pending_free and
-    // calls device_free_expert_if_pending_evict_locked to complete deferred free.
-    // This pattern already exists in device_free_expert_if_pending_evict_locked.
-
+    // BUGFIX 60: Issue 3 - TOCTOU deferred free pattern
     std::vector<std::pair<int, int>> flat_to_free;
     for (auto& to_free : all_to_free) {
         flat_to_free.insert(flat_to_free.end(), to_free.begin(), to_free.end());
     }
 
     // Set pending_free flags under map_mutex before actual free
-    // This prevents IO workers from starting new DMA on these experts
     if (!flat_to_free.empty()) {
         std::lock_guard<std::mutex> lock(engine->map_mutex);
         for (const auto& victim : flat_to_free) {
@@ -77,9 +94,6 @@ int moe_pc_engine_execute_prefetch_plan(
         }
     }
 
-    // Now safe to call device_free_experts_batched
-    // It will check pending_evict and inflight_copies
-    // If inflight, free is deferred to DMA completion handler
     if (!flat_to_free.empty()) {
         device_free_experts_batched(engine, flat_to_free, 4);
     }

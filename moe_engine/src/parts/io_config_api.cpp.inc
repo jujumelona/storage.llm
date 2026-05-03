@@ -11,7 +11,51 @@
     engine->pending_ram_reservation.store(0, std::memory_order_relaxed);
     engine->staging_numa_allocated = false;
 
+    const int using_default_io_config = config ? 0 : 1;
     engine->io_config = config ? *config : moe_pc_default_io_config();
+    const int staging_bypass = engine_bypass_staging_pipeline(engine);
+    const int dma_gpu_backend =
+        engine->backend_caps.backend == moe_BACKEND_CUDA ||
+        engine->backend_caps.backend == moe_BACKEND_HIP ||
+        engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
+        engine->backend_caps.backend == moe_BACKEND_SYCL;
+    if (!staging_bypass && dma_gpu_backend && engine->backend_caps.supports_pinned_host) {
+        engine->io_config.enable_multistage_pipeline = 1;
+        engine->io_config.enable_pinned_host = 1;
+    }
+    if (using_default_io_config || engine->io_config.prefetch_window_layers == 0) {
+        const uint64_t vram = engine->backend_caps.device_memory_bytes ?
+            engine->backend_caps.device_memory_bytes : engine->backend_caps.recommended_vram_cache_bytes;
+        const uint64_t gib = 1024ull * 1024ull * 1024ull;
+        engine->io_config.prefetch_window_layers =
+            !engine->config.prefer_gpu || engine->backend_caps.backend == moe_BACKEND_CPU ? 4u :
+            vram > 24ull * gib ? 8u :
+            vram >= 12ull * gib ? 4u : 2u;
+    }
+    if (engine->io_config.vram_eviction_threshold_pct == 0 && engine->config.prefer_gpu) {
+        const uint64_t vram = engine->backend_caps.device_memory_bytes ?
+            engine->backend_caps.device_memory_bytes : engine->backend_caps.recommended_vram_cache_bytes;
+        const uint64_t gib = 1024ull * 1024ull * 1024ull;
+        engine->io_config.vram_eviction_threshold_pct =
+            (vram > 0 && vram < 12ull * gib) || !engine->backend_caps.supports_gpu_direct_file_io ? 65u : 75u;
+    }
+    if (!staging_bypass && engine->backend_caps.supports_pinned_host) {
+        const uint32_t streams = std::max<uint32_t>(engine->backend_caps.copy_streams, 1u);
+        uint64_t tensor_bytes = engine->max_tensor_stream_bytes ?
+            engine->max_tensor_stream_bytes : normal_bundle_max_or(32ull * 1024ull * 1024ull);
+        uint64_t staging_target = tensor_bytes <= UINT64_MAX / streams ? tensor_bytes * streams : UINT64_MAX;
+        staging_target = staging_target <= UINT64_MAX / 4ull ? staging_target * 4ull : UINT64_MAX;
+        staging_target = std::max<uint64_t>(staging_target, engine->backend_caps.recommended_pinned_bytes);
+        staging_target = std::max<uint64_t>(staging_target, (uint64_t)streams * 64ull * 1024ull * 1024ull);
+        if (engine->config.ram_budget_bytes > 0) {
+            staging_target = std::min<uint64_t>(staging_target, engine->config.ram_budget_bytes / 2ull);
+        }
+        staging_target = moe_rt_align_4k(staging_target);
+        if (staging_target > 0 &&
+            (using_default_io_config || engine->io_config.pinned_staging_bytes < staging_target)) {
+            engine->io_config.pinned_staging_bytes = staging_target;
+        }
+    }
     if (engine->io_config.io_worker_threads > disk_worker_cap()) {
         engine->io_config.io_worker_threads = disk_worker_cap();
     }
@@ -24,9 +68,9 @@
         (engine->io_config.metal_memory_budget_pct < 50 ||
          engine->io_config.metal_memory_budget_pct > 90)) {
         fprintf(stderr,
-            "[storageLLM WARNING] metal_memory_budget_pct=%u out of safe range [50,90], using default 60\n",
+            "[storageLLM WARNING] metal_memory_budget_pct=%u out of safe range [50,90], using default 75\n",
             (unsigned)engine->io_config.metal_memory_budget_pct);
-        engine->io_config.metal_memory_budget_pct = 60;
+        engine->io_config.metal_memory_budget_pct = 75;
     }
     if (engine->io_config.vulkan_memory_headroom_pct > 90) {
         fprintf(stderr,
@@ -66,18 +110,28 @@
         engine->io_config.topology_max_edges_per_source = 1;
     }
     if (engine->io_config.disk_worker_threads == 0) {
-        engine->io_config.disk_worker_threads = engine->io_config.io_worker_threads ?
-            engine->io_config.io_worker_threads : 1;
+        engine->io_config.disk_worker_threads = moe_default_disk_worker_threads(moe_cpu_thread_count_hint());
+    } else if (using_default_io_config &&
+        engine->io_config.disk_worker_threads < moe_default_disk_worker_threads(moe_cpu_thread_count_hint())) {
+        engine->io_config.disk_worker_threads = moe_default_disk_worker_threads(moe_cpu_thread_count_hint());
     }
     engine->io_config.disk_worker_threads =
         clamp_to_cap(engine->io_config.disk_worker_threads, disk_worker_cap());
     if (engine->io_config.pinned_worker_threads == 0) {
         engine->io_config.pinned_worker_threads = 1;
+    } else if (using_default_io_config && engine->backend_caps.copy_streams > 2u) {
+        engine->io_config.pinned_worker_threads =
+            std::max<uint32_t>(engine->io_config.pinned_worker_threads,
+                std::min<uint32_t>(engine->backend_caps.copy_streams, 8u));
     }
     engine->io_config.pinned_worker_threads =
         clamp_to_cap(engine->io_config.pinned_worker_threads, pinned_worker_cap(engine));
     if (engine->io_config.gpu_worker_threads == 0) {
-        engine->io_config.gpu_worker_threads = engine->backend_caps.copy_streams > 1 ? 2u : 1u;
+        engine->io_config.gpu_worker_threads = engine->backend_caps.copy_streams ?
+            engine->backend_caps.copy_streams : 1u;
+    } else if (using_default_io_config && engine->backend_caps.copy_streams > engine->io_config.gpu_worker_threads) {
+        engine->io_config.gpu_worker_threads =
+            std::min<uint32_t>(engine->backend_caps.copy_streams, 8u);
     }
     engine->io_config.gpu_worker_threads =
         clamp_to_cap(engine->io_config.gpu_worker_threads, gpu_worker_cap(engine));
@@ -120,18 +174,11 @@
                 "(requested=%llu bytes)\n",
                 (unsigned long long)requested_staging_bytes);
         }
-        // BUG 1 FIX: non-pinned staging mistaken for pinned. allocate_best_staging returns non-null + non-pinned when mlock fails.
-        // Without this check, enable_pinned_host=1 and enable_multistage_pipeline=1 remain set,
-        // causing pinned_worker threads to launch and use non-pinned memory for "async" DMA.
-        // CUDA driver internally copies non-pinned memory to temp pinned buffer ??sync blocking.
-        // Result: entire pipeline blocks on every transfer with no stderr warning.
         if (engine->staging && !engine->staging_pinned) {
-            // Memory allocated but not pinned ??async DMA impossible, pipeline has no effect
-            engine->io_config.enable_pinned_host = 0;
-            engine->io_config.enable_multistage_pipeline = 0;
             fprintf(stderr,
                 "[storagellm] staging allocated but not pinned; "
-                "disabling multistage pipeline (sync DMA fallback).\n");
+                "keeping multistage pipeline with explicit synchronous DMA fallback. "
+                "Raise RLIMIT_MEMLOCK/ulimit -l for async pinned DMA.\n");
         }
         if (engine->staging) {
             std::memset(engine->staging, 0, static_cast<size_t>(std::min<uint64_t>(engine->staging_size, 4096)));

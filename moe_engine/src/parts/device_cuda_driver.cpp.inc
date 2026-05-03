@@ -54,8 +54,10 @@ static int cuda_driver_load(moe_cuda_driver_api* api) {
     }
     api->cuInit = (moe_cu_init_fn)moe_find_shared_symbol(api->library, "cuInit");
     api->cuDeviceGet = (moe_cu_device_get_fn)moe_find_shared_symbol(api->library, "cuDeviceGet");
+    api->cuDeviceGetAttribute = (moe_cu_device_get_attribute_fn)moe_find_shared_symbol(api->library, "cuDeviceGetAttribute");
     api->cuDeviceGetPCIBusId = (moe_cu_device_get_pci_bus_id_fn)moe_find_shared_symbol(api->library, "cuDeviceGetPCIBusId");
     api->cuCtxSetCurrent = (moe_cu_ctx_set_current_fn)moe_find_shared_symbol(api->library, "cuCtxSetCurrent");
+    api->cuCtxSynchronize = (moe_cu_ctx_synchronize_fn)moe_find_shared_symbol(api->library, "cuCtxSynchronize");
     api->cuDevicePrimaryCtxRetain = (moe_cu_primary_ctx_retain_fn)moe_find_shared_symbol(api->library, "cuDevicePrimaryCtxRetain");
     api->cuDevicePrimaryCtxRelease = (moe_cu_primary_ctx_release_fn)moe_find_shared_symbol(api->library, "cuDevicePrimaryCtxRelease");
     api->cuMemAlloc = (moe_cu_mem_alloc_fn)moe_find_cuda_symbol(api->library, "cuMemAlloc_v2", "cuMemAlloc");
@@ -63,6 +65,7 @@ static int cuda_driver_load(moe_cuda_driver_api* api) {
     api->cuMemcpyHtoD = (moe_cu_memcpy_htod_fn)moe_find_cuda_symbol(api->library, "cuMemcpyHtoD_v2", "cuMemcpyHtoD");
     api->cuMemGetInfo = (moe_cu_mem_get_info_fn)moe_find_cuda_symbol(api->library, "cuMemGetInfo_v2", "cuMemGetInfo");
     api->cuMemcpyHtoDAsync = (moe_cu_memcpy_htod_async_fn)moe_find_cuda_symbol(api->library, "cuMemcpyHtoDAsync_v2", "cuMemcpyHtoDAsync");
+    api->cuMemcpyDtoD = (moe_cu_memcpy_dtod_fn)moe_find_cuda_symbol(api->library, "cuMemcpyDtoD_v2", "cuMemcpyDtoD");
     api->cuStreamCreate = (moe_cu_stream_create_fn)moe_find_shared_symbol(api->library, "cuStreamCreate");
     api->cuStreamSynchronize = (moe_cu_stream_synchronize_fn)moe_find_shared_symbol(api->library, "cuStreamSynchronize");
     api->cuStreamDestroy = (moe_cu_stream_destroy_fn)moe_find_cuda_symbol(api->library, "cuStreamDestroy_v2", "cuStreamDestroy");
@@ -99,12 +102,12 @@ static int cuda_driver_load(moe_cuda_driver_api* api) {
     }
 #endif
     if (api->cufile_library) {
-        api->cuFileDriverOpen = (int (*)())moe_find_shared_symbol(api->cufile_library, "cuFileDriverOpen");
+        api->cuFileDriverOpen = (moe_cufile_error_t (*)())moe_find_shared_symbol(api->cufile_library, "cuFileDriverOpen");
         api->cuFileDriverClose = (void (*)())moe_find_shared_symbol(api->cufile_library, "cuFileDriverClose");
-        api->cuFileHandleRegister = (void* (*)(void*, void*))moe_find_shared_symbol(api->cufile_library, "cuFileHandleRegister");
+        api->cuFileHandleRegister = (moe_cufile_error_t (*)(void**, const void*))moe_find_shared_symbol(api->cufile_library, "cuFileHandleRegister");
         api->cuFileHandleDeregister = (void (*)(void*))moe_find_shared_symbol(api->cufile_library, "cuFileHandleDeregister");
-        api->cuFileBufRegister = (int (*)(void*, size_t, int))moe_find_shared_symbol(api->cufile_library, "cuFileBufRegister");
-        api->cuFileBufDeregister = (int (*)(void*))moe_find_shared_symbol(api->cufile_library, "cuFileBufDeregister");
+        api->cuFileBufRegister = (moe_cufile_error_t (*)(void*, size_t, int))moe_find_shared_symbol(api->cufile_library, "cuFileBufRegister");
+        api->cuFileBufDeregister = (moe_cufile_error_t (*)(void*))moe_find_shared_symbol(api->cufile_library, "cuFileBufDeregister");
         api->cuFileRead = (moe_cufile_read_fn)moe_find_shared_symbol(api->cufile_library, "cuFileRead");
         api->cufile_available = api->cuFileDriverOpen && api->cuFileRead && api->cuFileBufRegister;
         if (api->cufile_available) {

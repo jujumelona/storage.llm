@@ -233,6 +233,11 @@ struct moe_io_ring_adapter {
         return nullptr;
     }
 
+    void drain_without_free() {
+        if (!initialized) return;
+        while (peek_completion() != nullptr) {}
+    }
+
     void cleanup() {
         if (!initialized) return;
 #if defined(__linux__) && MOE_HAVE_LIBURING

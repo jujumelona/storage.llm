@@ -2511,7 +2511,21 @@ static void apply_format_model_id(server_options* opts) {
     }
 }
 
+// Declare the fast FP mode function so we can use it in main
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <xmmintrin.h>
+#include <pmmintrin.h>
+#endif
+static inline void moe_cpu_enable_fast_fp_mode_main() {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+#endif
+}
+
 static int server_main(int argc, char** argv) {
+    // Fix 21: Enable CPU Fast FP mode in the main thread to prevent denormal slow-downs
+    moe_cpu_enable_fast_fp_mode_main();
     server_options opts = parse_args(argc, argv);
     apply_format_model_id(&opts);
 

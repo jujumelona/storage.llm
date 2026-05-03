@@ -42,8 +42,17 @@ static uint64_t vram_expert_budget_bytes(const moe_pc_engine* engine) {
         return 0;
     }
     const uint64_t common = engine->common_vram_reserved_bytes.load();
-    const uint64_t kv_budget = engine->vram_kv_budget_bytes.load(std::memory_order_relaxed);
-    const uint64_t reserved = common + kv_budget;
+    const uint64_t kv_used = engine->vram_kv_used_bytes.load(std::memory_order_relaxed);
+    const uint64_t pending = engine->pending_vram_reservation.load(std::memory_order_relaxed);
+    uint64_t reserved = common;
+    if (reserved > UINT64_MAX - kv_used) {
+        return 0;
+    }
+    reserved += kv_used;
+    if (reserved > UINT64_MAX - pending) {
+        return 0;
+    }
+    reserved += pending;
     return engine->config.vram_budget_bytes > reserved ?
         engine->config.vram_budget_bytes - reserved : 0;
 }
@@ -57,8 +66,6 @@ static void init_kv_vram_budget(moe_pc_engine* engine) {
         return;
     }
 
-    // Default: 20% of VRAM for KV cache.
-    // vram_kv_ratio == 0 means auto; any positive value is explicit.
     float kv_ratio = engine->config.vram_kv_ratio;
 
     // BUGFIX Issue 2-5: Multi-tier KV VRAM ratio thresholds ★★★
@@ -68,25 +75,10 @@ static void init_kv_vram_budget(moe_pc_engine* engine) {
     // Solution: Use graduated thresholds based on VRAM size for better allocation
     // Auto-detect if not configured (0.0 means auto)
     if (kv_ratio <= 0.0f) {
-        const uint64_t vram_gb = engine->config.vram_budget_bytes / (1024ull * 1024ull * 1024ull);
-
-        // Multi-tier thresholds optimized for different GPU classes
-        if (vram_gb < 8) {
-            kv_ratio = 0.05f;  // 5% - Minimal KV, prioritize experts (consumer low-end)
-        } else if (vram_gb < 16) {
-            kv_ratio = 0.10f;  // 10% - Balanced for consumer GPUs (RTX 3060, 4060)
-        } else if (vram_gb < 32) {
-            kv_ratio = 0.15f;  // 15% - Professional GPUs (RTX 4070 Ti, 4080)
-        } else if (vram_gb < 64) {
-            kv_ratio = 0.20f;  // 20% - High-end workstation (RTX 4090, A5000)
-        } else {
-            kv_ratio = 0.25f;  // 25% - Data center GPUs (A100, H100)
-        }
-
-        fprintf(stderr,
-            "[storageLLM INFO] Auto-detected KV VRAM ratio: %.0f%% for %llu GB VRAM\n",
-            kv_ratio * 100.0f,
-            (unsigned long long)vram_gb);
+        const uint64_t gib = 1024ull * 1024ull * 1024ull;
+        const uint64_t vram = engine->config.vram_budget_bytes;
+        kv_ratio = vram <= 8ull * gib ? 0.10f :
+                   vram <= 24ull * gib ? 0.15f : 0.20f;
     } else if (kv_ratio > 1.0f) {
         fprintf(stderr,
             "[storageLLM WARNING] vram_kv_ratio=%.2f exceeds 1.0, clamping to full KV allocation\n",

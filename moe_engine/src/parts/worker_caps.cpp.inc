@@ -1,6 +1,5 @@
 static uint32_t engine_hw_threads() {
-    const unsigned int hw = std::thread::hardware_concurrency();
-    return hw ? static_cast<uint32_t>(hw) : 1u;
+    return moe_cpu_thread_count_hint();
 }
 
 static uint32_t disk_worker_cap() {
@@ -22,7 +21,7 @@ static uint32_t pinned_worker_cap(const moe_pc_engine* engine) {
     if (cap == 0) {
         cap = 1;
     }
-    return cap > 8u ? 8u : cap;
+    return cap > 16u ? 16u : cap;
 }
 
 static uint32_t gpu_worker_cap(const moe_pc_engine* engine) {

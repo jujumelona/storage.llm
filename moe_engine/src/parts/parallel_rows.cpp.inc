@@ -1,7 +1,37 @@
+#if defined(__APPLE__) && defined(__MACH__)
+#include <pthread/qos.h>
+#include <sys/sysctl.h>
+#endif
+
+static uint32_t row_thread_override() {
+    const uint32_t rows = moe_parse_env_u32("STORAGELLM_CPU_ROW_THREADS");
+    return rows > 0 ? std::min<uint32_t>(rows, 256u) : 0u;
+}
+
+#if defined(__APPLE__) && defined(__MACH__)
+static uint32_t macos_performance_core_count() {
+    uint32_t value = 0;
+    size_t size = sizeof(value);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &value, &size, nullptr, 0) == 0 && value > 0) {
+        return value;
+    }
+    return 0;
+}
+#endif
+
 static uint32_t row_hw_threads() {
     static const uint32_t hw = []() -> uint32_t {
-        const unsigned int n = std::thread::hardware_concurrency();
-        return n ? static_cast<uint32_t>(n) : 1u;
+#if defined(__APPLE__) && defined(__MACH__)
+        const uint32_t override_threads = row_thread_override();
+        if (override_threads > 0) {
+            return override_threads;
+        }
+        const uint32_t pcores = macos_performance_core_count();
+        if (pcores > 0) {
+            return pcores;
+        }
+#endif
+        return moe_cpu_thread_count_hint();
     }();
     return hw;
 }
@@ -15,6 +45,26 @@ static inline void moe_cpu_enable_fast_fp_mode() {
 #endif
 }
 
+static inline void moe_cpu_apply_row_worker_qos() {
+#if defined(__APPLE__) && defined(__MACH__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
+
+static uint32_t moe_cpu_row_min_block() {
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+    if (__builtin_cpu_supports("avx512f")) return 64u;
+    if (__builtin_cpu_supports("avx2")) return 32u;
+#endif
+#if defined(__AVX512F__)
+    return 64u;
+#elif defined(__AVX2__)
+    return 32u;
+#else
+    return 16u;
+#endif
+}
+
 // BUGFIX 710: Minimum block size to prevent excessive atomic fetch_add contention ★★
 // Problem: 256 rows / (16 workers * 4) = 4 rows per block → 64 fetch_add ops per dispatch.
 //   False sharing + cache ping-pong on next_row atomic degrades throughput.
@@ -25,7 +75,7 @@ static uint32_t auto_row_block(uint32_t rows, uint32_t workers) {
         workers = 1;
     }
     const uint32_t block = rows / (workers * 4u);
-    const uint32_t min_block = 16u;
+    const uint32_t min_block = moe_cpu_row_min_block();
     return std::max(block ? block : 1u, min_block);
 }
 
@@ -52,6 +102,7 @@ struct moe_cpu_row_pool_t {
 
     std::function<void()> work_fn;   // shared work function for all workers
     std::atomic<uint32_t> pending{0};
+    std::atomic<uint32_t> running{0};
     std::atomic<bool> shutdown{false};
     uint64_t generation = 0;
     uint32_t active_count = 0;
@@ -65,9 +116,11 @@ struct moe_cpu_row_pool_t {
         if (start >= count) return;
         threads.reserve(count);
         for (uint32_t i = start; i < count; ++i) {
-            threads.emplace_back([this, i]() {
+            const uint64_t initial_generation = generation;
+            threads.emplace_back([this, i, initial_generation]() {
                 moe_cpu_enable_fast_fp_mode();
-                uint64_t seen_generation = 0;
+                moe_cpu_apply_row_worker_qos();
+                uint64_t seen_generation = initial_generation;
                 for (;;) {
                     std::function<void()> fn;
                     {
@@ -84,8 +137,13 @@ struct moe_cpu_row_pool_t {
                             continue;
                         }
                         fn = work_fn;
+                        if (!fn) {
+                            continue;
+                        }
+                        running.fetch_add(1, std::memory_order_acq_rel);
                     }
                     if (fn) fn();
+                    running.fetch_sub(1, std::memory_order_acq_rel);
                     if (pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                         done_cv.notify_all();
                     }
@@ -100,6 +158,7 @@ struct moe_cpu_row_pool_t {
             work_fn = std::move(fn);
             active_count = std::min<uint32_t>(count, static_cast<uint32_t>(threads.size()));
             ++generation;
+            running.store(0, std::memory_order_release);
             pending.store(active_count, std::memory_order_release);
         }
         dispatch_cv.notify_all();
@@ -107,9 +166,31 @@ struct moe_cpu_row_pool_t {
 
     void wait() {
         std::unique_lock<std::mutex> lk(mtx);
-        done_cv.wait(lk, [this]() {
-            return pending.load(std::memory_order_relaxed) == 0;
-        });
+        for (;;) {
+            if (pending.load(std::memory_order_acquire) == 0) {
+                return;
+            }
+            if (done_cv.wait_for(lk, std::chrono::seconds(2), [this]() {
+                    return pending.load(std::memory_order_acquire) == 0;
+                })) {
+                return;
+            }
+            const uint32_t stuck_pending = pending.load(std::memory_order_acquire);
+            const uint32_t stuck_running = running.load(std::memory_order_acquire);
+            if (stuck_pending > 0 && stuck_running == 0) {
+                std::fprintf(
+                    stderr,
+                    "[storagellm cpu_row_pool] recovered stale dispatch generation=%llu pending=%u active=%u\n",
+                    (unsigned long long)generation,
+                    stuck_pending,
+                    active_count);
+                active_count = 0;
+                work_fn = nullptr;
+                pending.store(0, std::memory_order_release);
+                done_cv.notify_all();
+                return;
+            }
+        }
     }
 
     ~moe_cpu_row_pool_t() {
@@ -197,6 +278,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     std::atomic<int> ok{1};
     auto run_rows = [&]() {
         moe_cpu_enable_fast_fp_mode();
+        moe_cpu_apply_row_worker_qos();
         while (ok.load(std::memory_order_acquire)) {
             const uint32_t start = next_row.fetch_add(block_rows, std::memory_order_relaxed);
             if (start >= row_count) {

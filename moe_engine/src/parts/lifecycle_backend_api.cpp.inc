@@ -3,6 +3,7 @@ moe_pc_engine_t* moe_pc_engine_create(const moe_pc_engine_config_t* config) {
     moe_platform_init_limits();
     auto* engine = new (std::nothrow) moe_pc_engine();
     if (!engine) return nullptr;
+    engine->engine_generation = g_moe_engine_generation.fetch_add(1u, std::memory_order_relaxed) + 1u;
     engine->config = config ? *config : moe_pc_default_config();
     qkv_set_mode(engine->config.kv_mode == moe_KV_MODE_QKV);
     engine->expert_states.assign(expert_slot_count(engine), moe_block_state{});

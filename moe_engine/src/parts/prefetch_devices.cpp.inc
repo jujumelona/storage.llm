@@ -80,16 +80,72 @@ static int prefetch_tensor_pinned_to_gpu(
     return 1;
 }
 
+static int prefetch_expert_triplet_pinned_to_gpu_bundle(
+    moe_pc_engine* engine,
+    const moe_prefetch_task& task,
+    int sync_after = 1
+) {
+    if (!engine || !task.bundle_triplet ||
+        task.bundle_layer < 0 || task.bundle_expert < 0 ||
+        task.staging_slot >= engine->staging_slots.size() ||
+        !engine->staging_slots[task.staging_slot].buf) {
+        return 0;
+    }
+    const moe_projection_t projs[3] = {moe_PROJ_GATE, moe_PROJ_UP, moe_PROJ_DOWN};
+    uint64_t copied_total = 0;
+    for (uint32_t i = 0; i < 3u; ++i) {
+        const moe_tensor_record* rec = find_tensor_record(
+            engine,
+            task.bundle_layer,
+            task.bundle_expert,
+            projs[i]);
+        if (!rec || task.bundle_bytes[i] == 0 ||
+            task.bundle_offsets[i] > engine->staging_slots[task.staging_slot].size ||
+            task.bundle_bytes[i] > engine->staging_slots[task.staging_slot].size - task.bundle_offsets[i]) {
+            if (rec) {
+                demote_failed_device_expert(engine, *rec);
+            }
+            release_staging_slot(engine, task.staging_slot);
+            return 0;
+        }
+        const uint8_t* host = engine->staging_slots[task.staging_slot].buf + task.bundle_offsets[i];
+        const int ok = device_copy_tensor_from_host(
+            engine,
+            *rec,
+            moe_DEVICE_POOL_EXPERT,
+            host,
+            task.bundle_bytes[i],
+            task.staging_slot,
+            0);
+        if (!ok) {
+            demote_failed_device_expert(engine, *rec);
+            release_staging_slot(engine, task.staging_slot);
+            return 0;
+        }
+        copied_total += task.bundle_bytes[i];
+    }
+    release_staging_slot(engine, task.staging_slot);
+    if (sync_after) {
+        device_stream_sync_current(engine);
+    }
+    engine->io_atomic.bytes_pinned_to_gpu.fetch_add(copied_total, std::memory_order_relaxed);
+    engine->io_atomic.gpu_stage_done.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
 static int prefetch_tensor_direct_to_gpu(moe_pc_engine* engine, const moe_tensor_record& rec) {
     if (!engine) {
         return 0;
     }
     const uint64_t bytes = tensor_stream_bytes(rec);
-    // CRITICAL FIX: Allow sync fallback when staging slots are exhausted.
-    // Before: allow_sync_fallback=0 caused infinite BACKPRESSURE loop when slots unavailable.
-    // After: allow_sync_fallback=1 enables sync DMA as last resort, ensuring forward progress.
-    // Sync DMA blocks IO worker but completes the transfer; BACKPRESSURE blocks forever.
-    const int copied = device_copy_tensor(engine, rec, moe_DEVICE_POOL_EXPERT, 1);
+    int copied = device_copy_tensor_gpudirect_storage(engine, rec, moe_DEVICE_POOL_EXPERT);
+    if (!copied) {
+        // CRITICAL FIX: Allow sync fallback when staging slots are exhausted.
+        // Before: allow_sync_fallback=0 caused infinite BACKPRESSURE loop when slots unavailable.
+        // After: allow_sync_fallback=1 enables sync DMA as last resort, ensuring forward progress.
+        // Sync DMA blocks IO worker but completes the transfer; BACKPRESSURE blocks forever.
+        copied = device_copy_tensor(engine, rec, moe_DEVICE_POOL_EXPERT, 1);
+    }
     if (copied == moe_DEVICE_COPY_BACKPRESSURE) {
         return moe_DEVICE_COPY_BACKPRESSURE;
     }

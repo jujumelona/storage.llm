@@ -12,8 +12,17 @@
 #include <functional>
 #include <queue>
 
+#ifndef MOE_ENABLE_PAGED_KV
+#define MOE_ENABLE_PAGED_KV 0
+#endif
+
+// Fix 29: Define MOE_PAGED_KV_VRAM_TIER to enable VRAM tier for KV blocks
+#define MOE_PAGED_KV_VRAM_TIER
+
 #ifndef MOE_GENERATION_PAGED_KV_TYPES_DEFINED
 #define MOE_GENERATION_PAGED_KV_TYPES_DEFINED
+
+#if MOE_ENABLE_PAGED_KV
 
 struct moe_paged_kv_block_t {
     uint32_t block_id;
@@ -27,9 +36,14 @@ struct moe_paged_kv_block_t {
 
     // BUGFIX 문제4: Add VRAM tier support for hot KV blocks ★★★
     moe_tier_t tier = moe_TIER_RAM;  // RAM, VRAM, or PINNED
+#ifdef MOE_PAGED_KV_VRAM_TIER
+    // Fix 29: Guarded behind MOE_PAGED_KV_VRAM_TIER to save 36 bytes per block
+    // when VRAM tier is not compiled in. With 4096 blocks, this saves 148KB
+    // and improves cache-line density during eviction sweeps.
     void* vram_data = nullptr;       // VRAM allocation if tier == VRAM
     void* vram_scales = nullptr;
     void* vram_zeros = nullptr;
+#endif
     uint64_t last_access_epoch = 0;  // For LRU eviction
     uint32_t access_count = 0;       // For frequency tracking
 };
@@ -42,10 +56,10 @@ struct moe_paged_kv_manager_t {
     std::vector<bool> is_free;  // BUGFIX 문제7: O(1) duplicate check bitmap
     std::vector<moe_paged_kv_block_t> blocks;
     std::atomic<uint32_t> free_count{0};
-    std::priority_queue<
-        std::pair<uint64_t, uint32_t>,
-        std::vector<std::pair<uint64_t, uint32_t>>,
-        std::greater<std::pair<uint64_t, uint32_t>>> lru_heap;
+    // Fix 25: Replaced std::priority_queue with vector + lazy deletion
+    // priority_queue cannot remove arbitrary elements, causing stale entry buildup
+    std::vector<std::pair<uint64_t, uint32_t>> lru_heap;
+    bool lru_heap_compact_needed = false;
     std::mutex mtx;
 
     void init(uint32_t capacity_tokens, uint32_t b_size, uint32_t layers, uint32_t sink_tokens = 4) {
@@ -68,7 +82,7 @@ struct moe_paged_kv_manager_t {
         is_free.resize(max_blocks, false);  // BUGFIX 문제7: Initialize bitmap
         free_blocks.reserve(max_blocks);
         free_count.store(0, std::memory_order_relaxed);
-        lru_heap = {};
+        lru_heap.clear(); lru_heap_compact_needed = false;
 
         // BUGFIX 128: Calculate how many blocks contain sink tokens
         const uint32_t sink_blocks = (sink_token_count + block_size - 1) / block_size;
@@ -129,7 +143,7 @@ struct moe_paged_kv_manager_t {
         blocks.clear();
         free_blocks.clear();
         free_count.store(0, std::memory_order_relaxed);
-        lru_heap = {};
+        lru_heap.clear(); lru_heap_compact_needed = false;
         is_free.clear();  // BUGFIX 문제7: Clear bitmap
     }
 
@@ -153,7 +167,7 @@ struct moe_paged_kv_manager_t {
                        current, current - 1u,
                        std::memory_order_relaxed,
                        std::memory_order_relaxed)) {}
-            lru_heap.push({blocks[id].last_access_epoch, id});
+            lru_heap.push_back({blocks[id].last_access_epoch, id}); std::push_heap(lru_heap.begin(), lru_heap.end(), std::greater<std::pair<uint64_t, uint32_t>>());
             return id;
         }
         free_count.store(0, std::memory_order_relaxed);
@@ -179,19 +193,41 @@ struct moe_paged_kv_manager_t {
         free_count.fetch_add(1, std::memory_order_relaxed);
     }
 
+    uint32_t available_free_blocks() {
+        std::lock_guard<std::mutex> lock(mtx);
+        return static_cast<uint32_t>(free_blocks.size());
+    }
+
     // BUGFIX 128: Evict oldest non-pinned block when cache is full
     // Returns -1 if no evictable blocks available (all pinned or in use)
     int evict_lru_block() {
         std::lock_guard<std::mutex> lock(mtx);
+        // Fix 25: Compact heap if too many stale entries
+        if (lru_heap_compact_needed && lru_heap.size() > max_blocks * 2) {
+            std::vector<std::pair<uint64_t, uint32_t>> fresh;
+            fresh.reserve(max_blocks);
+            for (auto& e : lru_heap) {
+                if (e.second < max_blocks && !is_free[e.second] &&
+                    blocks[e.second].last_access_epoch == e.first) {
+                    fresh.push_back(e);
+                }
+            }
+            lru_heap = std::move(fresh);
+            std::make_heap(lru_heap.begin(), lru_heap.end(), std::greater<std::pair<uint64_t, uint32_t>>());
+            lru_heap_compact_needed = false;
+        }
         while (!lru_heap.empty()) {
-            const auto entry = lru_heap.top();
-            lru_heap.pop();
+            std::pop_heap(lru_heap.begin(), lru_heap.end(), std::greater<std::pair<uint64_t, uint32_t>>());
+            const auto entry = lru_heap.back();
+            lru_heap.pop_back();
             const uint32_t id = entry.second;
             if (id >= max_blocks || is_free[id] || blocks[id].pinned || blocks[id].num_tokens == 0) {
                 continue;
             }
             if (blocks[id].last_access_epoch != entry.first) {
-                lru_heap.push({blocks[id].last_access_epoch, id});
+                lru_heap.push_back({blocks[id].last_access_epoch, id});
+                std::push_heap(lru_heap.begin(), lru_heap.end(), std::greater<std::pair<uint64_t, uint32_t>>());
+                lru_heap_compact_needed = true;
                 continue;
             }
             blocks[id].num_tokens = 0;
@@ -239,9 +275,28 @@ struct moe_paged_kv_manager_t {
     }
 };
 
+#else
+
+struct moe_paged_kv_block_t {};
+
+struct moe_paged_kv_manager_t {
+    uint32_t block_size = 0;
+    uint32_t max_blocks = 0;
+    std::atomic<uint32_t> free_count{0};
+
+    void init(uint32_t, uint32_t, uint32_t, uint32_t = 4) {}
+    void cleanup() {}
+    int allocate_block() { return -1; }
+    void free_block(uint32_t) {}
+    int evict_lru_block() { return -1; }
+    uint32_t available_free_blocks() { return 0; }
+};
+
+#endif
+
 #endif // MOE_GENERATION_PAGED_KV_TYPES_DEFINED
 
-#ifndef MOE_GENERATION_PAGED_KV_TYPES_ONLY
+#if MOE_ENABLE_PAGED_KV && !defined(MOE_GENERATION_PAGED_KV_TYPES_ONLY)
 
 static void device_account_bytes_freed(moe_pc_engine* e, uint64_t bytes);
 static void device_account_free_bytes_sub(moe_pc_engine* e, uint64_t bytes);

@@ -669,7 +669,7 @@ static uint8_t moe_weight_encoding_from_gguf_type(uint32_t type, const moe_offlo
         return moe_WEIGHT_ENCODING_RAW_BF16;
     }
     if (type == 31u || type == 32u || type == 33u) {
-        return moe_WEIGHT_ENCODING_GGUF_Q4_0;
+        return moe_WEIGHT_ENCODING_UNKNOWN;
     }
     if (type == 34u) {
         return moe_WEIGHT_ENCODING_GGUF_TQ1_0;

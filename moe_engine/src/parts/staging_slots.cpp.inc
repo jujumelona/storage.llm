@@ -9,10 +9,11 @@ static uint32_t moe_gpu_stage_batch_max(const moe_pc_engine* engine) {
     if (!engine || engine->backend_caps.copy_streams <= 0) {
         return 4;  // Fallback for CPU-only or uninitialized
     }
-    // BUGFIX: Increase cap from 8 to 16 to let byte_limit control actual batch size
-    // For small experts (e.g. 512KB NVFP4), old cap of 8 prevented byte_limit from working
-    // Most PCIe controllers handle 8-16 concurrent DMA efficiently
-    return std::min(16u, (uint32_t)engine->backend_caps.copy_streams);
+    if (engine->backend_caps.backend == moe_BACKEND_CUDA &&
+        engine->backend_caps.copy_streams >= 8u) {
+        return 32u;
+    }
+    return 16u;
 }
 
 static void reset_staging_slots(moe_pc_engine* engine) {
@@ -53,25 +54,21 @@ static void reset_staging_slots(moe_pc_engine* engine) {
         fprintf(stderr, "[storageLLM ERROR] reset_staging_slots: Some slots still in use after 5s timeout. "
                 "Cannot safely reset - aborting reset to prevent use-after-free. "
                 "Staging slots will leak until engine shutdown.\n");
+        // 최소한 ring_adapter를 drain 시도 (free는 하지 않음)
+        engine->ring_adapter.drain_without_free();
         // Restore free_slot_count to allow continued operation
         engine->staging_free_slot_count.store(static_cast<uint32_t>(engine->staging_slots.size()),
                                               std::memory_order_release);
         return;
     }
 
+    engine->staging_generation.fetch_add(1, std::memory_order_relaxed);
     engine->ring_adapter.cleanup();
-    // BUGFIX 문제3: Free staging buffers before clearing slots to prevent memory leak ★★★
-    // Problem: allocate_staging() allocates memory with posix_memalign/VirtualAlloc
-    // but reset_staging_slots() only sets buf=nullptr without calling free_staging()
-    // → Memory leak on engine reload
-    // Solution: Call free_staging() for each slot before clearing
-    // FIXED: Now properly calls free_staging() with all required parameters
+    // Slots are non-owning slices into engine->staging. The caller owns and
+    // frees the single backing staging buffer when capacity/config changes.
     for (auto& slot : engine->staging_slots) {
-        if (slot.buf) {
-            free_staging(slot.buf, slot.size, slot.pinned, slot.numa_allocated);
-            slot.buf = nullptr;
-            slot.size = 0;
-        }
+        slot.buf = nullptr;
+        slot.size = 0;
     }
     engine->staging_slots.clear();
     engine->staging_slot_size = 0;
@@ -93,7 +90,9 @@ static void reset_staging_slots(moe_pc_engine* engine) {
 static uint64_t moe_staging_min_slot_bytes(const moe_pc_engine* engine) {
     // Size slots to actual tensor data + small padding.
     // Old 64MB floor wasted ~44MB per slot for NVFP4 (~20MB triplets).
-    const uint64_t base = engine ? engine->max_tensor_stream_bytes : 0ull;
+    const moe_storage_constants_t* storage = moe_storage_constants();
+    const uint64_t bundle = storage ? storage->normal_bundle_max_bytes : 0ull;
+    const uint64_t base = engine ? std::max<uint64_t>(engine->max_tensor_stream_bytes, bundle) : bundle;
     const uint64_t padding = 4ull * 1024ull * 1024ull;
     uint64_t sz = base > 0 ? base + padding : padding;
     return (sz + 31ull) & ~31ull;
@@ -325,7 +324,51 @@ static uint64_t moe_recommended_staging_bytes(const moe_pc_engine* engine) {
     if (!engine || min_slots == 0) {
         return 0;
     }
-    return (uint64_t)min_slots * moe_staging_min_slot_bytes(engine);
+    const uint32_t target_slots = min_slots + std::max(1u, min_slots / 4u);
+    return (uint64_t)target_slots * moe_staging_min_slot_bytes(engine);
+}
+
+static int moe_ensure_staging_capacity(moe_pc_engine* engine, uint64_t required_bytes) {
+    if (!engine || required_bytes == 0 || engine->staging_size >= required_bytes) {
+        return 1;
+    }
+    if (!engine->io_config.enable_pinned_host) {
+        return 0;
+    }
+
+    bool new_pinned = false;
+    bool new_numa = false;
+    uint64_t actual_bytes = 0;
+    uint8_t* new_staging = allocate_best_staging(
+        engine,
+        required_bytes,
+        &actual_bytes,
+        &new_pinned,
+        &new_numa);
+    if (!new_staging) {
+        fprintf(stderr,
+            "[storageLLM WARNING] unable to grow staging from %llu to %llu bytes; keeping existing staging\n",
+            (unsigned long long)engine->staging_size,
+            (unsigned long long)required_bytes);
+        return 0;
+    }
+
+    free_staging(engine->staging, engine->staging_size, engine->staging_pinned, engine->staging_numa_allocated);
+    engine->staging = new_staging;
+    engine->staging_size = actual_bytes;
+    engine->staging_pinned = new_pinned;
+    engine->staging_numa_allocated = new_numa;
+    engine->io_config.pinned_staging_bytes = actual_bytes;
+    if (!new_pinned) {
+        fprintf(stderr,
+            "[storageLLM WARNING] staging grew to %llu bytes as non-pinned memory; DMA uses sync fallback\n",
+            (unsigned long long)actual_bytes);
+    } else {
+        fprintf(stderr,
+            "[storageLLM INFO] staging grew to %llu bytes for worker slot budget\n",
+            (unsigned long long)actual_bytes);
+    }
+    return actual_bytes >= required_bytes ? 1 : 0;
 }
 
 static void update_staging_slot_deficit(moe_pc_engine* engine) {
@@ -407,6 +450,15 @@ static void configure_staging_slots(moe_pc_engine* engine) {
         fprintf(stderr, "[storageLLM CRITICAL] configure_staging_slots called before "
             "max_tensor_stream_bytes was set. Tensors must be indexed first. "
             "Slot size will be 4MB, causing copy failures for large tensors.\n");
+        update_staging_slot_deficit(engine);
+        return;
+    }
+
+    const uint64_t recommended_staging = moe_recommended_staging_bytes(engine);
+    if (recommended_staging > engine->staging_size) {
+        moe_ensure_staging_capacity(engine, recommended_staging);
+    }
+    if (!engine->staging || engine->staging_size == 0) {
         update_staging_slot_deficit(engine);
         return;
     }

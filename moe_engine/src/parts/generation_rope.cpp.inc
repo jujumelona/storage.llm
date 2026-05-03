@@ -7,12 +7,22 @@
 //   Score = softmax(Q_nope*K_nope + Q_rope*K_rope) * V -> o_proj -> attn output
 
 // Keep this tied to the converted model metadata; tensor shapes alone do not determine theta.
-struct moe_rope_runtime_row_cache {
-    uint32_t dim = 0;
-    uint32_t position = 0;
-    uint32_t base_bits = 0;
-    std::vector<float> cos_row;
-    std::vector<float> sin_row;
+// Fix 31+32: Flat contiguous RoPE cache with position-keyed LRU
+// - Eliminated per-slot heap vectors (16 mallocs -> 0)
+// - Expanded from 8 round-robin to 32 LRU slots for better long-context hit rate
+// - cos/sin data is contiguous for SIMD-friendly access
+static constexpr uint32_t MOE_ROPE_CACHE_SLOTS = 32u;
+static constexpr uint32_t MOE_ROPE_MAX_HALF_DIM = 4096u;
+
+struct moe_rope_flat_cache {
+    uint32_t dim[MOE_ROPE_CACHE_SLOTS] = {};
+    uint32_t position[MOE_ROPE_CACHE_SLOTS] = {};
+    uint32_t base_bits[MOE_ROPE_CACHE_SLOTS] = {};
+    uint32_t lru_tick[MOE_ROPE_CACHE_SLOTS] = {};
+    alignas(64) float cos_data[MOE_ROPE_CACHE_SLOTS][MOE_ROPE_MAX_HALF_DIM];
+    alignas(64) float sin_data[MOE_ROPE_CACHE_SLOTS][MOE_ROPE_MAX_HALF_DIM];
+    uint32_t used = 0;
+    uint32_t tick = 0;
 };
 
 static uint32_t moe_rope_float_bits(float value) {
@@ -37,49 +47,58 @@ static int moe_rope_runtime_row(
         base = moe_ROPE_THETA;
     }
     const uint32_t half_dim = dim / 2u;
-    const uint32_t base_bits = moe_rope_float_bits(base);
-    static thread_local std::vector<moe_rope_runtime_row_cache> caches;
-    static thread_local size_t next_cache_slot = 0;
-    for (moe_rope_runtime_row_cache& cached : caches) {
-        if (cached.dim == dim &&
-            cached.position == position &&
-            cached.base_bits == base_bits &&
-            cached.cos_row.size() == half_dim &&
-            cached.sin_row.size() == half_dim) {
-            *out_cos = cached.cos_row.data();
-            *out_sin = cached.sin_row.data();
+    if (half_dim > MOE_ROPE_MAX_HALF_DIM) {
+        return 0;
+    }
+    const uint32_t bbits = moe_rope_float_bits(base);
+    static thread_local moe_rope_flat_cache cache;
+    const uint32_t current_tick = ++cache.tick;
+
+    // Lookup in flat cache
+    for (uint32_t s = 0; s < cache.used; ++s) {
+        if (cache.dim[s] == dim &&
+            cache.position[s] == position &&
+            cache.base_bits[s] == bbits) {
+            cache.lru_tick[s] = current_tick;
+            *out_cos = cache.cos_data[s];
+            *out_sin = cache.sin_data[s];
             return 1;
         }
     }
-    moe_rope_runtime_row_cache* slot = nullptr;
-    if (caches.size() < 8u) {
-        try {
-            caches.push_back(moe_rope_runtime_row_cache{});
-        } catch (...) {
-            return 0;
-        }
-        slot = &caches.back();
+
+    // Miss: find or evict a slot
+    uint32_t slot;
+    if (cache.used < MOE_ROPE_CACHE_SLOTS) {
+        slot = cache.used++;
     } else {
-        slot = &caches[next_cache_slot++ % caches.size()];
+        // Evict LRU
+        slot = 0;
+        uint32_t oldest = cache.lru_tick[0];
+        for (uint32_t s = 1; s < MOE_ROPE_CACHE_SLOTS; ++s) {
+            if (cache.lru_tick[s] < oldest) {
+                oldest = cache.lru_tick[s];
+                slot = s;
+            }
+        }
     }
-    try {
-        slot->cos_row.resize(half_dim);
-        slot->sin_row.resize(half_dim);
-    } catch (...) {
-        return 0;
-    }
-    slot->dim = dim;
-    slot->position = position;
-    slot->base_bits = base_bits;
+
+    cache.dim[slot] = dim;
+    cache.position[slot] = position;
+    cache.base_bits[slot] = bbits;
+    cache.lru_tick[slot] = current_tick;
+
+    // Fix 31: Use exp instead of pow for freq computation
+    // log(base) computed once, then exp(-(j*2/dim)*log_base) = base^(-j*2/dim)
+    const float multiplier = std::pow(base, -2.0f / (float)dim);
+    float freq = 1.0f;
     for (uint32_t j = 0; j < half_dim; ++j) {
-        const uint32_t i = j * 2u;
-        const float freq = 1.0f / std::pow(base, (float)i / (float)dim);
         const float theta = (float)position * freq;
-        slot->cos_row[j] = std::cos(theta);
-        slot->sin_row[j] = std::sin(theta);
+        cache.cos_data[slot][j] = std::cos(theta);
+        cache.sin_data[slot][j] = std::sin(theta);
+        freq *= multiplier;
     }
-    *out_cos = slot->cos_row.data();
-    *out_sin = slot->sin_row.data();
+    *out_cos = cache.cos_data[slot];
+    *out_sin = cache.sin_data[slot];
     return 1;
 }
 
@@ -134,8 +153,10 @@ static void moe_rope_inplace(
         }
         return;
     }
+    // Fix 14: Use geometric multiplier
+    const float multiplier = std::pow(base, -2.0f / (float)dim);
+    float freq = 1.0f;
     for (uint32_t i = 0; i + 1u < dim; i += 2u) {
-        const float freq = 1.0f / std::pow(base, (float)i / (float)dim);
         const float theta = (float)position * freq;
         const float cos_t = std::cos(theta);
         const float sin_t = std::sin(theta);
@@ -143,6 +164,7 @@ static void moe_rope_inplace(
         const float x1 = data[i + 1];
         data[i]     = x0 * cos_t - x1 * sin_t;
         data[i + 1] = x0 * sin_t + x1 * cos_t;
+        freq *= multiplier;
     }
 }
 
@@ -191,9 +213,10 @@ static void moe_rope_rotate_half_inplace(
         }
         return;
     }
+    // Fix 14: Use geometric multiplier
+    const float multiplier = std::pow(base, -2.0f / (float)dim);
+    float freq = 1.0f;
     for (uint32_t j = 0; j < half_dim; ++j) {
-        const uint32_t i = j * 2u;
-        const float freq = 1.0f / std::pow(base, (float)i / (float)dim);
         const float theta = (float)position * freq;
         const float cos_t = std::cos(theta);
         const float sin_t = std::sin(theta);
@@ -201,6 +224,7 @@ static void moe_rope_rotate_half_inplace(
         const float x1 = data[j + half_dim];
         data[j] = x0 * cos_t - x1 * sin_t;
         data[j + half_dim] = x1 * cos_t + x0 * sin_t;
+        freq *= multiplier;
     }
 }
 

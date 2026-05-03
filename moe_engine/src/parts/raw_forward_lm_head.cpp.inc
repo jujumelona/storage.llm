@@ -44,13 +44,27 @@ int moe_pc_engine_lm_head_top1_f32(
         hidden_count != c->hidden_size || c->vocab_size == 0) {
         return 0;
     }
+    // Fix 35: Cache lm_head mapping — tensor is immutable after model load
+    // Eliminates per-token name lookup + mmap pointer recalculation
+    static thread_local uint64_t tls_lm_head_engine_generation = 0;
+    static thread_local moe_raw_tensor_cache_entry tls_lm_head_entry{};
+    static thread_local bool tls_lm_head_valid = false;
+    const uint64_t engine_generation = engine->engine_generation;
+
     moe_raw_tensor_cache_entry common{};
     const uint8_t* base = nullptr;
     uint64_t bytes = 0;
     uint8_t encoding = moe_RAW_SCALAR_BF16;
     uint8_t weight_format = moe_WEIGHT_ENCODING_RAW_FP16;
     uint64_t weight_row_bytes = 0;
-    if (moe_map_lm_head_tensor(engine, c, &common)) {
+    if (tls_lm_head_engine_generation == engine_generation && tls_lm_head_valid) {
+        common = tls_lm_head_entry;
+    } else if (moe_map_lm_head_tensor(engine, c, &common)) {
+        tls_lm_head_engine_generation = engine_generation;
+        tls_lm_head_entry = common;
+        tls_lm_head_valid = true;
+    }
+    if (tls_lm_head_valid && tls_lm_head_engine_generation == engine_generation) {
         base = common.base;
         bytes = common.bytes;
         encoding = common.scalar_encoding;
@@ -101,10 +115,11 @@ int moe_pc_engine_lm_head_top1_f32(
     engine->generation_phase.store(moe_GEN_PHASE_LM_HEAD, std::memory_order_relaxed);
     engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
 
-    static const unsigned int hw_raw = std::thread::hardware_concurrency();
-    static const unsigned int hw_threads = hw_raw > 0 ? hw_raw : 4u;
+    static const uint32_t hw_threads = std::max<uint32_t>(moe_cpu_thread_count_hint(), 4u);
     const uint32_t chunk_size = std::max(64u, (c->vocab_size + hw_threads * 8 - 1) / (hw_threads * 8));
     const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
+    const uint32_t chunk_block =
+        std::max(1u, (num_chunks + (uint32_t)hw_threads - 1u) / (uint32_t)hw_threads);
 
     struct chunk_result_t {
         uint32_t token;
@@ -118,13 +133,73 @@ int moe_pc_engine_lm_head_top1_f32(
 
     {
         moe_profile_parallel_label_scope rows_label("lm_head_top1");
-        if (!moe_parallel_rows(engine, num_chunks, 0, [&](uint32_t chunk) {
+        if (!moe_parallel_rows(engine, num_chunks, chunk_block, [&](uint32_t chunk) {
             const uint32_t start = chunk * chunk_size;
             const uint32_t end = std::min(start + chunk_size, c->vocab_size);
             uint32_t local_best = start;
             float local_max = -std::numeric_limits<float>::infinity();
 
-            for (uint32_t t = start; t < end; ++t) {
+            // Fix 15: Vectorize argmax search to reduce loop bottleneck
+            constexpr uint32_t batch = 32;
+            uint32_t t = start;
+            for (; t + batch <= end; t += batch) {
+                alignas(32) float scores[batch];
+                for (uint32_t i = 0; i < batch; ++i) {
+                    scores[i] = moe_apply_final_logit_softcap_cached(
+                        logit_softcap, moe_raw_tensor_dot_row(raw, t + i, hidden, hidden_count));
+                }
+#if defined(__AVX512F__)
+                __m512 v_max = _mm512_set1_ps(local_max);
+                __m512i v_best = _mm512_set1_epi32(local_best);
+                __m512i v_idx = _mm512_set_epi32(15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0);
+                for(int k=0; k<2; ++k) {
+                    __m512 v_score = _mm512_loadu_ps(scores + k*16);
+                    __mmask16 mask = _mm512_cmp_ps_mask(v_score, v_max, _CMP_GT_OQ);
+                    v_max = _mm512_mask_blend_ps(mask, v_max, v_score);
+                    __m512i curr_idx = _mm512_add_epi32(v_idx, _mm512_set1_epi32(t + k*16));
+                    v_best = _mm512_mask_blend_epi32(mask, v_best, curr_idx);
+                }
+                float max_arr[16];
+                uint32_t best_arr[16];
+                _mm512_storeu_ps(max_arr, v_max);
+                _mm512_storeu_epi32(best_arr, v_best);
+                for(int i=0; i<16; ++i) {
+                    if (max_arr[i] > local_max) {
+                        local_max = max_arr[i];
+                        local_best = best_arr[i];
+                    }
+                }
+#elif defined(__AVX2__)
+                __m256 v_max = _mm256_set1_ps(local_max);
+                __m256i v_best = _mm256_set1_epi32(local_best);
+                __m256i v_idx = _mm256_set_epi32(7,6,5,4,3,2,1,0);
+                for(int k=0; k<4; ++k) {
+                    __m256 v_score = _mm256_load_ps(scores + k*8);
+                    __m256 v_cmp = _mm256_cmp_ps(v_score, v_max, _CMP_GT_OQ);
+                    v_max = _mm256_blendv_ps(v_max, v_score, v_cmp);
+                    __m256i curr_idx = _mm256_add_epi32(v_idx, _mm256_set1_epi32(t + k*8));
+                    v_best = _mm256_blendv_epi8(v_best, curr_idx, _mm256_castps_si256(v_cmp));
+                }
+                float max_arr[8];
+                uint32_t best_arr[8];
+                _mm256_storeu_ps(max_arr, v_max);
+                _mm256_storeu_si256((__m256i*)best_arr, v_best);
+                for(int i=0; i<8; ++i) {
+                    if (max_arr[i] > local_max) {
+                        local_max = max_arr[i];
+                        local_best = best_arr[i];
+                    }
+                }
+#else
+                for (uint32_t i = 0; i < batch; ++i) {
+                    if (scores[i] > local_max) {
+                        local_max = scores[i];
+                        local_best = t + i;
+                    }
+                }
+#endif
+            }
+            for (; t < end; ++t) {
                 const float s = moe_apply_final_logit_softcap_cached(
                     logit_softcap, moe_raw_tensor_dot_row(raw, t, hidden, hidden_count));
                 if (s > local_max) {
@@ -183,7 +258,20 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     uint8_t encoding = moe_RAW_SCALAR_BF16;
     uint8_t weight_format = moe_WEIGHT_ENCODING_RAW_FP16;
     uint64_t weight_row_bytes = 0;
-    if (moe_map_lm_head_tensor(engine, c, &common)) {
+    // Fix 35: Reuse cached lm_head mapping (same tls declared in top1)
+    {
+        static thread_local const moe_pc_engine* tls_lp_engine = nullptr;
+        static thread_local moe_raw_tensor_cache_entry tls_lp_entry{};
+        static thread_local bool tls_lp_valid = false;
+        if (tls_lp_engine == engine && tls_lp_valid) {
+            common = tls_lp_entry;
+        } else if (moe_map_lm_head_tensor(engine, c, &common)) {
+            tls_lp_engine = engine;
+            tls_lp_entry = common;
+            tls_lp_valid = true;
+        }
+    }
+    if (common.base) {
         base = common.base;
         bytes = common.bytes;
         encoding = common.scalar_encoding;
@@ -235,10 +323,11 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     engine->generation_phase.store(moe_GEN_PHASE_LM_HEAD, std::memory_order_relaxed);
     engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
 
-    static const unsigned int hw_raw_2 = std::thread::hardware_concurrency();
-    static const unsigned int hw_threads_2 = hw_raw_2 > 0 ? hw_raw_2 : 4u;
+    static const uint32_t hw_threads_2 = std::max<uint32_t>(moe_cpu_thread_count_hint(), 4u);
     const uint32_t chunk_size = std::max(64u, (c->vocab_size + hw_threads_2 * 8 - 1) / (hw_threads_2 * 8));
     const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
+    const uint32_t chunk_block =
+        std::max(1u, (num_chunks + (uint32_t)hw_threads_2 - 1u) / (uint32_t)hw_threads_2);
 
     struct chunk_logsum_t {
         float max_score;
@@ -252,7 +341,7 @@ int moe_pc_engine_lm_head_token_logprob_f32(
 
     {
         moe_profile_parallel_label_scope rows_label("lm_head_logprob");
-        if (!moe_parallel_rows(engine, num_chunks, 0, [&](uint32_t chunk) {
+        if (!moe_parallel_rows(engine, num_chunks, chunk_block, [&](uint32_t chunk) {
             const uint32_t start = chunk * chunk_size;
             const uint32_t end = std::min(start + chunk_size, c->vocab_size);
             float local_max = -std::numeric_limits<float>::infinity();
@@ -262,7 +351,37 @@ int moe_pc_engine_lm_head_token_logprob_f32(
             float local_best_score = -std::numeric_limits<float>::infinity();
             int has_target = 0;
 
-            for (uint32_t t = start; t < end; ++t) {
+            // Fix 15: Vectorize loop to improve cache hits and enable auto-vectorization
+            constexpr uint32_t batch = 32;
+            uint32_t t = start;
+            for (; t + batch <= end; t += batch) {
+                alignas(32) float scores[batch];
+                for (uint32_t i = 0; i < batch; ++i) {
+                    scores[i] = moe_apply_final_logit_softcap_cached(
+                        logit_softcap, moe_raw_tensor_dot_row(raw, t + i, hidden, hidden_count));
+                }
+                for (uint32_t i = 0; i < batch; ++i) {
+                    const float score = scores[i];
+                    if (score > local_best_score) {
+                        local_best_score = score;
+                        local_best_token = t + i;
+                    }
+                    if (score <= local_max) {
+                        local_sum += std::exp((double)score - (double)local_max);
+                    } else if (std::isfinite(local_max)) {
+                        local_sum = local_sum * std::exp((double)local_max - (double)score) + 1.0;
+                        local_max = score;
+                    } else {
+                        local_max = score;
+                        local_sum = 1.0;
+                    }
+                    if (t + i == target_token_id) {
+                        target_score = score;
+                        has_target = 1;
+                    }
+                }
+            }
+            for (; t < end; ++t) {
                 const float score = moe_apply_final_logit_softcap_cached(
                     logit_softcap, moe_raw_tensor_dot_row(raw, t, hidden, hidden_count));
                 if (score > local_best_score) {

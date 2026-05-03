@@ -1,4 +1,4 @@
-﻿// Device tensor copy stream management
+// Device tensor copy stream management
 
 // DONE: BUGFIX 77 - CUDA stream pool is already implemented below to avoid cuStreamCreate/Destroy on worker resize.
 
@@ -10,7 +10,16 @@ struct moe_deferred_staging_copy {
     bool event_recorded = false;
 };
 
-struct ThreadStreamGuard { moe_pc_engine* engine = nullptr; CUstream stream = nullptr; ~ThreadStreamGuard() { if (engine && stream && engine->device_allocator_ready.load(std::memory_order_acquire)) { std::lock_guard<std::mutex> lock(engine->stream_pool_mutex); engine->stream_pool.push_back(stream); engine->stream_pool_available.fetch_add(1, std::memory_order_release); } } }; static thread_local std::unordered_map<moe_pc_engine*, ThreadStreamGuard> s_tl_stream_guards;
+struct ThreadStreamGuard {
+    moe_pc_engine* engine = nullptr;
+    CUstream stream = nullptr;
+    ~ThreadStreamGuard();
+        // BUGFIX 문제1: ThreadStreamGuard 소멸자 미구현 (스트림 누수) ★★★
+        // Problem: GPU worker 비정상 종료 시 CUDA/HIP 스트림이 stream pool에 반환되지 않음
+        // Solution: 소멸자에서 device_stream_destroy_current 호출하여 스트림 반환
+        // Note: 정상 종료 경로(gpu_worker_loop 마지막)에서는 stream_guard.e = nullptr로 설정하여 중복 방지
+};
+static thread_local std::unordered_map<moe_pc_engine*, ThreadStreamGuard> s_tl_stream_guards;
 static thread_local std::unordered_map<moe_pc_engine*, std::vector<uint64_t>> s_tl_tensor_pending_keys;
 // BUGFIX 67: Issue 2 - Change deferred_staging_copies from vector to deque.
 // Problem: copies.erase(copies.begin()) is O(n) on vector
@@ -86,7 +95,7 @@ static void device_destroy_copy_event_pool(moe_pc_engine* e) {
 }
 
 static void device_defer_staging_copy(moe_pc_engine* e, uint32_t slot, uint64_t key, uint64_t vram_bytes, CUstream stream) {
-    if (!e || slot == UINT32_MAX) {
+    if (!e) {
         return;
     }
     moe_deferred_staging_copy copy{};
@@ -192,8 +201,11 @@ static void device_stream_destroy_current(moe_pc_engine* e) {
     if (e) {
         auto it = s_tl_stream_guards.find(e);
         if (it != s_tl_stream_guards.end() && it->second.stream) {
+            CUstream stream = it->second.stream;
+            it->second.engine = nullptr;
+            it->second.stream = nullptr;
             std::lock_guard<std::mutex> lock(e->stream_pool_mutex);
-            e->stream_pool.push_back(it->second.stream);
+            e->stream_pool.push_back(stream);
             e->stream_pool_available.store(static_cast<uint32_t>(e->stream_pool.size()), std::memory_order_release);
             s_tl_stream_guards.erase(it);
         }
@@ -201,6 +213,16 @@ static void device_stream_destroy_current(moe_pc_engine* e) {
     s_tl_tensor_pending_keys.erase(e);
     s_tl_deferred_staging_copies.erase(e);
     device_destroy_copy_event_pool(e);
+}
+
+ThreadStreamGuard::~ThreadStreamGuard() {
+    moe_pc_engine* e = engine;
+    CUstream s = stream;
+    engine = nullptr;
+    stream = nullptr;
+    if (e && s) {
+        device_stream_destroy_current(e);
+    }
 }
 
 static void device_stream_pool_destroy(moe_pc_engine* e) {
@@ -222,12 +244,11 @@ static void device_stream_pool_init(moe_pc_engine* e) {
     std::lock_guard<std::mutex> lock(e->stream_pool_mutex);
     if (!e->stream_pool.empty()) return;
 
-    // Issue 7: Pre-allocate stream pool to avoid cuStreamCreate overhead
     uint32_t gpu_workers = runtime_gpu_workers(e);
     uint32_t io_workers = runtime_disk_workers(e);
     if (io_workers == 0) io_workers = e->io_config.io_worker_threads;
     uint32_t pinned_workers = runtime_pinned_workers(e);
-    uint32_t max_workers = gpu_workers + io_workers + pinned_workers + 2; // +2 for main thread and safety margin
+    uint32_t max_workers = gpu_workers + io_workers + pinned_workers + 2;
     if (max_workers == 0) max_workers = 4;
     uint32_t pool_size = max_workers * (e->backend_caps.copy_streams > 0 ? e->backend_caps.copy_streams : 1);
 

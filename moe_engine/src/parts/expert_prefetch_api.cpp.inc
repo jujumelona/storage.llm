@@ -61,6 +61,39 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
     }
 
     const moe_projection_t projs[3] = {moe_PROJ_GATE, moe_PROJ_UP, moe_PROJ_DOWN};
+    if (preferred_tier == moe_TIER_VRAM &&
+        engine->io_config.enable_compute_io_overlap &&
+        engine->io_config.enable_multistage_pipeline &&
+        engine->staging &&
+        engine->staging_slot_size >= bytes &&
+        engine_has_device_upload_workers(engine) &&
+        choose_active_io_path(engine) == moe_IO_PATH_PINNED_HOST &&
+        ensure_io_ready(engine)) {
+        const size_t gate_index = find_tensor_record_index(engine, layer, expert, moe_PROJ_GATE);
+        const size_t up_index = find_tensor_record_index(engine, layer, expert, moe_PROJ_UP);
+        const size_t down_index = find_tensor_record_index(engine, layer, expert, moe_PROJ_DOWN);
+        if (gate_index != tensor_slot_invalid() && gate_index < engine->tensors.size() &&
+            up_index != tensor_slot_invalid() && up_index < engine->tensors.size() &&
+            down_index != tensor_slot_invalid() && down_index < engine->tensors.size()) {
+            engine->io_atomic.active_path.store(
+                static_cast<uint32_t>(moe_IO_PATH_PINNED_HOST),
+                std::memory_order_relaxed);
+            moe_prefetch_task task{};
+            task.tensor_index = gate_index;
+            task.target_tier = preferred_tier;
+            task.bundle_triplet = 1;
+            task.bundle_layer = layer;
+            task.bundle_expert = expert;
+            task.urgent = 1;
+            if (enqueue_stage_or_retry(engine, engine->disk_stage, task)) {
+                engine->io_atomic.queued_requests.fetch_add(1, std::memory_order_relaxed);
+                if (notify_workers) {
+                    engine->disk_stage.cv.notify_one();
+                }
+                return 1;
+            }
+        }
+    }
     int queued = 0;
     for (auto proj : projs) {
         queued += enqueue_tensor_prefetch(engine, layer, expert, proj, preferred_tier, stream_state_prechecked);

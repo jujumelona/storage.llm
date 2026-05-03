@@ -71,8 +71,7 @@ static void cpu_row_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
 
 static void ensure_cpu_row_workers(moe_pc_engine* engine, uint32_t /*ignored*/) {
     if (!engine) return;
-    const unsigned int hw_raw = std::thread::hardware_concurrency();
-    const uint32_t hw = std::max(2u, hw_raw ? (uint32_t)hw_raw : 1u);
+    const uint32_t hw = std::max(2u, moe_cpu_thread_count_hint());
     const uint32_t disk_w = runtime_disk_workers(engine);
     const uint32_t pinned_w = runtime_pinned_workers(engine);
     const uint32_t gpu_w = engine->backend_caps.copy_streams > 0 ? 0 : runtime_gpu_workers(engine);

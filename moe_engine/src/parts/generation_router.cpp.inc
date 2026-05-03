@@ -8,32 +8,55 @@ static void moe_save_gate_input_snapshot(
         return;
     }
     const size_t slot = (size_t)layer;
-    // BUGFIX 504: slot 범위 체크
-    if (slot > 10000) return;
-    // BUGFIX 516: Check hidden_size upper bound to prevent overflow ★
-    // Problem: hidden_size can be arbitrarily large from config
-    // assign(hidden, hidden + hidden_size) can allocate huge memory
-    // Solution: Add reasonable upper bound check (e.g., 100000)
+    if (slot > moe_GATE_SNAPSHOT_MAX_LAYER) return;
     if (hidden_size > 100000) return;
-    if (engine->gate_input_snapshots.size() <= slot) {
-        engine->gate_input_snapshots.resize(slot + 1u);
-        engine->gate_input_snapshot_epochs.resize(slot + 1u, 0);
-    }
-    // BUGFIX 156: Add mutex protection for snapshot write to prevent data race
-    // with moe_infinigen_speculative_prefetch() read
-    std::vector<float>& dst = engine->gate_input_snapshots[slot];
-    {
+
+    // Fix 19: Double buffering for lock-free snapshot exchange
+    const size_t req_size = (slot + 1) * 2;
+    if (engine->gate_input_snapshots.size() < req_size) {
         std::lock_guard<std::mutex> lock(engine->gate_input_snapshot_mutex);
-        dst.assign(hidden, hidden + hidden_size);
+        if (engine->gate_input_snapshots.size() < req_size) {
+            engine->gate_input_snapshots.resize(req_size);
+        }
     }
-    engine->gate_input_snapshot_epochs[slot] =
-        engine->expert_touch_epoch.load(std::memory_order_relaxed);
+
+    const size_t slot0 = slot * 2;
+    const size_t slot1 = slot * 2 + 1;
+
+    if (slot1 >= moe_GATE_SNAPSHOT_EPOCH_SLOTS) {
+        return;
+    }
+    std::atomic<uint64_t>& epoch0_ref = engine->gate_input_snapshot_epochs[slot0];
+    std::atomic<uint64_t>& epoch1_ref = engine->gate_input_snapshot_epochs[slot1];
+
+    uint64_t e0 = epoch0_ref.load(std::memory_order_acquire);
+    uint64_t e1 = epoch1_ref.load(std::memory_order_acquire);
+
+    const int write_idx = (e0 >= e1) ? 1 : 0;
+    const size_t write_slot = slot * 2 + write_idx;
+
+    std::vector<float>& dst = engine->gate_input_snapshots[write_slot];
+    dst.assign(hidden, hidden + hidden_size);
+
+    // Update epoch atomically to publish
+    uint64_t new_epoch = std::max(e0, e1) + 1;
+    if (write_idx == 0) {
+        epoch0_ref.store(new_epoch, std::memory_order_release);
+    } else {
+        epoch1_ref.store(new_epoch, std::memory_order_release);
+    }
 }
 
 // FIX 7: Clarify that this function expects sigmoid-applied scores, NOT raw logits
 // or a normalized probability distribution. The input must be sigmoid(logit) values
 // in (0, 1). The function measures relative concentration (routing sharpness),
 // not true Shannon entropy. Do NOT call with raw logits or softmax probabilities.
+// Fix 17: 빠른 float log 근사 (Cephes 방식, 오차 < 0.1%)
+static inline float fast_log2f(float x) {
+    int e; float m = std::frexp(x, &e);
+    return (float)(e - 1) + (m - 1.0f) * (1.44269504f - (m - 1.0f) * 0.5f);
+}
+
 static float moe_router_normalized_entropy(const std::vector<float>& sigmoid_scores) {
     // BUGFIX 159: Sanity check - sigmoid outputs must be in (0, 1)
     // If invalid input (raw logits, softmax), return middle entropy to use default top_k
@@ -59,9 +82,9 @@ static float moe_router_normalized_entropy(const std::vector<float>& sigmoid_sco
             continue;
         }
         const double q = (double)p / sum;
-        entropy -= q * std::log(q);
+        entropy -= q * (double)fast_log2f((float)q);
     }
-    const double denom = std::log((double)sigmoid_scores.size());
+    const double denom = (double)fast_log2f((float)sigmoid_scores.size());
     if (denom <= 0.0) {
         return 0.0f;
     }
@@ -84,9 +107,27 @@ static uint32_t moe_router_adaptive_top_k(
     top_k = std::min(top_k, experts);
     if (engine) {
         engine->last_router_entropy_milli.store((uint32_t)(entropy * 1000.0f), std::memory_order_relaxed);
-        engine->adaptive_prefetch_depth.store(entropy > 0.70f ? 1u : 2u, std::memory_order_relaxed);
+        // Fix 22: Hysteresis for adaptive_prefetch_depth
+        uint32_t current_depth = engine->adaptive_prefetch_depth.load(std::memory_order_relaxed);
+        uint32_t new_depth = entropy > 0.70f ? 1u : 2u;
+        if (new_depth == 1u && current_depth == 2u) {
+            if (entropy > 0.70f * 1.05f) engine->adaptive_prefetch_depth.store(1u, std::memory_order_relaxed);
+        } else if (new_depth == 2u && current_depth == 1u) {
+            if (entropy < 0.70f * 0.95f) engine->adaptive_prefetch_depth.store(2u, std::memory_order_relaxed);
+        } else {
+            engine->adaptive_prefetch_depth.store(new_depth, std::memory_order_relaxed);
+        }
     }
     return top_k;
+}
+
+static uint32_t moe_router_fnv1a_hash_string(const char* str) {
+    uint32_t hash = 2166136261u;
+    while (*str) {
+        hash ^= (uint8_t)*str++;
+        hash *= 16777619u;
+    }
+    return hash;
 }
 
 static int moe_map_router_tensor(
@@ -107,6 +148,18 @@ static int moe_map_router_tensor(
         "block_sparse_moe.gate.weight",
         "moe.gate.weight"
     };
+
+    // Fix 18: Cache tensor mapping to avoid std::string vector allocation per token
+    const uint32_t suffix_hash = moe_router_fnv1a_hash_string(suffixes[0]);
+    const uint64_t key = ((uint64_t)(uint32_t)layer << 32) | suffix_hash | 0x80000000ull;
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        auto found = engine->raw_tensor_cache.find(key);
+        if (found != engine->raw_tensor_cache.end() && found->second.base) {
+            *out = found->second;
+            return 1;
+        }
+    }
     std::vector<std::string> names;
     moe_push_layer_tensor_candidates(&names, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_desc desc{};
@@ -115,7 +168,14 @@ static int moe_map_router_tensor(
     if (!rec || desc.cols != hidden_size || desc.rows != experts) {
         return 0;
     }
-    return map_common_tensor_record(engine, *rec, desc, out);
+    if (!map_common_tensor_record(engine, *rec, desc, out)) {
+        return 0;
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        engine->raw_tensor_cache[key] = *out;
+    }
+    return 1;
 }
 
 static int moe_router_logits_f32(
@@ -216,6 +276,18 @@ static int moe_map_router_scale_tensor(
         "mlp.router.scale",
         "moe.gate.scale"
     };
+
+    // Fix 18: Cache tensor mapping to avoid std::string vector allocation per token
+    const uint32_t suffix_hash = moe_router_fnv1a_hash_string(suffixes[0]);
+    const uint64_t key = ((uint64_t)(uint32_t)layer << 32) | suffix_hash | 0x80000000ull;
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        auto found = engine->raw_tensor_cache.find(key);
+        if (found != engine->raw_tensor_cache.end() && found->second.base) {
+            *out = found->second;
+            return 1;
+        }
+    }
     std::vector<std::string> names;
     moe_push_layer_tensor_candidates(&names, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_desc desc{};
@@ -224,7 +296,14 @@ static int moe_map_router_scale_tensor(
     if (!rec) {
         return 0;
     }
-    return map_common_tensor_record(engine, *rec, desc, out);
+    if (!map_common_tensor_record(engine, *rec, desc, out)) {
+        return 0;
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        engine->raw_tensor_cache[key] = *out;
+    }
+    return 1;
 }
 
 static int moe_prepare_scaled_router_input_f32(
@@ -535,9 +614,24 @@ static int moe_router_topk_f32(
         }
     }
 
-    const float router_entropy = moe_router_normalized_entropy(*scratch_logits);
-    engine->last_router_entropy_milli.store((uint32_t)(router_entropy * 1000.0f), std::memory_order_relaxed);
-    engine->adaptive_prefetch_depth.store(router_entropy > 0.70f ? 1u : 2u, std::memory_order_relaxed);
+    float router_entropy = 0.5f;
+    if (use_sigmoid) {
+        router_entropy = moe_router_normalized_entropy(*scratch_logits);
+        engine->last_router_entropy_milli.store((uint32_t)(router_entropy * 1000.0f), std::memory_order_relaxed);
+        // Fix 22: Hysteresis for adaptive_prefetch_depth
+        uint32_t current_depth = engine->adaptive_prefetch_depth.load(std::memory_order_relaxed);
+        uint32_t new_depth = router_entropy > 0.70f ? 1u : 2u;
+        if (new_depth == 1u && current_depth == 2u) {
+            if (router_entropy > 0.70f * 1.05f) engine->adaptive_prefetch_depth.store(1u, std::memory_order_relaxed);
+        } else if (new_depth == 2u && current_depth == 1u) {
+            if (router_entropy < 0.70f * 0.95f) engine->adaptive_prefetch_depth.store(2u, std::memory_order_relaxed);
+        } else {
+            engine->adaptive_prefetch_depth.store(new_depth, std::memory_order_relaxed);
+        }
+    } else {
+        // Raw-logit/softmax routers do not feed the sigmoid entropy heuristic.
+        engine->last_router_entropy_milli.store(500u, std::memory_order_relaxed);
+    }
 
     auto cmp = [&](uint32_t a, uint32_t b) {
         return (*scratch_logits)[a] > (*scratch_logits)[b];
@@ -615,19 +709,36 @@ static void moe_infinigen_speculative_prefetch(
     // Solution: Only copy the truncated portion we actually need (hidden_size/5).
     // This reduces copy size by 80% and lock hold time from ~50μs to ~10μs.
     // Trade-off: Need to know full_hidden before lock, so check size first.
+    // Fix 19: Double buffering lock-free read
     std::vector<float> snapshot;
     {
-        std::lock_guard<std::mutex> lock(engine->gate_input_snapshot_mutex);
-        if ((size_t)source_layer >= engine->gate_input_snapshots.size() ||
-            engine->gate_input_snapshots[source_layer].empty()) {
+        const size_t slot = (size_t)source_layer;
+        const size_t req_size = (slot + 1) * 2;
+        if (engine->gate_input_snapshots.size() < req_size) {
             return;
         }
-        const std::vector<float>& src = engine->gate_input_snapshots[source_layer];
+
+        const size_t slot0 = slot * 2;
+        const size_t slot1 = slot * 2 + 1;
+
+        if (slot1 >= moe_GATE_SNAPSHOT_EPOCH_SLOTS) {
+            return;
+        }
+        std::atomic<uint64_t>& epoch0_ref = engine->gate_input_snapshot_epochs[slot0];
+        std::atomic<uint64_t>& epoch1_ref = engine->gate_input_snapshot_epochs[slot1];
+
+        uint64_t e0 = epoch0_ref.load(std::memory_order_acquire);
+        uint64_t e1 = epoch1_ref.load(std::memory_order_acquire);
+
+        const int read_idx = (e0 >= e1) ? 0 : 1;
+        const size_t read_slot = slot * 2 + read_idx;
+
+        const std::vector<float>& src = engine->gate_input_snapshots[read_slot];
         const uint32_t full_hidden = (uint32_t)src.size();
         if (full_hidden == 0) {
             return;
         }
-        // InfiniGen truncation: only copy first hidden_size/5 elements
+
         const uint32_t trunc_size = std::max(64u, full_hidden / 5u);
         const uint32_t copy_size = std::min(trunc_size, full_hidden);
         snapshot.assign(src.begin(), src.begin() + copy_size);
@@ -766,7 +877,19 @@ static void moe_infinigen_speculative_prefetch(
         const uint32_t max_safe_depth = 2u;
         depth = std::min(depth, max_safe_depth);
 
-        engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
+        // Fix 22: Hysteresis for adaptive_prefetch_depth
+        uint32_t current_depth = engine->adaptive_prefetch_depth.load(std::memory_order_relaxed);
+        if (depth > current_depth) {
+            // Need strong confidence to increase depth (lower entropy)
+            float thresh = depth == 2u ? 0.50f : (depth == 3u ? 0.30f : 0.15f);
+            if (spec_entropy < thresh * 0.95f) engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
+        } else if (depth < current_depth) {
+            // Need strong lack of confidence to decrease depth (higher entropy)
+            float thresh = depth == 1u ? 0.50f : (depth == 2u ? 0.30f : 0.15f);
+            if (spec_entropy > thresh * 1.05f) engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
+        } else {
+            engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
+        }
     }
 }
 

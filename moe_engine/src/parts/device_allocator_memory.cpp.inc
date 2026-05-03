@@ -21,35 +21,78 @@ static void device_account_bytes_freed(moe_pc_engine* e, uint64_t bytes) {
 // Same 4GB data consumes 4GB from VRAM budget + 4GB from RAM budget = 8GB total.
 // Solution: Metal should use unified budget only. Set RAM budget to 0 in device_allocator_init.
 // All expert data tracked in "VRAM" budget (actually unified memory budget).
+// Device memory management and accounting
+
+// BUGFIX 76: Issue 11 - Document KV cache vs VRAM budget separation ??
+// Clarification: KV cache is RAM-only, NOT included in VRAM budget
+// - KV cache: CPU RAM (moe_kv_cache in generation_kv_cache.cpp.inc)
+// - VRAM budget: GPU memory for expert weights only (device_allocations map)
+// - QKV state (engine_core/kv/kv_qkv.cpp): Also CPU RAM, ~0.69 GiB
+// - device_budget_bytes() calculates VRAM for experts, does NOT include KV/QKV
+// - Separate accounting: tier_used(moe_TIER_RAM) for KV, device_allocated_bytes for VRAM
+// - No interaction: KV growth does not reduce expert cache space
+// Helper to encapsulate VRAM budget accounting.
+// Do not modify engine->device_free_bytes directly.
+
+// BUGFIX 124: Issue 29 - Metal unified memory budget double-counted ★★
+// Problem: Metal VRAM budget subtracts ram_used_bytes, but RAM budget also tracks ram_used_bytes.
+// Same 4GB data consumes 4GB from VRAM budget + 4GB from RAM budget = 8GB total.
+// Solution: Metal should use unified budget only. Set RAM budget to 0 in device_allocator_init.
+// All expert data tracked in "VRAM" budget (actually unified memory budget).
 // Trade-off: Relies on OS unified memory pressure management instead of explicit RAM eviction.
 // Metal handles this natively, so no functional loss.
 
 // BUGFIX 199: Metal VRAM budget configurable ★
 // Problem: 60% hardcoded → M3 Max 128GB wastes 25GB (60%=76.8GB vs 80%=102.4GB)
-// Solution: Use io_config.metal_memory_budget_pct (default 60, safe range 50-90)
+// Solution: Use io_config.metal_memory_budget_pct (0=auto, safe range 50-90)
 // Trade-off: >85% risks macOS memory pressure → swapping or app termination
 static uint64_t device_budget_bytes(const moe_pc_engine* e) {
     if (!e) return 0;
-    if (e->config.vram_budget_bytes) return e->config.vram_budget_bytes;
+
+    // BUGFIX: Subtract pending_vram_reservation from total budget to prevent over-allocation
+    // In-flight tensor copies consume budget even before device_free_bytes is updated.
+    const uint64_t pending = e->pending_vram_reservation.load(std::memory_order_relaxed);
+    // BUGFIX: VRAM 예산에서 KV + common 예약분을 먼저 빼야 함 (device_try_reserve_pending_vram 대신 여기서 일괄 적용)
+    const uint64_t kv_reserved = e->vram_kv_budget_bytes.load(std::memory_order_relaxed);
+    const uint64_t common_reserved = e->common_vram_reserved_bytes.load(std::memory_order_relaxed);
+    uint64_t reserved_total = pending;
+    if (reserved_total > UINT64_MAX - kv_reserved) {
+        reserved_total = UINT64_MAX;
+    } else {
+        reserved_total += kv_reserved;
+    }
+    if (reserved_total > UINT64_MAX - common_reserved) {
+        reserved_total = UINT64_MAX;
+    } else {
+        reserved_total += common_reserved;
+    }
+
+    if (e->config.vram_budget_bytes) {
+        return e->config.vram_budget_bytes > reserved_total ? e->config.vram_budget_bytes - reserved_total : 0;
+    }
     if (e->backend_caps.supports_unified_memory &&
         e->backend_caps.backend == moe_BACKEND_METAL) {
         // BUGFIX 124: Metal unified memory - do NOT subtract ram_used_bytes here.
         // RAM budget is set to 0 in device_allocator_init, so all tracking is in VRAM budget.
         const uint64_t sys = e->backend_caps.system_memory_bytes > 0
             ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
-        // BUGFIX 199: Use configurable percentage (default 60)
+        // BUGFIX 199: Use configurable percentage (0=auto from device_allocator_init)
         // BUGFIX 232: Ensure pct is never 0 to prevent zero budget
         // BUGFIX 274: Simplify zero budget check - pct validation already ensures non-zero
         uint64_t pct = e->io_config.metal_memory_budget_pct;
+        if (pct == 0) {
+            pct = 75ull;
+        }
         if (pct < 50 || pct > 90) {
             if (pct != 0) {
                 fprintf(stderr,
                     "[storageLLM WARNING] metal_memory_budget_pct=%llu out of safe range [50,90], clamping\n",
                     (unsigned long long)pct);
             }
-            pct = 60ull;
+            pct = 75ull;
         }
-        return (sys * pct) / 100ull;
+        const uint64_t raw_budget = (sys * pct) / 100ull;
+        return raw_budget > reserved_total ? raw_budget - reserved_total : 0;
     }
     const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
     const uint64_t free_b = e->device_free_bytes.load(std::memory_order_relaxed);
@@ -58,9 +101,11 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
         // Keep clamp for safety, but it should never trigger now.
         int64_t s_free = (int64_t)free_b;
         if (s_free < 0) s_free = 0;
-        return allocated > UINT64_MAX - (uint64_t)s_free ? UINT64_MAX : allocated + (uint64_t)s_free;
+        const uint64_t raw_budget = allocated > UINT64_MAX - (uint64_t)s_free ? UINT64_MAX : allocated + (uint64_t)s_free;
+        return raw_budget > reserved_total ? raw_budget - reserved_total : 0;
     }
-    return e->backend_caps.device_memory_bytes ? e->backend_caps.device_memory_bytes : e->backend_caps.recommended_vram_cache_bytes;
+    const uint64_t raw_budget = e->backend_caps.device_memory_bytes ? e->backend_caps.device_memory_bytes : e->backend_caps.recommended_vram_cache_bytes;
+    return raw_budget > reserved_total ? raw_budget - reserved_total : 0;
 }
 
 static uint64_t device_memory_headroom_pct(uint8_t configured) {
@@ -87,11 +132,10 @@ static uint64_t device_memory_headroom_pct(uint8_t configured) {
 
 static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
     if (!e) return;
-    // Diagnostics/failure-path refresh only. Hot paths maintain device_free_bytes directly.
     const auto now = std::chrono::steady_clock::now();
     int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     int64_t last = e->last_mem_query_ms.load(std::memory_order_relaxed);
-    const int64_t throttle_ms = retry_path ? 100 : 1000;
+    const int64_t throttle_ms = retry_path ? 1000 : 5000;
     if (now_ms - last < throttle_ms) {
         return;
     }
@@ -103,6 +147,7 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
     if (e && e->cuda.cuMemGetInfo && device_set_current(e) && e->cuda.cuMemGetInfo(&free_b, &total_b) == 0) {
         mem_queried = 1;
     } else if (e && e->hip.hipMemGetInfo && device_set_current(e) && e->hip.hipMemGetInfo(&free_b, &total_b) == 0) {
+        free_b = (free_b * 90ull) / 100ull;
         mem_queried = 1;
     } else if (e && e->backend_caps.backend == moe_BACKEND_VULKAN && e->vk.vkGetPhysicalDeviceMemoryProperties2 && e->vk.physicalDevice) {
         // BUGFIX 115: Vulkan memory query
@@ -209,6 +254,14 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
         // Delta sync for device_free_bytes to recover from accounting drift
         const uint64_t tracked_free = e->device_free_bytes.load(std::memory_order_relaxed);
         const int64_t delta = (int64_t)free_b - (int64_t)tracked_free;
+        const uint64_t abs_delta = delta < 0 ? (uint64_t)(-delta) : (uint64_t)delta;
+        const uint64_t sync_threshold = std::max<uint64_t>(
+            64ull * 1024ull * 1024ull,
+            ((uint64_t)total_b) / 100ull);
+        if (!retry_path && abs_delta < sync_threshold) {
+            e->device_total_bytes.store((uint64_t)total_b);
+            return;
+        }
         if (delta > 0) {
             e->device_free_bytes.fetch_add((uint64_t)delta, std::memory_order_relaxed);
         } else if (delta < 0) {
@@ -232,7 +285,7 @@ static void device_account_free_bytes_sub(moe_pc_engine* e, uint64_t bytes) {
         return;
     }
     if (e->backend_caps.backend == moe_BACKEND_METAL) return; // budget computed dynamically
-    
+
     // Fast path: atomic subtract without CAS loop
     const uint64_t old_val = e->device_free_bytes.fetch_sub(bytes, std::memory_order_relaxed);
 

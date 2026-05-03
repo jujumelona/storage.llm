@@ -122,9 +122,14 @@ struct moe_prefetch_task {
     moe_transfer_stage_t stage = moe_TRANSFER_STAGE_DISK_TO_RAM;
     uint32_t staging_slot = UINT32_MAX;
     uint64_t staging_bytes = 0;
+    uint64_t bundle_offsets[3]{};
+    uint64_t bundle_bytes[3]{};
+    int32_t bundle_layer = -1;
+    int32_t bundle_expert = -1;
     int32_t raw_span_index = -1;
     uint8_t raw_pool = 0;
     int staging_valid = 0;
+    int bundle_triplet = 0;
     int urgent = 0;
     uint8_t requeue_count = 0;
 };

@@ -45,9 +45,13 @@ int moe_pc_engine_plan_moe_prefetch(
         const uint64_t device_allocated = engine->device_allocated_bytes.load(std::memory_order_relaxed);
         const uint64_t device_free = device_budget > device_allocated ? device_budget - device_allocated : 0;
 
-        // Use headroom percentage (default 10%) to avoid filling VRAM completely
-        const uint64_t headroom_pct = engine->io_config.device_memory_headroom_pct > 0
-            ? engine->io_config.device_memory_headroom_pct : 10u;
+        // Use backend-specific headroom percentage (default 10%) to avoid filling device memory completely.
+        uint64_t headroom_pct = 10u;
+        if (engine->backend_caps.backend == moe_BACKEND_VULKAN && engine->io_config.vulkan_memory_headroom_pct > 0) {
+            headroom_pct = engine->io_config.vulkan_memory_headroom_pct;
+        } else if (engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO && engine->io_config.level_zero_memory_headroom_pct > 0) {
+            headroom_pct = engine->io_config.level_zero_memory_headroom_pct;
+        }
         const uint64_t usable_free = (device_free * (100u - headroom_pct)) / 100u;
 
         uint64_t cumulative_bytes = 0;
@@ -60,16 +64,23 @@ int moe_pc_engine_plan_moe_prefetch(
         // Solution: Use normal_bundle_max_bytes from hardcode_summary, which is the actual
         // maximum bytes for a gate+up+down bundle, already aggregated during model loading.
         const moe_storage_constants_t* storage = moe_storage_constants();
-        const uint64_t expert_bundle_bytes = storage && storage->normal_bundle_max_bytes
-            ? storage->normal_bundle_max_bytes
-            : 64ull * 1024 * 1024;  // Fallback: 64MB estimate
+        uint64_t fallback_bundle_bytes = storage && storage->normal_bundle_max_bytes
+            ? storage->normal_bundle_max_bytes : 0ull;
+        if (fallback_bundle_bytes == 0 && engine->max_tensor_stream_bytes > 0) {
+            fallback_bundle_bytes = engine->max_tensor_stream_bytes <= UINT64_MAX / 3ull
+                ? engine->max_tensor_stream_bytes * 3ull : UINT64_MAX;
+        }
+        if (fallback_bundle_bytes == 0) {
+            fallback_bundle_bytes = 24ull * 1024ull * 1024ull;
+        }
 
         for (size_t i = 0; i < items.size(); ++i) {
-            if (cumulative_bytes + expert_bundle_bytes > usable_free) {
+            const uint64_t item_bytes = items[i].bytes ? items[i].bytes : fallback_bundle_bytes;
+            if (cumulative_bytes + item_bytes > usable_free) {
                 trim_index = i;
                 break;
             }
-            cumulative_bytes += expert_bundle_bytes;
+            cumulative_bytes += item_bytes;
         }
 
         if (trim_index < items.size()) {

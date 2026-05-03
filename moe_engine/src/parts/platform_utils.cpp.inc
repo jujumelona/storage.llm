@@ -27,6 +27,48 @@ static void moe_platform_init_limits() {
 #endif
 }
 
+static uint32_t moe_parse_env_u32(const char* name) {
+    const char* value = name ? std::getenv(name) : nullptr;
+    if (!value || !value[0]) {
+        return 0;
+    }
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value || parsed == 0 || parsed > 4096ul) {
+        return 0;
+    }
+    return (uint32_t)parsed;
+}
+
+static uint32_t moe_cpu_thread_count_hint() {
+    const uint32_t override_threads = moe_parse_env_u32("STORAGELLM_CPU_THREADS");
+    if (override_threads > 0) {
+        return std::min<uint32_t>(override_threads, 256u);
+    }
+    uint32_t threads = 0;
+    const unsigned int cpp_threads = std::thread::hardware_concurrency();
+    if (cpp_threads > 0) {
+        threads = std::max<uint32_t>(threads, (uint32_t)cpp_threads);
+    }
+#ifdef _WIN32
+    const DWORD active = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (active > 0) {
+        threads = std::max<uint32_t>(threads, (uint32_t)active);
+    }
+#else
+#ifdef _SC_NPROCESSORS_ONLN
+    const long online = sysconf(_SC_NPROCESSORS_ONLN);
+    if (online > 0) {
+        threads = std::max<uint32_t>(threads, (uint32_t)online);
+    }
+#endif
+#endif
+    if (threads == 0) {
+        threads = 1;
+    }
+    return std::min<uint32_t>(threads, 256u);
+}
+
 #ifdef _WIN32
 static std::string moe_wide_to_utf8(const wchar_t* value) {
     if (!value || !value[0]) {

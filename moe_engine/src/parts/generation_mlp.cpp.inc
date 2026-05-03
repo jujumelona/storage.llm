@@ -13,6 +13,15 @@ static const moe_gguf_common_tensor_record* moe_find_layer_common_tensor(
     return moe_common_tensor_find_first_raw_compatible(engine, names, out_desc);
 }
 
+static uint32_t moe_fnv1a_hash_string(const char* str) {
+    uint32_t hash = 2166136261u;
+    while (*str) {
+        hash ^= (uint8_t)*str++;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
 static int moe_map_layer_common_tensor(
     moe_pc_engine* engine,
     int32_t layer,
@@ -20,8 +29,19 @@ static int moe_map_layer_common_tensor(
     size_t suffix_count,
     moe_raw_tensor_cache_entry* out
 ) {
-    if (!engine || !out) {
+    if (!engine || !out || suffix_count == 0) {
         return 0;
+    }
+    // Fix 18: Cache tensor mapping to avoid std::string vector allocation per token
+    const uint32_t suffix_hash = moe_fnv1a_hash_string(suffixes[0]);
+    const uint64_t key = ((uint64_t)(uint32_t)layer << 32) | suffix_hash | 0x80000000ull;
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        auto found = engine->raw_tensor_cache.find(key);
+        if (found != engine->raw_tensor_cache.end() && found->second.base) {
+            *out = found->second;
+            return 1;
+        }
     }
     std::vector<std::string> names;
     moe_push_layer_tensor_candidates(&names, layer, suffixes, suffix_count);
@@ -31,7 +51,14 @@ static int moe_map_layer_common_tensor(
     if (!rec) {
         return 0;
     }
-    return map_common_tensor_record(engine, *rec, desc, out);
+    if (!map_common_tensor_record(engine, *rec, desc, out)) {
+        return 0;
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        engine->raw_tensor_cache[key] = *out;
+    }
+    return 1;
 }
 
 static int moe_common_linear_f32(
@@ -239,18 +266,31 @@ static int moe_layer_post_attention_output_norm_f32(
         input, hidden_size, output, eps);
 }
 
+// Fix 28: Cached version — avoids repeated string searches in graph IR per layer per token
 static int moe_layer_uses_split_post_norm_block(const moe_pc_engine* engine, int32_t layer) {
     if (!engine || layer < 0) {
         return 0;
     }
+    // Use cached result if available (populated at engine init or first call)
+    static thread_local const moe_pc_engine* tls_cached_engine = nullptr;
+    static thread_local int tls_cached_result = -1;
+    if (tls_cached_engine == engine && tls_cached_result >= 0) {
+        return tls_cached_result;
+    }
+    int result = 0;
     if (moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_1.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_2.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "layer_output_scale.weight")) {
-        return 1;
+        result = 1;
+    } else {
+        result = (moe_engine_graph_ir_mentions(engine, "post_ffw_norm") ||
+            moe_engine_graph_ir_mentions(engine, "layer_output_scale")) ? 1 : 0;
     }
-    return moe_engine_graph_ir_mentions(engine, "post_ffw_norm") ||
-        moe_engine_graph_ir_mentions(engine, "layer_output_scale") ? 1 : 0;
+    // Cache: graph IR is immutable after load, so this is safe
+    tls_cached_engine = engine;
+    tls_cached_result = result;
+    return result;
 }
 
 static size_t moe_graph_ir_first_pos_any(
@@ -845,28 +885,20 @@ static int moe_layer_moe_mlp_f32(
     // Problem: touch_expert_heat only called during tier transitions, not during actual use
     // Solution: Touch heat for each selected expert after router selection
     // This ensures frequently-used experts maintain high heat scores
+    // Fix 23: Removed map_mutex from hot path. expert_states vector is stable after init,
+    // so reading tier/active without lock is safe. touch_expert_heat only writes hot_score
+    // which is tolerant of stale reads (proactive eviction re-sorts every 25ms).
     for (int expert_id : s->selected_experts) {
         const size_t slot = expert_dense_slot(engine, layer, expert_id);
         if (slot == tensor_slot_invalid() || slot >= engine->expert_states.size()) {
             continue;
         }
-
-        moe_block_state* state_ptr = nullptr;
-        moe_tier_t tier = moe_TIER_DB;
-        {
-            std::lock_guard<std::mutex> lock(engine->map_mutex);
-            if (slot < engine->expert_states.size() && engine->expert_states[slot].active) {
-                state_ptr = &engine->expert_states[slot];
-                tier = state_ptr->tier;
-            }
-        }
-
-        if (state_ptr) {
-            // Boost based on current tier (higher for VRAM experts)
-            const double boost = tier == moe_TIER_VRAM ? 4.0 :
-                                tier == moe_TIER_RAM ? 1.0 : 0.25;
-            touch_expert_heat(engine, state_ptr, boost);
-        }
+        moe_block_state& state = engine->expert_states[slot];
+        if (!state.active) continue;
+        const moe_tier_t tier = state.tier;
+        const double boost = tier == moe_TIER_VRAM ? 4.0 :
+                            tier == moe_TIER_RAM ? 1.0 : 0.25;
+        touch_expert_heat(engine, &state, boost);
     }
 
     moe_profile_log(
@@ -882,31 +914,44 @@ static int moe_layer_moe_mlp_f32(
         // InfiniGen speculative prefetch: use truncated hidden dot-product
         // with next layer's gate weights for ~85% accurate expert prediction.
         // This fires 200μs before the actual router runs, giving I/O a head start.
-        std::vector<int> infinigen_predicted;
+        // Fix 24: Stack-allocated arrays instead of heap vectors
+        int infinigen_predicted_buf[256];
+        int infinigen_predicted_count = 0;
         float spec_confidence = 0.0f;
         if (depth > 0u && layer + 1 < (int32_t)c->num_hidden_layers) {
+            std::vector<int> infinigen_predicted_vec;
             moe_infinigen_speculative_prefetch(
                 engine,
                 layer + 1,
                 c->experts_per_moe_layer,
-                infinigen_predicted,
+                infinigen_predicted_vec,
                 &spec_confidence
             );
+            infinigen_predicted_count = (int)std::min(infinigen_predicted_vec.size(), (size_t)256);
+            for (int ii = 0; ii < infinigen_predicted_count; ++ii)
+                infinigen_predicted_buf[ii] = infinigen_predicted_vec[ii];
         }
 
         // Fallback: co-activation statistics if InfiniGen yields nothing
-        std::vector<int> predicted_experts;
-        if (!infinigen_predicted.empty() && spec_confidence > 0.50f) {
-            predicted_experts = std::move(infinigen_predicted);
+        // Fix 24: Use stack buffer for predicted_experts
+        int predicted_experts_buf[256];
+        int predicted_experts_count = 0;
+        if (infinigen_predicted_count > 0 && spec_confidence > 0.50f) {
+            predicted_experts_count = infinigen_predicted_count;
+            for (int ii = 0; ii < predicted_experts_count; ++ii)
+                predicted_experts_buf[ii] = infinigen_predicted_buf[ii];
         } else {
-            predicted_experts = moe_juju_predict_co_activation(
+            std::vector<int> co_predicted = moe_juju_predict_co_activation(
                 engine,
                 layer + 1,
                 (int)std::min<uint32_t>(moe_MOE_TOP_EXPERTS, moe_MOE_BASE_TOP_EXPERTS * 2u)
             );
+            predicted_experts_count = (int)std::min(co_predicted.size(), (size_t)256);
+            for (int ii = 0; ii < predicted_experts_count; ++ii)
+                predicted_experts_buf[ii] = co_predicted[ii];
         }
         if (depth == 0u) {
-            predicted_experts.clear();
+            predicted_experts_count = 0;
         }
 
         // Primary lookahead: layer+1
@@ -915,8 +960,8 @@ static int moe_layer_moe_mlp_f32(
             layer,
             s->selected_experts.data(),
             (uint32_t)s->selected_experts.size(),
-            predicted_experts.empty() ? nullptr : predicted_experts.data(),
-            (uint32_t)predicted_experts.size()
+            predicted_experts_count > 0 ? predicted_experts_buf : nullptr,
+            (uint32_t)predicted_experts_count
         );
 
         // Deep speculative prefetch: layers +2 to +depth
@@ -1038,9 +1083,11 @@ static int moe_layer_moe_mlp_f32(
     //          cause buffer overflow if num_selected > moe_MOE_TOP_EXPERTS
     // Solution: Use std::vector for dynamic sizing based on num_selected
     // Impact: Prevents buffer overflow, supports dynamic top-k values
-    std::vector<expert_shards_t> shards(num_selected);
-    std::vector<std::atomic<int>> expert_ok(num_selected);
+    // Fix 24: Stack-allocated arrays instead of heap vectors (max 1000 from BUGFIX 511)
+    expert_shards_t shards[1000];
+    std::atomic<int> expert_ok[1000];
     for (size_t e = 0; e < num_selected; ++e) {
+        shards[e] = expert_shards_t{};
         expert_ok[e].store(0, std::memory_order_relaxed);
     }
     uint32_t missing_experts = 0;

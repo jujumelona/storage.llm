@@ -49,9 +49,9 @@ static double moe_rt_compute_tflops_hint(const moe_backend_caps_t& caps) {
     if (caps.tflops_hint > 0.0) return caps.tflops_hint;
     switch (caps.backend) {
     case moe_BACKEND_CUDA:
-        return caps.supports_fp4 || caps.supports_scale4 ? 35.0 : 22.0;
+        return caps.supports_fp4 || caps.supports_scale4 ? 150.0 : 80.0;
     case moe_BACKEND_HIP:
-        return 20.0;
+        return 60.0;
     case moe_BACKEND_METAL:
         return 8.0;
     case moe_BACKEND_VULKAN:
@@ -236,7 +236,7 @@ static void moe_rt_apply_juju_io_flags(
     io->pinned_worker_threads = pinned_cap ?
         clamp_to_cap(std::max(1u, (cfg.io_threads + 1u) / 2u), pinned_cap) : 0u;
     io->gpu_worker_threads = gpu_cap ?
-        clamp_to_cap(std::min(3u, std::max(1u, engine->backend_caps.copy_streams)), gpu_cap) : 0u;
+        clamp_to_cap(std::min(8u, std::max(1u, engine->backend_caps.copy_streams)), gpu_cap) : 0u;
 
     const uint64_t segment = cfg.segment_bytes ? cfg.segment_bytes :
         normal_bundle_max_or(24ull * 1024ull * 1024ull);
@@ -438,18 +438,19 @@ static void moe_juju_update_co_activation(moe_pc_engine* engine, int current_lay
     constexpr uint64_t kCoActivationEvictInterval = 100000;
 
     if (engine->co_activation_token_count - engine->last_merge_build_token_count >= kMergeMapRebuildInterval) {
+        // Fix 10: Snapshot stats to prevent unbounded growth before async rebuild completes
+        engine->co_activation_stats_snapshot = std::move(engine->co_activation_stats);
+        engine->co_activation_stats.clear();
+        const moe_model_shape_t shape = moe_engine_model_shape_or_static(engine);
+        engine->co_activation_stats.resize(shape.num_hidden_layers ? shape.num_hidden_layers : 1u);
         // Set flag for async rebuild (don't block inference thread)
         engine->merge_map_rebuild_pending.store(true, std::memory_order_release);
-    }
-
-    // BUGFIX 701: Sliding window eviction to prevent co_activation_stats memory leak ★★
-    // Clear stats every 100K tokens (after merge map has captured clustering at 50K)
-    if (engine->co_activation_token_count - engine->last_merge_build_token_count >= kCoActivationEvictInterval) {
-        for (auto& layer_stats : engine->co_activation_stats) {
-            layer_stats.clear();
-        }
         engine->last_merge_build_token_count = engine->co_activation_token_count;
     }
+
+    // Bugfix 701 clear loop is no longer needed here since we cleared it on snapshot
+
+
 }
 
 // ============================================================================
@@ -471,14 +472,14 @@ static void moe_build_expert_merge_map(moe_pc_engine* engine) {
         auto& grp = engine->expert_merge_map.merge_groups[L];
         auto& mem = engine->expert_merge_map.group_members[L];
         grp.assign(nE, -1); mem.clear();
-        if (L >= engine->co_activation_stats.size()) {
+        if (L >= engine->co_activation_stats_snapshot.size()) {
             for (uint32_t e = 0; e < nE; ++e) { grp[e]=(int)e; mem[(int)e]={(int)e}; }
             continue;
         }
         std::vector<int> par(nE);
         for (uint32_t i = 0; i < nE; ++i) par[i]=(int)i;
         std::function<int(int)> find=[&](int x)->int{while(par[x]!=x){par[x]=par[par[x]];x=par[x];}return x;};
-        for (const auto& [src,tgts] : engine->co_activation_stats[L]) {
+        for (const auto& [src,tgts] : engine->co_activation_stats_snapshot[L]) {
             float tot=0; for (const auto& [t,c2]:tgts) tot+=c2;
             if (tot<10.f) continue;
             for (const auto& [t,c2]:tgts) {
@@ -496,14 +497,8 @@ static void moe_build_expert_merge_map(moe_pc_engine* engine) {
     }
     engine->expert_merge_map.valid = true;
 
-    // BUGFIX 701: Clear stats after merge map rebuild ★★
-    // merge_map now holds the clustered grouping info. Raw counters are no longer needed.
-    // Clearing here ensures the next rebuild cycle uses only fresh post-rebuild data,
-    // implementing a true sliding window that prevents unbounded memory growth.
-    for (auto& layer_stats : engine->co_activation_stats) {
-        layer_stats.clear();
-    }
-    engine->last_merge_build_token_count = engine->co_activation_token_count;
+    // Fix 10: Clear snapshot after rebuild
+    engine->co_activation_stats_snapshot.clear();
 }
 
 static void moe_expand_merged_experts(moe_pc_engine* engine, int layer, const std::vector<int>& sel, std::vector<int>& out) {

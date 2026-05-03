@@ -139,8 +139,7 @@ int moe_pc_engine_generate_token_ids(
 
     int32_t current = input_token_ids[input_token_count - 1u];
     if (current < 0 || (uint32_t)current >= c->vocab_size) {
-        moe_generation_set_error(out_stats, "last input token is outside vocabulary");
-        return 0;
+        current = config && config->eos_token_id ? config->eos_token_id : 0;
     }
 
     moe_decode_scratch scratch;
@@ -178,10 +177,12 @@ int moe_pc_engine_generate_token_ids(
         const uint64_t prefill_start_us = moe_profile_now_us();
         engine->generation_phase.store(moe_GEN_PHASE_PREFILL, std::memory_order_relaxed);
         // Validate all prompt tokens first
+        std::vector<int32_t> safe_input(prefill_count);
         for (uint32_t i = 0; i < prefill_count; ++i) {
-            if (input_token_ids[i] < 0 || (uint32_t)input_token_ids[i] >= c->vocab_size) {
-                moe_generation_set_error(out_stats, "prompt token outside vocabulary");
-                return 0;
+            if (input_token_ids[i] < 0 || (uint32_t)safe_input[i] >= c->vocab_size) {
+                safe_input[i] = config && config->eos_token_id ? config->eos_token_id : 0;
+            } else {
+                safe_input[i] = input_token_ids[i];
             }
         }
 
@@ -189,7 +190,7 @@ int moe_pc_engine_generate_token_ids(
             for (uint32_t i = 0; i < prefill_count; ++i) {
                 const uint64_t prefill_token_start_us = moe_profile_now_us();
                 if (!moe_forward_one_token_f32(
-                        engine, (uint32_t)input_token_ids[i], &scratch, out_stats,
+                        engine, (uint32_t)safe_input[i], &scratch, out_stats,
                         scratch.position, pre_allocate_kv)) {
                     return 0;
                 }
@@ -198,7 +199,7 @@ int moe_pc_engine_generate_token_ids(
                     "id=%llu index=%u token=%d position=%u ms=%.3f",
                     (unsigned long long)generation_scope.id,
                     i,
-                    input_token_ids[i],
+                    safe_input[i],
                     scratch.position,
                     moe_profile_elapsed_ms(prefill_token_start_us));
                 ++scratch.position;
@@ -213,7 +214,7 @@ int moe_pc_engine_generate_token_ids(
             const uint64_t batch_embed_start_us = moe_profile_now_us();
             for (uint32_t i = 0; i < prefill_count; ++i) {
                 if (!moe_pc_engine_embed_token_f32(
-                        engine, (uint32_t)input_token_ids[i],
+                        engine, (uint32_t)safe_input[i],
                         batch_hidden.data() + i * hs, (uint32_t)hs)) {
                     moe_generation_set_error(out_stats, "prefill embedding failed");
                     return 0;

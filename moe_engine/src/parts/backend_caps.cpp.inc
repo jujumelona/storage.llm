@@ -39,7 +39,7 @@ static void fill_backend_caps(
         fill_levelzero_backend_caps(out_caps);
     } else if (backend == moe_BACKEND_SYCL) {
         out_caps->supports_sycl = compiled_sycl_available();
-        fill_shared_memory_backend_caps(out_caps);
+        fill_sycl_backend_caps(out_caps);
     } else if (backend == moe_BACKEND_METAL) {
         fill_metal_backend_caps(out_caps);
     } else if (backend == moe_BACKEND_VULKAN) {
@@ -54,4 +54,3 @@ static void fill_backend_caps(
         out_caps->supports_pinned_host = 1;
     }
 }
-

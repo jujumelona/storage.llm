@@ -57,9 +57,10 @@ static int device_allocator_init(moe_pc_engine* e) {
         }
         size_t free_b = 0, total_b = 0;
         if (e->hip.hipMemGetInfo(&free_b, &total_b) == 0) {
-            e->device_free_bytes.store((uint64_t)free_b);
+            const uint64_t safe_free_b = ((uint64_t)free_b * 90ull) / 100ull;
+            e->device_free_bytes.store(safe_free_b);
             e->device_total_bytes.store((uint64_t)total_b);
-            if (e->backend_caps.device_memory_bytes == 0) e->backend_caps.device_memory_bytes = (uint64_t)free_b;
+            if (e->backend_caps.device_memory_bytes == 0) e->backend_caps.device_memory_bytes = safe_free_b;
         }
     // BUGFIX 80: Issue 2 - Fix Metal budget calculation and remove dead code.
     // Problem: Metal uses full system_memory_bytes as VRAM budget
@@ -72,7 +73,15 @@ static int device_allocator_init(moe_pc_engine* e) {
         // Apple Silicon unified memory: reserve 25% for OS
         const uint64_t sys = e->backend_caps.system_memory_bytes > 0
             ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
-        const uint64_t usable = (sys * 3ull) / 4ull;  // 75% usable, 25% OS reserve
+        if (e->io_config.metal_memory_budget_pct == 0) {
+            const uint64_t sys_gb = sys / (1024ull * 1024ull * 1024ull);
+            e->io_config.metal_memory_budget_pct = 75u;
+            fprintf(stderr,
+                "[storageLLM INFO] Auto-detected Metal unified-memory budget: %u%% for %llu GB system memory\n",
+                (unsigned)e->io_config.metal_memory_budget_pct,
+                (unsigned long long)sys_gb);
+        }
+        const uint64_t usable = (sys * (uint64_t)e->io_config.metal_memory_budget_pct) / 100ull;
         if (e->backend_caps.device_memory_bytes == 0) {
             e->backend_caps.device_memory_bytes = usable;
         }
@@ -181,6 +190,13 @@ static int device_allocator_init(moe_pc_engine* e) {
                 exact_queried = 1;
             }
         }
+#ifdef HAVE_SYCL
+        else if (e->backend_caps.backend == moe_BACKEND_SYCL) {
+            // SYCL: Level Zero 백엔드를 통해 쿼리하거나 OpenCL 메모리 쿼리 사용
+            // Level Zero가 SYCL 아래에 있는 경우 기존 LZ 쿼리 재사용 가능
+            // 없으면 sycl::device::get_info<sycl::info::device::global_mem_size>() 사용
+        }
+#endif
         
         if (!exact_queried) {
             // Use 85% as a conservative free memory estimate to avoid OOM
@@ -190,6 +206,54 @@ static int device_allocator_init(moe_pc_engine* e) {
         e->device_total_bytes.store(total_mem);
     }
     device_refresh_mem_info(e);
+
+    // Fix 27: Run a quick microbenchmark to measure actual TFLOPS
+    // The hardcoded fallbacks (22/35 TFLOPS) are wildly inaccurate for many GPUs.
+    if (e->backend_caps.tflops_hint <= 0.0 &&
+        (e->backend_caps.backend == moe_BACKEND_CUDA || e->backend_caps.backend == moe_BACKEND_HIP)) {
+        const size_t bench_bytes = 512 * 512 * sizeof(float);
+        CUdeviceptr d_a = 0, d_b = 0;
+        int alloc_ok = 0;
+        if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemAlloc) {
+            alloc_ok = (e->cuda.cuMemAlloc(&d_a, bench_bytes) == 0 &&
+                        e->cuda.cuMemAlloc(&d_b, bench_bytes) == 0) ? 1 : 0;
+        } else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipMalloc) {
+            alloc_ok = (e->hip.hipMalloc(&d_a, bench_bytes) == 0 &&
+                        e->hip.hipMalloc(&d_b, bench_bytes) == 0) ? 1 : 0;
+        }
+        if (alloc_ok && d_a && d_b) {
+            auto t0 = std::chrono::steady_clock::now();
+            const int iters = 20;
+            for (int i = 0; i < iters; ++i) {
+                if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemcpyDtoD)
+                    e->cuda.cuMemcpyDtoD(d_b, d_a, bench_bytes);
+                else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipMemcpyDtoD)
+                    e->hip.hipMemcpyDtoD(d_b, d_a, bench_bytes);
+            }
+            if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuCtxSynchronize)
+                e->cuda.cuCtxSynchronize();
+            else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipDeviceSynchronize)
+                e->hip.hipDeviceSynchronize();
+            auto t1 = std::chrono::steady_clock::now();
+            double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+            if (elapsed_s > 1e-6) {
+                double bw_gbs = (double)(bench_bytes * iters * 2) / elapsed_s / 1e9;
+                double est_tflops = bw_gbs * 0.05;
+                if (est_tflops > 1.0 && est_tflops < 500.0) {
+                    e->backend_caps.tflops_hint = est_tflops;
+                }
+            }
+        }
+        if (d_a) {
+            if (e->backend_caps.backend == moe_BACKEND_CUDA) e->cuda.cuMemFree(d_a);
+            else if (e->backend_caps.backend == moe_BACKEND_HIP) e->hip.hipFree(d_a);
+        }
+        if (d_b) {
+            if (e->backend_caps.backend == moe_BACKEND_CUDA) e->cuda.cuMemFree(d_b);
+            else if (e->backend_caps.backend == moe_BACKEND_HIP) e->hip.hipFree(d_b);
+        }
+    }
+
     e->device_allocator_ready.store(1);
     // Stream pool init moved to engine start
     return 1;

@@ -35,6 +35,7 @@ static int hip_driver_load(moe_hip_driver_api* api) {
     api->hipDeviceGetAttribute = (moe_hip_device_get_attribute_fn)moe_find_shared_symbol(api->library, "hipDeviceGetAttribute");
     api->hipDeviceGetPCIBusId = (moe_cu_device_get_pci_bus_id_fn)moe_find_shared_symbol(api->library, "hipDeviceGetPCIBusId");
     api->hipCtxSetCurrent = (moe_cu_ctx_set_current_fn)moe_find_shared_symbol(api->library, "hipCtxSetCurrent");
+    api->hipDeviceSynchronize = (moe_cu_ctx_synchronize_fn)moe_find_shared_symbol(api->library, "hipDeviceSynchronize");
     api->hipDevicePrimaryCtxRetain = (moe_cu_primary_ctx_retain_fn)moe_find_shared_symbol(api->library, "hipDevicePrimaryCtxRetain");
     api->hipDevicePrimaryCtxRelease = (moe_cu_primary_ctx_release_fn)moe_find_shared_symbol(api->library, "hipDevicePrimaryCtxRelease");
     api->hipMalloc = (moe_cu_mem_alloc_fn)moe_find_hip_symbol(api->library, "hipMemAlloc_v2", "hipMemAlloc");
@@ -42,6 +43,7 @@ static int hip_driver_load(moe_hip_driver_api* api) {
     api->hipMemcpyHtoD = (moe_cu_memcpy_htod_fn)moe_find_hip_symbol(api->library, "hipMemcpyHtoD_v2", "hipMemcpyHtoD");
     api->hipMemGetInfo = (moe_cu_mem_get_info_fn)moe_find_hip_symbol(api->library, "hipMemGetInfo_v2", "hipMemGetInfo");
     api->hipMemcpyHtoDAsync = (moe_cu_memcpy_htod_async_fn)moe_find_hip_symbol(api->library, "hipMemcpyHtoDAsync_v2", "hipMemcpyHtoDAsync");
+    api->hipMemcpyDtoD = (moe_cu_memcpy_dtod_fn)moe_find_hip_symbol(api->library, "hipMemcpyDtoD_v2", "hipMemcpyDtoD");
     api->hipStreamCreate = (moe_cu_stream_create_fn)moe_find_shared_symbol(api->library, "hipStreamCreate");
     api->hipStreamSynchronize = (moe_cu_stream_synchronize_fn)moe_find_shared_symbol(api->library, "hipStreamSynchronize");
     api->hipStreamDestroy = (moe_cu_stream_destroy_fn)moe_find_hip_symbol(api->library, "hipStreamDestroy_v2", "hipStreamDestroy");

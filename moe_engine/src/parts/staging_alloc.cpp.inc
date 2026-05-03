@@ -2,6 +2,30 @@
 // Problem: static bool warned is not thread-safe
 // Multiple threads can print warning simultaneously
 // Solution: Use atomic<bool> with exchange
+#ifdef _WIN32
+static void prepare_windows_staging_working_set(uint64_t bytes) {
+    if (bytes == 0) {
+        return;
+    }
+    const SIZE_T min_ws = (SIZE_T)(bytes + 16ull * 1024ull * 1024ull);
+    const SIZE_T max_ws = (SIZE_T)(bytes + 64ull * 1024ull * 1024ull);
+    static std::mutex ws_mutex;
+    static SIZE_T reserved_min_ws = 0;
+    if (min_ws <= reserved_min_ws) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ws_mutex);
+    if (min_ws <= reserved_min_ws) {
+        return;
+    }
+    if (SetProcessWorkingSetSize(GetCurrentProcess(), min_ws, max_ws)) {
+        reserved_min_ws = min_ws;
+    }
+}
+#else
+static void prepare_windows_staging_working_set(uint64_t) {}
+#endif
+
 static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* pinned, bool* numa_allocated) {
     if (pinned) {
         *pinned = false;
@@ -20,11 +44,13 @@ static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* 
     // Impact: +5-10% DMA bandwidth, 95% → 99%+ TLB hit rate
     // Requires: "Lock pages in memory" privilege (SeLockMemoryPrivilege)
     void* ptr = nullptr;
+    bool large_page = false;
     if (preferred_numa_node >= 0) {
         // Try large pages with NUMA
         ptr = VirtualAllocExNuma(GetCurrentProcess(), nullptr, (SIZE_T)bytes,
                                 MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
                                 PAGE_READWRITE, preferred_numa_node);
+        large_page = ptr != nullptr;
         if (!ptr) {
             // Fallback to regular pages with NUMA
             ptr = VirtualAllocExNuma(GetCurrentProcess(), nullptr, (SIZE_T)bytes,
@@ -37,6 +63,7 @@ static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* 
         ptr = VirtualAlloc(nullptr, (SIZE_T)bytes,
                           MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
                           PAGE_READWRITE);
+        large_page = ptr != nullptr;
     }
     if (!ptr) {
         // Final fallback to regular pages
@@ -47,11 +74,14 @@ static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* 
     }
     if (pinned) {
         *pinned = VirtualLock(ptr, (SIZE_T)bytes) != 0;
-        if (!*pinned) {
-            const SIZE_T min_ws = (SIZE_T)(bytes + 16ull * 1024ull * 1024ull);
-            const SIZE_T max_ws = (SIZE_T)(bytes + 64ull * 1024ull * 1024ull);
-            SetProcessWorkingSetSize(GetCurrentProcess(), min_ws, max_ws);
-            *pinned = VirtualLock(ptr, (SIZE_T)bytes) != 0;
+        if (*pinned) {
+            static std::atomic<bool> logged_pinned{false};
+            if (!logged_pinned.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr,
+                    "[storageLLM INFO] Windows staging VirtualLock: OK%s (%llu bytes)\n",
+                    large_page ? ", large pages" : "",
+                    (unsigned long long)bytes);
+            }
         }
     }
     return static_cast<uint8_t*>(ptr);
@@ -135,6 +165,7 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
         *pinned = false;
     }
     uint64_t bytes = requested_bytes;
+    prepare_windows_staging_working_set(requested_bytes);
     const uint64_t min_pinned = 1ull * 1024ull * 1024ull;
 #ifndef _WIN32
     struct rlimit memlock_limit {};
@@ -167,10 +198,32 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
             return nullptr;
         }
         if (bytes > limit) {
+            fprintf(stderr,
+                "[storagellm] pinned staging exceeds RLIMIT_MEMLOCK: requested=%llu limit=%llu. "
+                "Using full-size non-pinned staging with synchronous DMA fallback.\n",
+                (unsigned long long)requested_bytes,
+                (unsigned long long)limit);
+            if (e) {
+                e->io_atomic.nonpinned_fallback_count.fetch_add(1, std::memory_order_relaxed);
+            }
+            uint8_t* ptr = allocate_staging(
+                e ? e->backend_caps.preferred_numa_node : -1,
+                requested_bytes,
+                nullptr,
+                numa_allocated);
+            if (ptr) {
+                if (actual_bytes) {
+                    *actual_bytes = requested_bytes;
+                }
+                if (pinned) {
+                    *pinned = false;
+                }
+                return ptr;
+            }
             bytes = limit & ~4095ull;
             fprintf(stderr,
-                "[storagellm] pinned staging capped by RLIMIT_MEMLOCK: requested=%llu actual=%llu\n",
-                (unsigned long long)requested_bytes,
+                "[storagellm] full-size non-pinned staging allocation failed; "
+                "trying capped pinned staging actual=%llu\n",
                 (unsigned long long)bytes);
         }
     }

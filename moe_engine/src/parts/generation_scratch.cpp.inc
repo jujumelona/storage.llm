@@ -48,8 +48,7 @@ struct moe_decode_scratch {
     std::vector<float> rope_q_cos;
     std::vector<float> rope_q_sin;
     std::vector<float> kv_entry;
-    // Legacy single-layer decode buffer; retained for compatibility with older paths.
-    std::vector<float> kv_decode_buf;
+    // Fix 38: kv_decode_buf removed (legacy dead allocation, same pattern as BUGFIX 53)
     std::vector<float> kv_decode_flat;
     std::vector<uint32_t> kv_decoded_up_to;
     uint64_t kv_decode_tracked_ram_bytes = 0;
@@ -111,6 +110,12 @@ static int moe_kv_decode_layer_cache_prepare(
         return 0;
     }
 
+    // Fix 33: Reserve full capacity upfront to prevent mid-session realloc+memcpy spikes
+    // With 79 layers × 8192 seq_len × 576 entry_dim, this can be ~1.5GB.
+    // A single reserve() avoids std::vector's 2x growth pattern that peaks at 3GB.
+    if (s->kv_decode_flat.capacity() < total_needed) {
+        s->kv_decode_flat.reserve(total_needed);
+    }
     if (s->kv_decode_flat.size() < total_needed) {
         s->kv_decode_flat.resize(total_needed);
         s->kv_decoded_up_to.assign(s->kv_cache.num_layers, 0u);
@@ -168,9 +173,12 @@ static void moe_rope_table_resize(
     cos_table->resize(needed);
     sin_table->resize(needed);
     std::vector<float> freqs(half_dim);
+    // Fix 14: Use geometric multiplier
+    const float multiplier = std::pow(base, -2.0f / (float)dim);
+    float freq = 1.0f;
     for (uint32_t j = 0; j < half_dim; ++j) {
-        const uint32_t i = j * 2u;
-        freqs[j] = 1.0f / std::pow(base, (float)i / (float)dim);
+        freqs[j] = freq;
+        freq *= multiplier;
     }
     for (uint32_t pos = 0; pos < table_len; ++pos) {
         float* cos_row = cos_table->data() + (size_t)pos * (size_t)half_dim;
@@ -216,6 +224,13 @@ static void moe_decode_scratch_resize(
         return;
     }
 
+    // Fix 34: Pre-allocate all float vectors in a single sequential burst.
+    // When all vectors are first allocated in rapid succession, the OS heap allocator
+    // typically places them contiguously in virtual memory. This improves L2/L3
+    // prefetcher hit rate during the forward pass (hidden → residual → norm → attn
+    // are accessed sequentially).
+    // Total: ~25 vectors × hidden_size(7168) × 4 bytes ≈ 700KB contiguous.
+    const bool first_alloc = s->hidden.empty();
     s->hidden.resize(hidden);
     s->residual.resize(hidden);
     s->norm.resize(hidden);
@@ -246,6 +261,22 @@ static void moe_decode_scratch_resize(
     s->expert_gate_pool.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)expert_intermediate);
     s->expert_up_pool.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)expert_intermediate);
     s->expert_out_pool.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)hidden);
+    // On first allocation, shrink all vectors to exact capacity to prevent
+    // 2x over-allocation from vector growth and to pack them tightly.
+    if (first_alloc) {
+        s->hidden.shrink_to_fit();
+        s->residual.shrink_to_fit();
+        s->norm.shrink_to_fit();
+        s->attn.shrink_to_fit();
+        s->mlp.shrink_to_fit();
+        s->shared.shrink_to_fit();
+        s->expert.shrink_to_fit();
+        s->gate.shrink_to_fit();
+        s->up.shrink_to_fit();
+        s->expert_gate_pool.shrink_to_fit();
+        s->expert_up_pool.shrink_to_fit();
+        s->expert_out_pool.shrink_to_fit();
+    }
     moe_rope_table_resize(&s->rope_k_cos, &s->rope_k_sin, cfg.qk_rope_head_dim, cfg.rope_theta, cfg.rope_table_len);
     moe_rope_table_resize(&s->rope_q_cos, &s->rope_q_sin, cfg.qk_rope_head_dim, cfg.rope_theta, cfg.rope_table_len);
     if (s->kv_cache.num_layers != c->num_hidden_layers ||

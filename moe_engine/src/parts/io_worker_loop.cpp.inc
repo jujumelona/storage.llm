@@ -68,6 +68,8 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         // Old: 5ms sleep caused CPU overhead and potential oscillation.
         // New: Wait on vram_eviction_cv. Triggered instantly when allocation > 85%.
         // Fallback to 50ms wait to periodically check RAM eviction.
+        bool vram_eviction_flag = false;
+        bool ram_eviction_flag = false;
         {
             std::unique_lock<std::mutex> lock(engine->vram_eviction_mutex);
             engine->vram_eviction_cv.wait_for(lock, std::chrono::milliseconds(25), [&]() {
@@ -75,8 +77,11 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
                        engine->ram_eviction_needed.load(std::memory_order_relaxed) ||
                        engine->io_stop.load(std::memory_order_relaxed);
             });
-            engine->vram_eviction_needed.store(false, std::memory_order_relaxed);
-            engine->ram_eviction_needed.store(false, std::memory_order_relaxed);
+            // BUGFIX 문제2: proactive_eviction_worker_loop에서 플래그를 eviction 전에 clear ★★★
+            // Problem: CV 깨어난 직후 플래그를 false로 세팅 → eviction 실패 시 재시도 없음
+            // Solution: 플래그를 읽어서 로컬 변수에 저장하고, eviction 완료 후에만 clear
+            vram_eviction_flag = engine->vram_eviction_needed.load(std::memory_order_relaxed);
+            ram_eviction_flag = engine->ram_eviction_needed.load(std::memory_order_relaxed);
         }
         if (engine->io_stop.load(std::memory_order_relaxed)) {
             break;
@@ -98,6 +103,7 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         const uint64_t vram_trigger_pct  = vram_target_pct + 10u <= 100u ? vram_target_pct + 10u : 100u;
         const uint64_t vram_target = (vram_bud * vram_target_pct) / 100ull;
         const uint64_t vram_threshold_85 = (vram_bud * vram_trigger_pct) / 100ull;
+        bool vram_eviction_succeeded = false;
         if (vram_bud > 0 && vram_used > vram_threshold_85 && vram_used > vram_target) {
             std::vector<std::pair<int, int>> freed;
             demote_cold_until(engine, moe_TIER_VRAM, vram_bud - vram_target, freed);
@@ -107,7 +113,25 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
                 // New: 4 × cuMemFree = 400µs device_mutex hold
                 // All device_copy_tensor calls wait on device_mutex ??halving hold time improves throughput
                 // Trade-off: More batches needed for large evictions, but each batch blocks less
-                device_free_experts_batched(engine, freed, 4);
+                const size_t free_batch_size =
+                    (engine->backend_caps.copy_streams >= 8u ||
+                     engine->backend_caps.dma_bandwidth_gbps >= 100.0) ? 8u : 4u;
+                device_free_experts_batched(engine, freed, free_batch_size);
+                vram_eviction_succeeded = true;
+            }
+        }
+
+        // BUGFIX 문제2: eviction 완료 후 플래그 clear (성공 시에만)
+        // 실패한 경우 플래그를 유지하여 다음 사이클에서 재시도
+        bool retry_vram_eviction = false;
+        if (vram_eviction_flag) {
+            const uint64_t vram_used_after = tier_used(engine, moe_TIER_VRAM);
+            // eviction이 성공했거나 사용률이 목표 이하로 떨어진 경우에만 플래그 clear
+            if (vram_used_after > vram_threshold_85 && vram_used_after > vram_target) {
+                engine->vram_eviction_needed.store(true, std::memory_order_relaxed);
+                retry_vram_eviction = true;
+            } else {
+                engine->vram_eviction_needed.store(false, std::memory_order_relaxed);
             }
         }
 
@@ -118,6 +142,7 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         const bool skip_ram_eviction = (engine->backend_caps.backend == moe_BACKEND_METAL &&
                                         engine->backend_caps.supports_unified_memory);
 
+        bool ram_eviction_succeeded = false;
         if (!skip_ram_eviction) {
             const uint64_t ram_target_pct  = engine->io_config.ram_eviction_threshold_pct  ? engine->io_config.ram_eviction_threshold_pct  : 80u;
             const uint64_t ram_trigger_pct  = ram_target_pct + 5u <= 100u ? ram_target_pct + 5u : 100u;
@@ -126,7 +151,32 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
             if (ram_bud > 0 && ram_used > ram_threshold_85 && ram_used > ram_target) {
                 std::vector<std::pair<int, int>> ignored;
                 demote_cold_until(engine, moe_TIER_RAM, ram_bud - ram_target, ignored);
+                ram_eviction_succeeded = true;
             }
+        }
+
+        // BUGFIX 문제2: RAM eviction 완료 후 플래그 clear (성공 시에만)
+        bool retry_ram_eviction = false;
+        if (ram_eviction_flag) {
+            const uint64_t ram_used_after = tier_used(engine, moe_TIER_RAM);
+            const uint64_t ram_target_pct  = engine->io_config.ram_eviction_threshold_pct  ? engine->io_config.ram_eviction_threshold_pct  : 80u;
+            const uint64_t ram_target = (ram_bud * ram_target_pct) / 100ull;
+            const uint64_t ram_trigger_pct = ram_target_pct + 5u <= 100u ? ram_target_pct + 5u : 100u;
+            const uint64_t ram_trigger = (ram_bud * ram_trigger_pct) / 100ull;
+            if (!skip_ram_eviction && ram_used_after > ram_trigger && ram_used_after > ram_target) {
+                engine->ram_eviction_needed.store(true, std::memory_order_relaxed);
+                retry_ram_eviction = true;
+            } else {
+                engine->ram_eviction_needed.store(false, std::memory_order_relaxed);
+            }
+        }
+
+        if ((retry_vram_eviction || retry_ram_eviction) &&
+            !engine->io_stop.load(std::memory_order_relaxed)) {
+            std::unique_lock<std::mutex> lock(engine->vram_eviction_mutex);
+            engine->vram_eviction_cv.wait_for(lock, std::chrono::milliseconds(25), [&]() {
+                return engine->io_stop.load(std::memory_order_relaxed);
+            });
         }
 
         // BUGFIX 235: Check and compact eviction heaps if needed
@@ -454,7 +504,92 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 }
             } else {
                 bool staged_direct_to_gpu = false;
-                if (task.target_tier == moe_TIER_VRAM &&
+                if (task.bundle_triplet && task.target_tier == moe_TIER_VRAM) {
+                    const uint64_t bundle_bytes = expert_triplet_or_hardcoded_bytes(
+                        engine, task.bundle_layer, task.bundle_expert);
+                    if (active_path == moe_IO_PATH_PINNED_HOST &&
+                        engine_has_device_upload_workers(engine) &&
+                        engine->backend_caps.supports_fixed_read_staging &&
+                        engine->io_config.enable_multistage_pipeline &&
+                        engine->staging &&
+                        engine->staging_pinned &&
+                        bundle_bytes > 0) {
+                        const uint32_t gpu_hard_cap = engine->gpu_stage_depth_cap;
+                        const uint32_t gpu_depth_pre = engine->gpu_stage.depth.load(std::memory_order_relaxed);
+                        if (gpu_hard_cap > 0 && gpu_depth_pre >= gpu_hard_cap) {
+                            ok = preserve_requeue(task, moe_TRANSFER_STAGE_DISK_TO_RAM);
+                            terminal = 0;
+                            staged_direct_to_gpu = true;
+                        } else {
+                            uint32_t slot = acquire_staging_slot(
+                                engine,
+                                worker_index,
+                                staging_turn++,
+                                bundle_bytes,
+                                false,
+                                true
+                            );
+                            if (slot != UINT32_MAX) {
+                                moe_prefetch_task next = task;
+                                next.stage = moe_TRANSFER_STAGE_PINNED_TO_GPU;
+                                next.staging_slot = slot;
+                                next.staging_bytes = 0;
+                                next.staging_valid = 0;
+                                uint64_t staging_offset = 0;
+                                int bundle_ok = 1;
+                                const moe_projection_t projs[3] = {moe_PROJ_GATE, moe_PROJ_UP, moe_PROJ_DOWN};
+                                for (uint32_t p = 0; p < 3u; ++p) {
+                                    const moe_tensor_record* brec = find_tensor_record(
+                                        engine, task.bundle_layer, task.bundle_expert, projs[p]);
+                                    if (!brec) {
+                                        bundle_ok = 0;
+                                        break;
+                                    }
+                                    next.bundle_offsets[p] = staging_offset;
+                                    uint64_t copied = 0;
+                                    if (!prefetch_tensor_ram_to_pinned_at(
+                                            engine, *brec, slot, &staging_offset, &copied, task.target_tier) ||
+                                        copied != tensor_stream_bytes(*brec)) {
+                                        bundle_ok = 0;
+                                        break;
+                                    }
+                                    next.bundle_bytes[p] = copied;
+                                }
+                                if (bundle_ok && staging_offset == bundle_bytes) {
+                                    next.staging_bytes = staging_offset;
+                                    next.staging_valid = 1;
+                                    engine->io_atomic.pinned_stage_done.fetch_add(1, std::memory_order_relaxed);
+                                    if (enqueue_stage_or_retry(engine, engine->gpu_stage, next)) {
+                                        ok = 1;
+                                        terminal = 0;
+                                        staged_direct_to_gpu = true;
+                                        engine->gpu_stage.cv.notify_one();
+                                    } else {
+                                        release_staging_slot(engine, slot);
+                                        ok = preserve_requeue(task, moe_TRANSFER_STAGE_DISK_TO_RAM);
+                                        terminal = 0;
+                                        staged_direct_to_gpu = true;
+                                    }
+                                } else {
+                                    release_staging_slot(engine, slot);
+                                    ok = preserve_requeue(task, moe_TRANSFER_STAGE_DISK_TO_RAM);
+                                    terminal = 0;
+                                    staged_direct_to_gpu = true;
+                                }
+                            } else {
+                                ok = preserve_requeue(task, moe_TRANSFER_STAGE_DISK_TO_RAM);
+                                terminal = 0;
+                                staged_direct_to_gpu = true;
+                            }
+                        }
+                    } else {
+                        ok = preserve_requeue(task, moe_TRANSFER_STAGE_DISK_TO_RAM);
+                        terminal = 0;
+                        staged_direct_to_gpu = true;
+                    }
+                }
+                if (!staged_direct_to_gpu &&
+                    task.target_tier == moe_TIER_VRAM &&
                     active_path == moe_IO_PATH_PINNED_HOST &&
                     engine_has_device_upload_workers(engine) &&
                     engine->backend_caps.supports_fixed_read_staging &&

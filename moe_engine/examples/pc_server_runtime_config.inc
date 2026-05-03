@@ -30,7 +30,9 @@ static void apply_detected_budgets(server_options* opts, const moe_backend_caps_
 static moe_io_config_t make_server_io_config(const server_options& opts, const moe_backend_caps_t& caps) {
     moe_io_config_t io = moe_pc_default_io_config();
     const moe_storage_constants_t* storage = moe_storage_constants();
-    const uint64_t expert_bytes = storage ? storage->normal_bundle_min_bytes : 8ull * 1024ull * 1024ull;
+    const uint64_t expert_min_bytes = storage ? storage->normal_bundle_min_bytes : 8ull * 1024ull * 1024ull;
+    const uint64_t expert_max_bytes = storage && storage->normal_bundle_max_bytes ?
+        storage->normal_bundle_max_bytes : expert_min_bytes;
     io.enable_compute_io_overlap = 1;
     io.enable_multistage_pipeline = 1;
     io.enable_lookahead_prefetch = 1;
@@ -47,8 +49,15 @@ static moe_io_config_t make_server_io_config(const server_options& opts, const m
     io.disk_worker_threads = 4;
     io.pinned_worker_threads = caps.copy_streams > 1 ? 4u : 2u;
     io.gpu_worker_threads = caps.copy_streams ? caps.copy_streams : 1u;
-    io.direct_upload_min_bytes = expert_bytes;
-    io.pinned_staging_bytes = std::max<uint64_t>(caps.recommended_pinned_bytes, expert_bytes * 16ull);
+    io.direct_upload_min_bytes = expert_min_bytes;
+    const uint32_t active_workers =
+        io.disk_worker_threads + io.pinned_worker_threads + io.gpu_worker_threads;
+    const uint64_t slot_bytes = expert_max_bytes + 4ull * 1024ull * 1024ull;
+    const uint64_t worker_slots = std::max<uint32_t>(8u, active_workers * 2u);
+    const uint64_t worker_staging = slot_bytes * worker_slots;
+    io.pinned_staging_bytes = std::max<uint64_t>(
+        std::max<uint64_t>(caps.recommended_pinned_bytes, worker_staging),
+        512ull * 1024ull * 1024ull);
     return io;
 }
 

@@ -21,6 +21,7 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
 
     for (;;) {
         moe_prefetch_task task{};
+        device_refresh_mem_info(engine, 0);
         if (!pop_stage_task(engine, engine->gpu_stage, &task, &engine->gpu_worker_target, worker_index)) {
             stream_guard.e = nullptr;  // BUG 4 FIX: Prevent double-destroy
             device_stream_destroy_current(engine);
@@ -109,7 +110,9 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         // DMA can overlap on the secondary stream. This hides transfer
         // latency behind compute for consecutive expert execution.
         CUstream dma_overlap_stream = nullptr;
-        if (batch_count > 1 && engine->stream_pool_available.load(std::memory_order_acquire) > 0) {
+        if (batch_count > 1 &&
+            engine->backend_caps.supports_backend_async_api &&
+            engine->stream_pool_available.load(std::memory_order_acquire) > 0) {
             std::lock_guard<std::mutex> lock(engine->stream_pool_mutex);
             if (!engine->stream_pool.empty()) {
                 dma_overlap_stream = engine->stream_pool.back();
@@ -125,6 +128,26 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
             if (batch[i].raw_span_index >= 0) {
                 const moe_storage_raw_span_spec_t* span = moe_storage_raw_span_at((uint32_t)batch[i].raw_span_index);
                 ok[i] = span ? prefetch_one_raw_span(engine, *span, batch[i].raw_pool, 1) : 0;
+            } else if (batch[i].bundle_triplet) {
+                ok[i] = prefetch_expert_triplet_pinned_to_gpu_bundle(engine, batch[i], 0);
+                if (ok[i] == moe_DEVICE_COPY_BACKPRESSURE) {
+                    moe_prefetch_task once_more = batch[i];
+                    once_more.stage = moe_TRANSFER_STAGE_PINNED_TO_GPU;
+                    once_more.urgent = 1;
+                    if (enqueue_stage_or_retry(engine, engine->gpu_stage, once_more)) {
+                        ok[i] = 1;
+                        terminal[i] = 0;
+                        engine->gpu_stage.cv.notify_one();
+                    } else {
+                        if (batch[i].staging_slot != UINT32_MAX) {
+                            release_staging_slot(engine, batch[i].staging_slot);
+                            batch[i].staging_slot = UINT32_MAX;
+                        }
+                        engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                        ok[i] = 0;
+                        terminal[i] = 1;
+                    }
+                }
             } else if (batch[i].tensor_index < engine->tensors.size()) {
                 // BUGFIX 325: Add explicit bounds check for tensor_index in gpu_worker ★
                 // Problem: batch[i].tensor_index can be negative

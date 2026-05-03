@@ -1,5 +1,5 @@
 static int compiled_directstorage_available() {
-#ifdef moe_ENABLE_DIRECTSTORAGE
+#if defined(moe_ENABLE_DIRECTSTORAGE) || defined(HAVE_DIRECTSTORAGE)
     return 1;
 #else
     return 0;
@@ -7,7 +7,7 @@ static int compiled_directstorage_available() {
 }
 
 static int compiled_gpudirect_available() {
-#ifdef moe_ENABLE_GPUDIRECT_STORAGE
+#if defined(moe_ENABLE_GPUDIRECT_STORAGE) || defined(HAVE_GPUDIRECT_STORAGE)
     return 1;
 #else
     return 0;
@@ -15,7 +15,7 @@ static int compiled_gpudirect_available() {
 }
 
 static int compiled_bam_nvme_available() {
-#ifdef moe_ENABLE_BAM_NVME
+#if defined(moe_ENABLE_BAM_NVME) || defined(HAVE_BAM_NVME)
     return 1;
 #else
     return 0;

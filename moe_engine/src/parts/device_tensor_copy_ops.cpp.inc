@@ -71,7 +71,8 @@ static int device_copy_tensor_from_host(
     uint8_t pool,
     const uint8_t* host,
     uint64_t host_bytes,
-    uint32_t staging_slot = UINT32_MAX
+    uint32_t staging_slot = UINT32_MAX,
+    int release_slot_on_submit = 1
 ) {
     const uint64_t bytes = tensor_stream_bytes(r);
     if (!e || !host || host_bytes < bytes || bytes == 0 ||
@@ -118,17 +119,137 @@ static int device_copy_tensor_from_host(
                 slot.last_copy_stream = stream;
             }
             // Release slot immediately — acquirer will wait on last_copy_event
-            release_staging_slot(e, staging_slot);
+            if (release_slot_on_submit) {
+                release_staging_slot(e, staging_slot);
+            }
             // Defer only the key completion tracking, no slot to release later
             device_defer_staging_copy(e, UINT32_MAX, key, 0, stream);  // 0 bytes - not VRAM target
         } else {
             s_tl_tensor_pending_keys[e].push_back(key);
         }
-    } else if (staging_slot != UINT32_MAX) {
+    } else if (staging_slot != UINT32_MAX && release_slot_on_submit) {
         release_staging_slot(e, staging_slot);
     }
     device_touch_allocation(e, key);
     return 1;
+}
+
+static int device_copy_tensor_gpudirect_storage(
+    moe_pc_engine* e,
+    const moe_tensor_record& r,
+    uint8_t pool
+) {
+#if defined(__linux__)
+    if (!e || e->backend_caps.backend != moe_BACKEND_CUDA ||
+        !e->io_config.enable_gpudirect_storage ||
+        !e->cuda.cufile_available ||
+        !e->cuda.cuFileHandleRegister ||
+        !e->cuda.cuFileHandleDeregister ||
+        !e->cuda.cuFileRead) {
+        return 0;
+    }
+    const uint64_t bytes = tensor_stream_bytes(r);
+    if (bytes == 0 || !device_allocator_init(e) || !device_set_current(e)) {
+        return 0;
+    }
+    mmap_context_t* shard = get_or_map_tensor_shard(e, r);
+    if (!shard || shard->fd < 0) {
+        return 0;
+    }
+    const uint64_t ranges[3][2] = {
+        {r.info.weight_byte_offset, r.info.weight_byte_length},
+        {r.info.scale_byte_offset, r.info.scale_byte_length},
+        {r.info.scale2_byte_offset, r.info.scale2_byte_length}
+    };
+    const uint64_t file_size = static_cast<uint64_t>(mmap_get_size(shard));
+    for (const auto& range : ranges) {
+        if (range[1] && (range[0] > file_size || range[1] > file_size - range[0])) {
+            return 0;
+        }
+    }
+
+    static std::once_flag cufile_open_once;
+    static std::atomic<int> cufile_open_ok{0};
+    if (e->cuda.cuFileDriverOpen) {
+        std::call_once(cufile_open_once, [&]() {
+            const moe_cufile_error_t st = e->cuda.cuFileDriverOpen();
+            cufile_open_ok.store(st.err == 0 ? 1 : -1, std::memory_order_release);
+        });
+        if (cufile_open_ok.load(std::memory_order_acquire) < 0) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr,
+                    "[storageLLM WARNING] GPUDirect Storage driver open failed; falling back to staged H2D\n");
+            }
+            return 0;
+        }
+    }
+
+    const uint64_t key = device_key_tensor(r);
+    CUdeviceptr dst = 0;
+    if (!device_prepare_tensor_allocation(e, key, bytes, pool, 0, &dst, nullptr)) {
+        return 0;
+    }
+
+    struct moe_cufile_descr_local {
+        int type;
+        union {
+            int fd;
+            void* handle;
+        } handle;
+        const void* fs_ops;
+    } desc{};
+    desc.type = 1; // CU_FILE_HANDLE_TYPE_OPAQUE_FD
+    desc.handle.fd = shard->fd;
+
+    void* file_handle = nullptr;
+    const moe_cufile_error_t hst = e->cuda.cuFileHandleRegister(&file_handle, &desc);
+    if (hst.err != 0 || !file_handle) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            fprintf(stderr,
+                "[storageLLM WARNING] cuFileHandleRegister failed (err=%d); "
+                "falling back to pinned staging. Check nvidia-fs, filesystem support, and O_DIRECT mode.\n",
+                hst.err);
+        }
+        device_free_key(e, key);
+        return 0;
+    }
+
+    int ok = 1;
+    uint64_t dst_offset = 0;
+    void* dst_base = reinterpret_cast<void*>(static_cast<uintptr_t>(dst));
+    for (const auto& range : ranges) {
+        if (range[1] == 0) {
+            continue;
+        }
+        const long long got = e->cuda.cuFileRead(
+            file_handle,
+            dst_base,
+            static_cast<size_t>(range[1]),
+            static_cast<int64_t>(range[0]),
+            static_cast<int64_t>(dst_offset));
+        if (got != static_cast<long long>(range[1])) {
+            ok = 0;
+            break;
+        }
+        dst_offset += range[1];
+    }
+
+    e->cuda.cuFileHandleDeregister(file_handle);
+    if (!ok || dst_offset != bytes) {
+        e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
+        device_free_key(e, key);
+        return 0;
+    }
+    device_touch_allocation(e, key);
+    return 1;
+#else
+    (void)e;
+    (void)r;
+    (void)pool;
+    return 0;
+#endif
 }
 
 static int device_copy_tensor(
@@ -240,6 +361,9 @@ static int device_copy_tensor(
     }
 
     // Fix 55: No staging ??use explicit synchronous cuMemcpyHtoD (no false async)
+    if (device_backend_is_metal(e) && e->staging_slots.size() > 0 && bytes <= e->staging_slot_size) {
+        return moe_DEVICE_COPY_BACKPRESSURE;
+    }
     if (!allow_sync_fallback && e->staging_slots.size() > 0 && bytes <= e->staging_slot_size) {
         return moe_DEVICE_COPY_BACKPRESSURE;
     }

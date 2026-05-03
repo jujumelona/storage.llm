@@ -9,14 +9,12 @@ static float policy_gpu_target(moe_execution_policy_t policy) {
 static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orchestrator_state_t* state,
     moe_runtime_orchestrator_plan_t* plan) {
     const moe_execution_policy_t policy = state ? state->policy : moe_EXECUTION_BALANCED;
-    // Fix 14: Handle hardware_concurrency() == 0 gracefully
-    static const unsigned int hw_raw = std::thread::hardware_concurrency();
-    static const unsigned int hw = hw_raw > 0 ? hw_raw : 4u;  // Fallback to 4 if undefined
-    const uint32_t perf_disk_workers = hw >= 16 ? 3u : 2u;
+    static const uint32_t hw = std::max<uint32_t>(moe_cpu_thread_count_hint(), 4u);
+    const uint32_t perf_disk_workers = moe_default_disk_worker_threads(hw);
     // Fix 3: Allow up to 3 GPU workers in PERFORMANCE mode to pipeline
     // blocking cuStreamSynchronize calls and improve PCIe utilization.
     const uint32_t perf_gpu_workers = engine && engine->backend_caps.copy_streams > 1
-        ? std::min(3u, (uint32_t)engine->backend_caps.copy_streams) : 1u;
+        ? std::min(8u, (uint32_t)engine->backend_caps.copy_streams) : 1u;
     std::memset(plan, 0, sizeof(*plan));
     plan->policy = policy;
     plan->disk_workers = policy == moe_EXECUTION_PERFORMANCE ? perf_disk_workers : policy == moe_EXECUTION_LOW_IMPACT ? 1u : 2u;
@@ -32,7 +30,7 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
         plan->pinned_workers = pinned_cap ?
             clamp_to_cap(std::max(1u, (juju_cfg->io_threads + 1u) / 2u), pinned_cap) : 0u;
         plan->gpu_workers = gpu_cap ?
-            clamp_to_cap(std::min(3u, std::max(1u, engine->backend_caps.copy_streams)), gpu_cap) : 0u;
+            clamp_to_cap(std::min(8u, std::max(1u, engine->backend_caps.copy_streams)), gpu_cap) : 0u;
     }
 
     // BUGFIX 59: Issue 5 - dropped_requests feedback loop ?�★??
