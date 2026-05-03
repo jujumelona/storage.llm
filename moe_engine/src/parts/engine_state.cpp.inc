@@ -294,6 +294,18 @@ struct moe_pc_engine {
     mutable std::shared_mutex text_mention_cache_mutex;
     mutable std::unordered_map<std::string, int> graph_ir_mention_cache;
     mutable std::unordered_map<std::string, int> metadata_mention_cache;
+    std::vector<uint8_t> model_config_full_attention_layers;
+    std::atomic<int> model_config_layer_types_valid{0};
+    std::atomic<int> model_config_attention_valid{0};
+    uint32_t model_config_num_attention_heads = 0;
+    uint32_t model_config_num_key_value_heads = 0;
+    uint32_t model_config_num_global_key_value_heads = 0;
+    uint32_t model_config_head_dim = 0;
+    uint32_t model_config_global_head_dim = 0;
+    uint32_t model_config_sliding_window = 0;
+    float model_config_sliding_rope_theta = 0.0f;
+    float model_config_full_rope_theta = 0.0f;
+    float model_config_partial_rotary_factor = 0.0f;
 
     // GAP 1A: Persistent per-head quantized KV cache
     // Key = head_index, value = qkv_state_t with quantized K/V for that head

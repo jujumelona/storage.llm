@@ -94,6 +94,10 @@ static int moe_engine_uses_hybrid_local_global_attention(const moe_pc_engine* en
     if (!engine) {
         return 0;
     }
+    if (engine->model_config_attention_valid.load(std::memory_order_relaxed) ||
+        engine->model_config_layer_types_valid.load(std::memory_order_relaxed)) {
+        return 1;
+    }
     if (moe_engine_graph_ir_mentions(engine, "hybrid_local_global_attention") ||
         moe_engine_graph_ir_mentions(engine, "local_global_attention") ||
         moe_engine_graph_ir_mentions(engine, "global_attention") ||
@@ -164,7 +168,12 @@ static int moe_hybrid_layer_is_full_attention(
     if (layer < 0) {
         return 0;
     }
-    const uint32_t period = moe_hybrid_attention_period_from_metadata(engine, 6u);
+    if (engine &&
+        engine->model_config_layer_types_valid.load(std::memory_order_relaxed) &&
+        (uint32_t)layer < engine->model_config_full_attention_layers.size()) {
+        return engine->model_config_full_attention_layers[(uint32_t)layer] ? 1 : 0;
+    }
+    const uint32_t period = moe_hybrid_attention_period_from_metadata(engine, 0u);
     if (period == 0) {
         return 0;
     }
@@ -184,21 +193,36 @@ static moe_attn_config_t moe_generation_layer_attn_config(
 
     uint64_t value = 0;
     double dvalue = 0.0;
-    const uint32_t base_num_heads =
-        moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_attention_heads", &value) && value > 0 ?
-        (uint32_t)std::min<uint64_t>(value, UINT32_MAX) : cfg.num_heads;
-    const uint32_t base_num_kv_heads =
-        moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_key_value_heads", &value) && value > 0 ?
-        (uint32_t)std::min<uint64_t>(value, UINT32_MAX) : cfg.num_kv_heads;
-    const uint32_t base_head_dim =
-        moe_json_get_u64_local(engine->offload_gguf_metadata_json, "head_dim", &value) && value > 0 ?
-        (uint32_t)std::min<uint64_t>(value, UINT32_MAX) : (cfg.head_dim ? cfg.head_dim : 256u);
-    const uint32_t global_head_dim =
-        moe_json_get_u64_local(engine->offload_gguf_metadata_json, "global_head_dim", &value) && value > 0 ?
-        (uint32_t)std::min<uint64_t>(value, UINT32_MAX) : std::max<uint32_t>(base_head_dim, cfg.head_dim);
-    const uint32_t global_num_kv_heads =
-        moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_global_key_value_heads", &value) && value > 0 ?
-        (uint32_t)std::min<uint64_t>(value, UINT32_MAX) : std::max<uint32_t>(1u, base_num_kv_heads / 4u);
+    uint32_t base_num_heads = cfg.num_heads;
+    uint32_t base_num_kv_heads = cfg.num_kv_heads;
+    uint32_t base_head_dim = cfg.head_dim;
+    uint32_t global_head_dim = cfg.head_dim;
+    uint32_t global_num_kv_heads = cfg.num_kv_heads;
+    if (engine->model_config_num_attention_heads) {
+        base_num_heads = engine->model_config_num_attention_heads;
+    } else if (moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_attention_heads", &value) && value > 0) {
+        base_num_heads = (uint32_t)std::min<uint64_t>(value, UINT32_MAX);
+    }
+    if (engine->model_config_num_key_value_heads) {
+        base_num_kv_heads = engine->model_config_num_key_value_heads;
+    } else if (moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_key_value_heads", &value) && value > 0) {
+        base_num_kv_heads = (uint32_t)std::min<uint64_t>(value, UINT32_MAX);
+    }
+    if (engine->model_config_head_dim) {
+        base_head_dim = engine->model_config_head_dim;
+    } else if (moe_json_get_u64_local(engine->offload_gguf_metadata_json, "head_dim", &value) && value > 0) {
+        base_head_dim = (uint32_t)std::min<uint64_t>(value, UINT32_MAX);
+    }
+    if (engine->model_config_global_head_dim) {
+        global_head_dim = engine->model_config_global_head_dim;
+    } else if (moe_json_get_u64_local(engine->offload_gguf_metadata_json, "global_head_dim", &value) && value > 0) {
+        global_head_dim = (uint32_t)std::min<uint64_t>(value, UINT32_MAX);
+    }
+    if (engine->model_config_num_global_key_value_heads) {
+        global_num_kv_heads = engine->model_config_num_global_key_value_heads;
+    } else if (moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_global_key_value_heads", &value) && value > 0) {
+        global_num_kv_heads = (uint32_t)std::min<uint64_t>(value, UINT32_MAX);
+    }
 
     cfg.num_heads = base_num_heads ? base_num_heads : cfg.num_heads;
     cfg.v_head_dim = 0;
@@ -206,15 +230,29 @@ static moe_attn_config_t moe_generation_layer_attn_config(
         cfg.head_dim = global_head_dim ? global_head_dim : cfg.head_dim;
         cfg.num_kv_heads = global_num_kv_heads ? global_num_kv_heads : cfg.num_kv_heads;
         const float partial =
-            moe_json_get_double_local(engine->offload_gguf_metadata_json, "partial_rotary_factor", &dvalue) &&
-            dvalue > 0.0 && dvalue <= 1.0 ? (float)dvalue : 0.25f;
-        cfg.qk_rope_head_dim = std::max<uint32_t>(2u, (uint32_t)std::round((float)cfg.head_dim * partial));
-        cfg.rope_theta = 1000000.0f;
+            engine->model_config_partial_rotary_factor > 0.0f && engine->model_config_partial_rotary_factor <= 1.0f ?
+            engine->model_config_partial_rotary_factor :
+            (moe_json_get_double_local(engine->offload_gguf_metadata_json, "partial_rotary_factor", &dvalue) &&
+            dvalue > 0.0 && dvalue <= 1.0 ? (float)dvalue : 0.0f);
+        if (partial > 0.0f) {
+            cfg.qk_rope_head_dim = std::max<uint32_t>(2u, (uint32_t)std::round((float)cfg.head_dim * partial));
+        }
+        if (engine->model_config_full_rope_theta > 0.0f) {
+            cfg.rope_theta = engine->model_config_full_rope_theta;
+        } else if (moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_rope_theta", &dvalue) ||
+                   moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_attention_rope_theta", &dvalue)) {
+            cfg.rope_theta = (float)dvalue;
+        }
     } else {
         cfg.head_dim = base_head_dim ? base_head_dim : cfg.head_dim;
         cfg.num_kv_heads = base_num_kv_heads ? base_num_kv_heads : cfg.num_kv_heads;
         cfg.qk_rope_head_dim = cfg.head_dim;
-        cfg.rope_theta = 10000.0f;
+        if (engine->model_config_sliding_rope_theta > 0.0f) {
+            cfg.rope_theta = engine->model_config_sliding_rope_theta;
+        } else if (moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_rope_theta", &dvalue) ||
+                   moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_attention_rope_theta", &dvalue)) {
+            cfg.rope_theta = (float)dvalue;
+        }
     }
     cfg.v_head_dim = cfg.head_dim;
     return cfg;

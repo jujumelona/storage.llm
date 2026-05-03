@@ -76,6 +76,18 @@ static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {
         engine->graph_ir_mention_cache.clear();
         engine->metadata_mention_cache.clear();
     }
+    engine->model_config_full_attention_layers.clear();
+    engine->model_config_layer_types_valid.store(0, std::memory_order_relaxed);
+    engine->model_config_attention_valid.store(0, std::memory_order_relaxed);
+    engine->model_config_num_attention_heads = 0;
+    engine->model_config_num_key_value_heads = 0;
+    engine->model_config_num_global_key_value_heads = 0;
+    engine->model_config_head_dim = 0;
+    engine->model_config_global_head_dim = 0;
+    engine->model_config_sliding_window = 0;
+    engine->model_config_sliding_rope_theta = 0.0f;
+    engine->model_config_full_rope_theta = 0.0f;
+    engine->model_config_partial_rotary_factor = 0.0f;
     engine->juju_idx_schema_version.store(0, std::memory_order_relaxed);
     engine->juju_split_group_count.store(0, std::memory_order_relaxed);
     engine->juju_split_missing_count.store(0, std::memory_order_relaxed);

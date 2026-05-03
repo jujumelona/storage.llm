@@ -771,6 +771,182 @@ static void moe_juju_probe_note_index_json(
     }
 }
 
+static void moe_juju_probe_note_model_config_json(
+    moe_pc_engine* engine,
+    moe_juju_runtime_probe_t* probe,
+    const std::string& config_json
+) {
+    if (!probe || config_json.empty()) {
+        return;
+    }
+    size_t text_begin = 0;
+    size_t text_end = config_json.size();
+    if (!moe_json_find_object_local(config_json, "text_config", &text_begin, &text_end)) {
+        text_begin = 0;
+        text_end = config_json.size();
+    }
+    const std::string text_config = config_json.substr(text_begin, text_end - text_begin);
+    uint64_t value = 0;
+    double double_value = 0.0;
+    std::string string_value;
+
+    if (moe_json_get_u64_local(text_config, "num_hidden_layers", &value)) {
+        probe->shape.num_hidden_layers = moe_u64_to_u32_clamped(value, probe->shape.num_hidden_layers);
+    }
+    if (moe_json_get_u64_local(text_config, "hidden_size", &value)) {
+        probe->shape.hidden_size = moe_u64_to_u32_clamped(value, probe->shape.hidden_size);
+    }
+    if (moe_json_get_u64_local(text_config, "vocab_size", &value)) {
+        probe->shape.vocab_size = moe_u64_to_u32_clamped(value, probe->shape.vocab_size);
+    }
+    if (moe_json_get_u64_local(text_config, "num_experts", &value) ||
+        moe_json_get_u64_local(text_config, "num_local_experts", &value) ||
+        moe_json_get_u64_local(text_config, "experts_per_moe_layer", &value)) {
+        probe->shape.experts_per_moe_layer = moe_u64_to_u32_clamped(value, probe->shape.experts_per_moe_layer);
+        probe->shape.projection_count = 3;
+    }
+    if (moe_json_get_u64_local(text_config, "moe_intermediate_size", &value) ||
+        moe_json_get_u64_local(text_config, "expert_intermediate_size", &value) ||
+        moe_json_get_u64_local(text_config, "expert_intermediate_dim", &value)) {
+        probe->shape.expert_intermediate_size = moe_u64_to_u32_clamped(value, probe->shape.expert_intermediate_size);
+    }
+    if (moe_json_get_u64_local(text_config, "num_attention_heads", &value)) {
+        probe->attn.num_heads = moe_u64_to_u32_clamped(value, probe->attn.num_heads);
+    }
+    if (moe_json_get_u64_local(text_config, "num_key_value_heads", &value)) {
+        probe->attn.num_kv_heads = moe_u64_to_u32_clamped(value, probe->attn.num_kv_heads);
+    }
+    if (moe_json_get_u64_local(text_config, "head_dim", &value)) {
+        probe->attn.head_dim = moe_u64_to_u32_clamped(value, probe->attn.head_dim);
+    }
+    if (moe_json_get_u64_local(text_config, "value_head_dim", &value) ||
+        moe_json_get_u64_local(text_config, "v_head_dim", &value)) {
+        probe->attn.v_head_dim = moe_u64_to_u32_clamped(value, probe->attn.v_head_dim);
+    }
+    if (moe_json_get_u64_local(text_config, "max_position_embeddings", &value) ||
+        moe_json_get_u64_local(text_config, "context_length", &value)) {
+        probe->attn.max_seq_len = moe_u64_to_u32_clamped(value, probe->attn.max_seq_len);
+    }
+    if (moe_json_get_double_local(text_config, "rms_norm_eps", &double_value) ||
+        moe_json_get_double_local(text_config, "norm_eps", &double_value)) {
+        probe->attn.rms_norm_eps = (float)double_value;
+    }
+    if (probe->architecture.empty() &&
+        (moe_json_get_string_local(text_config, "model_type", &string_value) ||
+         moe_json_get_string_local(config_json, "model_type", &string_value))) {
+        probe->architecture = string_value;
+    }
+
+    if (!engine) {
+        return;
+    }
+    int attention_valid = 0;
+    if (moe_json_get_u64_local(text_config, "num_attention_heads", &value)) {
+        engine->model_config_num_attention_heads = moe_u64_to_u32_clamped(value, 0);
+        attention_valid = 1;
+    }
+    if (moe_json_get_u64_local(text_config, "num_key_value_heads", &value)) {
+        engine->model_config_num_key_value_heads = moe_u64_to_u32_clamped(value, 0);
+        attention_valid = 1;
+    }
+    if (moe_json_get_u64_local(text_config, "num_global_key_value_heads", &value)) {
+        engine->model_config_num_global_key_value_heads = moe_u64_to_u32_clamped(value, 0);
+        attention_valid = 1;
+    }
+    if (moe_json_get_u64_local(text_config, "head_dim", &value)) {
+        engine->model_config_head_dim = moe_u64_to_u32_clamped(value, 0);
+        attention_valid = 1;
+    }
+    if (moe_json_get_u64_local(text_config, "global_head_dim", &value)) {
+        engine->model_config_global_head_dim = moe_u64_to_u32_clamped(value, 0);
+        attention_valid = 1;
+    }
+    if (moe_json_get_u64_local(text_config, "sliding_window", &value)) {
+        engine->model_config_sliding_window = moe_u64_to_u32_clamped(value, 0);
+        attention_valid = 1;
+    }
+
+    size_t rope_begin = 0;
+    size_t rope_end = 0;
+    if (moe_json_find_object_local(text_config, "rope_parameters", &rope_begin, &rope_end)) {
+        const std::string rope = text_config.substr(rope_begin, rope_end - rope_begin);
+        size_t full_begin = 0;
+        size_t full_end = 0;
+        if (moe_json_find_object_local(rope, "full_attention", &full_begin, &full_end)) {
+            const std::string full = rope.substr(full_begin, full_end - full_begin);
+            if (moe_json_get_double_local(full, "rope_theta", &double_value)) {
+                engine->model_config_full_rope_theta = (float)double_value;
+                attention_valid = 1;
+            }
+            if (moe_json_get_double_local(full, "partial_rotary_factor", &double_value)) {
+                engine->model_config_partial_rotary_factor = (float)double_value;
+                attention_valid = 1;
+            }
+        }
+        size_t sliding_begin = 0;
+        size_t sliding_end = 0;
+        if (moe_json_find_object_local(rope, "sliding_attention", &sliding_begin, &sliding_end)) {
+            const std::string sliding = rope.substr(sliding_begin, sliding_end - sliding_begin);
+            if (moe_json_get_double_local(sliding, "rope_theta", &double_value)) {
+                engine->model_config_sliding_rope_theta = (float)double_value;
+                attention_valid = 1;
+            }
+        }
+        if (engine->model_config_full_rope_theta <= 0.0f &&
+            moe_json_get_double_local(rope, "rope_theta", &double_value)) {
+            engine->model_config_full_rope_theta = (float)double_value;
+            engine->model_config_sliding_rope_theta = (float)double_value;
+            attention_valid = 1;
+        }
+    } else if (moe_json_get_double_local(text_config, "rope_theta", &double_value)) {
+        engine->model_config_full_rope_theta = (float)double_value;
+        engine->model_config_sliding_rope_theta = (float)double_value;
+        attention_valid = 1;
+    }
+
+    std::vector<std::string> layer_types;
+    if (moe_json_get_string_array_slice(config_json, text_begin, text_end, "layer_types", &layer_types)) {
+        std::vector<uint8_t> full_layers;
+        full_layers.reserve(layer_types.size());
+        int saw_full = 0;
+        int saw_local = 0;
+        for (const std::string& item : layer_types) {
+            const std::string lower = moe_lower_ascii_copy(item);
+            const int is_full =
+                lower.find("full") != std::string::npos ||
+                lower.find("global") != std::string::npos;
+            full_layers.push_back(is_full ? 1u : 0u);
+            if (is_full) {
+                saw_full = 1;
+            } else {
+                saw_local = 1;
+            }
+        }
+        if (!full_layers.empty()) {
+            engine->model_config_full_attention_layers = std::move(full_layers);
+            engine->model_config_layer_types_valid.store(1, std::memory_order_relaxed);
+            attention_valid = 1;
+        }
+        if (saw_full && saw_local) {
+            engine->model_config_attention_valid.store(1, std::memory_order_relaxed);
+        }
+    }
+    if (attention_valid) {
+        engine->model_config_attention_valid.store(1, std::memory_order_relaxed);
+        std::fprintf(stderr,
+            "[storagellm] model config attention loaded: heads=%u kv=%u global_kv=%u head_dim=%u global_head_dim=%u layers=%zu sliding_rope=%.6g full_rope=%.6g partial=%.6g\n",
+            engine->model_config_num_attention_heads,
+            engine->model_config_num_key_value_heads,
+            engine->model_config_num_global_key_value_heads,
+            engine->model_config_head_dim,
+            engine->model_config_global_head_dim,
+            engine->model_config_full_attention_layers.size(),
+            (double)engine->model_config_sliding_rope_theta,
+            (double)engine->model_config_full_rope_theta,
+            (double)engine->model_config_partial_rotary_factor);
+    }
+}
+
 static void moe_juju_probe_note_tensor(
     moe_juju_runtime_probe_t* probe,
     const moe_juju_tensor_json_entry_t& entry
@@ -1054,7 +1230,7 @@ static int load_gguf_tensor_directory_as_tensor_index(
     std::string model_config_json;
     const int has_model_config_json = moe_read_model_config_json(root, &model_config_json);
     if (has_model_config_json) {
-        moe_juju_probe_note_index_json(&probe, model_config_json);
+        moe_juju_probe_note_model_config_json(engine, &probe, model_config_json);
     }
     for (const std::string& path : paths) {
         moe_juju_header_t header{};
@@ -1255,7 +1431,7 @@ static int load_juju_tensor_index_as_tensor_index(
     std::string model_config_json;
     const int has_model_config_json = moe_read_model_config_json(root, &model_config_json);
     if (has_model_config_json) {
-        moe_juju_probe_note_index_json(&probe, model_config_json);
+        moe_juju_probe_note_model_config_json(engine, &probe, model_config_json);
     }
     for (const std::string& path : paths) {
         moe_juju_header_t header{};
@@ -1284,7 +1460,7 @@ static int load_juju_tensor_index_as_tensor_index(
     engine->tensors.reserve(tensor_record_capacity(engine));
     probe = moe_juju_runtime_probe_t{};
     if (has_model_config_json) {
-        moe_juju_probe_note_index_json(&probe, model_config_json);
+        moe_juju_probe_note_model_config_json(engine, &probe, model_config_json);
     }
     for (const std::string& path : paths) {
         moe_juju_header_t header{};

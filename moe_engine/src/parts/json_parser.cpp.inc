@@ -169,6 +169,26 @@ static int moe_json_find_array_local(
     return 1;
 }
 
+static int moe_json_find_object_local(
+    const std::string& text,
+    const char* key,
+    size_t* begin,
+    size_t* end
+) {
+    size_t value = 0;
+    if (!begin || !end || !moe_json_find_scalar(text, key, &value) ||
+        value >= text.size() || text[value] != '{') {
+        return 0;
+    }
+    const size_t close = moe_json_match_bracket_local(text, value, '{', '}');
+    if (close == std::string::npos) {
+        return 0;
+    }
+    *begin = value;
+    *end = close;
+    return 1;
+}
+
 static int moe_json_next_object_in_array(
     const std::string& text,
     size_t* cursor,
@@ -234,6 +254,65 @@ static int moe_json_get_string_slice(
         return 0;
     }
     return moe_json_get_string_local(text.substr(begin, end - begin), key, out);
+}
+
+static int moe_json_get_double_slice(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    double* out
+) {
+    if (begin >= end || end > text.size() || begin >= text.size()) {
+        return 0;
+    }
+    return moe_json_get_double_local(text.substr(begin, end - begin), key, out);
+}
+
+static int moe_json_get_string_array_slice(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    std::vector<std::string>* out
+) {
+    if (out) {
+        out->clear();
+    }
+    if (!out || begin >= end || end > text.size() || begin >= text.size()) {
+        return 0;
+    }
+    const std::string slice = text.substr(begin, end - begin);
+    size_t arr_begin = 0;
+    size_t arr_end = 0;
+    if (!moe_json_find_array_local(slice, key, &arr_begin, &arr_end)) {
+        return 0;
+    }
+    size_t pos = arr_begin + 1;
+    while (pos < arr_end) {
+        pos = slice.find_first_not_of(" \t\r\n,", pos);
+        if (pos == std::string::npos || pos >= arr_end || slice[pos] == ']') {
+            break;
+        }
+        if (slice[pos] != '"') {
+            return 0;
+        }
+        ++pos;
+        std::string value;
+        while (pos < arr_end) {
+            const char c = slice[pos++];
+            if (c == '"') {
+                out->push_back(std::move(value));
+                break;
+            }
+            if (c == '\\' && pos < arr_end) {
+                value.push_back(slice[pos++]);
+            } else {
+                value.push_back(c);
+            }
+        }
+    }
+    return !out->empty();
 }
 
 static int moe_json_get_u64_array_slice(

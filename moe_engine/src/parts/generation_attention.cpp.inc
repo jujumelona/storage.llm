@@ -157,22 +157,44 @@ static void moe_standard_attention_rope_params(
     if (!io_rope_dim || !io_rope_theta || head_dim == 0) {
         return;
     }
+    if (engine &&
+        engine->model_config_attention_valid.load(std::memory_order_relaxed) &&
+        *io_rope_dim > 0 && *io_rope_dim <= head_dim &&
+        *io_rope_theta > 0.0f) {
+        return;
+    }
     if (!moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
         return;
     }
+    double partial_value = 0.0;
+    if (!engine || engine->offload_gguf_metadata_json.empty() ||
+        !moe_json_get_double_local(engine->offload_gguf_metadata_json, "partial_rotary_factor", &partial_value) ||
+        partial_value <= 0.0 || partial_value > 1.0) {
+        return;
+    }
+    double full_theta = 0.0;
+    double sliding_theta = 0.0;
+    const int has_full_theta =
+        moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_rope_theta", &full_theta) ||
+        moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_attention_rope_theta", &full_theta);
+    const int has_sliding_theta =
+        moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_rope_theta", &sliding_theta) ||
+        moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_attention_rope_theta", &sliding_theta);
     const int full_attention_layout =
         !has_v ||
         (head_dim > 256u) ||
         (num_heads > 0 && num_kv_heads > 0 && num_kv_heads * 4u <= num_heads);
     if (full_attention_layout) {
-        uint32_t partial_dim = (uint32_t)std::round((float)head_dim * 0.25f);
+        uint32_t partial_dim = (uint32_t)std::round((float)head_dim * (float)partial_value);
         if (partial_dim < 2u) partial_dim = 2u;
         if (partial_dim > head_dim) partial_dim = head_dim;
         *io_rope_dim = partial_dim;
-        *io_rope_theta = 1000000.0f;
-    } else {
+        if (has_full_theta && full_theta > 0.0) {
+            *io_rope_theta = (float)full_theta;
+        }
+    } else if (has_sliding_theta && sliding_theta > 0.0) {
         *io_rope_dim = head_dim;
-        *io_rope_theta = 10000.0f;
+        *io_rope_theta = (float)sliding_theta;
     }
 }
 
