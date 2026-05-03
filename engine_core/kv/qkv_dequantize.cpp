@@ -121,7 +121,7 @@ int qkv_dequant_one(
             // Add residual: x_hat = x_tilde + scale * ||r|| * S^T * z
             // BUGFIX 376: d가 0일 때 division by zero 방지
             if (d <= 0) return 0;
-            const float qjl_scale = sqrtf((float)M_PI / (2.0f * (float)d));
+            const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)d;
             for (int i = 0; i < d; i++) {
                 x_tilde[i] += qjl_scale * r_norm * s_t_qjl[i];
             }
