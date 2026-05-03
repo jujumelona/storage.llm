@@ -172,7 +172,10 @@ static int moe_forward_one_token_f32(
                 position, layer, moe_profile_elapsed_ms(split_standard_attn_start_us));
             const uint64_t split_post_norm_start_us = moe_profile_now_us();
             const float* attn_residual = s->attn.data();
-            const int post_norm_used = moe_layer_post_attention_output_norm_f32(
+            const int graph_residual_first =
+                moe_graph_ir_attention_residual_before_ffn_norm(engine);
+            const int post_norm_used = graph_residual_first ? 0 :
+                moe_layer_post_attention_output_norm_f32(
                     engine, (int32_t)layer, s->attn.data(), c->hidden_size,
                     s->norm.data(), layer_attn_cfg.rms_norm_eps);
             if (post_norm_used) {
@@ -180,8 +183,8 @@ static int moe_forward_one_token_f32(
             }
             moe_profile_log(
                 "forward_split_post_attention_norm",
-                "position=%u layer=%u used=%d ms=%.3f",
-                position, layer, post_norm_used,
+                "position=%u layer=%u used=%d graph_residual_first=%d ms=%.3f",
+                position, layer, post_norm_used, graph_residual_first,
                 moe_profile_elapsed_ms(split_post_norm_start_us));
             const uint64_t split_residual_start_us = moe_profile_now_us();
             for (uint32_t i = 0; i < c->hidden_size; ++i) {

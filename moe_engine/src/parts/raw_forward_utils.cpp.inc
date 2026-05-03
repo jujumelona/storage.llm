@@ -19,15 +19,15 @@ static float moe_f32_from_bits(uint32_t bits) {
     return value;
 }
 
-static int moe_ascii_contains_ci(const std::string& haystack, const char* needle) {
+static size_t moe_ascii_find_ci(const std::string& haystack, const char* needle, size_t begin = 0) {
     if (!needle || !needle[0]) {
-        return 0;
+        return std::string::npos;
     }
     const size_t n = std::strlen(needle);
-    if (n == 0 || haystack.size() < n) {
-        return 0;
+    if (n == 0 || begin >= haystack.size() || haystack.size() < n) {
+        return std::string::npos;
     }
-    for (size_t i = 0; i + n <= haystack.size(); ++i) {
+    for (size_t i = begin; i + n <= haystack.size(); ++i) {
         size_t j = 0;
         for (; j < n; ++j) {
             const unsigned char a = static_cast<unsigned char>(haystack[i + j]);
@@ -37,8 +37,18 @@ static int moe_ascii_contains_ci(const std::string& haystack, const char* needle
             }
         }
         if (j == n) {
-            return 1;
+            return i;
         }
+    }
+    return std::string::npos;
+}
+
+static int moe_ascii_contains_ci(const std::string& haystack, const char* needle) {
+    if (!needle || !needle[0]) {
+        return 0;
+    }
+    if (moe_ascii_find_ci(haystack, needle) != std::string::npos) {
+        return 1;
     }
     return 0;
 }

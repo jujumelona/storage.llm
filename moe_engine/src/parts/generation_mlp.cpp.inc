@@ -252,6 +252,68 @@ static int moe_layer_uses_split_post_norm_block(const moe_pc_engine* engine, int
         moe_engine_graph_ir_mentions(engine, "layer_output_scale") ? 1 : 0;
 }
 
+static size_t moe_graph_ir_first_pos_any(
+    const moe_pc_engine* engine,
+    const char* const* needles,
+    size_t needle_count,
+    size_t begin = 0
+) {
+    if (!engine || !needles || engine->offload_graph_ir_json.empty()) {
+        return std::string::npos;
+    }
+    size_t best = std::string::npos;
+    for (size_t i = 0; i < needle_count; ++i) {
+        if (!needles[i] || !needles[i][0]) {
+            continue;
+        }
+        const size_t pos = moe_ascii_find_ci(engine->offload_graph_ir_json, needles[i], begin);
+        if (pos != std::string::npos && (best == std::string::npos || pos < best)) {
+            best = pos;
+        }
+    }
+    return best;
+}
+
+static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* engine) {
+    if (!engine || !engine->offload_graph_ir_ready.load(std::memory_order_relaxed)) {
+        return 0;
+    }
+    static const char* const post_attention_norm_ops[] = {
+        "\"name\":\"post_attention_norm\"",
+        "\"name\": \"post_attention_norm\"",
+        "\"name\":\"post_attention_layernorm\"",
+        "\"name\": \"post_attention_layernorm\"",
+        "\"name\":\"post_attention_layer_norm\"",
+        "\"name\": \"post_attention_layer_norm\""
+    };
+    static const char* const attention_residual_ops[] = {
+        "\"name\":\"attention_residual\"",
+        "\"name\": \"attention_residual\"",
+        "attention_residual"
+    };
+    static const char* const ffn_norm_ops[] = {
+        "\"name\":\"ffn_norm\"",
+        "\"name\": \"ffn_norm\"",
+        "ffn_norm"
+    };
+    const size_t residual_pos = moe_graph_ir_first_pos_any(
+        engine, attention_residual_ops, sizeof(attention_residual_ops) / sizeof(attention_residual_ops[0]));
+    if (residual_pos == std::string::npos) {
+        return 0;
+    }
+    const size_t ffn_norm_pos = moe_graph_ir_first_pos_any(
+        engine, ffn_norm_ops, sizeof(ffn_norm_ops) / sizeof(ffn_norm_ops[0]), residual_pos);
+    if (ffn_norm_pos == std::string::npos) {
+        return 0;
+    }
+    const size_t explicit_post_norm_pos = moe_graph_ir_first_pos_any(
+        engine, post_attention_norm_ops, sizeof(post_attention_norm_ops) / sizeof(post_attention_norm_ops[0]));
+    if (explicit_post_norm_pos != std::string::npos && explicit_post_norm_pos < residual_pos) {
+        return 0;
+    }
+    return 1;
+}
+
 static int moe_layer_post_ffw_norm_suffixes_f32(
     moe_pc_engine* engine,
     int32_t layer,
