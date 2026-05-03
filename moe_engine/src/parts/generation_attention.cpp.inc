@@ -138,6 +138,20 @@ static float moe_standard_attention_score_scale(
     if (head_dim == 0) {
         return 1.0f;
     }
+    float query_pre_attn_scalar = engine ? engine->model_config_query_pre_attn_scalar : 0.0f;
+    if (!(query_pre_attn_scalar > 0.0f) && engine && !engine->offload_gguf_metadata_json.empty()) {
+        double value = 0.0;
+        if (moe_json_get_double_local(engine->offload_gguf_metadata_json, "query_pre_attn_scalar", &value) ||
+            moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_query_pre_attn_scalar", &value) ||
+            moe_json_get_double_local(engine->offload_gguf_metadata_json, "attn_query_pre_attn_scalar", &value)) {
+            if (value > 0.0 && value <= 65536.0) {
+                query_pre_attn_scalar = (float)value;
+            }
+        }
+    }
+    if (query_pre_attn_scalar > 0.0f && std::isfinite(query_pre_attn_scalar)) {
+        return 1.0f / std::sqrt(query_pre_attn_scalar);
+    }
     if (moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
         return 1.0f;
     }

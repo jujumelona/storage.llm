@@ -182,6 +182,30 @@ static double elapsed_ms_since(std::chrono::steady_clock::time_point start) {
         std::chrono::steady_clock::now() - start).count() / 1000.0;
 }
 
+static std::string resource_log_suffix() {
+    using clock = std::chrono::steady_clock;
+    const uint64_t wall_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        clock::now().time_since_epoch()).count();
+    const uint64_t cpu_us = storagellm::current_process_cpu_time_us();
+    static std::atomic<uint64_t> last_wall_us{0};
+    static std::atomic<uint64_t> last_cpu_us{0};
+    const uint64_t prev_wall = last_wall_us.exchange(wall_us, std::memory_order_relaxed);
+    const uint64_t prev_cpu = last_cpu_us.exchange(cpu_us, std::memory_order_relaxed);
+    double core_pct = 0.0;
+    double host_pct = 0.0;
+    if (prev_wall && prev_cpu && wall_us > prev_wall && cpu_us >= prev_cpu) {
+        core_pct = 100.0 * (double)(cpu_us - prev_cpu) / (double)(wall_us - prev_wall);
+        const uint32_t hw = std::max<uint32_t>(1u, std::thread::hardware_concurrency());
+        host_pct = core_pct / (double)hw;
+    }
+    std::ostringstream out;
+    out << " proc_cpu_core_pct=" << core_pct
+        << " proc_cpu_host_pct=" << host_pct
+        << " rss_bytes=" << storagellm::current_process_rss_bytes()
+        << " avail_ram_bytes=" << storagellm::available_ram_bytes();
+    return out.str();
+}
+
 static std::string lower_ascii(std::string value) {
     for (char& ch : value) {
         ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
@@ -1283,6 +1307,7 @@ static server_generation_result run_server_generation(
     std::cerr << "[storagellm request] generation begin input_tokens=" << input_ids.size()
               << " max_tokens=" << max_tokens
               << " body_bytes=" << body.size()
+              << resource_log_suffix()
               << "\n" << std::flush;
     const auto generation_start = std::chrono::steady_clock::now();
     if (engine_mutex) {
@@ -1290,7 +1315,8 @@ static server_generation_result run_server_generation(
         const auto prefetch_start = std::chrono::steady_clock::now();
         server_orchestrate_request_prefetch(engine, opts, body);
         std::cerr << "[storagellm request] prefetch_orchestrate ms="
-                  << elapsed_ms_since(prefetch_start) << "\n" << std::flush;
+                  << elapsed_ms_since(prefetch_start)
+                  << resource_log_suffix() << "\n" << std::flush;
         generated = moe_pc_engine_generate_token_ids(
             engine,
             input_ids.data(),
@@ -1321,6 +1347,7 @@ static server_generation_result run_server_generation(
                   << " generation_ms=" << generation_ms
                   << " total_ms=" << elapsed_ms_since(request_start)
                   << " error=" << result.error_message
+                  << resource_log_suffix()
                   << "\n" << std::flush;
         return result;
     }
@@ -1336,6 +1363,7 @@ static server_generation_result run_server_generation(
               << " generation_ms=" << generation_ms
               << " decode_text_ms=" << elapsed_ms_since(decode_text_start)
               << " total_ms=" << elapsed_ms_since(request_start)
+              << resource_log_suffix()
               << "\n" << std::flush;
     return result;
 }
@@ -1395,11 +1423,20 @@ static server_eval_result run_server_eval(
         return result;
     }
 
+    const auto eval_start = std::chrono::steady_clock::now();
+    std::cerr << "[storagellm request] eval begin input_tokens=" << input_ids.size()
+              << " body_bytes=" << body.size()
+              << resource_log_suffix()
+              << "\n" << std::flush;
     moe_eval_stats_t stats{};
     int evaluated = 0;
     if (engine_mutex) {
         std::lock_guard<std::mutex> lock(*engine_mutex);
+        const auto prefetch_start = std::chrono::steady_clock::now();
         server_orchestrate_request_prefetch(engine, opts, body);
+        std::cerr << "[storagellm request] eval_prefetch_orchestrate ms="
+                  << elapsed_ms_since(prefetch_start)
+                  << resource_log_suffix() << "\n" << std::flush;
         evaluated = moe_pc_engine_eval_token_ids(
             engine,
             input_ids.data(),
@@ -1418,6 +1455,11 @@ static server_eval_result run_server_eval(
         result.http_status = 503;
         result.error_code = "eval_not_ready";
         result.error_message = stats.error[0] ? stats.error : "eval failed";
+        std::cerr << "[storagellm request] eval failed input_tokens=" << input_ids.size()
+                  << " total_ms=" << elapsed_ms_since(eval_start)
+                  << " error=" << result.error_message
+                  << resource_log_suffix()
+                  << "\n" << std::flush;
         return result;
     }
 
@@ -1427,6 +1469,13 @@ static server_eval_result run_server_eval(
     result.nll = stats.nll;
     result.mean_nll = stats.mean_nll;
     result.perplexity = stats.perplexity;
+    std::cerr << "[storagellm request] eval ok input_tokens=" << result.input_tokens
+              << " evaluated_tokens=" << result.evaluated_tokens
+              << " mean_nll=" << result.mean_nll
+              << " ppl=" << result.perplexity
+              << " total_ms=" << elapsed_ms_since(eval_start)
+              << resource_log_suffix()
+              << "\n" << std::flush;
     return result;
 }
 

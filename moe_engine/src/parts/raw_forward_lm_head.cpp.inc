@@ -260,13 +260,14 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     uint64_t weight_row_bytes = 0;
     // Fix 35: Reuse cached lm_head mapping (same tls declared in top1)
     {
-        static thread_local const moe_pc_engine* tls_lp_engine = nullptr;
+        static thread_local uint64_t tls_lp_engine_generation = 0;
         static thread_local moe_raw_tensor_cache_entry tls_lp_entry{};
         static thread_local bool tls_lp_valid = false;
-        if (tls_lp_engine == engine && tls_lp_valid) {
+        const uint64_t engine_generation = engine->engine_generation;
+        if (tls_lp_engine_generation == engine_generation && tls_lp_valid) {
             common = tls_lp_entry;
         } else if (moe_map_lm_head_tensor(engine, c, &common)) {
-            tls_lp_engine = engine;
+            tls_lp_engine_generation = engine_generation;
             tls_lp_entry = common;
             tls_lp_valid = true;
         }

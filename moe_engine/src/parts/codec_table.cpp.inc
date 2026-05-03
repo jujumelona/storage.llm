@@ -1151,6 +1151,17 @@ static void moe_juju_probe_note_model_config_json(
         engine->model_config_sliding_window = moe_u64_to_u32_clamped(value, 0);
         attention_valid = 1;
     }
+    if (moe_json_get_double_local(text_config, "query_pre_attn_scalar", &double_value) ||
+        moe_json_get_double_local(config_json, "query_pre_attn_scalar", &double_value) ||
+        moe_json_get_double_local(text_config, "attention_query_pre_attn_scalar", &double_value) ||
+        moe_json_get_double_local(config_json, "attention_query_pre_attn_scalar", &double_value) ||
+        moe_json_get_double_local(text_config, "attn_query_pre_attn_scalar", &double_value) ||
+        moe_json_get_double_local(config_json, "attn_query_pre_attn_scalar", &double_value)) {
+        if (double_value > 0.0 && double_value <= 65536.0) {
+            engine->model_config_query_pre_attn_scalar = (float)double_value;
+            attention_valid = 1;
+        }
+    }
 
     size_t rope_begin = 0;
     size_t rope_end = 0;
@@ -1220,7 +1231,7 @@ static void moe_juju_probe_note_model_config_json(
     if (attention_valid) {
         engine->model_config_attention_valid.store(1, std::memory_order_relaxed);
         std::fprintf(stderr,
-            "[storagellm] model config attention loaded: heads=%u kv=%u global_kv=%u head_dim=%u global_head_dim=%u kv_lora=%u q_lora=%u qk_nope=%u qk_rope=%u layers=%zu sliding_rope=%.6g full_rope=%.6g partial=%.6g\n",
+            "[storagellm] model config attention loaded: heads=%u kv=%u global_kv=%u head_dim=%u global_head_dim=%u kv_lora=%u q_lora=%u qk_nope=%u qk_rope=%u layers=%zu qpre=%.6g sliding_rope=%.6g full_rope=%.6g partial=%.6g\n",
             engine->model_config_num_attention_heads,
             engine->model_config_num_key_value_heads,
             engine->model_config_num_global_key_value_heads,
@@ -1231,6 +1242,7 @@ static void moe_juju_probe_note_model_config_json(
             probe->attn.qk_nope_head_dim,
             probe->attn.qk_rope_head_dim,
             engine->model_config_full_attention_layers.size(),
+            (double)engine->model_config_query_pre_attn_scalar,
             (double)engine->model_config_sliding_rope_theta,
             (double)engine->model_config_full_rope_theta,
             (double)engine->model_config_partial_rotary_factor);

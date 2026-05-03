@@ -10,11 +10,13 @@
 #elif defined(__linux__)
 #include <cstdio>
 #include <cstring>
+#include <sys/resource.h>
 #include <sys/sysinfo.h>
 #include <unistd.h>
 #elif defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_host.h>
+#include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 #endif
@@ -121,6 +123,37 @@ inline uint64_t current_process_rss_bytes() {
     }
     const long page_size = sysconf(_SC_PAGESIZE);
     return page_size > 0 ? resident_pages * static_cast<uint64_t>(page_size) : 0;
+#else
+    return 0;
+#endif
+}
+
+inline uint64_t current_process_cpu_time_us() {
+#ifdef _WIN32
+    FILETIME create_time{};
+    FILETIME exit_time{};
+    FILETIME kernel_time{};
+    FILETIME user_time{};
+    if (!GetProcessTimes(GetCurrentProcess(), &create_time, &exit_time, &kernel_time, &user_time)) {
+        return 0;
+    }
+    const auto filetime_to_u64 = [](const FILETIME& value) -> uint64_t {
+        ULARGE_INTEGER u{};
+        u.LowPart = value.dwLowDateTime;
+        u.HighPart = value.dwHighDateTime;
+        return u.QuadPart;
+    };
+    return (filetime_to_u64(kernel_time) + filetime_to_u64(user_time)) / 10ull;
+#elif defined(__linux__) || defined(__APPLE__)
+    struct rusage usage {};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        return 0;
+    }
+    const uint64_t user_us =
+        (uint64_t)usage.ru_utime.tv_sec * 1000000ull + (uint64_t)usage.ru_utime.tv_usec;
+    const uint64_t sys_us =
+        (uint64_t)usage.ru_stime.tv_sec * 1000000ull + (uint64_t)usage.ru_stime.tv_usec;
+    return user_us + sys_us;
 #else
     return 0;
 #endif

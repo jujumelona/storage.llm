@@ -1226,12 +1226,10 @@ static int moe_layer_moe_mlp_f32(
                 weight_sum += work[e].weight;
             }
         }
-        // BUGFIX 문제10b: Always renormalize when experts fail, not just norm_topk ★★★
-        // Problem: softmax router (norm_topk=false) zeroes failed expert weight but
-        // leaves remaining weights unchanged. Sum drops to ~0.875 per missing expert,
-        // cumulative bias across 79 MoE layers degrades output quality significantly.
-        // Solution: Renormalize unconditionally when any expert fails.
-        if (weight_sum > 1e-9f) {
+        // BUGFIX 문제10b: Failed experts are zeroed; renorm is router-dependent.
+        // Renormalize only for normalized top-k routers. Sigmoid non-normalized routers
+        // must preserve the remaining expert weights when a missing expert is zeroed.
+        if (norm_topk && weight_sum > 1e-9f) {
             const float scale = 1.0f / weight_sum;
             for (size_t e = 0; e < num_selected; ++e) {
                 if (expert_ok[e].load(std::memory_order_acquire)) {
@@ -1251,7 +1249,7 @@ static int moe_layer_moe_mlp_f32(
                 }
             }
             std::fprintf(stderr,
-                "[storagellm mlp] zeroed failed expert weights (weight_sum≈0) layer=%d selected=%zu mapped=%u missing=%u use_sigmoid=%d norm_topk=%d weight_sum=%.6f\n",
+                "[storagellm mlp] zeroed failed expert weights without renorm layer=%d selected=%zu mapped=%u missing=%u use_sigmoid=%d norm_topk=%d weight_sum=%.6f\n",
                 layer, num_selected, mapped_experts, failed_experts, use_sigmoid, norm_topk, weight_sum);
         }
     }
