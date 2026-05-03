@@ -173,7 +173,7 @@ static int moe_forward_one_token_f32(
             const uint64_t split_post_norm_start_us = moe_profile_now_us();
             const float* attn_residual = s->attn.data();
             const int graph_residual_first =
-                moe_graph_ir_attention_residual_before_ffn_norm(engine);
+                moe_graph_ir_attention_residual_before_ffn_norm(engine, (int32_t)layer);
             const int post_norm_used = graph_residual_first ? 0 :
                 moe_layer_post_attention_output_norm_f32(
                     engine, (int32_t)layer, s->attn.data(), c->hidden_size,
