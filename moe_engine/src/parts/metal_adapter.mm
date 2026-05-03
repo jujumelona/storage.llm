@@ -59,7 +59,7 @@ void* metal_buffer_alloc(void* device_handle, uint64_t bytes) {
     return buffer ? (void*)CFBridgingRetain(buffer) : nullptr;
 }
 
-static int metal_copy_h2d_impl(void* dst_buffer, const void* src, uint64_t bytes, void* stream) {
+static int metal_copy_h2d_sync_impl(void* dst_buffer, const void* src, uint64_t bytes) {
     if (!dst_buffer || !src || bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return 0;
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)dst_buffer;
     if (!buffer || bytes > (uint64_t)[buffer length] || ![buffer contents]) return 0;
@@ -67,23 +67,44 @@ static int metal_copy_h2d_impl(void* dst_buffer, const void* src, uint64_t bytes
 #if TARGET_OS_OSX
     [buffer didModifyRange:NSMakeRange(0, (NSUInteger)bytes)];
 #endif
-    if (stream) {
-        id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)stream;
-        id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
-        if (!commandBuffer) return 0;
-        [commandBuffer commit];
-    }
     return 1;
 }
 
 int metal_copy_h2d_async(void* dst_buffer, const void* src, uint64_t bytes, void* stream) {
-    return stream ? metal_copy_h2d_impl(dst_buffer, src, bytes, stream) : 0;
+    if (!dst_buffer || !src || !stream || bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return 0;
+    id<MTLBuffer> dst = (__bridge id<MTLBuffer>)dst_buffer;
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)stream;
+    if (!dst || !queue || bytes > (uint64_t)[dst length]) return 0;
+    id<MTLDevice> device = [dst device] ?: MTLCreateSystemDefaultDevice();
+    if (!device) return 0;
+
+    id<MTLBuffer> srcBuffer = [device newBufferWithBytes:src
+                                                  length:(NSUInteger)bytes
+                                                 options:MTLResourceStorageModeShared];
+    if (!srcBuffer) return 0;
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    if (!commandBuffer) return 0;
+    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+    if (!blit) return 0;
+    [blit copyFromBuffer:srcBuffer
+            sourceOffset:0
+                toBuffer:dst
+       destinationOffset:0
+                    size:(NSUInteger)bytes];
+    [blit endEncoding];
+    id<MTLBuffer> keepAliveSrc = srcBuffer;
+    id<MTLBuffer> keepAliveDst = dst;
+    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        (void)cb;
+        (void)keepAliveSrc;
+        (void)keepAliveDst;
+    }];
+    [commandBuffer commit];
+    return 1;
 }
 
 int metal_copy_h2d_sync(void* dst_buffer, const void* src, uint64_t bytes) {
-    return metal_copy_h2d_impl(dst_buffer, src, bytes, nullptr);
-}
-
+    return metal_copy_h2d_sync_impl(dst_buffer, src, bytes);
 }
 
 // Metal Async Callbacks

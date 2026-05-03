@@ -145,6 +145,7 @@ static uint64_t evict_heap_active_count(const moe_pc_engine* engine, int idx) {
     return 0;
 }
 
+// Lock order: heap_mutex -> map_mutex (device_mutex MUST NOT be held here)
 static void compact_evict_heap(moe_pc_engine* engine, int idx, bool force = false) {
     if (!engine || idx < 0 || idx >= 3) return;
     using heap_t = std::priority_queue<moe_evict_candidate, std::vector<moe_evict_candidate>, moe_evict_colder_first>;

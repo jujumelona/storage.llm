@@ -42,7 +42,7 @@ int moe_pc_engine_plan_moe_prefetch(
     // continuously frees VRAM, so no real throughput loss. Stabilizes token latency.
     {
         const uint64_t device_budget = device_budget_bytes(engine);
-        const uint64_t device_allocated = engine->device_allocated_bytes.load(std::memory_order_relaxed);
+        const uint64_t device_allocated = tier_used(engine, moe_TIER_VRAM);
         const uint64_t device_free = device_budget > device_allocated ? device_budget - device_allocated : 0;
 
         // Use backend-specific headroom percentage (default 10%) to avoid filling device memory completely.
@@ -66,9 +66,10 @@ int moe_pc_engine_plan_moe_prefetch(
         const moe_storage_constants_t* storage = moe_storage_constants();
         uint64_t fallback_bundle_bytes = storage && storage->normal_bundle_max_bytes
             ? storage->normal_bundle_max_bytes : 0ull;
-        if (fallback_bundle_bytes == 0 && engine->max_tensor_stream_bytes > 0) {
-            fallback_bundle_bytes = engine->max_tensor_stream_bytes <= UINT64_MAX / 3ull
-                ? engine->max_tensor_stream_bytes * 3ull : UINT64_MAX;
+        const uint64_t max_tensor_bytes = engine->max_tensor_stream_bytes.load(std::memory_order_relaxed);
+        if (fallback_bundle_bytes == 0 && max_tensor_bytes > 0) {
+            fallback_bundle_bytes = max_tensor_bytes <= UINT64_MAX / 3ull
+                ? max_tensor_bytes * 3ull : UINT64_MAX;
         }
         if (fallback_bundle_bytes == 0) {
             fallback_bundle_bytes = 24ull * 1024ull * 1024ull;

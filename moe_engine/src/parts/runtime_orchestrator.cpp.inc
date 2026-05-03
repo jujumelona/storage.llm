@@ -72,10 +72,11 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
             ? dropped_now - engine->last_dropped_requests_snapshot : 0;
         engine->last_dropped_requests_snapshot = dropped_now;
 
-        // If any drops in last orchestrate call, immediately shrink window
-        // Asymmetric hysteresis: drops ??instant reaction, growth ??3-streak
-        if (dropped_delta > 0) {
-            base_window = std::max(1u, base_window / 2u);
+        const uint64_t dropped_expert_equiv = (dropped_delta + 2ull) / 3ull;
+        if (dropped_expert_equiv > 0) {
+            base_window = dropped_expert_equiv >= 4ull
+                ? std::max(1u, base_window / 4u)
+                : std::max(1u, base_window / 2u);
             // Reset growth streak on drop detection
             engine->prefetch_window_streak = 0;
         }
@@ -400,8 +401,9 @@ static void prescope_compute_global_plan(
         const uint32_t n_experts = (uint32_t)predicted_experts[d].size();
 
         // Fix 16: Prevent divide-by-zero UB by ensuring avg_expert_bytes has a fallback
+        const uint64_t max_tensor_bytes = engine->max_tensor_stream_bytes.load(std::memory_order_relaxed);
         const uint64_t safe_avg_bytes = engine->avg_expert_bytes > 0 ? engine->avg_expert_bytes :
-            (engine->max_tensor_stream_bytes > 0 ? engine->max_tensor_stream_bytes : 20ull * 1024ull * 1024ull);
+            (max_tensor_bytes > 0 ? max_tensor_bytes : 20ull * 1024ull * 1024ull);
         const float expert_gb = safe_avg_bytes / 1e9f;
         // BUGFIX 639: Check total_bw > 0 before division ★
         // Problem: total_bw can be 0 causing division by zero

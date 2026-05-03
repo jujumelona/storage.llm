@@ -279,28 +279,28 @@ static void save_gate_input_snapshot(moe_pc_engine* engine, int layer, const flo
     if (layer_u > moe_GATE_SNAPSHOT_MAX_LAYER) return;
     const size_t req_size = (layer_u + 1u) * 2u;
     if (req_size > moe_GATE_SNAPSHOT_EPOCH_SLOTS) return;
-    if (engine->gate_input_snapshots.size() < req_size) {
+    {
         std::lock_guard<std::mutex> lock(engine->gate_input_snapshot_mutex);
         if (engine->gate_input_snapshots.size() < req_size) {
             engine->gate_input_snapshots.resize(req_size);
         }
-    }
 
-    const size_t slot0 = layer_u * 2u;
-    const size_t slot1 = slot0 + 1u;
-    std::atomic<uint64_t>& epoch0_ref = engine->gate_input_snapshot_epochs[slot0];
-    std::atomic<uint64_t>& epoch1_ref = engine->gate_input_snapshot_epochs[slot1];
-    const uint64_t e0 = epoch0_ref.load(std::memory_order_acquire);
-    const uint64_t e1 = epoch1_ref.load(std::memory_order_acquire);
-    const int write_idx = (e0 >= e1) ? 1 : 0;
-    const size_t write_slot = layer_u * 2u + (size_t)write_idx;
+        const size_t slot0 = layer_u * 2u;
+        const size_t slot1 = slot0 + 1u;
+        std::atomic<uint64_t>& epoch0_ref = engine->gate_input_snapshot_epochs[slot0];
+        std::atomic<uint64_t>& epoch1_ref = engine->gate_input_snapshot_epochs[slot1];
+        const uint64_t e0 = epoch0_ref.load(std::memory_order_acquire);
+        const uint64_t e1 = epoch1_ref.load(std::memory_order_acquire);
+        const int write_idx = (e0 >= e1) ? 1 : 0;
+        const size_t write_slot = layer_u * 2u + (size_t)write_idx;
 
-    engine->gate_input_snapshots[write_slot].assign(hidden, hidden + dim);
-    const uint64_t new_epoch = std::max(e0, e1) + 1u;
-    if (write_idx == 0) {
-        epoch0_ref.store(new_epoch, std::memory_order_release);
-    } else {
-        epoch1_ref.store(new_epoch, std::memory_order_release);
+        engine->gate_input_snapshots[write_slot].assign(hidden, hidden + dim);
+        const uint64_t new_epoch = std::max(e0, e1) + 1u;
+        if (write_idx == 0) {
+            epoch0_ref.store(new_epoch, std::memory_order_release);
+        } else {
+            epoch1_ref.store(new_epoch, std::memory_order_release);
+        }
     }
 }
 

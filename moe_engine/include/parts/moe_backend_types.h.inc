@@ -43,4 +43,6 @@ typedef struct {
     double dma_bandwidth_gbps;
     double tflops_hint;
     uint64_t copy_stream_bytes_limit;
+    uint64_t measured_h2d_bw_bytes_per_sec;
+    uint64_t measured_storage_bw_bytes_per_sec;
 } moe_backend_caps_t;

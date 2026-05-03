@@ -1,4 +1,4 @@
-﻿// Device memory eviction and room-making logic
+// Device memory eviction and room-making logic
 
 static void device_free_expert_locked(
     moe_pc_engine* e,
@@ -57,6 +57,10 @@ static uint32_t device_rebuild_activation_heap_unlocked(
     return device_rebuild_activation_heap_locked(e);
 }
 
+// Lock order: caller holds device_mutex → this function acquires map_mutex.
+// This is consistent with the canonical device_mutex → map_mutex hierarchy.
+// device_free_expert_locked (called at end) operates under device_mutex only;
+// it does NOT re-acquire map_mutex internally.
 static int device_free_expert_if_pending_evict_locked(
     moe_pc_engine* e,
     int layer,
@@ -66,6 +70,13 @@ static int device_free_expert_if_pending_evict_locked(
     if (!e || layer < 0 || expert < 0) {
         return 0;
     }
+#ifndef NDEBUG
+    // Verify caller holds device_mutex (lock order: device_mutex → map_mutex)
+    if (e->device_mutex.try_lock()) {
+        e->device_mutex.unlock();
+        assert(false && "device_free_expert_if_pending_evict_locked called without device_mutex");
+    }
+#endif
     const size_t slot = expert_dense_slot(e, layer, expert);
     if (slot == tensor_slot_invalid() || slot >= e->expert_states.size()) {
         return 0;
@@ -215,12 +226,15 @@ static void device_make_room_locked(
             //      with vram_eviction_mutex. std::condition_variable REQUIRES the same mutex across all threads!
             // New: Use the unused ram_eviction_cv as a synchronization primitive for device_mutex
             //      to strictly isolate the condition variables by mutex.
-            e->ram_eviction_cv.wait_for(
-                device_lock,
-                std::chrono::microseconds(500),
-                [&]() {
-                    return !e->vram_eviction_in_progress.load(std::memory_order_acquire);
-                });
+            {
+                std::unique_lock<std::mutex> ev_lock(e->vram_eviction_mutex);
+                e->vram_eviction_cv.wait_for(
+                    ev_lock,
+                    std::chrono::microseconds(500),
+                    [&]() {
+                        return !e->vram_eviction_in_progress.load(std::memory_order_acquire);
+                    });
+            }
             continue;
         }
         struct EvictGuard {
@@ -230,7 +244,7 @@ static void device_make_room_locked(
                 flag->store(false, std::memory_order_release);
                 cv->notify_all();
             }
-        } guard{&e->vram_eviction_in_progress, &e->ram_eviction_cv}; // BUGFIX 109: Use ram_eviction_cv
+        } guard{&e->vram_eviction_in_progress, &e->vram_eviction_cv};
 
         const uint64_t allocated_before = e->device_allocated_bytes.load(std::memory_order_relaxed);
 
@@ -288,7 +302,7 @@ static void device_make_room_locked(
             // Fourth wait: dma_drain_retries=4, wait_ms = 1 << 3 = 8ms → clamped to 4ms
             // Solution: Clamp exponent to 2 for max 4ms wait
             e->vram_eviction_in_progress.store(false, std::memory_order_release);
-            e->ram_eviction_cv.notify_all(); // BUGFIX 109: Use ram_eviction_cv
+            e->vram_eviction_cv.notify_all();
 
             device_lock.unlock();
             const uint32_t retry_exp =

@@ -22,8 +22,11 @@ static uint64_t moe_rt_expert_bytes_hint(
     const moe_offload_gguf_scan_t& scan
 ) {
     uint64_t expert_bytes = normal_bundle_max_or(24ull * 1024ull * 1024ull);
-    if (engine && engine->max_tensor_stream_bytes > expert_bytes) {
-        expert_bytes = engine->max_tensor_stream_bytes;
+    if (engine) {
+        const uint64_t max_tensor_bytes = engine->max_tensor_stream_bytes.load(std::memory_order_relaxed);
+        if (max_tensor_bytes > expert_bytes) {
+            expert_bytes = max_tensor_bytes;
+        }
     }
     if (scan.max_executable_tensor_bytes > expert_bytes) {
         expert_bytes = scan.max_executable_tensor_bytes;
@@ -88,6 +91,10 @@ static double moe_rt_fast_mem_bw_hint(const moe_pc_engine* engine) {
     if (!engine) {
         return 12.0;
     }
+    if (engine->backend_caps.measured_h2d_bw_bytes_per_sec > 0) {
+        const double measured = (double)engine->backend_caps.measured_h2d_bw_bytes_per_sec / 1e9;
+        return measured > 1.0 ? measured : 1.0;
+    }
     if (engine->backend_caps.supports_zero_copy_host ||
         engine->backend_caps.supports_unified_memory) {
         return 120.0;
@@ -102,6 +109,9 @@ static double moe_rt_fast_mem_bw_hint(const moe_pc_engine* engine) {
 static double moe_rt_slow_mem_bw_hint(const moe_pc_engine* engine) {
     if (!engine) {
         return 1.2;
+    }
+    if (engine->backend_caps.measured_storage_bw_bytes_per_sec > 0) {
+        return (double)engine->backend_caps.measured_storage_bw_bytes_per_sec / 1e9;
     }
     if (engine->backend_caps.supports_registered_io_buffers &&
         (engine->io_config.enable_gpudirect_storage ||
@@ -192,7 +202,7 @@ static void moe_rt_build_tiers(
     }
 
     tier0->capacity_bytes = gpu_available ? vram_budget : ram_budget;
-    tier0->bandwidth_gbps = gpu_available ? moe_rt_compute_mem_bw_hint(caps) : 45.0;
+    tier0->bandwidth_gbps = gpu_available ? moe_rt_compute_mem_bw_hint(caps) : moe_rt_fast_mem_bw_hint(engine);
     tier0->latency_us = gpu_available ? 0.2 : 1.0;
     tier0->compute_tflops = moe_rt_compute_tflops_hint(caps);
     tier0->supports_async = gpu_available ? caps.supports_backend_async_api : 1;

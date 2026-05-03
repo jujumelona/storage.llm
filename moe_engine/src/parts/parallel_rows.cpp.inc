@@ -65,7 +65,7 @@ static uint32_t moe_cpu_row_min_block() {
 #endif
 }
 
-// BUGFIX 710: Minimum block size to prevent excessive atomic fetch_add contention ★★
+// BUGFIX 710: Minimum block size to prevent excessive atomic fetch_add contention
 // Problem: 256 rows / (16 workers * 4) = 4 rows per block → 64 fetch_add ops per dispatch.
 //   False sharing + cache ping-pong on next_row atomic degrades throughput.
 // Solution: min_block = 16 ensures at most (rows / 16) atomic ops regardless of worker count.
@@ -80,7 +80,7 @@ static uint32_t auto_row_block(uint32_t rows, uint32_t workers) {
 }
 
 // ============================================================================
-// Persistent CPU Row Thread Pool (BUGFIX 704) ★★★
+// Persistent CPU Row Thread Pool (BUGFIX 704)
 // ============================================================================
 // Problem: moe_parallel_rows created workers-1 std::threads per call.
 //   MoE inference calls this dozens of times per token (gate/up/down × N_experts).
@@ -244,7 +244,14 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     // gracefully fall back to single-threaded execution. This is correct by design:
     // expert-level parallelism handles inter-expert concurrency, while row-level
     // parallelism within each expert is handled by the pool-owning thread.
-    const int prev_active = engine->cpu_row_active.fetch_add(1, std::memory_order_acq_rel);
+    // BUGFIX 문제9: Changed from engine->cpu_row_active (global atomic) to thread_local ★★★
+    // Problem: Global atomic serializes different batches' experts. Batch 2 sees
+    // prev_active>0 from Batch 1's thread and falls back to single-threaded,
+    // halving CPU matrix throughput at batch_size>=2.
+    // Solution: thread_local detects only same-thread nested calls (the real hazard)
+    // while allowing cross-batch parallelism on separate threads.
+    static thread_local int tl_cpu_row_active = 0;
+    const int prev_active = tl_cpu_row_active++;
     if (prev_active > 0) {
         // Another thread owns the pool - run single-threaded for this expert
         int ok = 1;
@@ -254,16 +261,8 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
                 break;
             }
         }
-        // BUGFIX 614: Check cpu_row_active > 0 before fetch_sub to prevent underflow ★
-        int current = engine->cpu_row_active.load(std::memory_order_acquire);
-        while (current > 0) {
-            if (engine->cpu_row_active.compare_exchange_weak(
-                    current, current - 1,
-                    std::memory_order_release,
-                    std::memory_order_acquire)) {
-                break;
-            }
-        }
+        // BUGFIX 614 + 문제9: thread_local decrement (no underflow possible)
+        --tl_cpu_row_active;
         moe_profile_log(
             "parallel_rows",
             "label=%s rows=%u block=%u workers=%u mode=nested_serial active_before=%d ok=%d ms=%.3f",
@@ -271,7 +270,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
         return ok;
     }
 
-    // BUGFIX 704: Use persistent thread pool instead of per-call fork/join ★★★
+    // BUGFIX 704: Use persistent thread pool instead of per-call fork/join
     // Old: std::thread creation + join per call → 50-100µs/thread overhead
     // New: Static pool with CV dispatch → ~1µs wake latency
     std::atomic<uint32_t> next_row{0};
@@ -322,7 +321,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
             for (std::thread& worker : local_workers) {
                 if (worker.joinable()) worker.join();
             }
-            engine->cpu_row_active.fetch_sub(1, std::memory_order_release);
+            --tl_cpu_row_active;
             return 0;
         }
         for (std::thread& worker : local_workers) {
@@ -330,16 +329,8 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
         }
     }
 
-    // BUGFIX 614: Check cpu_row_active > 0 before fetch_sub to prevent underflow ★
-    int current = engine->cpu_row_active.load(std::memory_order_acquire);
-    while (current > 0) {
-        if (engine->cpu_row_active.compare_exchange_weak(
-                current, current - 1,
-                std::memory_order_release,
-                std::memory_order_acquire)) {
-            break;
-        }
-    }
+    // BUGFIX 614 + 문제9: thread_local decrement (no underflow possible)
+    --tl_cpu_row_active;
     const int final_ok = ok.load(std::memory_order_acquire);
     moe_profile_log(
         "parallel_rows",

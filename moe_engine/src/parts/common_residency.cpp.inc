@@ -1,3 +1,5 @@
+static uint64_t moe_profile_now_us();
+
 static uint64_t moe_common_raw_tensor_bytes() {
     const moe_storage_constants_t* storage = moe_storage_constants();
     return storage ? storage->raw_tensor_total_bytes : 0;
@@ -22,7 +24,10 @@ static uint64_t common_vram_wanted_bytes(const moe_pc_engine* engine) {
     // Bug Fix: Router bytes removed from common VRAM reservation
     // Router weights are already prefetched via moe_enqueue_attention_prefetch (activation pool)
     // Including them here double-counts ~600MB, reducing expert VRAM budget unnecessarily
-    const uint64_t core = (s ? s->raw_tensor_lm_head_bytes : 0ull) + 12288ull;
+    // 12288 bytes = 2 * hidden_size(~6144) runtime overhead estimate for normalization
+    // and intermediate buffers. Replace with moe_storage_constants()->runtime_state_bytes.
+    const uint64_t runtime_overhead = s && s->runtime_state_bytes > 0 ? s->runtime_state_bytes : 12288ull;
+    const uint64_t core = (s ? s->raw_tensor_lm_head_bytes : 0ull) + runtime_overhead;
     const uint64_t embed = s ? s->raw_tensor_embedding_bytes : 0ull;
     const uint64_t bundle = s && s->normal_bundle_max_bytes ? s->normal_bundle_max_bytes : 32ull * 1024ull * 1024ull;
     const uint64_t expert_floor = bundle * 8ull;
@@ -57,6 +62,31 @@ static uint64_t vram_expert_budget_bytes(const moe_pc_engine* engine) {
         engine->config.vram_budget_bytes - reserved : 0;
 }
 
+// Rate-limited wrapper that warns on expert budget exhaustion
+static uint64_t vram_expert_budget_bytes_checked(const moe_pc_engine* engine) {
+    const uint64_t result = vram_expert_budget_bytes(engine);
+    if (result == 0 && engine && engine->config.vram_budget_bytes > 0) {
+        static std::atomic<uint64_t> s_last_warn{0};
+        const uint64_t now = moe_profile_now_us() / 1000000ull;
+        const uint64_t last = s_last_warn.load(std::memory_order_relaxed);
+        if (now > last + 5ull) {
+            s_last_warn.store(now, std::memory_order_relaxed);
+            const uint64_t common = engine->common_vram_reserved_bytes.load(std::memory_order_relaxed);
+            const uint64_t kv = engine->vram_kv_used_bytes.load(std::memory_order_relaxed);
+            const uint64_t pending = engine->pending_vram_reservation.load(std::memory_order_relaxed);
+            fprintf(stderr,
+                "[storageLLM WARNING] Expert VRAM budget exhausted: "
+                "total=%llu MB, KV=%llu MB, common=%llu MB, pending=%llu MB. "
+                "Consider reducing vram_kv_ratio or context length.\n",
+                (unsigned long long)(engine->config.vram_budget_bytes / (1024*1024)),
+                (unsigned long long)(kv / (1024*1024)),
+                (unsigned long long)(common / (1024*1024)),
+                (unsigned long long)(pending / (1024*1024)));
+        }
+    }
+    return result;
+}
+
 // BUGFIX 문제4: Initialize KV VRAM budget ★★★
 // Splits VRAM budget between experts and KV cache
 // Default: 80% experts, 20% KV (configurable via vram_kv_ratio)
@@ -88,11 +118,14 @@ static void init_kv_vram_budget(moe_pc_engine* engine) {
 
     // BUGFIX 문제F: Warn if user sets excessive KV ratio ★★
     // High KV ratio (>0.5) starves expert VRAM budget and kills prefetch hit rate
-    if (engine->config.vram_kv_ratio > 0.5f) {
+    if (kv_ratio > 0.5f) {
         fprintf(stderr,
-            "[storageLLM WARNING] vram_kv_ratio=%.2f exceeds 0.5, expert prefetch will be severely limited. "
+            "[storageLLM WARNING] effective vram_kv_ratio=%.2f exceeds 0.5, expert prefetch will be severely limited. "
             "Recommended range: 0.1-0.3; 1.0 explicitly reserves all VRAM for KV.\n",
-            engine->config.vram_kv_ratio);
+            kv_ratio);
+    }
+    if (engine->config.vram_kv_ratio <= 0.0f) {
+        fprintf(stderr, "[storageLLM INFO] vram_kv_ratio auto-adjusted to %.2f based on VRAM capacity.\n", kv_ratio);
     }
 
     const uint64_t kv_budget = (uint64_t)(engine->config.vram_budget_bytes * kv_ratio);

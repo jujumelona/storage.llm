@@ -19,6 +19,79 @@ static std::atomic<uint64_t>* device_pool_counter(moe_pc_engine* e, uint8_t pool
 
 static void device_stream_pool_init(moe_pc_engine* e);
 
+static void* moe_open_level_zero_loader_library() {
+#ifdef _WIN32
+    return (void*)LoadLibraryA("ze_loader.dll");
+#else
+    void* lib = dlopen("libze_loader.so.1", RTLD_LAZY | RTLD_LOCAL);
+    return lib ? lib : dlopen("libze_loader.so", RTLD_LAZY | RTLD_LOCAL);
+#endif
+}
+
+static int level_zero_driver_load(moe_level_zero_driver_api* api, uint32_t device_id) {
+    if (!api) {
+        return 0;
+    }
+    if (api->library && api->context && api->device) {
+        return 1;
+    }
+    api->library = moe_open_level_zero_loader_library();
+    if (!api->library) {
+        return 0;
+    }
+    api->zeInit = (moe_ze_init_fn)moe_find_shared_symbol(api->library, "zeInit");
+    api->zeDriverGet = (moe_ze_driver_get_fn)moe_find_shared_symbol(api->library, "zeDriverGet");
+    api->zeDeviceGet = (moe_ze_device_get_fn)moe_find_shared_symbol(api->library, "zeDeviceGet");
+    api->zeContextCreate = (moe_ze_context_create_fn)moe_find_shared_symbol(api->library, "zeContextCreate");
+    api->zeContextDestroy = (moe_ze_context_destroy_fn)moe_find_shared_symbol(api->library, "zeContextDestroy");
+    api->zeMemAllocHost = (moe_ze_mem_alloc_host_fn)moe_find_shared_symbol(api->library, "zeMemAllocHost");
+    api->zeMemFree = (moe_ze_mem_free_fn)moe_find_shared_symbol(api->library, "zeMemFree");
+    api->zeDeviceGetMemoryProperties = (moe_ze_device_get_memory_properties_fn)moe_find_shared_symbol(api->library, "zeDeviceGetMemoryProperties");
+    if (!api->zeInit || !api->zeDriverGet || !api->zeDeviceGet ||
+        !api->zeContextCreate || !api->zeContextDestroy ||
+        !api->zeMemAllocHost || !api->zeMemFree) {
+        moe_close_shared_library(api->library);
+        *api = moe_level_zero_driver_api{};
+        return 0;
+    }
+    if (api->zeInit(0) != 0) {
+        moe_close_shared_library(api->library);
+        *api = moe_level_zero_driver_api{};
+        return 0;
+    }
+    void* driver = nullptr;
+    uint32_t driver_count = 1;
+    if (api->zeDriverGet(&driver_count, &driver) != 0 || !driver) {
+        moe_close_shared_library(api->library);
+        *api = moe_level_zero_driver_api{};
+        return 0;
+    }
+    void* device = nullptr;
+    uint32_t device_count = device_id + 1u;
+    std::vector<void*> devices(device_count ? device_count : 1u, nullptr);
+    if (api->zeDeviceGet(driver, &device_count, devices.data()) != 0 || device_count == 0) {
+        moe_close_shared_library(api->library);
+        *api = moe_level_zero_driver_api{};
+        return 0;
+    }
+    device = devices[std::min<uint32_t>(device_id, device_count - 1u)];
+    struct ze_context_desc_t_local {
+        uint32_t stype;
+        const void* pNext;
+        uint32_t flags;
+    } ctx_desc{0xDu, nullptr, 0u}; // ZE_STRUCTURE_TYPE_CONTEXT_DESC
+    void* context = nullptr;
+    if (api->zeContextCreate(driver, &ctx_desc, &context) != 0 || !context) {
+        moe_close_shared_library(api->library);
+        *api = moe_level_zero_driver_api{};
+        return 0;
+    }
+    api->driver = driver;
+    api->device = device;
+    api->context = context;
+    return 1;
+}
+
 static int device_allocator_init(moe_pc_engine* e) {
     if (!e || e->device_allocator_ready.load() != 0) return e && e->device_allocator_ready.load() > 0;
     if (!e->config.prefer_gpu) return 0;
@@ -43,7 +116,9 @@ static int device_allocator_init(moe_pc_engine* e) {
         if (e->cuda.cuMemGetInfo(&free_b, &total_b) == 0) {
             e->device_free_bytes.store((uint64_t)free_b);
             e->device_total_bytes.store((uint64_t)total_b);
-            if (e->backend_caps.device_memory_bytes == 0) e->backend_caps.device_memory_bytes = (uint64_t)free_b;
+            if (e->backend_caps.device_memory_bytes == 0) {
+                e->backend_caps.device_memory_bytes = (uint64_t)(total_b ? total_b : free_b);
+            }
         }
     } else if (e->backend_caps.backend == moe_BACKEND_HIP) {
         if (!hip_driver_load(&e->hip) || e->hip.hipInit(0) != 0 ||
@@ -57,10 +132,11 @@ static int device_allocator_init(moe_pc_engine* e) {
         }
         size_t free_b = 0, total_b = 0;
         if (e->hip.hipMemGetInfo(&free_b, &total_b) == 0) {
-            const uint64_t safe_free_b = ((uint64_t)free_b * 90ull) / 100ull;
-            e->device_free_bytes.store(safe_free_b);
+            e->device_free_bytes.store((uint64_t)free_b);
             e->device_total_bytes.store((uint64_t)total_b);
-            if (e->backend_caps.device_memory_bytes == 0) e->backend_caps.device_memory_bytes = safe_free_b;
+            if (e->backend_caps.device_memory_bytes == 0) {
+                e->backend_caps.device_memory_bytes = (uint64_t)(total_b ? total_b : free_b);
+            }
         }
     // BUGFIX 80: Issue 2 - Fix Metal budget calculation and remove dead code.
     // Problem: Metal uses full system_memory_bytes as VRAM budget
@@ -96,6 +172,7 @@ static int device_allocator_init(moe_pc_engine* e) {
         // BUGFIX 124: Disable RAM budget for Metal - unified memory tracked in VRAM budget only
         e->config.ram_budget_bytes = 0;
     } else if (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO) {
+        level_zero_driver_load(&e->ze, e->backend_caps.device_id);
         if (e->backend_caps.device_memory_bytes == 0) {
             e->backend_caps.device_memory_bytes = e->backend_caps.system_memory_bytes > 0
                 ? e->backend_caps.system_memory_bytes : 16ull * 1024ull * 1024ull * 1024ull;
@@ -121,7 +198,7 @@ static int device_allocator_init(moe_pc_engine* e) {
             } ext_props{};
             ext_props.stype = 0x0001000B;
             ze_device_memory_properties_t_local mem_props{};
-            mem_props.stype = 0x1;
+            mem_props.stype = 0x7; // ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES
             mem_props.pNext = &ext_props;
             uint32_t count = 1;
             if (e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &mem_props) == 0 &&
@@ -139,9 +216,13 @@ static int device_allocator_init(moe_pc_engine* e) {
         if (free_mem == 0) {
             free_mem = (e->backend_caps.device_memory_bytes * 85ull) / 100ull;
         }
+        if (total_mem > 0) {
+            e->backend_caps.device_memory_bytes = total_mem;
+        }
         e->device_free_bytes.store(free_mem);
         e->device_total_bytes.store(total_mem);
     } else if (e->backend_caps.backend == moe_BACKEND_SYCL) {
+        level_zero_driver_load(&e->ze, e->backend_caps.device_id);
         if (e->backend_caps.device_memory_bytes == 0) {
             e->backend_caps.device_memory_bytes = e->backend_caps.system_memory_bytes > 0
                 ? e->backend_caps.system_memory_bytes : 16ull * 1024ull * 1024ull * 1024ull;
@@ -167,7 +248,7 @@ static int device_allocator_init(moe_pc_engine* e) {
             } ext_props{};
             ext_props.stype = 0x0001000B;
             ze_device_memory_properties_t_local mem_props{};
-            mem_props.stype = 0x1;
+            mem_props.stype = 0x7; // ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES
             mem_props.pNext = &ext_props;
             uint32_t count = 1;
             if (e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &mem_props) == 0 &&
@@ -182,6 +263,9 @@ static int device_allocator_init(moe_pc_engine* e) {
         }
         if (free_mem == 0) {
             free_mem = (e->backend_caps.device_memory_bytes * 85ull) / 100ull;
+        }
+        if (total_mem > 0) {
+            e->backend_caps.device_memory_bytes = total_mem;
         }
         e->device_free_bytes.store(free_mem);
         e->device_total_bytes.store(total_mem);
@@ -269,7 +353,7 @@ static int device_allocator_init(moe_pc_engine* e) {
             } ext_props{};
             ext_props.stype = 0x0001000B; // ZE_STRUCTURE_TYPE_DEVICE_MEMORY_EXT_PROPERTIES
             ze_device_memory_properties_t_local mem_props{};
-            mem_props.stype = 0x1; // ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES
+            mem_props.stype = 0x7; // ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES
             mem_props.pNext = &ext_props;
             uint32_t count = 1;
             if (e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &mem_props) == 0) {
@@ -392,6 +476,11 @@ static void device_allocator_shutdown(moe_pc_engine* e) {
         if (e->hip.hipDevicePrimaryCtxRelease && e->hip.context) e->hip.hipDevicePrimaryCtxRelease(e->hip.device);
         moe_close_shared_library(e->hip.library);
         e->hip = moe_hip_driver_api{};
+    } else if (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
+               e->backend_caps.backend == moe_BACKEND_SYCL) {
+        if (e->ze.zeContextDestroy && e->ze.context) e->ze.zeContextDestroy(e->ze.context);
+        moe_close_shared_library(e->ze.library);
+        e->ze = moe_level_zero_driver_api{};
     }
     e->device_allocator_ready.store(0);
 }

@@ -150,6 +150,7 @@ struct moe_staging_slot {
     uint64_t size = 0;
     bool pinned = false;
     bool numa_allocated = false;
+    bool device_host_allocated = false;
     std::atomic<bool> in_use{false};
     // BUGFIX: Per-slot DMA fence for immediate release after cuMemcpyAsync
     // Acquirer must cuStreamWaitEvent on this before writing to buf
@@ -165,6 +166,7 @@ struct moe_staging_slot {
         size = other.size;
         pinned = other.pinned;
         numa_allocated = other.numa_allocated;
+        device_host_allocated = other.device_host_allocated;
         in_use.store(other.in_use.load());
         last_copy_event = other.last_copy_event;
         last_copy_stream = other.last_copy_stream;
@@ -173,6 +175,7 @@ struct moe_staging_slot {
         other.size = 0;
         other.pinned = false;
         other.numa_allocated = false;
+        other.device_host_allocated = false;
         other.in_use.store(false);
         other.last_copy_event = nullptr;
         other.last_copy_stream = nullptr;
@@ -183,6 +186,7 @@ struct moe_staging_slot {
         size = other.size;
         pinned = other.pinned;
         numa_allocated = other.numa_allocated;
+        device_host_allocated = other.device_host_allocated;
         in_use.store(other.in_use.load());
         last_copy_event = other.last_copy_event;
         last_copy_stream = other.last_copy_stream;
@@ -191,6 +195,7 @@ struct moe_staging_slot {
         other.size = 0;
         other.pinned = false;
         other.numa_allocated = false;
+        other.device_host_allocated = false;
         other.in_use.store(false);
         other.last_copy_event = nullptr;
         other.last_copy_stream = nullptr;

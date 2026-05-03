@@ -13,37 +13,37 @@ static void moe_save_gate_input_snapshot(
 
     // Fix 19: Double buffering for lock-free snapshot exchange
     const size_t req_size = (slot + 1) * 2;
-    if (engine->gate_input_snapshots.size() < req_size) {
+    {
         std::lock_guard<std::mutex> lock(engine->gate_input_snapshot_mutex);
         if (engine->gate_input_snapshots.size() < req_size) {
             engine->gate_input_snapshots.resize(req_size);
         }
-    }
 
-    const size_t slot0 = slot * 2;
-    const size_t slot1 = slot * 2 + 1;
+        const size_t slot0 = slot * 2;
+        const size_t slot1 = slot * 2 + 1;
 
-    if (slot1 >= moe_GATE_SNAPSHOT_EPOCH_SLOTS) {
-        return;
-    }
-    std::atomic<uint64_t>& epoch0_ref = engine->gate_input_snapshot_epochs[slot0];
-    std::atomic<uint64_t>& epoch1_ref = engine->gate_input_snapshot_epochs[slot1];
+        if (slot0 >= moe_GATE_SNAPSHOT_EPOCH_SLOTS || slot1 >= moe_GATE_SNAPSHOT_EPOCH_SLOTS) {
+            return;
+        }
+        std::atomic<uint64_t>& epoch0_ref = engine->gate_input_snapshot_epochs[slot0];
+        std::atomic<uint64_t>& epoch1_ref = engine->gate_input_snapshot_epochs[slot1];
 
-    uint64_t e0 = epoch0_ref.load(std::memory_order_acquire);
-    uint64_t e1 = epoch1_ref.load(std::memory_order_acquire);
+        uint64_t e0 = epoch0_ref.load(std::memory_order_acquire);
+        uint64_t e1 = epoch1_ref.load(std::memory_order_acquire);
 
-    const int write_idx = (e0 >= e1) ? 1 : 0;
-    const size_t write_slot = slot * 2 + write_idx;
+        const int write_idx = (e0 >= e1) ? 1 : 0;
+        const size_t write_slot = slot * 2 + write_idx;
 
-    std::vector<float>& dst = engine->gate_input_snapshots[write_slot];
-    dst.assign(hidden, hidden + hidden_size);
+        std::vector<float>& dst = engine->gate_input_snapshots[write_slot];
+        dst.assign(hidden, hidden + hidden_size);
 
-    // Update epoch atomically to publish
-    uint64_t new_epoch = std::max(e0, e1) + 1;
-    if (write_idx == 0) {
-        epoch0_ref.store(new_epoch, std::memory_order_release);
-    } else {
-        epoch1_ref.store(new_epoch, std::memory_order_release);
+        // Update epoch atomically to publish
+        uint64_t new_epoch = std::max(e0, e1) + 1;
+        if (write_idx == 0) {
+            epoch0_ref.store(new_epoch, std::memory_order_release);
+        } else {
+            epoch1_ref.store(new_epoch, std::memory_order_release);
+        }
     }
 }
 
@@ -63,10 +63,17 @@ static float moe_router_normalized_entropy(const std::vector<float>& sigmoid_sco
     if (sigmoid_scores.size() <= 1u) {
         return 0.0f;
     }
-    if (!sigmoid_scores.empty() && (sigmoid_scores[0] < 0.0f || sigmoid_scores[0] > 1.0f)) {
-        // Invalid input detected - return middle entropy (0.5) to avoid extreme top_k
-        return 0.5f;
+#ifndef NDEBUG
+    for (float p : sigmoid_scores) {
+        if (p < 0.0f || p > 1.0f) { return 0.5f; }
     }
+#else
+    if (!sigmoid_scores.empty()) {
+        const float first = sigmoid_scores.front();
+        const float last = sigmoid_scores.back();
+        if (first < 0.0f || first > 1.0f || last < 0.0f || last > 1.0f) return 0.5f;
+    }
+#endif
     double sum = 0.0;
     for (float p : sigmoid_scores) {
         if (p > 0.0f) {
@@ -712,6 +719,7 @@ static void moe_infinigen_speculative_prefetch(
     // Fix 19: Double buffering lock-free read
     std::vector<float> snapshot;
     {
+        std::lock_guard<std::mutex> lock(engine->gate_input_snapshot_mutex);
         const size_t slot = (size_t)source_layer;
         const size_t req_size = (slot + 1) * 2;
         if (engine->gate_input_snapshots.size() < req_size) {
@@ -721,7 +729,7 @@ static void moe_infinigen_speculative_prefetch(
         const size_t slot0 = slot * 2;
         const size_t slot1 = slot * 2 + 1;
 
-        if (slot1 >= moe_GATE_SNAPSHOT_EPOCH_SLOTS) {
+        if (slot0 >= moe_GATE_SNAPSHOT_EPOCH_SLOTS || slot1 >= moe_GATE_SNAPSHOT_EPOCH_SLOTS) {
             return;
         }
         std::atomic<uint64_t>& epoch0_ref = engine->gate_input_snapshot_epochs[slot0];

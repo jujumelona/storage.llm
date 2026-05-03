@@ -1,4 +1,8 @@
-﻿static int prefetch_tensor_disk_to_ram(moe_pc_engine* engine, const moe_tensor_record& rec) {
+﻿static int prefetch_tensor_disk_to_ram(
+    moe_pc_engine* engine,
+    const moe_tensor_record& rec,
+    int allow_registered_io_bypass = 0
+) {
     mmap_context_t* shard = get_or_map_tensor_shard(engine, rec);
     if (!engine || !shard || !mmap_get_ptr(shard, 0)) {
         return 0;
@@ -37,28 +41,34 @@
             hint_issued = true;
         }
     }
-    // Bug #5: Removed fixed 100µs sleep → touch_mapped_range guarantees pages regardless.
-    // NVMe responds in <10µs (wasted wait), HDD needs 4-10ms (insufficient wait).
-    // Synchronously touch pages to guarantee data residency in RAM
-    for (const auto& range : ranges) {
-        const uint64_t offset = range[0];
-        const uint64_t length = range[1];
-        if (length > 0) {
-            const uint8_t* src = static_cast<const uint8_t*>(mmap_get_ptr(shard, static_cast<size_t>(offset)));
-            // BUGFIX 317: Check src validity before using ★
-            // Problem: mmap_get_ptr can return null if offset is invalid
-            // Dereferencing null src in touch_mapped_range causes crash
-            // Solution: Check src before use
-            if (!src) {
-                return 0;
+    const bool registered_async_disk =
+        allow_registered_io_bypass &&
+        engine->ring_adapter.initialized &&
+        engine->io_config.enable_multistage_pipeline &&
+        engine->staging_pinned;
+    if (!registered_async_disk) {
+        for (const auto& range : ranges) {
+            const uint64_t offset = range[0];
+            const uint64_t length = range[1];
+            if (length > 0) {
+                const uint8_t* src = static_cast<const uint8_t*>(mmap_get_ptr(shard, static_cast<size_t>(offset)));
+                // BUGFIX 317: Check src validity before using ★
+                // Problem: mmap_get_ptr can return null if offset is invalid
+                // Dereferencing null src in touch_mapped_range causes crash
+                // Solution: Check src before use
+                if (!src) {
+                    return 0;
+                }
+                touch_mapped_range(engine, src, length);
+                if (!hint_issued) {
+                    // BUGFIX 155: Add memory_order_relaxed for statistics counter
+                    engine->io_atomic.bytes_touch_fallback.fetch_add(length, std::memory_order_relaxed);
+                }
+                prefetched += length;
             }
-            touch_mapped_range(engine, src, length);
-            if (!hint_issued) {
-                // BUGFIX 155: Add memory_order_relaxed for statistics counter
-                engine->io_atomic.bytes_touch_fallback.fetch_add(length, std::memory_order_relaxed);
-            }
-            prefetched += length;
         }
+    } else {
+        prefetched = transfer_bytes;
     }
 
     // BUGFIX 155: Add memory_order_relaxed for statistics counters
@@ -71,9 +81,7 @@
 }
 
 // Optimization 5: Linux io_uring registered buffer.
-// The active path uses moe_io_ring_adapter. Keep this legacy path opt-in so
-// liburing-less Lightning images still build.
-#if defined(__linux__) && defined(MOE_HAVE_LIBURING) && MOE_HAVE_LIBURING && defined(MOE_ENABLE_LEGACY_URING_STATE)
+#if defined(__linux__) && defined(MOE_HAVE_LIBURING) && MOE_HAVE_LIBURING
 static bool init_io_uring(moe_pc_engine* engine) {
     if (!engine) return false;
     auto& state = engine->uring_state;

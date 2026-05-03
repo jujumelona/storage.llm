@@ -362,7 +362,8 @@ static void finish_tensor_index_load(moe_pc_engine* engine) {
             ++expert_count;
         }
     }
-    engine->avg_expert_bytes = expert_count ? expert_sum / expert_count : engine->max_tensor_stream_bytes;
+    engine->avg_expert_bytes = expert_count ? expert_sum / expert_count :
+        engine->max_tensor_stream_bytes.load(std::memory_order_relaxed);
     if (engine->staging && engine->staging_size > 0) {
         configure_staging_slots(engine);
         engine->staging_slot_cv.notify_all();
@@ -509,8 +510,8 @@ static int load_binary_tensor_index(moe_pc_engine* engine, const char* index_pat
                 moe_WEIGHT_ENCODING_UNKNOWN);
         finalize_tensor_layout(&rec, rec_encoding);
         const uint64_t stream_bytes = tensor_stream_bytes(rec);
-        if (stream_bytes > engine->max_tensor_stream_bytes) {
-            engine->max_tensor_stream_bytes = stream_bytes;
+        if (stream_bytes > engine->max_tensor_stream_bytes.load(std::memory_order_relaxed)) {
+            engine->max_tensor_stream_bytes.store(stream_bytes, std::memory_order_relaxed);
         }
         tensor_slots_set(engine, (int)rec.info.layer, (int)rec.info.expert, rec.info.proj, engine->tensors.size());
         expert_bytes_add(engine, (int)rec.info.layer, (int)rec.info.expert, stream_bytes);
@@ -1622,8 +1623,8 @@ static int load_gguf_tensor_directory_as_tensor_index(
                     rec.resolved_path_index = path_idx;
                     finalize_tensor_layout(&rec, moe_weight_encoding_from_gguf_type(entry.type, contract));
                     const uint64_t stream_bytes = tensor_stream_bytes(rec);
-                    if (stream_bytes > engine->max_tensor_stream_bytes) {
-                        engine->max_tensor_stream_bytes = stream_bytes;
+                    if (stream_bytes > engine->max_tensor_stream_bytes.load(std::memory_order_relaxed)) {
+                        engine->max_tensor_stream_bytes.store(stream_bytes, std::memory_order_relaxed);
                     }
                     tensor_slots_set(engine, (int)rec.info.layer, (int)rec.info.expert, rec.info.proj, engine->tensors.size());
                     expert_bytes_add(engine, (int)rec.info.layer, (int)rec.info.expert, stream_bytes);
@@ -1642,7 +1643,7 @@ static int load_gguf_tensor_directory_as_tensor_index(
         "[storagellm] GGUF tensor directory indexed: records=%llu paths=%zu max_stream=%llu\n",
         (unsigned long long)records,
         engine->tensor_paths.size(),
-        (unsigned long long)engine->max_tensor_stream_bytes);
+        (unsigned long long)engine->max_tensor_stream_bytes.load(std::memory_order_relaxed));
     std::fflush(stderr);
     return 1;
 }
@@ -1904,8 +1905,8 @@ static int load_juju_tensor_index_as_tensor_index(
                         return 0;
                     }
                     const uint64_t stream_bytes = tensor_stream_bytes(rec);
-                    if (stream_bytes > engine->max_tensor_stream_bytes) {
-                        engine->max_tensor_stream_bytes = stream_bytes;
+                    if (stream_bytes > engine->max_tensor_stream_bytes.load(std::memory_order_relaxed)) {
+                        engine->max_tensor_stream_bytes.store(stream_bytes, std::memory_order_relaxed);
                     }
                     tensor_slots_set(engine, (int)rec.info.layer, (int)rec.info.expert, rec.info.proj, engine->tensors.size());
                     expert_bytes_add(engine, (int)rec.info.layer, (int)rec.info.expert, stream_bytes);
@@ -1932,7 +1933,7 @@ static int load_juju_tensor_index_as_tensor_index(
         "[storagellm] JUJU tensor index loaded: records=%llu paths=%zu max_stream=%llu\n",
         (unsigned long long)records,
         engine->tensor_paths.size(),
-        (unsigned long long)engine->max_tensor_stream_bytes);
+        (unsigned long long)engine->max_tensor_stream_bytes.load(std::memory_order_relaxed));
     std::fflush(stderr);
     return 1;
 }
@@ -2002,7 +2003,7 @@ int moe_pc_engine_load_codec_table(
     engine->gguf_common_tensors.clear();
     engine->gguf_common_tensor_slots.clear();
     engine->tensor_paths.clear();
-    engine->max_tensor_stream_bytes = 0;
+    engine->max_tensor_stream_bytes.store(0, std::memory_order_relaxed);
     engine->common_raw_prefetched_bytes.store(0);
     engine->common_raw_prefetched_spans.store(0);
     engine->tensors.reserve(tensor_record_capacity(engine));
@@ -2180,8 +2181,8 @@ int moe_pc_engine_load_codec_table(
         rec.info.has_scale4 = rec.scale4_entry ? 1 : 0;
         finalize_tensor_layout(&rec);
         const uint64_t stream_bytes = tensor_stream_bytes(rec);
-        if (stream_bytes > engine->max_tensor_stream_bytes) {
-            engine->max_tensor_stream_bytes = stream_bytes;
+        if (stream_bytes > engine->max_tensor_stream_bytes.load(std::memory_order_relaxed)) {
+            engine->max_tensor_stream_bytes.store(stream_bytes, std::memory_order_relaxed);
         }
         tensor_slots_set(engine, (int)rec.info.layer, (int)rec.info.expert, rec.info.proj, engine->tensors.size());
         expert_bytes_add(engine, (int)rec.info.layer, (int)rec.info.expert, stream_bytes);

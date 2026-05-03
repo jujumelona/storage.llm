@@ -48,6 +48,7 @@ struct alignas(64) moe_io_atomic_stats {
     // New: Own cacheline (updated by all pinned_workers on every acquire attempt)
     // --- Cache line 8: staging slot contention (extremely hot) ---
     alignas(64) std::atomic<uint64_t> staging_slot_contention{0};
+    std::atomic<uint64_t> oversized_tensor_fallbacks{0};
     std::atomic<uint64_t> staging_slot_waits{0};
 
     // --- Cache line 9: status flags (read-mostly) ---

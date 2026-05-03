@@ -10,6 +10,8 @@
 #include <mutex>
 #include <string>
 
+#if defined(MOE_ENABLE_PAGED_KV) && MOE_ENABLE_PAGED_KV
+
 enum moe_request_phase_t {
     moe_REQ_WAITING,
     moe_REQ_PREFILL,
@@ -162,3 +164,10 @@ struct moe_continuous_batch_scheduler_t {
         }
     }
 };
+
+#else
+
+struct moe_batch_request_t {};
+struct moe_continuous_batch_scheduler_t {};
+
+#endif

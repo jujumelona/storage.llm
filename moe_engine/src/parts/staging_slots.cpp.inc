@@ -1,4 +1,6 @@
 #include <cassert>
+
+static void device_backend_event_destroy(moe_pc_engine* e, CUevent event);
 // BUGFIX 58/62: Issue 4A - Dynamic batch_max based on backend_caps ?�★
 // Problem: moe_gpu_stage_batch_max = 4 hardcoded
 // PCIe 5.0 x16: 4 too low (underutilizes bandwidth)
@@ -54,9 +56,19 @@ static void reset_staging_slots(moe_pc_engine* engine) {
                 "Staging slots will leak until engine shutdown.\n");
         // 최소한 ring_adapter를 drain 시도 (free는 하지 않음)
         engine->ring_adapter.drain_without_free();
-        // Restore free_slot_count to allow continued operation
-        engine->staging_free_slot_count.store(static_cast<uint32_t>(engine->staging_slots.size()),
-                                              std::memory_order_release);
+        engine->staging_slot_size = 0;
+        engine->staging_generation.fetch_add(1, std::memory_order_relaxed);
+        uint32_t free_slots = 0;
+        for (auto& slot : engine->staging_slots) {
+            if (slot.last_copy_event) {
+                device_backend_event_destroy(engine, slot.last_copy_event);
+                slot.last_copy_event = nullptr;
+            }
+            if (!slot.in_use.load(std::memory_order_acquire)) {
+                ++free_slots;
+            }
+        }
+        engine->staging_free_slot_count.store(free_slots, std::memory_order_release);
         return;
     }
 
@@ -65,6 +77,10 @@ static void reset_staging_slots(moe_pc_engine* engine) {
     // Slots are non-owning slices into engine->staging. The caller owns and
     // frees the single backing staging buffer when capacity/config changes.
     for (auto& slot : engine->staging_slots) {
+        if (slot.last_copy_event) {
+            device_backend_event_destroy(engine, slot.last_copy_event);
+            slot.last_copy_event = nullptr;
+        }
         slot.buf = nullptr;
         slot.size = 0;
     }
@@ -90,7 +106,9 @@ static uint64_t moe_staging_min_slot_bytes(const moe_pc_engine* engine) {
     // Old 64MB floor wasted ~44MB per slot for NVFP4 (~20MB triplets).
     const moe_storage_constants_t* storage = moe_storage_constants();
     const uint64_t bundle = storage ? storage->normal_bundle_max_bytes : 0ull;
-    const uint64_t base = engine ? std::max<uint64_t>(engine->max_tensor_stream_bytes, bundle) : bundle;
+    const uint64_t max_tensor_bytes = engine ?
+        engine->max_tensor_stream_bytes.load(std::memory_order_relaxed) : 0ull;
+    const uint64_t base = std::max<uint64_t>(max_tensor_bytes, bundle);
     const uint64_t padding = 4ull * 1024ull * 1024ull;
     uint64_t sz = base > 0 ? base + padding : padding;
     return (sz + 31ull) & ~31ull;
@@ -336,13 +354,15 @@ static int moe_ensure_staging_capacity(moe_pc_engine* engine, uint64_t required_
 
     bool new_pinned = false;
     bool new_numa = false;
+    bool new_device_host = false;
     uint64_t actual_bytes = 0;
     uint8_t* new_staging = allocate_best_staging(
         engine,
         required_bytes,
         &actual_bytes,
         &new_pinned,
-        &new_numa);
+        &new_numa,
+        &new_device_host);
     if (!new_staging) {
         fprintf(stderr,
             "[storageLLM WARNING] unable to grow staging from %llu to %llu bytes; keeping existing staging\n",
@@ -351,11 +371,13 @@ static int moe_ensure_staging_capacity(moe_pc_engine* engine, uint64_t required_
         return 0;
     }
 
-    free_staging(engine->staging, engine->staging_size, engine->staging_pinned, engine->staging_numa_allocated);
+    free_staging_for_engine(engine, engine->staging, engine->staging_size, engine->staging_pinned,
+                            engine->staging_numa_allocated, engine->staging_device_host_allocated);
     engine->staging = new_staging;
     engine->staging_size = actual_bytes;
     engine->staging_pinned = new_pinned;
     engine->staging_numa_allocated = new_numa;
+    engine->staging_device_host_allocated = new_device_host;
     engine->io_config.pinned_staging_bytes = actual_bytes;
     if (!new_pinned) {
         fprintf(stderr,
@@ -422,6 +444,10 @@ static void update_staging_slot_split_for_workers(moe_pc_engine* engine) {
 }
 
 static void configure_staging_slots(moe_pc_engine* engine) {
+    if (engine && engine->max_tensor_stream_bytes.load(std::memory_order_relaxed) == 0) {
+        assert(false && "tensor index must be built before configure_staging_slots");
+        return;
+    }
     reset_staging_slots(engine);
     if (!engine || !engine->staging || engine->staging_size == 0 ||
         engine_bypass_staging_pipeline(engine) ||
@@ -444,7 +470,8 @@ static void configure_staging_slots(moe_pc_engine* engine) {
     // max_tensor_stream_bytes must be set BEFORE configure_staging_slots is called.
     // It's set during tensor index parsing (safetensors manifest load).
     // If 0, slot size defaults to 4MB ??NVFP4 expert triplets (~20MB) fail to copy.
-    if (engine->max_tensor_stream_bytes == 0) {
+    const uint64_t max_tensor_bytes = engine->max_tensor_stream_bytes.load(std::memory_order_relaxed);
+    if (max_tensor_bytes == 0) {
         fprintf(stderr, "[storageLLM CRITICAL] configure_staging_slots called before "
             "max_tensor_stream_bytes was set. Tensors must be indexed first. "
             "Slot size will be 4MB, causing copy failures for large tensors.\n");
@@ -525,7 +552,7 @@ static void configure_staging_slots(moe_pc_engine* engine) {
         // Try to meet enforced minimum by reducing slot size
         const uint64_t reduced_slot_size = engine->staging_size / enforced_min_slots;
 
-        if (reduced_slot_size >= engine->max_tensor_stream_bytes) {
+        if (reduced_slot_size >= max_tensor_bytes) {
             // Can meet minimum by stripping padding
             slot_count = enforced_min_slots;
             slot_size = reduced_slot_size;
@@ -557,7 +584,7 @@ static void configure_staging_slots(moe_pc_engine* engine) {
                 (unsigned long long)required_staging);
 
             // Use what we can, but warn about structural shortage
-            if (slot_count < min_slots && engine->staging_size / min_slots >= engine->max_tensor_stream_bytes) {
+            if (slot_count < min_slots && engine->staging_size / min_slots >= max_tensor_bytes) {
                 slot_count = min_slots;
                 slot_size = engine->staging_size / slot_count;
             }
@@ -588,6 +615,7 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
         slot.size = i + 1 == slot_count ? engine->staging_size - offset : slot_size;
         slot.pinned = engine->staging_pinned;
         slot.numa_allocated = engine->staging_numa_allocated;
+        slot.device_host_allocated = engine->staging_device_host_allocated;
 #if defined(__APPLE__) && defined(__MACH__)
         if (engine->backend_caps.backend == moe_BACKEND_METAL) {
             slot.metal_buffer = metal_zero_copy_map(nullptr, slot.buf, slot.size);

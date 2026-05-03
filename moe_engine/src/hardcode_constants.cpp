@@ -32,6 +32,7 @@ static const moe_storage_constants_t kMoeStorageConstants = {
     1990656ull,
     150994944ull,
     5737807872ull,
+    12288ull,
     "GGUF-Offload",
     ".gguf",
     "GGUF"

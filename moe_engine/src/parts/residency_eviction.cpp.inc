@@ -229,6 +229,14 @@ static void demote_cold_until_impl(moe_pc_engine* engine, moe_tier_t tier, uint6
         return;
     }
 
+#ifndef NDEBUG
+    bool can_lock = engine->device_mutex.try_lock();
+    assert(can_lock && "compact_evict_heap called with device_mutex held (lock order violation)");
+    if (can_lock) {
+        engine->device_mutex.unlock();
+    }
+#endif
+
     compact_evict_heap(engine, idx);
 
     int max_attempts = 1000;

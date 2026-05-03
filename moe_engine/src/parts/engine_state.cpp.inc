@@ -1,4 +1,4 @@
-#if defined(__linux__) && defined(MOE_HAVE_LIBURING) && MOE_HAVE_LIBURING && defined(MOE_ENABLE_LEGACY_URING_STATE)
+#if defined(__linux__) && defined(MOE_HAVE_LIBURING) && MOE_HAVE_LIBURING
 #include <liburing.h>
 struct io_uring_state_t {
     struct io_uring ring;
@@ -23,6 +23,9 @@ struct moe_pc_engine {
     moe_io_atomic_stats io_atomic{};
     moe_backend_caps_t backend_caps{};
     moe_io_ring_adapter ring_adapter{};
+#if defined(__linux__) && defined(MOE_HAVE_LIBURING) && MOE_HAVE_LIBURING
+    io_uring_state_t uring_state{};
+#endif
     std::vector<moe_block_state> expert_states;
     std::vector<moe_tensor_record> tensors;
     std::vector<std::string> tensor_paths;
@@ -33,7 +36,7 @@ struct moe_pc_engine {
     std::vector<uint16_t> expert_prefetch_priorities;
     std::vector<uint8_t> expert_residency_hints;
     uint64_t avg_expert_bytes = 0;
-    uint64_t max_tensor_stream_bytes = 0;
+    std::atomic<uint64_t> max_tensor_stream_bytes{0};
     std::unordered_map<std::string, mmap_context_t*> shard_mmaps;
     std::unordered_map<uint64_t, mmap_context_t*> shard_mmaps_by_id;
     std::unordered_set<mmap_context_t*> locked_mmaps;
@@ -109,6 +112,7 @@ struct moe_pc_engine {
     uint64_t staging_size = 0;
     bool staging_pinned = false;
     bool staging_numa_allocated = false;
+    bool staging_device_host_allocated = false;
     std::vector<moe_staging_slot> staging_slots;
     uint64_t staging_slot_size = 0;
 #ifdef ENABLE_LOCKFREE_STAGING

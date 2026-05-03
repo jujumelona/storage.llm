@@ -46,6 +46,37 @@ static void device_account_bytes_freed(moe_pc_engine* e, uint64_t bytes) {
 // Problem: 60% hardcoded → M3 Max 128GB wastes 25GB (60%=76.8GB vs 80%=102.4GB)
 // Solution: Use io_config.metal_memory_budget_pct (0=auto, safe range 50-90)
 // Trade-off: >85% risks macOS memory pressure → swapping or app termination
+static void warn_device_budget_exhausted(
+    const moe_pc_engine* e,
+    uint64_t raw_budget,
+    uint64_t reserved_total,
+    uint64_t pending,
+    uint64_t kv_reserved,
+    uint64_t common_reserved
+) {
+    static std::atomic<int64_t> s_last_warn_ms{0};
+    const auto now = std::chrono::steady_clock::now();
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    int64_t last = s_last_warn_ms.load(std::memory_order_relaxed);
+    if (now_ms - last < 1000) {
+        return;
+    }
+    if (!s_last_warn_ms.compare_exchange_strong(last, now_ms, std::memory_order_relaxed)) {
+        return;
+    }
+    fprintf(stderr,
+        "[storageLLM WARNING] device_budget_bytes exhausted backend=%d raw=%llu reserved=%llu pending=%llu kv=%llu common=%llu allocated=%llu free=%llu configured=%llu\n",
+        e ? (int)e->backend_caps.backend : -1,
+        (unsigned long long)raw_budget,
+        (unsigned long long)reserved_total,
+        (unsigned long long)pending,
+        (unsigned long long)kv_reserved,
+        (unsigned long long)common_reserved,
+        (unsigned long long)(e ? e->device_allocated_bytes.load(std::memory_order_relaxed) : 0),
+        (unsigned long long)(e ? e->device_free_bytes.load(std::memory_order_relaxed) : 0),
+        (unsigned long long)(e ? e->config.vram_budget_bytes : 0));
+}
+
 static uint64_t device_budget_bytes(const moe_pc_engine* e) {
     if (!e) return 0;
 
@@ -68,7 +99,11 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
     }
 
     if (e->config.vram_budget_bytes) {
-        return e->config.vram_budget_bytes > reserved_total ? e->config.vram_budget_bytes - reserved_total : 0;
+        if (e->config.vram_budget_bytes <= reserved_total) {
+            warn_device_budget_exhausted(e, e->config.vram_budget_bytes, reserved_total, pending, kv_reserved, common_reserved);
+            return 0;
+        }
+        return e->config.vram_budget_bytes - reserved_total;
     }
     if (e->backend_caps.supports_unified_memory &&
         e->backend_caps.backend == moe_BACKEND_METAL) {
@@ -92,7 +127,11 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
             pct = 75ull;
         }
         const uint64_t raw_budget = (sys * pct) / 100ull;
-        return raw_budget > reserved_total ? raw_budget - reserved_total : 0;
+        if (raw_budget <= reserved_total) {
+            warn_device_budget_exhausted(e, raw_budget, reserved_total, pending, kv_reserved, common_reserved);
+            return 0;
+        }
+        return raw_budget - reserved_total;
     }
     const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
     const uint64_t free_b = e->device_free_bytes.load(std::memory_order_relaxed);
@@ -102,10 +141,18 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
         int64_t s_free = (int64_t)free_b;
         if (s_free < 0) s_free = 0;
         const uint64_t raw_budget = allocated > UINT64_MAX - (uint64_t)s_free ? UINT64_MAX : allocated + (uint64_t)s_free;
-        return raw_budget > reserved_total ? raw_budget - reserved_total : 0;
+        if (raw_budget <= reserved_total) {
+            warn_device_budget_exhausted(e, raw_budget, reserved_total, pending, kv_reserved, common_reserved);
+            return 0;
+        }
+        return raw_budget - reserved_total;
     }
     const uint64_t raw_budget = e->backend_caps.device_memory_bytes ? e->backend_caps.device_memory_bytes : e->backend_caps.recommended_vram_cache_bytes;
-    return raw_budget > reserved_total ? raw_budget - reserved_total : 0;
+    if (raw_budget <= reserved_total) {
+        warn_device_budget_exhausted(e, raw_budget, reserved_total, pending, kv_reserved, common_reserved);
+        return 0;
+    }
+    return raw_budget - reserved_total;
 }
 
 static uint64_t device_memory_headroom_pct(uint8_t configured) {
@@ -151,7 +198,6 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
     if (e && e->cuda.cuMemGetInfo && device_set_current(e) && e->cuda.cuMemGetInfo(&free_b, &total_b) == 0) {
         mem_queried = 1;
     } else if (e && e->hip.hipMemGetInfo && device_set_current(e) && e->hip.hipMemGetInfo(&free_b, &total_b) == 0) {
-        free_b = (free_b * 90ull) / 100ull;
         mem_queried = 1;
     } else if (e && e->backend_caps.backend == moe_BACKEND_VULKAN && e->vk.vkGetPhysicalDeviceMemoryProperties2 && e->vk.physicalDevice) {
         // BUGFIX 115: Vulkan memory query
@@ -203,7 +249,10 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
             total_b = calc_total;
             mem_queried = 1;
         }
-    } else if (e && e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO && e->ze.zeDeviceGetMemoryProperties && e->ze.device) {
+    } else if (e &&
+               (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
+                e->backend_caps.backend == moe_BACKEND_SYCL) &&
+               e->ze.zeDeviceGetMemoryProperties && e->ze.device) {
         // BUGFIX 115: Level Zero memory query
         struct ze_device_memory_properties_t_local {
             uint32_t stype;
@@ -223,7 +272,7 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
         } ext_props{};
         ext_props.stype = 0x0001000B; // ZE_STRUCTURE_TYPE_DEVICE_MEMORY_EXT_PROPERTIES
         ze_device_memory_properties_t_local mem_props{};
-        mem_props.stype = 0x1; // ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES
+        mem_props.stype = 0x7; // ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES
         mem_props.pNext = &ext_props;
         uint32_t count = 1;
         if (e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &mem_props) == 0) {
@@ -274,6 +323,9 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
             if (old < neg_delta) {
                 e->device_free_bytes.fetch_add(neg_delta - old, std::memory_order_relaxed);
             }
+        }
+        if (total_b > 0) {
+            e->backend_caps.device_memory_bytes = (uint64_t)total_b;
         }
         e->device_total_bytes.store((uint64_t)total_b);
     }

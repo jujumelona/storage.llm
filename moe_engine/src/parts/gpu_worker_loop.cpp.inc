@@ -54,7 +54,9 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
             // Impact: Reduces in-flight data, improves throughput on low-bandwidth systems
             const uint64_t byte_limit = engine->backend_caps.copy_stream_bytes_limit > 0
                 ? engine->backend_caps.copy_stream_bytes_limit
-                : (uint64_t)engine->backend_caps.copy_streams * 32ull * 1024ull * 1024ull;
+                : (engine->backend_caps.copy_streams > 0
+                    ? (uint64_t)engine->backend_caps.copy_streams * 32ull * 1024ull * 1024ull
+                    : 64ull * 1024ull * 1024ull);  // safe default for zero-copy-stream backends
 
             // BUGFIX: Check byte_limit BEFORE count to ensure byte-based throttling works
             while (!engine->gpu_stage.urgent_queue.empty()) {
@@ -66,7 +68,7 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 if (next_task.tensor_index >= 0 && (size_t)next_task.tensor_index < engine->tensors.size()) {
                     next_bytes = tensor_stream_bytes(engine->tensors[next_task.tensor_index]);
                 }
-                if (batch_bytes + next_bytes > byte_limit && batch_count > 0) {
+                if (byte_limit > 0 && batch_bytes + next_bytes > byte_limit && batch_count > 0) {
                     break;
                 }
                 batch_bytes += next_bytes;
@@ -86,7 +88,7 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 if (next_task.tensor_index >= 0 && (size_t)next_task.tensor_index < engine->tensors.size()) {
                     next_bytes = tensor_stream_bytes(engine->tensors[next_task.tensor_index]);
                 }
-                if (batch_bytes + next_bytes > byte_limit && batch_count > 0) {
+                if (byte_limit > 0 && batch_bytes + next_bytes > byte_limit && batch_count > 0) {
                     break;
                 }
                 batch_bytes += next_bytes;
@@ -109,19 +111,6 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         // While expert[i] computes on the primary stream, expert[i+1]'s
         // DMA can overlap on the secondary stream. This hides transfer
         // latency behind compute for consecutive expert execution.
-        CUstream dma_overlap_stream = nullptr;
-        if (batch_count > 1 &&
-            engine->backend_caps.supports_backend_async_api &&
-            engine->stream_pool_available.load(std::memory_order_acquire) > 0) {
-            std::lock_guard<std::mutex> lock(engine->stream_pool_mutex);
-            if (!engine->stream_pool.empty()) {
-                dma_overlap_stream = engine->stream_pool.back();
-                engine->stream_pool.pop_back();
-                engine->stream_pool_available.store(
-                    static_cast<uint32_t>(engine->stream_pool.size()),
-                    std::memory_order_release);
-            }
-        }
 
         for (uint32_t i = 0; i < batch_count; ++i) {
             terminal[i] = 1;
@@ -262,17 +251,6 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
 
         device_drain_deferred_staging_copies(engine, true);
 
-        // Return double-buffering DMA stream to pool after batch completes
-        if (dma_overlap_stream) {
-            // Sync the DMA stream before returning to ensure all transfers complete
-            device_backend_stream_sync(engine, dma_overlap_stream);
-            std::lock_guard<std::mutex> lock(engine->stream_pool_mutex);
-            engine->stream_pool.push_back(dma_overlap_stream);
-            engine->stream_pool_available.store(
-                static_cast<uint32_t>(engine->stream_pool.size()),
-                std::memory_order_release);
-            dma_overlap_stream = nullptr;
-        }
 
         // Successful async copies release their staging slot through per-copy events.
         // Failed copies never registered an event, so they are safe to release here.
@@ -280,24 +258,6 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
             if (batch[i].staging_slot != UINT32_MAX && !ok[i]) {
                 // Copy failed before async enqueue ??slot was NOT deferred, safe to release
                 release_staging_slot(engine, batch[i].staging_slot);
-            } else if (ok[i] == 1 && batch[i].tensor_index >= 0 && (size_t)batch[i].tensor_index < engine->tensors.size()) {
-#ifdef __linux__
-                mmap_context_t* shard = get_or_map_tensor_shard(engine, engine->tensors[batch[i].tensor_index]);
-                if (shard) {
-                    const auto& rec = engine->tensors[batch[i].tensor_index];
-                    const uint64_t ranges[][2] = {
-                        {rec.info.weight_byte_offset, rec.info.weight_byte_length},
-                        {rec.info.scale_byte_offset, rec.info.scale_byte_length},
-                        {rec.info.scale2_byte_offset, rec.info.scale2_byte_length},
-                    };
-                    for (const auto& range : ranges) {
-                        if (range[1] > 0) {
-                            void* ptr = mmap_get_ptr(shard, static_cast<size_t>(range[0]));
-                            if (ptr) madvise(ptr, static_cast<size_t>(range[1]), MADV_COLD);
-                        }
-                    }
-                }
-#endif
             }
         }
         for (uint32_t i = 0; i < batch_count; ++i) {

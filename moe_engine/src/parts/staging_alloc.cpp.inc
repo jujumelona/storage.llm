@@ -156,8 +156,74 @@ static void free_staging(uint8_t* ptr, uint64_t bytes, bool pinned, bool numa_al
 #endif
 }
 
-static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes, uint64_t* actual_bytes, bool* pinned, bool* numa_allocated) {
+static uint8_t* allocate_staging_for_engine(
+    moe_pc_engine* e,
+    int preferred_numa_node,
+    uint64_t bytes,
+    bool* pinned,
+    bool* numa_allocated,
+    bool* device_host_allocated
+) {
+    if (device_host_allocated) {
+        *device_host_allocated = false;
+    }
+    if (e &&
+        (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
+         e->backend_caps.backend == moe_BACKEND_SYCL) &&
+        e->ze.context && e->ze.zeMemAllocHost && bytes > 0) {
+        struct ze_host_mem_alloc_desc_t_local {
+            uint32_t stype;
+            const void* pNext;
+            uint32_t flags;
+        } host_desc{0x16u, nullptr, 0u}; // ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC
+        void* ptr = nullptr;
+        if (e->ze.zeMemAllocHost(e->ze.context, &host_desc, static_cast<size_t>(bytes), 4096u, &ptr) == 0 && ptr) {
+            if (pinned) {
+                *pinned = true;
+            }
+            if (numa_allocated) {
+                *numa_allocated = false;
+            }
+            if (device_host_allocated) {
+                *device_host_allocated = true;
+            }
+            static std::atomic<bool> logged_l0_host{false};
+            if (!logged_l0_host.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr,
+                    "[storageLLM INFO] Level Zero/SYCL staging: zeMemAllocHost OK (%llu bytes)\n",
+                    (unsigned long long)bytes);
+            }
+            return static_cast<uint8_t*>(ptr);
+        }
+    }
+    return allocate_staging(preferred_numa_node, bytes, pinned, numa_allocated);
+}
+
+static void free_staging_for_engine(
+    moe_pc_engine* e,
+    uint8_t* ptr,
+    uint64_t bytes,
+    bool pinned,
+    bool numa_allocated,
+    bool device_host_allocated
+) {
+    if (device_host_allocated && e && e->ze.context && e->ze.zeMemFree) {
+        e->ze.zeMemFree(e->ze.context, ptr);
+        return;
+    }
+    free_staging(ptr, bytes, pinned, numa_allocated);
+}
+
+static uint8_t* allocate_best_staging(
+    moe_pc_engine* e,
+    uint64_t requested_bytes,
+    uint64_t* actual_bytes,
+    bool* pinned,
+    bool* numa_allocated,
+    bool* device_host_allocated = nullptr
+) {
     if (numa_allocated) { *numa_allocated = false; }
+    if (device_host_allocated) { *device_host_allocated = false; }
     if (actual_bytes) {
         *actual_bytes = 0;
     }
@@ -167,9 +233,15 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
     uint64_t bytes = requested_bytes;
     prepare_windows_staging_working_set(requested_bytes);
     const uint64_t min_pinned = 1ull * 1024ull * 1024ull;
+    const bool prefer_device_host_staging = e &&
+        (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
+         e->backend_caps.backend == moe_BACKEND_SYCL) &&
+        e->ze.context && e->ze.zeMemAllocHost;
 #ifndef _WIN32
     struct rlimit memlock_limit {};
-    if (getrlimit(RLIMIT_MEMLOCK, &memlock_limit) == 0 && memlock_limit.rlim_cur != RLIM_INFINITY) {
+    if (!prefer_device_host_staging &&
+        getrlimit(RLIMIT_MEMLOCK, &memlock_limit) == 0 &&
+        memlock_limit.rlim_cur != RLIM_INFINITY) {
         const uint64_t limit = static_cast<uint64_t>(memlock_limit.rlim_cur);
         if (limit < min_pinned) {
             fprintf(stderr,
@@ -181,11 +253,13 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
                 e->io_atomic.nonpinned_fallback_count.fetch_add(1, std::memory_order_relaxed);
             }
             // Fallback: allocate non-pinned buffer
-            uint8_t* ptr = allocate_staging(
+            uint8_t* ptr = allocate_staging_for_engine(
+                e,
                 e ? e->backend_caps.preferred_numa_node : -1,
                 requested_bytes,
                 nullptr,
-                numa_allocated);
+                numa_allocated,
+                device_host_allocated);
             if (ptr) {
                 if (actual_bytes) {
                     *actual_bytes = requested_bytes;
@@ -206,17 +280,19 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
             if (e) {
                 e->io_atomic.nonpinned_fallback_count.fetch_add(1, std::memory_order_relaxed);
             }
-            uint8_t* ptr = allocate_staging(
+            uint8_t* ptr = allocate_staging_for_engine(
+                e,
                 e ? e->backend_caps.preferred_numa_node : -1,
                 requested_bytes,
                 nullptr,
-                numa_allocated);
+                numa_allocated,
+                device_host_allocated);
             if (ptr) {
                 if (actual_bytes) {
                     *actual_bytes = requested_bytes;
                 }
                 if (pinned) {
-                    *pinned = false;
+                    *pinned = device_host_allocated && *device_host_allocated;
                 }
                 return ptr;
             }
@@ -237,7 +313,14 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
     while (bytes >= min_pinned && retry_count < MAX_PINNED_RETRIES) {
         bool got_pinned = false;
         bool got_numa = false;
-        uint8_t* ptr = allocate_staging(e ? e->backend_caps.preferred_numa_node : -1, bytes, &got_pinned, &got_numa);
+        bool got_device_host = false;
+        uint8_t* ptr = allocate_staging_for_engine(
+            e,
+            e ? e->backend_caps.preferred_numa_node : -1,
+            bytes,
+            &got_pinned,
+            &got_numa,
+            &got_device_host);
         if (ptr && got_pinned) {
             if (actual_bytes) {
                 *actual_bytes = bytes;
@@ -248,6 +331,9 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
             if (numa_allocated) {
                 *numa_allocated = got_numa;
             }
+            if (device_host_allocated) {
+                *device_host_allocated = got_device_host;
+            }
             return ptr;
         }
         // Bug 12 Fix: Non-pinned success → free and try smaller pinned allocation.
@@ -255,7 +341,7 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
         // This ensures allocate_best_staging only returns pinned memory or NULL,
         // preventing silent sync DMA disguised as async.
         if (ptr) {
-            free_staging(ptr, bytes, false, got_numa);
+            free_staging_for_engine(e, ptr, bytes, false, got_numa, got_device_host);
         }
         bytes /= 2;
         ++retry_count;
@@ -274,17 +360,19 @@ static uint8_t* allocate_best_staging(moe_pc_engine* e, uint64_t requested_bytes
         (unsigned long long)(requested_bytes / (1024ull * 1024ull)));
 
     // Allocate non-pinned buffer as last resort
-    uint8_t* fallback_ptr = allocate_staging(
+    uint8_t* fallback_ptr = allocate_staging_for_engine(
+        e,
         e ? e->backend_caps.preferred_numa_node : -1,
         requested_bytes,
         nullptr,
-        numa_allocated);
+        numa_allocated,
+        device_host_allocated);
     if (fallback_ptr) {
         if (actual_bytes) {
             *actual_bytes = requested_bytes;
         }
         if (pinned) {
-            *pinned = false;
+            *pinned = device_host_allocated && *device_host_allocated;
         }
         return fallback_ptr;
     }

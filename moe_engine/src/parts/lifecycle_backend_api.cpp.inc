@@ -73,11 +73,13 @@ void moe_pc_engine_destroy(moe_pc_engine_t* engine) {
     // Workers may still reference staging_slots[i].buf in 5ms race window.
     // reset_staging_slots clears in_use flags and waits for workers to exit.
     reset_staging_slots(engine);
-    free_staging(engine->staging, engine->staging_size, engine->staging_pinned, engine->staging_numa_allocated);
+    free_staging_for_engine(engine, engine->staging, engine->staging_size, engine->staging_pinned,
+                            engine->staging_numa_allocated, engine->staging_device_host_allocated);
     engine->staging = nullptr;
     engine->staging_size = 0;
     engine->staging_pinned = false;
     engine->staging_numa_allocated = false;
+    engine->staging_device_host_allocated = false;
     delete engine;
 }
 

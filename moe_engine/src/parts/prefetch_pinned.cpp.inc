@@ -78,14 +78,20 @@ static int prefetch_tensor_file_to_pinned(
         // BUGFIX 문제3: Dynamic slot reallocation for oversized tensors ★★★
         // Problem: Oversized tensors silently fail forever, causing blocking sync loads
         // Solution: Attempt dynamic reallocation if tensor exceeds slot size
-        engine->io_atomic.staging_slot_contention.fetch_add(1, std::memory_order_relaxed);
+        engine->io_atomic.oversized_tensor_fallbacks.fetch_add(1, std::memory_order_relaxed);
 
         static std::atomic<uint64_t> s_last_warn_time_ms{0};
         const uint64_t now_ms = moe_profile_now_us() / 1000;
         const uint64_t last_warn = s_last_warn_time_ms.load(std::memory_order_relaxed);
 
         // Check if we should attempt reallocation
-        const bool should_try_realloc = total_bytes <= engine->staging_size / 2;
+        // BUGFIX: Check system free memory headroom before realloc to prevent OOM
+        // New buffer allocated BEFORE old one freed → temporarily uses 2× staging memory
+        const uint64_t sys_free = engine->backend_caps.system_memory_bytes > 0
+            ? (engine->backend_caps.system_memory_bytes * 85ull / 100ull)  // conservative estimate
+            : UINT64_MAX;
+        const bool enough_headroom = sys_free > total_bytes + 256ull * 1024ull * 1024ull;
+        const bool should_try_realloc = enough_headroom && total_bytes <= engine->staging_size / 2;
 
         if (should_try_realloc) {
             // BUGFIX Issue 2-3: Fix race condition in dynamic slot reallocation ★★★
@@ -94,9 +100,13 @@ static int prefetch_tensor_file_to_pinned(
             // Solution: New sequence "acquire new → if success, release old" prevents race.
             // Trade-off: Temporarily uses one extra slot worth of memory during reallocation.
 
-            // Update max_tensor_stream_bytes if this tensor is larger
-            if (total_bytes > engine->max_tensor_stream_bytes) {
-                engine->max_tensor_stream_bytes = total_bytes;
+            uint64_t observed_max = engine->max_tensor_stream_bytes.load(std::memory_order_relaxed);
+            while (total_bytes > observed_max &&
+                   !engine->max_tensor_stream_bytes.compare_exchange_weak(
+                       observed_max,
+                       total_bytes,
+                       std::memory_order_relaxed,
+                       std::memory_order_relaxed)) {
             }
 
             fprintf(stderr,
@@ -110,11 +120,14 @@ static int prefetch_tensor_file_to_pinned(
             // This prevents other workers from accessing memory being freed
             bool got_pinned = engine->staging_pinned;
             bool got_numa = engine->staging_numa_allocated;
-            uint8_t* new_buf = allocate_staging(
+            bool got_device_host = engine->staging_device_host_allocated;
+            uint8_t* new_buf = allocate_staging_for_engine(
+                engine,
                 engine->backend_caps.preferred_numa_node,
                 total_bytes,
                 &got_pinned,
-                &got_numa);
+                &got_numa,
+                &got_device_host);
 
             if (!new_buf) {
                 // Allocation failed - keep using old slot (graceful degradation)
@@ -129,14 +142,19 @@ static int prefetch_tensor_file_to_pinned(
             // Step 2: New buffer acquired successfully - now safe to release old buffer
             moe_staging_slot& slot = engine->staging_slots[slot_index];
             if (slot.buf) {
-                free_staging(slot.buf, slot.size, slot.pinned, slot.numa_allocated);
+                free_staging_for_engine(engine, slot.buf, slot.size, slot.pinned,
+                                        slot.numa_allocated, slot.device_host_allocated);
             }
 
             // Assign new buffer to current slot
-            slot.buf = new_buf;
-            slot.size = total_bytes;
-            slot.pinned = got_pinned;
-            slot.numa_allocated = got_numa;
+            {
+                std::lock_guard<std::mutex> lock(engine->staging_slot_mutex);
+                slot.buf = new_buf;
+                slot.size = total_bytes;
+                slot.pinned = got_pinned;
+                slot.numa_allocated = got_numa;
+                slot.device_host_allocated = got_device_host;
+            }
 
             // Check if reallocation succeeded
             if (slot_index < engine->staging_slots.size() &&
@@ -218,17 +236,9 @@ static int prefetch_tensor_file_to_pinned(
             // or blocking wait (Windows). io_worker has no other work during this wait, so blocking is fine.
             // Trade-off: None - blocking wait is correct behavior for synchronous I/O completion.
             while (completions < submits) {
-                void* data = engine->ring_adapter.peek_completion();
-                if (data) {
-                    completions++;
-                } else {
-                    // Yield once, then block wait if still no completion
-                    std::this_thread::yield();
-                    if (completions < submits) {
-                        data = engine->ring_adapter.wait_completion();
-                        if (data) completions++;
-                    }
-                }
+                void* data = engine->ring_adapter.wait_completion();
+                if (data) completions++;
+                else break;
             }
         }
     } else if (shard && mmap_get_ptr(shard, 0)) {
@@ -448,7 +458,8 @@ static int prefetch_tensor_ram_to_pinned(
             // BUGFIX 712: Increased MADV_COLD threshold to 30% ★★★
             // Problem: 15% threshold caused massive I/O spikes when RAM was almost exhausted.
             // Solution: Evict earlier at 30% to smooth out page cache eviction.
-            if (total > 0 && avail < total * 30ull / 100ull) {
+            const uint32_t threshold_pct = engine->io_config.madv_cold_threshold_pct;
+            if (total > 0 && avail < total * (uint64_t)threshold_pct / 100ull) {
                 madvise(const_cast<uint8_t*>(src), static_cast<size_t>(length), MADV_COLD);
             }
         }

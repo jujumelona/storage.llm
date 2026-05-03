@@ -301,17 +301,23 @@ static int prefetch_fixed_core_raw(moe_pc_engine* e) {
 
 static void trigger_ram_expert_promotion(moe_pc_engine* e) {
     if (!e) return;
-    const bool was_incomplete = !e->common_vram_upload_complete.exchange(true);
+    const uint64_t common_reserved = e->common_vram_reserved_bytes.load(std::memory_order_relaxed);
+    if (common_reserved > 0) {
+        e->vram_used_bytes.fetch_add(common_reserved, std::memory_order_release);
+    }
+    const bool was_incomplete = !e->common_vram_upload_complete.exchange(true, std::memory_order_acq_rel);
+    if (!was_incomplete && common_reserved > 0) {
+        e->vram_used_bytes.fetch_sub(common_reserved, std::memory_order_release);
+    }
     if (!was_incomplete) return;
-
-    e->vram_used_bytes.fetch_add(e->common_vram_reserved_bytes.load());
 
     const uint64_t vram_budget = tier_budget(e, moe_TIER_VRAM);
     const uint64_t vram_used = tier_used(e, moe_TIER_VRAM);
     if (vram_budget > vram_used) {
         const uint64_t vram_room = vram_budget - vram_used;
-        const uint64_t avg_expert_bytes = e->max_tensor_stream_bytes > 0
-            ? e->max_tensor_stream_bytes : 20ull * 1024ull * 1024ull;
+        const uint64_t max_tensor_bytes = e->max_tensor_stream_bytes.load(std::memory_order_relaxed);
+        const uint64_t avg_expert_bytes = max_tensor_bytes > 0
+            ? max_tensor_bytes : 20ull * 1024ull * 1024ull;
         const uint32_t max_promote = vram_room > 0 && avg_expert_bytes > 0
             ? std::min<uint32_t>(32u, (uint32_t)(vram_room / avg_expert_bytes)) : 0u;
         if (max_promote > 0) {

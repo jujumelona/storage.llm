@@ -75,6 +75,16 @@ struct moe_paged_kv_manager_t {
         if (layers > 1000) {
             return;
         }
+        if (b_size > 65536u) {
+            return;
+        }
+        const uint64_t data_bytes64 = (uint64_t)b_size * (uint64_t)layers * 512ull;
+        const uint64_t aux_bytes64 = (uint64_t)b_size * (uint64_t)layers * (uint64_t)sizeof(float);
+        if (data_bytes64 > (uint64_t)SIZE_MAX || aux_bytes64 > (uint64_t)SIZE_MAX) {
+            return;
+        }
+        const size_t data_bytes = (size_t)data_bytes64;
+        const size_t aux_bytes = (size_t)aux_bytes64;
         block_size = b_size;
         max_blocks = capacity_tokens / block_size;
         sink_token_count = sink_tokens; // BUGFIX 128: Store sink token count
@@ -94,9 +104,9 @@ struct moe_paged_kv_manager_t {
             blocks[i].pinned = (i < sink_blocks);
 
             // BUGFIX 171: Check malloc failure before using allocated memory
-            blocks[i].compressed_data = (uint8_t*)std::malloc(block_size * layers * 512);
-            blocks[i].scales = (float*)std::malloc(block_size * layers * sizeof(float));
-            blocks[i].zeros = (float*)std::malloc(block_size * layers * sizeof(float));
+            blocks[i].compressed_data = (uint8_t*)std::malloc(data_bytes);
+            blocks[i].scales = (float*)std::malloc(aux_bytes);
+            blocks[i].zeros = (float*)std::malloc(aux_bytes);
 
             // Check all allocations succeeded
             if (!blocks[i].compressed_data || !blocks[i].scales || !blocks[i].zeros) {
@@ -569,6 +579,10 @@ static void touch_kv_block_heat(
 
 // BUGFIX 문제4: Evict cold KV blocks from VRAM to RAM ★★★
 // Uses LRU + frequency scoring similar to expert eviction
+// BUGFIX 문제8: Added manager->mtx locking to prevent UAF ★★★
+// Without locking, concurrent attention threads can read block.vram_data
+// after cuMemFree completes but before nullptr assignment → Use-After-Free.
+// Strategy: collect candidates under lock → clear ptrs under lock → free VRAM outside lock.
 static uint32_t evict_cold_kv_blocks(
     moe_pc_engine* engine,
     moe_paged_kv_manager_t* manager,
@@ -582,78 +596,81 @@ static uint32_t evict_cold_kv_blocks(
     const uint32_t layers = moe_paged_kv_layer_count(engine);
     const uint64_t block_size = (uint64_t)manager->block_size * layers * (512 + 2 * sizeof(float));
 
-    std::vector<std::pair<uint32_t, float>> candidates;
-    candidates.reserve(manager->max_blocks);
+    // Phase 1: Collect eviction candidates and clear block pointers under lock.
+    // Attention threads check block.tier/vram_data under the same mtx,
+    // so clearing here prevents them from seeing freed pointers.
+    struct evict_victim_t {
+        uint32_t block_id;
+        void* vram_data;
+        void* vram_scales;
+        void* vram_zeros;
+    };
+    std::vector<evict_victim_t> victims;
 
-    // Collect VRAM blocks with scores
-    for (uint32_t i = 0; i < manager->max_blocks; ++i) {
-        moe_paged_kv_block_t& block = manager->blocks[i];
+    {
+        std::lock_guard<std::mutex> lock(manager->mtx);
+        std::vector<std::pair<uint32_t, float>> candidates;
+        candidates.reserve(manager->max_blocks);
 
-        if (block.tier != moe_TIER_VRAM || !block.vram_data) {
-            continue;
+        for (uint32_t i = 0; i < manager->max_blocks; ++i) {
+            moe_paged_kv_block_t& block = manager->blocks[i];
+            if (block.tier != moe_TIER_VRAM || !block.vram_data) continue;
+            if (block.pinned) continue;
+
+            const uint64_t age = now > block.last_access_epoch ? now - block.last_access_epoch : 0;
+            const float frequency = (float)block.access_count;
+            const float score = frequency / (1.0f + (float)age * 0.001f);
+            candidates.push_back({i, score});
         }
 
-        // Skip pinned blocks (sink tokens)
-        if (block.pinned) {
-            continue;
+        std::sort(candidates.begin(), candidates.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
+
+        uint64_t planned = 0;
+        for (const auto& [block_id, score] : candidates) {
+            if (planned >= bytes_needed) break;
+            moe_paged_kv_block_t& block = manager->blocks[block_id];
+            evict_victim_t v{};
+            v.block_id = block_id;
+            v.vram_data = block.vram_data;
+            v.vram_scales = block.vram_scales;
+            v.vram_zeros = block.vram_zeros;
+            // Atomically clear under lock so attention sees nullptr
+            block.vram_data = nullptr;
+            block.vram_scales = nullptr;
+            block.vram_zeros = nullptr;
+            block.tier = moe_TIER_RAM;
+            victims.push_back(v);
+            planned += block_size;
         }
-
-        // Calculate eviction score (lower = evict first)
-        const uint64_t age = now > block.last_access_epoch ? now - block.last_access_epoch : 0;
-        const float frequency = (float)block.access_count;
-        const float score = frequency / (1.0f + (float)age * 0.001f);
-
-        candidates.push_back({i, score});
     }
 
-    // Sort by score (ascending - coldest first)
-    std::sort(candidates.begin(), candidates.end(),
-        [](const auto& a, const auto& b) { return a.second < b.second; });
-
+    // Phase 2: Free VRAM outside lock (cuMemFree can block)
     uint64_t freed = 0;
     uint32_t evicted_count = 0;
 
-    for (const auto& [block_id, score] : candidates) {
-        if (freed >= bytes_needed) {
-            break;
+    for (const auto& v : victims) {
+        if (v.vram_data) {
+            if (engine->backend_caps.backend == moe_BACKEND_HIP)
+                engine->hip.hipFree((CUdeviceptr)v.vram_data);
+            else if (engine->backend_caps.backend == moe_BACKEND_CUDA)
+                engine->cuda.cuMemFree((CUdeviceptr)v.vram_data);
         }
-
-        moe_paged_kv_block_t& block = manager->blocks[block_id];
-
-        // Free VRAM allocations
-        if (block.vram_data) {
-            if (engine->backend_caps.backend == moe_BACKEND_HIP) {
-                engine->hip.hipFree((CUdeviceptr)block.vram_data);
-            } else if (engine->backend_caps.backend == moe_BACKEND_CUDA) {
-                engine->cuda.cuMemFree((CUdeviceptr)block.vram_data);
-            }
-            block.vram_data = nullptr;
+        if (v.vram_scales) {
+            if (engine->backend_caps.backend == moe_BACKEND_HIP)
+                engine->hip.hipFree((CUdeviceptr)v.vram_scales);
+            else if (engine->backend_caps.backend == moe_BACKEND_CUDA)
+                engine->cuda.cuMemFree((CUdeviceptr)v.vram_scales);
         }
-        if (block.vram_scales) {
-            if (engine->backend_caps.backend == moe_BACKEND_HIP) {
-                engine->hip.hipFree((CUdeviceptr)block.vram_scales);
-            } else if (engine->backend_caps.backend == moe_BACKEND_CUDA) {
-                engine->cuda.cuMemFree((CUdeviceptr)block.vram_scales);
-            }
-            block.vram_scales = nullptr;
-        }
-        if (block.vram_zeros) {
-            if (engine->backend_caps.backend == moe_BACKEND_HIP) {
-                engine->hip.hipFree((CUdeviceptr)block.vram_zeros);
-            } else if (engine->backend_caps.backend == moe_BACKEND_CUDA) {
-                engine->cuda.cuMemFree((CUdeviceptr)block.vram_zeros);
-            }
-            block.vram_zeros = nullptr;
+        if (v.vram_zeros) {
+            if (engine->backend_caps.backend == moe_BACKEND_HIP)
+                engine->hip.hipFree((CUdeviceptr)v.vram_zeros);
+            else if (engine->backend_caps.backend == moe_BACKEND_CUDA)
+                engine->cuda.cuMemFree((CUdeviceptr)v.vram_zeros);
         }
         device_account_bytes_freed(engine, block_size);
-
-        // Demote to RAM
-        block.tier = moe_TIER_RAM;
-
         freed += block_size;
         evicted_count++;
-
-        // Update budgets
         engine->vram_kv_used_bytes.fetch_sub(block_size, std::memory_order_relaxed);
         engine->device_kv_cache_bytes.fetch_sub(block_size, std::memory_order_relaxed);
     }

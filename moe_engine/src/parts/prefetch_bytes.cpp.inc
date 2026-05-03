@@ -265,9 +265,19 @@ try_next_lockfree_slot:
                 }
 
                 std::unique_lock<std::mutex> lock(engine->staging_slot_mutex);
+                // BUGFIX 문제11: Fix CV wait predicate for >64 staging slots ★★★
+                // Problem: staging_slot_free_mask is uint64_t → only 64 slots representable.
+                // When total_slots > 64, range_mask == 0, so (mask & range_mask) is always false.
+                // CV wait always times out even when slots are actually free.
+                // Solution: Fall back to staging_free_slot_count for >64 slot configurations.
                 if (target_cv->wait_for(
                         lock, std::chrono::milliseconds(10),
-                        [&]() { return (engine->staging_slot_free_mask.load(std::memory_order_acquire) & range_mask) != 0; }
+                        [&]() {
+                            if (total_slots <= 64u)
+                                return (engine->staging_slot_free_mask.load(std::memory_order_acquire) & range_mask) != 0;
+                            else
+                                return engine->staging_free_slot_count.load(std::memory_order_acquire) > 0u;
+                        }
                     )) {
                     // Slot became available during wait, retry acquisition
                     retry_count = 0;
@@ -298,9 +308,15 @@ try_next_lockfree_slot:
             // Still allows reasonable wait but prevents long GPU starvation
             // Impact: GPU idle time reduced from 100ms → 20ms worst case
             std::unique_lock<std::mutex> lock(engine->staging_slot_mutex);
+            // BUGFIX 문제11: Fix CV wait predicate for >64 staging slots ★★★
             target_cv->wait_for(
                 lock, std::chrono::milliseconds(1),
-                [&]() { return (engine->staging_slot_free_mask.load(std::memory_order_acquire) & range_mask) != 0; }
+                [&]() {
+                    if (total_slots <= 64u)
+                        return (engine->staging_slot_free_mask.load(std::memory_order_acquire) & range_mask) != 0;
+                    else
+                        return engine->staging_free_slot_count.load(std::memory_order_acquire) > 0u;
+                }
             );
         }
     }

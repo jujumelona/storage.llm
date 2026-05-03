@@ -30,6 +30,7 @@ typedef struct {
     uint64_t raw_tensor_normalization_bytes;
     uint64_t raw_tensor_other_bytes;
     uint64_t raw_tensor_shared_expert_bytes;
+    uint64_t runtime_state_bytes;
     const char* storage_repo;
     const char* extension;
     const char* magic;

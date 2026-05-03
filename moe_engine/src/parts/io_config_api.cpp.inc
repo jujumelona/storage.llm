@@ -4,15 +4,20 @@
     }
     stop_io_workers(engine);
     reset_staging_slots(engine);
-    free_staging(engine->staging, engine->staging_size, engine->staging_pinned, engine->staging_numa_allocated);
+    free_staging_for_engine(engine, engine->staging, engine->staging_size, engine->staging_pinned,
+                            engine->staging_numa_allocated, engine->staging_device_host_allocated);
     engine->staging = nullptr;
     engine->staging_size = 0;
     engine->staging_pinned = false;
     engine->pending_ram_reservation.store(0, std::memory_order_relaxed);
     engine->staging_numa_allocated = false;
+    engine->staging_device_host_allocated = false;
 
     const int using_default_io_config = config ? 0 : 1;
     engine->io_config = config ? *config : moe_pc_default_io_config();
+    if (engine->backend_caps.backend == moe_BACKEND_METAL) {
+        engine->io_config.enable_pinned_host = 0;
+    }
     const int staging_bypass = engine_bypass_staging_pipeline(engine);
     const int dma_gpu_backend =
         engine->backend_caps.backend == moe_BACKEND_CUDA ||
@@ -41,8 +46,9 @@
     }
     if (!staging_bypass && engine->backend_caps.supports_pinned_host) {
         const uint32_t streams = std::max<uint32_t>(engine->backend_caps.copy_streams, 1u);
-        uint64_t tensor_bytes = engine->max_tensor_stream_bytes ?
-            engine->max_tensor_stream_bytes : normal_bundle_max_or(32ull * 1024ull * 1024ull);
+        const uint64_t max_tensor_bytes = engine->max_tensor_stream_bytes.load(std::memory_order_relaxed);
+        uint64_t tensor_bytes = max_tensor_bytes ?
+            max_tensor_bytes : normal_bundle_max_or(32ull * 1024ull * 1024ull);
         uint64_t staging_target = tensor_bytes <= UINT64_MAX / streams ? tensor_bytes * streams : UINT64_MAX;
         staging_target = staging_target <= UINT64_MAX / 4ull ? staging_target * 4ull : UINT64_MAX;
         staging_target = std::max<uint64_t>(staging_target, engine->backend_caps.recommended_pinned_bytes);
@@ -163,7 +169,8 @@
             requested_staging_bytes,
             &engine->staging_size,
             &engine->staging_pinned,
-            &engine->staging_numa_allocated
+            &engine->staging_numa_allocated,
+            &engine->staging_device_host_allocated
         );
         if (!engine->staging) {
             engine->io_config.enable_pinned_host = 0;
@@ -182,7 +189,7 @@
         }
         if (engine->staging) {
             std::memset(engine->staging, 0, static_cast<size_t>(std::min<uint64_t>(engine->staging_size, 4096)));
-            if (engine->max_tensor_stream_bytes > 0) {
+            if (engine->max_tensor_stream_bytes.load(std::memory_order_relaxed) > 0) {
                 configure_staging_slots(engine);
             } else {
                 update_staging_slot_deficit(engine);

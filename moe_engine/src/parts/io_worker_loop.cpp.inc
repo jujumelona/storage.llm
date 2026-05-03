@@ -216,8 +216,9 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
 
             // gpu_stage idle AND pinned_stage underutilized → increase pinned cap
             if (gpu_depth < 4 && pin_depth < engine->pinned_stage_depth_cap * 3 / 10) {
-                const uint32_t max_pin_cap = std::min(base * 2,
-                    (uint32_t)(engine->staging_size / (1024 * 1024)));  // Limit by staging memory
+                const uint32_t max_pin_cap = std::min({base * 2,
+                    (uint32_t)engine->staging_slots.size(),    // never exceed actual slot count
+                    engine->disk_stage_depth_cap * 2});        // disk supply can't feed more
                 const uint32_t new_pin_cap = std::min(
                     engine->pinned_stage_depth_cap * 5 / 4,
                     max_pin_cap
@@ -687,7 +688,13 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                         continue;
                     }
                 }
-                ok = prefetch_tensor_disk_to_ram(engine, rec);
+                ok = prefetch_tensor_disk_to_ram(
+                    engine,
+                    rec,
+                    task.target_tier == moe_TIER_VRAM &&
+                    engine->io_config.enable_multistage_pipeline &&
+                    engine->staging &&
+                    engine->ring_adapter.initialized);
                 if (ok && task.target_tier == moe_TIER_VRAM &&
                     engine->io_config.enable_multistage_pipeline && engine->staging) {
                     if (active_path == moe_IO_PATH_ZERO_COPY_HOST) {

@@ -104,6 +104,7 @@ typedef struct {
     uint32_t staging_slot_deficit;
     uint64_t staging_slot_waits;
     uint64_t staging_slot_contention;
+    uint64_t oversized_tensor_fallbacks;
     uint64_t recommended_staging_bytes;
     uint64_t topology_predictions;
     uint64_t topology_updates;

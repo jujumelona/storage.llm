@@ -34,6 +34,14 @@ struct moe_cufile_error_t {
 };
 typedef long long (*moe_cufile_read_fn)(void*, void*, size_t, int64_t, int64_t);
 typedef int (*moe_hip_device_get_attribute_fn)(int*, int, int);
+typedef int (*moe_ze_init_fn)(uint32_t);
+typedef int (*moe_ze_driver_get_fn)(uint32_t*, void**);
+typedef int (*moe_ze_device_get_fn)(void*, uint32_t*, void**);
+typedef int (*moe_ze_context_create_fn)(void*, const void*, void**);
+typedef int (*moe_ze_context_destroy_fn)(void*);
+typedef int (*moe_ze_mem_alloc_host_fn)(void*, const void*, size_t, size_t, void**);
+typedef int (*moe_ze_mem_free_fn)(void*, void*);
+typedef int (*moe_ze_device_get_memory_properties_fn)(void*, uint32_t*, void*);
 
 struct moe_cuda_driver_api {
     void* library = nullptr;
@@ -120,9 +128,16 @@ struct moe_hip_driver_api {
 // Level Zero basic API hooks
 struct moe_level_zero_driver_api {
     void* library = nullptr;
+    void* driver = nullptr;
     void* context = nullptr;
     void* device = nullptr;
-    void* (*zeInit)(int, void*) = nullptr;
+    moe_ze_init_fn zeInit = nullptr;
+    moe_ze_driver_get_fn zeDriverGet = nullptr;
+    moe_ze_device_get_fn zeDeviceGet = nullptr;
+    moe_ze_context_create_fn zeContextCreate = nullptr;
+    moe_ze_context_destroy_fn zeContextDestroy = nullptr;
+    moe_ze_mem_alloc_host_fn zeMemAllocHost = nullptr;
+    moe_ze_mem_free_fn zeMemFree = nullptr;
     void* (*zeCommandQueueCreate)(void*, void*, void*, void**) = nullptr;
     void* (*zeCommandQueueDestroy)(void*) = nullptr;
     void* (*zeCommandQueueSynchronize)(void*, uint64_t) = nullptr;
@@ -131,7 +146,7 @@ struct moe_level_zero_driver_api {
     void* (*zeEventHostSynchronize)(void*, uint64_t) = nullptr;
     void* (*zeEventQueryStatus)(void*) = nullptr;
     void* (*zeCommandListAppendMemoryCopy)(void*, void*, const void*, size_t, void*, uint32_t, void**) = nullptr;
-    void* (*zeDeviceGetMemoryProperties)(void*, uint32_t*, void*) = nullptr;
+    moe_ze_device_get_memory_properties_fn zeDeviceGetMemoryProperties = nullptr;
 };
 
 // Vulkan basic API hooks

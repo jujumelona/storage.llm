@@ -146,6 +146,7 @@ int moe_pc_engine_eval_token_ids(
 );
 
 // Continuous Batching API
+#if defined(MOE_ENABLE_PAGED_KV) && MOE_ENABLE_PAGED_KV
 int moe_pc_engine_submit_request(
     moe_pc_engine_t* engine,
     uint64_t request_id,
@@ -154,6 +155,7 @@ int moe_pc_engine_submit_request(
 );
 
 int moe_pc_engine_step_batch(moe_pc_engine_t* engine);
+#endif
 
 int moe_pc_engine_find_raw_tensor(
     moe_pc_engine_t* engine,

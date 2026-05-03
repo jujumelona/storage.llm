@@ -55,6 +55,7 @@ typedef struct {
     int enable_lookahead_prefetch;
     int enable_topology_prefetch;
     int enable_mmap_prefetch;
+    int enable_bw_benchmark;
     int enable_pinned_host;
     int enable_directstorage;
     int enable_gpudirect_storage;
@@ -64,6 +65,7 @@ typedef struct {
     uint8_t vram_eviction_threshold_pct;
     uint8_t ram_eviction_threshold_pct;
     uint8_t attention_prefetch_threshold_pct;
+    uint8_t madv_cold_threshold_pct;
     uint8_t metal_memory_budget_pct;  // Metal unified-memory budget percentage (0=auto, safe range 50-90)
     uint8_t vulkan_memory_headroom_pct;  // Vulkan free-memory headroom percentage (0=default 10)
     uint8_t level_zero_memory_headroom_pct;  // Level Zero free-memory headroom percentage (0=default 10)

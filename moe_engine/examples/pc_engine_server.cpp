@@ -2445,6 +2445,7 @@ static void print_usage() {
         << "  moe_pc_engine_server --model-root path\n"
         << "\n"
         << "Backend, platform, RAM, VRAM, and local API mode are detected automatically.\n"
+        << "Use --backend auto|cpu|cuda|hip|metal|vulkan|levelzero|sycl and --platform auto|linux|windows|mac|cpu to override.\n"
         << "QKV is the default KV cache path; qkv/--qkv is accepted for compatibility.\n"
         << "\n"
         << "Endpoints:\n"
@@ -2455,6 +2456,35 @@ static void print_usage() {
         << "  POST /v1/responses\n"
         << "  POST /v1/storagellm/eval\n"
         << "  GET  /openclaw/config\n";
+}
+
+static moe_backend_t parse_backend_name(const char* name) {
+    if (!name || std::strcmp(name, "auto") == 0) return moe_BACKEND_AUTO;
+    if (std::strcmp(name, "cpu") == 0) return moe_BACKEND_CPU;
+    if (std::strcmp(name, "cuda") == 0 || std::strcmp(name, "nvidia") == 0) return moe_BACKEND_CUDA;
+    if (std::strcmp(name, "hip") == 0 || std::strcmp(name, "rocm") == 0 || std::strcmp(name, "amd") == 0) return moe_BACKEND_HIP;
+    if (std::strcmp(name, "metal") == 0) return moe_BACKEND_METAL;
+    if (std::strcmp(name, "vulkan") == 0) return moe_BACKEND_VULKAN;
+    if (std::strcmp(name, "directml") == 0) return moe_BACKEND_DIRECTML;
+    if (std::strcmp(name, "opencl") == 0) return moe_BACKEND_OPENCL;
+    if (std::strcmp(name, "levelzero") == 0 ||
+        std::strcmp(name, "level_zero") == 0 ||
+        std::strcmp(name, "level-zero") == 0 ||
+        std::strcmp(name, "intel") == 0) {
+        return moe_BACKEND_LEVEL_ZERO;
+    }
+    if (std::strcmp(name, "sycl") == 0 || std::strcmp(name, "oneapi") == 0) return moe_BACKEND_SYCL;
+    if (std::strcmp(name, "webgpu") == 0) return moe_BACKEND_WEBGPU;
+    return moe_BACKEND_AUTO;
+}
+
+static moe_platform_t parse_platform_name(const char* name) {
+    if (!name || std::strcmp(name, "auto") == 0) return moe_PLATFORM_AUTO;
+    if (std::strcmp(name, "windows") == 0 || std::strcmp(name, "win") == 0) return moe_PLATFORM_WINDOWS_PC;
+    if (std::strcmp(name, "linux") == 0) return moe_PLATFORM_LINUX_PC;
+    if (std::strcmp(name, "mac") == 0 || std::strcmp(name, "apple") == 0 || std::strcmp(name, "darwin") == 0) return moe_PLATFORM_MACOS_APPLE;
+    if (std::strcmp(name, "cpu") == 0 || std::strcmp(name, "cpu_only") == 0) return moe_PLATFORM_CPU_ONLY;
+    return moe_PLATFORM_AUTO;
 }
 
 static server_options parse_args(int argc, char** argv) {
@@ -2474,6 +2504,10 @@ static server_options parse_args(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--model-id") == 0 && i + 1 < argc) {
             opts.model_id = argv[++i];
             opts.model_id_explicit = true;
+        } else if (std::strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+            opts.engine_config.preferred_backend = parse_backend_name(argv[++i]);
+        } else if (std::strcmp(argv[i], "--platform") == 0 && i + 1 < argc) {
+            opts.engine_config.platform = parse_platform_name(argv[++i]);
         } else if (std::strcmp(argv[i], "--allow-remote") == 0) {
             opts.allow_remote = true;
         } else if (std::strcmp(argv[i], "--qkv") == 0 || std::strcmp(argv[i], "qkv") == 0) {

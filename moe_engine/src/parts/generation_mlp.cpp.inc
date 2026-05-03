@@ -1215,15 +1215,22 @@ static int moe_layer_moe_mlp_f32(
     }
 
     // BUGFIX 문제10: Renormalize weights when some experts are missing ★★
-    // If some experts failed to map, zero their weights and renormalize remaining
-    if (missing_experts > 0 || shape_mismatch_experts > 0 || map_failed_experts > 0) {
+    // If some experts failed to map, zero their weights. Renormalize only when router weights are normalized.
+    const uint32_t failed_experts = missing_experts + shape_mismatch_experts + map_failed_experts;
+    if (failed_experts > 0) {
+        const int use_sigmoid = moe_router_uses_sigmoid_scores(engine);
+        const int norm_topk = moe_router_norm_topk_prob(engine, use_sigmoid);
         float weight_sum = 0.0f;
         for (size_t e = 0; e < num_selected; ++e) {
             if (expert_ok[e].load(std::memory_order_acquire)) {
                 weight_sum += work[e].weight;
             }
         }
-        // Renormalize available expert weights to sum to original total
+        // BUGFIX 문제10b: Always renormalize when experts fail, not just norm_topk ★★★
+        // Problem: softmax router (norm_topk=false) zeroes failed expert weight but
+        // leaves remaining weights unchanged. Sum drops to ~0.875 per missing expert,
+        // cumulative bias across 79 MoE layers degrades output quality significantly.
+        // Solution: Renormalize unconditionally when any expert fails.
         if (weight_sum > 1e-9f) {
             const float scale = 1.0f / weight_sum;
             for (size_t e = 0; e < num_selected; ++e) {
@@ -1235,9 +1242,17 @@ static int moe_layer_moe_mlp_f32(
             }
             std::fprintf(stderr,
                 "[storagellm mlp] renormalized weights layer=%d selected=%zu mapped=%u missing=%u weight_sum=%.6f scale=%.6f\n",
-                layer, num_selected, mapped_experts,
-                missing_experts + shape_mismatch_experts + map_failed_experts,
-                weight_sum, scale);
+                layer, num_selected, mapped_experts, failed_experts, weight_sum, scale);
+        } else {
+            // All remaining experts have zero weight — nothing to renormalize
+            for (size_t e = 0; e < num_selected; ++e) {
+                if (!expert_ok[e].load(std::memory_order_acquire)) {
+                    work[e].weight = 0.0f;
+                }
+            }
+            std::fprintf(stderr,
+                "[storagellm mlp] zeroed failed expert weights (weight_sum≈0) layer=%d selected=%zu mapped=%u missing=%u use_sigmoid=%d norm_topk=%d weight_sum=%.6f\n",
+                layer, num_selected, mapped_experts, failed_experts, use_sigmoid, norm_topk, weight_sum);
         }
     }
     const uint32_t expert_intermediate = gate_rows;

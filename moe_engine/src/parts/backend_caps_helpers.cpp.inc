@@ -231,7 +231,7 @@ static void fill_cuda_backend_caps(moe_backend_caps_t* caps) {
                     (unsigned long long)(total_bytes / (1024*1024)));
             caps->device_memory_bytes = caps->recommended_vram_cache_bytes;
         } else {
-            caps->device_memory_bytes = free_bytes;
+            caps->device_memory_bytes = total_bytes > 0 ? total_bytes : free_bytes;
             caps->recommended_vram_cache_bytes = std::max<uint64_t>(
                 caps->recommended_vram_cache_bytes,
                 moe_budget_from_free_device_memory(free_bytes)
@@ -271,7 +271,7 @@ static void fill_hip_backend_caps(moe_backend_caps_t* caps) {
                     (unsigned long long)(total_bytes / (1024*1024)));
             caps->device_memory_bytes = caps->recommended_vram_cache_bytes;
         } else {
-            caps->device_memory_bytes = free_bytes;
+            caps->device_memory_bytes = total_bytes > 0 ? total_bytes : free_bytes;
             caps->recommended_vram_cache_bytes = std::max<uint64_t>(
                 caps->recommended_vram_cache_bytes,
                 moe_budget_from_free_device_memory(free_bytes)
