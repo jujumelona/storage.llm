@@ -135,7 +135,11 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
     const auto now = std::chrono::steady_clock::now();
     int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     int64_t last = e->last_mem_query_ms.load(std::memory_order_relaxed);
-    const int64_t throttle_ms = retry_path ? 1000 : 5000;
+    const bool external_budget_backend =
+        e->backend_caps.backend == moe_BACKEND_VULKAN ||
+        e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
+        e->backend_caps.backend == moe_BACKEND_SYCL;
+    const int64_t throttle_ms = retry_path || external_budget_backend ? 1000 : 5000;
     if (now_ms - last < throttle_ms) {
         return;
     }

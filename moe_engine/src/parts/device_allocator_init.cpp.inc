@@ -75,7 +75,13 @@ static int device_allocator_init(moe_pc_engine* e) {
             ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
         if (e->io_config.metal_memory_budget_pct == 0) {
             const uint64_t sys_gb = sys / (1024ull * 1024ull * 1024ull);
-            e->io_config.metal_memory_budget_pct = 75u;
+            uint64_t auto_pct = 75u;
+            if (sys_gb >= 64ull) {
+                auto_pct = 80u;
+            } else if (sys_gb >= 32ull) {
+                auto_pct = 77u;
+            }
+            e->io_config.metal_memory_budget_pct = (uint8_t)auto_pct;
             fprintf(stderr,
                 "[storageLLM INFO] Auto-detected Metal unified-memory budget: %u%% for %llu GB system memory\n",
                 (unsigned)e->io_config.metal_memory_budget_pct,
@@ -89,10 +95,98 @@ static int device_allocator_init(moe_pc_engine* e) {
         e->device_total_bytes.store(e->backend_caps.device_memory_bytes);
         // BUGFIX 124: Disable RAM budget for Metal - unified memory tracked in VRAM budget only
         e->config.ram_budget_bytes = 0;
-    } else if (e->backend_caps.backend == moe_BACKEND_VULKAN ||
-               e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
-               e->backend_caps.backend == moe_BACKEND_SYCL) {
-        // Vulkan/Level Zero/SYCL: use reported device memory or fallback
+    } else if (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO) {
+        if (e->backend_caps.device_memory_bytes == 0) {
+            e->backend_caps.device_memory_bytes = e->backend_caps.system_memory_bytes > 0
+                ? e->backend_caps.system_memory_bytes : 16ull * 1024ull * 1024ull * 1024ull;
+        }
+        uint64_t free_mem = 0;
+        uint64_t total_mem = e->backend_caps.device_memory_bytes;
+        if (e->ze.zeDeviceGetMemoryProperties && e->ze.device) {
+            struct ze_device_memory_properties_t_local {
+                uint32_t stype;
+                void* pNext;
+                uint32_t flags;
+                uint32_t maxClockRate;
+                uint32_t maxBusWidth;
+                uint64_t totalSize;
+                char name[256];
+            };
+            struct ze_device_memory_ext_properties_t_local {
+                uint32_t stype;
+                void* pNext;
+                uint32_t type;
+                uint64_t physicalSize;
+                uint64_t allocatedSize;
+            } ext_props{};
+            ext_props.stype = 0x0001000B;
+            ze_device_memory_properties_t_local mem_props{};
+            mem_props.stype = 0x1;
+            mem_props.pNext = &ext_props;
+            uint32_t count = 1;
+            if (e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &mem_props) == 0 &&
+                mem_props.totalSize > 0) {
+                total_mem = mem_props.totalSize;
+                if (ext_props.allocatedSize > 0) {
+                    const uint64_t avail = mem_props.totalSize > ext_props.allocatedSize
+                        ? mem_props.totalSize - ext_props.allocatedSize : mem_props.totalSize;
+                    free_mem = (avail * 90ull) / 100ull;
+                } else {
+                    free_mem = (mem_props.totalSize * 85ull) / 100ull;
+                }
+            }
+        }
+        if (free_mem == 0) {
+            free_mem = (e->backend_caps.device_memory_bytes * 85ull) / 100ull;
+        }
+        e->device_free_bytes.store(free_mem);
+        e->device_total_bytes.store(total_mem);
+    } else if (e->backend_caps.backend == moe_BACKEND_SYCL) {
+        if (e->backend_caps.device_memory_bytes == 0) {
+            e->backend_caps.device_memory_bytes = e->backend_caps.system_memory_bytes > 0
+                ? e->backend_caps.system_memory_bytes : 16ull * 1024ull * 1024ull * 1024ull;
+        }
+        uint64_t free_mem = 0;
+        uint64_t total_mem = e->backend_caps.device_memory_bytes;
+        if (e->ze.zeDeviceGetMemoryProperties && e->ze.device) {
+            struct ze_device_memory_properties_t_local {
+                uint32_t stype;
+                void* pNext;
+                uint32_t flags;
+                uint32_t maxClockRate;
+                uint32_t maxBusWidth;
+                uint64_t totalSize;
+                char name[256];
+            };
+            struct ze_device_memory_ext_properties_t_local {
+                uint32_t stype;
+                void* pNext;
+                uint32_t type;
+                uint64_t physicalSize;
+                uint64_t allocatedSize;
+            } ext_props{};
+            ext_props.stype = 0x0001000B;
+            ze_device_memory_properties_t_local mem_props{};
+            mem_props.stype = 0x1;
+            mem_props.pNext = &ext_props;
+            uint32_t count = 1;
+            if (e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &mem_props) == 0 &&
+                mem_props.totalSize > 0) {
+                total_mem = mem_props.totalSize;
+                if (ext_props.allocatedSize > 0) {
+                    const uint64_t avail = mem_props.totalSize > ext_props.allocatedSize
+                        ? mem_props.totalSize - ext_props.allocatedSize : mem_props.totalSize;
+                    free_mem = (avail * 90ull) / 100ull;
+                }
+            }
+        }
+        if (free_mem == 0) {
+            free_mem = (e->backend_caps.device_memory_bytes * 85ull) / 100ull;
+        }
+        e->device_free_bytes.store(free_mem);
+        e->device_total_bytes.store(total_mem);
+    } else if (e->backend_caps.backend == moe_BACKEND_VULKAN) {
+        // Vulkan: use reported device memory or fallback
         if (e->backend_caps.device_memory_bytes == 0) {
             e->backend_caps.device_memory_bytes = e->backend_caps.system_memory_bytes > 0
                 ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;

@@ -6,6 +6,17 @@ static float policy_gpu_target(moe_execution_policy_t policy) {
     return policy == moe_EXECUTION_PERFORMANCE ? 96.0f : policy == moe_EXECUTION_LOW_IMPACT ? 60.0f : 85.0f;
 }
 
+static void refresh_external_gpu_memory_budget_if_due(moe_pc_engine* engine) {
+    if (!engine) {
+        return;
+    }
+    if (engine->backend_caps.backend == moe_BACKEND_VULKAN ||
+        engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
+        engine->backend_caps.backend == moe_BACKEND_SYCL) {
+        device_refresh_mem_info(engine, 0);
+    }
+}
+
 static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orchestrator_state_t* state,
     moe_runtime_orchestrator_plan_t* plan) {
     const moe_execution_policy_t policy = state ? state->policy : moe_EXECUTION_BALANCED;
@@ -244,6 +255,7 @@ int moe_pc_engine_orchestrate_moe_step(moe_pc_engine_t* engine, int current_laye
     if (!engine || !out_plan) {
         return 0;
     }
+    refresh_external_gpu_memory_budget_if_due(engine);
 
     // BUGFIX 문제8: Async merge map rebuild ★★★
     // Check if rebuild is pending and trigger it

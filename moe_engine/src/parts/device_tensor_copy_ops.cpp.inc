@@ -84,6 +84,9 @@ static int device_copy_tensor_from_host(
     const uint64_t key = device_key_tensor(r);
     CUdeviceptr dst = 0;
     if (!device_prepare_tensor_allocation(e, key, bytes, pool, async_copy, &dst, host)) {
+        if (staging_slot != UINT32_MAX && release_slot_on_submit) {
+            release_staging_slot(e, staging_slot);
+        }
         return 0;
     }
 
@@ -99,6 +102,9 @@ static int device_copy_tensor_from_host(
             device_cancel_pending_copy(e, key);
         }
         device_free_key(e, key);
+        if (staging_slot != UINT32_MAX && release_slot_on_submit) {
+            release_staging_slot(e, staging_slot);
+        }
         return 0;
     }
 

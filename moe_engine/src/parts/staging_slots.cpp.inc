@@ -7,13 +7,11 @@
 // Allows dynamic adaptation to hardware capabilities
 static uint32_t moe_gpu_stage_batch_max(const moe_pc_engine* engine) {
     if (!engine || engine->backend_caps.copy_streams <= 0) {
-        return 4;  // Fallback for CPU-only or uninitialized
+        return 4;
     }
-    if (engine->backend_caps.backend == moe_BACKEND_CUDA &&
-        engine->backend_caps.copy_streams >= 8u) {
-        return 32u;
-    }
-    return 16u;
+    const uint32_t streams = engine->backend_caps.copy_streams;
+    const uint32_t derived = streams > UINT32_MAX / 4u ? UINT32_MAX : streams * 4u;
+    return std::max(4u, std::min(derived, 32u));
 }
 
 static void reset_staging_slots(moe_pc_engine* engine) {
