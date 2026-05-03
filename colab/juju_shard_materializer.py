@@ -988,6 +988,8 @@ def juju_arch_type(contract, source_name):
     ).lower()
     if "glm" in text:
         return 1
+    if "kimi" in text or "moonshot" in text:
+        return 6
     if "gemma" in text:
         return 2
     if "qwen" in text:
@@ -1682,6 +1684,8 @@ def infer_juju_graph_family(contract, tensors):
         return "gemma_moe"
     if any("ffn_gate_up_exps.weight" in n for n in names):
         return "combined_gate_up_moe"
+    if "kimi" in text or "moonshot" in text:
+        return "kimi_moe"
     if "qwen" in text:
         return "qwen"
     if "llama" in text or "mistral" in text:
@@ -1765,9 +1769,9 @@ def build_layer_graph_ir(layer, tensors):
 
     ops = [
         {"op": "rms_norm", "name": "attention_input_norm", "inputs": ["hidden"], "weights": bind("attn_norm.weight", "input_layernorm.weight"), "required": False},
-        {"op": "linear", "name": "q_projection", "inputs": ["attention_norm"], "weights": bind("attn_q.weight", "attention.wq.weight"), "output": "q", "required": False},
-        {"op": "linear", "name": "k_projection", "inputs": ["attention_norm"], "weights": bind("attn_k.weight", "attention.wk.weight"), "output": "k", "required": False},
-        {"op": "linear", "name": "v_projection", "inputs": ["attention_norm"], "weights": bind("attn_v.weight", "attention.wv.weight"), "output": "v", "required": False},
+        {"op": "linear", "name": "q_projection", "inputs": ["attention_norm"], "weights": bind("attn_q.weight", "attention.wq.weight", "attn_q_a_proj.weight", "attn_q_b_proj.weight"), "output": "q", "required": False},
+        {"op": "linear", "name": "k_projection", "inputs": ["attention_norm"], "weights": bind("attn_k.weight", "attention.wk.weight", "attn_kv_a_proj_with_mqa.weight"), "output": "k", "required": False},
+        {"op": "linear", "name": "v_projection", "inputs": ["attention_norm"], "weights": bind("attn_v.weight", "attention.wv.weight", "attn_kv_b_proj.weight"), "output": "v", "required": False},
         {"op": "rms_norm", "name": "q_norm", "inputs": ["q"], "weights": bind("attn_q_norm.weight"), "required": False},
         {"op": "rms_norm", "name": "k_norm", "inputs": ["k"], "weights": bind("attn_k_norm.weight"), "required": False},
         {"op": "rope", "name": "rotary_embedding", "inputs": ["q", "k"], "weights": bind("rope_freqs.weight"), "required": False},
