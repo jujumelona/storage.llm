@@ -316,16 +316,13 @@ static size_t moe_graph_ir_first_pos_any(
 }
 
 static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* engine, int32_t layer) {
-    if (!engine) {
+    if (!engine || !engine->offload_graph_ir_ready.load(std::memory_order_relaxed)) {
         return 0;
     }
-    if (!engine->offload_graph_ir_ready.load(std::memory_order_relaxed)) {
-        if (moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_norm.weight") ||
-            moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_layernorm.weight") ||
-            moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_layer_norm.weight") ||
-            moe_engine_has_common_tensor_suffix(engine, layer, "post_attn_norm.weight")) {
-            return 0;
-        }
+    if (moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_layernorm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_layer_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_attn_norm.weight")) {
         return 0;
     }
     static const char* const post_attention_norm_ops[] = {
