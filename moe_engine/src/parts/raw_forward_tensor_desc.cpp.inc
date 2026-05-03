@@ -15,23 +15,59 @@ static uint8_t moe_raw_scalar_encoding_from_common_tensor(
     uint32_t rows,
     uint32_t cols
 ) {
-    const uint64_t elems = (uint64_t)rows * (uint64_t)(cols ? cols : 1u);
-    if (elems && rec.bytes == elems * 4ull) {
+    if (rec.weight_encoding == moe_WEIGHT_ENCODING_RAW_FP32 || rec.type == 0u) {
         return moe_RAW_SCALAR_F32;
     }
-    if (elems && rec.bytes == elems * 2ull) {
-        return rec.type == 1u ? moe_RAW_SCALAR_F16 : moe_RAW_SCALAR_BF16;
-    }
-    if (rec.type == 0u) {
-        return moe_RAW_SCALAR_F32;
-    }
-    if (rec.type == 1u) {
+    if (rec.weight_encoding == moe_WEIGHT_ENCODING_RAW_FP16 || rec.type == 1u) {
         return moe_RAW_SCALAR_F16;
     }
-    if (rec.type == 30u || rec.type == 32u) {
+    if (rec.weight_encoding == moe_WEIGHT_ENCODING_RAW_BF16 || rec.type == 30u) {
         return moe_RAW_SCALAR_BF16;
     }
-    return moe_RAW_SCALAR_BF16;
+    (void)rows;
+    (void)cols;
+    return moe_RAW_SCALAR_UNKNOWN;
+}
+
+static uint8_t moe_raw_weight_encoding_from_common_tensor(
+    const moe_gguf_common_tensor_record& rec,
+    uint32_t rows,
+    uint32_t cols,
+    uint8_t scalar_encoding
+) {
+    (void)rows;
+    (void)cols;
+    (void)scalar_encoding;
+    if (rec.type == 0u || rec.weight_encoding == moe_WEIGHT_ENCODING_RAW_FP32) {
+        return moe_WEIGHT_ENCODING_RAW_FP32;
+    }
+    if (rec.type == 1u || rec.weight_encoding == moe_WEIGHT_ENCODING_RAW_FP16) {
+        return moe_WEIGHT_ENCODING_RAW_FP16;
+    }
+    if (rec.type == 30u || rec.weight_encoding == moe_WEIGHT_ENCODING_RAW_BF16) {
+        return moe_WEIGHT_ENCODING_RAW_BF16;
+    }
+    return moe_WEIGHT_ENCODING_UNKNOWN;
+}
+
+static void moe_trace_common_tensor_unknown_weight_format(
+    const moe_gguf_common_tensor_record& rec,
+    const moe_raw_tensor_desc& desc
+) {
+    static std::atomic<uint32_t> logged{0};
+    const uint32_t n = logged.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 32u) {
+        return;
+    }
+    moe_profile_log(
+        "common_tensor_unknown_weight_format",
+        "name=%s type=%u encoding=%u bytes=%llu rows=%u cols=%u",
+        rec.name.c_str(),
+        rec.type,
+        (uint32_t)rec.weight_encoding,
+        (unsigned long long)rec.bytes,
+        desc.rows,
+        desc.cols);
 }
 
 static int moe_common_tensor_record_to_raw_desc(
@@ -359,8 +395,12 @@ static int map_common_tensor_record(
     entry.weight_format = rec.weight_encoding != moe_WEIGHT_ENCODING_UNKNOWN ?
         rec.weight_encoding : moe_weight_encoding_from_gguf_type(rec.type, moe_offload_gguf_contract_t{});
     if (entry.weight_format == moe_WEIGHT_ENCODING_UNKNOWN) {
-        entry.weight_format = entry.scalar_encoding == moe_RAW_SCALAR_F32 ? moe_WEIGHT_ENCODING_RAW_FP32 :
-            (entry.scalar_encoding == moe_RAW_SCALAR_F16 ? moe_WEIGHT_ENCODING_RAW_FP16 : moe_WEIGHT_ENCODING_RAW_BF16);
+        entry.weight_format = moe_raw_weight_encoding_from_common_tensor(
+            rec, desc.rows, desc.cols, entry.scalar_encoding);
+        if (entry.weight_format == moe_WEIGHT_ENCODING_UNKNOWN) {
+            moe_trace_common_tensor_unknown_weight_format(rec, desc);
+            return 0;
+        }
     }
     moe_tensor_info_t info{};
     info.rows = desc.rows;

@@ -19,8 +19,23 @@ int moe_pc_engine_find_raw_tensor(
         out_info->bytes = rec->bytes;
         out_info->rows = desc.rows;
         out_info->cols = desc.cols;
-        out_info->bf16 =
-            moe_raw_scalar_encoding_from_common_tensor(*rec, desc.rows, desc.cols) == moe_RAW_SCALAR_BF16 ? 1 : 0;
+        const uint8_t scalar_encoding =
+            moe_raw_scalar_encoding_from_common_tensor(*rec, desc.rows, desc.cols);
+        uint8_t weight_format = rec->weight_encoding != moe_WEIGHT_ENCODING_UNKNOWN ?
+            rec->weight_encoding : moe_weight_encoding_from_gguf_type(rec->type, moe_offload_gguf_contract_t{});
+        if (weight_format == moe_WEIGHT_ENCODING_UNKNOWN) {
+            weight_format = moe_raw_weight_encoding_from_common_tensor(
+                *rec, desc.rows, desc.cols, scalar_encoding);
+        }
+        if (weight_format == moe_WEIGHT_ENCODING_UNKNOWN) {
+            return 0;
+        }
+        if (weight_format != moe_WEIGHT_ENCODING_RAW_FP32 &&
+            weight_format != moe_WEIGHT_ENCODING_RAW_FP16 &&
+            weight_format != moe_WEIGHT_ENCODING_RAW_BF16) {
+            return 0;
+        }
+        out_info->bf16 = weight_format == moe_WEIGHT_ENCODING_RAW_BF16 ? 1 : 0;
         return 1;
     }
     const moe_storage_raw_span_spec_t* span = nullptr;
@@ -84,6 +99,9 @@ int moe_pc_engine_raw_rmsnorm_f32(
         return 0;
     }
     const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
+    if (!elem) {
+        return 0;
+    }
     if (raw.bytes < (uint64_t)input_count * (uint64_t)elem) {
         return 0;
     }

@@ -56,10 +56,15 @@ static int moe_copy_embedding_row_f32(
         weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_XS ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_S ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_M ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_TQ1_0 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_TQ2_0 ||
         weight_format == moe_WEIGHT_ENCODING_MXFP4) {
         return moe_raw_tensor_copy_row_f32(raw, token_id, out_hidden, c->hidden_size);
     }
     const uint32_t elem = moe_raw_scalar_size(encoding);
+    if (!elem) {
+        return 0;
+    }
     uint32_t i = 0;
 #if defined(__AVX2__)
     if (encoding == moe_RAW_SCALAR_BF16) {

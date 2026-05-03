@@ -408,6 +408,60 @@ def gguf_tensor_exact_bytes(tensor_type, shape):
     return row_bytes * rows if row_bytes and rows > 0 else 0
 
 
+def gguf_tensor_byte_diagnostics(tensors, limit=32):
+    mismatches = []
+    type_stats = {}
+    for tensor in tensors or []:
+        t = u32(tensor.get("type"))
+        key = str(t)
+        exact = int(tensor.get("exact_bytes") or 0)
+        storage = int(tensor.get("source_storage_bytes") or 0)
+        emitted = int(tensor.get("bytes") or 0)
+        padding = int(tensor.get("source_padding_bytes") or 0)
+        stats = type_stats.setdefault(key, {
+            "gguf_type": t,
+            "gguf_type_name": gguf_type_name(t),
+            "count": 0,
+            "exact_bytes": 0,
+            "storage_bytes": 0,
+            "emitted_bytes": 0,
+            "padding_bytes": 0,
+            "unknown_exact_count": 0,
+        })
+        stats["count"] += 1
+        stats["exact_bytes"] += exact
+        stats["storage_bytes"] += storage
+        stats["emitted_bytes"] += emitted
+        stats["padding_bytes"] += padding
+        if not exact:
+            stats["unknown_exact_count"] += 1
+        if storage and (
+            not exact or
+            exact > storage or
+            emitted != exact or
+            exact * 100 < storage * 95 or
+            exact * 100 > storage * 105
+        ):
+            mismatches.append({
+                "name": tensor.get("name", ""),
+                "gguf_type": t,
+                "gguf_type_name": gguf_type_name(t),
+                "shape": tensor.get("shape", []),
+                "exact_bytes": exact,
+                "source_storage_bytes": storage,
+                "emitted_bytes": emitted,
+                "source_padding_bytes": padding,
+                "exact_to_storage": (exact / storage) if exact and storage else 0,
+            })
+    return {
+        "mismatch_count": len(mismatches),
+        "mismatches": mismatches[:int(limit or 32)],
+        "type_stats": [
+            type_stats[key] for key in sorted(type_stats, key=lambda value: int(value))
+        ],
+    }
+
+
 def file_size(session, url, token=None):
     headers = {}
     if token:
@@ -491,6 +545,7 @@ def parse_gguf_directory(prefix, total_bytes):
         tensors[idx]["bytes"] = exact_bytes if exact_bytes and exact_bytes <= storage_bytes else storage_bytes
         tensors[idx]["source_padding_bytes"] = max(0, storage_bytes - tensors[idx]["bytes"])
         tensors[idx]["bucket"] = tensor_bucket(tensors[idx]["name"])
+    byte_diagnostics = gguf_tensor_byte_diagnostics(tensors)
     return {
         "version": version,
         "tensor_count": tensor_count,
@@ -503,6 +558,7 @@ def parse_gguf_directory(prefix, total_bytes):
             k: v for k, v in gguf_kv_aliases.items()
             if isinstance(v, float)
         },
+        "byte_diagnostics": byte_diagnostics,
         "tensors": tensors,
     }
 
@@ -2126,6 +2182,7 @@ def build_juju_shard_plan_from_hf_url(
                 "gguf_kv": directory.get("gguf_kv", {}),
                 "gguf_runtime": directory.get("gguf_runtime", {}),
                 "gguf_kv_floats": directory.get("gguf_kv_floats", {}),
+                "byte_diagnostics": directory.get("byte_diagnostics", {}),
             },
             "contract": contract,
             "modality_flags": modality_flags,
@@ -2594,6 +2651,7 @@ def write_juju_shard_from_hf_url(
                     "gguf_kv": directory.get("gguf_kv", {}),
                     "gguf_runtime": directory.get("gguf_runtime", {}),
                     "gguf_kv_floats": directory.get("gguf_kv_floats", {}),
+                    "byte_diagnostics": directory.get("byte_diagnostics", {}),
                 },
                 "contract": contract,
                 "modality_flags": modality_flags,

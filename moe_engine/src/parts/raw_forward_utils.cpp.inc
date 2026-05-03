@@ -54,7 +54,13 @@ static int moe_ascii_contains_ci(const std::string& haystack, const char* needle
 }
 
 static uint32_t moe_raw_scalar_size(uint8_t encoding) {
-    return encoding == moe_RAW_SCALAR_F32 ? 4u : 2u;
+    if (encoding == moe_RAW_SCALAR_F32) {
+        return 4u;
+    }
+    if (encoding == moe_RAW_SCALAR_F16 || encoding == moe_RAW_SCALAR_BF16) {
+        return 2u;
+    }
+    return 0u;
 }
 
 static float moe_raw_scalar_to_f32(const uint8_t* ptr, uint8_t encoding) {
@@ -68,7 +74,13 @@ static float moe_raw_scalar_to_f32(const uint8_t* ptr, uint8_t encoding) {
     }
     uint16_t v = 0;
     std::memcpy(&v, ptr, sizeof(v));
-    return encoding == moe_RAW_SCALAR_F16 ? moe_raw_fp16_to_f32(v) : moe_raw_bf16_to_f32(v);
+    if (encoding == moe_RAW_SCALAR_F16) {
+        return moe_raw_fp16_to_f32(v);
+    }
+    if (encoding == moe_RAW_SCALAR_BF16) {
+        return moe_raw_bf16_to_f32(v);
+    }
+    return 0.0f;
 }
 
 static void moe_trace_raw_dot_unsupported(const moe_raw_tensor_cache_entry& raw) {
@@ -220,6 +232,9 @@ static float moe_dot_raw_row(
         return moe_dot_bf16_row(row, hidden, hidden_count);
     }
     const uint32_t elem = moe_raw_scalar_size(encoding);
+    if (!elem) {
+        return 0.0f;
+    }
     float acc = 0.0f;
     for (uint32_t i = 0; i < hidden_count; ++i) {
         acc += moe_raw_scalar_to_f32(row + (uint64_t)i * elem, encoding) * hidden[i];
@@ -782,6 +797,9 @@ static int moe_raw_tensor_copy_row_f32(
         return 0;
     }
     const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
+    if (!elem) {
+        return 0;
+    }
     for (uint32_t i = 0; i < out_count; ++i) {
         out[i] = moe_raw_scalar_to_f32(row_ptr + (uint64_t)i * (uint64_t)elem, raw.scalar_encoding);
     }

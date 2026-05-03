@@ -65,7 +65,8 @@ struct moe_tensor_record {
 enum moe_raw_scalar_encoding_t : uint8_t {
     moe_RAW_SCALAR_BF16 = 0,
     moe_RAW_SCALAR_F16 = 1,
-    moe_RAW_SCALAR_F32 = 2
+    moe_RAW_SCALAR_F32 = 2,
+    moe_RAW_SCALAR_UNKNOWN = 255
 };
 
 struct moe_gguf_common_tensor_record {
