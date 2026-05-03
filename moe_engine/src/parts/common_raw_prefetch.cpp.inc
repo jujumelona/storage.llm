@@ -244,8 +244,8 @@ static int prefetch_fixed_core_raw(moe_pc_engine* e) {
             if (bytes < ram_room) {
                 bytes += prefetch_raw_layer_roles(e, lm_head_layer, moe_RAW_ROLE_LM_HEAD, moe_DEVICE_POOL_FIXED, ram_room - bytes);
             }
-            if (bytes == 0 && ram_room > 0) {
-                bytes += prefetch_raw_layer_roles(e, -1, moe_RAW_ROLE_EMBED, moe_DEVICE_POOL_FIXED, ram_room);
+            if (bytes < ram_room) {
+                bytes += prefetch_raw_layer_roles(e, -1, moe_RAW_ROLE_EMBED, moe_DEVICE_POOL_FIXED, ram_room - bytes);
             }
             if (bytes < ram_room) {
                 bytes += prefetch_common_tensor_records_to_ram(e, ram_room - bytes);

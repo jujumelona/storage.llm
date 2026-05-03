@@ -112,17 +112,54 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
         engine->io_config.max_prefetch_queue : 4096u;
     const uint32_t queue_high = queue_cap > 32u ? queue_cap - 32u : queue_cap;
 
-    bool budget_full = false;
-    for (uint32_t layer = c->first_moe_layer; layer <= c->last_moe_layer && !budget_full; ++layer) {
-        for (uint32_t expert = 0; expert < c->experts_per_moe_layer; ++expert) {
-            const uint64_t bytes = expert_triplet_or_hardcoded_bytes(
-                engine,
-                (int)layer,
-                (int)expert
-            );
-            if (bytes == 0) {
-                continue;
+    struct startup_expert_candidate_t {
+        uint32_t layer = 0;
+        uint32_t expert = 0;
+        uint64_t bytes = 0;
+        uint16_t priority = 0;
+    };
+    std::vector<startup_expert_candidate_t> candidates;
+    const uint64_t layer_count =
+        c->last_moe_layer >= c->first_moe_layer ?
+        (uint64_t)c->last_moe_layer - (uint64_t)c->first_moe_layer + 1ull : 0ull;
+    if (layer_count > 0 && layer_count <= 10000ull &&
+        c->experts_per_moe_layer <= 10000u &&
+        layer_count <= UINT64_MAX / (uint64_t)c->experts_per_moe_layer) {
+        candidates.reserve((size_t)(layer_count * (uint64_t)c->experts_per_moe_layer));
+        for (uint32_t layer = c->first_moe_layer; layer <= c->last_moe_layer; ++layer) {
+            for (uint32_t expert = 0; expert < c->experts_per_moe_layer; ++expert) {
+                const uint64_t bytes = expert_triplet_or_hardcoded_bytes(
+                    engine,
+                    (int)layer,
+                    (int)expert
+                );
+                if (bytes == 0) {
+                    continue;
+                }
+                startup_expert_candidate_t cand{};
+                cand.layer = layer;
+                cand.expert = expert;
+                cand.bytes = bytes;
+                cand.priority = expert_prefetch_priority_hint(engine, (int)layer, (int)expert);
+                candidates.push_back(cand);
             }
+        }
+    }
+    std::stable_sort(candidates.begin(), candidates.end(),
+        [](const startup_expert_candidate_t& a, const startup_expert_candidate_t& b) {
+            if (a.priority != b.priority) {
+                return a.priority > b.priority;
+            }
+            if (a.expert != b.expert) {
+                return a.expert < b.expert;
+            }
+            return a.layer < b.layer;
+        });
+
+    for (const startup_expert_candidate_t& cand : candidates) {
+            const uint32_t layer = cand.layer;
+            const uint32_t expert = cand.expert;
+            const uint64_t bytes = cand.bytes;
             moe_tier_t target = moe_TIER_DB;
             if (vram_limit > 0 && planned_vram + bytes <= vram_limit) {
                 target = moe_TIER_VRAM;
@@ -134,7 +171,6 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
                 // Stop once the active compute tiers are full. CPU-only roots have
                 // no VRAM budget, so RAM warm is the primary way to avoid first-token
                 // cold page-fault storms.
-                budget_full = true;
                 break;
             }
 
@@ -176,7 +212,6 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
                     std::fflush(stderr);
                 }
             }
-        }
     }
     if (queued > 0) {
         engine->disk_stage.cv.notify_all();
