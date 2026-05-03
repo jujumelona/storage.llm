@@ -382,6 +382,12 @@ def gguf_tensor_row_bytes(tensor_type, cols):
         return cols * 8
     if t == 29:
         return block256 * 56
+    if t in {31, 32, 33}:
+        return block32 * 18
+    if t == 34:
+        return block256 * 54
+    if t == 35:
+        return block256 * 66
     if t == 39:
         return block32 * 17
     return 0
@@ -999,6 +1005,10 @@ def juju_weight_encoding(contract):
         return 11
     if "mxfp4" in family:
         return 4
+    if "tq1_0" in family or "ternary_tq1" in family:
+        return 35
+    if "tq2_0" in family or "ternary_tq2" in family:
+        return 36
     if "nvfp4" in family or "fp4" in family:
         return 3
     if "q8" in family:
@@ -1039,6 +1049,11 @@ def weight_encoding_from_gguf_type(tensor_type, contract=None):
         20: 27,
         23: 28,
         30: 21,
+        31: 22,
+        32: 22,
+        33: 22,
+        34: 35,
+        35: 36,
         39: 4,
     }
     enc = mapping.get(t, 0)
@@ -1078,6 +1093,9 @@ def gguf_type_name(tensor_type):
         28: "F64",
         29: "IQ1_M",
         30: "BF16",
+        31: "Q4_0_4_4",
+        32: "Q4_0_4_8",
+        33: "Q4_0_8_8",
         34: "TQ1_0",
         35: "TQ2_0",
         39: "MXFP4",
@@ -1091,6 +1109,8 @@ def quant_family_from_gguf_type(tensor_type, contract=None):
         return "raw_scalar_or_integer"
     if t in {2, 3, 6, 7, 8, 9}:
         return "legacy_ggml_quant"
+    if t in {31, 32, 33}:
+        return "legacy_ggml_interleaved_quant"
     if t in {10, 11, 12, 13, 14, 15}:
         return "k_quant"
     if t in {16, 17, 18, 19, 20, 21, 22, 23, 29}:

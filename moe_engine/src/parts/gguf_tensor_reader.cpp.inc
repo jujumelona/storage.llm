@@ -53,6 +53,11 @@ static uint64_t moe_gguf_tensor_row_bytes_from_type(uint32_t type, uint64_t cols
         case 27u:
         case 28u: return cols * 8ull;
         case 29u: return block256 * 56ull;
+        case 31u:
+        case 32u:
+        case 33u: return block32 * 18ull;
+        case 34u: return block256 * 54ull;
+        case 35u: return block256 * 66ull;
         case 39u: return block32 * 17ull;
         default: return 0;
     }

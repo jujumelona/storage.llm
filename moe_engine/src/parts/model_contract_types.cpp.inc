@@ -39,6 +39,12 @@ static uint32_t moe_weight_encoding_from_family(const std::string& family) {
     if (value.find("mxfp4") != std::string::npos) {
         return moe_WEIGHT_ENCODING_MXFP4;
     }
+    if (value.find("tq1_0") != std::string::npos || value.find("ternary_tq1") != std::string::npos) {
+        return moe_WEIGHT_ENCODING_GGUF_TQ1_0;
+    }
+    if (value.find("tq2_0") != std::string::npos || value.find("ternary_tq2") != std::string::npos) {
+        return moe_WEIGHT_ENCODING_GGUF_TQ2_0;
+    }
     if (value.find("bf16") != std::string::npos || value.find("bfloat16") != std::string::npos) {
         return moe_WEIGHT_ENCODING_RAW_BF16;
     }

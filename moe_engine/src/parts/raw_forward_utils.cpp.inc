@@ -424,6 +424,12 @@ static uint64_t moe_raw_tensor_row_bytes(
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_M) {
         return ((uint64_t)cols + 255ull) / 256ull * 56ull;
     }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_TQ1_0) {
+        return ((uint64_t)cols + 255ull) / 256ull * 54ull;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_TQ2_0) {
+        return ((uint64_t)cols + 255ull) / 256ull * 66ull;
+    }
     const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
     return (uint64_t)cols * (uint64_t)elem;
 }

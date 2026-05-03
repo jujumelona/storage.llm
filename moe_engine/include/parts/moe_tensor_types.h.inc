@@ -33,7 +33,9 @@ typedef enum {
     moe_WEIGHT_ENCODING_GGUF_IQ3_S = 31,
     moe_WEIGHT_ENCODING_GGUF_IQ1_S = 32,
     moe_WEIGHT_ENCODING_GGUF_IQ1_M = 33,
-    moe_WEIGHT_ENCODING_GGUF_Q8_K = 34
+    moe_WEIGHT_ENCODING_GGUF_Q8_K = 34,
+    moe_WEIGHT_ENCODING_GGUF_TQ1_0 = 35,
+    moe_WEIGHT_ENCODING_GGUF_TQ2_0 = 36
 } moe_weight_encoding_t;
 
 typedef struct {

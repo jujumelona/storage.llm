@@ -35,7 +35,10 @@ static uint8_t weight_bits_for_encoding(uint8_t encoding) {
         case moe_WEIGHT_ENCODING_GGUF_IQ1:
         case moe_WEIGHT_ENCODING_GGUF_IQ1_S:
         case moe_WEIGHT_ENCODING_GGUF_IQ1_M:
+        case moe_WEIGHT_ENCODING_GGUF_TQ1_0:
             return 1;
+        case moe_WEIGHT_ENCODING_GGUF_TQ2_0:
+            return 2;
         case moe_WEIGHT_ENCODING_LINEAR_Q8:
         case moe_WEIGHT_ENCODING_GGUF_Q8_0:
         case moe_WEIGHT_ENCODING_GGUF_Q8_1:
@@ -146,6 +149,12 @@ static uint64_t infer_weight_row_bytes(const moe_tensor_info_t& info, uint8_t fo
     }
     if (format == moe_WEIGHT_ENCODING_GGUF_IQ1_M) {
         return ((uint64_t)info.cols + 255ull) / 256ull * 56ull;
+    }
+    if (format == moe_WEIGHT_ENCODING_GGUF_TQ1_0) {
+        return ((uint64_t)info.cols + 255ull) / 256ull * 54ull;
+    }
+    if (format == moe_WEIGHT_ENCODING_GGUF_TQ2_0) {
+        return ((uint64_t)info.cols + 255ull) / 256ull * 66ull;
     }
     if (format == moe_WEIGHT_ENCODING_GGUF_Q2_K) {
         return ((uint64_t)info.cols + 255ull) / 256ull * 84ull;
