@@ -227,29 +227,71 @@ static int moe_engine_has_common_tensor_suffix(
     }
     const std::string layer_prefix = "blk." + std::to_string(layer) + ".";
     const std::string suffix_lower = moe_lower_ascii_copy(std::string(suffix));
+    std::string cache_key = std::to_string(layer);
+    cache_key.push_back('\n');
+    cache_key.append(suffix_lower);
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->common_tensor_suffix_cache_mutex);
+        auto found = engine->common_tensor_suffix_cache.find(cache_key);
+        if (found != engine->common_tensor_suffix_cache.end()) {
+            return found->second;
+        }
+    }
+    int result = 0;
     for (const auto& it : engine->gguf_common_tensor_slots) {
         const std::string& key = it.first;
         if (key.size() >= layer_prefix.size() + suffix_lower.size() &&
             key.compare(0, layer_prefix.size(), layer_prefix) == 0 &&
             key.compare(key.size() - suffix_lower.size(), suffix_lower.size(), suffix_lower) == 0) {
-            return 1;
+            result = 1;
+            break;
         }
     }
-    return 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->common_tensor_suffix_cache_mutex);
+        engine->common_tensor_suffix_cache.emplace(std::move(cache_key), result);
+    }
+    return result;
 }
 
 static int moe_engine_graph_ir_mentions(const moe_pc_engine* engine, const char* needle) {
     if (!engine || !needle || !needle[0] || engine->offload_graph_ir_json.empty()) {
         return 0;
     }
-    return moe_ascii_contains_ci(engine->offload_graph_ir_json, needle);
+    const std::string key = moe_lower_ascii_copy(std::string(needle));
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->text_mention_cache_mutex);
+        auto found = engine->graph_ir_mention_cache.find(key);
+        if (found != engine->graph_ir_mention_cache.end()) {
+            return found->second;
+        }
+    }
+    const int result = moe_ascii_contains_ci(engine->offload_graph_ir_json, needle);
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->text_mention_cache_mutex);
+        engine->graph_ir_mention_cache.emplace(key, result);
+    }
+    return result;
 }
 
 static int moe_engine_metadata_mentions(const moe_pc_engine* engine, const char* needle) {
     if (!engine || !needle || !needle[0] || engine->offload_gguf_metadata_json.empty()) {
         return 0;
     }
-    return moe_ascii_contains_ci(engine->offload_gguf_metadata_json, needle);
+    const std::string key = moe_lower_ascii_copy(std::string(needle));
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->text_mention_cache_mutex);
+        auto found = engine->metadata_mention_cache.find(key);
+        if (found != engine->metadata_mention_cache.end()) {
+            return found->second;
+        }
+    }
+    const int result = moe_ascii_contains_ci(engine->offload_gguf_metadata_json, needle);
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->text_mention_cache_mutex);
+        engine->metadata_mention_cache.emplace(key, result);
+    }
+    return result;
 }
 
 static int moe_engine_gelu_activation_mode(const moe_pc_engine* engine) {

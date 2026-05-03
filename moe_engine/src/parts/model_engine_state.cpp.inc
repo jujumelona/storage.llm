@@ -67,6 +67,15 @@ static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {
     engine->cached_router_route_scale_bits.store(0, std::memory_order_relaxed);
     engine->cached_embedding_scale_hidden.store(0, std::memory_order_relaxed);
     engine->cached_embedding_scale_bits.store(0, std::memory_order_relaxed);
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->common_tensor_suffix_cache_mutex);
+        engine->common_tensor_suffix_cache.clear();
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->text_mention_cache_mutex);
+        engine->graph_ir_mention_cache.clear();
+        engine->metadata_mention_cache.clear();
+    }
     engine->juju_idx_schema_version.store(0, std::memory_order_relaxed);
     engine->juju_split_group_count.store(0, std::memory_order_relaxed);
     engine->juju_split_missing_count.store(0, std::memory_order_relaxed);
