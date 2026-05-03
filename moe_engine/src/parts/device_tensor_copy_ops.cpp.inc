@@ -204,91 +204,51 @@ static int device_copy_tensor_gpudirect_storage(
         return 0;
     }
 
-    void* file_handle = nullptr;
-    if (shard->cufile_handle) {
-        file_handle = shard->cufile_handle;
-    } else {
-        struct moe_cufile_descr_local {
-            int type;
-            union {
-                int fd;
-                void* handle;
-            } handle;
-            const void* fs_ops;
-        } desc{};
-        desc.type = 1; // CU_FILE_HANDLE_TYPE_OPAQUE_FD
-        desc.handle.fd = shard->fd;
-        const moe_cufile_error_t hst = e->cuda.cuFileHandleRegister(&file_handle, &desc);
-        if (hst.err != 0 || !file_handle) {
-            static std::atomic<bool> warned{false};
-            if (!warned.exchange(true, std::memory_order_relaxed)) {
-                fprintf(stderr,
-                    "[storageLLM WARNING] cuFileHandleRegister failed (err=%d); "
-                    "falling back to pinned staging. Check nvidia-fs, filesystem support, and O_DIRECT mode.\n",
-                    hst.err);
-            }
-            device_free_key(e, key);
-            return 0;
-        }
-        shard->cufile_handle = file_handle;
-    }
+    struct moe_cufile_descr_local {
+        int type;
+        union {
+            int fd;
+            void* handle;
+        } handle;
+        const void* fs_ops;
+    } desc{};
+    desc.type = 1; // CU_FILE_HANDLE_TYPE_OPAQUE_FD
+    desc.handle.fd = shard->fd;
 
-    struct async_params {
-        size_t sizes[3];
-        int64_t file_offsets[3];
-        int64_t dev_offsets[3];
-        int64_t bytes_read[3];
-    };
+    void* file_handle = nullptr;
+    const moe_cufile_error_t hst = e->cuda.cuFileHandleRegister(&file_handle, &desc);
+    if (hst.err != 0 || !file_handle) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            fprintf(stderr,
+                "[storageLLM WARNING] cuFileHandleRegister failed (err=%d); "
+                "falling back to pinned staging. Check nvidia-fs, filesystem support, and O_DIRECT mode.\n",
+                hst.err);
+        }
+        device_free_key(e, key);
+        return 0;
+    }
 
     int ok = 1;
     uint64_t dst_offset = 0;
     void* dst_base = reinterpret_cast<void*>(static_cast<uintptr_t>(dst));
-    CUstream stream = device_tensor_stream_current(e);
-
-    if (e->cuda.cuFileReadAsync) {
-        // Use cuFileReadAsync. Allocate params in a staging slot.
-        static thread_local uint32_t tl_gds_turn = 0;
-        uint32_t slot_idx = acquire_staging_slot(e, 0u, tl_gds_turn++, sizeof(async_params), false);
-        if (slot_idx == UINT32_MAX) {
-            ok = 0;
+    int buf_registered = 0;
+    if (e->cuda.cuFileBufRegister) {
+        const moe_cufile_error_t bst = e->cuda.cuFileBufRegister(dst_base, (size_t)bytes, 0);
+        if (bst.err == 0) {
+            buf_registered = 1;
         } else {
-            async_params* params = (async_params*)e->staging_slots[slot_idx].buf;
-            int num_reads = 0;
-            for (int i = 0; i < 3; ++i) {
-                if (ranges[i][1] == 0) continue;
-                params->sizes[i] = static_cast<size_t>(ranges[i][1]);
-                params->file_offsets[i] = static_cast<int64_t>(ranges[i][0]);
-                params->dev_offsets[i] = static_cast<int64_t>(dst_offset);
-                params->bytes_read[i] = 0;
-                moe_cufile_error_t err = e->cuda.cuFileReadAsync(
-                    file_handle,
-                    dst_base,
-                    &params->sizes[i],
-                    &params->file_offsets[i],
-                    &params->dev_offsets[i],
-                    &params->bytes_read[i],
-                    stream
-                );
-                if (err.err != 0) {
-                    ok = 0;
-                    break;
-                }
-                dst_offset += ranges[i][1];
-                num_reads++;
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr,
+                    "[storageLLM WARNING] cuFileBufRegister failed (err=%d); falling back to pinned staging.\n",
+                    bst.err);
             }
-            if (ok) {
-                device_defer_staging_copy(e, slot_idx, key, bytes, stream);
-                return 1; // Success! It will be touched via defer.
-            } else {
-                release_staging_slot(e, slot_idx);
-            }
+            ok = 0;
         }
     }
 
-    // Fallback to sync cuFileRead if async not available or failed staging slot
-    if (!e->cuda.cuFileReadAsync || !ok) {
-        ok = 1;
-        dst_offset = 0;
+    if (ok) {
         for (const auto& range : ranges) {
             if (range[1] == 0) continue;
             const long long got = e->cuda.cuFileRead(
@@ -303,6 +263,13 @@ static int device_copy_tensor_gpudirect_storage(
             }
             dst_offset += range[1];
         }
+    }
+
+    if (buf_registered && e->cuda.cuFileBufDeregister) {
+        e->cuda.cuFileBufDeregister(dst_base);
+    }
+    if (file_handle && e->cuda.cuFileHandleDeregister) {
+        e->cuda.cuFileHandleDeregister(file_handle);
     }
 
     if (!ok || dst_offset != bytes) {
