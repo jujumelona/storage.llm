@@ -468,19 +468,6 @@ static int moe_layer_shared_expert_gate_f32(
     return 1;
 }
 
-static int moe_layer_router_uses_scaled_residual_input(
-    const moe_pc_engine* engine,
-    int32_t layer
-) {
-    if (!engine || layer < 0) {
-        return 0;
-    }
-    return moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "router.scale") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale");
-}
-
 static int moe_layer_apply_expert_down_scale_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -765,22 +752,16 @@ static int moe_layer_moe_mlp_f32(
     const uint64_t norm_start_us = moe_profile_now_us();
     const float* shared_input = s->norm.data();
     const float* expert_input = s->norm.data();
-    const int router_uses_residual =
-        moe_layer_router_uses_scaled_residual_input(engine, layer);
-    const float* router_input = router_uses_residual ? hidden : s->norm.data();
     moe_profile_log(
         "mlp_moe_norm_begin",
-        "layer=%d hidden=%u router_residual=%d hidden_ptr=%p expert_ptr=%p",
-        layer, hidden_size, router_uses_residual, (void*)hidden, (void*)s->expert.data());
+        "layer=%d hidden=%u hidden_ptr=%p expert_ptr=%p",
+        layer, hidden_size, (void*)hidden, (void*)s->expert.data());
     const int moe_norm_ok = moe_layer_moe_norm_f32(
         engine, layer, hidden, hidden_size, s->expert.data(), attn_cfg.rms_norm_eps);
     if (moe_norm_ok) {
         expert_input = s->expert.data();
     }
-    moe_profile_log(
-        "mlp_moe_norm",
-        "layer=%d ok=%d router_residual=%d ms=%.3f",
-        layer, moe_norm_ok, router_uses_residual, moe_profile_elapsed_ms(norm_start_us));
+    moe_profile_log("mlp_moe_norm", "layer=%d ok=%d ms=%.3f", layer, moe_norm_ok, moe_profile_elapsed_ms(norm_start_us));
 
     const uint64_t shared_bytes =
         2ull * (uint64_t)configured_expert_intermediate * (uint64_t)hidden_size * 2ull +
@@ -820,7 +801,7 @@ static int moe_layer_moe_mlp_f32(
     if (!moe_router_topk_f32(
             engine,
             layer,
-            router_input,
+            expert_input,
             hidden_size,
             c->experts_per_moe_layer,
             moe_router_top_k_from_metadata(engine, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer),
