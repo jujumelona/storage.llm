@@ -42,6 +42,10 @@ static int get_cached_raw_tensor(
         }
         return 1;
     }
+    if (engine->offload_gguf_valid.load(std::memory_order_relaxed)) {
+        moe_trace_raw_tensor_static_fallback_blocked(layer, kind);
+        return 0;
+    }
     const moe_storage_raw_span_spec_t* span = nullptr;
     if (!find_raw_tensor_desc_and_span(layer, kind, &desc, &span)) {
         return 0;

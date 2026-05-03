@@ -36,6 +36,210 @@ static int moe_read_model_config_json(
     return moe_read_model_root_text_file(root, "config.json", 64ull * 1024ull * 1024ull, out);
 }
 
+static int moe_runtime_sidecar_name_interesting(const std::string& path) {
+    const std::string lower = moe_lower_ascii_copy(path);
+    if (lower.empty()) {
+        return 0;
+    }
+    if (lower == "runtime_assets_manifest.json" ||
+        lower == "storagellm_performance_metadata_manifest.json" ||
+        lower == "generation_config.json" ||
+        lower == "tokenizer_config.json" ||
+        lower == "processor_config.json" ||
+        lower == "preprocessor_config.json" ||
+        lower == "image_processor_config.json" ||
+        lower == "feature_extractor.json" ||
+        lower == "audio_config.json" ||
+        lower == "video_preprocessor_config.json") {
+        return 1;
+    }
+    if (!moe_ends_with_ci(lower, ".json") &&
+        !moe_ends_with_ci(lower, ".jsonl")) {
+        return 0;
+    }
+    return lower.find("metadata") != std::string::npos ||
+        lower.find("manifest") != std::string::npos ||
+        lower.find("runtime") != std::string::npos ||
+        lower.find("contract") != std::string::npos ||
+        lower.find("graph") != std::string::npos ||
+        lower.find("priority") != std::string::npos ||
+        lower.find("prefetch") != std::string::npos ||
+        lower.find("residency") != std::string::npos ||
+        lower.find("qkv") != std::string::npos ||
+        lower.find("offload") != std::string::npos ||
+        lower.find("policy") != std::string::npos ||
+        lower.find("scheduler") != std::string::npos ||
+        lower.find("topology") != std::string::npos ||
+        lower.find("profile") != std::string::npos ||
+        lower.find("trace") != std::string::npos ||
+        lower.find("stats") != std::string::npos ||
+        lower.find("diagnostic") != std::string::npos ||
+        lower.find("verify") != std::string::npos ||
+        lower.find("tensor") != std::string::npos ||
+        lower.find("index") != std::string::npos;
+}
+
+static std::string moe_json_escape_runtime_path(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 8);
+    for (char c : value) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out.push_back(c); break;
+        }
+    }
+    return out;
+}
+
+static void moe_collect_runtime_sidecar_files(
+    const std::string& root,
+    const std::string& rel_dir,
+    int depth_left,
+    std::vector<std::pair<std::string, std::string>>* out
+) {
+    if (!out || root.empty() || out->size() >= 512 || depth_left < 0) {
+        return;
+    }
+    const std::string abs_dir = rel_dir.empty() ? root : storagellm::path_join(root, rel_dir);
+    if (!moe_path_is_directory_local(abs_dir)) {
+        return;
+    }
+    moe_dir_iterator_t* it = moe_open_directory(abs_dir);
+    if (!it) {
+        return;
+    }
+    std::string name;
+    bool is_dir = false;
+    while (moe_next_entry(it, &name, &is_dir)) {
+        if (moe_skip_scan_dir_name(name)) {
+            continue;
+        }
+        const std::string rel = rel_dir.empty() ? name : storagellm::path_join(rel_dir, name);
+        const std::string abs = storagellm::path_join(root, rel);
+        if (is_dir) {
+            moe_collect_runtime_sidecar_files(root, rel, depth_left - 1, out);
+        } else if (moe_runtime_sidecar_name_interesting(rel)) {
+            out->push_back(std::make_pair(rel, abs));
+        }
+        if (out->size() >= 512) {
+            break;
+        }
+    }
+    moe_close_directory(it);
+}
+
+static void moe_append_runtime_sidecar_blob(
+    moe_pc_engine* engine,
+    const std::string& rel_path,
+    const std::string& data
+) {
+    if (!engine || rel_path.empty() || data.empty()) {
+        return;
+    }
+    if (!engine->offload_gguf_metadata_json.empty()) {
+        engine->offload_gguf_metadata_json.push_back('\n');
+    }
+    engine->offload_gguf_metadata_json += "{\"__storagellm_runtime_sidecar_path__\":\"";
+    engine->offload_gguf_metadata_json += moe_json_escape_runtime_path(rel_path);
+    engine->offload_gguf_metadata_json += "\"}\n";
+    engine->offload_gguf_metadata_json += data;
+
+    const std::string lower = moe_lower_ascii_copy(rel_path);
+    const bool graph_hint =
+        lower.find("graph") != std::string::npos ||
+        lower.find("priority") != std::string::npos ||
+        lower.find("prefetch") != std::string::npos ||
+        lower.find("residency") != std::string::npos ||
+        lower.find("policy") != std::string::npos ||
+        data.find("\"graph_ir\"") != std::string::npos ||
+        data.find("\"priority_tables\"") != std::string::npos ||
+        data.find("\"moe_offload_policy\"") != std::string::npos;
+    if (graph_hint && engine->offload_graph_ir_json.size() < (4u << 20)) {
+        engine->offload_graph_ir_json.push_back('\n');
+        engine->offload_graph_ir_json += data.substr(0, std::min<size_t>(data.size(), 1u << 20));
+    }
+}
+
+static void moe_append_model_root_runtime_sidecars(
+    moe_pc_engine* engine,
+    const std::string& root
+) {
+    if (!engine || root.empty() ||
+        engine->offload_gguf_metadata_json.find("__storagellm_runtime_sidecar_path__") != std::string::npos) {
+        return;
+    }
+    static const char* kRootSidecars[] = {
+        "runtime_assets_manifest.json",
+        "storagellm_performance_metadata_manifest.json",
+        "generation_config.json",
+        "tokenizer_config.json",
+        "processor_config.json",
+        "preprocessor_config.json",
+        "image_processor_config.json",
+        "feature_extractor.json",
+        "audio_config.json",
+        "video_preprocessor_config.json",
+    };
+    std::vector<std::pair<std::string, std::string>> sidecars;
+    for (const char* rel : kRootSidecars) {
+        const std::string path = storagellm::path_join(root, rel);
+        uint64_t bytes = 0;
+        if (file_size_bytes(path, &bytes) && bytes > 0) {
+            sidecars.push_back(std::make_pair(std::string(rel), path));
+        }
+    }
+    moe_collect_runtime_sidecar_files(root, "metadata", 4, &sidecars);
+    moe_collect_runtime_sidecar_files(root, "verify", 3, &sidecars);
+    moe_collect_runtime_sidecar_files(root, "tokenizer", 2, &sidecars);
+    std::sort(sidecars.begin(), sidecars.end(),
+        [](const std::pair<std::string, std::string>& a, const std::pair<std::string, std::string>& b) {
+            return a.first < b.first;
+        });
+    sidecars.erase(std::unique(sidecars.begin(), sidecars.end(),
+        [](const std::pair<std::string, std::string>& a, const std::pair<std::string, std::string>& b) {
+            return a.first == b.first;
+        }), sidecars.end());
+
+    uint64_t total_loaded = 0;
+    uint32_t loaded_count = 0;
+    for (const auto& item : sidecars) {
+        if (!moe_runtime_sidecar_name_interesting(item.first)) {
+            continue;
+        }
+        uint64_t bytes = 0;
+        if (!file_size_bytes(item.second, &bytes) || bytes == 0 ||
+            bytes > (16ull << 20) || total_loaded + bytes > (64ull << 20)) {
+            continue;
+        }
+        std::string data;
+        if (!moe_read_model_root_text_file(root, item.first.c_str(), 16ull << 20, &data) || data.empty()) {
+            continue;
+        }
+        moe_append_runtime_sidecar_blob(engine, item.first, data);
+        total_loaded += bytes;
+        ++loaded_count;
+    }
+    if (loaded_count) {
+        if (!engine->offload_gguf_metadata_json.empty()) {
+            engine->offload_gguf_metadata_json.push_back('\n');
+        }
+        engine->offload_gguf_metadata_json += "{\"__storagellm_runtime_sidecars_loaded__\":";
+        engine->offload_gguf_metadata_json += std::to_string(loaded_count);
+        engine->offload_gguf_metadata_json += ",\"__storagellm_runtime_sidecar_bytes__\":";
+        engine->offload_gguf_metadata_json += std::to_string(total_loaded);
+        engine->offload_gguf_metadata_json += "}";
+        std::fprintf(stderr,
+            "[storagellm] runtime sidecars loaded: files=%u bytes=%llu\n",
+            loaded_count,
+            (unsigned long long)total_loaded);
+        std::fflush(stderr);
+    }
+}
+
 static void moe_append_model_config_metadata(
     moe_pc_engine* engine,
     const std::string& root
@@ -103,6 +307,7 @@ int moe_pc_engine_set_model_root(
         if (moe_engine_load_offload_gguf_contract(engine, engine->model_root, &check)) {
             valid = check.valid;
             moe_append_model_config_metadata(engine, engine->model_root);
+            moe_append_model_root_runtime_sidecars(engine, engine->model_root);
         } else {
             valid = moe_storage_validate_model_root(engine->model_root.c_str(), &check) && check.valid;
         }
@@ -501,19 +706,13 @@ static uint64_t moe_effective_juju_tensor_bytes(
     if (entry.juju_bytes == 0 || entry.dims == 0 || entry.shape[0] == 0) {
         return entry.juju_bytes;
     }
+    const uint32_t cols = (uint32_t)std::min<uint64_t>(entry.shape[0], UINT32_MAX);
     uint64_t rows64 = 1;
-    uint32_t cols = 1;
-    if (entry.dims >= 2) {
-        cols = (uint32_t)std::min<uint64_t>(entry.shape[0], UINT32_MAX);
-        for (uint32_t i = 1; i < std::min<uint32_t>(entry.dims, 4u); ++i) {
-            if (entry.shape[i] == 0 || rows64 > UINT64_MAX / entry.shape[i]) {
-                return entry.juju_bytes;
-            }
-            rows64 *= entry.shape[i];
+    for (uint32_t i = 1; i < std::min<uint32_t>(entry.dims, 4u); ++i) {
+        if (entry.shape[i] == 0 || rows64 > UINT64_MAX / entry.shape[i]) {
+            return entry.juju_bytes;
         }
-    } else {
-        rows64 = entry.shape[0];
-        cols = 1;
+        rows64 *= entry.shape[i];
     }
     if (rows64 == 0 || rows64 > UINT32_MAX || cols == 0) {
         return entry.juju_bytes;
@@ -786,15 +985,27 @@ static void moe_juju_probe_note_index_json(
     }
     if (moe_json_get_u64_local(index_json, "kv_lora_rank", &value)) {
         probe->attn.kv_lora_rank = moe_u64_to_u32_clamped(value, probe->attn.kv_lora_rank);
+        if (probe->attn.kv_lora_rank) {
+            probe->attn.type = moe_ATTN_TYPE_MLA;
+        }
     }
     if (moe_json_get_u64_local(index_json, "q_lora_rank", &value)) {
         probe->attn.q_lora_rank = moe_u64_to_u32_clamped(value, probe->attn.q_lora_rank);
+        if (probe->attn.q_lora_rank) {
+            probe->attn.type = moe_ATTN_TYPE_MLA;
+        }
     }
     if (moe_json_get_u64_local(index_json, "qk_nope_head_dim", &value)) {
         probe->attn.qk_nope_head_dim = moe_u64_to_u32_clamped(value, probe->attn.qk_nope_head_dim);
+        if (probe->attn.qk_nope_head_dim) {
+            probe->attn.type = moe_ATTN_TYPE_MLA;
+        }
     }
     if (moe_json_get_u64_local(index_json, "qk_rope_head_dim", &value)) {
         probe->attn.qk_rope_head_dim = moe_u64_to_u32_clamped(value, probe->attn.qk_rope_head_dim);
+        if (probe->attn.qk_rope_head_dim) {
+            probe->attn.type = moe_ATTN_TYPE_MLA;
+        }
     }
     if (moe_json_get_u64_local(index_json, "context_length", &value) ||
         moe_json_get_u64_local(index_json, "max_position_embeddings", &value)) {
@@ -1230,6 +1441,10 @@ static void moe_juju_probe_finalize_attention(moe_juju_runtime_probe_t* probe) {
     }
     if (cfg.rope_theta <= 0.0f) cfg.rope_theta = 500000.0f;
     if (cfg.rms_norm_eps <= 0.0f) cfg.rms_norm_eps = 1.0e-6f;
+    if (cfg.type == moe_ATTN_TYPE_UNKNOWN &&
+        (cfg.kv_lora_rank || cfg.q_lora_rank || cfg.qk_nope_head_dim || cfg.qk_rope_head_dim)) {
+        cfg.type = moe_ATTN_TYPE_MLA;
+    }
 }
 
 static void moe_juju_probe_apply(moe_pc_engine* engine, moe_juju_runtime_probe_t* probe) {
@@ -1799,6 +2014,7 @@ int moe_pc_engine_load_codec_table(
         if (moe_engine_load_offload_gguf_contract(engine, engine->model_root, &root_check)) {
             root_valid = root_check.valid;
             moe_append_model_config_metadata(engine, engine->model_root);
+            moe_append_model_root_runtime_sidecars(engine, engine->model_root);
         } else {
             root_valid = moe_storage_validate_model_root(engine->model_root.c_str(), &root_check) &&
                 root_check.valid;

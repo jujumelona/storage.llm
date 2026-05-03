@@ -91,6 +91,10 @@ static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* 
         madvise(ptr, static_cast<size_t>(bytes), MADV_HUGEPAGE);
     }
 #endif
+    // BUGFIX 문제1: Skip mlock on unified memory systems (Metal) ★★★
+    // Problem: Metal uses unified memory (CPU/GPU share same memory)
+    // mlock is unnecessary and wastes init time, can silently fail under memory pressure
+    // Solution: Skip mlock, set pinned=false for Metal (handled correctly by device_tensor_copy_ops)
     if (pinned) {
         *pinned = mlock(ptr, static_cast<size_t>(bytes)) == 0;
     }

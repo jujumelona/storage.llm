@@ -19,7 +19,15 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
     // serializes GPU upload workers that also need map_mutex.
     // Instead, just skip stale entries and let proactive_eviction_worker_loop
     // compact the heap periodically (every 25ms cycle).
-    const uint32_t stale_limit = std::max<uint32_t>(128u, std::min<uint32_t>(512u, heap_size / 4u));
+    // BUGFIX 문제5: Adaptive stale_limit for high-load scenarios ★★★
+    // Problem: Fixed 512 cap is too small when heap has 19,456 triplets
+    // Fast expert rotation can generate thousands of stale entries per second
+    // → eviction fails, VRAM OOM blocks generation
+    // Solution: When compact_needed flag is set, scan up to heap_size/2 (wider scan)
+    // Otherwise use conservative limit to avoid overhead
+    const uint32_t stale_limit = engine->evict_heap_compact_needed.load(std::memory_order_relaxed)
+        ? std::min(heap_size, heap_size / 2u)
+        : std::max<uint32_t>(128u, std::min<uint32_t>(512u, heap_size / 4u));
     uint32_t stale_count = 0;
     std::unique_lock<std::mutex> heap_lock(evict_heap_mutex(engine, idx));
     while (!engine->evict_heaps[idx].empty() && stale_count < stale_limit) {
@@ -49,7 +57,10 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
         ++stale_count;
     }
     // FIX 8: Signal deferred compact if we hit a lot of stale entries
-    if (stale_count >= 64u) {
+    // BUGFIX 문제5: Lower threshold from 64 to 32 for earlier compact trigger ★★
+    // Problem: 64 threshold delays compact too long in high-load scenarios
+    // Solution: Trigger compact earlier at 32 stale entries
+    if (stale_count >= 32u) {
         engine->evict_heap_compact_needed.store(true, std::memory_order_relaxed);
     }
     return 0;

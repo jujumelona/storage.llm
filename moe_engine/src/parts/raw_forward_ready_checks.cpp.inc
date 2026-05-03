@@ -37,6 +37,10 @@ static int raw_tensor_kind_available(
             find_common_raw_tensor_record(engine, layer, kind, nullptr)) {
         return common_tensor_backing_file_ready(engine, rec);
     }
+    if (engine && engine->offload_gguf_valid.load(std::memory_order_relaxed)) {
+        moe_trace_raw_tensor_static_fallback_blocked(layer, kind);
+        return 0;
+    }
     const moe_storage_raw_span_spec_t* span = nullptr;
     return find_raw_tensor_desc_and_span(layer, kind, nullptr, &span) &&
         raw_span_backing_file_ready(engine, span) ? 1 : 0;

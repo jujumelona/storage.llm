@@ -6,6 +6,7 @@ static int moe_forward_tokenizer_asset_ready(const moe_pc_engine* engine) {
         "tokenizer.json",
         "tokenizer.model",
         "sentencepiece.bpe.model",
+        "tiktoken.model",
         "vocab.json",
         "merges.txt"
     };

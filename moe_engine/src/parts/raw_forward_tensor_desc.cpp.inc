@@ -70,6 +70,95 @@ static void moe_trace_common_tensor_unknown_weight_format(
         desc.cols);
 }
 
+static void moe_trace_common_tensor_unsupported_weight_format(
+    const moe_gguf_common_tensor_record& rec,
+    const moe_raw_tensor_desc& desc,
+    uint8_t weight_format
+) {
+    static std::atomic<uint32_t> logged{0};
+    const uint32_t n = logged.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 32u) {
+        return;
+    }
+    moe_profile_log(
+        "common_tensor_unsupported_weight_format",
+        "name=%s type=%u encoding=%u format=%u bytes=%llu rows=%u cols=%u",
+        rec.name.c_str(),
+        rec.type,
+        (uint32_t)rec.weight_encoding,
+        (uint32_t)weight_format,
+        (unsigned long long)rec.bytes,
+        desc.rows,
+        desc.cols);
+}
+
+static uint8_t moe_common_tensor_effective_weight_format(
+    const moe_gguf_common_tensor_record& rec,
+    const moe_raw_tensor_desc& desc
+) {
+    const uint8_t scalar_encoding = moe_raw_scalar_encoding_from_common_tensor(rec, desc.rows, desc.cols);
+    uint8_t weight_format = rec.weight_encoding != moe_WEIGHT_ENCODING_UNKNOWN ?
+        rec.weight_encoding : moe_weight_encoding_from_gguf_type(rec.type, moe_offload_gguf_contract_t{});
+    if (weight_format == moe_WEIGHT_ENCODING_UNKNOWN) {
+        weight_format = moe_raw_weight_encoding_from_common_tensor(
+            rec, desc.rows, desc.cols, scalar_encoding);
+    }
+    return weight_format;
+}
+
+static int moe_common_tensor_raw_weight_format_supported(uint8_t weight_format) {
+    return weight_format == moe_WEIGHT_ENCODING_RAW_FP16 ||
+        weight_format == moe_WEIGHT_ENCODING_RAW_BF16 ||
+        weight_format == moe_WEIGHT_ENCODING_RAW_FP32 ||
+        weight_format == moe_WEIGHT_ENCODING_MXFP4 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_1 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_0 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_1 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q2_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q3_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q6_K ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XS ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_S ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_S ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_NL ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_XS ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_S ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_M;
+}
+
+static int moe_common_tensor_record_raw_compatible(
+    const moe_gguf_common_tensor_record& rec,
+    const moe_raw_tensor_desc& desc,
+    uint8_t* out_weight_format = nullptr
+) {
+    const uint8_t weight_format = moe_common_tensor_effective_weight_format(rec, desc);
+    if (out_weight_format) {
+        *out_weight_format = weight_format;
+    }
+    return moe_common_tensor_raw_weight_format_supported(weight_format);
+}
+
+static void moe_trace_raw_tensor_static_fallback_blocked(int32_t layer, moe_raw_tensor_kind_t kind) {
+    static std::atomic<uint32_t> logged{0};
+    const uint32_t n = logged.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 64u) {
+        return;
+    }
+    moe_profile_log(
+        "raw_tensor_static_fallback_blocked",
+        "layer=%d kind=%u",
+        (int)layer,
+        (uint32_t)kind);
+}
+
 static int moe_common_tensor_record_to_raw_desc(
     const moe_gguf_common_tensor_record& rec,
     moe_raw_tensor_desc* out_desc
@@ -296,14 +385,27 @@ static void moe_raw_tensor_kind_common_names(
     }
 }
 
-static const moe_gguf_common_tensor_record* moe_common_tensor_find_first(
+static const moe_gguf_common_tensor_record* moe_common_tensor_find_first_raw_compatible(
     const moe_pc_engine* engine,
-    const std::vector<std::string>& names
+    const std::vector<std::string>& names,
+    moe_raw_tensor_desc* out_desc
 ) {
     for (const std::string& name : names) {
-        if (const moe_gguf_common_tensor_record* rec = moe_common_tensor_find(engine, name)) {
-            return rec;
+        const moe_gguf_common_tensor_record* rec = moe_common_tensor_find(engine, name);
+        if (!rec) {
+            continue;
         }
+        moe_raw_tensor_desc desc{};
+        if (!moe_common_tensor_record_to_raw_desc(*rec, &desc)) {
+            continue;
+        }
+        if (!moe_common_tensor_record_raw_compatible(*rec, desc)) {
+            continue;
+        }
+        if (out_desc) {
+            *out_desc = desc;
+        }
+        return rec;
     }
     return nullptr;
 }
@@ -316,18 +418,7 @@ static const moe_gguf_common_tensor_record* find_common_raw_tensor_record(
 ) {
     std::vector<std::string> names;
     moe_raw_tensor_kind_common_names(layer, kind, &names);
-    const moe_gguf_common_tensor_record* rec = moe_common_tensor_find_first(engine, names);
-    if (!rec) {
-        return nullptr;
-    }
-    moe_raw_tensor_desc desc{};
-    if (!moe_common_tensor_record_to_raw_desc(*rec, &desc)) {
-        return nullptr;
-    }
-    if (out_desc) {
-        *out_desc = desc;
-    }
-    return rec;
+    return moe_common_tensor_find_first_raw_compatible(engine, names, out_desc);
 }
 
 static const moe_gguf_common_tensor_record* find_common_tensor_by_names(
@@ -343,6 +434,9 @@ static const moe_gguf_common_tensor_record* find_common_tensor_by_names(
         if (const moe_gguf_common_tensor_record* rec = moe_common_tensor_find(engine, names[i])) {
             moe_raw_tensor_desc desc{};
             if (!moe_common_tensor_record_to_raw_desc(*rec, &desc)) {
+                continue;
+            }
+            if (!moe_common_tensor_record_raw_compatible(*rec, desc)) {
                 continue;
             }
             if (out_desc) {
@@ -392,15 +486,14 @@ static int map_common_tensor_record(
     entry.rows = desc.rows;
     entry.cols = desc.cols;
     entry.scalar_encoding = moe_raw_scalar_encoding_from_common_tensor(rec, desc.rows, desc.cols);
-    entry.weight_format = rec.weight_encoding != moe_WEIGHT_ENCODING_UNKNOWN ?
-        rec.weight_encoding : moe_weight_encoding_from_gguf_type(rec.type, moe_offload_gguf_contract_t{});
+    entry.weight_format = moe_common_tensor_effective_weight_format(rec, desc);
     if (entry.weight_format == moe_WEIGHT_ENCODING_UNKNOWN) {
-        entry.weight_format = moe_raw_weight_encoding_from_common_tensor(
-            rec, desc.rows, desc.cols, entry.scalar_encoding);
-        if (entry.weight_format == moe_WEIGHT_ENCODING_UNKNOWN) {
-            moe_trace_common_tensor_unknown_weight_format(rec, desc);
-            return 0;
-        }
+        moe_trace_common_tensor_unknown_weight_format(rec, desc);
+        return 0;
+    }
+    if (!moe_common_tensor_raw_weight_format_supported(entry.weight_format)) {
+        moe_trace_common_tensor_unsupported_weight_format(rec, desc, entry.weight_format);
+        return 0;
     }
     moe_tensor_info_t info{};
     info.rows = desc.rows;

@@ -38,6 +38,10 @@ int moe_pc_engine_find_raw_tensor(
         out_info->bf16 = weight_format == moe_WEIGHT_ENCODING_RAW_BF16 ? 1 : 0;
         return 1;
     }
+    if (engine->offload_gguf_valid.load(std::memory_order_relaxed)) {
+        moe_trace_raw_tensor_static_fallback_blocked(layer, kind);
+        return 0;
+    }
     const moe_storage_raw_span_spec_t* span = nullptr;
     if (!find_raw_tensor_desc_and_span(layer, kind, &desc, &span)) {
         return 0;

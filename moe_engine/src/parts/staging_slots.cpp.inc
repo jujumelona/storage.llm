@@ -60,9 +60,18 @@ static void reset_staging_slots(moe_pc_engine* engine) {
     }
 
     engine->ring_adapter.cleanup();
+    // BUGFIX 문제3: Free staging buffers before clearing slots to prevent memory leak ★★★
+    // Problem: allocate_staging() allocates memory with posix_memalign/VirtualAlloc
+    // but reset_staging_slots() only sets buf=nullptr without calling free_staging()
+    // → Memory leak on engine reload
+    // Solution: Call free_staging() for each slot before clearing
+    // FIXED: Now properly calls free_staging() with all required parameters
     for (auto& slot : engine->staging_slots) {
-        slot.buf = nullptr;
-        slot.size = 0;
+        if (slot.buf) {
+            free_staging(slot.buf, slot.size, slot.pinned, slot.numa_allocated);
+            slot.buf = nullptr;
+            slot.size = 0;
+        }
     }
     engine->staging_slots.clear();
     engine->staging_slot_size = 0;
@@ -379,7 +388,18 @@ static void configure_staging_slots(moe_pc_engine* engine) {
         update_staging_slot_deficit(engine);
         return;
     }
-    // PIPELINE FIX 5: Validate initialization order ?�★
+
+    // BUGFIX 문제1: Override pinned flag for Metal unified memory ★★★
+    // Problem: Metal uses unified memory (CPU/GPU share same memory)
+    // mlock is unnecessary and can silently fail under memory pressure
+    // Solution: Force staging_pinned=false for Metal backend
+    // Impact: No regression - Metal path uses metal_zero_copy_map() which doesn't need pinned memory
+    if (engine->backend_caps.backend == moe_BACKEND_METAL && engine->staging_pinned) {
+        fprintf(stderr, "[storageLLM INFO] Metal unified memory detected - disabling mlock for staging buffers\n");
+        engine->staging_pinned = false;
+    }
+
+    // PIPELINE FIX 5: Validate initialization order ★
     // max_tensor_stream_bytes must be set BEFORE configure_staging_slots is called.
     // It's set during tensor index parsing (safetensors manifest load).
     // If 0, slot size defaults to 4MB ??NVFP4 expert triplets (~20MB) fail to copy.

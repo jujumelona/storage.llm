@@ -12,6 +12,8 @@ from pathlib import Path
 import requests
 
 
+STRICT_GGUF_EXACT_BYTES = os.environ.get("STRICT_GGUF_EXACT_BYTES", "0") != "0"
+
 GGUF_TYPE_UINT8 = 0
 GGUF_TYPE_INT8 = 1
 GGUF_TYPE_UINT16 = 2
@@ -253,6 +255,17 @@ def read_string(handle):
     return read_exact(handle, size).decode("utf-8")
 
 
+def skip_array_payload(handle, elem_type, count):
+    if elem_type == GGUF_TYPE_STRING:
+        for _ in range(count):
+            handle.seek(read_u64(handle), 1)
+        return
+    elem_size = GGUF_TYPE_SIZE.get(elem_type)
+    if elem_size is None:
+        raise ValueError(f"unsupported GGUF array element type: {elem_type}")
+    handle.seek(elem_size * count, 1)
+
+
 def skip_value(handle, value_type):
     if value_type == GGUF_TYPE_STRING:
         handle.seek(read_u64(handle), 1)
@@ -260,14 +273,7 @@ def skip_value(handle, value_type):
     if value_type == GGUF_TYPE_ARRAY:
         elem_type = read_u32(handle)
         count = read_u64(handle)
-        if elem_type == GGUF_TYPE_STRING:
-            for _ in range(count):
-                handle.seek(read_u64(handle), 1)
-            return
-        elem_size = GGUF_TYPE_SIZE.get(elem_type)
-        if elem_size is None:
-            raise ValueError(f"unsupported GGUF array element type: {elem_type}")
-        handle.seek(elem_size * count, 1)
+        skip_array_payload(handle, elem_type, count)
         return
     size = GGUF_TYPE_SIZE.get(value_type)
     if size is None:
@@ -301,6 +307,26 @@ def read_gguf_scalar_value(handle, value_type):
     if value_type == GGUF_TYPE_FLOAT64:
         return struct.unpack("<d", read_exact(handle, 8))[0]
     return None
+
+
+def read_gguf_array_value(handle):
+    elem_type = read_u32(handle)
+    count = read_u64(handle)
+    limit = int(os.environ.get("GGUF_RUNTIME_ARRAY_CAPTURE_LIMIT", "4096"))
+    if count > limit:
+        skip_array_payload(handle, elem_type, count)
+        return None
+    values = []
+    if elem_type == GGUF_TYPE_STRING:
+        for _ in range(count):
+            values.append(read_string(handle))
+        return values
+    if elem_type not in GGUF_TYPE_SIZE:
+        skip_array_payload(handle, elem_type, count)
+        return None
+    for _ in range(count):
+        values.append(read_gguf_scalar_value(handle, elem_type))
+    return values
 
 
 def should_capture_gguf_runtime_kv(key):
@@ -388,6 +414,8 @@ def gguf_tensor_row_bytes(tensor_type, cols):
         return block256 * 54
     if t == 35:
         return block256 * 66
+    if t in {36, 37, 38}:
+        return 0
     if t == 39:
         return block32 * 17
     return 0
@@ -397,13 +425,10 @@ def gguf_tensor_exact_bytes(tensor_type, shape):
     shape = [int(v or 0) for v in (shape or [])]
     if not shape or shape[0] <= 0:
         return 0
-    cols = shape[0] if len(shape) >= 2 else 1
+    cols = shape[0]
     rows = 1
-    if len(shape) >= 2:
-        for dim in shape[1:]:
-            rows *= max(0, dim)
-    else:
-        rows = shape[0]
+    for dim in shape[1:]:
+        rows *= max(0, dim)
     row_bytes = gguf_tensor_row_bytes(tensor_type, cols)
     return row_bytes * rows if row_bytes and rows > 0 else 0
 
@@ -454,12 +479,94 @@ def gguf_tensor_byte_diagnostics(tensors, limit=32):
                 "exact_to_storage": (exact / storage) if exact and storage else 0,
             })
     return {
+        "tensor_count": len(tensors or []),
         "mismatch_count": len(mismatches),
+        "unknown_exact_count": sum(stat["unknown_exact_count"] for stat in type_stats.values()),
         "mismatches": mismatches[:int(limit or 32)],
         "type_stats": [
             type_stats[key] for key in sorted(type_stats, key=lambda value: int(value))
         ],
     }
+
+
+def print_gguf_byte_diagnostics(directory, label=""):
+    if os.environ.get("JUJU_PRINT_GGUF_BYTE_DIAGNOSTICS", "1") == "0":
+        return
+    diag = (directory or {}).get("byte_diagnostics") or {}
+    prefix = f"[GGUF bytes:{label}]" if label else "[GGUF bytes]"
+    print(
+        f"{prefix} tensors={diag.get('tensor_count', 0)} "
+        f"mismatch={diag.get('mismatch_count', 0)} "
+        f"unknown_exact={diag.get('unknown_exact_count', 0)}"
+    )
+    for stat in diag.get("type_stats", []):
+        print(
+            f"{prefix} type={stat.get('gguf_type')}({stat.get('gguf_type_name')}) "
+            f"count={stat.get('count')} exact={stat.get('exact_bytes')} "
+            f"storage={stat.get('storage_bytes')} emitted={stat.get('emitted_bytes')} "
+            f"padding={stat.get('padding_bytes')} unknown={stat.get('unknown_exact_count')}"
+        )
+    for item in diag.get("mismatches", [])[:16]:
+        print(
+            f"{prefix} mismatch name={item.get('name')} "
+            f"type={item.get('gguf_type')}({item.get('gguf_type_name')}) "
+            f"exact={item.get('exact_bytes')} storage={item.get('source_storage_bytes')} "
+            f"emitted={item.get('emitted_bytes')} padding={item.get('source_padding_bytes')}"
+        )
+
+
+def _hex_preview(data, limit=256):
+    data = bytes(data or b"")[:int(limit or 256)]
+    return " ".join(f"{byte:02x}" for byte in data)
+
+
+def print_gguf_tensor_layout_probes(session, url, directory, token=None, label="", probe_types=None):
+    if os.environ.get("JUJU_PRINT_GGUF_LAYOUT_PROBES", "1") == "0":
+        return
+    probe_types = set(probe_types or (15, 22, 29, 36, 37, 38, 39))
+    tensors = list((directory or {}).get("tensors") or [])
+    present_types = sorted({u32(tensor.get("type")) for tensor in tensors})
+    prefix = f"[GGUF probe:{label}]" if label else "[GGUF probe]"
+    print(f"{prefix} present_types={present_types}")
+    selected = []
+    seen = {}
+    for tensor in tensors:
+        t = u32(tensor.get("type"))
+        if t not in probe_types and int(tensor.get("exact_bytes") or 0) > 0:
+            continue
+        if seen.get(t, 0) >= 1:
+            continue
+        seen[t] = seen.get(t, 0) + 1
+        selected.append(tensor)
+    for tensor in selected:
+        t = u32(tensor.get("type"))
+        size = min(256, int(tensor.get("source_storage_bytes") or tensor.get("bytes") or 0))
+        if size <= 0:
+            preview = ""
+        else:
+            resp = fetch_range(session, url, int(tensor["source_offset"]), int(tensor["source_offset"]) + size - 1, token=token, stream=False)
+            try:
+                preview = _hex_preview(resp.content, limit=size)
+            finally:
+                resp.close()
+        print(
+            f"{prefix} tensor={tensor.get('name')} "
+            f"type={t}({gguf_type_name(t)}) shape={tensor.get('shape')} "
+            f"source_offset={tensor.get('source_offset')} exact={tensor.get('exact_bytes')} "
+            f"storage={tensor.get('source_storage_bytes')} emitted={tensor.get('bytes')} "
+            f"padding={tensor.get('source_padding_bytes')} first{size}={preview}"
+        )
+
+
+def validate_gguf_byte_diagnostics(directory):
+    diag = (directory or {}).get("byte_diagnostics") or {}
+    fatal = list(diag.get("fatal_errors") or [])
+    if fatal:
+        raise RuntimeError(
+            "GGUF tensor byte layout has unsupported or inconsistent entries; "
+            f"first={json.dumps(fatal[0], ensure_ascii=False)} "
+            f"fatal_count={diag.get('fatal_error_count', len(fatal))}"
+        )
 
 
 def file_size(session, url, token=None):
@@ -505,10 +612,11 @@ def parse_gguf_directory(prefix, total_bytes):
             alignment = value
             gguf_kv[key] = value
             gguf_kv_aliases["alignment"] = value
-        elif should_capture_gguf_runtime_kv(key) and value_type != GGUF_TYPE_ARRAY:
-            value = read_gguf_scalar_value(handle, value_type)
+        elif should_capture_gguf_runtime_kv(key):
+            value = read_gguf_array_value(handle) if value_type == GGUF_TYPE_ARRAY else read_gguf_scalar_value(handle, value_type)
             if value is None:
-                skip_value(handle, value_type)
+                if value_type != GGUF_TYPE_ARRAY:
+                    skip_value(handle, value_type)
                 continue
             gguf_kv[key] = value
             gguf_kv_aliases[key] = value
@@ -534,18 +642,55 @@ def parse_gguf_directory(prefix, total_bytes):
     if data_start > len(prefix):
         raise EOFError(f"GGUF tensor table needs {data_start} bytes, got {len(prefix)}")
     order = sorted(range(len(tensors)), key=lambda i: tensors[i]["relative_offset"])
+    byte_fatal_errors = []
     for pos, idx in enumerate(order):
+        is_last_tensor = pos == len(order) - 1
         cur = tensors[idx]["relative_offset"]
         nxt = tensors[order[pos + 1]]["relative_offset"] if pos + 1 < len(order) else total_bytes - data_start
         storage_bytes = max(0, nxt - cur)
         exact_bytes = gguf_tensor_exact_bytes(tensors[idx]["type"], tensors[idx]["shape"])
+        if storage_bytes and not exact_bytes:
+            byte_fatal_errors.append({
+                "reason": "unsupported_gguf_tensor_byte_size",
+                "name": tensors[idx]["name"],
+                "type": tensors[idx]["type"],
+                "type_name": gguf_type_name(tensors[idx]["type"]),
+                "shape": tensors[idx]["shape"],
+                "storage": storage_bytes,
+            })
+        if storage_bytes and exact_bytes > storage_bytes:
+            status = "unknown" if not exact_bytes else "larger_than_storage"
+            byte_fatal_errors.append({
+                "reason": "inconsistent_gguf_tensor_byte_size",
+                "name": tensors[idx]["name"],
+                "type": tensors[idx]["type"],
+                "type_name": gguf_type_name(tensors[idx]["type"]),
+                "shape": tensors[idx]["shape"],
+                "exact": exact_bytes,
+                "storage": storage_bytes,
+                "status": status,
+            })
         tensors[idx]["source_offset"] = data_start + cur
         tensors[idx]["source_storage_bytes"] = storage_bytes
         tensors[idx]["exact_bytes"] = exact_bytes
-        tensors[idx]["bytes"] = exact_bytes if exact_bytes and exact_bytes <= storage_bytes else storage_bytes
+        tensors[idx]["bytes"] = exact_bytes if exact_bytes and exact_bytes <= storage_bytes else 0
         tensors[idx]["source_padding_bytes"] = max(0, storage_bytes - tensors[idx]["bytes"])
+        if STRICT_GGUF_EXACT_BYTES and tensors[idx]["bytes"] and tensors[idx]["source_padding_bytes"] >= alignment and not is_last_tensor:
+            byte_fatal_errors.append({
+                "reason": "impossible_alignment_padding",
+                "name": tensors[idx]["name"],
+                "type": tensors[idx]["type"],
+                "type_name": gguf_type_name(tensors[idx]["type"]),
+                "shape": tensors[idx]["shape"],
+                "exact": exact_bytes,
+                "storage": storage_bytes,
+                "padding": tensors[idx]["source_padding_bytes"],
+                "alignment": alignment,
+            })
         tensors[idx]["bucket"] = tensor_bucket(tensors[idx]["name"])
     byte_diagnostics = gguf_tensor_byte_diagnostics(tensors)
+    byte_diagnostics["fatal_error_count"] = len(byte_fatal_errors)
+    byte_diagnostics["fatal_errors"] = byte_fatal_errors[:32]
     return {
         "version": version,
         "tensor_count": tensor_count,
@@ -752,21 +897,37 @@ def tensor_bucket(name):
         "ocr_encoder.",
     )):
         return "document_encoder"
-    if "shared_expert" in lower or "shared.expert" in lower:
+    if is_shared_expert_tensor_name(lower):
         return "shared_weights"
     if "attn" in lower or "attention" in lower:
         return "shared_weights"
-    expert_name = (
-        "_exps" in lower or
-        "ffn_gate_up_exps" in lower or
-        "ffn_gate_exps" in lower or
-        "ffn_up_exps" in lower or
-        "ffn_down_exps" in lower or
-        re.search(r"(?:^|[.])(experts?|expert)[.]", lower) is not None
-    )
-    if expert_name:
+    if is_routed_expert_tensor_name(lower):
         return "cold_experts"
     return "shared_weights"
+
+
+def is_shared_expert_tensor_name(name):
+    text = str(name or "").lower()
+    normalized = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    if not normalized:
+        return False
+    if re.search(r"(?:^|_)shared_(?:expert|experts|exps)(?:_|$)", normalized):
+        return True
+    if re.search(r"(?:^|_)(?:expert|experts|exps)_shared(?:_|$)", normalized):
+        return True
+    return False
+
+
+def is_routed_expert_tensor_name(name):
+    text = str(name or "").lower()
+    if not text or is_shared_expert_tensor_name(text):
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    if "_exps" in normalized:
+        return True
+    if re.search(r"(?:^|_)(?:expert|experts)(?:_|$)", normalized):
+        return True
+    return False
 
 
 def section_type_for_bucket(bucket):
@@ -917,10 +1078,13 @@ def pack_section(entry):
     return payload + (b"\x00" * (JUJU_SECTION_ENTRY_BYTES - len(payload)))
 
 
-def write_padding(out, alignment=4096):
+def write_padding(out, alignment=4096, digest=None):
     pad = align_up(out.tell(), alignment) - out.tell()
     if pad:
-        out.write(b"\x00" * pad)
+        data = b"\x00" * pad
+        out.write(data)
+        if digest is not None:
+            digest.update(data)
 
 
 def stream_range(session, url, start, size, out, token, digest, chunk_size=16 * 1024 * 1024):
@@ -939,6 +1103,39 @@ def stream_range(session, url, start, size, out, token, digest, chunk_size=16 * 
         resp.close()
     if written != size:
         raise EOFError(f"short tensor range read: expected {size}, got {written}")
+
+
+def sha256_juju_section_ranges(session, url, section_offset, section_size, ranges, token=None, chunk_size=16 * 1024 * 1024):
+    digest = hashlib.sha256()
+    cursor = int(section_offset)
+    section_end = int(section_offset) + int(section_size)
+    for item in sorted(ranges or [], key=lambda value: int(value["offset"])):
+        item_offset = int(item["offset"])
+        if item_offset > cursor:
+            digest.update(b"\x00" * (item_offset - cursor))
+            cursor = item_offset
+        start = int(item["source_offset"])
+        size = int(item["size"])
+        if size <= 0:
+            continue
+        remaining = size
+        pos = start
+        while remaining > 0:
+            take = min(int(chunk_size), remaining)
+            resp = fetch_range(session, url, pos, pos + take - 1, token=token, stream=False)
+            try:
+                data = resp.content
+            finally:
+                resp.close()
+            if len(data) != take:
+                raise EOFError(f"short checksum range read: expected {take}, got {len(data)}")
+            digest.update(data)
+            pos += take
+            remaining -= take
+        cursor += size
+    if section_end > cursor:
+        digest.update(b"\x00" * (section_end - cursor))
+    return digest.hexdigest()
 
 
 def u32(value):
@@ -1156,6 +1353,9 @@ def gguf_type_name(tensor_type):
         33: "Q4_0_8_8",
         34: "TQ1_0",
         35: "TQ2_0",
+        36: "REMOVED_IQ4_NL_4_4",
+        37: "REMOVED_IQ4_NL_4_8",
+        38: "REMOVED_IQ4_NL_8_8",
         39: "MXFP4",
     }
     return names.get(u32(tensor_type), f"GGUF_TYPE_{u32(tensor_type)}")
@@ -1585,9 +1785,28 @@ def json_section_bytes(payload):
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+JUJU_LAYER_NAME_PATTERNS = (
+    re.compile(r"(?:^|[.])blk\.(\d+)\.(.+)$"),
+    re.compile(r"(?:^|[.])blocks\.(\d+)\.(.+)$"),
+    re.compile(r"(?:^|[.])layers\.(\d+)\.(.+)$"),
+    re.compile(r"(?:^|[.])model\.layers\.(\d+)\.(.+)$"),
+    re.compile(r"(?:^|[.])transformer\.h\.(\d+)\.(.+)$"),
+    re.compile(r"(?:^|[.])h\.(\d+)\.(.+)$"),
+)
+
+
+def _juju_layer_match(name):
+    text = str(name or "")
+    for pattern in JUJU_LAYER_NAME_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return int(match.group(1)), match.group(2)
+    return None, ""
+
+
 def _juju_layer_id_from_name(name):
-    match = __import__("re").search(r"(?:^|[.])blk\.(\d+)\.", str(name or ""))
-    return int(match.group(1)) if match else None
+    layer, _ = _juju_layer_match(name)
+    return layer
 
 
 def _juju_first_tensor(tensors, *names):
@@ -1606,6 +1825,21 @@ def _juju_tensors_by_prefix(tensors, prefix):
         for t in tensors
         if str(t.get("name") or "").lower().startswith(prefix)
     ]
+
+
+def _juju_tensors_by_layer(tensors, layer):
+    out = []
+    for tensor in tensors:
+        name = str(tensor.get("name") or "")
+        layer_id, _ = _juju_layer_match(name)
+        if layer_id == int(layer):
+            out.append(name)
+    return out
+
+
+def _juju_layer_suffix(name):
+    _, suffix = _juju_layer_match(name)
+    return suffix.lower()
 
 
 def _juju_tensor_shape_map(tensors):
@@ -1648,7 +1882,13 @@ def tensor_runtime_priority(name, bucket, size):
         prefetch = 95
         residency = "FAST_MEM"
         prefetch_class = "router_hot"
-    elif "_exps" in lower or "expert" in lower:
+    elif is_shared_expert_tensor_name(lower):
+        role = "shared_core"
+        priority = 90
+        prefetch = 90
+        residency = "FAST_MEM"
+        prefetch_class = "layer_hot"
+    elif is_routed_expert_tensor_name(lower):
         role = "expert"
         priority = 65
         prefetch = 80
@@ -1742,6 +1982,10 @@ def juju_runtime_arch_metadata(contract, directory=None):
         "partial_rotary_factor": first_present(arch.get("partial_rotary_factor"), runtime.get("partial_rotary_factor")),
         "full_rope_theta": first_present(arch.get("full_rope_theta"), arch.get("full_attention_rope_theta"), runtime.get("full_rope_theta"), runtime.get("full_attention_rope_theta")),
         "sliding_rope_theta": first_present(arch.get("sliding_rope_theta"), arch.get("sliding_attention_rope_theta"), runtime.get("sliding_rope_theta"), runtime.get("sliding_attention_rope_theta")),
+        "full_attention_interval": first_present(arch.get("full_attention_interval"), arch.get("global_attention_interval"), runtime.get("full_attention_interval"), runtime.get("global_attention_interval")),
+        "global_attention_interval": first_present(arch.get("global_attention_interval"), arch.get("full_attention_interval"), runtime.get("global_attention_interval"), runtime.get("full_attention_interval")),
+        "full_attention_offset": first_present(arch.get("full_attention_offset"), arch.get("global_attention_offset"), runtime.get("full_attention_offset"), runtime.get("global_attention_offset")),
+        "global_attention_offset": first_present(arch.get("global_attention_offset"), arch.get("full_attention_offset"), runtime.get("global_attention_offset"), runtime.get("full_attention_offset")),
         "routed_scaling_factor": first_present(arch.get("routed_scaling_factor"), arch.get("route_scale"), runtime.get("routed_scaling_factor"), runtime.get("route_scale")),
         "norm_topk_prob": first_present(arch.get("norm_topk_prob"), arch.get("normalize_topk_prob"), runtime.get("norm_topk_prob"), runtime.get("normalize_topk_prob")),
         "scoring_func": first_present(arch.get("scoring_func"), arch.get("score_func"), runtime.get("scoring_func"), runtime.get("score_func")),
@@ -1754,17 +1998,19 @@ def juju_runtime_arch_metadata(contract, directory=None):
 
 def build_layer_graph_ir(layer, tensors):
     prefix = f"blk.{layer}."
-    names = set(_juju_tensors_by_prefix(tensors, prefix))
+    names = set(_juju_tensors_by_layer(tensors, layer))
 
     def bind(*suffixes):
         out = []
-        for suffix in suffixes:
-            name = prefix + suffix
-            if name in names:
+        wanted = {str(suffix or "").lower() for suffix in suffixes if suffix}
+        for name in sorted(names):
+            suffix = _juju_layer_suffix(name)
+            if suffix in wanted:
                 out.append(name)
         return out
 
-    moe_weights = bind("ffn_gate_up_exps.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight")
+    moe_weights = sorted(name for name in names if is_routed_expert_tensor_name(name))
+    shared_expert_weights = sorted(name for name in names if is_shared_expert_tensor_name(name))
     dense_weights = bind("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight")
 
     ops = [
@@ -1783,6 +2029,7 @@ def build_layer_graph_ir(layer, tensors):
         {"op": "linear", "name": "moe_router", "inputs": ["ffn_norm"], "weights": bind("ffn_gate_inp.weight", "router.weight"), "scale": bind("ffn_gate_inp.scale"), "output": "expert_scores", "required": False},
         {"op": "topk", "name": "expert_select", "inputs": ["expert_scores"], "config_key": "adaptive_seq_topk_entropy", "required": False},
         {"op": "moe_expert_mlp", "name": "moe_experts", "inputs": ["ffn_norm", "selected_experts"], "weights": moe_weights, "required": bool(moe_weights)},
+        {"op": "shared_expert_mlp", "name": "shared_experts", "inputs": ["ffn_norm"], "weights": shared_expert_weights, "required": bool(shared_expert_weights)},
         {"op": "dense_mlp", "name": "dense_ffn_fallback", "inputs": ["ffn_norm"], "weights": dense_weights, "required": bool(dense_weights)},
         {"op": "residual", "name": "ffn_residual", "inputs": ["hidden", "ffn_out"], "required": True},
         {"op": "scale", "name": "layer_output_scale", "inputs": ["hidden"], "weights": bind("layer_output_scale.weight"), "required": False},
@@ -1790,14 +2037,76 @@ def build_layer_graph_ir(layer, tensors):
     return {
         "layer": int(layer),
         "tensor_prefix": prefix,
+        "layer_name_parser": "common_gguf_layer_prefixes",
         "available_tensors": sorted(names),
         "ops": ops,
     }
 
 
+def juju_expert_tensor_diagnostics(tensor_records):
+    diagnostics = {
+        "routed_expert_tensor_count": 0,
+        "shared_expert_tensor_count": 0,
+        "routed_expert_layers": [],
+        "shared_expert_layers": [],
+        "format_errors": [],
+    }
+    routed_layers = set()
+    shared_layers = set()
+    for rec in tensor_records or []:
+        name = str(rec.get("name") or "")
+        bucket = str(rec.get("bucket") or "")
+        role = str(rec.get("graph_role") or "")
+        prefetch_class = str(rec.get("prefetch_class") or "")
+        layer = _juju_layer_id_from_name(name)
+        is_shared = is_shared_expert_tensor_name(name)
+        is_routed = is_routed_expert_tensor_name(name)
+        if is_shared:
+            diagnostics["shared_expert_tensor_count"] += 1
+            if layer is not None:
+                shared_layers.add(int(layer))
+            if bucket != "shared_weights":
+                diagnostics["format_errors"].append({
+                    "name": name,
+                    "error": "shared_expert_not_in_shared_weights",
+                    "bucket": bucket,
+                })
+            if role == "expert" or prefetch_class == "expert_stream":
+                diagnostics["format_errors"].append({
+                    "name": name,
+                    "error": "shared_expert_marked_as_routed_expert",
+                    "graph_role": role,
+                    "prefetch_class": prefetch_class,
+                })
+        if is_routed:
+            diagnostics["routed_expert_tensor_count"] += 1
+            if layer is not None:
+                routed_layers.add(int(layer))
+            if bucket not in {"hot_experts", "warm_experts", "cold_experts"}:
+                diagnostics["format_errors"].append({
+                    "name": name,
+                    "error": "routed_expert_not_in_expert_bucket",
+                    "bucket": bucket,
+                })
+            if role != "expert":
+                diagnostics["format_errors"].append({
+                    "name": name,
+                    "error": "routed_expert_graph_role_not_expert",
+                    "graph_role": role,
+                })
+    diagnostics["routed_expert_layers"] = sorted(routed_layers)
+    diagnostics["shared_expert_layers"] = sorted(shared_layers)
+    if diagnostics["format_errors"]:
+        raise RuntimeError("JUJU expert tensor format validation failed: " + json.dumps(
+            diagnostics["format_errors"][:16], ensure_ascii=False
+        ))
+    return diagnostics
+
+
 def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, source_path, source_repo_id, weight_file, index_file, directory=None):
     arch = dict(contract.get("arch_meta") or {})
     runtime_arch = juju_runtime_arch_metadata(contract, directory)
+    expert_diagnostics = juju_expert_tensor_diagnostics(tensor_records)
     shape_map = _juju_tensor_shape_map(tensor_records)
     layers = sorted({
         layer for layer in (_juju_layer_id_from_name(t.get("name")) for t in tensor_records)
@@ -1893,6 +2202,7 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             "row_layout_field": "row_layout",
             "role_counts": role_counts,
             "bucket_counts": bucket_counts,
+            "expert_diagnostics": expert_diagnostics,
             "sections_embedded_in_header_table": True,
             "paired_idx_required": True,
             "external_adapter_required": False,
@@ -2135,6 +2445,9 @@ def build_juju_shard_plan_from_hf_url(
 
     with requests.Session() as session:
         directory, total_bytes = read_remote_directory(session, source_url, token=token)
+        print_gguf_byte_diagnostics(directory, source_name)
+        print_gguf_tensor_layout_probes(session, source_url, directory, token=token, label=source_name)
+        validate_gguf_byte_diagnostics(directory)
         allowset = set(tensor_name_allowlist or [])
         if allowset:
             known = {tensor["name"] for tensor in directory["tensors"]}
@@ -2204,14 +2517,17 @@ def build_juju_shard_plan_from_hf_url(
                 continue
             pos = align_up(pos, 4096)
             section_offset = pos
+            section_source_ranges = []
             for tensor in group:
                 pos = align_up(pos, 4096)
                 tensor_offset = pos
-                source_segments.append({
+                source_segment = {
                     "offset": tensor_offset,
                     "size": tensor["bytes"],
                     "source_offset": tensor["source_offset"],
-                })
+                }
+                source_segments.append(source_segment)
+                section_source_ranges.append(source_segment)
                 runtime_priority = tensor_runtime_priority(tensor["name"], bucket, tensor["bytes"])
                 tensor_records.append({
                     "name": tensor["name"],
@@ -2245,7 +2561,8 @@ def build_juju_shard_plan_from_hf_url(
                 "name": bucket.upper()[:32],
                 "offset": section_offset,
                 "size": size,
-                "sha256": "0" * 64,
+                "sha256": sha256_juju_section_ranges(session, source_url, section_offset, size, section_source_ranges, token=token, chunk_size=chunk_size),
+                "hash_semantics": "juju_section_bytes_including_alignment_padding",
                 "prefetch_distance": 2 if bucket != "shared_weights" else 0,
                 "mmap_friendly": 1,
             })
@@ -2519,6 +2836,9 @@ def prepare_juju_shard_upload_parts_from_hf_url(
 ):
     with requests.Session() as session:
         directory, total_bytes = read_remote_directory(session, source_url, token=token)
+        print_gguf_byte_diagnostics(directory, source_name)
+        print_gguf_tensor_layout_probes(session, source_url, directory, token=token, label=source_name)
+        validate_gguf_byte_diagnostics(directory)
     split_plan = plan_juju_tensor_splits(directory, max_file_bytes=max_file_bytes)
     base_index_path = Path(index_path)
     parts = []
@@ -2603,6 +2923,9 @@ def write_juju_shard_from_hf_url(
 
     with requests.Session() as session:
         directory, total_bytes = read_remote_directory(session, source_url, token=token)
+        print_gguf_byte_diagnostics(directory, source_name)
+        print_gguf_tensor_layout_probes(session, source_url, directory, token=token, label=source_name)
+        validate_gguf_byte_diagnostics(directory)
         allowset = set(tensor_name_allowlist or [])
         if allowset:
             known = {tensor["name"] for tensor in directory["tensors"]}
@@ -2675,7 +2998,7 @@ def write_juju_shard_from_hf_url(
                 offset = out.tell()
                 digest = hashlib.sha256()
                 for tensor in group:
-                    write_padding(out, 4096)
+                    write_padding(out, 4096, digest=digest)
                     tensor_offset = out.tell()
                     stream_range(
                         session,
@@ -2720,6 +3043,7 @@ def write_juju_shard_from_hf_url(
                     "offset": offset,
                     "size": size,
                     "sha256": digest.hexdigest(),
+                    "hash_semantics": "juju_section_bytes_including_alignment_padding",
                     "prefetch_distance": 2 if bucket != "shared_weights" else 0,
                     "mmap_friendly": 1,
                 })
@@ -2809,6 +3133,9 @@ def write_juju_shard_parts_from_hf_url(
 ):
     with requests.Session() as session:
         directory, total_bytes = read_remote_directory(session, source_url, token=token)
+        print_gguf_byte_diagnostics(directory, source_name)
+        print_gguf_tensor_layout_probes(session, source_url, directory, token=token, label=source_name)
+        validate_gguf_byte_diagnostics(directory)
     split_plan = plan_juju_tensor_splits(directory, max_file_bytes=max_file_bytes)
     base_output_path = Path(output_path)
     base_index_path = Path(index_path)

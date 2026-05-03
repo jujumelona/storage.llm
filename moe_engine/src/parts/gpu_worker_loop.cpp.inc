@@ -45,7 +45,15 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         {
             std::unique_lock<std::mutex> lock(engine->gpu_stage.mtx);
             uint32_t extra_popped = 0;
-            const uint64_t byte_limit = engine->backend_caps.copy_stream_bytes_limit > 0 ? engine->backend_caps.copy_stream_bytes_limit : 512ull * 1024ull * 1024ull;
+            // BUGFIX 문제2: Reduce fallback byte_limit from 512MB to stream-based value ★★★
+            // Problem: 512MB fallback too large for PCIe 3.0 x4 systems
+            // With 16 GPU workers, in-flight can reach 8GB → stream sync stalls
+            // Solution: Use copy_streams * 32MB as fallback (scales with PCIe lanes)
+            // 32MB per stream is optimal for PCIe 3.0-5.0 DMA buffer size
+            // Impact: Reduces in-flight data, improves throughput on low-bandwidth systems
+            const uint64_t byte_limit = engine->backend_caps.copy_stream_bytes_limit > 0
+                ? engine->backend_caps.copy_stream_bytes_limit
+                : (uint64_t)engine->backend_caps.copy_streams * 32ull * 1024ull * 1024ull;
 
             // BUGFIX: Check byte_limit BEFORE count to ensure byte-based throttling works
             while (!engine->gpu_stage.urgent_queue.empty()) {

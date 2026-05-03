@@ -91,6 +91,51 @@ hf download <target Hugging Face GGUF offload repo> --local-dir <model_root>
 moe_pc_engine_server <model_root>
 ```
 
+Do not download only `*.juju`. A runnable StorageLLM model root needs the
+weight package, the runtime assets, and the metadata sidecars:
+
+```text
+*.juju
+*.juju.idx
+*.juju.verify.json
+verify/*.json
+runtime_assets_manifest.json
+storagellm_performance_metadata_manifest.json
+metadata/**
+README.md
+config.json
+generation_config.json
+tokenizer.json
+tokenizer_config.json
+special_tokens_map.json
+added_tokens.json
+chat_template.jinja
+tokenizer.model
+sentencepiece.bpe.model
+tiktoken.model
+vocab.json
+merges.txt
+processor_config.json
+preprocessor_config.json
+image_processor_config.json
+feature_extractor.json
+video_preprocessor_config.json
+audio_config.json
+tokenization_*.py
+configuration_*.py
+modeling_*.py
+processing_*.py
+*_processor.py
+*_processing.py
+*_utils.py
+```
+
+The engine consumes these sidecars during `model_root` load. Runtime manifest,
+generation/tokenizer/processor config, graph/priority/prefetch/residency, QKV,
+offload policy, validation, and metadata JSON are merged into the runtime
+metadata path so attention, router, RoPE, embedding, graph hints, and planning
+code can see them.
+
 The expected StorageLLM Hugging Face repo must contain GGUF files with embedded
 `offload.runtime_tensor_index_v1` and scalar `offload.*` metadata. The official
 upstream model repo remains the source reference.

@@ -91,7 +91,12 @@ static int prefetch_tensor_file_to_pinned(
                                         (total_bytes <= engine->staging_size / 2);
 
         if (should_try_realloc) {
-            // Attempt to trigger slot reallocation
+            // BUGFIX Issue 2-3: Fix race condition in dynamic slot reallocation ★★★
+            // Problem: Old sequence "release → configure → acquire" allows other workers
+            // to access memory being freed during configure_staging_slots, causing use-after-free.
+            // Solution: New sequence "acquire new → if success, release old" prevents race.
+            // Trade-off: Temporarily uses one extra slot worth of memory during reallocation.
+
             s_realloc_attempt_count.fetch_add(1, std::memory_order_relaxed);
 
             // Update max_tensor_stream_bytes if this tensor is larger
@@ -107,27 +112,37 @@ static int prefetch_tensor_file_to_pinned(
                 (unsigned long long)engine->staging_slots[slot_index].size,
                 realloc_attempts + 1);
 
-            release_staging_slot(engine, slot_index);
-            if (io_slot_index) {
-                *io_slot_index = UINT32_MAX;
-            }
+            // Step 1: Try to acquire a new larger slot BEFORE releasing the old one
+            // This prevents other workers from accessing memory being freed
+            const uint32_t old_slot_index = slot_index;
 
-            // Trigger slot reconfiguration
+            // Trigger slot reconfiguration to create larger slots
             configure_staging_slots(engine);
-            slot_index = acquire_staging_slot(
+
+            // Step 2: Acquire new slot with required size
+            const uint32_t new_slot_index = acquire_staging_slot(
                 engine,
                 0u,
                 realloc_attempts + 1u,
                 total_bytes,
                 true,
                 false);
-            if (slot_index == UINT32_MAX) {
+
+            if (new_slot_index == UINT32_MAX) {
+                // Allocation failed - keep using old slot (graceful degradation)
                 fprintf(stderr,
-                    "[storageLLM ERROR] Slot reallocation failed. Could not reacquire staging slot.\n");
+                    "[storageLLM ERROR] Slot reallocation failed. Could not acquire new staging slot.\n"
+                    "  Keeping old slot. Increase staging_size to at least %llu bytes.\n",
+                    (unsigned long long)(total_bytes * 4));
                 return 0;
             }
+
+            // Step 3: New slot acquired successfully - now safe to release old slot
+            release_staging_slot(engine, old_slot_index);
+            slot_index = new_slot_index;
+
             if (io_slot_index) {
-                *io_slot_index = slot_index;
+                *io_slot_index = new_slot_index;
             }
 
             // Check if reallocation succeeded

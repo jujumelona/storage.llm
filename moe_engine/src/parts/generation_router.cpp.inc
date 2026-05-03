@@ -110,9 +110,9 @@ static int moe_map_router_tensor(
     std::vector<std::string> names;
     moe_push_layer_tensor_candidates(&names, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_desc desc{};
-    const moe_gguf_common_tensor_record* rec = moe_common_tensor_find_first(engine, names);
-    if (!rec || !moe_common_tensor_record_to_raw_desc(*rec, &desc) ||
-        desc.cols != hidden_size || desc.rows != experts) {
+    const moe_gguf_common_tensor_record* rec =
+        moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
+    if (!rec || desc.cols != hidden_size || desc.rows != experts) {
         return 0;
     }
     return map_common_tensor_record(engine, *rec, desc, out);
@@ -219,8 +219,9 @@ static int moe_map_router_scale_tensor(
     std::vector<std::string> names;
     moe_push_layer_tensor_candidates(&names, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_desc desc{};
-    const moe_gguf_common_tensor_record* rec = moe_common_tensor_find_first(engine, names);
-    if (!rec || !moe_common_tensor_record_to_raw_desc(*rec, &desc)) {
+    const moe_gguf_common_tensor_record* rec =
+        moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
+    if (!rec) {
         return 0;
     }
     return map_common_tensor_record(engine, *rec, desc, out);
@@ -306,6 +307,9 @@ static uint32_t moe_router_top_k_from_metadata(
         if (engine && !engine->offload_gguf_metadata_json.empty() &&
             (moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_experts_per_tok", &value) ||
              moe_json_get_u64_local(engine->offload_gguf_metadata_json, "n_experts_per_tok", &value) ||
+             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "routed_experts_per_token", &value) ||
+             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "expert_used_count", &value) ||
+             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_experts_per_token", &value) ||
              moe_json_get_u64_local(engine->offload_gguf_metadata_json, "moe_top_k", &value) ||
              moe_json_get_u64_local(engine->offload_gguf_metadata_json, "top_k_experts", &value) ||
              moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_selected_experts", &value) ||

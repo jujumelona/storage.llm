@@ -10,7 +10,7 @@ static const moe_gguf_common_tensor_record* moe_find_layer_common_tensor(
     }
     std::vector<std::string> names;
     moe_push_layer_tensor_candidates(&names, layer, suffixes, suffix_count);
-    return moe_common_tensor_find_first(engine, names);
+    return moe_common_tensor_find_first_raw_compatible(engine, names, out_desc);
 }
 
 static int moe_map_layer_common_tensor(
@@ -26,8 +26,9 @@ static int moe_map_layer_common_tensor(
     std::vector<std::string> names;
     moe_push_layer_tensor_candidates(&names, layer, suffixes, suffix_count);
     moe_raw_tensor_desc desc{};
-    const moe_gguf_common_tensor_record* rec = moe_common_tensor_find_first(engine, names);
-    if (!rec || !moe_common_tensor_record_to_raw_desc(*rec, &desc)) {
+    const moe_gguf_common_tensor_record* rec =
+        moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
+    if (!rec) {
         return 0;
     }
     return map_common_tensor_record(engine, *rec, desc, out);
@@ -564,7 +565,14 @@ static int moe_layer_common_dense_mlp_f32(
         "gate_proj.weight",
         "feed_forward.w1.weight",
         "ffn.w1.weight",
-        "w1.weight"
+        "w1.weight",
+        "shared_expert.gate_proj.weight",
+        "shared_experts.gate_proj.weight",
+        "shared_expert.w1.weight",
+        "shared_experts.w1.weight",
+        "ffn_shared_expert_gate.weight",
+        "ffn_shared_exps_gate.weight",
+        "ffn_shared_gate_proj.weight"
     };
     static const char* const up_suffixes[] = {
         "ffn_up.weight",
@@ -572,7 +580,14 @@ static int moe_layer_common_dense_mlp_f32(
         "up_proj.weight",
         "feed_forward.w3.weight",
         "ffn.w3.weight",
-        "w3.weight"
+        "w3.weight",
+        "shared_expert.up_proj.weight",
+        "shared_experts.up_proj.weight",
+        "shared_expert.w3.weight",
+        "shared_experts.w3.weight",
+        "ffn_shared_expert_up.weight",
+        "ffn_shared_exps_up.weight",
+        "ffn_shared_up_proj.weight"
     };
     static const char* const down_suffixes[] = {
         "ffn_down.weight",
@@ -580,7 +595,14 @@ static int moe_layer_common_dense_mlp_f32(
         "down_proj.weight",
         "feed_forward.w2.weight",
         "ffn.w2.weight",
-        "w2.weight"
+        "w2.weight",
+        "shared_expert.down_proj.weight",
+        "shared_experts.down_proj.weight",
+        "shared_expert.w2.weight",
+        "shared_experts.w2.weight",
+        "ffn_shared_expert_down.weight",
+        "ffn_shared_exps_down.weight",
+        "ffn_shared_down_proj.weight"
     };
     const uint64_t total_start_us = moe_profile_now_us();
     const uint64_t map_start_us = moe_profile_now_us();

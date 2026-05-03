@@ -71,15 +71,13 @@ static uint64_t moe_gguf_tensor_exact_bytes_from_shape(
     if (!shape || dims == 0 || shape[0] == 0) {
         return 0;
     }
-    const uint64_t cols = dims >= 2 ? shape[0] : 1ull;
-    uint64_t rows = dims >= 2 ? 1ull : shape[0];
-    if (dims >= 2) {
-        for (uint32_t i = 1; i < std::min<uint32_t>(dims, 4u); ++i) {
-            if (shape[i] == 0 || rows > UINT64_MAX / shape[i]) {
-                return 0;
-            }
-            rows *= shape[i];
+    const uint64_t cols = shape[0];
+    uint64_t rows = 1ull;
+    for (uint32_t i = 1; i < std::min<uint32_t>(dims, 4u); ++i) {
+        if (shape[i] == 0 || rows > UINT64_MAX / shape[i]) {
+            return 0;
         }
+        rows *= shape[i];
     }
     const uint64_t row_bytes = moe_gguf_tensor_row_bytes_from_type(type, cols);
     if (!row_bytes || rows > UINT64_MAX / row_bytes) {
