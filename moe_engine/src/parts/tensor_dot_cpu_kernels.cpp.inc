@@ -375,6 +375,45 @@ static float moe_dot_gguf_q8_1_row(
     return acc;
 }
 
+static float moe_dot_gguf_q8_k_row(
+    const uint8_t* packed,
+    const float* x,
+    uint32_t cols
+) {
+    if (!packed || !x) {
+        return 0.0f;
+    }
+    float acc = 0.0f;
+    const uint32_t block_cols = 256u;
+    const uint32_t block_bytes = 292u;
+    for (uint32_t start = 0; start < cols; start += block_cols) {
+        float d = 0.0f;
+        std::memcpy(&d, packed, sizeof(d));
+        const int8_t* q = reinterpret_cast<const int8_t*>(packed + 4u);
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
+#if defined(__AVX2__)
+        const __m256 vscale = _mm256_set1_ps(d);
+        __m256 vacc = _mm256_setzero_ps();
+        uint32_t i = 0;
+        for (; i + 7u < limit; i += 8u) {
+            const __m256 qv = moe_i8x8_to_ps(q + i);
+            const __m256 xv = _mm256_loadu_ps(x + start + i);
+            vacc = moe_madd_ps(_mm256_mul_ps(qv, vscale), xv, vacc);
+        }
+        acc += moe_dot_hsum256_ps(vacc);
+        for (; i < limit; ++i) {
+            acc += d * (float)q[i] * x[start + i];
+        }
+#else
+        for (uint32_t i = 0; i < limit; ++i) {
+            acc += d * (float)q[i] * x[start + i];
+        }
+#endif
+        packed += block_bytes;
+    }
+    return acc;
+}
+
 static float moe_dot_gguf_q4_0_row(
     const uint8_t* packed,
     const float* x,

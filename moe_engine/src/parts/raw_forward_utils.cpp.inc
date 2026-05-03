@@ -364,6 +364,9 @@ static uint64_t moe_raw_tensor_row_bytes(
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_1) {
         return ((uint64_t)cols + 31ull) / 32ull * 36ull;
     }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_K) {
+        return ((uint64_t)cols + 255ull) / 256ull * 292ull;
+    }
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0) {
         return ((uint64_t)cols + 31ull) / 32ull * 18ull;
     }
@@ -446,6 +449,9 @@ static float moe_raw_tensor_dot_row(
     }
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_1) {
         return moe_dot_gguf_q8_1_row(row_ptr, hidden, hidden_count);
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_K) {
+        return moe_dot_gguf_q8_k_row(row_ptr, hidden, hidden_count);
     }
     if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0) {
         return moe_dot_gguf_q4_0_row(row_ptr, hidden, hidden_count);
@@ -565,6 +571,24 @@ static int moe_raw_tensor_copy_row_f32(
             uint16_t d16 = 0;
             std::memcpy(&d16, block, sizeof(d16));
             const float d = moe_raw_fp16_to_f32(d16);
+            const int8_t* q = reinterpret_cast<const int8_t*>(block + 4u);
+            const uint32_t limit = std::min<uint32_t>(block_cols, out_count - dst);
+            for (uint32_t i = 0; i < limit; ++i) {
+                out[dst + i] = d * (float)q[i];
+            }
+            dst += limit;
+            block += block_bytes;
+        }
+        return 1;
+    }
+    if (raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_K) {
+        const uint32_t block_cols = 256u;
+        const uint32_t block_bytes = 292u;
+        uint32_t dst = 0;
+        const uint8_t* block = row_ptr;
+        while (dst < out_count) {
+            float d = 0.0f;
+            std::memcpy(&d, block, sizeof(d));
             const int8_t* q = reinterpret_cast<const int8_t*>(block + 4u);
             const uint32_t limit = std::min<uint32_t>(block_cols, out_count - dst);
             for (uint32_t i = 0; i < limit; ++i) {

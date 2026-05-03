@@ -60,6 +60,9 @@ static uint32_t moe_weight_encoding_from_family(const std::string& family) {
     if (value.find("q8_0") != std::string::npos) {
         return moe_WEIGHT_ENCODING_GGUF_Q8_0;
     }
+    if (value.find("q8_k") != std::string::npos) {
+        return moe_WEIGHT_ENCODING_GGUF_Q8_K;
+    }
     if (value.find("nvfp4") != std::string::npos || value.find("fp4") != std::string::npos) {
         return moe_WEIGHT_ENCODING_NVFP4;
     }

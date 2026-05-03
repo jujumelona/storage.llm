@@ -427,6 +427,9 @@ static uint8_t moe_weight_encoding_from_gguf_type(uint32_t type, const moe_offlo
     if (type == 14u) {
         return moe_WEIGHT_ENCODING_GGUF_Q6_K;
     }
+    if (type == 15u) {
+        return moe_WEIGHT_ENCODING_GGUF_Q8_K;
+    }
     if (type == 39u) {
         return moe_WEIGHT_ENCODING_MXFP4;
     }
@@ -480,6 +483,43 @@ static uint8_t moe_weight_encoding_from_juju_entry(
         return (uint8_t)std::min<uint32_t>(contract.weight_encoding, 255u);
     }
     return moe_WEIGHT_ENCODING_UNKNOWN;
+}
+
+static uint64_t moe_effective_juju_tensor_bytes(
+    const moe_juju_tensor_json_entry_t& entry,
+    const moe_offload_gguf_contract_t& contract
+) {
+    if (entry.juju_bytes == 0 || entry.dims == 0 || entry.shape[0] == 0) {
+        return entry.juju_bytes;
+    }
+    uint64_t rows64 = 1;
+    uint32_t cols = 1;
+    if (entry.dims >= 2) {
+        cols = (uint32_t)std::min<uint64_t>(entry.shape[0], UINT32_MAX);
+        for (uint32_t i = 1; i < std::min<uint32_t>(entry.dims, 4u); ++i) {
+            if (entry.shape[i] == 0 || rows64 > UINT64_MAX / entry.shape[i]) {
+                return entry.juju_bytes;
+            }
+            rows64 *= entry.shape[i];
+        }
+    } else {
+        rows64 = entry.shape[0];
+        cols = 1;
+    }
+    if (rows64 == 0 || rows64 > UINT32_MAX || cols == 0) {
+        return entry.juju_bytes;
+    }
+    moe_tensor_info_t info{};
+    info.rows = (uint32_t)rows64;
+    info.cols = cols;
+    info.weight_byte_length = entry.juju_bytes;
+    const uint8_t encoding = moe_weight_encoding_from_juju_entry(entry, contract);
+    const uint64_t row_bytes = infer_weight_row_bytes(info, encoding);
+    if (!row_bytes || rows64 > UINT64_MAX / row_bytes) {
+        return entry.juju_bytes;
+    }
+    const uint64_t exact = rows64 * row_bytes;
+    return exact > 0 && exact <= entry.juju_bytes ? exact : entry.juju_bytes;
 }
 
 static void moe_dynamic_shape_note_tensor(
@@ -823,9 +863,30 @@ static void moe_juju_probe_note_model_config_json(
         moe_json_get_u64_local(text_config, "v_head_dim", &value)) {
         probe->attn.v_head_dim = moe_u64_to_u32_clamped(value, probe->attn.v_head_dim);
     }
+    if (moe_json_get_u64_local(text_config, "kv_lora_rank", &value)) {
+        probe->attn.kv_lora_rank = moe_u64_to_u32_clamped(value, probe->attn.kv_lora_rank);
+        if (probe->attn.kv_lora_rank) {
+            probe->attn.type = moe_ATTN_TYPE_MLA;
+        }
+    }
+    if (moe_json_get_u64_local(text_config, "q_lora_rank", &value)) {
+        probe->attn.q_lora_rank = moe_u64_to_u32_clamped(value, probe->attn.q_lora_rank);
+        if (probe->attn.q_lora_rank) {
+            probe->attn.type = moe_ATTN_TYPE_MLA;
+        }
+    }
+    if (moe_json_get_u64_local(text_config, "qk_nope_head_dim", &value)) {
+        probe->attn.qk_nope_head_dim = moe_u64_to_u32_clamped(value, probe->attn.qk_nope_head_dim);
+    }
+    if (moe_json_get_u64_local(text_config, "qk_rope_head_dim", &value)) {
+        probe->attn.qk_rope_head_dim = moe_u64_to_u32_clamped(value, probe->attn.qk_rope_head_dim);
+    }
     if (moe_json_get_u64_local(text_config, "max_position_embeddings", &value) ||
         moe_json_get_u64_local(text_config, "context_length", &value)) {
         probe->attn.max_seq_len = moe_u64_to_u32_clamped(value, probe->attn.max_seq_len);
+    }
+    if (moe_json_get_double_local(text_config, "rope_theta", &double_value)) {
+        probe->attn.rope_theta = (float)double_value;
     }
     if (moe_json_get_double_local(text_config, "rms_norm_eps", &double_value) ||
         moe_json_get_double_local(text_config, "norm_eps", &double_value)) {
@@ -841,6 +902,10 @@ static void moe_juju_probe_note_model_config_json(
         return;
     }
     int attention_valid = 0;
+    if (probe->attn.kv_lora_rank || probe->attn.q_lora_rank ||
+        probe->attn.qk_nope_head_dim || probe->attn.qk_rope_head_dim) {
+        attention_valid = 1;
+    }
     if (moe_json_get_u64_local(text_config, "num_attention_heads", &value)) {
         engine->model_config_num_attention_heads = moe_u64_to_u32_clamped(value, 0);
         attention_valid = 1;
@@ -934,12 +999,16 @@ static void moe_juju_probe_note_model_config_json(
     if (attention_valid) {
         engine->model_config_attention_valid.store(1, std::memory_order_relaxed);
         std::fprintf(stderr,
-            "[storagellm] model config attention loaded: heads=%u kv=%u global_kv=%u head_dim=%u global_head_dim=%u layers=%zu sliding_rope=%.6g full_rope=%.6g partial=%.6g\n",
+            "[storagellm] model config attention loaded: heads=%u kv=%u global_kv=%u head_dim=%u global_head_dim=%u kv_lora=%u q_lora=%u qk_nope=%u qk_rope=%u layers=%zu sliding_rope=%.6g full_rope=%.6g partial=%.6g\n",
             engine->model_config_num_attention_heads,
             engine->model_config_num_key_value_heads,
             engine->model_config_num_global_key_value_heads,
             engine->model_config_head_dim,
             engine->model_config_global_head_dim,
+            probe->attn.kv_lora_rank,
+            probe->attn.q_lora_rank,
+            probe->attn.qk_nope_head_dim,
+            probe->attn.qk_rope_head_dim,
             engine->model_config_full_attention_layers.size(),
             (double)engine->model_config_sliding_rope_theta,
             (double)engine->model_config_full_rope_theta,
@@ -1526,7 +1595,7 @@ static int load_juju_tensor_index_as_tensor_index(
                 common.type = entry.gguf_type;
                 common.weight_encoding = moe_weight_encoding_from_juju_entry(entry, contract);
                 common.file_offset = entry.juju_offset;
-                common.bytes = entry.juju_bytes;
+                common.bytes = moe_effective_juju_tensor_bytes(entry, contract);
                 for (uint32_t i = 0; i < std::min<uint32_t>(entry.dims, 4u); ++i) {
                     common.shape[i] = entry.shape[i];
                 }
@@ -1554,7 +1623,8 @@ static int load_juju_tensor_index_as_tensor_index(
                 continue;
             }
             const uint64_t expert_count64 = entry.shape[2];
-            const uint64_t per_expert = expert_count64 ? entry.juju_bytes / expert_count64 : 0;
+            const uint64_t effective_entry_bytes = moe_effective_juju_tensor_bytes(entry, contract);
+            const uint64_t per_expert = expert_count64 ? effective_entry_bytes / expert_count64 : 0;
             if (per_expert == 0 || expert_count64 > 4096ull) {
                 continue;
             }

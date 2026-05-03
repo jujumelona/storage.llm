@@ -39,6 +39,86 @@ GGUF_TYPE_SIZE = {
     GGUF_TYPE_FLOAT64: 8,
 }
 
+GGUF_RUNTIME_KV_KEY_HINTS = (
+    "attention",
+    "attn",
+    "rope",
+    "rotary",
+    "norm",
+    "scale",
+    "softcap",
+    "sliding",
+    "expert",
+    "moe",
+    "router",
+    "lora",
+    "head",
+    "context",
+    "embedding",
+    "feed_forward",
+    "ffn",
+    "block_count",
+    "vocab_size",
+    "file_type",
+)
+
+GGUF_RUNTIME_KV_EXACT_KEYS = {
+    "general.architecture",
+    "general.name",
+    "tokenizer.ggml.model",
+    "tokenizer.ggml.pre",
+}
+
+GGUF_RUNTIME_KV_ALIAS_MAP = {
+    "general.architecture": ("architecture", "declared_architecture", "model_type"),
+    "general.name": ("model_name",),
+    "block_count": ("num_hidden_layers", "n_layers"),
+    "embedding_length": ("hidden_size", "hidden_dim"),
+    "vocab_size": ("vocab_size",),
+    "context_length": ("context_length", "max_position_embeddings"),
+    "attention.head_count": ("num_attention_heads", "n_heads", "head_count"),
+    "attention.head_count_kv": ("num_key_value_heads", "n_kv_heads", "head_count_kv"),
+    "attention.head_count_global_kv": ("num_global_key_value_heads", "global_head_count_kv"),
+    "attention.key_length": ("head_dim", "key_length"),
+    "attention.value_length": ("value_head_dim", "v_head_dim", "value_length"),
+    "attention.global_key_length": ("global_head_dim", "global_key_length"),
+    "attention.global_value_length": ("global_value_head_dim", "global_value_length"),
+    "attention.layer_norm_rms_epsilon": ("rms_norm_eps", "norm_eps"),
+    "attention.q_lora_rank": ("q_lora_rank",),
+    "attention.kv_lora_rank": ("kv_lora_rank",),
+    "attention.qk_nope_head_dim": ("qk_nope_head_dim",),
+    "attention.qk_rope_head_dim": ("qk_rope_head_dim",),
+    "rope.freq_base": ("rope_theta", "theta"),
+    "rope.dimension_count": ("qk_rope_head_dim", "rope_dimension_count"),
+    "expert_count": ("experts_per_moe_layer", "n_experts"),
+    "expert_used_count": ("routed_experts_per_token", "top_k", "num_experts_per_tok"),
+    "expert_feed_forward_length": ("expert_intermediate_size", "expert_intermediate_dim"),
+    "feed_forward_length": ("intermediate_size", "ffn_intermediate_size"),
+    "final_logit_softcap": ("final_logit_softcap", "final_logit_softcapping", "logit_softcap"),
+    "final_logit_softcapping": ("final_logit_softcapping", "final_logit_softcap", "logit_softcap"),
+    "logit_softcap": ("logit_softcap", "final_logit_softcap"),
+    "embedding_scale": ("embedding_scale", "embed_scale", "scale_emb"),
+    "embed_scale": ("embed_scale", "embedding_scale", "scale_emb"),
+    "scale_emb": ("scale_emb", "embedding_scale", "embed_scale"),
+    "scale_embedding": ("scale_embedding", "embedding_scale", "embed_scale"),
+    "partial_rotary_factor": ("partial_rotary_factor",),
+    "full_rope_theta": ("full_rope_theta", "full_attention_rope_theta"),
+    "sliding_rope_theta": ("sliding_rope_theta", "sliding_attention_rope_theta"),
+    "full_attention_rope_theta": ("full_attention_rope_theta", "full_rope_theta"),
+    "sliding_attention_rope_theta": ("sliding_attention_rope_theta", "sliding_rope_theta"),
+    "routed_scaling_factor": ("routed_scaling_factor", "route_scale", "moe_routed_scaling_factor"),
+    "route_scale": ("route_scale", "routed_scaling_factor"),
+    "scoring_func": ("scoring_func", "score_func", "router_score_func"),
+    "score_func": ("score_func", "scoring_func", "router_score_func"),
+    "norm_topk_prob": ("norm_topk_prob", "normalize_topk_prob"),
+    "normalize_topk_prob": ("normalize_topk_prob", "norm_topk_prob"),
+    "sliding_window": ("sliding_window",),
+    "full_attention_interval": ("full_attention_interval", "global_attention_interval"),
+    "global_attention_interval": ("global_attention_interval", "full_attention_interval"),
+    "full_attention_offset": ("full_attention_offset", "global_attention_offset"),
+    "global_attention_offset": ("global_attention_offset", "full_attention_offset"),
+}
+
 JUJU_HEADER_BYTES = 4096
 JUJU_SECTION_ENTRY_BYTES = 96
 JUJU_SECTION_TABLE_RESERVED_ENTRIES = 32
@@ -195,6 +275,133 @@ def skip_value(handle, value_type):
     handle.seek(size, 1)
 
 
+def read_gguf_scalar_value(handle, value_type):
+    if value_type == GGUF_TYPE_UINT8:
+        return struct.unpack("<B", read_exact(handle, 1))[0]
+    if value_type == GGUF_TYPE_INT8:
+        return struct.unpack("<b", read_exact(handle, 1))[0]
+    if value_type == GGUF_TYPE_UINT16:
+        return struct.unpack("<H", read_exact(handle, 2))[0]
+    if value_type == GGUF_TYPE_INT16:
+        return struct.unpack("<h", read_exact(handle, 2))[0]
+    if value_type == GGUF_TYPE_UINT32:
+        return read_u32(handle)
+    if value_type == GGUF_TYPE_INT32:
+        return struct.unpack("<i", read_exact(handle, 4))[0]
+    if value_type == GGUF_TYPE_FLOAT32:
+        return struct.unpack("<f", read_exact(handle, 4))[0]
+    if value_type == GGUF_TYPE_BOOL:
+        return bool(struct.unpack("<?", read_exact(handle, 1))[0])
+    if value_type == GGUF_TYPE_STRING:
+        return read_string(handle)
+    if value_type == GGUF_TYPE_UINT64:
+        return read_u64(handle)
+    if value_type == GGUF_TYPE_INT64:
+        return struct.unpack("<q", read_exact(handle, 8))[0]
+    if value_type == GGUF_TYPE_FLOAT64:
+        return struct.unpack("<d", read_exact(handle, 8))[0]
+    return None
+
+
+def should_capture_gguf_runtime_kv(key):
+    lower = str(key or "").lower()
+    if lower in GGUF_RUNTIME_KV_EXACT_KEYS:
+        return True
+    return any(hint in lower for hint in GGUF_RUNTIME_KV_KEY_HINTS)
+
+
+def gguf_runtime_aliases_for_key(key):
+    lower = str(key or "").lower()
+    aliases = []
+    for suffix, mapped in GGUF_RUNTIME_KV_ALIAS_MAP.items():
+        if lower == suffix or lower.endswith("." + suffix) or lower.endswith(suffix):
+            aliases.extend(mapped)
+    return aliases
+
+
+def gguf_tensor_row_bytes(tensor_type, cols):
+    t = u32(tensor_type)
+    cols = int(cols or 0)
+    if cols <= 0:
+        return 0
+    block32 = (cols + 31) // 32
+    block256 = (cols + 255) // 256
+    if t == 0:
+        return cols * 4
+    if t in {1, 30}:
+        return cols * 2
+    if t == 2:
+        return block32 * 18
+    if t == 3:
+        return block32 * 20
+    if t == 6:
+        return block32 * 22
+    if t == 7:
+        return block32 * 24
+    if t == 8:
+        return block32 * 34
+    if t == 9:
+        return block32 * 36
+    if t == 10:
+        return block256 * 84
+    if t == 11:
+        return block256 * 110
+    if t == 12:
+        return block256 * 144
+    if t == 13:
+        return block256 * 176
+    if t == 14:
+        return block256 * 210
+    if t == 15:
+        return block256 * 292
+    if t == 16:
+        return block256 * 66
+    if t == 17:
+        return block256 * 74
+    if t == 18:
+        return block256 * 98
+    if t == 19:
+        return block256 * 50
+    if t == 20:
+        return block32 * 18
+    if t == 21:
+        return block256 * 110
+    if t == 22:
+        return block256 * 82
+    if t == 23:
+        return block256 * 136
+    if t == 24:
+        return cols
+    if t == 25:
+        return cols * 2
+    if t == 26:
+        return cols * 4
+    if t == 27:
+        return cols * 8
+    if t == 28:
+        return cols * 8
+    if t == 29:
+        return block256 * 56
+    if t == 39:
+        return block32 * 17
+    return 0
+
+
+def gguf_tensor_exact_bytes(tensor_type, shape):
+    shape = [int(v or 0) for v in (shape or [])]
+    if not shape or shape[0] <= 0:
+        return 0
+    cols = shape[0] if len(shape) >= 2 else 1
+    rows = 1
+    if len(shape) >= 2:
+        for dim in shape[1:]:
+            rows *= max(0, dim)
+    else:
+        rows = shape[0]
+    row_bytes = gguf_tensor_row_bytes(tensor_type, cols)
+    return row_bytes * rows if row_bytes and rows > 0 else 0
+
+
 def file_size(session, url, token=None):
     headers = {}
     if token:
@@ -228,11 +435,25 @@ def parse_gguf_directory(prefix, total_bytes):
     tensor_count = read_u64(handle)
     kv_count = read_u64(handle)
     alignment = 32
+    gguf_kv = {}
+    gguf_kv_aliases = {}
     for _ in range(kv_count):
         key = read_string(handle)
         value_type = read_u32(handle)
         if key == "general.alignment" and value_type == GGUF_TYPE_UINT32:
-            alignment = read_u32(handle)
+            value = read_u32(handle)
+            alignment = value
+            gguf_kv[key] = value
+            gguf_kv_aliases["alignment"] = value
+        elif should_capture_gguf_runtime_kv(key) and value_type != GGUF_TYPE_ARRAY:
+            value = read_gguf_scalar_value(handle, value_type)
+            if value is None:
+                skip_value(handle, value_type)
+                continue
+            gguf_kv[key] = value
+            gguf_kv_aliases[key] = value
+            for alias in gguf_runtime_aliases_for_key(key):
+                gguf_kv_aliases.setdefault(alias, value)
         else:
             skip_value(handle, value_type)
     tensors = []
@@ -256,8 +477,13 @@ def parse_gguf_directory(prefix, total_bytes):
     for pos, idx in enumerate(order):
         cur = tensors[idx]["relative_offset"]
         nxt = tensors[order[pos + 1]]["relative_offset"] if pos + 1 < len(order) else total_bytes - data_start
+        storage_bytes = max(0, nxt - cur)
+        exact_bytes = gguf_tensor_exact_bytes(tensors[idx]["type"], tensors[idx]["shape"])
         tensors[idx]["source_offset"] = data_start + cur
-        tensors[idx]["bytes"] = max(0, nxt - cur)
+        tensors[idx]["source_storage_bytes"] = storage_bytes
+        tensors[idx]["exact_bytes"] = exact_bytes
+        tensors[idx]["bytes"] = exact_bytes if exact_bytes and exact_bytes <= storage_bytes else storage_bytes
+        tensors[idx]["source_padding_bytes"] = max(0, storage_bytes - tensors[idx]["bytes"])
         tensors[idx]["bucket"] = tensor_bucket(tensors[idx]["name"])
     return {
         "version": version,
@@ -265,6 +491,12 @@ def parse_gguf_directory(prefix, total_bytes):
         "kv_count": kv_count,
         "alignment": alignment,
         "data_start": data_start,
+        "gguf_kv": gguf_kv,
+        "gguf_runtime": gguf_kv_aliases,
+        "gguf_kv_floats": {
+            k: v for k, v in gguf_kv_aliases.items()
+            if isinstance(v, float)
+        },
         "tensors": tensors,
     }
 
@@ -796,6 +1028,7 @@ def weight_encoding_from_gguf_type(tensor_type, contract=None):
         12: 17,
         13: 14,
         14: 18,
+        15: 34,
         16: 19,
         18: 20,
         19: 32,
@@ -854,9 +1087,6 @@ def gguf_type_name(tensor_type):
 
 def quant_family_from_gguf_type(tensor_type, contract=None):
     t = u32(tensor_type)
-    explicit = contract_value(contract or {}, "source_weight_quant_family", "weight_quant_family", "weight_quant_schema.family", default="")
-    if explicit:
-        return str(explicit)
     if t in {0, 1, 24, 25, 26, 27, 28, 30}:
         return "raw_scalar_or_integer"
     if t in {2, 3, 6, 7, 8, 9}:
@@ -869,6 +1099,9 @@ def quant_family_from_gguf_type(tensor_type, contract=None):
         return "ternary_quant"
     if t == 39:
         return "mxfp4"
+    explicit = contract_value(contract or {}, "source_weight_quant_family", "weight_quant_family", "weight_quant_schema.family", default="")
+    if explicit:
+        return str(explicit)
     return "unknown_preserved_source_type"
 
 
@@ -1382,6 +1615,63 @@ def infer_juju_graph_family(contract, tensors):
     return "generic_transformer"
 
 
+def first_present(*values):
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and value == "":
+            continue
+        return value
+    return None
+
+
+def juju_runtime_arch_metadata(contract, directory=None):
+    arch = dict(contract.get("arch_meta") or {})
+    runtime = dict((directory or {}).get("gguf_runtime") or {})
+    out = dict(runtime)
+
+    fields = {
+        "declared_architecture": first_present(contract.get("architecture"), arch.get("architecture"), runtime.get("declared_architecture"), runtime.get("architecture")),
+        "model_id": first_present(contract.get("model_id"), contract.get("model_name"), runtime.get("model_id")),
+        "model_name": first_present(contract.get("model_name"), runtime.get("model_name")),
+        "num_hidden_layers": first_present(arch.get("n_layers"), arch.get("num_hidden_layers"), runtime.get("num_hidden_layers"), runtime.get("n_layers")),
+        "hidden_size": first_present(arch.get("hidden_dim"), arch.get("hidden_size"), runtime.get("hidden_size"), runtime.get("hidden_dim")),
+        "vocab_size": first_present(arch.get("vocab_size"), runtime.get("vocab_size")),
+        "head_dim": first_present(arch.get("head_dim"), runtime.get("head_dim"), runtime.get("key_length")),
+        "value_head_dim": first_present(arch.get("value_head_dim"), arch.get("v_head_dim"), runtime.get("value_head_dim"), runtime.get("v_head_dim")),
+        "global_head_dim": first_present(arch.get("global_head_dim"), runtime.get("global_head_dim")),
+        "num_attention_heads": first_present(arch.get("n_heads"), arch.get("num_attention_heads"), runtime.get("num_attention_heads"), runtime.get("n_heads")),
+        "num_key_value_heads": first_present(arch.get("n_kv_heads"), arch.get("num_key_value_heads"), runtime.get("num_key_value_heads"), runtime.get("n_kv_heads")),
+        "num_global_key_value_heads": first_present(arch.get("num_global_key_value_heads"), runtime.get("num_global_key_value_heads")),
+        "kv_lora_rank": first_present(arch.get("kv_lora_rank"), runtime.get("kv_lora_rank")),
+        "q_lora_rank": first_present(arch.get("q_lora_rank"), runtime.get("q_lora_rank")),
+        "qk_nope_head_dim": first_present(arch.get("qk_nope_head_dim"), runtime.get("qk_nope_head_dim")),
+        "qk_rope_head_dim": first_present(arch.get("qk_rope_head_dim"), runtime.get("qk_rope_head_dim")),
+        "experts_per_moe_layer": first_present(arch.get("experts_per_moe_layer"), arch.get("n_experts"), runtime.get("experts_per_moe_layer"), runtime.get("n_experts")),
+        "routed_experts_per_token": first_present(arch.get("routed_experts_per_token"), arch.get("top_k"), runtime.get("routed_experts_per_token"), runtime.get("top_k")),
+        "expert_intermediate_size": first_present(arch.get("expert_intermediate_size"), arch.get("expert_intermediate_dim"), runtime.get("expert_intermediate_size"), runtime.get("expert_intermediate_dim")),
+        "rms_norm_eps": first_present(arch.get("rms_norm_eps"), arch.get("norm_eps"), runtime.get("rms_norm_eps"), runtime.get("norm_eps")),
+        "norm_eps": first_present(arch.get("norm_eps"), arch.get("rms_norm_eps"), runtime.get("norm_eps"), runtime.get("rms_norm_eps")),
+        "rope_theta": first_present(arch.get("rope_theta"), runtime.get("rope_theta"), runtime.get("theta")),
+        "theta": first_present(arch.get("rope_theta"), runtime.get("theta"), runtime.get("rope_theta")),
+        "sliding_window": first_present(arch.get("sliding_window"), runtime.get("sliding_window")),
+        "embedding_scale": first_present(arch.get("embedding_scale"), arch.get("scale_emb"), runtime.get("embedding_scale"), runtime.get("scale_emb")),
+        "scale_emb": first_present(arch.get("scale_emb"), arch.get("embedding_scale"), runtime.get("scale_emb"), runtime.get("embedding_scale")),
+        "final_logit_softcap": first_present(arch.get("final_logit_softcap"), arch.get("final_logit_softcapping"), runtime.get("final_logit_softcap"), runtime.get("final_logit_softcapping"), runtime.get("logit_softcap")),
+        "final_logit_softcapping": first_present(arch.get("final_logit_softcapping"), arch.get("final_logit_softcap"), runtime.get("final_logit_softcapping"), runtime.get("final_logit_softcap"), runtime.get("logit_softcap")),
+        "partial_rotary_factor": first_present(arch.get("partial_rotary_factor"), runtime.get("partial_rotary_factor")),
+        "full_rope_theta": first_present(arch.get("full_rope_theta"), arch.get("full_attention_rope_theta"), runtime.get("full_rope_theta"), runtime.get("full_attention_rope_theta")),
+        "sliding_rope_theta": first_present(arch.get("sliding_rope_theta"), arch.get("sliding_attention_rope_theta"), runtime.get("sliding_rope_theta"), runtime.get("sliding_attention_rope_theta")),
+        "routed_scaling_factor": first_present(arch.get("routed_scaling_factor"), arch.get("route_scale"), runtime.get("routed_scaling_factor"), runtime.get("route_scale")),
+        "norm_topk_prob": first_present(arch.get("norm_topk_prob"), arch.get("normalize_topk_prob"), runtime.get("norm_topk_prob"), runtime.get("normalize_topk_prob")),
+        "scoring_func": first_present(arch.get("scoring_func"), arch.get("score_func"), runtime.get("scoring_func"), runtime.get("score_func")),
+    }
+    for key, value in fields.items():
+        if value is not None:
+            out[key] = value
+    return out
+
+
 def build_layer_graph_ir(layer, tensors):
     prefix = f"blk.{layer}."
     names = set(_juju_tensors_by_prefix(tensors, prefix))
@@ -1425,8 +1715,9 @@ def build_layer_graph_ir(layer, tensors):
     }
 
 
-def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, source_path, source_repo_id, weight_file, index_file):
+def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, source_path, source_repo_id, weight_file, index_file, directory=None):
     arch = dict(contract.get("arch_meta") or {})
+    runtime_arch = juju_runtime_arch_metadata(contract, directory)
     shape_map = _juju_tensor_shape_map(tensor_records)
     layers = sorted({
         layer for layer in (_juju_layer_id_from_name(t.get("name")) for t in tensor_records)
@@ -1485,6 +1776,7 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                 "theta": arch.get("rope_theta"),
                 "scaling": arch.get("rope_scaling"),
             },
+            **runtime_arch,
         },
         "tokenizer_contract": juju_tokenizer_contract(),
         "quantization": {
@@ -1811,6 +2103,9 @@ def build_juju_shard_plan_from_hf_url(
                 "alignment": directory["alignment"],
                 "data_start": directory["data_start"],
                 "source_bytes": total_bytes,
+                "gguf_kv": directory.get("gguf_kv", {}),
+                "gguf_runtime": directory.get("gguf_runtime", {}),
+                "gguf_kv_floats": directory.get("gguf_kv_floats", {}),
             },
             "contract": contract,
             "modality_flags": modality_flags,
@@ -1875,6 +2170,7 @@ def build_juju_shard_plan_from_hf_url(
             })
             section_sizes[section_type] = section_sizes.get(section_type, 0) + size
 
+        runtime_arch = juju_runtime_arch_metadata(contract, directory)
         graph_ir = build_juju_graph_ir(
             contract=contract,
             tensor_records=tensor_records,
@@ -1884,6 +2180,7 @@ def build_juju_shard_plan_from_hf_url(
             source_repo_id=source_repo_id,
             weight_file=artifact_names["weights"],
             index_file=artifact_names["index"],
+            directory=directory,
         )
         idx = {
             "format": "JUJU_IDX_JSON_V1",
@@ -1905,6 +2202,7 @@ def build_juju_shard_plan_from_hf_url(
             "tensor_count": len(tensor_records),
             "tensors": tensor_records,
             "sections": list(sections),
+            **runtime_arch,
         }
         pos = add_json_section_at(pos, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
         index_checksum = int(sections[-1].get("sha256", "0" * 64)[:16], 16) if sections else 0
@@ -2273,6 +2571,9 @@ def write_juju_shard_from_hf_url(
                     "alignment": directory["alignment"],
                     "data_start": directory["data_start"],
                     "source_bytes": total_bytes,
+                    "gguf_kv": directory.get("gguf_kv", {}),
+                    "gguf_runtime": directory.get("gguf_runtime", {}),
+                    "gguf_kv_floats": directory.get("gguf_kv_floats", {}),
                 },
                 "contract": contract,
                 "modality_flags": modality_flags,
@@ -2342,6 +2643,7 @@ def write_juju_shard_from_hf_url(
                 })
                 section_sizes[section_type] = section_sizes.get(section_type, 0) + size
 
+            runtime_arch = juju_runtime_arch_metadata(contract, directory)
             graph_ir = build_juju_graph_ir(
                 contract=contract,
                 tensor_records=tensor_records,
@@ -2351,6 +2653,7 @@ def write_juju_shard_from_hf_url(
                 source_repo_id=source_repo_id,
                 weight_file=output_path.name,
                 index_file=index_path.name,
+                directory=directory,
             )
             idx = {
                 "format": "JUJU_IDX_JSON_V1",
@@ -2372,6 +2675,7 @@ def write_juju_shard_from_hf_url(
                 "tensor_count": len(tensor_records),
                 "tensors": tensor_records,
                 "sections": sections,
+                **runtime_arch,
             }
             add_json_section(out, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
             index_checksum = int(sections[-1].get("sha256", "0" * 64)[:16], 16) if sections else 0

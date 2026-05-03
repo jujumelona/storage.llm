@@ -57,6 +57,10 @@ int moe_pc_engine_lm_head_top1_f32(
         weight_format = common.weight_format;
         weight_row_bytes = common.weight_row_bytes;
     } else {
+        if (engine->offload_gguf_valid.load(std::memory_order_relaxed)) {
+            moe_profile_log("lm_head_common_tensor_missing_offload", "vocab=%u hidden=%u", c->vocab_size, c->hidden_size);
+            return 0;
+        }
         const int32_t lm_head_layer = (int32_t)c->num_hidden_layers + 1;
         const moe_storage_raw_span_spec_t* span = find_raw_role_span(lm_head_layer, moe_RAW_ROLE_LM_HEAD);
         mmap_context_t* mapped = map_raw_span_part(engine, span);
@@ -186,6 +190,10 @@ int moe_pc_engine_lm_head_token_logprob_f32(
         weight_format = common.weight_format;
         weight_row_bytes = common.weight_row_bytes;
     } else {
+        if (engine->offload_gguf_valid.load(std::memory_order_relaxed)) {
+            moe_profile_log("lm_head_common_tensor_missing_offload", "vocab=%u hidden=%u", c->vocab_size, c->hidden_size);
+            return 0;
+        }
         const int32_t lm_head_layer = (int32_t)c->num_hidden_layers + 1;
         const moe_storage_raw_span_spec_t* span = find_raw_role_span(lm_head_layer, moe_RAW_ROLE_LM_HEAD);
         mmap_context_t* mapped = map_raw_span_part(engine, span);

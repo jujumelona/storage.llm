@@ -39,6 +39,7 @@ static uint8_t weight_bits_for_encoding(uint8_t encoding) {
         case moe_WEIGHT_ENCODING_LINEAR_Q8:
         case moe_WEIGHT_ENCODING_GGUF_Q8_0:
         case moe_WEIGHT_ENCODING_GGUF_Q8_1:
+        case moe_WEIGHT_ENCODING_GGUF_Q8_K:
             return 8;
         case moe_WEIGHT_ENCODING_GGUF_Q5_1:
         case moe_WEIGHT_ENCODING_GGUF_Q5_K:
@@ -110,6 +111,9 @@ static uint64_t infer_weight_row_bytes(const moe_tensor_info_t& info, uint8_t fo
     if (format == moe_WEIGHT_ENCODING_GGUF_Q8_1) {
         return ((uint64_t)info.cols + 31ull) / 32ull * 36ull;
     }
+    if (format == moe_WEIGHT_ENCODING_GGUF_Q8_K) {
+        return ((uint64_t)info.cols + 255ull) / 256ull * 292ull;
+    }
     if (format == moe_WEIGHT_ENCODING_GGUF_Q4_0) {
         return ((uint64_t)info.cols + 31ull) / 32ull * 18ull;
     }
@@ -118,6 +122,9 @@ static uint64_t infer_weight_row_bytes(const moe_tensor_info_t& info, uint8_t fo
     }
     if (format == moe_WEIGHT_ENCODING_GGUF_Q5_0) {
         return ((uint64_t)info.cols + 31ull) / 32ull * 22ull;
+    }
+    if (format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
+        return ((uint64_t)info.cols + 31ull) / 32ull * 24ull;
     }
     if (format == moe_WEIGHT_ENCODING_GGUF_IQ4_NL) {
         return ((uint64_t)info.cols + 31ull) / 32ull * 18ull;
@@ -140,17 +147,32 @@ static uint64_t infer_weight_row_bytes(const moe_tensor_info_t& info, uint8_t fo
     if (format == moe_WEIGHT_ENCODING_GGUF_IQ1_M) {
         return ((uint64_t)info.cols + 255ull) / 256ull * 56ull;
     }
-    if (format == moe_WEIGHT_ENCODING_GGUF_Q5_1 ||
-        format == moe_WEIGHT_ENCODING_GGUF_Q5_K ||
-        format == moe_WEIGHT_ENCODING_GGUF_Q2_K ||
-        format == moe_WEIGHT_ENCODING_GGUF_Q3_K ||
-        format == moe_WEIGHT_ENCODING_GGUF_Q4_K ||
-        format == moe_WEIGHT_ENCODING_GGUF_Q6_K ||
-        format == moe_WEIGHT_ENCODING_MXFP4 ||
-        format == moe_WEIGHT_ENCODING_GGUF_IQ2 ||
-        format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS ||
+    if (format == moe_WEIGHT_ENCODING_GGUF_Q2_K) {
+        return ((uint64_t)info.cols + 255ull) / 256ull * 84ull;
+    }
+    if (format == moe_WEIGHT_ENCODING_GGUF_Q3_K) {
+        return ((uint64_t)info.cols + 255ull) / 256ull * 110ull;
+    }
+    if (format == moe_WEIGHT_ENCODING_GGUF_Q4_K) {
+        return ((uint64_t)info.cols + 255ull) / 256ull * 144ull;
+    }
+    if (format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
+        return ((uint64_t)info.cols + 255ull) / 256ull * 176ull;
+    }
+    if (format == moe_WEIGHT_ENCODING_GGUF_Q6_K) {
+        return ((uint64_t)info.cols + 255ull) / 256ull * 210ull;
+    }
+    if (format == moe_WEIGHT_ENCODING_MXFP4) {
+        return ((uint64_t)info.cols + 31ull) / 32ull * 17ull;
+    }
+    if (format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS) {
+        return ((uint64_t)info.cols + 255ull) / 256ull * 66ull;
+    }
+    if (format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS) {
+        return ((uint64_t)info.cols + 255ull) / 256ull * 98ull;
+    }
+    if (format == moe_WEIGHT_ENCODING_GGUF_IQ2 ||
         format == moe_WEIGHT_ENCODING_GGUF_IQ3 ||
-        format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS ||
         format == moe_WEIGHT_ENCODING_GGUF_IQ4) {
         return info.rows ? info.weight_byte_length / (uint64_t)info.rows : 0;
     }
@@ -198,6 +220,7 @@ static void finalize_tensor_layout(moe_tensor_record* rec, uint8_t gguf_encoding
         rec->weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_1 ||
         rec->weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_0 ||
         rec->weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_1 ||
+        rec->weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_K ||
         rec->weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_NL ||
         rec->weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_XS ||
         rec->weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XS ||

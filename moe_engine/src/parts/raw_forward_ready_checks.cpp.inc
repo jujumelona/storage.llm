@@ -125,12 +125,7 @@ static int moe_raw_embedding_ready(const moe_pc_engine* engine) {
         return common_tensor_backing_file_ready(engine, rec);
     }
     if (engine && engine->offload_gguf_valid.load(std::memory_order_relaxed)) {
-        if (!engine->forward_adapter_executable.load(std::memory_order_relaxed)) {
-            return 0;
-        }
-        if (moe_gguf_common_tensor_ready(engine, "token_embd.weight")) {
-            return 1;
-        }
+        return 0;
     }
     if (!engine || engine->model_root.empty() || !c || !span ||
         c->hidden_size == 0 || c->vocab_size == 0) {
@@ -157,13 +152,7 @@ static int moe_raw_lm_head_ready(const moe_pc_engine* engine) {
         return common_tensor_backing_file_ready(engine, rec);
     }
     if (engine && engine->offload_gguf_valid.load(std::memory_order_relaxed)) {
-        if (!engine->forward_adapter_executable.load(std::memory_order_relaxed)) {
-            return 0;
-        }
-        if (moe_gguf_common_tensor_ready(engine, "output.weight") ||
-            moe_gguf_common_tensor_ready(engine, "token_embd.weight")) {
-            return 1;
-        }
+        return 0;
     }
     if (!engine || engine->model_root.empty() || !c || !span ||
         c->hidden_size == 0 || c->vocab_size == 0) {

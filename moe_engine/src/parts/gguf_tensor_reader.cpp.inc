@@ -17,6 +17,72 @@ static int moe_gguf_tensor_name_executable(const std::string& name) {
     return 0;
 }
 
+static uint64_t moe_gguf_tensor_row_bytes_from_type(uint32_t type, uint64_t cols) {
+    if (cols == 0) {
+        return 0;
+    }
+    const uint64_t block32 = (cols + 31ull) / 32ull;
+    const uint64_t block256 = (cols + 255ull) / 256ull;
+    switch (type) {
+        case 0u: return cols * 4ull;
+        case 1u:
+        case 30u: return cols * 2ull;
+        case 2u: return block32 * 18ull;
+        case 3u: return block32 * 20ull;
+        case 6u: return block32 * 22ull;
+        case 7u: return block32 * 24ull;
+        case 8u: return block32 * 34ull;
+        case 9u: return block32 * 36ull;
+        case 10u: return block256 * 84ull;
+        case 11u: return block256 * 110ull;
+        case 12u: return block256 * 144ull;
+        case 13u: return block256 * 176ull;
+        case 14u: return block256 * 210ull;
+        case 15u: return block256 * 292ull;
+        case 16u: return block256 * 66ull;
+        case 17u: return block256 * 74ull;
+        case 18u: return block256 * 98ull;
+        case 19u: return block256 * 50ull;
+        case 20u: return block32 * 18ull;
+        case 21u: return block256 * 110ull;
+        case 22u: return block256 * 82ull;
+        case 23u: return block256 * 136ull;
+        case 24u: return cols;
+        case 25u: return cols * 2ull;
+        case 26u: return cols * 4ull;
+        case 27u:
+        case 28u: return cols * 8ull;
+        case 29u: return block256 * 56ull;
+        case 39u: return block32 * 17ull;
+        default: return 0;
+    }
+}
+
+static uint64_t moe_gguf_tensor_exact_bytes_from_shape(
+    uint32_t type,
+    uint32_t dims,
+    const uint64_t* shape
+) {
+    if (!shape || dims == 0 || shape[0] == 0) {
+        return 0;
+    }
+    const uint64_t cols = dims >= 2 ? shape[0] : 1ull;
+    uint64_t rows = dims >= 2 ? 1ull : shape[0];
+    if (dims >= 2) {
+        for (uint32_t i = 1; i < std::min<uint32_t>(dims, 4u); ++i) {
+            if (shape[i] == 0 || rows > UINT64_MAX / shape[i]) {
+                return 0;
+            }
+            rows *= shape[i];
+        }
+    }
+    const uint64_t row_bytes = moe_gguf_tensor_row_bytes_from_type(type, cols);
+    if (!row_bytes || rows > UINT64_MAX / row_bytes) {
+        return 0;
+    }
+    return rows * row_bytes;
+}
+
 static int moe_read_gguf_tensor_infos(
     std::ifstream& input,
     uint64_t tensor_count,
@@ -89,7 +155,9 @@ static int moe_read_gguf_tensor_infos(
         }
         const uint64_t max_length = payload_bytes - entry.tensor_offset;
         if (next > entry.tensor_offset && next - entry.tensor_offset <= max_length) {
-            entry.bytes = next - entry.tensor_offset;
+            const uint64_t storage_bytes = next - entry.tensor_offset;
+            const uint64_t exact_bytes = moe_gguf_tensor_exact_bytes_from_shape(entry.type, entry.dims, entry.shape);
+            entry.bytes = exact_bytes && exact_bytes <= storage_bytes ? exact_bytes : storage_bytes;
         } else {
             entry.bytes = 0;
         }

@@ -37,6 +37,7 @@ static int moe_copy_embedding_row_f32(
     const uint8_t* row = base + row_offset;
     if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0 ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_1 ||
+        weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_K ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0 ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_1 ||
         weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_0 ||
@@ -116,6 +117,10 @@ int moe_pc_engine_embed_token_f32(
             c, common.base, common.bytes, common.scalar_encoding,
             common.weight_format, common.weight_row_bytes, token_id, out_hidden);
     }
+    if (engine->offload_gguf_valid.load(std::memory_order_relaxed)) {
+        moe_profile_log("embedding_common_tensor_missing_offload", "token=%u vocab=%u hidden=%u", token_id, c->vocab_size, c->hidden_size);
+        return 0;
+    }
     const moe_storage_raw_span_spec_t* span = find_raw_role_span(-1, moe_RAW_ROLE_EMBED);
     mmap_context_t* mapped = map_raw_span_part(engine, span);
     if (!raw_span_bounds_ok(span, mapped)) {
@@ -156,6 +161,10 @@ int moe_pc_engine_embed_tokens_f32(
                 c, common.base, common.bytes, common.scalar_encoding,
                 common.weight_format, common.weight_row_bytes, (uint32_t)token, dst);
         });
+    }
+    if (engine->offload_gguf_valid.load(std::memory_order_relaxed)) {
+        moe_profile_log("embedding_common_tensor_missing_offload", "tokens=%u vocab=%u hidden=%u", token_count, c->vocab_size, c->hidden_size);
+        return 0;
     }
     const moe_storage_raw_span_spec_t* span = find_raw_role_span(-1, moe_RAW_ROLE_EMBED);
     mmap_context_t* mapped = map_raw_span_part(engine, span);
