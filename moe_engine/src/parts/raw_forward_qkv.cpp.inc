@@ -105,6 +105,25 @@ static void moe_qkv_apply_contract_config_locked(
         moe_qkv_free_head_states_locked(engine);
         engine->qkv_cfg = desired;
         engine->qkv_cfg_initialized.store(true, std::memory_order_release);
+        moe_profile_log(
+            "qkv_config",
+            "head_dim=%u k_bits=%d v_bits=%d group=%u page=%u sink=%u "
+            "rotation=%d rotation_seed=%llu qjl=%d qjl_seed=%llu "
+            "outlier_channels=%d outlier_bits=%d normal_bits=%d plain_kv=%d",
+            head_dim,
+            desired.k_bits,
+            desired.v_bits,
+            desired.group_size,
+            desired.page_size_tokens,
+            desired.sink_tokens,
+            desired.enable_rotation ? 1 : 0,
+            (unsigned long long)desired.rotation_seed,
+            desired.enable_qjl ? 1 : 0,
+            (unsigned long long)desired.qjl_seed,
+            desired.outlier_channels,
+            desired.outlier_bits,
+            desired.normal_bits,
+            desired.plain_kv_persistent_storage ? 1 : 0);
     }
 }
 

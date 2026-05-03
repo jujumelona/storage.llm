@@ -383,7 +383,7 @@ static int probe_main(int argc, char** argv) {
     fflush(stderr);
 
     printf(
-        "kv=%s offload_gguf=%d files=%u tensor_headers=%llu executable_tensors=%llu juju_schema=%u split_groups=%u split_missing=%u hint_tensors=%llu priority_tensors=%llu fast_tensors=%llu slow_tensors=%llu qkv_forced=%u qkv_bits=%u/%u qkv_group=%u qkv_page=%u qkv_sink=%u weight=%s/%ub enc=%u kernel=%s first_gguf=%s vram=%llu common=%llu expert_vram=%llu device=%llu allocs=%llu device_mem=%llu/%llu device_pools=%llu/%llu/%llu/%llu model_lib=%d/%d/%d path=%s common_prefetch=%llu/%llu ram=%llu db=%llu experts=%llu tiers=%llu/%llu/%llu\n",
+        "kv=%s offload_gguf=%d files=%u tensor_headers=%llu executable_tensors=%llu juju_schema=%u split_groups=%u split_missing=%u hint_tensors=%llu priority_tensors=%llu fast_tensors=%llu slow_tensors=%llu qkv_forced=%u qkv_bits=%u/%u qkv_group=%u qkv_page=%u qkv_sink=%u qkv_rotation=%u qkv_rotation_seed=%llu qkv_qjl=%u qkv_qjl_seed=%llu qkv_outlier=%u/%u qkv_plain=%u weight=%s/%ub enc=%u kernel=%s first_gguf=%s vram=%llu common=%llu expert_vram=%llu device=%llu allocs=%llu device_mem=%llu/%llu device_pools=%llu/%llu/%llu/%llu model_lib=%d/%d/%d path=%s common_prefetch=%llu/%llu ram=%llu db=%llu experts=%llu tiers=%llu/%llu/%llu\n",
         moe_kv_mode_name(stats.kv_mode),
         stats.offload_gguf_valid,
         stats.offload_gguf_file_count,
@@ -402,6 +402,13 @@ static int probe_main(int argc, char** argv) {
         stats.qkv_group_size,
         stats.qkv_page_size_tokens,
         stats.qkv_sink_tokens,
+        stats.qkv_enable_rotation,
+        (unsigned long long)stats.qkv_rotation_seed,
+        stats.qkv_enable_qjl,
+        (unsigned long long)stats.qkv_qjl_seed,
+        stats.qkv_outlier_channels,
+        stats.qkv_outlier_bits,
+        stats.qkv_plain_kv_persistent_storage,
         stats.weight_quant_family,
         stats.weight_quant_bits,
         stats.weight_quant_encoding,

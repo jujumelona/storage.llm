@@ -1732,6 +1732,19 @@ def juju_contract_metadata(contract, source_name, source_repo_id):
     ):
         if src in qkv:
             out[dst] = qkv[src]
+    qkv_nested = (
+        ("rotation.seed", "rotation_seed"),
+        ("qjl.seed", "qjl_seed"),
+        ("qjl.enabled", "enable_qjl"),
+        ("rotation.enabled", "enable_rotation"),
+        ("outlier.channels", "outlier_channels"),
+        ("outlier.bits", "outlier_bits"),
+        ("residency.sink_tokens", "sink_tokens"),
+    )
+    for src, dst in qkv_nested:
+        value = contract_value(qkv, src, default=None)
+        if value is not None and dst not in out:
+            out[dst] = value
     return out
 
 

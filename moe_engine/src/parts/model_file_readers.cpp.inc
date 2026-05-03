@@ -234,6 +234,12 @@ static int moe_read_offload_gguf_file(
         } else if (key == "offload.qkv_enable_rotation" && moe_gguf_read_uint_value(input, type, &u64_value)) {
             consumed = 1;
             out->contract.qkv_enable_rotation = u64_value ? 1 : 0;
+        } else if (key == "offload.qkv_outlier_channels" && moe_gguf_read_uint_value(input, type, &u64_value)) {
+            consumed = 1;
+            out->contract.qkv_outlier_channels = moe_u64_to_u32_clamped(u64_value, 0);
+        } else if (key == "offload.qkv_outlier_bits" && moe_gguf_read_uint_value(input, type, &u64_value)) {
+            consumed = 1;
+            out->contract.qkv_outlier_bits = moe_u64_to_u32_clamped(u64_value, 0);
         } else if ((key == "offload.final_model_structure_contract" ||
                     key == "offload.pipeline_budget_contract" ||
                     key == "offload.execution_path_contract" ||

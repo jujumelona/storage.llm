@@ -37,6 +37,33 @@ static void moe_parse_juju_split_metadata_json(
     meta->split_enabled = meta->split_count > 1 && meta->split_index > 0;
 }
 
+static int moe_json_get_u64_from_object_local(
+    const std::string& text,
+    const char* object_key,
+    const char* key,
+    uint64_t* out
+) {
+    size_t begin = 0;
+    size_t end = 0;
+    return moe_json_find_object_local(text, object_key, &begin, &end) &&
+        moe_json_get_u64_slice(text, begin, end, key, out);
+}
+
+static int moe_json_get_bool_from_object_local(
+    const std::string& text,
+    const char* object_key,
+    const char* key,
+    int* out
+) {
+    size_t begin = 0;
+    size_t end = 0;
+    if (!out || !moe_json_find_object_local(text, object_key, &begin, &end) ||
+        begin >= end || end > text.size() || begin >= text.size()) {
+        return 0;
+    }
+    return moe_json_get_bool_local(text.substr(begin, end - begin), key, out);
+}
+
 static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
     if (!meta || meta->metadata_json.empty()) {
         return;
@@ -78,20 +105,35 @@ static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
         meta->contract.qkv_page_size_tokens = moe_u64_to_u32_clamped(value, 0);
     }
     if (meta->contract.qkv_sink_tokens == 0 &&
-        moe_json_get_u64_local(meta->metadata_json, "sink_tokens", &value)) {
+        (moe_json_get_u64_local(meta->metadata_json, "sink_tokens", &value) ||
+         moe_json_get_u64_from_object_local(meta->metadata_json, "residency", "sink_tokens", &value))) {
         meta->contract.qkv_sink_tokens = moe_u64_to_u32_clamped(value, 0);
     }
-    if (moe_json_get_u64_local(meta->metadata_json, "rotation_seed", &value)) {
+    if (moe_json_get_u64_local(meta->metadata_json, "rotation_seed", &value) ||
+        moe_json_get_u64_from_object_local(meta->metadata_json, "rotation", "seed", &value)) {
         meta->contract.qkv_rotation_seed = value;
     }
-    if (moe_json_get_u64_local(meta->metadata_json, "qjl_seed", &value)) {
+    if (moe_json_get_u64_local(meta->metadata_json, "qjl_seed", &value) ||
+        moe_json_get_u64_from_object_local(meta->metadata_json, "qjl", "seed", &value)) {
         meta->contract.qkv_qjl_seed = value;
     }
-    if (moe_json_get_bool_local(meta->metadata_json, "enable_qjl", &bool_value)) {
+    if (moe_json_get_bool_local(meta->metadata_json, "enable_qjl", &bool_value) ||
+        moe_json_get_bool_from_object_local(meta->metadata_json, "qjl", "enabled", &bool_value)) {
         meta->contract.qkv_enable_qjl = bool_value != 0 ? 1 : 0;
     }
-    if (moe_json_get_bool_local(meta->metadata_json, "enable_rotation", &bool_value)) {
+    if (moe_json_get_bool_local(meta->metadata_json, "enable_rotation", &bool_value) ||
+        moe_json_get_bool_from_object_local(meta->metadata_json, "rotation", "enabled", &bool_value)) {
         meta->contract.qkv_enable_rotation = bool_value != 0 ? 1 : 0;
+    }
+    if (meta->contract.qkv_outlier_channels == 0 &&
+        (moe_json_get_u64_local(meta->metadata_json, "outlier_channels", &value) ||
+         moe_json_get_u64_from_object_local(meta->metadata_json, "outlier", "channels", &value))) {
+        meta->contract.qkv_outlier_channels = moe_u64_to_u32_clamped(value, 0);
+    }
+    if (meta->contract.qkv_outlier_bits == 0 &&
+        (moe_json_get_u64_local(meta->metadata_json, "outlier_bits", &value) ||
+         moe_json_get_u64_from_object_local(meta->metadata_json, "outlier", "bits", &value))) {
+        meta->contract.qkv_outlier_bits = moe_u64_to_u32_clamped(value, 0);
     }
     if (moe_json_get_bool_local(meta->metadata_json, "qkv_packed_cache_required", &bool_value)) {
         meta->contract.qkv_required = bool_value != 0;

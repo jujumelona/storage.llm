@@ -54,6 +54,14 @@ int moe_pc_engine_get_stats(const moe_pc_engine_t* engine, moe_pc_engine_stats_t
         out_stats->qkv_group_size = engine->offload_qkv_cfg.group_size;
         out_stats->qkv_page_size_tokens = engine->offload_qkv_cfg.page_size_tokens;
         out_stats->qkv_sink_tokens = engine->offload_qkv_cfg.sink_tokens;
+        out_stats->qkv_rotation_seed = engine->offload_qkv_cfg.rotation_seed;
+        out_stats->qkv_qjl_seed = engine->offload_qkv_cfg.qjl_seed;
+        out_stats->qkv_enable_qjl = engine->offload_qkv_cfg.enable_qjl ? 1u : 0u;
+        out_stats->qkv_enable_rotation = engine->offload_qkv_cfg.enable_rotation ? 1u : 0u;
+        out_stats->qkv_outlier_channels = (uint32_t)std::max(0, engine->offload_qkv_cfg.outlier_channels);
+        out_stats->qkv_outlier_bits = (uint32_t)std::max(0, engine->offload_qkv_cfg.outlier_bits);
+        out_stats->qkv_plain_kv_persistent_storage =
+            engine->offload_qkv_cfg.plain_kv_persistent_storage ? 1u : 0u;
     }
     out_stats->weight_quant_bits = engine->offload_weight_quant_bits.load(std::memory_order_relaxed);
     out_stats->weight_quant_encoding = engine->offload_weight_encoding.load(std::memory_order_relaxed);

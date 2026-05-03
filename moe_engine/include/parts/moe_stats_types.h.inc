@@ -51,6 +51,13 @@ typedef struct {
     uint32_t qkv_group_size;
     uint32_t qkv_page_size_tokens;
     uint32_t qkv_sink_tokens;
+    uint64_t qkv_rotation_seed;
+    uint64_t qkv_qjl_seed;
+    uint32_t qkv_enable_qjl;
+    uint32_t qkv_enable_rotation;
+    uint32_t qkv_outlier_channels;
+    uint32_t qkv_outlier_bits;
+    uint32_t qkv_plain_kv_persistent_storage;
     uint32_t weight_quant_bits;
     uint32_t weight_quant_encoding;
     uint32_t weight_quant_block_size;
