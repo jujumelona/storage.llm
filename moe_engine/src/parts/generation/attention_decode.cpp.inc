@@ -138,7 +138,7 @@
             layer, num_heads, num_kv_heads, head_dim);
         return 0;
     }
-    if (has_v && moe_layer_uses_unweighted_v_norm(engine, layer) &&
+    if (moe_layer_uses_unweighted_v_norm(engine, layer) &&
         !moe_apply_unweighted_head_rmsnorm_f32(
             s->attn_value.data(), num_kv_heads, v_head_dim, cfg.rms_norm_eps)) {
         std::fprintf(stderr, "[storagellm attn] v norm failed layer=%d kv_heads=%u v_head_dim=%u\n",

@@ -155,9 +155,8 @@ static void moe_router_apply_group_limit(
     }
     const uint32_t groups = cached_groups > 0 ? (uint32_t)cached_groups : 0u;
     const uint32_t limited_groups = cached_limited > 0 ? (uint32_t)cached_limited : 0u;
-    if (groups == 0 ||
-        limited_groups == 0 ||
-        groups <= 1 || limited_groups == 0 || limited_groups >= groups || experts % groups != 0) {
+    // BUGFIX 668: Remove duplicate limited_groups == 0 check ★
+    if (groups <= 1 || limited_groups == 0 || limited_groups >= groups || experts % groups != 0) {
         return;
     }
 
@@ -247,21 +246,40 @@ static int moe_router_topk_f32(
         }
         moe_router_apply_group_limit(engine, scratch_logits, experts);
     } else {
+        // BUGFIX 665: Check for NaN/Inf before softmax computation ★★★
+        // BUGFIX 667: Prevent NaN propagation in router logits ★★
         float max_logit = -std::numeric_limits<float>::infinity();
+        bool has_invalid = false;
         for (float v : *scratch_logits) {
+            if (!std::isfinite(v)) {
+                has_invalid = true;
+                break;
+            }
             if (v > max_logit) max_logit = v;
         }
-        double exp_denom = 0.0;
-        for (float& v : *scratch_logits) {
-            v = (float)std::exp((double)v - (double)max_logit);
-            exp_denom += (double)v;
-        }
-        if (!(exp_denom > 0.0) || !std::isfinite(exp_denom)) {
-            return 0;
-        }
-        const float inv = (float)(1.0 / exp_denom);
-        for (float& v : *scratch_logits) {
-            v *= inv;
+        if (has_invalid || !std::isfinite(max_logit)) {
+            const float uniform = 1.0f / (float)experts;
+            for (float& v : *scratch_logits) {
+                v = uniform;
+            }
+        } else {
+            double exp_denom = 0.0;
+            std::vector<float> exp_values(scratch_logits->size());
+            for (size_t i = 0; i < scratch_logits->size(); ++i) {
+                exp_values[i] = (float)std::exp((double)(*scratch_logits)[i] - (double)max_logit);
+                exp_denom += (double)exp_values[i];
+            }
+            if (!(exp_denom > 0.0) || !std::isfinite(exp_denom)) {
+                const float uniform = 1.0f / (float)experts;
+                for (float& v : *scratch_logits) {
+                    v = uniform;
+                }
+            } else {
+                const float inv = (float)(1.0 / exp_denom);
+                for (size_t i = 0; i < scratch_logits->size(); ++i) {
+                    (*scratch_logits)[i] = exp_values[i] * inv;
+                }
+            }
         }
     }
 
@@ -303,11 +321,18 @@ static int moe_router_topk_f32(
     }
     const int norm_topk = moe_router_norm_topk_prob(engine, use_sigmoid);
     if (norm_topk) {
-        if (denom <= 0.0f) {
-            denom = 1e-8f;
-        }
-        for (float& w : *out_weights) {
-            w /= denom;
+        // BUGFIX 666: Prevent weight explosion from near-zero denom ★★★
+        // Problem: denom <= 0 → set to 1e-8f → weights explode by 1e8x → PPL corruption
+        // Solution: Use uniform distribution fallback when denom too small
+        if (denom <= 1e-6f) {
+            const float uniform = 1.0f / (float)top_k;
+            for (float& w : *out_weights) {
+                w = uniform;
+            }
+        } else {
+            for (float& w : *out_weights) {
+                w /= denom;
+            }
         }
     }
     const float scale = use_sigmoid ? moe_router_routed_scaling_factor(engine) : 1.0f;
@@ -354,5 +379,5 @@ static void moe_infinigen_speculative_prefetch(
         return;
     }
 
-    // BUGFIX 241: Optimize snapshot copy to reduce lock contention ?�★
+    // BUGFIX 241: Optimize snapshot copy to reduce lock contention ?�★
     // Problem: Copying entire snapshot vector (~24KB) under mutex lock.
