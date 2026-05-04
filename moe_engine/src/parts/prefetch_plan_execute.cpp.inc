@@ -156,25 +156,27 @@ int moe_pc_engine_execute_prefetch_plan(
             }
         }
         if (skip_item) {
-            // BUGFIX 716: Release pending VRAM reservation correctly on skip_item ★★★
-            // Problem: If skip_item=true, the reservation wasn't released because of an extra
-            // condition `&& items[i].target_tier == moe_TIER_VRAM`. If admitted_tiers[i]
-            // is VRAM, VRAM reservation was taken, regardless of the original target.
-            // Solution: Release based solely on admitted_tiers.
-            // BUGFIX Issue 1: Handle RAM→VRAM upgrade path in skip_item ★★★
-            // Problem: Pass 1 RAM→VRAM upgrade uses try_add_tier_usage (direct commit)
-            // without setting vram_pending_reserved[i]. If skip_item=true, vram_used_bytes
-            // remains incremented but expert not loaded → VRAM budget leak.
-            // Solution: Add third case for admitted_tiers[i]==VRAM && !vram_pending_reserved[i]
-            if (vram_pending_reserved[i] && items[i].bytes > 0) {
-                prefetch_release_pending_vram_reservation(engine, items[i].bytes);
-            } else if (admitted_tiers[i] == moe_TIER_VRAM
-                       && !vram_pending_reserved[i]
-                       && items[i].bytes > 0) {
+            // BUGFIX NEW-27: Fix reservation release order to prevent double-release ★★★
+            // Problem: Original code checks vram_pending_reserved[i] first, then RAM→VRAM upgrade case
+            // If Pass 1 does RAM→VRAM upgrade (try_add_tier_usage), vram_pending_reserved[i]=0
+            // but pending_ram_reservation was already released in Pass 1 upgrade path
+            // Then skip_item path tries to release RAM reservation AGAIN → underflow
+            // Solution: Check RAM→VRAM upgrade case FIRST (admitted_tiers[i]==VRAM && !vram_pending_reserved[i])
+            // This case means upgrade happened, so no reservation to release (already handled in Pass 1)
+            // Then check normal VRAM reservation, then RAM reservation
+            // Impact: Prevents pending_ram_reservation underflow, fixes budget accounting
+            if (admitted_tiers[i] == moe_TIER_VRAM && !vram_pending_reserved[i]) {
                 // RAM→VRAM upgrade path: try_add_tier_usage directly committed to vram_used_bytes
-                // Must subtract to prevent leak
-                subtract_tier_usage(engine, moe_TIER_VRAM, items[i].bytes);
+                // pending_ram_reservation was already released in Pass 1 upgrade path
+                // If skip_item=true, must subtract vram_used_bytes to prevent leak
+                if (items[i].bytes > 0) {
+                    subtract_tier_usage(engine, moe_TIER_VRAM, items[i].bytes);
+                }
+            } else if (vram_pending_reserved[i] && items[i].bytes > 0) {
+                // Normal VRAM admission path
+                prefetch_release_pending_vram_reservation(engine, items[i].bytes);
             } else if (admitted_tiers[i] == moe_TIER_RAM && items[i].bytes > 0) {
+                // RAM admission path (no upgrade happened)
                 prefetch_release_pending_ram_reservation(engine, items[i].bytes);
             }
             continue;

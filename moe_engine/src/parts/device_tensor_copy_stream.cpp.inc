@@ -237,7 +237,7 @@ ThreadStreamGuard::~ThreadStreamGuard() {
     if (dit != s_tl_deferred_staging_copies.end()) {
         for (auto& copy : dit->second) {
             if (copy.event) device_backend_event_destroy(e, copy.event);
-            if (copy.slot != UINT32_MAX) staging_slot_release(e, copy.slot);
+            if (copy.slot != UINT32_MAX) release_staging_slot(e, copy.slot);
         }
         s_tl_deferred_staging_copies.erase(dit);
     }

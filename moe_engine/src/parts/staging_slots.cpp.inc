@@ -91,6 +91,7 @@ static void reset_staging_slots(moe_pc_engine* engine) {
             if (slot.last_copy_event) {
                 device_backend_event_destroy(engine, slot.last_copy_event);
                 slot.last_copy_event = nullptr;
+                slot.last_copy_event_recorded.store(false, std::memory_order_release);
             }
             if (!slot.in_use.load(std::memory_order_acquire)) {
                 ++free_slots;
@@ -108,6 +109,7 @@ static void reset_staging_slots(moe_pc_engine* engine) {
         if (slot.last_copy_event) {
             device_backend_event_destroy(engine, slot.last_copy_event);
             slot.last_copy_event = nullptr;
+            slot.last_copy_event_recorded.store(false, std::memory_order_release);
         }
         slot.buf = nullptr;
         slot.size = 0;

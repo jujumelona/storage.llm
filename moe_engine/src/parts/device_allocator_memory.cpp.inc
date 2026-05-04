@@ -68,11 +68,12 @@ static void warn_device_budget_exhausted(
     // Solution: Use e->last_budget_warn_ms instead of static variable
     const auto now = std::chrono::steady_clock::now();
     const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-    int64_t last = e->last_budget_warn_ms.load(std::memory_order_relaxed);
+    auto* mutable_e = const_cast<moe_pc_engine*>(e);
+    int64_t last = mutable_e->last_budget_warn_ms.load(std::memory_order_relaxed);
     if (now_ms - last < 1000) {
         return;
     }
-    if (!e->last_budget_warn_ms.compare_exchange_strong(last, now_ms, std::memory_order_relaxed)) {
+    if (!mutable_e->last_budget_warn_ms.compare_exchange_strong(last, now_ms, std::memory_order_relaxed)) {
         return;
     }
     fprintf(stderr,

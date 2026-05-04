@@ -37,13 +37,17 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
     // Solution: Cap at 4096 even when compact_needed=true
     // Trade-off: May not find victim in extreme cases, but proactive_eviction_worker_loop
     // runs every 25ms to compact heap, so next attempt succeeds (25ms delay vs deadlock)
-    // BUGFIX NEW-3: Ensure stale_limit is always > 0 when heap is non-empty ★★★
-    // Problem: heap_size=0 → stale_limit=0 → while loop never executes → always returns 0
-    // But if heap is non-empty, we should always try at least once
-    // Solution: Use max(1, ...) to ensure at least 1 attempt when heap is non-empty
-    const uint32_t stale_limit = engine->evict_heap_compact_needed.load(std::memory_order_relaxed)
+    // BUGFIX NEW-26: Fix stale_limit calculation when heap_size < 4 ★★★
+    // Problem: heap_size=3 → heap_size/4=0 → max(1, max(128, min(512, 0)))=128
+    // But heap only has 3 entries! stale_limit=128 > heap_size=3
+    // → while loop tries to scan 128 entries but heap only has 3
+    // → pops all 3 entries, all are stale → returns 0 (failure) → VRAM OOM
+    // Solution: Always cap stale_limit at heap_size to prevent over-scanning
+    // This ensures we never try to scan more entries than exist in heap
+    const uint32_t raw_stale_limit = engine->evict_heap_compact_needed.load(std::memory_order_relaxed)
         ? std::min(heap_size, 4096u)
         : std::max<uint32_t>(1u, std::max<uint32_t>(128u, std::min<uint32_t>(512u, heap_size / 4u)));
+    const uint32_t stale_limit = std::min(raw_stale_limit, heap_size);
     if (heap_size == 0 || stale_limit == 0) {
         return 0;
     }

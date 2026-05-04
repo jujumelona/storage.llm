@@ -126,23 +126,34 @@ static uint32_t device_collect_activation_victims_locked(
     // Problem: active_count used uninitialized in stale check
     // Line: "const bool was_stale = e->activation_evict_heap.size() > active_count * 2u;"
     // active_count is undefined → undefined behavior
-    // Solution: Load from atomic counter before use
-    uint32_t active_count = (uint32_t)e->device_activation_count.load(std::memory_order_relaxed);
+    // Solution: Count actual active allocations before stale check
     // BUGFIX 569: Check activation_evict_heap.size() > 32 before should_rebuild ★
     // Problem: size() can be 0, causing unnecessary rebuild check
     // Solution: Check size > 32 before proceeding
     const bool should_rebuild = e->activation_evict_heap.size() > 32u;
+
+    // BUGFIX NEW-23: Fix stale check to use actual active count ★★★
+    // Problem: active_count loaded from atomic counter that is never updated
+    // was_stale check uses stale value, causing heap rebuild to never trigger
+    // Solution: Count actual active allocations before stale check
+    // Impact: Heap rebuild now triggers correctly, preventing stale entry accumulation
+    uint32_t actual_active_count = 0;
     if (should_rebuild) {
+        for (auto& [key, alloc] : e->device_allocations) {
+            if (alloc.pool == moe_DEVICE_POOL_ACTIVATION && !alloc.pending_free && alloc.bytes > 0) {
+                ++actual_active_count;
+            }
+        }
         // BUGFIX 471: active_count * 2u overflow 체크
         // BUGFIX 570: Check heap size > 0 before stale check ★
         // Problem: Empty heap causes division issues
         // Solution: Check size > 0
         const bool was_stale = e->activation_evict_heap.size() > 0 &&
-                               active_count > 0 &&
-                               active_count <= UINT32_MAX / 2u &&
-                               e->activation_evict_heap.size() > active_count * 2u;
+                               actual_active_count > 0 &&
+                               actual_active_count <= UINT32_MAX / 2u &&
+                               e->activation_evict_heap.size() > actual_active_count * 2u;
         if (was_stale) {
-            active_count = device_rebuild_activation_heap_unlocked(e, device_lock);
+            device_rebuild_activation_heap_unlocked(e, device_lock);
             stale = 0;  // Reset stale counter after rebuild
         }
     }

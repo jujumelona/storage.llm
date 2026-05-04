@@ -153,6 +153,7 @@
                 // Reading from disk then discovering pinned_stage is full wastes disk bandwidth.
                 // Check hard-cap before prefetch_tensor_disk_to_ram to avoid unnecessary I/O.
                 // BUGFIX 22: Snapshot pinned_depth once to avoid TOCTOU ?占썩쁾
+                // BUGFIX NEW-28: Remove duplicate condition check
                 if (task.target_tier == moe_TIER_VRAM &&
                     engine->io_config.enable_multistage_pipeline && engine->staging) {
                     const uint32_t pinned_depth = engine->pinned_stage.depth.load(std::memory_order_relaxed);
@@ -167,6 +168,7 @@
                         terminal = 0;
                         finish_stage_task(engine, engine->disk_stage, ok, terminal);
                         inflight_guard.mark_finished();  // BUGFIX 285: Mark as finished before continue ??                        if (worker_index >= engine->disk_worker_target.load()) {
+                        if (worker_index >= engine->disk_worker_target.load()) {
                             exit_worker();
                             return;
                         }
@@ -178,6 +180,7 @@
                         terminal = 0;
                         finish_stage_task(engine, engine->disk_stage, ok, terminal);
                         inflight_guard.mark_finished();  // BUGFIX 285: Mark as finished before continue ??                        if (worker_index >= engine->disk_worker_target.load()) {
+                        if (worker_index >= engine->disk_worker_target.load()) {
                             exit_worker();
                             return;
                         }

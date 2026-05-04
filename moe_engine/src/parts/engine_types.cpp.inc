@@ -157,6 +157,7 @@ struct moe_staging_slot {
     // Acquirer must cuStreamWaitEvent on this before writing to buf
     CUevent last_copy_event = nullptr;
     CUstream last_copy_stream = nullptr;
+    std::atomic<bool> last_copy_event_recorded{false};
 
     moe_staging_slot() = default;
     moe_staging_slot(const moe_staging_slot&) = delete;
@@ -171,6 +172,9 @@ struct moe_staging_slot {
         in_use.store(other.in_use.load());
         last_copy_event = other.last_copy_event;
         last_copy_stream = other.last_copy_stream;
+        last_copy_event_recorded.store(
+            other.last_copy_event_recorded.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
         other.buf = nullptr;
         other.metal_buffer = nullptr;
         other.size = 0;
@@ -180,6 +184,7 @@ struct moe_staging_slot {
         other.in_use.store(false);
         other.last_copy_event = nullptr;
         other.last_copy_stream = nullptr;
+        other.last_copy_event_recorded.store(false, std::memory_order_relaxed);
     }
     moe_staging_slot& operator=(moe_staging_slot&& other) noexcept {
         buf = other.buf;
@@ -191,6 +196,9 @@ struct moe_staging_slot {
         in_use.store(other.in_use.load());
         last_copy_event = other.last_copy_event;
         last_copy_stream = other.last_copy_stream;
+        last_copy_event_recorded.store(
+            other.last_copy_event_recorded.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
         other.buf = nullptr;
         other.metal_buffer = nullptr;
         other.size = 0;
@@ -200,6 +208,7 @@ struct moe_staging_slot {
         other.in_use.store(false);
         other.last_copy_event = nullptr;
         other.last_copy_stream = nullptr;
+        other.last_copy_event_recorded.store(false, std::memory_order_relaxed);
         return *this;
     }
 };

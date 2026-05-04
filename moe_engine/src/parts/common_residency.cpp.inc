@@ -25,7 +25,7 @@ static uint64_t common_vram_wanted_bytes(const moe_pc_engine* engine) {
         runtime_overhead = s->runtime_state_bytes;
     } else {
         const uint64_t hidden = s ? s->hidden_size : 6144ull;
-        const uint64_t experts = s ? s->num_experts : 256ull;
+        const uint64_t experts = s ? s->experts_per_moe_layer : 256ull;
         runtime_overhead = 2ull * hidden + experts * 4ull + hidden;
         fprintf(stderr,
             "[storageLLM WARNING] runtime_state_bytes not set in moe_storage_constants. "
@@ -78,9 +78,10 @@ static uint64_t vram_expert_budget_bytes_checked(const moe_pc_engine* engine) {
         // Problem: static s_last_warn shared across all engine instances
         // Solution: Use engine->last_expert_budget_warn_ms
         const uint64_t now = moe_profile_now_us() / 1000000ull;
-        const uint64_t last = engine->last_expert_budget_warn_ms.load(std::memory_order_relaxed);
+        auto* mutable_engine = const_cast<moe_pc_engine*>(engine);
+        const uint64_t last = mutable_engine->last_expert_budget_warn_ms.load(std::memory_order_relaxed);
         if (now > last + 5ull) {
-            engine->last_expert_budget_warn_ms.store(now, std::memory_order_relaxed);
+            mutable_engine->last_expert_budget_warn_ms.store(now, std::memory_order_relaxed);
             const uint64_t common = engine->common_vram_reserved_bytes.load(std::memory_order_relaxed);
             // OPTIMIZATION Issue 2: Update warning message for dynamic KV budget ★★★
             // Old message: "Consider reducing vram_kv_ratio"

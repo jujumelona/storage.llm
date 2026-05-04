@@ -424,7 +424,7 @@ static int device_allocator_init(moe_pc_engine* e) {
         // Solution: Set RAM budget to 0 for Metal, delegate all memory to unified VRAM budget
         // Impact: OS unified memory pressure handles eviction, no explicit RAM tier needed
         if (e->backend_caps.backend == moe_BACKEND_METAL) {
-            e->ram_budget_bytes = 0;
+            e->config.ram_budget_bytes = 0;
         }
     } else if (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO) {
         level_zero_driver_load(&e->ze, e->backend_caps.device_id);

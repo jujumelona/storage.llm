@@ -347,16 +347,19 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
             run_rows();
         } catch (...) {
             ok.store(0, std::memory_order_release);
-            for (std::thread& worker : local_workers) {
-                if (worker.joinable()) worker.join();
-            }
-            // BUGFIX NEW-2: Decrement both counters on exception ★★★
-            // Problem: Exception path decrements tl_cpu_row_active but not engine->cpu_row_active
-            // This causes permanent counter leak in engine->cpu_row_active
-            // Solution: Decrement both counters before returning
+            // BUGFIX NEW-25: Join workers AFTER decrementing counters to prevent deadlock ★★★
+            // Problem: Exception path joins workers while holding tl_cpu_row_active=1.
+            // If worker thread calls moe_parallel_rows (nested), it sees prev_active>0
+            // and runs single-threaded. But if worker is blocked waiting for main thread
+            // (e.g., on shared atomic), join() deadlocks.
+            // Solution: Decrement counters FIRST to release nesting lock, THEN join workers.
+            // This allows worker threads to complete their work before join.
             --tl_cpu_row_active;
             if (engine) {
                 engine->cpu_row_active.fetch_sub(1, std::memory_order_relaxed);
+            }
+            for (std::thread& worker : local_workers) {
+                if (worker.joinable()) worker.join();
             }
             return 0;
         }

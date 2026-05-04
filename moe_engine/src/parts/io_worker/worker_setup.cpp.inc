@@ -28,7 +28,8 @@ static int io_worker_requeue_disk_task(
         if (retry.requeue_count < UINT8_MAX) {
             ++retry.requeue_count;
         }
-        // BUGFIX 711: Respect disk_stage_depth_cap in requeue path ?끸쁾??        if (engine->disk_stage_depth_cap > 0 &&
+        // BUGFIX 711: Respect disk_stage_depth_cap in requeue path.
+        if (engine->disk_stage_depth_cap > 0 &&
             engine->disk_stage.depth.load(std::memory_order_relaxed) >= engine->disk_stage_depth_cap) {
             // Queue full - wait
             std::this_thread::yield();
@@ -119,7 +120,8 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         }
 
         // BUGFIX 臾몄젣2: eviction ?꾨즺 ???뚮옒洹?clear (?깃났 ?쒖뿉留?
-        // ?ㅽ뙣??寃쎌슦 ?뚮옒洹몃? ?좎??섏뿬 ?ㅼ쓬 ?ъ씠?댁뿉???ъ떆??        bool retry_vram_eviction = false;
+        // ?ㅽ뙣??寃쎌슦 ?뚮옒洹몃? ?좎??섏뿬 ?ㅼ쓬 ?ъ씠?댁뿉???ъ떆?
+        bool retry_vram_eviction = false;
         if (vram_eviction_flag) {
             const uint64_t vram_used_after = tier_used(engine, moe_TIER_VRAM);
             // eviction???깃났?덇굅???ъ슜瑜좎씠 紐⑺몴 ?댄븯濡??⑥뼱吏?寃쎌슦?먮쭔 ?뚮옒洹?clear

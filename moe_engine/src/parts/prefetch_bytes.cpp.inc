@@ -3,6 +3,7 @@ static uint64_t tensor_stream_bytes(const moe_tensor_record& rec) {
 }
 
 static int device_backend_event_sync(moe_pc_engine* e, CUevent event);
+static inline bool staging_slot_valid(const moe_pc_engine* e, uint32_t slot_index);
 
 static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int expert) {
     const uint64_t cached = expert_bytes_get(engine, layer, expert);
@@ -243,8 +244,10 @@ static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t st
                         }
                         engine->staging_slots[idx].in_use.store(true, std::memory_order_release);
                         // BUGFIX: Wait on per-slot DMA fence before reusing buffer
-                        if (engine->staging_slots[idx].last_copy_event) {
+                        if (engine->staging_slots[idx].last_copy_event &&
+                            engine->staging_slots[idx].last_copy_event_recorded.load(std::memory_order_acquire)) {
                             device_backend_event_sync(engine, engine->staging_slots[idx].last_copy_event);
+                            engine->staging_slots[idx].last_copy_event_recorded.store(false, std::memory_order_release);
                         }
                         // BUGFIX 622: Check staging_free_slot_count > 0 before fetch_sub to prevent underflow ★
                         // Problem: If staging_free_slot_count is 0, fetch_sub causes underflow
@@ -359,8 +362,10 @@ try_next_lockfree_slot:
                     continue;
                 }
                 // BUGFIX: Wait on per-slot DMA fence before reusing buffer
-                if (engine->staging_slots[idx].last_copy_event) {
+                if (engine->staging_slots[idx].last_copy_event &&
+                    engine->staging_slots[idx].last_copy_event_recorded.load(std::memory_order_acquire)) {
                     device_backend_event_sync(engine, engine->staging_slots[idx].last_copy_event);
+                    engine->staging_slots[idx].last_copy_event_recorded.store(false, std::memory_order_release);
                 }
                 // BUGFIX 622: Check staging_free_slot_count > 0 before fetch_sub to prevent underflow ★
                 // Problem: If staging_free_slot_count is 0, fetch_sub causes underflow
@@ -493,7 +498,6 @@ static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
         // All acquire_staging_slot paths now use type-specific CVs (staging_pinned_cv,
         // staging_gpu_cv, staging_direct_cv). No code path waits on staging_slot_cv.
         // The extra notify caused unnecessary context switches.
-    }
 }
 
 static uint64_t copy_mapped_range_to_staging(
