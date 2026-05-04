@@ -147,9 +147,10 @@ int moe_pc_engine_raw_rmsnorm_f32(
         ss += (double)input[i] * (double)input[i];
     }
     const float norm = 1.0f / std::sqrt((float)(ss / (double)input_count) + (eps > 0.0f ? eps : 1.0e-6f));
+    const int unit_offset = moe_engine_uses_gemma_rmsnorm_unit_offset(engine);
     return moe_parallel_rows(engine, input_count, 0, [&](uint32_t i) {
         const float w = moe_raw_scalar_to_f32(raw.base + (uint64_t)i * (uint64_t)elem, raw.scalar_encoding);
-        output[i] = input[i] * norm * w;
+        output[i] = input[i] * norm * (unit_offset ? (1.0f + w) : w);
         return 1;
     });
 }

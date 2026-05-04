@@ -144,6 +144,7 @@ static uint64_t moe_raw_tensor_scalar_count(const moe_raw_tensor_cache_entry& ra
 }
 
 static int moe_apply_rmsnorm_common_weight_f32(
+    const moe_pc_engine* engine,
     const moe_raw_tensor_cache_entry& raw,
     const float* input,
     uint32_t count,
@@ -162,12 +163,13 @@ static int moe_apply_rmsnorm_common_weight_f32(
     }
     // Safe: count > 0 guaranteed by check above
     const float norm = 1.0f / std::sqrt((float)(ss / (double)count) + (eps > 0.0f ? eps : 1.0e-6f));
+    const int unit_offset = moe_engine_uses_gemma_rmsnorm_unit_offset(engine);
     for (uint32_t i = 0; i < count; ++i) {
         float w = 0.0f;
         if (!moe_raw_tensor_scalar_at_f32(raw, i, &w)) {
             return 0;
         }
-        output[i] = input[i] * norm * w;
+        output[i] = input[i] * norm * (unit_offset ? (1.0f + w) : w);
     }
     return 1;
 }
@@ -199,7 +201,7 @@ static int moe_layer_rmsnorm_suffixes_f32(
     if (!mapped) {
         return 0;
     }
-    const int ok = moe_apply_rmsnorm_common_weight_f32(raw, input, hidden_size, output, eps);
+    const int ok = moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
     moe_profile_log(
         "rmsnorm_common_apply",
         "layer=%d suffix0=%s ok=%d hidden=%u scalar=%u",

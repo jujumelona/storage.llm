@@ -319,6 +319,14 @@ static int moe_engine_metadata_mentions(const moe_pc_engine* engine, const char*
     return result;
 }
 
+static int moe_engine_uses_gemma_rmsnorm_unit_offset(const moe_pc_engine* engine) {
+    if (!engine) {
+        return 0;
+    }
+    return moe_engine_metadata_mentions(engine, "gemma") ||
+        moe_engine_graph_ir_mentions(engine, "gemma");
+}
+
 static int moe_engine_gelu_activation_mode(const moe_pc_engine* engine) {
     if (!engine) {
         return 0;

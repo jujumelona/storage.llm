@@ -1,4 +1,5 @@
 static int moe_apply_rmsnorm_weight_entry_f32(
+    const moe_pc_engine* engine,
     const moe_raw_tensor_cache_entry& raw,
     const float* input,
     uint32_t count,
@@ -21,9 +22,10 @@ static int moe_apply_rmsnorm_weight_entry_f32(
     }
     // Safe: count > 0 guaranteed by check above
     const float norm = 1.0f / std::sqrt((float)(ss / (double)count) + (eps > 0.0f ? eps : 1.0e-6f));
+    const int unit_offset = moe_engine_uses_gemma_rmsnorm_unit_offset(engine);
     for (uint32_t i = 0; i < count; ++i) {
         const float w = moe_raw_scalar_to_f32(raw.base + (uint64_t)i * (uint64_t)elem, raw.scalar_encoding);
-        output[i] = input[i] * norm * w;
+        output[i] = input[i] * norm * (unit_offset ? (1.0f + w) : w);
     }
     return 1;
 }
@@ -50,7 +52,7 @@ static int moe_apply_optional_head_rmsnorm_f32(
     std::vector<float> tmp(head_dim);
     for (uint32_t h = 0; h < head_count; ++h) {
         float* head = values + (uint64_t)h * (uint64_t)head_dim;
-        if (!moe_apply_rmsnorm_weight_entry_f32(raw, head, head_dim, tmp.data(), eps)) {
+        if (!moe_apply_rmsnorm_weight_entry_f32(engine, raw, head, head_dim, tmp.data(), eps)) {
             return 0;
         }
         std::memcpy(head, tmp.data(), (size_t)head_dim * sizeof(float));
