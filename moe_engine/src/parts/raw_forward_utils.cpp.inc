@@ -319,6 +319,59 @@ static int moe_engine_metadata_mentions(const moe_pc_engine* engine, const char*
     return result;
 }
 
+static float moe_embedding_scale_value(const moe_pc_engine* engine, uint32_t hidden_size) {
+    if (!engine || hidden_size == 0 || hidden_size > 100000u) {
+        return 1.0f;
+    }
+    const uint32_t cached_hidden = engine->cached_embedding_scale_hidden.load(std::memory_order_acquire);
+    const uint32_t cached_bits = engine->cached_embedding_scale_bits.load(std::memory_order_acquire);
+    if (cached_hidden == hidden_size && cached_bits != 0u) {
+        return moe_f32_from_bits(cached_bits);
+    }
+
+    double value = 0.0;
+    float scale = 1.0f;
+    if (!engine->offload_gguf_metadata_json.empty() &&
+        (moe_json_get_double_local(engine->offload_gguf_metadata_json, "embedding_scale", &value) ||
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "embed_scale", &value) ||
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "scale_emb", &value) ||
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "scale_embedding", &value)) &&
+        value > 0.0) {
+        scale = (float)value;
+    }
+    else if (moe_engine_graph_ir_mentions(engine, "sqrt_hidden_size") ||
+        moe_engine_graph_ir_mentions(engine, "scale_embedding") ||
+        moe_engine_metadata_mentions(engine, "sqrt_hidden_size") ||
+        moe_engine_metadata_mentions(engine, "scale_embedding")) {
+        scale = std::sqrt((float)hidden_size);
+    }
+    else if (moe_engine_has_common_tensor_suffix(engine, 0, "layer_output_scale.weight") &&
+        moe_engine_has_common_tensor_suffix(engine, 0, "ffn_gate_inp.scale")) {
+        scale = std::sqrt((float)hidden_size);
+    }
+
+    engine->cached_embedding_scale_hidden.store(hidden_size, std::memory_order_release);
+    engine->cached_embedding_scale_bits.store(moe_f32_bits(scale), std::memory_order_release);
+    return scale;
+}
+
+static void moe_apply_embedding_scale_f32(
+    const moe_pc_engine* engine,
+    const moe_storage_constants_t* c,
+    float* hidden
+) {
+    if (!engine || !c || !hidden || c->hidden_size == 0) {
+        return;
+    }
+    const float scale = moe_embedding_scale_value(engine, c->hidden_size);
+    if (scale == 1.0f) {
+        return;
+    }
+    for (uint32_t i = 0; i < c->hidden_size; ++i) {
+        hidden[i] *= scale;
+    }
+}
+
 static int moe_engine_uses_gemma_rmsnorm_unit_offset(const moe_pc_engine* engine) {
     if (!engine) {
         return 0;

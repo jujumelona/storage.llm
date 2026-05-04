@@ -82,6 +82,26 @@ static int moe_copy_embedding_row_f32(
     return 1;
 }
 
+static int moe_copy_scaled_embedding_row_f32(
+    const moe_pc_engine* engine,
+    const moe_storage_constants_t* c,
+    const uint8_t* base,
+    uint64_t bytes,
+    uint8_t encoding,
+    uint8_t weight_format,
+    uint64_t weight_row_bytes,
+    uint32_t token_id,
+    float* out_hidden
+) {
+    if (!moe_copy_embedding_row_f32(
+            c, base, bytes, encoding, weight_format,
+            weight_row_bytes, token_id, out_hidden)) {
+        return 0;
+    }
+    moe_apply_embedding_scale_f32(engine, c, out_hidden);
+    return 1;
+}
+
 static int moe_map_embedding_tensor(
     moe_pc_engine* engine,
     const moe_storage_constants_t* c,
@@ -118,7 +138,8 @@ int moe_pc_engine_embed_token_f32(
     }
     moe_raw_tensor_cache_entry common{};
     if (moe_map_embedding_tensor(engine, c, &common)) {
-        return moe_copy_embedding_row_f32(
+        return moe_copy_scaled_embedding_row_f32(
+            engine,
             c, common.base, common.bytes, common.scalar_encoding,
             common.weight_format, common.weight_row_bytes, token_id, out_hidden);
     }
@@ -132,7 +153,8 @@ int moe_pc_engine_embed_token_f32(
         return 0;
     }
     const uint8_t* base = raw_span_ptr(span, mapped, 0, span->bytes);
-    return moe_copy_embedding_row_f32(
+    return moe_copy_scaled_embedding_row_f32(
+        engine,
         c, base, span->bytes, moe_RAW_SCALAR_BF16,
         moe_WEIGHT_ENCODING_RAW_FP16, (uint64_t)c->hidden_size * 2ull,
         token_id, out_hidden);
@@ -162,7 +184,8 @@ int moe_pc_engine_embed_tokens_f32(
                 return 0;
             }
             float* dst = out_hidden + (uint64_t)row * (uint64_t)c->hidden_size;
-            return moe_copy_embedding_row_f32(
+            return moe_copy_scaled_embedding_row_f32(
+                engine,
                 c, common.base, common.bytes, common.scalar_encoding,
                 common.weight_format, common.weight_row_bytes, (uint32_t)token, dst);
         });
@@ -183,7 +206,8 @@ int moe_pc_engine_embed_tokens_f32(
             return 0;
         }
         float* dst = out_hidden + (uint64_t)row * (uint64_t)c->hidden_size;
-        return moe_copy_embedding_row_f32(
+        return moe_copy_scaled_embedding_row_f32(
+            engine,
             c, base, span->bytes, moe_RAW_SCALAR_BF16,
             moe_WEIGHT_ENCODING_RAW_FP16, (uint64_t)c->hidden_size * 2ull,
             (uint32_t)token, dst);

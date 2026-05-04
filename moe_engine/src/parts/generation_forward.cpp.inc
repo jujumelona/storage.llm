@@ -123,10 +123,7 @@ static int moe_forward_one_token_f32(
         moe_generation_set_error(stats, "failed to read token embedding");
         return 0;
     }
-    const float embedding_scale = moe_forward_embedding_scale_value(engine, c->hidden_size);
-    if (embedding_scale != 1.0f) {
-        moe_scale_f32(hidden, embedding_scale, c->hidden_size);
-    }
+    const float embedding_scale = moe_embedding_scale_value(engine, c->hidden_size);
     moe_profile_log(
         "forward_embed",
         "position=%u token=%u hidden=%u scale=%.6g ms=%.3f",

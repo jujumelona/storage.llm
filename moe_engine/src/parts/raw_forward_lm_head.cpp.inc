@@ -22,13 +22,27 @@ static int moe_map_lm_head_tensor(
         "model.embed_tokens.weight",
         "embed_tokens.weight"
     };
-    moe_raw_tensor_desc desc{};
-    const moe_gguf_common_tensor_record* rec =
-        find_common_tensor_by_names(engine, lm_head_names, sizeof(lm_head_names) / sizeof(lm_head_names[0]), &desc);
-    if (!rec || desc.cols != c->hidden_size || desc.rows < c->vocab_size) {
-        return 0;
+    for (size_t i = 0; i < sizeof(lm_head_names) / sizeof(lm_head_names[0]); ++i) {
+        moe_raw_tensor_desc desc{};
+        const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_names(engine, &lm_head_names[i], 1, &desc);
+        if (!rec) {
+            continue;
+        }
+        if (desc.cols != c->hidden_size || desc.rows < c->vocab_size) {
+            moe_profile_log(
+                "lm_head_candidate_shape_rejected",
+                "name=%s rows=%u cols=%u vocab=%u hidden=%u",
+                lm_head_names[i],
+                desc.rows,
+                desc.cols,
+                c->vocab_size,
+                c->hidden_size);
+            continue;
+        }
+        return map_common_tensor_record(engine, *rec, desc, out);
     }
-    return map_common_tensor_record(engine, *rec, desc, out);
+    return 0;
 }
 
 int moe_pc_engine_lm_head_top1_f32(
@@ -46,6 +60,11 @@ int moe_pc_engine_lm_head_top1_f32(
     }
     // Fix 35: Cache lm_head mapping — tensor is immutable after model load
     // Eliminates per-token name lookup + mmap pointer recalculation
+    // BUGFIX Problem 6: Include engine pointer in cache key ★★★ CRITICAL
+    // Problem: Multi-engine processes use only engine_generation as key
+    // → Engine A and Engine B with same generation counter share wrong vocab table
+    // Solution: Use (engine_ptr, engine_generation) pair as cache key
+    static thread_local const moe_pc_engine* tls_lm_head_engine_ptr = nullptr;
     static thread_local uint64_t tls_lm_head_engine_generation = 0;
     static thread_local moe_raw_tensor_cache_entry tls_lm_head_entry{};
     static thread_local bool tls_lm_head_valid = false;
@@ -57,9 +76,10 @@ int moe_pc_engine_lm_head_top1_f32(
     uint8_t encoding = moe_RAW_SCALAR_BF16;
     uint8_t weight_format = moe_WEIGHT_ENCODING_RAW_FP16;
     uint64_t weight_row_bytes = 0;
-    if (tls_lm_head_engine_generation == engine_generation && tls_lm_head_valid) {
+    if (tls_lm_head_engine_ptr == engine && tls_lm_head_engine_generation == engine_generation && tls_lm_head_valid) {
         common = tls_lm_head_entry;
     } else if (moe_map_lm_head_tensor(engine, c, &common)) {
+        tls_lm_head_engine_ptr = engine;
         tls_lm_head_engine_generation = engine_generation;
         tls_lm_head_entry = common;
         tls_lm_head_valid = true;
@@ -261,14 +281,17 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     uint8_t weight_format = moe_WEIGHT_ENCODING_RAW_FP16;
     uint64_t weight_row_bytes = 0;
     // Fix 35: Reuse cached lm_head mapping (same tls declared in top1)
+    // BUGFIX Problem 6: Include engine pointer in cache key ★★★ CRITICAL
     {
+        static thread_local const moe_pc_engine* tls_lp_engine_ptr = nullptr;
         static thread_local uint64_t tls_lp_engine_generation = 0;
         static thread_local moe_raw_tensor_cache_entry tls_lp_entry{};
         static thread_local bool tls_lp_valid = false;
         const uint64_t engine_generation = engine->engine_generation;
-        if (tls_lp_engine_generation == engine_generation && tls_lp_valid) {
+        if (tls_lp_engine_ptr == engine && tls_lp_engine_generation == engine_generation && tls_lp_valid) {
             common = tls_lp_entry;
         } else if (moe_map_lm_head_tensor(engine, c, &common)) {
+            tls_lp_engine_ptr = engine;
             tls_lp_engine_generation = engine_generation;
             tls_lp_entry = common;
             tls_lp_valid = true;
