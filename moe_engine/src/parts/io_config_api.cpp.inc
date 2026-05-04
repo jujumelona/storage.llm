@@ -54,7 +54,7 @@
         staging_target = std::max<uint64_t>(staging_target, engine->backend_caps.recommended_pinned_bytes);
         staging_target = std::max<uint64_t>(staging_target, (uint64_t)streams * 64ull * 1024ull * 1024ull);
         if (engine->config.ram_budget_bytes > 0) {
-            staging_target = std::min<uint64_t>(staging_target, engine->config.ram_budget_bytes / 2ull);
+            staging_target = std::min<uint64_t>(staging_target, engine->config.ram_budget_bytes / 4ull);
         }
         staging_target = moe_rt_align_4k(staging_target);
         if (staging_target > 0 &&
@@ -115,11 +115,16 @@
     if (engine->io_config.topology_max_edges_per_source == 0) {
         engine->io_config.topology_max_edges_per_source = 1;
     }
+    const uint32_t hw_threads = moe_cpu_thread_count_hint();
+    const uint32_t balanced_disk_workers = moe_balanced_disk_worker_threads(
+        hw_threads,
+        engine->io_config.io_worker_threads,
+        engine->io_config.gpu_worker_threads);
     if (engine->io_config.disk_worker_threads == 0) {
-        engine->io_config.disk_worker_threads = moe_default_disk_worker_threads(moe_cpu_thread_count_hint());
+        engine->io_config.disk_worker_threads = balanced_disk_workers;
     } else if (using_default_io_config &&
-        engine->io_config.disk_worker_threads < moe_default_disk_worker_threads(moe_cpu_thread_count_hint())) {
-        engine->io_config.disk_worker_threads = moe_default_disk_worker_threads(moe_cpu_thread_count_hint());
+        engine->io_config.disk_worker_threads > balanced_disk_workers) {
+        engine->io_config.disk_worker_threads = balanced_disk_workers;
     }
     engine->io_config.disk_worker_threads =
         clamp_to_cap(engine->io_config.disk_worker_threads, disk_worker_cap());
@@ -141,6 +146,15 @@
     }
     engine->io_config.gpu_worker_threads =
         clamp_to_cap(engine->io_config.gpu_worker_threads, gpu_worker_cap(engine));
+    if (using_default_io_config) {
+        const uint32_t final_balanced_disk_workers = moe_balanced_disk_worker_threads(
+            hw_threads,
+            engine->io_config.io_worker_threads,
+            engine->io_config.gpu_worker_threads);
+        if (engine->io_config.disk_worker_threads > final_balanced_disk_workers) {
+            engine->io_config.disk_worker_threads = final_balanced_disk_workers;
+        }
+    }
     engine->runtime_prefetch_window_layers.store(
         engine->io_config.prefetch_window_layers, std::memory_order_relaxed);
     runtime_store_io_workers(

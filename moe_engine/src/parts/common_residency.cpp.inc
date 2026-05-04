@@ -47,13 +47,13 @@ static uint64_t vram_expert_budget_bytes(const moe_pc_engine* engine) {
         return 0;
     }
     const uint64_t common = engine->common_vram_reserved_bytes.load();
-    const uint64_t kv_used = engine->vram_kv_used_bytes.load(std::memory_order_relaxed);
+    const uint64_t kv_reserved = engine->vram_kv_budget_bytes.load(std::memory_order_relaxed);
     const uint64_t pending = engine->pending_vram_reservation.load(std::memory_order_relaxed);
     uint64_t reserved = common;
-    if (reserved > UINT64_MAX - kv_used) {
+    if (reserved > UINT64_MAX - kv_reserved) {
         return 0;
     }
-    reserved += kv_used;
+    reserved += kv_reserved;
     if (reserved > UINT64_MAX - pending) {
         return 0;
     }
@@ -72,7 +72,7 @@ static uint64_t vram_expert_budget_bytes_checked(const moe_pc_engine* engine) {
         if (now > last + 5ull) {
             s_last_warn.store(now, std::memory_order_relaxed);
             const uint64_t common = engine->common_vram_reserved_bytes.load(std::memory_order_relaxed);
-            const uint64_t kv = engine->vram_kv_used_bytes.load(std::memory_order_relaxed);
+            const uint64_t kv = engine->vram_kv_budget_bytes.load(std::memory_order_relaxed);
             const uint64_t pending = engine->pending_vram_reservation.load(std::memory_order_relaxed);
             fprintf(stderr,
                 "[storageLLM WARNING] Expert VRAM budget exhausted: "

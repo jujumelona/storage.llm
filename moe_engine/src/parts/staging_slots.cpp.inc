@@ -590,6 +590,15 @@ static void configure_staging_slots(moe_pc_engine* engine) {
             }
         }
     }
+#if defined(__APPLE__) && defined(__MACH__)
+    if (engine->backend_caps.backend == moe_BACKEND_METAL && slot_size >= 4096ull) {
+        const uint64_t page_aligned_slot_size = slot_size & ~4095ull;
+        if (page_aligned_slot_size >= max_tensor_bytes &&
+            page_aligned_slot_size >= min_slot) {
+            slot_size = page_aligned_slot_size;
+        }
+    }
+#endif
     if (slot_size == 0) {
         update_staging_slot_deficit(engine);
         return;

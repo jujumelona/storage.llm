@@ -12,6 +12,33 @@ static uint32_t moe_default_disk_worker_threads(uint32_t hw) {
     return hw >= 4u ? 2u : 1u;
 }
 
+static uint32_t moe_balanced_disk_worker_threads(uint32_t hw, uint32_t io_workers, uint32_t gpu_workers) {
+    const uint32_t default_disk = moe_default_disk_worker_threads(hw);
+    const uint32_t balanced = std::max(1u, io_workers + std::max(1u, gpu_workers));
+    return std::min(default_disk, balanced);
+}
+
+static uint64_t moe_default_pinned_staging_bytes(
+    uint64_t normal_min,
+    uint64_t normal_max,
+    uint32_t io_workers,
+    uint32_t gpu_workers
+) {
+    const uint32_t gpu = std::max(1u, gpu_workers);
+    uint64_t slot_count = (uint64_t)std::max(1u, io_workers) * (uint64_t)gpu * 2ull;
+    slot_count = std::max<uint64_t>(4ull, std::min<uint64_t>(slot_count, 64ull));
+    uint64_t desired = normal_max > 0 && slot_count <= UINT64_MAX / normal_max
+        ? normal_max * slot_count : UINT64_MAX;
+    const uint64_t ram_cap = storagellm::default_ram_budget_bytes(25);
+    if (ram_cap > 0) {
+        desired = std::min<uint64_t>(desired, ram_cap);
+    }
+    const uint64_t normal_floor = normal_min <= UINT64_MAX / 4ull ? normal_min * 4ull : UINT64_MAX;
+    const uint64_t floor = std::max<uint64_t>(128ull * 1024ull * 1024ull, normal_floor);
+    const uint64_t cap = ram_cap ? ram_cap : UINT64_MAX;
+    return std::min<uint64_t>(std::max<uint64_t>(desired, std::min<uint64_t>(floor, cap)), cap);
+}
+
 moe_pc_engine_config_t moe_pc_default_config(void) {
     moe_pc_engine_config_t cfg{};
     cfg.vram_budget_bytes = 0;
@@ -41,10 +68,14 @@ moe_io_config_t moe_pc_default_io_config(void) {
     cfg.max_prefetch_queue = 12288;
     cfg.topology_max_candidates = 2;
     cfg.topology_max_edges_per_source = 32;
-    cfg.disk_worker_threads = moe_default_disk_worker_threads(hw);
     cfg.pinned_worker_threads = hw >= 32 ? 4u : hw >= 16 ? 3u : 1u;
     cfg.gpu_worker_threads = hw >= 32 ? 4u : hw >= 16 ? 3u : 1u;
-    cfg.pinned_staging_bytes = std::max<uint64_t>(512ull * 1024ull * 1024ull, normal_max * 16ull);
+    cfg.disk_worker_threads = moe_balanced_disk_worker_threads(hw, cfg.io_worker_threads, cfg.gpu_worker_threads);
+    cfg.pinned_staging_bytes = moe_default_pinned_staging_bytes(
+        normal_min,
+        normal_max,
+        cfg.io_worker_threads,
+        cfg.gpu_worker_threads);
     cfg.direct_upload_min_bytes = normal_min;
     cfg.enable_compute_io_overlap = 1;
     cfg.enable_multistage_pipeline = 1;

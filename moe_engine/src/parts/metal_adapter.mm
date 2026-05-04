@@ -7,8 +7,7 @@ extern "C" {
 void* metal_zero_copy_map(void* device_handle, void* src, uint64_t bytes) {
     uint64_t prefix = 0;
     void* mapped = metal_zero_copy_map_aligned(device_handle, src, bytes, &prefix);
-    NSUInteger pageSize = [NSProcessInfo processInfo].pageSize;
-    if (prefix != 0 || (bytes % (uint64_t)pageSize) != 0) {
+    if (prefix != 0) {
         if (mapped) {
             metal_zero_copy_unmap(mapped);
         }
