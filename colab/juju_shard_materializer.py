@@ -412,7 +412,10 @@ def gguf_tensor_row_bytes(tensor_type, cols):
     if t == 29:
         return block256 * 56
     if t in {31, 32, 33}:
-        return block32 * 18
+        # GGUF interleaved Q4_0 variants have distinct layouts. The engine
+        # intentionally does not decode them yet, so fail closed instead of
+        # emitting bytes that would later be interpreted with the wrong kernel.
+        return 0
     if t == 34:
         return block256 * 54
     if t == 35:
