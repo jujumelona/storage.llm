@@ -200,6 +200,7 @@ static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
     if (moe_json_get_double_local(meta->metadata_json, "ram_to_gpu_ms", &double_value) ||
         moe_json_get_double_local(meta->metadata_json, "reference_ram_to_gpu_ms", &double_value)) {
         meta->contract.reference_ram_to_gpu_ms = double_value;
+    }
     if (moe_json_get_double_local(meta->metadata_json, "nvme_to_ram_ms", &double_value) ||
         moe_json_get_double_local(meta->metadata_json, "reference_nvme_to_ram_ms", &double_value)) {
         meta->contract.reference_nvme_to_ram_ms = double_value;
