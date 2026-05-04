@@ -156,27 +156,36 @@ int moe_pc_engine_execute_prefetch_plan(
             }
         }
         if (skip_item) {
-            // BUGFIX NEW-27: Fix reservation release order to prevent double-release ★★★
-            // Problem: Original code checks vram_pending_reserved[i] first, then RAM→VRAM upgrade case
-            // If Pass 1 does RAM→VRAM upgrade (try_add_tier_usage), vram_pending_reserved[i]=0
-            // but pending_ram_reservation was already released in Pass 1 upgrade path
-            // Then skip_item path tries to release RAM reservation AGAIN → underflow
-            // Solution: Check RAM→VRAM upgrade case FIRST (admitted_tiers[i]==VRAM && !vram_pending_reserved[i])
-            // This case means upgrade happened, so no reservation to release (already handled in Pass 1)
-            // Then check normal VRAM reservation, then RAM reservation
-            // Impact: Prevents pending_ram_reservation underflow, fixes budget accounting
+            // BUGFIX NEW-29: Fix RAM→VRAM upgrade reservation release logic ★★★
+            // Problem: RAM→VRAM upgrade path has TWO cases that need different handling:
+            // Case 1: Upgrade succeeded (admitted_tiers[i]==VRAM && !vram_pending_reserved[i])
+            //         → try_add_tier_usage committed to vram_used_bytes
+            //         → pending_ram_reservation already released in Pass 1
+            //         → If skip_item, must subtract vram_used_bytes to prevent leak
+            // Case 2: Upgrade failed, stayed in RAM (admitted_tiers[i]==RAM && items[i].target_tier==VRAM)
+            //         → pending_ram_reservation still held from Pass 1
+            //         → Must release pending_ram_reservation here
+            // Original code only handled Case 1, missing Case 2 → RAM reservation leak
+            // Solution: Add explicit check for Case 2 before normal RAM path
+            // Impact: Prevents pending_ram_reservation leak when upgrade fails + skip_item
             if (admitted_tiers[i] == moe_TIER_VRAM && !vram_pending_reserved[i]) {
-                // RAM→VRAM upgrade path: try_add_tier_usage directly committed to vram_used_bytes
+                // Case 1: RAM→VRAM upgrade succeeded
+                // try_add_tier_usage directly committed to vram_used_bytes
                 // pending_ram_reservation was already released in Pass 1 upgrade path
                 // If skip_item=true, must subtract vram_used_bytes to prevent leak
                 if (items[i].bytes > 0) {
                     subtract_tier_usage(engine, moe_TIER_VRAM, items[i].bytes);
                 }
             } else if (vram_pending_reserved[i] && items[i].bytes > 0) {
-                // Normal VRAM admission path
+                // Normal VRAM admission path (no upgrade attempted)
                 prefetch_release_pending_vram_reservation(engine, items[i].bytes);
+            } else if (admitted_tiers[i] == moe_TIER_RAM && items[i].target_tier == moe_TIER_VRAM && items[i].bytes > 0) {
+                // Case 2: RAM→VRAM upgrade failed, stayed in RAM
+                // pending_ram_reservation still held from Pass 1 admission
+                // Must release it here to prevent leak
+                prefetch_release_pending_ram_reservation(engine, items[i].bytes);
             } else if (admitted_tiers[i] == moe_TIER_RAM && items[i].bytes > 0) {
-                // RAM admission path (no upgrade happened)
+                // Normal RAM admission path (no upgrade attempted)
                 prefetch_release_pending_ram_reservation(engine, items[i].bytes);
             }
             continue;
