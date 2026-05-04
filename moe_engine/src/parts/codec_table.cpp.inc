@@ -11,7 +11,7 @@ static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine);
 static int moe_engine_load_offload_gguf_contract(
     moe_pc_engine* engine,
     const std::string& root,
-    moe_offload_gguf_scan_t* out_scan);
+    moe_model_root_check_t* out_check);
 
 #include "codec/model_file_io.cpp.inc"
 #include "codec/tensor_index_loader.cpp.inc"
