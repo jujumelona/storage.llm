@@ -1412,14 +1412,13 @@ static int moe_layer_moe_mlp_f32(
         work[e].ok = expert_ok[e].load(std::memory_order_acquire);
     }
 
-    // Phase 3: Accumulate weighted expert outputs into mlp.
+    // Phase 3: Accumulate weighted expert outputs, then apply the expert-branch
+    // post norm once. Gemma4 normalizes the summed expert branch, not each expert
+    // independently.
     const uint64_t accumulate_start_us = moe_profile_now_us();
+    std::fill(s->residual.begin(), s->residual.begin() + hidden_size, 0.0f);
     for (size_t e = 0; e < num_selected; ++e) {
         if (!work[e].ok) continue;
-        if (moe_layer_post_ffw_norm2_f32(
-                engine, layer, work[e].out, hidden_size, s->residual.data(), attn_cfg.rms_norm_eps)) {
-            std::memcpy(work[e].out, s->residual.data(), (size_t)hidden_size * sizeof(float));
-        }
         if (!moe_layer_apply_expert_down_scale_f32(
                 engine, layer, work[e].expert_id, c->experts_per_moe_layer,
                 work[e].out, hidden_size)) {
@@ -1427,7 +1426,15 @@ static int moe_layer_moe_mlp_f32(
                 layer, work[e].expert_id);
             return 0;
         }
-        moe_axpy_f32(s->mlp.data(), work[e].out, work[e].weight, hidden_size);
+        moe_axpy_f32(s->residual.data(), work[e].out, work[e].weight, hidden_size);
+    }
+    const float* expert_branch = s->residual.data();
+    if (moe_layer_post_ffw_norm2_f32(
+            engine, layer, s->residual.data(), hidden_size, s->expert.data(), attn_cfg.rms_norm_eps)) {
+        expert_branch = s->expert.data();
+    }
+    for (uint32_t i = 0; i < hidden_size; ++i) {
+        s->mlp[i] += expert_branch[i];
     }
     const double accumulate_ms = moe_profile_elapsed_ms(accumulate_start_us);
 
