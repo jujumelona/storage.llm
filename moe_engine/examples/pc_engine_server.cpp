@@ -401,8 +401,10 @@ struct server_tokenizer {
     std::unordered_map<std::string, uint32_t> piece_to_id;
     std::unordered_map<std::string, uint32_t> bpe_rank;
     std::vector<std::pair<std::string, std::string>> normalizer_replacements;
+    std::vector<std::pair<std::string, uint32_t>> special_token_pieces;
     std::unordered_set<uint32_t> special_ids;
     size_t max_piece_bytes = 0;
+    size_t max_special_piece_bytes = 0;
     uint32_t eos_token_id = 0;
     uint32_t unk_token_id = 0;
     bool has_eos = false;
@@ -923,6 +925,35 @@ static bool tokenizer_encode_bpe_piece(
     return true;
 }
 
+static bool tokenizer_is_control_token_text(const std::string& piece) {
+    if (piece == "<bos>" || piece == "<eos>" || piece == "<pad>" || piece == "<unk>") {
+        return true;
+    }
+    if (piece.size() >= 3u && piece.rfind("<|", 0) == 0) {
+        return true;
+    }
+    if (piece.size() >= 3u && piece.find("|>") != std::string::npos) {
+        return true;
+    }
+    return false;
+}
+
+static void tokenizer_add_special_piece(server_tokenizer* tok, const std::string& piece, uint32_t id) {
+    if (!tok || piece.empty()) {
+        return;
+    }
+    for (auto& existing : tok->special_token_pieces) {
+        if (existing.first == piece) {
+            existing.second = id;
+            tok->special_ids.insert(id);
+            return;
+        }
+    }
+    tok->special_token_pieces.emplace_back(piece, id);
+    tok->special_ids.insert(id);
+    tok->max_special_piece_bytes = std::max(tok->max_special_piece_bytes, piece.size());
+}
+
 static void tokenizer_add_piece(server_tokenizer* tok, const std::string& raw_piece, uint32_t id) {
     if (!tok) return;
     tok->id_to_piece[id] = raw_piece;
@@ -934,8 +965,11 @@ static void tokenizer_add_piece(server_tokenizer* tok, const std::string& raw_pi
         tok->text_to_id.emplace(text_piece, id);
         tok->max_piece_bytes = std::max(tok->max_piece_bytes, text_piece.size());
     }
-    if (raw_piece.size() >= 1 && raw_piece[0] == '<') {
-        tok->special_ids.insert(id);
+    if (tokenizer_is_control_token_text(raw_piece)) {
+        tokenizer_add_special_piece(tok, raw_piece, id);
+    }
+    if (text_piece != raw_piece && tokenizer_is_control_token_text(text_piece)) {
+        tokenizer_add_special_piece(tok, text_piece, id);
     }
     const std::string lowered = lower_ascii(raw_piece);
     if (!tok->has_unk && lowered.find("unk") != std::string::npos) {
@@ -1021,10 +1055,14 @@ static bool load_tokenizer_vocab(server_tokenizer* tok, const std::string& json)
             if (obj_end == std::string::npos || obj_end > added_end) break;
             uint32_t id = 0;
             std::string content;
+            bool special = false;
             if (json_read_u32_in_range(json, obj_begin, obj_end, "id", &id) &&
                 json_read_string_in_range(json, obj_begin, obj_end, "content", &content)) {
+                (void)json_read_bool_in_range(json, obj_begin, obj_end, "special", &special);
                 tokenizer_add_piece(tok, content, id);
-                tok->special_ids.insert(id);
+                if (special || tokenizer_is_control_token_text(content)) {
+                    tokenizer_add_special_piece(tok, content, id);
+                }
             }
             ap = obj_end + 1;
         }
@@ -1073,6 +1111,13 @@ static bool load_tokenizer_vocab(server_tokenizer* tok, const std::string& json)
         tok->has_merges = !tok->bpe_rank.empty();
     }
 
+    std::sort(tok->special_token_pieces.begin(), tok->special_token_pieces.end(),
+        [](const std::pair<std::string, uint32_t>& a, const std::pair<std::string, uint32_t>& b) {
+            if (a.first.size() != b.first.size()) {
+                return a.first.size() > b.first.size();
+            }
+            return a.first < b.first;
+        });
     tok->loaded = !tok->id_to_piece.empty() && !tok->piece_to_id.empty();
     if (!tok->loaded) {
         tok->error = "tokenizer vocab parse produced no usable pieces";
@@ -1104,33 +1149,70 @@ static server_tokenizer& get_server_tokenizer(const server_options& opts) {
     return tok;
 }
 
-static bool tokenizer_encode_greedy(const server_tokenizer& tok, const std::string& text, std::vector<int32_t>* out_ids) {
-    if (!tok.loaded || !out_ids) return false;
-    out_ids->clear();
+static bool tokenizer_match_special_at(
+    const server_tokenizer& tok,
+    const std::string& text,
+    size_t pos,
+    uint32_t* out_id,
+    size_t* out_len
+) {
+    if (pos >= text.size()) {
+        return false;
+    }
+    const size_t remaining = text.size() - pos;
+    if (tok.max_special_piece_bytes == 0 || remaining == 0) {
+        return false;
+    }
+    for (const auto& item : tok.special_token_pieces) {
+        const std::string& piece = item.first;
+        if (piece.empty() || piece.size() > remaining) {
+            continue;
+        }
+        if (text.compare(pos, piece.size(), piece) == 0) {
+            if (out_id) {
+                *out_id = item.second;
+            }
+            if (out_len) {
+                *out_len = piece.size();
+            }
+            return true;
+        }
+    }
+    return false;
+}
 
+static bool tokenizer_encode_regular_text(
+    const server_tokenizer& tok,
+    const std::string& text,
+    std::vector<int32_t>* out_ids
+) {
+    if (!out_ids || text.empty()) return true;
+    std::vector<int32_t> segment_ids;
     if (tok.byte_level && tok.has_merges) {
         bool ok = true;
         const std::string normalized_text = tokenizer_normalize_text(tok, text);
         const std::vector<std::string> pretokens = bytelevel_pretokenize_text(normalized_text);
         for (const std::string& pretoken : pretokens) {
             const std::string encoded = byte_level_encode_text(pretoken);
-            if (!tokenizer_encode_bpe_piece(tok, encoded, out_ids)) {
+            if (!tokenizer_encode_bpe_piece(tok, encoded, &segment_ids)) {
                 ok = false;
                 break;
             }
         }
-        if (ok && !out_ids->empty()) {
+        if (ok && !segment_ids.empty()) {
+            out_ids->insert(out_ids->end(), segment_ids.begin(), segment_ids.end());
             return true;
         }
-        out_ids->clear();
+        segment_ids.clear();
     }
 
     if (!tok.byte_level && tok.has_merges) {
         const std::string normalized_text = tokenizer_normalize_text(tok, text);
-        if (tokenizer_encode_bpe_piece(tok, normalized_text, out_ids) && !out_ids->empty()) {
+        if (tokenizer_encode_bpe_piece(tok, normalized_text, &segment_ids) && !segment_ids.empty()) {
+            out_ids->insert(out_ids->end(), segment_ids.begin(), segment_ids.end());
             return true;
         }
-        out_ids->clear();
+        segment_ids.clear();
     }
 
     const std::string normalized_text = tokenizer_normalize_text(tok, text);
@@ -1142,14 +1224,14 @@ static bool tokenizer_encode_greedy(const server_tokenizer& tok, const std::stri
         for (size_t len = max_len; len > 0; --len) {
             auto it = tok.piece_to_id.find(encoded_text.substr(pos, len));
             if (it != tok.piece_to_id.end()) {
-                out_ids->push_back((int32_t)it->second);
+                segment_ids.push_back((int32_t)it->second);
                 pos += len;
                 matched = true;
                 break;
             }
             auto text_it = tok.text_to_id.find(encoded_text.substr(pos, len));
             if (text_it != tok.text_to_id.end()) {
-                out_ids->push_back((int32_t)text_it->second);
+                segment_ids.push_back((int32_t)text_it->second);
                 pos += len;
                 matched = true;
                 break;
@@ -1157,7 +1239,7 @@ static bool tokenizer_encode_greedy(const server_tokenizer& tok, const std::stri
         }
         if (!matched) {
             if (tok.has_unk) {
-                out_ids->push_back((int32_t)tok.unk_token_id);
+                segment_ids.push_back((int32_t)tok.unk_token_id);
                 size_t next = pos;
                 std::string ignored;
                 if (utf8_next_symbol(encoded_text, &next, &ignored) && next > pos) {
@@ -1169,6 +1251,50 @@ static bool tokenizer_encode_greedy(const server_tokenizer& tok, const std::stri
                 return false;
             }
         }
+    }
+    if (segment_ids.empty()) {
+        return false;
+    }
+    out_ids->insert(out_ids->end(), segment_ids.begin(), segment_ids.end());
+    return true;
+}
+
+static bool tokenizer_encode_greedy(const server_tokenizer& tok, const std::string& text, std::vector<int32_t>* out_ids) {
+    if (!tok.loaded || !out_ids) return false;
+    out_ids->clear();
+
+    size_t pos = 0;
+    while (pos < text.size()) {
+        uint32_t special_id = 0;
+        size_t special_len = 0;
+        if (tokenizer_match_special_at(tok, text, pos, &special_id, &special_len)) {
+            out_ids->push_back(static_cast<int32_t>(special_id));
+            pos += special_len;
+            continue;
+        }
+        size_t next = pos;
+        while (next < text.size()) {
+            uint32_t ignored_id = 0;
+            size_t ignored_len = 0;
+            if (tokenizer_match_special_at(tok, text, next, &ignored_id, &ignored_len)) {
+                break;
+            }
+            size_t advance = next;
+            std::string ignored;
+            if (utf8_next_symbol(text, &advance, &ignored) && advance > next) {
+                next = advance;
+            } else {
+                ++next;
+            }
+        }
+        if (next == pos) {
+            ++pos;
+            continue;
+        }
+        if (!tokenizer_encode_regular_text(tok, text.substr(pos, next - pos), out_ids)) {
+            return false;
+        }
+        pos = next;
     }
     return !out_ids->empty();
 }
