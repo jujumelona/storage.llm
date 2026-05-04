@@ -13,6 +13,7 @@ import requests
 
 
 STRICT_GGUF_EXACT_BYTES = os.environ.get("STRICT_GGUF_EXACT_BYTES", "1") != "0"
+JUJU_ZERO_SHA256 = "0" * 64
 
 GGUF_TYPE_UINT8 = 0
 GGUF_TYPE_INT8 = 1
@@ -899,6 +900,10 @@ def read_remote_directory(session, url, token=None, initial_range_bytes=8 * 1024
             size = min(size * 2, total)
 
 
+def juju_precompute_stream_section_sha():
+    return os.environ.get("JUJU_PRECOMPUTE_STREAM_SECTION_SHA", "0") != "0"
+
+
 def juju_estimated_tensor_payload_bytes(tensors, is_first_shard=True):
     total = JUJU_SPLIT_METADATA_RESERVE_BYTES if is_first_shard else 32 * 1024 * 1024
     for tensor in tensors:
@@ -1338,6 +1343,47 @@ def stream_range(session, url, start, size, out, token, digest, chunk_size=16 * 
         raise EOFError(f"short tensor range read: expected {size}, got {written}")
 
 
+def fetch_range_bytes(session, url, start, size, token=None, chunk_size=16 * 1024 * 1024):
+    if size <= 0:
+        return b""
+    resp = fetch_range(session, url, start, start + size - 1, token=token, stream=True)
+    chunks = []
+    written = 0
+    try:
+        for chunk in resp.iter_content(chunk_size=chunk_size):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            written += len(chunk)
+    finally:
+        resp.close()
+    if written != size:
+        raise EOFError(f"short range read: expected {size}, got {written}")
+    return b"".join(chunks)
+
+
+def iter_source_row_batches(session, url, source_offset, rows, row_bytes, token=None, chunk_size=16 * 1024 * 1024):
+    rows = int(rows)
+    row_bytes = int(row_bytes)
+    if rows <= 0 or row_bytes <= 0:
+        return
+    rows_per_batch = max(1, int(chunk_size) // row_bytes)
+    row = 0
+    while row < rows:
+        count = min(rows_per_batch, rows - row)
+        start = int(source_offset) + row * row_bytes
+        size = count * row_bytes
+        yield row, count, fetch_range_bytes(
+            session,
+            url,
+            start,
+            size,
+            token=token,
+            chunk_size=chunk_size,
+        )
+        row += count
+
+
 def stream_juju_tensor_payload(session, url, tensor, out, token, digest, chunk_size=16 * 1024 * 1024):
     layout = juju_tensor_storage_layout(tensor)
     source_offset = int(tensor["source_offset"])
@@ -1348,18 +1394,20 @@ def stream_juju_tensor_payload(session, url, tensor, out, token, digest, chunk_s
     row_bytes = int(layout["row_bytes"])
     row_stride = int(layout["row_stride_bytes"])
     row_pad = row_stride - row_bytes
-    for row in range(rows):
-        stream_range(
-            session,
-            url,
-            source_offset + row * row_bytes,
-            row_bytes,
-            out,
-            token,
-            digest,
-            chunk_size=chunk_size,
-        )
-        write_zero_bytes(out, row_pad, digest)
+    for _row, count, data in iter_source_row_batches(
+        session,
+        url,
+        source_offset,
+        rows,
+        row_bytes,
+        token=token,
+        chunk_size=chunk_size,
+    ):
+        for idx in range(count):
+            row_data = data[idx * row_bytes:(idx + 1) * row_bytes]
+            out.write(row_data)
+            digest.update(row_data)
+            write_zero_bytes(out, row_pad, digest)
     return layout
 
 
@@ -1381,23 +1429,19 @@ def sha256_juju_section_ranges(session, url, section_offset, section_size, range
             row_bytes = int(item["row_bytes"])
             row_stride = int(item["row_stride_bytes"])
             row_pad = row_stride - row_bytes
-            for row in range(rows):
-                remaining = row_bytes
-                pos = start + row * row_bytes
-                while remaining > 0:
-                    take = min(int(chunk_size), remaining)
-                    resp = fetch_range(session, url, pos, pos + take - 1, token=token, stream=False)
-                    try:
-                        data = resp.content
-                    finally:
-                        resp.close()
-                    if len(data) != take:
-                        raise EOFError(f"short checksum range read: expected {take}, got {len(data)}")
-                    digest.update(data)
-                    pos += take
-                    remaining -= take
-                if row_pad > 0:
-                    digest.update(b"\x00" * row_pad)
+            for _row, count, data in iter_source_row_batches(
+                session,
+                url,
+                start,
+                rows,
+                row_bytes,
+                token=token,
+                chunk_size=chunk_size,
+            ):
+                for idx in range(count):
+                    digest.update(data[idx * row_bytes:(idx + 1) * row_bytes])
+                    if row_pad > 0:
+                        digest.update(b"\x00" * row_pad)
         else:
             remaining = size
             pos = start
@@ -2955,6 +2999,9 @@ def build_juju_shard_plan_from_hf_url(
     artifact_source_name=None,
     tensor_name_allowlist=None,
     split_info=None,
+    source_directory=None,
+    source_total_bytes=None,
+    print_layout_probes=True,
 ):
     artifact_source_name = artifact_source_name or source_name
     artifact_names = juju_artifact_names(artifact_source_name)
@@ -2986,9 +3033,16 @@ def build_juju_shard_plan_from_hf_url(
         return pos + len(raw)
 
     with requests.Session() as session:
-        directory, total_bytes = read_remote_directory(session, source_url, token=token)
+        if source_directory is None:
+            directory, total_bytes = read_remote_directory(session, source_url, token=token)
+        else:
+            directory = source_directory
+            total_bytes = int(source_total_bytes or 0)
+            if total_bytes <= 0:
+                raise RuntimeError("source_total_bytes is required when source_directory is reused")
         print_gguf_byte_diagnostics(directory, source_name)
-        print_gguf_tensor_layout_probes(session, source_url, directory, token=token, label=source_name)
+        if print_layout_probes:
+            print_gguf_tensor_layout_probes(session, source_url, directory, token=token, label=source_name)
         validate_gguf_byte_diagnostics(directory)
         allowset = set(tensor_name_allowlist or [])
         if allowset:
@@ -3082,13 +3136,27 @@ def build_juju_shard_plan_from_hf_url(
                 pos += int(layout["juju_bytes"])
             size = pos - section_offset
             section_type = section_type_for_bucket(bucket)
+            if juju_precompute_stream_section_sha():
+                section_sha = sha256_juju_section_ranges(
+                    session,
+                    source_url,
+                    section_offset,
+                    size,
+                    section_source_ranges,
+                    token=token,
+                    chunk_size=chunk_size,
+                )
+                hash_semantics = "juju_section_bytes_including_alignment_padding"
+            else:
+                section_sha = JUJU_ZERO_SHA256
+                hash_semantics = "not_precomputed_for_streamed_upload"
             sections.append({
                 "type": section_type,
                 "name": bucket.upper()[:32],
                 "offset": section_offset,
                 "size": size,
-                "sha256": sha256_juju_section_ranges(session, source_url, section_offset, size, section_source_ranges, token=token, chunk_size=chunk_size),
-                "hash_semantics": "juju_section_bytes_including_alignment_padding",
+                "sha256": section_sha,
+                "hash_semantics": hash_semantics,
                 "prefetch_distance": 2 if bucket != "shared_weights" else 0,
                 "mmap_friendly": 1,
             })
@@ -3354,6 +3422,9 @@ def prepare_juju_shard_upload_from_hf_url(
     artifact_source_name=None,
     tensor_name_allowlist=None,
     split_info=None,
+    source_directory=None,
+    source_total_bytes=None,
+    print_layout_probes=True,
 ):
     index_path = Path(index_path)
     index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3368,6 +3439,9 @@ def prepare_juju_shard_upload_from_hf_url(
         artifact_source_name=artifact_source_name,
         tensor_name_allowlist=tensor_name_allowlist,
         split_info=split_info,
+        source_directory=source_directory,
+        source_total_bytes=source_total_bytes,
+        print_layout_probes=print_layout_probes,
     )
     index_path.write_text(json.dumps(plan["index_json"], ensure_ascii=False, indent=2), encoding="utf-8")
     info = {
@@ -3446,6 +3520,9 @@ def prepare_juju_shard_upload_parts_from_hf_url(
             artifact_source_name=artifact_source_name,
             tensor_name_allowlist=split["tensor_names"],
             split_info=split_info,
+            source_directory=directory,
+            source_total_bytes=total_bytes,
+            print_layout_probes=False,
         )
         info["source_bytes"] = total_bytes
         parts.append((info, stream))
