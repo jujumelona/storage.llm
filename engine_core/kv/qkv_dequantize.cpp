@@ -122,6 +122,8 @@ static int qkv_dequant_one_split(
                 }
                 s_t_qjl[i] = sum;
             }
+            // BUGFIX 657: Prevent division by zero in QJL scale (split path) ★
+            if (d <= 0) return 0;
             const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)d;
             for (int i = 0; i < d; ++i) {
                 x_tilde[i] += qjl_scale * r_norm * s_t_qjl[i];
@@ -130,6 +132,11 @@ static int qkv_dequant_one_split(
     }
 
     const float norm = norms[token_idx];
+    // BUGFIX 656: Handle zero norm consistently (split path) ★★
+    if (norm < 1e-12f) {
+        memset(output, 0, (size_t)d * sizeof(float));
+        return 1;
+    }
     for (int i = 0; i < d; ++i) {
         output[i] = x_tilde[i] * norm;
     }
@@ -265,6 +272,15 @@ int qkv_dequant_one(
 
     // Step 5: Denormalize by stored norm
     const float norm = norms[token_idx];
+    // BUGFIX 656: Handle zero norm consistently with quantization ★★
+    // Problem: Quantization skips zero vectors (l2_norm < 1e-12f early return)
+    //          but dequantization multiplies by 0 → inconsistent behavior
+    // Solution: Return zero vector explicitly when norm is too small
+    // Impact: Consistent quantization/dequantization behavior → accurate PPL
+    if (norm < 1e-12f) {
+        memset(output, 0, (size_t)d * sizeof(float));
+        return 1;
+    }
     for (int i = 0; i < d; i++) {
         output[i] = x_tilde[i] * norm;
     }

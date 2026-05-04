@@ -194,6 +194,11 @@ static int qkv_quantize_split_vector_with_state(
         const int ch = outlier_channels[i];
         if (ch < 0 || ch >= dim) return 0;
         const int code = qkv_find_nearest_centroid(src[ch], out_centroids, out_thresholds, out_levels);
+        // BUGFIX 655: Validate centroid index before array access ★★★
+        // Problem: qkv_find_nearest_centroid may return invalid index due to numerical issues
+        // Solution: Explicit range check before accessing out_centroids array
+        // Impact: Prevents out-of-bounds access → memory corruption → PPL errors
+        if (code < 0 || code >= out_levels) return 0;
         indices[i] = code;
         y_tilde[ch] = out_centroids[code];
     }
@@ -206,6 +211,8 @@ static int qkv_quantize_split_vector_with_state(
             return 0;
         }
         const int code = qkv_find_nearest_centroid(src[ch], norm_centroids, norm_thresholds, norm_levels);
+        // BUGFIX 655: Validate centroid index before array access ★★★
+        if (code < 0 || code >= norm_levels) return 0;
         indices[normal_pos++] = code;
         y_tilde[ch] = norm_centroids[code];
     }
@@ -360,7 +367,11 @@ int qkv_quantize(
                 residual[i] = (k_inv_norm > 0.0f ? key_data[t * dim + i] * k_inv_norm : 0.0f) - x_mse[i];
                 r_norm_sq += residual[i] * residual[i];
             }
-            state->k_residual_norms[t] = sqrtf(r_norm_sq);
+            // BUGFIX 657: Prevent NaN from negative r_norm_sq due to floating point errors ★★
+            // Problem: Floating point accumulation can produce small negative values (e.g., -1e-15)
+            // Solution: Clamp to 0 before sqrt to prevent NaN propagation
+            // Impact: Prevents NaN in QJL residual norm → stable attention computation
+            state->k_residual_norms[t] = sqrtf(std::max(0.0f, r_norm_sq));
 
             // Step 3: QJL - sign(S * r)
             float* s_times_r = state->scratch_s_times_r;
@@ -459,7 +470,8 @@ int qkv_quantize(
                 residual[i] = (v_inv_norm > 0.0f ? value_data[t * dim + i] * v_inv_norm : 0.0f) - x_mse[i];
                 r_norm_sq += residual[i] * residual[i];
             }
-            state->v_residual_norms[t] = sqrtf(r_norm_sq);
+            // BUGFIX 657: Prevent NaN from negative r_norm_sq (V path) ★★
+            state->v_residual_norms[t] = sqrtf(std::max(0.0f, r_norm_sq));
 
             float* s_times_r = state->scratch_s_times_r;
             if (!s_times_r) return 0;

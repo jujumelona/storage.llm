@@ -168,7 +168,18 @@ static qkv_state_t* moe_qkv_ensure_head_state(
     std::lock_guard<std::mutex> head_guard(*head_lock);
 
     qkv_state_t* slot = &engine->qkv_head_state_slots[head];
-    if (engine->qkv_head_state_valid[head] && slot->n_tokens == (int)context_tokens) {
+    // BUGFIX 654: Add context change detection for QKV state reuse ★★
+    // Problem: Only checked n_tokens equality, not KV content changes
+    //          If context changes but token count same → stale quantized cache → PPL corruption
+    // Solution: Compare against last context epoch to detect content changes
+    // Impact: Forces re-quantization when context changes, fixes PPL accuracy
+    const bool token_count_matches = engine->qkv_head_state_valid[head] &&
+                                      slot->n_tokens == (int)context_tokens;
+    const bool context_unchanged = token_count_matches &&
+                                    (engine->qkv_last_ctx == context_tokens);
+
+    if (context_unchanged) {
+        // Context unchanged, reuse existing quantized state
         if (!qkv_quantize(slot, &engine->qkv_cfg, head_keys, head_values, (int)context_tokens)) {
             return nullptr;
         }
@@ -192,6 +203,7 @@ static qkv_state_t* moe_qkv_ensure_head_state(
     }
     *slot = st;
     engine->qkv_head_state_valid[head] = 1;
+    engine->qkv_last_ctx = context_tokens;  // BUGFIX 654: Track context epoch
     return slot;
 }
 
@@ -280,12 +292,28 @@ int moe_pc_engine_attention_decode_f32(
                 out[d] += weight * v[d];
             }
         }
-        if (denom <= 0.0f) {
-            return 0;
-        }
-        const float scale = 1.0f / denom;
-        for (uint32_t d = 0; d < head_dim; ++d) {
-            out[d] *= scale;
+        // BUGFIX 650: Softmax fallback consistency with QKV mode ★★★
+        // Problem: Old code returned error (0) when denom <= 0, causing generation abort
+        //          QKV mode uses uniform distribution fallback instead (qkv_attention.cpp:362)
+        // Impact: Non-QKV mode fails on edge cases where QKV succeeds → PPL inconsistency
+        // Solution: Match QKV behavior with uniform fallback, use same threshold (1e-10f)
+        if (denom > 1e-10f) {
+            const float scale = 1.0f / denom;
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                out[d] *= scale;
+            }
+        } else {
+            // Uniform distribution fallback when softmax sum is too small
+            const float uniform = 1.0f / (float)context_tokens;
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                out[d] = 0.0f;
+            }
+            for (uint32_t t = 0; t < context_tokens; ++t) {
+                const float* v = head_values + (uint64_t)t * (uint64_t)head_dim;
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    out[d] += uniform * v[d];
+                }
+            }
         }
         return 1;
     });

@@ -30,15 +30,18 @@ static void lloyd_max_codebook(
     if (!centroids || !thresholds || n_levels <= 0 || dim <= 0 || max_iters <= 0) {
         return;
     }
+    // BUGFIX 658: Reject invalid n_levels (must be at least 2 for quantization) ★
+    // Problem: n_levels == 1 is invalid for quantization (need at least 2 levels)
+    //          Division by (n_levels - 1) would be division by zero
+    // Solution: Early return for n_levels < 2
+    // Impact: Prevents division by zero in codebook initialization
+    if (n_levels < 2) {
+        return;
+    }
     // Fix 1: Initialize centroids within N(0, 1/d) distribution range
     double sigma = 1.0 / sqrt((double)dim);
     for (int i = 0; i < n_levels; i++) {
-        // BUGFIX 367: n_levels가 1일 때 division by zero 방지
-        if (n_levels <= 1) {
-            centroids[i] = 0.0f;
-        } else {
-            centroids[i] = (float)((-3.5 + 7.0 * (double)i / (double)(n_levels - 1)) * sigma);
-        }
+        centroids[i] = (float)((-3.5 + 7.0 * (double)i / (double)(n_levels - 1)) * sigma);
     }
 
     // Lloyd-Max iteration

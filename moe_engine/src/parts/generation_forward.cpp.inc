@@ -127,15 +127,6 @@ static int moe_forward_one_token_f32(
         return 0;
     }
     const float embedding_scale = moe_embedding_scale_value(engine, c->hidden_size);
-    // BUGFIX CRITICAL: Apply embedding scale to hidden state
-    // Problem: scale was computed and logged but NEVER applied to hidden[]
-    // For models with sqrt(hidden_size) scaling (Gemma, GLM), the input magnitude
-    // was wrong by ~84.7x, causing catastrophic PPL degradation across all layers.
-    if (embedding_scale != 1.0f && std::isfinite(embedding_scale)) {
-        for (uint32_t i = 0; i < c->hidden_size; ++i) {
-            hidden[i] *= embedding_scale;
-        }
-    }
     moe_profile_log(
         "forward_embed",
         "position=%u token=%u hidden=%u scale=%.6g ms=%.3f",

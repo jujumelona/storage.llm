@@ -131,7 +131,11 @@ int qkv_attention_decode_impl(
 
         auto score_range = [&](int begin, int end, int w, int* ok_flag) {
             // BUGFIX 359: work buffer 인덱스 overflow 방지
-            if (w < 0 || w >= workers) {
+            // BUGFIX 659: Validate begin/end range to prevent invalid loop ★
+            // Problem: No validation of begin/end bounds → out-of-bounds access in parallel workers
+            // Solution: Check begin/end are within valid range [0, n]
+            // Impact: Prevents memory corruption in parallel attention computation
+            if (w < 0 || w >= workers || begin < 0 || end > n || begin > end) {
                 *ok_flag = 0;
                 return;
             }

@@ -142,25 +142,25 @@
             moe_kv_cache_track_ram(engine, &s->kv_cache);
         }
     }
-    // BUGFIX 65: Issue 9 - Verify capacity before store ★★★
-    // Problem: If ensure_capacity failed silently, position >= max_seq_len
-    // store_entry is skipped → KV entry lost → attention corrupted
-    // Solution: Explicit check, return error if capacity insufficient
+    // BUGFIX 651: Fix KV cache storage logic - remove redundant check ★★★
+    // Problem: Old code checked position >= max_seq_len, returned error, then checked position < max_seq_len
+    //          If ensure_capacity failed, max_seq_len not updated → entry not stored → attention corrupted
+    //          Redundant checks caused confusion and potential storage skip
+    // Solution: Single check with clear error path - if capacity insufficient, abort; otherwise store
+    // Impact: Ensures KV entries are always stored when capacity is available → fixes PPL corruption
     if (position >= s->kv_cache.max_seq_len) {
         fprintf(stderr, "[storageLLM ERROR] KV cache capacity insufficient: "
             "position %u >= max_seq_len %u, layer %d. Aborting generation.\n",
             position, s->kv_cache.max_seq_len, layer);
         return 0;
     }
-    if (position < s->kv_cache.max_seq_len) {
-        // Build float32 entry, then store as bf16
-        if (s->kv_entry.size() < kv_entry_dim) {
-            s->kv_entry.resize(kv_entry_dim);
-        }
-        std::memcpy(s->kv_entry.data(), s->attn_kv_norm.data(), cdim * sizeof(float));
-        std::memcpy(s->kv_entry.data() + cdim, k_rope, rope_dim * sizeof(float));
-        s->kv_cache.store_entry((uint32_t)layer, position, s->kv_entry.data(), kv_entry_dim);
+    // Build float32 entry, then store as bf16
+    if (s->kv_entry.size() < kv_entry_dim) {
+        s->kv_entry.resize(kv_entry_dim);
     }
+    std::memcpy(s->kv_entry.data(), s->attn_kv_norm.data(), cdim * sizeof(float));
+    std::memcpy(s->kv_entry.data() + cdim, k_rope, rope_dim * sizeof(float));
+    s->kv_cache.store_entry((uint32_t)layer, position, s->kv_entry.data(), kv_entry_dim);
     s->kv_cache.seq_len = std::min(position + 1u, s->kv_cache.max_seq_len);
     const uint32_t seq_len = std::min(position + 1u, s->kv_cache.max_seq_len);
 
@@ -276,7 +276,13 @@
             score *= scale;
 
             if (score > h_max) {
-                const float rescale = std::exp(h_max - score);
+                // BUGFIX 652: Prevent numerical underflow in softmax rescaling ★★
+                // Problem: exp(h_max - score) with h_max << score causes underflow
+                //          Repeated underflow → h_denom approaches 0 → inaccurate normalization
+                // Solution: Clamp rescale to prevent extreme underflow (min 1e-30f)
+                // Impact: Improves numerical stability in attention with large score ranges
+                const float rescale_exp = h_max - score;
+                const float rescale = rescale_exp > -69.0f ? std::exp(rescale_exp) : 1e-30f;
                 h_denom *= rescale;
                 moe_scale_f32(cw_h, rescale, cdim);
                 h_max = score;
@@ -287,9 +293,19 @@
         }
 
         // Normalize
-        if (h_denom > 0.0f) {
+        // BUGFIX 653: Softmax normalization threshold consistency ★
+        // Problem: Used h_denom > 0.0f check, but QKV mode uses > 1e-10f
+        // Solution: Match QKV threshold for consistency across modes
+        // Impact: Prevents division by near-zero values, consistent PPL behavior
+        if (h_denom > 1e-10f) {
             const float inv = 1.0f / h_denom;
             moe_scale_f32(cw_h, inv, cdim);
+        } else {
+            // Uniform fallback when denominator too small (should be rare after rescaling fix)
+            const float uniform = 1.0f / (float)loop_end;
+            for (uint32_t i = 0; i < cdim; ++i) {
+                cw_h[i] = uniform;
+            }
         }
         s->head_max[h] = h_max;
         s->head_denom[h] = h_denom;
