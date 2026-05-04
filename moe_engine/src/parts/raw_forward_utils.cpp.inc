@@ -323,6 +323,14 @@ static int moe_engine_uses_gemma_rmsnorm_unit_offset(const moe_pc_engine* engine
     if (!engine) {
         return 0;
     }
+    if (moe_engine_metadata_mentions(engine, "gemma4") ||
+        moe_engine_metadata_mentions(engine, "gemma-4") ||
+        moe_engine_metadata_mentions(engine, "gemma_4") ||
+        moe_engine_graph_ir_mentions(engine, "gemma4") ||
+        moe_engine_graph_ir_mentions(engine, "gemma-4") ||
+        moe_engine_graph_ir_mentions(engine, "gemma_4")) {
+        return 0;
+    }
     return moe_engine_metadata_mentions(engine, "gemma") ||
         moe_engine_graph_ir_mentions(engine, "gemma");
 }
