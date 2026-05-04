@@ -78,6 +78,7 @@ struct moe_gguf_common_tensor_record {
     uint8_t weight_encoding = moe_WEIGHT_ENCODING_UNKNOWN;
     uint64_t file_offset = 0;
     uint64_t bytes = 0;
+    uint64_t weight_row_bytes = 0;
     uint16_t runtime_priority = 50;
     uint16_t prefetch_priority = 50;
     uint8_t residency_hint = moe_JUJU_RESIDENCY_AUTO;

@@ -30,6 +30,16 @@ struct moe_batch_request_t {
     // Tracks how many scheduling iterations this request was bypassed.
     // When skip_count >= kMaxSkipCount, the request is force-admitted next.
     uint32_t skip_count = 0;
+
+    // BUGFIX Problem F: Per-session router EMA state ★★★ PERFORMANCE
+    // Problem: Engine-level smoothed_router_entropy_milli shared across all batches
+    // → Different domains (code gen vs chat) mix EMA state
+    // → Hysteresis effectiveness reduced, cache hit rate drops
+    // Solution: Store EMA state per request/session
+    // → Each session maintains independent entropy smoothing
+    // → Better adaptive top_k decisions for each domain
+    // Impact: Improved cache hit rate in multi-domain workloads
+    uint32_t smoothed_router_entropy_milli = 0;
 };
 
 struct moe_continuous_batch_scheduler_t {

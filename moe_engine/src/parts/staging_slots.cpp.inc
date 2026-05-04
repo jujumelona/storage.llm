@@ -1,5 +1,21 @@
 #include <cassert>
 
+// BUGFIX 문제 1: Helper function to validate staging slot access ★★★ CRITICAL
+// Problem: staging_slot_size == 0 check must come BEFORE staging_slots.size() check
+// After reset_staging_slots timeout, staging_slot_size = 0 but slots vector not cleared
+// Code that checks slot_index < staging_slots.size() without checking staging_slot_size
+// can still try to access slots, causing null dereference
+// Solution: Centralized validation function enforces correct check order
+// All prefetch paths MUST use this function instead of manual checks
+static inline bool staging_slot_valid(
+    const moe_pc_engine* e, uint32_t slot_index
+) {
+    if (!e) return false;
+    if (e->staging_slot_size == 0) return false;  // MUST check first
+    if (slot_index >= e->staging_slots.size()) return false;
+    return e->staging_slots[slot_index].buf != nullptr;
+}
+
 static void device_backend_event_destroy(moe_pc_engine* e, CUevent event);
 // BUGFIX 58/62: Issue 4A - Dynamic batch_max based on backend_caps ?�★
 // Problem: moe_gpu_stage_batch_max = 4 hardcoded
@@ -50,13 +66,25 @@ static void reset_staging_slots(moe_pc_engine* engine) {
     // Workers still accessing slots when memory is freed → crash
     // Solution: Return early on timeout, leave slots intact
     // Trade-off: Staging slots leak, but prevents crash
+    // BUGFIX 문제 3: Add explicit comment about staging_slot_size check order ★★★
+    // Problem: staging_slots.size() is non-zero after timeout, but staging_slot_size = 0
+    // Code that checks slot_index < staging_slots.size() without checking staging_slot_size
+    // can still try to access slots, causing null dereference
+    // Solution: Document that staging_slot_size MUST be checked FIRST in all prefetch paths
+    // See prefetch_pinned.cpp.inc, device_tensor_copy_*.cpp.inc for validation examples
     if (!all_released) {
         fprintf(stderr, "[storageLLM ERROR] reset_staging_slots: Some slots still in use after 5s timeout. "
                 "Cannot safely reset - aborting reset to prevent use-after-free. "
-                "Staging slots will leak until engine shutdown.\n");
-        // 최소한 ring_adapter를 drain 시도 (free는 하지 않음)
+                "Staging slots will leak until engine shutdown.\n"
+                "IMPORTANT: staging_slot_size will be set to 0 to mark slots as invalid.\n"
+                "All prefetch paths MUST check staging_slot_size > 0 BEFORE accessing staging_slots.\n");
+        // BUGFIX Issue 3: Mark staging_slot_size = 0 to prevent further use ★★★
+        // Problem: After timeout, staging_slot_size = 0 but slot pointers still exist
+        // Code paths that check slot_index < staging_slots.size() but not staging_slot_size
+        // can still try to use the slots, causing null dereference or use-after-free
+        // Solution: Set staging_slot_size = 0 AND add defensive checks in all prefetch paths
         engine->ring_adapter.drain_without_free();
-        engine->staging_slot_size = 0;
+        engine->staging_slot_size = 0;  // Mark slots as invalid
         engine->staging_generation.fetch_add(1, std::memory_order_relaxed);
         uint32_t free_slots = 0;
         for (auto& slot : engine->staging_slots) {

@@ -209,6 +209,7 @@ int moe_pc_engine_generate_token_ids(
             // Allocate batch hidden states: one per prefill token
             const size_t hs = c->hidden_size;
             std::vector<float> batch_hidden(prefill_count * hs);
+            std::vector<float> batch_norm(prefill_count * hs);
 
             // Phase 1: Embed all tokens in parallel
             const uint64_t batch_embed_start_us = moe_profile_now_us();
@@ -259,7 +260,7 @@ int moe_pc_engine_generate_token_ids(
                 }
 
                 for (uint32_t t = 0; t < prefill_count; ++t) {
-                    const uint64_t prefill_step_start_us = moe_profile_now_us();
+                    const uint64_t prefill_attention_start_us = moe_profile_now_us();
                     float* current_hidden = batch_hidden.data() + t * hs;
                     engine->generation_token.store(t, std::memory_order_relaxed);
 
@@ -275,25 +276,64 @@ int moe_pc_engine_generate_token_ids(
                         moe_generation_set_error(out_stats, "prefill post-attention norm failed");
                         return 0;
                     }
-
-                    engine->generation_phase.store(moe_GEN_PHASE_MLP, std::memory_order_relaxed);
-                    const int is_moe = layer >= c->first_moe_layer && layer <= c->last_moe_layer;
-                    const int mlp_ok = is_moe ?
-                        moe_layer_moe_mlp_f32(engine, (int32_t)layer, &scratch, current_hidden, c) :
-                        moe_layer_dense_mlp_f32(engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs);
-                    if (!mlp_ok) {
-                        moe_generation_set_error(out_stats, "prefill mlp failed");
-                        return 0;
-                    }
+                    std::memcpy(
+                        batch_norm.data() + (size_t)t * hs,
+                        scratch.norm.data(),
+                        hs * sizeof(float));
                     moe_profile_log(
-                        "prefill_layer_token",
-                        "id=%llu layer=%u token_index=%u is_moe=%d ms=%.3f",
+                        "prefill_layer_attention_token",
+                        "id=%llu layer=%u token_index=%u ms=%.3f",
                         (unsigned long long)generation_scope.id,
                         layer,
                         t,
-                        is_moe,
-                        moe_profile_elapsed_ms(prefill_step_start_us));
+                        moe_profile_elapsed_ms(prefill_attention_start_us));
                 }
+
+                engine->generation_phase.store(moe_GEN_PHASE_MLP, std::memory_order_relaxed);
+                const int is_moe = layer >= c->first_moe_layer && layer <= c->last_moe_layer;
+                const uint64_t prefill_mlp_start_us = moe_profile_now_us();
+                int mlp_batch_ok = 0;
+                if (is_moe && prefill_count >= 2u) {
+                    mlp_batch_ok = moe_layer_moe_mlp_prefill_batch_f32(
+                        engine, (int32_t)layer,
+                        batch_hidden.data(), batch_norm.data(),
+                        prefill_count, c);
+                }
+                if (!mlp_batch_ok) {
+                    for (uint32_t t = 0; t < prefill_count; ++t) {
+                        const uint64_t prefill_step_start_us = moe_profile_now_us();
+                        float* current_hidden = batch_hidden.data() + (size_t)t * hs;
+                        std::memcpy(
+                            scratch.norm.data(),
+                            batch_norm.data() + (size_t)t * hs,
+                            hs * sizeof(float));
+                        engine->generation_token.store(t, std::memory_order_relaxed);
+                        const int mlp_ok = is_moe ?
+                            moe_layer_moe_mlp_f32(engine, (int32_t)layer, &scratch, current_hidden, c) :
+                            moe_layer_dense_mlp_f32(engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs);
+                        if (!mlp_ok) {
+                            moe_generation_set_error(out_stats, "prefill mlp failed");
+                            return 0;
+                        }
+                        moe_profile_log(
+                            "prefill_layer_token",
+                            "id=%llu layer=%u token_index=%u is_moe=%d batch_fallback=1 ms=%.3f",
+                            (unsigned long long)generation_scope.id,
+                            layer,
+                            t,
+                            is_moe,
+                            moe_profile_elapsed_ms(prefill_step_start_us));
+                    }
+                }
+                moe_profile_log(
+                    "prefill_layer_mlp",
+                    "id=%llu layer=%u tokens=%u is_moe=%d batch=%d ms=%.3f",
+                    (unsigned long long)generation_scope.id,
+                    layer,
+                    prefill_count,
+                    is_moe,
+                    mlp_batch_ok,
+                    moe_profile_elapsed_ms(prefill_mlp_start_us));
                 moe_profile_log(
                     "prefill_layer",
                     "id=%llu layer=%u tokens=%u ms=%.3f",

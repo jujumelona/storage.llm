@@ -54,6 +54,9 @@ moe_pc_engine_config_t moe_pc_default_config(void) {
     cfg.model_lib_path = nullptr;
     cfg.model_lib_compile_command = nullptr;
     cfg.enable_model_lib_jit = 0;
+    cfg.vram_kv_ratio = 0.0f;  // auto
+    cfg.device_id = -1;  // auto
+    cfg.max_context_len = 0;  // use default (8192)
     return cfg;
 }
 
@@ -92,6 +95,6 @@ moe_io_config_t moe_pc_default_io_config(void) {
     cfg.madv_cold_threshold_pct = 30;
     cfg.vulkan_memory_headroom_pct = 10;
     cfg.level_zero_memory_headroom_pct = 10;
+    cfg.enable_bw_benchmark = 1;
     return cfg;
 }
-

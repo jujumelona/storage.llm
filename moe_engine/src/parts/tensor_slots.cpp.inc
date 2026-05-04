@@ -124,6 +124,10 @@ static void tensor_slots_reset(moe_pc_engine* engine) {
     engine->expert_bytes.assign(expert_slot_count(engine), 0);
     engine->expert_prefetch_priorities.assign(expert_slot_count(engine), 0);
     engine->expert_residency_hints.assign(expert_slot_count(engine), moe_JUJU_RESIDENCY_AUTO);
+    engine->expert_segment_policies.assign(expert_slot_count(engine), moe_JUJU_SEGMENT_POLICY_AUTO);
+    engine->expert_partial_exec_flags.assign(expert_slot_count(engine), 0);
+    engine->expert_partial_accuracy_milli.assign(expert_slot_count(engine), 0);
+    engine->juju_buddy_expert_ids.assign(expert_slot_count(engine), std::vector<int>{});
 }
 
 static void tensor_slots_set(moe_pc_engine* engine, int layer, int expert, moe_projection_t proj, size_t index) {
@@ -175,6 +179,54 @@ static void expert_runtime_hints_update(
     }
 }
 
+static void expert_segment_hints_update(
+    moe_pc_engine* engine,
+    int layer,
+    int expert,
+    uint8_t segment_policy,
+    uint8_t can_partial_exec,
+    uint16_t partial_accuracy_milli
+) {
+    const size_t slot = expert_dense_slot(engine, layer, expert);
+    if (!engine || slot == tensor_slot_invalid()) {
+        return;
+    }
+    if (slot < engine->expert_segment_policies.size() &&
+        segment_policy != moe_JUJU_SEGMENT_POLICY_AUTO) {
+        engine->expert_segment_policies[slot] = segment_policy;
+    }
+    if (slot < engine->expert_partial_exec_flags.size() && can_partial_exec) {
+        engine->expert_partial_exec_flags[slot] = 1;
+    }
+    if (slot < engine->expert_partial_accuracy_milli.size() && partial_accuracy_milli > 0) {
+        engine->expert_partial_accuracy_milli[slot] =
+            std::max<uint16_t>(engine->expert_partial_accuracy_milli[slot], partial_accuracy_milli);
+    }
+}
+
+static void expert_buddy_hints_update(
+    moe_pc_engine* engine,
+    int layer,
+    int expert,
+    const std::vector<int>& buddies
+) {
+    const size_t slot = expert_dense_slot(engine, layer, expert);
+    if (!engine || buddies.empty() || slot == tensor_slot_invalid() ||
+        slot >= engine->juju_buddy_expert_ids.size()) {
+        return;
+    }
+    std::vector<int>& dst = engine->juju_buddy_expert_ids[slot];
+    for (int buddy : buddies) {
+        if (buddy < 0 || buddy == expert) {
+            continue;
+        }
+        if (std::find(dst.begin(), dst.end(), buddy) == dst.end()) {
+            dst.push_back(buddy);
+            engine->juju_buddy_explicit_edge_count.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
 static uint16_t expert_prefetch_priority_hint(const moe_pc_engine* engine, int layer, int expert) {
     const size_t slot = expert_dense_slot(engine, layer, expert);
     if (!engine || slot == tensor_slot_invalid() || slot >= engine->expert_prefetch_priorities.size()) {
@@ -189,6 +241,22 @@ static uint8_t expert_residency_hint(const moe_pc_engine* engine, int layer, int
         return moe_JUJU_RESIDENCY_AUTO;
     }
     return engine->expert_residency_hints[slot];
+}
+
+static uint8_t expert_partial_exec_hint(const moe_pc_engine* engine, int layer, int expert) {
+    const size_t slot = expert_dense_slot(engine, layer, expert);
+    if (!engine || slot == tensor_slot_invalid() || slot >= engine->expert_partial_exec_flags.size()) {
+        return 0;
+    }
+    return engine->expert_partial_exec_flags[slot];
+}
+
+static uint16_t expert_partial_accuracy_hint_milli(const moe_pc_engine* engine, int layer, int expert) {
+    const size_t slot = expert_dense_slot(engine, layer, expert);
+    if (!engine || slot == tensor_slot_invalid() || slot >= engine->expert_partial_accuracy_milli.size()) {
+        return 0;
+    }
+    return engine->expert_partial_accuracy_milli[slot];
 }
 
 static uint64_t expert_bytes_get(const moe_pc_engine* engine, int layer, int expert) {

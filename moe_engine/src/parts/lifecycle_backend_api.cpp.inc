@@ -12,7 +12,7 @@ moe_pc_engine_t* moe_pc_engine_create(const moe_pc_engine_config_t* config) {
     engine->shard_mmaps.reserve(105);
     engine->topology_edges.reserve(19456);
     engine->prefetch_plan_seen_gen.reserve(24576);
-    fill_backend_caps(engine->config.preferred_backend, engine->config.platform, &engine->backend_caps);
+    fill_backend_caps(engine->config.preferred_backend, engine->config.platform, &engine->backend_caps, &engine->config);
     model_lib_prepare(engine);
     if (engine->config.prefer_gpu && engine->config.vram_budget_bytes == 0 &&
         caps_gpu_backend_available(engine->backend_caps)) {
@@ -91,7 +91,7 @@ int moe_pc_detect_backend_caps(
     if (!out_caps) {
         return 0;
     }
-    fill_backend_caps(preferred_backend, platform, out_caps);
+    fill_backend_caps(preferred_backend, platform, out_caps, nullptr);
     return 1;
 }
 

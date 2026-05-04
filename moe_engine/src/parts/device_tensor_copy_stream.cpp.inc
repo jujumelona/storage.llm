@@ -95,7 +95,16 @@ static void device_destroy_copy_event_pool(moe_pc_engine* e) {
 }
 
 static void device_defer_staging_copy(moe_pc_engine* e, uint32_t slot, uint64_t key, uint64_t vram_bytes, CUstream stream) {
+    // BUGFIX Issue 6: Use staging_slot_valid() helper for correct check order ★★★
     if (!e) {
+        return;
+    }
+    // Check staging_slot_size > 0 to prevent use after timeout
+    // slot == UINT32_MAX is valid (no slot used, e.g., unified memory fast path)
+    if (slot != UINT32_MAX && !staging_slot_valid(e, slot)) {
+        fprintf(stderr,
+            "[storageLLM ERROR] device_defer_staging_copy: staging_slot_size=0, "
+            "slots are invalid after reset timeout. Rejecting deferred copy.\n");
         return;
     }
     moe_deferred_staging_copy copy{};
@@ -216,13 +225,24 @@ static void device_stream_destroy_current(moe_pc_engine* e) {
 }
 
 ThreadStreamGuard::~ThreadStreamGuard() {
+    if (!engine) return;
+
     moe_pc_engine* e = engine;
-    CUstream s = stream;
     engine = nullptr;
     stream = nullptr;
-    if (e && s) {
-        device_stream_destroy_current(e);
+
+    device_stream_destroy_current(e);
+
+    auto dit = s_tl_deferred_staging_copies.find(e);
+    if (dit != s_tl_deferred_staging_copies.end()) {
+        for (auto& copy : dit->second) {
+            if (copy.event) device_backend_event_destroy(e, copy.event);
+            if (copy.slot != UINT32_MAX) staging_slot_release(e, copy.slot);
+        }
+        s_tl_deferred_staging_copies.erase(dit);
     }
+
+    device_destroy_copy_event_pool(e);
 }
 
 static void device_stream_pool_destroy(moe_pc_engine* e) {
@@ -262,21 +282,34 @@ static void device_stream_pool_init(moe_pc_engine* e) {
 }
 
 // Fix 2: Thread-local cleanup function to prevent memory leak/dangling pointers
+// BUGFIX 문제 7: Add thread-local map cleanup for gpu_worker_loop ★★★ CRITICAL
+// Problem: s_tl_deferred_staging_copies, s_tl_tensor_pending_keys use engine* as key
+// → Engine destroyed → dangling pointer in thread_local map
+// → New engine at same address reuses stale data → corruption
+// Solution: GPU worker calls this function on exit to erase engine from all thread_local maps
+// Impact: Prevents use-after-free and memory corruption in multi-engine processes
 extern "C" {
 void device_cleanup_thread_locals(moe_pc_engine* engine) {
     if (!engine) return;
-    
+
+    // BUGFIX 문제 7: Clean up all thread_local maps ★★★
     auto it = s_tl_deferred_staging_copies.find(engine);
     if (it != s_tl_deferred_staging_copies.end()) {
         it->second.clear();
         s_tl_deferred_staging_copies.erase(it);
     }
-    
+
     device_destroy_copy_event_pool(engine);
-    
+
     auto pending_it = s_tl_tensor_pending_keys.find(engine);
     if (pending_it != s_tl_tensor_pending_keys.end()) {
         s_tl_tensor_pending_keys.erase(pending_it);
+    }
+
+    // BUGFIX 문제 7: Also clean up s_tl_stream_guards ★★★
+    auto stream_it = s_tl_stream_guards.find(engine);
+    if (stream_it != s_tl_stream_guards.end()) {
+        s_tl_stream_guards.erase(stream_it);
     }
 }
 }

@@ -1,4 +1,4 @@
-// BUGFIX 72: Issue 10 - Optimize KV cache layout to [pos][layer][dim] ★★
+// BUGFIX 72: Issue 10 - Optimize KV cache layout to [pos][layer][dim] ?끸쁾
 // Problem: Old layout [layer][pos][dim] requires 79 separate memcpy during realloc
 // Poor cache locality during attention decode (layers not contiguous)
 // Solution: Change to [pos][layer][dim] layout
@@ -13,19 +13,6 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
     uint8_t* data = nullptr;
     float* scales = nullptr;
     float* zeros = nullptr;
-
-    // BUGFIX 문제4: Add VRAM tier support for hot KV blocks ★★★
-    // Problem: KV cache is RAM-only, causing PCIe bottleneck for long contexts
-    // Solution: Add tier field and VRAM pointers for hot KV blocks
-    // Short-term: Use pinned memory for frequently accessed blocks
-    // Long-term: Promote hot blocks to VRAM with LRU eviction
-    moe_tier_t tier = moe_TIER_RAM;  // RAM, VRAM, or PINNED
-    void* vram_data = nullptr;       // VRAM allocation if tier == VRAM
-    void* vram_scales = nullptr;
-    void* vram_zeros = nullptr;
-    bool use_pinned_memory = false;  // Use pinned RAM for faster PCIe transfer
-    uint64_t last_access_epoch = 0;  // For LRU tracking
-    uint32_t access_count = 0;       // For frequency tracking
 
     moe_pc_engine_t* engine = nullptr;
     uint32_t num_layers = 0;
@@ -45,47 +32,27 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
     moe_kv_cache& operator=(const moe_kv_cache&) = delete;
     moe_kv_cache(moe_kv_cache&& other) noexcept :
         data(other.data), scales(other.scales), zeros(other.zeros),
-        tier(other.tier), vram_data(other.vram_data),
-        vram_scales(other.vram_scales), vram_zeros(other.vram_zeros),
-        use_pinned_memory(other.use_pinned_memory),
-        last_access_epoch(other.last_access_epoch),
-        access_count(other.access_count),
         engine(other.engine),
         num_layers(other.num_layers), max_seq_len(other.max_seq_len),
         seq_len(other.seq_len), entry_dim(other.entry_dim), seq_limit(other.seq_limit),
         tracked_ram_bytes(other.tracked_ram_bytes) {
         other.data = nullptr; other.scales = nullptr; other.zeros = nullptr;
-        other.vram_data = nullptr; other.vram_scales = nullptr; other.vram_zeros = nullptr;
         other.engine = nullptr;
-        other.tier = moe_TIER_RAM;
-        other.use_pinned_memory = false;
-        other.last_access_epoch = 0;
-        other.access_count = 0;
     }
     moe_kv_cache& operator=(moe_kv_cache&& other) noexcept {
         if (this != &other) {
             if (data) std::free(data);
             if (scales) std::free(scales);
             if (zeros) std::free(zeros);
+
             data = other.data; scales = other.scales; zeros = other.zeros;
-            tier = other.tier;
-            vram_data = other.vram_data;
-            vram_scales = other.vram_scales;
-            vram_zeros = other.vram_zeros;
-            use_pinned_memory = other.use_pinned_memory;
-            last_access_epoch = other.last_access_epoch;
-            access_count = other.access_count;
             engine = other.engine;
             num_layers = other.num_layers; max_seq_len = other.max_seq_len;
             seq_len = other.seq_len; entry_dim = other.entry_dim; seq_limit = other.seq_limit;
             tracked_ram_bytes = other.tracked_ram_bytes;
+
             other.data = nullptr; other.scales = nullptr; other.zeros = nullptr;
-            other.vram_data = nullptr; other.vram_scales = nullptr; other.vram_zeros = nullptr;
             other.engine = nullptr;
-            other.tier = moe_TIER_RAM;
-            other.use_pinned_memory = false;
-            other.last_access_epoch = 0;
-            other.access_count = 0;
         }
         return *this;
     }
@@ -106,7 +73,7 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
         data = (uint8_t*)std::calloc(total_entries * entry_dim, sizeof(uint8_t));
         scales = (float*)std::calloc(total_entries, sizeof(float));
         zeros = (float*)std::calloc(total_entries, sizeof(float));
-        // BUGFIX 633: Check calloc failure ★
+        // BUGFIX 633: Check calloc failure ??
         if (!data || !scales || !zeros) {
             if (data) std::free(data);
             if (scales) std::free(scales);
@@ -131,76 +98,69 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
         const size_t old_entries = (size_t)max_seq_len * num_layers;
         const size_t new_entries = (size_t)new_cap * num_layers;
 
-        // BUGFIX 158: Use realloc() instead of malloc+memcpy+free to reduce peak memory
-        // realloc() can expand in-place, avoiding 2x peak memory consumption
-        // Peak memory: malloc+memcpy = 2x, realloc in-place = 1x
-        // BUGFIX 299: Check for overflow in realloc size calculation ★★
-        // Problem: new_entries * entry_dim can overflow size_t
-        // Causes realloc to allocate wrong size or fail silently
-        // Solution: Check multiplication overflow before realloc
         if (new_entries > SIZE_MAX / entry_dim ||
             new_entries > SIZE_MAX / sizeof(float)) {
             return 0;
         }
-        uint8_t* new_data = (uint8_t*)std::realloc(data, new_entries * entry_dim);
-        if (!new_data) {
+
+        const size_t new_data_bytes = new_entries * entry_dim;
+        const size_t new_scales_bytes = new_entries * sizeof(float);
+
+        // BUGFIX Problem F: Fix realloc pointer state inconsistency ★★★
+        // Problem: If nd succeeds but ns fails, data is updated but scales/zeros are not
+        // This leaves pointers in inconsistent state (data points to new, scales/zeros to old)
+        // Solution: Use temporary variables, only update all three if all succeed
+        void* nd = std::realloc(data, new_data_bytes);
+        void* ns = nd ? std::realloc(scales, new_scales_bytes) : nullptr;
+        void* nz = (nd && ns) ? std::realloc(zeros, new_scales_bytes) : nullptr;
+
+        if (!nd || !ns || !nz) {
+            // Realloc failure: free any successful allocations and return failure
+            // Original pointers (data, scales, zeros) remain valid after realloc failure
+            // Only free the new allocations that succeeded
+            if (nd && nd != data) std::free(nd);
+            if (ns && ns != scales) std::free(ns);
+            if (nz && nz != zeros) std::free(nz);
             return 0;
         }
-        data = new_data;
-        float* new_scales = (float*)std::realloc(scales, new_entries * sizeof(float));
-        if (!new_scales) {
-            return 0;
-        }
-        scales = new_scales;
-        float* new_zeros = (float*)std::realloc(zeros, new_entries * sizeof(float));
-        if (!new_zeros) {
-            return 0;
-        }
-        zeros = new_zeros;
 
-        if (new_data && new_scales && new_zeros) {
-            // Initialize new entries to zero
-            std::memset(new_data + old_entries * entry_dim, 0, (new_entries - old_entries) * entry_dim);
-            std::memset(new_scales + old_entries, 0, (new_entries - old_entries) * sizeof(float));
-            std::memset(new_zeros + old_entries, 0, (new_entries - old_entries) * sizeof(float));
+        // All three succeeded - update pointers atomically
+        data = (uint8_t*)nd;
+        scales = (float*)ns;
+        zeros = (float*)nz;
 
-            data = new_data;
-            scales = new_scales;
-            zeros = new_zeros;
-            max_seq_len = new_cap;
+        // Initialize new entries to zero
+        std::memset(data + old_entries * entry_dim, 0, (new_entries - old_entries) * entry_dim);
+        std::memset(scales + old_entries, 0, (new_entries - old_entries) * sizeof(float));
+        std::memset(zeros + old_entries, 0, (new_entries - old_entries) * sizeof(float));
 
-            if (engine) {
-                int64_t delta = (int64_t)(new_entries - old_entries) * (entry_dim + sizeof(float) * 2);
-                if (delta > 0) {
-                    engine->ram_used_bytes.fetch_add((uint64_t)delta, std::memory_order_relaxed);
-                } else if (delta < 0) {
-                    // BUGFIX 617: Check ram_used_bytes > 0 before fetch_sub to prevent underflow ★
-                    // Problem: If ram_used_bytes is 0, fetch_sub causes underflow
-                    // Solution: Only decrement if > 0
-                    uint64_t to_sub = (uint64_t)(-delta);
-                    uint64_t current = engine->ram_used_bytes.load(std::memory_order_acquire);
-                    while (current > 0) {
-                        uint64_t new_val = current > to_sub ? current - to_sub : 0;
-                        if (engine->ram_used_bytes.compare_exchange_weak(
-                                current, new_val,
-                                std::memory_order_release,
-                                std::memory_order_acquire)) {
-                            break;
-                        }
+        max_seq_len = new_cap;
+
+        if (engine) {
+            int64_t delta = (int64_t)(new_entries - old_entries) * (entry_dim + sizeof(float) * 2);
+            if (delta > 0) {
+                engine->ram_used_bytes.fetch_add((uint64_t)delta, std::memory_order_relaxed);
+            } else if (delta < 0) {
+                uint64_t to_sub = (uint64_t)(-delta);
+                uint64_t current = engine->ram_used_bytes.load(std::memory_order_acquire);
+                while (current > 0) {
+                    uint64_t new_val = current > to_sub ? current - to_sub : 0;
+                    if (engine->ram_used_bytes.compare_exchange_weak(
+                            current, new_val,
+                            std::memory_order_release,
+                            std::memory_order_acquire)) {
+                        break;
                     }
                 }
             }
-        } else {
-            // realloc failure: original pointers are still valid
-            // No need to free - realloc preserves original on failure
-            return 0;
         }
-        return needed_pos < max_seq_len ? 1 : 0;
+
+        return 1;
     }
 
     // Asymmetric INT8 Quantization (Store)
     void store_entry(uint32_t layer, uint32_t pos, const float* src, uint32_t count) {
-        // BUGFIX 297: Add null pointer check for src ★
+        // BUGFIX 297: Add null pointer check for src ??
         // Problem: src can be null if caller passes invalid pointer
         // Dereferencing null src causes crash
         // Solution: Check src before use
@@ -258,7 +218,7 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
 
     // Asymmetric INT8 Dequantization (Load)
     void load_entry(uint32_t layer, uint32_t pos, float* dst, uint32_t count) const {
-        // BUGFIX 298: Add null pointer check for dst ★
+        // BUGFIX 298: Add null pointer check for dst ??
         // Problem: dst can be null if caller passes invalid pointer
         // Writing to null dst causes crash
         // Solution: Check dst before use
@@ -398,4 +358,3 @@ static int moe_generation_should_use_layer_first_prefill(
     }
     return 1;
 }
-

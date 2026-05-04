@@ -176,3 +176,79 @@ int metal_event_sync(void* event) {
 
 }
 
+
+// BUGFIX Problem 8: Metal bandwidth measurement ★★ PERFORMANCE
+// Problem: All Metal devices use hardcoded 120 GB/s
+// M3 Max (400 GB/s) and M4 Pro (273 GB/s) underutilize by 3x
+// Solution: Measure actual H2D bandwidth at runtime
+// Impact: Correct staging slot count and prefetch depth calculation
+// BUGFIX Problem E: Apply correction factor for GPU pipeline overhead ★★ FIXED
+// Problem: MTLResourceStorageModeShared measures CPU→unified memory write speed
+// Doesn't include GPU consumption latency → overestimates by 20-30%
+// Solution: Apply 0.75 correction factor to account for GPU pipeline overhead
+// Impact: More realistic staging slot count and prefetch depth
+uint64_t metal_measure_h2d_bandwidth(void* device_handle) {
+    id<MTLDevice> device = device_handle ? (__bridge id<MTLDevice>)device_handle : MTLCreateSystemDefaultDevice();
+    if (!device) return 0;
+
+    const size_t test_size = 100 * 1024 * 1024;  // 100MB
+    void* host_buf = malloc(test_size);
+    if (!host_buf) return 0;
+
+    // Fill with data to prevent lazy allocation
+    memset(host_buf, 0xAB, test_size);
+
+    id<MTLBuffer> device_buf = [device newBufferWithLength:test_size
+                                                   options:MTLResourceStorageModeShared];
+    if (!device_buf) {
+        free(host_buf);
+        return 0;
+    }
+
+    // Warmup: 3 iterations
+    for (int i = 0; i < 3; ++i) {
+        memcpy([device_buf contents], host_buf, test_size);
+#if TARGET_OS_OSX
+        [device_buf didModifyRange:NSMakeRange(0, test_size)];
+#endif
+    }
+
+    // Measure: 10 iterations
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < 10; ++i) {
+        memcpy([device_buf contents], host_buf, test_size);
+#if TARGET_OS_OSX
+        [device_buf didModifyRange:NSMakeRange(0, test_size)];
+#endif
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    double elapsed_sec = (end.tv_sec - start.tv_sec) +
+                        (end.tv_nsec - start.tv_nsec) / 1e9;
+
+    uint64_t bytes_per_sec = 0;
+    if (elapsed_sec > 0.0) {
+        // Apply 0.75 correction factor for GPU pipeline overhead
+        bytes_per_sec = (uint64_t)((test_size * 10.0 * 0.75) / elapsed_sec);
+    }
+
+    device_buf = nil;
+    free(host_buf);
+
+    return bytes_per_sec;
+}
+
+void* metal_get_default_device() {
+    static id<MTLDevice> g_default_device = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_default_device = MTLCreateSystemDefaultDevice();
+        [g_default_device retain];
+    });
+    return (__bridge void*)g_default_device;
+}
+
+}

@@ -131,6 +131,7 @@ struct moe_level_zero_driver_api {
     void* driver = nullptr;
     void* context = nullptr;
     void* device = nullptr;
+    void* command_queue = nullptr; // OPTIMIZATION: Add command queue handle ★★★
     moe_ze_init_fn zeInit = nullptr;
     moe_ze_driver_get_fn zeDriverGet = nullptr;
     moe_ze_device_get_fn zeDeviceGet = nullptr;
@@ -141,11 +142,23 @@ struct moe_level_zero_driver_api {
     void* (*zeCommandQueueCreate)(void*, void*, void*, void**) = nullptr;
     void* (*zeCommandQueueDestroy)(void*) = nullptr;
     void* (*zeCommandQueueSynchronize)(void*, uint64_t) = nullptr;
+    void* (*zeCommandQueueExecuteCommandLists)(void*, uint32_t, void**, void*) = nullptr; // OPTIMIZATION: Execute command lists ★★★
     void* (*zeEventCreate)(void*, void*, void**) = nullptr;
     void* (*zeEventDestroy)(void*) = nullptr;
     void* (*zeEventHostSynchronize)(void*, uint64_t) = nullptr;
     void* (*zeEventQueryStatus)(void*) = nullptr;
+    void* (*zeCommandListCreate)(void*, void*, void*, void**) = nullptr; // OPTIMIZATION: Create command list ★★★
+    void* (*zeCommandListDestroy)(void*) = nullptr; // OPTIMIZATION: Destroy command list ★★★
+    void* (*zeCommandListClose)(void*) = nullptr; // OPTIMIZATION: Close command list ★★★
+    void* (*zeCommandListReset)(void*) = nullptr; // OPTIMIZATION: Reset command list ★★★
     void* (*zeCommandListAppendMemoryCopy)(void*, void*, const void*, size_t, void*, uint32_t, void**) = nullptr;
+    void* (*zeCommandListAppendSignalEvent)(void*, void*) = nullptr; // OPTIMIZATION: Signal event in command list ★★★
+    void* (*zeCommandListAppendWaitOnEvents)(void*, uint32_t, void**) = nullptr; // OPTIMIZATION: Wait on events ★★★
+    int (*zeFenceCreate)(void*, void*, void**) = nullptr; // OPTIMIZATION: Create fence for sync ★★★
+    int (*zeFenceDestroy)(void*) = nullptr; // OPTIMIZATION: Destroy fence ★★★
+    int (*zeFenceHostSynchronize)(void*, uint64_t) = nullptr; // OPTIMIZATION: Fence host sync ★★★
+    int (*zeFenceQueryStatus)(void*) = nullptr; // OPTIMIZATION: Query fence status ★★★
+    int (*zeDeviceGetProperties)(void*, void*) = nullptr; // OPTIMIZATION: Get device properties ★★★
     moe_ze_device_get_memory_properties_fn zeDeviceGetMemoryProperties = nullptr;
 };
 
@@ -155,6 +168,8 @@ struct moe_vulkan_driver_api {
     void* instance = nullptr;
     void* physicalDevice = nullptr;
     void* device = nullptr;
+    void* queue = nullptr;  // BUGFIX Problem E: Add queue handle for command submission ★★★
+    void* commandPool = nullptr;  // BUGFIX Problem E: Add command pool for command buffers ★★★
     void* (*vkCreateCommandPool)(void*, const void*, const void*, void**) = nullptr;
     void* (*vkDestroyCommandPool)(void*, void*, const void*) = nullptr;
     void* (*vkAllocateCommandBuffers)(void*, const void*, void**) = nullptr;
@@ -165,6 +180,19 @@ struct moe_vulkan_driver_api {
     void* (*vkDestroyEvent)(void*, void*, const void*) = nullptr;
     void* (*vkGetEventStatus)(void*, void*) = nullptr;
     void* (*vkGetPhysicalDeviceMemoryProperties2)(void*, void*) = nullptr;
+    // BUGFIX Problem E: Add functions for H2D copy ★★★ FEATURE
+    void* (*vkCreateBuffer)(void*, const void*, const void*, void**) = nullptr;
+    void* (*vkDestroyBuffer)(void*, void*, const void*) = nullptr;
+    void* (*vkGetBufferMemoryRequirements)(void*, void*, void*) = nullptr;
+    void* (*vkAllocateMemory)(void*, const void*, const void*, void**) = nullptr;
+    void* (*vkFreeMemory)(void*, void*, const void*) = nullptr;
+    void* (*vkBindBufferMemory)(void*, void*, void*, uint64_t) = nullptr;
+    void* (*vkMapMemory)(void*, void*, uint64_t, uint64_t, uint32_t, void**) = nullptr;
+    void* (*vkUnmapMemory)(void*, void*) = nullptr;
+    void* (*vkBeginCommandBuffer)(void*, const void*) = nullptr;
+    void* (*vkEndCommandBuffer)(void*) = nullptr;
+    void* (*vkCmdCopyBuffer)(void*, void*, void*, uint32_t, const void*) = nullptr;
+    void* (*vkResetCommandBuffer)(void*, uint32_t) = nullptr;
 };
 
 struct moe_device_allocation {

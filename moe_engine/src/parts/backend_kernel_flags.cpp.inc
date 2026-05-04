@@ -13,3 +13,19 @@ static int compiled_scale4_device_fusion_available() {
     return 0;
 #endif
 }
+
+static int compiled_native_nvfp4_gemm_available() {
+#if defined(moe_ENABLE_NATIVE_NVFP4_GEMM) || defined(moe_ENABLE_NATIVE_FP4_GEMM)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static int compiled_native_mxfp4_gemm_available() {
+#ifdef moe_ENABLE_NATIVE_MXFP4_GEMM
+    return 1;
+#else
+    return 0;
+#endif
+}

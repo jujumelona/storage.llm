@@ -25,12 +25,16 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
     // → eviction fails, VRAM OOM blocks generation
     // Solution: When compact_needed flag is set, scan up to heap_size/2 (wider scan)
     // Otherwise use conservative limit to avoid overhead
+    // BUGFIX Problem 7: Fix edge case when heap_size < 2 ★★★ CRITICAL
+    // Problem: heap_size=1 → heap_size/2=0 → stale_limit=max(1,0)=1
+    // If that 1 entry is stale, function returns 0 (failure) → VRAM OOM
+    // Solution: When compact_needed=true, use full heap_size instead of heap_size/2
+    // This ensures all entries are scanned in emergency situations
     const uint32_t stale_limit = engine->evict_heap_compact_needed.load(std::memory_order_relaxed)
-        ? (heap_size > 0 ? std::min(heap_size, std::max(1u, heap_size / 2u)) : 0u)
+        ? heap_size
         : std::max<uint32_t>(128u, std::min<uint32_t>(512u, heap_size / 4u));
     if (stale_limit == 0) {
-        engine->evict_heap_compact_needed.store(false, std::memory_order_relaxed);
-        return 0;  // heap 자체가 비어있음, 정상 종료
+        return 0;
     }
     uint32_t stale_count = 0;
     std::unique_lock<std::mutex> heap_lock(evict_heap_mutex(engine, idx));
@@ -106,9 +110,11 @@ static int demote_one_victim_to(
         const bool metal_unified =
             engine->backend_caps.backend == moe_BACKEND_METAL &&
             engine->backend_caps.supports_unified_memory;
-        if (to == moe_TIER_RAM && !metal_unified &&
-            tier_used(engine, moe_TIER_RAM) + state.bytes > tier_budget(engine, moe_TIER_RAM)) {
-            return 0;
+        if (to == moe_TIER_RAM) {
+            if (!metal_unified &&
+                tier_used(engine, moe_TIER_RAM) + state.bytes > tier_budget(engine, moe_TIER_RAM)) {
+                return 0;
+            }
         }
         subtract_tier_usage(engine, from, state.bytes);
         if (from == moe_TIER_VRAM) {
@@ -125,29 +131,17 @@ static int demote_one_victim_to(
             // device_free_experts_batched called later without any locks held
             to_free.push_back({layer, expert});
             state.pending_evict = true;
+            // BUGFIX Problem 8: Remove MADV_WILLNEED from eviction path ★★ IMPORTANT
+            // Problem: VRAM → RAM demotion calls MADV_WILLNEED during eviction
+            // → OS starts page-in while we're trying to free VRAM
+            // → Memory pressure worsens instead of improving
+            // Solution: Remove MADV_WILLNEED from eviction path
+            // → Call it only during prefetch when expert is actually needed
+            // Impact: Prevents eviction from triggering swap-in, improves memory pressure handling
 #ifdef __linux__
-            if (to == moe_TIER_RAM) {
-                const moe_projection_t projs[3] = {moe_PROJ_GATE, moe_PROJ_UP, moe_PROJ_DOWN};
-                for (moe_projection_t proj : projs) {
-                    const moe_tensor_record* r = find_tensor_record(engine, layer, expert, proj);
-                    if (r) {
-                        mmap_context_t* shard = get_or_map_tensor_shard(engine, *r);
-                        if (shard) {
-                            const uint64_t ranges[][2] = {
-                                {r->info.weight_byte_offset, r->info.weight_byte_length},
-                                {r->info.scale_byte_offset, r->info.scale_byte_length},
-                                {r->info.scale2_byte_offset, r->info.scale2_byte_length},
-                            };
-                            for (const auto& range : ranges) {
-                                if (range[1] > 0) {
-                                    void* ptr = mmap_get_ptr(shard, static_cast<size_t>(range[0]));
-                                    if (ptr) madvise(ptr, static_cast<size_t>(range[1]), MADV_WILLNEED);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // MADV_WILLNEED removed - see BUGFIX Problem 8
+            // Original code triggered page-in during eviction, worsening memory pressure
+            // Now MADV_WILLNEED is only called during prefetch when expert is selected by router
 #endif
         } else if (from == moe_TIER_RAM) {
             // BUGFIX 606: Check ram_expert_count > 0 before fetch_sub ★
@@ -275,5 +269,3 @@ static void demote_cold_until_impl(moe_pc_engine* engine, moe_tier_t tier, uint6
 static void demote_cold_until(moe_pc_engine* engine, moe_tier_t tier, uint64_t needed, std::vector<std::pair<int, int>>& to_free) {
     demote_cold_until_impl(engine, tier, needed, to_free, 0);
 }
-
-

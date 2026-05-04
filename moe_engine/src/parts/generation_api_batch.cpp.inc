@@ -61,8 +61,17 @@ static int moe_layer_attention_batched_f32(
     uint32_t hidden_size,
     const uint32_t* batch_positions
 ) {
-    // Future Implementation: GEMM-based batched attention with Paged KV
-    return 1;
+    (void)engine;
+    (void)layer;
+    (void)s;
+    (void)batch_hidden;
+    (void)batch_size;
+    (void)hidden_size;
+    (void)batch_positions;
+    std::fprintf(stderr,
+        "[storageLLM ERROR] batched attention is not implemented; "
+        "continuous batching remains disabled.\n");
+    return 0;
 }
 
 static int moe_layer_moe_mlp_batched_f32(
@@ -73,8 +82,16 @@ static int moe_layer_moe_mlp_batched_f32(
     uint32_t batch_size,
     const moe_storage_constants_t* c
 ) {
-    // Future Implementation: Batched Expert Routing and GEMM dispatch
-    return 1;
+    (void)engine;
+    (void)layer;
+    (void)s;
+    (void)batch_hidden;
+    (void)batch_size;
+    (void)c;
+    std::fprintf(stderr,
+        "[storageLLM ERROR] public batched MLP API is not implemented; "
+        "prefill row-batch MLP is wired through moe_pc_engine_generate_token_ids.\n");
+    return 0;
 }
 
 #endif

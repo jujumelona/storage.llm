@@ -21,6 +21,10 @@ int metal_event_record(void* event, void* stream);
 int metal_event_query(void* event);
 int metal_event_sync(void* event);
 
+// Metal Bandwidth Measurement
+uint64_t metal_measure_h2d_bandwidth(void* device_handle);
+void* metal_get_default_device();
+
 #ifdef __cplusplus
 }
 #endif

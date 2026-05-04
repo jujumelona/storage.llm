@@ -29,10 +29,33 @@ static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int
 // The mmap handle can be reopened as a file handle (shard->hFile already exists in mmap_context_t).
 // Trade-off: Requires managing file handles, but eliminates blocking page faults.
 // Status: PrefetchVirtualMemory removed. Async ReadFile path is in prefetch_pinned.cpp.inc.
+// BUGFIX Problem 3: Windows mmap touch with VirtualLock ★★ IMPORTANT
+// Problem: touch_mapped_range is no-op on Windows without DirectStorage → page fault stalls
+// Solution: Use VirtualLock + VirtualUnlock pair to force pages into working set
+// This is non-blocking and acts as effective prefetch
+// Trade-off: VirtualLock can fail if working set limit reached (default 1.5GB)
+// Failure is silently ignored - page fault will occur but no worse than before
 static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, uint64_t bytes) {
 #ifdef _WIN32
     if (engine && engine->io_config.enable_directstorage) {
         return;
+    }
+    // Try VirtualLock to bring pages into working set
+    // This is a hint - failure is acceptable and common when working set limit reached
+    if (src && bytes > 0) {
+        // VirtualLock requires page-aligned address
+        const size_t page_size = 4096;
+        const uintptr_t aligned_addr = reinterpret_cast<uintptr_t>(src) & ~(page_size - 1);
+        const size_t prefix = reinterpret_cast<uintptr_t>(src) - aligned_addr;
+        const size_t aligned_size = ((bytes + prefix + page_size - 1) / page_size) * page_size;
+
+        // VirtualLock brings pages into working set (non-blocking)
+        if (VirtualLock(reinterpret_cast<LPVOID>(aligned_addr), aligned_size)) {
+            // Immediately unlock - we just wanted to fault pages in
+            VirtualUnlock(reinterpret_cast<LPVOID>(aligned_addr), aligned_size);
+        }
+        // Failure is OK - just means working set limit reached or insufficient privilege
+        // Fall through to counter tracking
     }
     if (engine) {
         const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_touch_fallback.fetch_add(bytes, std::memory_order_relaxed);
@@ -430,12 +453,13 @@ try_next_lockfree_slot:
 // Solution: Load once and reuse values
 static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
     // BUGFIX 594: Check engine pointer and slot_index bounds ★
-    // Problem: engine can be null, slot_index can be out of bounds
-    // Solution: Check both before accessing
-    if (!engine || slot_index >= engine->staging_slots.size()) {
+    // BUGFIX Issue 2: Use staging_slot_valid helper for correct check order ★★
+    // Problem: Direct index check doesn't verify staging_slot_size first
+    // Solution: Use centralized helper that enforces staging_slot_size > 0 check
+    if (!engine || !staging_slot_valid(engine, slot_index)) {
         return;
     }
-    if (engine && slot_index < engine->staging_slots.size()) {
+    if (staging_slot_valid(engine, slot_index)) {
         engine->staging_slots[slot_index].in_use.store(false, std::memory_order_release);
 #ifdef ENABLE_LOCKFREE_STAGING
         if (engine->staging_slots.size() <= 64u) {
@@ -474,7 +498,7 @@ static uint64_t copy_mapped_range_to_staging(
     uint64_t bytes,
     uint32_t slot_index
 ) {
-    if (!engine || !src || bytes == 0 || slot_index >= engine->staging_slots.size()) {
+    if (!engine || !src || bytes == 0 || !staging_slot_valid(engine, slot_index)) {
         // Problem 5 Fix: Separate transient contention from structural deficit
         // staging_slot_contention = can't acquire slot (transient, retry will succeed)
         // staging_wraps is kept for backward compatibility but now tracks contention
@@ -539,7 +563,7 @@ static uint64_t copy_mapped_range_to_staging_linear(
     uint32_t slot_index,
     uint64_t* staging_offset
 ) {
-    if (!engine || !src || bytes == 0 || slot_index >= engine->staging_slots.size() || !staging_offset) {
+    if (!engine || !src || bytes == 0 || !staging_slot_valid(engine, slot_index) || !staging_offset) {
         // Problem 5 Fix: Separate transient contention from structural deficit
         if (engine && slot_index == UINT32_MAX) {
             engine->io_atomic.staging_slot_contention.fetch_add(1);

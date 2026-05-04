@@ -1,4 +1,5 @@
 static int read_file_range_to_buffer(
+    moe_pc_engine* engine,
     std::ifstream& input,
     uint64_t file_offset,
     uint8_t* dst,
@@ -8,6 +9,16 @@ static int read_file_range_to_buffer(
         file_offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max())) {
         return 0;
     }
+
+    // BUGFIX Problem D: Adaptive storage bandwidth measurement ★★★
+    // Measure bandwidth from large reads (>10MB) to avoid init delay
+    const uint64_t measure_threshold = 10ull * 1024ull * 1024ull;
+    const bool should_measure = engine &&
+        bytes >= measure_threshold &&
+        engine->backend_caps.measured_storage_bw_bytes_per_sec == 0;
+
+    const uint64_t start_us = should_measure ? moe_profile_now_us() : 0;
+
     input.clear();
     input.seekg(static_cast<std::streamoff>(file_offset), std::ios::beg);
     if (!input) {
@@ -46,6 +57,20 @@ static int read_file_range_to_buffer(
         }
         copied += static_cast<uint64_t>(actual);
     }
+
+    // BUGFIX Problem D: Record measured bandwidth ★★★
+    if (should_measure && engine) {
+        const uint64_t elapsed_us = moe_profile_now_us() - start_us;
+        if (elapsed_us > 0) {
+            const uint64_t bytes_per_sec = (bytes * 1000000ull) / elapsed_us;
+            engine->backend_caps.measured_storage_bw_bytes_per_sec = bytes_per_sec;
+            const double gb_per_sec = (double)bytes_per_sec / 1e9;
+            fprintf(stderr,
+                "[storageLLM INFO] Storage bandwidth measured: %.2f GB/s from %llu MB read\n",
+                gb_per_sec, (unsigned long long)(bytes / (1024*1024)));
+        }
+    }
+
     return 1;
 }
 
@@ -65,9 +90,51 @@ static int prefetch_tensor_file_to_pinned(
         *out_staging_bytes = 0;
     }
     uint32_t slot_index = io_slot_index ? *io_slot_index : UINT32_MAX;
-    if (!engine ||
-        slot_index >= engine->staging_slots.size() ||
-        !engine->staging_slots[slot_index].buf) {
+
+    // BUGFIX Issue 5: Generalized unified memory fast path ★★★
+    // Problem: Metal, AMD APU, Intel integrated GPU all have unified memory
+    // Old: Metal-only fast path hardcoded to moe_BACKEND_METAL
+    // Solution: Check supports_unified_memory flag instead of backend type
+    // This enables zero-copy for AMD APU (780M), Intel Iris Xe, and Metal
+    // BUGFIX Issue 3: Add explicit zero-copy signal to caller ★★★
+    // Problem: Caller doesn't know if unified memory fast path was taken
+    // Solution: Set io_slot_index to UINT32_MAX to signal "no slot used"
+    if (engine && engine->backend_caps.supports_unified_memory &&
+        engine->backend_caps.unified_mmap_gpu_accessible) {
+        // Unified memory path - map file data directly without staging
+        // Works for Metal (Apple Silicon), AMD APU (780M), Intel integrated (Iris Xe)
+        mmap_context_t* shard = get_or_map_tensor_shard(engine, rec);
+        if (!shard || !mmap_get_ptr(shard, 0)) {
+            return 0;
+        }
+        const uint64_t total_bytes = tensor_stream_bytes(rec);
+        if (total_bytes == 0) {
+            return 0;
+        }
+        // For unified memory backends, we don't use staging slots at all
+        // The mmap'd data is directly accessible by GPU (zero-copy)
+        // Signal to caller that no slot was used by setting io_slot_index to UINT32_MAX
+        if (io_slot_index) {
+            *io_slot_index = UINT32_MAX;
+        }
+        if (out_staging_bytes) {
+            *out_staging_bytes = total_bytes;
+        }
+        engine->io_atomic.bytes_prefetched.fetch_add(total_bytes, std::memory_order_relaxed);
+        engine->io_atomic.disk_stage_done.fetch_add(1, std::memory_order_relaxed);
+        engine->io_atomic.pinned_stage_done.fetch_add(1, std::memory_order_relaxed);
+        return 1;
+    }
+
+    // BUGFIX Issue 3: Use staging_slot_valid() helper for correct check order ★★★
+    // Problem: Manual checks can get order wrong (size before staging_slot_size)
+    // Solution: Use centralized helper that enforces correct order
+    if (!engine || !staging_slot_valid(engine, slot_index)) {
+        if (engine && engine->staging_slot_size == 0 && slot_index < engine->staging_slots.size()) {
+            fprintf(stderr,
+                "[storageLLM ERROR] prefetch_tensor_file_to_pinned: staging_slot_size=0, "
+                "slots are invalid after reset timeout. Rejecting prefetch.\n");
+        }
         return 0;
     }
     const uint64_t total_bytes = tensor_stream_bytes(rec);
@@ -85,11 +152,17 @@ static int prefetch_tensor_file_to_pinned(
         const uint64_t last_warn = s_last_warn_time_ms.load(std::memory_order_relaxed);
 
         // Check if we should attempt reallocation
-        // BUGFIX: Check system free memory headroom before realloc to prevent OOM
+        // BUGFIX 문제 5: Use tier_budget(RAM) instead of system_memory_bytes for headroom ★★★
+        // Problem: system_memory_bytes is total system RAM, not current available RAM
+        // 16GB system with 14GB used still calculates sys_free = 13.6GB → OOM on realloc
+        // Solution: Use tier_budget(moe_TIER_RAM) which reflects actual available RAM budget
+        // This accounts for current RAM usage and provides accurate headroom calculation
         // New buffer allocated BEFORE old one freed → temporarily uses 2× staging memory
-        const uint64_t sys_free = engine->backend_caps.system_memory_bytes > 0
-            ? (engine->backend_caps.system_memory_bytes * 85ull / 100ull)  // conservative estimate
-            : UINT64_MAX;
+        const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
+        const uint64_t sys_free = ram_budget > 0 ? ram_budget :
+            (engine->backend_caps.system_memory_bytes > 0
+                ? (engine->backend_caps.system_memory_bytes * 85ull / 100ull)  // conservative fallback
+                : UINT64_MAX);
         const bool enough_headroom = sys_free > total_bytes + 256ull * 1024ull * 1024ull;
         const bool should_try_realloc = enough_headroom && total_bytes <= engine->staging_size / 2;
 
@@ -157,7 +230,7 @@ static int prefetch_tensor_file_to_pinned(
             }
 
             // Check if reallocation succeeded
-            if (slot_index < engine->staging_slots.size() &&
+            if (staging_slot_valid(engine, slot_index) &&
                 total_bytes <= engine->staging_slots[slot_index].size) {
                 fprintf(stderr,
                     "[storageLLM INFO] Slot reallocation succeeded. New slot size: %llu bytes\n",
@@ -342,7 +415,7 @@ static int prefetch_tensor_file_to_pinned(
                 staging_offset > total_bytes || length > total_bytes - staging_offset) {
                 return 0;
             }
-            if (!read_file_range_to_buffer(*input, offset, engine->staging_slots[slot_index].buf + staging_offset, length)) {
+            if (!read_file_range_to_buffer(engine, *input, offset, engine->staging_slots[slot_index].buf + staging_offset, length)) {
                 return 0;
             }
             staging_offset += length;
@@ -396,7 +469,7 @@ static int prefetch_tensor_ram_to_pinned(
     const uint64_t total_bytes = tensor_stream_bytes(rec);
     const bool can_stage =
         engine->staging &&
-        slot_index < engine->staging_slots.size() &&
+        staging_slot_valid(engine, slot_index) &&
         engine->staging_slots[slot_index].buf &&
         total_bytes <= engine->staging_slots[slot_index].size;
     if (!can_stage) {
@@ -500,7 +573,7 @@ static int prefetch_tensor_ram_to_pinned_at(
     }
     const uint64_t total_bytes = tensor_stream_bytes(rec);
     if (total_bytes == 0 ||
-        slot_index >= engine->staging_slots.size() ||
+        !staging_slot_valid(engine, slot_index) ||
         !engine->staging_slots[slot_index].buf ||
         *inout_staging_offset > engine->staging_slots[slot_index].size ||
         total_bytes > engine->staging_slots[slot_index].size - *inout_staging_offset) {
@@ -559,5 +632,3 @@ static int prefetch_tensor_ram_to_pinned_at(
     engine->io_atomic.bytes_ram_to_pinned.fetch_add(copied, std::memory_order_relaxed);
     return 1;
 }
-
-

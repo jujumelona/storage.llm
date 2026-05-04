@@ -69,7 +69,9 @@ static void print_optimization_plan(moe_pc_engine_t* engine) {
     if (!moe_pc_engine_get_optimization_plan(engine, moe_PHASE_BOTH, &plan)) {
         return;
     }
-    std::cout << "Optimization: fused_fp4=" << plan.use_fused_fp4_dequant_matmul
+    std::cout << "Optimization: native_nvfp4=" << plan.use_native_nvfp4_tensor_cores
+              << " native_mxfp4=" << plan.use_native_mxfp4_tensor_cores
+              << " fused_fp4=" << plan.use_fused_fp4_dequant_matmul
               << " scale4_fusion=" << plan.use_scale4_decode_fusion
               << " async_copy=" << plan.use_async_copy_stream
               << " vram_hot=" << plan.use_vram_hot_cache

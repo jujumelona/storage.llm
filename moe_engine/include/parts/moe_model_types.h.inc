@@ -28,6 +28,8 @@ typedef struct {
     int use_storage_streaming;
     int use_async_copy_stream;
     int use_direct_to_gpu_io;
+    int use_native_nvfp4_tensor_cores;
+    int use_native_mxfp4_tensor_cores;
     int use_fused_fp4_dequant_matmul;
     int use_scale4_decode_fusion;
     int use_quant_family_dispatch;
@@ -51,4 +53,3 @@ typedef struct {
     double juju_tier1_to_tier0_ms;
     double juju_tier2_to_tier1_ms;
 } moe_runtime_optimization_plan_t;
-

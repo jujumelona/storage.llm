@@ -83,7 +83,37 @@ static moe_attn_config_t moe_generation_attn_config(const moe_pc_engine* engine)
     }
     if (cfg.rms_norm_eps <= 0.0f) cfg.rms_norm_eps = 1.0e-6f;
     if (cfg.rope_theta <= 0.0f) cfg.rope_theta = moe_ROPE_THETA;
-    if (!cfg.max_seq_len) cfg.max_seq_len = moe_MLA_MAX_SEQ_LEN;
+
+    // BUGFIX Problem 7: Use config max_context_len if specified ★★★ CRITICAL
+    // Problem: moe_MLA_MAX_SEQ_LEN = 8192 hardcoded, truncates 128K context models
+    // Solution: Override with engine->config.max_context_len if non-zero
+    // Clamp to RAM budget to prevent OOM
+    if (!cfg.max_seq_len) {
+        uint32_t desired_max_seq = moe_MLA_MAX_SEQ_LEN;
+        if (engine && engine->config.max_context_len > 0) {
+            desired_max_seq = engine->config.max_context_len;
+
+            // Clamp to RAM budget: KV cache needs ~584 bytes per token per layer
+            // Reserve half of RAM budget for KV cache
+            if (engine->config.ram_budget_bytes > 0) {
+                const moe_model_shape_t shape = moe_engine_model_shape_or_static(engine);
+                const uint32_t layers = shape.num_hidden_layers ? shape.num_hidden_layers : 79u;
+                const uint64_t bytes_per_token = layers * 584ull;  // INT8 + scales + zeros
+                const uint64_t max_affordable = engine->config.ram_budget_bytes / (2 * bytes_per_token);
+                if (max_affordable < desired_max_seq) {
+                    fprintf(stderr, "[storageLLM WARNING] Requested context length %u requires %llu GB RAM. "
+                            "Clamping to %llu tokens based on ram_budget_bytes=%llu.\n",
+                            desired_max_seq,
+                            (unsigned long long)(desired_max_seq * bytes_per_token / (1024*1024*1024)),
+                            (unsigned long long)max_affordable,
+                            (unsigned long long)engine->config.ram_budget_bytes);
+                    desired_max_seq = (uint32_t)std::min<uint64_t>(max_affordable, UINT32_MAX);
+                }
+            }
+        }
+        cfg.max_seq_len = desired_max_seq;
+    }
+
     if (!cfg.rope_table_len || cfg.rope_table_len < cfg.max_seq_len) {
         cfg.rope_table_len = std::max<uint32_t>(moe_MLA_ROPE_TABLE_LEN, cfg.max_seq_len);
     }

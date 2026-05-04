@@ -269,6 +269,19 @@ static int moe_json_get_double_slice(
     return moe_json_get_double_local(text.substr(begin, end - begin), key, out);
 }
 
+static int moe_json_get_bool_slice(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    int* out
+) {
+    if (begin >= end || end > text.size() || begin >= text.size()) {
+        return 0;
+    }
+    return moe_json_get_bool_local(text.substr(begin, end - begin), key, out);
+}
+
 static int moe_json_get_string_array_slice(
     const std::string& text,
     size_t begin,
@@ -366,4 +379,3 @@ static int moe_json_get_u64_array_slice(
     }
     return count > 0 ? 1 : 0;
 }
-

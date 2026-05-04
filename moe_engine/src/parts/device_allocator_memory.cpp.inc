@@ -62,14 +62,17 @@ static void warn_device_budget_exhausted(
         e->device_free_bytes.load(std::memory_order_relaxed) == 0) {
         return;
     }
-    static std::atomic<int64_t> s_last_warn_ms{0};
+    // BUGFIX Issue 4: Move static timer to engine member to prevent cross-engine suppression ★★★
+    // Problem: static s_last_warn_ms shared across all engine instances
+    // One engine's warning suppresses other engine's warnings in multi-engine process
+    // Solution: Use e->last_budget_warn_ms instead of static variable
     const auto now = std::chrono::steady_clock::now();
     const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-    int64_t last = s_last_warn_ms.load(std::memory_order_relaxed);
+    int64_t last = e->last_budget_warn_ms.load(std::memory_order_relaxed);
     if (now_ms - last < 1000) {
         return;
     }
-    if (!s_last_warn_ms.compare_exchange_strong(last, now_ms, std::memory_order_relaxed)) {
+    if (!e->last_budget_warn_ms.compare_exchange_strong(last, now_ms, std::memory_order_relaxed)) {
         return;
     }
     fprintf(stderr,
@@ -88,11 +91,17 @@ static void warn_device_budget_exhausted(
 static uint64_t device_budget_bytes(const moe_pc_engine* e) {
     if (!e) return 0;
 
-    // BUGFIX: Subtract pending_vram_reservation from total budget to prevent over-allocation
-    // In-flight tensor copies consume budget even before device_free_bytes is updated.
     const uint64_t pending = e->pending_vram_reservation.load(std::memory_order_relaxed);
-    // BUGFIX: VRAM 예산에서 KV + common 예약분을 먼저 빼야 함 (device_try_reserve_pending_vram 대신 여기서 일괄 적용)
-    const uint64_t kv_reserved = e->vram_kv_budget_bytes.load(std::memory_order_relaxed);
+
+    // Problem 8: Use dynamic KV budget instead of static soft cap
+    // vram_kv_budget_bytes is soft cap, device_kv_cache_bytes is actual usage
+    // Use min(cap, actual) to avoid wasting budget when KV is empty
+    const uint64_t kv_cap = e->vram_kv_budget_bytes.load(std::memory_order_relaxed);
+    const uint64_t kv_actual = e->device_kv_cache_bytes.load(std::memory_order_relaxed);
+    const uint64_t kv_reserved = moe_kv_vram_attention_runtime_available(e)
+        ? std::min(kv_cap, kv_actual)
+        : 0;
+
     const uint64_t common_reserved = e->common_vram_reserved_bytes.load(std::memory_order_relaxed);
     uint64_t reserved_total = pending;
     if (reserved_total > UINT64_MAX - kv_reserved) {
@@ -522,6 +531,3 @@ static void device_free_pool(moe_pc_engine* e, uint8_t pool) {
     }
     device_free_deferred_ptrs(e, deferred_free_ptrs);
 }
-
-
-

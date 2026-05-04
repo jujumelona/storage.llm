@@ -342,13 +342,15 @@ static int probe_main(int argc, char** argv) {
     moe_runtime_optimization_plan_t plan;
     if (moe_pc_engine_get_optimization_plan(engine, moe_PHASE_BOTH, &plan)) {
         printf(
-            "plan static_shape=%d static_pool=%d prefetch=%d async=%d pinned_cache=%d direct_io=%d fused_fp4=%d scale4_fusion=%d cuda_graph=%d metal_cmd=%d paged_kv=%d split=%d streams=%u/%u/%u common_vram=%llu expert_vram=%llu\n",
+            "plan static_shape=%d static_pool=%d prefetch=%d async=%d pinned_cache=%d direct_io=%d native_nvfp4=%d native_mxfp4=%d fused_fp4=%d scale4_fusion=%d cuda_graph=%d metal_cmd=%d paged_kv=%d split=%d streams=%u/%u/%u common_vram=%llu expert_vram=%llu\n",
             plan.use_model_shape_constants,
             plan.use_static_memory_pool,
             plan.use_expert_prefetch,
             plan.use_async_copy_stream,
             plan.use_pinned_ram_cache,
             plan.use_direct_to_gpu_io,
+            plan.use_native_nvfp4_tensor_cores,
+            plan.use_native_mxfp4_tensor_cores,
             plan.use_fused_fp4_dequant_matmul,
             plan.use_scale4_decode_fusion,
             plan.use_cuda_graphs,
@@ -591,4 +593,3 @@ int main(int argc, char** argv) {
     return probe_main(argc, argv);
 }
 #endif
-

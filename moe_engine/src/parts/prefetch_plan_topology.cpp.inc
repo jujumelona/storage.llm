@@ -26,6 +26,16 @@ static void prefetch_plan_topology_candidates(
     std::unordered_map<int, std::unordered_map<int, uint64_t>> aggregated_dst;
 
     for (uint32_t i = 0; i < count; ++i) {
+        if (engine->juju_buddy_map_ready.load(std::memory_order_acquire)) {
+            const size_t buddy_slot = expert_dense_slot(engine, layer, experts[i]);
+            if (buddy_slot != tensor_slot_invalid() && buddy_slot < engine->juju_buddy_expert_ids.size()) {
+                for (int buddy : engine->juju_buddy_expert_ids[buddy_slot]) {
+                    if (buddy >= 0) {
+                        aggregated_dst[layer][buddy] += 100;
+                    }
+                }
+            }
+        }
         const uint64_t src_key = topology_key(layer, experts[i]);
         if (src_key == UINT64_MAX) {
             continue;

@@ -73,33 +73,50 @@ int moe_pc_engine_run_expert_triplet_f32(
         return 0;
     }
 
-    const int gate_up_ok = moe_parallel_rows(engine, intermediate_count, 0, [&](uint32_t row) {
-        // BUGFIX 559: Check row bounds before array access ★
-        // Problem: row can exceed intermediate_count due to race condition
-        // Solution: Add bounds check
-        if (row >= intermediate_count) {
-            return 0;
+    auto expert_triplet_tile_rows = [](uint32_t input_floats) -> uint32_t {
+        const uint32_t env_tile = moe_parse_env_u32("STORAGELLM_MLP_ROW_TILE");
+        if (env_tile > 0) {
+            return std::max(1u, std::min<uint32_t>(env_tile, 64u));
         }
-        if (!moe_dot_tensor_record_row(engine, gate, gate_shard, row, hidden, hidden_count, &scratch_gate[row]) ||
-            !moe_dot_tensor_record_row(engine, up, up_shard, row, hidden, hidden_count, &scratch_up[row])) {
-            return 0;
+        const uint64_t input_bytes = (uint64_t)input_floats * sizeof(float);
+        if (input_bytes <= 16ull * 1024ull) return 16u;
+        if (input_bytes <= 32ull * 1024ull) return 8u;
+        return 4u;
+    };
+
+    const uint32_t gate_tile_rows = std::max(1u, std::min(intermediate_count, expert_triplet_tile_rows(hidden_count)));
+    const uint32_t gate_block_count = (intermediate_count + gate_tile_rows - 1u) / gate_tile_rows;
+    const int gate_up_ok = moe_parallel_rows(engine, gate_block_count, 0, [&](uint32_t block) {
+        const uint32_t row_begin = block * gate_tile_rows;
+        uint32_t row_end = row_begin + gate_tile_rows;
+        if (row_end > intermediate_count) {
+            row_end = intermediate_count;
         }
-        scratch_gate[row] = moe_silu(scratch_gate[row]) * scratch_up[row];
+        for (uint32_t row = row_begin; row < row_end; ++row) {
+            if (!moe_dot_tensor_record_row(engine, gate, gate_shard, row, hidden, hidden_count, &scratch_gate[row]) ||
+                !moe_dot_tensor_record_row(engine, up, up_shard, row, hidden, hidden_count, &scratch_up[row])) {
+                return 0;
+            }
+            scratch_gate[row] = moe_silu(scratch_gate[row]) * scratch_up[row];
+        }
         return 1;
     });
     if (!gate_up_ok) {
         return 0;
     }
 
-    return moe_parallel_rows(engine, out_count, 0, [&](uint32_t row) {
-        // BUGFIX 560: Check row bounds before array access ★
-        // Problem: row can exceed out_count due to race condition
-        // Solution: Add bounds check
-        if (row >= out_count) {
-            return 0;
+    const uint32_t down_tile_rows = std::max(1u, std::min(out_count, expert_triplet_tile_rows(intermediate_count)));
+    const uint32_t down_block_count = (out_count + down_tile_rows - 1u) / down_tile_rows;
+    return moe_parallel_rows(engine, down_block_count, 0, [&](uint32_t block) {
+        const uint32_t row_begin = block * down_tile_rows;
+        uint32_t row_end = row_begin + down_tile_rows;
+        if (row_end > out_count) {
+            row_end = out_count;
         }
-        if (!moe_dot_tensor_record_row(engine, down, down_shard, row, scratch_gate, intermediate_count, &out_hidden[row])) {
-            return 0;
+        for (uint32_t row = row_begin; row < row_end; ++row) {
+            if (!moe_dot_tensor_record_row(engine, down, down_shard, row, scratch_gate, intermediate_count, &out_hidden[row])) {
+                return 0;
+            }
         }
         return 1;
     });

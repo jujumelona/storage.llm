@@ -20,6 +20,17 @@ static void prepare_windows_staging_working_set(uint64_t bytes) {
     }
     if (SetProcessWorkingSetSize(GetCurrentProcess(), min_ws, max_ws)) {
         reserved_min_ws = min_ws;
+    } else {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            DWORD err = GetLastError();
+            if (err == ERROR_PRIVILEGE_NOT_HELD) {
+                fprintf(stderr, "[storageLLM WARNING] SetProcessWorkingSetSize failed: insufficient privileges. "
+                    "Working set may be limited by OS. Run as administrator or adjust process privileges.\n");
+            } else {
+                fprintf(stderr, "[storageLLM WARNING] SetProcessWorkingSetSize failed: error %lu\n", err);
+            }
+        }
     }
 }
 #else
@@ -103,7 +114,9 @@ static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* 
     if (preferred_numa_node >= 0) {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true, std::memory_order_relaxed)) {
-            fprintf(stderr, "[storageLLM WARNING] NUMA: disabled (install libnuma-dev and define HAVE_NUMA for +20%% DMA bandwidth on multi-CCD AMD systems)\n");
+            fprintf(stderr, "[storageLLM WARNING] NUMA requested but not compiled in. "
+                "DMA bandwidth may be reduced on multi-CCD CPUs. "
+                "Recompile with HAVE_NUMA to enable.\n");
         }
     }
 #endif
@@ -390,4 +403,3 @@ static uint64_t compute_split_bytes(const moe_pc_engine* engine, int layer, int 
     const uint64_t full = expert_triplet_bytes(engine, layer, expert);
     return (uint64_t)(full * split_ratio);
 }
-

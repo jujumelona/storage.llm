@@ -1,7 +1,8 @@
 static void fill_backend_caps(
     moe_backend_t preferred,
     moe_platform_t platform,
-    moe_backend_caps_t* out_caps
+    moe_backend_caps_t* out_caps,
+    const moe_pc_engine_config_t* preferred_cfg = nullptr
 ) {
     if (!out_caps) {
         return;
@@ -14,13 +15,11 @@ static void fill_backend_caps(
     const moe_backend_t backend = choose_backend(preferred, platform);
     out_caps->backend = backend;
     out_caps->platform = platform;
-    // BUGFIX 246: Document device_id hardcoded to 0 (multi-GPU not supported) ★★
+    // BUGFIX Problem 5: Use device_id from config for multi-GPU support ★★ IMPORTANT
     // Problem: device_id always set to 0, cannot use GPU 1, 2, 3 in multi-GPU systems
-    // Root cause: moe_pc_engine_config_t has no device_id field
-    // Impact: Multi-GPU systems can only use first GPU, wasting resources
-    // Solution: Would require API change to add device_id to config struct
-    // For now, document limitation. Future: Add device_id to moe_pc_engine_config_t
-    out_caps->device_id = 0;
+    // Solution: Read device_id from moe_pc_engine_config_t, default to 0 if not specified
+    // Impact: Enables multi-GPU systems to select specific GPU device
+    out_caps->device_id = (preferred_cfg && preferred_cfg->device_id >= 0) ? preferred_cfg->device_id : 0;
     out_caps->supports_mmap = 1;
     out_caps->system_memory_bytes = storagellm::available_ram_bytes();
 

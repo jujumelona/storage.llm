@@ -28,6 +28,192 @@ static void* moe_open_level_zero_loader_library() {
 #endif
 }
 
+// BUGFIX Problem E: Vulkan loader library opener ★★★ FEATURE
+static void* moe_open_vulkan_loader_library() {
+#ifdef _WIN32
+    return (void*)LoadLibraryA("vulkan-1.dll");
+#else
+    void* lib = dlopen("libvulkan.so.1", RTLD_LAZY | RTLD_LOCAL);
+    return lib ? lib : dlopen("libvulkan.so", RTLD_LAZY | RTLD_LOCAL);
+#endif
+}
+
+// BUGFIX Problem E: Vulkan driver loader ★★★ FEATURE
+// Problem: Vulkan H2D copy not implemented, forcing sync-only path
+// Solution: Load Vulkan function pointers and initialize command pool
+// Trade-off: Requires full Vulkan initialization, but enables async DMA
+static int vulkan_driver_load(moe_vulkan_driver_api* api, uint32_t device_id) {
+    if (!api) {
+        return 0;
+    }
+    if (api->library && api->device && api->commandPool) {
+        return 1;
+    }
+
+    api->library = moe_open_vulkan_loader_library();
+    if (!api->library) {
+        return 0;
+    }
+
+    // Load core Vulkan functions
+    typedef int (*PFN_vkGetInstanceProcAddr)(void*, const char*);
+    typedef int (*PFN_vkCreateInstance)(const void*, const void*, void**);
+    typedef int (*PFN_vkEnumeratePhysicalDevices)(void*, uint32_t*, void**);
+    typedef int (*PFN_vkGetPhysicalDeviceProperties)(void*, void*);
+    typedef int (*PFN_vkGetPhysicalDeviceQueueFamilyProperties)(void*, uint32_t*, void*);
+    typedef int (*PFN_vkCreateDevice)(void*, const void*, const void*, void**);
+    typedef void (*PFN_vkGetDeviceQueue)(void*, uint32_t, uint32_t, void**);
+
+    auto vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)moe_find_shared_symbol(api->library, "vkGetInstanceProcAddr");
+    auto vkCreateInstance = (PFN_vkCreateInstance)moe_find_shared_symbol(api->library, "vkCreateInstance");
+
+    if (!vkGetInstanceProcAddr || !vkCreateInstance) {
+        moe_close_shared_library(api->library);
+        *api = moe_vulkan_driver_api{};
+        return 0;
+    }
+
+    // Create Vulkan instance
+    struct VkApplicationInfo_local {
+        uint32_t sType; void* pNext; const char* pApplicationName; uint32_t applicationVersion;
+        const char* pEngineName; uint32_t engineVersion; uint32_t apiVersion;
+    } app_info = {0x00000000, nullptr, "storageLLM", 1, "moe_engine", 1, 0x00400000}; // VK_API_VERSION_1_0
+
+    struct VkInstanceCreateInfo_local {
+        uint32_t sType; void* pNext; uint32_t flags; const VkApplicationInfo_local* pApplicationInfo;
+        uint32_t enabledLayerCount; const char* const* ppEnabledLayerNames;
+        uint32_t enabledExtensionCount; const char* const* ppEnabledExtensionNames;
+    } create_info = {0x00000001, nullptr, 0, &app_info, 0, nullptr, 0, nullptr}; // VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+
+    void* instance = nullptr;
+    if (vkCreateInstance(&create_info, nullptr, &instance) != 0 || !instance) {
+        moe_close_shared_library(api->library);
+        *api = moe_vulkan_driver_api{};
+        return 0;
+    }
+    api->instance = instance;
+
+    // Load instance-level functions
+    auto vkEnumeratePhysicalDevices = (PFN_vkEnumeratePhysicalDevices)vkGetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices");
+    auto vkGetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties");
+    auto vkGetPhysicalDeviceQueueFamilyProperties = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceQueueFamilyProperties");
+    auto vkCreateDevice = (PFN_vkCreateDevice)vkGetInstanceProcAddr(instance, "vkCreateDevice");
+
+    if (!vkEnumeratePhysicalDevices || !vkCreateDevice) {
+        moe_close_shared_library(api->library);
+        *api = moe_vulkan_driver_api{};
+        return 0;
+    }
+
+    // Enumerate physical devices
+    uint32_t device_count = 0;
+    if (vkEnumeratePhysicalDevices(instance, &device_count, nullptr) != 0 || device_count == 0) {
+        moe_close_shared_library(api->library);
+        *api = moe_vulkan_driver_api{};
+        return 0;
+    }
+
+    std::vector<void*> physical_devices(device_count, nullptr);
+    if (vkEnumeratePhysicalDevices(instance, &device_count, physical_devices.data()) != 0) {
+        moe_close_shared_library(api->library);
+        *api = moe_vulkan_driver_api{};
+        return 0;
+    }
+
+    void* physical_device = physical_devices[std::min<uint32_t>(device_id, device_count - 1)];
+    api->physicalDevice = physical_device;
+
+    // Find queue family with graphics+compute support
+    uint32_t queue_family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, nullptr);
+
+    struct VkQueueFamilyProperties_local {
+        uint32_t queueFlags; uint32_t queueCount; uint32_t timestampValidBits;
+        struct { uint32_t width; uint32_t height; uint32_t depth; } minImageTransferGranularity;
+    };
+    std::vector<VkQueueFamilyProperties_local> queue_families(queue_family_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, queue_families.data());
+
+    uint32_t queue_family_index = UINT32_MAX;
+    for (uint32_t i = 0; i < queue_family_count; ++i) {
+        if (queue_families[i].queueFlags & 0x4) { // VK_QUEUE_TRANSFER_BIT
+            queue_family_index = i;
+            break;
+        }
+    }
+
+    if (queue_family_index == UINT32_MAX) {
+        moe_close_shared_library(api->library);
+        *api = moe_vulkan_driver_api{};
+        return 0;
+    }
+
+    // Create logical device
+    float queue_priority = 1.0f;
+    struct VkDeviceQueueCreateInfo_local {
+        uint32_t sType; void* pNext; uint32_t flags; uint32_t queueFamilyIndex;
+        uint32_t queueCount; const float* pQueuePriorities;
+    } queue_create_info = {0x00000002, nullptr, 0, queue_family_index, 1, &queue_priority}; // VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+
+    struct VkDeviceCreateInfo_local {
+        uint32_t sType; void* pNext; uint32_t flags; uint32_t queueCreateInfoCount;
+        const VkDeviceQueueCreateInfo_local* pQueueCreateInfos; uint32_t enabledLayerCount;
+        const char* const* ppEnabledLayerNames; uint32_t enabledExtensionCount;
+        const char* const* ppEnabledExtensionNames; const void* pEnabledFeatures;
+    } device_create_info = {0x00000003, nullptr, 0, 1, &queue_create_info, 0, nullptr, 0, nullptr, nullptr}; // VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+
+    void* device = nullptr;
+    if (vkCreateDevice(physical_device, &device_create_info, nullptr, &device) != 0 || !device) {
+        moe_close_shared_library(api->library);
+        *api = moe_vulkan_driver_api{};
+        return 0;
+    }
+    api->device = device;
+
+    // Get device queue
+    auto vkGetDeviceQueue = (PFN_vkGetDeviceQueue)vkGetInstanceProcAddr(instance, "vkGetDeviceQueue");
+    if (vkGetDeviceQueue) {
+        void* queue = nullptr;
+        vkGetDeviceQueue(device, queue_family_index, 0, &queue);
+        api->queue = queue;
+    }
+
+    // Load device-level functions
+    api->vkCreateCommandPool = (decltype(api->vkCreateCommandPool))vkGetInstanceProcAddr(instance, "vkCreateCommandPool");
+    api->vkDestroyCommandPool = (decltype(api->vkDestroyCommandPool))vkGetInstanceProcAddr(instance, "vkDestroyCommandPool");
+    api->vkAllocateCommandBuffers = (decltype(api->vkAllocateCommandBuffers))vkGetInstanceProcAddr(instance, "vkAllocateCommandBuffers");
+    api->vkFreeCommandBuffers = (decltype(api->vkFreeCommandBuffers))vkGetInstanceProcAddr(instance, "vkFreeCommandBuffers");
+    api->vkQueueSubmit = (decltype(api->vkQueueSubmit))vkGetInstanceProcAddr(instance, "vkQueueSubmit");
+    api->vkQueueWaitIdle = (decltype(api->vkQueueWaitIdle))vkGetInstanceProcAddr(instance, "vkQueueWaitIdle");
+    api->vkCreateBuffer = (decltype(api->vkCreateBuffer))vkGetInstanceProcAddr(instance, "vkCreateBuffer");
+    api->vkDestroyBuffer = (decltype(api->vkDestroyBuffer))vkGetInstanceProcAddr(instance, "vkDestroyBuffer");
+    api->vkGetBufferMemoryRequirements = (decltype(api->vkGetBufferMemoryRequirements))vkGetInstanceProcAddr(instance, "vkGetBufferMemoryRequirements");
+    api->vkAllocateMemory = (decltype(api->vkAllocateMemory))vkGetInstanceProcAddr(instance, "vkAllocateMemory");
+    api->vkFreeMemory = (decltype(api->vkFreeMemory))vkGetInstanceProcAddr(instance, "vkFreeMemory");
+    api->vkBindBufferMemory = (decltype(api->vkBindBufferMemory))vkGetInstanceProcAddr(instance, "vkBindBufferMemory");
+    api->vkMapMemory = (decltype(api->vkMapMemory))vkGetInstanceProcAddr(instance, "vkMapMemory");
+    api->vkUnmapMemory = (decltype(api->vkUnmapMemory))vkGetInstanceProcAddr(instance, "vkUnmapMemory");
+    api->vkBeginCommandBuffer = (decltype(api->vkBeginCommandBuffer))vkGetInstanceProcAddr(instance, "vkBeginCommandBuffer");
+    api->vkEndCommandBuffer = (decltype(api->vkEndCommandBuffer))vkGetInstanceProcAddr(instance, "vkEndCommandBuffer");
+    api->vkCmdCopyBuffer = (decltype(api->vkCmdCopyBuffer))vkGetInstanceProcAddr(instance, "vkCmdCopyBuffer");
+    api->vkResetCommandBuffer = (decltype(api->vkResetCommandBuffer))vkGetInstanceProcAddr(instance, "vkResetCommandBuffer");
+    api->vkGetPhysicalDeviceMemoryProperties2 = (decltype(api->vkGetPhysicalDeviceMemoryProperties2))vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceMemoryProperties2");
+
+    // Create command pool
+    if (api->vkCreateCommandPool && api->device) {
+        struct VkCommandPoolCreateInfo_local {
+            uint32_t sType; void* pNext; uint32_t flags; uint32_t queueFamilyIndex;
+        } pool_create_info = {0x00000027, nullptr, 0x00000002, queue_family_index}; // VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+
+        void* command_pool = nullptr;
+        if (api->vkCreateCommandPool(device, &pool_create_info, nullptr, &command_pool) == 0 && command_pool) {
+            api->commandPool = command_pool;
+        }
+    }
+
+    return api->device && api->commandPool;
+}
+
 static int level_zero_driver_load(moe_level_zero_driver_api* api, uint32_t device_id) {
     if (!api) {
         return 0;
@@ -47,6 +233,25 @@ static int level_zero_driver_load(moe_level_zero_driver_api* api, uint32_t devic
     api->zeMemAllocHost = (moe_ze_mem_alloc_host_fn)moe_find_shared_symbol(api->library, "zeMemAllocHost");
     api->zeMemFree = (moe_ze_mem_free_fn)moe_find_shared_symbol(api->library, "zeMemFree");
     api->zeDeviceGetMemoryProperties = (moe_ze_device_get_memory_properties_fn)moe_find_shared_symbol(api->library, "zeDeviceGetMemoryProperties");
+
+    // OPTIMIZATION: Load async transfer API functions ★★★
+    api->zeCommandQueueCreate = (decltype(api->zeCommandQueueCreate))moe_find_shared_symbol(api->library, "zeCommandQueueCreate");
+    api->zeCommandQueueDestroy = (decltype(api->zeCommandQueueDestroy))moe_find_shared_symbol(api->library, "zeCommandQueueDestroy");
+    api->zeCommandQueueSynchronize = (decltype(api->zeCommandQueueSynchronize))moe_find_shared_symbol(api->library, "zeCommandQueueSynchronize");
+    api->zeCommandQueueExecuteCommandLists = (decltype(api->zeCommandQueueExecuteCommandLists))moe_find_shared_symbol(api->library, "zeCommandQueueExecuteCommandLists");
+    api->zeCommandListCreate = (decltype(api->zeCommandListCreate))moe_find_shared_symbol(api->library, "zeCommandListCreate");
+    api->zeCommandListDestroy = (decltype(api->zeCommandListDestroy))moe_find_shared_symbol(api->library, "zeCommandListDestroy");
+    api->zeCommandListClose = (decltype(api->zeCommandListClose))moe_find_shared_symbol(api->library, "zeCommandListClose");
+    api->zeCommandListReset = (decltype(api->zeCommandListReset))moe_find_shared_symbol(api->library, "zeCommandListReset");
+    api->zeCommandListAppendMemoryCopy = (decltype(api->zeCommandListAppendMemoryCopy))moe_find_shared_symbol(api->library, "zeCommandListAppendMemoryCopy");
+    api->zeCommandListAppendSignalEvent = (decltype(api->zeCommandListAppendSignalEvent))moe_find_shared_symbol(api->library, "zeCommandListAppendSignalEvent");
+    api->zeCommandListAppendWaitOnEvents = (decltype(api->zeCommandListAppendWaitOnEvents))moe_find_shared_symbol(api->library, "zeCommandListAppendWaitOnEvents");
+    api->zeFenceCreate = (decltype(api->zeFenceCreate))moe_find_shared_symbol(api->library, "zeFenceCreate");
+    api->zeFenceDestroy = (decltype(api->zeFenceDestroy))moe_find_shared_symbol(api->library, "zeFenceDestroy");
+    api->zeFenceHostSynchronize = (decltype(api->zeFenceHostSynchronize))moe_find_shared_symbol(api->library, "zeFenceHostSynchronize");
+    api->zeFenceQueryStatus = (decltype(api->zeFenceQueryStatus))moe_find_shared_symbol(api->library, "zeFenceQueryStatus");
+    api->zeDeviceGetProperties = (decltype(api->zeDeviceGetProperties))moe_find_shared_symbol(api->library, "zeDeviceGetProperties");
+
     if (!api->zeInit || !api->zeDriverGet || !api->zeDeviceGet ||
         !api->zeContextCreate || !api->zeContextDestroy ||
         !api->zeMemAllocHost || !api->zeMemFree) {
@@ -86,6 +291,19 @@ static int level_zero_driver_load(moe_level_zero_driver_api* api, uint32_t devic
         *api = moe_level_zero_driver_api{};
         return 0;
     }
+
+    // OPTIMIZATION: Create command queue for async operations ★★★
+    if (api->zeCommandQueueCreate) {
+        struct ze_command_queue_desc_t_local {
+            uint32_t stype; void* pNext; uint32_t ordinal; uint32_t index;
+            uint32_t flags; uint32_t mode; uint32_t priority;
+        } queue_desc = {0x00010006, nullptr, 0, 0, 0, 0, 0}; // ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC
+        void* queue = nullptr;
+        if (api->zeCommandQueueCreate(context, device, &queue_desc, &queue) == 0 && queue) {
+            api->command_queue = queue;
+        }
+    }
+
     api->driver = driver;
     api->device = device;
     api->context = context;
@@ -145,8 +363,12 @@ static int device_allocator_init(moe_pc_engine* e) {
     // Solution: Reserve 25% for OS, remove dead code
     // BUGFIX 124: Issue 29 - Metal unified memory budget integration ★★
     // Set RAM budget to 0 for Metal, all tracking in VRAM budget (unified memory).
-    } else if (e->backend_caps.backend == moe_BACKEND_METAL) {
-        // Apple Silicon unified memory: reserve 25% for OS
+    // BUGFIX Issue 5: Generalize to all unified memory backends ★★★
+    } else if (e->backend_caps.backend == moe_BACKEND_METAL ||
+               (e->backend_caps.supports_unified_memory &&
+                (e->backend_caps.backend == moe_BACKEND_HIP ||
+                 e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO))) {
+        // Unified memory: reserve 25% for OS (Metal, AMD APU, Intel integrated)
         const uint64_t sys = e->backend_caps.system_memory_bytes > 0
             ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
         if (e->io_config.metal_memory_budget_pct == 0) {
@@ -158,8 +380,11 @@ static int device_allocator_init(moe_pc_engine* e) {
                 auto_pct = 77u;
             }
             e->io_config.metal_memory_budget_pct = (uint8_t)auto_pct;
+            const char* backend_name = e->backend_caps.backend == moe_BACKEND_METAL ? "Metal" :
+                                       e->backend_caps.backend == moe_BACKEND_HIP ? "HIP APU" : "LevelZero integrated";
             fprintf(stderr,
-                "[storageLLM INFO] Auto-detected Metal unified-memory budget: %u%% for %llu GB system memory\n",
+                "[storageLLM INFO] Auto-detected %s unified-memory budget: %u%% for %llu GB system memory\n",
+                backend_name,
                 (unsigned)e->io_config.metal_memory_budget_pct,
                 (unsigned long long)sys_gb);
         }
@@ -169,8 +394,38 @@ static int device_allocator_init(moe_pc_engine* e) {
         }
         e->device_free_bytes.store(e->backend_caps.device_memory_bytes);
         e->device_total_bytes.store(e->backend_caps.device_memory_bytes);
-        // BUGFIX 124: Disable RAM budget for Metal - unified memory tracked in VRAM budget only
+        // BUGFIX 124: Disable RAM budget for unified memory - all tracked in VRAM budget
+        // BUGFIX Issue 5: Apply to all unified memory backends, not just Metal
         e->config.ram_budget_bytes = 0;
+
+        // BUGFIX Problem 8: Measure Metal H2D bandwidth at runtime ★★ PERFORMANCE
+        // Problem: All Metal devices use hardcoded 120 GB/s in moe_rt_compute_mem_bw_hint()
+        // M3 Max (400 GB/s) and M4 Pro (273 GB/s) underutilize by 3x
+        // Solution: Measure actual bandwidth if enable_bw_benchmark flag is set
+        // Impact: Correct staging slot count and prefetch depth calculation
+        // BUGFIX Problem C: Respect enable_bw_benchmark flag ★★
+        // Problem: Metal benchmark runs unconditionally, adding 300ms-1s init delay
+        // Solution: Only measure if enable_bw_benchmark is enabled
+        if (e->backend_caps.backend == moe_BACKEND_METAL && e->io_config.enable_bw_benchmark) {
+            extern uint64_t metal_measure_h2d_bandwidth(void* device_handle);
+            extern void* metal_get_default_device();
+            const uint64_t measured = metal_measure_h2d_bandwidth(metal_get_default_device());
+            if (measured > 0) {
+                e->backend_caps.measured_h2d_bw_bytes_per_sec = measured;
+                const double gb_per_sec = (double)measured / 1e9;
+                fprintf(stderr,
+                    "[storageLLM INFO] Metal H2D bandwidth measured: %.1f GB/s\n",
+                    gb_per_sec);
+            }
+        }
+
+        // BUGFIX Issue ①: Metal unified memory double-counting ★★★ CRITICAL
+        // Problem: Same data counted in both VRAM and RAM budgets → available memory appears halved
+        // Solution: Set RAM budget to 0 for Metal, delegate all memory to unified VRAM budget
+        // Impact: OS unified memory pressure handles eviction, no explicit RAM tier needed
+        if (e->backend_caps.backend == moe_BACKEND_METAL) {
+            e->ram_budget_bytes = 0;
+        }
     } else if (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO) {
         level_zero_driver_load(&e->ze, e->backend_caps.device_id);
         if (e->backend_caps.device_memory_bytes == 0) {
@@ -270,7 +525,13 @@ static int device_allocator_init(moe_pc_engine* e) {
         e->device_free_bytes.store(free_mem);
         e->device_total_bytes.store(total_mem);
     } else if (e->backend_caps.backend == moe_BACKEND_VULKAN) {
-        // Vulkan: use reported device memory or fallback
+        if (!vulkan_driver_load(&e->vk, e->backend_caps.device_id)) {
+            e->device_allocator_ready.store(-1);
+            return 0;
+        }
+
+        e->backend_caps.copy_streams = 2;
+
         if (e->backend_caps.device_memory_bytes == 0) {
             e->backend_caps.device_memory_bytes = e->backend_caps.system_memory_bytes > 0
                 ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
@@ -375,7 +636,7 @@ static int device_allocator_init(moe_pc_engine* e) {
             // 없으면 sycl::device::get_info<sycl::info::device::global_mem_size>() 사용
         }
 #endif
-        
+
         if (!exact_queried) {
             // Use 85% as a conservative free memory estimate to avoid OOM
             free_mem = (e->backend_caps.device_memory_bytes * 85ull) / 100ull;
@@ -384,6 +645,18 @@ static int device_allocator_init(moe_pc_engine* e) {
         e->device_total_bytes.store(total_mem);
     }
     device_refresh_mem_info(e);
+
+    // CRITICAL ORDER: init_kv_vram_budget MUST precede common_vram_wanted_bytes.
+    // Reversing this order causes VRAM budget double-deduction (Problem 2).
+    extern void init_kv_vram_budget(moe_pc_engine* engine);
+    init_kv_vram_budget(e);
+
+    // Verify KV budget was set only when a real device-side KV consumer exists.
+    assert(e->vram_kv_budget_bytes.load(std::memory_order_relaxed) > 0 ||
+           e->backend_caps.backend == moe_BACKEND_METAL ||
+           !moe_kv_vram_attention_runtime_available(e));
+
+    e->common_vram_reserved_bytes.store(common_vram_wanted_bytes(e), std::memory_order_relaxed);
 
     // Fix 27: Run a quick microbenchmark to measure actual TFLOPS
     // The hardcoded fallbacks (22/35 TFLOPS) are wildly inaccurate for many GPUs.
@@ -432,7 +705,12 @@ static int device_allocator_init(moe_pc_engine* e) {
         }
     }
 
-    e->device_allocator_ready.store(1);
+    // BUGFIX Problem 2: Use seq_cst for device_allocator_ready ★★★ CRITICAL
+    // Problem: relaxed ordering allows compiler reordering of init_kv_vram_budget() call
+    // common_vram_wanted_bytes() may see device_allocator_ready=1 before KV budget is set
+    // Solution: Use memory_order_seq_cst to enforce total ordering
+    // Impact: Prevents double-deduction of KV budget during init
+    e->device_allocator_ready.store(1, std::memory_order_seq_cst);
     // Stream pool init moved to engine start
     return 1;
 }

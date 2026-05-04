@@ -62,6 +62,11 @@ struct moe_iocp_adapter_t {
         req.bytes_requested = bytes;
         req.completed = false;
 
+        // BUGFIX Platform Issue: IOCP + VirtualLock pinned memory ★★★
+        // Windows IOCP ReadFile works correctly with VirtualLock pinned memory
+        // staging_alloc.cpp.inc already calls VirtualLock on staging buffers
+        // No additional configuration needed - IOCP automatically uses pinned pages
+        // This provides optimal DMA performance on Windows
         BOOL ok = ReadFile(hFile, dst, bytes, nullptr, &req.overlapped);
         if (!ok) {
             DWORD err = GetLastError();

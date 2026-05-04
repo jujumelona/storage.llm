@@ -99,11 +99,10 @@ int moe_pc_engine_request_expert(
         }
         if (target == moe_TIER_RAM) {
             const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
-            // Bug 1 Fix: RAM threshold matches prefetch_admitted_tier (93%). Critical Fix 4 raised
-            // prefetch_admitted_tier from 87% →93%. This must match to prevent synchronous
-            // demote_cold_until on the token forward path when RAM is 88~92% full.
-            // BUGFIX 99: Precompute percentage threshold
-            const uint64_t ram_limit = (ram_budget * 93ull) / 100ull;
+            const uint64_t eviction_pct = engine->io_config.ram_eviction_target_fill_pct > 0
+                ? engine->io_config.ram_eviction_target_fill_pct : 75ull;
+            const uint64_t admission_pct = std::min(95ull, eviction_pct + 10ull);
+            const uint64_t ram_limit = (ram_budget * admission_pct) / 100ull;
             const bool too_big = ram_budget > 0 && bytes > ram_budget;
             const bool over_limit = ram_budget > 0 &&
                 tier_used(engine, moe_TIER_RAM) + bytes > ram_limit;
@@ -142,7 +141,7 @@ int moe_pc_engine_request_expert(
     const int result = [&]() {
         std::lock_guard<std::mutex> lock(engine->map_mutex);
         moe_block_state& state = engine->expert_states[slot];
-        
+
         // BUGFIX: Verify state hasn't been changed by another thread during Phase 2
         // Phase 1 guarantees this expert was set to moe_TIER_STREAM.
         if (state.tier != moe_TIER_STREAM) {
@@ -151,13 +150,12 @@ int moe_pc_engine_request_expert(
 
         moe_tier_t final_target = target;
         const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
-        // Bug 1 Fix: RAM threshold matches prefetch_admitted_tier (93%). Critical Fix 4 raised
-        // prefetch_admitted_tier from 87% →93%. This must match to prevent synchronous
-        // demote_cold_until on the token forward path when RAM is 88~92% full.
-        // BUGFIX 99: Precompute percentage threshold
-        const uint64_t ram_threshold_93 = (ram_budget * 93ull) / 100ull;
+        const uint64_t eviction_pct = engine->io_config.ram_eviction_target_fill_pct > 0
+            ? engine->io_config.ram_eviction_target_fill_pct : 75ull;
+        const uint64_t admission_pct = std::min(95ull, eviction_pct + 10ull);
+        const uint64_t ram_threshold = (ram_budget * admission_pct) / 100ull;
         if (final_target == moe_TIER_RAM && ram_budget > 0 &&
-            tier_used(engine, moe_TIER_RAM) + bytes > ram_threshold_93) {
+            tier_used(engine, moe_TIER_RAM) + bytes > ram_threshold) {
             final_target = moe_TIER_DB;
         }
         if (try_add_tier_usage(engine, final_target, bytes, tier_budget(engine, final_target))) {

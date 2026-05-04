@@ -71,11 +71,12 @@ static int device_free_expert_if_pending_evict_locked(
         return 0;
     }
 #ifndef NDEBUG
-    // Verify caller holds device_mutex (lock order: device_mutex → map_mutex)
-    if (e->device_mutex.try_lock()) {
-        e->device_mutex.unlock();
-        assert(false && "device_free_expert_if_pending_evict_locked called without device_mutex");
-    }
+    // BUGFIX Problem 13: Remove try_lock() UB ★★
+    // Problem: try_lock() on already-held mutex is UB per C++ standard
+    // Most implementations return false, but TSAN/UBSAN flag it
+    // Solution: Document lock order requirement in comment, remove UB check
+    // Lock order: caller must hold device_mutex before calling this function
+    // (device_mutex → map_mutex hierarchy enforced by design)
 #endif
     const size_t slot = expert_dense_slot(e, layer, expert);
     if (slot == tensor_slot_invalid() || slot >= e->expert_states.size()) {

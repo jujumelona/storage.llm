@@ -1,4 +1,5 @@
 static uint64_t moe_profile_now_us();
+static uint64_t device_budget_bytes(const moe_pc_engine* e);
 
 static uint64_t moe_common_raw_tensor_bytes() {
     const moe_storage_constants_t* storage = moe_storage_constants();
@@ -19,67 +20,81 @@ static uint64_t common_vram_wanted_bytes(const moe_pc_engine* engine) {
         return std::min<uint64_t>(engine->config.common_vram_reserve_bytes, common_bytes);
     }
     const moe_storage_constants_t* s = moe_storage_constants();
-    // Fix: Use distinct fallback values for lm_head and embedding
-    // lm_head is typically smaller than embedding in current offload MoE roots.
-    // Bug Fix: Router bytes removed from common VRAM reservation
-    // Router weights are already prefetched via moe_enqueue_attention_prefetch (activation pool)
-    // Including them here double-counts ~600MB, reducing expert VRAM budget unnecessarily
-    // 12288 bytes = 2 * hidden_size(~6144) runtime overhead estimate for normalization
-    // and intermediate buffers. Replace with moe_storage_constants()->runtime_state_bytes.
-    const uint64_t runtime_overhead = s && s->runtime_state_bytes > 0 ? s->runtime_state_bytes : 12288ull;
+    uint64_t runtime_overhead = 0;
+    if (s && s->runtime_state_bytes > 0) {
+        runtime_overhead = s->runtime_state_bytes;
+    } else {
+        const uint64_t hidden = s ? s->hidden_size : 6144ull;
+        const uint64_t experts = s ? s->num_experts : 256ull;
+        runtime_overhead = 2ull * hidden + experts * 4ull + hidden;
+        fprintf(stderr,
+            "[storageLLM WARNING] runtime_state_bytes not set in moe_storage_constants. "
+            "Using calculated fallback: %llu bytes (2*hidden_size + num_experts*4 + hidden_size). "
+            "This may not match actual model requirements.\n",
+            (unsigned long long)runtime_overhead);
+    }
     const uint64_t core = (s ? s->raw_tensor_lm_head_bytes : 0ull) + runtime_overhead;
     const uint64_t embed = s ? s->raw_tensor_embedding_bytes : 0ull;
     const uint64_t bundle = s && s->normal_bundle_max_bytes ? s->normal_bundle_max_bytes : 32ull * 1024ull * 1024ull;
     const uint64_t expert_floor = bundle * 8ull;
-    const uint64_t budget = engine->config.vram_budget_bytes;
-    if (budget <= expert_floor) {
+
+    const uint64_t effective_budget = device_budget_bytes(engine);
+
+    if (effective_budget <= expert_floor) {
         return 0;
     }
-    uint64_t reserve = budget >= core + expert_floor ? core : 12288ull;
-    if (budget >= core + embed + expert_floor) {
+    uint64_t reserve = effective_budget >= core + expert_floor ? core : 12288ull;
+    if (effective_budget >= core + embed + expert_floor) {
         reserve += embed;
     }
     return std::min<uint64_t>(reserve, common_bytes);
 }
 
 static uint64_t vram_expert_budget_bytes(const moe_pc_engine* engine) {
-    if (!engine || engine->config.vram_budget_bytes == 0) {
+    // BUGFIX Issue 1: Unify with device_budget_bytes() to prevent inconsistency ★★★
+    // Problem: Two functions calculate VRAM budget differently
+    // device_budget_bytes() has Metal fallback, this function returns 0 for Metal
+    // Solution: Call device_budget_bytes() internally for consistency
+    // This ensures Metal unified memory and all backends use same budget logic
+    if (!engine) {
         return 0;
     }
-    const uint64_t common = engine->common_vram_reserved_bytes.load();
-    const uint64_t kv_reserved = engine->vram_kv_budget_bytes.load(std::memory_order_relaxed);
-    const uint64_t pending = engine->pending_vram_reservation.load(std::memory_order_relaxed);
-    uint64_t reserved = common;
-    if (reserved > UINT64_MAX - kv_reserved) {
-        return 0;
-    }
-    reserved += kv_reserved;
-    if (reserved > UINT64_MAX - pending) {
-        return 0;
-    }
-    reserved += pending;
-    return engine->config.vram_budget_bytes > reserved ?
-        engine->config.vram_budget_bytes - reserved : 0;
+
+    // Use device_budget_bytes() as single source of truth
+    // It handles Metal unified memory, Vulkan/LevelZero dynamic queries, etc.
+    const uint64_t total_budget = device_budget_bytes(engine);
+
+    // Subtract common and KV reservations (already subtracted in device_budget_bytes)
+    // device_budget_bytes already subtracts pending, kv_reserved, common_reserved
+    // So we just return the result directly
+    return total_budget;
 }
 
 // Rate-limited wrapper that warns on expert budget exhaustion
 static uint64_t vram_expert_budget_bytes_checked(const moe_pc_engine* engine) {
     const uint64_t result = vram_expert_budget_bytes(engine);
     if (result == 0 && engine && engine->config.vram_budget_bytes > 0) {
-        static std::atomic<uint64_t> s_last_warn{0};
+        // BUGFIX Issue 4: Move static timer to engine member ★★★
+        // Problem: static s_last_warn shared across all engine instances
+        // Solution: Use engine->last_expert_budget_warn_ms
         const uint64_t now = moe_profile_now_us() / 1000000ull;
-        const uint64_t last = s_last_warn.load(std::memory_order_relaxed);
+        const uint64_t last = engine->last_expert_budget_warn_ms.load(std::memory_order_relaxed);
         if (now > last + 5ull) {
-            s_last_warn.store(now, std::memory_order_relaxed);
+            engine->last_expert_budget_warn_ms.store(now, std::memory_order_relaxed);
             const uint64_t common = engine->common_vram_reserved_bytes.load(std::memory_order_relaxed);
-            const uint64_t kv = engine->vram_kv_budget_bytes.load(std::memory_order_relaxed);
+            // OPTIMIZATION Issue 2: Update warning message for dynamic KV budget ★★★
+            // Old message: "Consider reducing vram_kv_ratio"
+            // New message: Reflect that KV is soft cap, show actual usage
+            const uint64_t kv_cap = engine->vram_kv_budget_bytes.load(std::memory_order_relaxed);
+            const uint64_t kv_actual = engine->device_kv_cache_bytes.load(std::memory_order_relaxed);
             const uint64_t pending = engine->pending_vram_reservation.load(std::memory_order_relaxed);
             fprintf(stderr,
                 "[storageLLM WARNING] Expert VRAM budget exhausted: "
-                "total=%llu MB, KV=%llu MB, common=%llu MB, pending=%llu MB. "
-                "Consider reducing vram_kv_ratio or context length.\n",
+                "total=%llu MB, KV cap=%llu MB (actual=%llu MB), common=%llu MB, pending=%llu MB. "
+                "KV is using soft cap. Consider reducing context length or increasing VRAM budget.\n",
                 (unsigned long long)(engine->config.vram_budget_bytes / (1024*1024)),
-                (unsigned long long)(kv / (1024*1024)),
+                (unsigned long long)(kv_cap / (1024*1024)),
+                (unsigned long long)(kv_actual / (1024*1024)),
                 (unsigned long long)(common / (1024*1024)),
                 (unsigned long long)(pending / (1024*1024)));
         }
@@ -90,9 +105,55 @@ static uint64_t vram_expert_budget_bytes_checked(const moe_pc_engine* engine) {
 // BUGFIX 문제4: Initialize KV VRAM budget ★★★
 // Splits VRAM budget between experts and KV cache
 // Default: 80% experts, 20% KV (configurable via vram_kv_ratio)
-static void init_kv_vram_budget(moe_pc_engine* engine) {
+// OPTIMIZATION: Dynamic KV budget - soft cap instead of fixed reservation ★★★
+// Problem: Fixed KV budget wastes VRAM in short conversations, causes RAM spill in long ones
+// Solution: Track actual KV VRAM usage via device_kv_cache_bytes atomic
+// vram_kv_budget_bytes becomes soft cap, device_budget_bytes() uses real usage
+// BUGFIX Problem C: Changed from static to extern for device_allocator_init() ★★★
+static int moe_kv_vram_attention_runtime_available(const moe_pc_engine* engine) {
+    if (!engine) {
+        return 0;
+    }
+#if defined(MOE_ENABLE_DEVICE_KV_ATTENTION) && MOE_ENABLE_DEVICE_KV_ATTENTION
+    return engine->backend_caps.backend == moe_BACKEND_CUDA ||
+           engine->backend_caps.backend == moe_BACKEND_HIP;
+#else
+    (void)engine;
+    return 0;
+#endif
+}
+
+void init_kv_vram_budget(moe_pc_engine* engine) {
     if (!engine || engine->config.vram_budget_bytes == 0) {
+        if (engine) {
+            engine->vram_kv_budget_bytes.store(0, std::memory_order_relaxed);
+            engine->vram_kv_used_bytes.store(0, std::memory_order_relaxed);
+            engine->device_kv_cache_bytes.store(0, std::memory_order_relaxed);
+        }
+        return;
+    }
+
+    // BUGFIX Problem 1: Metal unified memory - set KV budget to 0 ★★★ CRITICAL
+    // Problem: Metal unified memory causes double-counting of KV cache
+    // KV cache tracked in tier_used(RAM) + device_budget_bytes() both reference same memory
+    // Solution: For Metal, set vram_kv_budget_bytes = 0, delegate to OS unified memory pressure
+    // Impact: Eliminates double-counting, KV managed by macOS memory pressure system
+    if (engine->backend_caps.backend == moe_BACKEND_METAL) {
         engine->vram_kv_budget_bytes.store(0, std::memory_order_relaxed);
+        engine->vram_kv_used_bytes.store(0, std::memory_order_relaxed);
+        engine->device_kv_cache_bytes.store(0, std::memory_order_relaxed);
+        fprintf(stderr,
+            "[storageLLM INFO] Metal unified memory: KV budget set to 0, delegated to OS memory pressure\n");
+        return;
+    }
+
+    if (!moe_kv_vram_attention_runtime_available(engine)) {
+        engine->vram_kv_budget_bytes.store(0, std::memory_order_relaxed);
+        engine->vram_kv_used_bytes.store(0, std::memory_order_relaxed);
+        engine->device_kv_cache_bytes.store(0, std::memory_order_relaxed);
+        fprintf(stderr,
+            "[storageLLM INFO] KV VRAM tier disabled: no compiled device-side KV attention consumer; "
+            "flat/QKV KV remains RAM-resident.\n");
         return;
     }
 
@@ -107,8 +168,33 @@ static void init_kv_vram_budget(moe_pc_engine* engine) {
     if (kv_ratio <= 0.0f) {
         const uint64_t gib = 1024ull * 1024ull * 1024ull;
         const uint64_t vram = engine->config.vram_budget_bytes;
-        kv_ratio = vram <= 8ull * gib ? 0.10f :
-                   vram <= 24ull * gib ? 0.15f : 0.20f;
+
+        // BUGFIX Problem 6: Context-aware KV ratio calculation ★★ IMPORTANT
+        // Problem: Fixed ratio ignores context length → 8GB with 32K context spills to RAM
+        // Solution: Calculate KV needed based on context length, adjust ratio accordingly
+        // Estimate: ~512 bytes/token for BF16 with GQA (conservative)
+        uint32_t ctx = 4096u;  // Default fallback
+        if (engine->attn_config_valid.load(std::memory_order_relaxed) &&
+            engine->attn_config.max_seq_len > 0) {
+            ctx = engine->attn_config.max_seq_len;
+        }
+
+        const uint64_t kv_needed_estimate = (uint64_t)ctx * 512ull;
+        const float ctx_ratio = vram > 0
+            ? std::min(0.4f, (float)kv_needed_estimate / (float)vram)
+            : 0.1f;
+
+        // Base ratio from VRAM size + context adjustment
+        const float base = vram <= 8ull * gib ? 0.10f :
+                          vram <= 24ull * gib ? 0.15f : 0.20f;
+        kv_ratio = std::max(base, std::min(ctx_ratio, 0.4f));
+
+        fprintf(stderr,
+            "[storageLLM INFO] Context-aware KV ratio: ctx=%u tokens, estimated=%llu MB, "
+            "base_ratio=%.2f, ctx_ratio=%.2f, final=%.2f\n",
+            ctx,
+            (unsigned long long)(kv_needed_estimate / (1024*1024)),
+            base, ctx_ratio, kv_ratio);
     } else if (kv_ratio > 1.0f) {
         fprintf(stderr,
             "[storageLLM WARNING] vram_kv_ratio=%.2f exceeds 1.0, clamping to full KV allocation\n",
@@ -128,12 +214,17 @@ static void init_kv_vram_budget(moe_pc_engine* engine) {
         fprintf(stderr, "[storageLLM INFO] vram_kv_ratio auto-adjusted to %.2f based on VRAM capacity.\n", kv_ratio);
     }
 
+    // OPTIMIZATION Issue 2: Soft cap instead of hard reservation ★★★
+    // Store as soft cap, actual usage tracked in device_kv_cache_bytes
+    // device_budget_bytes() will use device_kv_cache_bytes.load() for real-time accounting
     const uint64_t kv_budget = (uint64_t)(engine->config.vram_budget_bytes * kv_ratio);
     engine->vram_kv_budget_bytes.store(kv_budget, std::memory_order_relaxed);
     engine->vram_kv_used_bytes.store(0, std::memory_order_relaxed);
+    // OPTIMIZATION: Initialize device_kv_cache_bytes for dynamic tracking
+    engine->device_kv_cache_bytes.store(0, std::memory_order_relaxed);
 
     fprintf(stderr,
-        "[storageLLM INFO] VRAM budget split: Total=%llu MB, KV=%llu MB (%.0f%%), Experts=%llu MB\n",
+        "[storageLLM INFO] VRAM budget split: Total=%llu MB, KV soft cap=%llu MB (%.0f%%), Experts=%llu MB (dynamic)\n",
         (unsigned long long)(engine->config.vram_budget_bytes / (1024*1024)),
         (unsigned long long)(kv_budget / (1024*1024)),
         kv_ratio * 100.0f,

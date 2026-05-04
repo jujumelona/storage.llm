@@ -80,8 +80,16 @@ static int device_copy_tensor_from_host(
     int release_slot_on_submit = 1
 ) {
     const uint64_t bytes = tensor_stream_bytes(r);
+    // BUGFIX Issue 6: Use staging_slot_valid() helper for correct check order ★★★
     if (!e || !host || host_bytes < bytes || bytes == 0 ||
         !device_allocator_init(e) || !device_set_current(e)) {
+        return 0;
+    }
+    // Check staging_slot_size > 0 if staging_slot is provided
+    if (staging_slot != UINT32_MAX && !staging_slot_valid(e, staging_slot)) {
+        fprintf(stderr,
+            "[storageLLM ERROR] device_copy_tensor_from_host: staging_slot_size=0, "
+            "slots are invalid after reset timeout. Rejecting copy.\n");
         return 0;
     }
     CUstream stream = device_tensor_stream_current(e);
@@ -113,11 +121,14 @@ static int device_copy_tensor_from_host(
         return 0;
     }
 
-    // BUGFIX: Immediate staging slot release after cuMemcpyAsync submission
-    // Old: Slot held until CUevent fires in device_drain_deferred_staging_copies
-    // New: Record per-slot fence event, release slot immediately, acquirer waits on fence
-    // DMA engine still reads staging buffer, but next acquirer calls cuStreamWaitEvent
-    // to ensure the previous DMA completes before overwriting the buffer.
+    // BUGFIX 문제 2: Record event and set recorded flag BEFORE releasing slot ★★★ CRITICAL
+    // Problem: Old sequence "record event → release slot" has race condition
+    // → Slot released → Other worker acquires → Reads last_copy_event before record completes
+    // → cuStreamWaitEvent waits on incomplete event → undefined behavior
+    // Solution: Set event_recorded flag atomically AFTER successful record
+    // → Acquirer checks event_recorded flag before waiting
+    // Impact: Eliminates race condition, ensures DMA fence correctness
+    bool event_ok = false;
     if (async_copy) {
         if (staging_slot != UINT32_MAX && staging_slot < e->staging_slots.size()) {
             auto& slot = e->staging_slots[staging_slot];
@@ -126,8 +137,10 @@ static int device_copy_tensor_from_host(
                 slot.last_copy_event = device_take_copy_event(e);
             }
             if (slot.last_copy_event) {
-                device_backend_event_record(e, slot.last_copy_event, stream);
-                slot.last_copy_stream = stream;
+                event_ok = device_backend_event_record(e, slot.last_copy_event, stream) != 0;
+                slot.last_copy_stream = event_ok ? stream : nullptr;
+                // BUGFIX 문제 2: Set event_recorded flag AFTER successful record ★★★
+                slot.last_copy_event_recorded.store(event_ok, std::memory_order_release);
             }
             // Release slot immediately — acquirer will wait on last_copy_event
             if (release_slot_on_submit) {

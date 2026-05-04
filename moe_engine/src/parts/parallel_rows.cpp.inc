@@ -250,8 +250,14 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     // halving CPU matrix throughput at batch_size>=2.
     // Solution: thread_local detects only same-thread nested calls (the real hazard)
     // while allowing cross-batch parallelism on separate threads.
+    // BUGFIX Problem A: Sync thread_local with engine->cpu_row_active for orchestrator ★★★
+    // Problem: engine->cpu_row_active never updated → runtime_orchestrator sees 0 → CPU load underestimated
+    // Solution: Update both thread_local (for nesting check) and global atomic (for orchestrator)
     static thread_local int tl_cpu_row_active = 0;
     const int prev_active = tl_cpu_row_active++;
+    if (engine) {
+        engine->cpu_row_active.fetch_add(1, std::memory_order_relaxed);
+    }
     if (prev_active > 0) {
         // Another thread owns the pool - run single-threaded for this expert
         int ok = 1;
@@ -263,6 +269,9 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
         }
         // BUGFIX 614 + 문제9: thread_local decrement (no underflow possible)
         --tl_cpu_row_active;
+        if (engine) {
+            engine->cpu_row_active.fetch_sub(1, std::memory_order_relaxed);
+        }
         moe_profile_log(
             "parallel_rows",
             "label=%s rows=%u block=%u workers=%u mode=nested_serial active_before=%d ok=%d ms=%.3f",
@@ -331,6 +340,9 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
 
     // BUGFIX 614 + 문제9: thread_local decrement (no underflow possible)
     --tl_cpu_row_active;
+    if (engine) {
+        engine->cpu_row_active.fetch_sub(1, std::memory_order_relaxed);
+    }
     const int final_ok = ok.load(std::memory_order_acquire);
     moe_profile_log(
         "parallel_rows",

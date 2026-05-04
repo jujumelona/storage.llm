@@ -13,6 +13,8 @@ typedef struct {
     const char* model_lib_compile_command;
     int enable_model_lib_jit;
     float vram_kv_ratio;  // BUGFIX 문제F: KV/expert VRAM split ratio (0.0=auto, 0.1-0.3 recommended) ★★
+    int32_t device_id;  // BUGFIX Problem 5: GPU device index for multi-GPU systems (-1=auto, default 0) ★★
+    uint32_t max_context_len;  // BUGFIX Problem 7: Override KV cache context length (0=use default 8192) ★★★
 } moe_pc_engine_config_t;
 
 typedef enum {
@@ -90,7 +92,7 @@ typedef struct {
     uint32_t planned_prefetch_count;
     uint64_t selected_expert_bytes;
     int allow_gpu_dense;
-    int route_sparse_to_cpu;
+    int allow_speculative_prefetch;  // Renamed from route_sparse_to_cpu for clarity
     int throttle_speculative;
     int drop_speculative;
 } moe_runtime_orchestrator_plan_t;

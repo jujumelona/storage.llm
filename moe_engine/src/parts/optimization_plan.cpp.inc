@@ -42,7 +42,10 @@ int moe_pc_engine_get_optimization_plan(
     out_plan->use_async_copy_stream =
         caps.supports_async_copy && caps.supports_backend_async_api && io.enable_compute_io_overlap;
     out_plan->use_direct_to_gpu_io = direct_to_gpu;
-    out_plan->use_fused_fp4_dequant_matmul = gpu_available && caps.supports_fp4;
+    out_plan->use_native_nvfp4_tensor_cores = gpu_available && caps.supports_native_nvfp4_gemm;
+    out_plan->use_native_mxfp4_tensor_cores = gpu_available && caps.supports_native_mxfp4_gemm;
+    out_plan->use_fused_fp4_dequant_matmul =
+        gpu_available && caps.supports_fp4 && !out_plan->use_native_nvfp4_tensor_cores;
     out_plan->use_scale4_decode_fusion = gpu_available && caps.supports_scale4;
     out_plan->use_quant_family_dispatch = 1;
     out_plan->use_reference_weight_dequant =
@@ -52,7 +55,12 @@ int moe_pc_engine_get_optimization_plan(
     out_plan->preferred_weight_encoding = engine->offload_weight_encoding.load(std::memory_order_relaxed);
     out_plan->use_cuda_graphs = caps.backend == moe_BACKEND_CUDA && caps.supports_cuda;
     out_plan->use_metal_command_buffers = caps.backend == moe_BACKEND_METAL && caps.supports_metal;
-    out_plan->use_paged_kv_cache = gpu_available;
+#if defined(MOE_ENABLE_PAGED_KV) && MOE_ENABLE_PAGED_KV
+    out_plan->use_paged_kv_cache =
+        gpu_available && moe_kv_vram_attention_runtime_available(engine);
+#else
+    out_plan->use_paged_kv_cache = 0;
+#endif
     out_plan->use_prefill_decode_split = 1;
     out_plan->use_juju_format_strategy = engine->juju_strategy_valid.load(std::memory_order_relaxed);
     out_plan->juju_execution_path = (uint32_t)engine->juju_execution_path;
@@ -68,4 +76,3 @@ int moe_pc_engine_get_optimization_plan(
     out_plan->juju_tier2_to_tier1_ms = engine->juju_pipeline_config.tier2_to_tier1_ms;
     return 1;
 }
-

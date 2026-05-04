@@ -60,7 +60,7 @@ int moe_pc_engine_execute_prefetch_plan(
             const uint32_t dyn_batch_max = moe_gpu_stage_batch_max(engine);
             const uint32_t pinned_threshold = std::min(
                 engine->io_config.max_prefetch_queue / 4u,
-                std::max(64u, pinned_workers * dyn_batch_max * 12u));
+                std::max(64u, pinned_workers * dyn_batch_max * 6u));
             if (snap_pinned_load >= pinned_threshold) {
                 under_pressure = true;
             }
@@ -70,12 +70,17 @@ int moe_pc_engine_execute_prefetch_plan(
             adjusted_item.target_tier = moe_TIER_RAM;
         }
         admitted_tiers[i] = prefetch_admitted_tier(engine, adjusted_item, all_to_free[i]);
-        vram_pending_reserved[i] =
-            (admitted_tiers[i] == moe_TIER_VRAM && items[i].target_tier == moe_TIER_VRAM) ? 1u : 0u;
+        vram_pending_reserved[i] = (admitted_tiers[i] == moe_TIER_VRAM) ? 1u : 0u;
     }
 
     // BUGFIX 60: Issue 3 - TOCTOU deferred free pattern
+    // BUGFIX Problem 11: Reserve flat_to_free capacity to avoid O(n²) reallocation ★
+    // Problem: insert() without reserve causes log(n) reallocations for large plans
+    // Solution: Calculate total size and reserve once
     std::vector<std::pair<int, int>> flat_to_free;
+    size_t total_free_count = 0;
+    for (const auto& v : all_to_free) total_free_count += v.size();
+    flat_to_free.reserve(total_free_count);
     for (auto& to_free : all_to_free) {
         flat_to_free.insert(flat_to_free.end(), to_free.begin(), to_free.end());
     }
@@ -226,6 +231,3 @@ int moe_pc_engine_set_topology_path(moe_pc_engine_t* engine, const char* path) {
     engine->topology_path = path ? path : "";
     return 1;
 }
-
-
-

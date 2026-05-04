@@ -1,0 +1,246 @@
+        }
+    } stream_guard{engine};
+
+    // BUGFIX 129: Add InflightGuard to prevent inflight count leaks ?끸쁾
+    // Problem: Worker terminates (worker_index >= worker_target) while task is popped
+    // inflight incremented ??worker exits ??finish_stage_task never called ??inflight stuck
+    // Solution: RAII guard ensures finish_stage_task on all exit paths
+    // BUGFIX 251: Guard must be activated AFTER pop_stage_task succeeds ?끸쁾??    // Problem: Guard created before pop_stage_task ??if pop fails, inflight not incremented
+    // but destructor tries to decrement ??underflow
+    // Solution: Create guard inactive, activate only after successful pop
+    struct InflightGuard {
+        moe_pc_engine* e;
+        moe_stage_queue* stage;
+        bool active = false;
+        bool finished = false;
+
+        ~InflightGuard() {
+            if (e && stage && active && !finished) {
+                // Abnormal exit - decrement inflight
+                finish_stage_task(e, *stage, 0, 1);
+            }
+        }
+
+        void activate() {
+            active = true;
+            finished = false;
+        }
+
+        void mark_finished() {
+            finished = true;
+            active = false;
+        }
+    } inflight_guard{engine, &engine->disk_stage};
+
+    moe_io_path_t active_path = choose_active_io_path(engine);
+    engine->io_atomic.active_path.store(static_cast<uint32_t>(active_path));
+    const uint64_t initial_budget = device_budget_bytes(engine);
+    const uint64_t initial_allocated = io_worker_device_allocated_bytes(engine);
+    uint64_t last_vram_room = initial_budget > initial_allocated ? initial_budget - initial_allocated : 0;
+    uint32_t staging_turn = 0;
+    std::deque<std::pair<moe_prefetch_task, moe_transfer_stage_t>> local_requeues;
+    const auto should_stop = [&]() {
+        return engine->io_stop.load(std::memory_order_relaxed);
+    };
+    auto preserve_requeue = [&](const moe_prefetch_task& retry_task, moe_transfer_stage_t retry_stage) {
+        if (!io_worker_requeue_disk_task(engine, retry_task, retry_stage, 3u, 1u)) {
+            // Bug Fix: Cap local_requeues size to prevent unbounded growth
+            // When both disk_stage and gpu_stage are full, local_requeues grows indefinitely
+            const uint32_t cap = std::max(8u, engine->disk_stage_depth_cap);
+            if (local_requeues.size() < cap) {
+                local_requeues.emplace_back(retry_task, retry_stage);
+            } else {
+                engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        return 1;
+    };
+    auto drain_local_requeues = [&]() {
+        // BUGFIX 95: Cache io_stop check in requeue loop
+        while (!local_requeues.empty() && !should_stop()) {
+            const auto pending = local_requeues.front();
+            if (io_worker_requeue_disk_task(engine, pending.first, pending.second, 5u, 1u)) {
+                local_requeues.pop_front();
+            } else {
+                engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                local_requeues.pop_front();
+            }
+        }
+    };
+    auto exit_worker = [&]() {
+        drain_local_requeues();
+        stream_guard.e = nullptr;
+        device_stream_destroy_current(engine);
+    };
+    // BUGFIX 84: Issue 6 - Limit local_requeues retry attempts ?끸쁾
+    // Problem: Infinite retry when both disk_stage and gpu_stage full
+    // io_worker stuck in requeue loop ??no progress
+    // Solution: Max 100 retries per item, then drop
+    uint32_t requeue_retry_count = 0;
+    constexpr uint32_t MAX_REQUEUE_RETRIES = 100;
+
+    for (;;) {
+        if (!local_requeues.empty()) {
+            const auto pending = local_requeues.front();
+            if (io_worker_requeue_disk_task(engine, pending.first, pending.second, 1u, 0u)) {
+                local_requeues.pop_front();
+                requeue_retry_count = 0;  // Reset on success
+                continue;
+            }
+
+            // BUGFIX 84: Check retry limit
+            if (++requeue_retry_count >= MAX_REQUEUE_RETRIES) {
+                engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                local_requeues.pop_front();
+                requeue_retry_count = 0;
+                continue;
+            }
+
+            // PIPELINE FIX 10: Wait on correct CV based on requeue target ?끸쁾
+            // Old: Always waited on disk_stage.pop_cv even when gpu_stage was full
+            // New: Wait on gpu_stage.pop_cv when target is GPU, disk_stage.pop_cv otherwise
+            // Eliminates 2ms polling delay when GPU stage is the actual bottleneck
+            moe_stage_queue* target_stage = (pending.second == moe_TRANSFER_STAGE_PINNED_TO_GPU)
+                ? &engine->gpu_stage : &engine->disk_stage;
+            std::unique_lock<std::mutex> lock(target_stage->mtx);
+            target_stage->pop_cv.wait_for(lock, std::chrono::milliseconds(2));
+            continue;
+        }
+        requeue_retry_count = 0;  // Reset when queue empty
+        // Fix 10: GDS/mmap routing changes rarely ??refresh every 10 tasks.
+        // VRAM pressure changes fast; refresh when allocator budget headroom shifts >10%.
+        const uint64_t cur_budget = device_budget_bytes(engine);
+        const uint64_t cur_allocated = io_worker_device_allocated_bytes(engine);
+        const uint64_t cur_vram_room = cur_budget > cur_allocated ? cur_budget - cur_allocated : 0;
+        const bool vram_shifted = last_vram_room == 0
+            ? cur_vram_room > 0
+            : (cur_vram_room > last_vram_room + last_vram_room / 10 ||
+               cur_vram_room < last_vram_room - last_vram_room / 10);
+        if (vram_shifted) {
+            active_path = static_cast<moe_io_path_t>(
+                engine->io_atomic.active_path.load(std::memory_order_relaxed));
+            last_vram_room = cur_vram_room;
+        }
+        moe_prefetch_task task{};
+        if (!pop_stage_task(engine, engine->disk_stage, &task, &engine->disk_worker_target, worker_index)) {
+            exit_worker();
+            return;
+        }
+        // BUGFIX 251: Activate guard only after successful pop
+        inflight_guard.activate();
+
+        // Bug 2 Fix: Lookahead touch_mapped_range to prevent blocking page faults
+        // touch_mapped_range (MADV_WILLNEED/PrefetchVirtualMemory) is async. If we call it
+        // immediately before memcpy, pages may not be in RAM yet ??page fault blocks IO worker.
+        // Solution: peek next task and touch its pages NOW, while processing current task.
+        // By the time we process next task, its pages will likely be in RAM.
+        // PIPELINE FIX 11: Multi-task lookahead for multiple disk workers ?占썩쁾
+        // Old: Single lookahead ??only helps 1 worker, others still hit page faults
+        // New: Lookahead N tasks where N = disk_workers ??all workers benefit
+        // BUGFIX 34: Increase lookahead cap for high disk worker counts ?占썩쁾
+        // Old: min(disk_workers, 4) ??workers 5+ still hit page faults
+        // New: min(disk_workers * 2, 8) ??scales with worker count, caps at 8
+        // Rationale: OS prefetcher can handle 8 concurrent MADV_WILLNEED hints efficiently
+        {
+            const uint32_t max_lookahead = std::min(runtime_disk_workers(engine) * 4u, 16u);
+            std::vector<int32_t> lookahead_indices;
+            lookahead_indices.reserve(max_lookahead);
+            {
+                std::unique_lock<std::mutex> peek_lock(engine->disk_stage.mtx);
+                auto collect_indices = [&](const std::deque<moe_prefetch_task>& queue) {
+                    for (const auto& lookahead_task : queue) {
+                        if (lookahead_indices.size() >= max_lookahead) break;
+                        if (lookahead_task.tensor_index >= 0 &&
+                            (size_t)lookahead_task.tensor_index < engine->tensors.size() &&
+                            lookahead_task.raw_span_index < 0) {
+                            lookahead_indices.push_back(lookahead_task.tensor_index);
+                        }
+                    }
+                };
+                collect_indices(engine->disk_stage.urgent_queue);
+                collect_indices(engine->disk_stage.queue);
+            }
+            for (int32_t tensor_index : lookahead_indices) {
+                // BUGFIX 322: Check tensor_index bounds before accessing tensors array ??                // Problem: tensor_index can be corrupted or out of bounds
+                // Accessing engine->tensors[tensor_index] with invalid index causes crash
+                // Solution: Check bounds before access
+                if (tensor_index < 0 || (size_t)tensor_index >= engine->tensors.size()) {
+                    continue;
+                }
+                const moe_tensor_record& next_rec = engine->tensors[tensor_index];
+                mmap_context_t* next_shard = get_or_map_tensor_shard(engine, next_rec);
+                // BUGFIX 323: Check next_shard validity before accessing ??                // Problem: get_or_map_tensor_shard can return null
+                // Solution: Check next_shard before use
+                if (next_shard) {
+                    const uint8_t* next_src = static_cast<const uint8_t*>(mmap_get_ptr(next_shard, 0));
+                    // BUGFIX 565: Check tensor_stream_bytes before touch_mapped_range ??                    // Problem: tensor_stream_bytes can return 0, causing invalid touch
+                    // Solution: Check size > 0 before touch
+                    const uint64_t touch_size = tensor_stream_bytes(next_rec);
+                    if (next_src && touch_size > 0) {
+                        touch_mapped_range(engine, next_src, touch_size);
+                    }
+                }
+            }
+        }
+
+        int ok = 0;
+        int terminal = 1;
+        if (task.raw_span_index >= 0) {
+            const moe_storage_raw_span_spec_t* span = moe_storage_raw_span_at((uint32_t)task.raw_span_index);
+            ok = span ? prefetch_one_raw_span(engine, *span, task.raw_pool, 0) : 0;
+            // Bug Fix: Raw span BACKPRESSURE handling (same as tensor path)
+            // Without this, staging slot exhaustion causes sync H2D fallback, blocking IO worker
+            if (ok == moe_DEVICE_COPY_BACKPRESSURE) {
+                task.urgent = 1;
+                task.stage = moe_TRANSFER_STAGE_PINNED_TO_GPU;
+                ok = enqueue_stage_or_retry(engine, engine->gpu_stage, task) ? 1 : 0;
+                if (ok) {
+                    terminal = 0;
+                    engine->gpu_stage.cv.notify_one();
+                } else {
+                    ok = preserve_requeue(task, moe_TRANSFER_STAGE_DISK_TO_RAM);
+                    terminal = 0;
+                }
+            } else if (ok) {
+                const size_t deferred_copies = device_deferred_staging_copy_count(engine);
+                if (deferred_copies > 0) {
+                    const bool should_flush = deferred_copies >= moe_gpu_stage_batch_max(engine)
+                        || (deferred_copies >= 1u
+                            && engine->disk_stage.depth.load(std::memory_order_relaxed) == 0
+                            && engine->disk_stage.inflight.load(std::memory_order_relaxed) <= 1u);
+                    if (should_flush) {
+                        device_drain_deferred_staging_copies(engine, true);
+                    }
+                }
+            }
+        } else if (task.tensor_index < engine->tensors.size()) {
+            // BUGFIX 324: Add explicit bounds check for tensor_index ??            // Problem: task.tensor_index can be negative or out of bounds
+            // Accessing engine->tensors[task.tensor_index] with invalid index causes crash
+            // Solution: Check task.tensor_index >= 0 before use
+            if (task.tensor_index < 0) {
+                ok = 0;
+            } else {
+                const moe_tensor_record& rec = engine->tensors[task.tensor_index];
+            if (task.stage == moe_TRANSFER_STAGE_RAM_TO_PINNED &&
+                engine_bypass_staging_pipeline(engine)) {
+                ok = prefetch_tensor_disk_to_ram(engine, rec);
+            } else if (task.stage == moe_TRANSFER_STAGE_RAM_TO_PINNED &&
+                engine->io_config.enable_multistage_pipeline && engine->staging) {
+                if (enqueue_stage_or_retry(engine, engine->pinned_stage, task)) {
+                    ok = 1;
+                    terminal = 0;
+                    engine->pinned_stage.cv.notify_one();
+                } else {
+                    ok = preserve_requeue(task, moe_TRANSFER_STAGE_RAM_TO_PINNED);
+                    terminal = 0;
+                }
+            } else if (should_use_direct_device_path(engine, rec, task.target_tier, active_path)) {
+                ok = prefetch_tensor_direct_to_gpu(engine, rec);
+                if (ok == moe_DEVICE_COPY_BACKPRESSURE) {
+                    task.urgent = 1;
+                    task.stage = moe_TRANSFER_STAGE_PINNED_TO_GPU;
+                    ok = enqueue_stage_or_retry(engine, engine->gpu_stage, task) ? 1 : 0;
+                    if (ok) {
+                        terminal = 0;
+                        engine->gpu_stage.cv.notify_one();
+                    } else {

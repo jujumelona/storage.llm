@@ -439,6 +439,174 @@ def gguf_tensor_exact_bytes(tensor_type, shape):
     return row_bytes * rows if row_bytes and rows > 0 else 0
 
 
+def juju_row_stride_padding_enabled():
+    return os.environ.get("JUJU_ENABLE_ROW_STRIDE_PADDING", "1") != "0"
+
+
+def juju_row_stride_alignment_bytes():
+    raw = int(os.environ.get("JUJU_ROW_STRIDE_ALIGNMENT_BYTES", "64") or "64")
+    if raw <= 1:
+        return 1
+    return min(raw, 4096)
+
+
+def juju_row_stride_min_row_bytes():
+    return max(0, int(os.environ.get("JUJU_ROW_STRIDE_MIN_ROW_BYTES", "256") or "256"))
+
+
+def juju_row_stride_max_overhead_pct():
+    return max(0.0, float(os.environ.get("JUJU_ROW_STRIDE_MAX_OVERHEAD_PCT", "6.25") or "6.25"))
+
+
+def juju_tensor_matrix_shape(tensor):
+    shape = [int(v or 0) for v in (tensor.get("shape") or [])]
+    if not shape or shape[0] <= 0:
+        return 0, 0
+    rows = 1
+    for dim in shape[1:]:
+        rows *= max(0, int(dim or 0))
+    return rows, int(shape[0])
+
+
+def juju_tensor_storage_layout(tensor):
+    source_bytes = int(tensor.get("bytes") or 0)
+    rows, cols = juju_tensor_matrix_shape(tensor)
+    row_bytes = gguf_tensor_row_bytes(tensor.get("type"), cols)
+    logical_bytes = row_bytes * rows if row_bytes and rows > 0 else source_bytes
+    alignment = juju_row_stride_alignment_bytes()
+    layout = {
+        "logical_rows": int(rows),
+        "logical_cols": int(cols),
+        "source_row_bytes": int(row_bytes or 0),
+        "row_bytes": int(row_bytes or 0),
+        "row_stride_bytes": int(row_bytes or 0),
+        "row_padding_bytes": 0,
+        "source_bytes": int(source_bytes),
+        "logical_bytes": int(logical_bytes),
+        "juju_bytes": int(source_bytes),
+        "row_stride_alignment_bytes": int(alignment),
+        "row_stride_padded": False,
+        "row_layout": "source_gguf_quant_block_layout_preserved",
+    }
+    if (
+        not juju_row_stride_padding_enabled() or
+        source_bytes <= 0 or rows <= 1 or row_bytes <= 0 or
+        logical_bytes != source_bytes or row_bytes < juju_row_stride_min_row_bytes()
+    ):
+        return layout
+    row_stride = align_up(row_bytes, alignment)
+    if row_stride <= row_bytes:
+        return layout
+    padding_per_row = row_stride - row_bytes
+    padded_bytes = row_stride * rows
+    overhead_pct = ((padded_bytes - source_bytes) * 100.0 / source_bytes) if source_bytes else 0.0
+    max_overhead_pct = juju_row_stride_max_overhead_pct()
+    if max_overhead_pct > 0.0 and overhead_pct > max_overhead_pct:
+        layout["row_layout"] = "source_gguf_quant_block_layout_preserved_stride_padding_skipped_overhead"
+        return layout
+    layout.update({
+        "row_stride_bytes": int(row_stride),
+        "row_padding_bytes": int(padding_per_row),
+        "juju_bytes": int(padded_bytes),
+        "row_stride_padded": True,
+        "row_layout": "source_gguf_quant_blocks_row_stride_padded",
+        "row_stride_overhead_pct": round(overhead_pct, 6),
+    })
+    return layout
+
+
+def juju_tensor_payload_bytes(tensor):
+    return int(juju_tensor_storage_layout(tensor).get("juju_bytes") or 0)
+
+
+def juju_row_stride_stats(tensors):
+    stats = {
+        "enabled": juju_row_stride_padding_enabled(),
+        "alignment_bytes": juju_row_stride_alignment_bytes(),
+        "tensor_count": 0,
+        "padded_tensor_count": 0,
+        "source_bytes": 0,
+        "juju_bytes": 0,
+        "padding_bytes": 0,
+    }
+    for tensor in tensors or []:
+        layout = juju_tensor_storage_layout(tensor)
+        stats["tensor_count"] += 1
+        stats["source_bytes"] += int(layout["source_bytes"])
+        stats["juju_bytes"] += int(layout["juju_bytes"])
+        if layout.get("row_stride_padded"):
+            stats["padded_tensor_count"] += 1
+            stats["padding_bytes"] += int(layout["juju_bytes"]) - int(layout["source_bytes"])
+    if stats["source_bytes"] > 0:
+        stats["padding_overhead_pct"] = round(
+            stats["padding_bytes"] * 100.0 / stats["source_bytes"], 6
+        )
+    else:
+        stats["padding_overhead_pct"] = 0.0
+    return stats
+
+
+def juju_tensor_source_segment(tensor, tensor_offset, layout=None):
+    layout = layout or juju_tensor_storage_layout(tensor)
+    segment = {
+        "offset": int(tensor_offset),
+        "size": int(layout["juju_bytes"]),
+        "source_offset": int(tensor["source_offset"]),
+    }
+    if layout.get("row_stride_padded"):
+        segment.update({
+            "kind": "row_padded_source",
+            "rows": int(layout["logical_rows"]),
+            "row_bytes": int(layout["row_bytes"]),
+            "row_stride_bytes": int(layout["row_stride_bytes"]),
+            "source_size": int(layout["source_bytes"]),
+        })
+    return segment
+
+
+def juju_tensor_index_record(tensor, bucket, tensor_offset, layout, contract):
+    runtime_priority = tensor_runtime_priority(tensor["name"], bucket, tensor["bytes"])
+    record = {
+        "name": tensor["name"],
+        "bucket": bucket,
+        "dims": tensor["dims"],
+        "shape": tensor["shape"],
+        "logical_rows": layout["logical_rows"],
+        "logical_cols": layout["logical_cols"],
+        "gguf_type": tensor["type"],
+        "gguf_type_name": gguf_type_name(tensor["type"]),
+        "weight_encoding": weight_encoding_from_gguf_type(tensor["type"], contract),
+        "quant_family": quant_family_from_gguf_type(tensor["type"], contract),
+        "kernel_key": kernel_key_from_gguf_type(tensor["type"], contract),
+        "row_layout": layout["row_layout"],
+        "source_offset": tensor["source_offset"],
+        "source_bytes": layout["source_bytes"],
+        "source_row_bytes": layout["source_row_bytes"],
+        "logical_bytes": layout["logical_bytes"],
+        "juju_offset": tensor_offset,
+        "juju_bytes": layout["juju_bytes"],
+        "row_bytes": layout["row_bytes"],
+        "row_stride_bytes": layout["row_stride_bytes"],
+        "row_padding_bytes": layout["row_padding_bytes"],
+        "row_stride_alignment_bytes": layout["row_stride_alignment_bytes"],
+        "row_stride_padded": bool(layout["row_stride_padded"]),
+        "alignment": 4096,
+        "kernel_contract": {
+            "must_have_dot_kernel": True,
+            "must_not_return_silent_zero": True,
+            "decode_key": kernel_key_from_gguf_type(tensor["type"], contract),
+            "source_type_preserved": True,
+            "logical_cols_are_math_extent": True,
+            "row_stride_bytes_are_storage_extent": True,
+        },
+        **juju_tensor_segmentation_fields(tensor["name"], bucket, contract),
+        **runtime_priority,
+    }
+    if "row_stride_overhead_pct" in layout:
+        record["row_stride_overhead_pct"] = layout["row_stride_overhead_pct"]
+    return record
+
+
 def gguf_tensor_byte_diagnostics(tensors, limit=32):
     mismatches = []
     type_stats = {}
@@ -735,12 +903,12 @@ def juju_estimated_tensor_payload_bytes(tensors, is_first_shard=True):
     total = JUJU_SPLIT_METADATA_RESERVE_BYTES if is_first_shard else 32 * 1024 * 1024
     for tensor in tensors:
         total = align_up(total, 4096)
-        total += int(tensor.get("bytes") or 0)
+        total += juju_tensor_payload_bytes(tensor)
     return total
 
 
 def juju_aligned_tensor_bytes(tensor):
-    return align_up(int(tensor.get("bytes") or 0), 4096)
+    return align_up(juju_tensor_payload_bytes(tensor), 4096)
 
 
 def juju_groups_fit_upload_limits(groups, payload_limit_first, payload_limit_sub):
@@ -1138,6 +1306,20 @@ def write_padding(out, alignment=4096, digest=None):
             digest.update(data)
 
 
+def write_zero_bytes(out, size, digest=None, chunk_size=1024 * 1024):
+    remaining = int(size or 0)
+    if remaining <= 0:
+        return
+    zero = b"\x00" * min(chunk_size, remaining)
+    while remaining > 0:
+        take = min(len(zero), remaining)
+        data = zero if take == len(zero) else zero[:take]
+        out.write(data)
+        if digest is not None:
+            digest.update(data)
+        remaining -= take
+
+
 def stream_range(session, url, start, size, out, token, digest, chunk_size=16 * 1024 * 1024):
     if size <= 0:
         return
@@ -1156,6 +1338,31 @@ def stream_range(session, url, start, size, out, token, digest, chunk_size=16 * 
         raise EOFError(f"short tensor range read: expected {size}, got {written}")
 
 
+def stream_juju_tensor_payload(session, url, tensor, out, token, digest, chunk_size=16 * 1024 * 1024):
+    layout = juju_tensor_storage_layout(tensor)
+    source_offset = int(tensor["source_offset"])
+    if not layout.get("row_stride_padded"):
+        stream_range(session, url, source_offset, int(tensor["bytes"]), out, token, digest, chunk_size=chunk_size)
+        return layout
+    rows = int(layout["logical_rows"])
+    row_bytes = int(layout["row_bytes"])
+    row_stride = int(layout["row_stride_bytes"])
+    row_pad = row_stride - row_bytes
+    for row in range(rows):
+        stream_range(
+            session,
+            url,
+            source_offset + row * row_bytes,
+            row_bytes,
+            out,
+            token,
+            digest,
+            chunk_size=chunk_size,
+        )
+        write_zero_bytes(out, row_pad, digest)
+    return layout
+
+
 def sha256_juju_section_ranges(session, url, section_offset, section_size, ranges, token=None, chunk_size=16 * 1024 * 1024):
     digest = hashlib.sha256()
     cursor = int(section_offset)
@@ -1169,20 +1376,43 @@ def sha256_juju_section_ranges(session, url, section_offset, section_size, range
         size = int(item["size"])
         if size <= 0:
             continue
-        remaining = size
-        pos = start
-        while remaining > 0:
-            take = min(int(chunk_size), remaining)
-            resp = fetch_range(session, url, pos, pos + take - 1, token=token, stream=False)
-            try:
-                data = resp.content
-            finally:
-                resp.close()
-            if len(data) != take:
-                raise EOFError(f"short checksum range read: expected {take}, got {len(data)}")
-            digest.update(data)
-            pos += take
-            remaining -= take
+        if item.get("kind") == "row_padded_source":
+            rows = int(item["rows"])
+            row_bytes = int(item["row_bytes"])
+            row_stride = int(item["row_stride_bytes"])
+            row_pad = row_stride - row_bytes
+            for row in range(rows):
+                remaining = row_bytes
+                pos = start + row * row_bytes
+                while remaining > 0:
+                    take = min(int(chunk_size), remaining)
+                    resp = fetch_range(session, url, pos, pos + take - 1, token=token, stream=False)
+                    try:
+                        data = resp.content
+                    finally:
+                        resp.close()
+                    if len(data) != take:
+                        raise EOFError(f"short checksum range read: expected {take}, got {len(data)}")
+                    digest.update(data)
+                    pos += take
+                    remaining -= take
+                if row_pad > 0:
+                    digest.update(b"\x00" * row_pad)
+        else:
+            remaining = size
+            pos = start
+            while remaining > 0:
+                take = min(int(chunk_size), remaining)
+                resp = fetch_range(session, url, pos, pos + take - 1, token=token, stream=False)
+                try:
+                    data = resp.content
+                finally:
+                    resp.close()
+                if len(data) != take:
+                    raise EOFError(f"short checksum range read: expected {take}, got {len(data)}")
+                digest.update(data)
+                pos += take
+                remaining -= take
         cursor += size
     if section_end > cursor:
         digest.update(b"\x00" * (section_end - cursor))
@@ -1460,7 +1690,17 @@ def juju_format_extension_contract(contract):
         "length_unit": "exact_payload_byte_length",
         "alignment_bytes": 4096,
         "endianness": "little",
-        "tensor_payload_layout": "source_bytes_preserved_without_requantization",
+        "tensor_payload_layout": "source_quant_rows_preserved_with_optional_row_stride_padding",
+        "row_stride_contract": {
+            "enabled_by_default": True,
+            "logical_cols_are_math_extent": True,
+            "row_stride_bytes_are_storage_extent": True,
+            "padding_bytes_must_decode_as_zero_and_must_not_be_consumed_by_kernels": True,
+            "default_alignment_bytes": 64,
+            "env_enable": "JUJU_ENABLE_ROW_STRIDE_PADDING",
+            "env_alignment": "JUJU_ROW_STRIDE_ALIGNMENT_BYTES",
+            "env_max_overhead_pct": "JUJU_ROW_STRIDE_MAX_OVERHEAD_PCT",
+        },
         "json_sections_are_extension_surface": True,
         "additive_json_fields_allowed": True,
         "unknown_json_field_policy": "engine_ignore_if_not_required",
@@ -1494,6 +1734,7 @@ def juju_format_extension_contract(contract):
             "MODEL_META.validation_contract",
             "TENSOR_INDEX.tensors[].extension",
             "TENSOR_INDEX.tensors[].kernel_contract",
+            "TENSOR_INDEX.tensors[].row_stride_bytes",
             "GRAPH_IR.runtime_policy",
             "GRAPH_IR.execution_plan",
             "GRAPH_IR.priority_tables",
@@ -2029,6 +2270,48 @@ def _juju_expert_projection_name(name):
     return "expert"
 
 
+def juju_tensor_segmentation_fields(name, bucket, contract):
+    segment_policy = u32(contract_value(contract, "segment_policy", "expert_segmentation_contract.segment_policy", default=2))
+    allow_partial = bool(contract_value(
+        contract,
+        "allow_partial_expert_segments",
+        "expert_segmentation_contract.allow_partial_expert_segments",
+        default=False,
+    ))
+    importance_ordered = bool(contract_value(
+        contract,
+        "importance_ordered_rows",
+        "expert_segmentation_contract.importance_ordered_rows",
+        default=False,
+    ))
+    runtime_partial = bool(contract_value(
+        contract,
+        "partial_execution_runtime_enabled",
+        "expert_segmentation_contract.partial_execution_runtime_enabled",
+        default=False,
+    ))
+    routed = is_routed_expert_tensor_name(name)
+    can_partial = bool(routed and allow_partial and importance_ordered and runtime_partial and segment_policy in {3, 4})
+    partial_accuracy = float(contract_value(
+        contract,
+        "partial_accuracy",
+        "expert_segmentation_contract.partial_accuracy",
+        default=(0.90 if can_partial else 0.0),
+    ) or 0.0)
+    return {
+        "segment_policy": int(segment_policy),
+        "can_partial_exec": bool(can_partial),
+        "partial_accuracy": float(partial_accuracy if can_partial else 0.0),
+        "segment_contract": {
+            "policy": int(segment_policy),
+            "partial_enabled": bool(can_partial),
+            "requires_importance_ordered_rows": True,
+            "requires_runtime_partial_kernel": True,
+            "exact_ppl_default": True,
+        },
+    }
+
+
 def _juju_layer_expert_groups(tensor_records):
     layers = {}
     for rec in tensor_records or []:
@@ -2043,6 +2326,7 @@ def _juju_layer_expert_groups(tensor_records):
         layer_entry.setdefault(proj, []).append({
             "name": name,
             "bucket": rec.get("bucket"),
+            "shape": rec.get("shape"),
             "bytes": int(rec.get("juju_bytes") or rec.get("source_bytes") or 0),
             "prefetch_priority": int(rec.get("prefetch_priority") or 0),
             "runtime_priority": int(rec.get("runtime_priority") or 0),
@@ -2090,8 +2374,23 @@ def build_juju_predictor_section(tensor_records, contract, split_meta):
 def build_juju_buddy_map_section(tensor_records, contract, split_meta):
     expert_layers = _juju_layer_expert_groups(tensor_records)
     buddy_units = []
+    expert_bundles = []
     for layer in expert_layers:
         projections = layer["projection_groups"]
+        max_experts = 0
+        per_projection_bytes = {}
+        for proj, entries in projections.items():
+            proj_bytes = 0
+            proj_experts = 0
+            for entry in entries:
+                shape = entry.get("shape") or []
+                experts = int(shape[2]) if len(shape) >= 3 and int(shape[2] or 0) > 0 else 0
+                if experts > 0:
+                    proj_experts = max(proj_experts, experts)
+                    proj_bytes += int(entry.get("bytes") or 0) // max(1, experts)
+            if proj_experts > 0:
+                max_experts = max(max_experts, proj_experts)
+                per_projection_bytes[proj] = proj_bytes
         buddy_units.append({
             "layer": layer["layer"],
             "unit": "routed_expert_projection_bundle",
@@ -2099,13 +2398,29 @@ def build_juju_buddy_map_section(tensor_records, contract, split_meta):
             "projection_groups": projections,
             "tensor_count": layer["tensor_count"],
             "bytes": layer["bytes"],
+            "expert_count": max_experts,
         })
+        if max_experts > 0:
+            projection_order = [p for p in ("gate_up", "gate", "up", "down") if p in per_projection_bytes]
+            bundle_bytes = sum(per_projection_bytes.get(p, 0) for p in projection_order)
+            for expert_id in range(max_experts):
+                expert_bundles.append({
+                    "layer": layer["layer"],
+                    "expert": expert_id,
+                    "unit": "routed_expert_projection_bundle",
+                    "projection_order": projection_order,
+                    "bytes": int(bundle_bytes),
+                    "buddy_expert_ids": [],
+                    "coactivation_source": "runtime_mutable",
+                })
     return {
         "format": "JUJU_BUDDY_MAP_V1",
         "construction": "generic_layer_projection_grouping",
         "split": split_meta,
         "buddy_units": buddy_units,
+        "expert_bundles": expert_bundles,
         "unit_count": len(buddy_units),
+        "expert_bundle_count": len(expert_bundles),
         "tensor_count": sum(unit["tensor_count"] for unit in buddy_units),
         "runtime_update_allowed": True,
     }
@@ -2694,6 +3009,7 @@ def build_juju_shard_plan_from_hf_url(
             "artifact_source_name": artifact_source_name,
             "tensor_count": len(active_tensors),
         }
+        row_stride_stats = juju_row_stride_stats(active_tensors)
         modality_meta = juju_modality_metadata(contract, active_tensors)
         modality_flags = int(modality_meta["modality_flags"])
         pos = JUJU_HEADER_BYTES
@@ -2711,7 +3027,16 @@ def build_juju_shard_plan_from_hf_url(
             "artifact_source_name": artifact_source_name,
             "weight_file": artifact_names["weights"],
             "index_file": artifact_names["index"],
-            "tensor_payload_layout": "4kb_aligned_tensor_sections",
+            "tensor_payload_layout": "4kb_aligned_sections_optional_row_stride_padded_rows",
+            "row_stride_policy": {
+                "enabled": juju_row_stride_padding_enabled(),
+                "alignment_bytes": juju_row_stride_alignment_bytes(),
+                "min_row_bytes": juju_row_stride_min_row_bytes(),
+                "max_overhead_pct": juju_row_stride_max_overhead_pct(),
+                "logical_cols_are_math_extent": True,
+                "row_stride_bytes_are_storage_extent": True,
+            },
+            "row_stride_stats": row_stride_stats,
             "artifact_name_policy": "preserve_original_shard_stem_change_extension_only",
             "graph_ir_format": "JUJU_GRAPH_IR_V1",
             "graph_ir_required": True,
@@ -2749,39 +3074,12 @@ def build_juju_shard_plan_from_hf_url(
             for tensor in group:
                 pos = align_up(pos, 4096)
                 tensor_offset = pos
-                source_segment = {
-                    "offset": tensor_offset,
-                    "size": tensor["bytes"],
-                    "source_offset": tensor["source_offset"],
-                }
+                layout = juju_tensor_storage_layout(tensor)
+                source_segment = juju_tensor_source_segment(tensor, tensor_offset, layout)
                 source_segments.append(source_segment)
                 section_source_ranges.append(source_segment)
-                runtime_priority = tensor_runtime_priority(tensor["name"], bucket, tensor["bytes"])
-                tensor_records.append({
-                    "name": tensor["name"],
-                    "bucket": bucket,
-                    "dims": tensor["dims"],
-                    "shape": tensor["shape"],
-                    "gguf_type": tensor["type"],
-                    "gguf_type_name": gguf_type_name(tensor["type"]),
-                    "weight_encoding": weight_encoding_from_gguf_type(tensor["type"], contract),
-                    "quant_family": quant_family_from_gguf_type(tensor["type"], contract),
-                    "kernel_key": kernel_key_from_gguf_type(tensor["type"], contract),
-                    "row_layout": "source_gguf_quant_block_layout_preserved",
-                    "source_offset": tensor["source_offset"],
-                    "source_bytes": tensor["bytes"],
-                    "juju_offset": tensor_offset,
-                    "juju_bytes": tensor["bytes"],
-                    "alignment": 4096,
-                    "kernel_contract": {
-                        "must_have_dot_kernel": True,
-                        "must_not_return_silent_zero": True,
-                        "decode_key": kernel_key_from_gguf_type(tensor["type"], contract),
-                        "source_type_preserved": True,
-                    },
-                    **runtime_priority,
-                })
-                pos += tensor["bytes"]
+                tensor_records.append(juju_tensor_index_record(tensor, bucket, tensor_offset, layout, contract))
+                pos += int(layout["juju_bytes"])
             size = pos - section_offset
             section_type = section_type_for_bucket(bucket)
             sections.append({
@@ -2813,7 +3111,7 @@ def build_juju_shard_plan_from_hf_url(
         )
         idx = {
             "format": "JUJU_IDX_JSON_V1",
-            "schema_version": 2,
+            "schema_version": 3,
             "mutable_runtime_index": True,
             "weight_file": artifact_names["weights"],
             "source_repo_id": source_repo_id,
@@ -2831,6 +3129,7 @@ def build_juju_shard_plan_from_hf_url(
             "tensor_count": len(tensor_records),
             "tensors": tensor_records,
             "sections": list(sections),
+            "row_stride_stats": row_stride_stats,
             **runtime_arch,
         }
         pos = add_json_section_at(pos, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
@@ -2862,7 +3161,7 @@ def build_juju_shard_plan_from_hf_url(
         "source_bytes": total_bytes,
         "tensor_count": len(tensor_records),
         "section_count": len(sections),
-        "storage_mode": "remote_range_to_streamed_4kb_aligned_juju_sections",
+        "storage_mode": "remote_range_to_streamed_4kb_aligned_juju_sections_optional_row_stride",
         "artifact_name_policy": "original_shard_stem_with_juju_extension",
         "fixed_segments": fixed_segments,
         "source_segments": source_segments,
@@ -2893,12 +3192,20 @@ class JujuVirtualFile(io.BufferedIOBase):
                 "data": segment["data"],
             })
         for segment in plan["source_segments"]:
-            segments.append({
-                "kind": "source",
+            item = {
+                "kind": segment.get("kind", "source"),
                 "offset": int(segment["offset"]),
                 "size": int(segment["size"]),
                 "source_offset": int(segment["source_offset"]),
-            })
+            }
+            if item["kind"] == "row_padded_source":
+                item.update({
+                    "rows": int(segment["rows"]),
+                    "row_bytes": int(segment["row_bytes"]),
+                    "row_stride_bytes": int(segment["row_stride_bytes"]),
+                    "source_size": int(segment.get("source_size") or 0),
+                })
+            segments.append(item)
         self._segments = sorted(segments, key=lambda item: item["offset"])
         self._offsets = [item["offset"] for item in self._segments]
 
@@ -2951,6 +3258,8 @@ class JujuVirtualFile(io.BufferedIOBase):
                     take = min(end - self._pos, segment["size"] - rel)
                     if segment["kind"] == "fixed":
                         chunks.append(segment["data"][rel:rel + take])
+                    elif segment["kind"] == "row_padded_source":
+                        chunks.append(self._read_row_padded_source_segment(segment, rel, take))
                     else:
                         chunks.append(self._read_source_segment(segment, rel, take))
                     self._pos += take
@@ -2962,10 +3271,15 @@ class JujuVirtualFile(io.BufferedIOBase):
             return b"".join(chunks)
 
     def _read_source_segment(self, segment, rel, size):
+        return self._read_source_abs(
+            int(segment["source_offset"]) + int(rel),
+            int(size),
+            int(segment["source_offset"]) + int(segment["size"]),
+        )
+
+    def _read_source_abs(self, source_abs, size, source_limit):
         out = []
         remaining = int(size)
-        source_abs = int(segment["source_offset"]) + int(rel)
-        segment_end = int(segment["source_offset"]) + int(segment["size"])
         while remaining > 0:
             if self._cache_start <= source_abs < self._cache_end:
                 cache_rel = source_abs - self._cache_start
@@ -2974,7 +3288,7 @@ class JujuVirtualFile(io.BufferedIOBase):
                 source_abs += take
                 remaining -= take
                 continue
-            fetch_end = min(segment_end, source_abs + max(self._remote_chunk, remaining)) - 1
+            fetch_end = min(int(source_limit), source_abs + max(self._remote_chunk, remaining)) - 1
             resp = fetch_range(
                 self._session,
                 self._plan["source_url"],
@@ -2992,6 +3306,32 @@ class JujuVirtualFile(io.BufferedIOBase):
             self._cache_start = source_abs
             self._cache_end = source_abs + len(data)
             self._cache_data = data
+        return b"".join(out)
+
+    def _read_row_padded_source_segment(self, segment, rel, size):
+        out = []
+        remaining = int(size)
+        pos = int(rel)
+        rows = int(segment["rows"])
+        row_bytes = int(segment["row_bytes"])
+        row_stride = int(segment["row_stride_bytes"])
+        source_base = int(segment["source_offset"])
+        source_limit = source_base + int(segment.get("source_size") or (rows * row_bytes))
+        while remaining > 0:
+            row = pos // row_stride
+            in_row = pos % row_stride
+            if row >= rows:
+                out.append(b"\x00" * remaining)
+                break
+            if in_row < row_bytes:
+                take = min(remaining, row_bytes - in_row)
+                source_abs = source_base + row * row_bytes + in_row
+                out.append(self._read_source_abs(source_abs, take, source_limit))
+            else:
+                take = min(remaining, row_stride - in_row)
+                out.append(b"\x00" * take)
+            pos += take
+            remaining -= take
         return b"".join(out)
 
     def close(self):
@@ -3176,6 +3516,7 @@ def write_juju_shard_from_hf_url(
             "artifact_source_name": artifact_source_name,
             "tensor_count": len(active_tensors),
         }
+        row_stride_stats = juju_row_stride_stats(active_tensors)
         modality_meta = juju_modality_metadata(contract, active_tensors)
         modality_flags = int(modality_meta["modality_flags"])
         with output_path.open("wb") as out:
@@ -3194,7 +3535,16 @@ def write_juju_shard_from_hf_url(
                 "artifact_source_name": artifact_source_name,
                 "weight_file": output_path.name,
                 "index_file": index_path.name,
-                "tensor_payload_layout": "4kb_aligned_tensor_sections",
+                "tensor_payload_layout": "4kb_aligned_sections_optional_row_stride_padded_rows",
+                "row_stride_policy": {
+                    "enabled": juju_row_stride_padding_enabled(),
+                    "alignment_bytes": juju_row_stride_alignment_bytes(),
+                    "min_row_bytes": juju_row_stride_min_row_bytes(),
+                    "max_overhead_pct": juju_row_stride_max_overhead_pct(),
+                    "logical_cols_are_math_extent": True,
+                    "row_stride_bytes_are_storage_extent": True,
+                },
+                "row_stride_stats": row_stride_stats,
                 "artifact_name_policy": "preserve_original_shard_stem_change_extension_only",
                 "graph_ir_format": "JUJU_GRAPH_IR_V1",
                 "graph_ir_required": True,
@@ -3232,41 +3582,16 @@ def write_juju_shard_from_hf_url(
                 for tensor in group:
                     write_padding(out, 4096, digest=digest)
                     tensor_offset = out.tell()
-                    stream_range(
+                    layout = stream_juju_tensor_payload(
                         session,
                         source_url,
-                        tensor["source_offset"],
-                        tensor["bytes"],
+                        tensor,
                         out,
                         token,
                         digest,
                         chunk_size=chunk_size,
                     )
-                    runtime_priority = tensor_runtime_priority(tensor["name"], bucket, tensor["bytes"])
-                    tensor_records.append({
-                        "name": tensor["name"],
-                        "bucket": bucket,
-                        "dims": tensor["dims"],
-                        "shape": tensor["shape"],
-                        "gguf_type": tensor["type"],
-                        "gguf_type_name": gguf_type_name(tensor["type"]),
-                        "weight_encoding": weight_encoding_from_gguf_type(tensor["type"], contract),
-                        "quant_family": quant_family_from_gguf_type(tensor["type"], contract),
-                        "kernel_key": kernel_key_from_gguf_type(tensor["type"], contract),
-                        "row_layout": "source_gguf_quant_block_layout_preserved",
-                        "source_offset": tensor["source_offset"],
-                        "source_bytes": tensor["bytes"],
-                        "juju_offset": tensor_offset,
-                        "juju_bytes": tensor["bytes"],
-                        "alignment": 4096,
-                        "kernel_contract": {
-                            "must_have_dot_kernel": True,
-                            "must_not_return_silent_zero": True,
-                            "decode_key": kernel_key_from_gguf_type(tensor["type"], contract),
-                            "source_type_preserved": True,
-                        },
-                        **runtime_priority,
-                    })
+                    tensor_records.append(juju_tensor_index_record(tensor, bucket, tensor_offset, layout, contract))
                 size = out.tell() - offset
                 section_type = section_type_for_bucket(bucket)
                 sections.append({
@@ -3298,7 +3623,7 @@ def write_juju_shard_from_hf_url(
             )
             idx = {
                 "format": "JUJU_IDX_JSON_V1",
-                "schema_version": 2,
+                "schema_version": 3,
                 "mutable_runtime_index": True,
                 "weight_file": output_path.name,
                 "source_repo_id": source_repo_id,
@@ -3316,6 +3641,7 @@ def write_juju_shard_from_hf_url(
                 "tensor_count": len(tensor_records),
                 "tensors": tensor_records,
                 "sections": sections,
+                "row_stride_stats": row_stride_stats,
                 **runtime_arch,
             }
             add_json_section(out, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
@@ -3348,7 +3674,7 @@ def write_juju_shard_from_hf_url(
         "source_sha256": "",
         "tensor_count": len(tensor_records),
         "section_count": len(sections),
-        "storage_mode": "remote_range_to_4kb_aligned_juju_sections",
+        "storage_mode": "remote_range_to_4kb_aligned_juju_sections_optional_row_stride",
         "artifact_name_policy": "original_shard_stem_with_juju_extension",
     }
 

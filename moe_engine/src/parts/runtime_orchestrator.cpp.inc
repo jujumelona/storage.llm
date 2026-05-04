@@ -161,14 +161,19 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
     const uint32_t busy_task_threshold = hw;  // Already guaranteed > 0
     const bool os_busy = os_tasks >= busy_task_threshold;
     plan->allow_gpu_dense = gpu <= policy_gpu_target(policy);
-    plan->route_sparse_to_cpu = cpu <= policy_cpu_target(policy);
+    // BUGFIX Problem B: Renamed route_sparse_to_cpu → allow_speculative_prefetch ★★ FIXED
+    // Problem: Original name implied CPU offload routing, but feature was never implemented
+    // Flag only affects throttle_speculative calculation (speculative prefetch control)
+    // Solution: Rename to clarify actual purpose - controls whether speculative prefetch is allowed
+    // Impact: Code now matches actual behavior, no functional change
+    plan->allow_speculative_prefetch = cpu <= policy_cpu_target(policy);
     if (os_busy && policy != moe_EXECUTION_PERFORMANCE) {
         plan->disk_workers = plan->disk_workers > 1u ? plan->disk_workers / 2u : 1u;
         plan->pinned_workers = 1u;
         plan->gpu_workers = 1u;
         plan->prefetch_window_layers = plan->prefetch_window_layers > 1u ? plan->prefetch_window_layers - 1u : 1u;
     }
-    plan->throttle_speculative = !plan->allow_gpu_dense || !plan->route_sparse_to_cpu || os_busy;
+    plan->throttle_speculative = !plan->allow_gpu_dense || !plan->allow_speculative_prefetch || os_busy;
     plan->drop_speculative = policy == moe_EXECUTION_LOW_IMPACT && plan->throttle_speculative;
     const bool gpu_cache_ready = engine_has_device_upload_workers(engine) &&
         vram_expert_budget_bytes(engine) > 0 && plan->allow_gpu_dense;
@@ -432,4 +437,3 @@ static void prescope_compute_global_plan(
         }
     }
 }
-

@@ -9,6 +9,10 @@ static int device_prepare_tensor_allocation(
     CUdeviceptr* out_dst,
     const void* host_ptr = nullptr
 ) {
+    // BUGFIX Issue 6: Validate staging_slot_size before any staging slot access ★★★
+    // Problem: After reset_staging_slots timeout, staging_slot_size = 0 but vector not cleared
+    // Code that checks slot_index < staging_slots.size() passes, but slot.buf may be nullptr
+    // Solution: Check staging_slot_size > 0 before using any slot
     if (!e || !out_dst) {
         return 0;
     }
@@ -133,15 +137,6 @@ static int device_prepare_tensor_allocation(
             if (auto* c = device_pool_counter(e, pool)) {
                 c->fetch_add(bytes);
             }
-        // Fix 64: cuMemGetInfo is slow driver call →do NOT call under device_mutex
-            const uint64_t bud = device_budget_bytes(e);
-            // BUGFIX 99: Precompute percentage threshold
-            const uint64_t bud_threshold_85 = (bud * 85ull) / 100ull;
-            if (bud > 0 && e->device_allocated_bytes.load(std::memory_order_relaxed) > bud_threshold_85) {
-                // BUGFIX 90: Fix Lost Wakeup by setting vram_eviction_needed before notify
-                e->vram_eviction_needed.store(true, std::memory_order_relaxed);
-                e->vram_eviction_cv.notify_one();
-            }
             a = &e->device_allocations.emplace(key, next).first->second;
             if (pool == moe_DEVICE_POOL_ACTIVATION) {
                 e->activation_keys.insert(key);
@@ -151,9 +146,21 @@ static int device_prepare_tensor_allocation(
     } else {
         a = &it->second;
     }
+    const uint64_t allocated_snapshot = e->device_allocated_bytes.load(std::memory_order_relaxed);
+    lock.unlock();
+
+    const uint64_t bud = device_budget_bytes(e);
+    const uint64_t bud_threshold_85 = (bud * 85ull) / 100ull;
+    if (bud > 0 && allocated_snapshot > bud_threshold_85) {
+        e->vram_eviction_needed.store(true, std::memory_order_relaxed);
+        e->vram_eviction_cv.notify_one();
+    }
+
     if (!a) {
         return 0;
     }
+
+    lock.lock();
     if (async_copy && !device_mark_copy_pending_locked(e, key)) {
         device_free_locked(e, key, &deferred_free_ptrs);
         lock.unlock();

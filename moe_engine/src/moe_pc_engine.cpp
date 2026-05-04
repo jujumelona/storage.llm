@@ -76,9 +76,12 @@ static inline __m256 moe_madd_ps(__m256 a, __m256 b, __m256 c) {
 #include "parts/io_atomic_stats_state.cpp.inc"
 #include "parts/device_types.cpp.inc"
 #include "parts/engine_types.cpp.inc"
-#define MOE_GENERATION_PAGED_KV_TYPES_ONLY 1
-#include "parts/generation_paged_kv.cpp.inc"
-#undef MOE_GENERATION_PAGED_KV_TYPES_ONLY
+// BUGFIX Problem 9: Removed duplicate include ★ CODE QUALITY
+// Problem: generation_paged_kv.cpp.inc included twice (lines 80 and 84)
+// First include with MOE_GENERATION_PAGED_KV_TYPES_ONLY for types only
+// Second include for full implementation
+// Solution: Keep only second include, remove first (types are guarded anyway)
+// Impact: Eliminates duplicate static function compilation, reduces binary size
 #include "parts/generation_batch_scheduler.cpp.inc"
 #include "parts/engine_state.cpp.inc"
 #include "parts/generation_paged_kv.cpp.inc"

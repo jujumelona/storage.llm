@@ -30,13 +30,13 @@ static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {
     // while clear() invalidates them. This causes iterator invalidation and crashes.
     // Solution: Stop all workers first, then clear state, then restart workers if needed.
     // Note: Caller (set_model_root) will restart workers after loading new model.
-    
+
     // Stop IO workers (disk, pinned, gpu workers)
     stop_io_workers(engine);
-    
+
     // Stop CPU row workers (parallel computation threads)
     stop_cpu_row_workers(engine);
-    
+
     // Now safe to clear all state
     engine->offload_gguf_valid.store(0, std::memory_order_relaxed);
     engine->offload_gguf_file_count.store(0, std::memory_order_relaxed);
@@ -96,6 +96,22 @@ static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {
     engine->juju_priority_tensor_count.store(0, std::memory_order_relaxed);
     engine->juju_fastmem_tensor_count.store(0, std::memory_order_relaxed);
     engine->juju_slowmem_tensor_count.store(0, std::memory_order_relaxed);
+    engine->juju_predictor_metadata_ready.store(0, std::memory_order_relaxed);
+    engine->juju_predictor_layer_count.store(0, std::memory_order_relaxed);
+    engine->juju_predictor_expert_tensor_count.store(0, std::memory_order_relaxed);
+    engine->juju_buddy_map_ready.store(0, std::memory_order_relaxed);
+    engine->juju_buddy_unit_count.store(0, std::memory_order_relaxed);
+    engine->juju_buddy_tensor_count.store(0, std::memory_order_relaxed);
+    engine->juju_buddy_explicit_edge_count.store(0, std::memory_order_relaxed);
+    engine->juju_tier_hint_ready.store(0, std::memory_order_relaxed);
+    engine->juju_tier_hot_expert_tensor_count.store(0, std::memory_order_relaxed);
+    engine->juju_tier_warm_expert_tensor_count.store(0, std::memory_order_relaxed);
+    engine->juju_tier_cold_expert_tensor_count.store(0, std::memory_order_relaxed);
+    engine->juju_partial_expert_tensor_count.store(0, std::memory_order_relaxed);
+    engine->expert_segment_policies.clear();
+    engine->expert_partial_exec_flags.clear();
+    engine->expert_partial_accuracy_milli.clear();
+    engine->juju_buddy_expert_ids.clear();
     engine->offload_gguf_first_file.clear();
     engine->offload_gguf_metadata_json.clear();
     engine->offload_weight_quant_family.clear();

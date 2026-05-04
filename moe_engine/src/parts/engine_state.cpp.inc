@@ -35,6 +35,10 @@ struct moe_pc_engine {
     std::vector<uint64_t> expert_bytes;
     std::vector<uint16_t> expert_prefetch_priorities;
     std::vector<uint8_t> expert_residency_hints;
+    std::vector<uint8_t> expert_segment_policies;
+    std::vector<uint8_t> expert_partial_exec_flags;
+    std::vector<uint16_t> expert_partial_accuracy_milli;
+    std::vector<std::vector<int>> juju_buddy_expert_ids;
     uint64_t avg_expert_bytes = 0;
     std::atomic<uint64_t> max_tensor_stream_bytes{0};
     std::unordered_map<std::string, mmap_context_t*> shard_mmaps;
@@ -176,6 +180,12 @@ struct moe_pc_engine {
     alignas(64) std::atomic<uint64_t> vram_kv_used_bytes{0};
     std::atomic<uint64_t> vram_kv_budget_bytes{0};  // Set during init
 
+    // BUGFIX Issue 4: Add per-engine warning timers ★★★
+    // Problem: Static timers shared across all engines suppress warnings
+    // Solution: Per-engine atomic timers for independent warning rate-limiting
+    std::atomic<int64_t> last_budget_warn_ms{0};
+    std::atomic<uint64_t> last_expert_budget_warn_ms{0};
+
     // BUGFIX 문제8: Merge map rebuild trigger ★★★
     std::atomic<bool> merge_map_rebuild_pending{false};
 
@@ -281,6 +291,18 @@ struct moe_pc_engine {
     std::atomic<uint64_t> juju_priority_tensor_count{0};
     std::atomic<uint64_t> juju_fastmem_tensor_count{0};
     std::atomic<uint64_t> juju_slowmem_tensor_count{0};
+    std::atomic<uint32_t> juju_predictor_metadata_ready{0};
+    std::atomic<uint32_t> juju_predictor_layer_count{0};
+    std::atomic<uint64_t> juju_predictor_expert_tensor_count{0};
+    std::atomic<uint32_t> juju_buddy_map_ready{0};
+    std::atomic<uint32_t> juju_buddy_unit_count{0};
+    std::atomic<uint64_t> juju_buddy_tensor_count{0};
+    std::atomic<uint64_t> juju_buddy_explicit_edge_count{0};
+    std::atomic<uint32_t> juju_tier_hint_ready{0};
+    std::atomic<uint64_t> juju_tier_hot_expert_tensor_count{0};
+    std::atomic<uint64_t> juju_tier_warm_expert_tensor_count{0};
+    std::atomic<uint64_t> juju_tier_cold_expert_tensor_count{0};
+    std::atomic<uint64_t> juju_partial_expert_tensor_count{0};
     std::string offload_gguf_first_file;
     std::string offload_gguf_metadata_json;
     std::string offload_weight_quant_family;

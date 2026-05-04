@@ -500,10 +500,23 @@ static int map_common_tensor_record(
     info.cols = desc.cols;
     info.weight_byte_length = rec.bytes;
     entry.weight_row_bytes = infer_weight_row_bytes(info, entry.weight_format);
-    if ((!entry.weight_row_bytes ||
-         entry.weight_row_bytes * (uint64_t)entry.rows > entry.bytes) &&
-        entry.rows && entry.bytes % (uint64_t)entry.rows == 0) {
-        entry.weight_row_bytes = entry.bytes / (uint64_t)entry.rows;
+    if (rec.weight_row_bytes >= entry.weight_row_bytes &&
+        entry.rows > 0 &&
+        rec.weight_row_bytes <= entry.bytes &&
+        rec.weight_row_bytes <= UINT64_MAX / (uint64_t)entry.rows &&
+        (uint64_t)entry.rows * rec.weight_row_bytes <= entry.bytes) {
+        entry.weight_row_bytes = rec.weight_row_bytes;
+    }
+    if (entry.rows) {
+        const uint64_t rows64 = (uint64_t)entry.rows;
+        const int stride_out_of_range =
+            entry.weight_row_bytes &&
+            (entry.weight_row_bytes > UINT64_MAX / rows64 ||
+             entry.weight_row_bytes * rows64 > entry.bytes);
+        if ((!entry.weight_row_bytes || stride_out_of_range) &&
+            entry.bytes % rows64 == 0) {
+            entry.weight_row_bytes = entry.bytes / rows64;
+        }
     }
     *out_entry = entry;
     return 1;

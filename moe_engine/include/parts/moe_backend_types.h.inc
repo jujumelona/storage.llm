@@ -12,6 +12,8 @@ typedef struct {
     uint64_t recommended_pinned_bytes;
     int supports_fp4;
     int supports_scale4;
+    int supports_native_nvfp4_gemm;
+    int supports_native_mxfp4_gemm;
     int supports_weight_q2;
     int supports_weight_q3;
     int supports_weight_q4;
@@ -29,6 +31,11 @@ typedef struct {
     int supports_mmap;
     int supports_directstorage;
     int supports_gpudirect_storage;
+    // BUGFIX Platform Issue: AMD APU zero-copy validation ★★★
+    // Problem: supports_unified_memory doesn't guarantee mmap GPU accessibility
+    // AMD ROCm versions vary in zero-copy support
+    // Solution: Add explicit flag for validated GPU-accessible mmap
+    int unified_mmap_gpu_accessible;
     int supports_metal;
     int supports_vulkan;
     int supports_cuda;
