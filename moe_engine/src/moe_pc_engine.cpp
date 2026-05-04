@@ -84,8 +84,8 @@ static inline __m256 moe_madd_ps(__m256 a, __m256 b, __m256 c) {
 // Solution: Keep only second include, remove first (types are guarded anyway)
 // Impact: Eliminates duplicate static function compilation, reduces binary size
 #include "parts/generation_batch_scheduler.cpp.inc"
-#include "parts/engine_state.cpp.inc"
 #include "parts/generation_paged_kv.cpp.inc"
+#include "parts/engine_state.cpp.inc"
 #include "parts/csv_numbers.cpp.inc"
 #include "parts/projection_parse.cpp.inc"
 #include "parts/tensor_slots.cpp.inc"
