@@ -1272,11 +1272,10 @@ static bool load_chat_template_text(const server_options& opts, std::string* out
     };
     for (const char* rel : candidates) {
         const std::string path = join_model_file(opts.model_root, rel);
-        uint64_t bytes = 0;
-        if (file_size_bytes(path, &bytes) && bytes > 0 && bytes <= (1ull << 20) &&
-            read_text_file(path, out) && !out->empty()) {
+        if (read_text_file(path, out) && !out->empty() && out->size() <= (1u << 20)) {
             return true;
         }
+        out->clear();
     }
     return false;
 }
