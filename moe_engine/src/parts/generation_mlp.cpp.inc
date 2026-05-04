@@ -538,7 +538,10 @@ static int moe_layer_apply_expert_down_scale_f32(
     }
     static const char* const suffixes[] = {
         "ffn_down_exps.scale",
-        "ffn_gate_inp.per_expert_scale"
+        "ffn_gate_inp.per_expert_scale",
+        "router.per_expert_scale",
+        "mlp.router.per_expert_scale",
+        "moe.gate.per_expert_scale"
     };
     moe_raw_tensor_cache_entry raw{};
     if (!moe_map_layer_common_tensor(engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]), &raw)) {
