@@ -4,6 +4,22 @@
 
 [Hugging Face Repository](https://huggingface.co/storagejuju) | License: MIT
 
+## Current Status: Active Bug-Fix Build
+
+StorageLLM and the published JUJU model artifacts are still experimental. The
+runtime is being fixed quickly, and several correctness and performance paths
+are not yet production-ready.
+
+Known active work:
+- PPL and KV-cache correctness validation is still in progress.
+- Continuous batching, some hardware async paths, and several platform-specific
+  acceleration paths are incomplete or being rewired.
+- Model artifacts may load, but output quality and speed can change while the
+  engine is being stabilized.
+
+If you downloaded the current artifacts, treat them as development builds. A
+series of runtime and format fixes will land over the next few days.
+
 ## Project Goal
 Storage-based offloading architecture for running large-scale MoE models in memory-constrained environments.
 
