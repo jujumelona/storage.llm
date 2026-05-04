@@ -1,7 +1,8 @@
-int moe_pc_engine_eval_token_ids(
+int moe_pc_engine_eval_token_ids_from(
     moe_pc_engine_t* engine,
     const int32_t* input_token_ids,
     uint32_t input_token_count,
+    uint32_t first_target_index,
     moe_eval_stats_t* out_stats
 ) {
     if (out_stats) {
@@ -12,6 +13,13 @@ int moe_pc_engine_eval_token_ids(
     const moe_attn_config_t attn_cfg = moe_generation_attn_config(engine);
     if (!engine || !c || !input_token_ids || input_token_count < 2) {
         moe_eval_set_error(out_stats, "eval requires at least two input tokens");
+        return 0;
+    }
+    if (first_target_index == 0) {
+        first_target_index = 1;
+    }
+    if (first_target_index >= input_token_count) {
+        moe_eval_set_error(out_stats, "eval target range is empty");
         return 0;
     }
     moe_forward_status_t forward{};
@@ -90,8 +98,9 @@ int moe_pc_engine_eval_token_ids(
     }
     moe_profile_log(
         "eval_input_ids",
-        "input_tokens=%u preview=[%s]%s",
+        "input_tokens=%u first_target=%u preview=[%s]%s",
         input_token_count,
+        first_target_index,
         eval_ids_preview,
         input_token_count > eval_ids_limit ? " truncated=1" : "");
     const uint64_t eval_start_us = moe_profile_now_us();
@@ -111,8 +120,9 @@ int moe_pc_engine_eval_token_ids(
     const int pre_allocate_kv = 0;
     moe_profile_log(
         "eval_prepare_begin",
-        "input_tokens=%u layers=%u hidden=%u max_seq=%u rope_len=%u kv_entry=%u prealloc=%d",
+        "input_tokens=%u first_target=%u layers=%u hidden=%u max_seq=%u rope_len=%u kv_entry=%u prealloc=%d",
         input_token_count,
+        first_target_index,
         c->num_hidden_layers,
         c->hidden_size,
         attn_cfg.max_seq_len,
@@ -141,6 +151,7 @@ int moe_pc_engine_eval_token_ids(
     scratch.position = 0;
 
     double nll = 0.0;
+    uint32_t evaluated = 0;
     moe_generation_stats_t gen_stats{};
     for (uint32_t i = 0; i + 1u < input_token_count; ++i) {
         moe_profile_log(
@@ -159,11 +170,18 @@ int moe_pc_engine_eval_token_ids(
             moe_eval_set_error(out_stats, gen_stats.error[0] ? gen_stats.error : "eval forward failed");
             return 0;
         }
+        const uint32_t target_index = i + 1u;
+        const int score_target = target_index >= first_target_index;
         moe_profile_log(
             "eval_forward_call_end",
-            "pos=%u token=%u",
+            "pos=%u token=%u score=%d",
             i,
-            (uint32_t)input_token_ids[i]);
+            (uint32_t)input_token_ids[i],
+            score_target);
+        if (!score_target) {
+            ++scratch.position;
+            continue;
+        }
 
         float target_logit = 0.0f;
         float logsumexp = 0.0f;
@@ -205,6 +223,7 @@ int moe_pc_engine_eval_token_ids(
             return 0;
         }
         nll += neg_logprob;
+        ++evaluated;
         ++scratch.position;
     }
 
@@ -213,7 +232,6 @@ int moe_pc_engine_eval_token_ids(
     // But function already checks input_token_count < 2 at start
     // However, if input_token_count == 1, evaluated = 0, division by zero in mean_nll
     // Solution: Add explicit check (defense in depth)
-    const uint32_t evaluated = input_token_count - 1u;
     if (evaluated == 0) {
         moe_eval_set_error(out_stats, "no tokens evaluated");
         return 0;
@@ -235,12 +253,27 @@ int moe_pc_engine_eval_token_ids(
     }
     moe_profile_log(
         "eval_done",
-        "input_tokens=%u evaluated=%u nll=%.9g mean_nll=%.9g ppl=%.9g total_ms=%.3f",
+        "input_tokens=%u first_target=%u evaluated=%u nll=%.9g mean_nll=%.9g ppl=%.9g total_ms=%.3f",
         input_token_count,
+        first_target_index,
         evaluated,
         nll,
         mean_nll,
         ppl,
         moe_profile_elapsed_ms(eval_start_us));
     return 1;
+}
+
+int moe_pc_engine_eval_token_ids(
+    moe_pc_engine_t* engine,
+    const int32_t* input_token_ids,
+    uint32_t input_token_count,
+    moe_eval_stats_t* out_stats
+) {
+    return moe_pc_engine_eval_token_ids_from(
+        engine,
+        input_token_ids,
+        input_token_count,
+        1u,
+        out_stats);
 }

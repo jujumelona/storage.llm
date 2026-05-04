@@ -145,6 +145,14 @@ int moe_pc_engine_eval_token_ids(
     moe_eval_stats_t* out_stats
 );
 
+int moe_pc_engine_eval_token_ids_from(
+    moe_pc_engine_t* engine,
+    const int32_t* input_token_ids,
+    uint32_t input_token_count,
+    uint32_t first_target_index,
+    moe_eval_stats_t* out_stats
+);
+
 // Continuous Batching API
 #if defined(MOE_ENABLE_PAGED_KV) && MOE_ENABLE_PAGED_KV
 int moe_pc_engine_submit_request(

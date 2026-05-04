@@ -1522,6 +1522,59 @@ static std::string extract_generation_text(
     return "";
 }
 
+static bool role_is_assistant_like(const std::string& role) {
+    return role == "assistant" || role == "model";
+}
+
+static bool encode_chat_response_only_eval(
+    const server_options& opts,
+    const server_tokenizer& tok,
+    const std::string& body,
+    std::vector<int32_t>* out_ids,
+    uint32_t* out_first_target_index
+) {
+    if (!out_ids || !out_first_target_index) {
+        return false;
+    }
+    std::vector<server_chat_message> messages;
+    if (!parse_chat_messages(body, &messages) || messages.size() < 2u) {
+        return false;
+    }
+    bool score_response_only = true;
+    (void)json_read_bool_in_range(body, 0, body.size(), "score_response_only", &score_response_only);
+    if (!score_response_only) {
+        return false;
+    }
+    const server_chat_message& last = messages.back();
+    if (!role_is_assistant_like(last.role) || last.content.empty()) {
+        return false;
+    }
+    bool enable_thinking = false;
+    (void)json_read_bool_in_range(body, 0, body.size(), "enable_thinking", &enable_thinking);
+    std::vector<server_chat_message> prompt_messages(messages.begin(), messages.end() - 1);
+    const std::string prompt = apply_sidecar_chat_template(opts, prompt_messages, true, enable_thinking);
+    if (prompt.empty()) {
+        return false;
+    }
+    std::vector<int32_t> prompt_ids;
+    std::vector<int32_t> full_ids;
+    if (!tokenizer_encode_greedy(tok, prompt, &prompt_ids) || prompt_ids.empty()) {
+        return false;
+    }
+    if (!tokenizer_encode_greedy(tok, prompt + last.content, &full_ids) ||
+        full_ids.size() <= prompt_ids.size()) {
+        return false;
+    }
+    *out_ids = std::move(full_ids);
+    *out_first_target_index = static_cast<uint32_t>(prompt_ids.size());
+    std::cerr << "[storagellm request] eval response_only_chat prompt_tokens="
+              << prompt_ids.size()
+              << " target_tokens=" << (out_ids->size() - prompt_ids.size())
+              << " input_tokens=" << out_ids->size()
+              << "\n" << std::flush;
+    return true;
+}
+
 struct server_generation_result {
     int ok = 0;
     int http_status = 200;
@@ -1687,31 +1740,41 @@ static server_eval_result run_server_eval(
     server_eval_result result;
     std::vector<int> request_ids = storagellm::json_read_int_array(body, "input_ids");
     std::vector<int32_t> input_ids;
+    uint32_t first_target_index = 1u;
     server_tokenizer& tok = get_server_tokenizer(opts);
     if (!request_ids.empty()) {
         input_ids.reserve(request_ids.size());
         for (int id : request_ids) {
             input_ids.push_back((int32_t)id);
         }
+        int parsed_first_target = 0;
+        if (storagellm::json_read_int(body, "first_target_index", &parsed_first_target) && parsed_first_target > 0) {
+            first_target_index = static_cast<uint32_t>(parsed_first_target);
+        }
     } else {
-        const std::string text = extract_generation_text(opts, body, false);
-        if (text.empty()) {
-            result.http_status = 400;
-            result.error_code = "invalid_request_error";
-            result.error_message = "eval request must include input, prompt, messages/content, or input_ids";
-            return result;
-        }
-        if (!tok.loaded) {
-            result.http_status = 503;
-            result.error_code = "tokenizer_unavailable";
-            result.error_message = tok.error.empty() ? "tokenizer.json is not loaded" : tok.error;
-            return result;
-        }
-        if (!tokenizer_encode_greedy(tok, text, &input_ids)) {
-            result.http_status = 422;
-            result.error_code = "tokenization_failed";
-            result.error_message = "tokenizer vocab could not encode the eval text";
-            return result;
+        if (tok.loaded && encode_chat_response_only_eval(opts, tok, body, &input_ids, &first_target_index)) {
+            // Chat eval with a final assistant message scores only the assistant
+            // response while still forwarding the full prompt as context.
+        } else {
+            const std::string text = extract_generation_text(opts, body, false);
+            if (text.empty()) {
+                result.http_status = 400;
+                result.error_code = "invalid_request_error";
+                result.error_message = "eval request must include input, prompt, messages/content, or input_ids";
+                return result;
+            }
+            if (!tok.loaded) {
+                result.http_status = 503;
+                result.error_code = "tokenizer_unavailable";
+                result.error_message = tok.error.empty() ? "tokenizer.json is not loaded" : tok.error;
+                return result;
+            }
+            if (!tokenizer_encode_greedy(tok, text, &input_ids)) {
+                result.http_status = 422;
+                result.error_code = "tokenization_failed";
+                result.error_message = "tokenizer vocab could not encode the eval text";
+                return result;
+            }
         }
     }
     if (input_ids.size() < 2) {
@@ -1728,6 +1791,23 @@ static server_eval_result run_server_eval(
               << "\n" << std::flush;
     moe_eval_stats_t stats{};
     int evaluated = 0;
+    const auto eval_tokens = [&]() -> int {
+        if (first_target_index != 1u) {
+            return moe_pc_engine_eval_token_ids_from(
+                engine,
+                input_ids.data(),
+                static_cast<uint32_t>(input_ids.size()),
+                first_target_index,
+                &stats
+            );
+        }
+        return moe_pc_engine_eval_token_ids(
+            engine,
+            input_ids.data(),
+            static_cast<uint32_t>(input_ids.size()),
+            &stats
+        );
+    };
     if (engine_mutex) {
         std::lock_guard<std::mutex> lock(*engine_mutex);
         const auto prefetch_start = std::chrono::steady_clock::now();
@@ -1735,19 +1815,9 @@ static server_eval_result run_server_eval(
         std::cerr << "[storagellm request] eval_prefetch_orchestrate ms="
                   << elapsed_ms_since(prefetch_start)
                   << resource_log_suffix() << "\n" << std::flush;
-        evaluated = moe_pc_engine_eval_token_ids(
-            engine,
-            input_ids.data(),
-            static_cast<uint32_t>(input_ids.size()),
-            &stats
-        );
+        evaluated = eval_tokens();
     } else {
-        evaluated = moe_pc_engine_eval_token_ids(
-            engine,
-            input_ids.data(),
-            static_cast<uint32_t>(input_ids.size()),
-            &stats
-        );
+        evaluated = eval_tokens();
     }
     if (!evaluated) {
         result.http_status = 503;
