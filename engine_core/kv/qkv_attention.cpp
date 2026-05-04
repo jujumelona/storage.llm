@@ -102,8 +102,8 @@ int qkv_attention_decode_impl(
 
     // Parallel K scoring for large context (n >= 1024)
     if (n >= 1024) {
-        const int out_bits = cfg->outlier_bits;
-        const int norm_bits = cfg->normal_bits;
+        const int out_bits = qjl ? cfg->outlier_bits - 1 : cfg->outlier_bits;
+        const int norm_bits = qjl ? cfg->normal_bits - 1 : cfg->normal_bits;
         const int n_outliers = cfg->outlier_channels;
         const int n_normal = d - n_outliers;
         // BUGFIX 357: overflow 방지

@@ -97,11 +97,15 @@ static inline qkv_config_t qkv_config_default(int head_dim) {
 
 // Helper: compute exact configured average bits with outlier channels.
 static inline float qkv_effective_bits(const qkv_config_t* cfg) {
-    if (!cfg || cfg->outlier_channels <= 0) {
+    if (!cfg || cfg->head_dim <= 0 || cfg->outlier_channels <= 0) {
         return (float)(cfg ? cfg->k_bits : 3);
     }
-    int normal_channels = cfg->head_dim - cfg->outlier_channels;
-    return (float)(cfg->outlier_channels * cfg->outlier_bits + normal_channels * cfg->normal_bits) / (float)cfg->head_dim;
+    int outlier_channels = cfg->outlier_channels;
+    if (outlier_channels > cfg->head_dim) {
+        outlier_channels = cfg->head_dim;
+    }
+    int normal_channels = cfg->head_dim - outlier_channels;
+    return (float)(outlier_channels * cfg->outlier_bits + normal_channels * cfg->normal_bits) / (float)cfg->head_dim;
 }
 
 // ============================================================

@@ -5,10 +5,136 @@
 #include <math.h>
 #include <string.h>
 #include <climits>
+#include <algorithm>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+static int qkv_mse_bits_for_total_bits_dequant(int bits, bool use_qjl) {
+    const int mse_bits = use_qjl ? bits - 1 : bits;
+    return qkv_bits_valid(mse_bits) ? mse_bits : 0;
+}
+
+static int qkv_dequant_one_split(
+    const qkv_state_t* s,
+    const qkv_config_t* cfg,
+    int target,
+    const uint8_t* qjl,
+    const float* residual_norms,
+    const float* norms,
+    int token_idx,
+    bool use_qjl,
+    float* output
+) {
+    if (!s || !cfg || !norms || !output || token_idx < 0) {
+        return 0;
+    }
+    const int d = s->head_dim;
+    const int n_out = cfg->outlier_channels;
+    const int n_norm = d - n_out;
+    const int out_mse_bits = qkv_mse_bits_for_total_bits_dequant(cfg->outlier_bits, use_qjl);
+    const int norm_mse_bits = qkv_mse_bits_for_total_bits_dequant(cfg->normal_bits, use_qjl);
+    if (d <= 0 || d > 16384 || n_out <= 0 || n_out >= d || n_norm <= 0 ||
+        !out_mse_bits || !norm_mse_bits) {
+        return 0;
+    }
+    const int* outlier_channels = qkv_outlier_indices_for_target_const(s, target);
+    const uint8_t* split_outlier = qkv_idx_outlier_for_target_const(s, target);
+    const uint8_t* split_normal = qkv_idx_normal_for_target_const(s, target);
+    const uint8_t* is_outlier = qkv_is_outlier_for_target_const(s, target);
+    if (!outlier_channels || !split_outlier || !split_normal || !is_outlier ||
+        !s->scratch_indices || !s->scratch_y_tilde || !s->scratch_x_tilde) {
+        return 0;
+    }
+    if (n_out > INT_MAX / out_mse_bits || n_norm > INT_MAX / norm_mse_bits) {
+        return 0;
+    }
+    const int out_stride = (n_out * out_mse_bits + 7) / 8;
+    const int norm_stride = (n_norm * norm_mse_bits + 7) / 8;
+    const int qstride = (d + 7) / 8;
+    if (out_stride <= 0 || norm_stride <= 0 ||
+        token_idx > INT_MAX / std::max(out_stride, norm_stride)) {
+        return 0;
+    }
+    const float* out_centroids = qkv_codebook_for_bits(s, out_mse_bits);
+    const float* norm_centroids = qkv_codebook_for_bits(s, norm_mse_bits);
+    if (!out_centroids || !norm_centroids) {
+        return 0;
+    }
+
+    int* indices = s->scratch_indices;
+    float* y_tilde = s->scratch_y_tilde;
+    float* x_tilde = s->scratch_x_tilde;
+    const int out_levels = 1 << out_mse_bits;
+    const int norm_levels = 1 << norm_mse_bits;
+
+    qkv_unpack_indices(split_outlier + (size_t)token_idx * (size_t)out_stride,
+        indices, n_out, out_mse_bits);
+    for (int i = 0; i < n_out; ++i) {
+        const int channel = outlier_channels[i];
+        if (channel < 0 || channel >= d || indices[i] < 0 || indices[i] >= out_levels) {
+            return 0;
+        }
+        y_tilde[channel] = out_centroids[indices[i]];
+    }
+
+    qkv_unpack_indices(split_normal + (size_t)token_idx * (size_t)norm_stride,
+        indices, n_norm, norm_mse_bits);
+    int normal_pos = 0;
+    for (int i = 0; i < d; ++i) {
+        if (is_outlier[i]) {
+            continue;
+        }
+        if (normal_pos >= n_norm || indices[normal_pos] < 0 || indices[normal_pos] >= norm_levels) {
+            return 0;
+        }
+        y_tilde[i] = norm_centroids[indices[normal_pos++]];
+    }
+    if (normal_pos != n_norm) {
+        return 0;
+    }
+
+    if (cfg->enable_rotation && s->rotation_matrix) {
+        for (int i = 0; i < d; ++i) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; ++j) {
+                sum += s->rotation_matrix[(size_t)j * (size_t)d + (size_t)i] * y_tilde[j];
+            }
+            x_tilde[i] = sum;
+        }
+    } else {
+        memcpy(x_tilde, y_tilde, (size_t)d * sizeof(float));
+    }
+
+    if (use_qjl && qjl && residual_norms && s->qjl_matrix) {
+        const float r_norm = residual_norms[token_idx];
+        if (r_norm > 1e-10f) {
+            const uint8_t* tqjl = qjl + (size_t)token_idx * (size_t)qstride;
+            float* qjl_signs = s->scratch_qjl_signs;
+            float* s_t_qjl = s->scratch_s_t_qjl;
+            if (!qjl_signs || !s_t_qjl) return 0;
+            qkv_unpack_signs(tqjl, qjl_signs, d);
+            for (int i = 0; i < d; ++i) {
+                float sum = 0.0f;
+                for (int j = 0; j < d; ++j) {
+                    sum += s->qjl_matrix[(size_t)j * (size_t)d + (size_t)i] * qjl_signs[j];
+                }
+                s_t_qjl[i] = sum;
+            }
+            const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)d;
+            for (int i = 0; i < d; ++i) {
+                x_tilde[i] += qjl_scale * r_norm * s_t_qjl[i];
+            }
+        }
+    }
+
+    const float norm = norms[token_idx];
+    for (int i = 0; i < d; ++i) {
+        output[i] = x_tilde[i] * norm;
+    }
+    return 1;
+}
 
 // Paper Algorithm 2: TurboQuant_prod dequantization
 // x_hat = Pi^T * y_hat_mse + sqrt(pi/2) / d * ||r|| * S^T * sign(S*r)
@@ -27,6 +153,9 @@ int qkv_dequant_one(
     if (!s || !cfg || !idx || !norms || !output || token_idx < 0) {
         return 0;
     }
+    if (token_idx >= s->n_tokens) {
+        return 0;
+    }
 
     // BUGFIX 370: head_dim 유효성 체크
     const int d = s->head_dim;
@@ -36,6 +165,12 @@ int qkv_dequant_one(
     const int mse_bits = use_qjl ? bits - 1 : bits;
     if (!qkv_bits_valid(mse_bits)) {
         return 0;
+    }
+    const int split_target = qkv_target_from_buffers(s, idx, norms);
+    if (split_target && qkv_outlier_split_ready(s, cfg, split_target)) {
+        return qkv_dequant_one_split(
+            s, cfg, split_target, qjl, residual_norms, norms,
+            token_idx, use_qjl, output);
     }
     // BUGFIX 371: stride 계산 overflow 방지
     if (d > INT_MAX / mse_bits) {
@@ -156,8 +291,10 @@ int qkv_dot_mse_split_rotated_token(
     // BUGFIX 378: outlier_channels 범위 체크
     if (n_out < 0 || n_out > d) return 0;
     const int n_norm = d - n_out;
-    const int out_bits = cfg->outlier_bits;
-    const int norm_bits = cfg->normal_bits;
+    const bool use_qjl = cfg->enable_qjl && s->k_qjl && s->v_qjl && s->k_bits > 1 && s->v_bits > 1;
+    const int out_bits = qkv_mse_bits_for_total_bits_dequant(cfg->outlier_bits, use_qjl);
+    const int norm_bits = qkv_mse_bits_for_total_bits_dequant(cfg->normal_bits, use_qjl);
+    if (!out_bits || !norm_bits) return 0;
 
     const int* outlier_channels = qkv_outlier_indices_for_target_const(s, target);
     const uint8_t* split_outlier = qkv_idx_outlier_for_target_const(s, target);

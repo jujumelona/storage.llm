@@ -203,9 +203,14 @@ int qkv_state_init(
         int n_norm = dim - n_out;
         int out_bits = config->outlier_bits;
         int norm_bits = config->normal_bits;
+        const bool split_qjl = config->enable_qjl && out_bits > 1 && norm_bits > 1;
+        const int out_storage_bits = split_qjl ? out_bits - 1 : out_bits;
+        const int norm_storage_bits = split_qjl ? norm_bits - 1 : norm_bits;
 
         // BUGFIX 411: bits 범위 체크
-        if (out_bits < 1 || out_bits > 4 || norm_bits < 1 || norm_bits > 4) {
+        if (out_bits < 1 || out_bits > 4 || norm_bits < 1 || norm_bits > 4 ||
+            out_storage_bits < 1 || out_storage_bits > 4 ||
+            norm_storage_bits < 1 || norm_storage_bits > 4) {
             qkv_state_free(state);
             return 0;
         }
@@ -223,18 +228,18 @@ int qkv_state_init(
         state->v_is_outlier = (uint8_t*)calloc((size_t)dim, 1);
 
         // BUGFIX 413: outlier 할당 크기 overflow 방지
-        if ((size_t)n_tokens > SIZE_MAX / ((size_t)n_out * (size_t)out_bits)) {
+        if ((size_t)n_tokens > SIZE_MAX / ((size_t)n_out * (size_t)out_storage_bits)) {
             qkv_state_free(state);
             return 0;
         }
-        if ((size_t)n_tokens > SIZE_MAX / ((size_t)n_norm * (size_t)norm_bits)) {
+        if ((size_t)n_tokens > SIZE_MAX / ((size_t)n_norm * (size_t)norm_storage_bits)) {
             qkv_state_free(state);
             return 0;
         }
-        size_t k_out_size = ((size_t)n_tokens * (size_t)n_out * (size_t)out_bits + 7) / 8;
-        size_t k_norm_size = ((size_t)n_tokens * (size_t)n_norm * (size_t)norm_bits + 7) / 8;
-        size_t v_out_size = ((size_t)n_tokens * (size_t)n_out * (size_t)out_bits + 7) / 8;
-        size_t v_norm_size = ((size_t)n_tokens * (size_t)n_norm * (size_t)norm_bits + 7) / 8;
+        size_t k_out_size = ((size_t)n_tokens * (size_t)n_out * (size_t)out_storage_bits + 7) / 8;
+        size_t k_norm_size = ((size_t)n_tokens * (size_t)n_norm * (size_t)norm_storage_bits + 7) / 8;
+        size_t v_out_size = ((size_t)n_tokens * (size_t)n_out * (size_t)out_storage_bits + 7) / 8;
+        size_t v_norm_size = ((size_t)n_tokens * (size_t)n_norm * (size_t)norm_storage_bits + 7) / 8;
 
         state->k_idx_outlier = (uint8_t*)calloc(k_out_size, 1);
         state->k_idx_normal = (uint8_t*)calloc(k_norm_size, 1);

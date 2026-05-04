@@ -861,12 +861,18 @@ static int moe_layer_moe_mlp_f32(
         "layer=%d ok=%d has_raw_span=%d ms=%.3f",
         layer, shared_ok, shared ? 1 : 0, moe_profile_elapsed_ms(shared_start_us));
 
-    moe_save_gate_input_snapshot(engine, layer, expert_input, hidden_size);
+    const int router_has_internal_norm_scale =
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "router.scale") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale");
+    const float* router_input = router_has_internal_norm_scale ? hidden : expert_input;
+    moe_save_gate_input_snapshot(engine, layer, router_input, hidden_size);
     const uint64_t router_start_us = moe_profile_now_us();
     if (!moe_router_topk_f32(
             engine,
             layer,
-            expert_input,
+            router_input,
             hidden_size,
             c->experts_per_moe_layer,
             moe_router_top_k_from_metadata(engine, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer),
@@ -906,9 +912,10 @@ static int moe_layer_moe_mlp_f32(
 
     moe_profile_log(
         "mlp_moe_router",
-        "layer=%d selected=%zu weights=%zu logits=%zu ms=%.3f",
+        "layer=%d selected=%zu weights=%zu logits=%zu internal_norm_scale=%d ms=%.3f",
         layer, s->selected_experts.size(), s->selected_weights.size(),
-        s->router_logits.size(), moe_profile_elapsed_ms(router_start_us));
+        s->router_logits.size(), router_has_internal_norm_scale,
+        moe_profile_elapsed_ms(router_start_us));
     const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
     const uint64_t prefetch_start_us = moe_profile_now_us();
     if (phase != moe_GEN_PHASE_PREFILL) {

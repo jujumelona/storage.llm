@@ -125,6 +125,9 @@ JUJU_HEADER_BYTES = 4096
 JUJU_SECTION_ENTRY_BYTES = 96
 JUJU_SECTION_TABLE_RESERVED_ENTRIES = 32
 JUJU_SECTION_MODEL_META = 0x0001
+JUJU_SECTION_PREDICTOR = 0x0002
+JUJU_SECTION_BUDDY_MAP = 0x0003
+JUJU_SECTION_TIER_HINT = 0x0004
 JUJU_SECTION_SHARED_WEIGHTS = 0x0010
 JUJU_SECTION_HOT_EXPERTS = 0x0011
 JUJU_SECTION_WARM_EXPERTS = 0x0012
@@ -906,6 +909,45 @@ def tensor_bucket(name):
     return "shared_weights"
 
 
+def assign_bootstrap_expert_tiers(tensors, contract=None):
+    routed = []
+    for tensor in tensors or []:
+        if not tensor or not is_routed_expert_tensor_name(tensor.get("name")):
+            continue
+        layer = _juju_layer_id_from_name(tensor.get("name"))
+        if layer is None:
+            continue
+        routed.append((int(layer), tensor))
+    if not routed:
+        return
+
+    layers = sorted({layer for layer, _ in routed})
+    layer_count = len(layers)
+    layer_rank = {layer: idx for idx, layer in enumerate(layers)}
+
+    hot_default = max(1, min(2, layer_count // 16 or 1))
+    warm_default = max(hot_default + 1, min(layer_count, hot_default + max(1, layer_count // 8)))
+    try:
+        hot_layers = int(os.environ.get("JUJU_BOOTSTRAP_HOT_EXPERT_LAYERS", hot_default))
+    except Exception:
+        hot_layers = hot_default
+    try:
+        warm_layers = int(os.environ.get("JUJU_BOOTSTRAP_WARM_EXPERT_LAYERS", warm_default))
+    except Exception:
+        warm_layers = warm_default
+    hot_layers = max(0, min(hot_layers, layer_count))
+    warm_layers = max(hot_layers, min(warm_layers, layer_count))
+
+    for layer, tensor in routed:
+        rank = layer_rank.get(layer, layer_count)
+        if rank < hot_layers:
+            tensor["bucket"] = "hot_experts"
+        elif rank < warm_layers:
+            tensor["bucket"] = "warm_experts"
+        else:
+            tensor["bucket"] = "cold_experts"
+
+
 def is_shared_expert_tensor_name(name):
     text = str(name or "").lower()
     normalized = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
@@ -931,6 +973,12 @@ def is_routed_expert_tensor_name(name):
 
 
 def section_type_for_bucket(bucket):
+    if bucket == "predictor":
+        return JUJU_SECTION_PREDICTOR
+    if bucket == "buddy_map":
+        return JUJU_SECTION_BUDDY_MAP
+    if bucket == "tier_hint":
+        return JUJU_SECTION_TIER_HINT
     if bucket == "shared_weights":
         return JUJU_SECTION_SHARED_WEIGHTS
     if bucket == "hot_experts":
@@ -1451,6 +1499,9 @@ def juju_format_extension_contract(contract):
             "MODEL_META.modality_flags",
         ],
         "reserved_section_types": {
+            "predictor": JUJU_SECTION_PREDICTOR,
+            "buddy_map": JUJU_SECTION_BUDDY_MAP,
+            "tier_hint": JUJU_SECTION_TIER_HINT,
             "vision_encoder": JUJU_SECTION_VISION_ENCODER,
             "vision_projector": JUJU_SECTION_VISION_PROJ,
             "audio_encoder": JUJU_SECTION_AUDIO_ENCODER,
@@ -1904,10 +1955,21 @@ def tensor_runtime_priority(name, bucket, size):
         prefetch_class = "layer_hot"
     elif is_routed_expert_tensor_name(lower):
         role = "expert"
-        priority = 65
-        prefetch = 80
-        residency = "SLOW_MEM"
-        prefetch_class = "expert_stream"
+        if bucket == "hot_experts":
+            priority = 78
+            prefetch = 92
+            residency = "FAST_MEM_STREAMABLE"
+            prefetch_class = "expert_bootstrap_hot"
+        elif bucket == "warm_experts":
+            priority = 70
+            prefetch = 86
+            residency = "FAST_MEM_STREAMABLE"
+            prefetch_class = "expert_bootstrap_warm"
+        else:
+            priority = 65
+            prefetch = 80
+            residency = "SLOW_MEM"
+            prefetch_class = "expert_stream"
     elif ".ffn_" in lower:
         role = "dense_ffn"
         priority = 75
@@ -1929,6 +1991,154 @@ def tensor_runtime_priority(name, bucket, size):
         "prefetch_class": prefetch_class,
         "residency_hint": residency,
     }
+
+
+def _juju_bucket_stats(tensor_records):
+    stats = {}
+    for rec in tensor_records or []:
+        bucket = str(rec.get("bucket") or "unknown")
+        item = stats.setdefault(bucket, {
+            "tensor_count": 0,
+            "bytes": 0,
+            "layers": [],
+        })
+        item["tensor_count"] += 1
+        item["bytes"] += int(rec.get("juju_bytes") or rec.get("source_bytes") or 0)
+        layer = _juju_layer_id_from_name(rec.get("name"))
+        if layer is not None and layer not in item["layers"]:
+            item["layers"].append(int(layer))
+    for item in stats.values():
+        item["layers"] = sorted(item["layers"])
+        item["layer_count"] = len(item["layers"])
+    return stats
+
+
+def _juju_expert_projection_name(name):
+    lower = str(name or "").lower()
+    if "ffn_gate_up_exps.weight" in lower or "gate_up" in lower:
+        return "gate_up"
+    if "ffn_gate_exps.weight" in lower or "gate_proj" in lower or "ffn_gate" in lower:
+        return "gate"
+    if "ffn_up_exps.weight" in lower or "up_proj" in lower or "ffn_up" in lower:
+        return "up"
+    if "ffn_down_exps.weight" in lower or "down_proj" in lower or "ffn_down" in lower:
+        return "down"
+    return "expert"
+
+
+def _juju_layer_expert_groups(tensor_records):
+    layers = {}
+    for rec in tensor_records or []:
+        name = str(rec.get("name") or "")
+        if not is_routed_expert_tensor_name(name):
+            continue
+        layer = _juju_layer_id_from_name(name)
+        if layer is None:
+            continue
+        layer_entry = layers.setdefault(int(layer), {})
+        proj = _juju_expert_projection_name(name)
+        layer_entry.setdefault(proj, []).append({
+            "name": name,
+            "bucket": rec.get("bucket"),
+            "bytes": int(rec.get("juju_bytes") or rec.get("source_bytes") or 0),
+            "prefetch_priority": int(rec.get("prefetch_priority") or 0),
+            "runtime_priority": int(rec.get("runtime_priority") or 0),
+        })
+    out = []
+    for layer in sorted(layers):
+        groups = {
+            key: sorted(value, key=lambda item: item["name"])
+            for key, value in sorted(layers[layer].items())
+        }
+        out.append({
+            "layer": layer,
+            "projection_groups": groups,
+            "tensor_count": sum(len(value) for value in groups.values()),
+            "bytes": sum(item["bytes"] for value in groups.values() for item in value),
+        })
+    return out
+
+
+def build_juju_predictor_section(tensor_records, contract, split_meta):
+    expert_layers = _juju_layer_expert_groups(tensor_records)
+    return {
+        "format": "JUJU_PREDICTOR_BOOTSTRAP_V1",
+        "trained_weights_embedded": False,
+        "runtime_mutable": True,
+        "scope": "layer_expert_prefetch",
+        "split": split_meta,
+        "inputs": [
+            "router_scores",
+            "gate_input_snapshots",
+            "mutable_coactivation_index",
+            "prefetch_miss_feedback",
+        ],
+        "fallback_policy": {
+            "when_no_history": "router_score_order",
+            "cold_start": "bootstrap_layer_order_then_runtime_hits",
+            "avoid_model_specific_constants": True,
+        },
+        "expert_layer_count": len(expert_layers),
+        "expert_tensor_count": sum(layer["tensor_count"] for layer in expert_layers),
+        "metadata_only": True,
+    }
+
+
+def build_juju_buddy_map_section(tensor_records, contract, split_meta):
+    expert_layers = _juju_layer_expert_groups(tensor_records)
+    buddy_units = []
+    for layer in expert_layers:
+        projections = layer["projection_groups"]
+        buddy_units.append({
+            "layer": layer["layer"],
+            "unit": "routed_expert_projection_bundle",
+            "projection_order": [p for p in ("gate_up", "gate", "up", "down") if p in projections],
+            "projection_groups": projections,
+            "tensor_count": layer["tensor_count"],
+            "bytes": layer["bytes"],
+        })
+    return {
+        "format": "JUJU_BUDDY_MAP_V1",
+        "construction": "generic_layer_projection_grouping",
+        "split": split_meta,
+        "buddy_units": buddy_units,
+        "unit_count": len(buddy_units),
+        "tensor_count": sum(unit["tensor_count"] for unit in buddy_units),
+        "runtime_update_allowed": True,
+    }
+
+
+def build_juju_tier_hint_section(tensor_records, contract, split_meta):
+    stats = _juju_bucket_stats(tensor_records)
+    routed = [
+        rec for rec in tensor_records or []
+        if is_routed_expert_tensor_name(rec.get("name"))
+    ]
+    return {
+        "format": "JUJU_TIER_HINT_V1",
+        "split": split_meta,
+        "bootstrap_policy": {
+            "source": "tensor_name_layer_order",
+            "hot_layers_env": "JUJU_BOOTSTRAP_HOT_EXPERT_LAYERS",
+            "warm_layers_env": "JUJU_BOOTSTRAP_WARM_EXPERT_LAYERS",
+            "runtime_stats_override": True,
+            "hardware_cache_override": True,
+        },
+        "bucket_stats": stats,
+        "routed_expert_tensor_count": len(routed),
+        "hot_expert_tensor_count": int(stats.get("hot_experts", {}).get("tensor_count") or 0),
+        "warm_expert_tensor_count": int(stats.get("warm_experts", {}).get("tensor_count") or 0),
+        "cold_expert_tensor_count": int(stats.get("cold_experts", {}).get("tensor_count") or 0),
+        "qkv_policy_required": bool(contract.get("qkv_cache_schema")),
+    }
+
+
+def build_juju_runtime_metadata_sections(tensor_records, contract, split_meta):
+    return [
+        (JUJU_SECTION_PREDICTOR, "PREDICTOR", build_juju_predictor_section(tensor_records, contract, split_meta)),
+        (JUJU_SECTION_BUDDY_MAP, "BUDDY_MAP", build_juju_buddy_map_section(tensor_records, contract, split_meta)),
+        (JUJU_SECTION_TIER_HINT, "TIER_HINT", build_juju_tier_hint_section(tensor_records, contract, split_meta)),
+    ]
 
 
 def infer_juju_graph_family(contract, tensors):
@@ -2132,7 +2342,7 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
     priority_rules = [
         {"match": "token_embd.weight|output.weight|output_norm.weight|rope_freqs.weight", "priority": 100, "residency": "FAST_MEM", "prefetch": "startup_hot"},
         {"match": "attention/norm/router tensors", "priority": 85, "residency": "FAST_MEM", "prefetch": "layer_hot"},
-        {"match": "expert tensors", "priority": 65, "residency": "SLOW_MEM", "prefetch": "expert_stream"},
+        {"match": "expert tensors", "priority": "65/70/78 by cold/warm/hot bootstrap tier", "residency": "SLOW_MEM_or_FAST_MEM_STREAMABLE", "prefetch": "expert_stream_or_bootstrap"},
         {"match": "large FAST_MEM tensors", "priority": "keep but streamable", "residency": "FAST_MEM_STREAMABLE", "prefetch": "bounded"},
     ]
     role_counts = {}
@@ -2472,6 +2682,7 @@ def build_juju_shard_plan_from_hf_url(
             tensor for tensor in directory["tensors"]
             if int(tensor.get("bytes") or 0) > 0 and (not allowset or tensor["name"] in allowset)
         ]
+        assign_bootstrap_expert_tiers(active_tensors, contract)
         split_meta = split_info or {
             "enabled": False,
             "split_index": 1,
@@ -2581,6 +2792,9 @@ def build_juju_shard_plan_from_hf_url(
                 "mmap_friendly": 1,
             })
             section_sizes[section_type] = section_sizes.get(section_type, 0) + size
+
+        for section_type, name, payload in build_juju_runtime_metadata_sections(tensor_records, contract, split_meta):
+            pos = add_json_section_at(pos, section_type, name, payload)
 
         runtime_arch = juju_runtime_arch_metadata(contract, directory)
         graph_ir = build_juju_graph_ir(
@@ -2950,6 +3164,7 @@ def write_juju_shard_from_hf_url(
             tensor for tensor in directory["tensors"]
             if int(tensor.get("bytes") or 0) > 0 and (not allowset or tensor["name"] in allowset)
         ]
+        assign_bootstrap_expert_tiers(active_tensors, contract)
         split_meta = split_info or {
             "enabled": False,
             "split_index": 1,
@@ -3062,6 +3277,9 @@ def write_juju_shard_from_hf_url(
                     "mmap_friendly": 1,
                 })
                 section_sizes[section_type] = section_sizes.get(section_type, 0) + size
+
+            for section_type, name, payload in build_juju_runtime_metadata_sections(tensor_records, contract, split_meta):
+                add_json_section(out, section_type, name, payload)
 
             runtime_arch = juju_runtime_arch_metadata(contract, directory)
             graph_ir = build_juju_graph_ir(

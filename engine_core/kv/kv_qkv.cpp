@@ -12,6 +12,8 @@
 #include <atomic>
 #include <math.h>
 #include <string.h>
+#include <algorithm>
+#include <climits>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -40,6 +42,157 @@ void qkv_free(qkv_state_t* state) {
 // ============================================================
 // Public API - Quantization (Paper Algorithm 1 + Algorithm 2)
 // ============================================================
+
+static int qkv_mse_bits_for_total_bits(int bits, bool use_qjl) {
+    const int mse_bits = use_qjl ? bits - 1 : bits;
+    return qkv_bits_valid(mse_bits) ? mse_bits : 0;
+}
+
+static int qkv_quantize_split_vector_with_state(
+    qkv_state_t* state,
+    const qkv_config_t* config,
+    int target,
+    const float* input,
+    int token_idx,
+    float* norm_out,
+    uint8_t* qjl_base,
+    float* residual_norms
+) {
+    if (!state || !config || !input || !norm_out || token_idx < 0 ||
+        token_idx >= state->n_tokens) {
+        return 0;
+    }
+    const int dim = config->head_dim;
+    const int n_out = config->outlier_channels;
+    const int n_norm = dim - n_out;
+    const bool use_qjl = config->enable_qjl && qjl_base && residual_norms && state->qjl_matrix;
+    const int out_mse_bits = qkv_mse_bits_for_total_bits(config->outlier_bits, use_qjl);
+    const int norm_mse_bits = qkv_mse_bits_for_total_bits(config->normal_bits, use_qjl);
+    if (dim <= 0 || dim > 16384 || n_out <= 0 || n_out >= dim || n_norm <= 0 ||
+        !out_mse_bits || !norm_mse_bits) {
+        return 0;
+    }
+    uint8_t* split_outlier = qkv_idx_outlier_for_target(state, target);
+    uint8_t* split_normal = qkv_idx_normal_for_target(state, target);
+    const int* outlier_channels = qkv_outlier_indices_for_target_const(state, target);
+    const uint8_t* is_outlier = qkv_is_outlier_for_target_const(state, target);
+    if (!split_outlier || !split_normal || !outlier_channels || !is_outlier ||
+        !state->scratch_residual || !state->scratch_s_times_r ||
+        !state->scratch_indices || !state->scratch_y_tilde || !state->scratch_x_tilde) {
+        return 0;
+    }
+    if (n_out > INT_MAX / out_mse_bits || n_norm > INT_MAX / norm_mse_bits) {
+        return 0;
+    }
+    const int out_stride = (n_out * out_mse_bits + 7) / 8;
+    const int norm_stride = (n_norm * norm_mse_bits + 7) / 8;
+    const int qjl_stride = (dim + 7) / 8;
+    if (out_stride <= 0 || norm_stride <= 0 || token_idx > INT_MAX / std::max(out_stride, norm_stride)) {
+        return 0;
+    }
+    uint8_t* out_dst = split_outlier + (size_t)token_idx * (size_t)out_stride;
+    uint8_t* norm_dst = split_normal + (size_t)token_idx * (size_t)norm_stride;
+
+    float l2_norm = 0.0f;
+    for (int i = 0; i < dim; ++i) {
+        l2_norm += input[i] * input[i];
+    }
+    l2_norm = sqrtf(l2_norm);
+    *norm_out = l2_norm;
+    if (residual_norms) {
+        residual_norms[token_idx] = 0.0f;
+    }
+    if (l2_norm < 1e-12f) {
+        memset(out_dst, 0, (size_t)out_stride);
+        memset(norm_dst, 0, (size_t)norm_stride);
+        if (use_qjl) {
+            memset(qjl_base + (size_t)token_idx * (size_t)qjl_stride, 0, (size_t)qjl_stride);
+        }
+        return 1;
+    }
+
+    float* normalized = state->scratch_residual;
+    float* rotated = state->scratch_s_times_r;
+    float* y_tilde = state->scratch_y_tilde;
+    float* x_mse = state->scratch_x_tilde;
+    int* indices = state->scratch_indices;
+    const float inv_norm = 1.0f / l2_norm;
+    for (int i = 0; i < dim; ++i) {
+        normalized[i] = input[i] * inv_norm;
+    }
+
+    const float* src = normalized;
+    if (config->enable_rotation && state->rotation_matrix) {
+        for (int i = 0; i < dim; ++i) {
+            float sum = 0.0f;
+            for (int j = 0; j < dim; ++j) {
+                sum += state->rotation_matrix[(size_t)i * (size_t)dim + (size_t)j] * normalized[j];
+            }
+            rotated[i] = sum;
+        }
+        src = rotated;
+    }
+
+    const float* out_centroids = qkv_codebook_for_bits(state, out_mse_bits);
+    const float* out_thresholds = qkv_thresholds_for_bits(state, out_mse_bits);
+    const float* norm_centroids = qkv_codebook_for_bits(state, norm_mse_bits);
+    const float* norm_thresholds = qkv_thresholds_for_bits(state, norm_mse_bits);
+    if (!out_centroids || !out_thresholds || !norm_centroids || !norm_thresholds) {
+        return 0;
+    }
+    const int out_levels = 1 << out_mse_bits;
+    const int norm_levels = 1 << norm_mse_bits;
+    for (int i = 0; i < n_out; ++i) {
+        const int ch = outlier_channels[i];
+        if (ch < 0 || ch >= dim) return 0;
+        const int code = qkv_find_nearest_centroid(src[ch], out_centroids, out_thresholds, out_levels);
+        indices[i] = code;
+        y_tilde[ch] = out_centroids[code];
+    }
+    qkv_pack_indices(indices, out_dst, n_out, out_mse_bits);
+
+    int normal_pos = 0;
+    for (int ch = 0; ch < dim; ++ch) {
+        if (is_outlier[ch]) continue;
+        const int code = qkv_find_nearest_centroid(src[ch], norm_centroids, norm_thresholds, norm_levels);
+        indices[normal_pos++] = code;
+        y_tilde[ch] = norm_centroids[code];
+    }
+    if (normal_pos != n_norm) {
+        return 0;
+    }
+    qkv_pack_indices(indices, norm_dst, n_norm, norm_mse_bits);
+
+    if (config->enable_rotation && state->rotation_matrix) {
+        for (int i = 0; i < dim; ++i) {
+            float sum = 0.0f;
+            for (int j = 0; j < dim; ++j) {
+                sum += state->rotation_matrix[(size_t)j * (size_t)dim + (size_t)i] * y_tilde[j];
+            }
+            x_mse[i] = sum;
+        }
+    } else {
+        memcpy(x_mse, y_tilde, (size_t)dim * sizeof(float));
+    }
+
+    if (use_qjl) {
+        float r_norm_sq = 0.0f;
+        for (int i = 0; i < dim; ++i) {
+            normalized[i] = normalized[i] - x_mse[i];
+            r_norm_sq += normalized[i] * normalized[i];
+        }
+        residual_norms[token_idx] = sqrtf(r_norm_sq);
+        for (int i = 0; i < dim; ++i) {
+            float sum = 0.0f;
+            for (int j = 0; j < dim; ++j) {
+                sum += state->qjl_matrix[(size_t)i * (size_t)dim + (size_t)j] * normalized[j];
+            }
+            rotated[i] = sum;
+        }
+        qkv_pack_signs(rotated, qjl_base + (size_t)token_idx * (size_t)qjl_stride, dim);
+    }
+    return 1;
+}
 
 int qkv_quantize(
     qkv_state_t* state,
@@ -71,7 +224,15 @@ int qkv_quantize(
         if (!state->k_idx) return 0;
         size_t k_offset = (size_t)t * (size_t)((dim * k_mse_bits + 7) / 8);
         uint8_t* k_out = state->k_idx + k_offset;
-        if (!qkv_quantize_vector_with_state(
+        const bool k_split = qkv_outlier_split_ready(state, config, QKV_TARGET_KEY);
+        if (k_split) {
+            if (!qkv_quantize_split_vector_with_state(
+                    state, config, QKV_TARGET_KEY,
+                    key_data + t * dim, t, &state->k_norms[t],
+                    state->k_qjl, state->k_residual_norms)) {
+                return 0;
+            }
+        } else if (!qkv_quantize_vector_with_state(
                 state, config,
                 key_data + t * dim,
                 k_out,
@@ -82,7 +243,7 @@ int qkv_quantize(
         }
 
         // Paper Algorithm 2: QJL residual for unbiased inner product
-        if (use_qjl && state->k_qjl && state->qjl_matrix) {
+        if (!k_split && use_qjl && state->k_qjl && state->qjl_matrix) {
             // BUGFIX 343: k_qjl null 체크 및 overflow 방지
             size_t qjl_offset = (size_t)t * (size_t)((dim + 7) / 8);
             // Step 1: Dequantize MSE reconstruction
@@ -156,7 +317,15 @@ int qkv_quantize(
         if (!state->v_idx) return 0;
         size_t v_offset = (size_t)t * (size_t)((dim * v_mse_bits + 7) / 8);
         uint8_t* v_out = state->v_idx + v_offset;
-        if (!qkv_quantize_vector_with_state(
+        const bool v_split = qkv_outlier_split_ready(state, config, QKV_TARGET_VALUE);
+        if (v_split) {
+            if (!qkv_quantize_split_vector_with_state(
+                    state, config, QKV_TARGET_VALUE,
+                    value_data + t * dim, t, &state->v_norms[t],
+                    state->v_qjl, state->v_residual_norms)) {
+                return 0;
+            }
+        } else if (!qkv_quantize_vector_with_state(
                 state, config,
                 value_data + t * dim,
                 v_out,
@@ -167,7 +336,7 @@ int qkv_quantize(
         }
 
         // QJL residual for V
-        if (use_qjl && state->v_qjl && state->qjl_matrix) {
+        if (!v_split && use_qjl && state->v_qjl && state->qjl_matrix) {
             float* x_mse = state->scratch_x_tilde;
             if (!x_mse) return 0;
 

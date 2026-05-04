@@ -109,7 +109,7 @@ static void moe_qkv_apply_contract_config_locked(
             "qkv_config",
             "head_dim=%u k_bits=%d v_bits=%d group=%u page=%u sink=%u "
             "rotation=%d rotation_seed=%llu qjl=%d qjl_seed=%llu "
-            "outlier_channels=%d outlier_bits=%d normal_bits=%d plain_kv=%d",
+            "outlier_channels=%d outlier_bits=%d normal_bits=%d effective_bits=%.3f plain_kv=%d",
             head_dim,
             desired.k_bits,
             desired.v_bits,
@@ -123,6 +123,7 @@ static void moe_qkv_apply_contract_config_locked(
             desired.outlier_channels,
             desired.outlier_bits,
             desired.normal_bits,
+            (double)qkv_effective_bits(&desired),
             desired.plain_kv_persistent_storage ? 1 : 0);
     }
 }

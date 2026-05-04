@@ -152,6 +152,9 @@ static float moe_standard_attention_score_scale(
     if (query_pre_attn_scalar > 0.0f && std::isfinite(query_pre_attn_scalar)) {
         return 1.0f / std::sqrt(query_pre_attn_scalar);
     }
+    if (moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
+        return 1.0f;
+    }
     return 1.0f / std::sqrt((float)head_dim);
 }
 
@@ -566,8 +569,8 @@ static int moe_layer_standard_attention_f32(
     }
     moe_profile_log(
         "attn_standard_heads",
-        "layer=%d pos=%u heads=%u seq=%u head_dim=%u v_head_dim=%u ms=%.3f",
-        layer, position, num_heads, seq_len, head_dim, v_head_dim,
+        "layer=%d pos=%u heads=%u seq=%u head_dim=%u v_head_dim=%u scale=%.6g ms=%.3f",
+        layer, position, num_heads, seq_len, head_dim, v_head_dim, (double)scale,
         moe_profile_elapsed_ms(heads_start_us));
 
     const uint64_t o_start_us = moe_profile_now_us();
