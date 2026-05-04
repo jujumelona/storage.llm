@@ -1,13 +1,5 @@
 static int moe_profile_enabled() {
-    static const int enabled = []() -> int {
-        const char* value = std::getenv("STORAGELLM_TRACE");
-        if (!value || !value[0]) {
-            return 0;
-        }
-        const unsigned char c = static_cast<unsigned char>(value[0]);
-        return (c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T');
-    }();
-    return enabled;
+    return 1;
 }
 
 static uint64_t moe_profile_now_us() {
