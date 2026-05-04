@@ -14,6 +14,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1139,10 +1140,20 @@ static server_tokenizer& get_server_tokenizer(const server_options& opts) {
         tok.error = "model_root is required for tokenizer.json";
         return tok;
     }
-    const std::string path = join_model_file(opts.model_root, "tokenizer.json");
     std::string json;
-    if (!read_text_file(path, &json)) {
-        tok.error = "tokenizer.json was not found under model_root";
+    const char* candidates[] = {
+        "tokenizer.json",
+        "tokenizer/tokenizer.json"
+    };
+    for (const char* rel : candidates) {
+        const std::string path = join_model_file(opts.model_root, rel);
+        if (read_text_file(path, &json) && !json.empty()) {
+            break;
+        }
+        json.clear();
+    }
+    if (json.empty()) {
+        tok.error = "tokenizer.json was not found under model_root or tokenizer/";
         return tok;
     }
     load_tokenizer_vocab(&tok, json);
@@ -2002,6 +2013,7 @@ static std::string make_health_json(
         << "\"qkvForcedByFormat\":" << (stats.qkv_forced_by_format ? "true" : "false") << ","
         << "\"qkvKBits\":" << stats.qkv_k_bits << ","
         << "\"qkvVBits\":" << stats.qkv_v_bits << ","
+        << "\"qkvNormalBits\":" << stats.qkv_normal_bits << ","
         << "\"qkvGroupSize\":" << stats.qkv_group_size << ","
         << "\"qkvPageSizeTokens\":" << stats.qkv_page_size_tokens << ","
         << "\"qkvSinkTokens\":" << stats.qkv_sink_tokens << ","

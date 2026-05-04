@@ -51,8 +51,17 @@ static void moe_save_gate_input_snapshot(
 // or a normalized probability distribution. The input must be sigmoid(logit) values
 // in (0, 1). The function measures relative concentration (routing sharpness),
 // not true Shannon entropy. Do NOT call with raw logits or softmax probabilities.
-// Fix 17: 빠른 float log 근사 (Cephes 방식, ?�차 < 0.1%)
+// Fix 17: 빠른 float log 근사 (Cephes 방식, 오차 < 0.1%)
+// BUGFIX NEW-1: Add bounds check for fast_log2f input ★★
+// Problem: x <= 0 causes frexp to return undefined results
+// std::frexp(0.0f) returns m=0, e=0, then (e-1) = -1, causing negative log
+// std::frexp(negative) is undefined behavior
+// Solution: Clamp x to minimum positive value before frexp
 static inline float fast_log2f(float x) {
+    // Clamp to avoid undefined behavior with x <= 0
+    if (x <= 0.0f) {
+        x = 1.0e-10f;  // Return very negative log2 value
+    }
     int e; float m = std::frexp(x, &e);
     return (float)(e - 1) + (m - 1.0f) * (1.44269504f - (m - 1.0f) * 0.5f);
 }

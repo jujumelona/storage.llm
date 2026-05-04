@@ -311,14 +311,34 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     const uint32_t pool_workers = std::min(workers - 1u,
         static_cast<uint32_t>(pool.threads.size()));
 
-    if (pool_workers > 0 && pool.initialized) {
+    // BUGFIX Issue 8: Global CPU pool dispatch mutex to prevent cross-engine interference
+    // Problem: Global singleton pool allows Thread A (engine1) and Thread B (engine2) to
+    // dispatch simultaneously → work_fn/pending overwritten → cross-engine blocking
+    // Solution: Serialize dispatch with try_lock; fallback to single-threaded if busy
+    // Trade-off: Second engine runs single-threaded instead of corrupting first engine's work
+    static std::mutex g_cpu_row_pool_dispatch_mutex;
+    std::unique_lock<std::mutex> dispatch_guard(g_cpu_row_pool_dispatch_mutex, std::try_to_lock);
+
+    if (pool_workers > 0 && pool.initialized && dispatch_guard.owns_lock()) {
         // Dispatch to persistent pool
         pool.dispatch(run_rows, pool_workers);
         run_rows();  // Main thread participates
         pool.wait();
     } else {
-        // Fallback to fork/join if pool not available
-        std::vector<std::thread> local_workers;
+        // Fallback to single-threaded or fork/join if pool not available or busy
+        // BUGFIX Issue 8: If dispatch_guard failed to lock, another engine is using pool
+        // Run single-threaded to avoid corruption (better than stale data or cross-wait)
+        if (pool_workers > 0 && pool.initialized && !dispatch_guard.owns_lock()) {
+            // Pool busy with another engine - run single-threaded
+            for (uint32_t row = 0; row < row_count; ++row) {
+                if (!fn(row)) {
+                    ok.store(0, std::memory_order_release);
+                    break;
+                }
+            }
+        } else {
+            // Pool not initialized - fallback to fork/join
+            std::vector<std::thread> local_workers;
         local_workers.reserve(workers > 1 ? workers - 1u : 0u);
         try {
             for (uint32_t i = 1; i < workers; ++i) {
@@ -330,11 +350,19 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
             for (std::thread& worker : local_workers) {
                 if (worker.joinable()) worker.join();
             }
+            // BUGFIX NEW-2: Decrement both counters on exception ★★★
+            // Problem: Exception path decrements tl_cpu_row_active but not engine->cpu_row_active
+            // This causes permanent counter leak in engine->cpu_row_active
+            // Solution: Decrement both counters before returning
             --tl_cpu_row_active;
+            if (engine) {
+                engine->cpu_row_active.fetch_sub(1, std::memory_order_relaxed);
+            }
             return 0;
         }
-        for (std::thread& worker : local_workers) {
-            if (worker.joinable()) worker.join();
+            for (std::thread& worker : local_workers) {
+                if (worker.joinable()) worker.join();
+            }
         }
     }
 

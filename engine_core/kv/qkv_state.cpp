@@ -140,6 +140,20 @@ int qkv_state_init(
             qkv_state_free(state);
             return 0;
         }
+
+        // BUGFIX Issue 9: Extract sign vector for Hadamard structure (power-of-2 dims)
+        const bool is_power_of_2 = (dim & (dim - 1)) == 0;
+        if (is_power_of_2) {
+            state->rotation_signs = (float*)std::malloc((size_t)dim * sizeof(float));
+            if (!state->rotation_signs) {
+                qkv_state_free(state);
+                return 0;
+            }
+            // Extract column signs from first row (Hadamard structure property)
+            for (int col = 0; col < dim; ++col) {
+                state->rotation_signs[col] = state->rotation_matrix[col] > 0.0f ? 1.0f : -1.0f;
+            }
+        }
     }
 
     if (config->enable_qjl) {
@@ -349,6 +363,7 @@ void qkv_state_free(qkv_state_t* state) {
     free(state->v_qjl);
     free(state->v_residual_norms);
     if (state->owns_rotation_matrix) free(state->rotation_matrix);
+    free(state->rotation_signs);  // BUGFIX Issue 9: Free rotation_signs
     if (state->owns_qjl_matrix) free(state->qjl_matrix);
     free(state->qjl_signs_matrix);
     if (state->owns_codebooks) {

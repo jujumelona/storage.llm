@@ -183,6 +183,10 @@ static int promote_kv_block_to_vram(
 
     // Allocate data buffer
     if (data_size > 0) {
+        if (data_size > 10ull * 1024 * 1024 * 1024) {
+            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            return 0;
+        }
         if (engine->backend_caps.backend == moe_BACKEND_HIP && engine->hip.hipMalloc) {
             alloc_ok = (engine->hip.hipMalloc(&vram_data_ptr, (size_t)data_size) == 0) ? 1 : 0;
         } else if (engine->backend_caps.backend == moe_BACKEND_CUDA && engine->cuda.cuMemAlloc) {
@@ -196,6 +200,14 @@ static int promote_kv_block_to_vram(
 
     // Allocate scales buffer
     if (scales_size > 0) {
+        if (scales_size > 1ull * 1024 * 1024 * 1024) {
+            if (vram_data_ptr) {
+                if (engine->backend_caps.backend == moe_BACKEND_HIP) engine->hip.hipFree(vram_data_ptr);
+                else if (engine->backend_caps.backend == moe_BACKEND_CUDA) engine->cuda.cuMemFree(vram_data_ptr);
+            }
+            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            return 0;
+        }
         alloc_ok = 0;
         if (engine->backend_caps.backend == moe_BACKEND_HIP && engine->hip.hipMalloc) {
             alloc_ok = (engine->hip.hipMalloc(&vram_scales_ptr, (size_t)scales_size) == 0) ? 1 : 0;
@@ -214,6 +226,18 @@ static int promote_kv_block_to_vram(
 
     // Allocate zeros buffer
     if (zeros_size > 0) {
+        if (zeros_size > 1ull * 1024 * 1024 * 1024) {
+            if (vram_data_ptr) {
+                if (engine->backend_caps.backend == moe_BACKEND_HIP) engine->hip.hipFree(vram_data_ptr);
+                else if (engine->backend_caps.backend == moe_BACKEND_CUDA) engine->cuda.cuMemFree(vram_data_ptr);
+            }
+            if (vram_scales_ptr) {
+                if (engine->backend_caps.backend == moe_BACKEND_HIP) engine->hip.hipFree(vram_scales_ptr);
+                else if (engine->backend_caps.backend == moe_BACKEND_CUDA) engine->cuda.cuMemFree(vram_scales_ptr);
+            }
+            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            return 0;
+        }
         alloc_ok = 0;
         if (engine->backend_caps.backend == moe_BACKEND_HIP && engine->hip.hipMalloc) {
             alloc_ok = (engine->hip.hipMalloc(&vram_zeros_ptr, (size_t)zeros_size) == 0) ? 1 : 0;

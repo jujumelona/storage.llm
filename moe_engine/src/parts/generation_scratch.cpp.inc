@@ -89,6 +89,69 @@ struct moe_kv_decode_cache_ram_scope {
     }
 };
 
+static void moe_engine_signal_memory_pressure_recovery(
+    moe_pc_engine* engine,
+    const char* reason,
+    uint64_t requested_bytes = 0
+) {
+    if (!engine) {
+        return;
+    }
+    std::fprintf(stderr,
+        "[storageLLM WARNING] memory pressure recovery reason=%s requested=%llu ram_used=%llu ram_budget=%llu vram_alloc=%llu\n",
+        reason ? reason : "unknown",
+        (unsigned long long)requested_bytes,
+        (unsigned long long)tier_used(engine, moe_TIER_RAM),
+        (unsigned long long)engine->config.ram_budget_bytes,
+        (unsigned long long)engine->device_allocated_bytes.load(std::memory_order_relaxed));
+    engine->ram_eviction_needed.store(true, std::memory_order_relaxed);
+    engine->vram_eviction_needed.store(true, std::memory_order_relaxed);
+    engine->vram_eviction_cv.notify_one();
+    device_refresh_mem_info(engine, 1);
+    device_free_pool(engine, moe_DEVICE_POOL_STREAM);
+    device_free_pool(engine, moe_DEVICE_POOL_ACTIVATION);
+}
+
+static void moe_decode_scratch_drop_transient_buffers(moe_decode_scratch* s) {
+    if (!s) {
+        return;
+    }
+    std::vector<float>().swap(s->hidden);
+    std::vector<float>().swap(s->residual);
+    std::vector<float>().swap(s->norm);
+    std::vector<float>().swap(s->attn);
+    std::vector<float>().swap(s->attn_kv_a);
+    std::vector<float>().swap(s->attn_kv_norm);
+    std::vector<float>().swap(s->attn_value);
+    std::vector<float>().swap(s->mlp);
+    std::vector<float>().swap(s->shared);
+    std::vector<float>().swap(s->expert);
+    std::vector<float>().swap(s->gate);
+    std::vector<float>().swap(s->up);
+    std::vector<float>().swap(s->router_logits);
+    std::vector<uint32_t>().swap(s->router_order);
+    std::vector<int>().swap(s->selected_experts);
+    std::vector<float>().swap(s->selected_weights);
+    std::vector<moe_expert_work_t>().swap(s->expert_work);
+    std::vector<float>().swap(s->expert_gate_pool);
+    std::vector<float>().swap(s->expert_up_pool);
+    std::vector<float>().swap(s->expert_out_pool);
+    std::vector<float>().swap(s->q_a);
+    std::vector<float>().swap(s->q_a_norm);
+    std::vector<float>().swap(s->q_b);
+    std::vector<float>().swap(s->q_absorbed);
+    std::vector<float>().swap(s->c_weighted);
+    std::vector<float>().swap(s->head_max);
+    std::vector<float>().swap(s->head_denom);
+    std::vector<float>().swap(s->kv_entry);
+    std::vector<float>().swap(s->rope_k_cos);
+    std::vector<float>().swap(s->rope_k_sin);
+    std::vector<float>().swap(s->rope_q_cos);
+    std::vector<float>().swap(s->rope_q_sin);
+    std::vector<float>().swap(s->kv_decode_flat);
+    std::vector<uint32_t>().swap(s->kv_decoded_up_to);
+}
+
 static int moe_kv_decode_layer_cache_prepare(
     moe_pc_engine* engine,
     moe_decode_scratch* s,
@@ -113,16 +176,25 @@ static int moe_kv_decode_layer_cache_prepare(
     // Fix 33: Reserve full capacity upfront to prevent mid-session realloc+memcpy spikes
     // With 79 layers × 8192 seq_len × 576 entry_dim, this can be ~1.5GB.
     // A single reserve() avoids std::vector's 2x growth pattern that peaks at 3GB.
-    if (s->kv_decode_flat.capacity() < total_needed) {
-        s->kv_decode_flat.reserve(total_needed);
-    }
-    if (s->kv_decode_flat.size() < total_needed) {
-        s->kv_decode_flat.resize(total_needed);
-        s->kv_decoded_up_to.assign(s->kv_cache.num_layers, 0u);
-        moe_kv_decode_cache_track_ram(engine, s);
-    }
-    if (s->kv_decoded_up_to.size() != s->kv_cache.num_layers) {
-        s->kv_decoded_up_to.assign(s->kv_cache.num_layers, 0u);
+    try {
+        if (s->kv_decode_flat.capacity() < total_needed) {
+            s->kv_decode_flat.reserve(total_needed);
+        }
+        if (s->kv_decode_flat.size() < total_needed) {
+            s->kv_decode_flat.resize(total_needed);
+            s->kv_decoded_up_to.assign(s->kv_cache.num_layers, 0u);
+            moe_kv_decode_cache_track_ram(engine, s);
+        }
+        if (s->kv_decoded_up_to.size() != s->kv_cache.num_layers) {
+            s->kv_decoded_up_to.assign(s->kv_cache.num_layers, 0u);
+        }
+    } catch (const std::bad_alloc&) {
+        moe_kv_decode_cache_release_ram(engine, s);
+        std::vector<float>().swap(s->kv_decode_flat);
+        std::vector<uint32_t>().swap(s->kv_decoded_up_to);
+        moe_engine_signal_memory_pressure_recovery(
+            engine, "kv_decode_cache_bad_alloc", (uint64_t)total_needed * sizeof(float));
+        return 0;
     }
     *out_start = std::min(s->kv_decoded_up_to[layer], decoded_count);
     *out_buf = s->kv_decode_flat.data() + (layer * s->kv_cache.max_seq_len * entry_dim);
@@ -191,7 +263,7 @@ static void moe_rope_table_resize(
     }
 }
 
-static void moe_decode_scratch_resize(
+static int moe_decode_scratch_resize(
     moe_decode_scratch* s,
     const moe_storage_constants_t* c,
     const moe_attn_config_t* attn_cfg,
@@ -203,7 +275,7 @@ static void moe_decode_scratch_resize(
     // Solution: Check ranges before use
     if (!s || !c || c->hidden_size > 100000 || c->expert_intermediate_size > 100000 ||
         c->experts_per_moe_layer > 10000 || c->num_hidden_layers > 1000) {
-        return;
+        return 0;
     }
 
     const uint32_t hidden = c->hidden_size;
@@ -221,7 +293,7 @@ static void moe_decode_scratch_resize(
     if (kv_a_dim > 100000 || kv_entry_dim > 100000 || q_b_dim > 100000 ||
         v_total_dim > 100000 || q_lora_rank > 100000 || cfg.kv_lora_rank > 100000 ||
         cfg.num_heads > 1000) {
-        return;
+        return 0;
     }
 
     // Fix 34: Pre-allocate all float vectors in a single sequential burst.
@@ -230,55 +302,62 @@ static void moe_decode_scratch_resize(
     // prefetcher hit rate during the forward pass (hidden → residual → norm → attn
     // are accessed sequentially).
     // Total: ~25 vectors × hidden_size(7168) × 4 bytes ≈ 700KB contiguous.
-    const bool first_alloc = s->hidden.empty();
-    s->hidden.resize(hidden);
-    s->residual.resize(hidden);
-    s->norm.resize(hidden);
-    s->attn.resize(hidden);
-    s->attn_kv_a.resize(kv_a_dim);
-    s->attn_kv_norm.resize(cfg.kv_lora_rank);
-    // BUGFIX 53: attn_kv_b removed (dead allocation)
-    s->attn_value.resize(v_total_dim);
-    s->mlp.resize(hidden);
-    s->shared.resize(hidden);
-    s->expert.resize(hidden);
-    s->gate.resize(std::max<uint32_t>(12288u, expert_intermediate));
-    // Absorption buffers
-    s->q_a.resize(q_lora_rank);
-    s->q_a_norm.resize(q_lora_rank);
-    s->q_b.resize(q_b_dim);
-    s->q_absorbed.resize((size_t)cfg.num_heads * cfg.kv_lora_rank);
-    s->c_weighted.resize((size_t)cfg.num_heads * cfg.kv_lora_rank);
-    s->head_max.resize(cfg.num_heads);
-    s->head_denom.resize(cfg.num_heads);
-    s->kv_entry.resize(kv_entry_dim);
-    s->up.resize(std::max<uint32_t>(12288u, expert_intermediate));
-    s->router_logits.resize(c->experts_per_moe_layer);
-    s->router_order.resize(c->experts_per_moe_layer);
-    s->selected_experts.reserve(moe_MOE_TOP_EXPERTS);
-    s->selected_weights.reserve(moe_MOE_TOP_EXPERTS);
-    s->expert_work.resize(moe_MOE_TOP_EXPERTS);
-    s->expert_gate_pool.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)expert_intermediate);
-    s->expert_up_pool.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)expert_intermediate);
-    s->expert_out_pool.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)hidden);
-    // On first allocation, shrink all vectors to exact capacity to prevent
-    // 2x over-allocation from vector growth and to pack them tightly.
-    if (first_alloc) {
-        s->hidden.shrink_to_fit();
-        s->residual.shrink_to_fit();
-        s->norm.shrink_to_fit();
-        s->attn.shrink_to_fit();
-        s->mlp.shrink_to_fit();
-        s->shared.shrink_to_fit();
-        s->expert.shrink_to_fit();
-        s->gate.shrink_to_fit();
-        s->up.shrink_to_fit();
-        s->expert_gate_pool.shrink_to_fit();
-        s->expert_up_pool.shrink_to_fit();
-        s->expert_out_pool.shrink_to_fit();
+    try {
+        const bool first_alloc = s->hidden.empty();
+        s->hidden.resize(hidden);
+        s->residual.resize(hidden);
+        s->norm.resize(hidden);
+        s->attn.resize(hidden);
+        s->attn_kv_a.resize(kv_a_dim);
+        s->attn_kv_norm.resize(cfg.kv_lora_rank);
+        // BUGFIX 53: attn_kv_b removed (dead allocation)
+        s->attn_value.resize(v_total_dim);
+        s->mlp.resize(hidden);
+        s->shared.resize(hidden);
+        s->expert.resize(hidden);
+        s->gate.resize(std::max<uint32_t>(12288u, expert_intermediate));
+        // Absorption buffers
+        s->q_a.resize(q_lora_rank);
+        s->q_a_norm.resize(q_lora_rank);
+        s->q_b.resize(q_b_dim);
+        s->q_absorbed.resize((size_t)cfg.num_heads * cfg.kv_lora_rank);
+        s->c_weighted.resize((size_t)cfg.num_heads * cfg.kv_lora_rank);
+        s->head_max.resize(cfg.num_heads);
+        s->head_denom.resize(cfg.num_heads);
+        s->kv_entry.resize(kv_entry_dim);
+        s->up.resize(std::max<uint32_t>(12288u, expert_intermediate));
+        s->router_logits.resize(c->experts_per_moe_layer);
+        s->router_order.resize(c->experts_per_moe_layer);
+        s->selected_experts.reserve(moe_MOE_TOP_EXPERTS);
+        s->selected_weights.reserve(moe_MOE_TOP_EXPERTS);
+        s->expert_work.resize(moe_MOE_TOP_EXPERTS);
+        s->expert_gate_pool.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)expert_intermediate);
+        s->expert_up_pool.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)expert_intermediate);
+        s->expert_out_pool.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)hidden);
+        // On first allocation, shrink all vectors to exact capacity to prevent
+        // 2x over-allocation from vector growth and to pack them tightly.
+        if (first_alloc) {
+            s->hidden.shrink_to_fit();
+            s->residual.shrink_to_fit();
+            s->norm.shrink_to_fit();
+            s->attn.shrink_to_fit();
+            s->mlp.shrink_to_fit();
+            s->shared.shrink_to_fit();
+            s->expert.shrink_to_fit();
+            s->gate.shrink_to_fit();
+            s->up.shrink_to_fit();
+            s->expert_gate_pool.shrink_to_fit();
+            s->expert_up_pool.shrink_to_fit();
+            s->expert_out_pool.shrink_to_fit();
+        }
+        moe_rope_table_resize(&s->rope_k_cos, &s->rope_k_sin, cfg.qk_rope_head_dim, cfg.rope_theta, cfg.rope_table_len);
+        moe_rope_table_resize(&s->rope_q_cos, &s->rope_q_sin, cfg.qk_rope_head_dim, cfg.rope_theta, cfg.rope_table_len);
+    } catch (const std::bad_alloc&) {
+        moe_kv_decode_cache_release_ram(engine, s);
+        moe_decode_scratch_drop_transient_buffers(s);
+        moe_engine_signal_memory_pressure_recovery(engine, "decode_scratch_bad_alloc");
+        return 0;
     }
-    moe_rope_table_resize(&s->rope_k_cos, &s->rope_k_sin, cfg.qk_rope_head_dim, cfg.rope_theta, cfg.rope_table_len);
-    moe_rope_table_resize(&s->rope_q_cos, &s->rope_q_sin, cfg.qk_rope_head_dim, cfg.rope_theta, cfg.rope_table_len);
     if (s->kv_cache.num_layers != c->num_hidden_layers ||
         s->kv_cache.entry_dim != kv_entry_dim ||
         s->kv_cache.seq_limit != cfg.max_seq_len ||
@@ -294,5 +373,6 @@ static void moe_decode_scratch_resize(
         s->kv_decoded_up_to.clear();
         s->position = 0;
     }
+    return s->hidden.size() >= hidden && s->norm.size() >= hidden && s->kv_cache.data != nullptr;
 }
 

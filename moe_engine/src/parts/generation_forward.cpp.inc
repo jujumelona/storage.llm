@@ -97,7 +97,10 @@ static int moe_forward_one_token_f32(
         "forward_token_begin",
         "position=%u token=%u layers=%u hidden=%u vocab=%u prealloc_kv=%d",
         position, token_id, c->num_hidden_layers, c->hidden_size, c->vocab_size, pre_allocate_kv);
-    moe_decode_scratch_resize(s, c, &attn_cfg, pre_allocate_kv, engine);
+    if (!moe_decode_scratch_resize(s, c, &attn_cfg, pre_allocate_kv, engine)) {
+        moe_generation_set_error(stats, "decode scratch allocation failed");
+        return 0;
+    }
     moe_kv_cache_track_ram(engine, &s->kv_cache);  // ensure_capacity delta tracking
     float* hidden = s->hidden.data();
     engine->generation_phase.store(moe_GEN_PHASE_INIT, std::memory_order_relaxed);

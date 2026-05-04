@@ -110,18 +110,43 @@ static int device_prepare_tensor_allocation(
             next.key = key;
             next.bytes = bytes;
             next.pool = pool;
-            int alloc_ok = 0;
+            next.ptr = 0;
+            auto try_device_alloc = [&]() -> int {
+                next.ptr = 0;
 #if defined(__APPLE__) && defined(__MACH__)
-            if (e->backend_caps.backend == moe_BACKEND_METAL) {
-                extern "C" void* metal_buffer_alloc(void* device_handle, uint64_t bytes);
-                next.ptr = (CUdeviceptr)metal_buffer_alloc(nullptr, bytes);
-                alloc_ok = (next.ptr != 0) ? 1 : 0;
-            } else
+                if (e->backend_caps.backend == moe_BACKEND_METAL) {
+                    extern "C" void* metal_buffer_alloc(void* device_handle, uint64_t bytes);
+                    next.ptr = (CUdeviceptr)metal_buffer_alloc(nullptr, bytes);
+                    return (next.ptr != 0) ? 1 : 0;
+                } else
 #endif
-            if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipMalloc) {
-                alloc_ok = (e->hip.hipMalloc(&next.ptr, (size_t)bytes) == 0) ? 1 : 0;
-            } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemAlloc) {
-                alloc_ok = (e->cuda.cuMemAlloc(&next.ptr, (size_t)bytes) == 0) ? 1 : 0;
+                if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipMalloc) {
+                    return (e->hip.hipMalloc(&next.ptr, (size_t)bytes) == 0) ? 1 : 0;
+                } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemAlloc) {
+                    return (e->cuda.cuMemAlloc(&next.ptr, (size_t)bytes) == 0) ? 1 : 0;
+                }
+                return 0;
+            };
+            int alloc_ok = try_device_alloc();
+            if (!alloc_ok) {
+                e->io_atomic.device_alloc_failures.fetch_add(1, std::memory_order_relaxed);
+                e->vram_eviction_needed.store(true, std::memory_order_relaxed);
+                e->vram_eviction_cv.notify_one();
+                lock.unlock();
+                device_refresh_mem_info(e, 1);
+                device_free_pool(e, moe_DEVICE_POOL_STREAM);
+                device_free_pool(e, moe_DEVICE_POOL_ACTIVATION);
+                device_refresh_mem_info(e, 1);
+                lock.lock();
+                device_make_room_locked(e, pool, bytes, lock, deferred_free_ptrs);
+                if (!deferred_free_ptrs.empty()) {
+                    lock.unlock();
+                    device_free_deferred_ptrs(e, deferred_free_ptrs);
+                    deferred_free_ptrs.clear();
+                    device_refresh_mem_info(e, 1);
+                    lock.lock();
+                }
+                alloc_ok = try_device_alloc();
             }
             if (!alloc_ok) {
                 // NOTE: pending_vram_reservation은 prefetch_plan_execute의 Pass 2에서

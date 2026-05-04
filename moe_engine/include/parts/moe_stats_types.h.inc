@@ -48,6 +48,7 @@ typedef struct {
     uint32_t qkv_forced_by_format;
     uint32_t qkv_k_bits;
     uint32_t qkv_v_bits;
+    uint32_t qkv_normal_bits;
     uint32_t qkv_group_size;
     uint32_t qkv_page_size_tokens;
     uint32_t qkv_sink_tokens;

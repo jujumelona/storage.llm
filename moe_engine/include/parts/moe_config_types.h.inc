@@ -66,6 +66,7 @@ typedef struct {
     float int4_fallback_threshold;
     uint8_t vram_eviction_threshold_pct;
     uint8_t ram_eviction_threshold_pct;
+    uint8_t ram_eviction_target_fill_pct;  // RAM eviction target percentage (0=default 75%)
     uint8_t attention_prefetch_threshold_pct;
     uint8_t madv_cold_threshold_pct;
     uint8_t metal_memory_budget_pct;  // Metal unified-memory budget percentage (0=auto, safe range 50-90)

@@ -167,6 +167,10 @@ int qkv_attention_decode_impl(
                     int normal_pos = 0;
                     for (int i = 0; i < d; i++) {
                         if (is_outlier && is_outlier[i]) continue;
+                        if (normal_pos >= n_normal) {
+                            *ok_flag = 0;
+                            return;
+                        }
                         dot += q_eff[i] * norm_centroids[local_codes[normal_pos++]];
                     }
                 } else if (k_mse_bits == 2) {

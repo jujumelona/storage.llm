@@ -179,7 +179,18 @@ static void moe_staging_slot_targets(
     uint32_t gpu_target = gpu_workers > 0 ? std::max(1u, gpu_workers * gpu_batch_eff) : 0u;
     uint32_t direct_target = moe_staging_direct_slot_target(engine, disk_workers);
 
-    if (engine && engine->backend_caps.backend == moe_BACKEND_METAL) {
+    // BUGFIX Issue 2: Extend zero-copy slot optimization to AMD APU and Intel Xe ★★
+    // Problem: Only Metal gets pinned_target=0, gpu_target=0
+    // AMD APU (780M) and Intel Iris Xe have unified_memory + unified_mmap_gpu_accessible
+    // but still allocate staging slots that go unused (zero-copy path bypasses them)
+    // Solution: Check unified memory flags instead of backend type
+    const bool is_unified_zero_copy = engine && (
+        engine->backend_caps.backend == moe_BACKEND_METAL ||
+        (engine->backend_caps.supports_unified_memory &&
+         engine->backend_caps.unified_mmap_gpu_accessible)
+    );
+
+    if (is_unified_zero_copy) {
         pinned_target = 0;
         gpu_target = 0;
         direct_target = disk_workers > 0 ? std::max(1u, disk_workers) : 1u;
@@ -639,8 +650,13 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
 
     for (uint32_t i = 0; i < slot_count; ++i) {
         moe_staging_slot slot;
+        if (slot_size > 0 && i > UINT64_MAX / slot_size) {
+            fprintf(stderr, "[storageLLM ERROR] slot_size * i overflow\n");
+            update_staging_slot_deficit(engine);
+            return;
+        }
         slot.buf = engine->staging + slot_size * i;
-        // BUGFIX 587: Check slot_size * i doesn't overflow ★
+        // BUGFIX NEW-5: Check slot_size * i overflow before pointer arithmeticesn't overflow ★
         // Problem: slot_size * i can overflow
         // Solution: Check before calculation
         const uint64_t offset = (uint64_t)slot_size * i;

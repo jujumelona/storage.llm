@@ -2061,6 +2061,7 @@ def juju_contract_metadata(contract, source_name, source_repo_id):
     for src, dst in (
         ("k_bits", "k_bits"),
         ("v_bits", "v_bits"),
+        ("normal_bits", "normal_bits"),
         ("group_size", "group_size"),
         ("page_size_tokens", "page_size_tokens"),
         ("sink_tokens", "sink_tokens"),
@@ -2078,6 +2079,7 @@ def juju_contract_metadata(contract, source_name, source_repo_id):
         ("rotation.enabled", "enable_rotation"),
         ("outlier.channels", "outlier_channels"),
         ("outlier.bits", "outlier_bits"),
+        ("normal.bits", "normal_bits"),
         ("residency.sink_tokens", "sink_tokens"),
     )
     for src, dst in qkv_nested:

@@ -80,15 +80,16 @@
     return 1;
 }
 
-static uint64_t moe_count_json_key_occurrences(const std::string& text, const char* key) {
+static uint64_t moe_count_json_key_occurrences(const std::string& text, const char* key, size_t start_pos = 0) {
     if (!key || !key[0]) {
         return 0;
     }
     uint64_t count = 0;
-    size_t pos = 0;
+    size_t pos = start_pos;
+    const size_t key_len = std::strlen(key);
     while ((pos = text.find(key, pos)) != std::string::npos) {
         ++count;
-        pos += std::strlen(key);
+        pos += key_len;
     }
     return count;
 }
@@ -110,8 +111,9 @@ static void moe_ingest_juju_graph_ir(moe_pc_engine* engine, const std::string& i
     if (moe_json_get_u64_local(index_json, "split_count", &split_count) && split_count > 1) {
         engine->juju_split_group_count.fetch_add(1, std::memory_order_relaxed);
     }
-    if (index_json.find("\"graph_ir\"") == std::string::npos ||
-        index_json.find("JUJU_GRAPH_IR_V1") == std::string::npos) {
+    size_t graph_pos = index_json.find("\"graph_ir\"");
+    if (graph_pos == std::string::npos ||
+        index_json.find("JUJU_GRAPH_IR_V1", graph_pos) == std::string::npos) {
         return;
     }
     engine->offload_graph_ir_ready.store(1, std::memory_order_relaxed);
@@ -120,19 +122,15 @@ static void moe_ingest_juju_graph_ir(moe_pc_engine* engine, const std::string& i
         engine->offload_graph_ir_required.store(1, std::memory_order_relaxed);
     }
     uint64_t schema_version = 1;
-    size_t graph_pos = index_json.find("\"graph_ir\"");
-    if (graph_pos != std::string::npos) {
-        std::string graph_tail = index_json.substr(graph_pos);
-        moe_json_get_u64_local(graph_tail, "schema_version", &schema_version);
-        engine->offload_graph_ir_op_count.fetch_add(
-            moe_count_json_key_occurrences(graph_tail, "\"op\""),
-            std::memory_order_relaxed);
-        engine->offload_graph_ir_layer_count.fetch_add(
-            moe_count_json_key_occurrences(graph_tail, "\"layer\""),
-            std::memory_order_relaxed);
-        if (engine->offload_graph_ir_json.empty()) {
-            engine->offload_graph_ir_json = graph_tail.substr(0, std::min<size_t>(graph_tail.size(), 1u << 20));
-        }
+    moe_json_get_u64_slice(index_json, graph_pos, index_json.size(), "schema_version", &schema_version);
+    engine->offload_graph_ir_op_count.fetch_add(
+        moe_count_json_key_occurrences(index_json, "\"op\"", graph_pos),
+        std::memory_order_relaxed);
+    engine->offload_graph_ir_layer_count.fetch_add(
+        moe_count_json_key_occurrences(index_json, "\"layer\"", graph_pos),
+        std::memory_order_relaxed);
+    if (engine->offload_graph_ir_json.empty()) {
+        engine->offload_graph_ir_json = index_json.substr(graph_pos, std::min<size_t>(index_json.size() - graph_pos, 1u << 20));
     }
     engine->offload_graph_ir_version.store((uint32_t)std::min<uint64_t>(schema_version, UINT32_MAX), std::memory_order_relaxed);
 }

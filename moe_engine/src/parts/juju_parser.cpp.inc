@@ -425,6 +425,9 @@ static int moe_parse_juju_tensor_index_json(
             !moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_bytes", &rec.juju_bytes)) {
             continue;
         }
+        if (rec.juju_bytes == 0) {
+            continue;
+        }
         // BUGFIX 331: Check juju_bytes > 0 to prevent zero-size tensors ★
         // Problem: juju_bytes can be 0, causing issues in tensor loading
         // Solution: Skip tensors with juju_bytes == 0

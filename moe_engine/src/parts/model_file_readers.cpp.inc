@@ -213,6 +213,9 @@ static int moe_read_offload_gguf_file(
         } else if (key == "offload.qkv_v_bits" && moe_gguf_read_uint_value(input, type, &u64_value)) {
             consumed = 1;
             out->contract.qkv_v_bits = moe_u64_to_u32_clamped(u64_value, 0);
+        } else if (key == "offload.qkv_normal_bits" && moe_gguf_read_uint_value(input, type, &u64_value)) {
+            consumed = 1;
+            out->contract.qkv_normal_bits = moe_u64_to_u32_clamped(u64_value, 0);
         } else if (key == "offload.qkv_group_size" && moe_gguf_read_uint_value(input, type, &u64_value)) {
             consumed = 1;
             out->contract.qkv_group_size = moe_u64_to_u32_clamped(u64_value, 0);

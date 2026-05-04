@@ -30,10 +30,21 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
     // If that 1 entry is stale, function returns 0 (failure) → VRAM OOM
     // Solution: When compact_needed=true, use full heap_size instead of heap_size/2
     // This ensures all entries are scanned in emergency situations
+    // BUGFIX Issue 5: Cap stale_limit at 4096 to prevent heap_mutex long hold ★★★
+    // Problem: Large MoE models (Qwen2-57B-A14B) can have heap_size > 10,000
+    // compact_needed=true → scan entire heap → heap_mutex held for milliseconds
+    // → GPU upload workers blocked
+    // Solution: Cap at 4096 even when compact_needed=true
+    // Trade-off: May not find victim in extreme cases, but proactive_eviction_worker_loop
+    // runs every 25ms to compact heap, so next attempt succeeds (25ms delay vs deadlock)
+    // BUGFIX NEW-3: Ensure stale_limit is always > 0 when heap is non-empty ★★★
+    // Problem: heap_size=0 → stale_limit=0 → while loop never executes → always returns 0
+    // But if heap is non-empty, we should always try at least once
+    // Solution: Use max(1, ...) to ensure at least 1 attempt when heap is non-empty
     const uint32_t stale_limit = engine->evict_heap_compact_needed.load(std::memory_order_relaxed)
-        ? heap_size
-        : std::max<uint32_t>(128u, std::min<uint32_t>(512u, heap_size / 4u));
-    if (stale_limit == 0) {
+        ? std::min(heap_size, 4096u)
+        : std::max<uint32_t>(1u, std::max<uint32_t>(128u, std::min<uint32_t>(512u, heap_size / 4u)));
+    if (heap_size == 0 || stale_limit == 0) {
         return 0;
     }
     uint32_t stale_count = 0;

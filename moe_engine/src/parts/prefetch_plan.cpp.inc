@@ -57,11 +57,19 @@ int moe_pc_engine_plan_moe_prefetch(
         const uint64_t device_free = device_budget > device_allocated ? device_budget - device_allocated : 0;
 
         // Use backend-specific headroom percentage (default 10%) to avoid filling device memory completely.
+        // BUGFIX Issue 10: Add Metal headroom configuration
+        // Problem: Metal unified memory is shared with OS, but only Vulkan/Level Zero had configurable headroom
+        // Solution: Apply metal_memory_budget_pct or default 15% for Metal (higher than discrete GPUs)
         uint64_t headroom_pct = 10u;
         if (engine->backend_caps.backend == moe_BACKEND_VULKAN && engine->io_config.vulkan_memory_headroom_pct > 0) {
             headroom_pct = engine->io_config.vulkan_memory_headroom_pct;
         } else if (engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO && engine->io_config.level_zero_memory_headroom_pct > 0) {
             headroom_pct = engine->io_config.level_zero_memory_headroom_pct;
+        } else if (engine->backend_caps.backend == moe_BACKEND_METAL) {
+            // Metal unified memory needs more headroom due to OS sharing
+            headroom_pct = engine->io_config.metal_memory_budget_pct > 0
+                ? (100u - engine->io_config.metal_memory_budget_pct)
+                : 15u;
         }
         const uint64_t usable_free = (device_free * (100u - headroom_pct)) / 100u;
 

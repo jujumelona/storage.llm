@@ -146,12 +146,14 @@ static int enqueue_stage_or_retry(
         } else {
             stage.queue.push_back(queued);
         }
-        // Fix 30: Compute depth inside lock, but update atomics outside
+        // BUGFIX Issue 7: Move depth.store inside lock to prevent stale-store race
+        // Problem: Thread A computes final=5, releases lock, Thread B stores 6, Thread A stores 5
+        // Result: depth shows 5 but actual queue has 6 items → admission underestimates pressure
+        // Solution: Store depth inside lock, same pattern as enqueue_stage
         final_depth_after = stage.queue.size() + stage.urgent_queue.size();
+        stage.depth.store(static_cast<uint32_t>(final_depth_after), std::memory_order_relaxed);
     }
-    // Fix 30: Atomic counter updates moved outside lock to reduce contention
-    // stage.depth and total_queue_depth are atomics — safe without lock
-    stage.depth.store(static_cast<uint32_t>(final_depth_after), std::memory_order_relaxed);
+    // total_queue_depth is safe to update outside lock (atomic, no ordering dependency)
     engine->total_queue_depth.fetch_add(1, std::memory_order_relaxed);
     return 1;
 }

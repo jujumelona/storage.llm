@@ -161,8 +161,19 @@ int moe_pc_engine_execute_prefetch_plan(
             // condition `&& items[i].target_tier == moe_TIER_VRAM`. If admitted_tiers[i]
             // is VRAM, VRAM reservation was taken, regardless of the original target.
             // Solution: Release based solely on admitted_tiers.
+            // BUGFIX Issue 1: Handle RAM→VRAM upgrade path in skip_item ★★★
+            // Problem: Pass 1 RAM→VRAM upgrade uses try_add_tier_usage (direct commit)
+            // without setting vram_pending_reserved[i]. If skip_item=true, vram_used_bytes
+            // remains incremented but expert not loaded → VRAM budget leak.
+            // Solution: Add third case for admitted_tiers[i]==VRAM && !vram_pending_reserved[i]
             if (vram_pending_reserved[i] && items[i].bytes > 0) {
                 prefetch_release_pending_vram_reservation(engine, items[i].bytes);
+            } else if (admitted_tiers[i] == moe_TIER_VRAM
+                       && !vram_pending_reserved[i]
+                       && items[i].bytes > 0) {
+                // RAM→VRAM upgrade path: try_add_tier_usage directly committed to vram_used_bytes
+                // Must subtract to prevent leak
+                subtract_tier_usage(engine, moe_TIER_VRAM, items[i].bytes);
             } else if (admitted_tiers[i] == moe_TIER_RAM && items[i].bytes > 0) {
                 prefetch_release_pending_ram_reservation(engine, items[i].bytes);
             }

@@ -456,11 +456,15 @@ static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
     // BUGFIX Issue 2: Use staging_slot_valid helper for correct check order ★★
     // Problem: Direct index check doesn't verify staging_slot_size first
     // Solution: Use centralized helper that enforces staging_slot_size > 0 check
-    if (!engine || !staging_slot_valid(engine, slot_index)) {
+    // BUGFIX NEW-4: Remove redundant staging_slot_valid check ★
+    // Problem: staging_slot_valid called twice - first check returns if invalid,
+    // so second check is always true (dead code)
+    // Solution: Remove redundant second check
+    if (!staging_slot_valid(engine, slot_index)) {
         return;
     }
-    if (staging_slot_valid(engine, slot_index)) {
-        engine->staging_slots[slot_index].in_use.store(false, std::memory_order_release);
+
+    engine->staging_slots[slot_index].in_use.store(false, std::memory_order_release);
 #ifdef ENABLE_LOCKFREE_STAGING
         if (engine->staging_slots.size() <= 64u) {
             engine->staging_slot_free_mask.fetch_or(1ull << slot_index, std::memory_order_release);

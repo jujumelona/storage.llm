@@ -127,6 +127,7 @@ typedef struct {
 
     // Shared transforms and codebooks.
     float* rotation_matrix;   // [head_dim, head_dim] random orthogonal
+    float* rotation_signs;    // [head_dim] sign vector for Hadamard structure (Issue 9)
     float* qjl_matrix;        // [head_dim, head_dim] Gaussian S, S_ij ~ N(0,1) (paper Lemma 4)
     int8_t* qjl_signs_matrix; // Reserved (NULL — Rademacher disabled per paper)
     float* codebook_1bit;     // Bug ②: 2 levels for prod-mode v_bits=2

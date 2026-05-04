@@ -24,6 +24,28 @@
 std::atomic<bool> g_qkv_mode_enabled{true};
 
 // ============================================================
+// BUGFIX Issue 9: Fast Walsh-Hadamard Transform (FWHT)
+// ============================================================
+// Problem: Rotation matrix multiplication is O(dim²) but for power-of-2 dim,
+// the Hadamard structure allows O(dim·log₂dim) computation via FWHT
+// Solution: Implement in-place FWHT for power-of-2 dimensions
+// Impact: 18x speedup for dim=128 (16,384 ops → 896 ops)
+static void fwht_inplace(float* data, int dim) {
+    // In-place Fast Walsh-Hadamard Transform
+    // Assumes dim is power of 2
+    for (int h = 1; h < dim; h *= 2) {
+        for (int i = 0; i < dim; i += h * 2) {
+            for (int j = i; j < i + h; ++j) {
+                const float a = data[j];
+                const float b = data[j + h];
+                data[j] = a + b;
+                data[j + h] = a - b;
+            }
+        }
+    }
+}
+
+// ============================================================
 // Public API - State Management
 // ============================================================
 
@@ -123,14 +145,35 @@ static int qkv_quantize_split_vector_with_state(
 
     const float* src = normalized;
     if (config->enable_rotation && state->rotation_matrix) {
-        for (int i = 0; i < dim; ++i) {
-            float sum = 0.0f;
+        // BUGFIX Issue 9: Use Fast Hadamard Transform for power-of-2 dimensions
+        // O(dim²) → O(dim·log₂dim) speedup (18x for dim=128)
+        const bool is_power_of_2 = (dim & (dim - 1)) == 0;
+        if (is_power_of_2 && state->rotation_signs) {
+            // Fast path: Hadamard structure with sign vector
+            memcpy(rotated, normalized, (size_t)dim * sizeof(float));
+            // Apply sign vector (precomputed from rotation matrix)
             for (int j = 0; j < dim; ++j) {
-                sum += state->rotation_matrix[(size_t)i * (size_t)dim + (size_t)j] * normalized[j];
+                rotated[j] *= state->rotation_signs[j];
             }
-            rotated[i] = sum;
+            // Fast Walsh-Hadamard Transform
+            fwht_inplace(rotated, dim);
+            // Apply scale factor
+            const float scale = 1.0f / sqrtf((float)dim);
+            for (int i = 0; i < dim; ++i) {
+                rotated[i] *= scale;
+            }
+            src = rotated;
+        } else {
+            // Slow path: Full matrix multiplication for non-power-of-2
+            for (int i = 0; i < dim; ++i) {
+                float sum = 0.0f;
+                for (int j = 0; j < dim; ++j) {
+                    sum += state->rotation_matrix[(size_t)i * (size_t)dim + (size_t)j] * normalized[j];
+                }
+                rotated[i] = sum;
+            }
+            src = rotated;
         }
-        src = rotated;
     }
 
     const float* out_centroids = qkv_codebook_for_bits(state, out_mse_bits);
@@ -154,6 +197,9 @@ static int qkv_quantize_split_vector_with_state(
     int normal_pos = 0;
     for (int ch = 0; ch < dim; ++ch) {
         if (is_outlier[ch]) continue;
+        if (normal_pos >= n_norm) {
+            return 0;
+        }
         const int code = qkv_find_nearest_centroid(src[ch], norm_centroids, norm_thresholds, norm_levels);
         indices[normal_pos++] = code;
         y_tilde[ch] = norm_centroids[code];
@@ -268,7 +314,21 @@ int qkv_quantize(
 
             // Apply inverse rotation in the normalized domain. Algorithm 2 is
             // defined for x in S^{d-1}; norms[t] is applied only at dequant.
-            if (config->enable_rotation && state->rotation_matrix) {
+            // BUGFIX Issue 9: Use Fast Hadamard Transform for inverse rotation
+            const bool is_power_of_2 = (dim & (dim - 1)) == 0;
+            if (config->enable_rotation && state->rotation_matrix && is_power_of_2 && state->rotation_signs) {
+                // Fast path: Inverse Hadamard (self-inverse up to scale)
+                const float scale = 1.0f / sqrtf((float)dim);
+                for (int i = 0; i < dim; ++i) {
+                    x_mse[i] = y_tilde[i] * scale;
+                }
+                fwht_inplace(x_mse, dim);
+                // Apply inverse sign vector (sign is self-inverse)
+                for (int i = 0; i < dim; ++i) {
+                    x_mse[i] *= state->rotation_signs[i];
+                }
+            } else if (config->enable_rotation && state->rotation_matrix) {
+                // Slow path: Full matrix transpose multiplication
                 for (int i = 0; i < dim; i++) {
                     float sum = 0.0f;
                     for (int j = 0; j < dim; j++) {
@@ -355,7 +415,20 @@ int qkv_quantize(
                 y_tilde[i] = centroids[indices[i]];
             }
 
-            if (config->enable_rotation && state->rotation_matrix) {
+            // BUGFIX Issue 9: Use Fast Hadamard Transform for inverse rotation (V path)
+            const bool is_power_of_2_v = (dim & (dim - 1)) == 0;
+            if (config->enable_rotation && state->rotation_matrix && is_power_of_2_v && state->rotation_signs) {
+                // Fast path: Inverse Hadamard
+                const float scale = 1.0f / sqrtf((float)dim);
+                for (int i = 0; i < dim; ++i) {
+                    x_mse[i] = y_tilde[i] * scale;
+                }
+                fwht_inplace(x_mse, dim);
+                for (int i = 0; i < dim; ++i) {
+                    x_mse[i] *= state->rotation_signs[i];
+                }
+            } else if (config->enable_rotation && state->rotation_matrix) {
+                // Slow path: Full matrix transpose multiplication
                 for (int i = 0; i < dim; i++) {
                     float sum = 0.0f;
                     for (int j = 0; j < dim; j++) {

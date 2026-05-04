@@ -51,6 +51,7 @@ int moe_pc_engine_get_stats(const moe_pc_engine_t* engine, moe_pc_engine_stats_t
     if (engine->offload_qkv_cfg_available.load(std::memory_order_acquire)) {
         out_stats->qkv_k_bits = (uint32_t)std::max(0, engine->offload_qkv_cfg.k_bits);
         out_stats->qkv_v_bits = (uint32_t)std::max(0, engine->offload_qkv_cfg.v_bits);
+        out_stats->qkv_normal_bits = (uint32_t)std::max(0, engine->offload_qkv_cfg.normal_bits);
         out_stats->qkv_group_size = engine->offload_qkv_cfg.group_size;
         out_stats->qkv_page_size_tokens = engine->offload_qkv_cfg.page_size_tokens;
         out_stats->qkv_sink_tokens = engine->offload_qkv_cfg.sink_tokens;

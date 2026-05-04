@@ -114,6 +114,7 @@ struct moe_offload_gguf_contract_t {
     double reference_nvme_to_ram_ms = 0.0;
     uint32_t qkv_k_bits = 0;
     uint32_t qkv_v_bits = 0;
+    uint32_t qkv_normal_bits = 0;
     uint32_t qkv_group_size = 0;
     uint32_t qkv_page_size_tokens = 0;
     uint32_t qkv_sink_tokens = 0;

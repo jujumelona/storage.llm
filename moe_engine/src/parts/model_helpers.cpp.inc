@@ -59,6 +59,9 @@ static qkv_config_t moe_qkv_config_from_offload_contract(const moe_offload_gguf_
         cfg.v_bits = (int)std::min<uint32_t>(contract.qkv_v_bits, 4);
         cfg.normal_bits = cfg.v_bits;
     }
+    if (contract.qkv_normal_bits > 0) {
+        cfg.normal_bits = (int)std::min<uint32_t>(contract.qkv_normal_bits, 4);
+    }
     if (contract.qkv_group_size > 0) {
         cfg.group_size = contract.qkv_group_size;
     }

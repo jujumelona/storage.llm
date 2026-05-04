@@ -6,7 +6,7 @@ int moe_pc_engine_generate_token_ids(
     uint32_t* out_token_ids,
     uint32_t out_token_capacity,
     moe_generation_stats_t* out_stats
-) {
+) try {
     if (out_stats) {
         std::memset(out_stats, 0, sizeof(*out_stats));
     }
@@ -153,7 +153,10 @@ int moe_pc_engine_generate_token_ids(
             engine, c->num_hidden_layers, moe_attn_kv_entry_dim(attn_cfg), attn_cfg.max_seq_len);
 
     // Fix 1+2: Initialize KV cache and position counter
-    moe_decode_scratch_resize(&scratch, c, &attn_cfg, pre_allocate_kv);
+    if (!moe_decode_scratch_resize(&scratch, c, &attn_cfg, pre_allocate_kv, engine)) {
+        moe_generation_set_error(out_stats, "decode scratch allocation failed");
+        return 0;
+    }
     moe_kv_cache_track_ram(engine, &scratch.kv_cache);
     scratch.position = 0;
 
@@ -230,7 +233,10 @@ int moe_pc_engine_generate_token_ids(
                 moe_profile_elapsed_ms(batch_embed_start_us));
 
             // Ensure scratch is sized
-            moe_decode_scratch_resize(&scratch, c, &attn_cfg, pre_allocate_kv);
+            if (!moe_decode_scratch_resize(&scratch, c, &attn_cfg, pre_allocate_kv, engine)) {
+                moe_generation_set_error(out_stats, "prefill scratch allocation failed");
+                return 0;
+            }
             moe_kv_cache_track_ram(engine, &scratch.kv_cache);
 
             // Bug 8: Pre-allocate KV cache capacity to avoid reallocation inside tight loop
@@ -438,4 +444,12 @@ int moe_pc_engine_generate_token_ids(
     }
     generation_scope.ok = !failed && produced > 0 ? 1 : 0;
     return generation_scope.ok;
+} catch (const std::bad_alloc&) {
+    moe_generation_set_error(out_stats, "generation aborted under RAM pressure");
+    moe_engine_signal_memory_pressure_recovery(engine, "generation_bad_alloc");
+    return 0;
+} catch (...) {
+    moe_generation_set_error(out_stats, "generation aborted by unexpected exception");
+    moe_engine_signal_memory_pressure_recovery(engine, "generation_exception");
+    return 0;
 }

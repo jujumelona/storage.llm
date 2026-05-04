@@ -282,8 +282,10 @@ static int device_backend_event_sync(moe_pc_engine* e, CUevent event) {
             if (e->io_stop.load(std::memory_order_relaxed)) break;
             if (++spin_count < 20) {
                 std::this_thread::yield();
-            } else {
+            } else if (spin_count < 10000) {
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
+            } else {
+                break;
             }
         }
         return e->cuda.cuEventQuery(event) == 0;
@@ -301,8 +303,10 @@ static int device_backend_event_sync(moe_pc_engine* e, CUevent event) {
             if (e->io_stop.load(std::memory_order_relaxed)) break;
             if (++spin_count < 20) {
                 std::this_thread::yield();
-            } else {
+            } else if (spin_count < 10000) {
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
+            } else {
+                break;
             }
         }
         return e->hip.hipEventQuery(event) == 0;

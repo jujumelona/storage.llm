@@ -66,14 +66,62 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
             max_seq_len = 1;
         }
         seq_len = 0;
+        auto kv_bytes_for = [&](uint32_t cap) -> uint64_t {
+            if (layers == 0 || cap == 0 || entry_dim == 0) {
+                return 0;
+            }
+            if ((uint64_t)cap > UINT64_MAX / (uint64_t)layers) {
+                return UINT64_MAX;
+            }
+            const uint64_t entries = (uint64_t)cap * (uint64_t)layers;
+            const uint64_t entry_bytes = (uint64_t)entry_dim + 2ull * sizeof(float);
+            return entries > UINT64_MAX / entry_bytes ? UINT64_MAX : entries * entry_bytes;
+        };
+        if (pre_allocate) {
+            const uint64_t want = kv_bytes_for(max_seq_len);
+            const uint64_t avail = storagellm::available_ram_bytes();
+            const uint64_t guard = std::max<uint64_t>(256ull * 1024ull * 1024ull, want / 8ull);
+            if (want == UINT64_MAX || (avail != 0 && (avail <= guard || want > avail - guard))) {
+                max_seq_len = std::min<uint32_t>(moe_MLA_KV_INITIAL_CHUNK, seq_limit);
+                if (max_seq_len == 0) max_seq_len = 1;
+                std::fprintf(stderr,
+                    "[storageLLM WARNING] KV preallocation disabled under RAM pressure requested=%llu available=%llu chunk=%u\n",
+                    (unsigned long long)want,
+                    (unsigned long long)avail,
+                    max_seq_len);
+            }
+        }
+        if ((uint64_t)max_seq_len > SIZE_MAX / (uint64_t)std::max<uint32_t>(layers, 1u) ||
+            (uint64_t)max_seq_len * (uint64_t)std::max<uint32_t>(layers, 1u) > SIZE_MAX / (uint64_t)std::max<uint32_t>(entry_dim, 1u)) {
+            if (data) std::free(data);
+            if (scales) std::free(scales);
+            if (zeros) std::free(zeros);
+            data = nullptr; scales = nullptr; zeros = nullptr;
+            return;
+        }
+        const size_t total_entries = (size_t)max_seq_len * (size_t)layers;
+        uint8_t* new_data = (uint8_t*)std::calloc(total_entries * entry_dim, sizeof(uint8_t));
+        float* new_scales = (float*)std::calloc(total_entries, sizeof(float));
+        float* new_zeros = (float*)std::calloc(total_entries, sizeof(float));
+        if (!new_data || !new_scales || !new_zeros) {
+            if (new_data) std::free(new_data);
+            if (new_scales) std::free(new_scales);
+            if (new_zeros) std::free(new_zeros);
+            if (pre_allocate && max_seq_len > std::min<uint32_t>(moe_MLA_KV_INITIAL_CHUNK, seq_limit)) {
+                max_seq_len = std::min<uint32_t>(moe_MLA_KV_INITIAL_CHUNK, seq_limit);
+                if (max_seq_len == 0) max_seq_len = 1;
+                const size_t retry_entries = (size_t)max_seq_len * (size_t)layers;
+                new_data = (uint8_t*)std::calloc(retry_entries * entry_dim, sizeof(uint8_t));
+                new_scales = (float*)std::calloc(retry_entries, sizeof(float));
+                new_zeros = (float*)std::calloc(retry_entries, sizeof(float));
+            }
+        }
         if (data) std::free(data);
         if (scales) std::free(scales);
         if (zeros) std::free(zeros);
-        const size_t total_entries = (size_t)max_seq_len * layers;
-        data = (uint8_t*)std::calloc(total_entries * entry_dim, sizeof(uint8_t));
-        scales = (float*)std::calloc(total_entries, sizeof(float));
-        zeros = (float*)std::calloc(total_entries, sizeof(float));
-        // BUGFIX 633: Check calloc failure ??
+        data = new_data;
+        scales = new_scales;
+        zeros = new_zeros;
         if (!data || !scales || !zeros) {
             if (data) std::free(data);
             if (scales) std::free(scales);

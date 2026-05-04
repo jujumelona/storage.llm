@@ -4,7 +4,7 @@ int moe_pc_engine_eval_token_ids_from(
     uint32_t input_token_count,
     uint32_t first_target_index,
     moe_eval_stats_t* out_stats
-) {
+) try {
     if (out_stats) {
         std::memset(out_stats, 0, sizeof(*out_stats));
     }
@@ -132,7 +132,10 @@ int moe_pc_engine_eval_token_ids_from(
     // BUGFIX 563: Check moe_decode_scratch_resize success ★
     // Problem: moe_decode_scratch_resize can fail on allocation
     // Solution: Check return value (assuming it returns int)
-    moe_decode_scratch_resize(&scratch, c, &attn_cfg, pre_allocate_kv, engine);
+    if (!moe_decode_scratch_resize(&scratch, c, &attn_cfg, pre_allocate_kv, engine)) {
+        moe_eval_set_error(out_stats, "failed to allocate decode scratch");
+        return 0;
+    }
     moe_profile_log(
         "eval_prepare_end",
         "kv_max_seq=%u rope_q=%zu rope_k=%zu hidden=%zu",
@@ -262,6 +265,14 @@ int moe_pc_engine_eval_token_ids_from(
         ppl,
         moe_profile_elapsed_ms(eval_start_us));
     return 1;
+} catch (const std::bad_alloc&) {
+    moe_eval_set_error(out_stats, "eval aborted under RAM pressure");
+    moe_engine_signal_memory_pressure_recovery(engine, "eval_bad_alloc");
+    return 0;
+} catch (...) {
+    moe_eval_set_error(out_stats, "eval aborted by unexpected exception");
+    moe_engine_signal_memory_pressure_recovery(engine, "eval_exception");
+    return 0;
 }
 
 int moe_pc_engine_eval_token_ids(

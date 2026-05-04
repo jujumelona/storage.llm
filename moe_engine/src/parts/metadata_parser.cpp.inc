@@ -96,6 +96,11 @@ static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
         moe_json_get_u64_local(meta->metadata_json, "v_bits", &value)) {
         meta->contract.qkv_v_bits = moe_u64_to_u32_clamped(value, 0);
     }
+    if (meta->contract.qkv_normal_bits == 0 &&
+        (moe_json_get_u64_local(meta->metadata_json, "normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(meta->metadata_json, "normal", "bits", &value))) {
+        meta->contract.qkv_normal_bits = moe_u64_to_u32_clamped(value, 0);
+    }
     if (meta->contract.qkv_group_size == 0 &&
         moe_json_get_u64_local(meta->metadata_json, "group_size", &value)) {
         meta->contract.qkv_group_size = moe_u64_to_u32_clamped(value, 0);
@@ -195,25 +200,11 @@ static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
     if (moe_json_get_double_local(meta->metadata_json, "ram_to_gpu_ms", &double_value) ||
         moe_json_get_double_local(meta->metadata_json, "reference_ram_to_gpu_ms", &double_value)) {
         meta->contract.reference_ram_to_gpu_ms = double_value;
-    }
     if (moe_json_get_double_local(meta->metadata_json, "nvme_to_ram_ms", &double_value) ||
         moe_json_get_double_local(meta->metadata_json, "reference_nvme_to_ram_ms", &double_value)) {
         meta->contract.reference_nvme_to_ram_ms = double_value;
     }
-    if (meta->metadata_json.find("\"final_model_structure_contract\"") != std::string::npos ||
-        meta->metadata_json.find("\"pipeline_budget_contract\"") != std::string::npos ||
-        meta->metadata_json.find("\"execution_path_contract\"") != std::string::npos ||
-        meta->metadata_json.find("\"expert_segmentation_contract\"") != std::string::npos ||
-        meta->metadata_json.find("\"chunk_io_contract\"") != std::string::npos ||
-        meta->metadata_json.find("\"universal_tier_contract\"") != std::string::npos ||
-        meta->metadata_json.find("\"format_extension_contract\"") != std::string::npos ||
-        meta->metadata_json.find("\"kernel_registry_contract\"") != std::string::npos ||
-        meta->metadata_json.find("\"tokenizer_contract\"") != std::string::npos ||
-        meta->metadata_json.find("\"adapter_registry_contract\"") != std::string::npos ||
-        meta->metadata_json.find("\"validation_contract\"") != std::string::npos ||
-        meta->metadata_json.find("\"research_offload_contract\"") != std::string::npos ||
-        meta->metadata_json.find("\"multimodal_contract\"") != std::string::npos ||
-        meta->metadata_json.find("\"qkv_policy_contract\"") != std::string::npos) {
+    if (meta->metadata_json.find("_contract\"") != std::string::npos) {
         meta->contract.has_juju_contracts = true;
     }
     if (meta->contract.weight_encoding == 0 && !meta->contract.weight_quant_family.empty()) {

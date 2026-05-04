@@ -28,6 +28,7 @@
 #include <functional>
 #include <mutex>
 #include <memory>
+#include <new>
 #include <queue>
 #include <limits>
 #include <sstream>

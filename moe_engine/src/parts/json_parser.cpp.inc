@@ -14,9 +14,8 @@ static int moe_json_find_scalar(const std::string& text, const char* key, size_t
     const size_t needle_len = key_len + 2;  // "key"
 
     size_t pos = 0;
-    while (pos + needle_len <= text.size()) {
-        // Manual search: look for "key"
-        if (text[pos] == '"' &&
+    while ((pos = text.find('"', pos)) != std::string::npos) {
+        if (pos + 1 + key_len < text.size() &&
             text.compare(pos + 1, key_len, key) == 0 &&
             text[pos + 1 + key_len] == '"') {
             const size_t colon = text.find_first_not_of(" \t\r\n", pos + needle_len);
@@ -25,7 +24,7 @@ static int moe_json_find_scalar(const std::string& text, const char* key, size_t
                 return *value_pos != std::string::npos;
             }
         }
-        ++pos;
+        pos++;
     }
     return 0;
 }

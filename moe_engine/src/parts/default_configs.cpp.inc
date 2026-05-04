@@ -96,5 +96,6 @@ moe_io_config_t moe_pc_default_io_config(void) {
     cfg.vulkan_memory_headroom_pct = 10;
     cfg.level_zero_memory_headroom_pct = 10;
     cfg.enable_bw_benchmark = 1;
+    cfg.ram_eviction_target_fill_pct = 75;  // Default 75% RAM fill target
     return cfg;
 }
