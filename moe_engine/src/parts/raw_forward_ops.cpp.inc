@@ -148,9 +148,70 @@ int moe_pc_engine_raw_rmsnorm_f32(
     }
     const float norm = 1.0f / std::sqrt((float)(ss / (double)input_count) + (eps > 0.0f ? eps : 1.0e-6f));
     const int unit_offset = moe_engine_uses_gemma_rmsnorm_unit_offset(engine);
-    return moe_parallel_rows(engine, input_count, 0, [&](uint32_t i) {
+    if (moe_profile_enabled()) {
+        double weight_ss = 0.0;
+        double weight_abs = 0.0;
+        float weight_min = std::numeric_limits<float>::infinity();
+        float weight_max = -std::numeric_limits<float>::infinity();
+        float input_max_abs = 0.0f;
+        for (uint32_t j = 0; j < input_count; ++j) {
+            const float w_raw = moe_raw_scalar_to_f32(raw.base + (uint64_t)j * (uint64_t)elem, raw.scalar_encoding);
+            const float w = unit_offset ? (1.0f + w_raw) : w_raw;
+            const float aw = std::fabs(w);
+            weight_ss += (double)w * (double)w;
+            weight_abs += (double)aw;
+            if (w < weight_min) weight_min = w;
+            if (w > weight_max) weight_max = w;
+            const float ai = std::fabs(input[j]);
+            if (ai > input_max_abs) input_max_abs = ai;
+        }
+        moe_profile_log(
+            "rmsnorm_raw_stats_begin",
+            "layer=%d kind=%u hidden=%u scalar=%u bytes=%llu unit_offset=%d eps=%.6g norm=%.6g input_rms=%.6g input_max_abs=%.6g weight_rms=%.6g weight_mean_abs=%.6g weight_min=%.6g weight_max=%.6g",
+            (int)layer,
+            (uint32_t)kind,
+            input_count,
+            (uint32_t)raw.scalar_encoding,
+            (unsigned long long)raw.bytes,
+            unit_offset,
+            (double)eps,
+            (double)norm,
+            std::sqrt(ss / (double)input_count),
+            (double)input_max_abs,
+            std::sqrt(weight_ss / (double)input_count),
+            weight_abs / (double)input_count,
+            (double)weight_min,
+            (double)weight_max);
+    }
+    const int ok = moe_parallel_rows(engine, input_count, 0, [&](uint32_t i) {
         const float w = moe_raw_scalar_to_f32(raw.base + (uint64_t)i * (uint64_t)elem, raw.scalar_encoding);
         output[i] = input[i] * norm * (unit_offset ? (1.0f + w) : w);
         return 1;
     });
+    if (ok && moe_profile_enabled()) {
+        double output_ss = 0.0;
+        double output_abs = 0.0;
+        float output_max_abs = 0.0f;
+        for (uint32_t j = 0; j < input_count; ++j) {
+            const float v = output[j];
+            const float av = std::fabs(v);
+            output_ss += (double)v * (double)v;
+            output_abs += (double)av;
+            if (av > output_max_abs) output_max_abs = av;
+        }
+        moe_profile_log(
+            "rmsnorm_raw_stats_end",
+            "layer=%d kind=%u hidden=%u output_rms=%.6g output_mean_abs=%.6g output_max_abs=%.6g first4=[%.6g,%.6g,%.6g,%.6g]",
+            (int)layer,
+            (uint32_t)kind,
+            input_count,
+            std::sqrt(output_ss / (double)input_count),
+            output_abs / (double)input_count,
+            (double)output_max_abs,
+            input_count > 0 ? (double)output[0] : 0.0,
+            input_count > 1 ? (double)output[1] : 0.0,
+            input_count > 2 ? (double)output[2] : 0.0,
+            input_count > 3 ? (double)output[3] : 0.0);
+    }
+    return ok;
 }

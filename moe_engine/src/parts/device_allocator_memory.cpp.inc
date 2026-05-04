@@ -54,6 +54,14 @@ static void warn_device_budget_exhausted(
     uint64_t kv_reserved,
     uint64_t common_reserved
 ) {
+    if (!e || e->backend_caps.backend == moe_BACKEND_CPU) {
+        return;
+    }
+    if (raw_budget == 0 && e->config.vram_budget_bytes == 0 &&
+        e->device_allocated_bytes.load(std::memory_order_relaxed) == 0 &&
+        e->device_free_bytes.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
     static std::atomic<int64_t> s_last_warn_ms{0};
     const auto now = std::chrono::steady_clock::now();
     const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
