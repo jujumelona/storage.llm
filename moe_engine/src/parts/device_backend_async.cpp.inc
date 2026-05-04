@@ -30,6 +30,8 @@ extern "C" {
     int metal_event_sync(void* event);
     int metal_copy_h2d_async(void* dst_buffer, const void* src, uint64_t bytes, void* stream);
     int metal_copy_h2d_sync(void* dst_buffer, const void* src, uint64_t bytes);
+    uint64_t metal_measure_h2d_bandwidth(void* device_handle);
+    void* metal_get_default_device();
 }
 
 #if !(defined(__APPLE__) && defined(__MACH__))
@@ -42,6 +44,8 @@ extern "C" int metal_event_query(void*) { return 0; }
 extern "C" int metal_event_sync(void*) { return 0; }
 extern "C" int metal_copy_h2d_async(void*, const void*, uint64_t, void*) { return 0; }
 extern "C" int metal_copy_h2d_sync(void*, const void*, uint64_t) { return 0; }
+extern "C" uint64_t metal_measure_h2d_bandwidth(void*) { return 0; }
+extern "C" void* metal_get_default_device() { return nullptr; }
 #endif
 
 // BUGFIX 125: Issue 30 - Vulkan/Level Zero/SYCL dummy async is actually sync ★★

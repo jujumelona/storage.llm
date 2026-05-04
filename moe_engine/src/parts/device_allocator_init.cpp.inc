@@ -407,8 +407,8 @@ static int device_allocator_init(moe_pc_engine* e) {
         // Problem: Metal benchmark runs unconditionally, adding 300ms-1s init delay
         // Solution: Only measure if enable_bw_benchmark is enabled
         if (e->backend_caps.backend == moe_BACKEND_METAL && e->io_config.enable_bw_benchmark) {
-            extern uint64_t metal_measure_h2d_bandwidth(void* device_handle);
-            extern void* metal_get_default_device();
+            extern "C" uint64_t metal_measure_h2d_bandwidth(void* device_handle);
+            extern "C" void* metal_get_default_device();
             const uint64_t measured = metal_measure_h2d_bandwidth(metal_get_default_device());
             if (measured > 0) {
                 e->backend_caps.measured_h2d_bw_bytes_per_sec = measured;
