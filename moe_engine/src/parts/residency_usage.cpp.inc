@@ -250,7 +250,8 @@ static void touch_expert_heat(moe_pc_engine* engine, moe_block_state* state, dou
         return;
     }
     const uint64_t now = engine->expert_touch_epoch.fetch_add(1) + 1;
-    const uint64_t gap = state->last_touch_epoch ? now - state->last_touch_epoch : 0;
+    // Keep first access gap at zero so initial touches do not decay fresh heat.
+    const uint64_t gap = (state->last_touch_epoch > 0) ? (now - state->last_touch_epoch) : 0;
 
     // ARC frequency tracking (Megiddo & Modha 2003, adapted for MoE)
     state->access_count = (state->access_count < UINT16_MAX) ?

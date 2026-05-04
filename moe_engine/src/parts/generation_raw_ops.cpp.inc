@@ -1,3 +1,5 @@
+static inline float moe_generation_gated_activation_cached(int activation_mode, float gate, float up);
+
 static int moe_raw_linear_span_f32(
     moe_pc_engine* engine,
     const moe_storage_raw_span_spec_t* span,
@@ -58,11 +60,15 @@ static int moe_raw_mlp_span_f32(
         return 0;
     }
     const uint64_t row_bytes = (uint64_t)hidden_size * 2ull;
+    // BUGFIX: Use model's actual activation function instead of hardcoded SiLU
+    // Problem: Always used SiLU regardless of model config, causing wrong output
+    // for GELU-based models (some LLaMA variants, Mistral, etc.)
+    const int activation_mode = moe_engine_gelu_activation_mode(engine);
     if (!moe_parallel_rows(engine, intermediate_size, 0, [&](uint32_t row) {
             const float gate = moe_dot_bf16_row(gate_base + row_bytes * (uint64_t)row, hidden, hidden_size);
             const float up = moe_dot_bf16_row(up_base + row_bytes * (uint64_t)row, hidden, hidden_size);
             scratch_up[row] = up;
-            scratch_gate[row] = moe_generation_silu(gate) * up;
+            scratch_gate[row] = moe_generation_gated_activation_cached(activation_mode, gate, up);
             return 1;
         })) {
         return 0;

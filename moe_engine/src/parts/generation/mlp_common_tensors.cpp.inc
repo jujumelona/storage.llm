@@ -268,16 +268,30 @@ static int moe_layer_post_attention_output_norm_f32(
         input, hidden_size, output, eps);
 }
 
-// Fix 28: Cached version ??avoids repeated string searches in graph IR per layer per token
+// Cache split/post-norm detection per layer; layer 0 must not decide every layer.
 static int moe_layer_uses_split_post_norm_block(const moe_pc_engine* engine, int32_t layer) {
     if (!engine || layer < 0) {
         return 0;
     }
-    // Use cached result if available (populated at engine init or first call)
     static thread_local const moe_pc_engine* tls_cached_engine = nullptr;
-    static thread_local int tls_cached_result = -1;
-    if (tls_cached_engine == engine && tls_cached_result >= 0) {
-        return tls_cached_result;
+    static thread_local uint64_t tls_cached_generation = 0;
+    static thread_local std::vector<int8_t> tls_cached_results;
+    const uint64_t generation = engine->engine_generation;
+    const size_t layer_index = (size_t)layer;
+    int8_t* cached = nullptr;
+    if (layer_index < 10000u) {
+        if (tls_cached_engine != engine || tls_cached_generation != generation) {
+            tls_cached_engine = engine;
+            tls_cached_generation = generation;
+            tls_cached_results.clear();
+        }
+        if (tls_cached_results.size() <= layer_index) {
+            tls_cached_results.resize(layer_index + 1u, -1);
+        }
+        cached = &tls_cached_results[layer_index];
+        if (*cached >= 0) {
+            return *cached;
+        }
     }
     int result = 0;
     if (moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm.weight") ||
@@ -289,9 +303,9 @@ static int moe_layer_uses_split_post_norm_block(const moe_pc_engine* engine, int
         result = (moe_engine_graph_ir_mentions(engine, "post_ffw_norm") ||
             moe_engine_graph_ir_mentions(engine, "layer_output_scale")) ? 1 : 0;
     }
-    // Cache: graph IR is immutable after load, so this is safe
-    tls_cached_engine = engine;
-    tls_cached_result = result;
+    if (cached) {
+        *cached = result ? 1 : 0;
+    }
     return result;
 }
 

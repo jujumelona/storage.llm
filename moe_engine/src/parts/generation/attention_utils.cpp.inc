@@ -197,11 +197,12 @@
                     s->rope_q_cos,
                     s->rope_q_sin
                 );
-                float* qa_h = s->q_absorbed.data() + h * cdim;
-                // BUGFIX 292: Check h * cdim doesn't overflow before accessing.
-                if ((uint64_t)h * (uint64_t)cdim > s->q_absorbed.size()) {
+                // BUGFIX 292: Check (h+1)*cdim doesn't exceed buffer before accessing.
+                // Off-by-one fix: original checked h*cdim > size, but we access [h*cdim .. (h+1)*cdim-1]
+                if ((uint64_t)(h + 1) * (uint64_t)cdim > s->q_absorbed.size()) {
                     return 0;
                 }
+                float* qa_h = s->q_absorbed.data() + h * cdim;
                 for (uint32_t d = 0; d < nope_dim; ++d) {
                     const float qv = s->q_b[h * head_dim + d];
                     if (std::abs(qv) < 1e-12f) continue;

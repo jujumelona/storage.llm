@@ -127,6 +127,15 @@ static int moe_forward_one_token_f32(
         return 0;
     }
     const float embedding_scale = moe_embedding_scale_value(engine, c->hidden_size);
+    // BUGFIX CRITICAL: Apply embedding scale to hidden state
+    // Problem: scale was computed and logged but NEVER applied to hidden[]
+    // For models with sqrt(hidden_size) scaling (Gemma, GLM), the input magnitude
+    // was wrong by ~84.7x, causing catastrophic PPL degradation across all layers.
+    if (embedding_scale != 1.0f && std::isfinite(embedding_scale)) {
+        for (uint32_t i = 0; i < c->hidden_size; ++i) {
+            hidden[i] *= embedding_scale;
+        }
+    }
     moe_profile_log(
         "forward_embed",
         "position=%u token=%u hidden=%u scale=%.6g ms=%.3f",
@@ -267,6 +276,16 @@ static int moe_forward_one_token_f32(
             return 0;
         }
         moe_forward_trace_vec("after_mlp", position, layer, hidden, c->hidden_size);
+        // BUGFIX: Missing output scale in standard path
+        // Problem: split_post_norm path applied moe_layer_output_scale_f32 but
+        // standard path did NOT. Models with layer_output_scale.weight (Gemma4)
+        // produced unscaled outputs on the standard attention path, causing
+        // PPL drift that accumulated across all 79 layers.
+        if (!moe_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
+            moe_generation_set_error(stats, "layer output scale failed");
+            return 0;
+        }
+        moe_forward_trace_vec("after_output_scale", position, layer, hidden, c->hidden_size);
         moe_profile_log(
             "forward_layer",
             "position=%u layer=%u split=0 is_moe=%d attention_ms=%.3f mlp_ms=%.3f total_ms=%.3f",

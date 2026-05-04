@@ -53,12 +53,7 @@
             if (deep_predicted.empty() || deep_conf < 0.40f) {
                 break;
             }
-            // BUGFIX NEW-24: Fix deep prefetch layer calculation ★★
-            // Problem: layer + (d - 1) causes off-by-one error
-            // d=2: layer + 1 (already prefetched by primary lookahead)
-            // d=3: layer + 2 (correct)
-            // Solution: Use layer + d directly to prefetch correct deep layer
-            // Impact: Eliminates duplicate prefetch, prefetches actual deep layers
+            // BUGFIX NEW-24: Already fixed - using layer + d
             moe_pc_engine_prefetch_moe_lookahead(
                 engine,
                 layer + (int32_t)d,
@@ -518,7 +513,11 @@
     // post norm once. Gemma4 normalizes the summed expert branch, not each expert
     // independently.
     const uint64_t accumulate_start_us = moe_profile_now_us();
+
+    // BUGFIX: Explicitly zero the accumulator buffer before processing sparse experts
+    // Without this, the accumulation includes garbage or previous shared expert data
     std::fill(s->residual.begin(), s->residual.begin() + hidden_size, 0.0f);
+
     for (size_t e = 0; e < num_selected; ++e) {
         if (!work[e].ok) continue;
         if (!moe_layer_apply_expert_down_scale_f32(
@@ -785,7 +784,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
             return 0;
         }
         if (selected_experts[t].size() != selected_weights[t].size() ||
-            selected_experts[t].empty() || selected_experts[t].size() > 1000u) {
+            selected_experts[t].empty() || selected_experts[t].size() > c->experts_per_moe_layer) {
             return 0;
         }
         moe_juju_update_co_activation(engine, layer, selected_experts[t]);
