@@ -433,6 +433,7 @@ static void moe_register_gguf_common_tensor(
         entry.weight_encoding : moe_weight_encoding_from_gguf_type(entry.type, moe_offload_gguf_contract_t{});
     rec.file_offset = entry.file_offset;
     rec.bytes = entry.bytes;
+    rec.weight_row_bytes = entry.weight_row_bytes;
     engine->gguf_common_tensor_slots.emplace(rec.name, engine->gguf_common_tensors.size());
     engine->gguf_common_tensors.push_back(std::move(rec));
     moe_dynamic_shape_note_tensor(engine, key, entry.dims, entry.shape);

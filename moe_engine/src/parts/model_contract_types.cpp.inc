@@ -172,6 +172,7 @@ struct moe_gguf_tensor_dir_entry_t {
     uint64_t tensor_offset = 0;
     uint64_t file_offset = 0;
     uint64_t bytes = 0;
+    uint64_t weight_row_bytes = 0;
 };
 
 struct moe_gguf_tensor_dir_t {

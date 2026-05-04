@@ -629,7 +629,7 @@ int moe_pc_engine_load_codec_table(
             rec.scale4_entry = moe_scale4_find(engine->scale4, weight_key.c_str());
         }
         rec.info.has_scale4 = rec.scale4_entry ? 1 : 0;
-        finalize_tensor_layout(&rec);
+        finalize_tensor_layout(&rec, moe_WEIGHT_ENCODING_UNKNOWN);
         const uint64_t stream_bytes = tensor_stream_bytes(rec);
         if (stream_bytes > engine->max_tensor_stream_bytes.load(std::memory_order_relaxed)) {
             engine->max_tensor_stream_bytes.store(stream_bytes, std::memory_order_relaxed);

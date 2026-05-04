@@ -1,3 +1,6 @@
+static int row_bounds_ok(const moe_tensor_record& rec, uint32_t row);
+static int tensor_weight_format(const moe_tensor_record& rec);
+
 static int moe_dot_weight_format_supported(int weight_format) {
     return weight_format == moe_WEIGHT_ENCODING_RAW_FP16 ||
         weight_format == moe_WEIGHT_ENCODING_RAW_BF16 ||
