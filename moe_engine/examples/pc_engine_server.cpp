@@ -1199,7 +1199,180 @@ static std::string tokenizer_decode_ids(const server_tokenizer& tok, const std::
     return tokenizer_piece_to_text(pieces, false);
 }
 
-static std::string extract_generation_text(const std::string& body) {
+struct server_chat_message {
+    std::string role;
+    std::string content;
+};
+
+static std::string trim_ascii_copy(const std::string& value) {
+    size_t begin = 0;
+    while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin]))) {
+        ++begin;
+    }
+    size_t end = value.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1u]))) {
+        --end;
+    }
+    return value.substr(begin, end - begin);
+}
+
+static bool parse_chat_messages(const std::string& body, std::vector<server_chat_message>* out) {
+    if (out) {
+        out->clear();
+    }
+    if (!out) {
+        return false;
+    }
+    size_t begin = 0;
+    size_t end = 0;
+    if (!json_find_key_array_range(body, "messages", 0, &begin, &end)) {
+        return false;
+    }
+    size_t pos = begin + 1u;
+    while (pos < end) {
+        const size_t obj_begin = body.find('{', pos);
+        if (obj_begin == std::string::npos || obj_begin >= end) {
+            break;
+        }
+        const size_t obj_end = json_find_matching(body, obj_begin, '{', '}');
+        if (obj_end == std::string::npos || obj_end > end) {
+            break;
+        }
+        server_chat_message message;
+        (void)json_read_string_in_range(body, obj_begin, obj_end, "role", &message.role);
+        if (!json_read_string_in_range(body, obj_begin, obj_end, "content", &message.content)) {
+            std::vector<std::string> text_items = json_collect_string_values(body.substr(obj_begin, obj_end - obj_begin + 1u), "text");
+            for (const std::string& item : text_items) {
+                if (!message.content.empty()) {
+                    message.content.push_back('\n');
+                }
+                message.content += item;
+            }
+        }
+        message.role = lower_ascii(trim_ascii_copy(message.role));
+        message.content = trim_ascii_copy(message.content);
+        if (!message.role.empty() || !message.content.empty()) {
+            out->push_back(std::move(message));
+        }
+        pos = obj_end + 1u;
+    }
+    return !out->empty();
+}
+
+static bool load_chat_template_text(const server_options& opts, std::string* out) {
+    if (out) {
+        out->clear();
+    }
+    if (!out || opts.model_root.empty()) {
+        return false;
+    }
+    const char* candidates[] = {
+        "chat_template.jinja",
+        "tokenizer/chat_template.jinja"
+    };
+    for (const char* rel : candidates) {
+        const std::string path = join_model_file(opts.model_root, rel);
+        uint64_t bytes = 0;
+        if (file_size_bytes(path, &bytes) && bytes > 0 && bytes <= (1ull << 20) &&
+            read_text_file(path, out) && !out->empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::string apply_sidecar_chat_template(
+    const server_options& opts,
+    const std::vector<server_chat_message>& messages,
+    bool add_generation_prompt,
+    bool enable_thinking
+) {
+    if (messages.empty()) {
+        return "";
+    }
+    std::string templ;
+    if (!load_chat_template_text(opts, &templ) ||
+        templ.find("<|turn>") == std::string::npos ||
+        templ.find("<turn|>") == std::string::npos) {
+        return "";
+    }
+
+    std::string prompt = "<bos>";
+    size_t first_loop_message = 0;
+    const std::string first_role = messages.empty() ? "" : messages[0].role;
+    const bool first_is_system = first_role == "system" || first_role == "developer";
+    if (enable_thinking || first_is_system) {
+        prompt += "<|turn>system\n";
+        if (enable_thinking) {
+            prompt += "<|think|>";
+        }
+        if (first_is_system) {
+            prompt += messages[0].content;
+            first_loop_message = 1;
+        }
+        prompt += "<turn|>\n";
+    }
+
+    for (size_t i = first_loop_message; i < messages.size(); ++i) {
+        const server_chat_message& message = messages[i];
+        std::string role = message.role;
+        if (role == "assistant") {
+            role = "model";
+        } else if (role == "developer") {
+            role = "system";
+        }
+        if (role.empty()) {
+            role = "user";
+        }
+        prompt += "<|turn>";
+        prompt += role;
+        prompt.push_back('\n');
+        prompt += message.content;
+        prompt += "<turn|>\n";
+    }
+    if (add_generation_prompt) {
+        prompt += "<|turn>model\n";
+        if (!enable_thinking &&
+            templ.find("<|channel>thought") != std::string::npos &&
+            templ.find("<channel|>") != std::string::npos) {
+            prompt += "<|channel>thought\n<channel|>";
+        }
+    }
+    return prompt;
+}
+
+static std::string extract_generation_text(
+    const server_options& opts,
+    const std::string& body,
+    bool default_add_generation_prompt
+) {
+    std::vector<server_chat_message> messages;
+    if (parse_chat_messages(body, &messages)) {
+        bool add_generation_prompt = default_add_generation_prompt;
+        bool enable_thinking = false;
+        (void)json_read_bool_in_range(body, 0, body.size(), "add_generation_prompt", &add_generation_prompt);
+        (void)json_read_bool_in_range(body, 0, body.size(), "enable_thinking", &enable_thinking);
+        const std::string templated = apply_sidecar_chat_template(
+            opts,
+            messages,
+            add_generation_prompt,
+            enable_thinking
+        );
+        if (!templated.empty()) {
+            std::cerr << "[storagellm request] chat_template applied messages=" << messages.size()
+                      << " input_chars=" << templated.size()
+                      << " add_generation_prompt=" << (add_generation_prompt ? 1 : 0)
+                      << " enable_thinking=" << (enable_thinking ? 1 : 0)
+                      << "\n" << std::flush;
+            return templated;
+        }
+        std::string prompt;
+        for (const server_chat_message& message : messages) {
+            if (!prompt.empty()) prompt += "\n";
+            prompt += message.content;
+        }
+        return prompt;
+    }
     std::vector<std::string> contents = json_collect_string_values(body, "content");
     if (!contents.empty()) {
         std::string prompt;
@@ -1252,7 +1425,7 @@ static server_generation_result run_server_generation(
             input_ids.push_back((int32_t)id);
         }
     } else {
-        const std::string text = extract_generation_text(body);
+        const std::string text = extract_generation_text(opts, body, true);
         if (text.empty()) {
             result.http_status = 400;
             result.error_code = "invalid_request_error";
@@ -1396,7 +1569,7 @@ static server_eval_result run_server_eval(
             input_ids.push_back((int32_t)id);
         }
     } else {
-        const std::string text = extract_generation_text(body);
+        const std::string text = extract_generation_text(opts, body, false);
         if (text.empty()) {
             result.http_status = 400;
             result.error_code = "invalid_request_error";
