@@ -66,17 +66,87 @@ static int moe_engine_gelu_activation_mode(const moe_pc_engine* engine) {
     if (cached >= 0) {
         return cached;
     }
+
+    auto activation_mode_from_value = [](const std::string& value, int* out_mode) -> int {
+        if (!out_mode) {
+            return 0;
+        }
+        const std::string lower = moe_lower_ascii_copy(value);
+        if (lower.find("gelu_pytorch_tanh") != std::string::npos ||
+            lower.find("gelu_tanh") != std::string::npos ||
+            lower.find("gelu_new") != std::string::npos ||
+            lower.find("gelu_fast") != std::string::npos ||
+            lower.find("approximate_gelu") != std::string::npos) {
+            *out_mode = 2;
+            return 1;
+        }
+        if (lower.find("gelu") != std::string::npos) {
+            *out_mode = 1;
+            return 1;
+        }
+        if (lower.find("silu") != std::string::npos ||
+            lower.find("swiglu") != std::string::npos ||
+            lower.find("swi_glu") != std::string::npos) {
+            *out_mode = 0;
+            return 1;
+        }
+        return 0;
+    };
+
     int mode = 0;
-    if (moe_engine_graph_ir_mentions(engine, "gelu_pytorch_tanh") ||
-        moe_engine_graph_ir_mentions(engine, "gelu_tanh") ||
-        moe_engine_metadata_mentions(engine, "gelu_pytorch_tanh") ||
-        moe_engine_metadata_mentions(engine, "gelu_tanh")) {
+    int resolved = 0;
+    const char* source = "default_silu";
+    const char* explicit_key = "-";
+    std::string explicit_value;
+    if (!engine->offload_gguf_metadata_json.empty()) {
+        static const char* activation_keys[] = {
+            "hidden_activation",
+            "hidden_act",
+            "activation_function",
+            "activation_fn",
+            "act_fn",
+            "feed_forward_activation",
+            "mlp_activation",
+            "intermediate_act_fn",
+        };
+        for (const char* key : activation_keys) {
+            std::string value;
+            if (!moe_json_get_string_local(engine->offload_gguf_metadata_json, key, &value)) {
+                continue;
+            }
+            explicit_key = key;
+            explicit_value = value;
+            if (activation_mode_from_value(value, &mode)) {
+                source = "metadata_key";
+                resolved = 1;
+                break;
+            }
+        }
+    }
+    if (!resolved &&
+        (moe_engine_graph_ir_mentions(engine, "gelu_pytorch_tanh") ||
+         moe_engine_graph_ir_mentions(engine, "gelu_tanh") ||
+         moe_engine_metadata_mentions(engine, "gelu_pytorch_tanh") ||
+         moe_engine_metadata_mentions(engine, "gelu_tanh"))) {
         mode = 2;
-    } else if (moe_engine_graph_ir_mentions(engine, "gelu") ||
-        moe_engine_metadata_mentions(engine, "gelu")) {
+        source = "text_mention_tanh";
+        resolved = 1;
+    } else if (!resolved &&
+        (moe_engine_graph_ir_mentions(engine, "gelu") ||
+         moe_engine_metadata_mentions(engine, "gelu"))) {
         mode = 1;
+        source = "text_mention_gelu";
+        resolved = 1;
     }
     engine->cached_gelu_activation_mode.store(mode, std::memory_order_release);
+    moe_profile_log(
+        "activation_mode",
+        "mode=%d name=%s source=%s explicit_key=%s explicit_value=%s",
+        mode,
+        mode == 2 ? "gelu_pytorch_tanh" : (mode == 1 ? "gelu" : "silu"),
+        source,
+        explicit_key,
+        explicit_value.empty() ? "-" : explicit_value.c_str());
     return mode;
 }
 

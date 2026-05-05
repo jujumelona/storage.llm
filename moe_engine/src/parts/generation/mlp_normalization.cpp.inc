@@ -271,8 +271,8 @@ static int moe_layer_common_dense_mlp_f32(
     }
     moe_profile_log(
         "mlp_dense_end",
-        "layer=%d intermediate=%u hidden=%u gate_up_ms=%.3f down_ms=%.3f total_ms=%.3f",
-        layer, intermediate, hidden_size, gate_up_ms,
+        "layer=%d intermediate=%u hidden=%u activation_mode=%d gate_up_ms=%.3f down_ms=%.3f total_ms=%.3f",
+        layer, intermediate, hidden_size, activation_mode, gate_up_ms,
         moe_profile_elapsed_ms(down_start_us), moe_profile_elapsed_ms(total_start_us));
     return 1;
 }

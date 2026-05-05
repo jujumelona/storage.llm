@@ -138,7 +138,8 @@
             layer, num_heads, num_kv_heads, head_dim);
         return 0;
     }
-    if (moe_layer_uses_unweighted_v_norm(engine, layer) &&
+    const int use_v_norm = moe_layer_uses_unweighted_v_norm(engine, layer);
+    if (use_v_norm &&
         !moe_apply_unweighted_head_rmsnorm_f32(
             s->attn_value.data(), num_kv_heads, v_head_dim, cfg.rms_norm_eps)) {
         std::fprintf(stderr, "[storagellm attn] v norm failed layer=%d kv_heads=%u v_head_dim=%u\n",
@@ -147,8 +148,8 @@
     }
     moe_profile_log(
         "attn_standard_qkv_norm",
-        "layer=%d pos=%u q_norm=%d k_norm=%d has_v=%d ms=%.3f",
-        layer, position, has_q_norm, has_k_norm, has_v,
+        "layer=%d pos=%u q_norm=%d k_norm=%d has_v=%d v_norm=%d ms=%.3f",
+        layer, position, has_q_norm, has_k_norm, has_v, use_v_norm,
         moe_profile_elapsed_ms(qkv_norm_start_us));
     const uint64_t rope_start_us = moe_profile_now_us();
     if (rope_dim >= 2u) {

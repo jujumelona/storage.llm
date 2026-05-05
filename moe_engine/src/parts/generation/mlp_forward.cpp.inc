@@ -461,8 +461,8 @@
     });
     moe_profile_log(
         "mlp_moe_gate_up",
-        "layer=%d ok=%d selected=%zu rows=%u blocks=%u tile=%u hidden=%u intermediate=%u ms=%.3f",
-        layer, gate_up_ok, num_selected, total_gate_rows, total_gate_blocks, gate_tile_rows, hidden_size, expert_intermediate,
+        "layer=%d ok=%d activation_mode=%d selected=%zu rows=%u blocks=%u tile=%u hidden=%u intermediate=%u ms=%.3f",
+        layer, gate_up_ok, activation_mode, num_selected, total_gate_rows, total_gate_blocks, gate_tile_rows, hidden_size, expert_intermediate,
         moe_profile_elapsed_ms(gate_up_start_us));
     if (!gate_up_ok) return 0;
 
@@ -916,8 +916,8 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
     }
     moe_profile_log(
         "prefill_mlp_batch_experts",
-        "layer=%d tokens=%u active_groups=%u assignments=%u failed=%u chunk=%u ms=%.3f",
-        layer, batch_size, active_groups, total_assignments, failed_assignments,
+        "layer=%d tokens=%u activation_mode=%d active_groups=%u assignments=%u failed=%u chunk=%u ms=%.3f",
+        layer, batch_size, activation_mode, active_groups, total_assignments, failed_assignments,
         expert_batch_limit, moe_profile_elapsed_ms(expert_start_us));
 
     const int use_sigmoid = moe_router_uses_sigmoid_scores(engine);
