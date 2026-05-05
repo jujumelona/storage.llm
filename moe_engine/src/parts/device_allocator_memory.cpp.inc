@@ -150,7 +150,7 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
         // CPU-side KV also consumes unified memory on Metal. Include RAM tier
         // usage here because the Metal RAM budget is zeroed during allocator init.
         uint64_t total_reserved = reserved_total;
-        const uint64_t cpu_ram_used = e->tier_used_bytes[moe_TIER_RAM].load(std::memory_order_relaxed);
+        const uint64_t cpu_ram_used = e->ram_used_bytes.load(std::memory_order_relaxed);
         if (cpu_ram_used < UINT64_MAX - total_reserved) {
             total_reserved += cpu_ram_used;
         } else {
