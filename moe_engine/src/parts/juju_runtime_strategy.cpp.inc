@@ -33,7 +33,8 @@ static uint64_t moe_rt_expert_bytes_hint(
     }
     if (expert_bytes == 24ull * 1024ull * 1024ull && scan.executable_tensor_count > 0 && scan.present_total_bytes > 0) {
         const uint64_t avg = scan.present_total_bytes / scan.executable_tensor_count;
-        expert_bytes = std::max(expert_bytes, avg * 3ull);
+        const uint64_t avg_triplet = avg <= UINT64_MAX / 3ull ? avg * 3ull : UINT64_MAX;
+        expert_bytes = std::max<uint64_t>(expert_bytes, avg_triplet);
     }
     return moe_rt_align_4k(moe_rt_clamp_u64(expert_bytes, 512ull * 1024ull, 512ull * 1024ull * 1024ull));
 }
