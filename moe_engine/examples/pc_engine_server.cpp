@@ -1702,6 +1702,20 @@ static bool role_is_assistant_like(const std::string& role) {
     return role == "assistant" || role == "model";
 }
 
+static bool body_requests_response_only_chat_eval(const std::string& body) {
+    std::vector<server_chat_message> messages;
+    if (!parse_chat_messages(body, &messages) || messages.size() < 2u) {
+        return false;
+    }
+    bool score_response_only = true;
+    (void)json_read_bool_in_range(body, 0, body.size(), "score_response_only", &score_response_only);
+    if (!score_response_only) {
+        return false;
+    }
+    const server_chat_message& last = messages.back();
+    return role_is_assistant_like(last.role) && !last.content.empty();
+}
+
 static bool encode_chat_response_only_eval(
     const server_options& opts,
     const server_tokenizer& tok,
@@ -1974,6 +1988,14 @@ static server_eval_result run_server_eval(
             // Chat eval with a final assistant message scores only the assistant
             // response while still forwarding the full prompt as context.
         } else {
+            if (body_requests_response_only_chat_eval(body)) {
+                result.http_status = 422;
+                result.error_code = "chat_template_required";
+                result.error_message =
+                    "response-only chat eval requires a valid chat_template.jinja or tokenizer_config.json chat_template; "
+                    "use input_ids with first_target_index, or prompt/input for raw text eval";
+                return result;
+            }
             const std::string text = extract_generation_text(opts, body, false);
             if (text.empty()) {
                 result.http_status = 400;
