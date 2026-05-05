@@ -219,6 +219,27 @@ static float moe_standard_attention_score_scale(
     return result;
 }
 
+static int moe_attention_score_scale_source_is_explicit(
+    const char* source
+) {
+    return source &&
+        (std::strcmp(source, "metadata_scale") == 0 ||
+         std::strcmp(source, "query_pre_attn_scalar") == 0);
+}
+
+static int moe_attention_score_scale_violates_qk_norm_contract(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    float scale,
+    const char* source
+) {
+    if (!moe_layer_has_qk_norm_scaled_standard_layout(engine, layer) ||
+        moe_attention_score_scale_source_is_explicit(source)) {
+        return 0;
+    }
+    return !(std::isfinite(scale) && std::fabs(scale - 1.0f) <= 1.0e-6f);
+}
+
 static void moe_standard_attention_rope_params(
     const moe_pc_engine* engine,
     int32_t layer,

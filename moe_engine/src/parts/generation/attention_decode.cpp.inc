@@ -230,6 +230,16 @@
 
     const char* scale_source = nullptr;
     const float scale = moe_standard_attention_score_scale(engine, layer, head_dim, &scale_source);
+    if (moe_attention_score_scale_violates_qk_norm_contract(engine, layer, scale, scale_source)) {
+        std::fprintf(
+            stderr,
+            "[storagellm attn] qk-norm scale contract violation layer=%d head_dim=%u scale=%.9g source=%s\n",
+            layer,
+            head_dim,
+            (double)scale,
+            scale_source ? scale_source : "unknown");
+        return 0;
+    }
     const uint64_t heads_start_us = moe_profile_now_us();
     std::fill(s->attn_value.begin(), s->attn_value.begin() + v_total_dim, 0.0f);
     {
