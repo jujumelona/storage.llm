@@ -2,6 +2,7 @@
 
 #include "../../engine_core/core/mmap_loader.h"
 
+#include <cmath>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>

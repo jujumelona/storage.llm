@@ -2,6 +2,7 @@
 #include "qkv_helpers.h"
 #include "qkv_codebook.h"
 #include "qkv_packing.h"
+#include <cmath>
 #include <math.h>
 #include <string.h>
 #include <climits>
@@ -102,7 +103,7 @@ static int qkv_dequant_one_split(
                 sum += s->rotation_matrix[(size_t)j * (size_t)d + (size_t)i] * y_tilde[j];
             }
             // BUGFIX 725: Check inverse rotation result for NaN/Inf ★★
-            if (!isfinite(sum)) {
+            if (!std::isfinite(sum)) {
                 sum = 0.0f;
             }
             x_tilde[i] = sum;
@@ -125,7 +126,7 @@ static int qkv_dequant_one_split(
                     sum += s->qjl_matrix[(size_t)j * (size_t)d + (size_t)i] * qjl_signs[j];
                 }
                 // BUGFIX 731: Check QJL matrix multiplication result for NaN/Inf (split path) ★★
-                if (!isfinite(sum)) {
+                if (!std::isfinite(sum)) {
                     sum = 0.0f;
                 }
                 s_t_qjl[i] = sum;
@@ -134,11 +135,11 @@ static int qkv_dequant_one_split(
             if (d <= 0) return 0;
             const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)d;
             // BUGFIX 732: Check QJL scale for NaN/Inf (split path) ★★
-            if (!isfinite(qjl_scale)) return 0;
+            if (!std::isfinite(qjl_scale)) return 0;
             for (int i = 0; i < d; ++i) {
                 float residual_term = qjl_scale * r_norm * s_t_qjl[i];
                 // BUGFIX 733: Check residual term for NaN/Inf before adding (split path) ★★
-                if (isfinite(residual_term)) {
+                if (std::isfinite(residual_term)) {
                     x_tilde[i] += residual_term;
                 }
             }
@@ -148,14 +149,14 @@ static int qkv_dequant_one_split(
     const float norm = norms[token_idx];
     // BUGFIX 656: Handle zero norm consistently (split path) ★★
     // BUGFIX 734: Check norm for NaN/Inf (split path) ★★★
-    if (!isfinite(norm) || norm < 1e-12f) {
+    if (!std::isfinite(norm) || norm < 1e-12f) {
         memset(output, 0, (size_t)d * sizeof(float));
         return 1;
     }
     for (int i = 0; i < d; ++i) {
         float result = x_tilde[i] * norm;
         // BUGFIX 735: Check final denormalized result for NaN/Inf (split path) ★★★
-        if (!isfinite(result)) {
+        if (!std::isfinite(result)) {
             result = 0.0f;
         }
         output[i] = result;
@@ -244,7 +245,7 @@ int qkv_dequant_one(
                 sum += s->rotation_matrix[idx] * y_tilde[j];
             }
             // BUGFIX 736: Check inverse rotation result for NaN/Inf (main path) ★★
-            if (!isfinite(sum)) {
+            if (!std::isfinite(sum)) {
                 sum = 0.0f;
             }
             x_tilde[i] = sum;
@@ -282,7 +283,7 @@ int qkv_dequant_one(
                     sum += s->qjl_matrix[idx] * qjl_signs[j];
                 }
                 // BUGFIX 726: Check QJL matrix multiplication result for NaN/Inf ★★
-                if (!isfinite(sum)) {
+                if (!std::isfinite(sum)) {
                     sum = 0.0f;
                 }
                 s_t_qjl[i] = sum;
@@ -293,11 +294,11 @@ int qkv_dequant_one(
             if (d <= 0) return 0;
             const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)d;
             // BUGFIX 727: Check QJL scale for NaN/Inf ★★
-            if (!isfinite(qjl_scale)) return 0;
+            if (!std::isfinite(qjl_scale)) return 0;
             for (int i = 0; i < d; i++) {
                 float residual_term = qjl_scale * r_norm * s_t_qjl[i];
                 // BUGFIX 728: Check residual term for NaN/Inf before adding ★★
-                if (isfinite(residual_term)) {
+                if (std::isfinite(residual_term)) {
                     x_tilde[i] += residual_term;
                 }
             }
@@ -312,14 +313,14 @@ int qkv_dequant_one(
     // Solution: Return zero vector explicitly when norm is too small
     // Impact: Consistent quantization/dequantization behavior → accurate PPL
     // BUGFIX 729: Check norm for NaN/Inf ★★★
-    if (!isfinite(norm) || norm < 1e-12f) {
+    if (!std::isfinite(norm) || norm < 1e-12f) {
         memset(output, 0, (size_t)d * sizeof(float));
         return 1;
     }
     for (int i = 0; i < d; i++) {
         float result = x_tilde[i] * norm;
         // BUGFIX 730: Check final denormalized result for NaN/Inf ★★★
-        if (!isfinite(result)) {
+        if (!std::isfinite(result)) {
             result = 0.0f;
         }
         output[i] = result;
@@ -387,7 +388,7 @@ int qkv_dot_mse_split_rotated_token(
         if (channel < 0 || channel >= d) return 0;
         float term = q_rotated[channel] * out_centroids[indices[i]];
         // BUGFIX 737: Check dot product term for NaN/Inf (outlier) ★★
-        if (isfinite(term)) {
+        if (std::isfinite(term)) {
             dot += term;
         }
     }
@@ -405,13 +406,13 @@ int qkv_dot_mse_split_rotated_token(
         if (normal_pos >= n_norm) return 0;
         float term = q_rotated[i] * norm_centroids[indices[normal_pos++]];
         // BUGFIX 738: Check dot product term for NaN/Inf (normal) ★★
-        if (isfinite(term)) {
+        if (std::isfinite(term)) {
             dot += term;
         }
     }
 
     // BUGFIX 739: Check final dot product for NaN/Inf ★★★
-    if (!isfinite(dot)) {
+    if (!std::isfinite(dot)) {
         dot = 0.0f;
     }
     *out_dot = dot;

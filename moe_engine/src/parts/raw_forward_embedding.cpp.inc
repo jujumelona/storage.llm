@@ -79,7 +79,7 @@ static int moe_copy_embedding_row_f32(
     for (; i < c->hidden_size; ++i) {
         const float val = moe_raw_scalar_to_f32(row + (uint64_t)i * (uint64_t)elem, encoding);
         // BUGFIX 874: Check embedding value for NaN/Inf ★★★
-        if (!isfinite(val)) {
+        if (!std::isfinite(val)) {
             out_hidden[i] = 0.0f;
         } else {
             out_hidden[i] = val;

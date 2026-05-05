@@ -113,25 +113,25 @@ static inline float moe_generation_gelu_tanh(float x) {
 
 static inline float moe_generation_gated_activation_cached(int activation_mode, float gate, float up) {
     // BUGFIX 869: Check gate and up for NaN/Inf before activation ★★★
-    if (!isfinite(gate) || !isfinite(up)) {
+    if (!std::isfinite(gate) || !std::isfinite(up)) {
         return 0.0f;
     }
     if (activation_mode == 2) {
         const float result = moe_generation_gelu_tanh(gate) * up;
         // BUGFIX 870: Check result for NaN/Inf ★★★
-        if (!isfinite(result)) {
+        if (!std::isfinite(result)) {
             return 0.0f;
         }
         return result;
     }
     const float activated = (activation_mode == 1 ? moe_generation_gelu(gate) : moe_generation_silu(gate));
     // BUGFIX 871: Check activated for NaN/Inf ★★★
-    if (!isfinite(activated)) {
+    if (!std::isfinite(activated)) {
         return 0.0f;
     }
     const float result = activated * up;
     // BUGFIX 872: Check result for NaN/Inf ★★★
-    if (!isfinite(result)) {
+    if (!std::isfinite(result)) {
         return 0.0f;
     }
     return result;

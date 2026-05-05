@@ -451,7 +451,7 @@
             if (!moe_dot_tensor_record_row(engine, shards[e].gate_rec, shards[e].gate_shard, r, expert_input, hidden_size, &work[e].gate[r])) { expert_ok[e].store(0, std::memory_order_release); return 1; }
             if (!moe_dot_tensor_record_row(engine, shards[e].up_rec, shards[e].up_shard, r, expert_input, hidden_size, &work[e].up[r])) { expert_ok[e].store(0, std::memory_order_release); return 1; }
             // BUGFIX 850: Check gate/up results for NaN before activation ★★★
-            if (!isfinite(work[e].gate[r]) || !isfinite(work[e].up[r])) {
+            if (!std::isfinite(work[e].gate[r]) || !std::isfinite(work[e].up[r])) {
                 expert_ok[e].store(0, std::memory_order_release);
                 return 1;
             }
@@ -508,7 +508,7 @@
                 return 1;
             }
             // BUGFIX 851: Check down result for NaN ★★★
-            if (!isfinite(work[e].out[r])) {
+            if (!std::isfinite(work[e].out[r])) {
                 expert_ok[e].store(0, std::memory_order_release);
                 return 1;
             }
@@ -550,7 +550,7 @@
             return 0;
         }
         // BUGFIX 767: Check work[e].weight for NaN/Inf before axpy ★★★
-        if (!isfinite(work[e].weight)) {
+        if (!std::isfinite(work[e].weight)) {
             std::fprintf(stderr, "[storagellm mlp] invalid expert weight layer=%d expert=%d weight=%f\n",
                 layer, work[e].expert_id, work[e].weight);
             continue;
@@ -575,7 +575,7 @@
         return 0;
     }
     for (uint32_t i = 0; i < hidden_size; ++i) {
-        if (isfinite(expert_branch[i])) {
+        if (std::isfinite(expert_branch[i])) {
             s->mlp[i] += expert_branch[i];
         }
     }
