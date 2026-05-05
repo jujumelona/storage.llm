@@ -151,7 +151,8 @@ static uint64_t prefetch_raw_layer_roles(
 }
 
 static int common_tensor_is_startup_core(const moe_gguf_common_tensor_record& rec) {
-    if (rec.prefetch_class == moe_JUJU_PREFETCH_STARTUP_HOT ||
+    if (rec.hotset_rank <= 256 ||
+        rec.prefetch_class == moe_JUJU_PREFETCH_STARTUP_HOT ||
         rec.graph_role == moe_JUJU_ROLE_NORM) {
         return 1;
     }
@@ -187,7 +188,25 @@ static uint64_t prefetch_common_tensor_records_to_ram(moe_pc_engine* e, uint64_t
     uint64_t spans = 0;
     std::vector<std::pair<uint16_t, uint64_t>> seen;
     std::vector<std::pair<const uint8_t*, uint64_t>> ranges_to_touch_gguf;
+    std::vector<const moe_gguf_common_tensor_record*> ordered;
+    ordered.reserve(e->gguf_common_tensors.size());
     for (const moe_gguf_common_tensor_record& rec : e->gguf_common_tensors) {
+        ordered.push_back(&rec);
+    }
+    std::stable_sort(
+        ordered.begin(), ordered.end(),
+        [](const moe_gguf_common_tensor_record* a, const moe_gguf_common_tensor_record* b) {
+            if (!a || !b) return a != nullptr;
+            if (a->hotset_rank != b->hotset_rank) return a->hotset_rank < b->hotset_rank;
+            if (a->execution_order != b->execution_order) return a->execution_order < b->execution_order;
+            if (a->prefetch_priority != b->prefetch_priority) return a->prefetch_priority > b->prefetch_priority;
+            return a->file_offset < b->file_offset;
+        });
+    for (const moe_gguf_common_tensor_record* rec_ptr : ordered) {
+        if (!rec_ptr) {
+            continue;
+        }
+        const moe_gguf_common_tensor_record& rec = *rec_ptr;
         if (!common_tensor_is_startup_core(rec) ||
             rec.bytes == 0 ||
             bytes >= budget ||

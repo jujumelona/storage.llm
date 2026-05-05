@@ -27,6 +27,29 @@ static int moe_map_lm_head_tensor(
     if (!engine || !c || !out) {
         return 0;
     }
+    std::string graph_name;
+    if (moe_graph_ir_tensor_binding_name(engine, "lm_head", &graph_name)) {
+        moe_raw_tensor_desc desc{};
+        const char* exact_name = graph_name.c_str();
+        const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_names(engine, &exact_name, 1, &desc);
+        if (rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size) {
+            static std::atomic<uint32_t> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) == 0) {
+                int tied = 0;
+                (void)moe_json_get_bool_local(engine->offload_graph_ir_json, "lm_head_tied_to_token_embedding", &tied);
+                moe_profile_log(
+                    "lm_head_contract_binding",
+                    "name=%s tied=%d rows=%u cols=%u vocab=%u hidden=%u",
+                    graph_name.c_str(), tied, desc.rows, desc.cols, c->vocab_size, c->hidden_size);
+            }
+            return map_common_tensor_record(engine, *rec, desc, out);
+        }
+        moe_profile_log(
+            "lm_head_contract_binding_rejected",
+            "name=%s rows=%u cols=%u vocab=%u hidden=%u",
+            graph_name.c_str(), desc.rows, desc.cols, c->vocab_size, c->hidden_size);
+    }
     static const char* const lm_head_names[] = {
         "output.weight",
         "lm_head.weight",

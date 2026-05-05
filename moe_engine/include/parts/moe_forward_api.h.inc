@@ -25,6 +25,10 @@ typedef struct {
     uint32_t graph_ir_version;
     uint64_t graph_ir_layer_count;
     uint64_t graph_ir_op_count;
+    int runtime_access_plan_ready;
+    uint64_t runtime_access_hotset_count;
+    uint64_t runtime_access_file_group_count;
+    int kv_layout_contract_ready;
 } moe_forward_status_t;
 
 typedef enum {

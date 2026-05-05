@@ -328,6 +328,55 @@ static int moe_layer_post_attention_output_norm_f32(
         input, hidden_size, output, eps);
 }
 
+static int moe_final_norm_f32(
+    moe_pc_engine* engine,
+    const moe_storage_constants_t* c,
+    const float* input,
+    uint32_t hidden_size,
+    float* output,
+    float eps
+) {
+    if (!engine || !c || !input || !output || hidden_size == 0) {
+        return 0;
+    }
+    std::string graph_name;
+    if (moe_graph_ir_tensor_binding_name(engine, "final_norm", &graph_name)) {
+        moe_raw_tensor_desc desc{};
+        const char* exact_name = graph_name.c_str();
+        const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_names(engine, &exact_name, 1, &desc);
+        if (rec && desc.rows >= hidden_size) {
+            moe_raw_tensor_cache_entry raw{};
+            if (!map_common_tensor_record(engine, *rec, desc, &raw)) {
+                return 0;
+            }
+            static std::atomic<uint32_t> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) == 0) {
+                moe_profile_log(
+                    "final_norm_contract_binding",
+                    "name=%s rows=%u cols=%u hidden=%u",
+                    graph_name.c_str(), desc.rows, desc.cols, hidden_size);
+            }
+            return moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
+        }
+        moe_profile_log(
+            "final_norm_contract_binding_rejected",
+            "name=%s rows=%u cols=%u hidden=%u",
+            graph_name.c_str(), desc.rows, desc.cols, hidden_size);
+        return 0;
+    }
+    static const char* const suffixes[] = {
+        "output_norm.weight",
+        "model.norm.weight",
+        "norm.weight",
+        "transformer.ln_f.weight"
+    };
+    return moe_layer_rmsnorm_suffixes_f32(
+        engine, (int32_t)c->num_hidden_layers, suffixes,
+        sizeof(suffixes) / sizeof(suffixes[0]),
+        input, hidden_size, output, eps);
+}
+
 // Cache split/post-norm detection per layer; layer 0 must not decide every layer.
 static int moe_layer_uses_split_post_norm_block(const moe_pc_engine* engine, int32_t layer) {
     if (!engine || layer < 0) {

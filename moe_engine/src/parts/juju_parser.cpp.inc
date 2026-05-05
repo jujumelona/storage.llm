@@ -23,6 +23,8 @@ struct moe_juju_tensor_json_entry_t {
     uint64_t row_padding_bytes = 0;
     uint16_t runtime_priority = 50;
     uint16_t prefetch_priority = 50;
+    uint16_t execution_order = 500;
+    uint16_t hotset_rank = 1000;
     uint8_t residency_hint = moe_JUJU_RESIDENCY_AUTO;
     uint8_t graph_role = moe_JUJU_ROLE_UNKNOWN;
     uint8_t prefetch_class = moe_JUJU_PREFETCH_AUTO;
@@ -470,6 +472,12 @@ static int moe_parse_juju_tensor_index_json(
         }
         if (moe_json_get_u64_slice(json, obj_begin, obj_end, "prefetch_priority", &value)) {
             rec.prefetch_priority = (uint16_t)std::min<uint64_t>(value, 1000ull);
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "execution_order", &value)) {
+            rec.execution_order = (uint16_t)std::min<uint64_t>(value, 1000ull);
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "hotset_rank", &value)) {
+            rec.hotset_rank = (uint16_t)std::min<uint64_t>(value, 1000ull);
         }
         if (moe_json_get_string_slice(json, obj_begin, obj_end, "bucket", &rec.bucket)) {
             const std::string bucket = moe_lower_ascii_copy(rec.bucket);

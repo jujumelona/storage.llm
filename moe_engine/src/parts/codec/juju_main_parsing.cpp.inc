@@ -129,8 +129,25 @@ static void moe_ingest_juju_graph_ir(moe_pc_engine* engine, const std::string& i
     engine->offload_graph_ir_layer_count.fetch_add(
         moe_count_json_key_occurrences(index_json, "\"layer\"", graph_pos),
         std::memory_order_relaxed);
+    const int has_runtime_access_plan =
+        index_json.find("\"runtime_access_plan\"", graph_pos) != std::string::npos &&
+        index_json.find("JUJU_RUNTIME_ACCESS_PLAN_V1", graph_pos) != std::string::npos;
+    if (has_runtime_access_plan) {
+        engine->juju_runtime_access_plan_ready.store(1, std::memory_order_relaxed);
+        uint64_t value = 0;
+        if (moe_json_get_u64_slice(index_json, graph_pos, index_json.size(), "startup_hotset_count", &value)) {
+            engine->juju_runtime_access_hotset_count.store(value, std::memory_order_relaxed);
+        }
+        if (moe_json_get_u64_slice(index_json, graph_pos, index_json.size(), "file_locality_group_count", &value)) {
+            engine->juju_runtime_access_file_group_count.store(value, std::memory_order_relaxed);
+        }
+    }
+    if (index_json.find("\"kv_layout_contract\"", graph_pos) != std::string::npos &&
+        index_json.find("JUJU_KV_LAYOUT_CONTRACT_V1", graph_pos) != std::string::npos) {
+        engine->juju_kv_layout_contract_ready.store(1, std::memory_order_relaxed);
+    }
     if (engine->offload_graph_ir_json.empty()) {
-        engine->offload_graph_ir_json = index_json.substr(graph_pos, std::min<size_t>(index_json.size() - graph_pos, 1u << 20));
+        engine->offload_graph_ir_json = index_json.substr(graph_pos, std::min<size_t>(index_json.size() - graph_pos, 4u << 20));
     }
     engine->offload_graph_ir_version.store((uint32_t)std::min<uint64_t>(schema_version, UINT32_MAX), std::memory_order_relaxed);
 }
@@ -264,6 +281,8 @@ static int load_juju_tensor_index_as_tensor_index(
                     moe_gguf_common_tensor_record& common_rec = engine->gguf_common_tensors[common_it->second];
                     common_rec.runtime_priority = entry.runtime_priority;
                     common_rec.prefetch_priority = entry.prefetch_priority;
+                    common_rec.execution_order = entry.execution_order;
+                    common_rec.hotset_rank = entry.hotset_rank;
                     common_rec.residency_hint = entry.residency_hint;
                     common_rec.graph_role = entry.graph_role;
                     common_rec.prefetch_class = entry.prefetch_class;
@@ -317,6 +336,8 @@ static int load_juju_tensor_index_as_tensor_index(
                     rec.resolved_path_index = path_idx;
                     rec.runtime_priority = entry.runtime_priority;
                     rec.prefetch_priority = entry.prefetch_priority;
+                    rec.execution_order = entry.execution_order;
+                    rec.hotset_rank = entry.hotset_rank;
                     rec.residency_hint = entry.residency_hint;
                     rec.graph_role = entry.graph_role;
                     rec.prefetch_class = entry.prefetch_class;

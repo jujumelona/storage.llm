@@ -169,8 +169,25 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
     bool stream_synced = false;
     size_t released = 0;
     auto& copies = it->second;
+
+    // BUGFIX 898: RAII guard for vram_in_flight_bytes release ★★★ CRITICAL
+    // Problem: DMA failure or staging slot invalidation skips device_release_in_flight_vram_bytes
+    // → vram_in_flight_bytes accumulates → prefetch_plan trim sees device_free=0 → no prefetch
+    // Solution: RAII guard ensures bytes are released on all exit paths (success, failure, exception)
+    // Impact: Prevents VRAM budget deadlock from leaked in-flight bytes
+    struct VramReleaseGuard {
+        moe_pc_engine* engine;
+        uint64_t bytes;
+        bool released;
+        VramReleaseGuard(moe_pc_engine* e, uint64_t b) : engine(e), bytes(b), released(false) {}
+        ~VramReleaseGuard() { if (!released && bytes > 0) device_release_in_flight_vram_bytes(engine, bytes); }
+        void release() { if (!released) { device_release_in_flight_vram_bytes(engine, bytes); released = true; } }
+    };
+
     while (!copies.empty()) {
         moe_deferred_staging_copy& copy = copies.front();
+        VramReleaseGuard vram_guard(e, copy.bytes_for_vram_release);
+
         bool ready = false;
         if (copy.event && copy.event_recorded) {
             ready = wait_all ?
@@ -202,9 +219,8 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
             device_recycle_copy_event(e, copy.event);
         }
 
-        // BUGFIX 875: Decrement vram_in_flight_bytes when DMA completes ★★★ CRITICAL
-        // This releases the in-flight reservation, making VRAM budget available for new experts.
-        device_release_in_flight_vram_bytes(e, copy.bytes_for_vram_release);
+        // BUGFIX 898: Explicit release via RAII guard (replaces old manual call)
+        vram_guard.release();
 
         // BUGFIX 67: Issue 2 - Use pop_front() instead of erase(begin()).
         // Old: copies.erase(copies.begin()) → O(n) on vector

@@ -53,6 +53,27 @@ static int moe_ascii_contains_ci(const std::string& haystack, const char* needle
     return 0;
 }
 
+static int moe_graph_ir_tensor_binding_name(
+    const moe_pc_engine* engine,
+    const char* key,
+    std::string* out
+) {
+    if (out) {
+        out->clear();
+    }
+    if (!engine || !key || !key[0] || !out || engine->offload_graph_ir_json.empty()) {
+        return 0;
+    }
+    size_t begin = 0;
+    size_t end = 0;
+    if (moe_json_find_object_local(engine->offload_graph_ir_json, "tensor_bindings", &begin, &end) &&
+        moe_json_get_string_slice(engine->offload_graph_ir_json, begin, end, key, out) &&
+        !out->empty()) {
+        return 1;
+    }
+    return moe_json_get_string_local(engine->offload_graph_ir_json, key, out) && !out->empty();
+}
+
 static uint32_t moe_raw_scalar_size(uint8_t encoding) {
     if (encoding == moe_RAW_SCALAR_F32) {
         return 4u;

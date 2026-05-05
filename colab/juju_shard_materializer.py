@@ -567,6 +567,7 @@ def juju_tensor_source_segment(tensor, tensor_offset, layout=None):
 
 def juju_tensor_index_record(tensor, bucket, tensor_offset, layout, contract):
     runtime_priority = tensor_runtime_priority(tensor["name"], bucket, tensor["bytes"])
+    execution_meta = juju_tensor_execution_metadata(tensor["name"], bucket, tensor_offset, layout, runtime_priority)
     record = {
         "name": tensor["name"],
         "bucket": bucket,
@@ -601,6 +602,7 @@ def juju_tensor_index_record(tensor, bucket, tensor_offset, layout, contract):
             "row_stride_bytes_are_storage_extent": True,
         },
         **juju_tensor_segmentation_fields(tensor["name"], bucket, contract),
+        **execution_meta,
         **runtime_priority,
     }
     if "row_stride_overhead_pct" in layout:
@@ -2056,6 +2058,7 @@ def juju_contract_metadata(contract, source_name, source_repo_id):
             "mmap_friendly_sections": True,
             "split_large_uploads": True,
             "tokenizer_required_at_repo_root": True,
+            "sidecar_upload_format": "structured_json_yaml_toml_only_no_generated_md_pdf",
         },
     }
     for src, dst in (
@@ -2280,6 +2283,255 @@ def tensor_runtime_priority(name, bucket, size):
         "prefetch_priority": prefetch,
         "prefetch_class": prefetch_class,
         "residency_hint": residency,
+    }
+
+
+def juju_tensor_execution_metadata(name, bucket, tensor_offset=0, layout=None, priority=None):
+    lower = str(name or "").lower()
+    bucket = str(bucket or "")
+    layout = layout or {}
+    priority = priority or tensor_runtime_priority(name, bucket, layout.get("juju_bytes") or 0)
+    layer = _juju_layer_id_from_name(name)
+    suffix = _juju_layer_suffix(name) if layer is not None else lower
+    op = "weight"
+    order = 500
+    access_phase = "stream"
+    access_pattern = "on_demand"
+    locality = "zz_misc"
+    hotset_rank = 900
+
+    if lower == "token_embd.weight" or lower.endswith(".embed_tokens.weight"):
+        op, order, access_phase, access_pattern, locality, hotset_rank = (
+            "embedding_lookup", 0, "startup", "always_hot", "00_startup_core", 0)
+    elif lower in {"output.weight", "lm_head.weight"} or lower.endswith(".lm_head.weight"):
+        op, order, access_phase, access_pattern, locality, hotset_rank = (
+            "lm_head", 980, "logits", "always_hot", "00_startup_core", 2)
+    elif lower in {"output_norm.weight", "norm.weight", "model.norm.weight"}:
+        op, order, access_phase, access_pattern, locality, hotset_rank = (
+            "final_norm", 970, "final_norm", "always_hot", "00_startup_core", 1)
+    elif "rope_freqs" in lower or "rotary" in lower:
+        op, order, access_phase, access_pattern, locality, hotset_rank = (
+            "rope_constants", 40, "startup", "always_hot", "00_startup_core", 3)
+    elif bucket in {"vision_encoder", "vision_projector", "audio_encoder", "video_encoder", "document_encoder"}:
+        op, order, access_phase, access_pattern, locality, hotset_rank = (
+            bucket, 700, "modality", "stream_when_modality_present", f"80_{bucket}", 700)
+    elif layer is not None:
+        locality = f"10_layer_{int(layer):04d}_attention"
+        access_phase = "layer_attention"
+        hotset_rank = 100 + min(int(layer), 799)
+        if suffix in {"attn_norm.weight", "input_layernorm.weight", "pre_attention_norm.weight"}:
+            op, order = "attention_input_norm", 100
+        elif suffix in {"attn_q.weight", "attention.wq.weight", "q_proj.weight", "attn_q_a_proj.weight", "attn_q_b_proj.weight"}:
+            op, order = "q_projection", 110
+        elif suffix in {"attn_k.weight", "attention.wk.weight", "k_proj.weight", "attn_kv_a_proj_with_mqa.weight"}:
+            op, order = "k_projection", 120
+        elif suffix in {"attn_v.weight", "attention.wv.weight", "v_proj.weight", "attn_kv_b_proj.weight"}:
+            op, order = "v_projection", 130
+        elif suffix in {"attn_q_norm.weight", "q_norm.weight"}:
+            op, order = "q_norm", 140
+        elif suffix in {"attn_k_norm.weight", "k_norm.weight"}:
+            op, order = "k_norm", 150
+        elif suffix in {"attn_v_norm.weight", "v_norm.weight", "value_norm.weight"}:
+            op, order = "v_norm", 160
+        elif suffix in {"attn_output.weight", "attention.wo.weight", "o_proj.weight"}:
+            op, order = "attention_output", 180
+        elif suffix in {"post_attention_norm.weight", "post_attention_layernorm.weight", "post_attention_layer_norm.weight", "post_attn_norm.weight"}:
+            op, order = "post_attention_norm", 190
+        elif suffix in {"ffn_norm.weight", "ffn_pre_norm.weight", "pre_ffw_norm.weight", "mlp_norm.weight"}:
+            op, order, access_phase, locality = "ffn_norm", 210, "layer_mlp", f"20_layer_{int(layer):04d}_mlp_shared"
+        elif suffix in {"pre_ffw_norm_2.weight", "ffn_pre_norm_2.weight", "moe_norm.weight"}:
+            op, order, access_phase, locality = "expert_ffn_norm", 220, "layer_mlp", f"20_layer_{int(layer):04d}_mlp_shared"
+        elif suffix in {"ffn_gate_inp.weight", "router.weight", "mlp.router.weight", "moe.gate.weight"}:
+            op, order, access_phase, access_pattern, locality, hotset_rank = (
+                "moe_router", 230, "router", "always_layer_hot", f"20_layer_{int(layer):04d}_mlp_shared", 50 + min(int(layer), 849))
+        elif suffix in {"ffn_gate_inp.scale", "router.scale", "mlp.router.scale", "moe.gate.scale"}:
+            op, order, access_phase, access_pattern, locality, hotset_rank = (
+                "moe_router_scale", 231, "router", "always_layer_hot", f"20_layer_{int(layer):04d}_mlp_shared", 51 + min(int(layer), 849))
+        elif is_shared_expert_tensor_name(lower):
+            op, order, access_phase, locality = "shared_expert_mlp", 250, "layer_mlp", f"20_layer_{int(layer):04d}_mlp_shared"
+        elif suffix in {"post_ffw_norm_1.weight", "ffn_post_norm_1.weight"}:
+            op, order, access_phase, locality = "post_ffw_norm_1", 270, "layer_mlp", f"20_layer_{int(layer):04d}_mlp_shared"
+        elif is_routed_expert_tensor_name(lower):
+            op, order, access_phase, access_pattern, locality = (
+                "moe_expert_mlp", 300, "selected_experts", "router_selected_dynamic", f"30_layer_{int(layer):04d}_experts")
+            hotset_rank = 300 + min(int(layer), 699)
+        elif suffix in {"post_ffw_norm_2.weight", "ffn_post_norm_2.weight"}:
+            op, order, access_phase, locality = "post_ffw_norm_2", 350, "layer_mlp", f"20_layer_{int(layer):04d}_mlp_shared"
+        elif suffix in {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"}:
+            op, order, access_phase, locality = "dense_mlp", 360, "layer_mlp", f"20_layer_{int(layer):04d}_mlp_shared"
+        elif suffix in {"post_ffw_norm.weight", "ffn_post_norm.weight"}:
+            op, order, access_phase, locality = "post_ffw_norm", 380, "layer_mlp", f"20_layer_{int(layer):04d}_mlp_shared"
+        elif suffix in {"layer_output_scale.weight", "layer_scalar.weight", "layer_scalar"}:
+            op, order, access_phase, locality = "layer_output_scale", 390, "layer_tail", f"20_layer_{int(layer):04d}_mlp_shared"
+
+    if priority.get("prefetch_class") == "startup_hot":
+        hotset_rank = min(hotset_rank, 16)
+    elif priority.get("graph_role") in {"attention", "router", "norm", "shared_core"}:
+        hotset_rank = min(hotset_rank, 256)
+    return {
+        "execution_layer": int(layer) if layer is not None else -1,
+        "execution_op": op,
+        "execution_order": int(order),
+        "access_phase": access_phase,
+        "access_pattern": access_pattern,
+        "file_locality_group": locality,
+        "hotset_rank": int(hotset_rank),
+        "io_alignment_bytes": 4096,
+        "stream_bytes": int(layout.get("juju_bytes") or layout.get("source_bytes") or 0),
+    }
+
+
+def juju_tensor_file_order_key(tensor, bucket):
+    name = str(tensor.get("name") or "")
+    layout = juju_tensor_storage_layout(tensor)
+    priority = tensor_runtime_priority(name, bucket, tensor.get("bytes"))
+    meta = juju_tensor_execution_metadata(name, bucket, 0, layout, priority)
+    section_rank = {name: idx for idx, name in enumerate(JUJU_TENSOR_BUCKET_ORDER)}.get(bucket, 99)
+    return (
+        section_rank,
+        str(meta.get("file_locality_group") or ""),
+        int(meta.get("execution_layer", -1)),
+        int(meta.get("execution_order", 500)),
+        -int(priority.get("runtime_priority") or 0),
+        name,
+    )
+
+
+def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
+    layers = sorted({
+        int(rec.get("execution_layer"))
+        for rec in tensor_records or []
+        if int(rec.get("execution_layer", -1)) >= 0
+    })
+    startup_hot = sorted(
+        [
+            rec for rec in tensor_records or []
+            if int(rec.get("hotset_rank", 1000)) <= 256 or rec.get("access_phase") == "startup"
+        ],
+        key=lambda rec: (
+            int(rec.get("hotset_rank", 1000)),
+            int(rec.get("juju_offset") or 0),
+            str(rec.get("name") or ""),
+        ),
+    )
+    file_groups = {}
+    for rec in tensor_records or []:
+        group = str(rec.get("file_locality_group") or "zz_misc")
+        item = file_groups.setdefault(group, {
+            "tensor_count": 0,
+            "bytes": 0,
+            "min_offset": None,
+            "max_end": 0,
+            "phases": {},
+        })
+        begin = int(rec.get("juju_offset") or 0)
+        end = begin + int(rec.get("juju_bytes") or rec.get("stream_bytes") or 0)
+        item["tensor_count"] += 1
+        item["bytes"] += int(rec.get("juju_bytes") or rec.get("stream_bytes") or 0)
+        item["min_offset"] = begin if item["min_offset"] is None else min(item["min_offset"], begin)
+        item["max_end"] = max(item["max_end"], end)
+        phase = str(rec.get("access_phase") or "stream")
+        item["phases"][phase] = item["phases"].get(phase, 0) + 1
+    file_group_list = []
+    for name, item in sorted(file_groups.items(), key=lambda kv: (kv[1]["min_offset"] or 0, kv[0])):
+        file_group_list.append({
+            "name": name,
+            "tensor_count": item["tensor_count"],
+            "bytes": item["bytes"],
+            "offset_range": [int(item["min_offset"] or 0), int(item["max_end"])],
+            "phases": item["phases"],
+        })
+
+    per_layer = []
+    for layer in layers:
+        entries = [rec for rec in tensor_records if int(rec.get("execution_layer", -1)) == layer]
+        by_phase = {}
+        for rec in entries:
+            phase = str(rec.get("access_phase") or "stream")
+            phase_item = by_phase.setdefault(phase, {"tensor_count": 0, "bytes": 0, "ops": {}})
+            phase_item["tensor_count"] += 1
+            phase_item["bytes"] += int(rec.get("juju_bytes") or rec.get("stream_bytes") or 0)
+            op = str(rec.get("execution_op") or "weight")
+            phase_item["ops"][op] = phase_item["ops"].get(op, 0) + 1
+        per_layer.append({
+            "layer": layer,
+            "phase_summary": by_phase,
+            "attention_prefetch": "enqueue_layer_plus_1_attention_during_current_mlp",
+            "expert_prefetch": "router_selected_dynamic_plus_coactivation_history",
+        })
+
+    qkv = dict(contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract") or {})
+    max_seq = first_present(
+        runtime_arch.get("max_position_embeddings"),
+        runtime_arch.get("context_length"),
+        qkv.get("max_seq_len"),
+        qkv.get("max_position_embeddings"),
+    )
+    entry_dim = first_present(
+        runtime_arch.get("kv_lora_rank"),
+        runtime_arch.get("value_head_dim"),
+        runtime_arch.get("head_dim"),
+        qkv.get("entry_dim"),
+    )
+    kv_layout_contract = {
+        "format": "JUJU_KV_LAYOUT_CONTRACT_V1",
+        "layout": "position_major_layer_contiguous_entry_dim",
+        "entry_dtype": qkv.get("dtype") or qkv.get("cache_dtype") or "uint8_affine",
+        "scale_dtype": "float32",
+        "zero_dtype": "float32",
+        "entry_dim": entry_dim,
+        "max_seq_len": max_seq,
+        "growth_page_tokens": int(qkv.get("page_size_tokens") or qkv.get("block_size_tokens") or 4096),
+        "residency_policy": qkv.get("residency_policy") or "ram_tracked_via_tier_usage_device_vram_when_enabled",
+        "quantized": bool(qkv) or True,
+        "executor_contract": "moe_kv_cache_store_load_entry_must_match_layout",
+    }
+    return {
+        "format": "JUJU_RUNTIME_ACCESS_PLAN_V1",
+        "version": 1,
+        "source": "tensor_index_execution_metadata",
+        "sort_key": ["file_locality_group", "execution_layer", "execution_order", "runtime_priority"],
+        "startup_hotset_count": len(startup_hot),
+        "startup_hotset": [
+            {
+                "name": rec.get("name"),
+                "op": rec.get("execution_op"),
+                "priority": rec.get("runtime_priority"),
+                "prefetch": rec.get("prefetch_priority"),
+                "offset": rec.get("juju_offset"),
+                "bytes": rec.get("juju_bytes"),
+            }
+            for rec in startup_hot[:96]
+        ],
+        "protected_roles": ["token_embedding", "lm_head", "final_norm", "attention", "router", "norm"],
+        "file_locality_group_count": len(file_group_list),
+        "file_locality_groups": file_group_list,
+        "per_layer": per_layer,
+        "prefetch_schedule": {
+            "startup": ["token_embedding", "final_norm", "lm_head", "rope", "first_layer_attention", "first_layer_router"],
+            "per_layer": [
+                "attention_input_norm",
+                "qkv_projection",
+                "attention_output",
+                "post_attention_norm",
+                "ffn_norm_and_router",
+                "selected_expert_bundle",
+                "shared_expert_bundle",
+                "post_ffw_norm",
+                "layer_output_scale",
+            ],
+            "lookahead": {
+                "attention": "layer_plus_1_during_current_mlp",
+                "experts": "router_topk_current_layer_plus_mutable_coactivation_next_use",
+                "eviction": "protect_startup_hotset_and_current_next_layer",
+            },
+        },
+        "kv_layout_contract": kv_layout_contract,
+        "bottleneck_trace_contract": {
+            "token_level": ["forward_token_begin", "cpu_ram", "kv_cache", "io_pipeline", "forward_layer", "forward_token_end"],
+            "stage_level": ["forward_embed", "attn_standard_qkv_norm", "mlp_moe_end", "lm_head_logprob_end"],
+            "required_counters": ["ram_used_bytes", "vram_used_bytes", "db_used_bytes", "queue_depth", "inflight", "kv_bytes"],
+        },
     }
 
 
@@ -2599,35 +2851,217 @@ def build_layer_graph_ir(layer, tensors):
 
     moe_weights = sorted(name for name in names if is_routed_expert_tensor_name(name))
     shared_expert_weights = sorted(name for name in names if is_shared_expert_tensor_name(name))
-    dense_weights = bind("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight")
+    dense_weights = bind(
+        "ffn_gate.weight",
+        "ffn_up.weight",
+        "ffn_down.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight",
+    )
+    attention_norm_weights = bind("attn_norm.weight", "input_layernorm.weight", "pre_attention_norm.weight")
+    q_weights = bind("attn_q.weight", "attention.wq.weight", "q_proj.weight", "attn_q_a_proj.weight", "attn_q_b_proj.weight")
+    k_weights = bind("attn_k.weight", "attention.wk.weight", "k_proj.weight", "attn_kv_a_proj_with_mqa.weight")
+    v_weights = bind("attn_v.weight", "attention.wv.weight", "v_proj.weight", "attn_kv_b_proj.weight")
+    q_norm_weights = bind("attn_q_norm.weight", "q_norm.weight")
+    k_norm_weights = bind("attn_k_norm.weight", "k_norm.weight")
+    v_norm_weights = bind("attn_v_norm.weight", "v_norm.weight", "value_norm.weight")
+    o_weights = bind("attn_output.weight", "attention.wo.weight", "o_proj.weight")
+    post_attention_norm_weights = bind(
+        "post_attention_norm.weight",
+        "post_attention_layernorm.weight",
+        "post_attention_layer_norm.weight",
+        "post_attn_norm.weight",
+    )
+    ffn_norm_weights = bind("ffn_norm.weight", "ffn_pre_norm.weight", "pre_ffw_norm.weight", "mlp_norm.weight")
+    expert_norm_weights = bind("pre_ffw_norm_2.weight", "ffn_pre_norm_2.weight", "moe_norm.weight")
+    router_weights = bind("ffn_gate_inp.weight", "router.weight", "mlp.router.weight", "moe.gate.weight")
+    router_scale_weights = bind("ffn_gate_inp.scale", "router.scale", "mlp.router.scale", "moe.gate.scale")
+    shared_gate_weights = bind(
+        "shared_expert_gate.weight",
+        "shared_expert.gate.weight",
+        "ffn_shared_gate.weight",
+        "shared_gate.weight",
+    )
+    post_ffw_norm1_weights = bind("post_ffw_norm_1.weight", "ffn_post_norm_1.weight")
+    post_ffw_norm2_weights = bind("post_ffw_norm_2.weight", "ffn_post_norm_2.weight")
+    post_ffw_norm_weights = bind("post_ffw_norm.weight", "ffn_post_norm.weight")
+    layer_output_scale_weights = bind("layer_output_scale.weight", "layer_scalar.weight", "layer_scalar")
+    expert_down_scale_weights = bind(
+        "ffn_down_exps.scale",
+        "ffn_gate_inp.per_expert_scale",
+        "router.per_expert_scale",
+        "mlp.router.per_expert_scale",
+        "moe.gate.per_expert_scale",
+    )
 
     ops = [
-        {"op": "rms_norm", "name": "attention_input_norm", "inputs": ["hidden"], "weights": bind("attn_norm.weight", "input_layernorm.weight"), "required": False},
-        {"op": "linear", "name": "q_projection", "inputs": ["attention_norm"], "weights": bind("attn_q.weight", "attention.wq.weight", "attn_q_a_proj.weight", "attn_q_b_proj.weight"), "output": "q", "required": False},
-        {"op": "linear", "name": "k_projection", "inputs": ["attention_norm"], "weights": bind("attn_k.weight", "attention.wk.weight", "attn_kv_a_proj_with_mqa.weight"), "output": "k", "required": False},
-        {"op": "linear", "name": "v_projection", "inputs": ["attention_norm"], "weights": bind("attn_v.weight", "attention.wv.weight", "attn_kv_b_proj.weight"), "output": "v", "required": False},
-        {"op": "rms_norm", "name": "q_norm", "inputs": ["q"], "weights": bind("attn_q_norm.weight"), "required": False},
-        {"op": "rms_norm", "name": "k_norm", "inputs": ["k"], "weights": bind("attn_k_norm.weight"), "required": False},
+        {"op": "rms_norm", "name": "attention_input_norm", "inputs": ["hidden"], "weights": attention_norm_weights, "output": "attention_norm", "optional_behavior": "pass_hidden_when_weight_absent", "required": False},
+        {"op": "linear", "name": "q_projection", "inputs": ["attention_norm"], "weights": q_weights, "output": "q_raw", "required": bool(q_weights)},
+        {"op": "linear", "name": "k_projection", "inputs": ["attention_norm"], "weights": k_weights, "output": "k_raw", "required": bool(k_weights)},
+        {"op": "linear", "name": "v_projection", "inputs": ["attention_norm"], "weights": v_weights, "output": "v_raw", "fallback_output": "k_raw", "fallback_semantics": "when_no_v_projection_value_uses_raw_k_projection_before_k_norm", "required": False},
+        {"op": "rms_norm", "name": "q_norm", "inputs": ["q_raw"], "weights": q_norm_weights, "output": "q", "optional_behavior": "pass_q_raw_when_weight_absent", "required": False},
+        {"op": "rms_norm", "name": "k_norm", "inputs": ["k_raw"], "weights": k_norm_weights, "output": "k", "optional_behavior": "pass_k_raw_when_weight_absent", "required": False},
+        {"op": "rms_norm", "name": "v_norm", "inputs": ["v_raw" if v_weights else "k_raw"], "weights": v_norm_weights, "output": "v", "optional_behavior": "pass_value_raw_when_weight_absent", "required": False},
         {"op": "rope", "name": "rotary_embedding", "inputs": ["q", "k"], "weights": bind("rope_freqs.weight"), "required": False},
-        {"op": "attention", "name": "attention", "inputs": ["q", "k", "v"], "kv_cache": "quantized_qkv_cache", "required": False},
-        {"op": "linear", "name": "attention_output", "inputs": ["attention"], "weights": bind("attn_output.weight", "attention.wo.weight"), "output": "attention_out", "required": False},
-        {"op": "residual", "name": "attention_residual", "inputs": ["hidden", "attention_out"], "required": True},
-        {"op": "rms_norm", "name": "ffn_norm", "inputs": ["hidden"], "weights": bind("ffn_norm.weight", "post_attention_norm.weight", "pre_ffw_norm.weight"), "required": False},
-        {"op": "hidden_snapshot", "name": "fate_gate_input_snapshot", "inputs": ["ffn_norm"], "target": "engine_state.gate_input_snapshots[layer]", "required": False},
-        {"op": "linear", "name": "moe_router", "inputs": ["ffn_norm"], "weights": bind("ffn_gate_inp.weight", "router.weight"), "scale": bind("ffn_gate_inp.scale"), "output": "expert_scores", "required": False},
+        {"op": "attention", "name": "attention", "inputs": ["q", "k", "v"], "kv_cache": "quantized_qkv_cache", "attention_scale": "metadata_or_qk_norm_contract", "required": bool(q_weights and k_weights and (v_weights or k_weights))},
+        {"op": "linear", "name": "attention_output", "inputs": ["attention"], "weights": o_weights, "output": "attention_out", "required": bool(o_weights)},
+        {"op": "rms_norm", "name": "post_attention_norm", "inputs": ["attention_out"], "weights": post_attention_norm_weights, "output": "attention_branch", "optional_behavior": "pass_attention_out_when_weight_absent", "required": False},
+        {"op": "residual", "name": "attention_residual", "inputs": ["hidden", "attention_branch"], "output": "hidden", "required": True},
+        {"op": "rms_norm", "name": "ffn_norm", "inputs": ["hidden"], "weights": ffn_norm_weights, "output": "shared_ffn_input", "optional_behavior": "pass_hidden_when_weight_absent", "required": False},
+        {"op": "rms_norm", "name": "expert_ffn_norm", "inputs": ["hidden"], "weights": expert_norm_weights, "output": "expert_ffn_input", "optional_behavior": "use_shared_ffn_input_when_weight_absent", "required": False},
+        {"op": "select", "name": "router_input", "inputs": ["hidden", "expert_ffn_input"], "output": "router_input", "rule": "use_hidden_when_router_has_internal_scale_else_expert_ffn_input", "scale": router_scale_weights, "required": False},
+        {"op": "hidden_snapshot", "name": "fate_gate_input_snapshot", "inputs": ["router_input"], "target": "engine_state.gate_input_snapshots[layer]", "required": False},
+        {"op": "linear", "name": "moe_router", "inputs": ["router_input"], "weights": router_weights, "scale": router_scale_weights, "output": "expert_scores", "required": bool(router_weights)},
         {"op": "topk", "name": "expert_select", "inputs": ["expert_scores"], "config_key": "adaptive_seq_topk_entropy", "required": False},
-        {"op": "moe_expert_mlp", "name": "moe_experts", "inputs": ["ffn_norm", "selected_experts"], "weights": moe_weights, "required": bool(moe_weights)},
-        {"op": "shared_expert_mlp", "name": "shared_experts", "inputs": ["ffn_norm"], "weights": shared_expert_weights, "required": bool(shared_expert_weights)},
-        {"op": "dense_mlp", "name": "dense_ffn_fallback", "inputs": ["ffn_norm"], "weights": dense_weights, "required": bool(dense_weights)},
-        {"op": "residual", "name": "ffn_residual", "inputs": ["hidden", "ffn_out"], "required": True},
-        {"op": "scale", "name": "layer_output_scale", "inputs": ["hidden"], "weights": bind("layer_output_scale.weight"), "required": False},
+        {"op": "shared_expert_mlp", "name": "shared_experts", "inputs": ["shared_ffn_input"], "weights": shared_expert_weights, "gate": shared_gate_weights, "output": "shared_branch_raw", "required": bool(shared_expert_weights)},
+        {"op": "rms_norm", "name": "post_ffw_norm_1", "inputs": ["shared_branch_raw"], "weights": post_ffw_norm1_weights, "output": "shared_branch", "optional_behavior": "pass_shared_branch_raw_when_weight_absent", "required": False},
+        {"op": "moe_expert_mlp", "name": "moe_experts", "inputs": ["expert_ffn_input", "selected_experts"], "weights": moe_weights, "per_expert_output_scale": expert_down_scale_weights, "output": "expert_sum_raw", "required": bool(moe_weights)},
+        {"op": "rms_norm", "name": "post_ffw_norm_2", "inputs": ["expert_sum_raw"], "weights": post_ffw_norm2_weights, "output": "expert_branch", "optional_behavior": "pass_expert_sum_raw_when_weight_absent", "required": False},
+        {"op": "dense_mlp", "name": "dense_ffn_fallback", "inputs": ["shared_ffn_input"], "weights": dense_weights, "output": "dense_branch", "required": bool(dense_weights and not moe_weights and not shared_expert_weights)},
+        {"op": "add", "name": "ffn_branch_sum", "inputs": ["shared_branch", "expert_branch", "dense_branch"], "output": "ffn_out", "missing_input": "zero", "required": bool(moe_weights or shared_expert_weights or dense_weights)},
+        {"op": "rms_norm", "name": "post_ffw_norm", "inputs": ["ffn_out"], "weights": post_ffw_norm_weights, "output": "ffn_branch", "optional_behavior": "pass_ffn_out_when_weight_absent", "required": False},
+        {"op": "residual", "name": "ffn_residual", "inputs": ["hidden", "ffn_branch"], "output": "hidden", "required": True},
+        {"op": "scale", "name": "layer_output_scale", "inputs": ["hidden"], "weights": layer_output_scale_weights, "output": "hidden", "required": False},
     ]
     return {
         "layer": int(layer),
         "tensor_prefix": prefix,
         "layer_name_parser": "common_gguf_layer_prefixes",
         "available_tensors": sorted(names),
+        "tensor_layout_contract": {
+            "format": "JUJU_TENSOR_LAYOUT_REF_V1",
+            "shape_map_ref": "graph_ir.tensor_bindings.shape_map",
+            "tensor_index_ref": "juju.idx.tensor_records",
+            "layer_tensor_count": len(names),
+            "required_record_fields": ["name", "shape", "encoding", "offset", "size", "row_layout", "row_stride_bytes"],
+            "row_layout_contract": "tensor_index_record_is_authoritative_no_name_based_transpose",
+        },
+        "semantic_contract": {
+            "attention_post_norm_is_separate_from_ffn_norm": True,
+            "expert_branch_uses_expert_ffn_norm": bool(expert_norm_weights),
+            "router_uses_hidden_when_internal_scale_present": bool(router_scale_weights),
+            "value_uses_raw_k_projection_when_v_projection_missing": not bool(v_weights),
+            "shared_and_expert_post_norms_apply_before_branch_sum": bool(post_ffw_norm1_weights or post_ffw_norm2_weights),
+            "post_ffw_norm_applies_to_combined_ffn_before_residual": bool(post_ffw_norm_weights),
+            "layer_output_scale_after_ffn_residual": bool(layer_output_scale_weights),
+        },
         "ops": ops,
+    }
+
+
+def build_generation_contract(*, contract, tensor_records, runtime_arch, token_embd, lm_head, output_norm):
+    shape_map = _juju_tensor_shape_map(tensor_records)
+    hidden_size = runtime_arch.get("hidden_size") or runtime_arch.get("hidden_dim")
+    vocab_size = runtime_arch.get("vocab_size")
+    embedding_scale = first_present(
+        runtime_arch.get("embedding_scale"),
+        runtime_arch.get("scale_emb"),
+        (contract.get("arch_meta") or {}).get("embedding_scale"),
+        (contract.get("arch_meta") or {}).get("scale_emb"),
+    )
+    feature_counts = {
+        "layers_with_post_attention_norm": 0,
+        "layers_with_expert_ffn_norm": 0,
+        "layers_with_post_ffw_norm": 0,
+        "layers_with_post_ffw_norm_1": 0,
+        "layers_with_post_ffw_norm_2": 0,
+        "layers_with_layer_output_scale": 0,
+        "layers_without_v_projection": 0,
+        "layers_with_v_norm": 0,
+        "layers_with_router_scale": 0,
+    }
+    layers = sorted({
+        layer for layer in (_juju_layer_id_from_name(t.get("name")) for t in tensor_records)
+        if layer is not None
+    })
+    by_layer = {layer: {_juju_layer_suffix(n) for n in _juju_tensors_by_layer(tensor_records, layer)} for layer in layers}
+    for suffixes in by_layer.values():
+        if any(x in suffixes for x in {"post_attention_norm.weight", "post_attention_layernorm.weight", "post_attention_layer_norm.weight", "post_attn_norm.weight"}):
+            feature_counts["layers_with_post_attention_norm"] += 1
+        if any(x in suffixes for x in {"pre_ffw_norm_2.weight", "ffn_pre_norm_2.weight", "moe_norm.weight"}):
+            feature_counts["layers_with_expert_ffn_norm"] += 1
+        if any(x in suffixes for x in {"post_ffw_norm.weight", "ffn_post_norm.weight"}):
+            feature_counts["layers_with_post_ffw_norm"] += 1
+        if any(x in suffixes for x in {"post_ffw_norm_1.weight", "ffn_post_norm_1.weight"}):
+            feature_counts["layers_with_post_ffw_norm_1"] += 1
+        if any(x in suffixes for x in {"post_ffw_norm_2.weight", "ffn_post_norm_2.weight"}):
+            feature_counts["layers_with_post_ffw_norm_2"] += 1
+        if any(x in suffixes for x in {"layer_output_scale.weight", "layer_scalar.weight", "layer_scalar"}):
+            feature_counts["layers_with_layer_output_scale"] += 1
+        if not any(x in suffixes for x in {"attn_v.weight", "attention.wv.weight", "v_proj.weight", "attn_kv_b_proj.weight"}):
+            feature_counts["layers_without_v_projection"] += 1
+        if any(x in suffixes for x in {"attn_v_norm.weight", "v_norm.weight", "value_norm.weight"}):
+            feature_counts["layers_with_v_norm"] += 1
+        if any(x in suffixes for x in {"ffn_gate_inp.scale", "router.scale", "mlp.router.scale", "moe.gate.scale"}):
+            feature_counts["layers_with_router_scale"] += 1
+    return {
+        "format": "JUJU_GENERATION_CONTRACT_V1",
+        "required_runtime_loop": "tokenizer_contract_then_graph_ir_ops_then_tensor_layout_then_lm_head",
+        "contract_source": "generated_from_source_tensor_table_and_config_not_model_name",
+        "fail_closed": True,
+        "tokenizer": juju_tokenizer_contract(),
+        "embedding": {
+            "tensor": token_embd,
+            "shape": shape_map.get(token_embd, []),
+            "hidden_size": hidden_size,
+            "vocab_size": vocab_size,
+            "scale": embedding_scale,
+            "scale_source": "source_config" if embedding_scale is not None else "engine_contract_default",
+            "row_layout": "token_major_rows_vocab_by_hidden",
+        },
+        "layers": {
+            "count": len(layers),
+            "feature_counts": feature_counts,
+            "op_order_is_authoritative": True,
+            "unknown_required_op_behavior": "fail_closed",
+            "optional_missing_op_behavior": "documented_fallback_only",
+        },
+        "lm_head": {
+            "tensor": lm_head,
+            "shape": shape_map.get(lm_head, []),
+            "tied_to_token_embedding": bool(lm_head and token_embd and lm_head == token_embd),
+            "row_layout": "token_major_rows_vocab_by_hidden",
+            "required": bool(lm_head),
+        },
+        "final_norm": {
+            "tensor": output_norm,
+            "shape": shape_map.get(output_norm, []),
+            "required": bool(output_norm),
+        },
+        "performance_contract": {
+            "hot_startup_tensors": [x for x in [token_embd, lm_head, output_norm, _juju_first_tensor(tensor_records, "rope_freqs.weight")] if x],
+            "protect_roles": ["token_embedding", "lm_head", "final_norm", "attention", "router", "norm"],
+            "sidecar_upload_format": "structured_json_yaml_toml_only_no_generated_md_pdf",
+            "trace_required_keys": [
+                "tokenizer",
+                "embedding_contract_binding",
+                "final_norm_contract_binding",
+                "lm_head_contract_binding",
+                "runtime_access_plan",
+                "forward_layer",
+                "attn_standard_qkv_norm",
+                "mlp_moe_end",
+                "lm_head_logprob_end",
+                "cpu_ram",
+                "kv_cache",
+                "io_pipeline",
+            ],
+            "bottleneck_counters": [
+                "tokenize_ms",
+                "embed_ms",
+                "attention_ms",
+                "mlp_ms",
+                "lm_head_ms",
+                "kv_bytes",
+                "ram_used_bytes",
+                "vram_used_bytes",
+                "db_used_bytes",
+                "io_wait_ms",
+                "queue_depth",
+                "inflight",
+            ],
+        },
     }
 
 
@@ -2703,6 +3137,15 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
     token_embd = _juju_first_tensor(tensor_records, "token_embd.weight")
     lm_head = _juju_first_tensor(tensor_records, "output.weight") or token_embd
     output_norm = _juju_first_tensor(tensor_records, "output_norm.weight", "norm.weight")
+    generation_contract = build_generation_contract(
+        contract=contract,
+        tensor_records=tensor_records,
+        runtime_arch=runtime_arch,
+        token_embd=token_embd,
+        lm_head=lm_head,
+        output_norm=output_norm,
+    )
+    runtime_access_plan = build_juju_runtime_access_plan(tensor_records, contract, runtime_arch)
     priority_rules = [
         {"match": "token_embd.weight|output.weight|output_norm.weight|rope_freqs.weight", "priority": 100, "residency": "FAST_MEM", "prefetch": "startup_hot"},
         {"match": "attention/norm/router tensors", "priority": 85, "residency": "FAST_MEM", "prefetch": "layer_hot"},
@@ -2755,6 +3198,9 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             },
             **runtime_arch,
         },
+        "generation_contract": generation_contract,
+        "runtime_access_plan": runtime_access_plan,
+        "kv_layout_contract": runtime_access_plan["kv_layout_contract"],
         "tokenizer_contract": juju_tokenizer_contract(),
         "quantization": {
             "weight": contract.get("weight_quant_schema", {}),
@@ -2774,6 +3220,11 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             "rope_freqs": _juju_first_tensor(tensor_records, "rope_freqs.weight"),
             "layer_tensor_prefix": "blk.{layer}.",
             "shape_map": shape_map,
+            "layout_contract": {
+                "token_embedding": generation_contract["embedding"],
+                "lm_head": generation_contract["lm_head"],
+                "final_norm": generation_contract["final_norm"],
+            },
         },
         "tensor_index_contract": {
             "binary_schema_version": 3,
@@ -2809,6 +3260,8 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             "unknown_op": "fail_closed",
             "unknown_tensor": "fail_closed_for_required_optional_skip",
             "kv_cache": "quantized_qkv_cache_required" if contract.get("qkv_cache_schema") else "runtime_default",
+            "runtime_access_plan": "JUJU_RUNTIME_ACCESS_PLAN_V1_required_for_prefetch_residency_and_trace",
+            "kv_layout_contract": "JUJU_KV_LAYOUT_CONTRACT_V1_required_for_generation_cache_accounting",
             "model_load": "eager_validate_header_sections_idx_tokenizer_and_kernel_support",
             "weight_decode": "juju_weight_encoding_and_gguf_type_exact_dispatch",
             "residency_policy": contract.get("residency_policy", {}),
@@ -2856,6 +3309,8 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             "input": ["tokenizer_assets", "token_ids"],
             "prefill": ["embedding", "layer_loop", "kv_write", "logits"],
             "decode": ["next_token_embedding", "layer_loop", "kv_read_write", "logits"],
+            "access_plan_ref": "graph_ir.runtime_access_plan",
+            "kv_layout_ref": "graph_ir.kv_layout_contract",
             "offload_units": ["shared_tensor", "expert_tensor", "dense_ffn_tensor", "qkv_page", "vision_tensor", "audio_tensor", "video_tensor", "document_tensor"],
             "io_policy": {
                 "read_unit": "tensor_span",
@@ -3121,7 +3576,10 @@ def build_juju_shard_plan_from_hf_url(
             pos = add_json_section_at(pos, JUJU_SECTION_QKV_POLICY, "QKV_POLICY", qkv_schema)
 
         for bucket in JUJU_TENSOR_BUCKET_ORDER:
-            group = [t for t in active_tensors if t["bucket"] == bucket and t["bytes"] > 0]
+            group = sorted(
+                [t for t in active_tensors if t["bucket"] == bucket and t["bytes"] > 0],
+                key=lambda tensor, bucket=bucket: juju_tensor_file_order_key(tensor, bucket),
+            )
             if not group:
                 continue
             pos = align_up(pos, 4096)
@@ -3196,6 +3654,8 @@ def build_juju_shard_plan_from_hf_url(
             "graph_ir": graph_ir,
             "priority_tables": graph_ir["priority_tables"],
             "moe_offload_policy": graph_ir["moe_offload_policy"],
+            "runtime_access_plan": graph_ir["runtime_access_plan"],
+            "kv_layout_contract": graph_ir["kv_layout_contract"],
             "tensor_count": len(tensor_records),
             "tensors": tensor_records,
             "sections": list(sections),
@@ -3652,7 +4112,10 @@ def write_juju_shard_from_hf_url(
                 add_json_section(out, JUJU_SECTION_QKV_POLICY, "QKV_POLICY", qkv_schema)
 
             for bucket in JUJU_TENSOR_BUCKET_ORDER:
-                group = [t for t in active_tensors if t["bucket"] == bucket and t["bytes"] > 0]
+                group = sorted(
+                    [t for t in active_tensors if t["bucket"] == bucket and t["bytes"] > 0],
+                    key=lambda tensor, bucket=bucket: juju_tensor_file_order_key(tensor, bucket),
+                )
                 if not group:
                     continue
                 write_padding(out, 4096)

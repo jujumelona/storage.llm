@@ -27,15 +27,19 @@ int moe_pc_engine_eval_token_ids_from(
     if (forward_status_ok &&
         forward.dynamic_shape_ready &&
         !forward.forward_adapter_executable) {
-        char reason[192]{};
+        char reason[320]{};
         if (forward.graph_ir_ready) {
             std::snprintf(reason, sizeof(reason),
-                "graph IR executor not executable graph_ver=%u layers=%u ops=%llu hidden=%u vocab=%u",
+                "graph IR executor not executable graph_ver=%u layers=%u ops=%llu hidden=%u vocab=%u access_plan=%d kv_layout=%d hotset=%llu file_groups=%llu",
                 forward.graph_ir_version,
                 forward.dynamic_num_hidden_layers,
                 (unsigned long long)forward.graph_ir_op_count,
                 forward.dynamic_hidden_size,
-                forward.dynamic_vocab_size);
+                forward.dynamic_vocab_size,
+                forward.runtime_access_plan_ready,
+                forward.kv_layout_contract_ready,
+                (unsigned long long)forward.runtime_access_hotset_count,
+                (unsigned long long)forward.runtime_access_file_group_count);
         } else {
             std::snprintf(reason, sizeof(reason),
                 "forward adapter not executable adapter=%s layers=%u hidden=%u vocab=%u",

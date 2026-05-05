@@ -431,6 +431,33 @@ static int device_allocator_init(moe_pc_engine* e) {
         }
     } else if (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO) {
         level_zero_driver_load(&e->ze, e->backend_caps.device_id);
+
+        // BUGFIX 896: Detect integrated GPU and enable unified memory handling ★★★ CRITICAL
+        // Problem: Intel iGPU shares system RAM but allocatedSize==0 fallback uses totalSize (16GB).
+        // This overestimates available VRAM → OOM when actual GPU buffer space is much smaller.
+        // Solution: Query zeDeviceGetProperties to detect integrated GPU, set supports_unified_memory.
+        // Apply Metal-style unified memory budget calculation (same as HIP APU).
+        // Impact: Correct memory budget for Intel integrated GPUs, prevents OOM.
+        if (e->ze.zeDeviceGetProperties && e->ze.device) {
+            struct ze_device_properties_local {
+                uint32_t stype; void* pNext; uint32_t type;
+                uint32_t vendorId; uint32_t deviceId; uint32_t flags;
+                uint32_t subdeviceId; uint32_t coreClockRate; uint64_t maxMemAllocSize;
+                uint32_t maxHardwareContexts; uint32_t maxCommandQueuePriority;
+                uint32_t numThreadsPerEU; uint32_t physicalEUSimdWidth; uint32_t numEUsPerSubslice;
+                uint32_t numSubslicesPerSlice; uint32_t numSlices; uint64_t timerResolution;
+                uint32_t timestampValidBits; uint32_t kernelTimestampValidBits;
+                uint8_t uuid[16]; char name[256];
+            } props{};
+            props.stype = 0x00010003; // ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES
+            if (e->ze.zeDeviceGetProperties(e->ze.device, &props) == 0 && (props.flags & 1u)) {
+                // ZE_DEVICE_PROPERTY_FLAG_INTEGRATED (bit 0) set → integrated GPU
+                e->backend_caps.supports_unified_memory = true;
+                fprintf(stderr,
+                    "[storageLLM INFO] Level Zero integrated GPU detected, enabling unified memory mode\n");
+            }
+        }
+
         if (e->backend_caps.device_memory_bytes == 0) {
             e->backend_caps.device_memory_bytes = e->backend_caps.system_memory_bytes > 0
                 ? e->backend_caps.system_memory_bytes : 16ull * 1024ull * 1024ull * 1024ull;
@@ -714,6 +741,31 @@ static int device_allocator_init(moe_pc_engine* e) {
     // Solution: Use memory_order_seq_cst to enforce total ordering
     // Impact: Prevents double-deduction of KV budget during init
     e->device_allocator_ready.store(1, std::memory_order_seq_cst);
+
+    // BUGFIX 894: Validate staging_slot_size against max expert bytes ★★★ CRITICAL
+    // Problem: If staging_slot_size < max_expert_bytes, all prefetch attempts fail silently.
+    // Slot acquired → size insufficient → released → staging_slot_contention++ → infinite loop.
+    // Engine runs but nothing loads to VRAM → silent performance failure.
+    // Solution: Calculate max expert bytes and warn if staging_slot_size is too small.
+    // Impact: Prevents silent prefetch failures, enables auto-sizing.
+    if (e->staging_slot_size > 0) {
+        const moe_storage_constants_t* storage = moe_storage_constants();
+        if (storage && storage->normal_bundle_max_bytes > 0) {
+            const uint64_t max_expert_bytes = storage->normal_bundle_max_bytes;
+            if (e->staging_slot_size < max_expert_bytes) {
+                const uint64_t recommended = (max_expert_bytes * 110ull) / 100ull; // +10% margin
+                fprintf(stderr,
+                    "[storageLLM WARNING] staging_slot_size=%llu < max_expert_bytes=%llu.\n"
+                    "  All prefetch attempts will fail. Recommended: %llu bytes.\n"
+                    "  Set staging_size to at least %llu bytes (slot_size * slot_count).\n",
+                    (unsigned long long)e->staging_slot_size,
+                    (unsigned long long)max_expert_bytes,
+                    (unsigned long long)recommended,
+                    (unsigned long long)(recommended * e->staging_slots.size()));
+            }
+        }
+    }
+
     // Stream pool init moved to engine start
     return 1;
 }

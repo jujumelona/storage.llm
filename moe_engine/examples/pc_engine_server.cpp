@@ -245,6 +245,10 @@ static void log_engine_snapshot(const char* tag, moe_pc_engine_t* engine) {
                   << " graph_required=" << forward.graph_ir_required
                   << " graph_layers=" << forward.graph_ir_layer_count
                   << " graph_ops=" << forward.graph_ir_op_count
+                  << " access_plan=" << forward.runtime_access_plan_ready
+                  << " hotset=" << forward.runtime_access_hotset_count
+                  << " file_groups=" << forward.runtime_access_file_group_count
+                  << " kv_layout=" << forward.kv_layout_contract_ready
                   << " layers=" << forward.dynamic_num_hidden_layers
                   << " hidden=" << forward.dynamic_hidden_size
                   << " vocab=" << forward.dynamic_vocab_size
@@ -2088,6 +2092,10 @@ static std::string make_health_json(
         << "\"graphIrVersion\":" << forward.graph_ir_version << ","
         << "\"graphIrLayerCount\":" << forward.graph_ir_layer_count << ","
         << "\"graphIrOpCount\":" << forward.graph_ir_op_count << ","
+        << "\"runtimeAccessPlanReady\":" << (forward.runtime_access_plan_ready ? "true" : "false") << ","
+        << "\"runtimeAccessHotsetCount\":" << forward.runtime_access_hotset_count << ","
+        << "\"runtimeAccessFileGroupCount\":" << forward.runtime_access_file_group_count << ","
+        << "\"kvLayoutContractReady\":" << (forward.kv_layout_contract_ready ? "true" : "false") << ","
         << "\"storageStateValid\":" << (forward.storage_state_valid ? "true" : "false") << ","
         << "\"tensorTableLoaded\":" << (forward.tensor_table_loaded ? "true" : "false") << ","
         << "\"expertTripletAvailable\":" << (forward.expert_triplet_available ? "true" : "false") << ","
@@ -2467,6 +2475,10 @@ static std::string make_chat_not_ready_json(const moe_forward_status_t& forward)
         << ", decodeLoop=" << (forward.decode_loop_ready ? "ready" : "missing")
         << ", graphIr=" << (forward.graph_ir_ready ? "ready" : "missing")
         << ", graphIrRequired=" << (forward.graph_ir_required ? "yes" : "no")
+        << ", runtimeAccessPlan=" << (forward.runtime_access_plan_ready ? "ready" : "missing")
+        << ", runtimeHotset=" << forward.runtime_access_hotset_count
+        << ", runtimeFileGroups=" << forward.runtime_access_file_group_count
+        << ", kvLayoutContract=" << (forward.kv_layout_contract_ready ? "ready" : "missing")
         << "\","
         << "\"type\":\"service_unavailable\","
         << "\"code\":\"runtime_status_not_ready\""

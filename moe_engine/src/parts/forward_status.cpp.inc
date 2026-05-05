@@ -86,6 +86,14 @@ int moe_pc_engine_get_forward_status(
     out_status->graph_ir_version = engine->offload_graph_ir_version.load(std::memory_order_relaxed);
     out_status->graph_ir_layer_count = engine->offload_graph_ir_layer_count.load(std::memory_order_relaxed);
     out_status->graph_ir_op_count = engine->offload_graph_ir_op_count.load(std::memory_order_relaxed);
+    out_status->runtime_access_plan_ready =
+        engine->juju_runtime_access_plan_ready.load(std::memory_order_relaxed) ? 1 : 0;
+    out_status->runtime_access_hotset_count =
+        engine->juju_runtime_access_hotset_count.load(std::memory_order_relaxed);
+    out_status->runtime_access_file_group_count =
+        engine->juju_runtime_access_file_group_count.load(std::memory_order_relaxed);
+    out_status->kv_layout_contract_ready =
+        engine->juju_kv_layout_contract_ready.load(std::memory_order_relaxed) ? 1 : 0;
     if (out_status->dynamic_shape_ready) {
         out_status->dynamic_num_hidden_layers = engine->dynamic_shape.num_hidden_layers;
         out_status->dynamic_hidden_size = engine->dynamic_shape.hidden_size;
@@ -126,6 +134,7 @@ int moe_pc_engine_get_forward_status(
         out_status->attention_decode_ready;
     out_status->sampler_ready = out_status->lm_head_ready;
     out_status->decode_loop_ready =
+        out_status->forward_adapter_executable &&
         out_status->embedding_ready &&
         out_status->lm_head_ready &&
         out_status->expert_triplet_available &&
@@ -136,6 +145,7 @@ int moe_pc_engine_get_forward_status(
         out_status->storage_state_valid &&
         out_status->tensor_table_loaded &&
         out_status->expert_triplet_available &&
+        out_status->forward_adapter_executable &&
         out_status->tokenizer_ready &&
         out_status->embedding_ready &&
         out_status->lm_head_ready &&

@@ -294,6 +294,10 @@ struct moe_pc_engine {
     std::atomic<uint32_t> offload_graph_ir_version{0};
     std::atomic<uint64_t> offload_graph_ir_op_count{0};
     std::atomic<uint64_t> offload_graph_ir_layer_count{0};
+    std::atomic<uint32_t> juju_runtime_access_plan_ready{0};
+    std::atomic<uint64_t> juju_runtime_access_hotset_count{0};
+    std::atomic<uint64_t> juju_runtime_access_file_group_count{0};
+    std::atomic<uint32_t> juju_kv_layout_contract_ready{0};
     std::atomic<uint32_t> juju_idx_schema_version{0};
     std::atomic<uint32_t> juju_split_group_count{0};
     std::atomic<uint32_t> juju_split_missing_count{0};

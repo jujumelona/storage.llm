@@ -56,6 +56,8 @@ struct moe_tensor_record {
     uint8_t gpu_executable = 0;
     uint16_t runtime_priority = 50;
     uint16_t prefetch_priority = 50;
+    uint16_t execution_order = 500;
+    uint16_t hotset_rank = 1000;
     uint8_t residency_hint = moe_JUJU_RESIDENCY_AUTO;
     uint8_t graph_role = moe_JUJU_ROLE_UNKNOWN;
     uint8_t prefetch_class = moe_JUJU_PREFETCH_AUTO;
@@ -81,6 +83,8 @@ struct moe_gguf_common_tensor_record {
     uint64_t weight_row_bytes = 0;
     uint16_t runtime_priority = 50;
     uint16_t prefetch_priority = 50;
+    uint16_t execution_order = 500;
+    uint16_t hotset_rank = 1000;
     uint8_t residency_hint = moe_JUJU_RESIDENCY_AUTO;
     uint8_t graph_role = moe_JUJU_ROLE_UNKNOWN;
     uint8_t prefetch_class = moe_JUJU_PREFETCH_AUTO;

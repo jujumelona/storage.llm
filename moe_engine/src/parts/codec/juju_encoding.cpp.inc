@@ -22,11 +22,11 @@ static uint64_t moe_effective_juju_tensor_bytes(
     const moe_juju_tensor_json_entry_t& entry,
     const moe_offload_gguf_contract_t& contract
 ) {
-    // BUGFIX 803: Check entry.juju_bytes for zero ★★★
+    // BUGFIX 803: Check entry.juju_bytes for zero.
     if (entry.juju_bytes == 0 || entry.dims == 0 || entry.shape[0] == 0) {
         return entry.juju_bytes;
     }
-    // BUGFIX 804: Check dims for reasonable upper bound ★★
+    // BUGFIX 804: Check dims for reasonable upper bound.
     if (entry.dims > 8) {
         return entry.juju_bytes;
     }
@@ -136,3 +136,54 @@ static int moe_graph_ir_executor_compiled(const moe_pc_engine* engine) {
     if (!engine ||
         !engine->offload_graph_ir_ready.load(std::memory_order_relaxed) ||
         !engine->dynamic_shape_valid.load(std::memory_order_relaxed) ||
+        !engine->attn_config_valid.load(std::memory_order_relaxed) ||
+        engine->gguf_common_tensor_slots.empty() ||
+        engine->offload_graph_ir_json.empty()) {
+        return 0;
+    }
+    const moe_model_shape_t& shape = engine->dynamic_shape;
+    if (!shape.hidden_size || !shape.vocab_size || !shape.num_hidden_layers) {
+        return 0;
+    }
+    const moe_attn_config_t& cfg = engine->attn_config;
+    if (!cfg.num_heads || !cfg.num_kv_heads || !cfg.head_dim ||
+        cfg.num_kv_heads > cfg.num_heads) {
+        return 0;
+    }
+    if (cfg.type != moe_ATTN_TYPE_MLA &&
+        cfg.type != moe_ATTN_TYPE_MHA &&
+        cfg.type != moe_ATTN_TYPE_GQA &&
+        cfg.type != moe_ATTN_TYPE_MQA) {
+        return 0;
+    }
+    if (engine->offload_graph_ir_op_count.load(std::memory_order_relaxed) == 0 ||
+        engine->offload_graph_ir_layer_count.load(std::memory_order_relaxed) == 0) {
+        return 0;
+    }
+    const std::string& graph = engine->offload_graph_ir_json;
+    static const char* kRequiredGraphKeys[] = {
+        "JUJU_GRAPH_IR_V1",
+        "\"generation_contract\"",
+        "\"tensor_bindings\"",
+        "\"token_embedding\"",
+        "\"lm_head\"",
+        "\"final_norm\"",
+        "\"ops\"",
+        "\"layers\""
+    };
+    for (const char* key : kRequiredGraphKeys) {
+        if (graph.find(key) == std::string::npos) {
+            return 0;
+        }
+    }
+    const int graph_required = engine->offload_graph_ir_required.load(std::memory_order_relaxed);
+    if ((graph_required || graph.find("\"runtime_access_plan\"") != std::string::npos) &&
+        !engine->juju_runtime_access_plan_ready.load(std::memory_order_relaxed)) {
+        return 0;
+    }
+    if ((graph_required || graph.find("\"kv_layout_contract\"") != std::string::npos) &&
+        !engine->juju_kv_layout_contract_ready.load(std::memory_order_relaxed)) {
+        return 0;
+    }
+    return 1;
+}

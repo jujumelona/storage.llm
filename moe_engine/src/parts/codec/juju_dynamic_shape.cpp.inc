@@ -1,18 +1,4 @@
 // JUJU dynamic shape inference
-        !engine->attn_config_valid.load(std::memory_order_relaxed) ||
-        engine->gguf_common_tensor_slots.empty()) {
-        return 0;
-    }
-    const moe_attn_config_t& cfg = engine->attn_config;
-    if (!cfg.num_heads || !cfg.num_kv_heads || !cfg.head_dim ||
-        cfg.num_kv_heads > cfg.num_heads) {
-        return 0;
-    }
-    return cfg.type == moe_ATTN_TYPE_MLA ||
-        cfg.type == moe_ATTN_TYPE_MHA ||
-        cfg.type == moe_ATTN_TYPE_GQA ||
-        cfg.type == moe_ATTN_TYPE_MQA;
-}
 
 static void moe_dynamic_shape_finalize_adapter(moe_pc_engine* engine) {
     if (!engine || !engine->dynamic_shape_valid.load(std::memory_order_relaxed)) {

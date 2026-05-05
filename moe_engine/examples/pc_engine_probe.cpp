@@ -31,7 +31,7 @@ static void print_forward_status(const char* label, moe_pc_engine_t* engine) {
         return;
     }
     printf(
-        "forward[%s] storage=%d tensors=%d expert_triplet=%d tokenizer=%d embed=%d lm_head=%d attn_proj=%d attn_decode=%d kv_cache=%d attention=%d sampler=%d decode_loop=%d chat=%d tensor_count=%llu adapter=%s adapter_exec=%d dynamic_shape=%d layers=%u hidden=%u vocab=%u graph_ir=%d required=%d graph_ver=%u graph_layers=%llu graph_ops=%llu\n",
+        "forward[%s] storage=%d tensors=%d expert_triplet=%d tokenizer=%d embed=%d lm_head=%d attn_proj=%d attn_decode=%d kv_cache=%d attention=%d sampler=%d decode_loop=%d chat=%d tensor_count=%llu adapter=%s adapter_exec=%d dynamic_shape=%d layers=%u hidden=%u vocab=%u graph_ir=%d required=%d graph_ver=%u graph_layers=%llu graph_ops=%llu access_plan=%d hotset=%llu file_groups=%llu kv_layout=%d\n",
         label,
         status.storage_state_valid,
         status.tensor_table_loaded,
@@ -57,7 +57,11 @@ static void print_forward_status(const char* label, moe_pc_engine_t* engine) {
         status.graph_ir_required,
         status.graph_ir_version,
         (unsigned long long)status.graph_ir_layer_count,
-        (unsigned long long)status.graph_ir_op_count
+        (unsigned long long)status.graph_ir_op_count,
+        status.runtime_access_plan_ready,
+        (unsigned long long)status.runtime_access_hotset_count,
+        (unsigned long long)status.runtime_access_file_group_count,
+        status.kv_layout_contract_ready
     );
 }
 

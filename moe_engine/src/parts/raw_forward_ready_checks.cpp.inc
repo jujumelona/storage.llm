@@ -118,6 +118,15 @@ static int moe_raw_embedding_ready(const moe_pc_engine* engine) {
     const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
     const moe_storage_constants_t* c = &runtime_c;
     const moe_storage_raw_span_spec_t* span = find_raw_role_span(-1, moe_RAW_ROLE_EMBED);
+    std::string graph_name;
+    if (engine && c && moe_graph_ir_tensor_binding_name(engine, "token_embedding", &graph_name)) {
+        moe_raw_tensor_desc desc{};
+        const char* exact_name = graph_name.c_str();
+        const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_names(engine, &exact_name, 1, &desc);
+        return rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size ?
+            common_tensor_backing_file_ready(engine, rec) : 0;
+    }
     static const char* const embedding_names[] = {
         "token_embd.weight",
         "model.embed_tokens.weight",
@@ -144,6 +153,15 @@ static int moe_raw_lm_head_ready(const moe_pc_engine* engine) {
     const moe_storage_constants_t* c = &runtime_c;
     const int32_t lm_head_layer = c ? (int32_t)c->num_hidden_layers + 1 : 80;
     const moe_storage_raw_span_spec_t* span = find_raw_role_span(lm_head_layer, moe_RAW_ROLE_LM_HEAD);
+    std::string graph_name;
+    if (engine && c && moe_graph_ir_tensor_binding_name(engine, "lm_head", &graph_name)) {
+        moe_raw_tensor_desc desc{};
+        const char* exact_name = graph_name.c_str();
+        const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_names(engine, &exact_name, 1, &desc);
+        return rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size ?
+            common_tensor_backing_file_ready(engine, rec) : 0;
+    }
     static const char* const lm_head_names[] = {
         "output.weight",
         "lm_head.weight",

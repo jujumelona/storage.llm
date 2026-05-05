@@ -34,6 +34,138 @@ static void moe_forward_trace_vec(
         count > 3 ? (double)values[3] : 0.0);
 }
 
+static void moe_forward_trace_generation_contract(
+    const moe_pc_engine* engine,
+    const moe_storage_constants_t* c
+) {
+    if (!engine || !c || !moe_profile_enabled()) {
+        return;
+    }
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) != 0) {
+        return;
+    }
+    std::string token_embedding;
+    std::string lm_head;
+    std::string final_norm;
+    int tied = 0;
+    uint64_t post_attn = 0;
+    uint64_t expert_norm = 0;
+    uint64_t post_ffw = 0;
+    uint64_t post_ffw1 = 0;
+    uint64_t post_ffw2 = 0;
+    uint64_t output_scale = 0;
+    uint64_t no_v_proj = 0;
+    uint64_t v_norm = 0;
+    uint64_t router_scale = 0;
+    const uint32_t access_plan_ready = engine->juju_runtime_access_plan_ready.load(std::memory_order_relaxed);
+    const uint64_t hotset_count = engine->juju_runtime_access_hotset_count.load(std::memory_order_relaxed);
+    const uint64_t file_group_count = engine->juju_runtime_access_file_group_count.load(std::memory_order_relaxed);
+    const uint32_t kv_layout_ready = engine->juju_kv_layout_contract_ready.load(std::memory_order_relaxed);
+    (void)moe_graph_ir_tensor_binding_name(engine, "token_embedding", &token_embedding);
+    (void)moe_graph_ir_tensor_binding_name(engine, "lm_head", &lm_head);
+    (void)moe_graph_ir_tensor_binding_name(engine, "final_norm", &final_norm);
+    (void)moe_json_get_bool_local(engine->offload_graph_ir_json, "lm_head_tied_to_token_embedding", &tied);
+    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_post_attention_norm", &post_attn);
+    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_expert_ffn_norm", &expert_norm);
+    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_post_ffw_norm", &post_ffw);
+    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_post_ffw_norm_1", &post_ffw1);
+    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_post_ffw_norm_2", &post_ffw2);
+    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_layer_output_scale", &output_scale);
+    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_without_v_projection", &no_v_proj);
+    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_v_norm", &v_norm);
+    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_router_scale", &router_scale);
+    moe_profile_log(
+        "generation_contract",
+        "layers=%u hidden=%u vocab=%u token_embedding=%s lm_head=%s tied=%d final_norm=%s post_attn=%llu expert_norm=%llu post_ffw=%llu post_ffw1=%llu post_ffw2=%llu output_scale=%llu no_v_proj=%llu v_norm=%llu router_scale=%llu access_plan=%u hotset=%llu file_groups=%llu kv_layout=%u",
+        c->num_hidden_layers,
+        c->hidden_size,
+        c->vocab_size,
+        token_embedding.empty() ? "" : token_embedding.c_str(),
+        lm_head.empty() ? "" : lm_head.c_str(),
+        tied,
+        final_norm.empty() ? "" : final_norm.c_str(),
+        (unsigned long long)post_attn,
+        (unsigned long long)expert_norm,
+        (unsigned long long)post_ffw,
+        (unsigned long long)post_ffw1,
+        (unsigned long long)post_ffw2,
+        (unsigned long long)output_scale,
+        (unsigned long long)no_v_proj,
+        (unsigned long long)v_norm,
+        (unsigned long long)router_scale,
+        access_plan_ready,
+        (unsigned long long)hotset_count,
+        (unsigned long long)file_group_count,
+        kv_layout_ready);
+}
+
+static void moe_forward_trace_runtime_resources(
+    const moe_pc_engine* engine,
+    const moe_decode_scratch* s,
+    uint32_t position,
+    uint32_t layer,
+    const char* stage
+) {
+    if (!engine || !moe_profile_enabled()) {
+        return;
+    }
+    const uint64_t ram_tier = tier_used(engine, moe_TIER_RAM);
+    const uint64_t vram_tier = tier_used(engine, moe_TIER_VRAM);
+    const uint64_t db_tier = tier_used(engine, moe_TIER_DB);
+    const uint64_t ram_used = engine->ram_used_bytes.load(std::memory_order_relaxed);
+    const uint64_t vram_used = engine->vram_used_bytes.load(std::memory_order_relaxed);
+    const uint64_t db_used = engine->db_used_bytes.load(std::memory_order_relaxed);
+    const uint64_t available_ram = storagellm::available_ram_bytes();
+    const uint64_t kv_bytes = s ? moe_kv_cache_allocated_bytes(s->kv_cache) : 0;
+    const uint32_t kv_seq = s ? s->kv_cache.max_seq_len : 0;
+    const uint32_t kv_entry_dim = s ? s->kv_cache.entry_dim : 0;
+    moe_profile_log(
+        "cpu_ram",
+        "position=%u layer=%u stage=%s ram_tier=%llu vram_tier=%llu db_tier=%llu ram_used=%llu vram_used=%llu db_used=%llu available_ram=%llu cpu_workers=%u",
+        position,
+        layer,
+        stage ? stage : "",
+        (unsigned long long)ram_tier,
+        (unsigned long long)vram_tier,
+        (unsigned long long)db_tier,
+        (unsigned long long)ram_used,
+        (unsigned long long)vram_used,
+        (unsigned long long)db_used,
+        (unsigned long long)available_ram,
+        engine->cpu_active_workers.load(std::memory_order_relaxed));
+    moe_profile_log(
+        "kv_cache",
+        "position=%u layer=%u stage=%s bytes=%llu tracked_ram=%llu seq_len=%u max_seq_len=%u entry_dim=%u layout=position_major_layer_contiguous",
+        position,
+        layer,
+        stage ? stage : "",
+        (unsigned long long)kv_bytes,
+        (unsigned long long)(s ? s->kv_cache.tracked_ram_bytes : 0),
+        s ? s->kv_cache.seq_len : 0,
+        kv_seq,
+        kv_entry_dim);
+    moe_profile_log(
+        "io_pipeline",
+        "position=%u layer=%u stage=%s disk_depth=%u pinned_depth=%u gpu_depth=%u total_depth=%u disk_inflight=%u pinned_inflight=%u gpu_inflight=%u queued=%llu prefetch=%llu disk_to_ram=%llu ram_to_pinned=%llu pinned_to_gpu=%llu direct_to_gpu=%llu",
+        position,
+        layer,
+        stage ? stage : "",
+        engine->disk_stage.depth.load(std::memory_order_relaxed),
+        engine->pinned_stage.depth.load(std::memory_order_relaxed),
+        engine->gpu_stage.depth.load(std::memory_order_relaxed),
+        engine->total_queue_depth.load(std::memory_order_relaxed),
+        engine->disk_stage.inflight.load(std::memory_order_relaxed),
+        engine->pinned_stage.inflight.load(std::memory_order_relaxed),
+        engine->gpu_stage.inflight.load(std::memory_order_relaxed),
+        (unsigned long long)engine->io_atomic.queued_requests.load(std::memory_order_relaxed),
+        (unsigned long long)engine->io_atomic.bytes_prefetched.load(std::memory_order_relaxed),
+        (unsigned long long)engine->io_atomic.bytes_disk_to_ram.load(std::memory_order_relaxed),
+        (unsigned long long)engine->io_atomic.bytes_ram_to_pinned.load(std::memory_order_relaxed),
+        (unsigned long long)engine->io_atomic.bytes_pinned_to_gpu.load(std::memory_order_relaxed),
+        (unsigned long long)engine->io_atomic.bytes_direct_to_gpu.load(std::memory_order_relaxed));
+}
+
 static float moe_forward_embedding_scale_value(const moe_pc_engine* engine, uint32_t hidden_size) {
     // BUGFIX 500: hidden_size 범위 체크 강화
     if (!engine || hidden_size == 0 || hidden_size > 100000) {
@@ -97,11 +229,13 @@ static int moe_forward_one_token_f32(
         "forward_token_begin",
         "position=%u token=%u layers=%u hidden=%u vocab=%u prealloc_kv=%d",
         position, token_id, c->num_hidden_layers, c->hidden_size, c->vocab_size, pre_allocate_kv);
+    moe_forward_trace_generation_contract(engine, c);
     if (!moe_decode_scratch_resize(s, c, &attn_cfg, pre_allocate_kv, engine)) {
         moe_generation_set_error(stats, "decode scratch allocation failed");
         return 0;
     }
     moe_kv_cache_track_ram(engine, &s->kv_cache);  // ensure_capacity delta tracking
+    moe_forward_trace_runtime_resources(engine, s, position, 0xffffffffu, "after_scratch");
     float* hidden = s->hidden.data();
     engine->generation_phase.store(moe_GEN_PHASE_INIT, std::memory_order_relaxed);
     engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
@@ -228,6 +362,7 @@ static int moe_forward_one_token_f32(
                 "forward_layer",
                 "position=%u layer=%u split=1 is_moe=%d attention_ms=%.3f mlp_ms=%.3f total_ms=%.3f",
                 position, layer, is_moe, attention_ms, mlp_ms, moe_profile_elapsed_ms(layer_start_us));
+            moe_forward_trace_runtime_resources(engine, s, position, layer, "after_layer");
             continue;
         }
         const uint64_t attn_start_us = moe_profile_now_us();
@@ -282,12 +417,13 @@ static int moe_forward_one_token_f32(
             "position=%u layer=%u split=0 is_moe=%d attention_ms=%.3f mlp_ms=%.3f total_ms=%.3f",
             position, layer, is_moe, attention_ms,
             moe_profile_elapsed_ms(mlp_start_us), moe_profile_elapsed_ms(layer_start_us));
+        moe_forward_trace_runtime_resources(engine, s, position, layer, "after_layer");
     }
 
     const uint64_t final_norm_start_us = moe_profile_now_us();
-    if (!moe_pc_engine_raw_rmsnorm_f32(
-            engine, (int32_t)c->num_hidden_layers, moe_RAW_TENSOR_INPUT_LAYER_NORM,
-            hidden, c->hidden_size, s->norm.data(), c->hidden_size, attn_cfg.rms_norm_eps)) {
+    if (!moe_final_norm_f32(
+            engine, c, hidden, c->hidden_size,
+            s->norm.data(), attn_cfg.rms_norm_eps)) {
         moe_generation_set_error(stats, "final rmsnorm failed");
         return 0;
     }
@@ -298,6 +434,7 @@ static int moe_forward_one_token_f32(
         "position=%u token=%u final_norm_ms=%.3f total_ms=%.3f",
         position, token_id, moe_profile_elapsed_ms(final_norm_start_us),
         moe_profile_elapsed_ms(token_start_us));
+    moe_forward_trace_runtime_resources(engine, s, position, c->num_hidden_layers, "after_token");
 
     return 1;
 }

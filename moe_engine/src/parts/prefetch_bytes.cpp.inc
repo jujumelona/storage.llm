@@ -36,9 +36,21 @@ static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int
 // This is non-blocking and acts as effective prefetch
 // Trade-off: VirtualLock can fail if working set limit reached (default 1.5GB)
 // Failure is silently ignored - page fault will occur but no worse than before
+// BUGFIX 897: Windows non-DirectStorage mmap page residency ★★★ CRITICAL
+// Problem: VirtualLock + VirtualUnlock brings pages into working set, but OS can evict them
+// before copy_mapped_range_to_staging runs. Page fault blocks io_worker.
+// Solution: Add prefer_overlapped_io flag. When enabled + DirectStorage disabled,
+// use OVERLAPPED ReadFile instead of mmap. io_iocp_adapter.cpp.inc handles completion.
+// Impact: Eliminates blocking page faults on Windows non-DirectStorage path.
 static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, uint64_t bytes) {
 #ifdef _WIN32
     if (engine && engine->io_config.enable_directstorage) {
+        return;
+    }
+    // BUGFIX 897: If prefer_overlapped_io enabled, skip mmap touch entirely.
+    // OVERLAPPED ReadFile path in prefetch_pinned.cpp.inc handles async I/O directly.
+    if (engine && engine->io_config.prefer_overlapped_io) {
+        // OVERLAPPED path bypasses mmap entirely - no touch needed
         return;
     }
     // Try VirtualLock to bring pages into working set

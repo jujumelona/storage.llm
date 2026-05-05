@@ -147,10 +147,14 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
         }
         const uint64_t raw_budget = (sys * pct) / 100ull;
 
-        // CPU-side KV also consumes unified memory on Metal. Include RAM tier
-        // usage here because the Metal RAM budget is zeroed during allocator init.
+        // BUGFIX 893: Include CPU KV cache in unified memory budget ★★★ CRITICAL
+        // Problem: Metal KV cache in CPU RAM not counted in unified memory budget.
+        // Long sequences → KV grows → unified memory exhausted but engine unaware.
+        // Solution: Add tier_used_bytes[RAM] to total_reserved for Metal.
+        // Impact: Prevents OOM on long sequences by accounting for CPU KV usage.
         uint64_t total_reserved = reserved_total;
-        const uint64_t cpu_ram_used = e->ram_used_bytes.load(std::memory_order_relaxed);
+        const uint64_t cpu_ram_used = e->tier_used_bytes[moe_TIER_RAM]
+                                        .load(std::memory_order_relaxed);
         if (cpu_ram_used < UINT64_MAX - total_reserved) {
             total_reserved += cpu_ram_used;
         } else {
@@ -271,11 +275,15 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
                 calc_total += props.memoryProperties.memoryHeaps[i].size;
                 if (budget.heapBudget[i] > 0) {
                     uint64_t avail = (budget.heapBudget[i] > budget.heapUsage[i]) ? (budget.heapBudget[i] - budget.heapUsage[i]) : 0;
-                    const uint64_t keep_free_pct = 100ull - device_memory_headroom_pct(e->io_config.vulkan_memory_headroom_pct);
-                    calc_free += (avail * keep_free_pct) / 100ull;
+                    // BUGFIX 895: Remove headroom application here ★★★ CRITICAL
+                    // Problem: Headroom applied here, then again in prefetch_admission.cpp.inc
+                    // Double headroom: (avail * 90%) * 90% = avail * 81% instead of 90%
+                    // Solution: Use raw avail, let prefetch_admission apply single headroom
+                    // Impact: Correct VRAM budget, prevents over-conservative allocation
+                    calc_free += avail;
                 } else {
-                    const uint64_t keep_free_pct = 100ull - device_memory_headroom_pct(e->io_config.vulkan_memory_headroom_pct);
-                    calc_free += (props.memoryProperties.memoryHeaps[i].size * keep_free_pct) / 100ull;
+                    // Fallback when budget not available: use heap size directly
+                    calc_free += props.memoryProperties.memoryHeaps[i].size;
                 }
             }
         }
