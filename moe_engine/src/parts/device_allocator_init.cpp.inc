@@ -184,24 +184,39 @@ static int vulkan_driver_load(moe_vulkan_driver_api* api, uint32_t device_id) {
     }
 
     // Load device-level functions
-    api->vkCreateCommandPool = (decltype(api->vkCreateCommandPool))vkGetInstanceProcAddr(instance, "vkCreateCommandPool");
-    api->vkDestroyCommandPool = (decltype(api->vkDestroyCommandPool))vkGetInstanceProcAddr(instance, "vkDestroyCommandPool");
-    api->vkAllocateCommandBuffers = (decltype(api->vkAllocateCommandBuffers))vkGetInstanceProcAddr(instance, "vkAllocateCommandBuffers");
-    api->vkFreeCommandBuffers = (decltype(api->vkFreeCommandBuffers))vkGetInstanceProcAddr(instance, "vkFreeCommandBuffers");
-    api->vkQueueSubmit = (decltype(api->vkQueueSubmit))vkGetInstanceProcAddr(instance, "vkQueueSubmit");
-    api->vkQueueWaitIdle = (decltype(api->vkQueueWaitIdle))vkGetInstanceProcAddr(instance, "vkQueueWaitIdle");
-    api->vkCreateBuffer = (decltype(api->vkCreateBuffer))vkGetInstanceProcAddr(instance, "vkCreateBuffer");
-    api->vkDestroyBuffer = (decltype(api->vkDestroyBuffer))vkGetInstanceProcAddr(instance, "vkDestroyBuffer");
-    api->vkGetBufferMemoryRequirements = (decltype(api->vkGetBufferMemoryRequirements))vkGetInstanceProcAddr(instance, "vkGetBufferMemoryRequirements");
-    api->vkAllocateMemory = (decltype(api->vkAllocateMemory))vkGetInstanceProcAddr(instance, "vkAllocateMemory");
-    api->vkFreeMemory = (decltype(api->vkFreeMemory))vkGetInstanceProcAddr(instance, "vkFreeMemory");
-    api->vkBindBufferMemory = (decltype(api->vkBindBufferMemory))vkGetInstanceProcAddr(instance, "vkBindBufferMemory");
-    api->vkMapMemory = (decltype(api->vkMapMemory))vkGetInstanceProcAddr(instance, "vkMapMemory");
-    api->vkUnmapMemory = (decltype(api->vkUnmapMemory))vkGetInstanceProcAddr(instance, "vkUnmapMemory");
-    api->vkBeginCommandBuffer = (decltype(api->vkBeginCommandBuffer))vkGetInstanceProcAddr(instance, "vkBeginCommandBuffer");
-    api->vkEndCommandBuffer = (decltype(api->vkEndCommandBuffer))vkGetInstanceProcAddr(instance, "vkEndCommandBuffer");
-    api->vkCmdCopyBuffer = (decltype(api->vkCmdCopyBuffer))vkGetInstanceProcAddr(instance, "vkCmdCopyBuffer");
-    api->vkResetCommandBuffer = (decltype(api->vkResetCommandBuffer))vkGetInstanceProcAddr(instance, "vkResetCommandBuffer");
+    // BUGFIX 910: Use vkGetDeviceProcAddr for device-level functions ★★★ IMPORTANT
+    // Problem: vkCreateCommandPool, vkAllocateCommandBuffers, vkQueueSubmit are device-level functions
+    // → Must be loaded via vkGetDeviceProcAddr(device, ...), not vkGetInstanceProcAddr
+    // → Some ICDs (NVIDIA, AMD) return nullptr or global stub → Vulkan H2D copy fails silently
+    // Solution: Load vkGetDeviceProcAddr first, then use it for all device-level functions
+    // Impact: Fixes Vulkan backend compatibility, enables async H2D copy on all ICDs
+    typedef void* (*PFN_vkGetDeviceProcAddr)(void*, const char*);
+    auto vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)vkGetInstanceProcAddr(instance, "vkGetDeviceProcAddr");
+    if (!vkGetDeviceProcAddr) {
+        moe_close_shared_library(api->library);
+        *api = moe_vulkan_driver_api{};
+        return 0;
+    }
+
+    api->vkCreateCommandPool = (decltype(api->vkCreateCommandPool))vkGetDeviceProcAddr(device, "vkCreateCommandPool");
+    api->vkDestroyCommandPool = (decltype(api->vkDestroyCommandPool))vkGetDeviceProcAddr(device, "vkDestroyCommandPool");
+    api->vkAllocateCommandBuffers = (decltype(api->vkAllocateCommandBuffers))vkGetDeviceProcAddr(device, "vkAllocateCommandBuffers");
+    api->vkFreeCommandBuffers = (decltype(api->vkFreeCommandBuffers))vkGetDeviceProcAddr(device, "vkFreeCommandBuffers");
+    api->vkQueueSubmit = (decltype(api->vkQueueSubmit))vkGetDeviceProcAddr(device, "vkQueueSubmit");
+    api->vkQueueWaitIdle = (decltype(api->vkQueueWaitIdle))vkGetDeviceProcAddr(device, "vkQueueWaitIdle");
+    api->vkCreateBuffer = (decltype(api->vkCreateBuffer))vkGetDeviceProcAddr(device, "vkCreateBuffer");
+    api->vkDestroyBuffer = (decltype(api->vkDestroyBuffer))vkGetDeviceProcAddr(device, "vkDestroyBuffer");
+    api->vkGetBufferMemoryRequirements = (decltype(api->vkGetBufferMemoryRequirements))vkGetDeviceProcAddr(device, "vkGetBufferMemoryRequirements");
+    api->vkAllocateMemory = (decltype(api->vkAllocateMemory))vkGetDeviceProcAddr(device, "vkAllocateMemory");
+    api->vkFreeMemory = (decltype(api->vkFreeMemory))vkGetDeviceProcAddr(device, "vkFreeMemory");
+    api->vkBindBufferMemory = (decltype(api->vkBindBufferMemory))vkGetDeviceProcAddr(device, "vkBindBufferMemory");
+    api->vkMapMemory = (decltype(api->vkMapMemory))vkGetDeviceProcAddr(device, "vkMapMemory");
+    api->vkUnmapMemory = (decltype(api->vkUnmapMemory))vkGetDeviceProcAddr(device, "vkUnmapMemory");
+    api->vkBeginCommandBuffer = (decltype(api->vkBeginCommandBuffer))vkGetDeviceProcAddr(device, "vkBeginCommandBuffer");
+    api->vkEndCommandBuffer = (decltype(api->vkEndCommandBuffer))vkGetDeviceProcAddr(device, "vkEndCommandBuffer");
+    api->vkCmdCopyBuffer = (decltype(api->vkCmdCopyBuffer))vkGetDeviceProcAddr(device, "vkCmdCopyBuffer");
+    api->vkResetCommandBuffer = (decltype(api->vkResetCommandBuffer))vkGetDeviceProcAddr(device, "vkResetCommandBuffer");
+    // vkGetPhysicalDeviceMemoryProperties2 is instance-level, keep vkGetInstanceProcAddr
     api->vkGetPhysicalDeviceMemoryProperties2 = (decltype(api->vkGetPhysicalDeviceMemoryProperties2))vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceMemoryProperties2");
 
     // Create command pool

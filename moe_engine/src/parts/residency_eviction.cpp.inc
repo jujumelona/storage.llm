@@ -90,34 +90,50 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
     // loop keeps failing in the meantime → VRAM allocation blocked → deadlock.
     // Solution: When stale limit reached, unlock heap_mutex, compact inline, retry once.
     // Impact: Eviction succeeds immediately instead of waiting 25ms for background compact.
+    // BUGFIX 915: Increase retry count from 1 to 3 ★★ IMPORTANT
+    // Problem: Single retry insufficient when heap has many stale entries
+    // → Eviction still fails → OOM or deadlock
+    // Solution: Retry up to 3 times after compact
+    // Impact: Higher success rate for eviction in high-load scenarios
     if (stale_count >= stale_limit) {
         engine->evict_heap_compact_needed.store(true, std::memory_order_relaxed);
 
-        // Inline compact and retry once
+        // Inline compact and retry up to 3 times
         heap_lock.unlock();  // Release heap_mutex before compact (it will re-acquire)
         compact_evict_heap(engine, idx);
 
-        // Retry once after compact (don't recurse, just one more attempt)
-        heap_lock.lock();
-        if (!engine->evict_heaps[idx].empty()) {
-            moe_evict_candidate victim = engine->evict_heaps[idx].top();
-            engine->evict_heaps[idx].pop();
-            engine->evict_heap_versions[idx].fetch_add(1, std::memory_order_release);
+        // Retry up to 3 times after compact
+        for (int retry = 0; retry < 3; ++retry) {
+            heap_lock.lock();
+            if (!engine->evict_heaps[idx].empty()) {
+                moe_evict_candidate victim = engine->evict_heaps[idx].top();
+                engine->evict_heaps[idx].pop();
+                engine->evict_heap_versions[idx].fetch_add(1, std::memory_order_release);
 
-            if (victim.slot < engine->expert_states.size()) {
-                std::lock_guard<std::mutex> map_lock(engine->map_mutex);
                 if (victim.slot < engine->expert_states.size()) {
-                    const moe_block_state& state = engine->expert_states[victim.slot];
-                    if (state.active && !state.pending_evict && state.tier == tier &&
-                        state.bytes == victim.bytes && state.hot_score == victim.hot_score &&
-                        state.last_touch_epoch == victim.last_touch_epoch &&
-                        state.predicted_next_use_epoch == victim.predicted_next_use_epoch) {
-                        *out = victim;
-                        return 1;
+                    heap_lock.unlock();  // Release before acquiring map_lock
+                    std::lock_guard<std::mutex> map_lock(engine->map_mutex);
+                    if (victim.slot < engine->expert_states.size()) {
+                        const moe_block_state& state = engine->expert_states[victim.slot];
+                        if (state.active && !state.pending_evict && state.tier == tier &&
+                            state.bytes == victim.bytes && state.hot_score == victim.hot_score &&
+                            state.last_touch_epoch == victim.last_touch_epoch &&
+                            state.predicted_next_use_epoch == victim.predicted_next_use_epoch) {
+                            *out = victim;
+                            return 1;
+                        }
                     }
+                    // Stale entry, continue to next retry
+                    continue;
+                } else {
+                    heap_lock.unlock();
                 }
+            } else {
+                heap_lock.unlock();
+                break;  // Heap empty, no point retrying
             }
         }
+        return 0;
     }
     return 0;
 }

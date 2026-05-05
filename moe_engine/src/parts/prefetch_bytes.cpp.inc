@@ -261,6 +261,8 @@ static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t st
                             device_backend_event_sync(engine, engine->staging_slots[idx].last_copy_event);
                             engine->staging_slots[idx].last_copy_event_recorded.store(false, std::memory_order_release);
                         }
+                        // BUGFIX 912: Set slot generation on acquisition ★★ IMPORTANT
+                        engine->staging_slots[idx].generation = engine->staging_generation.load(std::memory_order_acquire);
                         // BUGFIX 622: Check staging_free_slot_count > 0 before fetch_sub to prevent underflow ★
                         // Problem: If staging_free_slot_count is 0, fetch_sub causes underflow
                         // Solution: Only decrement if > 0
@@ -379,6 +381,8 @@ try_next_lockfree_slot:
                     device_backend_event_sync(engine, engine->staging_slots[idx].last_copy_event);
                     engine->staging_slots[idx].last_copy_event_recorded.store(false, std::memory_order_release);
                 }
+                // BUGFIX 912: Set slot generation on acquisition ★★ IMPORTANT
+                engine->staging_slots[idx].generation = engine->staging_generation.load(std::memory_order_acquire);
                 // BUGFIX 622: Check staging_free_slot_count > 0 before fetch_sub to prevent underflow ★
                 // Problem: If staging_free_slot_count is 0, fetch_sub causes underflow
                 // Solution: Only decrement if > 0
@@ -478,6 +482,19 @@ static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
     // so second check is always true (dead code)
     // Solution: Remove redundant second check
     if (!staging_slot_valid(engine, slot_index)) {
+        return;
+    }
+
+    // BUGFIX 912: Check staging_generation before release ★★ IMPORTANT
+    // Problem: Worker completes after timeout → releases slot with stale buf pointer
+    // Solution: Check if generation changed (timeout occurred), skip release if stale
+    // Impact: Prevents use-after-free when workers complete after staging reset
+    const uint32_t current_gen = engine->staging_generation.load(std::memory_order_acquire);
+    const uint32_t slot_gen = engine->staging_slots[slot_index].generation;
+    if (slot_gen != current_gen) {
+        // Slot is from old generation (timeout occurred), don't release
+        // Just mark as not in_use to prevent further access
+        engine->staging_slots[slot_index].in_use.store(false, std::memory_order_release);
         return;
     }
 

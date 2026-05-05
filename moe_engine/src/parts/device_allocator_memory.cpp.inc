@@ -97,10 +97,16 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
     // Problem 8: Use dynamic KV budget instead of static soft cap
     // vram_kv_budget_bytes is soft cap, device_kv_cache_bytes is actual usage
     // Use min(cap, actual) to avoid wasting budget when KV is empty
+    // BUGFIX 905: Remove std::min - use actual KV usage ★★★ CRITICAL
+    // Problem: std::min(kv_cap, kv_actual) hides KV overflow from budget calculation
+    // → When kv_actual > kv_cap, overflow is not subtracted from device_budget
+    // → Engine thinks VRAM is available, admits more experts → silent OOM or eviction storm
+    // Solution: Use kv_actual directly (full actual usage), kv_cap is only for allocation limit
+    // Impact: Prevents OOM when KV cache exceeds soft cap during long sequences
     const uint64_t kv_cap = e->vram_kv_budget_bytes.load(std::memory_order_relaxed);
     const uint64_t kv_actual = e->device_kv_cache_bytes.load(std::memory_order_relaxed);
     const uint64_t kv_reserved = moe_kv_vram_attention_runtime_available(e)
-        ? std::min(kv_cap, kv_actual)
+        ? kv_actual  // Use actual usage, not min(cap, actual)
         : 0;
 
     const uint64_t common_reserved = e->common_vram_reserved_bytes.load(std::memory_order_relaxed);
@@ -152,9 +158,14 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
         // Long sequences → KV grows → unified memory exhausted but engine unaware.
         // Solution: Add tier_used_bytes[RAM] to total_reserved for Metal.
         // Impact: Prevents OOM on long sequences by accounting for CPU KV usage.
-        uint64_t total_reserved = reserved_total;
-        const uint64_t cpu_ram_used = e->tier_used_bytes[moe_TIER_RAM]
-                                        .load(std::memory_order_relaxed);
+        // BUGFIX 906: Remove KV double-counting in Metal UMA ★★★ CRITICAL
+        // Problem: reserved_total already includes kv_reserved (from device_kv_cache_bytes)
+        // → tier_used_bytes[RAM] also includes KV cache → KV counted twice
+        // → Metal VRAM budget underestimated → unnecessary expert eviction
+        // Solution: Subtract kv_reserved before adding cpu_ram_used (which includes KV)
+        // Impact: Correct Metal budget calculation, prevents over-eviction
+        uint64_t total_reserved = reserved_total > kv_reserved ? reserved_total - kv_reserved : 0;
+        const uint64_t cpu_ram_used = tier_used(e, moe_TIER_RAM);
         if (cpu_ram_used < UINT64_MAX - total_reserved) {
             total_reserved += cpu_ram_used;
         } else {

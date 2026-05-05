@@ -223,12 +223,18 @@ static int qkv_quantize_split_vector_with_state(
     qkv_pack_indices(indices, norm_dst, n_norm, norm_mse_bits);
 
     if (config->enable_rotation && state->rotation_matrix) {
+        // BUGFIX 911: Optimize rotation matrix access pattern (location 1/3) ★★ PERFORMANCE
+        // Problem: rotation_matrix[j * dim + i] with i outer, j inner → cache miss
+        // Solution: Loop interchange for better spatial locality
         for (int i = 0; i < dim; ++i) {
-            float sum = 0.0f;
-            for (int j = 0; j < dim; ++j) {
-                sum += state->rotation_matrix[(size_t)j * (size_t)dim + (size_t)i] * y_tilde[j];
+            x_mse[i] = 0.0f;
+        }
+        for (int j = 0; j < dim; ++j) {
+            const float y_val = y_tilde[j];
+            const float* row = &state->rotation_matrix[(size_t)j * (size_t)dim];
+            for (int i = 0; i < dim; ++i) {
+                x_mse[i] += row[i] * y_val;
             }
-            x_mse[i] = sum;
         }
     } else {
         memcpy(x_mse, y_tilde, (size_t)dim * sizeof(float));
@@ -345,13 +351,16 @@ int qkv_quantize(
                     x_mse[i] *= state->rotation_signs[i];
                 }
             } else if (config->enable_rotation && state->rotation_matrix) {
-                // Slow path: Full matrix transpose multiplication
+                // BUGFIX 911: Optimize rotation matrix access pattern (location 2/3) ★★ PERFORMANCE
                 for (int i = 0; i < dim; i++) {
-                    float sum = 0.0f;
-                    for (int j = 0; j < dim; j++) {
-                        sum += state->rotation_matrix[j * dim + i] * y_tilde[j];
+                    x_mse[i] = 0.0f;
+                }
+                for (int j = 0; j < dim; j++) {
+                    const float y_val = y_tilde[j];
+                    const float* row = &state->rotation_matrix[j * dim];
+                    for (int i = 0; i < dim; i++) {
+                        x_mse[i] += row[i] * y_val;
                     }
-                    x_mse[i] = sum;
                 }
             } else {
                 for (int i = 0; i < dim; i++) {
@@ -451,13 +460,16 @@ int qkv_quantize(
                     x_mse[i] *= state->rotation_signs[i];
                 }
             } else if (config->enable_rotation && state->rotation_matrix) {
-                // Slow path: Full matrix transpose multiplication
+                // BUGFIX 911: Optimize rotation matrix access pattern (location 3/3) ★★ PERFORMANCE
                 for (int i = 0; i < dim; i++) {
-                    float sum = 0.0f;
-                    for (int j = 0; j < dim; j++) {
-                        sum += state->rotation_matrix[j * dim + i] * y_tilde[j];
+                    x_mse[i] = 0.0f;
+                }
+                for (int j = 0; j < dim; j++) {
+                    const float y_val = y_tilde[j];
+                    const float* row = &state->rotation_matrix[j * dim];
+                    for (int i = 0; i < dim; i++) {
+                        x_mse[i] += row[i] * y_val;
                     }
-                    x_mse[i] = sum;
                 }
             } else {
                 for (int i = 0; i < dim; i++) {

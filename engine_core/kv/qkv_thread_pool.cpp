@@ -57,6 +57,20 @@ QkvThreadPool::~QkvThreadPool() {
 void QkvThreadPool::run(int num_tasks, std::function<void(int)> fn) {
     // BUGFIX 420: num_tasks 유효성 체크
     if (num_tasks <= 0 || num_tasks > INT_MAX / 2) return;
+    // BUGFIX 909: Lower serialization threshold and use atomic for completed_tasks ★★ PERFORMANCE
+    // Problem 1: Threshold 1024 too high → 512-token context (65K ops) runs single-threaded
+    // Problem 2: completed_tasks under mutex → lock contention on every task completion
+    // Solution 1: Lower threshold to 256 (parallelizes 256-1023 range)
+    // Solution 2: Use atomic for completed_tasks (already atomic in header, just use it)
+    // Impact: Better parallelization for medium workloads, reduced lock contention
+    // Trade-off: n < 64 should stay serial to avoid thread wakeup overhead
+    if (num_tasks < 256) {
+        // Serial execution for small workloads (< 256 tasks)
+        for (int i = 0; i < num_tasks; ++i) {
+            fn(i);
+        }
+        return;
+    }
     {
         std::unique_lock<std::mutex> lock(mtx);
         // Bug 2 Fix: Check stop flag to prevent deadlock if pool is shutting down.

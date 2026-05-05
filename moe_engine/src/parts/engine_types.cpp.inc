@@ -157,6 +157,8 @@ struct moe_staging_slot {
     bool numa_allocated = false;
     bool device_host_allocated = false;
     std::atomic<bool> in_use{false};
+    // BUGFIX 912: Add generation field for timeout detection ★★ IMPORTANT
+    uint32_t generation = 0;
     // BUGFIX: Per-slot DMA fence for immediate release after cuMemcpyAsync
     // Acquirer must cuStreamWaitEvent on this before writing to buf
     CUevent last_copy_event = nullptr;
@@ -174,6 +176,7 @@ struct moe_staging_slot {
         numa_allocated = other.numa_allocated;
         device_host_allocated = other.device_host_allocated;
         in_use.store(other.in_use.load());
+        generation = other.generation;
         last_copy_event = other.last_copy_event;
         last_copy_stream = other.last_copy_stream;
         last_copy_event_recorded.store(
@@ -186,6 +189,7 @@ struct moe_staging_slot {
         other.numa_allocated = false;
         other.device_host_allocated = false;
         other.in_use.store(false);
+        other.generation = 0;
         other.last_copy_event = nullptr;
         other.last_copy_stream = nullptr;
         other.last_copy_event_recorded.store(false, std::memory_order_relaxed);
@@ -198,6 +202,7 @@ struct moe_staging_slot {
         numa_allocated = other.numa_allocated;
         device_host_allocated = other.device_host_allocated;
         in_use.store(other.in_use.load());
+        generation = other.generation;
         last_copy_event = other.last_copy_event;
         last_copy_stream = other.last_copy_stream;
         last_copy_event_recorded.store(
@@ -210,6 +215,7 @@ struct moe_staging_slot {
         other.numa_allocated = false;
         other.device_host_allocated = false;
         other.in_use.store(false);
+        other.generation = 0;
         other.last_copy_event = nullptr;
         other.last_copy_stream = nullptr;
         other.last_copy_event_recorded.store(false, std::memory_order_relaxed);

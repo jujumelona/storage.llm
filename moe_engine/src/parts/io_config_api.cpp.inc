@@ -177,6 +177,20 @@
         engine->io_config.pinned_worker_threads = 0;
         engine->io_config.gpu_worker_threads = 0;
     }
+
+    // BUGFIX 907: Windows mmap default path - auto-enable prefer_overlapped_io ★★★ HIGH
+    // Problem: DirectStorage disabled (most Windows users) → VirtualLock path used
+    // → VirtualLock doesn't guarantee page residency → OS can evict pages before copy
+    // → io_worker blocks on page fault during copy_mapped_range_to_staging
+    // Solution: Auto-enable prefer_overlapped_io when DirectStorage is disabled
+    // → Uses OVERLAPPED ReadFile (io_iocp_adapter.cpp.inc) instead of mmap
+    // → Eliminates blocking page faults, async I/O completion via IOCP
+    // Impact: Safe async I/O on Windows without DirectStorage, no page fault stalls
+#ifdef _WIN32
+    if (!engine->io_config.enable_directstorage && !engine->io_config.prefer_overlapped_io) {
+        engine->io_config.prefer_overlapped_io = 1;
+    }
+#endif
     if (engine->io_config.enable_pinned_host && engine->io_config.pinned_staging_bytes > 0) {
         const uint64_t requested_staging_bytes = engine->io_config.pinned_staging_bytes;
         engine->staging = allocate_best_staging(engine,

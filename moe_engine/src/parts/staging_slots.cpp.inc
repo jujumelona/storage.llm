@@ -83,6 +83,11 @@ static void reset_staging_slots(moe_pc_engine* engine) {
         // Code paths that check slot_index < staging_slots.size() but not staging_slot_size
         // can still try to use the slots, causing null dereference or use-after-free
         // Solution: Set staging_slot_size = 0 AND add defensive checks in all prefetch paths
+        // BUGFIX 908: Nullify slot.buf pointers for !in_use slots ★★ IMPORTANT
+        // Problem: slot.buf != nullptr check in external code sees stale pointers after timeout
+        // → Debug code or wrappers may try to access freed memory
+        // Solution: Set slot.buf = nullptr for all !in_use slots to make invalidation explicit
+        // Impact: Prevents use-after-free in code that checks slot.buf directly
         engine->ring_adapter.drain_without_free();
         engine->staging_slot_size = 0;  // Mark slots as invalid
         engine->staging_generation.fetch_add(1, std::memory_order_relaxed);
@@ -93,6 +98,12 @@ static void reset_staging_slots(moe_pc_engine* engine) {
                 slot.last_copy_event = nullptr;
                 slot.last_copy_event_recorded.store(false, std::memory_order_release);
             }
+            // BUGFIX 912: Nullify buf for ALL slots on timeout ★★ IMPORTANT
+            // Problem: in_use slots keep valid buf pointer after timeout
+            // → GPU worker completes later, returns slot with stale buf → use-after-free
+            // Solution: Nullify buf for all slots, workers check staging_generation
+            // Impact: Prevents use-after-free when workers complete after timeout
+            slot.buf = nullptr;
             if (!slot.in_use.load(std::memory_order_acquire)) {
                 ++free_slots;
             }
