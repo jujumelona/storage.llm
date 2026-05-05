@@ -16,9 +16,6 @@ static void orchestrator_append_item(
     if (!items || !count || *count >= max_items || layer < 0 || expert < 0) {
         return;
     }
-    if (prefetch_plan_has_item(engine, layer, expert)) {
-        return;
-    }
     const uint64_t bytes = orchestrator_expert_bytes(engine, layer, expert);
     if (bytes == 0) {
         return;
@@ -26,6 +23,9 @@ static void orchestrator_append_item(
     tier = juju_hint_target_tier(engine, layer, expert, tier, reason);
     priority = juju_hint_priority(engine, layer, expert, reason, priority);
     if (tier == moe_TIER_DB && reason != moe_PREFETCH_REASON_ROUTER_SELECTED) {
+        return;
+    }
+    if (!prefetch_plan_mark_if_absent(engine, layer, expert)) {
         return;
     }
     moe_expert_prefetch_item_t item{};
@@ -36,7 +36,6 @@ static void orchestrator_append_item(
     item.reason = reason;
     item.priority = priority;
     items[(*count)++] = item;
-    prefetch_plan_mark_seen(engine, layer, expert);
 }
 
 static void orchestrator_append_topology(

@@ -21,6 +21,7 @@ moe_pc_engine_t* moe_pc_engine_create(const moe_pc_engine_config_t* config) {
     device_allocator_init(engine);
     apply_common_vram_reservation(engine);
     moe_pc_engine_configure_io(engine, nullptr);
+    engine->last_dropped_requests_snapshot = engine->io_atomic.dropped_requests.load(std::memory_order_relaxed);
     ensure_cpu_row_workers(engine, 0);
     device_stream_pool_init(engine);
     return engine;

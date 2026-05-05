@@ -31,11 +31,9 @@ static uint64_t moe_rt_expert_bytes_hint(
     if (scan.max_executable_tensor_bytes > expert_bytes) {
         expert_bytes = scan.max_executable_tensor_bytes;
     }
-    if (scan.executable_tensor_count > 0 && scan.present_total_bytes > 0) {
-        const uint64_t avg_tensor = scan.present_total_bytes / scan.executable_tensor_count;
-        if (avg_tensor > expert_bytes) {
-            expert_bytes = avg_tensor;
-        }
+    if (expert_bytes == 24ull * 1024ull * 1024ull && scan.executable_tensor_count > 0 && scan.present_total_bytes > 0) {
+        const uint64_t avg = scan.present_total_bytes / scan.executable_tensor_count;
+        expert_bytes = std::max(expert_bytes, avg * 3ull);
     }
     return moe_rt_align_4k(moe_rt_clamp_u64(expert_bytes, 512ull * 1024ull, 512ull * 1024ull * 1024ull));
 }

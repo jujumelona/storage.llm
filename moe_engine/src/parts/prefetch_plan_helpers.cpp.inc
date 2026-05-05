@@ -14,23 +14,26 @@ static void prefetch_plan_clear_seen(moe_pc_engine* engine) {
         return;
     }
 
-    // BUGFIX 문제11: Protect with mutex
-    std::lock_guard<std::mutex> lock(engine->prefetch_plan_mutex);
+    std::unordered_map<uint64_t, uint64_t> empty;
+    {
+        // BUGFIX 문제11: Protect with mutex
+        std::lock_guard<std::mutex> lock(engine->prefetch_plan_mutex);
 
-    ++engine->prefetch_plan_generation;
-    // Periodic cleanup: every 10000 generations OR when map exceeds 50k entries
-    // At 100 tokens/sec, generation cleanup triggers every ~100 seconds
-    // Size cleanup prevents multi-MB growth in long-running inference
-    const bool should_clear =
-        (engine->prefetch_plan_generation % 10000 == 0) ||
-        (engine->prefetch_plan_seen_gen.size() > 50000);
+        ++engine->prefetch_plan_generation;
+        // Periodic cleanup: every 10000 generations OR when map exceeds 50k entries
+        // At 100 tokens/sec, generation cleanup triggers every ~100 seconds
+        // Size cleanup prevents multi-MB growth in long-running inference
+        const bool should_clear =
+            (engine->prefetch_plan_generation % 10000 == 0) ||
+            (engine->prefetch_plan_seen_gen.size() > 50000);
 
-    if (should_clear) {
-        engine->prefetch_plan_seen_gen.clear();
+        if (should_clear) {
+            engine->prefetch_plan_seen_gen.swap(empty);
+        }
     }
 }
 
-static bool prefetch_plan_has_item(moe_pc_engine* engine, int layer, int expert) {
+static bool prefetch_plan_mark_if_absent(moe_pc_engine* engine, int layer, int expert) {
     if (!engine || layer < 0 || expert < 0) {
         return false;
     }
@@ -39,21 +42,12 @@ static bool prefetch_plan_has_item(moe_pc_engine* engine, int layer, int expert)
     std::lock_guard<std::mutex> lock(engine->prefetch_plan_mutex);
 
     const uint64_t key = prefetch_plan_item_key((uint32_t)layer, (uint32_t)expert);
-    auto it = engine->prefetch_plan_seen_gen.find(key);
-    return it != engine->prefetch_plan_seen_gen.end() &&
-           it->second == engine->prefetch_plan_generation;
-}
-
-static void prefetch_plan_mark_seen(moe_pc_engine* engine, int layer, int expert) {
-    if (!engine || layer < 0 || expert < 0) {
-        return;
+    auto [it, inserted] = engine->prefetch_plan_seen_gen.emplace(key, engine->prefetch_plan_generation);
+    if (!inserted && it->second == engine->prefetch_plan_generation) {
+        return false; // already planned
     }
-
-    // BUGFIX 문제11: Protect with mutex
-    std::lock_guard<std::mutex> lock(engine->prefetch_plan_mutex);
-
-    engine->prefetch_plan_seen_gen[prefetch_plan_item_key((uint32_t)layer, (uint32_t)expert)] =
-        engine->prefetch_plan_generation;
+    it->second = engine->prefetch_plan_generation;
+    return true; // newly marked
 }
 
 static moe_tier_t juju_hint_target_tier(
@@ -118,7 +112,7 @@ static void prefetch_plan_add_item(
     // BUGFIX 572: Check engine pointer before use ★
     // Problem: engine can be null
     // Solution: Check at start
-    if (!engine || layer < 0 || expert < 0 || prefetch_plan_has_item(engine, layer, expert)) {
+    if (!engine || layer < 0 || expert < 0) {
         return;
     }
     uint64_t bytes = expert_triplet_or_hardcoded_bytes(engine, layer, expert);
@@ -171,6 +165,9 @@ static void prefetch_plan_add_item(
     if (tier == moe_TIER_DB && reason != moe_PREFETCH_REASON_ROUTER_SELECTED) {
         return;
     }
+    if (!prefetch_plan_mark_if_absent(engine, layer, expert)) {
+        return;
+    }
     moe_expert_prefetch_item_t item{};
     item.layer = (uint32_t)layer;
     item.expert = (uint32_t)expert;
@@ -179,7 +176,6 @@ static void prefetch_plan_add_item(
     item.reason = reason;
     item.priority = priority;
     items.push_back(item);
-    prefetch_plan_mark_seen(engine, layer, expert);
 }
 
 static moe_tier_t prefetch_plan_selected_tier(const moe_pc_engine* engine) {
@@ -214,6 +210,10 @@ static void prefetch_plan_add_lookahead(
         return;
     }
     if (engine->generation_phase.load(std::memory_order_relaxed) == moe_GEN_PHASE_PREFILL) {
+        const moe_tier_t tier = prefetch_plan_selected_tier(engine);
+        for (uint32_t i = 0; i < std::min(count, 4u); ++i) {
+            prefetch_plan_add_item(engine, items, next_layer, experts[i], tier, moe_PREFETCH_REASON_LOOKAHEAD, 50.0f);
+        }
         return;
     }
     if (count <= 2u) {

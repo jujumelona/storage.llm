@@ -1,4 +1,4 @@
-﻿
+
 // ============================================================================
 // PagedAttention KV Cache Manager (vLLM Style Continuous Batching)
 // ============================================================================
@@ -199,9 +199,8 @@ struct moe_paged_kv_manager_t {
         free_count.fetch_add(1, std::memory_order_relaxed);
     }
 
-    uint32_t available_free_blocks() {
-        std::lock_guard<std::mutex> lock(mtx);
-        return static_cast<uint32_t>(free_blocks.size());
+    uint32_t available_free_blocks() const {
+        return free_count.load(std::memory_order_relaxed);
     }
 
     // BUGFIX 128: Evict oldest non-pinned block when cache is full
