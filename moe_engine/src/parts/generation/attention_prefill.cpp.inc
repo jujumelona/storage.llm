@@ -18,14 +18,25 @@
     }
     double ss = 0.0;
     for (uint32_t i = 0; i < count; ++i) {
-        ss += (double)input[i] * (double)input[i];
+        const double val = (double)input[i];
+        if (!std::isfinite(val)) {
+            return 0;
+        }
+        ss += val * val;
     }
     // Safe: count > 0 guaranteed by check above
     const float norm = 1.0f / std::sqrt((float)(ss / (double)count) + (eps > 0.0f ? eps : 1.0e-6f));
-    const int unit_offset = moe_engine_uses_gemma_rmsnorm_unit_offset(engine);
+    const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, raw);
     for (uint32_t i = 0; i < count; ++i) {
         const float w = moe_raw_scalar_to_f32(raw.base + (uint64_t)i * (uint64_t)elem, raw.scalar_encoding);
-        output[i] = input[i] * norm * (unit_offset ? (1.0f + w) : w);
+        if (!std::isfinite(w)) {
+            return 0;
+        }
+        const float result = input[i] * norm * (unit_offset ? (1.0f + w) : w);
+        if (!std::isfinite(result)) {
+            return 0;
+        }
+        output[i] = result;
     }
     return 1;
 }
@@ -77,12 +88,20 @@ static int moe_apply_unweighted_head_rmsnorm_f32(
         float* head = values + (uint64_t)h * (uint64_t)head_dim;
         double ss = 0.0;
         for (uint32_t i = 0; i < head_dim; ++i) {
-            ss += (double)head[i] * (double)head[i];
+            const double val = (double)head[i];
+            if (!std::isfinite(val)) {
+                return 0;
+            }
+            ss += val * val;
         }
         // Safe: head_dim > 0 guaranteed by check above
         const float norm = 1.0f / std::sqrt((float)(ss / (double)head_dim) + norm_eps);
         for (uint32_t i = 0; i < head_dim; ++i) {
-            head[i] *= norm;
+            const float result = head[i] * norm;
+            if (!std::isfinite(result)) {
+                return 0;
+            }
+            head[i] = result;
         }
     }
     return 1;
@@ -146,18 +165,26 @@ static float moe_standard_attention_score_scale(
         if (moe_json_get_double_local(engine->offload_gguf_metadata_json, "query_pre_attn_scalar", &value) ||
             moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_query_pre_attn_scalar", &value) ||
             moe_json_get_double_local(engine->offload_gguf_metadata_json, "attn_query_pre_attn_scalar", &value)) {
-            if (value > 0.0 && value <= 65536.0) {
+            if (value > 0.0 && value <= 65536.0 && std::isfinite(value)) {
                 query_pre_attn_scalar = (float)value;
             }
         }
     }
     if (query_pre_attn_scalar > 0.0f && std::isfinite(query_pre_attn_scalar)) {
-        return 1.0f / std::sqrt(query_pre_attn_scalar);
+        float result = 1.0f / std::sqrt(query_pre_attn_scalar);
+        if (!std::isfinite(result)) {
+            return 1.0f;
+        }
+        return result;
     }
     if (moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
         return 1.0f;
     }
-    return 1.0f / std::sqrt((float)head_dim);
+    float result = 1.0f / std::sqrt((float)head_dim);
+    if (!std::isfinite(result)) {
+        return 1.0f;
+    }
+    return result;
 }
 
 static void moe_standard_attention_rope_params(
@@ -221,6 +248,10 @@ static int moe_standard_kv_cache_ensure(
     uint32_t kv_entry_dim
 ) {
     if (!engine || !s || kv_entry_dim == 0) {
+        return 0;
+    }
+    // BUGFIX 778: Check position for overflow ★★★
+    if (position > UINT32_MAX / 2) {
         return 0;
     }
     if (position < s->kv_cache.max_seq_len) {

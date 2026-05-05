@@ -506,6 +506,7 @@ static uint64_t copy_mapped_range_to_staging(
     uint64_t bytes,
     uint32_t slot_index
 ) {
+    // BUGFIX 740: Check src pointer for NULL before memcpy ★★★
     if (!engine || !src || bytes == 0 || !staging_slot_valid(engine, slot_index)) {
         // Problem 5 Fix: Separate transient contention from structural deficit
         // staging_slot_contention = can't acquire slot (transient, retry will succeed)
@@ -517,10 +518,15 @@ static uint64_t copy_mapped_range_to_staging(
         return 0;
     }
     moe_staging_slot& slot = engine->staging_slots[slot_index];
+    // BUGFIX 741: Check slot.buf for NULL before memcpy ★★★
     if (!slot.buf || slot.size == 0 || bytes > slot.size) {
         // Problem 5 Fix: This is also transient contention (slot too small for this tensor)
         engine->io_atomic.staging_slot_contention.fetch_add(1);
         engine->io_atomic.staging_wraps.fetch_add(1);
+        return 0;
+    }
+    // BUGFIX 742: Check for integer overflow in bytes cast to size_t ★★
+    if (bytes > SIZE_MAX) {
         return 0;
     }
 
@@ -571,6 +577,7 @@ static uint64_t copy_mapped_range_to_staging_linear(
     uint32_t slot_index,
     uint64_t* staging_offset
 ) {
+    // BUGFIX 743: Check src pointer for NULL before memcpy (linear) ★★★
     if (!engine || !src || bytes == 0 || !staging_slot_valid(engine, slot_index) || !staging_offset) {
         // Problem 5 Fix: Separate transient contention from structural deficit
         if (engine && slot_index == UINT32_MAX) {
@@ -581,11 +588,16 @@ static uint64_t copy_mapped_range_to_staging_linear(
     }
     moe_staging_slot& slot = engine->staging_slots[slot_index];
     // BUGFIX 497: *staging_offset + bytes overflow 체크
+    // BUGFIX 744: Check slot.buf for NULL before memcpy (linear) ★★★
     if (!slot.buf || *staging_offset > slot.size || bytes > slot.size - *staging_offset ||
         (*staging_offset > 0 && bytes > UINT64_MAX - *staging_offset)) {
         // Problem 5 Fix: This is also transient contention
         engine->io_atomic.staging_slot_contention.fetch_add(1);
         engine->io_atomic.staging_wraps.fetch_add(1);
+        return 0;
+    }
+    // BUGFIX 745: Check for integer overflow in bytes cast to size_t (linear) ★★
+    if (bytes > SIZE_MAX) {
         return 0;
     }
     if (bytes >= 1024ull * 1024ull) {

@@ -4,10 +4,16 @@ static int device_mark_copy_pending_locked(moe_pc_engine* e, uint64_t key) {
     if (!e) {
         return 0;
     }
+    // BUGFIX 836: Key validation
+    if (key == 0) return 0;
+
     auto it = e->device_allocations.find(key);
     if (it == e->device_allocations.end() || it->second.pending_free) {
         return 0;
     }
+    // BUGFIX 837: Overflow check for inflight_copies
+    if (it->second.inflight_copies >= UINT32_MAX) return 0;
+
     ++it->second.inflight_copies;
     return 1;
 }
@@ -20,6 +26,9 @@ static void device_complete_copy_locked(
     if (!e) {
         return;
     }
+    // BUGFIX 838: Key validation
+    if (key == 0) return;
+
     auto it = e->device_allocations.find(key);
     if (it == e->device_allocations.end()) {
         return;
@@ -114,9 +123,16 @@ static void device_touch_allocation(moe_pc_engine* e, uint64_t key) {
     if (!e) {
         return;
     }
+    // BUGFIX 839: Key validation
+    if (key == 0) return;
+
     std::lock_guard<std::mutex> lock(e->device_mutex);
     auto it = e->device_allocations.find(key);
     if (it != e->device_allocations.end()) {
-        it->second.last_touch_epoch = e->expert_touch_epoch.fetch_add(1) + 1;
+        const uint64_t epoch = e->expert_touch_epoch.fetch_add(1) + 1;
+        // BUGFIX 840: Epoch overflow check
+        if (epoch != 0) {
+            it->second.last_touch_epoch = epoch;
+        }
     }
 }

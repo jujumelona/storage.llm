@@ -169,6 +169,7 @@ struct moe_pc_engine {
     mutable std::atomic<uint32_t> cached_router_route_scale_bits{0};
     mutable std::atomic<uint32_t> cached_embedding_scale_hidden{0};
     mutable std::atomic<uint32_t> cached_embedding_scale_bits{0};
+    mutable std::atomic<int> cached_rmsnorm_unit_offset{-1};
     alignas(64) std::atomic<uint64_t> vram_used_bytes{0};
     alignas(64) std::atomic<uint64_t> ram_used_bytes{0};
     alignas(64) std::atomic<uint64_t> db_used_bytes{0};

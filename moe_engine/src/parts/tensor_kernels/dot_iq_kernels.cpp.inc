@@ -82,6 +82,13 @@ static float moe_dot_linear_q8_group(
     uint32_t start,
     uint32_t limit
 ) {
+    // BUGFIX 807: NULL pointer check
+    if (!packed || !x) return 0.0f;
+    // BUGFIX 808: Range validation
+    if (start > limit) return 0.0f;
+    // BUGFIX 809: Scale NaN/Inf check
+    if (!std::isfinite(scale)) return 0.0f;
+
     float acc = 0.0f;
     uint32_t col = start;
 #if defined(__AVX2__)
@@ -98,6 +105,8 @@ static float moe_dot_linear_q8_group(
         std::memcpy(&q, packed + col, sizeof(q));
         acc += (float)q * scale * x[col];
     }
+    // BUGFIX 810: Result NaN check
+    if (!std::isfinite(acc)) return 0.0f;
     return acc;
 }
 
@@ -109,6 +118,15 @@ static float moe_dot_linear_packed_group(
     uint32_t start,
     uint32_t limit
 ) {
+    // BUGFIX 811: NULL pointer check
+    if (!packed || !x) return 0.0f;
+    // BUGFIX 812: Range validation
+    if (start > limit) return 0.0f;
+    // BUGFIX 813: Bits validation
+    if (bits == 0 || bits > 8) return 0.0f;
+    // BUGFIX 814: Scale NaN/Inf check
+    if (!std::isfinite(scale)) return 0.0f;
+
     const float midpoint = ((float)((1u << bits) - 1u)) * 0.5f;
     float a0 = 0.0f;
     float a1 = 0.0f;
@@ -140,7 +158,12 @@ static float moe_dot_linear_packed_group(
     for (; col < limit; ++col) {
         acc += ((float)moe_packed_lsb_code_at(packed, col, bits) - midpoint) * x[col];
     }
-    return acc * scale;
+    // BUGFIX 815: Result NaN check before scale
+    if (!std::isfinite(acc)) return 0.0f;
+    acc *= scale;
+    // BUGFIX 816: Final result NaN check
+    if (!std::isfinite(acc)) return 0.0f;
+    return acc;
 }
 
 static float moe_dot_linear_quant_row(
@@ -151,14 +174,25 @@ static float moe_dot_linear_quant_row(
     uint32_t bits,
     uint32_t row
 ) {
+    // BUGFIX 817: NULL pointer checks
+    if (!shard || !packed || !x) return 0.0f;
+    // BUGFIX 818: Cols validation
+    if (rec.info.cols == 0 || rec.info.cols > 1000000) return 0.0f;
+
     const uint32_t ngroups = rec.info.groups ? rec.info.groups : 1u;
     const uint32_t group_size = rec.info.group_size ? rec.info.group_size : rec.info.cols;
+    // BUGFIX 819: Groups overflow check
+    if (ngroups > 100000) return 0.0f;
+
     float acc = 0.0f;
     if (bits != 2u && bits != 3u && bits != 4u && bits != 8u) {
         return 0.0f;
     }
     for (uint32_t group = 0; group < ngroups; ++group) {
         const float scale = moe_raw_scale_at(rec, shard, row, group);
+        // BUGFIX 820: Scale NaN check
+        if (!std::isfinite(scale)) continue;
+
         const uint32_t start = group * group_size;
         const uint32_t limit = std::min<uint32_t>(start + group_size, rec.info.cols);
         if (bits == 8u) {
@@ -166,6 +200,8 @@ static float moe_dot_linear_quant_row(
         } else {
             acc += moe_dot_linear_packed_group(packed, x, scale, bits, start, limit);
         }
+        // BUGFIX 821: Accumulator NaN check per group
+        if (!std::isfinite(acc)) return 0.0f;
     }
     return acc;
 }
@@ -214,6 +250,13 @@ static float moe_dot_fp4_row(
     moe_pc_engine_t* engine,
     uint32_t row
 ) {
+    // BUGFIX 822: NULL pointer checks
+    if (!shard || !packed || !x) return 0.0f;
+    // BUGFIX 823: Cols validation
+    if (rec.info.cols == 0 || rec.info.cols > 1000000) return 0.0f;
+    // BUGFIX 824: Group size validation
+    if (rec.info.group_size == 0 || rec.info.group_size > rec.info.cols) return 0.0f;
+
     const uint32_t ngroups = rec.info.groups;
     // Fix 28: Shrink thread_local buffer if it grew too large (4x current need)
     static thread_local std::vector<float> tls_scales_buf;
@@ -237,6 +280,9 @@ static float moe_dot_fp4_row(
         const float scale = use_scale4
             ? moe_scale4_get_scale(engine->scale4, rec.scale4_entry, row, group)
             : scales_buf[group];
+        // BUGFIX 825: Scale NaN check
+        if (!std::isfinite(scale)) continue;
+
         const uint32_t start = group * rec.info.group_size;
         const uint32_t limit = std::min<uint32_t>(start + rec.info.group_size, rec.info.cols);
 #if defined(__AVX2__)
@@ -282,6 +328,8 @@ static float moe_dot_fp4_row(
             acc += moe_engine::fp4_value_at(packed, col, scale) * x[col];
         }
 #endif
+        // BUGFIX 826: Accumulator NaN check per group
+        if (!std::isfinite(acc)) return 0.0f;
     }
     return acc;
 }

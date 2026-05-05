@@ -19,7 +19,12 @@ static void fill_backend_caps(
     // Problem: device_id always set to 0, cannot use GPU 1, 2, 3 in multi-GPU systems
     // Solution: Read device_id from moe_pc_engine_config_t, default to 0 if not specified
     // Impact: Enables multi-GPU systems to select specific GPU device
+    // BUGFIX 783: Check device_id for negative values ★★
     out_caps->device_id = (preferred_cfg && preferred_cfg->device_id >= 0) ? preferred_cfg->device_id : 0;
+    // BUGFIX 784: Check device_id for reasonable upper bound ★★
+    if (out_caps->device_id > 16) {
+        out_caps->device_id = 0;
+    }
     out_caps->supports_mmap = 1;
     out_caps->system_memory_bytes = storagellm::available_ram_bytes();
 

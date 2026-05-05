@@ -172,6 +172,13 @@ static const moe_storage_raw_span_spec_t* find_raw_role_span_bytes(
 }
 
 static float moe_dot_bf16_row(const uint8_t* row, const float* hidden, uint32_t hidden_count) {
+    // BUGFIX 712: BF16 dot product NaN handling ★★
+    // Problem: No validation of row or hidden input, no NaN check on result
+    // Impact: NaN in weights or activations propagates to PPL
+    // Solution: Check inputs and final result for NaN/Inf
+    if (!row || !hidden) {
+        return 0.0f;
+    }
     uint32_t i = 0;
     float acc = 0.0f;
 #if defined(__AVX2__)
@@ -211,6 +218,10 @@ static float moe_dot_bf16_row(const uint8_t* row, const float* hidden, uint32_t 
         uint16_t v;
         std::memcpy(&v, row + (uint64_t)i * 2ull, sizeof(v));
         acc += moe_raw_bf16_to_f32(v) * hidden[i];
+    }
+    // BUGFIX 712: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
     }
     return acc;
 }

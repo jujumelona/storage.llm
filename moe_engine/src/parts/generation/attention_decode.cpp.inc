@@ -237,6 +237,9 @@
                 layer_decode + (size_t)p * kv_entry_dim;
             const float* k = entry + (uint64_t)kv_h * head_dim;
             float score = moe_dot_f32(q, k, head_dim) * scale;
+            if (!std::isfinite(score)) {
+                return 0;
+            }
             if (score > max_score) {
                 const float rescale = std::exp(max_score - score);
                 denom *= rescale;
@@ -248,8 +251,10 @@
             const float* v = entry + k_dim + (uint64_t)kv_h * v_head_dim;
             moe_axpy_f32(out_h, v, w, v_head_dim);
         }
-        if (denom > 0.0f) {
+        if (denom > 1e-10f && std::isfinite(denom)) {
             moe_scale_f32(out_h, 1.0f / denom, v_head_dim);
+        } else {
+            return 0;
         }
         return 1;
         })) {
@@ -277,6 +282,9 @@
     const uint64_t residual_start_us = moe_profile_now_us();
     if (add_residual) {
         for (uint32_t i = 0; i < hidden_size; ++i) {
+            if (!std::isfinite(s->attn[i])) {
+                return 0;
+            }
             hidden[i] += s->attn[i];
         }
     }

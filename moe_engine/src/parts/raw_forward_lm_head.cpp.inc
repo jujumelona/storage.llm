@@ -1,10 +1,22 @@
 // Raw forward - LM head operations
 
 static inline float moe_apply_final_logit_softcap_cached(float cap, float score) {
+    // BUGFIX 719: Logit softcap NaN handling ★★
+    // Problem: No validation of score before tanh
+    // Impact: NaN in logit propagates to final token selection
+    // Solution: Check for NaN in score and tanh result
     if (!(cap > 0.0f) || !std::isfinite(score)) {
         return score;
     }
-    return std::tanh(score / cap) * cap;
+    const float scaled = score / cap;
+    if (!std::isfinite(scaled)) {
+        return score > 0.0f ? cap : -cap;
+    }
+    const float tanh_val = std::tanh(scaled);
+    if (!std::isfinite(tanh_val)) {
+        return score > 0.0f ? cap : -cap;
+    }
+    return tanh_val * cap;
 }
 
 static int moe_map_lm_head_tensor(
@@ -477,12 +489,21 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     // can still become 0.0 due to floating point underflow in exp() operations
     // Solution: Check exp_sum > 0.0 and isfinite before log()
     // Impact: Prevents log(0) = -inf and subsequent NaN propagation
-    if (!(exp_sum > 0.0) || !std::isfinite(exp_sum)) {
+    // BUGFIX 775: Check global_max for NaN/Inf before logsumexp ★★★
+    if (!(exp_sum > 0.0) || !std::isfinite(exp_sum) || !std::isfinite(global_max)) {
         return 0;
     }
 
     const double logsumexp = (double)global_max + std::log(exp_sum);
+    // BUGFIX 776: Check logsumexp for NaN/Inf ★★★
+    if (!std::isfinite(logsumexp)) {
+        return 0;
+    }
     const double logprob = (double)target_score - logsumexp;
+    // BUGFIX 777: Check target_score for NaN/Inf ★★★
+    if (!std::isfinite(target_score)) {
+        return 0;
+    }
     moe_profile_log(
         "lm_head_logprob_end",
         "target=%u target_score=%.6g best=%u best_score=%.6g global_max=%.6g logsumexp=%.6g logprob=%.6g softcap=%.6g",

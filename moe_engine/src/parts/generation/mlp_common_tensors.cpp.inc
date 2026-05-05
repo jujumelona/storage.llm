@@ -92,15 +92,49 @@ static int moe_common_linear_f32(
 }
 
 static inline float moe_generation_gelu_tanh(float x) {
+    // BUGFIX 718: GELU tanh NaN handling ★★
+    // Problem: No validation of input x or tanh result
+    // Impact: NaN in activation propagates to MLP output
+    // Solution: Check for NaN in input and tanh result
+    if (!std::isfinite(x)) {
+        return 0.0f;
+    }
     const float k = 0.7978845608028654f;
-    return 0.5f * x * (1.0f + std::tanh(k * (x + 0.044715f * x * x * x)));
+    const float inner = k * (x + 0.044715f * x * x * x);
+    if (!std::isfinite(inner)) {
+        return x > 0.0f ? x : 0.0f;
+    }
+    const float tanh_val = std::tanh(inner);
+    if (!std::isfinite(tanh_val)) {
+        return x > 0.0f ? x : 0.0f;
+    }
+    return 0.5f * x * (1.0f + tanh_val);
 }
 
 static inline float moe_generation_gated_activation_cached(int activation_mode, float gate, float up) {
-    if (activation_mode == 2) {
-        return moe_generation_gelu_tanh(gate) * up;
+    // BUGFIX 869: Check gate and up for NaN/Inf before activation ★★★
+    if (!isfinite(gate) || !isfinite(up)) {
+        return 0.0f;
     }
-    return (activation_mode == 1 ? moe_generation_gelu(gate) : moe_generation_silu(gate)) * up;
+    if (activation_mode == 2) {
+        const float result = moe_generation_gelu_tanh(gate) * up;
+        // BUGFIX 870: Check result for NaN/Inf ★★★
+        if (!isfinite(result)) {
+            return 0.0f;
+        }
+        return result;
+    }
+    const float activated = (activation_mode == 1 ? moe_generation_gelu(gate) : moe_generation_silu(gate));
+    // BUGFIX 871: Check activated for NaN/Inf ★★★
+    if (!isfinite(activated)) {
+        return 0.0f;
+    }
+    const float result = activated * up;
+    // BUGFIX 872: Check result for NaN/Inf ★★★
+    if (!isfinite(result)) {
+        return 0.0f;
+    }
+    return result;
 }
 
 static int moe_raw_tensor_scalar_at_f32(
@@ -151,6 +185,10 @@ static int moe_apply_rmsnorm_common_weight_f32(
     float* output,
     float eps
 ) {
+    // BUGFIX 710: RMSNorm input NaN handling ★★★
+    // Problem: No validation of input values before computing sum of squares
+    // Impact: NaN in input propagates to all normalized outputs
+    // Solution: Check for NaN in input and skip NaN values in sum
     // BUGFIX 208: Division by zero when count == 0
     // Problem: ss / (double)count crashes if count == 0
     // Solution: Check count == 0 BEFORE division (already done), but clarify comment
@@ -158,18 +196,40 @@ static int moe_apply_rmsnorm_common_weight_f32(
         return 0;
     }
     double ss = 0.0;
+    uint32_t valid_count = 0;
     for (uint32_t i = 0; i < count; ++i) {
-        ss += (double)input[i] * (double)input[i];
+        // BUGFIX 710: Skip NaN values in sum
+        if (std::isfinite(input[i])) {
+            ss += (double)input[i] * (double)input[i];
+            ++valid_count;
+        }
     }
-    // Safe: count > 0 guaranteed by check above
-    const float norm = 1.0f / std::sqrt((float)(ss / (double)count) + (eps > 0.0f ? eps : 1.0e-6f));
-    const int unit_offset = moe_engine_uses_gemma_rmsnorm_unit_offset(engine);
+    // BUGFIX 710: Check if we have any valid values
+    if (valid_count == 0) {
+        // All inputs are NaN/Inf - output zeros
+        for (uint32_t i = 0; i < count; ++i) {
+            output[i] = 0.0f;
+        }
+        return 1;
+    }
+    // Safe: valid_count > 0 guaranteed by check above
+    const float norm = 1.0f / std::sqrt((float)(ss / (double)valid_count) + (eps > 0.0f ? eps : 1.0e-6f));
+    const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, raw);
     for (uint32_t i = 0; i < count; ++i) {
         float w = 0.0f;
         if (!moe_raw_tensor_scalar_at_f32(raw, i, &w)) {
             return 0;
         }
-        output[i] = input[i] * norm * (unit_offset ? (1.0f + w) : w);
+        // BUGFIX 710: Check weight validity
+        if (!std::isfinite(w)) {
+            w = 0.0f;
+        }
+        // BUGFIX 710: Check input validity before normalization
+        if (!std::isfinite(input[i])) {
+            output[i] = 0.0f;
+        } else {
+            output[i] = input[i] * norm * (unit_offset ? (1.0f + w) : w);
+        }
     }
     return 1;
 }
@@ -448,6 +508,10 @@ static int moe_layer_output_scale_f32(
     float* hidden,
     uint32_t hidden_size
 ) {
+    // BUGFIX 711: Layer output scale NaN handling ★★
+    // Problem: No validation of scale values before multiplication
+    // Impact: NaN in scale propagates to all hidden states
+    // Solution: Check for NaN in scale values
     if (!engine || !hidden || hidden_size == 0) {
         return 0;
     }
@@ -473,6 +537,10 @@ static int moe_layer_output_scale_f32(
         if (!moe_raw_tensor_scalar_at_f32(raw, 0, &scale)) {
             return 0;
         }
+        // BUGFIX 711: Check scale validity
+        if (!std::isfinite(scale)) {
+            scale = 1.0f;
+        }
         moe_scale_f32(hidden, scale, hidden_size);
         return 1;
     }
@@ -483,6 +551,10 @@ static int moe_layer_output_scale_f32(
         float scale = 1.0f;
         if (!moe_raw_tensor_scalar_at_f32(raw, i, &scale)) {
             return 0;
+        }
+        // BUGFIX 711: Check scale validity
+        if (!std::isfinite(scale)) {
+            scale = 1.0f;
         }
         hidden[i] *= scale;
     }

@@ -207,6 +207,88 @@ static std::string resource_log_suffix() {
     return out.str();
 }
 
+static const char* forward_adapter_name(uint32_t adapter);
+
+static const char* server_generation_phase_name(uint32_t phase) {
+    switch (phase) {
+        case moe_GEN_PHASE_INIT: return "init";
+        case moe_GEN_PHASE_PREFILL: return "prefill";
+        case moe_GEN_PHASE_ATTENTION: return "attention";
+        case moe_GEN_PHASE_MLP: return "mlp";
+        case moe_GEN_PHASE_LM_HEAD: return "lm_head";
+        case moe_GEN_PHASE_DONE: return "done";
+        case moe_GEN_PHASE_IDLE:
+        default: return "idle";
+    }
+}
+
+static void log_engine_snapshot(const char* tag, moe_pc_engine_t* engine) {
+    if (!engine) {
+        std::cerr << "[storagellm request] " << (tag ? tag : "engine_snapshot")
+                  << " engine=null" << resource_log_suffix() << "\n" << std::flush;
+        return;
+    }
+    moe_forward_status_t forward{};
+    moe_pc_engine_stats_t stats{};
+    moe_io_stats_t io{};
+    const int forward_ok = moe_pc_engine_get_forward_status(engine, &forward);
+    const int stats_ok = moe_pc_engine_get_stats(engine, &stats);
+    const int io_ok = moe_pc_engine_get_io_stats(engine, &io);
+    std::cerr << "[storagellm request] " << (tag ? tag : "engine_snapshot")
+              << " forward_ok=" << forward_ok
+              << " stats_ok=" << stats_ok
+              << " io_ok=" << io_ok;
+    if (forward_ok) {
+        std::cerr << " adapter=" << forward_adapter_name(forward.forward_adapter)
+                  << " executable=" << forward.forward_adapter_executable
+                  << " graph_ir=" << forward.graph_ir_ready
+                  << " graph_required=" << forward.graph_ir_required
+                  << " graph_layers=" << forward.graph_ir_layer_count
+                  << " graph_ops=" << forward.graph_ir_op_count
+                  << " layers=" << forward.dynamic_num_hidden_layers
+                  << " hidden=" << forward.dynamic_hidden_size
+                  << " vocab=" << forward.dynamic_vocab_size
+                  << " embed=" << forward.embedding_ready
+                  << " lm_head=" << forward.lm_head_ready
+                  << " attention=" << forward.attention_ready
+                  << " decode_loop=" << forward.decode_loop_ready;
+    }
+    if (stats_ok) {
+        std::cerr << " phase=" << server_generation_phase_name(stats.generation_phase)
+                  << " gen_started=" << stats.generation_started
+                  << " gen_done=" << stats.generation_completed
+                  << " gen_failed=" << stats.generation_failed
+                  << " gen_active=" << stats.generation_active
+                  << " gen_token=" << stats.generation_token
+                  << " gen_layer=" << stats.generation_layer
+                  << " kv=" << moe_kv_mode_name(stats.kv_mode)
+                  << " qkv_forced=" << stats.qkv_forced_by_format
+                  << " qkv_bits=" << stats.qkv_k_bits << "/" << stats.qkv_v_bits
+                  << " qkv_group=" << stats.qkv_group_size
+                  << " ram_used=" << stats.ram_used_bytes
+                  << " vram_used=" << stats.vram_used_bytes
+                  << " common_raw=" << stats.common_raw_prefetched_bytes
+                  << " ram_experts=" << stats.ram_expert_count
+                  << " storage_experts=" << stats.db_expert_count
+                  << " weight_bits=" << stats.weight_quant_bits
+                  << " weight_encoding=" << stats.weight_quant_encoding
+                  << " weight_kernel=" << stats.weight_kernel_family;
+    }
+    if (io_ok) {
+        std::cerr << " io_queued=" << io.queued_requests
+                  << " io_done=" << io.completed_requests
+                  << " io_failed=" << io.failed_requests
+                  << " io_dropped=" << io.dropped_requests
+                  << " disk_q=" << io.disk_queue_depth
+                  << " pinned_q=" << io.pinned_queue_depth
+                  << " gpu_q=" << io.gpu_queue_depth
+                  << " active_workers=" << io.active_workers
+                  << " bytes_prefetched=" << io.bytes_prefetched
+                  << " h2d_fallback=" << io.bytes_sync_h2d_fallback;
+    }
+    std::cerr << resource_log_suffix() << "\n" << std::flush;
+}
+
 static std::string lower_ascii(std::string value) {
     for (char& ch : value) {
         ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
@@ -1671,6 +1753,7 @@ static server_generation_result run_server_generation(
               << " body_bytes=" << body.size()
               << resource_log_suffix()
               << "\n" << std::flush;
+    log_engine_snapshot("generation_engine_begin", engine);
     const auto generation_start = std::chrono::steady_clock::now();
     if (engine_mutex) {
         std::lock_guard<std::mutex> lock(*engine_mutex);
@@ -1711,6 +1794,7 @@ static server_generation_result run_server_generation(
                   << " error=" << result.error_message
                   << resource_log_suffix()
                   << "\n" << std::flush;
+        log_engine_snapshot("generation_engine_failed", engine);
         return result;
     }
     out_ids.resize(stats.completion_tokens);
@@ -1722,11 +1806,14 @@ static server_generation_result run_server_generation(
     result.text = tok.loaded ? tokenizer_decode_ids(tok, out_ids) : tokenizer_decode_ids(server_tokenizer{}, out_ids);
     std::cerr << "[storagellm request] generation ok prompt_tokens=" << result.prompt_tokens
               << " completion_tokens=" << result.completion_tokens
+              << " finish_reason=" << result.finish_reason
+              << " last_logit=" << stats.last_logit
               << " generation_ms=" << generation_ms
               << " decode_text_ms=" << elapsed_ms_since(decode_text_start)
               << " total_ms=" << elapsed_ms_since(request_start)
               << resource_log_suffix()
               << "\n" << std::flush;
+    log_engine_snapshot("generation_engine_end", engine);
     return result;
 }
 
@@ -1797,9 +1884,11 @@ static server_eval_result run_server_eval(
 
     const auto eval_start = std::chrono::steady_clock::now();
     std::cerr << "[storagellm request] eval begin input_tokens=" << input_ids.size()
+              << " first_target_index=" << first_target_index
               << " body_bytes=" << body.size()
               << resource_log_suffix()
               << "\n" << std::flush;
+    log_engine_snapshot("eval_engine_begin", engine);
     moe_eval_stats_t stats{};
     int evaluated = 0;
     const auto eval_tokens = [&]() -> int {
@@ -1839,6 +1928,7 @@ static server_eval_result run_server_eval(
                   << " error=" << result.error_message
                   << resource_log_suffix()
                   << "\n" << std::flush;
+        log_engine_snapshot("eval_engine_failed", engine);
         return result;
     }
 
@@ -1850,11 +1940,13 @@ static server_eval_result run_server_eval(
     result.perplexity = stats.perplexity;
     std::cerr << "[storagellm request] eval ok input_tokens=" << result.input_tokens
               << " evaluated_tokens=" << result.evaluated_tokens
+              << " nll=" << result.nll
               << " mean_nll=" << result.mean_nll
               << " ppl=" << result.perplexity
               << " total_ms=" << elapsed_ms_since(eval_start)
               << resource_log_suffix()
               << "\n" << std::flush;
+    log_engine_snapshot("eval_engine_end", engine);
     return result;
 }
 

@@ -34,12 +34,20 @@ static float moe_dot_gguf_q5_1_row(
 }
 
 static float moe_gguf_q2_k_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    // BUGFIX 702: Q2_K NaN handling ★★
+    // Problem: No validation of scale/min values or accumulated result
+    // Impact: NaN in quantization parameters propagates to PPL
+    // Solution: Check for NaN/Inf in final result
     float acc = 0.0f;
     for (uint32_t base = 0; base < cols; base += 256u, packed += 84u) {
         const uint8_t* scales = packed;
         const uint8_t* q = packed + 16u;
         const float d = moe_load_f16le(packed + 80u);
         const float minv = moe_load_f16le(packed + 82u);
+        // BUGFIX 702: Check scale validity
+        if (!std::isfinite(d) || !std::isfinite(minv)) {
+            continue;
+        }
         uint32_t is = 0;
         for (uint32_t n = 0; n < 256u; n += 128u) {
             uint32_t shift = 0;
@@ -63,10 +71,18 @@ static float moe_gguf_q2_k_row_impl(const uint8_t* packed, const float* x, float
             q += 32u;
         }
     }
+    // BUGFIX 702: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
+    }
     return acc;
 }
 
 static float moe_gguf_q3_k_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    // BUGFIX 703: Q3_K NaN handling ★★
+    // Problem: No validation of scale values or accumulated result
+    // Impact: NaN in quantization parameters propagates to PPL
+    // Solution: Check for NaN/Inf in scale and final result
     float acc = 0.0f;
     const uint32_t kmask1 = 0x03030303u;
     const uint32_t kmask2 = 0x0f0f0f0fu;
@@ -75,6 +91,10 @@ static float moe_gguf_q3_k_row_impl(const uint8_t* packed, const float* x, float
         const uint8_t* q = packed + 32u;
         const uint8_t* scale_bytes = packed + 96u;
         const float d_all = moe_load_f16le(packed + 108u);
+        // BUGFIX 703: Check scale validity
+        if (!std::isfinite(d_all)) {
+            continue;
+        }
         uint32_t aux[4]{};
         std::memcpy(aux, scale_bytes, 12u);
         const uint32_t tmp = aux[2];
@@ -104,14 +124,26 @@ static float moe_gguf_q3_k_row_impl(const uint8_t* packed, const float* x, float
             q += 32u;
         }
     }
+    // BUGFIX 703: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
+    }
     return acc;
 }
 
 static float moe_gguf_q4_k_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    // BUGFIX 704: Q4_K NaN handling ★★
+    // Problem: No validation of scale/min values or accumulated result
+    // Impact: NaN in quantization parameters propagates to PPL
+    // Solution: Check for NaN/Inf in scale and final result
     float acc = 0.0f;
     for (uint32_t base = 0; base < cols; base += 256u, packed += 144u) {
         const float d = moe_load_f16le(packed);
         const float minv = moe_load_f16le(packed + 2u);
+        // BUGFIX 704: Check scale validity
+        if (!std::isfinite(d) || !std::isfinite(minv)) {
+            continue;
+        }
         const uint8_t* scales = packed + 4u;
         const uint8_t* q = packed + 16u;
         uint32_t is = 0;
@@ -134,14 +166,26 @@ static float moe_gguf_q4_k_row_impl(const uint8_t* packed, const float* x, float
             is += 2u;
         }
     }
+    // BUGFIX 704: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
+    }
     return acc;
 }
 
 static float moe_gguf_q5_k_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    // BUGFIX 705: Q5_K NaN handling ★★
+    // Problem: No validation of scale/min values or accumulated result
+    // Impact: NaN in quantization parameters propagates to PPL
+    // Solution: Check for NaN/Inf in scale and final result
     float acc = 0.0f;
     for (uint32_t base = 0; base < cols; base += 256u, packed += 176u) {
         const float d = moe_load_f16le(packed);
         const float minv = moe_load_f16le(packed + 2u);
+        // BUGFIX 705: Check scale validity
+        if (!std::isfinite(d) || !std::isfinite(minv)) {
+            continue;
+        }
         const uint8_t* scales = packed + 4u;
         const uint8_t* qh = packed + 16u;
         const uint8_t* ql = packed + 48u;
@@ -171,16 +215,28 @@ static float moe_gguf_q5_k_row_impl(const uint8_t* packed, const float* x, float
             u2 = (uint8_t)(u2 << 2);
         }
     }
+    // BUGFIX 705: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
+    }
     return acc;
 }
 
 static float moe_gguf_q6_k_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    // BUGFIX 706: Q6_K NaN handling ★★
+    // Problem: No validation of scale values or accumulated result
+    // Impact: NaN in quantization parameters propagates to PPL
+    // Solution: Check for NaN/Inf in scale and final result
     float acc = 0.0f;
     for (uint32_t base = 0; base < cols; base += 256u, packed += 210u) {
         const uint8_t* ql = packed;
         const uint8_t* qh = packed + 128u;
         const int8_t* sc = reinterpret_cast<const int8_t*>(packed + 192u);
         const float d = moe_load_f16le(packed + 208u);
+        // BUGFIX 706: Check scale validity
+        if (!std::isfinite(d)) {
+            continue;
+        }
         for (uint32_t n = 0; n < 256u; n += 128u) {
             for (uint32_t l = 0; l < 32u; ++l) {
                 const uint32_t is = l / 16u;
@@ -198,13 +254,25 @@ static float moe_gguf_q6_k_row_impl(const uint8_t* packed, const float* x, float
             sc += 8u;
         }
     }
+    // BUGFIX 706: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
+    }
     return acc;
 }
 
 static float moe_gguf_iq2_xxs_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    // BUGFIX 707: IQ2_XXS NaN handling ★★
+    // Problem: No validation of scale values or accumulated result
+    // Impact: NaN in quantization parameters propagates to PPL
+    // Solution: Check for NaN/Inf in scale and final result
     float acc = 0.0f;
     for (uint32_t base = 0; base < cols; base += 256u, packed += 66u) {
         const float d = moe_load_f16le(packed);
+        // BUGFIX 707: Check scale validity
+        if (!std::isfinite(d)) {
+            continue;
+        }
         const uint8_t* qs = packed + 2u;
         for (uint32_t ib32 = 0; ib32 < 8u; ++ib32) {
             uint32_t aux32[2] = {
@@ -222,6 +290,10 @@ static float moe_gguf_iq2_xxs_row_impl(const uint8_t* packed, const float* x, fl
                 }
             }
         }
+    }
+    // BUGFIX 707: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
     }
     return acc;
 }
@@ -345,10 +417,18 @@ static float moe_gguf_iq3_s_row_impl(const uint8_t* packed, const float* x, floa
 }
 
 static float moe_gguf_iq1_s_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    // BUGFIX 708: IQ1_S NaN handling ★★
+    // Problem: No validation of scale values or accumulated result
+    // Impact: NaN in quantization parameters propagates to PPL
+    // Solution: Check for NaN/Inf in scale and final result
     float acc = 0.0f;
     constexpr float delta_value = 0.125f;
     for (uint32_t base = 0; base < cols; base += 256u, packed += 50u) {
         const float d = moe_load_f16le(packed);
+        // BUGFIX 708: Check scale validity
+        if (!std::isfinite(d)) {
+            continue;
+        }
         const uint8_t* qs = packed + 2u;
         const uint8_t* qh = packed + 34u;
         for (uint32_t ib = 0; ib < 8u; ++ib) {
@@ -365,10 +445,18 @@ static float moe_gguf_iq1_s_row_impl(const uint8_t* packed, const float* x, floa
             qs += 4u;
         }
     }
+    // BUGFIX 708: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
+    }
     return acc;
 }
 
 static float moe_gguf_iq1_m_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
+    // BUGFIX 709: IQ1_M NaN handling ★★
+    // Problem: No validation of scale values or accumulated result
+    // Impact: NaN in quantization parameters propagates to PPL
+    // Solution: Check for NaN/Inf in scale and final result
     float acc = 0.0f;
     constexpr float delta_value = 0.125f;
     for (uint32_t base = 0; base < cols; base += 256u, packed += 56u) {
@@ -381,6 +469,10 @@ static float moe_gguf_iq1_m_row_impl(const uint8_t* packed, const float* x, floa
                        ((moe_load_u16le(scales + 4u) >> 4) & 0x0f00u) |
                        (moe_load_u16le(scales + 6u) & 0xf000u));
         const float d = moe_raw_fp16_to_f32(scale_u16);
+        // BUGFIX 709: Check scale validity
+        if (!std::isfinite(d)) {
+            continue;
+        }
         for (uint32_t ib = 0; ib < 8u; ++ib) {
             const uint16_t s = moe_load_u16le(scales + (ib / 2u) * 2u);
             const float dl1 = d * (float)(2u * ((s >> (6u * (ib & 1u) + 0u)) & 0x7u) + 1u);
@@ -409,6 +501,10 @@ static float moe_gguf_iq1_m_row_impl(const uint8_t* packed, const float* x, floa
             qs += 4u;
             qh += 2u;
         }
+    }
+    // BUGFIX 709: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
     }
     return acc;
 }

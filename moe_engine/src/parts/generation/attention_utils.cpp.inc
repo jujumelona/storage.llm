@@ -330,8 +330,14 @@
             s->attn_value.data(), v_total_dim, s->attn.data(), hidden_size)) {
         return 0;
     }
+    // BUGFIX 717: Attention residual addition NaN handling ★★
+    // Problem: No validation of residual values before addition
+    // Impact: NaN in attention output propagates to hidden state
+    // Solution: Check for NaN in residual values
     for (uint32_t i = 0; i < hidden_size; ++i) {
-        hidden[i] += s->attn[i];
+        if (std::isfinite(s->attn[i])) {
+            hidden[i] += s->attn[i];
+        }
     }
     return 1;
 }

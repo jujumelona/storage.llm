@@ -350,6 +350,12 @@
     }
     // BUGFIX 512: The 100000 intermediate size limit was removed as it arbitrarily
     // restricts extremely wide experts. Memory exhaustion is prevented by the SIZE_MAX check below.
+    // BUGFIX 765: Check expert_intermediate for reasonable upper bound ★★★
+    if (expert_intermediate > 1000000) {
+        std::fprintf(stderr, "[storagellm mlp] excessive intermediate size layer=%d intermediate=%u\n",
+            layer, expert_intermediate);
+        return 0;
+    }
     const size_t needed_gate = num_selected * (size_t)expert_intermediate;
     const size_t needed_up = needed_gate;
     const size_t needed_out = num_selected * (size_t)hidden_size;
@@ -444,6 +450,11 @@
         for (uint32_t r = row_begin; r < row_end; ++r) {
             if (!moe_dot_tensor_record_row(engine, shards[e].gate_rec, shards[e].gate_shard, r, expert_input, hidden_size, &work[e].gate[r])) { expert_ok[e].store(0, std::memory_order_release); return 1; }
             if (!moe_dot_tensor_record_row(engine, shards[e].up_rec, shards[e].up_shard, r, expert_input, hidden_size, &work[e].up[r])) { expert_ok[e].store(0, std::memory_order_release); return 1; }
+            // BUGFIX 850: Check gate/up results for NaN before activation ★★★
+            if (!isfinite(work[e].gate[r]) || !isfinite(work[e].up[r])) {
+                expert_ok[e].store(0, std::memory_order_release);
+                return 1;
+            }
             work[e].gate[r] = moe_generation_gated_activation_cached(activation_mode, work[e].gate[r], work[e].up[r]);
         }
         return 1;
@@ -496,6 +507,11 @@
                 expert_ok[e].store(0, std::memory_order_release);
                 return 1;
             }
+            // BUGFIX 851: Check down result for NaN ★★★
+            if (!isfinite(work[e].out[r])) {
+                expert_ok[e].store(0, std::memory_order_release);
+                return 1;
+            }
         }
         return 1;
     });
@@ -516,6 +532,12 @@
 
     // BUGFIX: Explicitly zero the accumulator buffer before processing sparse experts
     // Without this, the accumulation includes garbage or previous shared expert data
+    // BUGFIX 766: Check hidden_size bounds before fill ★★★
+    if (hidden_size > s->residual.size()) {
+        std::fprintf(stderr, "[storagellm mlp] hidden_size exceeds residual buffer layer=%d hidden=%u buffer=%zu\n",
+            layer, hidden_size, s->residual.size());
+        return 0;
+    }
     std::fill(s->residual.begin(), s->residual.begin() + hidden_size, 0.0f);
 
     for (size_t e = 0; e < num_selected; ++e) {
@@ -527,6 +549,18 @@
                 layer, work[e].expert_id);
             return 0;
         }
+        // BUGFIX 767: Check work[e].weight for NaN/Inf before axpy ★★★
+        if (!isfinite(work[e].weight)) {
+            std::fprintf(stderr, "[storagellm mlp] invalid expert weight layer=%d expert=%d weight=%f\n",
+                layer, work[e].expert_id, work[e].weight);
+            continue;
+        }
+        // BUGFIX 848: Check work[e].out for NULL before axpy ★★★
+        if (!work[e].out) {
+            std::fprintf(stderr, "[storagellm mlp] NULL expert output layer=%d expert=%d\n",
+                layer, work[e].expert_id);
+            continue;
+        }
         moe_axpy_f32(s->residual.data(), work[e].out, work[e].weight, hidden_size);
     }
     const float* expert_branch = s->residual.data();
@@ -534,8 +568,16 @@
             engine, layer, s->residual.data(), hidden_size, s->expert.data(), attn_cfg.rms_norm_eps)) {
         expert_branch = s->expert.data();
     }
+    // BUGFIX 768: Check for NaN/Inf in expert_branch before addition ★★★
+    // BUGFIX 849: Check expert_branch for NULL before loop ★★★
+    if (!expert_branch) {
+        std::fprintf(stderr, "[storagellm mlp] NULL expert_branch layer=%d\n", layer);
+        return 0;
+    }
     for (uint32_t i = 0; i < hidden_size; ++i) {
-        s->mlp[i] += expert_branch[i];
+        if (isfinite(expert_branch[i])) {
+            s->mlp[i] += expert_branch[i];
+        }
     }
     const double accumulate_ms = moe_profile_elapsed_ms(accumulate_start_us);
 
@@ -577,10 +619,17 @@ static int moe_run_expert_triplet_row_batch_f32(
     uint32_t out_count,
     int activation_mode
 ) {
+    // BUGFIX 769: Check batch_hidden for NULL pointers ★★★
     if (!engine || !batch_hidden || !gate_pool || !up_pool || !out_pool ||
         batch_size == 0 || batch_size > 4096u ||
         hidden_size == 0 || intermediate_size == 0 || out_count != hidden_size) {
         return 0;
+    }
+    // BUGFIX 770: Check each batch_hidden[i] for NULL ★★★
+    for (uint32_t i = 0; i < batch_size; ++i) {
+        if (!batch_hidden[i]) {
+            return 0;
+        }
     }
     const moe_tensor_record* gate = find_tensor_record(engine, layer, expert, moe_PROJ_GATE);
     const moe_tensor_record* up = find_tensor_record(engine, layer, expert, moe_PROJ_UP);
@@ -899,12 +948,21 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         if (moe_layer_post_ffw_norm_f32(
                 engine, layer, mlp_out, hidden_size,
                 local.shared.data(), attn_cfg.rms_norm_eps)) {
+            // BUGFIX 715: MLP residual addition NaN handling ★★
+            // Problem: No validation of residual values before addition
+            // Impact: NaN in MLP output propagates to hidden state
+            // Solution: Check for NaN in residual values
             for (uint32_t i = 0; i < hidden_size; ++i) {
-                hidden[i] += local.shared[i];
+                if (std::isfinite(local.shared[i])) {
+                    hidden[i] += local.shared[i];
+                }
             }
         } else {
+            // BUGFIX 715: MLP residual addition NaN handling ★★
             for (uint32_t i = 0; i < hidden_size; ++i) {
-                hidden[i] += mlp_out[i];
+                if (std::isfinite(mlp_out[i])) {
+                    hidden[i] += mlp_out[i];
+                }
             }
         }
     }

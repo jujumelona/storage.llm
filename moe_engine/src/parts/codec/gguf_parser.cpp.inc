@@ -3,6 +3,10 @@ static int moe_parse_layer_from_gguf_name(const std::string& name, uint32_t* lay
     if (!layer) {
         return 0;
     }
+    // BUGFIX 771: Check name for empty string ★★
+    if (name.empty()) {
+        return 0;
+    }
     const char* needles[] = {
         "blk.",
         "model.layers.",
@@ -24,9 +28,17 @@ static int moe_parse_layer_from_gguf_name(const std::string& name, uint32_t* lay
         return 0;
     }
     size_t p = pos + needle_len;
+    // BUGFIX 772: Check p bounds before loop ★★
+    if (p >= name.size()) {
+        return 0;
+    }
     uint64_t value = 0;
     bool any = false;
     while (p < name.size() && name[p] >= '0' && name[p] <= '9') {
+        // BUGFIX 773: Check for overflow in value calculation ★★★
+        if (value > UINT64_MAX / 10ull) {
+            return 0;
+        }
         value = value * 10ull + (uint64_t)(name[p] - '0');
         any = true;
         ++p;
@@ -40,6 +52,10 @@ static int moe_parse_layer_from_gguf_name(const std::string& name, uint32_t* lay
 
 static int moe_gguf_expert_projection(const std::string& name, moe_projection_t* proj) {
     if (!proj) {
+        return 0;
+    }
+    // BUGFIX 774: Check name for empty string ★★
+    if (name.empty()) {
         return 0;
     }
     const std::string value = moe_lower_ascii_copy(name);

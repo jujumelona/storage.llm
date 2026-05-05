@@ -101,6 +101,10 @@ static int qkv_dequant_one_split(
             for (int j = 0; j < d; ++j) {
                 sum += s->rotation_matrix[(size_t)j * (size_t)d + (size_t)i] * y_tilde[j];
             }
+            // BUGFIX 725: Check inverse rotation result for NaN/Inf ★★
+            if (!isfinite(sum)) {
+                sum = 0.0f;
+            }
             x_tilde[i] = sum;
         }
     } else {
@@ -120,25 +124,41 @@ static int qkv_dequant_one_split(
                 for (int j = 0; j < d; ++j) {
                     sum += s->qjl_matrix[(size_t)j * (size_t)d + (size_t)i] * qjl_signs[j];
                 }
+                // BUGFIX 731: Check QJL matrix multiplication result for NaN/Inf (split path) ★★
+                if (!isfinite(sum)) {
+                    sum = 0.0f;
+                }
                 s_t_qjl[i] = sum;
             }
             // BUGFIX 657: Prevent division by zero in QJL scale (split path) ★
             if (d <= 0) return 0;
             const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)d;
+            // BUGFIX 732: Check QJL scale for NaN/Inf (split path) ★★
+            if (!isfinite(qjl_scale)) return 0;
             for (int i = 0; i < d; ++i) {
-                x_tilde[i] += qjl_scale * r_norm * s_t_qjl[i];
+                float residual_term = qjl_scale * r_norm * s_t_qjl[i];
+                // BUGFIX 733: Check residual term for NaN/Inf before adding (split path) ★★
+                if (isfinite(residual_term)) {
+                    x_tilde[i] += residual_term;
+                }
             }
         }
     }
 
     const float norm = norms[token_idx];
     // BUGFIX 656: Handle zero norm consistently (split path) ★★
-    if (norm < 1e-12f) {
+    // BUGFIX 734: Check norm for NaN/Inf (split path) ★★★
+    if (!isfinite(norm) || norm < 1e-12f) {
         memset(output, 0, (size_t)d * sizeof(float));
         return 1;
     }
     for (int i = 0; i < d; ++i) {
-        output[i] = x_tilde[i] * norm;
+        float result = x_tilde[i] * norm;
+        // BUGFIX 735: Check final denormalized result for NaN/Inf (split path) ★★★
+        if (!isfinite(result)) {
+            result = 0.0f;
+        }
+        output[i] = result;
     }
     return 1;
 }
@@ -223,6 +243,10 @@ int qkv_dequant_one(
                 size_t idx = (size_t)j * (size_t)d + (size_t)i;
                 sum += s->rotation_matrix[idx] * y_tilde[j];
             }
+            // BUGFIX 736: Check inverse rotation result for NaN/Inf (main path) ★★
+            if (!isfinite(sum)) {
+                sum = 0.0f;
+            }
             x_tilde[i] = sum;
         }
     } else {
@@ -257,6 +281,10 @@ int qkv_dequant_one(
                     size_t idx = (size_t)j * (size_t)d + (size_t)i;
                     sum += s->qjl_matrix[idx] * qjl_signs[j];
                 }
+                // BUGFIX 726: Check QJL matrix multiplication result for NaN/Inf ★★
+                if (!isfinite(sum)) {
+                    sum = 0.0f;
+                }
                 s_t_qjl[i] = sum;
             }
 
@@ -264,8 +292,14 @@ int qkv_dequant_one(
             // BUGFIX 376: d가 0일 때 division by zero 방지
             if (d <= 0) return 0;
             const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)d;
+            // BUGFIX 727: Check QJL scale for NaN/Inf ★★
+            if (!isfinite(qjl_scale)) return 0;
             for (int i = 0; i < d; i++) {
-                x_tilde[i] += qjl_scale * r_norm * s_t_qjl[i];
+                float residual_term = qjl_scale * r_norm * s_t_qjl[i];
+                // BUGFIX 728: Check residual term for NaN/Inf before adding ★★
+                if (isfinite(residual_term)) {
+                    x_tilde[i] += residual_term;
+                }
             }
         }
     }
@@ -277,12 +311,18 @@ int qkv_dequant_one(
     //          but dequantization multiplies by 0 → inconsistent behavior
     // Solution: Return zero vector explicitly when norm is too small
     // Impact: Consistent quantization/dequantization behavior → accurate PPL
-    if (norm < 1e-12f) {
+    // BUGFIX 729: Check norm for NaN/Inf ★★★
+    if (!isfinite(norm) || norm < 1e-12f) {
         memset(output, 0, (size_t)d * sizeof(float));
         return 1;
     }
     for (int i = 0; i < d; i++) {
-        output[i] = x_tilde[i] * norm;
+        float result = x_tilde[i] * norm;
+        // BUGFIX 730: Check final denormalized result for NaN/Inf ★★★
+        if (!isfinite(result)) {
+            result = 0.0f;
+        }
+        output[i] = result;
     }
 
     return 1;
@@ -345,7 +385,11 @@ int qkv_dot_mse_split_rotated_token(
     for (int i = 0; i < n_out; i++) {
         const int channel = outlier_channels[i];
         if (channel < 0 || channel >= d) return 0;
-        dot += q_rotated[channel] * out_centroids[indices[i]];
+        float term = q_rotated[channel] * out_centroids[indices[i]];
+        // BUGFIX 737: Check dot product term for NaN/Inf (outlier) ★★
+        if (isfinite(term)) {
+            dot += term;
+        }
     }
 
     // Normal channels
@@ -359,9 +403,17 @@ int qkv_dot_mse_split_rotated_token(
         if (is_outlier[i]) continue;
         // BUGFIX 382: normal_pos 범위 체크
         if (normal_pos >= n_norm) return 0;
-        dot += q_rotated[i] * norm_centroids[indices[normal_pos++]];
+        float term = q_rotated[i] * norm_centroids[indices[normal_pos++]];
+        // BUGFIX 738: Check dot product term for NaN/Inf (normal) ★★
+        if (isfinite(term)) {
+            dot += term;
+        }
     }
 
+    // BUGFIX 739: Check final dot product for NaN/Inf ★★★
+    if (!isfinite(dot)) {
+        dot = 0.0f;
+    }
     *out_dot = dot;
     return 1;
 }

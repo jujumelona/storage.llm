@@ -13,7 +13,16 @@ static int device_prepare_tensor_allocation(
     // Problem: After reset_staging_slots timeout, staging_slot_size = 0 but vector not cleared
     // Code that checks slot_index < staging_slots.size() passes, but slot.buf may be nullptr
     // Solution: Check staging_slot_size > 0 before using any slot
-    if (!e || !out_dst) {
+    // BUGFIX 760: Check bytes for SIZE_MAX overflow ★★★
+    if (!e || !out_dst || bytes > SIZE_MAX) {
+        return 0;
+    }
+    // BUGFIX 761: Check bytes for zero ★★
+    if (bytes == 0) {
+        return 0;
+    }
+    // BUGFIX 847: Check key for zero ★★
+    if (key == 0) {
         return 0;
     }
     *out_dst = 0;

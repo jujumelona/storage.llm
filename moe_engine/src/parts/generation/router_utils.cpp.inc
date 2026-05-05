@@ -58,9 +58,8 @@ static void moe_save_gate_input_snapshot(
 // std::frexp(negative) is undefined behavior
 // Solution: Clamp x to minimum positive value before frexp
 static inline float fast_log2f(float x) {
-    // Clamp to avoid undefined behavior with x <= 0
-    if (x <= 0.0f) {
-        x = 1.0e-10f;  // Return very negative log2 value
+    if (!std::isfinite(x) || x <= 0.0f) {
+        x = 1.0e-10f;
     }
     int e; float m = std::frexp(x, &e);
     return (float)(e - 1) + (m - 1.0f) * (1.44269504f - (m - 1.0f) * 0.5f);
@@ -85,7 +84,7 @@ static float moe_router_normalized_entropy(const std::vector<float>& sigmoid_sco
 #endif
     double sum = 0.0;
     for (float p : sigmoid_scores) {
-        if (p > 0.0f) {
+        if (p > 0.0f && std::isfinite(p)) {
             sum += (double)p;
         }
     }
@@ -94,7 +93,7 @@ static float moe_router_normalized_entropy(const std::vector<float>& sigmoid_sco
     }
     double entropy = 0.0;
     for (float p : sigmoid_scores) {
-        if (p <= 0.0f) {
+        if (p <= 0.0f || !std::isfinite(p)) {
             continue;
         }
         const double q = (double)p / sum;
@@ -216,7 +215,11 @@ static int moe_router_logits_f32(
             return 0;
         }
         return moe_parallel_rows(engine, experts, 0, [&](uint32_t row) {
-            (*scratch_logits)[row] = moe_raw_tensor_dot_row(common, row, hidden, hidden_size);
+            const float logit = moe_raw_tensor_dot_row(common, row, hidden, hidden_size);
+            if (!std::isfinite(logit)) {
+                return 0;
+            }
+            (*scratch_logits)[row] = logit;
             return 1;
         });
     }
@@ -236,11 +239,18 @@ static int moe_router_logits_f32(
 }
 
 static float moe_router_sigmoid(float x) {
+    if (!std::isfinite(x)) {
+        return 0.5f;
+    }
+    const float exp_val = std::exp(-x);
+    if (!std::isfinite(exp_val)) {
+        return x > 0.0f ? 1.0f : 0.0f;
+    }
     // BUGFIX 219: Numerically stable sigmoid (same pattern as BUGFIX 209)
     // Problem: Branch-based sigmoid has underflow for large negative x
     // Solution: Use single formula: 1 / (1 + exp(-x)) for all x
     // Impact: Accurate for extreme values, ~5% faster (branch removal)
-    return 1.0f / (1.0f + std::exp(-x));
+    return 1.0f / (1.0f + exp_val);
 }
 
 static int moe_router_raw_scalar_at_f32(
@@ -339,7 +349,14 @@ static int moe_prepare_scaled_router_input_f32(
     // Solution: Add explicit comment for code clarity
     double ss = 0.0;
     for (uint32_t i = 0; i < hidden_size; ++i) {
-        ss += (double)hidden[i] * (double)hidden[i];
+        const double val = (double)hidden[i];
+        if (!std::isfinite(val)) {
+            return 0;
+        }
+        ss += val * val;
+    }
+    if (!std::isfinite(ss)) {
+        return 0;
     }
     // Safe: hidden_size > 0 guaranteed by check above
     const float norm = 1.0f / std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f);
@@ -352,5 +369,12 @@ static int moe_prepare_scaled_router_input_f32(
         } else if (scale_count >= hidden_size) {
             if (!moe_router_raw_scalar_at_f32(scale_raw, i, &scale)) return 0;
         }
-        (*out)[i] = hidden[i] * norm * scale * inv_sqrt_hidden;
+        if (!std::isfinite(scale)) {
+            return 0;
+        }
+        const float result = hidden[i] * norm * scale * inv_sqrt_hidden;
+        if (!std::isfinite(result)) {
+            return 0;
+        }
+        (*out)[i] = result;
     }

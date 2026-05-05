@@ -25,9 +25,21 @@ int qkv_quantize_vector_with_state(
     }
 
     // Step 1: Compute L2 norm
+    // BUGFIX 722: Check for NaN/Inf in input before accumulation ★★★
     float l2_norm = 0.0f;
     for (int i = 0; i < dim; ++i) {
+        if (!isfinite(input[i])) {
+            *norm_out = 0.0f;
+            memset(output, 0, (size_t)(dim * bits + 7) / 8);
+            return 1;
+        }
         l2_norm += input[i] * input[i];
+    }
+    // BUGFIX 723: Check for overflow in l2_norm accumulation ★★
+    if (!isfinite(l2_norm)) {
+        *norm_out = 0.0f;
+        memset(output, 0, (size_t)(dim * bits + 7) / 8);
+        return 1;
     }
     l2_norm = sqrtf(l2_norm);
     *norm_out = l2_norm;
@@ -67,6 +79,10 @@ int qkv_quantize_vector_with_state(
             for (int j = 0; j < dim; j++) {
                 size_t idx = (size_t)i * (size_t)dim + (size_t)j;
                 sum += state->rotation_matrix[idx] * normalized[j];
+            }
+            // BUGFIX 724: Check rotation result for NaN/Inf ★★
+            if (!isfinite(sum)) {
+                sum = 0.0f;
             }
             rotated[i] = sum;
         }

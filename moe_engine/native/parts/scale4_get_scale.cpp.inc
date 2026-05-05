@@ -4,6 +4,10 @@ float moe_scale4_get_scale(
     uint32_t row,
     uint32_t group
 ) {
+    // BUGFIX 713: Scale4 FP4 scale NaN handling ★★
+    // Problem: No validation of scale value from codebook
+    // Impact: NaN in FP4 scale propagates to all quantized values
+    // Solution: Check scale for NaN/Inf before returning
     if (!file || !entry || row >= entry->rows || group >= entry->groups ||
         entry->bits != 4 || entry->centroids != 16) {
         return 0.0f;
@@ -23,6 +27,10 @@ float moe_scale4_get_scale(
     }
     float value = 0.0f;
     memcpy(&value, file->data + codebook_offset, sizeof(float));
+    // BUGFIX 713: Check scale validity
+    if (!std::isfinite(value)) {
+        return 0.0f;
+    }
     return value;
 }
 

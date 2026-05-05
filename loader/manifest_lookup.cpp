@@ -95,7 +95,8 @@ bool ManifestLookup::load(const char* manifest_path) {
             continue;  // malformed entry, skip and keep scanning
         }
         const size_t object_end = json_match_object(text_, object_begin);
-        if (object_end == std::string::npos || object_end > text_.size()) {
+        // BUGFIX 835: object_end bounds check
+        if (object_end == std::string::npos || object_end > text_.size() || object_end <= object_begin) {
             pos = object_begin + 1;
             continue;  // malformed entry, skip and keep scanning
         }

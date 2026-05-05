@@ -62,6 +62,11 @@ static int moe_layer_apply_expert_down_scale_f32(
     if (experts > 10000) {
         return 0;
     }
+    // BUGFIX 842: Check expert_id bounds ★★
+    if ((uint32_t)expert_id >= experts) {
+        return 0;
+    }
+
     static const char* const suffixes[] = {
         "ffn_down_exps.scale",
         "ffn_gate_inp.per_expert_scale",
@@ -77,20 +82,29 @@ static int moe_layer_apply_expert_down_scale_f32(
     if (count == 1u) {
         float scale = 1.0f;
         if (!moe_raw_tensor_scalar_at_f32(raw, 0, &scale)) return 0;
+        // BUGFIX 843: Check scale for NaN/Inf ★★★
+        if (!std::isfinite(scale)) return 0;
         moe_scale_f32(values, scale, hidden_size);
         return 1;
     }
     if (experts && count == experts && (uint32_t)expert_id < experts) {
         float scale = 1.0f;
         if (!moe_raw_tensor_scalar_at_f32(raw, (uint64_t)expert_id, &scale)) return 0;
+        // BUGFIX 844: Check scale for NaN/Inf ★★★
+        if (!std::isfinite(scale)) return 0;
         moe_scale_f32(values, scale, hidden_size);
         return 1;
     }
     const uint64_t base = (uint64_t)expert_id * (uint64_t)hidden_size;
+    // BUGFIX 845: Check base overflow ★★
+    if (base > UINT64_MAX - hidden_size) return 0;
+
     if (base <= count && (uint64_t)hidden_size <= count - base) {
         for (uint32_t i = 0; i < hidden_size; ++i) {
             float scale = 1.0f;
             if (!moe_raw_tensor_scalar_at_f32(raw, base + i, &scale)) return 0;
+            // BUGFIX 846: Check scale for NaN/Inf ★★★
+            if (!std::isfinite(scale)) return 0;
             values[i] *= scale;
         }
         return 1;
@@ -105,6 +119,10 @@ static int moe_add_mlp_residual_f32(
     float* hidden,
     uint32_t hidden_size
 ) {
+    // BUGFIX 716: MLP residual addition NaN handling ★★
+    // Problem: No validation of residual values before addition
+    // Impact: NaN in MLP output propagates to hidden state
+    // Solution: Check for NaN in residual values
     if (!engine || !s || !hidden) {
         return 0;
     }
@@ -112,12 +130,16 @@ static int moe_add_mlp_residual_f32(
     if (moe_layer_post_ffw_norm_f32(
             engine, layer, s->mlp.data(), hidden_size, s->shared.data(), cfg.rms_norm_eps)) {
         for (uint32_t i = 0; i < hidden_size; ++i) {
-            hidden[i] += s->shared[i];
+            if (std::isfinite(s->shared[i])) {
+                hidden[i] += s->shared[i];
+            }
         }
         return 1;
     }
     for (uint32_t i = 0; i < hidden_size; ++i) {
-        hidden[i] += s->mlp[i];
+        if (std::isfinite(s->mlp[i])) {
+            hidden[i] += s->mlp[i];
+        }
     }
     return 1;
 }
@@ -421,7 +443,7 @@ static int moe_layer_moe_mlp_f32(
     }
     moe_juju_update_co_activation(engine, layer, s->selected_experts);
 
-    // BUGFIX 문제10: Update heat for actually used experts ?�★
+    // BUGFIX 문제10: Update heat for actually used experts ?�★
     // Problem: touch_expert_heat only called during tier transitions, not during actual use
     // Solution: Touch heat for each selected expert after router selection
     // This ensures frequently-used experts maintain high heat scores

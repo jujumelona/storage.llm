@@ -1,6 +1,18 @@
 static float moe_dot_raw_fp16_row(const uint8_t* packed, const float* x, uint32_t cols) {
+    // BUGFIX 699: FP16 input validation - NaN/Inf handling ★★
+    // Problem: No validation of packed FP16 data or x input
+    // Impact: NaN/Inf in weights or activations propagate to PPL
+    // Solution: Check for NaN/Inf in result and return 0.0f
+    // BUGFIX 787: Check cols for zero ★★★
+    if (!packed || !x || cols == 0) {
+        return 0.0f;
+    }
+    // BUGFIX 788: Check cols for overflow ★★
+    if (cols > UINT32_MAX / 2) {
+        return 0.0f;
+    }
 #if defined(__AVX512F__) && defined(__F16C__)
-    // BUGFIX 708: AVX-512 16-wide FP16 dot product ?�★??
+    // BUGFIX 708: AVX-512 16-wide FP16 dot product ?�★??
     const uint16_t* fp16 = reinterpret_cast<const uint16_t*>(packed);
     __m512 acc0 = _mm512_setzero_ps();
     __m512 acc1 = _mm512_setzero_ps();
@@ -25,6 +37,10 @@ static float moe_dot_raw_fp16_row(const uint8_t* packed, const float* x, uint32_
     float acc = _mm512_reduce_add_ps(acc0);
     for (; col < cols; ++col) {
         acc += moe_raw_fp16_to_f32(fp16[col]) * x[col];
+    }
+    // BUGFIX 699: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
     }
     return acc;
 #elif defined(__F16C__) && defined(__AVX2__)
@@ -60,9 +76,13 @@ static float moe_dot_raw_fp16_row(const uint8_t* packed, const float* x, uint32_
     for (; col < cols; ++col) {
         acc += moe_raw_fp16_to_f32(fp16[col]) * x[col];
     }
+    // BUGFIX 699: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
+    }
     return acc;
 #elif defined(__ARM_NEON) || defined(__aarch64__)
-    // BUGFIX 문제9: ARM NEON SIMD for Apple Silicon / ARM64 ?�★??
+    // BUGFIX 문제9: ARM NEON SIMD for Apple Silicon / ARM64 ?�★??
     // Problem: Only AVX-512/AVX2 paths existed, ARM fell back to scalar loop
     // Impact: 8x slower on Apple Silicon M2/M3 despite Metal zero-copy
     // Solution: Add NEON intrinsics for FP16 dot product
@@ -85,6 +105,10 @@ static float moe_dot_raw_fp16_row(const uint8_t* packed, const float* x, uint32_
     for (; col < cols; ++col) {
         acc += moe_raw_fp16_to_f32(fp16[col]) * x[col];
     }
+    // BUGFIX 699: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
+    }
     return acc;
 #else
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
@@ -106,13 +130,29 @@ static float moe_dot_raw_fp16_row(const uint8_t* packed, const float* x, uint32_
         std::memcpy(&v, packed + (uint64_t)col * 2ull, sizeof(v));
         acc += moe_raw_fp16_to_f32(v) * x[col];
     }
+    // BUGFIX 699: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
+    }
     return acc;
 #endif
 }
 
 static float moe_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32_t cols) {
+    // BUGFIX 700: FP32 input validation - NaN/Inf handling ★★
+    // Problem: No validation of packed FP32 data or x input
+    // Impact: NaN/Inf in weights or activations propagate to PPL
+    // Solution: Check for NaN/Inf in result and return 0.0f
+    // BUGFIX 789: Check cols for zero ★★★
+    if (!packed || !x || cols == 0) {
+        return 0.0f;
+    }
+    // BUGFIX 790: Check cols for overflow ★★
+    if (cols > UINT32_MAX / 4) {
+        return 0.0f;
+    }
 #if defined(__AVX512F__)
-    // BUGFIX 708: AVX-512 16-wide FP32 dot product ?�★??
+    // BUGFIX 708: AVX-512 16-wide FP32 dot product ?�★??
     // ~2x throughput over AVX2 on Ice Lake+/Zen4+.
     const float* fp32 = reinterpret_cast<const float*>(packed);
     __m512 acc0 = _mm512_setzero_ps();
@@ -135,6 +175,10 @@ static float moe_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32_
     float acc = _mm512_reduce_add_ps(acc0);
     for (; col < cols; ++col) {
         acc += fp32[col] * x[col];
+    }
+    // BUGFIX 700: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
     }
     return acc;
 #elif defined(__AVX2__)
@@ -167,9 +211,13 @@ static float moe_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32_
     for (; col < cols; ++col) {
         acc += fp32[col] * x[col];
     }
+    // BUGFIX 700: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
+    }
     return acc;
 #elif defined(__ARM_NEON) || defined(__aarch64__)
-    // BUGFIX 문제9: ARM NEON SIMD for Apple Silicon / ARM64 ?�★??
+    // BUGFIX 문제9: ARM NEON SIMD for Apple Silicon / ARM64 ?�★??
     // Problem: Only AVX-512/AVX2 paths existed, ARM fell back to scalar loop
     // Impact: 8x slower on Apple Silicon for FP32 operations
     // Solution: Add NEON intrinsics for FP32 dot product
@@ -190,6 +238,10 @@ static float moe_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32_
     float acc = vaddvq_f32(acc0);
     for (; col < cols; ++col) {
         acc += fp32[col] * x[col];
+    }
+    // BUGFIX 700: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
     }
     return acc;
 #else
@@ -212,6 +264,10 @@ static float moe_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32_
         std::memcpy(&v, packed + (uint64_t)col * 4ull, sizeof(v));
         acc += v * x[col];
     }
+    // BUGFIX 700: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
+    }
     return acc;
 #endif
 }
@@ -224,7 +280,16 @@ static inline float moe_tensor_bf16_to_f32(uint16_t v) {
 }
 
 static float moe_dot_raw_bf16_row(const uint8_t* packed, const float* x, uint32_t cols) {
-    if (!packed || !x) {
+    // BUGFIX 701: BF16 input validation - NaN/Inf handling ★★
+    // Problem: No validation of packed BF16 data or x input
+    // Impact: NaN/Inf in weights or activations propagate to PPL
+    // Solution: Check for NaN/Inf in result and return 0.0f
+    // BUGFIX 785: Check cols for zero ★★★
+    if (!packed || !x || cols == 0) {
+        return 0.0f;
+    }
+    // BUGFIX 786: Check cols for overflow ★★
+    if (cols > UINT32_MAX / 2) {
         return 0.0f;
     }
     float acc = 0.0f;
@@ -233,12 +298,28 @@ static float moe_dot_raw_bf16_row(const uint8_t* packed, const float* x, uint32_
         std::memcpy(&v, packed + (uint64_t)i * 2ull, sizeof(v));
         acc += moe_tensor_bf16_to_f32(v) * x[i];
     }
+    // BUGFIX 701: Final NaN/Inf check
+    if (!std::isfinite(acc)) {
+        return 0.0f;
+    }
     return acc;
 }
 
 static uint32_t moe_packed_lsb_code_at(const uint8_t* packed, uint32_t element_index, uint32_t bits) {
+    // BUGFIX 796: Check packed for NULL ★★★
+    if (!packed) {
+        return 0;
+    }
+    // BUGFIX 797: Check bits for valid range ★★★
+    if (bits == 0 || bits > 8) {
+        return 0;
+    }
     const uint64_t bit_offset = (uint64_t)element_index * bits;
     const uint64_t byte_offset = bit_offset >> 3;
+    // BUGFIX 798: Check byte_offset for overflow ★★
+    if (byte_offset > UINT32_MAX - 1) {
+        return 0;
+    }
     const uint32_t shift = (uint32_t)(bit_offset & 7u);
     uint32_t window = packed[byte_offset];
     if (shift + bits > 8u) {

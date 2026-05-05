@@ -1,5 +1,150 @@
 // Raw forward - Linear and RMSNorm operations
 
+static int moe_rmsnorm_unit_offset_from_json(
+    const std::string& text,
+    int* out
+) {
+    if (!out || text.empty()) {
+        return 0;
+    }
+    static const char* const bool_keys[] = {
+        "rms_norm_unit_offset",
+        "rmsnorm_unit_offset",
+        "rms_norm_weight_unit_offset",
+        "rmsnorm_weight_unit_offset",
+        "rms_norm_weight_plus_one",
+        "rmsnorm_weight_plus_one",
+        "rms_norm_add_unit",
+        "rmsnorm_add_unit"
+    };
+    int bool_value = 0;
+    for (const char* key : bool_keys) {
+        if (moe_json_get_bool_local(text, key, &bool_value)) {
+            *out = bool_value ? 1 : 0;
+            return 1;
+        }
+    }
+    static const char* const offset_keys[] = {
+        "rms_norm_weight_offset",
+        "rmsnorm_weight_offset",
+        "rms_norm_gamma_offset",
+        "rmsnorm_gamma_offset"
+    };
+    double offset = 0.0;
+    for (const char* key : offset_keys) {
+        if (moe_json_get_double_local(text, key, &offset) && std::isfinite(offset)) {
+            *out = std::fabs(offset) >= 0.5 ? 1 : 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_rmsnorm_unit_offset_from_weight_stats(
+    const moe_raw_tensor_cache_entry& raw,
+    int* out,
+    uint32_t* out_samples,
+    double* out_raw_mean,
+    double* out_raw_rms,
+    double* out_mean_abs_raw,
+    double* out_mean_abs_plus_one
+) {
+    if (!out || !raw.base || raw.cols != 0 || raw.rows == 0) {
+        return 0;
+    }
+    const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
+    if (!elem || raw.bytes < (uint64_t)raw.rows * (uint64_t)elem) {
+        return 0;
+    }
+    const uint32_t max_samples = 512u;
+    const uint32_t step = raw.rows > max_samples ? (raw.rows + max_samples - 1u) / max_samples : 1u;
+    uint32_t samples = 0;
+    double raw_sum = 0.0;
+    double raw_ss = 0.0;
+    double mean_abs_raw = 0.0;
+    double mean_abs_plus_one = 0.0;
+    for (uint32_t i = 0; i < raw.rows; i += step) {
+        const float w = moe_raw_scalar_to_f32(raw.base + (uint64_t)i * (uint64_t)elem, raw.scalar_encoding);
+        if (!std::isfinite(w)) {
+            continue;
+        }
+        raw_sum += (double)w;
+        raw_ss += (double)w * (double)w;
+        mean_abs_raw += (double)std::fabs(w);
+        mean_abs_plus_one += (double)std::fabs(1.0f + w);
+        ++samples;
+    }
+    if (samples < 16u) {
+        return 0;
+    }
+    const double inv = 1.0 / (double)samples;
+    const double raw_mean = raw_sum * inv;
+    const double raw_rms = std::sqrt(raw_ss * inv);
+    mean_abs_raw *= inv;
+    mean_abs_plus_one *= inv;
+    if (out_samples) *out_samples = samples;
+    if (out_raw_mean) *out_raw_mean = raw_mean;
+    if (out_raw_rms) *out_raw_rms = raw_rms;
+    if (out_mean_abs_raw) *out_mean_abs_raw = mean_abs_raw;
+    if (out_mean_abs_plus_one) *out_mean_abs_plus_one = mean_abs_plus_one;
+
+    if (mean_abs_raw < 0.35 && mean_abs_plus_one > 0.65 && mean_abs_plus_one < 1.35) {
+        *out = 1;
+        return 1;
+    }
+    if (mean_abs_raw > 0.50 || raw_rms > 0.50) {
+        *out = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int moe_engine_rmsnorm_unit_offset(
+    const moe_pc_engine* engine,
+    const moe_raw_tensor_cache_entry& raw
+) {
+    if (!engine) {
+        return 0;
+    }
+    const int cached = engine->cached_rmsnorm_unit_offset.load(std::memory_order_acquire);
+    if (cached >= 0) {
+        return cached ? 1 : 0;
+    }
+    int value = 0;
+    const char* source = "default";
+    uint32_t samples = 0;
+    double raw_mean = 0.0;
+    double raw_rms = 0.0;
+    double mean_abs_raw = 0.0;
+    double mean_abs_plus_one = 0.0;
+    if (moe_rmsnorm_unit_offset_from_json(engine->offload_gguf_metadata_json, &value)) {
+        source = "metadata";
+    } else if (moe_rmsnorm_unit_offset_from_json(engine->offload_graph_ir_json, &value)) {
+        source = "graph_ir";
+    } else if (moe_rmsnorm_unit_offset_from_weight_stats(
+                   raw,
+                   &value,
+                   &samples,
+                   &raw_mean,
+                   &raw_rms,
+                   &mean_abs_raw,
+                   &mean_abs_plus_one)) {
+        source = "weight_stats";
+    }
+    engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0, std::memory_order_release);
+    moe_profile_log(
+        "rmsnorm_unit_offset",
+        "source=%s value=%d samples=%u raw_mean=%.6g raw_rms=%.6g mean_abs_raw=%.6g mean_abs_plus_one=%.6g",
+        source,
+        value ? 1 : 0,
+        samples,
+        raw_mean,
+        raw_rms,
+        mean_abs_raw,
+        mean_abs_plus_one);
+    return value ? 1 : 0;
+}
+
 int moe_pc_engine_find_raw_tensor(
     moe_pc_engine_t* engine,
     int32_t layer,
@@ -144,10 +289,19 @@ int moe_pc_engine_raw_rmsnorm_f32(
     ss = buf[0] + buf[1] + buf[2] + buf[3];
 #endif
     for (; i < input_count; ++i) {
+        if (!std::isfinite(input[i])) {
+            return 0;
+        }
         ss += (double)input[i] * (double)input[i];
     }
+    if (!std::isfinite(ss) || ss < 0.0) {
+        return 0;
+    }
     const float norm = 1.0f / std::sqrt((float)(ss / (double)input_count) + (eps > 0.0f ? eps : 1.0e-6f));
-    const int unit_offset = moe_engine_uses_gemma_rmsnorm_unit_offset(engine);
+    if (!std::isfinite(norm)) {
+        return 0;
+    }
+    const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, raw);
     if (moe_profile_enabled()) {
         double weight_ss = 0.0;
         double weight_abs = 0.0;
@@ -185,7 +339,14 @@ int moe_pc_engine_raw_rmsnorm_f32(
     }
     const int ok = moe_parallel_rows(engine, input_count, 0, [&](uint32_t i) {
         const float w = moe_raw_scalar_to_f32(raw.base + (uint64_t)i * (uint64_t)elem, raw.scalar_encoding);
-        output[i] = input[i] * norm * (unit_offset ? (1.0f + w) : w);
+        if (!std::isfinite(w)) {
+            return 0;
+        }
+        const float result = input[i] * norm * (unit_offset ? (1.0f + w) : w);
+        if (!std::isfinite(result)) {
+            return 0;
+        }
+        output[i] = result;
         return 1;
     });
     if (ok && moe_profile_enabled()) {

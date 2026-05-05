@@ -190,11 +190,16 @@ static int moe_dot_tensor_record_row(
     uint32_t x_count,
     float* out_value
 ) {
+    // BUGFIX 858: Check engine pointer for NULL ★★
     if (!engine || !rec || !x || !out_value ||
         x_count != rec->info.cols || !row_bounds_ok(*rec, row)) {
         return 0;
     }
     if (!shard || !mmap_get_ptr(shard, 0)) {
+        return 0;
+    }
+    // BUGFIX 859: Check x_count for zero to prevent division by zero ★★★
+    if (x_count == 0) {
         return 0;
     }
     const int declared_weight_format = tensor_weight_format(*rec);
@@ -214,14 +219,26 @@ static int moe_dot_tensor_record_row(
     }
     if (weight_format == moe_WEIGHT_ENCODING_RAW_FP16) {
         *out_value = moe_dot_raw_fp16_row(packed, x, rec->info.cols);
+        // BUGFIX 860: Check result for NaN/Inf ★★★
+        if (!isfinite(*out_value)) {
+            return 0;
+        }
         return 1;
     }
     if (weight_format == moe_WEIGHT_ENCODING_RAW_BF16) {
         *out_value = moe_dot_raw_bf16_row(packed, x, rec->info.cols);
+        // BUGFIX 861: Check result for NaN/Inf ★★★
+        if (!isfinite(*out_value)) {
+            return 0;
+        }
         return 1;
     }
     if (weight_format == moe_WEIGHT_ENCODING_RAW_FP32) {
         *out_value = moe_dot_raw_fp32_row(packed, x, rec->info.cols);
+        // BUGFIX 862: Check result for NaN/Inf ★★★
+        if (!isfinite(*out_value)) {
+            return 0;
+        }
         return 1;
     }
     if (weight_format == moe_WEIGHT_ENCODING_NVFP4) {

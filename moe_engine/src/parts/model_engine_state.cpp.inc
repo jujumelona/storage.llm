@@ -67,6 +67,7 @@ static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {
     engine->cached_router_route_scale_bits.store(0, std::memory_order_relaxed);
     engine->cached_embedding_scale_hidden.store(0, std::memory_order_relaxed);
     engine->cached_embedding_scale_bits.store(0, std::memory_order_relaxed);
+    engine->cached_rmsnorm_unit_offset.store(-1, std::memory_order_relaxed);
     {
         std::unique_lock<std::shared_mutex> lock(engine->common_tensor_suffix_cache_mutex);
         engine->common_tensor_suffix_cache.clear();

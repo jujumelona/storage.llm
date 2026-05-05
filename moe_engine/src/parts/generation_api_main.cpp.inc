@@ -182,7 +182,7 @@ int moe_pc_engine_generate_token_ids(
         // Validate all prompt tokens first
         std::vector<int32_t> safe_input(prefill_count);
         for (uint32_t i = 0; i < prefill_count; ++i) {
-            if (input_token_ids[i] < 0 || (uint32_t)safe_input[i] >= c->vocab_size) {
+            if (input_token_ids[i] < 0 || (uint32_t)input_token_ids[i] >= c->vocab_size) {
                 safe_input[i] = config && config->eos_token_id ? config->eos_token_id : 0;
             } else {
                 safe_input[i] = input_token_ids[i];

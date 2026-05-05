@@ -251,12 +251,24 @@ static void moe_juju_probe_note_model_config_json(
     std::string string_value;
 
     if (moe_json_get_u64_local(text_config, "num_hidden_layers", &value)) {
+        // BUGFIX 854: Check value bounds before clamping ★★
+        if (value > UINT32_MAX) {
+            value = UINT32_MAX;
+        }
         probe->shape.num_hidden_layers = moe_u64_to_u32_clamped(value, probe->shape.num_hidden_layers);
     }
     if (moe_json_get_u64_local(text_config, "hidden_size", &value)) {
+        // BUGFIX 855: Check value bounds before clamping ★★
+        if (value > UINT32_MAX) {
+            value = UINT32_MAX;
+        }
         probe->shape.hidden_size = moe_u64_to_u32_clamped(value, probe->shape.hidden_size);
     }
     if (moe_json_get_u64_local(text_config, "vocab_size", &value)) {
+        // BUGFIX 856: Check value bounds before clamping ★★
+        if (value > UINT32_MAX) {
+            value = UINT32_MAX;
+        }
         probe->shape.vocab_size = moe_u64_to_u32_clamped(value, probe->shape.vocab_size);
     }
     if (moe_json_get_u64_local(text_config, "num_experts", &value) ||

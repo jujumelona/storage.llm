@@ -22,7 +22,12 @@ static uint64_t moe_effective_juju_tensor_bytes(
     const moe_juju_tensor_json_entry_t& entry,
     const moe_offload_gguf_contract_t& contract
 ) {
+    // BUGFIX 803: Check entry.juju_bytes for zero ★★★
     if (entry.juju_bytes == 0 || entry.dims == 0 || entry.shape[0] == 0) {
+        return entry.juju_bytes;
+    }
+    // BUGFIX 804: Check dims for reasonable upper bound ★★
+    if (entry.dims > 8) {
         return entry.juju_bytes;
     }
     const uint32_t cols = (uint32_t)std::min<uint64_t>(entry.shape[0], UINT32_MAX);
@@ -65,6 +70,10 @@ static void moe_dynamic_shape_note_tensor(
     const uint64_t* shape
 ) {
     if (!engine || key.empty() || !shape) {
+        return;
+    }
+    // BUGFIX 802: Check dims for reasonable upper bound ★★
+    if (dims > 8) {
         return;
     }
     moe_model_shape_t next = engine->dynamic_shape;

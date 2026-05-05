@@ -11,7 +11,7 @@
                 continue;
             }
 
-            // BUGFIX 臾몄젣7: O(1) check with bitmap instead of O(n) loop
+            // BUGFIX ?얜챷??: O(1) check with bitmap instead of O(n) loop
             if (is_free[i]) {
                 continue;
             }
@@ -25,7 +25,7 @@
         }
 
         if (evict_candidate >= 0) {
-            // BUGFIX 302 + 臾몄젣7: O(1) check with bitmap ??            if (!is_free[evict_candidate]) {
+            if (!is_free[evict_candidate]) {
                 // Clear the block and add to free list
                 blocks[evict_candidate].num_tokens = 0;
                 is_free[evict_candidate] = true;
@@ -99,7 +99,7 @@ static void moe_free_kv_vram_allocations(
 }
 
 
-// BUGFIX 臾몄젣4: KV block VRAM promotion/eviction ?끸쁾??// Promotes hot KV blocks to VRAM for faster attention computation
+// BUGFIX ?얜챷??: KV block VRAM promotion/eviction ??몄겲??// Promotes hot KV blocks to VRAM for faster attention computation
 // Uses LRU + frequency tracking similar to expert residency
 
 static int promote_kv_block_to_vram(
@@ -133,10 +133,19 @@ static int promote_kv_block_to_vram(
 
     // Calculate block size (assuming layers from engine config)
     const uint32_t layers = moe_paged_kv_layer_count(engine);
+    if (layers == 0) {
+        return 0;
+    }
     const uint64_t data_size = (uint64_t)manager->block_size * layers * 512;
     const uint64_t scales_size = (uint64_t)manager->block_size * layers * sizeof(float);
     const uint64_t zeros_size = (uint64_t)manager->block_size * layers * sizeof(float);
+    if (data_size > UINT64_MAX / 2 || scales_size > UINT64_MAX / 2 || zeros_size > UINT64_MAX / 2) {
+        return 0;
+    }
     const uint64_t total_size = data_size + scales_size + zeros_size;
+    if (total_size < data_size || total_size < scales_size || total_size < zeros_size) {
+        return 0;
+    }
 
     // Check VRAM KV budget
     const uint64_t kv_budget = engine->vram_kv_budget_bytes.load(std::memory_order_relaxed);
@@ -148,11 +157,18 @@ static int promote_kv_block_to_vram(
 
     // Try to allocate VRAM budget
     uint64_t current_used = kv_used;
+    if (current_used > UINT64_MAX - total_size) {
+        return 0;
+    }
     while (current_used + total_size <= kv_budget) {
         if (engine->vram_kv_used_bytes.compare_exchange_weak(
                 current_used, current_used + total_size,
                 std::memory_order_acq_rel, std::memory_order_acquire)) {
             break;
+        }
+        // BUGFIX 754: Re-check overflow after CAS failure ?끸쁾
+        if (current_used > UINT64_MAX - total_size) {
+            return 0;
         }
     }
 
@@ -183,7 +199,7 @@ static int promote_kv_block_to_vram(
 
     // Allocate data buffer
     if (data_size > 0) {
-        if (data_size > 10ull * 1024 * 1024 * 1024) {
+        if (data_size > 10ull * 1024 * 1024 * 1024 || data_size > SIZE_MAX) {
             engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
             return 0;
         }
@@ -200,7 +216,7 @@ static int promote_kv_block_to_vram(
 
     // Allocate scales buffer
     if (scales_size > 0) {
-        if (scales_size > 1ull * 1024 * 1024 * 1024) {
+        if (scales_size > 1ull * 1024 * 1024 * 1024 || scales_size > SIZE_MAX) {
             if (vram_data_ptr) {
                 if (engine->backend_caps.backend == moe_BACKEND_HIP) engine->hip.hipFree(vram_data_ptr);
                 else if (engine->backend_caps.backend == moe_BACKEND_CUDA) engine->cuda.cuMemFree(vram_data_ptr);
@@ -226,7 +242,7 @@ static int promote_kv_block_to_vram(
 
     // Allocate zeros buffer
     if (zeros_size > 0) {
-        if (zeros_size > 1ull * 1024 * 1024 * 1024) {
+        if (zeros_size > 1ull * 1024 * 1024 * 1024 || zeros_size > SIZE_MAX) {
             if (vram_data_ptr) {
                 if (engine->backend_caps.backend == moe_BACKEND_HIP) engine->hip.hipFree(vram_data_ptr);
                 else if (engine->backend_caps.backend == moe_BACKEND_CUDA) engine->cuda.cuMemFree(vram_data_ptr);
@@ -258,9 +274,8 @@ static int promote_kv_block_to_vram(
         }
     }
 
-    // BUGFIX Problem 14: Fix device_accounted initialization ★★★
-    // Problem: device_accounted = 1 after device_account_free_bytes_sub
-    // → Error paths before sub() don't restore VRAM budget → budget leak
+    // Keep device accounting ownership aligned after the pending reservation becomes a real allocation.
+    // ??Error paths before sub() don't restore VRAM budget ??budget leak
     // Solution: Initialize to 0, set to 1 after sub() call
     // Impact: Correct budget restoration on allocation failure
     int device_accounted = 0;
@@ -268,6 +283,11 @@ static int promote_kv_block_to_vram(
 
     // Copy data to VRAM
     if (host_data && vram_data_ptr) {
+        if (data_size > SIZE_MAX) {
+            moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr, device_accounted ? total_size : 0);
+            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            return 0;
+        }
         if (engine->backend_caps.backend == moe_BACKEND_HIP) {
             res = engine->hip.hipMemcpyHtoD(vram_data_ptr, host_data, data_size);
         } else if (engine->backend_caps.backend == moe_BACKEND_CUDA) {

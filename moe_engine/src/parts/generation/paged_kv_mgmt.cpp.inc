@@ -80,6 +80,8 @@ static void touch_kv_block_heat(
     }
 
     const uint64_t now = engine->expert_touch_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    // BUGFIX 827: Overflow check for epoch
+    if (now == 0) return;
     block->last_access_epoch = now;
     block->access_count = (block->access_count < UINT32_MAX) ?
         block->access_count + 1 : UINT32_MAX;
@@ -100,7 +102,14 @@ static uint32_t evict_cold_kv_blocks(
 
     const uint64_t now = engine->expert_touch_epoch.load(std::memory_order_relaxed);
     const uint32_t layers = moe_paged_kv_layer_count(engine);
+    // BUGFIX 828: Layers validation
+    if (layers == 0 || layers > 1000) return 0;
+    // BUGFIX 829: Block size validation
+    if (manager->block_size == 0 || manager->block_size > 1000000) return 0;
+
     const uint64_t block_size = (uint64_t)manager->block_size * layers * (512 + 2 * sizeof(float));
+    // BUGFIX 830: Block size overflow check
+    if (block_size == 0 || block_size > UINT64_MAX / 2) return 0;
 
     // Phase 1: Collect eviction candidates and clear block pointers under lock.
     // Attention threads check block.tier/vram_data under the same mtx,
@@ -126,6 +135,8 @@ static uint32_t evict_cold_kv_blocks(
             const uint64_t age = now > block.last_access_epoch ? now - block.last_access_epoch : 0;
             const float frequency = (float)block.access_count;
             const float score = frequency / (1.0f + (float)age * 0.001f);
+            // BUGFIX 831: Score NaN check
+            if (!std::isfinite(score)) continue;
             candidates.push_back({i, score});
         }
 
@@ -202,9 +213,19 @@ static int enable_kv_pinned_memory(
 
     uint32_t pinned_count = 0;
     const uint32_t layers = moe_paged_kv_layer_count(engine);
+    // BUGFIX 832: Layers validation
+    if (layers == 0 || layers > 1000) return 0;
+    // BUGFIX 833: Block size validation
+    if (manager->block_size == 0 || manager->block_size > 1000000) return 0;
+
     const size_t data_size = (size_t)manager->block_size * layers * 512;
     const size_t scales_size = (size_t)manager->block_size * layers * sizeof(float);
     const size_t zeros_size = (size_t)manager->block_size * layers * sizeof(float);
+
+    // BUGFIX 834: Size overflow checks
+    if (data_size == 0 || data_size > SIZE_MAX / 2) return 0;
+    if (scales_size == 0 || scales_size > SIZE_MAX / 2) return 0;
+    if (zeros_size == 0 || zeros_size > SIZE_MAX / 2) return 0;
 
     for (uint32_t i = 0; i < manager->max_blocks; ++i) {
         moe_paged_kv_block_t& block = manager->blocks[i];

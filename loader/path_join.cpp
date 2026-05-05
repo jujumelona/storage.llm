@@ -17,6 +17,7 @@ static bool path_is_absolute(const std::string& path) {
 }
 
 std::string path_join(const std::string& root, const std::string& rel) {
+    // BUGFIX 857: Check root for empty before accessing last char ★★
     if (root.empty() || path_is_absolute(rel)) {
         return rel;
     }

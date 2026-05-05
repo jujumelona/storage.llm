@@ -22,11 +22,23 @@ static moe_tier_t moe_hot_miss_preferred_tier(
     }
     const float dma_gbps = engine->backend_caps.dma_bandwidth_gbps > 0.0f ?
         engine->backend_caps.dma_bandwidth_gbps : 12.0f;
+    // BUGFIX 746: Check dma_gbps for zero before division ★★★
+    if (dma_gbps <= 0.0f) {
+        return preferred_tier;
+    }
     const float pcie_ms = (float)bytes / (dma_gbps * 1e9f / 1000.0f);
+    // BUGFIX 747: Check pcie_ms for NaN/Inf ★★
+    if (!isfinite(pcie_ms)) {
+        return preferred_tier;
+    }
     constexpr float cpu_gflops = 100.0f;
     constexpr uint32_t token_count = 1u;
     const float compute_gflops = ((float)bytes / 2.0f * 2.0f * (float)token_count) / 1e9f;
     const float cpu_ms = (compute_gflops / cpu_gflops) * 1000.0f;
+    // BUGFIX 748: Check cpu_ms for NaN/Inf ★★
+    if (!isfinite(cpu_ms)) {
+        return preferred_tier;
+    }
     return cpu_ms < pcie_ms ? moe_TIER_RAM : preferred_tier;
 }
 

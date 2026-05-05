@@ -11,8 +11,16 @@ static moe_platform_t default_platform() {
 }
 
 static moe_backend_t choose_backend(moe_backend_t preferred, moe_platform_t platform) {
+    // BUGFIX 852: Check preferred for invalid enum value ★★
+    if (preferred < moe_BACKEND_AUTO || preferred >= moe_BACKEND_COUNT) {
+        preferred = moe_BACKEND_AUTO;
+    }
     if (preferred != moe_BACKEND_AUTO) {
         return preferred;
+    }
+    // BUGFIX 853: Check platform for invalid enum value ★★
+    if (platform < moe_PLATFORM_AUTO || platform >= moe_PLATFORM_COUNT) {
+        platform = moe_PLATFORM_AUTO;
     }
     if (platform == moe_PLATFORM_AUTO) {
         platform = default_platform();

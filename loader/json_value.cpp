@@ -36,6 +36,10 @@ bool json_get_u64(const JsonSlice& slice, const char* key, uint64_t* out) {
     char* end = nullptr;
     const char* begin = slice.text->c_str() + value;
     const char* limit = slice.text->c_str() + slice.end;
+    // BUGFIX 805: Check begin for NULL ★★★
+    if (!begin || !limit || begin >= limit) {
+        return false;
+    }
     *out = std::strtoull(begin, &end, 10);
     // Bug 1: Verify strtoull didn't read past slice boundary
     // BUGFIX 463: errno == ERANGE 체크 추가
@@ -55,6 +59,10 @@ bool json_get_string(const JsonSlice& slice, const char* key, std::string* out) 
     }
     // Bug 5: Handle escaped quotes inside string
     size_t end = begin + 1;
+    // BUGFIX 806: Check end bounds before loop ★★
+    if (end >= slice.end) {
+        return false;
+    }
     while (end < slice.end) {
         if ((*slice.text)[end] == '\\') {
             // BUGFIX 464: end + 2 범위 체크

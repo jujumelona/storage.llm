@@ -80,9 +80,21 @@
     // Gate weight layout: [experts × hidden_size] in BF16
     // We compute: approx_logit[e] = sum_{i=0}^{trunc_size-1} hidden[i] * gate[e][i]
     const uint32_t router_elem = moe_raw_scalar_size(router_encoding);
+    // BUGFIX 791: Check router_elem for zero ★★★
+    if (router_elem == 0) {
+        return;
+    }
     const uint64_t row_bytes = common_router.base ?
         moe_raw_tensor_row_bytes(common_router, full_hidden) :
         (uint64_t)full_hidden * (uint64_t)router_elem;
+    // BUGFIX 792: Check row_bytes for overflow ★★★
+    if (row_bytes == 0 || row_bytes > UINT64_MAX / experts) {
+        return;
+    }
+    // BUGFIX 793: Check experts for reasonable upper bound ★★
+    if (experts > 10000) {
+        return;
+    }
     std::vector<float> approx_logits(experts, 0.0f);
 
     for (uint32_t e = 0; e < experts; ++e) {
@@ -100,11 +112,31 @@
 
     // Apply sigmoid activation (same as actual router)
     auto sigmoid = [](float x) -> float {
+        // BUGFIX 720: Sigmoid NaN handling ★★
+        // Problem: No validation of x before exp
+        // Impact: NaN in router logit propagates to expert selection
+        // Solution: Check for NaN in input and exp result
+        if (!std::isfinite(x)) {
+            return 0.5f;
+        }
+        // BUGFIX 794: Check for overflow in exp argument ★★★
+        if (x > 88.0f) {
+            return 1.0f;
+        }
+        if (x < -88.0f) {
+            return 0.0f;
+        }
         if (x >= 0.0f) {
             const float z = std::exp(-x);
+            if (!std::isfinite(z)) {
+                return 1.0f;
+            }
             return 1.0f / (1.0f + z);
         }
         const float z = std::exp(x);
+        if (!std::isfinite(z)) {
+            return 0.0f;
+        }
         return z / (1.0f + z);
     };
     for (float& v : approx_logits) {
@@ -116,6 +148,10 @@
 
     // Select top-k predicted experts (use base top-k, not adaptive)
     const uint32_t predict_k = std::min(experts, (uint32_t)moe_MOE_BASE_TOP_EXPERTS * 2u);
+    // BUGFIX 795: Check experts for zero before vector resize ★★★
+    if (experts == 0) {
+        return;
+    }
     std::vector<uint32_t> order(experts);
     for (uint32_t i = 0; i < experts; ++i) order[i] = i;
 
