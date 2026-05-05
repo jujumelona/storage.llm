@@ -20,36 +20,76 @@ static void moe_profile_resource_snapshot(
     uint64_t* out_rss_bytes,
     uint64_t* out_avail_ram_bytes
 ) {
-    if (out_proc_cpu_core_pct) {
-        *out_proc_cpu_core_pct = 0.0;
-    }
-    if (out_proc_cpu_host_pct) {
-        *out_proc_cpu_host_pct = 0.0;
-    }
-    if (out_rss_bytes) {
-        *out_rss_bytes = storagellm::current_process_rss_bytes();
-    }
-    if (out_avail_ram_bytes) {
-        *out_avail_ram_bytes = storagellm::available_ram_bytes();
-    }
-    const uint64_t cpu_us = storagellm::current_process_cpu_time_us();
+    static std::atomic<uint64_t> last_sample_us{0};
     static std::atomic<uint64_t> last_wall_us{0};
     static std::atomic<uint64_t> last_cpu_us{0};
+    static std::atomic<uint64_t> cached_core_milli{0};
+    static std::atomic<uint64_t> cached_host_milli{0};
+    static std::atomic<uint64_t> cached_rss_bytes{0};
+    static std::atomic<uint64_t> cached_avail_ram_bytes{0};
+
+    const auto store_pct = [](double value) -> uint64_t {
+        if (!std::isfinite(value) || value <= 0.0) {
+            return 0;
+        }
+        const double capped = std::min<double>(value, 1000000.0);
+        return (uint64_t)(capped * 1000.0 + 0.5);
+    };
+    const auto emit_cached = [&]() {
+        if (out_proc_cpu_core_pct) {
+            *out_proc_cpu_core_pct = (double)cached_core_milli.load(std::memory_order_relaxed) / 1000.0;
+        }
+        if (out_proc_cpu_host_pct) {
+            *out_proc_cpu_host_pct = (double)cached_host_milli.load(std::memory_order_relaxed) / 1000.0;
+        }
+        if (out_rss_bytes) {
+            *out_rss_bytes = cached_rss_bytes.load(std::memory_order_relaxed);
+        }
+        if (out_avail_ram_bytes) {
+            *out_avail_ram_bytes = cached_avail_ram_bytes.load(std::memory_order_relaxed);
+        }
+    };
+
+    const uint64_t sample_us = last_sample_us.load(std::memory_order_relaxed);
+    if (sample_us && now_us >= sample_us && now_us - sample_us < 10000ull) {
+        emit_cached();
+        return;
+    }
+    uint64_t expected = sample_us;
+    if (!last_sample_us.compare_exchange_strong(
+            expected,
+            now_us,
+            std::memory_order_relaxed,
+            std::memory_order_relaxed)) {
+        emit_cached();
+        return;
+    }
+
+    const uint64_t rss_bytes = storagellm::current_process_rss_bytes();
+    const uint64_t avail_ram_bytes = storagellm::available_ram_bytes();
+    const uint64_t cpu_us = storagellm::current_process_cpu_time_us();
     const uint64_t prev_wall = last_wall_us.exchange(now_us, std::memory_order_relaxed);
     const uint64_t prev_cpu = last_cpu_us.exchange(cpu_us, std::memory_order_relaxed);
+    double core_pct = 0.0;
+    double host_pct = 0.0;
     if (!prev_wall || !prev_cpu || now_us <= prev_wall || cpu_us < prev_cpu) {
+        cached_core_milli.store(0, std::memory_order_relaxed);
+        cached_host_milli.store(0, std::memory_order_relaxed);
+        cached_rss_bytes.store(rss_bytes, std::memory_order_relaxed);
+        cached_avail_ram_bytes.store(avail_ram_bytes, std::memory_order_relaxed);
+        emit_cached();
         return;
     }
     const double wall_delta = (double)(now_us - prev_wall);
     const double cpu_delta = (double)(cpu_us - prev_cpu);
-    const double core_pct = wall_delta > 0.0 ? (100.0 * cpu_delta / wall_delta) : 0.0;
+    core_pct = wall_delta > 0.0 ? (100.0 * cpu_delta / wall_delta) : 0.0;
     const uint32_t hw = std::max<uint32_t>(1u, std::thread::hardware_concurrency());
-    if (out_proc_cpu_core_pct) {
-        *out_proc_cpu_core_pct = core_pct;
-    }
-    if (out_proc_cpu_host_pct) {
-        *out_proc_cpu_host_pct = core_pct / (double)hw;
-    }
+    host_pct = core_pct / (double)hw;
+    cached_core_milli.store(store_pct(core_pct), std::memory_order_relaxed);
+    cached_host_milli.store(store_pct(host_pct), std::memory_order_relaxed);
+    cached_rss_bytes.store(rss_bytes, std::memory_order_relaxed);
+    cached_avail_ram_bytes.store(avail_ram_bytes, std::memory_order_relaxed);
+    emit_cached();
 }
 
 static void moe_profile_log(const char* tag, const char* fmt, ...) {
