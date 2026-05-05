@@ -2587,16 +2587,51 @@ def _juju_build_layer_prefetch_plan(tensor_records, layers):
     return plan
 
 
+def _juju_scalar_value(value):
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            scalar = _juju_scalar_value(item)
+            if scalar is not None and scalar != "":
+                return scalar
+        return None
+    if isinstance(value, dict):
+        for key in ("value", "default", "size", "dim", "count"):
+            if key in value:
+                scalar = _juju_scalar_value(value.get(key))
+                if scalar is not None and scalar != "":
+                    return scalar
+        return None
+    return value
+
+
+def _juju_int_or_none(value):
+    value = _juju_scalar_value(value)
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _juju_first_int(*values):
+    for value in values:
+        parsed = _juju_int_or_none(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def _juju_kv_layout_contract(contract, runtime_arch):
     qkv = dict(contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract") or {})
-    num_heads = first_present(runtime_arch.get("num_attention_heads"), qkv.get("num_attention_heads"))
-    sliding_kv_heads = first_present(runtime_arch.get("num_key_value_heads"), qkv.get("num_key_value_heads"), qkv.get("kv_heads"))
-    global_kv_heads = first_present(runtime_arch.get("num_global_key_value_heads"), qkv.get("num_global_key_value_heads"), sliding_kv_heads)
-    head_dim = first_present(runtime_arch.get("head_dim"), qkv.get("head_dim"), runtime_arch.get("key_length"))
-    value_head_dim = first_present(runtime_arch.get("value_head_dim"), qkv.get("value_head_dim"), qkv.get("v_head_dim"), head_dim)
-    global_head_dim = first_present(runtime_arch.get("global_head_dim"), qkv.get("global_head_dim"), head_dim)
-    global_value_head_dim = first_present(runtime_arch.get("global_value_head_dim"), qkv.get("global_value_head_dim"), global_head_dim)
-    max_seq = first_present(
+    num_heads = _juju_first_int(runtime_arch.get("num_attention_heads"), qkv.get("num_attention_heads"))
+    sliding_kv_heads = _juju_first_int(runtime_arch.get("num_key_value_heads"), qkv.get("num_key_value_heads"), qkv.get("kv_heads"))
+    global_kv_heads = _juju_first_int(runtime_arch.get("num_global_key_value_heads"), qkv.get("num_global_key_value_heads"), sliding_kv_heads)
+    head_dim = _juju_first_int(runtime_arch.get("head_dim"), qkv.get("head_dim"), runtime_arch.get("key_length"))
+    value_head_dim = _juju_first_int(runtime_arch.get("value_head_dim"), qkv.get("value_head_dim"), qkv.get("v_head_dim"), head_dim)
+    global_head_dim = _juju_first_int(runtime_arch.get("global_head_dim"), qkv.get("global_head_dim"), head_dim)
+    global_value_head_dim = _juju_first_int(runtime_arch.get("global_value_head_dim"), qkv.get("global_value_head_dim"), global_head_dim)
+    max_seq = _juju_first_int(
         runtime_arch.get("max_position_embeddings"),
         runtime_arch.get("context_length"),
         qkv.get("max_seq_len"),
@@ -2607,16 +2642,21 @@ def _juju_kv_layout_contract(contract, runtime_arch):
         if num_kv is None or k_dim is None:
             return None
         value_dim = v_dim if v_dim is not None else k_dim
-        return int(num_kv) * (int(k_dim) + int(value_dim))
+        num_kv = _juju_int_or_none(num_kv)
+        k_dim = _juju_int_or_none(k_dim)
+        value_dim = _juju_int_or_none(value_dim)
+        if num_kv is None or k_dim is None or value_dim is None:
+            return None
+        return num_kv * (k_dim + value_dim)
 
     sliding_entry = _entry(sliding_kv_heads, head_dim, value_head_dim)
     global_entry = _entry(global_kv_heads, global_head_dim, global_value_head_dim)
-    entry_dim = first_present(
+    entry_dim = _juju_first_int(
         qkv.get("entry_dim"),
         max(x for x in [sliding_entry or 0, global_entry or 0] if x is not None),
     )
-    page_tokens = int(qkv.get("page_size_tokens") or qkv.get("block_size_tokens") or 16)
-    entry_dtype = qkv.get("dtype") or qkv.get("cache_dtype") or "quantized_uint_packed"
+    page_tokens = _juju_first_int(qkv.get("page_size_tokens"), qkv.get("block_size_tokens"), 16) or 16
+    entry_dtype = _juju_scalar_value(qkv.get("dtype") or qkv.get("cache_dtype")) or "quantized_uint_packed"
     return {
         "format": "JUJU_KV_LAYOUT_CONTRACT_V1",
         "layout": "position_major_layer_contiguous_entry_dim",
@@ -2637,16 +2677,16 @@ def _juju_kv_layout_contract(contract, runtime_arch):
             "max_entry_dim": entry_dim,
         },
         "entry_dtype": entry_dtype,
-        "key_bits": qkv.get("k_bits"),
-        "value_bits": qkv.get("v_bits"),
-        "normal_bits": qkv.get("normal_bits"),
-        "scale_dtype": qkv.get("scale_dtype") or "float32",
-        "zero_dtype": qkv.get("zero_dtype") or "float32",
+        "key_bits": _juju_int_or_none(qkv.get("k_bits")),
+        "value_bits": _juju_int_or_none(qkv.get("v_bits")),
+        "normal_bits": _juju_int_or_none(qkv.get("normal_bits")),
+        "scale_dtype": _juju_scalar_value(qkv.get("scale_dtype")) or "float32",
+        "zero_dtype": _juju_scalar_value(qkv.get("zero_dtype")) or "float32",
         "entry_dim": entry_dim,
         "max_seq_len": max_seq,
         "page_size_tokens": page_tokens,
         "growth_page_tokens": page_tokens,
-        "residency_policy": qkv.get("residency_policy") or "ram_tracked_via_tier_usage_device_vram_when_enabled",
+        "residency_policy": _juju_scalar_value(qkv.get("residency_policy")) or "ram_tracked_via_tier_usage_device_vram_when_enabled",
         "quantized": bool(qkv),
         "page_layout": "layer_position_page_major",
         "executor_contract": "moe_kv_cache_store_load_entry_must_match_layout_and_entry_dim",
