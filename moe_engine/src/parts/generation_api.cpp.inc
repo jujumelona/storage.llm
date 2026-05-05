@@ -5,6 +5,7 @@ static uint64_t tier_budget(const moe_pc_engine* engine, moe_tier_t tier);
 static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int expert);
 static int tensor_weight_format(const moe_tensor_record& rec);
 static void touch_expert_heat(moe_pc_engine* engine, moe_block_state* state, double boost);
+struct moe_decode_scratch;
 
 // Error handling (no dependencies)
 #include "generation_error.cpp.inc"

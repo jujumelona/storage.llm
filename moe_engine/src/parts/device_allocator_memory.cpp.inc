@@ -314,13 +314,18 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
         uint32_t count = 1;
         if (e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &mem_props) == 0) {
             total_b = mem_props.totalSize;
+            // BUGFIX 926: Remove headroom application here ★★★ CRITICAL
+            // Problem: Headroom applied here, then again in prefetch_admission.cpp.inc
+            // Double headroom: (avail * 80%) * 80% = avail * 64% instead of 80%
+            // Solution: Use raw avail, let prefetch_admission apply single headroom
+            // Impact: Correct VRAM budget for Intel GPUs, prevents over-conservative allocation
             if (ext_props.allocatedSize > 0) {
-                uint64_t avail = (mem_props.totalSize > ext_props.allocatedSize) ? (mem_props.totalSize - ext_props.allocatedSize) : mem_props.totalSize;
-                const uint64_t keep_free_pct = 100ull - device_memory_headroom_pct(e->io_config.level_zero_memory_headroom_pct);
-                free_b = (avail * keep_free_pct) / 100ull;
+                uint64_t avail = (mem_props.totalSize > ext_props.allocatedSize)
+                    ? (mem_props.totalSize - ext_props.allocatedSize)
+                    : mem_props.totalSize;
+                free_b = avail;
             } else {
-                const uint64_t keep_free_pct = 100ull - device_memory_headroom_pct(e->io_config.level_zero_memory_headroom_pct);
-                free_b = (mem_props.totalSize * keep_free_pct) / 100ull;
+                free_b = mem_props.totalSize;
             }
             mem_queried = 1;
         }
