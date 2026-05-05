@@ -203,15 +203,18 @@ static float moe_standard_attention_score_scale(
         }
         return result;
     }
+    if (moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
+        if (source_out) {
+            *source_out = "qk_norm_layout";
+        }
+        return 1.0f;
+    }
     float result = 1.0f / std::sqrt((float)head_dim);
     if (!std::isfinite(result)) {
         if (source_out) {
             *source_out = "fallback";
         }
         return 1.0f;
-    }
-    if (moe_layer_has_qk_norm_scaled_standard_layout(engine, layer) && source_out) {
-        *source_out = "qk_norm_head_dim";
     }
     return result;
 }
