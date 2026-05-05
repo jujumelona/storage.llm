@@ -181,6 +181,7 @@ static int load_juju_tensor_index_as_tensor_index(
     std::sort(paths.begin(), paths.end());
     std::unordered_map<std::string, uint16_t> path_index_map;
     uint64_t records = 0;
+    uint64_t common_records = 0;
     moe_juju_runtime_probe_t probe{};
     std::string model_config_json;
     const int has_model_config_json = moe_read_model_config_json(root, &model_config_json);
@@ -288,6 +289,7 @@ static int load_juju_tensor_index_as_tensor_index(
                     common.shape[i] = entry.shape[i];
                 }
                 moe_register_gguf_common_tensor(engine, common, path_idx);
+                ++common_records;
                 auto common_it = engine->gguf_common_tensor_slots.find(moe_lower_ascii_copy(entry.name));
                 if (common_it != engine->gguf_common_tensor_slots.end() &&
                     common_it->second < engine->gguf_common_tensors.size()) {
@@ -407,15 +409,16 @@ static int load_juju_tensor_index_as_tensor_index(
             }
         }
     }
-    if (!records) {
+    if (!records && !common_records) {
         return 0;
     }
     moe_juju_probe_apply(engine, &probe);
     finish_tensor_index_load(engine);
     moe_dynamic_shape_finalize_adapter(engine);
     std::fprintf(stderr,
-        "[storagellm] JUJU tensor index loaded: records=%llu paths=%zu max_stream=%llu\n",
+        "[storagellm] JUJU tensor index loaded: records=%llu common_records=%llu paths=%zu max_stream=%llu\n",
         (unsigned long long)records,
+        (unsigned long long)common_records,
         engine->tensor_paths.size(),
         (unsigned long long)engine->max_tensor_stream_bytes.load(std::memory_order_relaxed));
     std::fflush(stderr);
