@@ -1,4 +1,4 @@
-static uint64_t tensor_stream_bytes(const moe_tensor_record& rec) {
+﻿static uint64_t tensor_stream_bytes(const moe_tensor_record& rec) {
     return rec.info.weight_byte_length + rec.info.scale_byte_length + rec.info.scale2_byte_length;
 }
 
@@ -21,8 +21,7 @@ static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int
     return bytes;
 }
 
-// BUGFIX 120: Issue 25 - Windows PrefetchVirtualMemory is blocking, not async ★★★
-// Problem: PrefetchVirtualMemory is a hint, not a guarantee. When io_worker calls memcpy,
+// BUGFIX 120: Issue 25 - Windows PrefetchVirtualMemory is blocking, not async ?끸쁾??// Problem: PrefetchVirtualMemory is a hint, not a guarantee. When io_worker calls memcpy,
 // if pages aren't in RAM yet, page fault blocks the worker. This is the root cause of
 // "TODO: Issue 8" that was never fully resolved.
 // Solution: Remove PrefetchVirtualMemory entirely on Windows when DirectStorage is off.
@@ -30,13 +29,13 @@ static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int
 // The mmap handle can be reopened as a file handle (shard->hFile already exists in mmap_context_t).
 // Trade-off: Requires managing file handles, but eliminates blocking page faults.
 // Status: PrefetchVirtualMemory removed. Async ReadFile path is in prefetch_pinned.cpp.inc.
-// BUGFIX Problem 3: Windows mmap touch with VirtualLock ★★ IMPORTANT
-// Problem: touch_mapped_range is no-op on Windows without DirectStorage → page fault stalls
+// BUGFIX Problem 3: Windows mmap touch with VirtualLock ?끸쁾 IMPORTANT
+// Problem: touch_mapped_range is no-op on Windows without DirectStorage ??page fault stalls
 // Solution: Use VirtualLock + VirtualUnlock pair to force pages into working set
 // This is non-blocking and acts as effective prefetch
 // Trade-off: VirtualLock can fail if working set limit reached (default 1.5GB)
 // Failure is silently ignored - page fault will occur but no worse than before
-// BUGFIX 897: Windows non-DirectStorage mmap page residency ★★★ CRITICAL
+// BUGFIX 897: Windows non-DirectStorage mmap page residency ?끸쁾??CRITICAL
 // Problem: VirtualLock + VirtualUnlock brings pages into working set, but OS can evict them
 // before copy_mapped_range_to_staging runs. Page fault blocks io_worker.
 // Solution: Add prefer_overlapped_io flag. When enabled + DirectStorage disabled,
@@ -100,9 +99,9 @@ static void touch_mapped_ranges(const moe_pc_engine* engine, const std::vector<s
         const uint8_t* next_start = ranges[i].first;
         uint64_t next_len = ranges[i].second;
 
-        // BUGFIX 924: Fix madvise range merge logic ★★ IMPORTANT
+        // BUGFIX 924: Fix madvise range merge logic ?끸쁾 IMPORTANT
         // Problem: + PAGE_SIZE allows merging non-adjacent ranges with 1-page gap
-        // → madvise called on unrelated memory between ranges → performance degradation
+        // ??madvise called on unrelated memory between ranges ??performance degradation
         // Solution: Only merge strictly adjacent ranges (no gap tolerance)
         // Impact: More accurate madvise hints, reduced syscall overhead without side effects
         if (next_start >= current_start && next_start <= current_start + current_len) {
@@ -209,22 +208,19 @@ static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t st
         return UINT32_MAX;
     }
     const uint32_t preferred = count > 1 ? (worker_index * 2u + turn) % count : 0u;
-    // BUGFIX 83: Issue 5 - Limit staging slot acquire retries ★★★
-    // Problem: Infinite loop when staging_free_slot_count=0
-    // All io_workers blocked in this loop → pipeline freeze
+    // BUGFIX 83: Issue 5 - Limit staging slot acquire retries ?끸쁾??    // Problem: Infinite loop when staging_free_slot_count=0
+    // All io_workers blocked in this loop ??pipeline freeze
     // Solution: Max 20 retries (100ms total), then return UINT32_MAX
     // Upper layer handles failure (requeue or drop)
     uint32_t retry_count = 0;
-    // BUGFIX 714: Increase MAX_RETRIES to 50 ★★★
-    // Problem: 20 retries is too short during heavy load, causing valid
+    // BUGFIX 714: Increase MAX_RETRIES to 50 ?끸쁾??    // Problem: 20 retries is too short during heavy load, causing valid
     // prefetch requests to be dropped unnecessarily.
     // Solution: Increase to 50 to give more time for staging slots to free up.
     constexpr uint32_t MAX_RETRIES = 50;
 
 #ifdef ENABLE_LOCKFREE_STAGING
     const uint32_t total_slots = static_cast<uint32_t>(engine->staging_slots.size());
-    // BUGFIX 593: Check total_slots > 0 before range_mask ★
-    // Problem: total_slots can be 0
+    // BUGFIX 593: Check total_slots > 0 before range_mask ??    // Problem: total_slots can be 0
     // Solution: Check before calling moe_staging_range_mask
     if (total_slots == 0) {
         return UINT32_MAX;
@@ -265,10 +261,9 @@ static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t st
                             device_backend_event_sync(engine, engine->staging_slots[idx].last_copy_event);
                             engine->staging_slots[idx].last_copy_event_recorded.store(false, std::memory_order_release);
                         }
-                        // BUGFIX 912: Set slot generation on acquisition ★★ IMPORTANT
+                        // BUGFIX 912: Set slot generation on acquisition ?끸쁾 IMPORTANT
                         engine->staging_slots[idx].generation = engine->staging_generation.load(std::memory_order_acquire);
-                        // BUGFIX 622: Check staging_free_slot_count > 0 before fetch_sub to prevent underflow ★
-                        // Problem: If staging_free_slot_count is 0, fetch_sub causes underflow
+                        // BUGFIX 622: Check staging_free_slot_count > 0 before fetch_sub to prevent underflow ??                        // Problem: If staging_free_slot_count is 0, fetch_sub causes underflow
                         // Solution: Only decrement if > 0
                         uint32_t current = engine->staging_free_slot_count.load(std::memory_order_acquire);
                         while (current > 0) {
@@ -290,8 +285,7 @@ try_next_lockfree_slot:
                 return UINT32_MAX;
             }
 
-            // BUGFIX 문제2: Add CV wait before giving up ★★★
-            // Problem: 50 retries with spin-wait wastes CPU, then silently drops prefetch
+            // BUGFIX 臾몄젣2: Add CV wait before giving up ?끸쁾??            // Problem: 50 retries with spin-wait wastes CPU, then silently drops prefetch
             // Solution: Use CV wait with short timeout, retry up to 500ms total
             // This prevents CPU waste while giving more time for slots to free up
             if (++retry_count >= MAX_RETRIES) {
@@ -309,8 +303,7 @@ try_next_lockfree_slot:
                 }
 
                 std::unique_lock<std::mutex> lock(engine->staging_slot_mutex);
-                // BUGFIX 문제11: Fix CV wait predicate for >64 staging slots ★★★
-                // Problem: staging_slot_free_mask is uint64_t → only 64 slots representable.
+                // BUGFIX 臾몄젣11: Fix CV wait predicate for >64 staging slots ?끸쁾??                // Problem: staging_slot_free_mask is uint64_t ??only 64 slots representable.
                 // When total_slots > 64, range_mask == 0, so (mask & range_mask) is always false.
                 // CV wait always times out even when slots are actually free.
                 // Solution: Fall back to staging_free_slot_count for >64 slot configurations.
@@ -345,15 +338,13 @@ try_next_lockfree_slot:
             } else {
                 target_cv = &engine->staging_direct_cv;
             }
-            // BUGFIX 195: Reduce wait timeout to prevent GPU starvation ★★★
-            // Problem: 20 retries × 5ms = 100ms blocking
-            // During this time gpu_stage queue empties → GPU completely idle
-            // Solution: Reduce timeout 5ms → 1ms (20ms total max)
+            // BUGFIX 195: Reduce wait timeout to prevent GPU starvation ?끸쁾??            // Problem: 20 retries 횞 5ms = 100ms blocking
+            // During this time gpu_stage queue empties ??GPU completely idle
+            // Solution: Reduce timeout 5ms ??1ms (20ms total max)
             // Still allows reasonable wait but prevents long GPU starvation
-            // Impact: GPU idle time reduced from 100ms → 20ms worst case
+            // Impact: GPU idle time reduced from 100ms ??20ms worst case
             std::unique_lock<std::mutex> lock(engine->staging_slot_mutex);
-            // BUGFIX 문제11: Fix CV wait predicate for >64 staging slots ★★★
-            target_cv->wait_for(
+            // BUGFIX 臾몄젣11: Fix CV wait predicate for >64 staging slots ?끸쁾??            target_cv->wait_for(
                 lock, std::chrono::milliseconds(1),
                 [&]() {
                     if (total_slots <= 64u)
@@ -385,10 +376,9 @@ try_next_lockfree_slot:
                     device_backend_event_sync(engine, engine->staging_slots[idx].last_copy_event);
                     engine->staging_slots[idx].last_copy_event_recorded.store(false, std::memory_order_release);
                 }
-                // BUGFIX 912: Set slot generation on acquisition ★★ IMPORTANT
+                // BUGFIX 912: Set slot generation on acquisition ?끸쁾 IMPORTANT
                 engine->staging_slots[idx].generation = engine->staging_generation.load(std::memory_order_acquire);
-                // BUGFIX 622: Check staging_free_slot_count > 0 before fetch_sub to prevent underflow ★
-                // Problem: If staging_free_slot_count is 0, fetch_sub causes underflow
+                // BUGFIX 622: Check staging_free_slot_count > 0 before fetch_sub to prevent underflow ??                // Problem: If staging_free_slot_count is 0, fetch_sub causes underflow
                 // Solution: Only decrement if > 0
                 uint32_t current = engine->staging_free_slot_count.load(std::memory_order_acquire);
                 while (current > 0) {
@@ -406,8 +396,7 @@ try_next_lockfree_slot:
             return UINT32_MAX;
         }
 
-        // BUGFIX 문제2: Add CV wait before giving up (non-lockfree path) ★★★
-        // Problem: 50 retries with spin-wait wastes CPU, then silently drops prefetch
+        // BUGFIX 臾몄젣2: Add CV wait before giving up (non-lockfree path) ?끸쁾??        // Problem: 50 retries with spin-wait wastes CPU, then silently drops prefetch
         // Solution: Use CV wait with short timeout, retry up to 500ms total
         if (++retry_count >= MAX_RETRIES) {
             // Before giving up, try CV wait one more time
@@ -440,9 +429,9 @@ try_next_lockfree_slot:
             return UINT32_MAX;
         }
 
-        // BUGFIX 68: Issue 5 - Wait on correct CV based on slot type ★★
-        // Old: All workers wait on staging_slot_cv → Thundering Herd
-        // New: Wait on type-specific CV → only relevant workers wake
+        // BUGFIX 68: Issue 5 - Wait on correct CV based on slot type ?끸쁾
+        // Old: All workers wait on staging_slot_cv ??Thundering Herd
+        // New: Wait on type-specific CV ??only relevant workers wake
         std::condition_variable* target_cv = &engine->staging_slot_cv;
         const uint32_t pinned_count = engine->staging_pinned_slot_count.load(std::memory_order_acquire);
         const uint32_t gpu_start = pinned_count;
@@ -458,10 +447,9 @@ try_next_lockfree_slot:
         }
 
         std::unique_lock<std::mutex> lock(engine->staging_slot_mutex);
-        // BUGFIX 195: Reduce wait timeout to prevent GPU starvation ★★★
-        // Fix 4: Use predicate wait to eliminate polling delay.
+        // BUGFIX 195: Reduce wait timeout to prevent GPU starvation ?끸쁾??        // Fix 4: Use predicate wait to eliminate polling delay.
         // Wake immediately when a slot is freed, timeout after 1ms max (was 5ms).
-        // 20 retries × 1ms = 20ms total (was 100ms) → reduces GPU idle time
+        // 20 retries 횞 1ms = 20ms total (was 100ms) ??reduces GPU idle time
         const bool got_slot = target_cv->wait_for(
             lock, std::chrono::milliseconds(1),
             [&]() { return engine->staging_free_slot_count.load(std::memory_order_acquire) > 0; }
@@ -473,24 +461,21 @@ try_next_lockfree_slot:
     }
 }
 
-// BUGFIX 107: Issue 21 - Cache slot counts to avoid redundant atomic loads ★
-// Problem: Same atomic variables loaded twice in short time
+// BUGFIX 107: Issue 21 - Cache slot counts to avoid redundant atomic loads ??// Problem: Same atomic variables loaded twice in short time
 // Solution: Load once and reuse values
 static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
-    // BUGFIX 594: Check engine pointer and slot_index bounds ★
-    // BUGFIX Issue 2: Use staging_slot_valid helper for correct check order ★★
+    // BUGFIX 594: Check engine pointer and slot_index bounds ??    // BUGFIX Issue 2: Use staging_slot_valid helper for correct check order ?끸쁾
     // Problem: Direct index check doesn't verify staging_slot_size first
     // Solution: Use centralized helper that enforces staging_slot_size > 0 check
-    // BUGFIX NEW-4: Remove redundant staging_slot_valid check ★
-    // Problem: staging_slot_valid called twice - first check returns if invalid,
+    // BUGFIX NEW-4: Remove redundant staging_slot_valid check ??    // Problem: staging_slot_valid called twice - first check returns if invalid,
     // so second check is always true (dead code)
     // Solution: Remove redundant second check
     if (!staging_slot_valid(engine, slot_index)) {
         return;
     }
 
-    // BUGFIX 912: Check staging_generation before release ★★ IMPORTANT
-    // Problem: Worker completes after timeout → releases slot with stale buf pointer
+    // BUGFIX 912: Check staging_generation before release ?끸쁾 IMPORTANT
+    // Problem: Worker completes after timeout ??releases slot with stale buf pointer
     // Solution: Check if generation changed (timeout occurred), skip release if stale
     // Impact: Prevents use-after-free when workers complete after staging reset
     const uint32_t current_gen = engine->staging_generation.load(std::memory_order_acquire);
@@ -510,9 +495,9 @@ static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
 #endif
         engine->staging_free_slot_count.fetch_add(1, std::memory_order_release);
 
-        // BUGFIX 68: Issue 5 - Notify only relevant CV based on slot type ★★
-        // Old: notify_one on staging_slot_cv → random worker wakes (may be wrong type)
-        // New: Notify type-specific CV → correct worker type wakes
+        // BUGFIX 68: Issue 5 - Notify only relevant CV based on slot type ?끸쁾
+        // Old: notify_one on staging_slot_cv ??random worker wakes (may be wrong type)
+        // New: Notify type-specific CV ??correct worker type wakes
         // Impact: Eliminates unnecessary wakeups, reduces context switches
         const uint32_t pinned_count = engine->staging_pinned_slot_count.load(std::memory_order_acquire);
         const uint32_t gpu_count = engine->staging_gpu_slot_count.load(std::memory_order_acquire);
@@ -527,8 +512,7 @@ static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
             engine->staging_direct_cv.notify_one();
         }
 
-        // BUGFIX 706: Removed staging_slot_cv.notify_one() ★
-        // All acquire_staging_slot paths now use type-specific CVs (staging_pinned_cv,
+        // BUGFIX 706: Removed staging_slot_cv.notify_one() ??        // All acquire_staging_slot paths now use type-specific CVs (staging_pinned_cv,
         // staging_gpu_cv, staging_direct_cv). No code path waits on staging_slot_cv.
         // The extra notify caused unnecessary context switches.
 }
@@ -539,11 +523,7 @@ static uint64_t copy_mapped_range_to_staging(
     uint64_t bytes,
     uint32_t slot_index
 ) {
-    // BUGFIX 740: Check src pointer for NULL before memcpy ★★★
     if (!engine || !src || bytes == 0 || !staging_slot_valid(engine, slot_index)) {
-        // Problem 5 Fix: Separate transient contention from structural deficit
-        // staging_slot_contention = can't acquire slot (transient, retry will succeed)
-        // staging_wraps is kept for backward compatibility but now tracks contention
         if (engine && slot_index == UINT32_MAX) {
             engine->io_atomic.staging_slot_contention.fetch_add(1);
             engine->io_atomic.staging_wraps.fetch_add(1);
@@ -551,26 +531,20 @@ static uint64_t copy_mapped_range_to_staging(
         return 0;
     }
     moe_staging_slot& slot = engine->staging_slots[slot_index];
-    // BUGFIX 741: Check slot.buf for NULL before memcpy ★★★
-    if (!slot.buf || slot.size == 0 || bytes > slot.size) {
-        // Problem 5 Fix: This is also transient contention (slot too small for this tensor)
+    uint8_t* slot_buf = slot.buf.load(std::memory_order_acquire);
+    if (!slot_buf || slot.size == 0 || bytes > slot.size) {
         engine->io_atomic.staging_slot_contention.fetch_add(1);
         engine->io_atomic.staging_wraps.fetch_add(1);
         return 0;
     }
-    // BUGFIX 742: Check for integer overflow in bytes cast to size_t ★★
     if (bytes > SIZE_MAX) {
         return 0;
     }
 
     if (bytes >= 1024ull * 1024ull) {
 #if defined(__AVX2__)
-        // BUGFIX 707: Relaxed alignment — only dst needs 32B alignment for stream stores ★★
-        // _mm256_loadu_si256 handles unaligned src safely. mmap offsets are rarely 32B-aligned,
-        // so requiring src alignment caused fallback to memcpy in most cases.
-        // Staging buffers are allocated via cudaHostAlloc/posix_memalign → always 32B-aligned.
-        if (reinterpret_cast<uintptr_t>(slot.buf) % 32 == 0) {
-            uint8_t* d = static_cast<uint8_t*>(slot.buf);
+        if (reinterpret_cast<uintptr_t>(slot_buf) % 32 == 0) {
+            uint8_t* d = slot_buf;
             const uint8_t* s = static_cast<const uint8_t*>(src);
             size_t i = 0;
             for (; i + 127 < static_cast<size_t>(bytes); i += 128) {
@@ -592,13 +566,13 @@ static uint64_t copy_mapped_range_to_staging(
                 std::memcpy(d + i, s + i, static_cast<size_t>(bytes) - i);
             }
         } else {
-            std::memcpy(slot.buf, src, static_cast<size_t>(bytes));
+            std::memcpy(slot_buf, src, static_cast<size_t>(bytes));
         }
 #else
-        std::memcpy(slot.buf, src, static_cast<size_t>(bytes));
+        std::memcpy(slot_buf, src, static_cast<size_t>(bytes));
 #endif
     } else {
-        std::memcpy(slot.buf, src, static_cast<size_t>(bytes));
+        std::memcpy(slot_buf, src, static_cast<size_t>(bytes));
     }
     return bytes;
 }
@@ -610,9 +584,7 @@ static uint64_t copy_mapped_range_to_staging_linear(
     uint32_t slot_index,
     uint64_t* staging_offset
 ) {
-    // BUGFIX 743: Check src pointer for NULL before memcpy (linear) ★★★
-    if (!engine || !src || bytes == 0 || !staging_slot_valid(engine, slot_index) || !staging_offset) {
-        // Problem 5 Fix: Separate transient contention from structural deficit
+    if (!engine || !src || bytes == 0 || !staging_offset || !staging_slot_valid(engine, slot_index)) {
         if (engine && slot_index == UINT32_MAX) {
             engine->io_atomic.staging_slot_contention.fetch_add(1);
             engine->io_atomic.staging_wraps.fetch_add(1);
@@ -620,25 +592,22 @@ static uint64_t copy_mapped_range_to_staging_linear(
         return 0;
     }
     moe_staging_slot& slot = engine->staging_slots[slot_index];
-    // BUGFIX 497: *staging_offset + bytes overflow 체크
-    // BUGFIX 744: Check slot.buf for NULL before memcpy (linear) ★★★
-    if (!slot.buf || *staging_offset > slot.size || bytes > slot.size - *staging_offset ||
+    uint8_t* slot_buf = slot.buf.load(std::memory_order_acquire);
+    if (!slot_buf || *staging_offset > slot.size || bytes > slot.size - *staging_offset ||
         (*staging_offset > 0 && bytes > UINT64_MAX - *staging_offset)) {
-        // Problem 5 Fix: This is also transient contention
         engine->io_atomic.staging_slot_contention.fetch_add(1);
         engine->io_atomic.staging_wraps.fetch_add(1);
         return 0;
     }
-    // BUGFIX 745: Check for integer overflow in bytes cast to size_t (linear) ★★
     if (bytes > SIZE_MAX) {
         return 0;
     }
+
+    uint8_t* dst = slot_buf + *staging_offset;
     if (bytes >= 1024ull * 1024ull) {
 #if defined(__AVX2__)
-        // BUGFIX 707: Relaxed alignment — only dst needs 32B alignment for stream stores ★★
-        // _mm256_loadu_si256 handles unaligned src. Staging dst is pinned → 32B aligned.
-        if (reinterpret_cast<uintptr_t>(slot.buf + *staging_offset) % 32 == 0) {
-            uint8_t* d = static_cast<uint8_t*>(slot.buf + *staging_offset);
+        if (reinterpret_cast<uintptr_t>(dst) % 32 == 0) {
+            uint8_t* d = dst;
             const uint8_t* s = static_cast<const uint8_t*>(src);
             size_t i = 0;
             for (; i + 127 < static_cast<size_t>(bytes); i += 128) {
@@ -660,23 +629,21 @@ static uint64_t copy_mapped_range_to_staging_linear(
                 std::memcpy(d + i, s + i, static_cast<size_t>(bytes) - i);
             }
         } else {
-            std::memcpy(slot.buf + *staging_offset, src, static_cast<size_t>(bytes));
+            std::memcpy(dst, src, static_cast<size_t>(bytes));
         }
 #else
-        std::memcpy(slot.buf + *staging_offset, src, static_cast<size_t>(bytes));
+        std::memcpy(dst, src, static_cast<size_t>(bytes));
 #endif
     } else {
-        std::memcpy(slot.buf + *staging_offset, src, static_cast<size_t>(bytes));
+        std::memcpy(dst, src, static_cast<size_t>(bytes));
     }
     *staging_offset += bytes;
     return bytes;
 }
 
-
 // Additional 1: HOBBIT - Mixed precision dynamic expert loading based on gate score importance
 // This is a stub integration point for the int4 fallback decoder.
-// BUGFIX 279: Mark as unused to prevent compiler warnings ★
-// Problem: Function defined but never called → compiler warning
+// BUGFIX 279: Mark as unused to prevent compiler warnings ??// Problem: Function defined but never called ??compiler warning
 // Solution: Add [[maybe_unused]] attribute or comment as future integration point
 // Status: Reserved for future HOBBIT integration, not currently used
 [[maybe_unused]]
