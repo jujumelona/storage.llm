@@ -493,10 +493,13 @@ struct server_tokenizer {
     size_t max_piece_bytes = 0;
     size_t max_special_piece_bytes = 0;
     std::string model_type;
+    uint32_t bos_token_id = 0;
     uint32_t eos_token_id = 0;
     uint32_t unk_token_id = 0;
+    bool has_bos = false;
     bool has_eos = false;
     bool has_unk = false;
+    bool add_bos_token = false;
     bool byte_fallback = false;
     std::string error;
 };
@@ -1060,6 +1063,10 @@ static void tokenizer_add_piece(server_tokenizer* tok, const std::string& raw_pi
         tokenizer_add_special_piece(tok, text_piece, id);
     }
     const std::string lowered = lower_ascii(raw_piece);
+    if (!tok->has_bos && lowered.find("bos") != std::string::npos) {
+        tok->bos_token_id = id;
+        tok->has_bos = true;
+    }
     if (!tok->has_unk && lowered.find("unk") != std::string::npos) {
         tok->unk_token_id = id;
         tok->has_unk = true;
@@ -1214,6 +1221,52 @@ static bool load_tokenizer_vocab(server_tokenizer* tok, const std::string& json)
     return tok->loaded;
 }
 
+static void tokenizer_apply_runtime_config(server_tokenizer* tok, const std::string& json) {
+    if (!tok || json.empty()) {
+        return;
+    }
+    bool add_bos = false;
+    if (json_read_bool_in_range(json, 0, json.size(), "add_bos_token", &add_bos)) {
+        tok->add_bos_token = add_bos;
+    }
+    uint32_t bos_id = 0;
+    if (json_read_u32_in_range(json, 0, json.size(), "bos_token_id", &bos_id)) {
+        tok->bos_token_id = bos_id;
+        tok->has_bos = true;
+    }
+    std::string bos_piece;
+    if (json_read_string_value(json, "bos_token", &bos_piece) && !bos_piece.empty()) {
+        auto pit = tok->piece_to_id.find(bos_piece);
+        if (pit != tok->piece_to_id.end()) {
+            tok->bos_token_id = pit->second;
+            tok->has_bos = true;
+        } else {
+            auto tit = tok->text_to_id.find(bos_piece);
+            if (tit != tok->text_to_id.end()) {
+                tok->bos_token_id = tit->second;
+                tok->has_bos = true;
+            }
+        }
+    }
+    if (!tok->has_bos) {
+        auto it = tok->piece_to_id.find("<bos>");
+        if (it != tok->piece_to_id.end()) {
+            tok->bos_token_id = it->second;
+            tok->has_bos = true;
+        }
+    }
+}
+
+static void tokenizer_prepend_bos_if_needed(const server_tokenizer& tok, std::vector<int32_t>* ids) {
+    if (!ids || !tok.add_bos_token || !tok.has_bos) {
+        return;
+    }
+    if (!ids->empty() && ids->front() == static_cast<int32_t>(tok.bos_token_id)) {
+        return;
+    }
+    ids->insert(ids->begin(), static_cast<int32_t>(tok.bos_token_id));
+}
+
 static server_tokenizer& get_server_tokenizer(const server_options& opts) {
     static std::mutex mtx;
     static server_tokenizer tok;
@@ -1245,6 +1298,19 @@ static server_tokenizer& get_server_tokenizer(const server_options& opts) {
         return tok;
     }
     load_tokenizer_vocab(&tok, json);
+    tokenizer_apply_runtime_config(&tok, json);
+    const char* config_candidates[] = {
+        "tokenizer_config.json",
+        "tokenizer/tokenizer_config.json"
+    };
+    for (const char* rel : config_candidates) {
+        std::string config_json;
+        const std::string path = join_model_file(opts.model_root, rel);
+        if (read_text_file(path, &config_json) && !config_json.empty()) {
+            tokenizer_apply_runtime_config(&tok, config_json);
+            break;
+        }
+    }
     std::cerr << "[storagellm tokenizer] load"
               << " loaded=" << (tok.loaded ? 1 : 0)
               << " model_type=" << (tok.model_type.empty() ? "unknown" : tok.model_type)
@@ -1253,6 +1319,9 @@ static server_tokenizer& get_server_tokenizer(const server_options& opts) {
               << " byte_fallback=" << (tok.byte_fallback ? 1 : 0)
               << " pieces=" << tok.id_to_piece.size()
               << " specials=" << tok.special_ids.size()
+              << " add_bos=" << (tok.add_bos_token ? 1 : 0)
+              << " has_bos=" << (tok.has_bos ? 1 : 0)
+              << " bos=" << tok.bos_token_id
               << " has_eos=" << (tok.has_eos ? 1 : 0)
               << " eos=" << tok.eos_token_id
               << " has_unk=" << (tok.has_unk ? 1 : 0)
@@ -1438,6 +1507,7 @@ static bool tokenizer_encode_greedy(const server_tokenizer& tok, const std::stri
         }
         pos = next;
     }
+    tokenizer_prepend_bos_if_needed(tok, out_ids);
     return !out_ids->empty();
 }
 
@@ -2028,6 +2098,18 @@ static server_eval_result run_server_eval(
         parsed_first_target > 0 &&
         static_cast<size_t>(parsed_first_target) < input_ids.size()) {
         first_target_index = static_cast<uint32_t>(parsed_first_target);
+    }
+    int max_input_tokens = 0;
+    if (storagellm::json_read_int(body, "max_input_tokens", &max_input_tokens) && max_input_tokens > 1 &&
+        static_cast<size_t>(max_input_tokens) < input_ids.size()) {
+        input_ids.resize(static_cast<size_t>(max_input_tokens));
+    }
+    int max_eval_tokens = 0;
+    if (storagellm::json_read_int(body, "max_eval_tokens", &max_eval_tokens) && max_eval_tokens > 0) {
+        const size_t wanted = static_cast<size_t>(first_target_index) + static_cast<size_t>(max_eval_tokens);
+        if (wanted > 1u && wanted < input_ids.size()) {
+            input_ids.resize(wanted);
+        }
     }
     log_token_ids_preview("eval_input_ids", tok, input_ids, first_target_index);
     if (input_ids.size() < 2) {
