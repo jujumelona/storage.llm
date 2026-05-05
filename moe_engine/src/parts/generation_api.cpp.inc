@@ -5,7 +5,6 @@ static uint64_t tier_budget(const moe_pc_engine* engine, moe_tier_t tier);
 static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int expert);
 static int tensor_weight_format(const moe_tensor_record& rec);
 static void touch_expert_heat(moe_pc_engine* engine, moe_block_state* state, double boost);
-struct moe_decode_scratch;
 
 // Error handling (no dependencies)
 #include "generation_error.cpp.inc"
@@ -21,14 +20,14 @@ struct moe_decode_scratch;
 // Raw operations (depends on: silu, simd_helpers)
 #include "generation_raw_ops.cpp.inc"
 
-// Router (depends on: raw_ops)
-#include "generation_router.cpp.inc"
-
 // KV cache (depends on: bf16_convert, mla_constants)
 #include "generation_kv_cache.cpp.inc"
 
 // Scratch (depends on: kv_cache, mla_constants)
 #include "generation_scratch.cpp.inc"
+
+// Router (depends on: raw_ops, scratch session telemetry)
+#include "generation_router.cpp.inc"
 
 // RoPE (depends on: mla_constants)
 #include "generation_rope.cpp.inc"

@@ -432,9 +432,27 @@ static void device_free_deferred_ptrs(moe_pc_engine* e, std::vector<std::pair<CU
             } else
 #endif
             if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipFree) {
-                e->hip.hipFree(pair.first);
+                // BUGFIX 928: Check hipFree return value ★★ IMPORTANT
+                // Problem: hipFree can fail if context lost or pointer already freed
+                // → Memory leak tracked in device_allocated_bytes but not actually freed
+                // Solution: Log error on failure (best-effort, continue loop)
+                // Impact: Enables debugging of VRAM accounting mismatches
+                const int hip_err = e->hip.hipFree(pair.first);
+                if (hip_err != 0) {
+                    fprintf(stderr, "[storageLLM ERROR] hipFree failed: ptr=%p bytes=%llu err=%d\n",
+                        (void*)pair.first, (unsigned long long)pair.second, hip_err);
+                }
             } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemFree) {
-                e->cuda.cuMemFree(pair.first);
+                // BUGFIX 928: Check cuMemFree return value ★★ IMPORTANT
+                // Problem: cuMemFree can fail if context lost or pointer already freed
+                // → Memory leak tracked in device_allocated_bytes but not actually freed
+                // Solution: Log error on failure (best-effort, continue loop)
+                // Impact: Enables debugging of VRAM accounting mismatches
+                const int cuda_err = e->cuda.cuMemFree(pair.first);
+                if (cuda_err != 0) {
+                    fprintf(stderr, "[storageLLM ERROR] cuMemFree failed: ptr=%p bytes=%llu err=%d\n",
+                        (void*)pair.first, (unsigned long long)pair.second, cuda_err);
+                }
             }
             // Bug 2: device_free_bytes already updated in device_release_allocation_locked
             // Do NOT double-add here
