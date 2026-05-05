@@ -168,6 +168,68 @@ static int moe_json_find_array_local(
     return 1;
 }
 
+static int moe_json_find_top_level_array_local(
+    const std::string& text,
+    const char* key,
+    size_t* begin,
+    size_t* end
+) {
+    if (!key || !begin || !end) {
+        return 0;
+    }
+    const size_t key_len = std::strlen(key);
+    int depth = 0;
+    for (size_t i = 0; i < text.size();) {
+        const char c = text[i];
+        if (c == '"') {
+            const size_t key_begin = i + 1;
+            size_t j = key_begin;
+            int escape = 0;
+            while (j < text.size()) {
+                const char sc = text[j];
+                if (escape) {
+                    escape = 0;
+                } else if (sc == '\\') {
+                    escape = 1;
+                } else if (sc == '"') {
+                    break;
+                }
+                ++j;
+            }
+            if (j >= text.size()) {
+                return 0;
+            }
+            if (depth == 1 &&
+                j - key_begin == key_len &&
+                text.compare(key_begin, key_len, key) == 0) {
+                const size_t colon = text.find_first_not_of(" \t\r\n", j + 1);
+                if (colon != std::string::npos && colon < text.size() && text[colon] == ':') {
+                    const size_t value = text.find_first_not_of(" \t\r\n", colon + 1);
+                    if (value != std::string::npos && value < text.size() && text[value] == '[') {
+                        const size_t close = moe_json_match_bracket_local(text, value, '[', ']');
+                        if (close != std::string::npos) {
+                            *begin = value;
+                            *end = close;
+                            return 1;
+                        }
+                    }
+                }
+            }
+            i = j + 1;
+            continue;
+        }
+        if (c == '{' || c == '[') {
+            ++depth;
+        } else if (c == '}' || c == ']') {
+            if (depth > 0) {
+                --depth;
+            }
+        }
+        ++i;
+    }
+    return 0;
+}
+
 static int moe_json_find_object_local(
     const std::string& text,
     const char* key,

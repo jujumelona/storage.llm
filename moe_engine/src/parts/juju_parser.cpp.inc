@@ -423,7 +423,9 @@ static int moe_parse_juju_tensor_index_json(
     }
     size_t arr_begin = 0;
     size_t arr_end = 0;
-    if (json.empty() || !moe_json_find_array_local(json, "tensors", &arr_begin, &arr_end)) {
+    if (json.empty() ||
+        (!moe_json_find_top_level_array_local(json, "tensors", &arr_begin, &arr_end) &&
+         !moe_json_find_array_local(json, "tensors", &arr_begin, &arr_end))) {
         return 0;
     }
     uint64_t tensor_count = 0;
