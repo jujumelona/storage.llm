@@ -2622,16 +2622,130 @@ def _juju_first_int(*values):
     return None
 
 
+def _juju_bool_or_none(value):
+    value = _juju_scalar_value(value)
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _juju_config_dict(value):
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", errors="ignore")
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _juju_contract_source_config(contract):
+    arch = dict(contract.get("arch_meta") or {})
+    for value in (
+        contract.get("source_config"),
+        contract.get("hf_config"),
+        contract.get("config_json"),
+        arch.get("source_config"),
+        arch.get("hf_config"),
+        arch.get("config_json"),
+    ):
+        data = _juju_config_dict(value)
+        if data:
+            return data
+    return {}
+
+
+def _juju_contract_text_config(contract):
+    arch = dict(contract.get("arch_meta") or {})
+    source_config = _juju_contract_source_config(contract)
+    for parent in (source_config, arch, contract):
+        for key in ("text_config", "llm_config", "model_config", "language_config", "transformer_config"):
+            data = _juju_config_dict(parent.get(key) if isinstance(parent, dict) else None)
+            if data:
+                return data
+    return {}
+
+
+def _juju_first_config_value(contract, *keys):
+    arch = dict(contract.get("arch_meta") or {})
+    text_config = _juju_contract_text_config(contract)
+    source_config = _juju_contract_source_config(contract)
+    for parent in (text_config, source_config, arch):
+        if not isinstance(parent, dict):
+            continue
+        for key in keys:
+            if key in parent and parent.get(key) not in (None, ""):
+                return parent.get(key)
+    return None
+
+
 def _juju_kv_layout_contract(contract, runtime_arch):
     qkv = dict(contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract") or {})
-    num_heads = _juju_first_int(runtime_arch.get("num_attention_heads"), qkv.get("num_attention_heads"))
-    sliding_kv_heads = _juju_first_int(runtime_arch.get("num_key_value_heads"), qkv.get("num_key_value_heads"), qkv.get("kv_heads"))
-    global_kv_heads = _juju_first_int(runtime_arch.get("num_global_key_value_heads"), qkv.get("num_global_key_value_heads"), sliding_kv_heads)
-    head_dim = _juju_first_int(runtime_arch.get("head_dim"), qkv.get("head_dim"), runtime_arch.get("key_length"))
-    value_head_dim = _juju_first_int(runtime_arch.get("value_head_dim"), qkv.get("value_head_dim"), qkv.get("v_head_dim"), head_dim)
-    global_head_dim = _juju_first_int(runtime_arch.get("global_head_dim"), qkv.get("global_head_dim"), head_dim)
-    global_value_head_dim = _juju_first_int(runtime_arch.get("global_value_head_dim"), qkv.get("global_value_head_dim"), global_head_dim)
+    num_heads = _juju_first_int(
+        _juju_first_config_value(contract, "num_attention_heads", "n_heads", "head_count"),
+        qkv.get("num_attention_heads"),
+        runtime_arch.get("num_attention_heads"),
+    )
+    sliding_kv_heads = _juju_first_int(
+        _juju_first_config_value(contract, "num_key_value_heads", "n_kv_heads", "head_count_kv"),
+        qkv.get("num_key_value_heads"),
+        qkv.get("kv_heads"),
+        runtime_arch.get("num_key_value_heads"),
+    )
+    global_kv_heads = _juju_first_int(
+        _juju_first_config_value(contract, "num_global_key_value_heads", "global_head_count_kv"),
+        qkv.get("num_global_key_value_heads"),
+        runtime_arch.get("num_global_key_value_heads"),
+        sliding_kv_heads,
+    )
+    head_dim = _juju_first_int(
+        _juju_first_config_value(contract, "head_dim", "key_length"),
+        qkv.get("head_dim"),
+        runtime_arch.get("head_dim"),
+        runtime_arch.get("key_length"),
+    )
+    value_head_dim = _juju_first_int(
+        _juju_first_config_value(contract, "value_head_dim", "v_head_dim", "value_length"),
+        qkv.get("value_head_dim"),
+        qkv.get("v_head_dim"),
+        runtime_arch.get("value_head_dim"),
+        runtime_arch.get("v_head_dim"),
+        head_dim,
+    )
+    global_head_dim = _juju_first_int(
+        _juju_first_config_value(contract, "global_head_dim", "global_key_length"),
+        qkv.get("global_head_dim"),
+        runtime_arch.get("global_head_dim"),
+        head_dim,
+    )
+    global_value_head_dim = _juju_first_int(
+        _juju_first_config_value(contract, "global_value_head_dim", "global_value_length"),
+        qkv.get("global_value_head_dim"),
+        runtime_arch.get("global_value_head_dim"),
+        global_head_dim,
+    )
+    attention_k_eq_v = _juju_bool_or_none(_juju_first_config_value(contract, "attention_k_eq_v"))
+    if attention_k_eq_v is True:
+        value_head_dim = head_dim
+        global_value_head_dim = global_head_dim
     max_seq = _juju_first_int(
+        _juju_first_config_value(contract, "max_position_embeddings", "max_seq_len", "context_length"),
         runtime_arch.get("max_position_embeddings"),
         runtime_arch.get("context_length"),
         qkv.get("max_seq_len"),
@@ -2652,8 +2766,8 @@ def _juju_kv_layout_contract(contract, runtime_arch):
     sliding_entry = _entry(sliding_kv_heads, head_dim, value_head_dim)
     global_entry = _entry(global_kv_heads, global_head_dim, global_value_head_dim)
     entry_dim = _juju_first_int(
-        qkv.get("entry_dim"),
         max(x for x in [sliding_entry or 0, global_entry or 0] if x is not None),
+        qkv.get("entry_dim"),
     )
     page_tokens = _juju_first_int(qkv.get("page_size_tokens"), qkv.get("block_size_tokens"), 16) or 16
     entry_dtype = _juju_scalar_value(qkv.get("dtype") or qkv.get("cache_dtype")) or "quantized_uint_packed"
@@ -2662,6 +2776,7 @@ def _juju_kv_layout_contract(contract, runtime_arch):
         "layout": "position_major_layer_contiguous_entry_dim",
         "head_layout": {
             "num_attention_heads": num_heads,
+            "attention_k_eq_v": attention_k_eq_v,
             "sliding": {
                 "num_key_value_heads": sliding_kv_heads,
                 "key_head_dim": head_dim,
@@ -3106,20 +3221,23 @@ def juju_runtime_arch_metadata(contract, directory=None):
     arch = dict(contract.get("arch_meta") or {})
     runtime = dict((directory or {}).get("gguf_runtime") or {})
     out = dict(runtime)
+    cfg = lambda *keys: _juju_first_config_value(contract, *keys)
 
     fields = {
         "declared_architecture": first_present(contract.get("architecture"), arch.get("architecture"), runtime.get("declared_architecture"), runtime.get("architecture")),
         "model_id": first_present(contract.get("model_id"), contract.get("model_name"), runtime.get("model_id")),
         "model_name": first_present(contract.get("model_name"), runtime.get("model_name")),
-        "num_hidden_layers": first_present(arch.get("n_layers"), arch.get("num_hidden_layers"), runtime.get("num_hidden_layers"), runtime.get("n_layers")),
-        "hidden_size": first_present(arch.get("hidden_dim"), arch.get("hidden_size"), runtime.get("hidden_size"), runtime.get("hidden_dim")),
-        "vocab_size": first_present(arch.get("vocab_size"), runtime.get("vocab_size")),
-        "head_dim": first_present(arch.get("head_dim"), runtime.get("head_dim"), runtime.get("key_length")),
-        "value_head_dim": first_present(arch.get("value_head_dim"), arch.get("v_head_dim"), runtime.get("value_head_dim"), runtime.get("v_head_dim")),
-        "global_head_dim": first_present(arch.get("global_head_dim"), runtime.get("global_head_dim")),
-        "num_attention_heads": first_present(arch.get("n_heads"), arch.get("num_attention_heads"), runtime.get("num_attention_heads"), runtime.get("n_heads")),
-        "num_key_value_heads": first_present(arch.get("n_kv_heads"), arch.get("num_key_value_heads"), runtime.get("num_key_value_heads"), runtime.get("n_kv_heads")),
-        "num_global_key_value_heads": first_present(arch.get("num_global_key_value_heads"), runtime.get("num_global_key_value_heads")),
+        "num_hidden_layers": first_present(cfg("num_hidden_layers", "n_layers"), arch.get("n_layers"), arch.get("num_hidden_layers"), runtime.get("num_hidden_layers"), runtime.get("n_layers")),
+        "hidden_size": first_present(cfg("hidden_size", "hidden_dim"), arch.get("hidden_dim"), arch.get("hidden_size"), runtime.get("hidden_size"), runtime.get("hidden_dim")),
+        "vocab_size": first_present(cfg("vocab_size"), arch.get("vocab_size"), runtime.get("vocab_size")),
+        "head_dim": first_present(cfg("head_dim", "key_length"), arch.get("head_dim"), runtime.get("head_dim"), runtime.get("key_length")),
+        "value_head_dim": first_present(cfg("value_head_dim", "v_head_dim", "value_length"), arch.get("value_head_dim"), arch.get("v_head_dim"), runtime.get("value_head_dim"), runtime.get("v_head_dim")),
+        "global_head_dim": first_present(cfg("global_head_dim", "global_key_length"), arch.get("global_head_dim"), runtime.get("global_head_dim")),
+        "global_value_head_dim": first_present(cfg("global_value_head_dim", "global_value_length"), arch.get("global_value_head_dim"), runtime.get("global_value_head_dim")),
+        "num_attention_heads": first_present(cfg("num_attention_heads", "n_heads"), arch.get("n_heads"), arch.get("num_attention_heads"), runtime.get("num_attention_heads"), runtime.get("n_heads")),
+        "num_key_value_heads": first_present(cfg("num_key_value_heads", "n_kv_heads"), arch.get("n_kv_heads"), arch.get("num_key_value_heads"), runtime.get("num_key_value_heads"), runtime.get("n_kv_heads")),
+        "num_global_key_value_heads": first_present(cfg("num_global_key_value_heads"), arch.get("num_global_key_value_heads"), runtime.get("num_global_key_value_heads")),
+        "attention_k_eq_v": first_present(_juju_bool_or_none(cfg("attention_k_eq_v")), arch.get("attention_k_eq_v"), runtime.get("attention_k_eq_v")),
         "kv_lora_rank": first_present(arch.get("kv_lora_rank"), runtime.get("kv_lora_rank")),
         "q_lora_rank": first_present(arch.get("q_lora_rank"), runtime.get("q_lora_rank")),
         "qk_nope_head_dim": first_present(arch.get("qk_nope_head_dim"), runtime.get("qk_nope_head_dim")),
@@ -3147,6 +3265,11 @@ def juju_runtime_arch_metadata(contract, directory=None):
         "norm_topk_prob": first_present(arch.get("norm_topk_prob"), arch.get("normalize_topk_prob"), runtime.get("norm_topk_prob"), runtime.get("normalize_topk_prob")),
         "scoring_func": first_present(arch.get("scoring_func"), arch.get("score_func"), runtime.get("scoring_func"), runtime.get("score_func")),
     }
+    if _juju_bool_or_none(fields.get("attention_k_eq_v")) is True:
+        if fields.get("head_dim") is not None:
+            fields["value_head_dim"] = fields["head_dim"]
+        if fields.get("global_head_dim") is not None:
+            fields["global_value_head_dim"] = fields["global_head_dim"]
     for key, value in fields.items():
         if value is not None:
             out[key] = value
