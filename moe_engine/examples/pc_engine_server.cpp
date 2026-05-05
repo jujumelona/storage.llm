@@ -1545,7 +1545,41 @@ static bool load_chat_template_text(const server_options& opts, std::string* out
         }
         out->clear();
     }
+    const char* config_candidates[] = {
+        "tokenizer_config.json",
+        "tokenizer/tokenizer_config.json"
+    };
+    for (const char* rel : config_candidates) {
+        std::string json;
+        const std::string path = join_model_file(opts.model_root, rel);
+        if (read_text_file(path, &json) && !json.empty() && json.size() <= (4u << 20) &&
+            json_read_string_value(json, "chat_template", out) && !out->empty() &&
+            out->size() <= (1u << 20)) {
+            return true;
+        }
+        out->clear();
+    }
     return false;
+}
+
+static size_t token_common_prefix_len(
+    const std::vector<int32_t>& a,
+    const std::vector<int32_t>& b
+) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) {
+        ++i;
+    }
+    return i;
+}
+
+static bool tokens_have_prefix(
+    const std::vector<int32_t>& value,
+    const std::vector<int32_t>& prefix
+) {
+    return prefix.size() <= value.size() &&
+        token_common_prefix_len(value, prefix) == prefix.size();
 }
 
 static std::string apply_sidecar_chat_template(
@@ -1703,8 +1737,43 @@ static bool encode_chat_response_only_eval(
     if (!tokenizer_encode_greedy(tok, prompt, &prompt_ids) || prompt_ids.empty()) {
         return false;
     }
+
+    const std::string full_templated = apply_sidecar_chat_template(opts, messages, false, enable_thinking);
+    if (!full_templated.empty()) {
+        const size_t content_pos = full_templated.rfind(last.content);
+        if (content_pos != std::string::npos) {
+            const std::string full_prefix = full_templated.substr(0, content_pos);
+            std::vector<int32_t> full_prefix_ids;
+            if (tokenizer_encode_greedy(tok, full_templated, &full_ids) &&
+                tokenizer_encode_greedy(tok, full_prefix, &full_prefix_ids) &&
+                !full_prefix_ids.empty() &&
+                full_ids.size() > full_prefix_ids.size() &&
+                tokens_have_prefix(full_ids, full_prefix_ids)) {
+                *out_ids = std::move(full_ids);
+                *out_first_target_index = static_cast<uint32_t>(full_prefix_ids.size());
+                std::cerr << "[storagellm request] eval response_only_chat prompt_tokens="
+                          << full_prefix_ids.size()
+                          << " target_tokens=" << (out_ids->size() - full_prefix_ids.size())
+                          << " input_tokens=" << out_ids->size()
+                          << " template_mode=full_messages"
+                          << " generation_prompt_tokens=" << prompt_ids.size()
+                          << "\n" << std::flush;
+                return true;
+            }
+            full_ids.clear();
+        }
+    }
+
     if (!tokenizer_encode_greedy(tok, prompt + last.content, &full_ids) ||
-        full_ids.size() <= prompt_ids.size()) {
+        full_ids.size() <= prompt_ids.size() ||
+        !tokens_have_prefix(full_ids, prompt_ids)) {
+        const size_t common = token_common_prefix_len(full_ids, prompt_ids);
+        std::cerr << "[storagellm request] eval response_only_chat rejected"
+                  << " reason=prompt_prefix_mismatch"
+                  << " prompt_tokens=" << prompt_ids.size()
+                  << " full_tokens=" << full_ids.size()
+                  << " common_prefix=" << common
+                  << "\n" << std::flush;
         return false;
     }
     *out_ids = std::move(full_ids);
@@ -1713,6 +1782,7 @@ static bool encode_chat_response_only_eval(
               << prompt_ids.size()
               << " target_tokens=" << (out_ids->size() - prompt_ids.size())
               << " input_tokens=" << out_ids->size()
+              << " template_mode=generation_prompt"
               << "\n" << std::flush;
     return true;
 }
