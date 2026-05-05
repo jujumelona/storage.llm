@@ -15,6 +15,52 @@ int moe_pc_engine_eval_token_ids_from(
         moe_eval_set_error(out_stats, "eval requires at least two input tokens");
         return 0;
     }
+    struct eval_scope_t {
+        moe_pc_engine_t* engine = nullptr;
+        int ok = 0;
+        uint64_t id = 0;
+        uint64_t start_us = 0;
+        explicit eval_scope_t(moe_pc_engine_t* e) : engine(e) {
+            if (!engine) return;
+            id = moe_profile_next_generation_id();
+            start_us = moe_profile_now_us();
+            engine->generation_started.fetch_add(1, std::memory_order_relaxed);
+            engine->generation_active.fetch_add(1, std::memory_order_relaxed);
+            engine->generation_token.store(0, std::memory_order_relaxed);
+            engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
+            engine->generation_phase.store(moe_GEN_PHASE_INIT, std::memory_order_relaxed);
+        }
+        ~eval_scope_t() {
+            if (!engine) return;
+            if (ok) {
+                engine->generation_completed.fetch_add(1, std::memory_order_relaxed);
+                engine->generation_phase.store(moe_GEN_PHASE_DONE, std::memory_order_relaxed);
+            } else {
+                engine->generation_failed.fetch_add(1, std::memory_order_relaxed);
+            }
+            uint32_t current = engine->generation_active.load(std::memory_order_acquire);
+            while (current > 0) {
+                if (engine->generation_active.compare_exchange_weak(
+                        current, current - 1,
+                        std::memory_order_release,
+                        std::memory_order_acquire)) {
+                    break;
+                }
+            }
+            if (engine->generation_active.load(std::memory_order_relaxed) == 0) {
+                engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
+            }
+            moe_profile_log(
+                "eval_end",
+                "id=%llu ok=%d active=%u layer=%u phase=%u ms=%.3f",
+                (unsigned long long)id,
+                ok,
+                engine->generation_active.load(std::memory_order_relaxed),
+                engine->generation_layer.load(std::memory_order_relaxed),
+                engine->generation_phase.load(std::memory_order_relaxed),
+                moe_profile_elapsed_ms(start_us));
+        }
+    } eval_scope(engine);
     if (first_target_index == 0) {
         first_target_index = 1;
     }
@@ -165,6 +211,7 @@ int moe_pc_engine_eval_token_ids_from(
     uint32_t evaluated = 0;
     moe_generation_stats_t gen_stats{};
     for (uint32_t i = 0; i + 1u < input_token_count; ++i) {
+        engine->generation_token.store(i, std::memory_order_relaxed);
         moe_profile_log(
             "eval_forward_call_begin",
             "pos=%u token=%u target=%u",
@@ -264,7 +311,8 @@ int moe_pc_engine_eval_token_ids_from(
     }
     moe_profile_log(
         "eval_done",
-        "input_tokens=%u first_target=%u evaluated=%u nll=%.9g mean_nll=%.9g ppl=%.9g total_ms=%.3f",
+        "id=%llu input_tokens=%u first_target=%u evaluated=%u nll=%.9g mean_nll=%.9g ppl=%.9g total_ms=%.3f",
+        (unsigned long long)eval_scope.id,
         input_token_count,
         first_target_index,
         evaluated,
@@ -272,6 +320,7 @@ int moe_pc_engine_eval_token_ids_from(
         mean_nll,
         ppl,
         moe_profile_elapsed_ms(eval_start_us));
+    eval_scope.ok = 1;
     return 1;
 } catch (const std::bad_alloc&) {
     moe_eval_set_error(out_stats, "eval aborted under RAM pressure");

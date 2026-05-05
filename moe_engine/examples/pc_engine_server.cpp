@@ -1925,6 +1925,12 @@ static server_eval_result run_server_eval(
             }
         }
     }
+    int parsed_first_target = 0;
+    if (storagellm::json_read_int(body, "first_target_index", &parsed_first_target) &&
+        parsed_first_target > 0 &&
+        static_cast<size_t>(parsed_first_target) < input_ids.size()) {
+        first_target_index = static_cast<uint32_t>(parsed_first_target);
+    }
     log_token_ids_preview("eval_input_ids", tok, input_ids, first_target_index);
     if (input_ids.size() < 2) {
         result.http_status = 400;
