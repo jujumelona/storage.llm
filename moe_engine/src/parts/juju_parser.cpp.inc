@@ -245,10 +245,25 @@ static int moe_read_juju_tensor_index_json(
     uint64_t file_bytes,
     std::string* out
 ) {
+    std::string sidecar;
+    if (moe_read_text_file_local(path + ".idx", &sidecar) &&
+        sidecar.find("\"JUJU_IDX_JSON_V1\"") != std::string::npos &&
+        sidecar.find("\"tensors\"") != std::string::npos) {
+        if (out) {
+            *out = std::move(sidecar);
+        }
+        return 1;
+    }
     if (moe_read_juju_json_section(path, entries, moe_JUJU_SECTION_LAYER_ORDER_INDEX, file_bytes, out)) {
         return 1;
     }
-    return moe_read_text_file_local(path + ".idx", out);
+    if (!sidecar.empty()) {
+        if (out) {
+            *out = std::move(sidecar);
+        }
+        return 1;
+    }
+    return 0;
 }
 
 static uint16_t moe_juju_accuracy_to_milli(double value) {
