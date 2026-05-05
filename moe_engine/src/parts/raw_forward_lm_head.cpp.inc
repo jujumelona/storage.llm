@@ -384,6 +384,12 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     const uint32_t chunk_size = std::max(64u, (c->vocab_size + target_chunks - 1u) / target_chunks);
     const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
     const uint32_t chunk_block = 1u;
+    const float target_score_precomputed = moe_apply_final_logit_softcap_cached(
+        logit_softcap,
+        moe_raw_tensor_dot_row(raw, target_token_id, hidden, hidden_count));
+    if (!std::isfinite(target_score_precomputed)) {
+        return 0;
+    }
     moe_profile_log(
         "lm_head_logprob_begin",
         "target=%u vocab=%u hidden=%u fmt=%u eff_fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.6g row_workers=%u chunk_size=%u chunks=%u",
@@ -406,6 +412,7 @@ int moe_pc_engine_lm_head_token_logprob_f32(
         float target_score;
         uint32_t best_token;
         float best_score;
+        uint32_t greater_than_target;
         int has_target;
     };
     std::vector<chunk_logsum_t> chunk_results(num_chunks);
@@ -420,6 +427,7 @@ int moe_pc_engine_lm_head_token_logprob_f32(
             float target_score = 0.0f;
             uint32_t local_best_token = start;
             float local_best_score = -std::numeric_limits<float>::infinity();
+            uint32_t local_greater_than_target = 0;
             int has_target = 0;
 
             // Fix 15: Vectorize loop to improve cache hits and enable auto-vectorization
@@ -436,6 +444,9 @@ int moe_pc_engine_lm_head_token_logprob_f32(
                     if (score > local_best_score) {
                         local_best_score = score;
                         local_best_token = t + i;
+                    }
+                    if (score > target_score_precomputed) {
+                        ++local_greater_than_target;
                     }
                     if (score <= local_max) {
                         local_sum += std::exp((double)score - (double)local_max);
@@ -459,6 +470,9 @@ int moe_pc_engine_lm_head_token_logprob_f32(
                     local_best_score = score;
                     local_best_token = t;
                 }
+                if (score > target_score_precomputed) {
+                    ++local_greater_than_target;
+                }
                 if (score <= local_max) {
                     local_sum += std::exp((double)score - (double)local_max);
                 } else if (std::isfinite(local_max)) {
@@ -474,7 +488,15 @@ int moe_pc_engine_lm_head_token_logprob_f32(
                 }
             }
 
-            chunk_results[chunk] = {local_max, local_sum, target_score, local_best_token, local_best_score, has_target};
+            chunk_results[chunk] = {
+                local_max,
+                local_sum,
+                target_score,
+                local_best_token,
+                local_best_score,
+                local_greater_than_target,
+                has_target
+            };
             return 1;
         })) {
             return 0;
@@ -486,6 +508,7 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     float target_score = 0.0f;
     uint32_t best_token = 0;
     float best_score = -std::numeric_limits<float>::infinity();
+    uint64_t greater_than_target = 0;
     int found_target = 0;
     for (uint32_t i = 0; i < num_chunks; ++i) {
         if (!(chunk_results[i].exp_sum > 0.0) || !std::isfinite(chunk_results[i].max_score)) {
@@ -495,6 +518,7 @@ int moe_pc_engine_lm_head_token_logprob_f32(
             best_score = chunk_results[i].best_score;
             best_token = chunk_results[i].best_token;
         }
+        greater_than_target += chunk_results[i].greater_than_target;
         if (chunk_results[i].max_score <= global_max) {
             exp_sum += chunk_results[i].exp_sum *
                 std::exp((double)chunk_results[i].max_score - (double)global_max);
@@ -535,13 +559,17 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     if (!std::isfinite(target_score)) {
         return 0;
     }
+    const uint64_t target_rank = greater_than_target + 1ull;
+    const double best_gap = (double)best_score - (double)target_score;
     moe_profile_log(
         "lm_head_logprob_end",
-        "target=%u target_score=%.6g best=%u best_score=%.6g global_max=%.6g logsumexp=%.6g logprob=%.6g softcap=%.6g",
+        "target=%u target_score=%.6g best=%u best_score=%.6g target_rank=%llu best_gap=%.6g global_max=%.6g logsumexp=%.6g logprob=%.6g softcap=%.6g",
         target_token_id,
         (double)target_score,
         best_token,
         (double)best_score,
+        (unsigned long long)target_rank,
+        best_gap,
         (double)global_max,
         logsumexp,
         logprob,
