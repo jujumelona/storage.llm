@@ -66,9 +66,9 @@ static int read_file_range_to_buffer(
         const uint64_t elapsed_us = moe_profile_now_us() - start_us;
         if (elapsed_us > 0) {
             const uint64_t current_bw = (bytes * 1000000ull) / elapsed_us;
-            uint64_t old_bw = engine->backend_caps.measured_storage_bw_bytes_per_sec.load(std::memory_order_relaxed);
+            uint64_t old_bw = engine->backend_caps.measured_storage_bw_bytes_per_sec;
             if (old_bw == 0) {
-                engine->backend_caps.measured_storage_bw_bytes_per_sec.store(current_bw, std::memory_order_relaxed);
+                engine->backend_caps.measured_storage_bw_bytes_per_sec = current_bw;
                 const double gb_per_sec = (double)current_bw / 1e9;
                 fprintf(stderr,
                     "[storageLLM INFO] Initial storage bandwidth measured: %.2f GB/s from %llu MB read\n",
@@ -76,7 +76,7 @@ static int read_file_range_to_buffer(
             } else {
                 // EMA: new = 0.8 * old + 0.2 * current
                 const uint64_t new_bw = (old_bw * 8ull + current_bw * 2ull) / 10ull;
-                engine->backend_caps.measured_storage_bw_bytes_per_sec.store(new_bw, std::memory_order_relaxed);
+                engine->backend_caps.measured_storage_bw_bytes_per_sec = new_bw;
             }
         }
     }

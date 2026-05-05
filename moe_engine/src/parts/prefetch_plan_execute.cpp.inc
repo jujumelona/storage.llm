@@ -163,7 +163,11 @@ int moe_pc_engine_execute_prefetch_plan(
             // Additionally documents all 4 cases for future maintenance.
             if (items[i].bytes == 0) {
                 // Zero-byte items should never have reservations; warn if they do
-                if (vram_pending_reserved[i] || admitted_tiers[i] != moe_TIER_NONE) {
+                const bool reservation_active =
+                    vram_pending_reserved[i] ||
+                    admitted_tiers[i] == moe_TIER_VRAM ||
+                    admitted_tiers[i] == moe_TIER_RAM;
+                if (reservation_active) {
                     fprintf(stderr,
                         "[storageLLM WARNING] skip_item with bytes=0 but reservation active: "
                         "tier=%d vram_pending=%d target=%d layer=%u expert=%u\n",
