@@ -157,7 +157,6 @@ static float moe_standard_attention_score_scale(
     uint32_t head_dim,
     const char** source_out = nullptr
 ) {
-    (void)layer;
     if (source_out) {
         *source_out = "head_dim";
     }
@@ -203,6 +202,12 @@ static float moe_standard_attention_score_scale(
             *source_out = "query_pre_attn_scalar";
         }
         return result;
+    }
+    if (moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
+        if (source_out) {
+            *source_out = "qk_norm_layout";
+        }
+        return 1.0f;
     }
     float result = 1.0f / std::sqrt((float)head_dim);
     if (!std::isfinite(result)) {

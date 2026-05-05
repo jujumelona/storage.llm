@@ -315,8 +315,9 @@ static float moe_mxfp4_value_from_code(uint8_t code) {
 }
 
 static uint8_t moe_mxfp4_code_at(const uint8_t* qs, uint32_t index) {
-    const uint8_t byte = qs[index >> 1u];
-    return (index & 1u) ? (byte >> 4) : (byte & 0x0fu);
+    const uint32_t half = 16u;
+    const uint8_t byte = qs[(index < half) ? index : (index - half)];
+    return (index < half) ? (byte & 0x0fu) : (byte >> 4);
 }
 
 static float moe_dot_gguf_mxfp4_row(
@@ -339,7 +340,7 @@ static float moe_dot_gguf_mxfp4_row(
         const float* xb = x + start;
         float low = 0.0f;
         float high = 0.0f;
-#if 0 && defined(__AVX2__) && defined(__FMA__)
+#if defined(__AVX2__) && defined(__FMA__)
         // BUGFIX 705: AVX2 vectorized MXFP4 dot product ?끸쁾??
         // 16-entry FP32 table (64B) always in L1. Gather throughput ~5cy on Haswell+.
         const __m256i lo_mask = _mm256_set1_epi32(0x0F);
@@ -360,8 +361,8 @@ static float moe_dot_gguf_mxfp4_row(
 #else
         for (uint32_t j = 0; j < 16u; ++j) {
             const uint8_t byte = qs[j];
-            low += table[byte & 0x0fu] * xb[j * 2u];
-            high += table[byte >> 4] * xb[j * 2u + 1u];
+            low += table[byte & 0x0fu] * xb[j];
+            high += table[byte >> 4] * xb[j + 16u];
         }
 #endif
         acc += (low + high) * scale;
