@@ -125,8 +125,9 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
     }
     if (e->backend_caps.supports_unified_memory &&
         e->backend_caps.backend == moe_BACKEND_METAL) {
-        // BUGFIX 124: Metal unified memory - do NOT subtract ram_used_bytes here.
-        // RAM budget is set to 0 in device_allocator_init, so all tracking is in VRAM budget.
+        // Metal unified memory must avoid RAM double-counting.
+        // Metal unified memory is accounted through the VRAM budget here. RAM
+        // budget is set to 0 during device allocator init for this backend.
         const uint64_t sys = e->backend_caps.system_memory_bytes > 0
             ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
         // BUGFIX 199: Use configurable percentage (0=auto from device_allocator_init)
@@ -145,11 +146,22 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
             pct = 75ull;
         }
         const uint64_t raw_budget = (sys * pct) / 100ull;
-        if (raw_budget <= reserved_total) {
-            warn_device_budget_exhausted(e, raw_budget, reserved_total, pending, kv_reserved, common_reserved);
+
+        // CPU-side KV also consumes unified memory on Metal. Include RAM tier
+        // usage here because the Metal RAM budget is zeroed during allocator init.
+        uint64_t total_reserved = reserved_total;
+        const uint64_t cpu_ram_used = e->tier_used_bytes[moe_TIER_RAM].load(std::memory_order_relaxed);
+        if (cpu_ram_used < UINT64_MAX - total_reserved) {
+            total_reserved += cpu_ram_used;
+        } else {
+            total_reserved = UINT64_MAX;
+        }
+
+        if (raw_budget <= total_reserved) {
+            warn_device_budget_exhausted(e, raw_budget, total_reserved, pending, kv_reserved, common_reserved);
             return 0;
         }
-        return raw_budget - reserved_total;
+        return raw_budget - total_reserved;
     }
     const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
     const uint64_t free_b = e->device_free_bytes.load(std::memory_order_relaxed);
@@ -204,7 +216,12 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
         e->backend_caps.backend == moe_BACKEND_VULKAN ||
         e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
         e->backend_caps.backend == moe_BACKEND_SYCL;
-    const int64_t throttle_ms = retry_path || external_budget_backend ? 1000 : 5000;
+    // BUGFIX 891: Unify throttle to 1s for all paths ★★★ CRITICAL
+    // Problem: 5s throttle for non-external backends causes stale VRAM estimates.
+    // With top-k=8 experts loading/unloading per token, 5s gap allows hundreds of MB drift.
+    // Solution: Use 1s throttle for all paths. CAS guard prevents concurrent driver calls.
+    // Impact: More accurate VRAM tracking, minimal overhead (~1 driver call/sec max).
+    const int64_t throttle_ms = 1000;
     if (now_ms - last < throttle_ms) {
         return;
     }

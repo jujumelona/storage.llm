@@ -9,6 +9,8 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <algorithm>
+#include <utility>
 
 #if defined(MOE_ENABLE_PAGED_KV) && MOE_ENABLE_PAGED_KV
 
@@ -92,6 +94,27 @@ struct moe_continuous_batch_scheduler_t {
                                  std::vector<moe_batch_request_t*>& out_prefill,
                                  std::vector<moe_batch_request_t*>& out_decode) {
         std::lock_guard<std::mutex> lock(mtx);
+        auto allocate_request_blocks = [](moe_paged_kv_manager_t* manager,
+                                          uint32_t needed,
+                                          std::vector<uint32_t>* out_blocks) -> bool {
+            if (!manager || !out_blocks) {
+                return false;
+            }
+            out_blocks->clear();
+            out_blocks->reserve(needed);
+            for (uint32_t i = 0; i < needed; ++i) {
+                const int block_id = manager->allocate_block();
+                if (block_id < 0) {
+                    for (uint32_t allocated : *out_blocks) {
+                        manager->free_block(allocated);
+                    }
+                    out_blocks->clear();
+                    return false;
+                }
+                out_blocks->push_back((uint32_t)block_id);
+            }
+            return true;
+        };
 
         // 1. Evict finished requests
         // Fix 26: O(n) single-pass sweep instead of O(n²) repeated vector::erase
@@ -121,15 +144,15 @@ struct moe_continuous_batch_scheduler_t {
         //      kMaxSkipCount, force-block: stop admitting others until this request can go.
         //      This preserves approximate FIFO fairness while allowing small requests through.
 
-        // BUGFIX 286: Check kv_manager validity before accessing free_blocks ★
+        // BUGFIX 286: Check kv_manager validity before accessing free blocks.
         if (!kv_manager || kv_manager->block_size == 0) {
-            // Cannot admit requests without valid KV manager
+            // Cannot admit requests without valid KV manager.
         } else {
             auto it = waiting_queue.begin();
             while (it != waiting_queue.end() && running_queue.size() < max_running_requests) {
                 auto* req = *it;
 
-                // BUGFIX 306: Check req validity before accessing members ★
+                // BUGFIX 306: Check req validity before accessing members.
                 if (!req) {
                     it = waiting_queue.erase(it);
                     continue;
@@ -138,7 +161,20 @@ struct moe_continuous_batch_scheduler_t {
                 uint32_t needed_blocks = (static_cast<uint32_t>(req->prompt_tokens.size()) + kv_manager->block_size - 1) / kv_manager->block_size;
 
                 // free_count is only a lock-free hint; the free-list is authoritative.
-                if (kv_manager->available_free_blocks() >= needed_blocks) {
+                const bool force_admit = req->skip_count >= kMaxSkipCount;
+                const bool enough_blocks_hint = kv_manager->available_free_blocks() >= needed_blocks;
+                if (enough_blocks_hint || force_admit) {
+                    std::vector<uint32_t> allocated_blocks;
+                    if (!allocate_request_blocks(kv_manager, needed_blocks, &allocated_blocks)) {
+                        if (force_admit) {
+                            req->skip_count = kMaxSkipCount / 2;
+                            break;
+                        }
+                        ++req->skip_count;
+                        ++it;
+                        continue;
+                    }
+                    req->kv_block_table = std::move(allocated_blocks);
                     // Enough KV blocks available — admit this request
                     req->phase = moe_REQ_PREFILL;
                     req->skip_count = 0;
@@ -152,11 +188,22 @@ struct moe_continuous_batch_scheduler_t {
                     // If this request has been skipped too many times, STOP admitting
                     // any further requests. This forces the system to drain KV blocks
                     // until this starved request can be served, preserving SLO fairness.
+                    //
+                    // BUGFIX 882: Force-admit failure recovery ★★★ CRITICAL
+                    // Problem: Force-admitted request (skip_count >= kMaxSkipCount) blocks
+                    // all other requests. If KV block allocation fails, request stays in
+                    // waiting_queue with skip_count >= kMaxSkipCount, blocking forever.
+                    // Running queue empty → no eviction → deadlock.
+                    // Solution: On force-admit KV allocation failure, reduce skip_count to
+                    // kMaxSkipCount/2 and break. Next iteration will retry with lower priority.
+                    // Impact: Prevents deadlock, allows other requests to proceed while waiting
+                    // for KV eviction to free blocks.
                     if (req->skip_count >= kMaxSkipCount) {
-                        break;  // Force-block: no more admissions until this one fits
+                        req->skip_count = kMaxSkipCount / 2;
+                        break;
+                    } else {
+                        ++it;  // Skip this request, try the next one
                     }
-
-                    ++it;  // Skip this request, try the next one
                 }
             }
         }

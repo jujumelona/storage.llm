@@ -152,6 +152,7 @@ static int qkv_quantize_split_vector_with_state(
         // Forward: y = H*x = (1/sqrt(d)) * D * W * x
         // The sign vector extraction in qkv_state.cpp extracts D from first row
         // So the correct order is: copy → apply signs → FWHT → scale
+
         const bool is_power_of_2 = (dim & (dim - 1)) == 0;
         if (is_power_of_2 && state->rotation_signs) {
             // Fast path: Hadamard structure with sign vector
@@ -329,8 +330,10 @@ int qkv_quantize(
             // BUGFIX Issue 9: Use Fast Hadamard Transform for inverse rotation
             // Inverse: H^T = sqrt(d) * W^T * D^T = sqrt(d) * W * D (both self-transpose)
             // So inverse order is: scale → FWHT → signs (reverse of forward)
+
             const bool is_power_of_2 = (dim & (dim - 1)) == 0;
-            if (config->enable_rotation && state->rotation_matrix && is_power_of_2 && state->rotation_signs) {
+            if (config->enable_rotation && state->rotation_matrix &&
+                is_power_of_2 && state->rotation_signs) {
                 // Fast path: Inverse Hadamard (self-inverse up to scale)
                 const float scale = 1.0f / sqrtf((float)dim);
                 for (int i = 0; i < dim; ++i) {
@@ -434,8 +437,10 @@ int qkv_quantize(
             }
 
             // BUGFIX Issue 9: Use Fast Hadamard Transform for inverse rotation (V path)
+
             const bool is_power_of_2_v = (dim & (dim - 1)) == 0;
-            if (config->enable_rotation && state->rotation_matrix && is_power_of_2_v && state->rotation_signs) {
+            if (config->enable_rotation && state->rotation_matrix &&
+                is_power_of_2_v && state->rotation_signs) {
                 // Fast path: Inverse Hadamard
                 const float scale = 1.0f / sqrtf((float)dim);
                 for (int i = 0; i < dim; ++i) {

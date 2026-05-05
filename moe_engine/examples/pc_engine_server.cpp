@@ -488,6 +488,7 @@ struct server_tokenizer {
     std::unordered_set<uint32_t> special_ids;
     size_t max_piece_bytes = 0;
     size_t max_special_piece_bytes = 0;
+    std::string model_type;
     uint32_t eos_token_id = 0;
     uint32_t unk_token_id = 0;
     bool has_eos = false;
@@ -1079,6 +1080,7 @@ static bool load_tokenizer_vocab(server_tokenizer* tok, const std::string& json)
     if (json_find_key_object_range(json, "model", 0, &tmp_begin, &tmp_end)) {
         model_begin = tmp_begin;
         model_end = tmp_end;
+        (void)json_read_string_in_range(json, model_begin, model_end, "type", &tok->model_type);
         (void)json_read_bool_in_range(json, model_begin, model_end, "byte_fallback", &tok->byte_fallback);
     }
 
@@ -1239,7 +1241,50 @@ static server_tokenizer& get_server_tokenizer(const server_options& opts) {
         return tok;
     }
     load_tokenizer_vocab(&tok, json);
+    std::cerr << "[storagellm tokenizer] load"
+              << " loaded=" << (tok.loaded ? 1 : 0)
+              << " model_type=" << (tok.model_type.empty() ? "unknown" : tok.model_type)
+              << " byte_level=" << (tok.byte_level ? 1 : 0)
+              << " has_merges=" << (tok.has_merges ? 1 : 0)
+              << " byte_fallback=" << (tok.byte_fallback ? 1 : 0)
+              << " pieces=" << tok.id_to_piece.size()
+              << " specials=" << tok.special_ids.size()
+              << " has_eos=" << (tok.has_eos ? 1 : 0)
+              << " eos=" << tok.eos_token_id
+              << " has_unk=" << (tok.has_unk ? 1 : 0)
+              << " unk=" << tok.unk_token_id
+              << " error=" << (tok.error.empty() ? "-" : tok.error)
+              << "\n" << std::flush;
     return tok;
+}
+
+static void log_token_ids_preview(
+    const char* tag,
+    const server_tokenizer& tok,
+    const std::vector<int32_t>& ids,
+    uint32_t first_target_index = UINT32_MAX
+) {
+    std::cerr << "[storagellm tokenizer] " << (tag ? tag : "tokens")
+              << " tokens=" << ids.size();
+    if (first_target_index != UINT32_MAX) {
+        std::cerr << " first_target_index=" << first_target_index;
+    }
+    std::cerr << " model_type=" << (tok.model_type.empty() ? "unknown" : tok.model_type)
+              << " byte_level=" << (tok.byte_level ? 1 : 0)
+              << " has_merges=" << (tok.has_merges ? 1 : 0)
+              << " ids=[";
+    const size_t limit = std::min<size_t>(ids.size(), 32u);
+    for (size_t i = 0; i < limit; ++i) {
+        if (i) {
+            std::cerr << ",";
+        }
+        std::cerr << ids[i];
+    }
+    std::cerr << "]";
+    if (ids.size() > limit) {
+        std::cerr << " truncated=1";
+    }
+    std::cerr << "\n" << std::flush;
 }
 
 static bool tokenizer_match_special_at(
@@ -1729,6 +1774,7 @@ static server_generation_result run_server_generation(
                   << " ms=" << elapsed_ms_since(tokenize_start)
                   << "\n" << std::flush;
     }
+    log_token_ids_preview("generation_input_ids", tok, input_ids);
 
     int max_tokens = 128;
     int parsed = 0;
@@ -1875,6 +1921,7 @@ static server_eval_result run_server_eval(
             }
         }
     }
+    log_token_ids_preview("eval_input_ids", tok, input_ids, first_target_index);
     if (input_ids.size() < 2) {
         result.http_status = 400;
         result.error_code = "invalid_request_error";

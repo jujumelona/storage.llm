@@ -122,7 +122,14 @@ static void prefetch_plan_add_item(
         return;
     }
     const uint64_t bytes = expert_triplet_or_hardcoded_bytes(engine, layer, expert);
+    // A zero-byte expert cannot be budgeted by the trim pass, so treat it as
+    // missing runtime metadata instead of enqueueing an unaccounted prefetch.
     if (bytes == 0) {
+        fprintf(stderr,
+            "[storageLLM ERROR] prefetch_plan_add_item: expert_triplet_or_hardcoded_bytes returned 0 "
+            "for layer=%d expert=%d. This indicates missing hardcode_summary data. "
+            "Prefetch trim will not work correctly.\n",
+            layer, expert);
         return;
     }
     // BUGFIX 573: Check priority is finite ★

@@ -10,9 +10,47 @@ static void refresh_external_gpu_memory_budget_if_due(moe_pc_engine* engine) {
     if (!engine) {
         return;
     }
-    if (engine->backend_caps.backend == moe_BACKEND_VULKAN ||
-        engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
-        engine->backend_caps.backend == moe_BACKEND_SYCL) {
+    // BUGFIX 881: Add CUDA/HIP to external memory refresh ★★★ CRITICAL
+    // Problem: device_refresh_mem_info only called for Vulkan/Level Zero/SYCL.
+    // CUDA backend uses internal counter device_allocated_bytes only.
+    // After hundreds of tokens, CUDA driver internal fragmentation and stream buffer
+    // overhead accumulate, causing 100s of MB difference between counter and actual free VRAM.
+    // Engine thinks VRAM is available, loads experts, hits OOM.
+    // Solution: Call device_refresh_mem_info for CUDA/HIP with conditional refresh.
+    //
+    // BUGFIX 889: Improve CUDA/HIP refresh trigger conditions ★★★ CRITICAL
+    // Problem: 10s absolute cooldown is too long for large batches - OOM can occur within 10s.
+    // Vulkan/Level Zero refresh every orchestration cycle with no cooldown.
+    // Solution: Conditional refresh based on VRAM pressure:
+    // - If device_allocated_bytes >= 85% of budget, refresh immediately (no cooldown)
+    // - Otherwise, use 10s cooldown to avoid overhead
+    // - Also refresh on dropped_requests increase (indicates memory pressure)
+    // Impact: Prevents OOM while limiting cuMemGetInfo overhead to high-pressure situations.
+    if (engine->backend_caps.backend == moe_BACKEND_CUDA ||
+        engine->backend_caps.backend == moe_BACKEND_HIP) {
+        const uint64_t now_ms = moe_profile_now_us() / 1000ull;
+        const int64_t last_ms = engine->last_mem_query_ms.load(std::memory_order_relaxed);
+        const uint64_t elapsed_ms = now_ms > (uint64_t)last_ms ? now_ms - (uint64_t)last_ms : 0;
+
+        // Check if we're under memory pressure
+        const uint64_t allocated = engine->device_allocated_bytes.load(std::memory_order_relaxed);
+        const uint64_t budget = device_budget_bytes(engine);
+        const bool high_pressure = budget > 0 && allocated >= (budget * 85ull) / 100ull;
+
+        // Check if dropped_requests increased (indicates memory pressure)
+        const uint64_t dropped_now = engine->io_atomic.dropped_requests.load(std::memory_order_relaxed);
+        const bool drops_increased = dropped_now > engine->last_dropped_requests_snapshot;
+
+        // Refresh immediately if high pressure or drops, otherwise use 10s cooldown
+        const bool should_refresh = high_pressure || drops_increased || elapsed_ms >= 10000ull;
+
+        if (should_refresh) {
+            device_refresh_mem_info(engine, 0);
+            engine->last_mem_query_ms.store((int64_t)now_ms, std::memory_order_relaxed);
+        }
+    } else if (engine->backend_caps.backend == moe_BACKEND_VULKAN ||
+               engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
+               engine->backend_caps.backend == moe_BACKEND_SYCL) {
         device_refresh_mem_info(engine, 0);
     }
 }
@@ -56,6 +94,17 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
     // Orchestrator call interval is long ??window=1 persists too long
     // Solution: Reduce recovery streak from 5 to 3 for faster adaptation
     // Asymmetric: drops ??instant (window/2), recovery ??3-streak
+    //
+    // BUGFIX 880: Separate dropped_requests and live_pressure adjustments ★★★ CRITICAL
+    // Problem: Two independent mechanisms modify base_window sequentially:
+    // 1. dropped_requests check reduces window (e.g., 6→3)
+    // 2. live_pressure check modifies again (e.g., 3→1)
+    // Hysteresis 3-streak sees final value which changes every call due to both variables.
+    // Result: pending value oscillates, streak never accumulates, window vibrates 1-6.
+    // Solution: Separate into two paths:
+    // - dropped_requests → hysteresis → committed_window
+    // - live_pressure → immediate cap (no hysteresis) on committed_window
+    // Impact: Stable window convergence, eliminates 1-6 oscillation.
     uint32_t base_window = policy == moe_EXECUTION_PERFORMANCE ? 6u : policy == moe_EXECUTION_LOW_IMPACT ? 1u : 3u;
     if (juju_cfg && juju_cfg->prefetch_depth > 0) {
         base_window = juju_cfg->prefetch_depth;
@@ -66,6 +115,7 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
     const uint32_t max_window = juju_cfg ?
         std::max(8u, juju_cfg->prefetch_depth ? juju_cfg->prefetch_depth : 8u) : 8u;
 
+    // BUGFIX 880: Step 1 - dropped_requests path with hysteresis
     if (engine) {
         const uint64_t dropped_now = engine->io_atomic.dropped_requests.load(std::memory_order_relaxed);
         const uint64_t dropped_delta = dropped_now > engine->last_dropped_requests_snapshot
@@ -81,36 +131,14 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
             engine->prefetch_window_streak = 0;
         }
     }
-    if (engine && policy == moe_EXECUTION_PERFORMANCE) {
-        const uint32_t queued_depth = engine->total_queue_depth.load(std::memory_order_relaxed);
-        const uint32_t inflight =
-            engine->disk_stage.inflight.load(std::memory_order_relaxed) +
-            engine->pinned_stage.inflight.load(std::memory_order_relaxed) +
-            engine->gpu_stage.inflight.load(std::memory_order_relaxed);
-        const uint32_t live_pressure = queued_depth + inflight;
-        const uint32_t total_workers = plan->disk_workers + plan->pinned_workers + plan->gpu_workers;
-        if (live_pressure > total_workers * 4u) {
-            base_window = std::max(2u, base_window / 2u);
-        } else if (live_pressure < total_workers) {
-            base_window = std::min(max_window, base_window + 1u);
-        }
-    }
-    // BUG 3 FIX: Apply 5-streak hysteresis to prevent window oscillation ?�★
-    // BUGFIX 74: Issue 7 - Reduce recovery streak from 5 to 3 ?�★
-    // Problem: 5-streak too slow for recovery after drops stop
-    // Long orchestrator intervals ??window=1 persists for dozens of tokens
-    // Solution: 3-streak for faster adaptation while still preventing oscillation
-    // Without hysteresis, window toggles 2?? every orchestrate call when live_pressure
-    // hovers around total_workers*4, causing stalls (window=2) and waste (window=8).
+
+    // BUGFIX 880: Apply hysteresis to dropped_requests path only
+    uint32_t committed_window = base_window;
     if (engine) {
-        uint32_t current_window = plan->prefetch_window_layers;
-        if (current_window == 0) {
-            current_window = engine->runtime_prefetch_window_layers.load(std::memory_order_relaxed);
-        }
+        uint32_t current_window = engine->runtime_prefetch_window_layers.load(std::memory_order_relaxed);
         if (current_window == 0) {
             current_window = base_window;
         }
-        plan->prefetch_window_layers = current_window;
         if (base_window != current_window) {
             if (engine->prefetch_window_pending == base_window) {
                 ++engine->prefetch_window_streak;
@@ -120,18 +148,38 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
             }
             // Reduced from 5 to 3 for faster recovery
             if (engine->prefetch_window_streak >= 3u) {
-                plan->prefetch_window_layers = base_window;
+                committed_window = base_window;
                 engine->prefetch_window_streak = 0;
             } else {
                 // Keep current window until 3 consecutive same signals
-                plan->prefetch_window_layers = current_window;
+                committed_window = current_window;
             }
         } else {
+            committed_window = base_window;
             engine->prefetch_window_streak = 0;
         }
-    } else {
-        plan->prefetch_window_layers = base_window;
     }
+
+    // BUGFIX 880: Step 2 - live_pressure immediate cap (no hysteresis)
+    // This allows fast pipeline throttle without interfering with dropped_requests hysteresis
+    if (engine && policy == moe_EXECUTION_PERFORMANCE) {
+        const uint32_t queued_depth = engine->total_queue_depth.load(std::memory_order_relaxed);
+        const uint32_t inflight =
+            engine->disk_stage.inflight.load(std::memory_order_relaxed) +
+            engine->pinned_stage.inflight.load(std::memory_order_relaxed) +
+            engine->gpu_stage.inflight.load(std::memory_order_relaxed);
+        const uint32_t live_pressure = queued_depth + inflight;
+        const uint32_t total_workers = plan->disk_workers + plan->pinned_workers + plan->gpu_workers;
+        if (live_pressure > total_workers * 4u) {
+            // Immediate cap without hysteresis
+            committed_window = std::max(2u, committed_window / 2u);
+        } else if (live_pressure < total_workers) {
+            // Immediate increase without hysteresis
+            committed_window = std::min(max_window, committed_window + 1u);
+        }
+    }
+
+    plan->prefetch_window_layers = committed_window;
     float cpu = state ? state->cpu_load_pct : 0.0f;
     float gpu = state ? state->gpu_load_pct : 0.0f;
     if (!state && engine) {

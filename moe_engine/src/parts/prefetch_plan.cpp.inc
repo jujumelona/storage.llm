@@ -54,7 +54,15 @@ int moe_pc_engine_plan_moe_prefetch(
     {
         const uint64_t device_budget = device_budget_bytes(engine);
         const uint64_t device_allocated = tier_used(engine, moe_TIER_VRAM);
-        const uint64_t device_free = device_budget > device_allocated ? device_budget - device_allocated : 0;
+
+        const uint64_t in_flight = engine->vram_in_flight_bytes.load(std::memory_order_relaxed);
+        // device_budget_bytes() already subtracts pending VRAM reservations,
+        // runtime KV VRAM use, and common reservations. Only subtract bytes for
+        // DMA transfers that have been queued but are not visible through the
+        // tier counter yet.
+        const uint64_t accounted = device_allocated > UINT64_MAX - in_flight
+            ? UINT64_MAX : device_allocated + in_flight;
+        const uint64_t device_free = device_budget > accounted ? device_budget - accounted : 0;
 
         // Use backend-specific headroom percentage (default 10%) to avoid filling device memory completely.
         // BUGFIX Issue 10: Add Metal headroom configuration

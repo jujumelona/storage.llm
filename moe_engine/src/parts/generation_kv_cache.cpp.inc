@@ -23,6 +23,16 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
     uint64_t tracked_ram_bytes = 0;
 
     ~moe_kv_cache() {
+        // BUGFIX 879: Release RAM tier usage before freeing memory ★★★ CRITICAL
+        // Problem: Destructor frees data/scales/zeros but doesn't call subtract_tier_usage.
+        // Engine's tier usage counter remains elevated, causing premature RAM admission rejection.
+        // This occurs during batch request cancellation or exception paths.
+        // Solution: Call subtract_tier_usage before freeing memory.
+        // Impact: Prevents RAM usage counter leak, enables correct tensor loading decisions.
+        if (engine && tracked_ram_bytes > 0) {
+            subtract_tier_usage(engine, moe_TIER_RAM, tracked_ram_bytes);
+            tracked_ram_bytes = 0;
+        }
         if (data) std::free(data);
         if (scales) std::free(scales);
         if (zeros) std::free(zeros);
@@ -38,9 +48,14 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
         tracked_ram_bytes(other.tracked_ram_bytes) {
         other.data = nullptr; other.scales = nullptr; other.zeros = nullptr;
         other.engine = nullptr;
+        other.tracked_ram_bytes = 0;
     }
     moe_kv_cache& operator=(moe_kv_cache&& other) noexcept {
         if (this != &other) {
+            if (engine && tracked_ram_bytes > 0) {
+                subtract_tier_usage(engine, moe_TIER_RAM, tracked_ram_bytes);
+                tracked_ram_bytes = 0;
+            }
             if (data) std::free(data);
             if (scales) std::free(scales);
             if (zeros) std::free(zeros);
@@ -53,6 +68,7 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
 
             other.data = nullptr; other.scales = nullptr; other.zeros = nullptr;
             other.engine = nullptr;
+            other.tracked_ram_bytes = 0;
         }
         return *this;
     }
@@ -93,6 +109,10 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
         }
         if ((uint64_t)max_seq_len > SIZE_MAX / (uint64_t)std::max<uint32_t>(layers, 1u) ||
             (uint64_t)max_seq_len * (uint64_t)std::max<uint32_t>(layers, 1u) > SIZE_MAX / (uint64_t)std::max<uint32_t>(entry_dim, 1u)) {
+            if (engine && tracked_ram_bytes > 0) {
+                subtract_tier_usage(engine, moe_TIER_RAM, tracked_ram_bytes);
+                tracked_ram_bytes = 0;
+            }
             if (data) std::free(data);
             if (scales) std::free(scales);
             if (zeros) std::free(zeros);
@@ -115,6 +135,10 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
                 new_scales = (float*)std::calloc(retry_entries, sizeof(float));
                 new_zeros = (float*)std::calloc(retry_entries, sizeof(float));
             }
+        }
+        if (engine && tracked_ram_bytes > 0) {
+            subtract_tier_usage(engine, moe_TIER_RAM, tracked_ram_bytes);
+            tracked_ram_bytes = 0;
         }
         if (data) std::free(data);
         if (scales) std::free(scales);

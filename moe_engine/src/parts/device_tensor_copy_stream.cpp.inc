@@ -14,10 +14,11 @@ struct ThreadStreamGuard {
     moe_pc_engine* engine = nullptr;
     CUstream stream = nullptr;
     ~ThreadStreamGuard();
-        // BUGFIX 문제1: ThreadStreamGuard 소멸자 미구현 (스트림 누수) ★★★
+        // BUGFIX 886: ThreadStreamGuard 소멸자 구현 완료 ★★★ CRITICAL
         // Problem: GPU worker 비정상 종료 시 CUDA/HIP 스트림이 stream pool에 반환되지 않음
         // Solution: 소멸자에서 device_stream_destroy_current 호출하여 스트림 반환
         // Note: 정상 종료 경로(gpu_worker_loop 마지막)에서는 stream_guard.e = nullptr로 설정하여 중복 방지
+        // Implementation: See destructor below - calls device_stream_destroy_current + releases in-flight bytes
 };
 static thread_local std::unordered_map<moe_pc_engine*, ThreadStreamGuard> s_tl_stream_guards;
 static thread_local std::unordered_map<moe_pc_engine*, std::vector<uint64_t>> s_tl_tensor_pending_keys;
@@ -29,6 +30,23 @@ static thread_local std::unordered_map<moe_pc_engine*, std::vector<uint64_t>> s_
 static thread_local std::unordered_map<moe_pc_engine*, std::deque<moe_deferred_staging_copy>> s_tl_deferred_staging_copies;
 static thread_local std::unordered_map<moe_pc_engine*, std::vector<CUevent>> s_tl_copy_event_pool;
 static constexpr int moe_DEVICE_COPY_BACKPRESSURE = -2;
+
+static void device_release_in_flight_vram_bytes(moe_pc_engine* e, uint64_t bytes) {
+    if (!e || bytes == 0) {
+        return;
+    }
+    uint64_t current = e->vram_in_flight_bytes.load(std::memory_order_relaxed);
+    for (;;) {
+        const uint64_t next = current > bytes ? current - bytes : 0;
+        if (e->vram_in_flight_bytes.compare_exchange_weak(
+                current,
+                next,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
 
 // BUGFIX 77: Issue 7 - CUDA stream pool to avoid cuStreamCreate/Destroy on worker resize.
 static CUstream device_tensor_stream_current(moe_pc_engine* e) {
@@ -120,6 +138,13 @@ static void device_defer_staging_copy(moe_pc_engine* e, uint32_t slot, uint64_t 
         }
     }
     s_tl_deferred_staging_copies[e].push_back(copy);
+
+    // BUGFIX 875: Increment vram_in_flight_bytes when DMA queued ★★★ CRITICAL
+    // This byte count is subtracted from device_free in prefetch_plan trim calculation
+    // to prevent over-admission of experts while DMA is in-flight.
+    if (vram_bytes > 0) {
+        e->vram_in_flight_bytes.fetch_add(vram_bytes, std::memory_order_relaxed);
+    }
 }
 
 static size_t device_deferred_staging_copy_count(moe_pc_engine* e) {
@@ -176,6 +201,11 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
         if (copy.event) {
             device_recycle_copy_event(e, copy.event);
         }
+
+        // BUGFIX 875: Decrement vram_in_flight_bytes when DMA completes ★★★ CRITICAL
+        // This releases the in-flight reservation, making VRAM budget available for new experts.
+        device_release_in_flight_vram_bytes(e, copy.bytes_for_vram_release);
+
         // BUGFIX 67: Issue 2 - Use pop_front() instead of erase(begin()).
         // Old: copies.erase(copies.begin()) → O(n) on vector
         // New: copies.pop_front() → O(1) on deque
@@ -205,6 +235,11 @@ static void device_stream_sync_current(moe_pc_engine* e) {
 // Problem: Same as sync - finds in s_tl_stream_guards, checks s_tl_tensor_streams
 // Stream never returned to pool -> pool exhaustion -> cuStreamCreate fallback.
 // Solution: Check s_tl_stream_guards.end() and return it->second.stream to pool
+// BUGFIX 888: Remove deferred_staging_copies.erase() from here ★★★ CRITICAL
+// Problem: ThreadStreamGuard destructor calls this function, then tries to access
+// s_tl_deferred_staging_copies again to release in-flight bytes. But this function
+// already erased it, so destructor's cleanup code becomes dead code → VRAM deadlock.
+// Solution: Only erase deferred_staging_copies in destructor, not here.
 static void device_stream_destroy_current(moe_pc_engine* e) {
     device_stream_sync_current(e);
     if (e) {
@@ -220,7 +255,7 @@ static void device_stream_destroy_current(moe_pc_engine* e) {
         }
     }
     s_tl_tensor_pending_keys.erase(e);
-    s_tl_deferred_staging_copies.erase(e);
+    // BUGFIX 888: Removed s_tl_deferred_staging_copies.erase(e) - moved to destructor
     device_destroy_copy_event_pool(e);
 }
 
@@ -231,18 +266,26 @@ ThreadStreamGuard::~ThreadStreamGuard() {
     engine = nullptr;
     stream = nullptr;
 
-    device_stream_destroy_current(e);
-
+    // BUGFIX 888: Clean up deferred copies BEFORE calling device_stream_destroy_current ★★★ CRITICAL
+    // Problem: device_stream_destroy_current() used to erase s_tl_deferred_staging_copies,
+    // so the cleanup code below became dead code. In-flight bytes were never released → VRAM deadlock.
+    // Solution: Clean up deferred copies first, then call device_stream_destroy_current.
+    // Impact: Fixes VRAM budget deadlock on worker crash, ensures in-flight bytes are released.
     auto dit = s_tl_deferred_staging_copies.find(e);
     if (dit != s_tl_deferred_staging_copies.end()) {
         for (auto& copy : dit->second) {
             if (copy.event) device_backend_event_destroy(e, copy.event);
             if (copy.slot != UINT32_MAX) release_staging_slot(e, copy.slot);
+            // Release in-flight bytes for this copy
+            device_release_in_flight_vram_bytes(e, copy.bytes_for_vram_release);
         }
         s_tl_deferred_staging_copies.erase(dit);
     }
 
     device_destroy_copy_event_pool(e);
+
+    // Now safe to call device_stream_destroy_current (won't double-erase deferred_staging_copies)
+    device_stream_destroy_current(e);
 }
 
 static void device_stream_pool_destroy(moe_pc_engine* e) {

@@ -5,6 +5,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
+#include <atomic>
 
 // QKV Thread Pool - Parallel execution for K scoring and V accumulation
 class QkvThreadPool {
@@ -14,9 +15,9 @@ public:
     std::condition_variable done_cv;
     std::mutex mtx;
     std::function<void(int)> task;
-    int total_tasks = 0;
-    int current_task = 0;
-    int completed_tasks = 0;
+    std::atomic<int> total_tasks{0};
+    std::atomic<int> current_task{0};
+    std::atomic<int> completed_tasks{0};
     bool stop = false;
 
     explicit QkvThreadPool(int num_threads);

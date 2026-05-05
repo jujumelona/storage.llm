@@ -15,22 +15,27 @@ QkvThreadPool::QkvThreadPool(int num_threads) {
                 std::function<void(int)> my_fn;
                 {
                     std::unique_lock<std::mutex> lock(mtx);
-                    cv.wait(lock, [this]() { return stop || current_task < total_tasks; });
-                    if (stop && current_task >= total_tasks) return;
-                    my_task = current_task++;
-                    // Bug 3: Copy total_tasks under mutex to avoid data race
-                    local_total = total_tasks;
+                    cv.wait(lock, [this]() {
+                        return stop ||
+                            current_task.load(std::memory_order_relaxed) <
+                                total_tasks.load(std::memory_order_acquire);
+                    });
+                    local_total = total_tasks.load(std::memory_order_acquire);
+                    if (stop &&
+                        current_task.load(std::memory_order_relaxed) >= local_total) {
+                        return;
+                    }
                     my_fn = task;
                 }
-                // Bug 3: Use local_total instead of total_tasks (no mutex here)
-                if (my_task < local_total) {
+                for (;;) {
+                    my_task = current_task.fetch_add(1, std::memory_order_relaxed);
+                    if (my_task >= local_total) {
+                        break;
+                    }
                     my_fn(my_task);
-                    {
-                        std::unique_lock<std::mutex> lock(mtx);
-                        completed_tasks++;
-                        if (completed_tasks == total_tasks) {
-                            done_cv.notify_one();
-                        }
+                    const int done = completed_tasks.fetch_add(1, std::memory_order_release) + 1;
+                    if (done == local_total) {
+                        done_cv.notify_one();
                     }
                 }
             }
@@ -59,9 +64,9 @@ void QkvThreadPool::run(int num_tasks, std::function<void(int)> fn) {
         // no listeners and done_cv.wait would hang forever.
         if (stop) return;
         task = fn;
-        total_tasks = num_tasks;
-        current_task = 0;
-        completed_tasks = 0;
+        total_tasks.store(num_tasks, std::memory_order_release);
+        current_task.store(0, std::memory_order_relaxed);
+        completed_tasks.store(0, std::memory_order_release);
     }
     cv.notify_all();
     {
@@ -70,6 +75,9 @@ void QkvThreadPool::run(int num_tasks, std::function<void(int)> fn) {
         // Workers complete current tasks before exiting, so completed_tasks will
         // reach total_tasks even during shutdown. Checking stop here causes
         // premature return with incomplete attention scores.
-        done_cv.wait(lock, [this]() { return completed_tasks == total_tasks; });
+        done_cv.wait(lock, [this]() {
+            return completed_tasks.load(std::memory_order_acquire) >=
+                total_tasks.load(std::memory_order_acquire);
+        });
     }
 }

@@ -83,8 +83,41 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
     // BUGFIX 문제5: Lower threshold from 64 to 32 for earlier compact trigger ★★
     // Problem: 64 threshold delays compact too long in high-load scenarios
     // Solution: Trigger compact earlier at 32 stale entries
-    if (stale_count >= 32u) {
+    //
+    // BUGFIX 892: Inline compact and retry when stale limit reached ★★★ CRITICAL
+    // Problem: stale_count >= stale_limit → sets compact_needed flag → returns 0 (failure)
+    // Background worker compacts every 25ms, but demote_cold_until_impl's 1000-attempt
+    // loop keeps failing in the meantime → VRAM allocation blocked → deadlock.
+    // Solution: When stale limit reached, unlock heap_mutex, compact inline, retry once.
+    // Impact: Eviction succeeds immediately instead of waiting 25ms for background compact.
+    if (stale_count >= stale_limit) {
         engine->evict_heap_compact_needed.store(true, std::memory_order_relaxed);
+
+        // Inline compact and retry once
+        heap_lock.unlock();  // Release heap_mutex before compact (it will re-acquire)
+        compact_evict_heap(engine, idx);
+
+        // Retry once after compact (don't recurse, just one more attempt)
+        heap_lock.lock();
+        if (!engine->evict_heaps[idx].empty()) {
+            moe_evict_candidate victim = engine->evict_heaps[idx].top();
+            engine->evict_heaps[idx].pop();
+            engine->evict_heap_versions[idx].fetch_add(1, std::memory_order_release);
+
+            if (victim.slot < engine->expert_states.size()) {
+                std::lock_guard<std::mutex> map_lock(engine->map_mutex);
+                if (victim.slot < engine->expert_states.size()) {
+                    const moe_block_state& state = engine->expert_states[victim.slot];
+                    if (state.active && !state.pending_evict && state.tier == tier &&
+                        state.bytes == victim.bytes && state.hot_score == victim.hot_score &&
+                        state.last_touch_epoch == victim.last_touch_epoch &&
+                        state.predicted_next_use_epoch == victim.predicted_next_use_epoch) {
+                        *out = victim;
+                        return 1;
+                    }
+                }
+            }
+        }
     }
     return 0;
 }
@@ -232,9 +265,27 @@ static void demote_cold_until_impl(moe_pc_engine* engine, moe_tier_t tier, uint6
         return;
     }
     // BUGFIX 272: Prevent unbounded recursion
+    // BUGFIX 890: Add DB fallback path when recursion limit reached ★★★ CRITICAL
+    // Problem: recursion_depth > 2 just returns, leaving cold experts in RAM.
+    // RAM stays full, VRAM eviction fails, subsequent allocations fail → deadlock.
+    // Solution: When recursion limit reached, directly evict to DB (non-recursive).
+    // Impact: Ensures eviction always completes, prevents RAM saturation deadlock.
     if (recursion_depth > 2) {
         // BUGFIX 717: Track silent failures from recursion limit
         engine->io_atomic.eviction_depth_exceeded.fetch_add(1, std::memory_order_relaxed);
+
+        // BUGFIX 890: Non-recursive DB eviction fallback
+        // Instead of returning (leaving RAM full), directly evict cold experts to DB
+        compact_evict_heap(engine, idx);
+        int fallback_attempts = 100;  // Limit to prevent infinite loop
+        while (tier_used(engine, tier) + needed > budget && fallback_attempts-- > 0) {
+            moe_evict_candidate victim{};
+            if (!pop_valid_evict_candidate(engine, tier, &victim)) {
+                break;
+            }
+            // Direct eviction to DB, no recursion
+            demote_one_victim_to(engine, victim, tier, moe_TIER_DB, to_free);
+        }
         return;
     }
 

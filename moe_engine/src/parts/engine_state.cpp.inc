@@ -174,6 +174,15 @@ struct moe_pc_engine {
     alignas(64) std::atomic<uint64_t> ram_used_bytes{0};
     alignas(64) std::atomic<uint64_t> db_used_bytes{0};
 
+    // BUGFIX 875: Track VRAM in-flight bytes (DMA queued but not completed) ★★★ CRITICAL
+    // Problem: prefetch_plan trim calculation only sees tier_used(VRAM), missing bytes
+    // already queued to GPU DMA but not yet completed. GPU workers keep queueing new
+    // experts while old transfers are in-flight, causing VRAM overflow → eviction storm.
+    // Solution: Atomic counter incremented when DMA queued, decremented when event completes.
+    // prefetch_plan.cpp.inc subtracts this from device_free to prevent over-admission.
+    // Impact: Eliminates VRAM overflow, stabilizes token latency, prevents eviction thrashing.
+    alignas(64) std::atomic<uint64_t> vram_in_flight_bytes{0};
+
     // BUGFIX 문제4: Add KV cache VRAM budget tracking ★★★
     // Problem: VRAM budget shared between experts and KV, no separation
     // Solution: Split VRAM budget into expert and KV portions
