@@ -221,7 +221,8 @@
         layer, position, seq_len, decode_start, kv_entry_dim,
         moe_profile_elapsed_ms(kv_start_us));
 
-    const float scale = moe_standard_attention_score_scale(engine, layer, head_dim);
+    const char* scale_source = nullptr;
+    const float scale = moe_standard_attention_score_scale(engine, layer, head_dim, &scale_source);
     const uint64_t heads_start_us = moe_profile_now_us();
     std::fill(s->attn_value.begin(), s->attn_value.begin() + v_total_dim, 0.0f);
     {
@@ -263,8 +264,9 @@
     }
     moe_profile_log(
         "attn_standard_heads",
-        "layer=%d pos=%u heads=%u seq=%u head_dim=%u v_head_dim=%u scale=%.6g ms=%.3f",
+        "layer=%d pos=%u heads=%u seq=%u head_dim=%u v_head_dim=%u scale=%.6g scale_source=%s ms=%.3f",
         layer, position, num_heads, seq_len, head_dim, v_head_dim, (double)scale,
+        scale_source ? scale_source : "unknown",
         moe_profile_elapsed_ms(heads_start_us));
 
     const uint64_t o_start_us = moe_profile_now_us();

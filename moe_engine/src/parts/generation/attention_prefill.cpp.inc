@@ -154,10 +154,31 @@ static int moe_layer_has_qk_norm_scaled_standard_layout(
 static float moe_standard_attention_score_scale(
     const moe_pc_engine* engine,
     int32_t layer,
-    uint32_t head_dim
+    uint32_t head_dim,
+    const char** source_out = nullptr
 ) {
+    (void)layer;
+    if (source_out) {
+        *source_out = "head_dim";
+    }
     if (head_dim == 0) {
+        if (source_out) {
+            *source_out = "fallback";
+        }
         return 1.0f;
+    }
+    if (engine && !engine->offload_gguf_metadata_json.empty()) {
+        double direct_scale = 0.0;
+        if ((moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_scale", &direct_scale) ||
+             moe_json_get_double_local(engine->offload_gguf_metadata_json, "attn_scale", &direct_scale) ||
+             moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_score_scale", &direct_scale) ||
+             moe_json_get_double_local(engine->offload_gguf_metadata_json, "qk_scale", &direct_scale)) &&
+            direct_scale > 0.0 && direct_scale <= 1024.0 && std::isfinite(direct_scale)) {
+            if (source_out) {
+                *source_out = "metadata_scale";
+            }
+            return (float)direct_scale;
+        }
     }
     float query_pre_attn_scalar = engine ? engine->model_config_query_pre_attn_scalar : 0.0f;
     if (!(query_pre_attn_scalar > 0.0f) && engine && !engine->offload_gguf_metadata_json.empty()) {
@@ -173,15 +194,21 @@ static float moe_standard_attention_score_scale(
     if (query_pre_attn_scalar > 0.0f && std::isfinite(query_pre_attn_scalar)) {
         float result = 1.0f / std::sqrt(query_pre_attn_scalar);
         if (!std::isfinite(result)) {
+            if (source_out) {
+                *source_out = "fallback";
+            }
             return 1.0f;
+        }
+        if (source_out) {
+            *source_out = "query_pre_attn_scalar";
         }
         return result;
     }
-    if (moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
-        return 1.0f;
-    }
     float result = 1.0f / std::sqrt((float)head_dim);
     if (!std::isfinite(result)) {
+        if (source_out) {
+            *source_out = "fallback";
+        }
         return 1.0f;
     }
     return result;
