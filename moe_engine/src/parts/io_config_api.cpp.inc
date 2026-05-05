@@ -1,4 +1,4 @@
-﻿int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* config) {
+int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* config) {
     if (!engine) {
         return 0;
     }
@@ -86,9 +86,10 @@
     }
     if (engine->io_config.level_zero_memory_headroom_pct > 90) {
         fprintf(stderr,
-            "[storageLLM WARNING] level_zero_memory_headroom_pct=%u out of range [0,90], using default 10\n",
+            "[storageLLM WARNING] level_zero_memory_headroom_pct=%u out of range [0,90], using default 20\n",
             (unsigned)engine->io_config.level_zero_memory_headroom_pct);
-        engine->io_config.level_zero_memory_headroom_pct = 10;
+        // BUGFIX 902: Level Zero iGPU needs higher headroom
+        engine->io_config.level_zero_memory_headroom_pct = 20;
     }
 
     // BUGFIX 645: 큐 깊이 불균형 수정 - 단계별 독립 큐 깊이 설정 ★★★

@@ -94,7 +94,8 @@ moe_io_config_t moe_pc_default_io_config(void) {
     cfg.metal_memory_budget_pct = 0;
     cfg.madv_cold_threshold_pct = 30;
     cfg.vulkan_memory_headroom_pct = 10;
-    cfg.level_zero_memory_headroom_pct = 10;
+    // BUGFIX 902: Level Zero iGPU needs higher headroom (20% default)
+    cfg.level_zero_memory_headroom_pct = 20;
     cfg.enable_bw_benchmark = 1;
     cfg.ram_eviction_target_fill_pct = 75;  // Default 75% RAM fill target
     return cfg;

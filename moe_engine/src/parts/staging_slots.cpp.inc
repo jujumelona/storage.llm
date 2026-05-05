@@ -13,7 +13,7 @@ static inline bool staging_slot_valid(
     if (!e) return false;
     if (e->staging_slot_size == 0) return false;  // MUST check first
     if (slot_index >= e->staging_slots.size()) return false;
-    return e->staging_slots[slot_index].buf != nullptr;
+    return e->staging_slots[slot_index].buf.load(std::memory_order_acquire) != nullptr;
 }
 
 static void device_backend_event_destroy(moe_pc_engine* e, CUevent event);

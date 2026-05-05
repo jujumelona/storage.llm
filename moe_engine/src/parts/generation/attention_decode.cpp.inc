@@ -152,17 +152,19 @@
         layer, position, has_q_norm, has_k_norm, has_v, use_v_norm,
         moe_profile_elapsed_ms(qkv_norm_start_us));
     const uint64_t rope_start_us = moe_profile_now_us();
+    const int rope_rotate_half = moe_standard_rope_uses_rotate_half_cached(engine, cfg);
+    const int rope_partial_half_split = (rope_rotate_half && rope_dim < head_dim) ? 1 : 0;
     if (rope_dim >= 2u) {
         static const std::vector<float> empty_rope_table;
         const std::vector<float>& q_cos = use_dynamic_rope ? empty_rope_table : s->rope_q_cos;
         const std::vector<float>& q_sin = use_dynamic_rope ? empty_rope_table : s->rope_q_sin;
         const std::vector<float>& k_cos = use_dynamic_rope ? empty_rope_table : s->rope_k_cos;
         const std::vector<float>& k_sin = use_dynamic_rope ? empty_rope_table : s->rope_k_sin;
-        const int rope_rotate_half = moe_standard_rope_uses_rotate_half_cached(engine, cfg);
         for (uint32_t h = 0; h < num_heads; ++h) {
-            moe_standard_rope_apply_inplace_with_layout(
+            moe_standard_rope_apply_inplace_with_full_dim(
                 rope_rotate_half,
                 s->q_b.data() + (uint64_t)h * head_dim,
+                head_dim,
                 rope_dim,
                 position,
                 q_cos,
@@ -170,9 +172,10 @@
                 rope_theta);
         }
         for (uint32_t h = 0; h < num_kv_heads; ++h) {
-            moe_standard_rope_apply_inplace_with_layout(
+            moe_standard_rope_apply_inplace_with_full_dim(
                 rope_rotate_half,
                 s->attn_kv_a.data() + (uint64_t)h * head_dim,
+                head_dim,
                 rope_dim,
                 position,
                 k_cos,
@@ -182,8 +185,11 @@
     }
     moe_profile_log(
         "attn_standard_rope",
-        "layer=%d pos=%u rope_dim=%u dynamic=%d ms=%.3f",
-        layer, position, rope_dim, use_dynamic_rope,
+        "layer=%d pos=%u rope_dim=%u rope_full_dim=%u rotate_half=%d partial_half_split=%d dynamic=%d ms=%.3f",
+        layer, position, rope_dim, head_dim,
+        rope_rotate_half,
+        rope_partial_half_split,
+        use_dynamic_rope,
         moe_profile_elapsed_ms(rope_start_us));
     const uint64_t kv_start_us = moe_profile_now_us();
     if (!moe_standard_kv_cache_ensure(engine, s, position, kv_entry_dim)) {

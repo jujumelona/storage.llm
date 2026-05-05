@@ -50,9 +50,37 @@ struct moe_iocp_adapter_t {
         if (!initialized || !dst || bytes == 0) return false;
 
         uint32_t slot = request_head % MAX_CONCURRENT;
+
+        // BUGFIX 918: Check if slot is still in use before reusing ★★★ CRITICAL
+        // Problem: When request_head wraps around (>64 requests), slot reuse happens
+        // without checking if previous request completed → OVERLAPPED struct corruption
+        // Solution: Check completed flag, poll IOCP if not completed, fail if still busy
+        // Impact: Prevents memory corruption on Windows non-DirectStorage path
+        iocp_request_t& req = requests[slot];
+        if (!req.completed && req.file_handle != INVALID_HANDLE_VALUE) {
+            // Slot still in use, try to drain one completion
+            DWORD bytes_transferred = 0;
+            ULONG_PTR completion_key = 0;
+            OVERLAPPED* pOverlapped = nullptr;
+            BOOL ok = GetQueuedCompletionStatus(iocp, &bytes_transferred, &completion_key, &pOverlapped, 0);
+            if (ok && pOverlapped) {
+                // Mark completed
+                for (uint32_t i = 0; i < MAX_CONCURRENT; ++i) {
+                    if (&requests[i].overlapped == pOverlapped) {
+                        requests[i].completed = true;
+                        break;
+                    }
+                }
+            }
+            // Re-check after drain attempt
+            if (!req.completed) {
+                // Slot still busy, cannot submit
+                return false;
+            }
+        }
+
         request_head++;
 
-        iocp_request_t& req = requests[slot];
         memset(&req.overlapped, 0, sizeof(OVERLAPPED));
         req.overlapped.Offset = (DWORD)(file_offset & 0xFFFFFFFF);
         req.overlapped.OffsetHigh = (DWORD)(file_offset >> 32);

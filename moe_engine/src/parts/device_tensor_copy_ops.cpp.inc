@@ -93,7 +93,7 @@ static int device_copy_tensor_from_host(
         return 0;
     }
     CUstream stream = device_tensor_stream_current(e);
-    bool is_host_pinned = true; if (staging_slot != UINT32_MAX && staging_slot < e->staging_slots.size()) { is_host_pinned = e->staging_slots[staging_slot].pinned; } if (!is_host_pinned) { e->io_atomic.nonpinned_fallback_count.fetch_add(1, std::memory_order_relaxed); } const int async_copy = is_host_pinned && device_backend_async_h2d_available(e, stream, 1);
+    bool is_host_pinned = true; if (staging_slot != UINT32_MAX && staging_slot_valid(e, staging_slot)) { is_host_pinned = e->staging_slots[staging_slot].pinned; } if (!is_host_pinned) { e->io_atomic.nonpinned_fallback_count.fetch_add(1, std::memory_order_relaxed); } const int async_copy = is_host_pinned && device_backend_async_h2d_available(e, stream, 1);
     const uint64_t key = device_key_tensor(r);
     CUdeviceptr dst = 0;
     if (!device_prepare_tensor_allocation(e, key, bytes, pool, async_copy, &dst, host)) {
@@ -130,7 +130,7 @@ static int device_copy_tensor_from_host(
     // Impact: Eliminates race condition, ensures DMA fence correctness
     bool event_ok = false;
     if (async_copy) {
-        if (staging_slot != UINT32_MAX && staging_slot < e->staging_slots.size()) {
+        if (staging_slot != UINT32_MAX && staging_slot_valid(e, staging_slot)) {
             auto& slot = e->staging_slots[staging_slot];
             // Record fence event on the slot itself
             if (!slot.last_copy_event) {

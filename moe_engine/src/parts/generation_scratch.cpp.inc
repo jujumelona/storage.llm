@@ -35,6 +35,16 @@ struct moe_decode_scratch {
     std::vector<float> expert_out_pool;
     moe_kv_cache kv_cache;
     uint32_t position = 0;
+    // Per-session router EMA state (BUGFIX Problem F, stage 2: wiring) ★★★ PERFORMANCE
+    // Problem: Engine-level smoothed_router_entropy_milli shared across all sessions
+    // → Different domains (code gen vs chat) mix EMA state
+    // → Hysteresis effectiveness reduced, cache hit rate drops
+    // Solution: Each decode scratch maintains independent entropy and prefetch depth
+    // → Router writes here instead of engine->last_router_entropy_milli
+    // → MLP reads depth from here instead of engine->adaptive_prefetch_depth
+    // → Engine-level atomics kept as secondary sync for diagnostics/profiling only
+    uint32_t session_router_entropy_milli = 0;
+    uint32_t session_adaptive_prefetch_depth = 2;
     // Absorption scratch (moved from thread_local)
     std::vector<float> q_a;
     std::vector<float> q_a_norm;
@@ -112,10 +122,21 @@ static void moe_engine_signal_memory_pressure_recovery(
     device_free_pool(engine, moe_DEVICE_POOL_ACTIVATION);
 }
 
-static void moe_decode_scratch_drop_transient_buffers(moe_decode_scratch* s) {
+static void moe_decode_scratch_drop_transient_buffers(moe_pc_engine* engine, moe_decode_scratch* s) {
     if (!s) {
         return;
     }
+    // BUGFIX 925: Release kv_decode RAM tracking before dropping buffers ★★ IMPORTANT
+    // Problem: kv_decode_flat is freed but kv_decode_tracked_ram_bytes not cleared
+    // → RAM usage counter stays high until next moe_kv_decode_cache_track_ram() call
+    // → RAM budget miscalculated during token latency window
+    // Solution: Call subtract_tier_usage() before swap to immediately update RAM counter
+    // Impact: Accurate RAM accounting during transient buffer drops
+    if (engine && s->kv_decode_tracked_ram_bytes > 0) {
+        subtract_tier_usage(engine, moe_TIER_RAM, s->kv_decode_tracked_ram_bytes);
+        s->kv_decode_tracked_ram_bytes = 0;
+    }
+
     std::vector<float>().swap(s->hidden);
     std::vector<float>().swap(s->residual);
     std::vector<float>().swap(s->norm);
@@ -354,7 +375,7 @@ static int moe_decode_scratch_resize(
         moe_rope_table_resize(&s->rope_q_cos, &s->rope_q_sin, cfg.qk_rope_head_dim, cfg.rope_theta, cfg.rope_table_len);
     } catch (const std::bad_alloc&) {
         moe_kv_decode_cache_release_ram(engine, s);
-        moe_decode_scratch_drop_transient_buffers(s);
+        moe_decode_scratch_drop_transient_buffers(engine, s);
         moe_engine_signal_memory_pressure_recovery(engine, "decode_scratch_bad_alloc");
         return 0;
     }
@@ -375,4 +396,3 @@ static int moe_decode_scratch_resize(
     }
     return s->hidden.size() >= hidden && s->norm.size() >= hidden && s->kv_cache.data != nullptr;
 }
-

@@ -28,7 +28,11 @@ typedef struct {
     int runtime_access_plan_ready;
     uint64_t runtime_access_hotset_count;
     uint64_t runtime_access_file_group_count;
+    uint64_t runtime_access_executor_tensor_count;
+    uint64_t runtime_access_layer_prefetch_plan_count;
     int kv_layout_contract_ready;
+    uint64_t kv_layout_max_entry_dim;
+    uint64_t kv_layout_page_size_tokens;
 } moe_forward_status_t;
 
 typedef enum {

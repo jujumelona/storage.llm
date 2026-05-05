@@ -210,7 +210,8 @@ static int moe_router_topk_f32(
     std::vector<int>* out_experts,
     std::vector<float>* out_weights,
     std::vector<float>* scratch_logits,
-    std::vector<uint32_t>* scratch_order
+    std::vector<uint32_t>* scratch_order,
+    moe_decode_scratch* session = nullptr
 ) {
     if (!engine || !hidden || !out_experts || !out_weights || !scratch_logits || !scratch_order ||
         hidden_size == 0 || experts == 0 || top_k == 0) {
@@ -286,19 +287,33 @@ static int moe_router_topk_f32(
     float router_entropy = 0.5f;
     if (use_sigmoid) {
         router_entropy = moe_router_normalized_entropy(*scratch_logits);
-        engine->last_router_entropy_milli.store((uint32_t)(router_entropy * 1000.0f), std::memory_order_relaxed);
-        // Fix 22: Hysteresis for adaptive_prefetch_depth
-        uint32_t current_depth = engine->adaptive_prefetch_depth.load(std::memory_order_relaxed);
+        const uint32_t entropy_milli = (uint32_t)(router_entropy * 1000.0f);
+        // BUGFIX Problem F stage 2: Per-session entropy and prefetch depth ★★★
+        // Primary: write to session-level fields for proper isolation
+        // Secondary: engine-level atomics kept for profiling/diagnostics only
+        if (session) {
+            session->session_router_entropy_milli = entropy_milli;
+        }
+        engine->last_router_entropy_milli.store(entropy_milli, std::memory_order_relaxed);
+        // Fix 22: Hysteresis for adaptive_prefetch_depth (now per-session)
+        const uint32_t current_depth = session ?
+            session->session_adaptive_prefetch_depth :
+            engine->adaptive_prefetch_depth.load(std::memory_order_relaxed);
         uint32_t new_depth = router_entropy > 0.70f ? 1u : 2u;
         if (new_depth == 1u && current_depth == 2u) {
-            if (router_entropy > 0.70f * 1.05f) engine->adaptive_prefetch_depth.store(1u, std::memory_order_relaxed);
+            if (router_entropy > 0.70f * 1.05f) new_depth = 1u; else new_depth = current_depth;
         } else if (new_depth == 2u && current_depth == 1u) {
-            if (router_entropy < 0.70f * 0.95f) engine->adaptive_prefetch_depth.store(2u, std::memory_order_relaxed);
-        } else {
-            engine->adaptive_prefetch_depth.store(new_depth, std::memory_order_relaxed);
+            if (router_entropy < 0.70f * 0.95f) new_depth = 2u; else new_depth = current_depth;
         }
+        if (session) {
+            session->session_adaptive_prefetch_depth = new_depth;
+        }
+        engine->adaptive_prefetch_depth.store(new_depth, std::memory_order_relaxed);
     } else {
         // Raw-logit/softmax routers do not feed the sigmoid entropy heuristic.
+        if (session) {
+            session->session_router_entropy_milli = 500u;
+        }
         engine->last_router_entropy_milli.store(500u, std::memory_order_relaxed);
     }
 
@@ -355,7 +370,8 @@ static void moe_infinigen_speculative_prefetch(
     int32_t target_layer,
     uint32_t experts,
     std::vector<int>& predicted_experts,
-    float* out_confidence
+    float* out_confidence,
+    moe_decode_scratch* session = nullptr
 ) {
     predicted_experts.clear();
     if (out_confidence) *out_confidence = 0.0f;

@@ -50,14 +50,13 @@ static int prefetch_tensor_pinned_to_gpu(
     }
     const uint64_t bytes = tensor_stream_bytes(rec);
     int copied = 0;
-    if (staging_slot < engine->staging_slots.size() &&
-        staging_bytes >= bytes &&
-        engine->staging_slots[staging_slot].buf) {
+    if (staging_slot != UINT32_MAX && staging_slot_valid(engine, staging_slot) &&
+        staging_bytes >= bytes) {
         copied = device_copy_tensor_from_host(
             engine,
             rec,
             moe_DEVICE_POOL_EXPERT,
-            engine->staging_slots[staging_slot].buf,
+            engine->staging_slots[staging_slot].buf.load(std::memory_order_acquire),
             staging_bytes,
             staging_slot
         );
@@ -87,8 +86,8 @@ static int prefetch_expert_triplet_pinned_to_gpu_bundle(
 ) {
     if (!engine || !task.bundle_triplet ||
         task.bundle_layer < 0 || task.bundle_expert < 0 ||
-        task.staging_slot >= engine->staging_slots.size() ||
-        !engine->staging_slots[task.staging_slot].buf) {
+        task.staging_slot == UINT32_MAX ||
+        !staging_slot_valid(engine, task.staging_slot)) {
         return 0;
     }
     const moe_projection_t projs[3] = {moe_PROJ_GATE, moe_PROJ_UP, moe_PROJ_DOWN};
@@ -108,7 +107,7 @@ static int prefetch_expert_triplet_pinned_to_gpu_bundle(
             release_staging_slot(engine, task.staging_slot);
             return 0;
         }
-        const uint8_t* host = engine->staging_slots[task.staging_slot].buf + task.bundle_offsets[i];
+        const uint8_t* host = engine->staging_slots[task.staging_slot].buf.load(std::memory_order_acquire) + task.bundle_offsets[i];
         const int ok = device_copy_tensor_from_host(
             engine,
             *rec,

@@ -61,7 +61,11 @@ static void moe_forward_trace_generation_contract(
     const uint32_t access_plan_ready = engine->juju_runtime_access_plan_ready.load(std::memory_order_relaxed);
     const uint64_t hotset_count = engine->juju_runtime_access_hotset_count.load(std::memory_order_relaxed);
     const uint64_t file_group_count = engine->juju_runtime_access_file_group_count.load(std::memory_order_relaxed);
+    const uint64_t executor_tensor_count = engine->juju_runtime_executor_tensor_count.load(std::memory_order_relaxed);
+    const uint64_t layer_prefetch_count = engine->juju_runtime_layer_prefetch_plan_count.load(std::memory_order_relaxed);
     const uint32_t kv_layout_ready = engine->juju_kv_layout_contract_ready.load(std::memory_order_relaxed);
+    const uint64_t kv_entry_dim = engine->juju_kv_layout_max_entry_dim.load(std::memory_order_relaxed);
+    const uint64_t kv_page_tokens = engine->juju_kv_layout_page_size_tokens.load(std::memory_order_relaxed);
     (void)moe_graph_ir_tensor_binding_name(engine, "token_embedding", &token_embedding);
     (void)moe_graph_ir_tensor_binding_name(engine, "lm_head", &lm_head);
     (void)moe_graph_ir_tensor_binding_name(engine, "final_norm", &final_norm);
@@ -77,7 +81,7 @@ static void moe_forward_trace_generation_contract(
     (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_router_scale", &router_scale);
     moe_profile_log(
         "generation_contract",
-        "layers=%u hidden=%u vocab=%u token_embedding=%s lm_head=%s tied=%d final_norm=%s post_attn=%llu expert_norm=%llu post_ffw=%llu post_ffw1=%llu post_ffw2=%llu output_scale=%llu no_v_proj=%llu v_norm=%llu router_scale=%llu access_plan=%u hotset=%llu file_groups=%llu kv_layout=%u",
+        "layers=%u hidden=%u vocab=%u token_embedding=%s lm_head=%s tied=%d final_norm=%s post_attn=%llu expert_norm=%llu post_ffw=%llu post_ffw1=%llu post_ffw2=%llu output_scale=%llu no_v_proj=%llu v_norm=%llu router_scale=%llu access_plan=%u hotset=%llu file_groups=%llu tensor_refs=%llu layer_prefetch=%llu kv_layout=%u kv_entry_dim=%llu kv_page_tokens=%llu",
         c->num_hidden_layers,
         c->hidden_size,
         c->vocab_size,
@@ -97,7 +101,11 @@ static void moe_forward_trace_generation_contract(
         access_plan_ready,
         (unsigned long long)hotset_count,
         (unsigned long long)file_group_count,
-        kv_layout_ready);
+        (unsigned long long)executor_tensor_count,
+        (unsigned long long)layer_prefetch_count,
+        kv_layout_ready,
+        (unsigned long long)kv_entry_dim,
+        (unsigned long long)kv_page_tokens);
 }
 
 static void moe_forward_trace_runtime_resources(
@@ -243,6 +251,9 @@ static int moe_forward_one_token_f32(
 
     // Fix 4: Reset adaptive prefetch depth for the new token
     engine->adaptive_prefetch_depth.store(2u, std::memory_order_relaxed);
+    // BUGFIX Problem F stage 2: Reset per-session depth too ★★★
+    s->session_adaptive_prefetch_depth = 2u;
+    s->session_router_entropy_milli = 0u;
 
     // Fix 10: Safely resize co_activation structures here (single-threaded forward loop)
     // BUGFIX 499: num_hidden_layers 범위 체크

@@ -1,6 +1,6 @@
 // Device memory management and accounting
 
-// BUGFIX 76: Issue 11 - Document KV cache vs VRAM budget separation ??
+// BUGFIX 76: Issue 11 - Document KV cache vs VRAM budget separation ★★
 // Clarification: KV cache is RAM-only, NOT included in VRAM budget
 // - KV cache: CPU RAM (moe_kv_cache in generation_kv_cache.cpp.inc)
 // - VRAM budget: GPU memory for expert weights only (device_allocations map)
@@ -8,6 +8,7 @@
 // - device_budget_bytes() calculates VRAM for experts, does NOT include KV/QKV
 // - Separate accounting: tier_used(moe_TIER_RAM) for KV, device_allocated_bytes for VRAM
 // - No interaction: KV growth does not reduce expert cache space
+
 // Helper to encapsulate VRAM budget accounting.
 // Do not modify engine->device_free_bytes directly.
 static void device_account_bytes_freed(moe_pc_engine* e, uint64_t bytes) {
@@ -15,24 +16,6 @@ static void device_account_bytes_freed(moe_pc_engine* e, uint64_t bytes) {
     if (e->backend_caps.backend == moe_BACKEND_METAL) return; // budget computed dynamically
     e->device_free_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
-
-// BUGFIX 124: Issue 29 - Metal unified memory budget double-counted ★★
-// Problem: Metal VRAM budget subtracts ram_used_bytes, but RAM budget also tracks ram_used_bytes.
-// Same 4GB data consumes 4GB from VRAM budget + 4GB from RAM budget = 8GB total.
-// Solution: Metal should use unified budget only. Set RAM budget to 0 in device_allocator_init.
-// All expert data tracked in "VRAM" budget (actually unified memory budget).
-// Device memory management and accounting
-
-// BUGFIX 76: Issue 11 - Document KV cache vs VRAM budget separation ??
-// Clarification: KV cache is RAM-only, NOT included in VRAM budget
-// - KV cache: CPU RAM (moe_kv_cache in generation_kv_cache.cpp.inc)
-// - VRAM budget: GPU memory for expert weights only (device_allocations map)
-// - QKV state (engine_core/kv/kv_qkv.cpp): Also CPU RAM, ~0.69 GiB
-// - device_budget_bytes() calculates VRAM for experts, does NOT include KV/QKV
-// - Separate accounting: tier_used(moe_TIER_RAM) for KV, device_allocated_bytes for VRAM
-// - No interaction: KV growth does not reduce expert cache space
-// Helper to encapsulate VRAM budget accounting.
-// Do not modify engine->device_free_bytes directly.
 
 // BUGFIX 124: Issue 29 - Metal unified memory budget double-counted ★★
 // Problem: Metal VRAM budget subtracts ram_used_bytes, but RAM budget also tracks ram_used_bytes.

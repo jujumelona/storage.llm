@@ -297,7 +297,11 @@ struct moe_pc_engine {
     std::atomic<uint32_t> juju_runtime_access_plan_ready{0};
     std::atomic<uint64_t> juju_runtime_access_hotset_count{0};
     std::atomic<uint64_t> juju_runtime_access_file_group_count{0};
+    std::atomic<uint64_t> juju_runtime_executor_tensor_count{0};
+    std::atomic<uint64_t> juju_runtime_layer_prefetch_plan_count{0};
     std::atomic<uint32_t> juju_kv_layout_contract_ready{0};
+    std::atomic<uint64_t> juju_kv_layout_max_entry_dim{0};
+    std::atomic<uint64_t> juju_kv_layout_page_size_tokens{0};
     std::atomic<uint32_t> juju_idx_schema_version{0};
     std::atomic<uint32_t> juju_split_group_count{0};
     std::atomic<uint32_t> juju_split_missing_count{0};

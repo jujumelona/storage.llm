@@ -2095,7 +2095,11 @@ static std::string make_health_json(
         << "\"runtimeAccessPlanReady\":" << (forward.runtime_access_plan_ready ? "true" : "false") << ","
         << "\"runtimeAccessHotsetCount\":" << forward.runtime_access_hotset_count << ","
         << "\"runtimeAccessFileGroupCount\":" << forward.runtime_access_file_group_count << ","
+        << "\"runtimeAccessExecutorTensorCount\":" << forward.runtime_access_executor_tensor_count << ","
+        << "\"runtimeAccessLayerPrefetchPlanCount\":" << forward.runtime_access_layer_prefetch_plan_count << ","
         << "\"kvLayoutContractReady\":" << (forward.kv_layout_contract_ready ? "true" : "false") << ","
+        << "\"kvLayoutMaxEntryDim\":" << forward.kv_layout_max_entry_dim << ","
+        << "\"kvLayoutPageSizeTokens\":" << forward.kv_layout_page_size_tokens << ","
         << "\"storageStateValid\":" << (forward.storage_state_valid ? "true" : "false") << ","
         << "\"tensorTableLoaded\":" << (forward.tensor_table_loaded ? "true" : "false") << ","
         << "\"expertTripletAvailable\":" << (forward.expert_triplet_available ? "true" : "false") << ","
@@ -2478,7 +2482,11 @@ static std::string make_chat_not_ready_json(const moe_forward_status_t& forward)
         << ", runtimeAccessPlan=" << (forward.runtime_access_plan_ready ? "ready" : "missing")
         << ", runtimeHotset=" << forward.runtime_access_hotset_count
         << ", runtimeFileGroups=" << forward.runtime_access_file_group_count
+        << ", runtimeTensorRefs=" << forward.runtime_access_executor_tensor_count
+        << ", layerPrefetchPlans=" << forward.runtime_access_layer_prefetch_plan_count
         << ", kvLayoutContract=" << (forward.kv_layout_contract_ready ? "ready" : "missing")
+        << ", kvEntryDim=" << forward.kv_layout_max_entry_dim
+        << ", kvPageTokens=" << forward.kv_layout_page_size_tokens
         << "\","
         << "\"type\":\"service_unavailable\","
         << "\"code\":\"runtime_status_not_ready\""

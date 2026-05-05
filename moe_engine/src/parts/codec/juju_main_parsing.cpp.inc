@@ -141,10 +141,23 @@ static void moe_ingest_juju_graph_ir(moe_pc_engine* engine, const std::string& i
         if (moe_json_get_u64_slice(index_json, graph_pos, index_json.size(), "file_locality_group_count", &value)) {
             engine->juju_runtime_access_file_group_count.store(value, std::memory_order_relaxed);
         }
+        if (moe_json_get_u64_slice(index_json, graph_pos, index_json.size(), "executor_tensor_count", &value)) {
+            engine->juju_runtime_executor_tensor_count.store(value, std::memory_order_relaxed);
+        }
+        if (moe_json_get_u64_slice(index_json, graph_pos, index_json.size(), "layer_prefetch_plan_count", &value)) {
+            engine->juju_runtime_layer_prefetch_plan_count.store(value, std::memory_order_relaxed);
+        }
     }
     if (index_json.find("\"kv_layout_contract\"", graph_pos) != std::string::npos &&
         index_json.find("JUJU_KV_LAYOUT_CONTRACT_V1", graph_pos) != std::string::npos) {
         engine->juju_kv_layout_contract_ready.store(1, std::memory_order_relaxed);
+        uint64_t value = 0;
+        if (moe_json_get_u64_slice(index_json, graph_pos, index_json.size(), "max_entry_dim", &value)) {
+            engine->juju_kv_layout_max_entry_dim.store(value, std::memory_order_relaxed);
+        }
+        if (moe_json_get_u64_slice(index_json, graph_pos, index_json.size(), "page_size_tokens", &value)) {
+            engine->juju_kv_layout_page_size_tokens.store(value, std::memory_order_relaxed);
+        }
     }
     if (engine->offload_graph_ir_json.empty()) {
         engine->offload_graph_ir_json = index_json.substr(graph_pos, std::min<size_t>(index_json.size() - graph_pos, 4u << 20));

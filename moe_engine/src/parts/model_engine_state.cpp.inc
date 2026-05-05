@@ -61,7 +61,11 @@ static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {
     engine->juju_runtime_access_plan_ready.store(0, std::memory_order_relaxed);
     engine->juju_runtime_access_hotset_count.store(0, std::memory_order_relaxed);
     engine->juju_runtime_access_file_group_count.store(0, std::memory_order_relaxed);
+    engine->juju_runtime_executor_tensor_count.store(0, std::memory_order_relaxed);
+    engine->juju_runtime_layer_prefetch_plan_count.store(0, std::memory_order_relaxed);
     engine->juju_kv_layout_contract_ready.store(0, std::memory_order_relaxed);
+    engine->juju_kv_layout_max_entry_dim.store(0, std::memory_order_relaxed);
+    engine->juju_kv_layout_page_size_tokens.store(0, std::memory_order_relaxed);
     engine->cached_gelu_activation_mode.store(-1, std::memory_order_relaxed);
     engine->cached_router_use_sigmoid.store(-1, std::memory_order_relaxed);
     engine->cached_router_norm_topk_prob.store(-1, std::memory_order_relaxed);

@@ -111,7 +111,8 @@ static uint32_t moe_router_adaptive_top_k(
     moe_pc_engine* engine,
     uint32_t requested_top_k,
     uint32_t experts,
-    float entropy
+    float entropy,
+    moe_decode_scratch* session = nullptr
 ) {
     uint32_t top_k = requested_top_k;
     if (entropy < 0.30f) {
@@ -120,8 +121,13 @@ static uint32_t moe_router_adaptive_top_k(
         top_k = std::min<uint32_t>(experts, 12u);
     }
     top_k = std::min(top_k, experts);
+    const uint32_t entropy_milli = (uint32_t)(entropy * 1000.0f);
+    // BUGFIX Problem F stage 2: Per-session entropy ★★★
+    if (session) {
+        session->session_router_entropy_milli = entropy_milli;
+    }
     if (engine) {
-        engine->last_router_entropy_milli.store((uint32_t)(entropy * 1000.0f), std::memory_order_relaxed);
+        engine->last_router_entropy_milli.store(entropy_milli, std::memory_order_relaxed);
     }
     return top_k;
 }

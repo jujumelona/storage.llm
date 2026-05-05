@@ -208,17 +208,26 @@
         const uint32_t max_safe_depth = 2u;
         depth = std::min(depth, max_safe_depth);
 
-        // Fix 22: Hysteresis for adaptive_prefetch_depth
-        uint32_t current_depth = engine->adaptive_prefetch_depth.load(std::memory_order_relaxed);
+        // Fix 22: Hysteresis for adaptive_prefetch_depth (now per-session)
+        const uint32_t current_depth = session ?
+            session->session_adaptive_prefetch_depth :
+            engine->adaptive_prefetch_depth.load(std::memory_order_relaxed);
         if (depth > current_depth) {
             // Need strong confidence to increase depth (lower entropy)
             float thresh = depth == 2u ? 0.50f : (depth == 3u ? 0.30f : 0.15f);
-            if (spec_entropy < thresh * 0.95f) engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
+            if (spec_entropy < thresh * 0.95f) {
+                if (session) session->session_adaptive_prefetch_depth = depth;
+                engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
+            }
         } else if (depth < current_depth) {
             // Need strong lack of confidence to decrease depth (higher entropy)
             float thresh = depth == 1u ? 0.50f : (depth == 2u ? 0.30f : 0.15f);
-            if (spec_entropy > thresh * 1.05f) engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
+            if (spec_entropy > thresh * 1.05f) {
+                if (session) session->session_adaptive_prefetch_depth = depth;
+                engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
+            }
         } else {
+            if (session) session->session_adaptive_prefetch_depth = depth;
             engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
         }
     }

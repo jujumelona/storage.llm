@@ -432,7 +432,8 @@ static int moe_layer_moe_mlp_f32(
             &s->selected_experts,
             &s->selected_weights,
             &s->router_logits,
-            &s->router_order)) {
+            &s->router_order,
+            s)) {
         std::fprintf(stderr,
             "[storagellm mlp] router top-k failed layer=%d hidden=%u experts=%u topk=%u\n",
             layer,
@@ -472,7 +473,8 @@ static int moe_layer_moe_mlp_f32(
     const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
     const uint64_t prefetch_start_us = moe_profile_now_us();
     if (phase != moe_GEN_PHASE_PREFILL) {
-        const uint32_t depth = engine->adaptive_prefetch_depth.load(std::memory_order_relaxed);
+        // BUGFIX Problem F stage 2: Read depth from per-session state ★★★
+        const uint32_t depth = s->session_adaptive_prefetch_depth;
 
         // InfiniGen speculative prefetch: use truncated hidden dot-product
         // with next layer's gate weights for ~85% accurate expert prediction.
@@ -488,7 +490,8 @@ static int moe_layer_moe_mlp_f32(
                 layer + 1,
                 c->experts_per_moe_layer,
                 infinigen_predicted_vec,
-                &spec_confidence
+                &spec_confidence,
+                s
             );
             infinigen_predicted_count = (int)std::min(infinigen_predicted_vec.size(), (size_t)256);
             for (int ii = 0; ii < infinigen_predicted_count; ++ii)

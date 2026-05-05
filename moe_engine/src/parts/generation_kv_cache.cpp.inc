@@ -178,54 +178,58 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
         const size_t new_data_bytes = new_entries * entry_dim;
         const size_t new_scales_bytes = new_entries * sizeof(float);
 
-        // BUGFIX Problem F: Fix realloc pointer state inconsistency ★★★
-        // Problem: If nd succeeds but ns fails, data is updated but scales/zeros are not
-        // This leaves pointers in inconsistent state (data points to new, scales/zeros to old)
-        // Solution: Use temporary variables, only update all three if all succeed
-        void* nd = std::realloc(data, new_data_bytes);
-        void* ns = nd ? std::realloc(scales, new_scales_bytes) : nullptr;
-        void* nz = (nd && ns) ? std::realloc(zeros, new_scales_bytes) : nullptr;
+        // BUGFIX 923: Use malloc+memcpy instead of realloc to avoid pointer leak ★★★ CRITICAL
+        // Problem: realloc(data, ...) success invalidates original 'data' pointer.
+        // If subsequent realloc(scales, ...) fails, we try to free nd but 'data' is dangling.
+        // Solution: Use malloc+memcpy+free pattern for atomic all-or-nothing allocation.
+        // Trade-off: Peak memory usage temporarily doubles (old + new), but safer.
+        // In tight RAM situations, this may trigger OOM earlier than realloc would.
+        void* nd = std::malloc(new_data_bytes);
+        void* ns = std::malloc(new_scales_bytes);
+        void* nz = std::malloc(new_scales_bytes);
 
         if (!nd || !ns || !nz) {
-            // Realloc failure: free any successful allocations and return failure
-            // Original pointers (data, scales, zeros) remain valid after realloc failure
-            // Only free the new allocations that succeeded
-            if (nd && nd != data) std::free(nd);
-            if (ns && ns != scales) std::free(ns);
-            if (nz && nz != zeros) std::free(nz);
+            // Allocation failure: free any successful allocations and return failure
+            // Original pointers (data, scales, zeros) remain valid
+            std::free(nd);
+            std::free(ns);
+            std::free(nz);
             return 0;
         }
 
-        // All three succeeded - update pointers atomically
+        // Copy existing data
+        const size_t copy_entries = old_entries < new_entries ? old_entries : new_entries;
+        std::memcpy(nd, data, copy_entries * entry_dim);
+        std::memcpy(ns, scales, copy_entries * sizeof(float));
+        std::memcpy(nz, zeros, copy_entries * sizeof(float));
+
+        // Free old allocations
+        std::free(data);
+        std::free(scales);
+        std::free(zeros);
+
+        // Update pointers atomically
         data = (uint8_t*)nd;
         scales = (float*)ns;
         zeros = (float*)nz;
 
         // Initialize new entries to zero
-        std::memset(data + old_entries * entry_dim, 0, (new_entries - old_entries) * entry_dim);
-        std::memset(scales + old_entries, 0, (new_entries - old_entries) * sizeof(float));
-        std::memset(zeros + old_entries, 0, (new_entries - old_entries) * sizeof(float));
+        if (new_entries > old_entries) {
+            std::memset(data + old_entries * entry_dim, 0, (new_entries - old_entries) * entry_dim);
+            std::memset(scales + old_entries, 0, (new_entries - old_entries) * sizeof(float));
+            std::memset(zeros + old_entries, 0, (new_entries - old_entries) * sizeof(float));
+        }
 
         max_seq_len = new_cap;
 
-        if (engine) {
-            int64_t delta = (int64_t)(new_entries - old_entries) * (entry_dim + sizeof(float) * 2);
-            if (delta > 0) {
-                engine->ram_used_bytes.fetch_add((uint64_t)delta, std::memory_order_relaxed);
-            } else if (delta < 0) {
-                uint64_t to_sub = (uint64_t)(-delta);
-                uint64_t current = engine->ram_used_bytes.load(std::memory_order_acquire);
-                while (current > 0) {
-                    uint64_t new_val = current > to_sub ? current - to_sub : 0;
-                    if (engine->ram_used_bytes.compare_exchange_weak(
-                            current, new_val,
-                            std::memory_order_release,
-                            std::memory_order_acquire)) {
-                        break;
-                    }
-                }
-            }
-        }
+        // BUGFIX 921: Remove tracked_ram_bytes update ★★★ CRITICAL
+        // Problem: BUGFIX 917 set tracked_ram_bytes = new_bytes here,
+        // but moe_kv_cache_track_ram() calculates current = moe_kv_cache_allocated_bytes()
+        // which uses same formula → current == tracked_ram_bytes → no delta → no RAM tracking!
+        // Solution: Don't touch tracked_ram_bytes here, let moe_kv_cache_track_ram() detect
+        // current (new size) > tracked (old size) and call add_tier_usage() correctly
+        // Impact: KV cache RAM usage properly tracked after realloc
+        // Note: Callers already call moe_kv_cache_track_ram() after ensure_capacity()
 
         return 1;
     }

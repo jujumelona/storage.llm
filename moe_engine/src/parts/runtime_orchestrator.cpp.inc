@@ -47,6 +47,14 @@ static void refresh_external_gpu_memory_budget_if_due(moe_pc_engine* engine) {
         if (should_refresh) {
             device_refresh_mem_info(engine, 0);
             engine->last_mem_query_ms.store((int64_t)now_ms, std::memory_order_relaxed);
+            // BUGFIX 922: Update snapshot after refresh ★★★ CRITICAL
+            // Problem: drops_increased check uses last_dropped_requests_snapshot,
+            // but snapshot is never updated → drops_increased always true after first drop
+            // → device_refresh_mem_info called every orchestrator cycle (excessive cuMemGetInfo)
+            // → GPU worker contention on device_mutex, performance degradation
+            // Solution: Update snapshot after refresh to reset drops_increased flag
+            // Impact: Correct throttling behavior, reduces unnecessary driver queries
+            engine->last_dropped_requests_snapshot = dropped_now;
         }
     } else if (engine->backend_caps.backend == moe_BACKEND_VULKAN ||
                engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||

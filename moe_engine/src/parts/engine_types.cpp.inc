@@ -150,7 +150,7 @@ struct moe_stage_queue {
 };
 
 struct moe_staging_slot {
-    uint8_t* buf = nullptr;
+    std::atomic<uint8_t*> buf{nullptr};
     void* metal_buffer = nullptr; // BUGFIX 83: Issue 4 - Metal Zero-Copy path support
     uint64_t size = 0;
     bool pinned = false;
@@ -169,7 +169,7 @@ struct moe_staging_slot {
     moe_staging_slot(const moe_staging_slot&) = delete;
     moe_staging_slot& operator=(const moe_staging_slot&) = delete;
     moe_staging_slot(moe_staging_slot&& other) noexcept {
-        buf = other.buf;
+        buf.store(other.buf.load(std::memory_order_relaxed), std::memory_order_relaxed);
         metal_buffer = other.metal_buffer;
         size = other.size;
         pinned = other.pinned;
@@ -182,7 +182,7 @@ struct moe_staging_slot {
         last_copy_event_recorded.store(
             other.last_copy_event_recorded.load(std::memory_order_relaxed),
             std::memory_order_relaxed);
-        other.buf = nullptr;
+        other.buf.store(nullptr, std::memory_order_relaxed);
         other.metal_buffer = nullptr;
         other.size = 0;
         other.pinned = false;
@@ -195,7 +195,7 @@ struct moe_staging_slot {
         other.last_copy_event_recorded.store(false, std::memory_order_relaxed);
     }
     moe_staging_slot& operator=(moe_staging_slot&& other) noexcept {
-        buf = other.buf;
+        buf.store(other.buf.load(std::memory_order_relaxed), std::memory_order_relaxed);
         metal_buffer = other.metal_buffer;
         size = other.size;
         pinned = other.pinned;
@@ -208,7 +208,7 @@ struct moe_staging_slot {
         last_copy_event_recorded.store(
             other.last_copy_event_recorded.load(std::memory_order_relaxed),
             std::memory_order_relaxed);
-        other.buf = nullptr;
+        other.buf.store(nullptr, std::memory_order_relaxed);
         other.metal_buffer = nullptr;
         other.size = 0;
         other.pinned = false;

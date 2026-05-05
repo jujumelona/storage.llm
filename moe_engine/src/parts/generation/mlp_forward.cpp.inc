@@ -47,7 +47,8 @@
                 layer + (int32_t)d,
                 c->experts_per_moe_layer,
                 deep_predicted,
-                &deep_conf
+                &deep_conf,
+                s
             );
             // Only prefetch deep layers if confidence remains adequate
             if (deep_predicted.empty() || deep_conf < 0.40f) {
@@ -76,9 +77,10 @@
     }
     moe_profile_log(
         "mlp_moe_prefetch",
-        "layer=%d phase=%u adaptive_depth=%u ms=%.3f",
+        "layer=%d phase=%u adaptive_depth=%u session_depth=%u ms=%.3f",
         layer, phase,
         engine ? engine->adaptive_prefetch_depth.load(std::memory_order_relaxed) : 0u,
+        s ? s->session_adaptive_prefetch_depth : 0u,
         moe_profile_elapsed_ms(prefetch_start_us));
 
 

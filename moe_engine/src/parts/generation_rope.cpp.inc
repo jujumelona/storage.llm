@@ -228,6 +228,71 @@ static void moe_rope_rotate_half_inplace(
     }
 }
 
+static void moe_rope_rotate_half_partial_inplace(
+    float* data,
+    uint32_t full_dim,
+    uint32_t active_dim,
+    uint32_t position,
+    const std::vector<float>& cos_table,
+    const std::vector<float>& sin_table,
+    float base = moe_ROPE_THETA
+) {
+    if (!data || full_dim < 2u || active_dim < 2u) {
+        return;
+    }
+    if (position == 0) {
+        return;
+    }
+    active_dim = std::min<uint32_t>(active_dim, full_dim);
+    const uint32_t half_dim = full_dim / 2u;
+    const uint32_t active_pairs = std::min<uint32_t>(active_dim / 2u, half_dim);
+    if (active_pairs == 0u) {
+        return;
+    }
+    const size_t row_offset = (size_t)position * (size_t)active_pairs;
+    const size_t table_len = active_pairs ? cos_table.size() / active_pairs : 0;
+    if ((size_t)position < table_len &&
+        cos_table.size() >= row_offset + active_pairs &&
+        sin_table.size() >= row_offset + active_pairs) {
+        const float* cos_row = cos_table.data() + row_offset;
+        const float* sin_row = sin_table.data() + row_offset;
+        for (uint32_t j = 0; j < active_pairs; ++j) {
+            const float cos_t = cos_row[j];
+            const float sin_t = sin_row[j];
+            const float x0 = data[j];
+            const float x1 = data[j + half_dim];
+            data[j] = x0 * cos_t - x1 * sin_t;
+            data[j + half_dim] = x1 * cos_t + x0 * sin_t;
+        }
+        return;
+    }
+    const float* cached_cos = nullptr;
+    const float* cached_sin = nullptr;
+    if (moe_rope_runtime_row(active_dim, position, base, &cached_cos, &cached_sin)) {
+        for (uint32_t j = 0; j < active_pairs; ++j) {
+            const float cos_t = cached_cos[j];
+            const float sin_t = cached_sin[j];
+            const float x0 = data[j];
+            const float x1 = data[j + half_dim];
+            data[j] = x0 * cos_t - x1 * sin_t;
+            data[j + half_dim] = x1 * cos_t + x0 * sin_t;
+        }
+        return;
+    }
+    const float multiplier = std::pow(base, -2.0f / (float)active_dim);
+    float freq = 1.0f;
+    for (uint32_t j = 0; j < active_pairs; ++j) {
+        const float theta = (float)position * freq;
+        const float cos_t = std::cos(theta);
+        const float sin_t = std::sin(theta);
+        const float x0 = data[j];
+        const float x1 = data[j + half_dim];
+        data[j] = x0 * cos_t - x1 * sin_t;
+        data[j + half_dim] = x1 * cos_t + x0 * sin_t;
+        freq *= multiplier;
+    }
+}
+
 static void moe_standard_rope_apply_inplace_with_layout(
     int rotate_half,
     float* data,
@@ -241,6 +306,25 @@ static void moe_standard_rope_apply_inplace_with_layout(
         moe_rope_rotate_half_inplace(data, dim, position, cos_table, sin_table, base);
     } else {
         moe_rope_inplace(data, dim, position, cos_table, sin_table, base);
+    }
+}
+
+static void moe_standard_rope_apply_inplace_with_full_dim(
+    int rotate_half,
+    float* data,
+    uint32_t full_dim,
+    uint32_t active_dim,
+    uint32_t position,
+    const std::vector<float>& cos_table,
+    const std::vector<float>& sin_table,
+    float base
+) {
+    if (rotate_half && active_dim < full_dim) {
+        moe_rope_rotate_half_partial_inplace(
+            data, full_dim, active_dim, position, cos_table, sin_table, base);
+    } else {
+        moe_standard_rope_apply_inplace_with_layout(
+            rotate_half, data, active_dim, position, cos_table, sin_table, base);
     }
 }
 

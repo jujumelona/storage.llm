@@ -100,8 +100,12 @@ static void touch_mapped_ranges(const moe_pc_engine* engine, const std::vector<s
         const uint8_t* next_start = ranges[i].first;
         uint64_t next_len = ranges[i].second;
 
-        // Check if next span is adjacent or within the same page
-        if (next_start >= current_start && next_start <= current_start + current_len + PAGE_SIZE) {
+        // BUGFIX 924: Fix madvise range merge logic ★★ IMPORTANT
+        // Problem: + PAGE_SIZE allows merging non-adjacent ranges with 1-page gap
+        // → madvise called on unrelated memory between ranges → performance degradation
+        // Solution: Only merge strictly adjacent ranges (no gap tolerance)
+        // Impact: More accurate madvise hints, reduced syscall overhead without side effects
+        if (next_start >= current_start && next_start <= current_start + current_len) {
             uint64_t diff = (next_start + next_len) - current_start;
             if (diff > current_len) {
                 current_len = diff;

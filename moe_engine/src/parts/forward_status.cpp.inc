@@ -92,8 +92,16 @@ int moe_pc_engine_get_forward_status(
         engine->juju_runtime_access_hotset_count.load(std::memory_order_relaxed);
     out_status->runtime_access_file_group_count =
         engine->juju_runtime_access_file_group_count.load(std::memory_order_relaxed);
+    out_status->runtime_access_executor_tensor_count =
+        engine->juju_runtime_executor_tensor_count.load(std::memory_order_relaxed);
+    out_status->runtime_access_layer_prefetch_plan_count =
+        engine->juju_runtime_layer_prefetch_plan_count.load(std::memory_order_relaxed);
     out_status->kv_layout_contract_ready =
         engine->juju_kv_layout_contract_ready.load(std::memory_order_relaxed) ? 1 : 0;
+    out_status->kv_layout_max_entry_dim =
+        engine->juju_kv_layout_max_entry_dim.load(std::memory_order_relaxed);
+    out_status->kv_layout_page_size_tokens =
+        engine->juju_kv_layout_page_size_tokens.load(std::memory_order_relaxed);
     if (out_status->dynamic_shape_ready) {
         out_status->dynamic_num_hidden_layers = engine->dynamic_shape.num_hidden_layers;
         out_status->dynamic_hidden_size = engine->dynamic_shape.hidden_size;

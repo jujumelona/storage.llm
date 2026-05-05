@@ -76,7 +76,7 @@ int moe_pc_engine_generate_token_ids(
         char reason[320]{};
         if (forward.graph_ir_ready) {
             std::snprintf(reason, sizeof(reason),
-                "graph IR executor not executable graph_ver=%u layers=%u ops=%llu hidden=%u vocab=%u access_plan=%d kv_layout=%d hotset=%llu file_groups=%llu",
+                "graph IR executor not executable graph_ver=%u layers=%u ops=%llu hidden=%u vocab=%u access_plan=%d kv_layout=%d hotset=%llu file_groups=%llu tensor_refs=%llu layer_prefetch=%llu kv_entry=%llu kv_page=%llu",
                 forward.graph_ir_version,
                 forward.dynamic_num_hidden_layers,
                 (unsigned long long)forward.graph_ir_op_count,
@@ -85,7 +85,11 @@ int moe_pc_engine_generate_token_ids(
                 forward.runtime_access_plan_ready,
                 forward.kv_layout_contract_ready,
                 (unsigned long long)forward.runtime_access_hotset_count,
-                (unsigned long long)forward.runtime_access_file_group_count);
+                (unsigned long long)forward.runtime_access_file_group_count,
+                (unsigned long long)forward.runtime_access_executor_tensor_count,
+                (unsigned long long)forward.runtime_access_layer_prefetch_plan_count,
+                (unsigned long long)forward.kv_layout_max_entry_dim,
+                (unsigned long long)forward.kv_layout_page_size_tokens);
         } else {
             std::snprintf(reason, sizeof(reason),
                 "forward adapter not executable adapter=%s layers=%u hidden=%u vocab=%u",

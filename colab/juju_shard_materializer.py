@@ -2397,6 +2397,262 @@ def juju_tensor_file_order_key(tensor, bucket):
     )
 
 
+def _juju_record_int(rec, key, default=0):
+    try:
+        value = rec.get(key, default)
+        if value is None or value == "":
+            value = default
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _juju_runtime_tensor_ref(rec):
+    return {
+        "name": rec.get("name"),
+        "role": rec.get("graph_role"),
+        "layer": _juju_record_int(rec, "execution_layer", -1),
+        "op": rec.get("execution_op"),
+        "phase": rec.get("access_phase"),
+        "shape": list(rec.get("shape") or []),
+        "encoding": rec.get("weight_encoding"),
+        "quant_family": rec.get("quant_family"),
+        "row_layout": rec.get("row_layout"),
+        "row_stride_bytes": _juju_record_int(rec, "row_stride_bytes", 0),
+        "offset": _juju_record_int(rec, "juju_offset", 0),
+        "bytes": _juju_record_int(rec, "juju_bytes", rec.get("stream_bytes") or 0),
+        "file_locality_group": rec.get("file_locality_group"),
+        "runtime_priority": _juju_record_int(rec, "runtime_priority", 0),
+        "prefetch_priority": _juju_record_int(rec, "prefetch_priority", 0),
+        "prefetch_class": rec.get("prefetch_class"),
+        "residency_hint": rec.get("residency_hint"),
+    }
+
+
+def _juju_execution_sort_key(rec):
+    return (
+        str(rec.get("file_locality_group") or ""),
+        _juju_record_int(rec, "execution_layer", -1),
+        _juju_record_int(rec, "execution_order", 500),
+        -_juju_record_int(rec, "prefetch_priority", 0),
+        -_juju_record_int(rec, "runtime_priority", 0),
+        _juju_record_int(rec, "juju_offset", 0),
+        str(rec.get("name") or ""),
+    )
+
+
+def _juju_stage_tensor_refs(entries, ops):
+    op_set = set(ops or [])
+    return [
+        _juju_runtime_tensor_ref(rec)
+        for rec in sorted(entries, key=_juju_execution_sort_key)
+        if str(rec.get("execution_op") or "") in op_set
+    ]
+
+
+def _juju_layer_stage_bytes(refs):
+    return sum(int(ref.get("bytes") or 0) for ref in refs or [])
+
+
+def _juju_layer_stage_plan(entries, stage_name, ops, trigger, residency_policy):
+    refs = _juju_stage_tensor_refs(entries, ops)
+    return {
+        "stage": stage_name,
+        "ops": list(ops),
+        "trigger": trigger,
+        "residency_policy": residency_policy,
+        "tensor_count": len(refs),
+        "bytes": _juju_layer_stage_bytes(refs),
+        "tensors": refs,
+    }
+
+
+def _juju_layer_records_by_id(tensor_records):
+    by_layer = {}
+    for rec in tensor_records or []:
+        layer = _juju_record_int(rec, "execution_layer", -1)
+        if layer >= 0:
+            by_layer.setdefault(layer, []).append(rec)
+    return by_layer
+
+
+def _juju_build_layer_prefetch_plan(tensor_records, layers):
+    by_layer = _juju_layer_records_by_id(tensor_records)
+    attention_ops = [
+        "attention_input_norm",
+        "q_projection",
+        "k_projection",
+        "v_projection",
+        "q_norm",
+        "k_norm",
+        "v_norm",
+        "attention_output",
+        "post_attention_norm",
+    ]
+    router_ops = ["ffn_norm", "expert_ffn_norm", "moe_router", "moe_router_scale"]
+    shared_ops = ["shared_expert_mlp", "dense_mlp", "post_ffw_norm_1"]
+    expert_ops = ["moe_expert_mlp"]
+    tail_ops = ["post_ffw_norm_2", "post_ffw_norm", "layer_output_scale"]
+    plan = []
+    for idx, layer in enumerate(layers or []):
+        current = list(by_layer.get(layer, []))
+        next_layer = layers[idx + 1] if idx + 1 < len(layers or []) else None
+        next_entries = list(by_layer.get(next_layer, [])) if next_layer is not None else []
+        current_stages = [
+            _juju_layer_stage_plan(
+                current,
+                "attention",
+                attention_ops,
+                "before_layer_attention",
+                "keep_current_layer_attention_until_attention_output",
+            ),
+            _juju_layer_stage_plan(
+                current,
+                "router",
+                router_ops,
+                "during_attention_output",
+                "keep_router_until_selected_expert_prefetch_dispatched",
+            ),
+            _juju_layer_stage_plan(
+                current,
+                "shared_expert",
+                shared_ops,
+                "after_router_scores_before_mlp",
+                "keep_shared_expert_for_layer_mlp",
+            ),
+            _juju_layer_stage_plan(
+                current,
+                "selected_experts",
+                expert_ops,
+                "after_router_topk",
+                "stream_or_promote_router_selected_expert_tensors",
+            ),
+            _juju_layer_stage_plan(
+                current,
+                "mlp_tail",
+                tail_ops,
+                "after_expert_accumulation",
+                "keep_until_layer_residual_written",
+            ),
+        ]
+        lookahead = {
+            "next_layer": next_layer,
+            "attention": _juju_layer_stage_plan(
+                next_entries,
+                "next_attention",
+                attention_ops,
+                "current_layer_mlp_begin",
+                "prefetch_next_layer_attention_to_ram_or_fastmem",
+            ),
+            "router": _juju_layer_stage_plan(
+                next_entries,
+                "next_router",
+                router_ops,
+                "current_layer_attention_output",
+                "prefetch_next_layer_router_before_next_attention_tail",
+            ),
+            "shared_expert": _juju_layer_stage_plan(
+                next_entries,
+                "next_shared_expert",
+                shared_ops,
+                "current_layer_mlp_tail",
+                "prefetch_next_layer_shared_expert_when_budget_allows",
+            ),
+            "expert_policy": {
+                "trigger": "router_topk_scores_current_layer_plus_coactivation_history",
+                "fallback": "prefetch_current_layer_expert_tensors_by_prefetch_priority_when_no_history",
+                "candidate_stage": _juju_layer_stage_plan(
+                    current,
+                    "current_expert_candidates",
+                    expert_ops,
+                    "router_scores_ready",
+                    "bounded_by_ram_vram_staging_slots_and_io_depth",
+                ),
+            },
+        }
+        plan.append({
+            "layer": int(layer),
+            "tensor_count": len(current),
+            "bytes": sum(_juju_record_int(rec, "juju_bytes", rec.get("stream_bytes") or 0) for rec in current),
+            "execute_stage_order": ["attention", "router", "shared_expert", "selected_experts", "mlp_tail"],
+            "current_layer": current_stages,
+            "lookahead": lookahead,
+            "eviction_protection": [
+                "startup_hotset",
+                "current_layer_attention_router_norm",
+                "current_layer_selected_experts_until_mlp_done",
+                "next_layer_attention_router",
+            ],
+        })
+    return plan
+
+
+def _juju_kv_layout_contract(contract, runtime_arch):
+    qkv = dict(contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract") or {})
+    num_heads = first_present(runtime_arch.get("num_attention_heads"), qkv.get("num_attention_heads"))
+    sliding_kv_heads = first_present(runtime_arch.get("num_key_value_heads"), qkv.get("num_key_value_heads"), qkv.get("kv_heads"))
+    global_kv_heads = first_present(runtime_arch.get("num_global_key_value_heads"), qkv.get("num_global_key_value_heads"), sliding_kv_heads)
+    head_dim = first_present(runtime_arch.get("head_dim"), qkv.get("head_dim"), runtime_arch.get("key_length"))
+    value_head_dim = first_present(runtime_arch.get("value_head_dim"), qkv.get("value_head_dim"), qkv.get("v_head_dim"), head_dim)
+    global_head_dim = first_present(runtime_arch.get("global_head_dim"), qkv.get("global_head_dim"), head_dim)
+    global_value_head_dim = first_present(runtime_arch.get("global_value_head_dim"), qkv.get("global_value_head_dim"), global_head_dim)
+    max_seq = first_present(
+        runtime_arch.get("max_position_embeddings"),
+        runtime_arch.get("context_length"),
+        qkv.get("max_seq_len"),
+        qkv.get("max_position_embeddings"),
+    )
+
+    def _entry(num_kv, k_dim, v_dim):
+        if num_kv is None or k_dim is None:
+            return None
+        value_dim = v_dim if v_dim is not None else k_dim
+        return int(num_kv) * (int(k_dim) + int(value_dim))
+
+    sliding_entry = _entry(sliding_kv_heads, head_dim, value_head_dim)
+    global_entry = _entry(global_kv_heads, global_head_dim, global_value_head_dim)
+    entry_dim = first_present(
+        qkv.get("entry_dim"),
+        max(x for x in [sliding_entry or 0, global_entry or 0] if x is not None),
+    )
+    page_tokens = int(qkv.get("page_size_tokens") or qkv.get("block_size_tokens") or 16)
+    entry_dtype = qkv.get("dtype") or qkv.get("cache_dtype") or "quantized_uint_packed"
+    return {
+        "format": "JUJU_KV_LAYOUT_CONTRACT_V1",
+        "layout": "position_major_layer_contiguous_entry_dim",
+        "head_layout": {
+            "num_attention_heads": num_heads,
+            "sliding": {
+                "num_key_value_heads": sliding_kv_heads,
+                "key_head_dim": head_dim,
+                "value_head_dim": value_head_dim,
+                "entry_dim": sliding_entry,
+            },
+            "global": {
+                "num_key_value_heads": global_kv_heads,
+                "key_head_dim": global_head_dim,
+                "value_head_dim": global_value_head_dim,
+                "entry_dim": global_entry,
+            },
+            "max_entry_dim": entry_dim,
+        },
+        "entry_dtype": entry_dtype,
+        "key_bits": qkv.get("k_bits"),
+        "value_bits": qkv.get("v_bits"),
+        "normal_bits": qkv.get("normal_bits"),
+        "scale_dtype": qkv.get("scale_dtype") or "float32",
+        "zero_dtype": qkv.get("zero_dtype") or "float32",
+        "entry_dim": entry_dim,
+        "max_seq_len": max_seq,
+        "page_size_tokens": page_tokens,
+        "growth_page_tokens": page_tokens,
+        "residency_policy": qkv.get("residency_policy") or "ram_tracked_via_tier_usage_device_vram_when_enabled",
+        "quantized": bool(qkv),
+        "page_layout": "layer_position_page_major",
+        "executor_contract": "moe_kv_cache_store_load_entry_must_match_layout_and_entry_dim",
+    }
+
+
 def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
     layers = sorted({
         int(rec.get("execution_layer"))
@@ -2460,46 +2716,49 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
             "expert_prefetch": "router_selected_dynamic_plus_coactivation_history",
         })
 
-    qkv = dict(contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract") or {})
-    max_seq = first_present(
-        runtime_arch.get("max_position_embeddings"),
-        runtime_arch.get("context_length"),
-        qkv.get("max_seq_len"),
-        qkv.get("max_position_embeddings"),
-    )
-    entry_dim = first_present(
-        runtime_arch.get("kv_lora_rank"),
-        runtime_arch.get("value_head_dim"),
-        runtime_arch.get("head_dim"),
-        qkv.get("entry_dim"),
-    )
-    kv_layout_contract = {
-        "format": "JUJU_KV_LAYOUT_CONTRACT_V1",
-        "layout": "position_major_layer_contiguous_entry_dim",
-        "entry_dtype": qkv.get("dtype") or qkv.get("cache_dtype") or "uint8_affine",
-        "scale_dtype": "float32",
-        "zero_dtype": "float32",
-        "entry_dim": entry_dim,
-        "max_seq_len": max_seq,
-        "growth_page_tokens": int(qkv.get("page_size_tokens") or qkv.get("block_size_tokens") or 4096),
-        "residency_policy": qkv.get("residency_policy") or "ram_tracked_via_tier_usage_device_vram_when_enabled",
-        "quantized": bool(qkv) or True,
-        "executor_contract": "moe_kv_cache_store_load_entry_must_match_layout",
-    }
+    layer_prefetch_plan = _juju_build_layer_prefetch_plan(tensor_records, layers)
+    kv_layout_contract = _juju_kv_layout_contract(contract, runtime_arch)
+    executor_tensor_table = [
+        _juju_runtime_tensor_ref(rec)
+        for rec in sorted(tensor_records or [], key=_juju_execution_sort_key)
+    ]
     return {
         "format": "JUJU_RUNTIME_ACCESS_PLAN_V1",
-        "version": 1,
+        "version": 2,
         "source": "tensor_index_execution_metadata",
         "sort_key": ["file_locality_group", "execution_layer", "execution_order", "runtime_priority"],
+        "executor_contract": {
+            "tensor_table_required": True,
+            "layer_prefetch_plan_required": True,
+            "kv_layout_contract_required": True,
+            "executor_must_consume_graph_ir_op_order": True,
+            "unknown_required_tensor_or_op_behavior": "fail_closed",
+            "tensor_ref_fields": [
+                "name",
+                "role",
+                "layer",
+                "op",
+                "shape",
+                "encoding",
+                "row_stride_bytes",
+                "offset",
+                "bytes",
+            ],
+        },
+        "executor_tensor_count": len(executor_tensor_table),
+        "executor_tensor_table": executor_tensor_table,
         "startup_hotset_count": len(startup_hot),
         "startup_hotset": [
             {
                 "name": rec.get("name"),
                 "op": rec.get("execution_op"),
+                "role": rec.get("graph_role"),
                 "priority": rec.get("runtime_priority"),
                 "prefetch": rec.get("prefetch_priority"),
                 "offset": rec.get("juju_offset"),
                 "bytes": rec.get("juju_bytes"),
+                "row_stride_bytes": rec.get("row_stride_bytes"),
+                "encoding": rec.get("weight_encoding"),
             }
             for rec in startup_hot[:96]
         ],
@@ -2507,6 +2766,8 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
         "file_locality_group_count": len(file_group_list),
         "file_locality_groups": file_group_list,
         "per_layer": per_layer,
+        "layer_prefetch_plan_count": len(layer_prefetch_plan),
+        "layer_prefetch_plan": layer_prefetch_plan,
         "prefetch_schedule": {
             "startup": ["token_embedding", "final_norm", "lm_head", "rope", "first_layer_attention", "first_layer_router"],
             "per_layer": [
@@ -2530,7 +2791,23 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
         "bottleneck_trace_contract": {
             "token_level": ["forward_token_begin", "cpu_ram", "kv_cache", "io_pipeline", "forward_layer", "forward_token_end"],
             "stage_level": ["forward_embed", "attn_standard_qkv_norm", "mlp_moe_end", "lm_head_logprob_end"],
-            "required_counters": ["ram_used_bytes", "vram_used_bytes", "db_used_bytes", "queue_depth", "inflight", "kv_bytes"],
+            "required_counters": [
+                "token_index",
+                "load_ms",
+                "io_wait_ms",
+                "attention_ms",
+                "mlp_ms",
+                "lm_head_ms",
+                "kv_ms",
+                "ram_used_bytes",
+                "vram_used_bytes",
+                "db_used_bytes",
+                "cpu_pct",
+                "rss_bytes",
+                "queue_depth",
+                "inflight",
+                "kv_bytes",
+            ],
         },
     }
 
