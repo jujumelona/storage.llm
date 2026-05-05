@@ -138,18 +138,46 @@ static int device_backend_stream_sync(moe_pc_engine* e, CUstream stream) {
         e->ze.zeCommandQueueSynchronize && e->ze.command_queue && e->ze.zeCommandListReset) {
         void* cmd_list = (void*)stream;
         if (e->ze.zeCommandListClose(cmd_list) == 0) {
-            if (e->ze.zeCommandQueueExecuteCommandLists(e->ze.command_queue, 1, &cmd_list, nullptr) == 0) {
-                if (e->ze.zeCommandQueueSynchronize(e->ze.command_queue, UINT64_MAX) == 0) {
-                    // Reset command list for next use
-                    e->ze.zeCommandListReset(cmd_list);
-                    return 1;
+            // BUGFIX 946: Use fence to guarantee GPU completion before reset ★★★ CRITICAL
+            // Problem: zeCommandQueueSynchronize may return before GPU is fully idle
+            //   on some Intel driver versions → zeCommandListReset on active list = UB
+            // Solution: Execute with fence, wait on fence, then reset
+            // Impact: Prevents Level Zero driver UB on command list reuse
+            void* fence = nullptr;
+            bool fence_created = false;
+            if (e->ze.zeFenceCreate && e->ze.zeFenceHostSynchronize && e->ze.zeFenceDestroy) {
+                struct ze_fence_desc_t_local {
+                    uint32_t stype; void* pNext; uint32_t flags;
+                } fence_desc = {0x0001000C, nullptr, 0};
+                if (e->ze.zeFenceCreate(e->ze.command_queue, &fence_desc, &fence) == 0 && fence) {
+                    fence_created = true;
                 }
+            }
+            if (e->ze.zeCommandQueueExecuteCommandLists(e->ze.command_queue, 1, &cmd_list, fence) == 0) {
+                if (fence_created) {
+                    // Wait on fence (guarantees GPU completion)
+                    e->ze.zeFenceHostSynchronize(fence, UINT64_MAX);
+                } else {
+                    // Fallback: queue-level sync (less precise)
+                    e->ze.zeCommandQueueSynchronize(e->ze.command_queue, UINT64_MAX);
+                }
+                e->ze.zeCommandListReset(cmd_list);
+                if (fence_created && fence) {
+                    e->ze.zeFenceDestroy(fence);
+                }
+                return 1;
+            }
+            if (fence_created && fence) {
+                e->ze.zeFenceDestroy(fence);
             }
         }
     }
-    // BUGFIX Problem E: Vulkan stream sync via queue submit + wait ★★★ FEATURE
-    // Problem: Vulkan command buffers need explicit submission and sync
-    // Solution: End command buffer, submit to queue, wait for completion, reset
+    // BUGFIX 948: Vulkan command buffer reset on all paths ★★★ CRITICAL
+    // Problem: If vkQueueSubmit or vkQueueWaitIdle fails, command buffer stays
+    //   in submitted/recording state → next vkBeginCommandBuffer triggers
+    //   VK_ERROR_COMMAND_BUFFER_ALREADY_RECORDING or silent corruption
+    // Solution: Always reset command buffer after sync attempt, even on failure
+    // Impact: Prevents Vulkan command buffer state corruption on error recovery
     if (e && e->backend_caps.backend == moe_BACKEND_VULKAN &&
         e->vk.vkEndCommandBuffer && e->vk.vkQueueSubmit && e->vk.vkQueueWaitIdle &&
         e->vk.vkResetCommandBuffer && e->vk.queue) {
@@ -159,15 +187,18 @@ static int device_backend_stream_sync(moe_pc_engine* e, CUstream stream) {
                 uint32_t sType; void* pNext; uint32_t waitSemaphoreCount; const void* pWaitSemaphores;
                 const uint32_t* pWaitDstStageMask; uint32_t commandBufferCount; const void* pCommandBuffers;
                 uint32_t signalSemaphoreCount; const void* pSignalSemaphores;
-            } submit_info = {0x00000004, nullptr, 0, nullptr, nullptr, 1, &cmd_buffer, 0, nullptr}; // VK_STRUCTURE_TYPE_SUBMIT_INFO
+            } submit_info = {0x00000004, nullptr, 0, nullptr, nullptr, 1, &cmd_buffer, 0, nullptr};
 
-            if (e->vk.vkQueueSubmit(e->vk.queue, 1, &submit_info, nullptr) == 0) {
-                if (e->vk.vkQueueWaitIdle(e->vk.queue) == 0) {
-                    // Reset command buffer for next use
-                    e->vk.vkResetCommandBuffer(cmd_buffer, 0);
-                    return 1;
-                }
+            int submit_ok = (e->vk.vkQueueSubmit(e->vk.queue, 1, &submit_info, nullptr) == 0);
+            if (submit_ok) {
+                e->vk.vkQueueWaitIdle(e->vk.queue);
             }
+            // Always reset command buffer for reuse, regardless of submit/wait result
+            e->vk.vkResetCommandBuffer(cmd_buffer, 0);
+            return submit_ok ? 1 : 0;
+        } else {
+            // vkEndCommandBuffer failed — reset to initial state for reuse
+            e->vk.vkResetCommandBuffer(cmd_buffer, 0);
         }
     }
     // BUGFIX 125: Removed dummy sync for Vulkan/SYCL

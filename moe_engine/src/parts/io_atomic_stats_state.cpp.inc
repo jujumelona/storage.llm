@@ -50,6 +50,11 @@ struct alignas(64) moe_io_atomic_stats {
     alignas(64) std::atomic<uint64_t> staging_slot_contention{0};
     std::atomic<uint64_t> oversized_tensor_fallbacks{0};
     std::atomic<uint64_t> staging_slot_waits{0};
+    // BUGFIX 936: Track bytes going through OVERLAPPED ReadFile path ★★ DIAGNOSTIC
+    // Problem: prefer_overlapped_io=true early returns without updating bytes_touch_fallback
+    // → I/O diagnostics show 0 bytes for this path → impossible to identify bottlenecks
+    // Solution: Separate counter for overlapped I/O bytes
+    std::atomic<uint64_t> bytes_overlapped_io{0};
 
     // --- Cache line 9: status flags (read-mostly) ---
     alignas(64) std::atomic<uint32_t> active_path{0};

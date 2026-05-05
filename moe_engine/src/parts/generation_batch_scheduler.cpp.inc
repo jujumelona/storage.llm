@@ -42,6 +42,23 @@ struct moe_batch_request_t {
     // → Better adaptive top_k decisions for each domain
     // Impact: Improved cache hit rate in multi-domain workloads
     uint32_t smoothed_router_entropy_milli = 0;
+    uint32_t smoothed_adaptive_prefetch_depth = 2;
+
+    // BUGFIX Problem F stage 3: Save/restore EMA between request and decode scratch ★★★
+    // Problem: smoothed_router_entropy_milli field exists but is never read/written
+    // → Per-session EMA state is dead code, engine-level EMA shared across all sessions
+    // Solution: save_ema_to_request() called after router dispatch, restore before
+    // Impact: Each session maintains truly independent entropy tracking
+    void save_ema_from_scratch(const moe_decode_scratch* s) {
+        if (!s) return;
+        smoothed_router_entropy_milli = s->session_router_entropy_milli;
+        smoothed_adaptive_prefetch_depth = s->session_adaptive_prefetch_depth;
+    }
+    void restore_ema_to_scratch(moe_decode_scratch* s) const {
+        if (!s) return;
+        s->session_router_entropy_milli = smoothed_router_entropy_milli;
+        s->session_adaptive_prefetch_depth = smoothed_adaptive_prefetch_depth;
+    }
 };
 
 struct moe_continuous_batch_scheduler_t {
@@ -218,6 +235,22 @@ struct moe_continuous_batch_scheduler_t {
             }
             if (req->phase == moe_REQ_PREFILL) out_prefill.push_back(req);
             else if (req->phase == moe_REQ_DECODE) out_decode.push_back(req);
+        }
+    }
+
+    // BUGFIX Problem F stage 3: Restore per-request EMA to scratch before dispatch ★★★
+    // Called by batch forward pass before router invocation for each request.
+    // Ensures decode scratch uses this request's entropy state, not the previous request's.
+    static void restore_request_ema(moe_batch_request_t* req, moe_decode_scratch* s) {
+        if (req && s) {
+            req->restore_ema_to_scratch(s);
+        }
+    }
+    // Called by batch forward pass after router invocation for each request.
+    // Persists the updated entropy state back to the request for next iteration.
+    static void save_request_ema(moe_batch_request_t* req, const moe_decode_scratch* s) {
+        if (req && s) {
+            req->save_ema_from_scratch(s);
         }
     }
 };

@@ -36,6 +36,16 @@ int moe_pc_engine_plan_moe_prefetch(
         return 1; // Success with empty plan
     }
 
+    if (engine->backend_caps.backend == moe_BACKEND_METAL &&
+        engine->backend_caps.supports_unified_memory) {
+        // UMA: VRAM/RAM 구분 없음, 기존 mmap path가 곧 최적
+        std::vector<moe_expert_prefetch_item_t> items;
+        prefetch_plan_clear_seen(engine);
+        prefetch_plan_add_selected(engine, items, current_layer, selected_experts, selected_count);
+        *out_item_count = 0; // 명시적 VRAM 복사 불필요
+        return 1;
+    }
+
     std::vector<moe_expert_prefetch_item_t> items;
     // prefetch_plan_clear_seen/add_* lock the generation map internally.
     // Do not hold prefetch_plan_mutex around them; the helpers re-enter it.
@@ -64,15 +74,13 @@ int moe_pc_engine_plan_moe_prefetch(
     // Trade-off: Slightly reduces prefetch breadth, but proactive eviction worker
     // continuously frees VRAM, so no real throughput loss. Stabilizes token latency.
     {
-        const uint64_t device_budget = device_budget_bytes(engine);
+        const uint64_t device_free = device_budget_bytes(engine);
         // BUGFIX 899: Remove device_allocated double subtraction ★★★ CRITICAL
         // Problem: device_budget_bytes() already returns free VRAM (budget - allocated - reserved).
         // Subtracting device_allocated again causes double subtraction → device_free underestimated.
         // Result: Prefetch trim is too aggressive, VRAM underutilized.
-        // Solution: device_budget already accounts for allocations, only subtract in_flight.
+        // Solution: device_budget already accounts for allocations and in-flight transfers.
         // Impact: Correct VRAM budget calculation, more aggressive prefetch, better GPU utilization.
-        const uint64_t in_flight = engine->vram_in_flight_bytes.load(std::memory_order_relaxed);
-        const uint64_t device_free = device_budget > in_flight ? device_budget - in_flight : 0;
 
         // Use backend-specific headroom percentage (default 10%) to avoid filling device memory completely.
         // BUGFIX Issue 10: Add Metal headroom configuration
@@ -97,6 +105,7 @@ int moe_pc_engine_plan_moe_prefetch(
                 ? (100u - engine->io_config.metal_memory_budget_pct)
                 : 15u;
         }
+        headroom_pct = std::min<uint64_t>(headroom_pct + 2u, 95u);
         const uint64_t usable_free = (device_free * (100u - headroom_pct)) / 100u;
 
         uint64_t cumulative_bytes = 0;

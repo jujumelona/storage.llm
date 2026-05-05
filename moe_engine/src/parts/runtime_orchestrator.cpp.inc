@@ -114,14 +114,22 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
     // - live_pressure → immediate cap (no hysteresis) on committed_window
     // Impact: Stable window convergence, eliminates 1-6 oscillation.
     uint32_t base_window = policy == moe_EXECUTION_PERFORMANCE ? 6u : policy == moe_EXECUTION_LOW_IMPACT ? 1u : 3u;
+    // BUGFIX 949: Use prefetch_depth as max_window, not base_window override ★★★ CRITICAL
+    // Problem: Setting base_window = prefetch_depth BEFORE dropped_requests path
+    //   causes drops to reduce from prefetch_depth every cycle, but hysteresis
+    //   streak never accumulates because base_window resets to prefetch_depth
+    //   → window oscillates between prefetch_depth and prefetch_depth/2
+    // Solution: Apply prefetch_depth as initial suggestion only if no pressure,
+    //   then let dropped_requests independently reduce base_window
+    // Impact: Dropped_requests hysteresis works correctly with juju strategy active
+    const uint32_t max_window = juju_cfg ?
+        std::max(8u, juju_cfg->prefetch_depth ? juju_cfg->prefetch_depth : 8u) : 8u;
     if (juju_cfg && juju_cfg->prefetch_depth > 0) {
-        base_window = juju_cfg->prefetch_depth;
+        base_window = std::min(juju_cfg->prefetch_depth, max_window);
     }
     if (juju_cfg && engine->generation_token.load(std::memory_order_relaxed) < 128u) {
         base_window = std::max(base_window, 4u);
     }
-    const uint32_t max_window = juju_cfg ?
-        std::max(8u, juju_cfg->prefetch_depth ? juju_cfg->prefetch_depth : 8u) : 8u;
 
     // BUGFIX 880: Step 1 - dropped_requests path with hysteresis
     if (engine) {

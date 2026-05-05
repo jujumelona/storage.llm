@@ -28,6 +28,7 @@ static void reset_io_stats_for_config(moe_pc_engine* engine) {
     engine->io_atomic.staging_wraps.store(0, std::memory_order_relaxed);
     engine->io_atomic.staging_slot_waits.store(0, std::memory_order_relaxed);
     engine->io_atomic.staging_slot_contention.store(0, std::memory_order_relaxed);
+    engine->io_atomic.bytes_overlapped_io.store(0, std::memory_order_relaxed);  // BUGFIX 936
     engine->io_atomic.topology_predictions.store(0, std::memory_order_relaxed);
     engine->io_atomic.topology_updates.store(0, std::memory_order_relaxed);
     const moe_io_path_t active_path = choose_active_io_path(engine);
@@ -73,6 +74,7 @@ static void snapshot_io_stats(const moe_pc_engine* engine, moe_io_stats_t* out) 
     out->recommended_staging_bytes = moe_recommended_staging_bytes(engine);
     out->topology_predictions = engine->io_atomic.topology_predictions.load(std::memory_order_relaxed);
     out->topology_updates = engine->io_atomic.topology_updates.load(std::memory_order_relaxed);
+    out->bytes_overlapped_io = engine->io_atomic.bytes_overlapped_io.load(std::memory_order_relaxed);  // BUGFIX 936
     out->disk_queue_depth = engine->disk_stage.depth.load(std::memory_order_relaxed);
     out->pinned_queue_depth = engine->pinned_stage.depth.load(std::memory_order_relaxed);
     out->gpu_queue_depth = engine->gpu_stage.depth.load(std::memory_order_relaxed);

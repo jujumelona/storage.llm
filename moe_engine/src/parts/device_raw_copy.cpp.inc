@@ -94,7 +94,13 @@ static int device_copy_raw_span(
 
     if (slot_idx != UINT32_MAX) {
         moe_staging_slot& slot = e->staging_slots[slot_idx];
-        if (!slot.buf || s.bytes > slot.size) {
+        // BUGFIX 935: Use staging_slot_valid() for thread-safe buf access ★★★
+        if (!staging_slot_valid(e, slot_idx)) {
+            release_staging_slot(e, slot_idx);
+            return 0;
+        }
+        uint8_t* buf_ptr = static_cast<uint8_t*>(slot.buf.load(std::memory_order_acquire));
+        if (!buf_ptr || s.bytes > slot.size) {
             release_staging_slot(e, slot_idx);
             return 0;
         }
@@ -112,8 +118,8 @@ static int device_copy_raw_span(
             return 0;
         }
         const int ok = async_copy ?
-            device_backend_copy_h2d_async(e, dst, slot.buf, s.bytes, stream) :
-            device_backend_copy_h2d_sync(e, dst, slot.buf, s.bytes);
+            device_backend_copy_h2d_async(e, dst, buf_ptr, s.bytes, stream) :
+            device_backend_copy_h2d_sync(e, dst, buf_ptr, s.bytes);
         if (ok && async_copy) {
             device_defer_staging_copy(e, slot_idx, key, s.bytes, stream);  // BUGFIX 문제1: Track bytes for VRAM
         } else {

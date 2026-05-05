@@ -445,7 +445,16 @@ static int device_allocator_init(moe_pc_engine* e) {
             e->config.ram_budget_bytes = 0;
         }
     } else if (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO) {
-        level_zero_driver_load(&e->ze, e->backend_caps.device_id);
+        // BUGFIX 943: Explicit warning on Level Zero init failure ★★ DIAGNOSTIC
+        // Problem: level_zero_driver_load fails silently → user thinks L0 is active
+        //   but actual path falls back to Vulkan or CPU without any indication
+        // Solution: Warn on failure, suggest Vulkan fallback
+        if (!level_zero_driver_load(&e->ze, e->backend_caps.device_id)) {
+            fprintf(stderr,
+                "[storageLLM WARNING] Level Zero driver initialization failed. "
+                "H2D copy will use synchronous fallback. Consider setting "
+                "backend=vulkan for Intel GPUs without Level Zero runtime.\n");
+        }
 
         // BUGFIX 896: Detect integrated GPU and enable unified memory handling ★★★ CRITICAL
         // Problem: Intel iGPU shares system RAM but allocatedSize==0 fallback uses totalSize (16GB).
@@ -575,7 +584,16 @@ static int device_allocator_init(moe_pc_engine* e) {
             return 0;
         }
 
-        e->backend_caps.copy_streams = 2;
+        // BUGFIX 934: Vulkan async H2D copy status ★★ FEATURE
+        // Problem: Vulkan H2D copy not implemented, forcing sync-only path
+        // → GPU idle during expert loading → tok/s degradation
+        // Solution (short-term): Set copy_streams=1 to signal sync-only mode
+        // → Caller code uses sync path, reduces staging slot allocation
+        // Solution (long-term): Implement vkCmdCopyBuffer + vkQueueSubmit + vkFence
+        // → Replace CUevent abstraction with VkFence in device_tensor_copy_ops.cpp.inc
+        // Impact: Explicit sync-only mode prevents false async expectations
+        e->backend_caps.copy_streams = 1;  // Sync-only until async H2D implemented
+        e->backend_caps.supports_backend_async_api = false;  // Disable async path
 
         if (e->backend_caps.device_memory_bytes == 0) {
             e->backend_caps.device_memory_bytes = e->backend_caps.system_memory_bytes > 0

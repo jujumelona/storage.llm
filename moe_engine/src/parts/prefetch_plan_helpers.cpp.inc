@@ -121,16 +121,44 @@ static void prefetch_plan_add_item(
     if (!engine || layer < 0 || expert < 0 || prefetch_plan_has_item(engine, layer, expert)) {
         return;
     }
-    const uint64_t bytes = expert_triplet_or_hardcoded_bytes(engine, layer, expert);
-    // A zero-byte expert cannot be budgeted by the trim pass, so treat it as
-    // missing runtime metadata instead of enqueueing an unaccounted prefetch.
+    uint64_t bytes = expert_triplet_or_hardcoded_bytes(engine, layer, expert);
+    // A zero-byte expert cannot be budgeted by the trim pass. Keep the item
+    // budgeted with the hardcode summary bundle size when per-expert metadata
+    // is missing, but do not turn invalid layer/expert pairs into prefetches.
     if (bytes == 0) {
-        fprintf(stderr,
-            "[storageLLM ERROR] prefetch_plan_add_item: expert_triplet_or_hardcoded_bytes returned 0 "
-            "for layer=%d expert=%d. This indicates missing hardcode_summary data. "
-            "Prefetch trim will not work correctly.\n",
-            layer, expert);
-        return;
+        const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
+        if (runtime_c.experts_per_moe_layer == 0 ||
+            runtime_c.last_moe_layer < runtime_c.first_moe_layer ||
+            layer < (int)runtime_c.first_moe_layer ||
+            layer > (int)runtime_c.last_moe_layer ||
+            expert >= (int)runtime_c.experts_per_moe_layer) {
+            fprintf(stderr,
+                "[storageLLM ERROR] prefetch_plan_add_item: invalid expert layer=%d expert=%d; "
+                "skipping unbudgetable prefetch item.\n",
+                layer, expert);
+            return;
+        }
+        bytes = runtime_c.normal_bundle_max_bytes;
+        if (bytes == 0) {
+            const uint64_t max_tensor_bytes =
+                engine->max_tensor_stream_bytes.load(std::memory_order_relaxed);
+            bytes = max_tensor_bytes <= UINT64_MAX / 3ull
+                ? max_tensor_bytes * 3ull : UINT64_MAX;
+        }
+        if (bytes == 0) {
+            fprintf(stderr,
+                "[storageLLM ERROR] prefetch_plan_add_item: no bundle byte estimate for "
+                "layer=%d expert=%d; skipping unbudgetable prefetch item.\n",
+                layer, expert);
+            return;
+        }
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            fprintf(stderr,
+                "[storageLLM WARNING] prefetch item bytes missing from expert metadata; "
+                "using fallback bundle size %llu bytes for VRAM trim.\n",
+                (unsigned long long)bytes);
+        }
     }
     // BUGFIX 573: Check priority is finite ★
     // Problem: priority can be NaN or infinity

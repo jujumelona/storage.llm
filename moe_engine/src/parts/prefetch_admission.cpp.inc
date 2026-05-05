@@ -74,16 +74,15 @@ static moe_tier_t prefetch_admitted_tier(
     if (target == moe_TIER_VRAM) {
         uint64_t pending = engine->pending_vram_reservation.load(std::memory_order_relaxed);
         for (;;) {
-            const uint64_t used = tier_used(engine, moe_TIER_VRAM);
             const uint64_t vram_budget = device_budget_bytes(engine);
 
             if (vram_budget == 0 || item.bytes > vram_budget) {
                 target = moe_TIER_RAM;
                 break;
             }
-            if (used > vram_budget || item.bytes > vram_budget - used ||
-                pending > vram_budget - used ||
-                item.bytes > vram_budget - used - pending) {
+            // BUGFIX 899 follow-up: Remove device_allocated (used) double subtraction ★★
+            if (pending > vram_budget ||
+                item.bytes > vram_budget - pending) {
                 target = moe_TIER_RAM;
                 device_refresh_mem_info(engine, 1);
                 break;

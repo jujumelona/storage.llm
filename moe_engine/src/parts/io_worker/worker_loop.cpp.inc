@@ -35,8 +35,8 @@
     moe_io_path_t active_path = choose_active_io_path(engine);
     engine->io_atomic.active_path.store(static_cast<uint32_t>(active_path));
     const uint64_t initial_budget = device_budget_bytes(engine);
-    const uint64_t initial_allocated = io_worker_device_allocated_bytes(engine);
-    uint64_t last_vram_room = initial_budget > initial_allocated ? initial_budget - initial_allocated : 0;
+    // BUGFIX 899 follow-up: Remove device_allocated double subtraction
+    uint64_t last_vram_room = initial_budget;
     uint32_t staging_turn = 0;
     std::deque<std::pair<moe_prefetch_task, moe_transfer_stage_t>> local_requeues;
     const auto should_stop = [&]() {
@@ -110,8 +110,10 @@
         // Fix 10: GDS/mmap routing changes rarely ??refresh every 10 tasks.
         // VRAM pressure changes fast; refresh when allocator budget headroom shifts >10%.
         const uint64_t cur_budget = device_budget_bytes(engine);
-        const uint64_t cur_allocated = io_worker_device_allocated_bytes(engine);
-        const uint64_t cur_vram_room = cur_budget > cur_allocated ? cur_budget - cur_allocated : 0;
+        // BUGFIX 899 follow-up: Remove device_allocated double subtraction ★★
+        // Problem: device_budget_bytes() already returns free VRAM
+        // Solution: Do not subtract cur_allocated again
+        const uint64_t cur_vram_room = cur_budget;
         const bool vram_shifted = last_vram_room == 0
             ? cur_vram_room > 0
             : (cur_vram_room > last_vram_room + last_vram_room / 10 ||

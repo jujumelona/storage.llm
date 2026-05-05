@@ -338,17 +338,32 @@ static int device_copy_tensor(
     // Old: worker_index=0, turn=0 fixed ??all workers compete for slot 0
     // New: thread-local turn counter ??workers spread across slot pool
     static thread_local uint32_t tl_device_copy_turn = 0;
-    const uint32_t slot_idx = (e->staging_slots.size() > 0 && bytes <= e->staging_slot_size)
+    // BUGFIX 935: Add staging_slot_size > 0 guard ★★★ CRITICAL
+    // Problem: After reset timeout, staging_slots.size() > 0 but staging_slot_size = 0
+    // → acquire_staging_slot may return valid index to slot with null buf
+    // Solution: Check staging_slot_size > 0 before attempting staging fast-path
+    uint32_t slot_idx = (e->staging_slots.size() > 0 && e->staging_slot_size > 0 && bytes <= e->staging_slot_size)
         ? acquire_staging_slot(e, 0u, tl_device_copy_turn++, bytes, false) : UINT32_MAX;
+
+    // BUGFIX: 슬롯 할당 실패 시 즉시 drain을 한 번 더 시도
+    if (slot_idx == UINT32_MAX && e->staging_slots.size() > 0 && e->staging_slot_size > 0 && bytes <= e->staging_slot_size) {
+        device_drain_deferred_staging_copies(e, false); // 즉시 drain 재시도
+        slot_idx = acquire_staging_slot(e, 0u, tl_device_copy_turn++, bytes, false);
+    }
 
     if (slot_idx != UINT32_MAX) {
         // Staging fast-path: memcpy ranges ??pinned staging ??single H2D async
         moe_staging_slot& slot = e->staging_slots[slot_idx];
-        if (!slot.buf || bytes > slot.size) {
+        // BUGFIX 935: Use staging_slot_valid() for thread-safe buf access ★★★
+        if (!staging_slot_valid(e, slot_idx)) {
             release_staging_slot(e, slot_idx);
             return 0;
         }
-        uint8_t* staging_buf = slot.buf;
+        uint8_t* staging_buf = static_cast<uint8_t*>(slot.buf.load(std::memory_order_acquire));
+        if (!staging_buf || bytes > slot.size) {
+            release_staging_slot(e, slot_idx);
+            return 0;
+        }
         // PIPELINE FIX 16: Use AVX2 non-temporal copy instead of plain memcpy ?�★??
         // Old: plain memcpy ??L1/L2 cache pollution, ~1.5-2x slower
         // New: copy_mapped_range_to_staging_linear ??AVX2 streaming stores
@@ -409,10 +424,11 @@ static int device_copy_tensor(
     }
 
     // Fix 55: No staging ??use explicit synchronous cuMemcpyHtoD (no false async)
-    if (device_backend_is_metal(e) && e->staging_slots.size() > 0 && bytes <= e->staging_slot_size) {
+    // BUGFIX 935: Add staging_slot_size > 0 guard ★★★
+    if (device_backend_is_metal(e) && e->staging_slots.size() > 0 && e->staging_slot_size > 0 && bytes <= e->staging_slot_size) {
         return moe_DEVICE_COPY_BACKPRESSURE;
     }
-    if (!allow_sync_fallback && e->staging_slots.size() > 0 && bytes <= e->staging_slot_size) {
+    if (!allow_sync_fallback && e->staging_slots.size() > 0 && e->staging_slot_size > 0 && bytes <= e->staging_slot_size) {
         return moe_DEVICE_COPY_BACKPRESSURE;
     }
     if (e) {

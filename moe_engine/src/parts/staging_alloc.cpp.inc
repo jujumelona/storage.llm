@@ -10,16 +10,20 @@ static void prepare_windows_staging_working_set(uint64_t bytes) {
     const SIZE_T min_ws = (SIZE_T)(bytes + 16ull * 1024ull * 1024ull);
     const SIZE_T max_ws = (SIZE_T)(bytes + 64ull * 1024ull * 1024ull);
     static std::mutex ws_mutex;
-    static SIZE_T reserved_min_ws = 0;
-    if (min_ws <= reserved_min_ws) {
+    // BUGFIX 932: Windows staging working set data race ★★ IMPORTANT
+    // Problem: reserved_min_ws is non-atomic but read outside mutex → data race (C++ UB)
+    // Solution: Use std::atomic<SIZE_T> with relaxed memory order
+    // Impact: Eliminates undefined behavior, no performance change
+    static std::atomic<SIZE_T> reserved_min_ws{0};
+    if (min_ws <= reserved_min_ws.load(std::memory_order_relaxed)) {
         return;
     }
     std::lock_guard<std::mutex> lock(ws_mutex);
-    if (min_ws <= reserved_min_ws) {
+    if (min_ws <= reserved_min_ws.load(std::memory_order_relaxed)) {
         return;
     }
     if (SetProcessWorkingSetSize(GetCurrentProcess(), min_ws, max_ws)) {
-        reserved_min_ws = min_ws;
+        reserved_min_ws.store(min_ws, std::memory_order_relaxed);
     } else {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true, std::memory_order_relaxed)) {

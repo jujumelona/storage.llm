@@ -4,7 +4,20 @@
         const int predicted_experts_cap =
             (int)(sizeof(predicted_experts_buf) / sizeof(predicted_experts_buf[0]));
         int predicted_experts_count = 0;
-        if (infinigen_predicted_count > 0 && spec_confidence > 0.50f) {
+        // BUGFIX 950: Entropy-adaptive InfiniGen confidence threshold ★★★ PERFORMANCE
+        // Problem: Hardcoded 0.50 threshold never reached by high-entropy models
+        //   (uniform router distributions e.g. GLM-4-9B) → speculative prefetch disabled
+        // Solution: Scale threshold based on per-session router entropy
+        //   Low entropy (sharp topk): threshold stays ~0.50 (high accuracy requirement)
+        //   High entropy (uniform):   threshold drops to ~0.30 (allow lower-confidence predictions)
+        // session_router_entropy_milli: 0 = untrained/unknown, 100-300 = sharp, 500+ = uniform
+        const float spec_threshold = [&]() -> float {
+            if (!s || s->session_router_entropy_milli == 0) return 0.50f;
+            const float entropy_norm = std::min(1.0f, (float)s->session_router_entropy_milli / 1000.0f);
+            // Linear interpolation: entropy=0 → 0.50, entropy=1.0 → 0.25
+            return 0.50f - 0.25f * entropy_norm;
+        }();
+        if (infinigen_predicted_count > 0 && spec_confidence > spec_threshold) {
             predicted_experts_count = std::min(infinigen_predicted_count, predicted_experts_cap);
             for (int ii = 0; ii < predicted_experts_count; ++ii)
                 predicted_experts_buf[ii] = infinigen_predicted_buf[ii];
@@ -51,7 +64,13 @@
                 s
             );
             // Only prefetch deep layers if confidence remains adequate
-            if (deep_predicted.empty() || deep_conf < 0.40f) {
+            // BUGFIX 950: Entropy-adaptive deep speculative threshold ★★★ PERFORMANCE
+            const float deep_threshold = [&]() -> float {
+                if (!s || s->session_router_entropy_milli == 0) return 0.40f;
+                const float entropy_norm = std::min(1.0f, (float)s->session_router_entropy_milli / 1000.0f);
+                return 0.40f - 0.20f * entropy_norm;
+            }();
+            if (deep_predicted.empty() || deep_conf < deep_threshold) {
                 break;
             }
             // BUGFIX NEW-24: Already fixed - using layer + d

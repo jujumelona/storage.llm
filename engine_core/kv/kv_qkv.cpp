@@ -177,6 +177,45 @@ static int qkv_quantize_split_vector_with_state(
             src = rotated;
         } else {
             // Slow path: Full matrix multiplication for non-power-of-2
+            // BUGFIX 942: Add SIMD for non-power-of-2 forward rotation ★★ PERFORMANCE
+#if defined(__AVX2__)
+            for (int i = 0; i < dim; ++i) {
+                __m256 sum_vec = _mm256_setzero_ps();
+                const float* row = &state->rotation_matrix[(size_t)i * (size_t)dim];
+                int j = 0;
+                for (; j + 7 < dim; j += 8) {
+                    __m256 r_vec = _mm256_loadu_ps(&row[j]);
+                    __m256 n_vec = _mm256_loadu_ps(&normalized[j]);
+                    sum_vec = _mm256_add_ps(sum_vec, _mm256_mul_ps(r_vec, n_vec));
+                }
+                __m128 hi = _mm256_extractf128_ps(sum_vec, 1);
+                __m128 lo = _mm256_castps256_ps128(sum_vec);
+                __m128 sum4 = _mm_add_ps(lo, hi);
+                sum4 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+                sum4 = _mm_add_ss(sum4, _mm_shuffle_ps(sum4, sum4, 1));
+                float sum = _mm_cvtss_f32(sum4);
+                for (; j < dim; ++j) {
+                    sum += row[j] * normalized[j];
+                }
+                rotated[i] = sum;
+            }
+#elif defined(__ARM_NEON)
+            for (int i = 0; i < dim; ++i) {
+                float32x4_t sum_vec = vdupq_n_f32(0.0f);
+                const float* row = &state->rotation_matrix[(size_t)i * (size_t)dim];
+                int j = 0;
+                for (; j + 3 < dim; j += 4) {
+                    float32x4_t r_vec = vld1q_f32(&row[j]);
+                    float32x4_t n_vec = vld1q_f32(&normalized[j]);
+                    sum_vec = vmlaq_f32(sum_vec, r_vec, n_vec);
+                }
+                float sum = vaddvq_f32(sum_vec);
+                for (; j < dim; ++j) {
+                    sum += row[j] * normalized[j];
+                }
+                rotated[i] = sum;
+            }
+#else
             for (int i = 0; i < dim; ++i) {
                 float sum = 0.0f;
                 for (int j = 0; j < dim; ++j) {
@@ -184,6 +223,7 @@ static int qkv_quantize_split_vector_with_state(
                 }
                 rotated[i] = sum;
             }
+#endif
             src = rotated;
         }
     }
@@ -253,6 +293,45 @@ static int qkv_quantize_split_vector_with_state(
             r_norm_sq += normalized[i] * normalized[i];
         }
         residual_norms[token_idx] = sqrtf(r_norm_sq);
+        // BUGFIX 942: SIMD for QJL projection in split vector path ★★ PERFORMANCE
+#if defined(__AVX2__)
+        for (int i = 0; i < dim; ++i) {
+            __m256 sum_vec = _mm256_setzero_ps();
+            const float* qjl_row = &state->qjl_matrix[(size_t)i * (size_t)dim];
+            int j = 0;
+            for (; j + 7 < dim; j += 8) {
+                __m256 q_vec = _mm256_loadu_ps(&qjl_row[j]);
+                __m256 n_vec = _mm256_loadu_ps(&normalized[j]);
+                sum_vec = _mm256_add_ps(sum_vec, _mm256_mul_ps(q_vec, n_vec));
+            }
+            __m128 hi = _mm256_extractf128_ps(sum_vec, 1);
+            __m128 lo = _mm256_castps256_ps128(sum_vec);
+            __m128 sum4 = _mm_add_ps(lo, hi);
+            sum4 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+            sum4 = _mm_add_ss(sum4, _mm_shuffle_ps(sum4, sum4, 1));
+            float sum = _mm_cvtss_f32(sum4);
+            for (; j < dim; ++j) {
+                sum += qjl_row[j] * normalized[j];
+            }
+            rotated[i] = sum;
+        }
+#elif defined(__ARM_NEON)
+        for (int i = 0; i < dim; ++i) {
+            float32x4_t sum_vec = vdupq_n_f32(0.0f);
+            const float* qjl_row = &state->qjl_matrix[(size_t)i * (size_t)dim];
+            int j = 0;
+            for (; j + 3 < dim; j += 4) {
+                float32x4_t q_vec = vld1q_f32(&qjl_row[j]);
+                float32x4_t n_vec = vld1q_f32(&normalized[j]);
+                sum_vec = vmlaq_f32(sum_vec, q_vec, n_vec);
+            }
+            float sum = vaddvq_f32(sum_vec);
+            for (; j < dim; ++j) {
+                sum += qjl_row[j] * normalized[j];
+            }
+            rotated[i] = sum;
+        }
+#else
         for (int i = 0; i < dim; ++i) {
             float sum = 0.0f;
             for (int j = 0; j < dim; ++j) {
@@ -260,6 +339,7 @@ static int qkv_quantize_split_vector_with_state(
             }
             rotated[i] = sum;
         }
+#endif
         qkv_pack_signs(rotated, qjl_base + (size_t)token_idx * (size_t)qjl_stride, dim);
     }
     return 1;
@@ -444,6 +524,48 @@ int qkv_quantize(
             float* s_times_r = state->scratch_s_times_r;
             if (!s_times_r) return 0;
 
+            // BUGFIX 942: Add SIMD optimization for QJL projection ★★ PERFORMANCE
+            // Problem: O(d²) scalar loop for QJL S*r projection
+            // Solution: AVX2/NEON vectorization matching rotation matrix pattern
+#if defined(__AVX2__)
+            for (int i = 0; i < dim; i++) {
+                __m256 sum_vec = _mm256_setzero_ps();
+                const float* qjl_row = &state->qjl_matrix[i * dim];
+                int j = 0;
+                for (; j + 7 < dim; j += 8) {
+                    __m256 q_vec = _mm256_loadu_ps(&qjl_row[j]);
+                    __m256 r_vec = _mm256_loadu_ps(&residual[j]);
+                    sum_vec = _mm256_add_ps(sum_vec, _mm256_mul_ps(q_vec, r_vec));
+                }
+                // Horizontal sum
+                __m128 hi = _mm256_extractf128_ps(sum_vec, 1);
+                __m128 lo = _mm256_castps256_ps128(sum_vec);
+                __m128 sum4 = _mm_add_ps(lo, hi);
+                sum4 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+                sum4 = _mm_add_ss(sum4, _mm_shuffle_ps(sum4, sum4, 1));
+                float sum = _mm_cvtss_f32(sum4);
+                for (; j < dim; j++) {
+                    sum += qjl_row[j] * residual[j];
+                }
+                s_times_r[i] = sum;
+            }
+#elif defined(__ARM_NEON)
+            for (int i = 0; i < dim; i++) {
+                float32x4_t sum_vec = vdupq_n_f32(0.0f);
+                const float* qjl_row = &state->qjl_matrix[i * dim];
+                int j = 0;
+                for (; j + 3 < dim; j += 4) {
+                    float32x4_t q_vec = vld1q_f32(&qjl_row[j]);
+                    float32x4_t r_vec = vld1q_f32(&residual[j]);
+                    sum_vec = vmlaq_f32(sum_vec, q_vec, r_vec);
+                }
+                float sum = vaddvq_f32(sum_vec);
+                for (; j < dim; j++) {
+                    sum += qjl_row[j] * residual[j];
+                }
+                s_times_r[i] = sum;
+            }
+#else
             for (int i = 0; i < dim; i++) {
                 float sum = 0.0f;
                 for (int j = 0; j < dim; j++) {
@@ -451,6 +573,7 @@ int qkv_quantize(
                 }
                 s_times_r[i] = sum;
             }
+#endif
 
             // Pack signs
             uint8_t* qjl_out = state->k_qjl + qjl_offset;
@@ -594,6 +717,45 @@ int qkv_quantize(
             float* s_times_r = state->scratch_s_times_r;
             if (!s_times_r) return 0;
 
+            // BUGFIX 942: Add SIMD optimization for QJL projection (V path) ★★ PERFORMANCE
+#if defined(__AVX2__)
+            for (int i = 0; i < dim; i++) {
+                __m256 sum_vec = _mm256_setzero_ps();
+                const float* qjl_row = &state->qjl_matrix[i * dim];
+                int j = 0;
+                for (; j + 7 < dim; j += 8) {
+                    __m256 q_vec = _mm256_loadu_ps(&qjl_row[j]);
+                    __m256 r_vec = _mm256_loadu_ps(&residual[j]);
+                    sum_vec = _mm256_add_ps(sum_vec, _mm256_mul_ps(q_vec, r_vec));
+                }
+                __m128 hi = _mm256_extractf128_ps(sum_vec, 1);
+                __m128 lo = _mm256_castps256_ps128(sum_vec);
+                __m128 sum4 = _mm_add_ps(lo, hi);
+                sum4 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+                sum4 = _mm_add_ss(sum4, _mm_shuffle_ps(sum4, sum4, 1));
+                float sum = _mm_cvtss_f32(sum4);
+                for (; j < dim; j++) {
+                    sum += qjl_row[j] * residual[j];
+                }
+                s_times_r[i] = sum;
+            }
+#elif defined(__ARM_NEON)
+            for (int i = 0; i < dim; i++) {
+                float32x4_t sum_vec = vdupq_n_f32(0.0f);
+                const float* qjl_row = &state->qjl_matrix[i * dim];
+                int j = 0;
+                for (; j + 3 < dim; j += 4) {
+                    float32x4_t q_vec = vld1q_f32(&qjl_row[j]);
+                    float32x4_t r_vec = vld1q_f32(&residual[j]);
+                    sum_vec = vmlaq_f32(sum_vec, q_vec, r_vec);
+                }
+                float sum = vaddvq_f32(sum_vec);
+                for (; j < dim; j++) {
+                    sum += qjl_row[j] * residual[j];
+                }
+                s_times_r[i] = sum;
+            }
+#else
             for (int i = 0; i < dim; i++) {
                 float sum = 0.0f;
                 for (int j = 0; j < dim; j++) {
@@ -601,6 +763,7 @@ int qkv_quantize(
                 }
                 s_times_r[i] = sum;
             }
+#endif
 
             // BUGFIX 345: v_qjl overflow 방지
             size_t v_qjl_offset = (size_t)t * (size_t)((dim + 7) / 8);

@@ -10,9 +10,8 @@ QkvThreadPool::QkvThreadPool(int num_threads) {
     for (int i = 0; i < num_threads; ++i) {
         workers.emplace_back([this]() {
             while (true) {
-                int my_task = -1;
-                int local_total = 0;
                 std::function<void(int)> my_fn;
+                int local_total = 0;
                 {
                     std::unique_lock<std::mutex> lock(mtx);
                     cv.wait(lock, [this]() {
@@ -27,13 +26,16 @@ QkvThreadPool::QkvThreadPool(int num_threads) {
                     }
                     my_fn = task;
                 }
+                // BUGFIX 940: Lock-free task loop ★★★ PERFORMANCE
+                // Workers self-assign tasks via atomic fetch_add.
+                // No mutex held during task execution → zero lock contention.
                 for (;;) {
-                    my_task = current_task.fetch_add(1, std::memory_order_relaxed);
+                    const int my_task = current_task.fetch_add(1, std::memory_order_relaxed);
                     if (my_task >= local_total) {
                         break;
                     }
                     my_fn(my_task);
-                    const int done = completed_tasks.fetch_add(1, std::memory_order_release) + 1;
+                    const int done = completed_tasks.fetch_add(1, std::memory_order_acq_rel) + 1;
                     if (done == local_total) {
                         done_cv.notify_one();
                     }
@@ -57,15 +59,13 @@ QkvThreadPool::~QkvThreadPool() {
 void QkvThreadPool::run(int num_tasks, std::function<void(int)> fn) {
     // BUGFIX 420: num_tasks 유효성 체크
     if (num_tasks <= 0 || num_tasks > INT_MAX / 2) return;
-    // BUGFIX 909: Lower serialization threshold and use atomic for completed_tasks ★★ PERFORMANCE
-    // Problem 1: Threshold 1024 too high → 512-token context (65K ops) runs single-threaded
-    // Problem 2: completed_tasks under mutex → lock contention on every task completion
-    // Solution 1: Lower threshold to 256 (parallelizes 256-1023 range)
-    // Solution 2: Use atomic for completed_tasks (already atomic in header, just use it)
-    // Impact: Better parallelization for medium workloads, reduced lock contention
-    // Trade-off: n < 64 should stay serial to avoid thread wakeup overhead
-    if (num_tasks < 256) {
-        // Serial execution for small workloads (< 256 tasks)
+    // BUGFIX 909/940: Dynamic serialization threshold ★★ PERFORMANCE
+    // Problem: Fixed threshold 1024 → medium workloads (256-1023) run single-threaded
+    // Solution: Lower to 64 for small SIMD-width workloads, stay serial only when
+    //   thread wakeup overhead (~5μs per worker) exceeds task compute time.
+    // Trade-off: n < 64 stays serial to avoid wakeup cost > compute cost.
+    const int serial_threshold = 64;
+    if (num_tasks < serial_threshold) {
         for (int i = 0; i < num_tasks; ++i) {
             fn(i);
         }
@@ -74,8 +74,6 @@ void QkvThreadPool::run(int num_tasks, std::function<void(int)> fn) {
     {
         std::unique_lock<std::mutex> lock(mtx);
         // Bug 2 Fix: Check stop flag to prevent deadlock if pool is shutting down.
-        // If destructor already set stop=true and workers exited, notify_all has
-        // no listeners and done_cv.wait would hang forever.
         if (stop) return;
         task = fn;
         total_tasks.store(num_tasks, std::memory_order_release);
@@ -85,10 +83,6 @@ void QkvThreadPool::run(int num_tasks, std::function<void(int)> fn) {
     cv.notify_all();
     {
         std::unique_lock<std::mutex> lock(mtx);
-        // Bug 2 Fix: Wait ONLY for task completion, not stop flag.
-        // Workers complete current tasks before exiting, so completed_tasks will
-        // reach total_tasks even during shutdown. Checking stop here causes
-        // premature return with incomplete attention scores.
         done_cv.wait(lock, [this]() {
             return completed_tasks.load(std::memory_order_acquire) >=
                 total_tasks.load(std::memory_order_acquire);

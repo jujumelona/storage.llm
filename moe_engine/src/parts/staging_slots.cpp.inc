@@ -189,7 +189,12 @@ static void moe_staging_slot_targets(
     }
     const uint32_t gpu_batch_eff = moe_gpu_stage_batch_max(engine);
     uint32_t pinned_target = pinned_workers > 0 ? std::max(1u, pinned_workers * 2u) : 0u;
-    uint32_t gpu_target = gpu_workers > 0 ? std::max(1u, gpu_workers * gpu_batch_eff) : 0u;
+    // BUGFIX 933: GPU staging slot cap to prevent memory explosion ★★ IMPORTANT
+    // Problem: gpu_workers * gpu_batch_eff can be 4 * 32 = 128 slots
+    // → 128 × 20MB = 2.56GB pinned staging → excessive memory pressure
+    // Solution: Cap gpu_target at 64 slots (1.28GB for 20MB triplets)
+    // Impact: Reduces staging memory usage, minimal throughput impact (64 slots sufficient)
+    uint32_t gpu_target = gpu_workers > 0 ? std::min(std::max(1u, gpu_workers * gpu_batch_eff), 64u) : 0u;
     uint32_t direct_target = moe_staging_direct_slot_target(engine, disk_workers);
 
     // BUGFIX Issue 2: Extend zero-copy slot optimization to AMD APU and Intel Xe ★★
@@ -206,7 +211,17 @@ static void moe_staging_slot_targets(
     if (is_unified_zero_copy) {
         pinned_target = 0;
         gpu_target = 0;
-        direct_target = disk_workers > 0 ? std::max(1u, disk_workers) : 1u;
+        // BUGFIX 931: Unified memory staging slot capability check ★★★ CRITICAL
+        // Problem: Direct slot count forced to disk_workers without checking backend capabilities
+        // → AMD APU/Intel Xe with supports_fixed_read_staging=false still allocate direct slots
+        // → I/O workers try to use null staging buffers → crash
+        // Solution: Call moe_staging_direct_slot_target() to check all 5 capability conditions
+        // Impact: Prevents null pointer dereference on unified memory devices
+        direct_target = moe_staging_direct_slot_target(engine, disk_workers);
+        // If capability check passed but returned 0, ensure minimum for zero-copy path
+        if (direct_target == 0 && disk_workers > 0 && engine->staging) {
+            direct_target = std::min(disk_workers, 4u);
+        }
     }
 
     if (pinned_out) *pinned_out = pinned_target;

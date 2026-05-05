@@ -93,7 +93,22 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
         : 0;
 
     const uint64_t common_reserved = e->common_vram_reserved_bytes.load(std::memory_order_relaxed);
+    // BUGFIX 938: Include in-flight VRAM bytes in budget calculation ★★★ CRITICAL
+    // Problem: pending_vram_reservation tracks admission intent, but vram_in_flight_bytes
+    //   tracks actual DMA transfers queued on GPU. Neither includes the other.
+    //   Multiple GPU workers can each see positive budget, admit experts, then exceed VRAM.
+    // Lifecycle: pending_vram_reservation released at enqueue → vram_in_flight_bytes
+    //   incremented at DMA start → decremented at DMA completion event.
+    //   No overlap: pending is released before in_flight is added.
+    // Solution: Add in_flight to reserved_total alongside pending.
+    // Impact: Prevents VRAM over-commitment during concurrent DMA transfers.
+    const uint64_t in_flight = e->vram_in_flight_bytes.load(std::memory_order_relaxed);
     uint64_t reserved_total = pending;
+    if (reserved_total > UINT64_MAX - in_flight) {
+        reserved_total = UINT64_MAX;
+    } else {
+        reserved_total += in_flight;
+    }
     if (reserved_total > UINT64_MAX - kv_reserved) {
         reserved_total = UINT64_MAX;
     } else {
@@ -136,21 +151,26 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
         }
         const uint64_t raw_budget = (sys * pct) / 100ull;
 
-        // BUGFIX 893: Include CPU KV cache in unified memory budget ★★★ CRITICAL
-        // Problem: Metal KV cache in CPU RAM not counted in unified memory budget.
-        // Long sequences → KV grows → unified memory exhausted but engine unaware.
-        // Solution: Add tier_used_bytes[RAM] to total_reserved for Metal.
-        // Impact: Prevents OOM on long sequences by accounting for CPU KV usage.
-        // BUGFIX 906: Remove KV double-counting in Metal UMA ★★★ CRITICAL
-        // Problem: reserved_total already includes kv_reserved (from device_kv_cache_bytes)
-        // → tier_used_bytes[RAM] also includes KV cache → KV counted twice
-        // → Metal VRAM budget underestimated → unnecessary expert eviction
-        // Solution: Subtract kv_reserved before adding cpu_ram_used (which includes KV)
-        // Impact: Correct Metal budget calculation, prevents over-eviction
-        uint64_t total_reserved = reserved_total > kv_reserved ? reserved_total - kv_reserved : 0;
+        // BUGFIX 893/906/937: Metal UMA KV budget — single source of truth ★★★ CRITICAL
+        // Problem: BUGFIX 893 added tier_used(RAM) to account for CPU KV in UMA budget.
+        //   BUGFIX 906 tried to fix double-counting by subtracting kv_reserved first.
+        //   But tier_used(RAM) includes ALL RAM usage (KV + vision encoder + MLA buffers),
+        //   while kv_reserved is only device_kv_cache_bytes (GPU-side KV).
+        //   On Apple Silicon these can differ (vision encoder allocates RAM but not GPU KV).
+        //   Subtracting kv_reserved from reserved_total then adding full tier_used(RAM)
+        //   double-counts the non-KV RAM portion and can cause uint64_t underflow.
+        // Solution: Use device_kv_cache_bytes as the sole KV source (already in reserved_total).
+        //   For non-KV RAM usage, compute: tier_used(RAM) - min(kv_actual, tier_used(RAM))
+        //   This isolates non-KV RAM contributions (vision, MLA, scratch) cleanly.
+        // Impact: Correct budget on Apple Silicon with mixed workloads, no underflow.
         const uint64_t cpu_ram_used = tier_used(e, moe_TIER_RAM);
-        if (cpu_ram_used < UINT64_MAX - total_reserved) {
-            total_reserved += cpu_ram_used;
+        // Estimate how much of tier_used(RAM) is KV: at most kv_actual (which is already
+        // counted in reserved_total via kv_reserved). Subtract it to avoid double-count.
+        const uint64_t kv_in_ram = std::min(kv_actual, cpu_ram_used);
+        const uint64_t non_kv_ram = cpu_ram_used - kv_in_ram;
+        uint64_t total_reserved = reserved_total;
+        if (non_kv_ram < UINT64_MAX - total_reserved) {
+            total_reserved += non_kv_ram;
         } else {
             total_reserved = UINT64_MAX;
         }

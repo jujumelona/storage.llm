@@ -13,9 +13,7 @@ static int read_file_range_to_buffer(
     // BUGFIX Problem D: Adaptive storage bandwidth measurement ★★★
     // Measure bandwidth from large reads (>10MB) to avoid init delay
     const uint64_t measure_threshold = 10ull * 1024ull * 1024ull;
-    const bool should_measure = engine &&
-        bytes >= measure_threshold &&
-        engine->backend_caps.measured_storage_bw_bytes_per_sec == 0;
+    const bool should_measure = engine && bytes >= measure_threshold;
 
     const uint64_t start_us = should_measure ? moe_profile_now_us() : 0;
 
@@ -58,16 +56,28 @@ static int read_file_range_to_buffer(
         copied += static_cast<uint64_t>(actual);
     }
 
-    // BUGFIX Problem D: Record measured bandwidth ★★★
+    // BUGFIX 951: Adaptive EMA (Exponential Moving Average) for storage bandwidth ★★★ PERFORMANCE
+    // Problem: Bandwidth was measured once and fixed, ignoring SSD thermal throttling,
+    //   cache exhaustion, or OS page cache hits over time.
+    // Solution: Use EMA (alpha=0.2) to update measured bandwidth continuously
+    //   on large reads, adapting to current system conditions.
+    // Impact: Juju strategy router uses accurate real-time I/O latency estimations
     if (should_measure && engine) {
         const uint64_t elapsed_us = moe_profile_now_us() - start_us;
         if (elapsed_us > 0) {
-            const uint64_t bytes_per_sec = (bytes * 1000000ull) / elapsed_us;
-            engine->backend_caps.measured_storage_bw_bytes_per_sec = bytes_per_sec;
-            const double gb_per_sec = (double)bytes_per_sec / 1e9;
-            fprintf(stderr,
-                "[storageLLM INFO] Storage bandwidth measured: %.2f GB/s from %llu MB read\n",
-                gb_per_sec, (unsigned long long)(bytes / (1024*1024)));
+            const uint64_t current_bw = (bytes * 1000000ull) / elapsed_us;
+            uint64_t old_bw = engine->backend_caps.measured_storage_bw_bytes_per_sec.load(std::memory_order_relaxed);
+            if (old_bw == 0) {
+                engine->backend_caps.measured_storage_bw_bytes_per_sec.store(current_bw, std::memory_order_relaxed);
+                const double gb_per_sec = (double)current_bw / 1e9;
+                fprintf(stderr,
+                    "[storageLLM INFO] Initial storage bandwidth measured: %.2f GB/s from %llu MB read\n",
+                    gb_per_sec, (unsigned long long)(bytes / (1024*1024)));
+            } else {
+                // EMA: new = 0.8 * old + 0.2 * current
+                const uint64_t new_bw = (old_bw * 8ull + current_bw * 2ull) / 10ull;
+                engine->backend_caps.measured_storage_bw_bytes_per_sec.store(new_bw, std::memory_order_relaxed);
+            }
         }
     }
 

@@ -1,4 +1,4 @@
-﻿static uint64_t tensor_stream_bytes(const moe_tensor_record& rec) {
+static uint64_t tensor_stream_bytes(const moe_tensor_record& rec) {
     return rec.info.weight_byte_length + rec.info.scale_byte_length + rec.info.scale2_byte_length;
 }
 
@@ -49,6 +49,13 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
     // BUGFIX 897: If prefer_overlapped_io enabled, skip mmap touch entirely.
     // OVERLAPPED ReadFile path in prefetch_pinned.cpp.inc handles async I/O directly.
     if (engine && engine->io_config.prefer_overlapped_io) {
+        // BUGFIX 936: Track bytes going through overlapped path for diagnostics ★★
+        // Problem: Early return without counter update makes this path invisible
+        // → I/O bottleneck analysis impossible when overlapped_io is the dominant path
+        // Solution: Update bytes_overlapped_io counter before returning
+        if (src && bytes > 0) {
+            const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_overlapped_io.fetch_add(bytes, std::memory_order_relaxed);
+        }
         // OVERLAPPED path bypasses mmap entirely - no touch needed
         return;
     }
@@ -65,9 +72,25 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
         if (VirtualLock(reinterpret_cast<LPVOID>(aligned_addr), aligned_size)) {
             // Immediately unlock - we just wanted to fault pages in
             VirtualUnlock(reinterpret_cast<LPVOID>(aligned_addr), aligned_size);
+        } else {
+            // BUGFIX 939: Auto-fallback to OVERLAPPED IO on VirtualLock failure ★★★
+            // Problem: VirtualLock fails at ~1.5GB working set limit → memcpy page-faults
+            //   → io_worker blocked 100-500ms per fault → pipeline stall
+            // Solution: Track consecutive failures. After 8 failures, dynamically switch
+            //   to prefer_overlapped_io=true. OVERLAPPED ReadFile path already implemented.
+            // Impact: Eliminates blocking page faults on Windows non-DirectStorage path.
+            static thread_local uint32_t s_vlock_fail_count = 0;
+            if (++s_vlock_fail_count >= 8 && engine) {
+                auto* mutable_engine = const_cast<moe_pc_engine*>(engine);
+                if (!mutable_engine->io_config.prefer_overlapped_io) {
+                    mutable_engine->io_config.prefer_overlapped_io = true;
+                    fprintf(stderr,
+                        "[storageLLM INFO] VirtualLock failed %u times, auto-enabling prefer_overlapped_io. "
+                        "Subsequent I/O will use OVERLAPPED ReadFile to avoid page fault stalls.\n",
+                        s_vlock_fail_count);
+                }
+            }
         }
-        // Failure is OK - just means working set limit reached or insufficient privilege
-        // Fall through to counter tracking
     }
     if (engine) {
         const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_touch_fallback.fetch_add(bytes, std::memory_order_relaxed);

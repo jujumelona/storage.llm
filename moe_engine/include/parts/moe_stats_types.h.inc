@@ -116,6 +116,7 @@ typedef struct {
     uint64_t recommended_staging_bytes;
     uint64_t topology_predictions;
     uint64_t topology_updates;
+    uint64_t bytes_overlapped_io;  // BUGFIX 936: Track OVERLAPPED ReadFile path bytes
     uint32_t active_workers;
     uint32_t disk_queue_depth;
     uint32_t pinned_queue_depth;
