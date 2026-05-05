@@ -19,6 +19,10 @@ static inline float moe_apply_final_logit_softcap_cached(float cap, float score)
     return tanh_val * cap;
 }
 
+static uint32_t moe_lm_head_worker_hint() {
+    return std::max<uint32_t>(row_hw_threads(), 1u);
+}
+
 static int moe_map_lm_head_tensor(
     moe_pc_engine* engine,
     const moe_storage_constants_t* c,
@@ -157,9 +161,17 @@ int moe_pc_engine_lm_head_top1_f32(
     const float logit_softcap = moe_final_logit_softcap_value(engine);
     const uint64_t total_start_us = moe_profile_now_us();
     const uint8_t effective_weight_format = moe_effective_weight_format_for_row_bytes(raw, c->hidden_size);
+    engine->generation_phase.store(moe_GEN_PHASE_LM_HEAD, std::memory_order_relaxed);
+    engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
+
+    const uint32_t worker_hint = moe_lm_head_worker_hint();
+    const uint32_t target_chunks = std::max<uint32_t>(worker_hint * 16u, 32u);
+    const uint32_t chunk_size = std::max(64u, (c->vocab_size + target_chunks - 1u) / target_chunks);
+    const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
+    const uint32_t chunk_block = 1u;
     moe_profile_log(
         "lm_head_top1_begin",
-        "vocab=%u hidden=%u fmt=%u eff_fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.6g",
+        "vocab=%u hidden=%u fmt=%u eff_fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.6g row_workers=%u chunk_size=%u chunks=%u",
         c->vocab_size,
         c->hidden_size,
         (unsigned)raw.weight_format,
@@ -167,16 +179,10 @@ int moe_pc_engine_lm_head_top1_f32(
         (unsigned)raw.scalar_encoding,
         (unsigned long long)row_bytes,
         (unsigned long long)bytes,
-        (double)logit_softcap);
-
-    engine->generation_phase.store(moe_GEN_PHASE_LM_HEAD, std::memory_order_relaxed);
-    engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
-
-    static const uint32_t hw_threads = std::max<uint32_t>(moe_cpu_thread_count_hint(), 4u);
-    const uint32_t chunk_size = std::max(64u, (c->vocab_size + hw_threads * 8 - 1) / (hw_threads * 8));
-    const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
-    const uint32_t chunk_block =
-        std::max(1u, (num_chunks + (uint32_t)hw_threads - 1u) / (uint32_t)hw_threads);
+        (double)logit_softcap,
+        worker_hint,
+        chunk_size,
+        num_chunks);
 
     struct chunk_result_t {
         uint32_t token;
@@ -370,9 +376,17 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     const float logit_softcap = moe_final_logit_softcap_value(engine);
     const uint64_t total_start_us = moe_profile_now_us();
     const uint8_t effective_weight_format = moe_effective_weight_format_for_row_bytes(raw, c->hidden_size);
+    engine->generation_phase.store(moe_GEN_PHASE_LM_HEAD, std::memory_order_relaxed);
+    engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
+
+    const uint32_t worker_hint = moe_lm_head_worker_hint();
+    const uint32_t target_chunks = std::max<uint32_t>(worker_hint * 16u, 32u);
+    const uint32_t chunk_size = std::max(64u, (c->vocab_size + target_chunks - 1u) / target_chunks);
+    const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
+    const uint32_t chunk_block = 1u;
     moe_profile_log(
         "lm_head_logprob_begin",
-        "target=%u vocab=%u hidden=%u fmt=%u eff_fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.6g",
+        "target=%u vocab=%u hidden=%u fmt=%u eff_fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.6g row_workers=%u chunk_size=%u chunks=%u",
         target_token_id,
         c->vocab_size,
         c->hidden_size,
@@ -381,16 +395,10 @@ int moe_pc_engine_lm_head_token_logprob_f32(
         (unsigned)raw.scalar_encoding,
         (unsigned long long)row_bytes,
         (unsigned long long)bytes,
-        (double)logit_softcap);
-
-    engine->generation_phase.store(moe_GEN_PHASE_LM_HEAD, std::memory_order_relaxed);
-    engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
-
-    static const uint32_t hw_threads_2 = std::max<uint32_t>(moe_cpu_thread_count_hint(), 4u);
-    const uint32_t chunk_size = std::max(64u, (c->vocab_size + hw_threads_2 * 8 - 1) / (hw_threads_2 * 8));
-    const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
-    const uint32_t chunk_block =
-        std::max(1u, (num_chunks + (uint32_t)hw_threads_2 - 1u) / (uint32_t)hw_threads_2);
+        (double)logit_softcap,
+        worker_hint,
+        chunk_size,
+        num_chunks);
 
     struct chunk_logsum_t {
         float max_score;

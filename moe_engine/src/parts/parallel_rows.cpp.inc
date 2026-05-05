@@ -21,11 +21,11 @@ static uint32_t macos_performance_core_count() {
 
 static uint32_t row_hw_threads() {
     static const uint32_t hw = []() -> uint32_t {
-#if defined(__APPLE__) && defined(__MACH__)
         const uint32_t override_threads = row_thread_override();
         if (override_threads > 0) {
             return override_threads;
         }
+#if defined(__APPLE__) && defined(__MACH__)
         const uint32_t pcores = macos_performance_core_count();
         if (pcores > 0) {
             return pcores;
