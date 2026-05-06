@@ -7,6 +7,7 @@ import os
 import re
 import struct
 import time
+import math
 from pathlib import Path
 
 import requests
@@ -139,6 +140,10 @@ GGUF_RUNTIME_KV_ALIAS_MAP = {
     "full_attention_offset": ("full_attention_offset", "global_attention_offset"),
     "global_attention_offset": ("global_attention_offset", "full_attention_offset"),
 }
+
+JUJU_EMBEDDING_SCALE_FAMILY_RULES = (
+    (("gemma",), "sqrt_hidden_size", "hf_forward_gemma_sqrt_hidden_size"),
+)
 
 JUJU_HEADER_BYTES = 4096
 JUJU_SECTION_ENTRY_BYTES = 96
@@ -3241,6 +3246,71 @@ def first_present(*values):
     return None
 
 
+def _juju_model_family_text(contract, runtime=None):
+    runtime = runtime or {}
+    arch = dict(contract.get("arch_meta") or {})
+    source_config = _juju_contract_source_config(contract)
+    text_config = _juju_contract_text_config(contract)
+    parts = [
+        contract.get("architecture"),
+        contract.get("model_type"),
+        contract.get("model_id"),
+        contract.get("model_name"),
+        source_config.get("model_type"),
+        text_config.get("model_type"),
+        arch.get("architecture"),
+        arch.get("model_type"),
+        arch.get("model_id"),
+        runtime.get("declared_architecture"),
+        runtime.get("architecture"),
+        runtime.get("model_type"),
+        runtime.get("model_id"),
+        runtime.get("model_name"),
+    ]
+    return " ".join(str(x).lower() for x in parts if x not in (None, ""))
+
+
+def _juju_float_or_none(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    return out if math.isfinite(out) and out > 0.0 else None
+
+
+def _juju_infer_embedding_scale(contract, runtime):
+    hidden = _juju_first_int(runtime.get("hidden_size"), runtime.get("hidden_dim"), _juju_first_config_value(contract, "hidden_size", "hidden_dim"))
+    explicit = first_present(
+        runtime.get("embedding_scale"),
+        runtime.get("scale_emb"),
+        (contract.get("arch_meta") or {}).get("embedding_scale"),
+        (contract.get("arch_meta") or {}).get("scale_emb"),
+        _juju_first_config_value(contract, "embedding_scale", "scale_emb"),
+    )
+    explicit_float = _juju_float_or_none(explicit)
+    if explicit_float is not None:
+        return explicit_float, "source_config"
+    scale_embedding = first_present(
+        runtime.get("scale_embedding"),
+        (contract.get("arch_meta") or {}).get("scale_embedding"),
+        _juju_first_config_value(contract, "scale_embedding"),
+    )
+    scale_embedding_float = _juju_float_or_none(scale_embedding)
+    if scale_embedding_float is not None:
+        return scale_embedding_float, "source_config_scale_embedding"
+    if hidden and _juju_bool_or_none(scale_embedding) is True:
+        return float(math.sqrt(float(hidden))), "source_config_scale_embedding_true"
+    family = _juju_model_family_text(contract, runtime)
+    for needles, rule, source in JUJU_EMBEDDING_SCALE_FAMILY_RULES:
+        if not hidden or not any(needle in family for needle in needles):
+            continue
+        if rule == "sqrt_hidden_size":
+            return float(math.sqrt(float(hidden))), source
+    return None, "absent_no_embedding_scale"
+
+
 def juju_runtime_arch_metadata(contract, directory=None):
     arch = dict(contract.get("arch_meta") or {})
     runtime = dict((directory or {}).get("gguf_runtime") or {})
@@ -3302,6 +3372,11 @@ def juju_runtime_arch_metadata(contract, directory=None):
             fields["value_head_dim"] = fields["head_dim"]
         if fields.get("global_head_dim") is not None:
             fields["global_value_head_dim"] = fields["global_head_dim"]
+    embedding_scale, embedding_scale_source = _juju_infer_embedding_scale(contract, {**runtime, **fields})
+    fields["embedding_scale"] = embedding_scale
+    fields["scale_emb"] = embedding_scale
+    fields["embedding_scale_source"] = embedding_scale_source
+    fields["embedding_scale_semantics"] = "multiply_token_embedding_before_first_layer" if embedding_scale is not None else "none"
     for key, value in fields.items():
         if value is not None:
             out[key] = value
@@ -3435,6 +3510,9 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
         (contract.get("arch_meta") or {}).get("embedding_scale"),
         (contract.get("arch_meta") or {}).get("scale_emb"),
     )
+    embedding_scale_source = runtime_arch.get("embedding_scale_source") or (
+        "source_config" if embedding_scale is not None else "absent_no_embedding_scale"
+    )
     feature_counts = {
         "layers_with_post_attention_norm": 0,
         "layers_with_expert_ffn_norm": 0,
@@ -3482,7 +3560,8 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
             "hidden_size": hidden_size,
             "vocab_size": vocab_size,
             "scale": embedding_scale,
-            "scale_source": "source_config" if embedding_scale is not None else "engine_contract_default",
+            "scale_source": embedding_scale_source,
+            "scale_semantics": runtime_arch.get("embedding_scale_semantics") or ("multiply_token_embedding_before_first_layer" if embedding_scale is not None else "none"),
             "row_layout": "token_major_rows_vocab_by_hidden",
         },
         "layers": {
