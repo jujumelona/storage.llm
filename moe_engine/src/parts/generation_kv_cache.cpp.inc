@@ -267,9 +267,17 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
             }
             return 0;
         }
-        std::memcpy(nd, data, copy_entries * entry_dim);
-        std::memcpy(ns, scales, copy_entries * sizeof(float));
-        std::memcpy(nz, zeros, copy_entries * sizeof(float));
+        // BUGFIX NEW-BUG6: Check data/scales/zeros != nullptr before memcpy ★★★ CRITICAL
+        // Problem: If init() failed, data/scales/zeros are nullptr but max_seq_len/num_layers
+        // may be non-zero. ensure_capacity() computes copy_entries > 0 and calls memcpy
+        // from nullptr → segfault.
+        // Solution: Only copy if source pointers are valid.
+        // Impact: Prevents crash when ensure_capacity called after failed init.
+        if (data && scales && zeros && copy_entries > 0) {
+            std::memcpy(nd, data, copy_entries * entry_dim);
+            std::memcpy(ns, scales, copy_entries * sizeof(float));
+            std::memcpy(nz, zeros, copy_entries * sizeof(float));
+        }
 
         // Free old allocations
         std::free(data);

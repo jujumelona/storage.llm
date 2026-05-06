@@ -2,6 +2,63 @@
 #include <random>
 #include <vector>
 #include <math.h>
+#include <string.h>
+
+bool qkv_dim_is_power_of_two(int dim) {
+    return dim > 0 && (dim & (dim - 1)) == 0;
+}
+
+void qkv_fwht_inplace(float* data, int dim) {
+    if (!data || !qkv_dim_is_power_of_two(dim)) return;
+    for (int h = 1; h < dim; h <<= 1) {
+        for (int i = 0; i < dim; i += h << 1) {
+            for (int j = i; j < i + h; ++j) {
+                const float a = data[j];
+                const float b = data[j + h];
+                data[j] = a + b;
+                data[j + h] = a - b;
+            }
+        }
+    }
+}
+
+int qkv_apply_hadamard_rotation_forward(
+    const float* input,
+    const float* signs,
+    float* output,
+    int dim
+) {
+    if (!input || !signs || !output || !qkv_dim_is_power_of_two(dim) || dim > 16384) {
+        return 0;
+    }
+    for (int i = 0; i < dim; ++i) {
+        output[i] = input[i] * signs[i];
+    }
+    qkv_fwht_inplace(output, dim);
+    const float scale = 1.0f / sqrtf((float)dim);
+    for (int i = 0; i < dim; ++i) {
+        output[i] *= scale;
+    }
+    return 1;
+}
+
+int qkv_apply_hadamard_rotation_inverse(
+    const float* input,
+    const float* signs,
+    float* output,
+    int dim
+) {
+    if (!input || !signs || !output || !qkv_dim_is_power_of_two(dim) || dim > 16384) {
+        return 0;
+    }
+    memcpy(output, input, (size_t)dim * sizeof(float));
+    qkv_fwht_inplace(output, dim);
+    const float scale = 1.0f / sqrtf((float)dim);
+    for (int i = 0; i < dim; ++i) {
+        output[i] *= scale * signs[i];
+    }
+    return 1;
+}
 
 void qkv_generate_rotation_matrix(
     float* Pi,

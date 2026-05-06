@@ -2,6 +2,7 @@
 #include "qkv_helpers.h"
 #include "qkv_codebook.h"
 #include "qkv_packing.h"
+#include "qkv_matrix.h"
 #include <cmath>
 #include <string.h>
 #include <math.h>
@@ -87,6 +88,10 @@ int qkv_quantize_vector_with_state(
     // Step 3: Apply random rotation Pi
     const float* src = normalized;
     if (state && state->rotation_matrix && config && config->enable_rotation) {
+        if (state->rotation_signs &&
+            qkv_apply_hadamard_rotation_forward(normalized, state->rotation_signs, rotated, dim)) {
+            src = rotated;
+        } else {
         // BUGFIX 403: rotation_matrix 범위 체크
         for (int i = 0; i < dim; i++) {
             float sum = 0.0f;
@@ -100,7 +105,8 @@ int qkv_quantize_vector_with_state(
             }
             rotated[i] = sum;
         }
-        src = rotated;
+            src = rotated;
+        }
     }
 
     if (qkv_bits_raw(bits)) {

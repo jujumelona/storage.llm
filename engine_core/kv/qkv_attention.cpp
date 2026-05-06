@@ -4,6 +4,7 @@
 #include "qkv_codebook.h"
 #include "qkv_packing.h"
 #include "qkv_thread_pool.h"
+#include "qkv_matrix.h"
 #include <math.h>
 #include <string.h>
 #include <vector>
@@ -71,6 +72,10 @@ int qkv_attention_decode_impl(
     if (cfg->enable_rotation && s->rotation_matrix) {
         float* rq = s->scratch_rotated_q;
         if (!rq) return 0;
+        if (s->rotation_signs &&
+            qkv_apply_hadamard_rotation_forward(query, s->rotation_signs, rq, d)) {
+            q_eff = rq;
+        } else {
         // BUGFIX 351: rotation_matrix 범위 체크
         for (int i = 0; i < d; i++) {
             float sum = 0.0f;
@@ -81,6 +86,7 @@ int qkv_attention_decode_impl(
             rq[i] = sum;
         }
         q_eff = rq;
+        }
     }
 
     // BUGFIX 352: d가 0일 때 division by zero 방지

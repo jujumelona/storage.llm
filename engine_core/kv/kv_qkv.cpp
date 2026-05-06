@@ -9,6 +9,7 @@
 #include "qkv_helpers.h"
 #include "qkv_codebook.h"
 #include "qkv_packing.h"
+#include "qkv_matrix.h"
 #include <atomic>
 #include <math.h>
 #include <string.h>
@@ -314,6 +315,10 @@ static int qkv_quantize_split_vector_with_state(
     }
 
     if (config->enable_rotation && state->rotation_matrix) {
+        if (state->rotation_signs &&
+            qkv_apply_hadamard_rotation_inverse(y_tilde, state->rotation_signs, x_mse, dim)) {
+            // Fast inverse rotation path for Hadamard-backed QKV states.
+        } else {
         // BUGFIX 911: Optimize rotation matrix access pattern (location 1/3) ★★ PERFORMANCE
         // Problem: rotation_matrix[j * dim + i] with i outer, j inner → cache miss
         // Solution: Loop interchange for better spatial locality
@@ -326,6 +331,7 @@ static int qkv_quantize_split_vector_with_state(
             for (int i = 0; i < dim; ++i) {
                 x_mse[i] += row[i] * y_val;
             }
+        }
         }
     } else {
         memcpy(x_mse, y_tilde, (size_t)dim * sizeof(float));
@@ -431,12 +437,17 @@ static int qkv_store_qjl_residual_for_token(
         y_tilde[i] = centroids[indices[i]];
     }
     if (config->enable_rotation && state->rotation_matrix) {
+        if (state->rotation_signs &&
+            qkv_apply_hadamard_rotation_inverse(y_tilde, state->rotation_signs, x_mse, dim)) {
+            // Fast inverse rotation path for Hadamard-backed QKV states.
+        } else {
         for (int i = 0; i < dim; ++i) {
             float sum = 0.0f;
             for (int j = 0; j < dim; ++j) {
                 sum += state->rotation_matrix[(size_t)j * (size_t)dim + (size_t)i] * y_tilde[j];
             }
             x_mse[i] = sum;
+        }
         }
     } else {
         memcpy(x_mse, y_tilde, (size_t)dim * sizeof(float));

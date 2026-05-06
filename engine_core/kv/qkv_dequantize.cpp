@@ -2,6 +2,7 @@
 #include "qkv_helpers.h"
 #include "qkv_codebook.h"
 #include "qkv_packing.h"
+#include "qkv_matrix.h"
 #include <cmath>
 #include <math.h>
 #include <string.h>
@@ -143,6 +144,10 @@ static int qkv_dequant_one_split(
     }
 
     if (cfg->enable_rotation && s->rotation_matrix) {
+        if (s->rotation_signs &&
+            qkv_apply_hadamard_rotation_inverse(y_tilde, s->rotation_signs, x_tilde, d)) {
+            // Fast inverse rotation path for Hadamard-backed QKV states.
+        } else {
         for (int i = 0; i < d; ++i) {
             float sum = 0.0f;
             for (int j = 0; j < d; ++j) {
@@ -153,6 +158,7 @@ static int qkv_dequant_one_split(
                 sum = 0.0f;
             }
             x_tilde[i] = sum;
+        }
         }
     } else {
         memcpy(x_tilde, y_tilde, (size_t)d * sizeof(float));
@@ -291,6 +297,10 @@ int qkv_dequant_one(
     if (!x_tilde) return 0;
 
     if (cfg->enable_rotation && s->rotation_matrix) {
+        if (s->rotation_signs &&
+            qkv_apply_hadamard_rotation_inverse(y_tilde, s->rotation_signs, x_tilde, d)) {
+            // Fast inverse rotation path for Hadamard-backed QKV states.
+        } else {
         // x_tilde = Pi^T * y_tilde
         // BUGFIX 373: rotation_matrix 범위 체크
         for (int i = 0; i < d; i++) {
@@ -305,6 +315,7 @@ int qkv_dequant_one(
                 sum = 0.0f;
             }
             x_tilde[i] = sum;
+        }
         }
     } else {
         // BUGFIX 449: d * sizeof(float) overflow 방지

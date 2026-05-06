@@ -343,6 +343,7 @@ static int moe_qkv_append_layer_head_token(
     if (!engine || !key || !value || context_tokens == 0 || capacity_tokens < context_tokens) {
         return 0;
     }
+    const uint64_t total_start_us = moe_profile_now_us();
     size_t slot_index = 0;
     qkv_state_t* slot = moe_qkv_ensure_layer_head_state_locked(
         engine, layer, head, head_stride, capacity_tokens, head_dim, &slot_index);
@@ -357,14 +358,31 @@ static int moe_qkv_append_layer_head_token(
         return 0;
     }
     const uint32_t token_index = context_tokens - 1u;
+    const uint64_t quant_start_us = moe_profile_now_us();
     if (!moe_qkv_quantize_current_token_mse(
             slot, &engine->qkv_cfg, key, value, token_index, head_dim)) {
+        moe_profile_log(
+            "qkv_append_head",
+            "layer=%u head=%u slot=%zu ctx=%u token=%u dim=%u ok=0 quant_ms=%.3f total_ms=%.3f",
+            layer, head, slot_index, context_tokens, token_index, head_dim,
+            moe_profile_elapsed_ms(quant_start_us),
+            moe_profile_elapsed_ms(total_start_us));
         return 0;
     }
     if (slot_index < engine->qkv_head_state_fingerprints.size()) {
         engine->qkv_head_state_fingerprints[slot_index] =
             ((uint64_t)layer << 48) ^ ((uint64_t)head << 32) ^ (uint64_t)context_tokens;
     }
+    moe_profile_log(
+        "qkv_append_head",
+        "layer=%u head=%u slot=%zu ctx=%u token=%u dim=%u ok=1 quant_ms=%.3f total_ms=%.3f k_bits=%d v_bits=%d qjl=%d rotation=%d",
+        layer, head, slot_index, context_tokens, token_index, head_dim,
+        moe_profile_elapsed_ms(quant_start_us),
+        moe_profile_elapsed_ms(total_start_us),
+        engine->qkv_cfg.k_bits,
+        engine->qkv_cfg.v_bits,
+        engine->qkv_cfg.enable_qjl ? 1 : 0,
+        engine->qkv_cfg.enable_rotation ? 1 : 0);
     return 1;
 }
 
@@ -384,6 +402,7 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
     if (!engine || !query || !output || context_tokens == 0 || capacity_tokens < context_tokens || head_dim == 0) {
         return 0;
     }
+    const uint64_t total_start_us = moe_profile_now_us();
     size_t slot_index = 0;
     qkv_state_t* slot = moe_qkv_ensure_layer_head_state_locked(
         engine, layer, kv_head, head_stride, capacity_tokens, head_dim, &slot_index);
@@ -413,7 +432,21 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
     }
     qkv_config_t qkv_decode_cfg = engine->qkv_cfg;
     qkv_decode_cfg.attention_logit_softcap = attn_logit_softcap;
-    return qkv_attention_decode(q, slot, &qkv_decode_cfg, context_tokens, head_dim, output);
+    const uint64_t decode_start_us = moe_profile_now_us();
+    const int ok = qkv_attention_decode(q, slot, &qkv_decode_cfg, context_tokens, head_dim, output);
+    moe_profile_log(
+        "qkv_decode_head",
+        "layer=%u kv_head=%u slot=%zu ctx=%u dim=%u ok=%d decode_ms=%.3f total_ms=%.3f score_scale=%.6g softcap=%.6g k_bits=%d v_bits=%d qjl=%d rotation=%d",
+        layer, kv_head, slot_index, context_tokens, head_dim, ok ? 1 : 0,
+        moe_profile_elapsed_ms(decode_start_us),
+        moe_profile_elapsed_ms(total_start_us),
+        score_scale,
+        attn_logit_softcap,
+        qkv_decode_cfg.k_bits,
+        qkv_decode_cfg.v_bits,
+        qkv_decode_cfg.enable_qjl ? 1 : 0,
+        qkv_decode_cfg.enable_rotation ? 1 : 0);
+    return ok;
 }
 
 static qkv_state_t* moe_qkv_ensure_head_state(
