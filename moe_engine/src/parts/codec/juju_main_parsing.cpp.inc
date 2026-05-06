@@ -162,7 +162,7 @@ static void moe_ingest_juju_graph_ir(moe_pc_engine* engine, const std::string& i
         }
     }
     if (engine->offload_graph_ir_json.empty()) {
-        engine->offload_graph_ir_json = index_json.substr(graph_pos, std::min<size_t>(index_json.size() - graph_pos, 4u << 20));
+        engine->offload_graph_ir_json = index_json.substr(graph_pos);
     }
     engine->offload_graph_ir_version.store((uint32_t)std::min<uint64_t>(schema_version, UINT32_MAX), std::memory_order_relaxed);
 }
