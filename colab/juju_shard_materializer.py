@@ -147,7 +147,12 @@ JUJU_EMBEDDING_SCALE_FAMILY_RULES = (
 
 JUJU_HEADER_BYTES = 4096
 JUJU_SECTION_ENTRY_BYTES = 96
-JUJU_SECTION_TABLE_RESERVED_ENTRIES = 32
+# BUGFIX 974: Increase section table from 32→64 for multimodal models ★★★
+# Problem: 15 defined section types + runtime metadata sections can exceed 32
+# on large multimodal models. RuntimeError raised AFTER writing tens of GB.
+# Solution: Double to 64. Header stores actual section_count, so readers
+# handle this transparently without wire format version change.
+JUJU_SECTION_TABLE_RESERVED_ENTRIES = 64
 JUJU_SECTION_MODEL_META = 0x0001
 JUJU_SECTION_PREDICTOR = 0x0002
 JUJU_SECTION_BUDDY_MAP = 0x0003
@@ -468,7 +473,13 @@ def juju_row_stride_padding_enabled():
 
 
 def juju_row_stride_alignment_bytes():
-    raw = int(os.environ.get("JUJU_ROW_STRIDE_ALIGNMENT_BYTES", "64") or "64")
+    # BUGFIX 975: Default 64→512 for GPU Direct Storage / O_DIRECT compatibility ★★★
+    # Problem: 64-byte row padding → row N offset not 512/4096-aligned
+    # → individual row DMA requests fail on GDS/O_DIRECT (need 512B+ alignment)
+    # → forces whole-section reads instead of per-row random access
+    # Solution: Default 512. Set JUJU_ROW_STRIDE_ALIGNMENT_BYTES=4096 for strict GDS.
+    # Impact: Slight file size increase within 6.25% overhead budget.
+    raw = int(os.environ.get("JUJU_ROW_STRIDE_ALIGNMENT_BYTES", "512") or "512")
     if raw <= 1:
         return 1
     return min(raw, 4096)
@@ -1113,6 +1124,15 @@ def tensor_bucket(name):
 
 
 def assign_bootstrap_expert_tiers(tensors, contract=None, lock=False):
+    # BUGFIX 976: All routed experts start cold, shared weights stay hot ★★★
+    # Problem: Old logic assigned hot/warm/cold by layer index (0-1=hot, 2-9=warm, rest=cold).
+    # MoE executes ALL layers every token — layer number has zero correlation with access
+    # frequency. Layer 50 experts are called as often as layer 0 experts.
+    # Result: Initial cold experts suffer repeated storage reads until EMA warms up.
+    # Solution: All routed experts → cold_experts. Runtime EMA will promote the actually
+    # hot ones within ~100-200 tokens. shared_weights are already hot via bucket_for_name().
+    # This "cold start → EMA warm-up" approach yields better steady-state VRAM utilization
+    # because only truly hot experts occupy VRAM, not arbitrarily chosen low-layer ones.
     routed = []
     for tensor in tensors or []:
         if not tensor or not is_routed_expert_tensor_name(tensor.get("name")):
@@ -1126,31 +1146,8 @@ def assign_bootstrap_expert_tiers(tensors, contract=None, lock=False):
     if not routed:
         return
 
-    layers = sorted({layer for layer, _ in routed})
-    layer_count = len(layers)
-    layer_rank = {layer: idx for idx, layer in enumerate(layers)}
-
-    hot_default = max(1, min(2, layer_count // 16 or 1))
-    warm_default = max(hot_default + 1, min(layer_count, hot_default + max(1, layer_count // 8)))
-    try:
-        hot_layers = int(os.environ.get("JUJU_BOOTSTRAP_HOT_EXPERT_LAYERS", hot_default))
-    except Exception:
-        hot_layers = hot_default
-    try:
-        warm_layers = int(os.environ.get("JUJU_BOOTSTRAP_WARM_EXPERT_LAYERS", warm_default))
-    except Exception:
-        warm_layers = warm_default
-    hot_layers = max(0, min(hot_layers, layer_count))
-    warm_layers = max(hot_layers, min(warm_layers, layer_count))
-
     for layer, tensor in routed:
-        rank = layer_rank.get(layer, layer_count)
-        if rank < hot_layers:
-            tensor["bucket"] = "hot_experts"
-        elif rank < warm_layers:
-            tensor["bucket"] = "warm_experts"
-        else:
-            tensor["bucket"] = "cold_experts"
+        tensor["bucket"] = "cold_experts"
         if lock:
             tensor["_juju_bootstrap_tier_locked"] = True
 
@@ -1870,6 +1867,8 @@ def juju_tokenizer_contract():
         "required_any_of": list(JUJU_REQUIRED_TOKENIZER_ANY_OF),
         "target_subdirs": ["", "tokenizer"],
         "chat_template_source": "tokenizer_config_or_model_card",
+        "chat_template_jinja_source": "generated_from_tokenizer_config.chat_template_when_present",
+        "missing_chat_template_behavior": "chat_api_requires_template_or_explicit_messages_formatter; raw_completion_input_ids_allowed",
         "missing_tokenizer_behavior": "fail_text_api_if_required_tokenizer_missing",
         "input_ids_api_allowed_without_tokenizer": True,
     }
@@ -2651,6 +2650,14 @@ def _juju_first_int(*values):
     return None
 
 
+def _juju_list_or_none(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return None
+
+
 def _juju_bool_or_none(value):
     value = _juju_scalar_value(value)
     if value is None or value == "":
@@ -2682,6 +2689,118 @@ def _juju_config_dict(value):
             return {}
         return dict(parsed) if isinstance(parsed, dict) else {}
     return {}
+
+
+def _juju_qkv_required(contract, qkv):
+    return bool(
+        contract_value(contract, "qkv_cache.validation.required_quantized_qkv", default=False) or
+        contract_value(contract, "qkv_policy_contract.validation.required_quantized_qkv", default=False) or
+        contract_value(qkv, "validation.required_quantized_qkv", default=False) or
+        contract_value(qkv, "required_quantized_qkv", default=False) or
+        contract_value(contract, "qkv_packed_cache_required", default=False)
+    )
+
+
+def _juju_qkv_runtime_policy(contract, qkv):
+    qkv = dict(qkv or {})
+    has_qkv = bool(qkv)
+    qkv_required = _juju_qkv_required(contract, qkv)
+    return {
+        "format": "JUJU_KV_RUNTIME_POLICY_V1",
+        "available_backends": [
+            "flat_position_major_layer_contiguous_cache",
+            *([] if not has_qkv else ["qkv_quantized_per_layer_head_cache"]),
+        ],
+        "preferred_backend": "qkv_quantized_per_layer_head_cache" if has_qkv else "flat_position_major_layer_contiguous_cache",
+        "required_backend": "qkv_quantized_per_layer_head_cache" if qkv_required else "",
+        "plain_reference_backend": "flat_position_major_layer_contiguous_cache",
+        "plain_reference_required_for_ppl": True,
+        "plain_fallback_allowed": not qkv_required,
+        "qkv_approximate_cache": has_qkv,
+        "qkv_must_match_plain_within_eval_tolerance_before_ppl_accept": has_qkv,
+        "qkv_state_key_scope": [
+            "request_id",
+            "layer",
+            "kv_head",
+            "head_dim",
+            "context_epoch",
+            "qkv_policy_hash",
+        ],
+        "qkv_state_reuse_forbidden_across": [
+            "different_layer",
+            "different_request",
+            "different_context_contents",
+            "different_head_dim",
+            "different_policy",
+        ],
+        "executor_contract": "do_not_use_head_only_qkv_state_cache; layer_and_epoch_are_part_of_identity",
+    }
+
+
+def _juju_layer_attention_kind(layer, runtime_arch):
+    runtime_arch = runtime_arch or {}
+    layer_types = _juju_list_or_none(runtime_arch.get("layer_types"))
+    if layer_types and 0 <= int(layer) < len(layer_types):
+        text = str(layer_types[int(layer)]).lower()
+        if "global" in text or "full" in text:
+            return "global_full_attention"
+        if "sliding" in text or "local" in text:
+            return "sliding_window_attention"
+    interval = _juju_first_int(
+        runtime_arch.get("full_attention_interval"),
+        runtime_arch.get("global_attention_interval"),
+    )
+    offset = _juju_first_int(
+        runtime_arch.get("full_attention_offset"),
+        runtime_arch.get("global_attention_offset"),
+        interval - 1 if interval else None,
+    )
+    if interval and interval > 0:
+        return "global_full_attention" if int(layer) % interval == int(offset or 0) else "sliding_window_attention"
+    return "standard_attention"
+
+
+def _juju_layer_rope_contract(layer, runtime_arch):
+    runtime_arch = runtime_arch or {}
+    kind = _juju_layer_attention_kind(layer, runtime_arch)
+    params = _juju_config_dict(runtime_arch.get("rope_parameters"))
+    full_params = _juju_config_dict(params.get("full_attention")) or _juju_config_dict(params.get("global_attention"))
+    sliding_params = _juju_config_dict(params.get("sliding_attention")) or _juju_config_dict(params.get("local_attention"))
+    selected = full_params if kind == "global_full_attention" and full_params else sliding_params
+    if not selected:
+        selected = {}
+    theta = first_present(
+        runtime_arch.get("full_rope_theta") if kind == "global_full_attention" else runtime_arch.get("sliding_rope_theta"),
+        selected.get("rope_theta"),
+        selected.get("theta"),
+        runtime_arch.get("rope_theta"),
+        runtime_arch.get("theta"),
+    )
+    head_dim = _juju_first_int(
+        runtime_arch.get("global_head_dim") if kind == "global_full_attention" else runtime_arch.get("head_dim"),
+        runtime_arch.get("head_dim"),
+    )
+    partial = _juju_float_or_none(first_present(selected.get("partial_rotary_factor"), runtime_arch.get("partial_rotary_factor")))
+    rope_dim = _juju_first_int(
+        selected.get("rope_dimension_count"),
+        selected.get("qk_rope_head_dim"),
+        runtime_arch.get("qk_rope_head_dim"),
+        int(head_dim * partial) if head_dim and partial else None,
+        head_dim,
+    )
+    rope_type = first_present(selected.get("rope_type"), selected.get("type"), runtime_arch.get("rope_type"), "default")
+    frequency_dim = head_dim if str(rope_type).lower() == "proportional" and head_dim else rope_dim
+    return {
+        "kind": kind,
+        "rope_type": rope_type,
+        "theta": theta,
+        "head_dim": head_dim,
+        "rope_dim": rope_dim,
+        "frequency_dim": frequency_dim,
+        "partial_rotary_factor": partial,
+        "rotate_half": True,
+        "proportional_frequency_dim_uses_full_head_dim": str(rope_type).lower() == "proportional",
+    }
 
 
 def _juju_contract_source_config(contract):
@@ -2726,6 +2845,7 @@ def _juju_first_config_value(contract, *keys):
 
 def _juju_kv_layout_contract(contract, runtime_arch):
     qkv = dict(contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract") or {})
+    qkv_runtime_policy = _juju_qkv_runtime_policy(contract, qkv)
     num_heads = _juju_first_int(
         _juju_first_config_value(contract, "num_attention_heads", "n_heads", "head_count"),
         qkv.get("num_attention_heads"),
@@ -2832,6 +2952,18 @@ def _juju_kv_layout_contract(contract, runtime_arch):
         "growth_page_tokens": page_tokens,
         "residency_policy": _juju_scalar_value(qkv.get("residency_policy")) or "ram_tracked_via_tier_usage_device_vram_when_enabled",
         "quantized": bool(qkv),
+        "runtime_cache_policy": qkv_runtime_policy,
+        "cache_identity": {
+            "position_major_entry_layout": True,
+            "entry_scope": ["request_id", "position", "layer"],
+            "qkv_state_scope": qkv_runtime_policy["qkv_state_key_scope"],
+            "qkv_head_index_is_not_global_without_layer": True,
+        },
+        "accuracy_contract": {
+            "ppl_must_use_plain_reference_or_validated_qkv": True,
+            "qkv_decode_requires_plain_comparison_probe": bool(qkv),
+            "qkv_fallback_allowed": qkv_runtime_policy["plain_fallback_allowed"],
+        },
         "page_layout": "layer_position_page_major",
         "executor_contract": "moe_kv_cache_store_load_entry_must_match_layout_and_entry_dim",
     }
@@ -2983,8 +3115,13 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
                 "mlp_ms",
                 "lm_head_ms",
                 "kv_ms",
+                "kv_backend",
+                "kv_entry_dim",
+                "kv_page_size_tokens",
+                "qkv_error_vs_plain",
                 "ram_used_bytes",
                 "vram_used_bytes",
+                "gpu_util_pct",
                 "db_used_bytes",
                 "cpu_pct",
                 "rss_bytes",
@@ -3366,6 +3503,9 @@ def juju_runtime_arch_metadata(contract, directory=None):
         "routed_scaling_factor": first_present(arch.get("routed_scaling_factor"), arch.get("route_scale"), runtime.get("routed_scaling_factor"), runtime.get("route_scale")),
         "norm_topk_prob": first_present(arch.get("norm_topk_prob"), arch.get("normalize_topk_prob"), runtime.get("norm_topk_prob"), runtime.get("normalize_topk_prob")),
         "scoring_func": first_present(arch.get("scoring_func"), arch.get("score_func"), runtime.get("scoring_func"), runtime.get("score_func")),
+        "layer_types": first_present(cfg("layer_types"), arch.get("layer_types"), runtime.get("layer_types")),
+        "rope_parameters": first_present(cfg("rope_parameters"), arch.get("rope_parameters"), runtime.get("rope_parameters")),
+        "rope_type": first_present(arch.get("rope_type"), runtime.get("rope_type")),
     }
     if _juju_bool_or_none(fields.get("attention_k_eq_v")) is True:
         if fields.get("head_dim") is not None:
@@ -3383,7 +3523,8 @@ def juju_runtime_arch_metadata(contract, directory=None):
     return out
 
 
-def build_layer_graph_ir(layer, tensors):
+def build_layer_graph_ir(layer, tensors, runtime_arch=None):
+    runtime_arch = runtime_arch or {}
     prefix = f"blk.{layer}."
     names = set(_juju_tensors_by_layer(tensors, layer))
 
@@ -3441,6 +3582,22 @@ def build_layer_graph_ir(layer, tensors):
         "mlp.router.per_expert_scale",
         "moe.gate.per_expert_scale",
     )
+    attention_k_eq_v = _juju_bool_or_none(runtime_arch.get("attention_k_eq_v")) is True
+    value_uses_k = not bool(v_weights)
+    implicit_unweighted_v_norm = bool(value_uses_k and attention_k_eq_v and q_norm_weights and k_norm_weights)
+    value_norm_mode = (
+        "weighted_rmsnorm" if v_norm_weights else
+        "unweighted_rmsnorm_contract" if implicit_unweighted_v_norm else
+        "identity"
+    )
+    rope_contract = _juju_layer_rope_contract(layer, runtime_arch)
+    attention_cache_contract = {
+        "kv_cache": "contract_selected_backend",
+        "kv_layout_ref": "graph_ir.kv_layout_contract",
+        "cache_backend_policy_ref": "graph_ir.kv_layout_contract.runtime_cache_policy",
+        "plain_reference_required_for_ppl": True,
+        "qkv_state_scope": ["request_id", "layer", "kv_head", "head_dim", "context_epoch", "qkv_policy_hash"],
+    }
 
     ops = [
         {"op": "rms_norm", "name": "attention_input_norm", "inputs": ["hidden"], "weights": attention_norm_weights, "output": "attention_norm", "optional_behavior": "pass_hidden_when_weight_absent", "required": False},
@@ -3449,11 +3606,11 @@ def build_layer_graph_ir(layer, tensors):
         {"op": "linear", "name": "v_projection", "inputs": ["attention_norm"], "weights": v_weights, "output": "v_raw", "fallback_output": "k_raw", "fallback_semantics": "when_no_v_projection_value_uses_raw_k_projection_before_k_norm", "required": False},
         {"op": "rms_norm", "name": "q_norm", "inputs": ["q_raw"], "weights": q_norm_weights, "output": "q", "optional_behavior": "pass_q_raw_when_weight_absent", "required": False},
         {"op": "rms_norm", "name": "k_norm", "inputs": ["k_raw"], "weights": k_norm_weights, "output": "k", "optional_behavior": "pass_k_raw_when_weight_absent", "required": False},
-        *([{"op": "rms_norm", "name": "v_norm", "inputs": ["v_raw" if v_weights else "k_raw"], "weights": v_norm_weights, "output": "v", "required": False}]
-          if v_norm_weights else
+        *([{"op": "rms_norm", "name": "v_norm", "inputs": ["v_raw" if v_weights else "k_raw"], "weights": v_norm_weights, "output": "v", "norm_mode": value_norm_mode, "required": False}]
+          if v_norm_weights or implicit_unweighted_v_norm else
           [{"op": "identity", "name": "value_passthrough", "inputs": ["v_raw" if v_weights else "k_raw"], "weights": [], "output": "v", "required": False}]),
-        {"op": "rope", "name": "rotary_embedding", "inputs": ["q", "k"], "weights": bind("rope_freqs.weight"), "required": False},
-        {"op": "attention", "name": "attention", "inputs": ["q", "k", "v"], "kv_cache": "quantized_qkv_cache", "attention_scale": "metadata_or_qk_norm_contract", "required": bool(q_weights and k_weights and (v_weights or k_weights))},
+        {"op": "rope", "name": "rotary_embedding", "inputs": ["q", "k"], "weights": bind("rope_freqs.weight"), "rope_contract": rope_contract, "required": False},
+        {"op": "attention", "name": "attention", "inputs": ["q", "k", "v"], **attention_cache_contract, "attention_scale": "metadata_or_qk_norm_contract", "required": bool(q_weights and k_weights and (v_weights or k_weights))},
         {"op": "linear", "name": "attention_output", "inputs": ["attention"], "weights": o_weights, "output": "attention_out", "required": bool(o_weights)},
         {"op": "rms_norm", "name": "post_attention_norm", "inputs": ["attention_out"], "weights": post_attention_norm_weights, "output": "attention_branch", "optional_behavior": "pass_attention_out_when_weight_absent", "required": False},
         {"op": "residual", "name": "attention_residual", "inputs": ["hidden", "attention_branch"], "output": "hidden", "required": True},
@@ -3491,7 +3648,11 @@ def build_layer_graph_ir(layer, tensors):
             "expert_branch_uses_expert_ffn_norm": bool(expert_norm_weights),
             "router_uses_hidden_when_internal_scale_present": bool(router_scale_weights),
             "value_uses_raw_k_projection_when_v_projection_missing": not bool(v_weights),
-            "value_norm_requires_layer_local_weight_tensor": True,
+            "value_norm_mode": value_norm_mode,
+            "value_norm_requires_layer_local_weight_tensor": bool(v_norm_weights),
+            "unweighted_value_norm_is_contractual_when_declared": bool(implicit_unweighted_v_norm),
+            "attention_kind": rope_contract.get("kind"),
+            "rope_contract": rope_contract,
             "shared_and_expert_post_norms_apply_before_branch_sum": bool(post_ffw_norm1_weights or post_ffw_norm2_weights),
             "post_ffw_norm_applies_to_combined_ffn_before_residual": bool(post_ffw_norm_weights),
             "layer_output_scale_after_ffn_residual": bool(layer_output_scale_weights),
@@ -3579,6 +3740,9 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
         "layers_with_v_projection": 0,
         "layers_with_o_projection": 0,
         "layers_with_v_norm": 0,
+        "layers_with_unweighted_v_norm_contract": 0,
+        "layers_with_global_attention": 0,
+        "layers_with_sliding_attention": 0,
         "layers_with_router": 0,
         "layers_with_router_scale": 0,
         "layers_with_moe_experts": 0,
@@ -3589,7 +3753,7 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
         if layer is not None
     })
     by_layer = {layer: {_juju_layer_suffix(n) for n in _juju_tensors_by_layer(tensor_records, layer)} for layer in layers}
-    for suffixes in by_layer.values():
+    for layer, suffixes in by_layer.items():
         if any(x in suffixes for x in {"post_attention_norm.weight", "post_attention_layernorm.weight", "post_attention_layer_norm.weight", "post_attn_norm.weight"}):
             feature_counts["layers_with_post_attention_norm"] += 1
         if any(x in suffixes for x in {"pre_ffw_norm_2.weight", "ffn_pre_norm_2.weight", "moe_norm.weight"}):
@@ -3612,8 +3776,22 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
             feature_counts["layers_with_v_projection"] += 1
         if any(x in suffixes for x in {"attn_output.weight", "attention.wo.weight", "o_proj.weight"}):
             feature_counts["layers_with_o_projection"] += 1
-        if any(x in suffixes for x in {"attn_v_norm.weight", "v_norm.weight", "value_norm.weight"}):
+        explicit_v_norm = any(x in suffixes for x in {"attn_v_norm.weight", "v_norm.weight", "value_norm.weight"})
+        implicit_v_norm = (
+            not any(x in suffixes for x in {"attn_v.weight", "attention.wv.weight", "v_proj.weight", "attn_kv_b_proj.weight"}) and
+            _juju_bool_or_none(runtime_arch.get("attention_k_eq_v")) is True and
+            any(x in suffixes for x in {"attn_q_norm.weight", "q_norm.weight"}) and
+            any(x in suffixes for x in {"attn_k_norm.weight", "k_norm.weight"})
+        )
+        if explicit_v_norm or implicit_v_norm:
             feature_counts["layers_with_v_norm"] += 1
+        if implicit_v_norm:
+            feature_counts["layers_with_unweighted_v_norm_contract"] += 1
+        attention_kind = _juju_layer_attention_kind(layer, runtime_arch)
+        if attention_kind == "global_full_attention":
+            feature_counts["layers_with_global_attention"] += 1
+        elif attention_kind == "sliding_window_attention":
+            feature_counts["layers_with_sliding_attention"] += 1
         if any(x in suffixes for x in {"ffn_gate_inp.weight", "router.weight", "mlp.router.weight", "moe.gate.weight"}):
             feature_counts["layers_with_router"] += 1
         if any(x in suffixes for x in {"ffn_gate_inp.scale", "router.scale", "mlp.router.scale", "moe.gate.scale"}):
@@ -3795,6 +3973,9 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
     )
     runtime_access_plan = build_juju_runtime_access_plan(tensor_records, contract, runtime_arch)
     generation_contract["layers"]["kv_layout_contract_available"] = bool(runtime_access_plan.get("kv_layout_contract"))
+    generation_contract["layers"]["kv_runtime_policy"] = dict(
+        (runtime_access_plan.get("kv_layout_contract") or {}).get("runtime_cache_policy") or {}
+    )
     generation_contract["forward_contract_validation"] = build_juju_forward_contract_validation(
         generation_contract,
         runtime_arch,
@@ -3911,12 +4092,12 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             {"op": "lm_head", "weights": [lm_head] if lm_head else [], "tied_to_embedding": bool(lm_head == token_embd), "required": bool(lm_head)},
             {"op": "sampler", "inputs": ["logits"], "required": True},
         ],
-        "layers": [build_layer_graph_ir(layer, tensor_records) for layer in layers],
+        "layers": [build_layer_graph_ir(layer, tensor_records, runtime_arch) for layer in layers],
         "runtime_policy": {
             "execution": "graph_ir_executor_required",
             "unknown_op": "fail_closed",
             "unknown_tensor": "fail_closed_for_required_optional_skip",
-            "kv_cache": "quantized_qkv_cache_required" if contract.get("qkv_cache_schema") else "runtime_default",
+            "kv_cache": (runtime_access_plan.get("kv_layout_contract") or {}).get("runtime_cache_policy", {}).get("preferred_backend", "runtime_default"),
             "runtime_access_plan": "JUJU_RUNTIME_ACCESS_PLAN_V1_required_for_prefetch_residency_and_trace",
             "kv_layout_contract": "JUJU_KV_LAYOUT_CONTRACT_V1_required_for_generation_cache_accounting",
             "model_load": "eager_validate_header_sections_idx_tokenizer_and_kernel_support",
@@ -4087,7 +4268,9 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             "require_all_required_ops_bound": True,
             "require_tensor_shape_match": True,
             "require_quant_schema_match": True,
-            "require_qkv_policy_match": bool(contract.get("qkv_cache_schema")),
+            "require_qkv_policy_match": bool(contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract")),
+            "require_qkv_layer_head_epoch_scope": bool(contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract")),
+            "allow_plain_kv_reference_for_ppl": not _juju_qkv_required(contract, contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract") or {}),
             "allow_optional_ops_missing": True,
             "tensor_count": len(tensor_records),
             "section_count": len(sections),
@@ -4231,6 +4414,26 @@ def build_juju_shard_plan_from_hf_url(
         qkv_schema = contract.get("qkv_cache_schema")
         if qkv_schema:
             pos = add_json_section_at(pos, JUJU_SECTION_QKV_POLICY, "QKV_POLICY", qkv_schema)
+        # BUGFIX 974b: Pre-flight section count validation ★★★
+        # Problem: Section count check at line 4325 happens AFTER writing all tensor data.
+        # On large multimodal models, this means tens of GB are written before failure.
+        # Solution: Estimate section count before writing and fail fast.
+        estimated_sections = 2  # MODEL_META + TENSOR_INDEX (always present)
+        if qkv_schema:
+            estimated_sections += 1
+        non_empty_buckets = sum(
+            1 for bucket in JUJU_TENSOR_BUCKET_ORDER
+            if any(t["bucket"] == bucket and t["bytes"] > 0 for t in active_tensors)
+        )
+        estimated_sections += non_empty_buckets
+        # Runtime metadata sections (tier hint, predictor, etc.) — estimate conservatively
+        estimated_sections += 8  # typical runtime metadata section count
+        if estimated_sections > JUJU_SECTION_TABLE_RESERVED_ENTRIES:
+            raise RuntimeError(
+                f"JUJU section count will exceed limit: estimated {estimated_sections} > "
+                f"{JUJU_SECTION_TABLE_RESERVED_ENTRIES}. Reduce multimodal encoders or "
+                f"increase JUJU_SECTION_TABLE_RESERVED_ENTRIES."
+            )
 
         for bucket in JUJU_TENSOR_BUCKET_ORDER:
             group = sorted(
@@ -4323,7 +4526,10 @@ def build_juju_shard_plan_from_hf_url(
         index_checksum = int(sections[-1].get("sha256", "0" * 64)[:16], 16) if sections else 0
         file_size_value = pos
         if len(sections) > JUJU_SECTION_TABLE_RESERVED_ENTRIES:
-            raise RuntimeError(f"too many JUJU sections: {len(sections)}")
+            raise RuntimeError(
+                f"too many JUJU sections: {len(sections)} > {JUJU_SECTION_TABLE_RESERVED_ENTRIES}. "
+                f"Increase JUJU_SECTION_TABLE_RESERVED_ENTRIES or reduce multimodal encoder sections."
+            )
 
         table = b"".join(pack_section(entry) for entry in sections)
         table_capacity = JUJU_SECTION_TABLE_RESERVED_ENTRIES * JUJU_SECTION_ENTRY_BYTES
@@ -4366,6 +4572,24 @@ class JujuVirtualFile(io.BufferedIOBase):
         self._size = int(plan["bytes"])
         self._pos = 0
         self._session = requests.Session()
+        # BUGFIX 977: Add retry adapter for network resilience ★★★
+        # Problem: Single HTTP failure after 30min of conversion = restart from scratch.
+        # Colab network is unstable; HuggingFace CDN has intermittent 502 errors.
+        # Solution: Mount HTTPAdapter with Retry(3, backoff_factor=1) on the session.
+        from requests.adapters import HTTPAdapter
+        try:
+            from urllib3.util.retry import Retry
+            retry_strategy = Retry(
+                total=5,
+                backoff_factor=1,  # 1s, 2s, 4s, 8s, 16s
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["GET", "HEAD"],
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+        except ImportError:
+            adapter = HTTPAdapter(max_retries=3)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
         self._remote_chunk = max(1, int(plan.get("chunk_size") or (16 * 1024 * 1024)))
         self._cache_start = -1
         self._cache_end = -1
@@ -4395,6 +4619,14 @@ class JujuVirtualFile(io.BufferedIOBase):
             segments.append(item)
         self._segments = sorted(segments, key=lambda item: item["offset"])
         self._offsets = [item["offset"] for item in self._segments]
+        # BUGFIX 978: Running SHA256 digest for streamed upload integrity ★★★
+        # Problem: hash_semantics = "not_precomputed_for_streamed_upload" means
+        # uploaded JUJU files have no integrity verification. Partial corruption
+        # during upload is undetectable.
+        # Solution: Running SHA256 over all read() output. After streaming completes,
+        # source_sha256 property returns the hex digest for post-upload verification.
+        self._running_sha256 = hashlib.sha256()
+        self._total_bytes_hashed = 0
 
     def readable(self):
         return True
@@ -4455,7 +4687,21 @@ class JujuVirtualFile(io.BufferedIOBase):
                 take = min(end - self._pos, next_offset - self._pos)
                 chunks.append(b"\x00" * take)
                 self._pos += take
-            return b"".join(chunks)
+            result = b"".join(chunks)
+            # BUGFIX 978: Feed all emitted bytes to running SHA256
+            if result:
+                self._running_sha256.update(result)
+                self._total_bytes_hashed += len(result)
+            return result
+
+    @property
+    def source_sha256(self):
+        """Return hex SHA256 of all bytes read so far (complete after full streaming)."""
+        return self._running_sha256.hexdigest()
+
+    @property
+    def total_bytes_hashed(self):
+        return self._total_bytes_hashed
 
     def _read_source_segment(self, segment, rel, size):
         return self._read_source_abs(
@@ -4465,6 +4711,11 @@ class JujuVirtualFile(io.BufferedIOBase):
         )
 
     def _read_source_abs(self, source_abs, size, source_limit):
+        # BUGFIX 977: Exponential backoff retry for HTTP range requests ★★★
+        # Problem: Single 502 error after hours of conversion = total restart.
+        # Solution: 3 retries with exponential backoff (1s, 2s, 4s).
+        # The session already has urllib3 Retry, but this handles cache-miss fetches
+        # where resp.content might be empty due to transient CDN issues.
         out = []
         remaining = int(size)
         while remaining > 0:
@@ -4476,20 +4727,39 @@ class JujuVirtualFile(io.BufferedIOBase):
                 remaining -= take
                 continue
             fetch_end = min(int(source_limit), source_abs + max(self._remote_chunk, remaining)) - 1
-            resp = fetch_range(
-                self._session,
-                self._plan["source_url"],
-                source_abs,
-                fetch_end,
-                token=self._plan.get("token"),
-                stream=False,
-            )
-            try:
-                data = resp.content
-            finally:
-                resp.close()
+            data = None
+            last_error = None
+            for attempt in range(5):
+                try:
+                    resp = fetch_range(
+                        self._session,
+                        self._plan["source_url"],
+                        source_abs,
+                        fetch_end,
+                        token=self._plan.get("token"),
+                        stream=False,
+                    )
+                    try:
+                        data = resp.content
+                    finally:
+                        resp.close()
+                    if data:
+                        break
+                except Exception as e:
+                    last_error = e
+                    if attempt < 4:
+                        delay = (2 ** attempt)  # 1, 2, 4, 8, 16 seconds
+                        import sys
+                        print(
+                            f"[JUJU WARNING] HTTP range fetch failed (attempt {attempt + 1}/5), "
+                            f"retrying in {delay}s: {e}",
+                            file=sys.stderr,
+                        )
+                        time.sleep(delay)
             if not data:
-                raise EOFError("empty source range while streaming JUJU upload")
+                if last_error:
+                    raise last_error
+                raise EOFError("empty source range while streaming JUJU upload after retries")
             self._cache_start = source_abs
             self._cache_end = source_abs + len(data)
             self._cache_data = data
