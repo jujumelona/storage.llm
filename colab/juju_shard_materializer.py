@@ -3472,6 +3472,35 @@ def _juju_kv_layout_contract(contract, runtime_arch):
     return {
         "format": "JUJU_KV_LAYOUT_CONTRACT_V1",
         "layout": "qkv_quantized_per_layer_head_page_major",
+        "serving_cache_model": {
+            "page_table_required": True,
+            "sequence_lengths_required": True,
+            "max_decode_seq_len_required": True,
+            "non_contiguous_physical_pages_allowed": True,
+            "logical_to_physical_block_table_required": True,
+            "source_contracts": [
+                "vllm_paged_attention_block_tables",
+                "flashinfer_paged_kv_csr_page_table",
+                "tensorrt_llm_kv_block_pool_reuse_eviction",
+            ],
+        },
+        "runtime_fields": {
+            "seq_lens_tensor": {"dtype": "int32", "shape": ["batch"], "required_for_decode": True},
+            "max_decode_seq_len": {"dtype": "int32", "required_for_decode": True},
+            "block_tables": {"dtype": "int32", "shape": ["batch", "max_blocks_per_seq"], "required_for_decode": True},
+            "kv_page_indptr": {"dtype": "int32", "shape": ["batch_plus_1"], "required_for_paged_decode": True},
+            "kv_page_indices": {"dtype": "int32", "shape": ["num_used_pages"], "required_for_paged_decode": True},
+            "kv_last_page_len": {"dtype": "int32", "shape": ["batch"], "range": [1, page_tokens], "required_for_paged_decode": True},
+            "request_epoch": {"dtype": "uint64", "required_for_cache_identity": True},
+            "cache_salt_hash": {"dtype": "uint64", "required_for_cross_request_reuse": False},
+        },
+        "kv_cache_tensor_layout_options": {
+            "preferred": "HND_for_low_precision_decode",
+            "supported": ["HND", "NHD"],
+            "HND": {"shape": ["num_pages", "num_kv_heads", "page_size_tokens", "head_dim"]},
+            "NHD": {"shape": ["num_pages", "page_size_tokens", "num_kv_heads", "head_dim"]},
+            "qkv_storage": "key_value_quantized_pages_with_scale_zero_side_data",
+        },
         "head_layout": {
             "num_attention_heads": num_heads,
             "attention_k_eq_v": attention_k_eq_v,
@@ -3515,7 +3544,37 @@ def _juju_kv_layout_contract(contract, runtime_arch):
         "entry_dim": entry_dim,
         "max_seq_len": max_seq,
         "page_size_tokens": page_tokens,
+        "tokens_per_block": page_tokens,
+        "tokens_per_block_power_of_two_required": True,
         "growth_page_tokens": page_tokens,
+        "block_pool_contract": {
+            "pool_key_fields": ["attention_window_size", "num_key_value_heads", "key_head_dim", "value_head_dim", "qkv_policy_hash"],
+            "separate_pool_per_attention_window_and_head_layout": True,
+            "allocate_blocks_on_demand": True,
+            "reuse_full_blocks": True,
+            "partial_reuse": {"enabled": True, "copy_on_partial_reuse": True},
+            "prefix_reuse": {
+                "enabled": True,
+                "block_identity_fields": ["cache_salt_hash", "prefix_hash", "block_token_hash", "qkv_policy_hash"],
+                "search_structure": "radix_or_hash_tree",
+                "evict_only_reusable_leaf_blocks_when_tree_is_used": True,
+            },
+            "eviction": {
+                "primary": "priority_then_lru",
+                "priority_range": [0, 100],
+                "host_offload_allowed": True,
+                "secondary_offload_min_priority": 35,
+                "event_stream_required": True,
+            },
+        },
+        "attention_window_contract": {
+            "per_layer_window_required": True,
+            "sliding_window_supported": True,
+            "global_window_supported": True,
+            "window_source_priority": ["gguf_runtime", "source_config", "runtime_arch", "default_full_context"],
+            "sliding_window_size": _juju_first_config_value(contract, "sliding_window", "sliding_window_size", "attention.sliding_window"),
+            "global_window_size": max_seq,
+        },
         "residency_policy": _juju_scalar_value(qkv.get("residency_policy")) or "ram_tracked_via_tier_usage_device_vram_when_enabled",
         "quantized": bool(qkv),
         "runtime_cache_policy": qkv_runtime_policy,
@@ -3604,6 +3663,7 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
     qkv_fields = _juju_qkv_contract_fields(_juju_effective_qkv_schema(contract, runtime_arch))
     expert_tier_entries = _juju_expert_tier_entries(tensor_records, contract)
     expert_offset_table = _juju_expert_offset_table(tensor_records, contract)
+    expert_bundle_table = _juju_expert_bundle_table(tensor_records, contract)
     moe_layers, moe_layer_bitmask_words = _juju_moe_layer_bitmask_words(tensor_records)
     executor_tensor_table = [
         _juju_runtime_tensor_ref(rec)
@@ -3657,6 +3717,7 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
         "moe_layer_bitmask_words": moe_layer_bitmask_words,
         "expert_tier_entries": expert_tier_entries,
         "expert_offset_table": expert_offset_table,
+        "expert_bundle_table": expert_bundle_table,
         "expert_offset_table_kind": "layer_expert_projection_o1_lookup",
         "router_calibration_manifest": router_calibration_manifest_from_juju_idx({"tensors": tensor_records}),
         "layer_prefetch_plan_count": len(layer_prefetch_plan),
@@ -3987,6 +4048,68 @@ def _juju_expert_offset_table(tensor_records, contract):
     return rows
 
 
+def _juju_expert_bundle_table(tensor_records, contract):
+    offsets = _juju_expert_offset_table(tensor_records, contract)
+    grouped = {}
+    for row in offsets:
+        key = (int(row.get("layer") or 0), int(row.get("expert") or 0))
+        item = grouped.setdefault(key, {
+            "layer": key[0],
+            "expert": key[1],
+            "offset": None,
+            "end": 0,
+            "bytes": 0,
+            "projection_count": 0,
+            "projections": [],
+            "tier": row.get("tier", "cold"),
+            "activation_prior": row.get("activation_prior", 0.0),
+            "prefetch_priority": int(row.get("prefetch_priority") or 80),
+            "runtime_priority": int(row.get("runtime_priority") or 65),
+            "residency_hint": row.get("residency_hint", "SLOW_MEM"),
+            "segment_count": 1,
+        })
+        begin = int(row.get("offset") or 0)
+        size = int(row.get("bytes") or 0)
+        end = begin + size
+        item["offset"] = begin if item["offset"] is None else min(int(item["offset"]), begin)
+        item["end"] = max(int(item["end"]), end)
+        item["projection_count"] += 1
+        item["prefetch_priority"] = max(int(item["prefetch_priority"]), int(row.get("prefetch_priority") or 80))
+        item["runtime_priority"] = max(int(item["runtime_priority"]), int(row.get("runtime_priority") or 65))
+        projection = {
+            "name": row.get("projection"),
+            "offset": begin,
+            "bytes": size,
+            "end": end,
+            "order": _juju_projection_order_value(row.get("projection")),
+        }
+        if row.get("combined_gate_up_split"):
+            projection["combined_gate_up_split"] = row["combined_gate_up_split"]
+        item["projections"].append(projection)
+    bundles = []
+    for item in grouped.values():
+        item["offset"] = int(item["offset"] or 0)
+        item["bytes"] = int(item["end"]) - int(item["offset"])
+        item["projections"].sort(key=lambda p: (int(p.get("order") or 0), int(p.get("offset") or 0)))
+        item["projection_offsets"] = [int(p["offset"]) for p in item["projections"]]
+        item["projection_bytes"] = [int(p["bytes"]) for p in item["projections"]]
+        item["projection_names"] = [str(p.get("name") or "") for p in item["projections"]]
+        item["single_range_fetch"] = all(
+            int(item["projections"][i]["end"]) == int(item["projections"][i + 1]["offset"])
+            for i in range(max(0, len(item["projections"]) - 1))
+        )
+        bundles.append(item)
+    bundles.sort(key=lambda item: (int(item["layer"]), int(item["expert"])))
+    return {
+        "format": "JUJU_EXPERT_BUNDLE_TABLE_V1",
+        "bundle_count": len(bundles),
+        "lookup_key": ["layer", "expert"],
+        "range_fields": ["offset", "bytes", "end"],
+        "projection_fields": ["projection_names", "projection_offsets", "projection_bytes"],
+        "bundles": bundles,
+    }
+
+
 def juju_section_priority(bucket):
     table = {
         "shared_weights": 100,
@@ -4306,6 +4429,7 @@ def build_juju_tier_hint_section(tensor_records, contract, split_meta):
     tier_entries = _juju_expert_tier_entries(tensor_records, contract)
     moe_layers, moe_layer_mask = _juju_moe_layer_bitmask_words(tensor_records)
     expert_offset_table = _juju_expert_offset_table(tensor_records, contract)
+    expert_bundle_table = _juju_expert_bundle_table(tensor_records, contract)
     tier_counts = {"hot": 0, "warm": 0, "cold": 0}
     for item in tier_entries:
         tier_counts[item.get("tier", "cold")] = tier_counts.get(item.get("tier", "cold"), 0) + 1
@@ -4328,6 +4452,7 @@ def build_juju_tier_hint_section(tensor_records, contract, split_meta):
         "expert_tier_entries": tier_entries,
         "expert_tier_counts": tier_counts,
         "expert_offset_table": expert_offset_table,
+        "expert_bundle_table": expert_bundle_table,
         "expert_offset_table_kind": "layer_expert_projection_o1_lookup",
         "moe_layers": moe_layers,
         "moe_layer_bitmask_words": moe_layer_mask,
@@ -5270,6 +5395,11 @@ def juju_format_self_check(idx, sections, qkv_schema):
                 err("kv_layout_field_missing", field=field)
     if not runtime_access_plan.get("expert_offset_table"):
         err("expert_offset_table_missing")
+    bundle_table = runtime_access_plan.get("expert_bundle_table") or idx.get("expert_bundle_table") or {}
+    if not bundle_table:
+        err("expert_bundle_table_missing")
+    elif bundle_table.get("format") != "JUJU_EXPERT_BUNDLE_TABLE_V1":
+        err("expert_bundle_table_wrong_format")
     if not runtime_access_plan.get("moe_layer_bitmask_words"):
         warn("moe_layer_bitmask_missing_or_empty")
     if not runtime_access_plan.get("router_calibration_manifest"):
@@ -5544,6 +5674,7 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
         "moe_offload_policy": {
             "enabled": True,
             "router_first": True,
+            "format": "JUJU_MOE_OFFLOAD_POLICY_V1",
             "expert_tensor_patterns": [
                 "blk.{layer}.ffn_gate_up_exps.weight",
                 "blk.{layer}.ffn_gate_exps.weight",
@@ -5575,6 +5706,50 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                 "expert": 70,
                 "cold_expert": 60,
             },
+            "expert_unit_contract": {
+                "unit": "layer_expert_projection_bundle",
+                "projection_order": ["gate_up", "gate", "up", "down"],
+                "o1_lookup": "runtime_access_plan.expert_offset_table",
+                "tier_lookup": "runtime_access_plan.expert_tier_entries",
+                "buddy_lookup": "BUDDY_MAP.expert_bundles",
+                "predictor_lookup": "PREDICTOR.expert_activation_priors",
+                "segment_lookup": "tensor.expert_layout.segment_count_per_expert",
+                "combined_gate_up_split_offsets": "tensor.combined_gate_up_split",
+                "partial_segment_fetch_allowed": True,
+                "single_expert_fetch_goal": "contiguous_or_minimal_range_read_per_selected_expert",
+            },
+            "stage_contract": {
+                "prefill": {
+                    "lookahead_enabled": False,
+                    "phase_source": "engine.generation_phase == PREFILL",
+                    "expert_policy": "stream_or_cpu_execute_selected_experts",
+                    "protect_roles": ["token_embedding", "attention", "router", "norm", "lm_head"],
+                },
+                "decode": {
+                    "lookahead_enabled": True,
+                    "phase_source": "engine.generation_phase == DECODE",
+                    "prediction_inputs": ["current_router_logits", "previous_layer_topk", "coactivation_history", "gate_input_snapshot"],
+                    "cache_policy": "activation_aware_admission_and_eviction",
+                },
+            },
+            "activation_trace": {
+                "enabled": True,
+                "record_per_token_topk": True,
+                "record_router_entropy": True,
+                "record_selected_expert_ids": True,
+                "record_selected_expert_weights": True,
+                "record_layer_transition": True,
+                "mutable_idx_update": "expert_activation_priors_and_coactivation",
+                "cold_start_source": "router_calibration_manifest_or_structural_uniform",
+            },
+            "predictor": {
+                "enabled": True,
+                "section_ref": "PREDICTOR",
+                "inputs": ["router_scores", "gate_input_snapshots", "mutable_coactivation_index", "prefetch_miss_feedback"],
+                "outputs": ["next_layer_expert_scores", "expert_next_use_epoch", "prefetch_priority"],
+                "fallback_order": ["calibration_prior", "cross_layer_transition_prior", "static_same_layer_buddy", "router_score"],
+                "online_update": True,
+            },
             "prefetch": {
                 "unit": "layer_expert_tensor",
                 "trigger": "router_topk_and_previous_layer_coactivation",
@@ -5583,6 +5758,21 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                 "fallback_when_no_history": "router_scores",
                 "bounded_by": ["ram_budget", "vram_budget", "staging_slots", "io_queue_depth"],
                 "priority_field": "prefetch_priority",
+                "schedule_contract": {
+                    "prefetch_next_layer_attention_during_current_mlp": True,
+                    "prefetch_selected_expert_bundle_after_router": True,
+                    "prefetch_buddy_experts_when_bandwidth_free": True,
+                    "avoid_decode_io_wait_bubbles": True,
+                    "io_compute_overlap_required": True,
+                    "max_adaptive_depth": 1,
+                },
+                "budget_inputs": {
+                    "nvme_bandwidth_bytes_per_s": "hardware_probe.nvme_read_bw",
+                    "pcie_bandwidth_bytes_per_s": "hardware_probe.pcie_h2d_bw",
+                    "cpu_gflops": "hardware_probe.cpu_gflops",
+                    "gpu_free_bytes": "runtime_device_free_bytes",
+                    "ram_free_bytes": "runtime_available_ram_bytes",
+                },
                 "score_filter": {
                     "enabled": True,
                     "vram_percentile": 0.70,
@@ -5597,6 +5787,9 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                 "primary_key": "predicted_next_use_epoch",
                 "tie_breakers": ["hot_score", "last_touch_epoch"],
                 "rollback_required": True,
+                "state_updates_atomic": True,
+                "no_double_admission": True,
+                "do_not_evict_inflight_or_current_layer": True,
             },
             "cpu_hot_miss": {
                 "enabled": True,
@@ -5622,6 +5815,10 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                 "direct_io_alignment": 4096,
                 "split_combined_gate_up": True,
                 "allow_partial_expert_segments": True,
+                "io_backend_priority": ["io_uring_or_native_async", "direct_aligned_read", "mmap_shared_hot_only"],
+                "chunk_size_source": "section.sequential_block_size",
+                "cold_experts_mmap_forbidden": True,
+                "gate_up_split_offsets_required": True,
             },
             "telemetry": {
                 "record_expert_hits": True,
@@ -5916,6 +6113,7 @@ def build_juju_shard_plan_from_hf_url(
             "qkv_cache_schema_effective": graph_ir["runtime_access_plan"].get("qkv_cache_schema_effective", {}),
             "expert_tier_entries": graph_ir["runtime_access_plan"].get("expert_tier_entries", []),
             "expert_offset_table": graph_ir["runtime_access_plan"].get("expert_offset_table", []),
+            "expert_bundle_table": graph_ir["runtime_access_plan"].get("expert_bundle_table", {}),
             "moe_layer_bitmask_words": graph_ir["runtime_access_plan"].get("moe_layer_bitmask_words", []),
             "router_calibration_manifest": graph_ir["runtime_access_plan"].get("router_calibration_manifest", {}),
             "tensor_count": len(tensor_records),
@@ -6526,6 +6724,7 @@ def write_juju_shard_from_hf_url(
                 "qkv_cache_schema_effective": graph_ir["runtime_access_plan"].get("qkv_cache_schema_effective", {}),
                 "expert_tier_entries": graph_ir["runtime_access_plan"].get("expert_tier_entries", []),
                 "expert_offset_table": graph_ir["runtime_access_plan"].get("expert_offset_table", []),
+                "expert_bundle_table": graph_ir["runtime_access_plan"].get("expert_bundle_table", {}),
                 "moe_layer_bitmask_words": graph_ir["runtime_access_plan"].get("moe_layer_bitmask_words", []),
                 "router_calibration_manifest": graph_ir["runtime_access_plan"].get("router_calibration_manifest", {}),
                 "tensor_count": len(tensor_records),
