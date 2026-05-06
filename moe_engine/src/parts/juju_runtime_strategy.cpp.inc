@@ -84,7 +84,7 @@ static double moe_rt_compute_tflops_hint(const moe_backend_caps_t& caps) {
         // Solution: Use device_vram_bytes > 4GB as discrete GPU indicator.
         // Intel Xe iGPU: shared VRAM ≤ 4GB, Arc discrete: ≥ 6GB dedicated.
         // Impact: Correct classification of Arc B580/A770 with ReBAR.
-        if (caps.device_vram_bytes <= 4ull * 1024ull * 1024ull * 1024ull) return 10.0; // iGPU (Xe integrated)
+        if (caps.device_memory_bytes <= 4ull * 1024ull * 1024ull * 1024ull) return 10.0; // iGPU (Xe integrated)
         // BUGFIX 1003: Raise Arc TFLOPS closer to real INT8 throughput ★★ PERFORMANCE
         // B580=256 TFLOPS(INT8), A770=128 TFLOPS(INT8). Old values (100/80) were
         // 2-2.5x too low → overlap budget overestimated → shallow prefetch.

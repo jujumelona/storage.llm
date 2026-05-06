@@ -3,6 +3,7 @@ static uint64_t tensor_stream_bytes(const moe_tensor_record& rec) {
 }
 
 static int device_backend_event_sync(moe_pc_engine* e, CUevent event);
+static void device_backend_event_destroy(moe_pc_engine* e, CUevent event);
 static inline bool staging_slot_valid(const moe_pc_engine* e, uint32_t slot_index);
 
 static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int expert) {

@@ -45,7 +45,8 @@ int moe_pc_engine_plan_moe_prefetch(
     if ((engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
          engine->backend_caps.backend == moe_BACKEND_SYCL) &&
         engine->backend_caps.supports_unified_memory &&
-        engine->backend_caps.device_vram_bytes == 0) {
+        (engine->backend_caps.device_memory_bytes == 0 ||
+         engine->backend_caps.unified_mmap_gpu_accessible)) {
         // iGPU unified memory: stats only, no staging copies
         std::vector<moe_expert_prefetch_item_t> items;
         prefetch_plan_clear_seen(engine);
@@ -85,9 +86,7 @@ int moe_pc_engine_plan_moe_prefetch(
                 // Solution: Check engine->juju_co_activation_bank_initialized before calling.
                 // JUJU parsing sets this flag to true after co_activation_stats is allocated.
                 // Impact: Prevents crash on Metal UMA with GGUF offload or early inference calls.
-                if (engine->juju_co_activation_bank_initialized.load(std::memory_order_acquire)) {
-                    moe_juju_predict_co_activation(engine, lookahead_layer, 8);
-                }
+                moe_juju_predict_co_activation(engine, lookahead_layer, 8);
             }
         }
         *out_item_count = 0; // 명시적 VRAM 복사 불필요
