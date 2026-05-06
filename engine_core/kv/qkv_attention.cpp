@@ -9,6 +9,7 @@
 #include <vector>
 #include <algorithm>
 #include <climits>
+#include <cmath>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -27,6 +28,13 @@ static float qkv_attention_load_raw_scalar(const uint8_t* src, int index, int bi
         return out;
     }
     return 0.0f;
+}
+
+static float qkv_attention_apply_logit_softcap(float cap, float score) {
+    if (!(cap > 0.0f) || !std::isfinite(cap) || !std::isfinite(score)) {
+        return score;
+    }
+    return tanhf(score / cap) * cap;
 }
 
 // Paper: Attention decode directly on quantized KV cache
@@ -78,6 +86,10 @@ int qkv_attention_decode_impl(
     // BUGFIX 352: d가 0일 때 division by zero 방지
     if (d <= 0) return 0;
     const float sc = 1.0f / sqrtf((float)d);
+    const float attn_logit_softcap =
+        (cfg->attention_logit_softcap > 0.0f && std::isfinite(cfg->attention_logit_softcap))
+            ? cfg->attention_logit_softcap
+            : 0.0f;
 
     // Bug 2 Fix: Use pre-computed worker limit instead of OS call
     const int max_workers = s->computed_workers > 0 ? s->computed_workers : 1;
@@ -240,7 +252,7 @@ int qkv_attention_decode_impl(
                         }
                     }
                 }
-                att[t] = dot * norm_k * sc;
+                att[t] = qkv_attention_apply_logit_softcap(attn_logit_softcap, dot * norm_k * sc);
             }
         };
 
@@ -302,7 +314,7 @@ int qkv_attention_decode_impl(
                     }
                 }
             }
-            att[t] = dot * norm_k * sc;
+            att[t] = qkv_attention_apply_logit_softcap(attn_logit_softcap, dot * norm_k * sc);
         }
     }
 

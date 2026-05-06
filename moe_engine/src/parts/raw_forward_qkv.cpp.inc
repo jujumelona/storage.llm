@@ -353,6 +353,7 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
     uint32_t capacity_tokens,
     uint32_t head_dim,
     float score_scale,
+    float attn_logit_softcap,
     float* output
 ) {
     if (!engine || !query || !output || context_tokens == 0 || capacity_tokens < context_tokens || head_dim == 0) {
@@ -385,7 +386,9 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
         slot->n_tokens < (int)context_tokens) {
         return 0;
     }
-    return qkv_attention_decode(q, slot, &engine->qkv_cfg, context_tokens, head_dim, output);
+    qkv_config_t qkv_decode_cfg = engine->qkv_cfg;
+    qkv_decode_cfg.attention_logit_softcap = attn_logit_softcap;
+    return qkv_attention_decode(q, slot, &qkv_decode_cfg, context_tokens, head_dim, output);
 }
 
 static qkv_state_t* moe_qkv_ensure_head_state(

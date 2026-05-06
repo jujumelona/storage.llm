@@ -180,6 +180,19 @@ static float moe_standard_attention_score_scale(
         }
         return 1.0f;
     }
+    if (engine && !engine->offload_graph_ir_json.empty()) {
+        double direct_scale = 0.0;
+        if ((moe_json_get_double_local(engine->offload_graph_ir_json, "attention_scale", &direct_scale) ||
+             moe_json_get_double_local(engine->offload_graph_ir_json, "attn_scale", &direct_scale) ||
+             moe_json_get_double_local(engine->offload_graph_ir_json, "attention_score_scale", &direct_scale) ||
+             moe_json_get_double_local(engine->offload_graph_ir_json, "qk_scale", &direct_scale)) &&
+            direct_scale > 0.0 && direct_scale <= 1024.0 && std::isfinite(direct_scale)) {
+            if (source_out) {
+                *source_out = "graph_ir_scale";
+            }
+            return (float)direct_scale;
+        }
+    }
     if (engine && !engine->offload_gguf_metadata_json.empty()) {
         double direct_scale = 0.0;
         if ((moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_scale", &direct_scale) ||
@@ -194,6 +207,16 @@ static float moe_standard_attention_score_scale(
         }
     }
     float query_pre_attn_scalar = engine ? engine->model_config_query_pre_attn_scalar : 0.0f;
+    if (!(query_pre_attn_scalar > 0.0f) && engine && !engine->offload_graph_ir_json.empty()) {
+        double value = 0.0;
+        if (moe_json_get_double_local(engine->offload_graph_ir_json, "query_pre_attn_scalar", &value) ||
+            moe_json_get_double_local(engine->offload_graph_ir_json, "attention_query_pre_attn_scalar", &value) ||
+            moe_json_get_double_local(engine->offload_graph_ir_json, "attn_query_pre_attn_scalar", &value)) {
+            if (value > 0.0 && value <= 65536.0 && std::isfinite(value)) {
+                query_pre_attn_scalar = (float)value;
+            }
+        }
+    }
     if (!(query_pre_attn_scalar > 0.0f) && engine && !engine->offload_gguf_metadata_json.empty()) {
         double value = 0.0;
         if (moe_json_get_double_local(engine->offload_gguf_metadata_json, "query_pre_attn_scalar", &value) ||
@@ -217,18 +240,15 @@ static float moe_standard_attention_score_scale(
         }
         return result;
     }
-    if (moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
-        if (source_out) {
-            *source_out = "qk_norm_layout";
-        }
-        return 1.0f;
-    }
     float result = 1.0f / std::sqrt((float)head_dim);
     if (!std::isfinite(result)) {
         if (source_out) {
             *source_out = "fallback";
         }
         return 1.0f;
+    }
+    if (source_out && moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
+        *source_out = "head_dim_qk_norm_fallback";
     }
     return result;
 }
@@ -237,7 +257,8 @@ static int moe_attention_score_scale_source_is_explicit(
     const char* source
 ) {
     return source &&
-        (std::strcmp(source, "metadata_scale") == 0 ||
+        (std::strcmp(source, "graph_ir_scale") == 0 ||
+         std::strcmp(source, "metadata_scale") == 0 ||
          std::strcmp(source, "query_pre_attn_scalar") == 0);
 }
 
@@ -251,7 +272,42 @@ static int moe_attention_score_scale_violates_qk_norm_contract(
         moe_attention_score_scale_source_is_explicit(source)) {
         return 0;
     }
-    return !(std::isfinite(scale) && std::fabs(scale - 1.0f) <= 1.0e-6f);
+    return !(std::isfinite(scale) && scale > 0.0f && scale <= 1.0f);
+}
+
+static float moe_attention_logit_softcap_value(
+    const moe_pc_engine* engine
+) {
+    double value = 0.0;
+    if (engine &&
+        !engine->offload_graph_ir_json.empty() &&
+        (moe_json_get_double_local(engine->offload_graph_ir_json, "attn_logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "attn_logit_softcap", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "attention_logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "attention_logit_softcap", &value)) &&
+        value > 0.0 && value <= 100000.0 && std::isfinite(value)) {
+        return (float)value;
+    }
+    if (engine &&
+        !engine->offload_gguf_metadata_json.empty() &&
+        (moe_json_get_double_local(engine->offload_gguf_metadata_json, "attn_logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "attn_logit_softcap", &value) ||
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_logit_softcap", &value)) &&
+        value > 0.0 && value <= 100000.0 && std::isfinite(value)) {
+        return (float)value;
+    }
+    return 0.0f;
+}
+
+static float moe_apply_attention_logit_softcap(
+    float cap,
+    float score
+) {
+    if (!(cap > 0.0f) || !std::isfinite(cap) || !std::isfinite(score)) {
+        return score;
+    }
+    return std::tanh(score / cap) * cap;
 }
 
 static void moe_standard_attention_rope_params(

@@ -239,6 +239,7 @@
 
     const char* scale_source = nullptr;
     const float scale = moe_standard_attention_score_scale(engine, layer, head_dim, &scale_source);
+    const float attn_logit_softcap = moe_attention_logit_softcap_value(engine);
     if (moe_attention_score_scale_violates_qk_norm_contract(engine, layer, scale, scale_source)) {
         std::fprintf(
             stderr,
@@ -286,7 +287,7 @@
             "attn_standard_qkv_append",
             "layer=%d pos=%u kv_heads=%u seq=%u cap=%u head_dim=%u "
             "k_bits=%d v_bits=%d outlier_channels=%d outlier_bits=%d normal_bits=%d "
-            "scale=%.6g scale_source=%s ms=%.3f",
+            "scale=%.6g scale_source=%s attn_softcap=%.6g ms=%.3f",
             layer, position, num_kv_heads, seq_len, qkv_capacity_tokens, head_dim,
             engine->qkv_cfg.k_bits,
             engine->qkv_cfg.v_bits,
@@ -295,6 +296,7 @@
             engine->qkv_cfg.normal_bits,
             (double)scale,
             scale_source ? scale_source : "unknown",
+            (double)attn_logit_softcap,
             moe_profile_elapsed_ms(qkv_append_start_us));
     }
     const uint64_t heads_start_us = moe_profile_now_us();
@@ -318,6 +320,7 @@
                 qkv_capacity_tokens,
                 head_dim,
                 scale,
+                attn_logit_softcap,
                 out_h);
         }
         float max_score = -std::numeric_limits<float>::infinity();
@@ -326,7 +329,9 @@
             const float* entry = p == position ? s->kv_entry.data() :
                 layer_decode + (size_t)p * kv_entry_dim;
             const float* k = entry + (uint64_t)kv_h * head_dim;
-            float score = moe_dot_f32(q, k, head_dim) * scale;
+            float score = moe_apply_attention_logit_softcap(
+                attn_logit_softcap,
+                moe_dot_f32(q, k, head_dim) * scale);
             if (!std::isfinite(score)) {
                 return 0;
             }
@@ -353,12 +358,13 @@
     }
     moe_profile_log(
         "attn_standard_heads",
-        "layer=%d pos=%u heads=%u seq=%u head_dim=%u v_head_dim=%u qkv=%d kv_backend=%s scale=%.6g scale_source=%s ms=%.3f",
+        "layer=%d pos=%u heads=%u seq=%u head_dim=%u v_head_dim=%u qkv=%d kv_backend=%s scale=%.6g scale_source=%s attn_softcap=%.6g ms=%.3f",
         layer, position, num_heads, seq_len, head_dim, v_head_dim,
         qkv_decode,
         qkv_decode ? "qkv_layer_head_append" : "plain_kv_cache",
         (double)scale,
         scale_source ? scale_source : "unknown",
+        (double)attn_logit_softcap,
         moe_profile_elapsed_ms(heads_start_us));
 
     const uint64_t o_start_us = moe_profile_now_us();
