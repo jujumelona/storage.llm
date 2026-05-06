@@ -3179,6 +3179,8 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
     runtime_arch = dict(runtime_arch or {})
     qkv = dict(contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract") or {})
     synthesized = not bool(qkv)
+    explicit_normal_bits = qkv.get("normal_bits") not in (None, "") or contract_value(qkv, "normal.bits", default=None) not in (None, "")
+    explicit_enable_qjl = qkv.get("enable_qjl") not in (None, "") or contract_value(qkv, "qjl.enabled", default=None) not in (None, "")
 
     def fill(key, *values):
         if qkv.get(key) not in (None, ""):
@@ -3198,8 +3200,6 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
     qkv["plain_fallback_allowed"] = False
     qkv.setdefault("k_bits", 3)
     qkv.setdefault("v_bits", 2)
-    qkv.setdefault("normal_bits", 8)
-    qkv.setdefault("enable_qjl", False)
     qkv.setdefault("enable_rotation", True)
     qkv.setdefault("rotation_seed", 1234)
     qkv.setdefault("qjl_seed", 5678)
@@ -3246,13 +3246,30 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
     fill("max_seq_len", _juju_first_config_value(contract, "max_position_embeddings", "max_seq_len", "context_length"), runtime_arch.get("max_position_embeddings"), runtime_arch.get("context_length"))
     k_bits = _juju_int_or_none(qkv.get("k_bits"))
     v_bits = _juju_int_or_none(qkv.get("v_bits"))
-    normal_bits = _juju_int_or_none(qkv.get("normal_bits"))
+    normal_bits = _juju_first_int(qkv.get("normal_bits"), contract_value(qkv, "normal.bits", default=None))
     outlier_channels = _juju_int_or_none(qkv.get("outlier_channels"))
     outlier_bits = _juju_int_or_none(qkv.get("outlier_bits"))
     group_size = _juju_int_or_none(qkv.get("group_size"))
     page_tokens = _juju_int_or_none(qkv.get("page_size_tokens"))
     sink_tokens = _juju_int_or_none(qkv.get("sink_tokens"))
-    enable_qjl = bool(_juju_bool_or_none(qkv.get("enable_qjl")))
+    if normal_bits is None:
+        normal_bits = v_bits if v_bits is not None else (k_bits if k_bits is not None else 2)
+        qkv["normal_bits_source"] = "derived_from_value_bits_for_non_outlier_qkv_channels"
+    else:
+        qkv.setdefault("normal_bits_source", "source_contract" if explicit_normal_bits else "source_contract_default")
+    raw_qkv_bits = any(bit in (16, 32) for bit in (k_bits, v_bits, normal_bits, outlier_bits) if bit is not None)
+    qjl_value = _juju_bool_or_none(qkv.get("enable_qjl"))
+    if qjl_value is None:
+        qjl_value = _juju_bool_or_none(contract_value(qkv, "qjl.enabled", default=None))
+    if qjl_value is None:
+        enable_qjl = not raw_qkv_bits
+        qkv["enable_qjl_source"] = "derived_from_quantized_qkv_bits"
+    else:
+        enable_qjl = bool(qjl_value)
+        qkv.setdefault("enable_qjl_source", "source_contract" if explicit_enable_qjl else "source_contract_default")
+    if enable_qjl and raw_qkv_bits:
+        enable_qjl = False
+        qkv["enable_qjl_source"] = "disabled_for_plain_or_raw_qkv_bits"
     enable_rotation = _juju_bool_or_none(qkv.get("enable_rotation"))
     if enable_rotation is None:
         enable_rotation = True
@@ -3278,11 +3295,26 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         "plain_fallback_allowed": False,
         "plain_kv_runtime_allowed": False,
     })
-    qkv["normal"] = {"bits": normal_bits}
+    qkv["bit_layout"] = {
+        "key_bits": k_bits,
+        "value_bits": v_bits,
+        "normal_bits": normal_bits,
+        "normal_bits_semantics": "non_outlier_channel_quant_bits",
+        "outlier_channels": outlier_channels,
+        "outlier_bits": outlier_bits,
+        "qjl_required_for_codebook_bits": not raw_qkv_bits,
+        "plain_or_raw_bits_present": raw_qkv_bits,
+    }
+    if isinstance(qkv.get("validation"), dict):
+        qkv["validation"]["normal_bits_semantics"] = "non_outlier_channel_quant_bits"
+        qkv["validation"]["qjl_enabled_for_codebook_quantized_qkv"] = not raw_qkv_bits
+        qkv["validation"]["reject_inconsistent_normal_bits"] = True
+        qkv["validation"]["format_generation_requires_qkv_policy_self_check"] = True
+    qkv["normal"] = {"bits": normal_bits, "semantics": "non_outlier_channel_quant_bits", "source": qkv.get("normal_bits_source")}
     qkv["outlier"] = {"channels": outlier_channels, "bits": outlier_bits}
     qkv["residency"] = {"sink_tokens": sink_tokens, "policy": qkv.get("residency_policy")}
     qkv["rotation"] = {"enabled": bool(enable_rotation), "seed": _juju_int_or_none(qkv.get("rotation_seed"))}
-    qkv["qjl"] = {"enabled": enable_qjl, "seed": _juju_int_or_none(qkv.get("qjl_seed"))}
+    qkv["qjl"] = {"enabled": enable_qjl, "seed": _juju_int_or_none(qkv.get("qjl_seed")), "source": qkv.get("enable_qjl_source")}
     qkv["cache_layout"] = {
         "backend": qkv.get("backend"),
         "dtype": qkv.get("cache_dtype"),
@@ -5109,6 +5141,169 @@ def juju_expert_tensor_diagnostics(tensor_records):
     return diagnostics
 
 
+def juju_format_self_check(idx, sections, qkv_schema):
+    idx = idx or {}
+    sections = sections or []
+    qkv_schema = qkv_schema or {}
+    errors = []
+    warnings = []
+
+    def err(code, **fields):
+        item = {"code": code}
+        item.update(fields)
+        errors.append(item)
+
+    def warn(code, **fields):
+        item = {"code": code}
+        item.update(fields)
+        warnings.append(item)
+
+    k_bits = _juju_int_or_none(qkv_schema.get("k_bits"))
+    v_bits = _juju_int_or_none(qkv_schema.get("v_bits"))
+    normal_bits = _juju_int_or_none(qkv_schema.get("normal_bits"))
+    outlier_bits = _juju_int_or_none(qkv_schema.get("outlier_bits"))
+    outlier_channels = _juju_int_or_none(qkv_schema.get("outlier_channels")) or 0
+    raw_qkv_bits = any(bit in (16, 32) for bit in (k_bits, v_bits, normal_bits, outlier_bits) if bit is not None)
+    enable_qjl = bool(_juju_bool_or_none(qkv_schema.get("enable_qjl")))
+    if k_bits is None or v_bits is None or normal_bits is None:
+        err("qkv_bits_incomplete", k_bits=k_bits, v_bits=v_bits, normal_bits=normal_bits)
+    if not raw_qkv_bits and not enable_qjl:
+        err("qkv_codebook_bits_without_qjl", k_bits=k_bits, v_bits=v_bits, normal_bits=normal_bits)
+    if (
+        str(qkv_schema.get("source") or "") == "juju_generator_synthesized_runtime_qkv_contract" and
+        not raw_qkv_bits and outlier_channels > 0 and v_bits is not None and normal_bits != v_bits
+    ):
+        err("synthesized_qkv_normal_bits_not_derived_from_value_bits", v_bits=v_bits, normal_bits=normal_bits)
+    normal = qkv_schema.get("normal") if isinstance(qkv_schema.get("normal"), dict) else {}
+    if normal.get("semantics") != "non_outlier_channel_quant_bits":
+        err("qkv_normal_bits_semantics_missing")
+
+    if idx.get("format") != "JUJU_IDX_JSON_V1":
+        err("idx_format_missing_or_wrong")
+    if int(idx.get("schema_version") or 0) < 3:
+        err("idx_schema_version_too_old", schema_version=idx.get("schema_version"))
+    if idx.get("mutable_runtime_index") is not True:
+        err("idx_mutable_runtime_index_not_enabled")
+
+    required_section_names = {
+        "MODEL_META",
+        "QKV_POLICY",
+        "PREDICTOR",
+        "BUDDY_MAP",
+        "TIER_HINT",
+        "RUNTIME_CONTRACT",
+    }
+    present_names = {str(s.get("name") or "") for s in sections}
+    for name in sorted(required_section_names - present_names):
+        err("required_section_missing", section=name)
+    for s in sections:
+        name = str(s.get("name") or "")
+        if name == "COLD_EXPERTS":
+            if int(s.get("mmap_friendly") or 0) != 0:
+                err("cold_experts_mmap_enabled")
+            if int(s.get("sequential_block_size") or 0) < 128 * 1024:
+                err("cold_experts_sequential_block_too_small", value=int(s.get("sequential_block_size") or 0))
+        if name == "WARM_EXPERTS" and int(s.get("sequential_block_size") or 0) < 64 * 1024:
+            warn("warm_experts_sequential_block_small", value=int(s.get("sequential_block_size") or 0))
+        if name == "SHARED_WEIGHTS" and int(s.get("mmap_friendly") or 0) != 1:
+            warn("shared_weights_not_mmap_friendly")
+
+    tensors = idx.get("tensors") or []
+    required_tensor_fields = [
+        "name",
+        "shape",
+        "weight_encoding",
+        "row_stride_bytes",
+        "juju_offset",
+        "juju_bytes",
+        "graph_role",
+        "execution_op",
+        "execution_layer",
+    ]
+    for rec in tensors:
+        missing = [key for key in required_tensor_fields if rec.get(key) in (None, "")]
+        if missing:
+            err("tensor_contract_fields_missing", name=rec.get("name"), missing=missing)
+            break
+    graph_ir = idx.get("graph_ir") or {}
+    if graph_ir.get("format") != "JUJU_GRAPH_IR_V1":
+        err("graph_ir_missing_or_wrong_format")
+    if not graph_ir.get("ops"):
+        err("graph_ir_root_ops_missing")
+    if not graph_ir.get("layers"):
+        err("graph_ir_layer_ops_missing")
+    generation_contract = graph_ir.get("generation_contract") or {}
+    if generation_contract.get("format") != "JUJU_GENERATION_CONTRACT_V1":
+        err("generation_contract_missing_or_wrong_format")
+    tokenizer = generation_contract.get("tokenizer") or {}
+    if not tokenizer.get("required_any_of"):
+        err("tokenizer_required_any_of_missing")
+    if tokenizer.get("missing_chat_template_policy") != "base_completion_template_only_never_invent_family_template":
+        err("tokenizer_missing_chat_template_policy_not_fail_closed")
+    forward_validation = generation_contract.get("forward_contract_validation") or {}
+    if forward_validation.get("format") != "JUJU_FORWARD_CONTRACT_VALIDATION_V1":
+        err("forward_contract_validation_missing")
+    elif forward_validation.get("contract_complete") is not True:
+        err("forward_contract_incomplete", missing=forward_validation.get("missing") or [])
+    runtime_access_plan = graph_ir.get("runtime_access_plan") or idx.get("runtime_access_plan") or {}
+    if runtime_access_plan.get("format") != "JUJU_RUNTIME_ACCESS_PLAN_V1":
+        err("runtime_access_plan_missing_or_wrong_format")
+    executor_contract = runtime_access_plan.get("executor_contract") or {}
+    tensor_ref_fields = set(executor_contract.get("tensor_ref_fields") or [])
+    for field in ("name", "role", "layer", "op", "shape", "encoding", "row_stride_bytes", "offset", "bytes"):
+        if field not in tensor_ref_fields:
+            err("executor_tensor_ref_field_missing", field=field)
+    if not runtime_access_plan.get("executor_tensor_table"):
+        err("executor_tensor_table_missing")
+    if not runtime_access_plan.get("file_locality_groups"):
+        err("runtime_file_locality_groups_missing")
+    if not runtime_access_plan.get("layer_prefetch_plan"):
+        err("layer_prefetch_plan_missing")
+    kv_layout = runtime_access_plan.get("kv_layout_contract") or graph_ir.get("kv_layout_contract") or idx.get("kv_layout_contract") or {}
+    if not kv_layout:
+        err("kv_layout_contract_missing")
+    else:
+        if kv_layout.get("format") != "JUJU_KV_LAYOUT_CONTRACT_V1":
+            err("kv_layout_contract_wrong_format")
+        for field in ("layout", "page_size_tokens", "key_bits", "value_bits", "normal_bits", "outlier_bits", "group_size", "enable_qjl", "runtime_cache_policy"):
+            if kv_layout.get(field) in (None, ""):
+                err("kv_layout_field_missing", field=field)
+    if not runtime_access_plan.get("expert_offset_table"):
+        err("expert_offset_table_missing")
+    if not runtime_access_plan.get("moe_layer_bitmask_words"):
+        warn("moe_layer_bitmask_missing_or_empty")
+    if not runtime_access_plan.get("router_calibration_manifest"):
+        err("router_calibration_manifest_missing")
+    priority_tables = graph_ir.get("priority_tables") or idx.get("priority_tables") or {}
+    if not priority_tables.get("section_priorities"):
+        err("section_priority_table_missing")
+    moe_policy = graph_ir.get("moe_offload_policy") or idx.get("moe_offload_policy") or {}
+    streaming = moe_policy.get("streaming") or {}
+    if streaming.get("split_combined_gate_up") is not True:
+        err("combined_gate_up_split_policy_missing")
+    prefetch = moe_policy.get("prefetch") or {}
+    if not prefetch.get("trigger") or not prefetch.get("priority_field"):
+        err("moe_prefetch_policy_incomplete")
+    perf = generation_contract.get("performance_contract") or {}
+    trace_keys = set(perf.get("trace_required_keys") or [])
+    for key in ("forward_layer", "attn_standard_qkv_norm", "mlp_moe_end", "lm_head_logprob_end", "cpu_ram", "kv_cache", "io_pipeline"):
+        if key not in trace_keys:
+            err("trace_required_key_missing", trace_key=key)
+    bottleneck_counters = set(perf.get("bottleneck_counters") or [])
+    for key in ("attention_ms", "mlp_ms", "lm_head_ms", "kv_bytes", "ram_used_bytes", "vram_used_bytes", "io_wait_ms", "qkv_k_bits", "qkv_v_bits", "qkv_normal_bits", "qkv_qjl_enabled"):
+        if key not in bottleneck_counters:
+            err("bottleneck_counter_missing", counter=key)
+
+    return {
+        "format": "JUJU_FORMAT_SELF_CHECK_V1",
+        "ok": not errors,
+        "error_count": len(errors),
+        "warning_count": len(warnings),
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
 def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, source_path, source_repo_id, weight_file, index_file, directory=None):
     arch = dict(contract.get("arch_meta") or {})
     runtime_arch = juju_runtime_arch_metadata(contract, directory)
@@ -5716,12 +5911,24 @@ def build_juju_shard_plan_from_hf_url(
             "moe_offload_policy": graph_ir["moe_offload_policy"],
             "runtime_access_plan": graph_ir["runtime_access_plan"],
             "kv_layout_contract": graph_ir["kv_layout_contract"],
+            "generation_contract": graph_ir["generation_contract"],
+            "qkv_policy_contract": graph_ir["runtime_access_plan"].get("qkv_policy_contract", {}),
+            "qkv_cache_schema_effective": graph_ir["runtime_access_plan"].get("qkv_cache_schema_effective", {}),
+            "expert_tier_entries": graph_ir["runtime_access_plan"].get("expert_tier_entries", []),
+            "expert_offset_table": graph_ir["runtime_access_plan"].get("expert_offset_table", []),
+            "moe_layer_bitmask_words": graph_ir["runtime_access_plan"].get("moe_layer_bitmask_words", []),
+            "router_calibration_manifest": graph_ir["runtime_access_plan"].get("router_calibration_manifest", {}),
             "tensor_count": len(tensor_records),
             "tensors": tensor_records,
             "sections": list(sections),
             "row_stride_stats": row_stride_stats,
             **runtime_arch,
         }
+        idx["format_self_check"] = juju_format_self_check(idx, sections, qkv_schema)
+        if not idx["format_self_check"]["ok"]:
+            raise RuntimeError("JUJU format self-check failed: " + json.dumps(
+                idx["format_self_check"]["errors"][:16], ensure_ascii=False
+            ))
         pos = add_json_section_at(pos, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
         index_checksum = int(juju_section_checksum16_hex(sections[-1])[:16], 16) if sections else 0
         file_size_value = pos
@@ -6312,12 +6519,26 @@ def write_juju_shard_from_hf_url(
                 "graph_ir": graph_ir,
                 "priority_tables": graph_ir["priority_tables"],
                 "moe_offload_policy": graph_ir["moe_offload_policy"],
+                "runtime_access_plan": graph_ir["runtime_access_plan"],
+                "kv_layout_contract": graph_ir["kv_layout_contract"],
+                "generation_contract": graph_ir["generation_contract"],
+                "qkv_policy_contract": graph_ir["runtime_access_plan"].get("qkv_policy_contract", {}),
+                "qkv_cache_schema_effective": graph_ir["runtime_access_plan"].get("qkv_cache_schema_effective", {}),
+                "expert_tier_entries": graph_ir["runtime_access_plan"].get("expert_tier_entries", []),
+                "expert_offset_table": graph_ir["runtime_access_plan"].get("expert_offset_table", []),
+                "moe_layer_bitmask_words": graph_ir["runtime_access_plan"].get("moe_layer_bitmask_words", []),
+                "router_calibration_manifest": graph_ir["runtime_access_plan"].get("router_calibration_manifest", {}),
                 "tensor_count": len(tensor_records),
                 "tensors": tensor_records,
                 "sections": sections,
                 "row_stride_stats": row_stride_stats,
                 **runtime_arch,
             }
+            idx["format_self_check"] = juju_format_self_check(idx, sections, qkv_schema)
+            if not idx["format_self_check"]["ok"]:
+                raise RuntimeError("JUJU format self-check failed: " + json.dumps(
+                    idx["format_self_check"]["errors"][:16], ensure_ascii=False
+                ))
             add_json_section(out, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
             index_checksum = int(juju_section_checksum16_hex(sections[-1])[:16], 16) if sections else 0
             file_size_value = out.tell()

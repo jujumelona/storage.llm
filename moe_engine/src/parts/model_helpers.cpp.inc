@@ -50,6 +50,14 @@ static void moe_fill_check_from_offload_gguf_scan(
     out_check->valid = scan.valid ? 1 : 0;
 }
 
+static bool moe_qkv_contract_codebook_bits(int bits) {
+    return bits >= 2 && bits <= 8;
+}
+
+static bool moe_qkv_contract_raw_bits(int bits) {
+    return bits == 16 || bits == 32;
+}
+
 static qkv_config_t moe_qkv_config_from_offload_contract(const moe_offload_gguf_contract_t& contract) {
     qkv_config_t cfg = qkv_config_default(128);
     if (contract.qkv_k_bits > 0) {
@@ -91,10 +99,31 @@ static qkv_config_t moe_qkv_config_from_offload_contract(const moe_offload_gguf_
         cfg.outlier_bits = (int)((contract.qkv_outlier_bits <= 8 || contract.qkv_outlier_bits == 16 || contract.qkv_outlier_bits == 32)
             ? contract.qkv_outlier_bits : 8);
     }
+    const bool raw_qkv =
+        moe_qkv_contract_raw_bits(cfg.k_bits) ||
+        moe_qkv_contract_raw_bits(cfg.v_bits) ||
+        moe_qkv_contract_raw_bits(cfg.normal_bits) ||
+        moe_qkv_contract_raw_bits(cfg.outlier_bits);
+    const bool codebook_qkv =
+        moe_qkv_contract_codebook_bits(cfg.k_bits) &&
+        moe_qkv_contract_codebook_bits(cfg.v_bits) &&
+        moe_qkv_contract_codebook_bits(cfg.normal_bits) &&
+        moe_qkv_contract_codebook_bits(cfg.outlier_bits);
+    if (contract.qkv_required && codebook_qkv && cfg.outlier_channels > 0 && cfg.v_bits > 1 && cfg.normal_bits > cfg.v_bits) {
+        std::fprintf(stderr,
+            "[storagellm] qkv contract repair: normal_bits=%d -> %d for non-outlier value-channel layout\n",
+            cfg.normal_bits,
+            cfg.v_bits);
+        cfg.normal_bits = cfg.v_bits;
+    }
     if (cfg.k_bits <= 1 || cfg.v_bits <= 1 ||
         cfg.k_bits > 8 || cfg.v_bits > 8 ||
-        cfg.normal_bits > 8 || cfg.outlier_bits > 8) {
+        cfg.normal_bits > 8 || cfg.outlier_bits > 8 || raw_qkv) {
         cfg.enable_qjl = false;
+    } else if (contract.qkv_required && codebook_qkv && !cfg.enable_qjl) {
+        std::fprintf(stderr,
+            "[storagellm] qkv contract repair: enable_qjl=0 -> 1 for required codebook QKV cache\n");
+        cfg.enable_qjl = true;
     }
     cfg.plain_kv_persistent_storage = contract.plain_kv_persistent_allowed;
     return cfg;
