@@ -1,6 +1,7 @@
 #include "qkv_state.h"
 #include "qkv_thread_pool.h"
 #include "qkv_codebook.h"
+#include "qkv_helpers.h"
 #include "qkv_matrix.h"
 #include <stdlib.h>
 #include <string.h>
@@ -63,6 +64,29 @@ static std::shared_ptr<std::vector<float>> qkv_cached_qjl(int dim, uint64_t seed
     return matrix;
 }
 
+static int qkv_state_assign_codebook(qkv_state_t* state, int dim, int bits) {
+    if (!state) return 0;
+    if (qkv_bits_raw(bits)) return 1;
+    if (!qkv_bits_codebook(bits)) return 0;
+    auto codebook = qkv_cached_codebook(dim, bits, false);
+    auto thresholds = qkv_cached_codebook(dim, bits, true);
+    if (!codebook || !thresholds || codebook->empty() || thresholds->empty()) {
+        return 0;
+    }
+    switch (bits) {
+    case 1: state->codebook_1bit = codebook->data(); state->thresholds_1bit = thresholds->data(); break;
+    case 2: state->codebook_2bit = codebook->data(); state->thresholds_2bit = thresholds->data(); break;
+    case 3: state->codebook_3bit = codebook->data(); state->thresholds_3bit = thresholds->data(); break;
+    case 4: state->codebook_4bit = codebook->data(); state->thresholds_4bit = thresholds->data(); break;
+    case 5: state->codebook_5bit = codebook->data(); state->thresholds_5bit = thresholds->data(); break;
+    case 6: state->codebook_6bit = codebook->data(); state->thresholds_6bit = thresholds->data(); break;
+    case 7: state->codebook_7bit = codebook->data(); state->thresholds_7bit = thresholds->data(); break;
+    case 8: state->codebook_8bit = codebook->data(); state->thresholds_8bit = thresholds->data(); break;
+    default: return 0;
+    }
+    return 1;
+}
+
 int qkv_state_init(
     qkv_state_t* state,
     const qkv_config_t* config,
@@ -76,28 +100,33 @@ int qkv_state_init(
     int k_bits = config->k_bits;
     int v_bits = config->v_bits;
     // BUGFIX 404: dim 범위 체크 강화
-    if (dim <= 0 || dim > 16384 || k_bits < 1 || k_bits > 4 || v_bits < 1 || v_bits > 4) {
+    if (dim <= 0 || dim > 16384 || !qkv_bits_valid(k_bits) || !qkv_bits_valid(v_bits)) {
         return 0;
     }
     // BUGFIX 405: n_tokens 범위 체크
     if (n_tokens > INT_MAX / dim) {
         return 0;
     }
-    if (config->enable_qjl && (k_bits <= 1 || v_bits <= 1)) {
+    const bool qjl_streams = config->enable_qjl &&
+        qkv_bits_codebook(k_bits) && qkv_bits_codebook(v_bits) &&
+        k_bits > 1 && v_bits > 1;
+    const int k_storage_bits = qjl_streams ? k_bits - 1 : k_bits;
+    const int v_storage_bits = qjl_streams ? v_bits - 1 : v_bits;
+    if (!qkv_bits_valid(k_storage_bits) || !qkv_bits_valid(v_storage_bits)) {
         return 0;
     }
 
     // Allocate main KV storage
     // BUGFIX 406: k_packed_size overflow 방지
-    if ((size_t)n_tokens > SIZE_MAX / ((size_t)dim * (size_t)k_bits)) {
+    if ((size_t)n_tokens > SIZE_MAX / ((size_t)dim * (size_t)k_storage_bits)) {
         return 0;
     }
-    size_t k_packed_size = ((size_t)n_tokens * (size_t)dim * (size_t)k_bits + 7) / 8;
+    size_t k_packed_size = ((size_t)n_tokens * (size_t)dim * (size_t)k_storage_bits + 7) / 8;
     // BUGFIX 407: v_packed_size overflow 방지
-    if ((size_t)n_tokens > SIZE_MAX / ((size_t)dim * (size_t)v_bits)) {
+    if ((size_t)n_tokens > SIZE_MAX / ((size_t)dim * (size_t)v_storage_bits)) {
         return 0;
     }
-    size_t v_packed_size = ((size_t)n_tokens * (size_t)dim * (size_t)v_bits + 7) / 8;
+    size_t v_packed_size = ((size_t)n_tokens * (size_t)dim * (size_t)v_storage_bits + 7) / 8;
 
     state->k_idx = (uint8_t*)calloc(k_packed_size, 1);
     state->v_idx = (uint8_t*)calloc(v_packed_size, 1);
@@ -110,7 +139,7 @@ int qkv_state_init(
     }
 
     // Allocate QJL residual storage
-    if (config->enable_qjl) {
+    if (qjl_streams) {
         // BUGFIX 408: QJL 할당 크기 overflow 방지
         if ((size_t)n_tokens > SIZE_MAX / (size_t)dim) {
             qkv_state_free(state);
@@ -156,7 +185,7 @@ int qkv_state_init(
         }
     }
 
-    if (config->enable_qjl) {
+    if (qjl_streams) {
         state->qjl_signs_matrix = NULL;
         auto matrix = qkv_cached_qjl(dim, config->qjl_seed);
         // BUGFIX 410: matrix 유효성 체크 강화
@@ -171,19 +200,8 @@ int qkv_state_init(
         }
     }
 
-    state->codebook_1bit = qkv_cached_codebook(dim, 1, false)->data();
-    state->thresholds_1bit = qkv_cached_codebook(dim, 1, true)->data();
-    state->codebook_2bit = qkv_cached_codebook(dim, 2, false)->data();
-    state->thresholds_2bit = qkv_cached_codebook(dim, 2, true)->data();
-    state->codebook_3bit = qkv_cached_codebook(dim, 3, false)->data();
-    state->thresholds_3bit = qkv_cached_codebook(dim, 3, true)->data();
-    state->codebook_4bit = qkv_cached_codebook(dim, 4, false)->data();
-    state->thresholds_4bit = qkv_cached_codebook(dim, 4, true)->data();
-
-    if (!state->codebook_1bit || !state->thresholds_1bit ||
-        !state->codebook_2bit || !state->thresholds_2bit ||
-        !state->codebook_3bit || !state->thresholds_3bit ||
-        !state->codebook_4bit || !state->thresholds_4bit) {
+    if (!qkv_state_assign_codebook(state, dim, k_storage_bits) ||
+        !qkv_state_assign_codebook(state, dim, v_storage_bits)) {
         qkv_state_free(state);
         return 0;
     }
@@ -217,14 +235,17 @@ int qkv_state_init(
         int n_norm = dim - n_out;
         int out_bits = config->outlier_bits;
         int norm_bits = config->normal_bits;
-        const bool split_qjl = config->enable_qjl && out_bits > 1 && norm_bits > 1;
+        const bool split_qjl = qjl_streams &&
+            qkv_bits_codebook(out_bits) && qkv_bits_codebook(norm_bits) &&
+            out_bits > 1 && norm_bits > 1;
         const int out_storage_bits = split_qjl ? out_bits - 1 : out_bits;
         const int norm_storage_bits = split_qjl ? norm_bits - 1 : norm_bits;
 
         // BUGFIX 411: bits 범위 체크
-        if (out_bits < 1 || out_bits > 4 || norm_bits < 1 || norm_bits > 4 ||
-            out_storage_bits < 1 || out_storage_bits > 4 ||
-            norm_storage_bits < 1 || norm_storage_bits > 4) {
+        if (!qkv_bits_valid(out_bits) || !qkv_bits_valid(norm_bits) ||
+            !qkv_bits_valid(out_storage_bits) || !qkv_bits_valid(norm_storage_bits) ||
+            !qkv_state_assign_codebook(state, dim, out_storage_bits) ||
+            !qkv_state_assign_codebook(state, dim, norm_storage_bits)) {
             qkv_state_free(state);
             return 0;
         }
@@ -375,6 +396,14 @@ void qkv_state_free(qkv_state_t* state) {
         free(state->thresholds_3bit);
         free(state->codebook_4bit);
         free(state->thresholds_4bit);
+        free(state->codebook_5bit);
+        free(state->thresholds_5bit);
+        free(state->codebook_6bit);
+        free(state->thresholds_6bit);
+        free(state->codebook_7bit);
+        free(state->thresholds_7bit);
+        free(state->codebook_8bit);
+        free(state->thresholds_8bit);
     }
     free(state->scratch_qjl_signs);
     free(state->scratch_s_t_qjl);

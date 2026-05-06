@@ -53,14 +53,17 @@ static void moe_fill_check_from_offload_gguf_scan(
 static qkv_config_t moe_qkv_config_from_offload_contract(const moe_offload_gguf_contract_t& contract) {
     qkv_config_t cfg = qkv_config_default(128);
     if (contract.qkv_k_bits > 0) {
-        cfg.k_bits = (int)std::min<uint32_t>(contract.qkv_k_bits, 4);
+        cfg.k_bits = (int)((contract.qkv_k_bits <= 8 || contract.qkv_k_bits == 16 || contract.qkv_k_bits == 32)
+            ? contract.qkv_k_bits : 8);
     }
     if (contract.qkv_v_bits > 0) {
-        cfg.v_bits = (int)std::min<uint32_t>(contract.qkv_v_bits, 4);
+        cfg.v_bits = (int)((contract.qkv_v_bits <= 8 || contract.qkv_v_bits == 16 || contract.qkv_v_bits == 32)
+            ? contract.qkv_v_bits : 8);
         cfg.normal_bits = cfg.v_bits;
     }
     if (contract.qkv_normal_bits > 0) {
-        cfg.normal_bits = (int)std::min<uint32_t>(contract.qkv_normal_bits, 4);
+        cfg.normal_bits = (int)((contract.qkv_normal_bits <= 8 || contract.qkv_normal_bits == 16 || contract.qkv_normal_bits == 32)
+            ? contract.qkv_normal_bits : 8);
     }
     if (contract.qkv_group_size > 0) {
         cfg.group_size = contract.qkv_group_size;
@@ -75,6 +78,8 @@ static qkv_config_t moe_qkv_config_from_offload_contract(const moe_offload_gguf_
     cfg.qjl_seed = contract.qkv_qjl_seed;
     if (contract.qkv_enable_qjl >= 0) {
         cfg.enable_qjl = contract.qkv_enable_qjl != 0;
+    } else if (contract.qkv_required) {
+        cfg.enable_qjl = false;
     }
     if (contract.qkv_enable_rotation >= 0) {
         cfg.enable_rotation = contract.qkv_enable_rotation != 0;
@@ -83,9 +88,12 @@ static qkv_config_t moe_qkv_config_from_offload_contract(const moe_offload_gguf_
         cfg.outlier_channels = (int)contract.qkv_outlier_channels;
     }
     if (contract.qkv_outlier_bits > 0) {
-        cfg.outlier_bits = (int)std::min<uint32_t>(contract.qkv_outlier_bits, 4);
+        cfg.outlier_bits = (int)((contract.qkv_outlier_bits <= 8 || contract.qkv_outlier_bits == 16 || contract.qkv_outlier_bits == 32)
+            ? contract.qkv_outlier_bits : 8);
     }
-    if (cfg.k_bits <= 1 || cfg.v_bits <= 1) {
+    if (cfg.k_bits <= 1 || cfg.v_bits <= 1 ||
+        cfg.k_bits > 8 || cfg.v_bits > 8 ||
+        cfg.normal_bits > 8 || cfg.outlier_bits > 8) {
         cfg.enable_qjl = false;
     }
     cfg.plain_kv_persistent_storage = contract.plain_kv_persistent_allowed;

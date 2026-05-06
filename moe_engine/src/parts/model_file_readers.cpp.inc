@@ -252,8 +252,15 @@ static int moe_read_offload_gguf_file(
                     key == "offload.qkv_policy_contract") &&
                    type == moe_GGUF_TYPE_STRING) {
             consumed = 1;
-            std::string ignored;
-            moe_gguf_read_string(input, &ignored, 16ull * 1024ull * 1024ull);
+            std::string contract_json;
+            if (moe_gguf_read_string(input, &contract_json, 16ull * 1024ull * 1024ull) &&
+                !contract_json.empty()) {
+                if (!out->metadata_json.empty()) {
+                    out->metadata_json.push_back('\n');
+                }
+                out->metadata_json += contract_json;
+                out->has_metadata = true;
+            }
             out->contract.has_juju_contracts = true;
         }
         if (!consumed && !moe_gguf_skip_value(input, type)) {

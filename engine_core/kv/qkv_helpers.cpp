@@ -2,24 +2,45 @@
 #include <stddef.h>
 
 bool qkv_bits_valid(int bits) {
-    // BUGFIX 383: bits 범위 체크 강화
-    return bits >= 1 && bits <= 4;
+    return (bits >= 1 && bits <= 8) || bits == 16 || bits == 32;
+}
+
+bool qkv_bits_codebook(int bits) {
+    return bits >= 1 && bits <= 8;
+}
+
+bool qkv_bits_raw(int bits) {
+    return bits == 16 || bits == 32;
 }
 
 const float* qkv_codebook_for_bits(const qkv_state_t* state, int bits) {
-    // BUGFIX 384: state null 체크
     if (!state) return NULL;
-    return (bits == 1) ? state->codebook_1bit :
-           (bits == 2) ? state->codebook_2bit :
-           (bits == 3) ? state->codebook_3bit : state->codebook_4bit;
+    switch (bits) {
+    case 1: return state->codebook_1bit;
+    case 2: return state->codebook_2bit;
+    case 3: return state->codebook_3bit;
+    case 4: return state->codebook_4bit;
+    case 5: return state->codebook_5bit;
+    case 6: return state->codebook_6bit;
+    case 7: return state->codebook_7bit;
+    case 8: return state->codebook_8bit;
+    default: return NULL;
+    }
 }
 
 const float* qkv_thresholds_for_bits(const qkv_state_t* state, int bits) {
-    // BUGFIX 385: state null 체크
     if (!state) return NULL;
-    return (bits == 1) ? state->thresholds_1bit :
-           (bits == 2) ? state->thresholds_2bit :
-           (bits == 3) ? state->thresholds_3bit : state->thresholds_4bit;
+    switch (bits) {
+    case 1: return state->thresholds_1bit;
+    case 2: return state->thresholds_2bit;
+    case 3: return state->thresholds_3bit;
+    case 4: return state->thresholds_4bit;
+    case 5: return state->thresholds_5bit;
+    case 6: return state->thresholds_6bit;
+    case 7: return state->thresholds_7bit;
+    case 8: return state->thresholds_8bit;
+    default: return NULL;
+    }
 }
 
 int qkv_target_from_buffers(const qkv_state_t* state, const uint8_t* idx, const float* norms) {

@@ -7,6 +7,19 @@
 #include <math.h>
 #include <climits>
 
+static void qkv_store_raw_vector(uint8_t* output, const float* src, int dim, int bits) {
+    if (!output || !src || dim <= 0) return;
+    if (bits == 16) {
+        for (int i = 0; i < dim; ++i) {
+            const uint16_t h = qkv_float_to_fp16_bits(src[i]);
+            output[(size_t)i * 2u] = (uint8_t)(h & 0xffu);
+            output[(size_t)i * 2u + 1u] = (uint8_t)((h >> 8) & 0xffu);
+        }
+    } else if (bits == 32) {
+        memcpy(output, src, (size_t)dim * sizeof(float));
+    }
+}
+
 int qkv_quantize_vector_with_state(
     const qkv_state_t* state,
     const qkv_config_t* config,
@@ -90,14 +103,20 @@ int qkv_quantize_vector_with_state(
         src = rotated;
     }
 
+    if (qkv_bits_raw(bits)) {
+        qkv_store_raw_vector(output, src, dim, bits);
+        return 1;
+    }
+
     // Step 4: Lloyd-Max codebook quantization
+    if (!qkv_bits_codebook(bits)) return 0;
     const float* centroids_s = qkv_codebook_for_bits(state, bits);
     const float* thresholds_s = qkv_thresholds_for_bits(state, bits);
     // BUGFIX 485: centroids/thresholds null 체크
     if (!centroids_s || !thresholds_s) return 0;
     const int n_levels = 1 << bits;
     // BUGFIX 486: n_levels 범위 체크
-    if (n_levels <= 0 || n_levels > 16) return 0;
+    if (n_levels <= 0 || n_levels > 256) return 0;
 
     for (int i = 0; i < dim; ++i) {
         indices[i] = qkv_find_nearest_centroid(src[i], centroids_s, thresholds_s, n_levels);

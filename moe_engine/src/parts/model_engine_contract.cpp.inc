@@ -44,17 +44,28 @@ static int moe_engine_load_offload_gguf_contract(
         engine->qkv_forced_by_format.store(1, std::memory_order_relaxed);
         engine->config.kv_mode = moe_KV_MODE_QKV;
         qkv_set_mode(true);
+    } else {
+        qkv_set_mode(engine->config.kv_mode == moe_KV_MODE_QKV);
     }
     moe_engine_apply_juju_strategy(engine, scan, primary.contract);
     std::fprintf(stderr,
-        "[storagellm] offload %s contract loaded: files=%u first=%s qkv=%s weight=%s/%ub catalog=%u\n",
+        "[storagellm] offload %s contract loaded: files=%u first=%s qkv=%s k_bits=%d v_bits=%d normal_bits=%d outlier_bits=%d group=%u page=%u qjl=%d rotation=%d weight=%s/%ub catalog=%u plain_kv=%d\n",
         scan.juju_format ? "JUJU" : "GGUF",
         scan.expected_count,
         primary.path.c_str(),
-        qkv_required ? "required" : "available",
+        qkv_required ? "required" : "absent",
+        engine->offload_qkv_cfg.k_bits,
+        engine->offload_qkv_cfg.v_bits,
+        engine->offload_qkv_cfg.normal_bits,
+        engine->offload_qkv_cfg.outlier_bits,
+        engine->offload_qkv_cfg.group_size,
+        engine->offload_qkv_cfg.page_size_tokens,
+        engine->offload_qkv_cfg.enable_qjl ? 1 : 0,
+        engine->offload_qkv_cfg.enable_rotation ? 1 : 0,
         primary.contract.weight_quant_family.empty() ? "unknown" : primary.contract.weight_quant_family.c_str(),
         primary.contract.weight_bits,
-        primary.contract.optimization_catalog_count);
+        primary.contract.optimization_catalog_count,
+        primary.contract.plain_kv_persistent_allowed ? 1 : 0);
     std::fflush(stderr);
     return 1;
 }

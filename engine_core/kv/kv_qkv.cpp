@@ -51,6 +51,17 @@ static void fwht_inplace(float* data, int dim) {
     }
 }
 
+static void qkv_store_raw_scalar(uint8_t* dst, int index, float value, int bits) {
+    if (!dst || index < 0) return;
+    if (bits == 16) {
+        const uint16_t h = qkv_float_to_fp16_bits(value);
+        dst[(size_t)index * 2u] = (uint8_t)(h & 0xffu);
+        dst[(size_t)index * 2u + 1u] = (uint8_t)((h >> 8) & 0xffu);
+    } else if (bits == 32) {
+        memcpy(dst + (size_t)index * sizeof(float), &value, sizeof(float));
+    }
+}
+
 // ============================================================
 // Public API - State Management
 // ============================================================
@@ -72,8 +83,9 @@ void qkv_free(qkv_state_t* state) {
 // ============================================================
 
 static int qkv_mse_bits_for_total_bits(int bits, bool use_qjl) {
+    if (qkv_bits_raw(bits)) return bits;
     const int mse_bits = use_qjl ? bits - 1 : bits;
-    return qkv_bits_valid(mse_bits) ? mse_bits : 0;
+    return qkv_bits_codebook(mse_bits) ? mse_bits : 0;
 }
 
 static int qkv_quantize_split_vector_with_state(
@@ -93,7 +105,8 @@ static int qkv_quantize_split_vector_with_state(
     const int dim = config->head_dim;
     const int n_out = config->outlier_channels;
     const int n_norm = dim - n_out;
-    const bool use_qjl = config->enable_qjl && qjl_base && residual_norms && state->qjl_matrix;
+    const bool use_qjl = config->enable_qjl && qjl_base && residual_norms && state->qjl_matrix &&
+        qkv_bits_codebook(config->outlier_bits) && qkv_bits_codebook(config->normal_bits);
     const int out_mse_bits = qkv_mse_bits_for_total_bits(config->outlier_bits, use_qjl);
     const int norm_mse_bits = qkv_mse_bits_for_total_bits(config->normal_bits, use_qjl);
     if (dim <= 0 || dim > 16384 || n_out <= 0 || n_out >= dim || n_norm <= 0 ||
@@ -228,18 +241,26 @@ static int qkv_quantize_split_vector_with_state(
         }
     }
 
-    const float* out_centroids = qkv_codebook_for_bits(state, out_mse_bits);
-    const float* out_thresholds = qkv_thresholds_for_bits(state, out_mse_bits);
-    const float* norm_centroids = qkv_codebook_for_bits(state, norm_mse_bits);
-    const float* norm_thresholds = qkv_thresholds_for_bits(state, norm_mse_bits);
-    if (!out_centroids || !out_thresholds || !norm_centroids || !norm_thresholds) {
+    const bool out_raw = qkv_bits_raw(out_mse_bits);
+    const bool norm_raw = qkv_bits_raw(norm_mse_bits);
+    const float* out_centroids = out_raw ? nullptr : qkv_codebook_for_bits(state, out_mse_bits);
+    const float* out_thresholds = out_raw ? nullptr : qkv_thresholds_for_bits(state, out_mse_bits);
+    const float* norm_centroids = norm_raw ? nullptr : qkv_codebook_for_bits(state, norm_mse_bits);
+    const float* norm_thresholds = norm_raw ? nullptr : qkv_thresholds_for_bits(state, norm_mse_bits);
+    if ((!out_raw && (!out_centroids || !out_thresholds)) ||
+        (!norm_raw && (!norm_centroids || !norm_thresholds))) {
         return 0;
     }
-    const int out_levels = 1 << out_mse_bits;
-    const int norm_levels = 1 << norm_mse_bits;
+    const int out_levels = out_raw ? 0 : (1 << out_mse_bits);
+    const int norm_levels = norm_raw ? 0 : (1 << norm_mse_bits);
     for (int i = 0; i < n_out; ++i) {
         const int ch = outlier_channels[i];
         if (ch < 0 || ch >= dim) return 0;
+        if (out_raw) {
+            qkv_store_raw_scalar(out_dst, i, src[ch], out_mse_bits);
+            y_tilde[ch] = src[ch];
+            continue;
+        }
         const int code = qkv_find_nearest_centroid(src[ch], out_centroids, out_thresholds, out_levels);
         // BUGFIX 655: Validate centroid index before array access ★★★
         // Problem: qkv_find_nearest_centroid may return invalid index due to numerical issues
@@ -249,13 +270,21 @@ static int qkv_quantize_split_vector_with_state(
         indices[i] = code;
         y_tilde[ch] = out_centroids[code];
     }
-    qkv_pack_indices(indices, out_dst, n_out, out_mse_bits);
+    if (!out_raw) {
+        qkv_pack_indices(indices, out_dst, n_out, out_mse_bits);
+    }
 
     int normal_pos = 0;
     for (int ch = 0; ch < dim; ++ch) {
         if (is_outlier[ch]) continue;
         if (normal_pos >= n_norm) {
             return 0;
+        }
+        if (norm_raw) {
+            qkv_store_raw_scalar(norm_dst, normal_pos, src[ch], norm_mse_bits);
+            y_tilde[ch] = src[ch];
+            ++normal_pos;
+            continue;
         }
         const int code = qkv_find_nearest_centroid(src[ch], norm_centroids, norm_thresholds, norm_levels);
         // BUGFIX 655: Validate centroid index before array access ★★★
@@ -266,7 +295,9 @@ static int qkv_quantize_split_vector_with_state(
     if (normal_pos != n_norm) {
         return 0;
     }
-    qkv_pack_indices(indices, norm_dst, n_norm, norm_mse_bits);
+    if (!norm_raw) {
+        qkv_pack_indices(indices, norm_dst, n_norm, norm_mse_bits);
+    }
 
     if (config->enable_rotation && state->rotation_matrix) {
         // BUGFIX 911: Optimize rotation matrix access pattern (location 1/3) ★★ PERFORMANCE
@@ -361,7 +392,9 @@ int qkv_quantize(
     if (dim <= 0 || dim > 16384) {
         return 0;
     }
-    const bool use_qjl = config->enable_qjl;
+    const bool use_qjl = config->enable_qjl && state->k_qjl && state->v_qjl &&
+        qkv_bits_codebook(state->k_bits) && qkv_bits_codebook(state->v_bits) &&
+        state->k_bits > 1 && state->v_bits > 1;
     const int k_mse_bits = use_qjl ? state->k_bits - 1 : state->k_bits;
     const int v_mse_bits = use_qjl ? state->v_bits - 1 : state->v_bits;
     if (!qkv_bits_valid(k_mse_bits) || !qkv_bits_valid(v_mse_bits)) {
@@ -795,7 +828,8 @@ int qkv_dequantize(
     if (dim <= 0 || dim > 16384) {
         return 0;
     }
-    bool use_qjl = config->enable_qjl && state->k_qjl && state->v_qjl;
+    bool use_qjl = config->enable_qjl && state->k_qjl && state->v_qjl &&
+        qkv_bits_codebook(state->k_bits) && qkv_bits_codebook(state->v_bits);
     if (use_qjl && (state->k_bits <= 1 || state->v_bits <= 1)) {
         use_qjl = false;
     }

@@ -13,8 +13,35 @@
 #endif
 
 static int qkv_mse_bits_for_total_bits_dequant(int bits, bool use_qjl) {
+    if (qkv_bits_raw(bits)) return bits;
     const int mse_bits = use_qjl ? bits - 1 : bits;
-    return qkv_bits_valid(mse_bits) ? mse_bits : 0;
+    return qkv_bits_codebook(mse_bits) ? mse_bits : 0;
+}
+
+static float qkv_load_raw_scalar(const uint8_t* src, int index, int bits) {
+    if (!src || index < 0) return 0.0f;
+    if (bits == 16) {
+        const uint16_t h = (uint16_t)src[(size_t)index * 2u] |
+            ((uint16_t)src[(size_t)index * 2u + 1u] << 8);
+        return qkv_fp16_bits_to_float(h);
+    }
+    if (bits == 32) {
+        float out = 0.0f;
+        memcpy(&out, src + (size_t)index * sizeof(float), sizeof(float));
+        return out;
+    }
+    return 0.0f;
+}
+
+static void qkv_load_raw_vector(const uint8_t* src, float* dst, int dim, int bits) {
+    if (!src || !dst || dim <= 0) return;
+    if (bits == 32) {
+        memcpy(dst, src, (size_t)dim * sizeof(float));
+        return;
+    }
+    for (int i = 0; i < dim; ++i) {
+        dst[i] = qkv_load_raw_scalar(src, i, bits);
+    }
 }
 
 static int qkv_dequant_one_split(
@@ -58,39 +85,55 @@ static int qkv_dequant_one_split(
         token_idx > INT_MAX / std::max(out_stride, norm_stride)) {
         return 0;
     }
-    const float* out_centroids = qkv_codebook_for_bits(s, out_mse_bits);
-    const float* norm_centroids = qkv_codebook_for_bits(s, norm_mse_bits);
-    if (!out_centroids || !norm_centroids) {
+    const bool out_raw = qkv_bits_raw(out_mse_bits);
+    const bool norm_raw = qkv_bits_raw(norm_mse_bits);
+    const float* out_centroids = out_raw ? nullptr : qkv_codebook_for_bits(s, out_mse_bits);
+    const float* norm_centroids = norm_raw ? nullptr : qkv_codebook_for_bits(s, norm_mse_bits);
+    if ((!out_raw && !out_centroids) || (!norm_raw && !norm_centroids)) {
         return 0;
     }
 
     int* indices = s->scratch_indices;
     float* y_tilde = s->scratch_y_tilde;
     float* x_tilde = s->scratch_x_tilde;
-    const int out_levels = 1 << out_mse_bits;
-    const int norm_levels = 1 << norm_mse_bits;
+    const int out_levels = out_raw ? 0 : (1 << out_mse_bits);
+    const int norm_levels = norm_raw ? 0 : (1 << norm_mse_bits);
 
-    qkv_unpack_indices(split_outlier + (size_t)token_idx * (size_t)out_stride,
-        indices, n_out, out_mse_bits);
+    const uint8_t* out_src = split_outlier + (size_t)token_idx * (size_t)out_stride;
+    if (!out_raw) {
+        qkv_unpack_indices(out_src, indices, n_out, out_mse_bits);
+    }
     for (int i = 0; i < n_out; ++i) {
         const int channel = outlier_channels[i];
-        if (channel < 0 || channel >= d || indices[i] < 0 || indices[i] >= out_levels) {
+        if (channel < 0 || channel >= d) {
             return 0;
         }
-        y_tilde[channel] = out_centroids[indices[i]];
+        if (out_raw) {
+            y_tilde[channel] = qkv_load_raw_scalar(out_src, i, out_mse_bits);
+        } else {
+            if (indices[i] < 0 || indices[i] >= out_levels) return 0;
+            y_tilde[channel] = out_centroids[indices[i]];
+        }
     }
 
-    qkv_unpack_indices(split_normal + (size_t)token_idx * (size_t)norm_stride,
-        indices, n_norm, norm_mse_bits);
+    const uint8_t* norm_src = split_normal + (size_t)token_idx * (size_t)norm_stride;
+    if (!norm_raw) {
+        qkv_unpack_indices(norm_src, indices, n_norm, norm_mse_bits);
+    }
     int normal_pos = 0;
     for (int i = 0; i < d; ++i) {
         if (is_outlier[i]) {
             continue;
         }
-        if (normal_pos >= n_norm || indices[normal_pos] < 0 || indices[normal_pos] >= norm_levels) {
+        if (normal_pos >= n_norm) {
             return 0;
         }
-        y_tilde[i] = norm_centroids[indices[normal_pos++]];
+        if (norm_raw) {
+            y_tilde[i] = qkv_load_raw_scalar(norm_src, normal_pos++, norm_mse_bits);
+        } else {
+            if (indices[normal_pos] < 0 || indices[normal_pos] >= norm_levels) return 0;
+            y_tilde[i] = norm_centroids[indices[normal_pos++]];
+        }
     }
     if (normal_pos != n_norm) {
         return 0;
@@ -217,7 +260,10 @@ int qkv_dequant_one(
     float* y_tilde = s->scratch_y_tilde;
     if (!indices || !y_tilde) return 0;
 
-    qkv_unpack_indices(tidx, indices, d, mse_bits);
+    if (qkv_bits_raw(mse_bits)) {
+        qkv_load_raw_vector(tidx, y_tilde, d, mse_bits);
+    } else {
+        qkv_unpack_indices(tidx, indices, d, mse_bits);
 
     // Step 4: Lookup centroids (in rotated space)
     const float* centroids = qkv_codebook_for_bits(s, mse_bits);
@@ -228,6 +274,7 @@ int qkv_dequant_one(
         // BUGFIX 484: indices 범위 체크
         if (indices[i] < 0 || indices[i] >= max_idx) return 0;
         y_tilde[i] = centroids[indices[i]];
+    }
     }
 
     // Step 3: Apply inverse rotation Pi^T
@@ -348,7 +395,9 @@ int qkv_dot_mse_split_rotated_token(
     // BUGFIX 378: outlier_channels 범위 체크
     if (n_out < 0 || n_out > d) return 0;
     const int n_norm = d - n_out;
-    const bool use_qjl = cfg->enable_qjl && s->k_qjl && s->v_qjl && s->k_bits > 1 && s->v_bits > 1;
+    const bool use_qjl = cfg->enable_qjl && s->k_qjl && s->v_qjl &&
+        qkv_bits_codebook(cfg->outlier_bits) && qkv_bits_codebook(cfg->normal_bits) &&
+        s->k_bits > 1 && s->v_bits > 1;
     const int out_bits = qkv_mse_bits_for_total_bits_dequant(cfg->outlier_bits, use_qjl);
     const int norm_bits = qkv_mse_bits_for_total_bits_dequant(cfg->normal_bits, use_qjl);
     if (!out_bits || !norm_bits) return 0;
@@ -362,8 +411,11 @@ int qkv_dot_mse_split_rotated_token(
         return 0;
     }
 
-    const float* out_centroids = qkv_codebook_for_bits(s, out_bits);
-    const float* norm_centroids = qkv_codebook_for_bits(s, norm_bits);
+    const bool out_raw = qkv_bits_raw(out_bits);
+    const bool norm_raw = qkv_bits_raw(norm_bits);
+    const float* out_centroids = out_raw ? nullptr : qkv_codebook_for_bits(s, out_bits);
+    const float* norm_centroids = norm_raw ? nullptr : qkv_codebook_for_bits(s, norm_bits);
+    if ((!out_raw && !out_centroids) || (!norm_raw && !norm_centroids)) return 0;
 
     // BUGFIX 379: packed_size overflow 방지
     if (n_out > INT_MAX / out_bits || n_norm > INT_MAX / norm_bits) {
@@ -382,11 +434,15 @@ int qkv_dot_mse_split_rotated_token(
     if (token_idx < 0 || (out_packed_size > 0 && token_idx > INT_MAX / out_packed_size)) {
         return 0;
     }
-    qkv_unpack_indices(split_outlier + (size_t)token_idx * (size_t)out_packed_size, indices, n_out, out_bits);
+    const uint8_t* out_src = split_outlier + (size_t)token_idx * (size_t)out_packed_size;
+    if (!out_raw) {
+        qkv_unpack_indices(out_src, indices, n_out, out_bits);
+    }
     for (int i = 0; i < n_out; i++) {
         const int channel = outlier_channels[i];
         if (channel < 0 || channel >= d) return 0;
-        float term = q_rotated[channel] * out_centroids[indices[i]];
+        const float kv = out_raw ? qkv_load_raw_scalar(out_src, i, out_bits) : out_centroids[indices[i]];
+        float term = q_rotated[channel] * kv;
         // BUGFIX 737: Check dot product term for NaN/Inf (outlier) ★★
         if (std::isfinite(term)) {
             dot += term;
@@ -398,13 +454,19 @@ int qkv_dot_mse_split_rotated_token(
     if (norm_packed_size > 0 && token_idx > INT_MAX / norm_packed_size) {
         return 0;
     }
-    qkv_unpack_indices(split_normal + (size_t)token_idx * (size_t)norm_packed_size, indices, n_norm, norm_bits);
+    const uint8_t* norm_src = split_normal + (size_t)token_idx * (size_t)norm_packed_size;
+    if (!norm_raw) {
+        qkv_unpack_indices(norm_src, indices, n_norm, norm_bits);
+    }
     int normal_pos = 0;
     for (int i = 0; i < d; i++) {
         if (is_outlier[i]) continue;
         // BUGFIX 382: normal_pos 범위 체크
         if (normal_pos >= n_norm) return 0;
-        float term = q_rotated[i] * norm_centroids[indices[normal_pos++]];
+        const float kv = norm_raw ? qkv_load_raw_scalar(norm_src, normal_pos, norm_bits) :
+            norm_centroids[indices[normal_pos]];
+        ++normal_pos;
+        float term = q_rotated[i] * kv;
         // BUGFIX 738: Check dot product term for NaN/Inf (normal) ★★
         if (std::isfinite(term)) {
             dot += term;

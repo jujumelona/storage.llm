@@ -21,7 +21,7 @@ moe_pc_engine_t* moe_pc_engine_create(const moe_pc_engine_config_t* config) {
     device_allocator_init(engine);
     apply_common_vram_reservation(engine);
     moe_pc_engine_configure_io(engine, nullptr);
-    engine->last_dropped_requests_snapshot = engine->io_atomic.dropped_requests.load(std::memory_order_relaxed);
+    engine->last_dropped_requests_snapshot.store(engine->io_atomic.dropped_requests.load(std::memory_order_relaxed), std::memory_order_relaxed);
     ensure_cpu_row_workers(engine, 0);
     device_stream_pool_init(engine);
     return engine;
@@ -34,6 +34,8 @@ void moe_pc_engine_destroy(moe_pc_engine_t* engine) {
     if (!engine->topology_path.empty()) {
         moe_pc_engine_save_topology(engine, nullptr);
     }
+    // BUGFIX 971: Persist EMA residency stats on shutdown (atomic write-back)
+    flush_residency_ema_to_idx(engine);
     stop_cpu_row_workers(engine);
     stop_io_workers(engine);
     for (size_t i = 0; i < engine->qkv_head_state_slots.size(); ++i) {
@@ -44,6 +46,9 @@ void moe_pc_engine_destroy(moe_pc_engine_t* engine) {
     engine->qkv_head_state_slots.clear();
     engine->qkv_head_state_valid.clear();
     engine->qkv_head_state_locks.clear();
+    engine->qkv_head_state_layers.clear();
+    engine->qkv_head_state_heads.clear();
+    engine->qkv_head_state_fingerprints.clear();
     device_stream_pool_destroy(engine);
     device_allocator_shutdown(engine);
     model_lib_unload(engine);
@@ -73,6 +78,18 @@ void moe_pc_engine_destroy(moe_pc_engine_t* engine) {
     // Bug 13 Fix: Call reset_staging_slots BEFORE free_staging to prevent use-after-free.
     // Workers may still reference staging_slots[i].buf in 5ms race window.
     // reset_staging_slots clears in_use flags and waits for workers to exit.
+    // BUGFIX 988: Drain orphaned_events on shutdown ★★ IMPORTANT
+    // Problem: orphaned_events only drained in release_staging_slot.
+    // If workers terminated via exception (no slot return), orphaned_events
+    // accumulate permanently → CUDA event handle leak until process exit.
+    // Solution: Drain all orphaned events before reset to prevent driver handle leak.
+    {
+        std::lock_guard<std::mutex> orphan_lock(engine->orphaned_events_mutex);
+        for (CUevent ev : engine->orphaned_events) {
+            device_backend_event_destroy(engine, ev);
+        }
+        engine->orphaned_events.clear();
+    }
     reset_staging_slots(engine);
     free_staging_for_engine(engine, engine->staging, engine->staging_size, engine->staging_pinned,
                             engine->staging_numa_allocated, engine->staging_device_host_allocated);

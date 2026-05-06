@@ -138,6 +138,14 @@ typedef struct {
     float* thresholds_3bit;
     float* codebook_4bit;     // 4-bit support: 16 levels
     float* thresholds_4bit;
+    float* codebook_5bit;
+    float* thresholds_5bit;
+    float* codebook_6bit;
+    float* thresholds_6bit;
+    float* codebook_7bit;
+    float* thresholds_7bit;
+    float* codebook_8bit;
+    float* thresholds_8bit;
     int owns_rotation_matrix;
     int owns_qjl_matrix;
     int owns_codebooks;

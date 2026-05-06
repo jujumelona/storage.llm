@@ -2,26 +2,32 @@
 
 // GAP 1A: Quantize plain float K/V into persistent per-head qkv_state_t
 // Called once per head when context changes; state persists across decode calls
-static void moe_qkv_ensure_head_storage_locked(moe_pc_engine* engine, size_t head_count) {
-    if (!engine || head_count == 0) {
+static void moe_qkv_ensure_head_storage_locked(moe_pc_engine* engine, size_t slot_count) {
+    if (!engine || slot_count == 0) {
         return;
     }
-    // BUGFIX 618: Fix return type mismatch - function returns void, not int ★
-    // Problem: Function declared as void but has "return 0;" statement
-    // Solution: Remove return value from range check
-    if (head_count > 10000) {
+    if (slot_count > 1000000) {
         return;
     }
-    if (engine->qkv_head_state_slots.size() < head_count) {
-        engine->qkv_head_state_slots.resize(head_count);
+    if (engine->qkv_head_state_slots.size() < slot_count) {
+        engine->qkv_head_state_slots.resize(slot_count);
     }
-    if (engine->qkv_head_state_valid.size() < head_count) {
-        engine->qkv_head_state_valid.resize(head_count, 0);
+    if (engine->qkv_head_state_valid.size() < slot_count) {
+        engine->qkv_head_state_valid.resize(slot_count, 0);
     }
-    if (engine->qkv_head_state_locks.size() < head_count) {
-        engine->qkv_head_state_locks.resize(head_count);
+    if (engine->qkv_head_state_locks.size() < slot_count) {
+        engine->qkv_head_state_locks.resize(slot_count);
     }
-    for (size_t i = 0; i < head_count; ++i) {
+    if (engine->qkv_head_state_layers.size() < slot_count) {
+        engine->qkv_head_state_layers.resize(slot_count, UINT32_MAX);
+    }
+    if (engine->qkv_head_state_heads.size() < slot_count) {
+        engine->qkv_head_state_heads.resize(slot_count, UINT32_MAX);
+    }
+    if (engine->qkv_head_state_fingerprints.size() < slot_count) {
+        engine->qkv_head_state_fingerprints.resize(slot_count, 0);
+    }
+    for (size_t i = 0; i < slot_count; ++i) {
         if (!engine->qkv_head_state_locks[i]) {
             engine->qkv_head_state_locks[i] = std::make_unique<std::mutex>();
         }
@@ -40,6 +46,9 @@ static void moe_qkv_free_head_states_locked(moe_pc_engine* engine) {
     engine->qkv_head_state_slots.clear();
     engine->qkv_head_state_valid.clear();
     engine->qkv_head_state_locks.clear();
+    engine->qkv_head_state_layers.clear();
+    engine->qkv_head_state_heads.clear();
+    engine->qkv_head_state_fingerprints.clear();
     engine->qkv_last_ctx = 0;
 }
 
@@ -130,16 +139,226 @@ static void moe_qkv_apply_contract_config_locked(
 
 static int moe_qkv_prepare_head_states(
     moe_pc_engine* engine,
-    uint32_t head_count,
+    uint32_t slot_count,
     uint32_t head_dim
 ) {
-    if (!engine || head_count == 0 || head_dim == 0) {
+    if (!engine || slot_count == 0 || head_dim == 0) {
         return 0;
     }
     std::lock_guard<std::mutex> lock(engine->qkv_mutex);
     moe_qkv_apply_contract_config_locked(engine, head_dim);
-    moe_qkv_ensure_head_storage_locked(engine, head_count);
+    moe_qkv_ensure_head_storage_locked(engine, slot_count);
     return 1;
+}
+
+static int moe_qkv_slot_index(
+    uint32_t layer,
+    uint32_t head,
+    uint32_t head_stride,
+    size_t* out_slot
+) {
+    if (!out_slot || head_stride == 0 || head >= head_stride) {
+        return 0;
+    }
+    if ((uint64_t)layer > (UINT64_MAX - (uint64_t)head) / (uint64_t)head_stride) {
+        return 0;
+    }
+    const uint64_t slot = (uint64_t)layer * (uint64_t)head_stride + (uint64_t)head;
+    if (slot > (uint64_t)SIZE_MAX) {
+        return 0;
+    }
+    *out_slot = (size_t)slot;
+    return 1;
+}
+
+static qkv_state_t* moe_qkv_ensure_layer_head_state_locked(
+    moe_pc_engine* engine,
+    uint32_t layer,
+    uint32_t head,
+    uint32_t head_stride,
+    uint32_t capacity_tokens,
+    uint32_t head_dim,
+    size_t* out_slot_index
+) {
+    if (!engine || head_stride == 0 || capacity_tokens == 0 || head_dim == 0) {
+        return nullptr;
+    }
+    size_t slot_index = 0;
+    if (!moe_qkv_slot_index(layer, head, head_stride, &slot_index)) {
+        return nullptr;
+    }
+    const size_t slot_count = slot_index + 1u;
+    {
+        std::lock_guard<std::mutex> lock(engine->qkv_mutex);
+        moe_qkv_apply_contract_config_locked(engine, head_dim);
+        moe_qkv_ensure_head_storage_locked(engine, slot_count);
+    }
+    if (slot_index >= engine->qkv_head_state_locks.size() ||
+        !engine->qkv_head_state_locks[slot_index]) {
+        return nullptr;
+    }
+    if (out_slot_index) {
+        *out_slot_index = slot_index;
+    }
+    qkv_state_t* slot = &engine->qkv_head_state_slots[slot_index];
+    const int valid =
+        slot_index < engine->qkv_head_state_valid.size() &&
+        engine->qkv_head_state_valid[slot_index] &&
+        slot->head_dim == (int)head_dim &&
+        slot->n_tokens >= (int)capacity_tokens &&
+        slot_index < engine->qkv_head_state_layers.size() &&
+        slot_index < engine->qkv_head_state_heads.size() &&
+        engine->qkv_head_state_layers[slot_index] == layer &&
+        engine->qkv_head_state_heads[slot_index] == head;
+    if (valid) {
+        return slot;
+    }
+    if (slot_index < engine->qkv_head_state_valid.size() &&
+        engine->qkv_head_state_valid[slot_index]) {
+        qkv_free(slot);
+        *slot = qkv_state_t{};
+        engine->qkv_head_state_valid[slot_index] = 0;
+    }
+    qkv_state_t st{};
+    if (capacity_tokens > (uint32_t)std::numeric_limits<int>::max() ||
+        !qkv_init(&st, &engine->qkv_cfg, (int)capacity_tokens)) {
+        return nullptr;
+    }
+    *slot = st;
+    engine->qkv_head_state_valid[slot_index] = 1;
+    engine->qkv_head_state_layers[slot_index] = layer;
+    engine->qkv_head_state_heads[slot_index] = head;
+    engine->qkv_head_state_fingerprints[slot_index] = 0;
+    return slot;
+}
+
+static int moe_qkv_quantize_current_token_mse(
+    qkv_state_t* slot,
+    const qkv_config_t* cfg,
+    const float* key,
+    const float* value,
+    uint32_t token_index,
+    uint32_t head_dim
+) {
+    if (!slot || !cfg || !key || !value || head_dim == 0 ||
+        token_index >= (uint32_t)std::max(slot->n_tokens, 0)) {
+        return 0;
+    }
+    const int dim = (int)head_dim;
+    const int k_bits = cfg->enable_qjl ? slot->k_bits - 1 : slot->k_bits;
+    const int v_bits = cfg->enable_qjl ? slot->v_bits - 1 : slot->v_bits;
+    if (!qkv_bits_valid(k_bits) || !qkv_bits_valid(v_bits)) {
+        return 0;
+    }
+    const size_t k_stride = ((size_t)dim * (size_t)k_bits + 7u) / 8u;
+    const size_t v_stride = ((size_t)dim * (size_t)v_bits + 7u) / 8u;
+    if (!slot->k_idx || !slot->v_idx || !slot->k_norms || !slot->v_norms) {
+        return 0;
+    }
+    uint8_t* k_out = slot->k_idx + (size_t)token_index * k_stride;
+    uint8_t* v_out = slot->v_idx + (size_t)token_index * v_stride;
+    if (!qkv_quantize_vector_with_state(
+            slot, cfg, key, k_out, &slot->k_norms[token_index], dim, k_bits) ||
+        !qkv_quantize_vector_with_state(
+            slot, cfg, value, v_out, &slot->v_norms[token_index], dim, v_bits)) {
+        return 0;
+    }
+    if (cfg->enable_qjl) {
+        const size_t qjl_stride = ((size_t)dim + 7u) / 8u;
+        if (slot->k_qjl && slot->k_residual_norms) {
+            std::memset(slot->k_qjl + (size_t)token_index * qjl_stride, 0, qjl_stride);
+            slot->k_residual_norms[token_index] = 0.0f;
+        }
+        if (slot->v_qjl && slot->v_residual_norms) {
+            std::memset(slot->v_qjl + (size_t)token_index * qjl_stride, 0, qjl_stride);
+            slot->v_residual_norms[token_index] = 0.0f;
+        }
+    }
+    return 1;
+}
+
+static int moe_qkv_append_layer_head_token(
+    moe_pc_engine* engine,
+    uint32_t layer,
+    uint32_t head,
+    uint32_t head_stride,
+    uint32_t capacity_tokens,
+    uint32_t context_tokens,
+    uint32_t head_dim,
+    const float* key,
+    const float* value
+) {
+    if (!engine || !key || !value || context_tokens == 0 || capacity_tokens < context_tokens) {
+        return 0;
+    }
+    size_t slot_index = 0;
+    qkv_state_t* slot = moe_qkv_ensure_layer_head_state_locked(
+        engine, layer, head, head_stride, capacity_tokens, head_dim, &slot_index);
+    if (!slot || slot_index >= engine->qkv_head_state_locks.size() ||
+        !engine->qkv_head_state_locks[slot_index]) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> head_guard(*engine->qkv_head_state_locks[slot_index]);
+    slot = moe_qkv_ensure_layer_head_state_locked(
+        engine, layer, head, head_stride, capacity_tokens, head_dim, &slot_index);
+    if (!slot) {
+        return 0;
+    }
+    const uint32_t token_index = context_tokens - 1u;
+    if (!moe_qkv_quantize_current_token_mse(
+            slot, &engine->qkv_cfg, key, value, token_index, head_dim)) {
+        return 0;
+    }
+    if (slot_index < engine->qkv_head_state_fingerprints.size()) {
+        engine->qkv_head_state_fingerprints[slot_index] =
+            ((uint64_t)layer << 48) ^ ((uint64_t)head << 32) ^ (uint64_t)context_tokens;
+    }
+    return 1;
+}
+
+static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
+    moe_pc_engine_t* engine,
+    uint32_t layer,
+    uint32_t kv_head,
+    uint32_t head_stride,
+    const float* query,
+    uint32_t context_tokens,
+    uint32_t capacity_tokens,
+    uint32_t head_dim,
+    float score_scale,
+    float* output
+) {
+    if (!engine || !query || !output || context_tokens == 0 || capacity_tokens < context_tokens || head_dim == 0) {
+        return 0;
+    }
+    size_t slot_index = 0;
+    qkv_state_t* slot = moe_qkv_ensure_layer_head_state_locked(
+        engine, layer, kv_head, head_stride, capacity_tokens, head_dim, &slot_index);
+    if (!slot || slot_index >= engine->qkv_head_state_locks.size() ||
+        !engine->qkv_head_state_locks[slot_index]) {
+        return 0;
+    }
+    static thread_local std::vector<float> qkv_scaled_query;
+    const float internal_scale = 1.0f / std::sqrt((float)head_dim);
+    const float multiplier = internal_scale > 0.0f ? score_scale / internal_scale : 1.0f;
+    const float* q = query;
+    if (std::isfinite(multiplier) && std::fabs(multiplier - 1.0f) > 1e-6f) {
+        qkv_scaled_query.resize(head_dim);
+        for (uint32_t i = 0; i < head_dim; ++i) {
+            qkv_scaled_query[i] = query[i] * multiplier;
+        }
+        q = qkv_scaled_query.data();
+    } else if (!std::isfinite(multiplier)) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> head_guard(*engine->qkv_head_state_locks[slot_index]);
+    slot = &engine->qkv_head_state_slots[slot_index];
+    if (slot_index >= engine->qkv_head_state_valid.size() ||
+        !engine->qkv_head_state_valid[slot_index] ||
+        slot->n_tokens < (int)context_tokens) {
+        return 0;
+    }
+    return qkv_attention_decode(q, slot, &engine->qkv_cfg, context_tokens, head_dim, output);
 }
 
 static qkv_state_t* moe_qkv_ensure_head_state(

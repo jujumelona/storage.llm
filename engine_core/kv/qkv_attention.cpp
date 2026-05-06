@@ -14,6 +14,21 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+static float qkv_attention_load_raw_scalar(const uint8_t* src, int index, int bits) {
+    if (!src || index < 0) return 0.0f;
+    if (bits == 16) {
+        const uint16_t h = (uint16_t)src[(size_t)index * 2u] |
+            ((uint16_t)src[(size_t)index * 2u + 1u] << 8);
+        return qkv_fp16_bits_to_float(h);
+    }
+    if (bits == 32) {
+        float out = 0.0f;
+        memcpy(&out, src + (size_t)index * sizeof(float), sizeof(float));
+        return out;
+    }
+    return 0.0f;
+}
+
 // Paper: Attention decode directly on quantized KV cache
 // Avoids full dequantize → attention → discard cycle
 int qkv_attention_decode_impl(
@@ -28,7 +43,9 @@ int qkv_attention_decode_impl(
     if (!query || !s || !cfg || !output || ctx == 0 || hdim == 0) return 0;
     if (hdim > 16384) return 0;  // 비정상적으로 큰 차원 방지
     const int d = (int)hdim, n = (int)ctx;
-    const bool qjl = cfg->enable_qjl && s->k_bits > 1 && s->v_bits > 1 && s->k_qjl && s->v_qjl;
+    const bool qjl = cfg->enable_qjl && s->k_bits > 1 && s->v_bits > 1 &&
+        qkv_bits_codebook(s->k_bits) && qkv_bits_codebook(s->v_bits) &&
+        s->k_qjl && s->v_qjl;
 
     // Use scratch buffers
     float* row = s->scratch_residual;
@@ -71,7 +88,9 @@ int qkv_attention_decode_impl(
     // Paper Algorithm 2: For unbiased inner product, include QJL residual
     const int k_mse_bits = qjl ? s->k_bits - 1 : s->k_bits;
     if (!qkv_bits_valid(k_mse_bits)) return 0;
-    const float* k_centroids = qkv_codebook_for_bits(s, k_mse_bits);
+    const bool k_raw = qkv_bits_raw(k_mse_bits);
+    const float* k_centroids = k_raw ? nullptr : qkv_codebook_for_bits(s, k_mse_bits);
+    if (!k_raw && !k_centroids) return 0;
     // BUGFIX 354: k_stride overflow 방지
     if (d > INT_MAX / k_mse_bits) return 0;
     const int k_stride = (d * k_mse_bits + 7) / 8;
@@ -109,7 +128,7 @@ int qkv_attention_decode_impl(
         // BUGFIX 357: overflow 방지
         if (n_outliers < 0 || n_outliers > d || n_normal < 0) return 0;
         // BUGFIX 487: out_bits/norm_bits 범위 체크
-        if (out_bits < 1 || out_bits > 4 || norm_bits < 1 || norm_bits > 4) return 0;
+        if (!qkv_bits_valid(out_bits) || !qkv_bits_valid(norm_bits)) return 0;
         // BUGFIX 488: packed_size overflow 방지
         if (n_outliers > INT_MAX / out_bits || n_normal > INT_MAX / norm_bits) return 0;
         const int out_packed_size = k_split ? (n_outliers * out_bits + 7) / 8 : 0;
@@ -117,8 +136,10 @@ int qkv_attention_decode_impl(
         const int* outlier_channels = k_split ? qkv_outlier_indices_for_target_const(s, QKV_TARGET_KEY) : nullptr;
         const uint8_t* split_outlier = k_split ? qkv_idx_outlier_for_target_const(s, QKV_TARGET_KEY) : nullptr;
         const uint8_t* split_normal = k_split ? qkv_idx_normal_for_target_const(s, QKV_TARGET_KEY) : nullptr;
-        const float* out_centroids = k_split ? qkv_codebook_for_bits(s, out_bits) : nullptr;
-        const float* norm_centroids = k_split ? qkv_codebook_for_bits(s, norm_bits) : nullptr;
+        const bool out_raw = qkv_bits_raw(out_bits);
+        const bool norm_raw = qkv_bits_raw(norm_bits);
+        const float* out_centroids = (k_split && !out_raw) ? qkv_codebook_for_bits(s, out_bits) : nullptr;
+        const float* norm_centroids = (k_split && !norm_raw) ? qkv_codebook_for_bits(s, norm_bits) : nullptr;
         const uint8_t* is_outlier = k_split ? qkv_is_outlier_for_target_const(s, QKV_TARGET_KEY) : nullptr;
 
         const int local_stride = std::max(d, std::max(n_outliers, n_normal));
@@ -152,22 +173,29 @@ int qkv_attention_decode_impl(
                 float dot = 0.0f;
 
                 if (k_split) {
-                    if (!outlier_channels || !split_outlier || !split_normal || !out_centroids || !norm_centroids) {
+                    if (!outlier_channels || !split_outlier || !split_normal ||
+                        (!out_raw && !out_centroids) || (!norm_raw && !norm_centroids)) {
                         *ok_flag = 0;
                         return;
                     }
-                    qkv_unpack_indices(split_outlier + (size_t)t * (size_t)out_packed_size,
-                        local_codes, n_outliers, out_bits);
+                    const uint8_t* out_src = split_outlier + (size_t)t * (size_t)out_packed_size;
+                    if (!out_raw) {
+                        qkv_unpack_indices(out_src, local_codes, n_outliers, out_bits);
+                    }
                     for (int i = 0; i < n_outliers; i++) {
                         const int channel = outlier_channels[i];
                         if (channel < 0 || channel >= d) {
                             *ok_flag = 0;
                             return;
                         }
-                        dot += q_eff[channel] * out_centroids[local_codes[i]];
+                        const float kv = out_raw ? qkv_attention_load_raw_scalar(out_src, i, out_bits) :
+                            out_centroids[local_codes[i]];
+                        dot += q_eff[channel] * kv;
                     }
-                    qkv_unpack_indices(split_normal + (size_t)t * (size_t)norm_packed_size,
-                        local_codes, n_normal, norm_bits);
+                    const uint8_t* norm_src = split_normal + (size_t)t * (size_t)norm_packed_size;
+                    if (!norm_raw) {
+                        qkv_unpack_indices(norm_src, local_codes, n_normal, norm_bits);
+                    }
                     int normal_pos = 0;
                     for (int i = 0; i < d; i++) {
                         if (is_outlier && is_outlier[i]) continue;
@@ -175,7 +203,15 @@ int qkv_attention_decode_impl(
                             *ok_flag = 0;
                             return;
                         }
-                        dot += q_eff[i] * norm_centroids[local_codes[normal_pos++]];
+                        const float kv = norm_raw ? qkv_attention_load_raw_scalar(norm_src, normal_pos, norm_bits) :
+                            norm_centroids[local_codes[normal_pos]];
+                        ++normal_pos;
+                        dot += q_eff[i] * kv;
+                    }
+                } else if (k_raw) {
+                    const uint8_t* tidx = s->k_idx + t * k_stride;
+                    for (int i = 0; i < d; i++) {
+                        dot += q_eff[i] * qkv_attention_load_raw_scalar(tidx, i, k_mse_bits);
                     }
                 } else if (k_mse_bits == 2) {
                     const uint8_t* tidx = s->k_idx + t * k_stride;
@@ -232,6 +268,11 @@ int qkv_attention_decode_impl(
 
             if (k_split) {
                 if (!qkv_dot_mse_split_rotated_token(s, cfg, QKV_TARGET_KEY, t, q_eff, &dot)) return 0;
+            } else if (k_raw) {
+                const uint8_t* tidx = s->k_idx + t * k_stride;
+                for (int i = 0; i < d; i++) {
+                    dot += q_eff[i] * qkv_attention_load_raw_scalar(tidx, i, k_mse_bits);
+                }
             } else if (k_mse_bits == 2) {
                 const uint8_t* tidx = s->k_idx + t * k_stride;
                 for (int i = 0; i < d; i++) {

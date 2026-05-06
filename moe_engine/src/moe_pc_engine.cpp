@@ -4,6 +4,8 @@
 #include "../native/fp4_decode.h"
 #include "../native/scale4.h"
 #include "../../engine_core/kv/kv_qkv.h"
+#include "../../engine_core/kv/qkv_helpers.h"
+#include "../../engine_core/kv/qkv_quantize.h"
 #include "../../engine_core/core/mmap_loader.h"
 #include "../../loader/path_join.h"
 #include "../../loader/wide_path.h"

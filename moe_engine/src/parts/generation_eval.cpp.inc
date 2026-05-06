@@ -25,6 +25,7 @@ int moe_pc_engine_eval_token_ids_from(
             id = moe_profile_next_generation_id();
             start_us = moe_profile_now_us();
             engine->generation_started.fetch_add(1, std::memory_order_relaxed);
+            moe_engine_reset_qkv_cache(engine);
             engine->generation_active.fetch_add(1, std::memory_order_relaxed);
             engine->generation_token.store(0, std::memory_order_relaxed);
             engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);

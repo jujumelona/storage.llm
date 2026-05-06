@@ -8,8 +8,11 @@
 #define QKV_TARGET_KEY 1
 #define QKV_TARGET_VALUE 2
 
-// Check if bits are valid (1-4)
+// Check if bits are valid. 1-8 use packed Lloyd-Max indices; 16/32 use raw
+// fp16/fp32 entries in the same byte stream.
 bool qkv_bits_valid(int bits);
+bool qkv_bits_codebook(int bits);
+bool qkv_bits_raw(int bits);
 
 // Get codebook for given bit-width
 const float* qkv_codebook_for_bits(const qkv_state_t* state, int bits);

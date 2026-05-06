@@ -1,6 +1,59 @@
 // Model root scanning functions
 // Scans GGUF and JUJU files in model root directory
 
+static int moe_read_model_root_text_sidecar_for_scan(
+    const std::string& root,
+    const char* file_name,
+    uint64_t max_bytes,
+    std::string* out
+) {
+    if (out) {
+        out->clear();
+    }
+    if (!file_name || !out) {
+        return 0;
+    }
+    const std::string path = storagellm::path_join(root, file_name);
+    uint64_t bytes = 0;
+    if (!file_size_bytes(path, &bytes) || bytes == 0 || bytes > max_bytes) {
+        return 0;
+    }
+    std::ifstream input;
+    open_ifstream_path(input, path, std::ios::in | std::ios::binary);
+    if (!input) {
+        return 0;
+    }
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    *out = buffer.str();
+    return !out->empty();
+}
+
+static void moe_apply_runtime_contract_sidecar_to_scan(
+    const std::string& root,
+    moe_offload_gguf_scan_t* scan
+) {
+    if (!scan || scan->files.empty()) {
+        return;
+    }
+    std::string contract_json;
+    if (!moe_read_model_root_text_sidecar_for_scan(
+            root, "storagellm_runtime_contract.json", 128ull * 1024ull * 1024ull, &contract_json)) {
+        return;
+    }
+    for (moe_offload_gguf_file_t& file : scan->files) {
+        if (!file.metadata_json.empty()) {
+            file.metadata_json.push_back('\n');
+        }
+        file.metadata_json += contract_json;
+        file.has_metadata = true;
+        moe_parse_offload_metadata_json(&file);
+        if (file.contract.qkv_required) {
+            file.contract.plain_kv_persistent_allowed = false;
+        }
+    }
+}
+
 static int moe_scan_offload_gguf_root(
     const std::string& root,
     moe_offload_gguf_scan_t* out
@@ -180,5 +233,9 @@ static int moe_scan_offload_model_root(
     const std::string& root,
     moe_offload_gguf_scan_t* out
 ) {
-    return moe_scan_offload_juju_root(root, out) || moe_scan_offload_gguf_root(root, out);
+    if (moe_scan_offload_juju_root(root, out) || moe_scan_offload_gguf_root(root, out)) {
+        moe_apply_runtime_contract_sidecar_to_scan(root, out);
+        return 1;
+    }
+    return 0;
 }

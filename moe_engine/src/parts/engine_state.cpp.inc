@@ -107,11 +107,20 @@ struct moe_pc_engine {
     uint32_t worker_resize_pending_gpu{0};
     int worker_resize_pending_direction{0};
     uint32_t worker_resize_streak{0};
-    uint64_t last_dropped_requests_snapshot{0};
+    // BUGFIX 958: Use atomic for thread-safe access ★★
+    // Problem: Plain uint64_t written from orchestration loop which can be called
+    // from multiple threads → data race (C++ UB). Value is always same (monotonic
+    // snapshot of dropped_requests), but undefined behavior nonetheless.
+    // Solution: std::atomic<uint64_t> with relaxed ordering (no perf impact).
+    std::atomic<uint64_t> last_dropped_requests_snapshot{0};
 
     // BUG 3 FIX: Prefetch window hysteresis (same pattern as worker resize) ?�★
-    uint32_t prefetch_window_pending{0};
-    uint32_t prefetch_window_streak{0};
+    // BUGFIX 1000: Make window hysteresis fields atomic ★★ DEFENSIVE
+    // Problem: Non-atomic uint32_t accessed from fill_orchestrator_plan which can
+    // be called from multiple threads → data race per C++ standard (UB).
+    // Solution: std::atomic<uint32_t> with relaxed ordering. Zero perf cost on x86.
+    std::atomic<uint32_t> prefetch_window_pending{0};
+    std::atomic<uint32_t> prefetch_window_streak{0};
     uint8_t* staging = nullptr;
     uint64_t staging_size = 0;
     bool staging_pinned = false;
@@ -125,9 +134,26 @@ struct moe_pc_engine {
     std::mutex staging_slot_mutex;
     std::condition_variable staging_slot_cv;
     std::atomic<uint64_t> staging_generation{0};
+    // BUGFIX 949: Orphaned events from staging timeout ★★★
+    // When reset_staging_slots times out, in-use slots' last_copy_event handles
+    // are moved here instead of being destroyed (GPU workers may still reference them).
+    // release_staging_slot drains this list to prevent unbounded growth.
+    std::mutex orphaned_events_mutex;
+    std::vector<CUevent> orphaned_events;
     std::condition_variable staging_pinned_cv;
     std::condition_variable staging_gpu_cv;
     std::condition_variable staging_direct_cv;
+    std::atomic<bool> staging_reinit_needed{false};
+    // BUGFIX 986: Atomic mirror for prefer_overlapped_io ★★ IMPORTANT
+    // Problem: io_config.prefer_overlapped_io is plain int (public C ABI).
+    // Multiple io_worker threads write it concurrently → UB (data race on non-atomic int).
+    // Solution: Internal atomic bool is the source of truth. Reads use this;
+    // writes update both this AND io_config.prefer_overlapped_io for external callers.
+    std::atomic<bool> prefer_overlapped_io_atomic{false};
+    // BUGFIX 989: Mutex for atomic pending→in_flight VRAM transition ★★★
+    // Held only during the 2-atomic-op transition (~20ns). device_budget_bytes()
+    // reads both counters under this mutex to get a consistent snapshot.
+    std::mutex vram_transition_mutex;
     std::string topology_path;
     std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> topology_edges;
     std::mutex prefetch_plan_mutex;
@@ -362,12 +388,15 @@ struct moe_pc_engine {
     float model_config_full_rope_theta = 0.0f;
     float model_config_partial_rotary_factor = 0.0f;
 
-    // GAP 1A: Persistent per-head quantized KV cache
-    // Key = head_index, value = qkv_state_t with quantized K/V for that head
+    // GAP 1A: Persistent per-layer/head quantized KV cache.
+    // Key = layer * kv_heads + head. Head-only reuse corrupts KV across layers.
     std::mutex qkv_mutex;  // protects qkv_cfg and head-state vector growth
     std::vector<qkv_state_t> qkv_head_state_slots;
     std::vector<uint8_t> qkv_head_state_valid;
     std::vector<std::unique_ptr<std::mutex>> qkv_head_state_locks;
+    std::vector<uint32_t> qkv_head_state_layers;
+    std::vector<uint32_t> qkv_head_state_heads;
+    std::vector<uint64_t> qkv_head_state_fingerprints;
     qkv_config_t qkv_cfg{};
     std::atomic<bool> qkv_cfg_initialized{false};
     uint32_t qkv_last_ctx = 0;  // Track context size for reallocation
