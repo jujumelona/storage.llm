@@ -122,25 +122,16 @@ int moe_pc_engine_plan_moe_prefetch(
         // → Fallback to max_tensor * 3 causes over-conservative trim
         // Solution: Warn user, use fallback, but mark for lazy measurement after first prefetch
         // Impact: Prevents silent performance degradation on legacy formats
-        const moe_storage_constants_t* storage = moe_storage_constants();
-        uint64_t fallback_bundle_bytes = storage && storage->normal_bundle_max_bytes
-            ? storage->normal_bundle_max_bytes : 0ull;
-        const uint64_t max_tensor_bytes = engine->max_tensor_stream_bytes.load(std::memory_order_relaxed);
-        if (fallback_bundle_bytes == 0 && max_tensor_bytes > 0) {
+        uint64_t fallback_bundle_bytes = moe_expert_bundle_bytes_hint(engine, 0);
+        if (fallback_bundle_bytes == 0) {
             // BUGFIX 901: Warn about fallback usage
             static std::atomic<bool> warned{false};
             if (!warned.exchange(true, std::memory_order_relaxed)) {
                 fprintf(stderr,
                     "[storageLLM WARNING] normal_bundle_max_bytes not set (GGUF v1 or missing profile).\n"
-                    "  Using fallback: max_tensor_bytes * 3 = %llu bytes.\n"
-                    "  This may cause over-conservative VRAM trim. Consider updating model profile.\n",
-                    (unsigned long long)(max_tensor_bytes * 3ull));
+                    "  No runtime expert byte estimate is available; zero-byte prefetch items will be dropped.\n"
+                    "  Ensure the model index provides per-expert bytes or shape metadata.\n");
             }
-            fallback_bundle_bytes = max_tensor_bytes <= UINT64_MAX / 3ull
-                ? max_tensor_bytes * 3ull : UINT64_MAX;
-        }
-        if (fallback_bundle_bytes == 0) {
-            fallback_bundle_bytes = 24ull * 1024ull * 1024ull;
         }
 
         // BUGFIX Issue 2: Validate item bytes are populated ★★★
@@ -150,6 +141,10 @@ int moe_pc_engine_plan_moe_prefetch(
         bool used_fallback = false;
         for (size_t i = 0; i < items.size(); ++i) {
             const uint64_t item_bytes = items[i].bytes ? items[i].bytes : fallback_bundle_bytes;
+            if (item_bytes == 0) {
+                trim_index = i;
+                break;
+            }
             if (!items[i].bytes && !used_fallback) {
                 fprintf(stderr,
                     "[storageLLM WARNING] Prefetch item %zu has bytes=0, using fallback %llu. "

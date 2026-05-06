@@ -2,9 +2,90 @@ static uint32_t caps_hw_threads() {
     return moe_cpu_thread_count_hint();
 }
 
+static uint64_t moe_saturating_mul_u64(uint64_t a, uint64_t b) {
+    if (a != 0 && b > UINT64_MAX / a) {
+        return UINT64_MAX;
+    }
+    return a * b;
+}
+
+static uint64_t moe_storage_shape_expert_bundle_bytes(const moe_storage_constants_t* storage) {
+    if (!storage || storage->hidden_size == 0) {
+        return 0;
+    }
+    const uint64_t hidden = storage->hidden_size;
+    const uint64_t intermediate = storage->expert_intermediate_size ?
+        storage->expert_intermediate_size : storage->hidden_size;
+    if (intermediate == 0) {
+        return 0;
+    }
+    const uint64_t projections = storage->expert_projection_count ?
+        storage->expert_projection_count : 3ull;
+    uint64_t bytes = moe_saturating_mul_u64(hidden, intermediate);
+    bytes = moe_saturating_mul_u64(bytes, projections);
+    // Shape fallback is an FP16/BF16 upper-bound for gate/up/down matrices.
+    return moe_saturating_mul_u64(bytes, 2ull);
+}
+
+static uint64_t moe_storage_summary_expert_bundle_bytes(const moe_storage_constants_t* storage) {
+    uint64_t best = storage ? storage->normal_bundle_max_bytes : 0ull;
+    const uint32_t layer_count = moe_storage_layer_count();
+    for (uint32_t i = 0; i < layer_count; ++i) {
+        const moe_storage_layer_spec_t* layer = moe_storage_layer_at(i);
+        if (!layer || !layer->has_moe_experts || layer->expert_count == 0) {
+            continue;
+        }
+        uint64_t bytes = layer->bundle_max_bytes;
+        if (bytes == 0 && layer->bundle_total_bytes > 0) {
+            bytes = layer->bundle_total_bytes / layer->expert_count;
+        }
+        if (bytes > best) {
+            best = bytes;
+        }
+    }
+    const uint64_t shape_bytes = moe_storage_shape_expert_bundle_bytes(storage);
+    return best ? best : shape_bytes;
+}
+
 static uint64_t normal_bundle_max_or(uint64_t fallback) {
     const moe_storage_constants_t* storage = moe_storage_constants();
-    return storage && storage->normal_bundle_max_bytes ? storage->normal_bundle_max_bytes : fallback;
+    const uint64_t model_hint = moe_storage_summary_expert_bundle_bytes(storage);
+    return model_hint ? model_hint : fallback;
+}
+
+static uint64_t moe_expert_bundle_bytes_hint(const moe_pc_engine* engine, uint64_t fallback) {
+    uint64_t best = 0;
+    if (engine) {
+        for (uint64_t bytes : engine->expert_bytes) {
+            if (bytes > best) {
+                best = bytes;
+            }
+        }
+        if (engine->avg_expert_bytes > best) {
+            best = engine->avg_expert_bytes;
+        }
+        const uint64_t max_tensor_bytes =
+            engine->max_tensor_stream_bytes.load(std::memory_order_relaxed);
+        if (max_tensor_bytes > 0) {
+            const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
+            const uint64_t projections = runtime_c.expert_projection_count ?
+                runtime_c.expert_projection_count : 3ull;
+            const uint64_t tensor_bundle =
+                moe_saturating_mul_u64(max_tensor_bytes, projections);
+            if (tensor_bundle > best) {
+                best = tensor_bundle;
+            }
+            const uint64_t shape_bytes = moe_storage_shape_expert_bundle_bytes(&runtime_c);
+            if (best == 0 && shape_bytes > 0) {
+                best = shape_bytes;
+            }
+        }
+    }
+    if (best == 0) {
+        const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
+        best = moe_storage_summary_expert_bundle_bytes(&runtime_c);
+    }
+    return best ? best : fallback;
 }
 
 static uint64_t cache_for_experts(uint32_t expert_count) {

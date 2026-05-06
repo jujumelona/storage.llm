@@ -132,13 +132,7 @@ static void prefetch_plan_add_item(
                 layer, expert);
             return;
         }
-        bytes = runtime_c.normal_bundle_max_bytes;
-        if (bytes == 0) {
-            const uint64_t max_tensor_bytes =
-                engine->max_tensor_stream_bytes.load(std::memory_order_relaxed);
-            bytes = max_tensor_bytes <= UINT64_MAX / 3ull
-                ? max_tensor_bytes * 3ull : UINT64_MAX;
-        }
+        bytes = moe_expert_bundle_bytes_hint(engine, 0);
         if (bytes == 0) {
             fprintf(stderr,
                 "[storageLLM ERROR] prefetch_plan_add_item: no bundle byte estimate for "

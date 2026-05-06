@@ -21,7 +21,7 @@ static uint64_t moe_rt_expert_bytes_hint(
     const moe_pc_engine* engine,
     const moe_offload_gguf_scan_t& scan
 ) {
-    uint64_t expert_bytes = normal_bundle_max_or(24ull * 1024ull * 1024ull);
+    uint64_t expert_bytes = moe_expert_bundle_bytes_hint(engine, 0);
     if (engine) {
         const uint64_t max_tensor_bytes = engine->max_tensor_stream_bytes.load(std::memory_order_relaxed);
         if (max_tensor_bytes > expert_bytes) {
@@ -31,7 +31,7 @@ static uint64_t moe_rt_expert_bytes_hint(
     if (scan.max_executable_tensor_bytes > expert_bytes) {
         expert_bytes = scan.max_executable_tensor_bytes;
     }
-    if (expert_bytes == 24ull * 1024ull * 1024ull && scan.executable_tensor_count > 0 && scan.present_total_bytes > 0) {
+    if (scan.executable_tensor_count > 0 && scan.present_total_bytes > 0) {
         const uint64_t avg = scan.present_total_bytes / scan.executable_tensor_count;
         const uint64_t avg_triplet = avg <= UINT64_MAX / 3ull ? avg * 3ull : UINT64_MAX;
         expert_bytes = std::max<uint64_t>(expert_bytes, avg_triplet);
@@ -283,7 +283,7 @@ static void moe_rt_apply_juju_io_flags(
         clamp_to_cap(std::min(8u, std::max(1u, engine->backend_caps.copy_streams)), gpu_cap) : 0u;
 
     const uint64_t segment = cfg.segment_bytes ? cfg.segment_bytes :
-        normal_bundle_max_or(24ull * 1024ull * 1024ull);
+        moe_expert_bundle_bytes_hint(engine, 0);
     io->direct_upload_min_bytes = segment > 0xffffffffull ? 0xffffffffull : segment;
     if (io->max_prefetch_queue < 12288u) {
         io->max_prefetch_queue = 12288u;
