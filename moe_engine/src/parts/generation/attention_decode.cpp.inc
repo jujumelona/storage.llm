@@ -154,6 +154,11 @@
     const uint64_t rope_start_us = moe_profile_now_us();
     const int rope_rotate_half = moe_standard_rope_uses_rotate_half_cached(engine, cfg);
     const int rope_partial_half_split = (rope_rotate_half && rope_dim < head_dim) ? 1 : 0;
+    const int rope_proportional_freq =
+        rope_partial_half_split &&
+        moe_hybrid_layer_is_full_attention(engine, layer) &&
+        moe_engine_metadata_mentions(engine, "proportional");
+    const uint32_t rope_frequency_dim = rope_proportional_freq ? head_dim : rope_dim;
     if (rope_dim >= 2u) {
         static const std::vector<float> empty_rope_table;
         const std::vector<float>& q_cos = use_dynamic_rope ? empty_rope_table : s->rope_q_cos;
@@ -166,6 +171,7 @@
                 s->q_b.data() + (uint64_t)h * head_dim,
                 head_dim,
                 rope_dim,
+                rope_frequency_dim,
                 position,
                 q_cos,
                 q_sin,
@@ -177,6 +183,7 @@
                 s->attn_kv_a.data() + (uint64_t)h * head_dim,
                 head_dim,
                 rope_dim,
+                rope_frequency_dim,
                 position,
                 k_cos,
                 k_sin,
@@ -185,10 +192,12 @@
     }
     moe_profile_log(
         "attn_standard_rope",
-        "layer=%d pos=%u rope_dim=%u rope_full_dim=%u rotate_half=%d partial_half_split=%d dynamic=%d ms=%.3f",
+        "layer=%d pos=%u rope_dim=%u rope_full_dim=%u freq_dim=%u rotate_half=%d partial_half_split=%d proportional=%d dynamic=%d ms=%.3f",
         layer, position, rope_dim, head_dim,
+        rope_frequency_dim,
         rope_rotate_half,
         rope_partial_half_split,
+        rope_proportional_freq,
         use_dynamic_rope,
         moe_profile_elapsed_ms(rope_start_us));
     const uint64_t kv_start_us = moe_profile_now_us();
