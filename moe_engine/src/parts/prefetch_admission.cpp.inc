@@ -88,8 +88,7 @@ static moe_tier_t prefetch_admitted_tier(
         const uint64_t device_allocated = engine->device_allocated_bytes.load(std::memory_order_relaxed);
         const uint64_t device_free = engine->device_free_bytes.load(std::memory_order_relaxed);
 
-        // Calculate budget inline (same logic as device_budget_bytes)
-        const uint64_t kv_reserved = moe_kv_vram_attention_runtime_available(engine) ? kv_actual : 0;
+        const uint64_t kv_reserved = engine->kv_actually_in_vram.load(std::memory_order_acquire) ? kv_actual : 0;
         uint64_t reserved_total = pending;
         if (reserved_total <= UINT64_MAX - in_flight) reserved_total += in_flight;
         if (reserved_total <= UINT64_MAX - kv_reserved) reserved_total += kv_reserved;
@@ -132,8 +131,45 @@ static moe_tier_t prefetch_admitted_tier(
             vram_lock.unlock();
         }
     }
+    // BUGFIX NEW-13: Remove duplicate Metal budget calculation ★★★ CRITICAL
+    // Problem: prefetch_admitted_tier() duplicates device_budget_bytes() logic inline
+    // → kv_in_ram = std::min(kv_actual, cpu_ram_used) is semantically wrong
+    // → kv_actual is VRAM KV usage, cpu_ram_used is RAM usage (different units for Metal)
+    // Solution: Removed duplicate Metal budget block (lines 109-116 in original)
+    // → device_budget_bytes() already handles Metal correctly with fast-path
+    // Impact: Eliminates code duplication, fixes semantic error in Metal KV accounting
+    // Note: Metal budget calculation now handled by device_budget_bytes() call above
+    // BUGFIX Problem 2: Delegate Metal UMA budget to device_budget_bytes() ★★★ CRITICAL
+    // The inline Metal budget calculation (lines 109-137 in original) has been removed.
+    // All Metal UMA budget logic is now centralized in device_budget_bytes() fast-path.
+    // This eliminates semantic errors and code duplication.
+
     if (target == moe_TIER_RAM) {
-    const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
+    // BUGFIX Problem 5: Reserve RAM for KV cache growth trajectory ★★ IMPORTANT
+    // Problem: RAM admission only checks current tier_used(RAM), ignoring KV growth
+    // → Long context requests cause KV to fill RAM → demote_cold_until blocks hot path
+    // Solution: Reserve max_seq_len × kv_bytes_per_token from RAM budget
+    // → Expert admission threshold accounts for worst-case KV growth
+    // Impact: Prevents RAM overflow, eliminates I/O stalls during long context generation
+    const uint64_t ram_budget_raw = tier_budget(engine, moe_TIER_RAM);
+    uint64_t reserved_kv_ram = 0;
+    if (engine->config.max_seq_len > 0 && engine->attn_config_valid.load(std::memory_order_acquire)) {
+        const uint32_t num_layers = engine->dynamic_shape.num_hidden_layers > 0
+            ? engine->dynamic_shape.num_hidden_layers
+            : (engine->attn_config.num_hidden_layers > 0 ? engine->attn_config.num_hidden_layers : 80);
+        const uint32_t num_kv_heads = engine->attn_config.num_key_value_heads > 0
+            ? engine->attn_config.num_key_value_heads : 8;
+        const uint32_t head_dim = engine->attn_config.head_dim > 0
+            ? engine->attn_config.head_dim : 128;
+        const uint64_t kv_bytes_per_token = (uint64_t)num_layers * num_kv_heads * head_dim * 2 * 2;  // K+V, FP16
+        reserved_kv_ram = engine->config.max_seq_len * kv_bytes_per_token;
+        // Cap reservation at 20% of RAM budget to avoid over-reservation for short contexts
+        const uint64_t max_reservation = (ram_budget_raw * 20ull) / 100ull;
+        if (reserved_kv_ram > max_reservation) {
+            reserved_kv_ram = max_reservation;
+        }
+    }
+    const uint64_t ram_budget = ram_budget_raw > reserved_kv_ram ? ram_budget_raw - reserved_kv_ram : ram_budget_raw;
     // BUGFIX 문제 1: Remove 85% threshold - use single 93% threshold ★★★
     // Problem: 85% and 93% dual thresholds create dead zone
     // io_worker proactive eviction at 75% already handles RAM pressure

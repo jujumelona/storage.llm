@@ -16,21 +16,36 @@ static int compiled_gpudirect_available() {
     // Solution: Try dlopen/LoadLibrary for cuFile library at runtime.
     // If found, GDS path can be used (cuFile API loaded via function pointers).
     // Impact: Enables NVMe→VRAM direct path without recompilation.
-    static int cached = -1;
-    if (cached >= 0) return cached;
+    // BUGFIX NEW-BUG2: Static variable race condition ★★ IMPORTANT
+    // Problem: static int cached = -1 → multiple threads race on check and update
+    // → Multiple LoadLibrary calls, data race on cached write
+    // Solution: Use atomic with CAS for thread-safe lazy initialization
+    // Impact: Eliminates race condition, ensures single library check
+    static std::atomic<int> cached{-1};
+    int current = cached.load(std::memory_order_acquire);
+    if (current >= 0) return current;
+
+    int result = 0;
 #ifdef _WIN32
     HMODULE lib = LoadLibraryA("cufile.dll");
-    cached = lib ? 1 : 0;
+    result = lib ? 1 : 0;
     if (lib) FreeLibrary(lib);
 #elif defined(__linux__)
     void* lib = dlopen("libcufile.so", RTLD_LAZY | RTLD_NOLOAD);
     if (!lib) lib = dlopen("libcufile.so.0", RTLD_LAZY);
-    cached = lib ? 1 : 0;
+    result = lib ? 1 : 0;
     if (lib) dlclose(lib);
 #else
-    cached = 0;
+    result = 0;
 #endif
-    return cached;
+
+    // CAS to ensure only one thread updates
+    int expected = -1;
+    if (cached.compare_exchange_strong(expected, result, std::memory_order_release, std::memory_order_acquire)) {
+        return result;
+    }
+    // Another thread won the race, use their result
+    return cached.load(std::memory_order_acquire);
 #endif
 }
 

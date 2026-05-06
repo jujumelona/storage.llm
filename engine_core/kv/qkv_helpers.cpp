@@ -13,6 +13,20 @@ bool qkv_bits_raw(int bits) {
     return bits == 16 || bits == 32;
 }
 
+int qkv_outlier_bits_for_target(const qkv_config_t* cfg, int target) {
+    if (!cfg) return 0;
+    if (target == QKV_TARGET_KEY && cfg->key_outlier_bits > 0) return cfg->key_outlier_bits;
+    if (target == QKV_TARGET_VALUE && cfg->value_outlier_bits > 0) return cfg->value_outlier_bits;
+    return cfg->outlier_bits;
+}
+
+int qkv_normal_bits_for_target(const qkv_config_t* cfg, int target) {
+    if (!cfg) return 0;
+    if (target == QKV_TARGET_KEY && cfg->key_normal_bits > 0) return cfg->key_normal_bits;
+    if (target == QKV_TARGET_VALUE && cfg->value_normal_bits > 0) return cfg->value_normal_bits;
+    return cfg->normal_bits;
+}
+
 const float* qkv_codebook_for_bits(const qkv_state_t* state, int bits) {
     if (!state) return NULL;
     switch (bits) {

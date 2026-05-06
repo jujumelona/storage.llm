@@ -58,10 +58,15 @@ typedef struct {
     uint64_t rotation_seed;   // Seed for random rotation matrix
     uint64_t qjl_seed;        // Seed for QJL random matrix
     // Fix 4: Outlier channel support (paper Table 1, Section 4.3)
-    // Paper uses 32 outlier channels @ 3-bit + 96 normal channels @ 2-bit = 2.5-bit average
+    // The paper labels this as a 2.5-bit setup, but 32 @ 3-bit + 96 @ 2-bit
+    // over 128 channels computes to 2.25 bits/channel. Keep budgets arithmetic-based.
     int outlier_channels;     // Number of outlier channels (0 = disabled, paper uses 32)
     int outlier_bits;         // Bits for outlier channels (paper uses 3)
     int normal_bits;          // Bits for normal channels (paper uses 2)
+    int key_outlier_bits;     // Optional key-specific outlier-channel bits
+    int key_normal_bits;      // Optional key-specific normal-channel bits
+    int value_outlier_bits;   // Optional value-specific outlier-channel bits
+    int value_normal_bits;    // Optional value-specific normal-channel bits
     // Problem 11 Fix: Engine IO thread count to prevent CPU over-subscription
     uint32_t engine_io_thread_count;  // disk+pinned+gpu workers from engine
     const int* outlier_channel_indices; // Bug 4: Allow custom outlier indices instead of hardcoded 0..n
@@ -86,6 +91,10 @@ static inline qkv_config_t qkv_config_default(int head_dim) {
     cfg.outlier_channels = 0;
     cfg.outlier_bits = 3;
     cfg.normal_bits = 2;
+    cfg.key_outlier_bits = cfg.outlier_bits;
+    cfg.key_normal_bits = cfg.normal_bits;
+    cfg.value_outlier_bits = cfg.outlier_bits;
+    cfg.value_normal_bits = cfg.normal_bits;
     // Problem 11 Fix: Default to 0 (no adjustment)
     cfg.engine_io_thread_count = 0;
     cfg.outlier_channel_indices = nullptr;
@@ -97,17 +106,32 @@ static inline qkv_config_t qkv_config_default(int head_dim) {
     return cfg;
 }
 
-// Helper: compute exact configured average bits with outlier channels.
+static inline float qkv_effective_bits_for_values(int head_dim, int outlier_channels, int outlier_bits, int normal_bits) {
+    if (head_dim <= 0 || outlier_channels <= 0) {
+        return (float)normal_bits;
+    }
+    if (outlier_channels > head_dim) {
+        outlier_channels = head_dim;
+    }
+    const int normal_channels = head_dim - outlier_channels;
+    return (float)(outlier_channels * outlier_bits + normal_channels * normal_bits) / (float)head_dim;
+}
+
+// Helper: compute exact configured average bits across K and V split policies.
 static inline float qkv_effective_bits(const qkv_config_t* cfg) {
-    if (!cfg || cfg->head_dim <= 0 || cfg->outlier_channels <= 0) {
-        return (float)(cfg ? cfg->k_bits : 3);
+    if (!cfg) {
+        return 3.0f;
     }
-    int outlier_channels = cfg->outlier_channels;
-    if (outlier_channels > cfg->head_dim) {
-        outlier_channels = cfg->head_dim;
+    if (cfg->outlier_channels <= 0) {
+        return 0.5f * ((float)cfg->k_bits + (float)cfg->v_bits);
     }
-    int normal_channels = cfg->head_dim - outlier_channels;
-    return (float)(outlier_channels * cfg->outlier_bits + normal_channels * cfg->normal_bits) / (float)cfg->head_dim;
+    const int key_out = cfg->key_outlier_bits > 0 ? cfg->key_outlier_bits : cfg->outlier_bits;
+    const int key_norm = cfg->key_normal_bits > 0 ? cfg->key_normal_bits : cfg->normal_bits;
+    const int value_out = cfg->value_outlier_bits > 0 ? cfg->value_outlier_bits : cfg->outlier_bits;
+    const int value_norm = cfg->value_normal_bits > 0 ? cfg->value_normal_bits : cfg->normal_bits;
+    const float key_bits = qkv_effective_bits_for_values(cfg->head_dim, cfg->outlier_channels, key_out, key_norm);
+    const float value_bits = qkv_effective_bits_for_values(cfg->head_dim, cfg->outlier_channels, value_out, value_norm);
+    return 0.5f * (key_bits + value_bits);
 }
 
 // ============================================================

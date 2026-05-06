@@ -61,8 +61,10 @@ static int qkv_dequant_one_split(
     const int d = s->head_dim;
     const int n_out = cfg->outlier_channels;
     const int n_norm = d - n_out;
-    const int out_mse_bits = qkv_mse_bits_for_total_bits_dequant(cfg->outlier_bits, use_qjl);
-    const int norm_mse_bits = qkv_mse_bits_for_total_bits_dequant(cfg->normal_bits, use_qjl);
+    const int outlier_bits = qkv_outlier_bits_for_target(cfg, target);
+    const int normal_bits = qkv_normal_bits_for_target(cfg, target);
+    const int out_mse_bits = qkv_mse_bits_for_total_bits_dequant(outlier_bits, use_qjl);
+    const int norm_mse_bits = qkv_mse_bits_for_total_bits_dequant(normal_bits, use_qjl);
     if (d <= 0 || d > 16384 || n_out <= 0 || n_out >= d || n_norm <= 0 ||
         !out_mse_bits || !norm_mse_bits) {
         return 0;
@@ -155,7 +157,7 @@ static int qkv_dequant_one_split(
         memcpy(x_tilde, y_tilde, (size_t)d * sizeof(float));
     }
 
-    if (use_qjl && qjl && residual_norms && s->qjl_matrix) {
+    if (base_use_qjl && qjl && residual_norms && s->qjl_matrix) {
         const float r_norm = residual_norms[token_idx];
         if (r_norm > 1e-10f) {
             const uint8_t* tqjl = qjl + (size_t)token_idx * (size_t)qstride;
@@ -233,15 +235,21 @@ int qkv_dequant_one(
     if (d <= 0 || d > 16384) {
         return 0;
     }
-    const int mse_bits = use_qjl ? bits - 1 : bits;
+    const bool base_use_qjl = use_qjl && bits > 1;
+    const int mse_bits = base_use_qjl ? bits - 1 : bits;
     if (!qkv_bits_valid(mse_bits)) {
         return 0;
     }
     const int split_target = qkv_target_from_buffers(s, idx, norms);
     if (split_target && qkv_outlier_split_ready(s, cfg, split_target)) {
+        const int outlier_bits = qkv_outlier_bits_for_target(cfg, split_target);
+        const int normal_bits = qkv_normal_bits_for_target(cfg, split_target);
+        const bool split_use_qjl = base_use_qjl &&
+            qkv_bits_codebook(outlier_bits) && qkv_bits_codebook(normal_bits) &&
+            outlier_bits > 1 && normal_bits > 1;
         return qkv_dequant_one_split(
             s, cfg, split_target, qjl, residual_norms, norms,
-            token_idx, use_qjl, output);
+            token_idx, split_use_qjl, output);
     }
     // BUGFIX 371: stride 계산 overflow 방지
     if (d > INT_MAX / mse_bits) {
@@ -395,11 +403,14 @@ int qkv_dot_mse_split_rotated_token(
     // BUGFIX 378: outlier_channels 범위 체크
     if (n_out < 0 || n_out > d) return 0;
     const int n_norm = d - n_out;
+    const int outlier_bits = qkv_outlier_bits_for_target(cfg, target);
+    const int normal_bits = qkv_normal_bits_for_target(cfg, target);
     const bool use_qjl = cfg->enable_qjl && s->k_qjl && s->v_qjl &&
-        qkv_bits_codebook(cfg->outlier_bits) && qkv_bits_codebook(cfg->normal_bits) &&
-        s->k_bits > 1 && s->v_bits > 1;
-    const int out_bits = qkv_mse_bits_for_total_bits_dequant(cfg->outlier_bits, use_qjl);
-    const int norm_bits = qkv_mse_bits_for_total_bits_dequant(cfg->normal_bits, use_qjl);
+        qkv_bits_codebook(outlier_bits) && qkv_bits_codebook(normal_bits) &&
+        s->k_bits > 1 && s->v_bits > 1 &&
+        outlier_bits > 1 && normal_bits > 1;
+    const int out_bits = qkv_mse_bits_for_total_bits_dequant(outlier_bits, use_qjl);
+    const int norm_bits = qkv_mse_bits_for_total_bits_dequant(normal_bits, use_qjl);
     if (!out_bits || !norm_bits) return 0;
 
     const int* outlier_channels = qkv_outlier_indices_for_target_const(s, target);

@@ -112,12 +112,20 @@ int qkv_attention_decode_impl(
     // The stored gamma is the normalized residual norm, so att[t] applies norm_k once.
     const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)d;
     const bool k_split = qkv_outlier_split_ready(s, cfg, QKV_TARGET_KEY);
-    const bool use_qjl_key_residual = qjl && s->k_qjl && s->qjl_matrix;
+    const int key_outlier_total_bits = qkv_outlier_bits_for_target(cfg, QKV_TARGET_KEY);
+    const int key_normal_total_bits = qkv_normal_bits_for_target(cfg, QKV_TARGET_KEY);
+    const bool key_split_qjl = qjl &&
+        qkv_bits_codebook(key_outlier_total_bits) &&
+        qkv_bits_codebook(key_normal_total_bits) &&
+        key_outlier_total_bits > 1 &&
+        key_normal_total_bits > 1;
+    const bool use_qjl_key_residual = qjl && (!k_split || key_split_qjl) && s->k_qjl && s->qjl_matrix;
 
     float* s_q_precomputed = s->scratch_s_times_r;
     float* qjl_z = s->scratch_qjl_signs;
 
-    // Precompute S * q_eff for QJL residual
+    // TurboQuant Algorithm 2 stores QJL on the residual in the original basis.
+    // q_eff is only for the rotated MSE codebook dot product.
     if (use_qjl_key_residual) {
         if (!s_q_precomputed || !qjl_z) return 0;
         // BUGFIX 356: qjl_matrix 범위 체크
@@ -125,7 +133,7 @@ int qkv_attention_decode_impl(
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
                 size_t idx = (size_t)i * (size_t)d + (size_t)j;
-                sum += s->qjl_matrix[idx] * q_eff[j];
+                sum += s->qjl_matrix[idx] * query[j];
             }
             s_q_precomputed[i] = sum;
         }
@@ -133,8 +141,8 @@ int qkv_attention_decode_impl(
 
     // Parallel K scoring for large context (n >= 1024)
     if (n >= 1024) {
-        const int out_bits = qjl ? cfg->outlier_bits - 1 : cfg->outlier_bits;
-        const int norm_bits = qjl ? cfg->normal_bits - 1 : cfg->normal_bits;
+        const int out_bits = key_split_qjl ? key_outlier_total_bits - 1 : key_outlier_total_bits;
+        const int norm_bits = key_split_qjl ? key_normal_total_bits - 1 : key_normal_total_bits;
         const int n_outliers = cfg->outlier_channels;
         const int n_normal = d - n_outliers;
         // BUGFIX 357: overflow 방지

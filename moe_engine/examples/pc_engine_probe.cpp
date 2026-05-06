@@ -31,7 +31,7 @@ static void print_forward_status(const char* label, moe_pc_engine_t* engine) {
         return;
     }
     printf(
-        "forward[%s] storage=%d tensors=%d expert_triplet=%d tokenizer=%d embed=%d lm_head=%d attn_proj=%d attn_decode=%d kv_cache=%d attention=%d sampler=%d decode_loop=%d chat=%d tensor_count=%llu adapter=%s adapter_exec=%d dynamic_shape=%d layers=%u hidden=%u vocab=%u graph_ir=%d required=%d graph_ver=%u graph_layers=%llu graph_ops=%llu access_plan=%d hotset=%llu file_groups=%llu kv_layout=%d\n",
+        "forward[%s] storage=%d tensors=%d expert_triplet=%d tokenizer=%d embed=%d lm_head=%d attn_proj=%d attn_decode=%d kv_cache=%d attention=%d sampler=%d decode_loop=%d chat=%d tensor_count=%llu adapter=%s adapter_exec=%d dynamic_shape=%d layers=%u hidden=%u vocab=%u graph_ir=%d required=%d graph_ver=%u graph_layers=%llu graph_ops=%llu runtime_manifest=%d access_plan=%d hotset=%llu file_groups=%llu kv_layout=%d\n",
         label,
         status.storage_state_valid,
         status.tensor_table_loaded,
@@ -58,6 +58,7 @@ static void print_forward_status(const char* label, moe_pc_engine_t* engine) {
         status.graph_ir_version,
         (unsigned long long)status.graph_ir_layer_count,
         (unsigned long long)status.graph_ir_op_count,
+        status.runtime_execution_manifest_ready,
         status.runtime_access_plan_ready,
         (unsigned long long)status.runtime_access_hotset_count,
         (unsigned long long)status.runtime_access_file_group_count,
@@ -389,7 +390,7 @@ static int probe_main(int argc, char** argv) {
     fflush(stderr);
 
     printf(
-        "kv=%s offload_gguf=%d files=%u tensor_headers=%llu executable_tensors=%llu juju_schema=%u split_groups=%u split_missing=%u hint_tensors=%llu priority_tensors=%llu fast_tensors=%llu slow_tensors=%llu qkv_forced=%u qkv_bits=%u/%u normal=%u qkv_group=%u qkv_page=%u qkv_sink=%u qkv_rotation=%u qkv_rotation_seed=%llu qkv_qjl=%u qkv_qjl_seed=%llu qkv_outlier=%u/%u qkv_plain=%u weight=%s/%ub enc=%u kernel=%s first_gguf=%s vram=%llu common=%llu expert_vram=%llu device=%llu allocs=%llu device_mem=%llu/%llu device_pools=%llu/%llu/%llu/%llu model_lib=%d/%d/%d path=%s common_prefetch=%llu/%llu ram=%llu db=%llu experts=%llu tiers=%llu/%llu/%llu\n",
+        "kv=%s offload_gguf=%d files=%u tensor_headers=%llu executable_tensors=%llu juju_schema=%u split_groups=%u split_missing=%u hint_tensors=%llu priority_tensors=%llu fast_tensors=%llu slow_tensors=%llu qkv_forced=%u qkv_bits=%u/%u normal=%u key_normal=%u value_normal=%u qkv_group=%u qkv_page=%u qkv_sink=%u qkv_rotation=%u qkv_rotation_seed=%llu qkv_qjl=%u qkv_qjl_seed=%llu qkv_outlier=%u/%u key_outlier=%u value_outlier=%u qkv_plain=%u weight=%s/%ub enc=%u kernel=%s first_gguf=%s vram=%llu common=%llu expert_vram=%llu device=%llu allocs=%llu device_mem=%llu/%llu device_pools=%llu/%llu/%llu/%llu model_lib=%d/%d/%d path=%s common_prefetch=%llu/%llu ram=%llu db=%llu experts=%llu tiers=%llu/%llu/%llu\n",
         moe_kv_mode_name(stats.kv_mode),
         stats.offload_gguf_valid,
         stats.offload_gguf_file_count,
@@ -406,6 +407,8 @@ static int probe_main(int argc, char** argv) {
         stats.qkv_k_bits,
         stats.qkv_v_bits,
         stats.qkv_normal_bits,
+        stats.qkv_key_normal_bits,
+        stats.qkv_value_normal_bits,
         stats.qkv_group_size,
         stats.qkv_page_size_tokens,
         stats.qkv_sink_tokens,
@@ -415,6 +418,8 @@ static int probe_main(int argc, char** argv) {
         (unsigned long long)stats.qkv_qjl_seed,
         stats.qkv_outlier_channels,
         stats.qkv_outlier_bits,
+        stats.qkv_key_outlier_bits,
+        stats.qkv_value_outlier_bits,
         stats.qkv_plain_kv_persistent_storage,
         stats.weight_quant_family,
         stats.weight_quant_bits,

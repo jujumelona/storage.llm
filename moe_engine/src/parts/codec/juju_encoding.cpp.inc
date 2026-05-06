@@ -177,6 +177,10 @@ static int moe_graph_ir_executor_compiled(const moe_pc_engine* engine) {
         }
     }
     const int graph_required = engine->offload_graph_ir_required.load(std::memory_order_relaxed);
+    if ((graph_required || graph.find("\"runtime_execution_manifest\"") != std::string::npos) &&
+        !engine->juju_runtime_execution_manifest_ready.load(std::memory_order_relaxed)) {
+        return 0;
+    }
     if ((graph_required || graph.find("\"runtime_access_plan\"") != std::string::npos) &&
         !engine->juju_runtime_access_plan_ready.load(std::memory_order_relaxed)) {
         return 0;

@@ -224,6 +224,12 @@ static int moe_read_offload_gguf_file(
         } else if (key == "offload.qkv_normal_bits" && moe_gguf_read_uint_value(input, type, &u64_value)) {
             consumed = 1;
             out->contract.qkv_normal_bits = moe_u64_to_u32_clamped(u64_value, 0);
+        } else if (key == "offload.qkv_key_normal_bits" && moe_gguf_read_uint_value(input, type, &u64_value)) {
+            consumed = 1;
+            out->contract.qkv_key_normal_bits = moe_u64_to_u32_clamped(u64_value, 0);
+        } else if (key == "offload.qkv_value_normal_bits" && moe_gguf_read_uint_value(input, type, &u64_value)) {
+            consumed = 1;
+            out->contract.qkv_value_normal_bits = moe_u64_to_u32_clamped(u64_value, 0);
         } else if (key == "offload.qkv_group_size" && moe_gguf_read_uint_value(input, type, &u64_value)) {
             consumed = 1;
             out->contract.qkv_group_size = moe_u64_to_u32_clamped(u64_value, 0);
@@ -251,6 +257,12 @@ static int moe_read_offload_gguf_file(
         } else if (key == "offload.qkv_outlier_bits" && moe_gguf_read_uint_value(input, type, &u64_value)) {
             consumed = 1;
             out->contract.qkv_outlier_bits = moe_u64_to_u32_clamped(u64_value, 0);
+        } else if (key == "offload.qkv_key_outlier_bits" && moe_gguf_read_uint_value(input, type, &u64_value)) {
+            consumed = 1;
+            out->contract.qkv_key_outlier_bits = moe_u64_to_u32_clamped(u64_value, 0);
+        } else if (key == "offload.qkv_value_outlier_bits" && moe_gguf_read_uint_value(input, type, &u64_value)) {
+            consumed = 1;
+            out->contract.qkv_value_outlier_bits = moe_u64_to_u32_clamped(u64_value, 0);
         } else if ((key == "offload.final_model_structure_contract" ||
                     key == "offload.pipeline_budget_contract" ||
                     key == "offload.execution_path_contract" ||
@@ -276,7 +288,11 @@ static int moe_read_offload_gguf_file(
         }
     }
     moe_parse_offload_metadata_json(out);
-    if (out->contract.qkv_k_bits || out->contract.qkv_v_bits) {
+    if (out->contract.qkv_k_bits || out->contract.qkv_v_bits ||
+        out->contract.qkv_normal_bits || out->contract.qkv_outlier_channels ||
+        out->contract.qkv_outlier_bits ||
+        out->contract.qkv_key_normal_bits || out->contract.qkv_value_normal_bits ||
+        out->contract.qkv_key_outlier_bits || out->contract.qkv_value_outlier_bits) {
         out->contract.qkv_required = true;
     }
     if (out->contract.weight_encoding == 0 && !out->contract.weight_quant_family.empty()) {

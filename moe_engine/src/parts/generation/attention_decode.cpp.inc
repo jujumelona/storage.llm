@@ -287,6 +287,7 @@
             "attn_standard_qkv_append",
             "layer=%d pos=%u kv_heads=%u seq=%u cap=%u head_dim=%u "
             "k_bits=%d v_bits=%d outlier_channels=%d outlier_bits=%d normal_bits=%d "
+            "key_outlier_bits=%d key_normal_bits=%d value_outlier_bits=%d value_normal_bits=%d "
             "scale=%.6g scale_source=%s attn_softcap=%.6g ms=%.3f",
             layer, position, num_kv_heads, seq_len, qkv_capacity_tokens, head_dim,
             engine->qkv_cfg.k_bits,
@@ -294,6 +295,10 @@
             engine->qkv_cfg.outlier_channels,
             engine->qkv_cfg.outlier_bits,
             engine->qkv_cfg.normal_bits,
+            engine->qkv_cfg.key_outlier_bits,
+            engine->qkv_cfg.key_normal_bits,
+            engine->qkv_cfg.value_outlier_bits,
+            engine->qkv_cfg.value_normal_bits,
             (double)scale,
             scale_source ? scale_source : "unknown",
             (double)attn_logit_softcap,

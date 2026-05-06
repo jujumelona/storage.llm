@@ -151,6 +151,14 @@ struct moe_pc_engine {
     // writes update both this AND io_config.prefer_overlapped_io for external callers.
     std::atomic<bool> prefer_overlapped_io_atomic{false};
     std::atomic<bool> overlapped_io_transition_done{false};
+    std::atomic<bool> vlock_recovery_reset_pending{false};
+    // BUGFIX Problem 3: Engine-wide VirtualLock recovery counters ★★★ CRITICAL
+    // Problem: thread_local counters → each worker tracks independently
+    // → Recovery transition races with in-flight OVERLAPPED operations
+    // Solution: Engine-wide atomic counters shared by all IO workers
+    // Impact: Consistent recovery state, proper synchronization
+    std::atomic<uint32_t> vlock_recovery_counter{0};
+    std::atomic<uint32_t> vlock_fail_counter{0};
     // BUGFIX 989: Mutex for atomic pending→in_flight VRAM transition ★★★
     // Held only during the 2-atomic-op transition (~20ns). device_budget_bytes()
     // reads both counters under this mutex to get a consistent snapshot.
@@ -253,6 +261,9 @@ struct moe_pc_engine {
     std::atomic<uint64_t> pending_vram_reservation{0}; // Fix 15: VRAM double admission prevention
     std::atomic<int64_t> last_mem_query_ms{0};  // Fix 41: per-engine cuMemGetInfo throttle
     std::atomic<int> device_allocator_ready{0};
+    std::atomic<bool> kv_actually_in_vram{false};
+    std::atomic<bool> lifecycle_terminated{false};
+    std::atomic<bool> juju_co_activation_bank_initialized{false};
     std::unordered_set<uint64_t> activation_keys;
     std::priority_queue<
         moe_device_evict_candidate,
@@ -321,6 +332,7 @@ struct moe_pc_engine {
     std::atomic<uint32_t> offload_graph_ir_version{0};
     std::atomic<uint64_t> offload_graph_ir_op_count{0};
     std::atomic<uint64_t> offload_graph_ir_layer_count{0};
+    std::atomic<uint32_t> juju_runtime_execution_manifest_ready{0};
     std::atomic<uint32_t> juju_runtime_access_plan_ready{0};
     std::atomic<uint64_t> juju_runtime_access_hotset_count{0};
     std::atomic<uint64_t> juju_runtime_access_file_group_count{0};

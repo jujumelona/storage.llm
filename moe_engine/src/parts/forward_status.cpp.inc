@@ -86,6 +86,8 @@ int moe_pc_engine_get_forward_status(
     out_status->graph_ir_version = engine->offload_graph_ir_version.load(std::memory_order_relaxed);
     out_status->graph_ir_layer_count = engine->offload_graph_ir_layer_count.load(std::memory_order_relaxed);
     out_status->graph_ir_op_count = engine->offload_graph_ir_op_count.load(std::memory_order_relaxed);
+    out_status->runtime_execution_manifest_ready =
+        engine->juju_runtime_execution_manifest_ready.load(std::memory_order_relaxed) ? 1 : 0;
     out_status->runtime_access_plan_ready =
         engine->juju_runtime_access_plan_ready.load(std::memory_order_relaxed) ? 1 : 0;
     out_status->runtime_access_hotset_count =

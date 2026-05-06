@@ -172,11 +172,20 @@ int moe_juju_compute_pipeline_config(
         return 0;
     }
     std::memset(out_config, 0, sizeof(*out_config));
-    const double compute_ms = juju_compute_ms(tier0, expert_bytes, expert_flops);
-    const double t1_to_t0_ms = juju_transfer_ms(tier1, expert_bytes);
-    const double t2_to_t1_ms = juju_transfer_ms(tier2, expert_bytes);
-    const uint64_t block_size = juju_choose_block_size(expert_bytes, tier2);
-    const uint64_t segment_bytes = juju_choose_segment_bytes(expert_bytes, block_size, compute_ms, t2_to_t1_ms);
+
+    // BUGFIX NEW-10: Copy scan structure to local variable ★★★ CRITICAL
+    // Problem: BUGFIX 550 noted race condition but only added defensive check
+    // → expert_bytes can still change between check and division
+    // Solution: Copy all inputs to local variables at function entry
+    // Impact: Eliminates TOCTOU race, prevents division by zero
+    const uint64_t local_expert_bytes = expert_bytes;
+    const double local_expert_flops = expert_flops;
+
+    const double compute_ms = juju_compute_ms(tier0, local_expert_bytes, local_expert_flops);
+    const double t1_to_t0_ms = juju_transfer_ms(tier1, local_expert_bytes);
+    const double t2_to_t1_ms = juju_transfer_ms(tier2, local_expert_bytes);
+    const uint64_t block_size = juju_choose_block_size(local_expert_bytes, tier2);
+    const uint64_t segment_bytes = juju_choose_segment_bytes(local_expert_bytes, block_size, compute_ms, t2_to_t1_ms);
     const uint32_t prefetch_depth = (uint32_t)juju_clamp_u64(
         t2_to_t1_ms > 0.0 ? (uint64_t)std::ceil(t2_to_t1_ms / compute_ms) + 1ull : 1ull,
         1ull,
@@ -188,12 +197,13 @@ int moe_juju_compute_pipeline_config(
     // Problem: expert_bytes can be 0 (checked at function start) but tier capacity calculation doesn't check
     // If expert_bytes somehow becomes 0 after check (race condition), division by zero occurs
     // Solution: Add defensive check before division
-    out_config->tier0_expert_count = (expert_bytes > 0) ? tier0->capacity_bytes / expert_bytes : 0;
-    out_config->tier1_expert_count = (tier1 && expert_bytes > 0) ? tier1->capacity_bytes / expert_bytes : 0;
+    // BUGFIX NEW-10: Use local_expert_bytes instead of expert_bytes
+    out_config->tier0_expert_count = (local_expert_bytes > 0) ? tier0->capacity_bytes / local_expert_bytes : 0;
+    out_config->tier1_expert_count = (tier1 && local_expert_bytes > 0) ? tier1->capacity_bytes / local_expert_bytes : 0;
     out_config->io_threads = io_threads;
     out_config->block_size = block_size;
     out_config->segment_bytes = segment_bytes;
-    out_config->segment_count = segment_bytes ? (uint32_t)((expert_bytes + segment_bytes - 1ull) / segment_bytes) : 0;
+    out_config->segment_count = segment_bytes ? (uint32_t)((local_expert_bytes + segment_bytes - 1ull) / segment_bytes) : 0;
     out_config->compute_ms = compute_ms;
     out_config->tier1_to_tier0_ms = t1_to_t0_ms;
     out_config->tier2_to_tier1_ms = t2_to_t1_ms;

@@ -78,12 +78,13 @@ int moe_pc_engine_generate_token_ids(
         char reason[320]{};
         if (forward.graph_ir_ready) {
             std::snprintf(reason, sizeof(reason),
-                "graph IR executor not executable graph_ver=%u layers=%u ops=%llu hidden=%u vocab=%u access_plan=%d kv_layout=%d hotset=%llu file_groups=%llu tensor_refs=%llu layer_prefetch=%llu kv_entry=%llu kv_page=%llu",
+                "graph IR executor not executable graph_ver=%u layers=%u ops=%llu hidden=%u vocab=%u runtime_manifest=%d access_plan=%d kv_layout=%d hotset=%llu file_groups=%llu tensor_refs=%llu layer_prefetch=%llu kv_entry=%llu kv_page=%llu",
                 forward.graph_ir_version,
                 forward.dynamic_num_hidden_layers,
                 (unsigned long long)forward.graph_ir_op_count,
                 forward.dynamic_hidden_size,
                 forward.dynamic_vocab_size,
+                forward.runtime_execution_manifest_ready,
                 forward.runtime_access_plan_ready,
                 forward.kv_layout_contract_ready,
                 (unsigned long long)forward.runtime_access_hotset_count,

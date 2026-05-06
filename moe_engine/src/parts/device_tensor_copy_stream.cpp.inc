@@ -214,11 +214,16 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
             ready = wait_all ?
                 (device_backend_event_sync(e, copy.event) != 0) :
                 (device_backend_event_query(e, copy.event) != 0);
-            if (!ready && wait_all && stream && !stream_synced) {
+            // BUGFIX NEW-7: Check supports_backend_async_api before stream operations ★★★ CRITICAL
+            // Problem: Vulkan sets supports_backend_async_api=false but stream != nullptr check passes
+            // → Code tries async path with sync-only backend → double-buffering activated incorrectly
+            // Solution: Check both supports_backend_async_api AND stream != nullptr
+            // Impact: Ensures Vulkan uses correct sync-only path, prevents false async assumptions
+            if (!ready && wait_all && e->backend_caps.supports_backend_async_api && stream && !stream_synced) {
                 ready = device_backend_stream_sync(e, stream) != 0;
                 stream_synced = ready;
             }
-        } else if (wait_all && stream) {
+        } else if (wait_all && e->backend_caps.supports_backend_async_api && stream) {
             if (!stream_synced) {
                 stream_synced = device_backend_stream_sync(e, stream) != 0;
             }

@@ -115,6 +115,8 @@ struct moe_offload_gguf_contract_t {
     uint32_t qkv_k_bits = 0;
     uint32_t qkv_v_bits = 0;
     uint32_t qkv_normal_bits = 0;
+    uint32_t qkv_key_normal_bits = 0;
+    uint32_t qkv_value_normal_bits = 0;
     uint32_t qkv_group_size = 0;
     uint32_t qkv_page_size_tokens = 0;
     uint32_t qkv_sink_tokens = 0;
@@ -124,6 +126,8 @@ struct moe_offload_gguf_contract_t {
     int qkv_enable_rotation = -1;
     uint32_t qkv_outlier_channels = 0;
     uint32_t qkv_outlier_bits = 0;
+    uint32_t qkv_key_outlier_bits = 0;
+    uint32_t qkv_value_outlier_bits = 0;
     bool has_juju_contracts = false;
 };
 

@@ -245,6 +245,7 @@ static void log_engine_snapshot(const char* tag, moe_pc_engine_t* engine) {
                   << " graph_required=" << forward.graph_ir_required
                   << " graph_layers=" << forward.graph_ir_layer_count
                   << " graph_ops=" << forward.graph_ir_op_count
+                  << " runtime_manifest=" << forward.runtime_execution_manifest_ready
                   << " access_plan=" << forward.runtime_access_plan_ready
                   << " hotset=" << forward.runtime_access_hotset_count
                   << " file_groups=" << forward.runtime_access_file_group_count
@@ -268,6 +269,12 @@ static void log_engine_snapshot(const char* tag, moe_pc_engine_t* engine) {
                   << " kv=" << moe_kv_mode_name(stats.kv_mode)
                   << " qkv_forced=" << stats.qkv_forced_by_format
                   << " qkv_bits=" << stats.qkv_k_bits << "/" << stats.qkv_v_bits
+                  << " qkv_normal=" << stats.qkv_normal_bits
+                  << " qkv_key_normal=" << stats.qkv_key_normal_bits
+                  << " qkv_value_normal=" << stats.qkv_value_normal_bits
+                  << " qkv_outlier=" << stats.qkv_outlier_channels << "/" << stats.qkv_outlier_bits
+                  << " qkv_key_outlier=" << stats.qkv_key_outlier_bits
+                  << " qkv_value_outlier=" << stats.qkv_value_outlier_bits
                   << " qkv_group=" << stats.qkv_group_size
                   << " ram_used=" << stats.ram_used_bytes
                   << " vram_used=" << stats.vram_used_bytes
@@ -2288,6 +2295,7 @@ static std::string make_health_json(
         << "\"graphIrVersion\":" << forward.graph_ir_version << ","
         << "\"graphIrLayerCount\":" << forward.graph_ir_layer_count << ","
         << "\"graphIrOpCount\":" << forward.graph_ir_op_count << ","
+        << "\"runtimeExecutionManifestReady\":" << (forward.runtime_execution_manifest_ready ? "true" : "false") << ","
         << "\"runtimeAccessPlanReady\":" << (forward.runtime_access_plan_ready ? "true" : "false") << ","
         << "\"runtimeAccessHotsetCount\":" << forward.runtime_access_hotset_count << ","
         << "\"runtimeAccessFileGroupCount\":" << forward.runtime_access_file_group_count << ","
@@ -2361,6 +2369,8 @@ static std::string make_health_json(
         << "\"qkvKBits\":" << stats.qkv_k_bits << ","
         << "\"qkvVBits\":" << stats.qkv_v_bits << ","
         << "\"qkvNormalBits\":" << stats.qkv_normal_bits << ","
+        << "\"qkvKeyNormalBits\":" << stats.qkv_key_normal_bits << ","
+        << "\"qkvValueNormalBits\":" << stats.qkv_value_normal_bits << ","
         << "\"qkvGroupSize\":" << stats.qkv_group_size << ","
         << "\"qkvPageSizeTokens\":" << stats.qkv_page_size_tokens << ","
         << "\"qkvSinkTokens\":" << stats.qkv_sink_tokens << ","
@@ -2370,6 +2380,8 @@ static std::string make_health_json(
         << "\"qkvQjlSeed\":" << stats.qkv_qjl_seed << ","
         << "\"qkvOutlierChannels\":" << stats.qkv_outlier_channels << ","
         << "\"qkvOutlierBits\":" << stats.qkv_outlier_bits << ","
+        << "\"qkvKeyOutlierBits\":" << stats.qkv_key_outlier_bits << ","
+        << "\"qkvValueOutlierBits\":" << stats.qkv_value_outlier_bits << ","
         << "\"qkvPlainPersistentStorage\":" << (stats.qkv_plain_kv_persistent_storage ? "true" : "false") << ","
         << "\"weightQuantBits\":" << stats.weight_quant_bits << ","
         << "\"weightQuantEncoding\":" << stats.weight_quant_encoding << ","
@@ -2675,6 +2687,7 @@ static std::string make_chat_not_ready_json(const moe_forward_status_t& forward)
         << ", decodeLoop=" << (forward.decode_loop_ready ? "ready" : "missing")
         << ", graphIr=" << (forward.graph_ir_ready ? "ready" : "missing")
         << ", graphIrRequired=" << (forward.graph_ir_required ? "yes" : "no")
+        << ", runtimeExecutionManifest=" << (forward.runtime_execution_manifest_ready ? "ready" : "missing")
         << ", runtimeAccessPlan=" << (forward.runtime_access_plan_ready ? "ready" : "missing")
         << ", runtimeHotset=" << forward.runtime_access_hotset_count
         << ", runtimeFileGroups=" << forward.runtime_access_file_group_count

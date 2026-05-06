@@ -44,17 +44,21 @@
     };
     auto preserve_requeue = [&](const moe_prefetch_task& retry_task, moe_transfer_stage_t retry_stage) {
         if (!io_worker_requeue_disk_task(engine, retry_task, retry_stage, 3u, 1u)) {
-            // Bug Fix: Cap local_requeues size to prevent unbounded growth
-            // When both disk_stage and gpu_stage are full, local_requeues grows indefinitely
-            // BUGFIX 997: Reduce cap to limit untracked RAM ★★ IMPORTANT
-            // Problem: Old cap = disk_stage_depth_cap (2048). With 8 io_workers,
-            //   max 16,384 tasks × ~sizeof(pair) in heap, invisible to tier counters
-            //   → RAM tier admission sees hundreds of MB less than reality.
-            // Solution: Cap at min(64, depth_cap/8). 8 workers × 64 = 512 tasks max.
-            //   Still enough buffer for back-pressure transients, but bounded memory.
             const uint32_t cap = std::max(8u, std::min(64u, engine->disk_stage_depth_cap / 8u));
             if (local_requeues.size() < cap) {
                 local_requeues.emplace_back(retry_task, retry_stage);
+                uint64_t task_bytes = 0;
+                if (retry_task.tensor_index >= 0 && (size_t)retry_task.tensor_index < engine->tensors.size()) {
+                    task_bytes = tensor_stream_bytes(engine->tensors[retry_task.tensor_index]);
+                } else if (retry_task.raw_span_index >= 0) {
+                    const moe_storage_raw_span_spec_t* span = moe_storage_raw_span_at((uint32_t)retry_task.raw_span_index);
+                    if (span) {
+                        task_bytes = span->byte_count;
+                    }
+                }
+                if (task_bytes > 0) {
+                    add_tier_usage(engine, moe_TIER_RAM, task_bytes);
+                }
             } else {
                 engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
             }
@@ -62,14 +66,28 @@
         return 1;
     };
     auto drain_local_requeues = [&]() {
-        // BUGFIX 95: Cache io_stop check in requeue loop
         while (!local_requeues.empty() && !should_stop()) {
             const auto pending = local_requeues.front();
+            uint64_t task_bytes = 0;
+            if (pending.first.tensor_index >= 0 && (size_t)pending.first.tensor_index < engine->tensors.size()) {
+                task_bytes = tensor_stream_bytes(engine->tensors[pending.first.tensor_index]);
+            } else if (pending.first.raw_span_index >= 0) {
+                const moe_storage_raw_span_spec_t* span = moe_storage_raw_span_at((uint32_t)pending.first.raw_span_index);
+                if (span) {
+                    task_bytes = span->byte_count;
+                }
+            }
             if (io_worker_requeue_disk_task(engine, pending.first, pending.second, 5u, 1u)) {
                 local_requeues.pop_front();
+                if (task_bytes > 0) {
+                    subtract_tier_usage(engine, moe_TIER_RAM, task_bytes);
+                }
             } else {
                 engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
                 local_requeues.pop_front();
+                if (task_bytes > 0) {
+                    subtract_tier_usage(engine, moe_TIER_RAM, task_bytes);
+                }
             }
         }
     };
@@ -88,24 +106,34 @@
     for (;;) {
         if (!local_requeues.empty()) {
             const auto pending = local_requeues.front();
+            uint64_t task_bytes = 0;
+            if (pending.first.tensor_index >= 0 && (size_t)pending.first.tensor_index < engine->tensors.size()) {
+                task_bytes = tensor_stream_bytes(engine->tensors[pending.first.tensor_index]);
+            } else if (pending.first.raw_span_index >= 0) {
+                const moe_storage_raw_span_spec_t* span = moe_storage_raw_span_at((uint32_t)pending.first.raw_span_index);
+                if (span) {
+                    task_bytes = span->byte_count;
+                }
+            }
             if (io_worker_requeue_disk_task(engine, pending.first, pending.second, 1u, 0u)) {
                 local_requeues.pop_front();
-                requeue_retry_count = 0;  // Reset on success
-                continue;
-            }
-
-            // BUGFIX 84: Check retry limit
-            if (++requeue_retry_count >= MAX_REQUEUE_RETRIES) {
-                engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
-                local_requeues.pop_front();
+                if (task_bytes > 0) {
+                    subtract_tier_usage(engine, moe_TIER_RAM, task_bytes);
+                }
                 requeue_retry_count = 0;
                 continue;
             }
 
-            // PIPELINE FIX 10: Wait on correct CV based on requeue target ?끸쁾
-            // Old: Always waited on disk_stage.pop_cv even when gpu_stage was full
-            // New: Wait on gpu_stage.pop_cv when target is GPU, disk_stage.pop_cv otherwise
-            // Eliminates 2ms polling delay when GPU stage is the actual bottleneck
+            if (++requeue_retry_count >= MAX_REQUEUE_RETRIES) {
+                engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+                local_requeues.pop_front();
+                if (task_bytes > 0) {
+                    subtract_tier_usage(engine, moe_TIER_RAM, task_bytes);
+                }
+                requeue_retry_count = 0;
+                continue;
+            }
+
             moe_stage_queue* target_stage = (pending.second == moe_TRANSFER_STAGE_PINNED_TO_GPU)
                 ? &engine->gpu_stage : &engine->disk_stage;
             std::unique_lock<std::mutex> lock(target_stage->mtx);

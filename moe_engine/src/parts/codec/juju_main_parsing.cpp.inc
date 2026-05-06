@@ -131,6 +131,10 @@ static void moe_ingest_juju_graph_ir(moe_pc_engine* engine, const std::string& i
     engine->offload_graph_ir_layer_count.fetch_add(
         moe_count_json_key_occurrences(index_json, "\"layer\"", graph_pos),
         std::memory_order_relaxed);
+    if (index_json.find("\"runtime_execution_manifest\"", graph_pos) != std::string::npos &&
+        index_json.find("JUJU_RUNTIME_EXECUTION_MANIFEST_V1", graph_pos) != std::string::npos) {
+        engine->juju_runtime_execution_manifest_ready.store(1, std::memory_order_relaxed);
+    }
     const int has_runtime_access_plan =
         index_json.find("\"runtime_access_plan\"", graph_pos) != std::string::npos &&
         index_json.find("JUJU_RUNTIME_ACCESS_PLAN_V1", graph_pos) != std::string::npos;

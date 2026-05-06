@@ -51,7 +51,13 @@ static void stop_io_workers_locked(moe_pc_engine* engine) {
     engine->pinned_workers.clear();
     engine->gpu_workers.clear();
     engine->total_queue_depth.store(0, std::memory_order_relaxed);
-    engine->io_stop.store(false);
+    // BUGFIX NEW-9: Move io_stop.store(false) to start_io_workers() ★★★ CRITICAL
+    // Problem: io_stop=false set here → ensure_io_ready() starts threads immediately after
+    // → Another stop_io_workers() called before threads check io_stop → threads see true and exit
+    // → disk_worker_target > 0 but actual workers = 0 → silent pipeline failure
+    // Solution: Remove io_stop.store(false) from here, move to start_io_workers() beginning
+    // Impact: Guarantees threads see io_stop=false when they start
+    // Note: Removed line: engine->io_stop.store(false);
     engine->io_done_cv.notify_all();
 }
 
@@ -66,6 +72,13 @@ static void start_io_workers(moe_pc_engine* engine) {
     if (!engine || !engine->io_config.enable_compute_io_overlap) {
         return;
     }
+    // BUGFIX NEW-9: Clear io_stop BEFORE creating threads ★★★ CRITICAL
+    // Problem: stop_io_workers_locked() sets io_stop=true but doesn't clear it
+    // → New threads created here may see io_stop=true and exit immediately
+    // Solution: Clear io_stop at function start (under io_start_mutex)
+    // Impact: Guarantees all new threads see io_stop=false
+    engine->io_stop.store(false, std::memory_order_release);
+
     uint32_t workers = runtime_disk_workers(engine);
     if (workers == 0) {
         workers = 1;

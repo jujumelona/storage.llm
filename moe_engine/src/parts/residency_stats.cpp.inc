@@ -52,6 +52,8 @@ int moe_pc_engine_get_stats(const moe_pc_engine_t* engine, moe_pc_engine_stats_t
         out_stats->qkv_k_bits = (uint32_t)std::max(0, engine->offload_qkv_cfg.k_bits);
         out_stats->qkv_v_bits = (uint32_t)std::max(0, engine->offload_qkv_cfg.v_bits);
         out_stats->qkv_normal_bits = (uint32_t)std::max(0, engine->offload_qkv_cfg.normal_bits);
+        out_stats->qkv_key_normal_bits = (uint32_t)std::max(0, engine->offload_qkv_cfg.key_normal_bits);
+        out_stats->qkv_value_normal_bits = (uint32_t)std::max(0, engine->offload_qkv_cfg.value_normal_bits);
         out_stats->qkv_group_size = engine->offload_qkv_cfg.group_size;
         out_stats->qkv_page_size_tokens = engine->offload_qkv_cfg.page_size_tokens;
         out_stats->qkv_sink_tokens = engine->offload_qkv_cfg.sink_tokens;
@@ -61,6 +63,8 @@ int moe_pc_engine_get_stats(const moe_pc_engine_t* engine, moe_pc_engine_stats_t
         out_stats->qkv_enable_rotation = engine->offload_qkv_cfg.enable_rotation ? 1u : 0u;
         out_stats->qkv_outlier_channels = (uint32_t)std::max(0, engine->offload_qkv_cfg.outlier_channels);
         out_stats->qkv_outlier_bits = (uint32_t)std::max(0, engine->offload_qkv_cfg.outlier_bits);
+        out_stats->qkv_key_outlier_bits = (uint32_t)std::max(0, engine->offload_qkv_cfg.key_outlier_bits);
+        out_stats->qkv_value_outlier_bits = (uint32_t)std::max(0, engine->offload_qkv_cfg.value_outlier_bits);
         out_stats->qkv_plain_kv_persistent_storage =
             engine->offload_qkv_cfg.plain_kv_persistent_storage ? 1u : 0u;
     }

@@ -25,11 +25,16 @@ static std::atomic<uint64_t>* device_pool_counter(moe_pc_engine* e, uint8_t pool
     // Solution: Only return device_kv_cache_bytes counter if KV is actually in VRAM.
     // Check: backend is CUDA/HIP AND device-side KV attention is compiled in.
     // Impact: Correct budget accounting for CPU and RAM-side KV configurations.
+    // BUGFIX NEW-1: Use runtime state instead of compile-time macro ★★★ CRITICAL
+    // Problem: moe_kv_vram_attention_runtime_available() depends on MOE_ENABLE_DEVICE_KV_ATTENTION
+    // → If macro is enabled but KV spills to RAM due to memory pressure, still returns VRAM counter
+    // → Double-counting persists (RAM tier + VRAM budget both subtract same bytes)
+    // Solution: Check engine->kv_actually_in_vram runtime flag instead of compile-time macro
+    // → generation_kv_cache.cpp.inc sets this flag on alloc/dealloc
+    // Impact: Eliminates double-counting even when KV dynamically spills to RAM
     if (pool == moe_DEVICE_POOL_KV_CACHE) {
-        // Only count KV in VRAM budget if it's actually allocated in VRAM
-        const bool kv_in_vram = (e->backend_caps.backend == moe_BACKEND_CUDA ||
-                                 e->backend_caps.backend == moe_BACKEND_HIP) &&
-                                moe_kv_vram_attention_runtime_available(e);
+        // Only count KV in VRAM budget if it's actually allocated in VRAM (runtime check)
+        const bool kv_in_vram = e->kv_actually_in_vram.load(std::memory_order_acquire);
         return kv_in_vram ? &e->device_kv_cache_bytes : nullptr;
     }
     return nullptr;

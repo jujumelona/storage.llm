@@ -63,9 +63,9 @@
         block.vram_scales = (void*)vram_scales_ptr;
         block.vram_zeros = (void*)vram_zeros_ptr;
         block.tier = moe_TIER_VRAM;
+        engine->kv_actually_in_vram.store(true, std::memory_order_release);
     }
 
-    // Update device pool counter
     engine->device_kv_cache_bytes.fetch_add(total_size, std::memory_order_relaxed);
 
     return 1;
@@ -195,6 +195,11 @@ static uint32_t evict_cold_kv_blocks(
     if (evicted_count > 0) {
         fprintf(stderr, "[storageLLM INFO] Evicted %u cold KV blocks from VRAM, freed %llu MB\n",
             evicted_count, (unsigned long long)(freed / (1024*1024)));
+
+        const uint64_t remaining_kv = engine->device_kv_cache_bytes.load(std::memory_order_relaxed);
+        if (remaining_kv == 0) {
+            engine->kv_actually_in_vram.store(false, std::memory_order_release);
+        }
     }
 
     return evicted_count;

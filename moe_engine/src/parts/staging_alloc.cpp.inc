@@ -19,17 +19,21 @@ static void prepare_windows_staging_working_set(uint64_t bytes) {
     // → Second 4GB staging buffer not included in working set → page faults on memcpy
     // Solution: Accumulate all staging allocations in reserved_total_ws
     // Impact: Eliminates blocking page faults on multi-buffer staging
+    // BUGFIX NEW-2: Fix race condition in cumulative tracking ★★★ CRITICAL
+    // Problem: new_total calculated outside mutex → another thread can modify reserved_total_ws
+    // between load and store → lost updates or incorrect overflow check
+    // Solution: Move all calculation inside mutex, use single atomic snapshot
+    // Impact: Eliminates race condition, ensures correct cumulative tracking
     static std::atomic<SIZE_T> reserved_total_ws{0};
-    const SIZE_T new_total = reserved_total_ws.load(std::memory_order_relaxed) + min_ws;
-    if (new_total <= reserved_total_ws.load(std::memory_order_relaxed)) {
-        return; // Overflow protection
-    }
+
     std::lock_guard<std::mutex> lock(ws_mutex);
     const SIZE_T current_total = reserved_total_ws.load(std::memory_order_relaxed);
     const SIZE_T updated_total = current_total + min_ws;
+
     if (updated_total < current_total) {
-        return; // Overflow protection
+        return;
     }
+
     const SIZE_T updated_max = updated_total + 64ull * 1024ull * 1024ull;
     if (SetProcessWorkingSetSize(GetCurrentProcess(), updated_total, updated_max)) {
         reserved_total_ws.store(updated_total, std::memory_order_relaxed);

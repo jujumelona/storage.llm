@@ -73,6 +73,16 @@ static qkv_config_t moe_qkv_config_from_offload_contract(const moe_offload_gguf_
         cfg.normal_bits = (int)((contract.qkv_normal_bits <= 8 || contract.qkv_normal_bits == 16 || contract.qkv_normal_bits == 32)
             ? contract.qkv_normal_bits : 8);
     }
+    cfg.key_normal_bits = cfg.normal_bits;
+    cfg.value_normal_bits = cfg.normal_bits;
+    if (contract.qkv_key_normal_bits > 0) {
+        cfg.key_normal_bits = (int)((contract.qkv_key_normal_bits <= 8 || contract.qkv_key_normal_bits == 16 || contract.qkv_key_normal_bits == 32)
+            ? contract.qkv_key_normal_bits : 8);
+    }
+    if (contract.qkv_value_normal_bits > 0) {
+        cfg.value_normal_bits = (int)((contract.qkv_value_normal_bits <= 8 || contract.qkv_value_normal_bits == 16 || contract.qkv_value_normal_bits == 32)
+            ? contract.qkv_value_normal_bits : 8);
+    }
     if (contract.qkv_group_size > 0) {
         cfg.group_size = contract.qkv_group_size;
     }
@@ -99,26 +109,49 @@ static qkv_config_t moe_qkv_config_from_offload_contract(const moe_offload_gguf_
         cfg.outlier_bits = (int)((contract.qkv_outlier_bits <= 8 || contract.qkv_outlier_bits == 16 || contract.qkv_outlier_bits == 32)
             ? contract.qkv_outlier_bits : 8);
     }
+    cfg.key_outlier_bits = cfg.outlier_bits;
+    cfg.value_outlier_bits = cfg.outlier_bits;
+    if (contract.qkv_key_outlier_bits > 0) {
+        cfg.key_outlier_bits = (int)((contract.qkv_key_outlier_bits <= 8 || contract.qkv_key_outlier_bits == 16 || contract.qkv_key_outlier_bits == 32)
+            ? contract.qkv_key_outlier_bits : 8);
+    }
+    if (contract.qkv_value_outlier_bits > 0) {
+        cfg.value_outlier_bits = (int)((contract.qkv_value_outlier_bits <= 8 || contract.qkv_value_outlier_bits == 16 || contract.qkv_value_outlier_bits == 32)
+            ? contract.qkv_value_outlier_bits : 8);
+    }
     const bool raw_qkv =
         moe_qkv_contract_raw_bits(cfg.k_bits) ||
         moe_qkv_contract_raw_bits(cfg.v_bits) ||
         moe_qkv_contract_raw_bits(cfg.normal_bits) ||
-        moe_qkv_contract_raw_bits(cfg.outlier_bits);
+        moe_qkv_contract_raw_bits(cfg.outlier_bits) ||
+        moe_qkv_contract_raw_bits(cfg.key_normal_bits) ||
+        moe_qkv_contract_raw_bits(cfg.value_normal_bits) ||
+        moe_qkv_contract_raw_bits(cfg.key_outlier_bits) ||
+        moe_qkv_contract_raw_bits(cfg.value_outlier_bits);
     const bool codebook_qkv =
         moe_qkv_contract_codebook_bits(cfg.k_bits) &&
         moe_qkv_contract_codebook_bits(cfg.v_bits) &&
         moe_qkv_contract_codebook_bits(cfg.normal_bits) &&
-        moe_qkv_contract_codebook_bits(cfg.outlier_bits);
+        moe_qkv_contract_codebook_bits(cfg.outlier_bits) &&
+        moe_qkv_contract_codebook_bits(cfg.key_normal_bits) &&
+        moe_qkv_contract_codebook_bits(cfg.value_normal_bits) &&
+        moe_qkv_contract_codebook_bits(cfg.key_outlier_bits) &&
+        moe_qkv_contract_codebook_bits(cfg.value_outlier_bits);
     if (contract.qkv_required && codebook_qkv && cfg.outlier_channels > 0 && cfg.v_bits > 1 && cfg.normal_bits > cfg.v_bits) {
         std::fprintf(stderr,
             "[storagellm] qkv contract repair: normal_bits=%d -> %d for non-outlier value-channel layout\n",
             cfg.normal_bits,
             cfg.v_bits);
         cfg.normal_bits = cfg.v_bits;
+        if (contract.qkv_value_normal_bits == 0) {
+            cfg.value_normal_bits = cfg.v_bits;
+        }
     }
     if (cfg.k_bits <= 1 || cfg.v_bits <= 1 ||
         cfg.k_bits > 8 || cfg.v_bits > 8 ||
-        cfg.normal_bits > 8 || cfg.outlier_bits > 8 || raw_qkv) {
+        cfg.normal_bits > 8 || cfg.outlier_bits > 8 ||
+        cfg.key_normal_bits > 8 || cfg.value_normal_bits > 8 ||
+        cfg.key_outlier_bits > 8 || cfg.value_outlier_bits > 8 || raw_qkv) {
         cfg.enable_qjl = false;
     } else if (contract.qkv_required && codebook_qkv && !cfg.enable_qjl) {
         std::fprintf(stderr,

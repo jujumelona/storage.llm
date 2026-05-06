@@ -75,6 +75,51 @@ static void warn_device_budget_exhausted(
 static uint64_t device_budget_bytes(const moe_pc_engine* e) {
     if (!e) return 0;
 
+    // BUGFIX NEW-3: Metal fast-path without mutex ★★★ PERFORMANCE
+    // Problem: Metal unified memory doesn't need atomic counter snapshot (single memory pool)
+    // → shared_lock adds unnecessary serialization for Metal backends
+    // Solution: Early-return for Metal with direct atomic loads (memory_order_acquire)
+    // Impact: Eliminates mutex contention for Metal, no change for CUDA/HIP/Vulkan
+    if (e->backend_caps.backend == moe_BACKEND_METAL &&
+        e->backend_caps.supports_unified_memory) {
+        // Metal unified memory: calculate budget without mutex
+        const uint64_t sys = e->backend_caps.system_memory_bytes > 0
+            ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
+        uint64_t pct = e->io_config.metal_memory_budget_pct;
+        if (pct == 0 || pct < 50 || pct > 90) pct = 75ull;
+        const uint64_t raw_budget = (sys * pct) / 100ull;
+
+        // Read counters with acquire semantics (no mutex needed for Metal)
+        const uint64_t pending = e->pending_vram_reservation.load(std::memory_order_acquire);
+        const uint64_t in_flight = e->vram_in_flight_bytes.load(std::memory_order_acquire);
+        const uint64_t kv_actual = e->device_kv_cache_bytes.load(std::memory_order_acquire);
+        const uint64_t common_reserved = e->common_vram_reserved_bytes.load(std::memory_order_acquire);
+
+        const uint64_t kv_reserved = e->kv_actually_in_vram.load(std::memory_order_acquire) ? kv_actual : 0;
+
+        const uint64_t cpu_ram_used = tier_used(e, moe_TIER_RAM);
+
+        // BUGFIX Problem 1: Metal KV cache double-counting ★★★ CRITICAL
+        // Problem: cpu_ram_used includes KV cache, kv_reserved also includes KV cache
+        // → KV counted twice when kv_actually_in_vram=true
+        // Solution: Subtract min(kv_actual, cpu_ram_used) from cpu_ram_used before adding
+        // Impact: Correct VRAM budget on Metal, prevents over-conservative allocation
+        const uint64_t kv_in_ram = std::min(kv_actual, cpu_ram_used);
+        const uint64_t non_kv_ram = cpu_ram_used - kv_in_ram;
+
+        uint64_t total_reserved = pending;
+        if (total_reserved <= UINT64_MAX - in_flight) total_reserved += in_flight;
+        if (total_reserved <= UINT64_MAX - kv_reserved) total_reserved += kv_reserved;
+        if (total_reserved <= UINT64_MAX - common_reserved) total_reserved += common_reserved;
+        if (non_kv_ram < UINT64_MAX - total_reserved) total_reserved += non_kv_ram;
+
+        if (raw_budget <= total_reserved) {
+            warn_device_budget_exhausted(e, raw_budget, total_reserved, pending, kv_reserved, common_reserved);
+            return 0;
+        }
+        return raw_budget - total_reserved;
+    }
+
     // BUGFIX 989: Read pending, in_flight, kv_actual, common_reserved, device_allocated_bytes under vram_transition_mutex ★★★ CRITICAL
     // Problem: Without the mutex, this function can observe a state where pending
     //   is already decremented but in_flight not yet incremented → bytes invisible
@@ -108,8 +153,8 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
     // → Engine thinks VRAM is available, admits more experts → silent OOM or eviction storm
     // Solution: Use kv_actual directly (full actual usage), kv_cap is only for allocation limit
     // Impact: Prevents OOM when KV cache exceeds soft cap during long sequences
-    const uint64_t kv_reserved = moe_kv_vram_attention_runtime_available(e)
-        ? kv_actual  // Use actual usage, not min(cap, actual)
+    const uint64_t kv_reserved = e->kv_actually_in_vram.load(std::memory_order_acquire)
+        ? kv_actual
         : 0;
 
     // BUGFIX 989: All counters already read under vram_transition_mutex above.

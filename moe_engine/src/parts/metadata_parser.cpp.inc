@@ -161,13 +161,39 @@ static void moe_parse_qkv_runtime_contract_json(
          moe_json_get_u64_from_object_local(json, "v", "bits", &value))) {
         meta->contract.qkv_v_bits = moe_u64_to_u32_clamped(value, 0);
     }
+    if (meta->contract.qkv_key_normal_bits == 0 &&
+        (moe_json_get_u64_local(json, "key_normal_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "key_normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "key", "normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "qkv_cache_schema", "key_normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "qkv_cache_schema_effective", "key_normal_bits", &value))) {
+        meta->contract.qkv_key_normal_bits = moe_u64_to_u32_clamped(value, 0);
+    }
+    if (meta->contract.qkv_value_normal_bits == 0 &&
+        (moe_json_get_u64_local(json, "value_normal_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "value_normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "value", "normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "qkv_cache_schema", "value_normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "qkv_cache_schema_effective", "value_normal_bits", &value))) {
+        meta->contract.qkv_value_normal_bits = moe_u64_to_u32_clamped(value, 0);
+    }
     if (meta->contract.qkv_normal_bits == 0 &&
         (moe_json_get_u64_local(json, "normal_bits", &value) ||
+         moe_json_get_u64_local(json, "value_normal_bits", &value) ||
+         moe_json_get_u64_local(json, "key_normal_bits", &value) ||
          moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "normal_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "value_normal_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "key_normal_bits", &value) ||
          moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "normal", &value) ||
          moe_json_get_u64_from_object_local(json, "normal", "bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "value", "normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "key", "normal_bits", &value) ||
          moe_json_get_u64_from_object_local(json, "qkv_cache_schema", "normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "qkv_cache_schema", "value_normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "qkv_cache_schema", "key_normal_bits", &value) ||
          moe_json_get_u64_from_object_local(json, "qkv_cache_schema_effective", "normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "qkv_cache_schema_effective", "value_normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "qkv_cache_schema_effective", "key_normal_bits", &value) ||
          moe_json_get_u64_from_object_local(json, "kv_layout_contract", "normal_bits", &value))) {
         meta->contract.qkv_normal_bits = moe_u64_to_u32_clamped(value, 0);
     }
@@ -200,9 +226,31 @@ static void moe_parse_qkv_runtime_contract_json(
          moe_json_get_u64_from_object_local(json, "outlier", "channels", &value))) {
         meta->contract.qkv_outlier_channels = moe_u64_to_u32_clamped(value, 0);
     }
+    if (meta->contract.qkv_key_outlier_bits == 0 &&
+        (moe_json_get_u64_local(json, "key_outlier_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "key_outlier_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "key", "outlier_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "qkv_cache_schema", "key_outlier_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "qkv_cache_schema_effective", "key_outlier_bits", &value))) {
+        meta->contract.qkv_key_outlier_bits = moe_u64_to_u32_clamped(value, 0);
+    }
+    if (meta->contract.qkv_value_outlier_bits == 0 &&
+        (moe_json_get_u64_local(json, "value_outlier_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "value_outlier_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "value", "outlier_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "qkv_cache_schema", "value_outlier_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "qkv_cache_schema_effective", "value_outlier_bits", &value))) {
+        meta->contract.qkv_value_outlier_bits = moe_u64_to_u32_clamped(value, 0);
+    }
     if (meta->contract.qkv_outlier_bits == 0 &&
         (moe_json_get_u64_local(json, "outlier_bits", &value) ||
+         moe_json_get_u64_local(json, "value_outlier_bits", &value) ||
+         moe_json_get_u64_local(json, "key_outlier_bits", &value) ||
          moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "outlier_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "value_outlier_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "key_outlier_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "value", "outlier_bits", &value) ||
+         moe_json_get_u64_from_object_local(json, "key", "outlier_bits", &value) ||
          moe_json_get_u64_from_object_local(json, "outlier", "bits", &value))) {
         meta->contract.qkv_outlier_bits = moe_u64_to_u32_clamped(value, 0);
     }
@@ -275,15 +323,33 @@ static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
         meta->file_index = moe_u64_to_u32_clamped(value, 0);
     }
     if (meta->contract.qkv_k_bits == 0 &&
-        moe_json_get_u64_local(meta->metadata_json, "k_bits", &value)) {
+        (moe_json_get_u64_local(meta->metadata_json, "k_bits", &value) ||
+         moe_json_get_u64_local(meta->metadata_json, "key_bits", &value) ||
+         moe_json_get_u64_from_object_local(meta->metadata_json, "key", "bits", &value))) {
         meta->contract.qkv_k_bits = moe_u64_to_u32_clamped(value, 0);
     }
     if (meta->contract.qkv_v_bits == 0 &&
-        moe_json_get_u64_local(meta->metadata_json, "v_bits", &value)) {
+        (moe_json_get_u64_local(meta->metadata_json, "v_bits", &value) ||
+         moe_json_get_u64_local(meta->metadata_json, "value_bits", &value) ||
+         moe_json_get_u64_from_object_local(meta->metadata_json, "value", "bits", &value))) {
         meta->contract.qkv_v_bits = moe_u64_to_u32_clamped(value, 0);
+    }
+    if (meta->contract.qkv_key_normal_bits == 0 &&
+        (moe_json_get_u64_local(meta->metadata_json, "key_normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(meta->metadata_json, "key", "normal_bits", &value))) {
+        meta->contract.qkv_key_normal_bits = moe_u64_to_u32_clamped(value, 0);
+    }
+    if (meta->contract.qkv_value_normal_bits == 0 &&
+        (moe_json_get_u64_local(meta->metadata_json, "value_normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(meta->metadata_json, "value", "normal_bits", &value))) {
+        meta->contract.qkv_value_normal_bits = moe_u64_to_u32_clamped(value, 0);
     }
     if (meta->contract.qkv_normal_bits == 0 &&
         (moe_json_get_u64_local(meta->metadata_json, "normal_bits", &value) ||
+         moe_json_get_u64_local(meta->metadata_json, "value_normal_bits", &value) ||
+         moe_json_get_u64_local(meta->metadata_json, "key_normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(meta->metadata_json, "value", "normal_bits", &value) ||
+         moe_json_get_u64_from_object_local(meta->metadata_json, "key", "normal_bits", &value) ||
          moe_json_get_u64_from_object_local(meta->metadata_json, "normal", "bits", &value))) {
         meta->contract.qkv_normal_bits = moe_u64_to_u32_clamped(value, 0);
     }
@@ -321,8 +387,22 @@ static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
          moe_json_get_u64_from_object_local(meta->metadata_json, "outlier", "channels", &value))) {
         meta->contract.qkv_outlier_channels = moe_u64_to_u32_clamped(value, 0);
     }
+    if (meta->contract.qkv_key_outlier_bits == 0 &&
+        (moe_json_get_u64_local(meta->metadata_json, "key_outlier_bits", &value) ||
+         moe_json_get_u64_from_object_local(meta->metadata_json, "key", "outlier_bits", &value))) {
+        meta->contract.qkv_key_outlier_bits = moe_u64_to_u32_clamped(value, 0);
+    }
+    if (meta->contract.qkv_value_outlier_bits == 0 &&
+        (moe_json_get_u64_local(meta->metadata_json, "value_outlier_bits", &value) ||
+         moe_json_get_u64_from_object_local(meta->metadata_json, "value", "outlier_bits", &value))) {
+        meta->contract.qkv_value_outlier_bits = moe_u64_to_u32_clamped(value, 0);
+    }
     if (meta->contract.qkv_outlier_bits == 0 &&
         (moe_json_get_u64_local(meta->metadata_json, "outlier_bits", &value) ||
+         moe_json_get_u64_local(meta->metadata_json, "value_outlier_bits", &value) ||
+         moe_json_get_u64_local(meta->metadata_json, "key_outlier_bits", &value) ||
+         moe_json_get_u64_from_object_local(meta->metadata_json, "value", "outlier_bits", &value) ||
+         moe_json_get_u64_from_object_local(meta->metadata_json, "key", "outlier_bits", &value) ||
          moe_json_get_u64_from_object_local(meta->metadata_json, "outlier", "bits", &value))) {
         meta->contract.qkv_outlier_bits = moe_u64_to_u32_clamped(value, 0);
     }

@@ -14,6 +14,11 @@ bool qkv_bits_valid(int bits);
 bool qkv_bits_codebook(int bits);
 bool qkv_bits_raw(int bits);
 
+// Resolve target-specific split bit-widths. If a target-specific field is not
+// present in older contracts, these fall back to the legacy shared fields.
+int qkv_outlier_bits_for_target(const qkv_config_t* cfg, int target);
+int qkv_normal_bits_for_target(const qkv_config_t* cfg, int target);
+
 // Get codebook for given bit-width
 const float* qkv_codebook_for_bits(const qkv_state_t* state, int bits);
 

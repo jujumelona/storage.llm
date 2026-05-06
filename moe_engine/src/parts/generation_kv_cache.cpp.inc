@@ -52,7 +52,12 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
     }
     moe_kv_cache& operator=(moe_kv_cache&& other) noexcept {
         if (this != &other) {
-            if (engine && tracked_ram_bytes > 0) {
+            // BUGFIX NEW-11: Check engine validity before subtract_tier_usage ★★★ CRITICAL
+            // Problem: engine pointer can be dangling if engine destroyed before cache
+            // → subtract_tier_usage accesses freed memory → UB/crash
+            // Solution: Add lifecycle_terminated check (or use weak_ptr in production)
+            // Impact: Prevents UB during shutdown, safe move assignment
+            if (engine && tracked_ram_bytes > 0 && !engine->lifecycle_terminated.load(std::memory_order_acquire)) {
                 subtract_tier_usage(engine, moe_TIER_RAM, tracked_ram_bytes);
                 tracked_ram_bytes = 0;
             }
@@ -130,7 +135,16 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
             if (pre_allocate && max_seq_len > std::min<uint32_t>(moe_MLA_KV_INITIAL_CHUNK, seq_limit)) {
                 max_seq_len = std::min<uint32_t>(moe_MLA_KV_INITIAL_CHUNK, seq_limit);
                 if (max_seq_len == 0) max_seq_len = 1;
+                // BUGFIX NEW-BUG1: Retry path missing overflow check ★★★ CRITICAL
+                // Problem: retry_entries * entry_dim overflow not checked
+                // → calloc wraps around → small allocation → buffer overflow
+                // Solution: Add same overflow check as main path
+                // Impact: Prevents memory corruption on retry allocation
                 const size_t retry_entries = (size_t)max_seq_len * (size_t)layers;
+                if (retry_entries > SIZE_MAX / entry_dim) {
+                    // Overflow would occur, cannot allocate
+                    return;
+                }
                 new_data = (uint8_t*)std::calloc(retry_entries * entry_dim, sizeof(uint8_t));
                 new_scales = (float*)std::calloc(retry_entries, sizeof(float));
                 new_zeros = (float*)std::calloc(retry_entries, sizeof(float));
@@ -197,48 +211,62 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
         const size_t new_data_bytes = new_entries * entry_dim;
         const size_t new_scales_bytes = new_entries * sizeof(float);
 
-        // BUGFIX 1006: Pre-check available RAM before triple malloc ★★★ CRITICAL
-        // Problem: malloc+memcpy+free pattern requires old + new buffers simultaneously.
-        //   Peak memory = old_data + old_scales*2 + new_data + new_scales*2.
-        //   Without pre-check, first malloc succeeds → OS RAM pressure spikes →
-        //   second/third malloc fails → partial free + return 0, but damage done.
-        // Solution: Compare required peak against available RAM before any malloc.
-        //   available_ram_bytes() is a snapshot (may be stale), but catches the
-        //   common case of insufficient headroom.
-        // Impact: Prevents cascading OOM in other components (staging, prefetch).
+        // BUGFIX NEW-10: Optimistic RAM reservation to prevent concurrent allocation race ★★★ CRITICAL
+        // Problem: available_ram_bytes() is OS snapshot that doesn't reflect concurrent allocations.
+        // Multiple concurrent KV resize operations each see "sufficient RAM" and proceed.
+        // N requests × peak_bytes can exceed actual available RAM → OS OOM.
+        // Solution: Optimistically reserve RAM in tier counter BEFORE malloc.
+        // If malloc fails, rollback reservation. This serializes admission across all components.
+        // Impact: Prevents concurrent KV resize race, coordinates with prefetch admission.
+        const size_t old_data_bytes = old_entries * entry_dim;
+        const size_t old_scales_bytes = old_entries * sizeof(float);
+        const size_t peak_bytes = new_data_bytes + new_scales_bytes * 2;
+        const size_t transient_total = peak_bytes + old_data_bytes + old_scales_bytes * 2;
+
+        // Optimistic reservation: reserve transient peak in tier counter
+        bool reserved = false;
         if (engine) {
-            const size_t old_data_bytes = old_entries * entry_dim;
-            const size_t old_scales_bytes = old_entries * sizeof(float);
-            const size_t peak_bytes = new_data_bytes + new_scales_bytes * 2;
-            // old buffers still alive during malloc, so total transient = peak + old
-            const size_t transient_total = peak_bytes + old_data_bytes + old_scales_bytes * 2;
-            const uint64_t avail = storagellm::available_ram_bytes();
-            if (avail > 0 && transient_total > avail) {
-                return 0;  // Pre-reject: not enough RAM for safe resize
+            const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
+            const uint64_t ram_used = tier_used(engine, moe_TIER_RAM);
+            if (ram_budget > 0 && ram_used + transient_total > ram_budget) {
+                return 0;  // Budget check failed
             }
+            // Reserve transient peak (will be adjusted after malloc completes)
+            add_tier_usage(engine, moe_TIER_RAM, transient_total);
+            reserved = true;
         }
 
-        // BUGFIX 923: Use malloc+memcpy instead of realloc to avoid pointer leak ★★★ CRITICAL
-        // Problem: realloc(data, ...) success invalidates original 'data' pointer.
-        // If subsequent realloc(scales, ...) fails, we try to free nd but 'data' is dangling.
-        // Solution: Use malloc+memcpy+free pattern for atomic all-or-nothing allocation.
-        // Trade-off: Peak memory usage temporarily doubles (old + new), but safer.
-        // In tight RAM situations, this may trigger OOM earlier than realloc would.
         void* nd = std::malloc(new_data_bytes);
         void* ns = std::malloc(new_scales_bytes);
         void* nz = std::malloc(new_scales_bytes);
 
         if (!nd || !ns || !nz) {
-            // Allocation failure: free any successful allocations and return failure
-            // Original pointers (data, scales, zeros) remain valid
             std::free(nd);
             std::free(ns);
             std::free(nz);
+            // Rollback reservation on failure
+            if (reserved && engine) {
+                subtract_tier_usage(engine, moe_TIER_RAM, transient_total);
+            }
             return 0;
         }
 
         // Copy existing data
         const size_t copy_entries = old_entries < new_entries ? old_entries : new_entries;
+        // BUGFIX NEW-BUG3: memcpy size overflow check ★★★ CRITICAL
+        // Problem: copy_entries * entry_dim can overflow size_t
+        // → memcpy with wrapped size → buffer overflow or data corruption
+        // Solution: Check overflow before memcpy
+        // Impact: Prevents memory corruption during KV cache growth
+        if (copy_entries > SIZE_MAX / entry_dim) {
+            std::free(nd);
+            std::free(ns);
+            std::free(nz);
+            if (reserved && engine) {
+                subtract_tier_usage(engine, moe_TIER_RAM, transient_total);
+            }
+            return 0;
+        }
         std::memcpy(nd, data, copy_entries * entry_dim);
         std::memcpy(ns, scales, copy_entries * sizeof(float));
         std::memcpy(nz, zeros, copy_entries * sizeof(float));
@@ -262,14 +290,16 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
 
         max_seq_len = new_cap;
 
-        // BUGFIX 921: Remove tracked_ram_bytes update ★★★ CRITICAL
-        // Problem: BUGFIX 917 set tracked_ram_bytes = new_bytes here,
-        // but moe_kv_cache_track_ram() calculates current = moe_kv_cache_allocated_bytes()
-        // which uses same formula → current == tracked_ram_bytes → no delta → no RAM tracking!
-        // Solution: Don't touch tracked_ram_bytes here, let moe_kv_cache_track_ram() detect
-        // current (new size) > tracked (old size) and call add_tier_usage() correctly
-        // Impact: KV cache RAM usage properly tracked after realloc
-        // Note: Callers already call moe_kv_cache_track_ram() after ensure_capacity()
+        // BUGFIX NEW-10: Adjust reservation to actual delta after malloc succeeds ★★★ CRITICAL
+        // Problem: We reserved transient_total (peak during malloc), but actual increase
+        // is only (new_bytes - old_bytes). Must adjust reservation to reflect reality.
+        // Solution: Subtract transient_total, then let moe_kv_cache_track_ram() add actual delta.
+        // Impact: Correct RAM tier accounting after resize completes.
+        if (reserved && engine) {
+            // Remove transient reservation
+            subtract_tier_usage(engine, moe_TIER_RAM, transient_total);
+            // moe_kv_cache_track_ram() will be called by caller to add actual delta
+        }
 
         return 1;
     }

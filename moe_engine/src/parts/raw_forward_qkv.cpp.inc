@@ -105,6 +105,10 @@ static qkv_config_t moe_qkv_contract_config_for_head_dim(
     cfg.v_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_V_BITS", cfg.v_bits, &bits_overridden);
     cfg.normal_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_NORMAL_BITS", cfg.normal_bits, &bits_overridden);
     cfg.outlier_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_OUTLIER_BITS", cfg.outlier_bits, &bits_overridden);
+    cfg.key_normal_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_KEY_NORMAL_BITS", cfg.key_normal_bits, &bits_overridden);
+    cfg.value_normal_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_VALUE_NORMAL_BITS", cfg.value_normal_bits, &bits_overridden);
+    cfg.key_outlier_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_KEY_OUTLIER_BITS", cfg.key_outlier_bits, &bits_overridden);
+    cfg.value_outlier_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_VALUE_OUTLIER_BITS", cfg.value_outlier_bits, &bits_overridden);
     const uint32_t outlier_channels_override = moe_parse_env_u32("STORAGELLM_QKV_OUTLIER_CHANNELS");
     if (outlier_channels_override > 0 || std::getenv("STORAGELLM_QKV_OUTLIER_CHANNELS")) {
         cfg.outlier_channels = (int)std::min<uint32_t>(outlier_channels_override, head_dim);
@@ -112,11 +116,17 @@ static qkv_config_t moe_qkv_contract_config_for_head_dim(
         cfg.outlier_channels = 0;
         cfg.normal_bits = cfg.v_bits;
         cfg.outlier_bits = cfg.k_bits;
+        cfg.key_normal_bits = cfg.normal_bits;
+        cfg.value_normal_bits = cfg.normal_bits;
+        cfg.key_outlier_bits = cfg.outlier_bits;
+        cfg.value_outlier_bits = cfg.outlier_bits;
     }
     cfg.enable_rotation = moe_qkv_env_bool_or_current("STORAGELLM_QKV_ROTATION", cfg.enable_rotation ? 1 : 0) != 0;
     cfg.enable_qjl = moe_qkv_env_bool_or_current("STORAGELLM_QKV_QJL", cfg.enable_qjl ? 1 : 0) != 0;
     if (qkv_bits_raw(cfg.k_bits) || qkv_bits_raw(cfg.v_bits) ||
-        qkv_bits_raw(cfg.normal_bits) || qkv_bits_raw(cfg.outlier_bits)) {
+        qkv_bits_raw(cfg.normal_bits) || qkv_bits_raw(cfg.outlier_bits) ||
+        qkv_bits_raw(cfg.key_normal_bits) || qkv_bits_raw(cfg.value_normal_bits) ||
+        qkv_bits_raw(cfg.key_outlier_bits) || qkv_bits_raw(cfg.value_outlier_bits)) {
         cfg.enable_qjl = false;
     }
     if (cfg.outlier_channels < 0) {
@@ -144,6 +154,10 @@ static bool moe_qkv_config_matches_contract(
         current.outlier_channels == desired.outlier_channels &&
         current.outlier_bits == desired.outlier_bits &&
         current.normal_bits == desired.normal_bits &&
+        current.key_outlier_bits == desired.key_outlier_bits &&
+        current.key_normal_bits == desired.key_normal_bits &&
+        current.value_outlier_bits == desired.value_outlier_bits &&
+        current.value_normal_bits == desired.value_normal_bits &&
         current.group_size == desired.group_size &&
         current.page_size_tokens == desired.page_size_tokens &&
         current.sink_tokens == desired.sink_tokens &&
@@ -167,8 +181,11 @@ static void moe_qkv_apply_contract_config_locked(
             "qkv_config",
             "head_dim=%u k_bits=%d v_bits=%d group=%u page=%u sink=%u "
             "rotation=%d rotation_seed=%llu qjl=%d qjl_seed=%llu "
-            "outlier_channels=%d outlier_bits=%d normal_bits=%d effective_bits=%.3f plain_kv=%d "
-            "env_k=%u env_v=%u env_normal=%u env_outlier=%u",
+            "outlier_channels=%d outlier_bits=%d normal_bits=%d "
+            "key_outlier_bits=%d key_normal_bits=%d value_outlier_bits=%d value_normal_bits=%d "
+            "effective_bits=%.3f plain_kv=%d "
+            "env_k=%u env_v=%u env_normal=%u env_outlier=%u "
+            "env_key_normal=%u env_value_normal=%u env_key_outlier=%u env_value_outlier=%u",
             head_dim,
             desired.k_bits,
             desired.v_bits,
@@ -182,12 +199,20 @@ static void moe_qkv_apply_contract_config_locked(
             desired.outlier_channels,
             desired.outlier_bits,
             desired.normal_bits,
+            desired.key_outlier_bits,
+            desired.key_normal_bits,
+            desired.value_outlier_bits,
+            desired.value_normal_bits,
             (double)qkv_effective_bits(&desired),
             desired.plain_kv_persistent_storage ? 1 : 0,
             moe_parse_env_u32("STORAGELLM_QKV_K_BITS"),
             moe_parse_env_u32("STORAGELLM_QKV_V_BITS"),
             moe_parse_env_u32("STORAGELLM_QKV_NORMAL_BITS"),
-            moe_parse_env_u32("STORAGELLM_QKV_OUTLIER_BITS"));
+            moe_parse_env_u32("STORAGELLM_QKV_OUTLIER_BITS"),
+            moe_parse_env_u32("STORAGELLM_QKV_KEY_NORMAL_BITS"),
+            moe_parse_env_u32("STORAGELLM_QKV_VALUE_NORMAL_BITS"),
+            moe_parse_env_u32("STORAGELLM_QKV_KEY_OUTLIER_BITS"),
+            moe_parse_env_u32("STORAGELLM_QKV_VALUE_OUTLIER_BITS"));
     }
 }
 

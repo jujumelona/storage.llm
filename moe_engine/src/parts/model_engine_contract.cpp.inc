@@ -39,7 +39,14 @@ static int moe_engine_load_offload_gguf_contract(
     const int qkv_required = primary.contract.qkv_required ||
         !primary.contract.plain_kv_persistent_allowed ||
         primary.contract.qkv_k_bits != 0 ||
-        primary.contract.qkv_v_bits != 0;
+        primary.contract.qkv_v_bits != 0 ||
+        primary.contract.qkv_normal_bits != 0 ||
+        primary.contract.qkv_outlier_channels != 0 ||
+        primary.contract.qkv_outlier_bits != 0 ||
+        primary.contract.qkv_key_normal_bits != 0 ||
+        primary.contract.qkv_value_normal_bits != 0 ||
+        primary.contract.qkv_key_outlier_bits != 0 ||
+        primary.contract.qkv_value_outlier_bits != 0;
     if (qkv_required) {
         engine->qkv_forced_by_format.store(1, std::memory_order_relaxed);
         engine->config.kv_mode = moe_KV_MODE_QKV;
@@ -49,7 +56,10 @@ static int moe_engine_load_offload_gguf_contract(
     }
     moe_engine_apply_juju_strategy(engine, scan, primary.contract);
     std::fprintf(stderr,
-        "[storagellm] offload %s contract loaded: files=%u first=%s qkv=%s k_bits=%d v_bits=%d normal_bits=%d outlier_bits=%d group=%u page=%u qjl=%d rotation=%d weight=%s/%ub catalog=%u plain_kv=%d\n",
+        "[storagellm] offload %s contract loaded: files=%u first=%s qkv=%s "
+        "k_bits=%d v_bits=%d normal_bits=%d outlier_bits=%d "
+        "key_normal_bits=%d value_normal_bits=%d key_outlier_bits=%d value_outlier_bits=%d "
+        "group=%u page=%u qjl=%d rotation=%d weight=%s/%ub catalog=%u plain_kv=%d\n",
         scan.juju_format ? "JUJU" : "GGUF",
         scan.expected_count,
         primary.path.c_str(),
@@ -58,6 +68,10 @@ static int moe_engine_load_offload_gguf_contract(
         engine->offload_qkv_cfg.v_bits,
         engine->offload_qkv_cfg.normal_bits,
         engine->offload_qkv_cfg.outlier_bits,
+        engine->offload_qkv_cfg.key_normal_bits,
+        engine->offload_qkv_cfg.value_normal_bits,
+        engine->offload_qkv_cfg.key_outlier_bits,
+        engine->offload_qkv_cfg.value_outlier_bits,
         engine->offload_qkv_cfg.group_size,
         engine->offload_qkv_cfg.page_size_tokens,
         engine->offload_qkv_cfg.enable_qjl ? 1 : 0,

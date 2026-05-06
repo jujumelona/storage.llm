@@ -1994,8 +1994,10 @@ def juju_tokenizer_contract():
         "required_files": list(JUJU_REQUIRED_TOKENIZER_FILES),
         "required_any_of": list(JUJU_REQUIRED_TOKENIZER_ANY_OF),
         "target_subdirs": ["", "tokenizer"],
+        "chat_template_sources": ["tokenizer_config.json.chat_template", "chat_template.jinja"],
         "chat_template_source": "tokenizer_config_or_model_card",
         "chat_template_jinja_source": "generated_from_tokenizer_config.chat_template_when_present",
+        "missing_chat_template_policy": "base_completion_template_only_never_invent_family_template",
         "missing_chat_template_behavior": "chat_api_requires_template_or_explicit_messages_formatter; raw_completion_input_ids_allowed",
         "missing_tokenizer_behavior": "fail_text_api_if_required_tokenizer_missing",
         "input_ids_api_allowed_without_tokenizer": True,
@@ -2322,6 +2324,7 @@ def juju_contract_metadata(contract, source_name, source_repo_id, runtime_arch=N
             "qkv_policy",
             "kv_layout",
             "runtime_policy",
+            "runtime_execution_manifest",
             "graph_ir",
             "execution_correctness",
             "bottleneck_trace",
@@ -2999,8 +3002,14 @@ def _juju_qkv_runtime_policy(contract, qkv):
         "key_bits": _juju_int_or_none(qkv.get("k_bits")),
         "value_bits": _juju_int_or_none(qkv.get("v_bits")),
         "normal_bits": _juju_int_or_none(qkv.get("normal_bits")),
+        "key_normal_bits": _juju_int_or_none(qkv.get("key_normal_bits")),
+        "value_normal_bits": _juju_int_or_none(qkv.get("value_normal_bits")),
         "outlier_channels": _juju_int_or_none(qkv.get("outlier_channels")),
         "outlier_bits": _juju_int_or_none(qkv.get("outlier_bits")),
+        "key_outlier_bits": _juju_int_or_none(qkv.get("key_outlier_bits")),
+        "value_outlier_bits": _juju_int_or_none(qkv.get("value_outlier_bits")),
+        "key_effective_bits": qkv.get("key_effective_bits"),
+        "value_effective_bits": qkv.get("value_effective_bits"),
         "group_size": _juju_int_or_none(qkv.get("group_size")),
         "page_size_tokens": _juju_int_or_none(qkv.get("page_size_tokens")),
         "sink_tokens": _juju_int_or_none(qkv.get("sink_tokens")),
@@ -3026,6 +3035,10 @@ def _juju_qkv_runtime_policy(contract, qkv):
             "different_policy",
         ],
         "executor_contract": "do_not_use_head_only_qkv_state_cache; layer_and_epoch_are_part_of_identity",
+        "query_policy": dict(qkv.get("query_policy") or {}),
+        "key_cache_policy": dict(qkv.get("key") or {}),
+        "value_cache_policy": dict(qkv.get("value") or {}),
+        "turboquant_policy": dict(qkv.get("turboquant") or {}),
     }
 
 
@@ -3049,8 +3062,14 @@ def _juju_qkv_contract_fields(qkv):
         "key_bits": _juju_int_or_none(qkv.get("k_bits")),
         "value_bits": _juju_int_or_none(qkv.get("v_bits")),
         "normal_bits": _juju_int_or_none(qkv.get("normal_bits")),
+        "key_normal_bits": _juju_int_or_none(qkv.get("key_normal_bits")),
+        "value_normal_bits": _juju_int_or_none(qkv.get("value_normal_bits")),
         "outlier_channels": _juju_int_or_none(qkv.get("outlier_channels")),
         "outlier_bits": _juju_int_or_none(qkv.get("outlier_bits")),
+        "key_outlier_bits": _juju_int_or_none(qkv.get("key_outlier_bits")),
+        "value_outlier_bits": _juju_int_or_none(qkv.get("value_outlier_bits")),
+        "key_effective_bits": qkv.get("key_effective_bits"),
+        "value_effective_bits": qkv.get("value_effective_bits"),
         "group_size": _juju_int_or_none(qkv.get("group_size")),
         "page_size_tokens": _juju_int_or_none(qkv.get("page_size_tokens")),
         "sink_tokens": _juju_int_or_none(qkv.get("sink_tokens")),
@@ -3064,6 +3083,10 @@ def _juju_qkv_contract_fields(qkv):
         "rotation": dict(qkv.get("rotation") or {}),
         "normal": dict(qkv.get("normal") or {}),
         "outlier": dict(qkv.get("outlier") or {}),
+        "query_policy": dict(qkv.get("query_policy") or {}),
+        "key_cache_policy": dict(qkv.get("key") or {}),
+        "value_cache_policy": dict(qkv.get("value") or {}),
+        "turboquant_policy": dict(qkv.get("turboquant") or {}),
         "residency": dict(qkv.get("residency") or {}),
         "cache_layout": dict(qkv.get("cache_layout") or {}),
     }
@@ -3180,6 +3203,16 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
     qkv = dict(contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract") or {})
     synthesized = not bool(qkv)
     explicit_normal_bits = qkv.get("normal_bits") not in (None, "") or contract_value(qkv, "normal.bits", default=None) not in (None, "")
+    explicit_key_normal_bits = (
+        qkv.get("key_normal_bits") not in (None, "") or
+        contract_value(qkv, "key.normal_bits", default=None) not in (None, "") or
+        contract_value(qkv, "key.normal.bits", default=None) not in (None, "")
+    )
+    explicit_value_normal_bits = (
+        qkv.get("value_normal_bits") not in (None, "") or
+        contract_value(qkv, "value.normal_bits", default=None) not in (None, "") or
+        contract_value(qkv, "value.normal.bits", default=None) not in (None, "")
+    )
     explicit_enable_qjl = qkv.get("enable_qjl") not in (None, "") or contract_value(qkv, "qjl.enabled", default=None) not in (None, "")
 
     def fill(key, *values):
@@ -3249,6 +3282,26 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
     normal_bits = _juju_first_int(qkv.get("normal_bits"), contract_value(qkv, "normal.bits", default=None))
     outlier_channels = _juju_int_or_none(qkv.get("outlier_channels"))
     outlier_bits = _juju_int_or_none(qkv.get("outlier_bits"))
+    key_normal_bits = _juju_first_int(
+        qkv.get("key_normal_bits"),
+        contract_value(qkv, "key.normal_bits", default=None),
+        contract_value(qkv, "key.normal.bits", default=None),
+    )
+    value_normal_bits = _juju_first_int(
+        qkv.get("value_normal_bits"),
+        contract_value(qkv, "value.normal_bits", default=None),
+        contract_value(qkv, "value.normal.bits", default=None),
+    )
+    key_outlier_bits = _juju_first_int(
+        qkv.get("key_outlier_bits"),
+        contract_value(qkv, "key.outlier_bits", default=None),
+        contract_value(qkv, "key.outlier.bits", default=None),
+    )
+    value_outlier_bits = _juju_first_int(
+        qkv.get("value_outlier_bits"),
+        contract_value(qkv, "value.outlier_bits", default=None),
+        contract_value(qkv, "value.outlier.bits", default=None),
+    )
     group_size = _juju_int_or_none(qkv.get("group_size"))
     page_tokens = _juju_int_or_none(qkv.get("page_size_tokens"))
     sink_tokens = _juju_int_or_none(qkv.get("sink_tokens"))
@@ -3257,7 +3310,40 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         qkv["normal_bits_source"] = "derived_from_value_bits_for_non_outlier_qkv_channels"
     else:
         qkv.setdefault("normal_bits_source", "source_contract" if explicit_normal_bits else "source_contract_default")
-    raw_qkv_bits = any(bit in (16, 32) for bit in (k_bits, v_bits, normal_bits, outlier_bits) if bit is not None)
+    if key_normal_bits is None:
+        key_normal_bits = normal_bits
+        qkv["key_normal_bits_source"] = "derived_from_legacy_normal_bits" if explicit_normal_bits else "turboquant_2p5_non_outlier_default"
+    else:
+        qkv.setdefault("key_normal_bits_source", "source_contract" if explicit_key_normal_bits else "source_contract_default")
+    if value_normal_bits is None:
+        value_normal_bits = normal_bits
+        qkv["value_normal_bits_source"] = "derived_from_legacy_normal_bits" if explicit_normal_bits else "turboquant_2p5_non_outlier_default"
+    else:
+        qkv.setdefault("value_normal_bits_source", "source_contract" if explicit_value_normal_bits else "source_contract_default")
+    if key_outlier_bits is None:
+        key_outlier_bits = outlier_bits
+        qkv["key_outlier_bits_source"] = "derived_from_legacy_outlier_bits"
+    else:
+        qkv.setdefault("key_outlier_bits_source", "source_contract")
+    if value_outlier_bits is None:
+        value_outlier_bits = outlier_bits
+        qkv["value_outlier_bits_source"] = "derived_from_legacy_outlier_bits"
+    else:
+        qkv.setdefault("value_outlier_bits_source", "source_contract")
+    raw_qkv_bits = any(
+        bit in (16, 32)
+        for bit in (
+            k_bits,
+            v_bits,
+            normal_bits,
+            outlier_bits,
+            key_normal_bits,
+            value_normal_bits,
+            key_outlier_bits,
+            value_outlier_bits,
+        )
+        if bit is not None
+    )
     qjl_value = _juju_bool_or_none(qkv.get("enable_qjl"))
     if qjl_value is None:
         qjl_value = _juju_bool_or_none(contract_value(qkv, "qjl.enabled", default=None))
@@ -3273,14 +3359,99 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
     enable_rotation = _juju_bool_or_none(qkv.get("enable_rotation"))
     if enable_rotation is None:
         enable_rotation = True
+
+    def _split_effective_bits(normal, outlier, channels, dim):
+        normal = _juju_int_or_none(normal)
+        outlier = _juju_int_or_none(outlier)
+        channels = _juju_int_or_none(channels) or 0
+        dim = _juju_int_or_none(dim)
+        if normal is None:
+            return None
+        if outlier is None or channels <= 0 or dim is None or dim <= 0:
+            return float(normal)
+        channels = max(0, min(channels, dim))
+        return float(channels * outlier + (dim - channels) * normal) / float(dim)
+
+    def _qjl_mse_bits(total_bits):
+        total_bits = _juju_int_or_none(total_bits)
+        if total_bits is None:
+            return None
+        if not enable_qjl or total_bits in (16, 32):
+            return total_bits
+        return total_bits - 1 if total_bits > 1 else None
+
+    head_dim_for_bits = _juju_first_int(qkv.get("head_dim"), qkv.get("global_head_dim"), 128)
+    key_effective_bits = _split_effective_bits(key_normal_bits, key_outlier_bits, outlier_channels, head_dim_for_bits)
+    value_effective_bits = _split_effective_bits(value_normal_bits, value_outlier_bits, outlier_channels, head_dim_for_bits)
+    qkv["query_policy"] = {
+        "target": "query_activation",
+        "cached": False,
+        "persistent_cache": False,
+        "quantized_cache_bits": None,
+        "storage": "runtime_fp_activation_not_kv_cache",
+        "role": "attention_query_for_inner_product_against_cached_keys",
+    }
+    key_cache_policy = {
+        "target": "key_cache",
+        "cached": True,
+        "bits": k_bits,
+        "normal_bits": key_normal_bits,
+        "outlier_bits": key_outlier_bits,
+        "outlier_channels": outlier_channels,
+        "effective_bits": key_effective_bits,
+        "mse_bits": _qjl_mse_bits(key_normal_bits),
+        "outlier_mse_bits": _qjl_mse_bits(key_outlier_bits),
+        "qjl_residual_bits": 1 if enable_qjl and not raw_qkv_bits else 0,
+        "estimator": "turboquantprod_inner_product",
+    }
+    value_cache_policy = {
+        "target": "value_cache",
+        "cached": True,
+        "bits": v_bits,
+        "normal_bits": value_normal_bits,
+        "outlier_bits": value_outlier_bits,
+        "outlier_channels": outlier_channels,
+        "effective_bits": value_effective_bits,
+        "mse_bits": _qjl_mse_bits(value_normal_bits),
+        "outlier_mse_bits": _qjl_mse_bits(value_outlier_bits),
+        "qjl_residual_bits": 1 if enable_qjl and not raw_qkv_bits else 0,
+        "estimator": "turboquantprod_vector_reconstruction",
+    }
+    turboquant_policy = {
+        "paper": "TurboQuant_Qprod",
+        "kv_only": True,
+        "query_cached": False,
+        "algorithm": "mse_quantizer_with_1bit_qjl_residual_when_codebook_bits_are_used",
+        "bit_budget_semantics": "total_bits_include_qjl_residual; mse_codebook_bits_are_total_bits_minus_one",
+        "split_channel_semantics": "outlier_and_non_outlier_channels_use_independent_turboquant_instances",
+        "default_2p5_bits": {
+            "paper_reported_label_bits": 2.5,
+            "head_dim": 128,
+            "outlier_channels": 32,
+            "outlier_bits": 3,
+            "normal_channels": 96,
+            "normal_bits": 2,
+            "computed_effective_bits": (32 * 3 + 96 * 2) / 128,
+            "arithmetic_checked": True,
+        },
+        "key_cache": key_cache_policy,
+        "value_cache": value_cache_policy,
+        "query": qkv["query_policy"],
+    }
     qkv.update({
         "k_bits": k_bits,
         "v_bits": v_bits,
         "key_bits": k_bits,
         "value_bits": v_bits,
         "normal_bits": normal_bits,
+        "key_normal_bits": key_normal_bits,
+        "value_normal_bits": value_normal_bits,
         "outlier_channels": outlier_channels,
         "outlier_bits": outlier_bits,
+        "key_outlier_bits": key_outlier_bits,
+        "value_outlier_bits": value_outlier_bits,
+        "key_effective_bits": key_effective_bits,
+        "value_effective_bits": value_effective_bits,
         "group_size": group_size,
         "page_size_tokens": page_tokens,
         "sink_tokens": sink_tokens,
@@ -3299,19 +3470,32 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         "key_bits": k_bits,
         "value_bits": v_bits,
         "normal_bits": normal_bits,
+        "key_normal_bits": key_normal_bits,
+        "value_normal_bits": value_normal_bits,
         "normal_bits_semantics": "non_outlier_channel_quant_bits",
         "outlier_channels": outlier_channels,
         "outlier_bits": outlier_bits,
+        "key_outlier_bits": key_outlier_bits,
+        "value_outlier_bits": value_outlier_bits,
+        "key_effective_bits": key_effective_bits,
+        "value_effective_bits": value_effective_bits,
         "qjl_required_for_codebook_bits": not raw_qkv_bits,
         "plain_or_raw_bits_present": raw_qkv_bits,
+        "query_cached": False,
     }
     if isinstance(qkv.get("validation"), dict):
         qkv["validation"]["normal_bits_semantics"] = "non_outlier_channel_quant_bits"
+        qkv["validation"]["key_value_split_bits_required"] = True
+        qkv["validation"]["query_must_not_be_persistent_kv_cache"] = True
+        qkv["validation"]["turboquant_total_bits_include_qjl_residual"] = True
         qkv["validation"]["qjl_enabled_for_codebook_quantized_qkv"] = not raw_qkv_bits
         qkv["validation"]["reject_inconsistent_normal_bits"] = True
         qkv["validation"]["format_generation_requires_qkv_policy_self_check"] = True
     qkv["normal"] = {"bits": normal_bits, "semantics": "non_outlier_channel_quant_bits", "source": qkv.get("normal_bits_source")}
     qkv["outlier"] = {"channels": outlier_channels, "bits": outlier_bits}
+    qkv["key"] = key_cache_policy
+    qkv["value"] = value_cache_policy
+    qkv["turboquant"] = turboquant_policy
     qkv["residency"] = {"sink_tokens": sink_tokens, "policy": qkv.get("residency_policy")}
     qkv["rotation"] = {"enabled": bool(enable_rotation), "seed": _juju_int_or_none(qkv.get("rotation_seed"))}
     qkv["qjl"] = {"enabled": enable_qjl, "seed": _juju_int_or_none(qkv.get("qjl_seed")), "source": qkv.get("enable_qjl_source")}
@@ -3356,12 +3540,20 @@ def _juju_execution_correctness_contract(contract, runtime_arch, qkv):
                 "value": _juju_int_or_none(qkv.get("v_bits")),
                 "normal": _juju_int_or_none(qkv.get("normal_bits")),
                 "outlier": _juju_int_or_none(qkv.get("outlier_bits")),
+                "key_normal": _juju_int_or_none(qkv.get("key_normal_bits")),
+                "value_normal": _juju_int_or_none(qkv.get("value_normal_bits")),
+                "key_outlier": _juju_int_or_none(qkv.get("key_outlier_bits")),
+                "value_outlier": _juju_int_or_none(qkv.get("value_outlier_bits")),
+                "query_cached": False,
                 "group_size": _juju_int_or_none(qkv.get("group_size")),
                 "page_size_tokens": _juju_int_or_none(qkv.get("page_size_tokens")),
                 "sink_tokens": _juju_int_or_none(qkv.get("sink_tokens")),
                 "enable_qjl": bool(_juju_bool_or_none(qkv.get("enable_qjl"))),
                 "enable_rotation": bool(_juju_bool_or_none(qkv.get("enable_rotation"))),
             },
+            "query_policy": dict(qkv.get("query_policy") or {}),
+            "key_cache_policy": dict(qkv.get("key") or {}),
+            "value_cache_policy": dict(qkv.get("value") or {}),
             "qkv_contract": qkv_fields,
         },
         "tensor_layout": {
@@ -3522,8 +3714,14 @@ def _juju_kv_layout_contract(contract, runtime_arch):
         "key_bits": _juju_int_or_none(qkv.get("k_bits")),
         "value_bits": _juju_int_or_none(qkv.get("v_bits")),
         "normal_bits": _juju_int_or_none(qkv.get("normal_bits")),
+        "key_normal_bits": _juju_int_or_none(qkv.get("key_normal_bits")),
+        "value_normal_bits": _juju_int_or_none(qkv.get("value_normal_bits")),
         "outlier_channels": _juju_int_or_none(qkv.get("outlier_channels")),
         "outlier_bits": _juju_int_or_none(qkv.get("outlier_bits")),
+        "key_outlier_bits": _juju_int_or_none(qkv.get("key_outlier_bits")),
+        "value_outlier_bits": _juju_int_or_none(qkv.get("value_outlier_bits")),
+        "key_effective_bits": qkv.get("key_effective_bits"),
+        "value_effective_bits": qkv.get("value_effective_bits"),
         "group_size": _juju_int_or_none(qkv.get("group_size")),
         "sink_tokens": _juju_int_or_none(qkv.get("sink_tokens")),
         "enable_qjl": bool(_juju_bool_or_none(qkv.get("enable_qjl"))),
@@ -3536,6 +3734,10 @@ def _juju_kv_layout_contract(contract, runtime_arch):
         "rotation": qkv_fields["rotation"],
         "normal": qkv_fields["normal"],
         "outlier": qkv_fields["outlier"],
+        "query_policy": qkv_fields["query_policy"],
+        "key_cache_policy": qkv_fields["key_cache_policy"],
+        "value_cache_policy": qkv_fields["value_cache_policy"],
+        "turboquant_policy": qkv_fields["turboquant_policy"],
         "residency": qkv_fields["residency"],
         "cache_layout": qkv_fields["cache_layout"],
         "qkv_policy_contract": qkv_fields["qkv_policy_contract"],
@@ -3776,6 +3978,11 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
                 "qkv_v_bits",
                 "qkv_normal_bits",
                 "qkv_outlier_bits",
+                "qkv_key_normal_bits",
+                "qkv_value_normal_bits",
+                "qkv_key_outlier_bits",
+                "qkv_value_outlier_bits",
+                "qkv_query_cached",
                 "qkv_group_size",
                 "qkv_page_size_tokens",
                 "qkv_qjl_enabled",
@@ -4625,6 +4832,12 @@ def build_juju_runtime_metadata_sections(tensor_records, contract, split_meta):
         "tokenizer_contract": juju_tokenizer_contract(),
         "validation_contract": juju_validation_contract(),
         "runtime_loop": "tokenizer_contract_then_graph_ir_ops_then_tensor_layout_then_qkv_cache_then_lm_head",
+        "runtime_execution_manifest": {
+            "format": "JUJU_RUNTIME_EXECUTION_MANIFEST_V1",
+            "location": ["graph_ir.runtime_execution_manifest", "idx.runtime_execution_manifest"],
+            "engine_read_first": True,
+            "model_name_specific_fallback_allowed": False,
+        },
         "plain_kv_runtime_allowed": False,
         "graph_ir_required": True,
         "tensor_layout_records_required": True,
@@ -5182,6 +5395,11 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
                 "qkv_v_bits",
                 "qkv_normal_bits",
                 "qkv_outlier_bits",
+                "qkv_key_normal_bits",
+                "qkv_value_normal_bits",
+                "qkv_key_outlier_bits",
+                "qkv_value_outlier_bits",
+                "qkv_query_cached",
                 "qkv_group_size",
                 "qkv_page_size_tokens",
                 "qkv_qjl_enabled",
@@ -5266,6 +5484,145 @@ def juju_expert_tensor_diagnostics(tensor_records):
     return diagnostics
 
 
+def build_juju_runtime_execution_manifest(*, generation_contract, runtime_access_plan, runtime_arch, qkv_fields):
+    generation_contract = dict(generation_contract or {})
+    runtime_access_plan = dict(runtime_access_plan or {})
+    runtime_arch = dict(runtime_arch or {})
+    qkv_fields = dict(qkv_fields or {})
+    perf = dict(generation_contract.get("performance_contract") or {})
+    executor = dict(runtime_access_plan.get("executor_contract") or {})
+    tensor_table = runtime_access_plan.get("executor_tensor_table") or []
+    role_counts = {}
+    op_counts = {}
+    for rec in tensor_table:
+        if not isinstance(rec, dict):
+            continue
+        role = str(rec.get("role") or rec.get("graph_role") or "unknown")
+        op = str(rec.get("op") or rec.get("execution_op") or "unknown")
+        role_counts[role] = role_counts.get(role, 0) + 1
+        op_counts[op] = op_counts.get(op, 0) + 1
+    tokenizer = generation_contract.get("tokenizer") or juju_tokenizer_contract()
+    kv_layout = runtime_access_plan.get("kv_layout_contract") or {}
+    return {
+        "format": "JUJU_RUNTIME_EXECUTION_MANIFEST_V1",
+        "schema_version": 1,
+        "required": True,
+        "source": "generated_from_source_config_tensor_table_and_runtime_contracts",
+        "fail_closed_if_missing": True,
+        "runtime_loop": [
+            "tokenizer_contract",
+            "embedding_lookup_and_scale",
+            "graph_ir_ops_in_declared_order",
+            "tensor_layout_contract",
+            "attention_router_norm_mlp_ops",
+            "qkv_cache_contract",
+            "final_norm",
+            "lm_head",
+            "sampler",
+            "bottleneck_trace",
+        ],
+        "executor_read_order": {
+            "first": "runtime_execution_manifest",
+            "then": [
+                "tokenizer",
+                "special_tokens",
+                "embedding",
+                "graph_ir",
+                "tensor_layout",
+                "kv_layout_contract",
+                "qkv_policy_contract",
+                "runtime_access_plan",
+                "bottleneck_trace_contract",
+            ],
+            "model_name_specific_fallback_allowed": False,
+            "unknown_required_field_behavior": "fail_closed",
+        },
+        "tokenizer": tokenizer,
+        "special_tokens": {
+            "bos_token_id": runtime_arch.get("bos_token_id"),
+            "eos_token_id": runtime_arch.get("eos_token_id"),
+            "unk_token_id": runtime_arch.get("unk_token_id"),
+            "pad_token_id": runtime_arch.get("pad_token_id"),
+            "add_bos_token": runtime_arch.get("add_bos_token"),
+            "add_eos_token": runtime_arch.get("add_eos_token"),
+            "add_space_prefix": runtime_arch.get("add_space_prefix"),
+            "source": "source_config_or_gguf_runtime_metadata",
+        },
+        "embedding": generation_contract.get("embedding") or {},
+        "attention": {
+            "qkv_cache_required": True,
+            "plain_kv_runtime_allowed": False,
+            "kv_layout_ref": "runtime_execution_manifest.kv_layout_contract",
+            "qkv_policy_ref": "runtime_execution_manifest.qkv_policy_contract",
+            "score_scale_source": "source_config_or_qk_norm_layout",
+            "rope_source": "source_config_or_gguf_runtime_metadata",
+            "head_layout": (kv_layout.get("head_layout") or {}),
+            "window_contract": (kv_layout.get("attention_window_contract") or {}),
+        },
+        "router": {
+            "execution_op": "moe_router",
+            "topk_source_fields": ["routed_experts_per_token", "experts_per_moe_layer", "norm_topk_prob", "scoring_func"],
+            "runtime_arch_values": {
+                "experts_per_moe_layer": runtime_arch.get("experts_per_moe_layer"),
+                "routed_experts_per_token": runtime_arch.get("routed_experts_per_token"),
+                "norm_topk_prob": runtime_arch.get("norm_topk_prob"),
+                "scoring_func": runtime_arch.get("scoring_func"),
+                "routed_scaling_factor": runtime_arch.get("routed_scaling_factor"),
+            },
+            "calibration_manifest_ref": "runtime_access_plan.router_calibration_manifest",
+            "buddy_map_section_required": True,
+            "predictor_section_required": True,
+        },
+        "norms": {
+            "eps": runtime_arch.get("norm_eps") or runtime_arch.get("rms_norm_eps"),
+            "source": "source_config_or_gguf_runtime_metadata",
+            "optional_missing_op_behavior": generation_contract.get("layers", {}).get("optional_missing_op_behavior"),
+        },
+        "lm_head": generation_contract.get("lm_head") or {},
+        "final_norm": generation_contract.get("final_norm") or {},
+        "graph_ir": {
+            "format": "JUJU_GRAPH_IR_V1",
+            "ops_ref": "graph_ir.ops",
+            "layers_ref": "graph_ir.layers",
+            "executor_must_consume_ops_in_declared_order": True,
+            "required_ops_fail_closed": True,
+        },
+        "tensor_layout": {
+            "executor_tensor_table_ref": "runtime_access_plan.executor_tensor_table",
+            "tensor_ref_fields": list(executor.get("tensor_ref_fields") or []),
+            "role_counts": role_counts,
+            "op_counts": op_counts,
+            "shape_offset_stride_are_authoritative": True,
+            "name_based_shape_or_transpose_guess_forbidden": True,
+        },
+        "runtime_access_plan": {
+            "format": runtime_access_plan.get("format"),
+            "version": runtime_access_plan.get("version"),
+            "file_locality_group_count": runtime_access_plan.get("file_locality_group_count"),
+            "layer_prefetch_plan_count": runtime_access_plan.get("layer_prefetch_plan_count"),
+            "startup_hotset_count": runtime_access_plan.get("startup_hotset_count"),
+            "expert_offset_table_kind": runtime_access_plan.get("expert_offset_table_kind"),
+            "moe_layer_bitmask_words": runtime_access_plan.get("moe_layer_bitmask_words") or [],
+        },
+        "kv_layout_contract": kv_layout,
+        "qkv_policy_contract": qkv_fields.get("qkv_policy_contract") or runtime_access_plan.get("qkv_policy_contract") or {},
+        "qkv_cache_schema_effective": qkv_fields.get("qkv_cache_schema_effective") or runtime_access_plan.get("qkv_cache_schema_effective") or {},
+        "bottleneck_trace_contract": runtime_access_plan.get("bottleneck_trace_contract") or {
+            "required_counters": perf.get("bottleneck_counters") or [],
+            "trace_required_keys": perf.get("trace_required_keys") or [],
+        },
+        "ppl_correctness_gates": {
+            "bad_ppl_is_correctness_failure": True,
+            "require_finite_hidden_vectors": True,
+            "require_finite_logits": True,
+            "require_tokenizer_contract_match": True,
+            "require_embedding_scale_semantics": True,
+            "require_qkv_policy_match": True,
+            "require_lm_head_contract_match": True,
+        },
+    }
+
+
 def juju_format_self_check(idx, sections, qkv_schema):
     idx = idx or {}
     sections = sections or []
@@ -5286,12 +5643,43 @@ def juju_format_self_check(idx, sections, qkv_schema):
     k_bits = _juju_int_or_none(qkv_schema.get("k_bits"))
     v_bits = _juju_int_or_none(qkv_schema.get("v_bits"))
     normal_bits = _juju_int_or_none(qkv_schema.get("normal_bits"))
+    key_normal_bits = _juju_int_or_none(qkv_schema.get("key_normal_bits"))
+    value_normal_bits = _juju_int_or_none(qkv_schema.get("value_normal_bits"))
     outlier_bits = _juju_int_or_none(qkv_schema.get("outlier_bits"))
+    key_outlier_bits = _juju_int_or_none(qkv_schema.get("key_outlier_bits"))
+    value_outlier_bits = _juju_int_or_none(qkv_schema.get("value_outlier_bits"))
     outlier_channels = _juju_int_or_none(qkv_schema.get("outlier_channels")) or 0
-    raw_qkv_bits = any(bit in (16, 32) for bit in (k_bits, v_bits, normal_bits, outlier_bits) if bit is not None)
+    raw_qkv_bits = any(
+        bit in (16, 32)
+        for bit in (
+            k_bits,
+            v_bits,
+            normal_bits,
+            key_normal_bits,
+            value_normal_bits,
+            outlier_bits,
+            key_outlier_bits,
+            value_outlier_bits,
+        )
+        if bit is not None
+    )
     enable_qjl = bool(_juju_bool_or_none(qkv_schema.get("enable_qjl")))
-    if k_bits is None or v_bits is None or normal_bits is None:
-        err("qkv_bits_incomplete", k_bits=k_bits, v_bits=v_bits, normal_bits=normal_bits)
+    if k_bits is None or v_bits is None or normal_bits is None or key_normal_bits is None or value_normal_bits is None:
+        err(
+            "qkv_bits_incomplete",
+            k_bits=k_bits,
+            v_bits=v_bits,
+            normal_bits=normal_bits,
+            key_normal_bits=key_normal_bits,
+            value_normal_bits=value_normal_bits,
+        )
+    if outlier_channels > 0 and (outlier_bits is None or key_outlier_bits is None or value_outlier_bits is None):
+        err(
+            "qkv_outlier_bits_incomplete",
+            outlier_bits=outlier_bits,
+            key_outlier_bits=key_outlier_bits,
+            value_outlier_bits=value_outlier_bits,
+        )
     if not raw_qkv_bits and not enable_qjl:
         err("qkv_codebook_bits_without_qjl", k_bits=k_bits, v_bits=v_bits, normal_bits=normal_bits)
     if (
@@ -5302,6 +5690,18 @@ def juju_format_self_check(idx, sections, qkv_schema):
     normal = qkv_schema.get("normal") if isinstance(qkv_schema.get("normal"), dict) else {}
     if normal.get("semantics") != "non_outlier_channel_quant_bits":
         err("qkv_normal_bits_semantics_missing")
+    query_policy = qkv_schema.get("query_policy") if isinstance(qkv_schema.get("query_policy"), dict) else {}
+    if query_policy.get("cached") is not False:
+        err("qkv_query_policy_must_be_uncached", cached=query_policy.get("cached"))
+    key_policy = qkv_schema.get("key") if isinstance(qkv_schema.get("key"), dict) else qkv_schema.get("key_cache_policy")
+    value_policy = qkv_schema.get("value") if isinstance(qkv_schema.get("value"), dict) else qkv_schema.get("value_cache_policy")
+    if not isinstance(key_policy, dict) or key_policy.get("cached") is not True:
+        err("qkv_key_cache_policy_missing")
+    if not isinstance(value_policy, dict) or value_policy.get("cached") is not True:
+        err("qkv_value_cache_policy_missing")
+    turboquant_policy = qkv_schema.get("turboquant") if isinstance(qkv_schema.get("turboquant"), dict) else qkv_schema.get("turboquant_policy")
+    if not isinstance(turboquant_policy, dict) or turboquant_policy.get("query_cached") is not False:
+        err("qkv_turboquant_policy_missing_or_query_cached")
 
     if idx.get("format") != "JUJU_IDX_JSON_V1":
         err("idx_format_missing_or_wrong")
@@ -5360,6 +5760,32 @@ def juju_format_self_check(idx, sections, qkv_schema):
     generation_contract = graph_ir.get("generation_contract") or {}
     if generation_contract.get("format") != "JUJU_GENERATION_CONTRACT_V1":
         err("generation_contract_missing_or_wrong_format")
+    runtime_execution_manifest = graph_ir.get("runtime_execution_manifest") or idx.get("runtime_execution_manifest") or {}
+    if runtime_execution_manifest.get("format") != "JUJU_RUNTIME_EXECUTION_MANIFEST_V1":
+        err("runtime_execution_manifest_missing_or_wrong_format")
+    else:
+        for field in (
+            "tokenizer",
+            "special_tokens",
+            "embedding",
+            "attention",
+            "router",
+            "lm_head",
+            "graph_ir",
+            "tensor_layout",
+            "runtime_access_plan",
+            "kv_layout_contract",
+            "qkv_policy_contract",
+            "bottleneck_trace_contract",
+            "ppl_correctness_gates",
+        ):
+            if runtime_execution_manifest.get(field) in (None, "", [], {}):
+                err("runtime_execution_manifest_field_missing", field=field)
+        read_order = runtime_execution_manifest.get("executor_read_order") or {}
+        if read_order.get("model_name_specific_fallback_allowed") is not False:
+            err("runtime_execution_manifest_allows_model_name_fallback")
+        if runtime_execution_manifest.get("ppl_correctness_gates", {}).get("bad_ppl_is_correctness_failure") is not True:
+            err("runtime_execution_manifest_ppl_gate_missing")
     tokenizer = generation_contract.get("tokenizer") or {}
     if not tokenizer.get("required_any_of"):
         err("tokenizer_required_any_of_missing")
@@ -5390,7 +5816,24 @@ def juju_format_self_check(idx, sections, qkv_schema):
     else:
         if kv_layout.get("format") != "JUJU_KV_LAYOUT_CONTRACT_V1":
             err("kv_layout_contract_wrong_format")
-        for field in ("layout", "page_size_tokens", "key_bits", "value_bits", "normal_bits", "outlier_bits", "group_size", "enable_qjl", "runtime_cache_policy"):
+        for field in (
+            "layout",
+            "page_size_tokens",
+            "key_bits",
+            "value_bits",
+            "normal_bits",
+            "key_normal_bits",
+            "value_normal_bits",
+            "outlier_bits",
+            "key_outlier_bits",
+            "value_outlier_bits",
+            "group_size",
+            "enable_qjl",
+            "runtime_cache_policy",
+            "query_policy",
+            "key_cache_policy",
+            "value_cache_policy",
+        ):
             if kv_layout.get(field) in (None, ""):
                 err("kv_layout_field_missing", field=field)
     if not runtime_access_plan.get("expert_offset_table"):
@@ -5420,7 +5863,24 @@ def juju_format_self_check(idx, sections, qkv_schema):
         if key not in trace_keys:
             err("trace_required_key_missing", trace_key=key)
     bottleneck_counters = set(perf.get("bottleneck_counters") or [])
-    for key in ("attention_ms", "mlp_ms", "lm_head_ms", "kv_bytes", "ram_used_bytes", "vram_used_bytes", "io_wait_ms", "qkv_k_bits", "qkv_v_bits", "qkv_normal_bits", "qkv_qjl_enabled"):
+    for key in (
+        "attention_ms",
+        "mlp_ms",
+        "lm_head_ms",
+        "kv_bytes",
+        "ram_used_bytes",
+        "vram_used_bytes",
+        "io_wait_ms",
+        "qkv_k_bits",
+        "qkv_v_bits",
+        "qkv_normal_bits",
+        "qkv_key_normal_bits",
+        "qkv_value_normal_bits",
+        "qkv_outlier_bits",
+        "qkv_key_outlier_bits",
+        "qkv_value_outlier_bits",
+        "qkv_qjl_enabled",
+    ):
         if key not in bottleneck_counters:
             err("bottleneck_counter_missing", counter=key)
 
@@ -5470,6 +5930,12 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
         lm_head=lm_head,
         output_norm=output_norm,
         layers=layers,
+    )
+    runtime_execution_manifest = build_juju_runtime_execution_manifest(
+        generation_contract=generation_contract,
+        runtime_access_plan=runtime_access_plan,
+        runtime_arch=runtime_arch,
+        qkv_fields=qkv_fields,
     )
     priority_rules = [
         {"match": "token_embd.weight|output.weight|output_norm.weight|rope_freqs.weight", "priority": 100, "residency": "FAST_MEM", "prefetch": "startup_hot"},
@@ -5529,6 +5995,7 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             **runtime_arch,
         },
         "generation_contract": generation_contract,
+        "runtime_execution_manifest": runtime_execution_manifest,
         "runtime_access_plan": runtime_access_plan,
         "kv_layout_contract": runtime_access_plan["kv_layout_contract"],
         "qkv_policy_contract": qkv_fields["qkv_policy_contract"],
@@ -6109,6 +6576,7 @@ def build_juju_shard_plan_from_hf_url(
             "runtime_access_plan": graph_ir["runtime_access_plan"],
             "kv_layout_contract": graph_ir["kv_layout_contract"],
             "generation_contract": graph_ir["generation_contract"],
+            "runtime_execution_manifest": graph_ir["runtime_execution_manifest"],
             "qkv_policy_contract": graph_ir["runtime_access_plan"].get("qkv_policy_contract", {}),
             "qkv_cache_schema_effective": graph_ir["runtime_access_plan"].get("qkv_cache_schema_effective", {}),
             "expert_tier_entries": graph_ir["runtime_access_plan"].get("expert_tier_entries", []),
@@ -6720,6 +7188,7 @@ def write_juju_shard_from_hf_url(
                 "runtime_access_plan": graph_ir["runtime_access_plan"],
                 "kv_layout_contract": graph_ir["kv_layout_contract"],
                 "generation_contract": graph_ir["generation_contract"],
+                "runtime_execution_manifest": graph_ir["runtime_execution_manifest"],
                 "qkv_policy_contract": graph_ir["runtime_access_plan"].get("qkv_policy_contract", {}),
                 "qkv_cache_schema_effective": graph_ir["runtime_access_plan"].get("qkv_cache_schema_effective", {}),
                 "expert_tier_entries": graph_ir["runtime_access_plan"].get("expert_tier_entries", []),

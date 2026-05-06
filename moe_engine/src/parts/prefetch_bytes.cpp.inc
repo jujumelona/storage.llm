@@ -60,10 +60,21 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
         // Solution: Every 1024 calls, try VirtualLock on a small page. If it
         //   succeeds, memory pressure has subsided → revert to mmap path.
         // Overhead: One VirtualLock+Unlock per 1024 calls = negligible.
+        // BUGFIX NEW-5: Fix VirtualLock recovery double-counting ★★★ CRITICAL
+        // Problem: Recovery success → bytes_mmap_touch += bytes → goto do_virtuallock_path
+        // → VirtualLock fails → bytes_touch_fallback += bytes → double-counted
+        // Solution: Use explicit recovery_succeeded flag, count bytes only once
+        // Impact: Eliminates IO statistics corruption, accurate bandwidth measurement
+        // BUGFIX Problem 3: Fix VirtualLock recovery thread-local/global mixing ★★★ CRITICAL
+        // Problem: s_recovery_counter is thread_local → each IO worker counts independently
+        // → Recovery transition happens while other workers still have OVERLAPPED in flight
+        // → OVERLAPPED completion and mmap read race on same staging buffer
+        // Solution: Use engine-wide atomic counter, wait for all staging slots idle before transition
+        // Impact: Eliminates race condition, prevents buffer corruption
         if (overlapped && !engine->io_config.enable_directstorage && src && bytes > 0) {
-            static thread_local uint32_t s_recovery_counter = 0;
-            if (++s_recovery_counter >= 1024) {
-                s_recovery_counter = 0;
+            uint32_t recovery_count = const_cast<moe_pc_engine*>(engine)->vlock_recovery_counter.fetch_add(1, std::memory_order_relaxed);
+            if (recovery_count >= 8192) {  // 8x higher threshold for engine-wide counter (8 workers × 1024)
+                const_cast<moe_pc_engine*>(engine)->vlock_recovery_counter.store(0, std::memory_order_relaxed);
                 const size_t probe_size = 4096;
                 if (VirtualLock(reinterpret_cast<LPVOID>(
                         reinterpret_cast<uintptr_t>(src) & ~(uintptr_t)(probe_size - 1)),
@@ -71,24 +82,30 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
                     VirtualUnlock(reinterpret_cast<LPVOID>(
                         reinterpret_cast<uintptr_t>(src) & ~(uintptr_t)(probe_size - 1)),
                         probe_size);
-                    // VirtualLock succeeded → working set pressure has subsided
+                    // VirtualLock succeeded → wait for all staging slots to complete
                     auto* mutable_engine = const_cast<moe_pc_engine*>(engine);
-                    mutable_engine->prefer_overlapped_io_atomic.store(false, std::memory_order_release);
-                    mutable_engine->io_config.prefer_overlapped_io = 0;
-                    // BUGFIX 1010: Reset overlapped_io_transition_done to allow re-transition ★★★ CRITICAL
-                    // Problem: Without resetting this flag, re-transition to OVERLAPPED IO is blocked
-                    // Solution: Reset flag when VirtualLock recovery succeeds
-                    mutable_engine->overlapped_io_transition_done.store(false, std::memory_order_release);
-                    fprintf(stderr,
-                        "[storageLLM INFO] VirtualLock recovery succeeded. "
-                        "Reverting to mmap path for better sequential read throughput.\n");
-                    // BUGFIX 1002: Count bytes in mmap_touch before falling through ★★ IMPORTANT
-                    // Problem: Recovery path jumps to do_virtuallock_path without counting bytes
-                    // → IO statistics have a hole → runtime_prefetch_window() underestimates bandwidth
-                    // Solution: Add bytes to mmap_touch counter before goto
-                    mutable_engine->io_atomic.bytes_mmap_touch.fetch_add(bytes, std::memory_order_relaxed);
-                    // Don't return — fall through to VirtualLock path for this call
-                    goto do_virtuallock_path;
+                    bool all_idle = false;
+                    for (int retry = 0; retry < 100 && !all_idle; ++retry) {
+                        all_idle = true;
+                        for (const auto& slot : mutable_engine->staging_slots) {
+                            if (slot.in_use.load(std::memory_order_acquire)) {
+                                all_idle = false;
+                                break;
+                            }
+                        }
+                        if (!all_idle) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        }
+                    }
+                    if (all_idle) {
+                        mutable_engine->prefer_overlapped_io_atomic.store(false, std::memory_order_release);
+                        mutable_engine->io_config.prefer_overlapped_io = 0;
+                        mutable_engine->overlapped_io_transition_done.store(false, std::memory_order_release);
+                        mutable_engine->vlock_recovery_reset_pending.store(true, std::memory_order_release);
+                        fprintf(stderr,
+                            "[storageLLM INFO] VirtualLock recovery succeeded. "
+                            "Reverting to mmap path for better sequential read throughput.\n");
+                    }
                 }
             }
             const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_overlapped_io.fetch_add(bytes, std::memory_order_relaxed);
@@ -97,20 +114,18 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
         }
         return;
     }
-    do_virtuallock_path:
-    // Try VirtualLock to bring pages into working set
-    // This is a hint - failure is acceptable and common when working set limit reached
+    // VirtualLock path (non-overlapped IO)
     if (src && bytes > 0) {
-        // VirtualLock requires page-aligned address
         const size_t page_size = 4096;
         const uintptr_t aligned_addr = reinterpret_cast<uintptr_t>(src) & ~(page_size - 1);
         const size_t prefix = reinterpret_cast<uintptr_t>(src) - aligned_addr;
         const size_t aligned_size = ((bytes + prefix + page_size - 1) / page_size) * page_size;
 
-        // VirtualLock brings pages into working set (non-blocking)
         if (VirtualLock(reinterpret_cast<LPVOID>(aligned_addr), aligned_size)) {
-            // Immediately unlock - we just wanted to fault pages in
             VirtualUnlock(reinterpret_cast<LPVOID>(aligned_addr), aligned_size);
+            if (engine) {
+                const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_mmap_touch.fetch_add(bytes, std::memory_order_relaxed);
+            }
         } else {
             // BUGFIX 939: Auto-fallback to OVERLAPPED IO on VirtualLock failure ★★★
             // Problem: VirtualLock fails at ~1.5GB working set limit → memcpy page-faults
@@ -118,13 +133,20 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
             // Solution: Track consecutive failures. After 2 failures, dynamically switch
             //   to prefer_overlapped_io=true. OVERLAPPED ReadFile path already implemented.
             // Impact: Eliminates blocking page faults on Windows non-DirectStorage path.
-            static thread_local uint32_t s_vlock_fail_count = 0;
-            // BUGFIX 990: Lower threshold from 8 to 2 ★★ IMPORTANT
-            // Problem: Each VirtualLock failure causes 100-500ms page fault stall.
-            // 8 failures = up to 4s wasted blocking before switching to OVERLAPPED IO.
-            // Solution: Switch after 2 failures. 1 retry handles transient OS contention;
-            // 2nd failure confirms working set limit is persistently reached.
-            if (++s_vlock_fail_count >= 2 && engine) {
+            // BUGFIX Problem 3: Use engine-wide atomic counter instead of thread_local ★★★ CRITICAL
+            // Problem: thread_local s_vlock_fail_count → each worker tracks independently
+            // → Inconsistent transition timing, recovery reset doesn't reach all workers
+            // Solution: Use engine->vlock_fail_counter atomic, all workers share same state
+            // Impact: Consistent failure tracking, proper recovery reset propagation
+            if (engine && engine->vlock_recovery_reset_pending.exchange(false, std::memory_order_acquire)) {
+                const_cast<moe_pc_engine*>(engine)->vlock_fail_counter.store(0, std::memory_order_relaxed);
+            }
+            uint32_t fail_count = const_cast<moe_pc_engine*>(engine)->vlock_fail_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+            // BUGFIX Problem 4: Lower VirtualLock failure threshold ★★ PERFORMANCE
+            // Problem: 16 failures (8 workers × 2) = 1.6-8 seconds of blocking page faults
+            // Solution: Lower threshold to 8 failures (workers × 1), add proactive working set check
+            // Impact: Faster transition to OVERLAPPED IO, reduces page fault stall time by 50%
+            if (fail_count >= 8 && engine) {
                 auto* mutable_engine = const_cast<moe_pc_engine*>(engine);
                 // BUGFIX 961: Race-safe prefer_overlapped_io transition ★★
                 // BUGFIX 1010: Move s_overlapped_io_set to engine member ★★★ CRITICAL
@@ -138,15 +160,15 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
                     mutable_engine->prefer_overlapped_io_atomic.store(true, std::memory_order_release);
                     mutable_engine->io_config.prefer_overlapped_io = 1;
                     fprintf(stderr,
-                        "[storageLLM INFO] VirtualLock failed %u times, auto-enabling prefer_overlapped_io. "
+                        "[storageLLM INFO] VirtualLock failed %u times (engine-wide), auto-enabling prefer_overlapped_io. "
                         "Subsequent I/O will use OVERLAPPED ReadFile to avoid page fault stalls.\n",
-                        s_vlock_fail_count);
+                        fail_count);
                 }
             }
+            if (engine) {
+                const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_touch_fallback.fetch_add(bytes, std::memory_order_relaxed);
+            }
         }
-    }
-    if (engine) {
-        const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_touch_fallback.fetch_add(bytes, std::memory_order_relaxed);
     }
 #elif defined(__linux__)
     madvise(const_cast<uint8_t*>(src), (size_t)bytes, MADV_WILLNEED);

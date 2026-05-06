@@ -13,6 +13,14 @@
 #include <vector>
 #include <climits>
 
+// BUGFIX Problem 2: Windows QKV working set preparation ★★ IMPORTANT
+// Forward declare prepare_windows_staging_working_set from staging_alloc.cpp.inc
+#ifdef _WIN32
+extern "C" void prepare_windows_staging_working_set(uint64_t bytes);
+#else
+static inline void prepare_windows_staging_working_set(uint64_t) {}
+#endif
+
 static uint64_t qkv_cache_key(int dim, uint64_t tag) {
     uint64_t x = tag ^ ((uint64_t)(uint32_t)dim * 0x9e3779b97f4a7c15ull);
     x ^= x >> 33;
@@ -99,8 +107,15 @@ int qkv_state_init(
     int dim = config->head_dim;
     int k_bits = config->k_bits;
     int v_bits = config->v_bits;
+    const int k_outlier_bits = qkv_outlier_bits_for_target(config, QKV_TARGET_KEY);
+    const int k_normal_bits = qkv_normal_bits_for_target(config, QKV_TARGET_KEY);
+    const int v_outlier_bits = qkv_outlier_bits_for_target(config, QKV_TARGET_VALUE);
+    const int v_normal_bits = qkv_normal_bits_for_target(config, QKV_TARGET_VALUE);
     // BUGFIX 404: dim 범위 체크 강화
-    if (dim <= 0 || dim > 16384 || !qkv_bits_valid(k_bits) || !qkv_bits_valid(v_bits)) {
+    if (dim <= 0 || dim > 16384 ||
+        !qkv_bits_valid(k_bits) || !qkv_bits_valid(v_bits) ||
+        !qkv_bits_valid(k_outlier_bits) || !qkv_bits_valid(k_normal_bits) ||
+        !qkv_bits_valid(v_outlier_bits) || !qkv_bits_valid(v_normal_bits)) {
         return 0;
     }
     // BUGFIX 405: n_tokens 범위 체크
@@ -201,7 +216,11 @@ int qkv_state_init(
     }
 
     if (!qkv_state_assign_codebook(state, dim, k_storage_bits) ||
-        !qkv_state_assign_codebook(state, dim, v_storage_bits)) {
+        !qkv_state_assign_codebook(state, dim, v_storage_bits) ||
+        !qkv_state_assign_codebook(state, dim, k_outlier_bits) ||
+        !qkv_state_assign_codebook(state, dim, k_normal_bits) ||
+        !qkv_state_assign_codebook(state, dim, v_outlier_bits) ||
+        !qkv_state_assign_codebook(state, dim, v_normal_bits)) {
         qkv_state_free(state);
         return 0;
     }
@@ -233,19 +252,24 @@ int qkv_state_init(
     if (config->outlier_channels > 0 && config->outlier_channels < dim) {
         int n_out = config->outlier_channels;
         int n_norm = dim - n_out;
-        int out_bits = config->outlier_bits;
-        int norm_bits = config->normal_bits;
-        const bool split_qjl = qjl_streams &&
-            qkv_bits_codebook(out_bits) && qkv_bits_codebook(norm_bits) &&
-            out_bits > 1 && norm_bits > 1;
-        const int out_storage_bits = split_qjl ? out_bits - 1 : out_bits;
-        const int norm_storage_bits = split_qjl ? norm_bits - 1 : norm_bits;
+        const bool k_split_qjl = qjl_streams &&
+            qkv_bits_codebook(k_outlier_bits) && qkv_bits_codebook(k_normal_bits) &&
+            k_outlier_bits > 1 && k_normal_bits > 1;
+        const bool v_split_qjl = qjl_streams &&
+            qkv_bits_codebook(v_outlier_bits) && qkv_bits_codebook(v_normal_bits) &&
+            v_outlier_bits > 1 && v_normal_bits > 1;
+        const int k_out_storage_bits = k_split_qjl ? k_outlier_bits - 1 : k_outlier_bits;
+        const int k_norm_storage_bits = k_split_qjl ? k_normal_bits - 1 : k_normal_bits;
+        const int v_out_storage_bits = v_split_qjl ? v_outlier_bits - 1 : v_outlier_bits;
+        const int v_norm_storage_bits = v_split_qjl ? v_normal_bits - 1 : v_normal_bits;
 
         // BUGFIX 411: bits 범위 체크
-        if (!qkv_bits_valid(out_bits) || !qkv_bits_valid(norm_bits) ||
-            !qkv_bits_valid(out_storage_bits) || !qkv_bits_valid(norm_storage_bits) ||
-            !qkv_state_assign_codebook(state, dim, out_storage_bits) ||
-            !qkv_state_assign_codebook(state, dim, norm_storage_bits)) {
+        if (!qkv_bits_valid(k_out_storage_bits) || !qkv_bits_valid(k_norm_storage_bits) ||
+            !qkv_bits_valid(v_out_storage_bits) || !qkv_bits_valid(v_norm_storage_bits) ||
+            !qkv_state_assign_codebook(state, dim, k_out_storage_bits) ||
+            !qkv_state_assign_codebook(state, dim, k_norm_storage_bits) ||
+            !qkv_state_assign_codebook(state, dim, v_out_storage_bits) ||
+            !qkv_state_assign_codebook(state, dim, v_norm_storage_bits)) {
             qkv_state_free(state);
             return 0;
         }
@@ -263,18 +287,18 @@ int qkv_state_init(
         state->v_is_outlier = (uint8_t*)calloc((size_t)dim, 1);
 
         // BUGFIX 413: outlier 할당 크기 overflow 방지
-        if ((size_t)n_tokens > SIZE_MAX / ((size_t)n_out * (size_t)out_storage_bits)) {
+        if ((size_t)n_tokens > SIZE_MAX / ((size_t)n_out * (size_t)std::max(k_out_storage_bits, v_out_storage_bits))) {
             qkv_state_free(state);
             return 0;
         }
-        if ((size_t)n_tokens > SIZE_MAX / ((size_t)n_norm * (size_t)norm_storage_bits)) {
+        if ((size_t)n_tokens > SIZE_MAX / ((size_t)n_norm * (size_t)std::max(k_norm_storage_bits, v_norm_storage_bits))) {
             qkv_state_free(state);
             return 0;
         }
-        size_t k_out_size = ((size_t)n_tokens * (size_t)n_out * (size_t)out_storage_bits + 7) / 8;
-        size_t k_norm_size = ((size_t)n_tokens * (size_t)n_norm * (size_t)norm_storage_bits + 7) / 8;
-        size_t v_out_size = ((size_t)n_tokens * (size_t)n_out * (size_t)out_storage_bits + 7) / 8;
-        size_t v_norm_size = ((size_t)n_tokens * (size_t)n_norm * (size_t)norm_storage_bits + 7) / 8;
+        size_t k_out_size = ((size_t)n_tokens * (size_t)n_out * (size_t)k_out_storage_bits + 7) / 8;
+        size_t k_norm_size = ((size_t)n_tokens * (size_t)n_norm * (size_t)k_norm_storage_bits + 7) / 8;
+        size_t v_out_size = ((size_t)n_tokens * (size_t)n_out * (size_t)v_out_storage_bits + 7) / 8;
+        size_t v_norm_size = ((size_t)n_tokens * (size_t)n_norm * (size_t)v_norm_storage_bits + 7) / 8;
 
         state->k_idx_outlier = (uint8_t*)calloc(k_out_size, 1);
         state->k_idx_normal = (uint8_t*)calloc(k_norm_size, 1);
@@ -368,6 +392,38 @@ int qkv_state_init(
     state->head_dim = dim;
     state->k_bits = k_bits;
     state->v_bits = v_bits;
+
+    // BUGFIX Problem 2: Windows QKV working set preparation ★★ IMPORTANT
+    // Problem: QKV state memory (~0.69 GiB) allocated independently, not included in working set
+    // → Page faults during attention operations block io_worker threads
+    // Solution: Call prepare_windows_staging_working_set with total QKV allocation size
+    // Impact: Eliminates blocking page faults on Windows during attention
+    uint64_t total_qkv_bytes = k_packed_size + v_packed_size +
+        (size_t)n_tokens * sizeof(float) * 2; // k_norms + v_norms
+    if (qjl_streams) {
+        total_qkv_bytes += ((size_t)n_tokens * (size_t)dim + 7) / 8 * 2; // k_qjl + v_qjl
+        total_qkv_bytes += (size_t)n_tokens * sizeof(float) * 2; // residual_norms
+    }
+    if (config->outlier_channels > 0 && config->outlier_channels < dim) {
+        int n_out = config->outlier_channels;
+        int n_norm = dim - n_out;
+        const bool k_split_qjl = qjl_streams &&
+            qkv_bits_codebook(k_outlier_bits) && qkv_bits_codebook(k_normal_bits) &&
+            k_outlier_bits > 1 && k_normal_bits > 1;
+        const bool v_split_qjl = qjl_streams &&
+            qkv_bits_codebook(v_outlier_bits) && qkv_bits_codebook(v_normal_bits) &&
+            v_outlier_bits > 1 && v_normal_bits > 1;
+        const int k_out_storage_bits = k_split_qjl ? k_outlier_bits - 1 : k_outlier_bits;
+        const int k_norm_storage_bits = k_split_qjl ? k_normal_bits - 1 : k_normal_bits;
+        const int v_out_storage_bits = v_split_qjl ? v_outlier_bits - 1 : v_outlier_bits;
+        const int v_norm_storage_bits = v_split_qjl ? v_normal_bits - 1 : v_normal_bits;
+        total_qkv_bytes += ((size_t)n_tokens * (size_t)n_out * (size_t)k_out_storage_bits + 7) / 8;
+        total_qkv_bytes += ((size_t)n_tokens * (size_t)n_norm * (size_t)k_norm_storage_bits + 7) / 8;
+        total_qkv_bytes += ((size_t)n_tokens * (size_t)n_out * (size_t)v_out_storage_bits + 7) / 8;
+        total_qkv_bytes += ((size_t)n_tokens * (size_t)n_norm * (size_t)v_norm_storage_bits + 7) / 8;
+        total_qkv_bytes += (size_t)n_tokens * sizeof(float) * 4; // outlier/normal norms
+    }
+    prepare_windows_staging_working_set(total_qkv_bytes);
 
     return 1;
 }

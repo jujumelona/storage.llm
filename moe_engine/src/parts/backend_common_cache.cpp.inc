@@ -28,13 +28,22 @@ static uint64_t max_raw_role_layer_bytes(uint32_t roles) {
 }
 
 static uint64_t working_common_cache_bytes() {
-    // Bug #14: memoize ??raw spans are hardcoded constants, result never changes
-    static uint64_t cached = 0;
-    if (cached) return cached;
+    // Bug #14: memoize – raw spans are hardcoded constants, result never changes
+    // BUGFIX NEW-BUG4: Static variable race (benign but can be improved) ★ MINOR
+    // Problem: Multiple threads may compute and write same value simultaneously
+    // → Benign race (same value), but technically undefined behavior
+    // Solution: Use atomic for thread-safe lazy initialization
+    // Impact: Eliminates UB, ensures single computation
+    static std::atomic<uint64_t> cached{0};
+    uint64_t current = cached.load(std::memory_order_acquire);
+    if (current) return current;
+
     const uint32_t activation_roles = 1u | 2u | 4u;
     const uint32_t shared_compute_roles = 8u;
-    cached = fixed_output_core_bytes() +
+    uint64_t result = fixed_output_core_bytes() +
         max_raw_role_layer_bytes(activation_roles) +
         max_raw_role_layer_bytes(shared_compute_roles);
-    return cached;
+
+    cached.store(result, std::memory_order_release);
+    return result;
 }

@@ -29,6 +29,17 @@
 // legacy callers can still explicitly disable it for debug comparisons.
 std::atomic<bool> g_qkv_mode_enabled{true};
 
+// BUGFIX Problem 2: Windows QKV working set preparation ★★ IMPORTANT
+// Problem: QKV state memory (~0.69 GiB) allocated independently, not included in working set
+// → Page faults during attention operations block io_worker threads
+// Solution: Forward-declare prepare_windows_staging_working_set and call after QKV allocation
+// Impact: Eliminates blocking page faults on Windows during attention
+#ifdef _WIN32
+extern void prepare_windows_staging_working_set(uint64_t bytes);
+#else
+static inline void prepare_windows_staging_working_set(uint64_t) {}
+#endif
+
 // ============================================================
 // BUGFIX Issue 9: Fast Walsh-Hadamard Transform (FWHT)
 // ============================================================
@@ -105,10 +116,13 @@ static int qkv_quantize_split_vector_with_state(
     const int dim = config->head_dim;
     const int n_out = config->outlier_channels;
     const int n_norm = dim - n_out;
+    const int outlier_bits = qkv_outlier_bits_for_target(config, target);
+    const int normal_bits = qkv_normal_bits_for_target(config, target);
     const bool use_qjl = config->enable_qjl && qjl_base && residual_norms && state->qjl_matrix &&
-        qkv_bits_codebook(config->outlier_bits) && qkv_bits_codebook(config->normal_bits);
-    const int out_mse_bits = qkv_mse_bits_for_total_bits(config->outlier_bits, use_qjl);
-    const int norm_mse_bits = qkv_mse_bits_for_total_bits(config->normal_bits, use_qjl);
+        qkv_bits_codebook(outlier_bits) && qkv_bits_codebook(normal_bits) &&
+        outlier_bits > 1 && normal_bits > 1;
+    const int out_mse_bits = qkv_mse_bits_for_total_bits(outlier_bits, use_qjl);
+    const int norm_mse_bits = qkv_mse_bits_for_total_bits(normal_bits, use_qjl);
     if (dim <= 0 || dim > 16384 || n_out <= 0 || n_out >= dim || n_norm <= 0 ||
         !out_mse_bits || !norm_mse_bits) {
         return 0;

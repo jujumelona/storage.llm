@@ -79,14 +79,9 @@ int moe_pc_engine_plan_moe_prefetch(
             const int lookahead_layer = current_layer + 1;
             const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
             if (moe_layer_is_moe_runtime(engine, &runtime_c, lookahead_layer)) {
-                // BUGFIX 1009: Guard moe_juju_predict_co_activation with initialization check ★★★ CRITICAL
-                // Problem: Metal UMA path calls moe_juju_predict_co_activation() before
-                // juju_co_activation_bank is initialized (JUJU format not loaded yet, or GGUF offload).
-                // → Null pointer dereference or access to uninitialized memory.
-                // Solution: Check engine->juju_co_activation_bank_initialized before calling.
-                // JUJU parsing sets this flag to true after co_activation_stats is allocated.
-                // Impact: Prevents crash on Metal UMA with GGUF offload or early inference calls.
-                moe_juju_predict_co_activation(engine, lookahead_layer, 8);
+                if (engine->juju_co_activation_bank_initialized.load(std::memory_order_acquire)) {
+                    moe_juju_predict_co_activation(engine, lookahead_layer, 8);
+                }
             }
         }
         *out_item_count = 0; // 명시적 VRAM 복사 불필요
@@ -121,16 +116,13 @@ int moe_pc_engine_plan_moe_prefetch(
         const int lookahead_layer = current_layer + 1;
         const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
         if (moe_layer_is_moe_runtime(engine, &runtime_c, lookahead_layer)) {
-            // BUGFIX 1009: Guard moe_juju_predict_co_activation with initialization check ★★★ CRITICAL
-            // Problem: moe_juju_predict_co_activation() accesses engine->juju_co_activation_bank
-            // which may not be initialized yet (JUJU format not loaded, or GGUF offload format).
-            // Solution: Check engine->juju_co_activation_bank_initialized before calling.
-            // Impact: Prevents crash on early inference calls or non-JUJU formats.
-            std::vector<int> predicted = moe_juju_predict_co_activation(
-                engine, lookahead_layer, 8);
-            if (!predicted.empty()) {
-                prefetch_plan_add_lookahead(engine, items, lookahead_layer,
-                    predicted.data(), (uint32_t)predicted.size());
+            if (engine->juju_co_activation_bank_initialized.load(std::memory_order_acquire)) {
+                std::vector<int> predicted = moe_juju_predict_co_activation(
+                    engine, lookahead_layer, 8);
+                if (!predicted.empty()) {
+                    prefetch_plan_add_lookahead(engine, items, lookahead_layer,
+                        predicted.data(), (uint32_t)predicted.size());
+                }
             }
         }
     }

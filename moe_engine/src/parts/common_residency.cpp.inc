@@ -31,18 +31,34 @@ static uint64_t common_vram_wanted_bytes(const moe_pc_engine* engine) {
         // Solution: Use 2 × hidden_size × max_seq_len × 2 (bf16) as minimum activation buffer
         // This approximates KQ matrix size, which is the dominant runtime allocation.
         // Fallback to 8192 if max_seq_len unavailable.
+        // BUGFIX Problem 3: Account for MLA projection buffers ★★★ CRITICAL
+        // Problem: MLA models have latent_dim projection buffers much larger than KQ matrix
+        // → GLM-5.1: latent_dim=512, num_experts=256 → projection scratch ~2GB
+        // → Fallback underestimates by 10-15x → embedding/lm_head evicted every token
+        // Solution: Add MLA latent buffer estimate: num_experts × latent_dim × max_seq_len × 2
+        // Impact: Correct VRAM reservation for MLA models, prevents reload thrashing
         const uint64_t hidden = s ? s->hidden_size : 6144ull;
         uint32_t max_seq = 8192u;
         if (engine && engine->attn_config_valid.load(std::memory_order_relaxed) &&
             engine->attn_config.max_seq_len > 0) {
             max_seq = engine->attn_config.max_seq_len;
         }
-        runtime_overhead = 2ull * hidden * (uint64_t)max_seq * 2ull; // bf16 = 2 bytes
+        // Base: KQ matrix (2 × hidden × seq × bf16)
+        runtime_overhead = 2ull * hidden * (uint64_t)max_seq * 2ull;
+
+        // Add MLA projection buffer estimate if model has MLA
+        if (s && s->experts_per_moe_layer > 0) {
+            // Estimate MLA latent buffer: experts × latent_dim × seq × bf16
+            // Conservative: assume latent_dim = hidden/8 (typical for MLA)
+            const uint64_t latent_dim = hidden / 8ull;
+            const uint64_t mla_buffer = (uint64_t)s->experts_per_moe_layer * latent_dim * (uint64_t)max_seq * 2ull;
+            runtime_overhead += mla_buffer;
+        }
+
         fprintf(stderr,
             "[storageLLM WARNING] runtime_state_bytes not set in moe_storage_constants. "
-            "Using calculated fallback: %llu bytes (2 * hidden_size * max_seq_len * 2). "
-            "This approximates minimum activation buffer size. "
-            "Actual runtime state may be larger with MLA or vision encoders.\n",
+            "Using calculated fallback: %llu bytes (KQ matrix + MLA projection estimate). "
+            "Actual runtime state may be larger with vision encoders or custom attention.\n",
             (unsigned long long)runtime_overhead);
     }
     const uint64_t core = (s ? s->raw_tensor_lm_head_bytes : 0ull) + runtime_overhead;
