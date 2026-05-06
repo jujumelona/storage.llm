@@ -43,6 +43,7 @@ static int moe_profile_tag_enabled(const char* tag) {
         "generation_contract",
         "generation_begin",
         "generation_end",
+        "forward_embed",
         "decode_forward",
         "decode_sample",
         "forward_token_end",
