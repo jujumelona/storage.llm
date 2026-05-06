@@ -1,5 +1,72 @@
+static int moe_profile_level() {
+    static std::atomic<int> cached{-1};
+    int value = cached.load(std::memory_order_acquire);
+    if (value >= 0) {
+        return value;
+    }
+    int parsed = 2;
+    const char* env = std::getenv("STORAGELLM_TRACE_LEVEL");
+    if (!env || !env[0]) {
+        env = std::getenv("STORAGELLM_TRACE");
+    }
+    if (env && env[0]) {
+        if (std::strcmp(env, "0") == 0 ||
+            std::strcmp(env, "off") == 0 ||
+            std::strcmp(env, "false") == 0 ||
+            std::strcmp(env, "none") == 0) {
+            parsed = 0;
+        } else if (std::strcmp(env, "1") == 0 ||
+                   std::strcmp(env, "summary") == 0 ||
+                   std::strcmp(env, "basic") == 0) {
+            parsed = 1;
+        } else {
+            parsed = 2;
+        }
+    }
+    cached.store(parsed, std::memory_order_release);
+    return parsed;
+}
+
 static int moe_profile_enabled() {
-    return 1;
+    return moe_profile_level() > 0;
+}
+
+static int moe_profile_tag_enabled(const char* tag) {
+    const int level = moe_profile_level();
+    if (level <= 0) {
+        return 0;
+    }
+    if (level >= 2 || !tag) {
+        return 1;
+    }
+    static const char* const summary_tags[] = {
+        "generation_contract",
+        "generation_begin",
+        "generation_end",
+        "decode_forward",
+        "decode_sample",
+        "forward_token_end",
+        "forward_layer",
+        "cpu_ram",
+        "kv_cache",
+        "io_pipeline",
+        "lm_head_top1_begin",
+        "lm_head_top1_end",
+        "lm_head_logprob_time",
+        "lm_head_logprob_end",
+        "eval_input_ids",
+        "eval_prepare_begin",
+        "eval_prepare_end",
+        "eval_token_logprob",
+        "eval_done",
+        "eval_end",
+    };
+    for (const char* allowed : summary_tags) {
+        if (std::strcmp(tag, allowed) == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static uint64_t moe_profile_now_us() {
@@ -93,7 +160,7 @@ static void moe_profile_resource_snapshot(
 }
 
 static void moe_profile_log(const char* tag, const char* fmt, ...) {
-    if (!moe_profile_enabled()) {
+    if (!moe_profile_tag_enabled(tag)) {
         return;
     }
     const uint64_t now_us = moe_profile_now_us();

@@ -413,12 +413,6 @@ int moe_pc_engine_orchestrate_moe_step(moe_pc_engine_t* engine, int current_laye
         return 1;
     }
     const int ok = moe_pc_engine_execute_prefetch_plan(engine, out_items, out_plan->planned_prefetch_count);
-    prefetch_moe_activation_raw(engine, current_layer);
-    prefetch_moe_shared_compute_raw(engine, current_layer);
-    // Bug #12: activation prefetch unconditional
-    if (!out_plan->drop_speculative) {
-        prefetch_moe_activation_raw(engine, current_layer + 1);
-    }
     moe_pc_engine_apply_topology_updates(engine);
     return ok;
 }

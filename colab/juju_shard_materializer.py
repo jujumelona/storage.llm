@@ -70,11 +70,29 @@ GGUF_RUNTIME_KV_EXACT_KEYS = {
     "general.name",
     "tokenizer.ggml.model",
     "tokenizer.ggml.pre",
+    "tokenizer.ggml.bos_token_id",
+    "tokenizer.ggml.eos_token_id",
+    "tokenizer.ggml.unknown_token_id",
+    "tokenizer.ggml.padding_token_id",
+    "tokenizer.ggml.mask_token_id",
+    "tokenizer.ggml.add_bos_token",
+    "tokenizer.ggml.add_eos_token",
+    "tokenizer.ggml.add_space_prefix",
+    "tokenizer.chat_template",
 }
 
 GGUF_RUNTIME_KV_ALIAS_MAP = {
     "general.architecture": ("architecture", "declared_architecture", "model_type"),
     "general.name": ("model_name",),
+    "tokenizer.ggml.bos_token_id": ("bos_token_id",),
+    "tokenizer.ggml.eos_token_id": ("eos_token_id",),
+    "tokenizer.ggml.unknown_token_id": ("unk_token_id", "unknown_token_id"),
+    "tokenizer.ggml.padding_token_id": ("pad_token_id", "padding_token_id"),
+    "tokenizer.ggml.mask_token_id": ("mask_token_id",),
+    "tokenizer.ggml.add_bos_token": ("add_bos_token", "tokenizer_add_bos_token"),
+    "tokenizer.ggml.add_eos_token": ("add_eos_token", "tokenizer_add_eos_token"),
+    "tokenizer.ggml.add_space_prefix": ("add_space_prefix", "tokenizer_add_space_prefix"),
+    "tokenizer.chat_template": ("chat_template",),
     "block_count": ("num_hidden_layers", "n_layers"),
     "embedding_length": ("hidden_size", "hidden_dim"),
     "vocab_size": ("vocab_size",),
@@ -982,7 +1000,7 @@ def plan_juju_tensor_splits(directory, max_file_bytes=None):
         raise ValueError("JUJU upload file limit is too small after metadata reserve")
 
     tensors = [
-        tensor for tensor in sorted(directory["tensors"], key=lambda item: (int(item.get("source_offset") or 0), str(item.get("name") or "")))
+        tensor for tensor in directory["tensors"]
         if int(tensor.get("bytes") or 0) > 0
     ]
     if not tensors:
@@ -994,6 +1012,8 @@ def plan_juju_tensor_splits(directory, max_file_bytes=None):
             "tensor_bytes": 0,
             "max_file_bytes": limit,
         }]
+    assign_bootstrap_expert_tiers(tensors, lock=True)
+    tensors = sorted(tensors, key=lambda item: juju_tensor_file_order_key(item, item.get("bucket", "shared_weights")))
 
     groups = []
     current = []
@@ -1087,10 +1107,12 @@ def tensor_bucket(name):
     return "shared_weights"
 
 
-def assign_bootstrap_expert_tiers(tensors, contract=None):
+def assign_bootstrap_expert_tiers(tensors, contract=None, lock=False):
     routed = []
     for tensor in tensors or []:
         if not tensor or not is_routed_expert_tensor_name(tensor.get("name")):
+            continue
+        if tensor.get("_juju_bootstrap_tier_locked"):
             continue
         layer = _juju_layer_id_from_name(tensor.get("name"))
         if layer is None:
@@ -1124,6 +1146,8 @@ def assign_bootstrap_expert_tiers(tensors, contract=None):
             tensor["bucket"] = "warm_experts"
         else:
             tensor["bucket"] = "cold_experts"
+        if lock:
+            tensor["_juju_bootstrap_tier_locked"] = True
 
 
 def is_shared_expert_tensor_name(name):
@@ -3227,6 +3251,14 @@ def juju_runtime_arch_metadata(contract, directory=None):
         "declared_architecture": first_present(contract.get("architecture"), arch.get("architecture"), runtime.get("declared_architecture"), runtime.get("architecture")),
         "model_id": first_present(contract.get("model_id"), contract.get("model_name"), runtime.get("model_id")),
         "model_name": first_present(contract.get("model_name"), runtime.get("model_name")),
+        "bos_token_id": first_present(runtime.get("bos_token_id"), arch.get("bos_token_id"), cfg("bos_token_id")),
+        "eos_token_id": first_present(runtime.get("eos_token_id"), arch.get("eos_token_id"), cfg("eos_token_id")),
+        "unk_token_id": first_present(runtime.get("unk_token_id"), runtime.get("unknown_token_id"), arch.get("unk_token_id"), cfg("unk_token_id")),
+        "pad_token_id": first_present(runtime.get("pad_token_id"), runtime.get("padding_token_id"), arch.get("pad_token_id"), cfg("pad_token_id")),
+        "mask_token_id": first_present(runtime.get("mask_token_id"), arch.get("mask_token_id"), cfg("mask_token_id")),
+        "add_bos_token": first_present(_juju_bool_or_none(runtime.get("add_bos_token")), _juju_bool_or_none(runtime.get("tokenizer_add_bos_token")), _juju_bool_or_none(arch.get("add_bos_token")), _juju_bool_or_none(cfg("add_bos_token"))),
+        "add_eos_token": first_present(_juju_bool_or_none(runtime.get("add_eos_token")), _juju_bool_or_none(runtime.get("tokenizer_add_eos_token")), _juju_bool_or_none(arch.get("add_eos_token")), _juju_bool_or_none(cfg("add_eos_token"))),
+        "add_space_prefix": first_present(_juju_bool_or_none(runtime.get("add_space_prefix")), _juju_bool_or_none(runtime.get("tokenizer_add_space_prefix")), _juju_bool_or_none(arch.get("add_space_prefix")), _juju_bool_or_none(cfg("add_space_prefix"))),
         "num_hidden_layers": first_present(cfg("num_hidden_layers", "n_layers"), arch.get("n_layers"), arch.get("num_hidden_layers"), runtime.get("num_hidden_layers"), runtime.get("n_layers")),
         "hidden_size": first_present(cfg("hidden_size", "hidden_dim"), arch.get("hidden_dim"), arch.get("hidden_size"), runtime.get("hidden_size"), runtime.get("hidden_dim")),
         "vocab_size": first_present(cfg("vocab_size"), arch.get("vocab_size"), runtime.get("vocab_size")),
@@ -3342,7 +3374,9 @@ def build_layer_graph_ir(layer, tensors):
         {"op": "linear", "name": "v_projection", "inputs": ["attention_norm"], "weights": v_weights, "output": "v_raw", "fallback_output": "k_raw", "fallback_semantics": "when_no_v_projection_value_uses_raw_k_projection_before_k_norm", "required": False},
         {"op": "rms_norm", "name": "q_norm", "inputs": ["q_raw"], "weights": q_norm_weights, "output": "q", "optional_behavior": "pass_q_raw_when_weight_absent", "required": False},
         {"op": "rms_norm", "name": "k_norm", "inputs": ["k_raw"], "weights": k_norm_weights, "output": "k", "optional_behavior": "pass_k_raw_when_weight_absent", "required": False},
-        {"op": "rms_norm", "name": "v_norm", "inputs": ["v_raw" if v_weights else "k_raw"], "weights": v_norm_weights, "output": "v", "optional_behavior": "pass_value_raw_when_weight_absent", "required": False},
+        *([{"op": "rms_norm", "name": "v_norm", "inputs": ["v_raw" if v_weights else "k_raw"], "weights": v_norm_weights, "output": "v", "required": False}]
+          if v_norm_weights else
+          [{"op": "identity", "name": "value_passthrough", "inputs": ["v_raw" if v_weights else "k_raw"], "weights": [], "output": "v", "required": False}]),
         {"op": "rope", "name": "rotary_embedding", "inputs": ["q", "k"], "weights": bind("rope_freqs.weight"), "required": False},
         {"op": "attention", "name": "attention", "inputs": ["q", "k", "v"], "kv_cache": "quantized_qkv_cache", "attention_scale": "metadata_or_qk_norm_contract", "required": bool(q_weights and k_weights and (v_weights or k_weights))},
         {"op": "linear", "name": "attention_output", "inputs": ["attention"], "weights": o_weights, "output": "attention_out", "required": bool(o_weights)},
@@ -3382,6 +3416,7 @@ def build_layer_graph_ir(layer, tensors):
             "expert_branch_uses_expert_ffn_norm": bool(expert_norm_weights),
             "router_uses_hidden_when_internal_scale_present": bool(router_scale_weights),
             "value_uses_raw_k_projection_when_v_projection_missing": not bool(v_weights),
+            "value_norm_requires_layer_local_weight_tensor": True,
             "shared_and_expert_post_norms_apply_before_branch_sum": bool(post_ffw_norm1_weights or post_ffw_norm2_weights),
             "post_ffw_norm_applies_to_combined_ffn_before_residual": bool(post_ffw_norm_weights),
             "layer_output_scale_after_ffn_residual": bool(layer_output_scale_weights),

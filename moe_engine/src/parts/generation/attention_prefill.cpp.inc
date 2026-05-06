@@ -114,21 +114,15 @@ static int moe_layer_uses_unweighted_v_norm(
     if (!engine || layer < 0) {
         return 0;
     }
-    if (moe_engine_graph_ir_mentions(engine, "attn_v_norm") ||
-        moe_engine_graph_ir_mentions(engine, "value_norm") ||
-        moe_engine_graph_ir_mentions(engine, "v_norm")) {
-        return 1;
-    }
+    // V norm is a layer-local execution contract. A global GraphIR string
+    // mention can come from another layer or metadata summary and must not
+    // silently change every attention value path.
     if (moe_engine_has_common_tensor_suffix(engine, layer, "attn_v_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "value_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "v_norm.weight")) {
         return 1;
     }
-    return moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale") &&
-        (moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm.weight") ||
-         moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_1.weight") ||
-         moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_2.weight") ||
-         moe_engine_has_common_tensor_suffix(engine, layer, "layer_output_scale.weight")) ? 1 : 0;
+    return 0;
 }
 
 static int moe_layer_has_qk_norm_scaled_standard_layout(

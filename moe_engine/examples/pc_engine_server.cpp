@@ -1301,7 +1301,10 @@ static server_tokenizer& get_server_tokenizer(const server_options& opts) {
     tokenizer_apply_runtime_config(&tok, json);
     const char* config_candidates[] = {
         "tokenizer_config.json",
-        "tokenizer/tokenizer_config.json"
+        "tokenizer/tokenizer_config.json",
+        "config.json",
+        "storagellm_runtime_contract.json",
+        "runtime_assets_manifest.json"
     };
     for (const char* rel : config_candidates) {
         std::string config_json;
