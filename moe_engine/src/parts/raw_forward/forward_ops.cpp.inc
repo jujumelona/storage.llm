@@ -50,7 +50,7 @@ static void moe_apply_embedding_scale_f32(
         return;
     }
     const float scale = moe_embedding_scale_value(engine, c->hidden_size);
-    if (scale == 1.0f) {
+    if (scale == 1.0f || !std::isfinite(scale)) {
         return;
     }
     for (uint32_t i = 0; i < c->hidden_size; ++i) {

@@ -174,41 +174,6 @@ static void moe_forward_trace_runtime_resources(
         (unsigned long long)engine->io_atomic.bytes_direct_to_gpu.load(std::memory_order_relaxed));
 }
 
-static float moe_forward_embedding_scale_value(const moe_pc_engine* engine, uint32_t hidden_size) {
-    // BUGFIX 500: hidden_size 범위 체크 강화
-    if (!engine || hidden_size == 0 || hidden_size > 100000) {
-        return 1.0f;
-    }
-    const uint32_t cached_hidden = engine->cached_embedding_scale_hidden.load(std::memory_order_acquire);
-    const uint32_t cached_bits = engine->cached_embedding_scale_bits.load(std::memory_order_acquire);
-    if (cached_hidden == hidden_size && cached_bits != 0u) {
-        return moe_f32_from_bits(cached_bits);
-    }
-    double value = 0.0;
-    float scale = 1.0f;
-    if (!engine->offload_gguf_metadata_json.empty() &&
-        (moe_json_get_double_local(engine->offload_gguf_metadata_json, "embedding_scale", &value) ||
-         moe_json_get_double_local(engine->offload_gguf_metadata_json, "embed_scale", &value) ||
-         moe_json_get_double_local(engine->offload_gguf_metadata_json, "scale_emb", &value) ||
-         moe_json_get_double_local(engine->offload_gguf_metadata_json, "scale_embedding", &value)) &&
-        value > 0.0) {
-        scale = (float)value;
-    }
-    else if (moe_engine_graph_ir_mentions(engine, "sqrt_hidden_size") ||
-        moe_engine_graph_ir_mentions(engine, "scale_embedding") ||
-        moe_engine_metadata_mentions(engine, "sqrt_hidden_size") ||
-        moe_engine_metadata_mentions(engine, "scale_embedding")) {
-        scale = std::sqrt((float)hidden_size);
-    }
-    else if (moe_engine_has_common_tensor_suffix(engine, 0, "layer_output_scale.weight") &&
-        moe_engine_has_common_tensor_suffix(engine, 0, "ffn_gate_inp.scale")) {
-        scale = std::sqrt((float)hidden_size);
-    }
-    engine->cached_embedding_scale_hidden.store(hidden_size, std::memory_order_release);
-    engine->cached_embedding_scale_bits.store(moe_f32_bits(scale), std::memory_order_release);
-    return scale;
-}
-
 // CUDA Graph cached structures for decode
 struct moe_cuda_graph_cache_t {
     void* graph = nullptr;
@@ -271,10 +236,11 @@ static int moe_forward_one_token_f32(
         moe_generation_set_error(stats, "failed to read token embedding");
         return 0;
     }
+    // moe_pc_engine_embed_token_f32 returns an already scaled embedding row.
     const float embedding_scale = moe_embedding_scale_value(engine, c->hidden_size);
     moe_profile_log(
         "forward_embed",
-        "position=%u token=%u hidden=%u scale=%.6g ms=%.3f",
+        "position=%u token=%u hidden=%u scale=%.6g scale_applied=1 ms=%.3f",
         position, token_id, c->hidden_size, (double)embedding_scale,
         moe_profile_elapsed_ms(embed_start_us));
     moe_forward_trace_vec("embed", position, 0xffffffffu, hidden, c->hidden_size);
