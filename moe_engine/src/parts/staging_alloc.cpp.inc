@@ -14,16 +14,25 @@ static void prepare_windows_staging_working_set(uint64_t bytes) {
     // Problem: reserved_min_ws is non-atomic but read outside mutex → data race (C++ UB)
     // Solution: Use std::atomic<SIZE_T> with relaxed memory order
     // Impact: Eliminates undefined behavior, no performance change
-    static std::atomic<SIZE_T> reserved_min_ws{0};
-    if (min_ws <= reserved_min_ws.load(std::memory_order_relaxed)) {
-        return;
+    // BUGFIX 1012: Track cumulative staging allocation, not maximum ★★★ CRITICAL
+    // Problem: reserved_min_ws tracks max single allocation, not total allocated
+    // → Second 4GB staging buffer not included in working set → page faults on memcpy
+    // Solution: Accumulate all staging allocations in reserved_total_ws
+    // Impact: Eliminates blocking page faults on multi-buffer staging
+    static std::atomic<SIZE_T> reserved_total_ws{0};
+    const SIZE_T new_total = reserved_total_ws.load(std::memory_order_relaxed) + min_ws;
+    if (new_total <= reserved_total_ws.load(std::memory_order_relaxed)) {
+        return; // Overflow protection
     }
     std::lock_guard<std::mutex> lock(ws_mutex);
-    if (min_ws <= reserved_min_ws.load(std::memory_order_relaxed)) {
-        return;
+    const SIZE_T current_total = reserved_total_ws.load(std::memory_order_relaxed);
+    const SIZE_T updated_total = current_total + min_ws;
+    if (updated_total < current_total) {
+        return; // Overflow protection
     }
-    if (SetProcessWorkingSetSize(GetCurrentProcess(), min_ws, max_ws)) {
-        reserved_min_ws.store(min_ws, std::memory_order_relaxed);
+    const SIZE_T updated_max = updated_total + 64ull * 1024ull * 1024ull;
+    if (SetProcessWorkingSetSize(GetCurrentProcess(), updated_total, updated_max)) {
+        reserved_total_ws.store(updated_total, std::memory_order_relaxed);
     } else {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true, std::memory_order_relaxed)) {

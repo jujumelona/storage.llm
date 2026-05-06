@@ -74,6 +74,10 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
                     auto* mutable_engine = const_cast<moe_pc_engine*>(engine);
                     mutable_engine->prefer_overlapped_io_atomic.store(false, std::memory_order_release);
                     mutable_engine->io_config.prefer_overlapped_io = 0;
+                    // BUGFIX 1010: Reset overlapped_io_transition_done to allow re-transition ★★★ CRITICAL
+                    // Problem: Without resetting this flag, re-transition to OVERLAPPED IO is blocked
+                    // Solution: Reset flag when VirtualLock recovery succeeds
+                    mutable_engine->overlapped_io_transition_done.store(false, std::memory_order_release);
                     fprintf(stderr,
                         "[storageLLM INFO] VirtualLock recovery succeeded. "
                         "Reverting to mmap path for better sequential read throughput.\n");
@@ -122,9 +126,13 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
             if (++s_vlock_fail_count >= 2 && engine) {
                 auto* mutable_engine = const_cast<moe_pc_engine*>(engine);
                 // BUGFIX 961: Race-safe prefer_overlapped_io transition ★★
-                // BUGFIX 1002: Use file-scope flag so recovery can reset it
-                static std::atomic<bool> s_overlapped_io_set{false};
-                if (!s_overlapped_io_set.exchange(true, std::memory_order_acq_rel)) {
+                // BUGFIX 1010: Move s_overlapped_io_set to engine member ★★★ CRITICAL
+                // Problem: static s_overlapped_io_set is file-scope → recovery probe resets
+                // prefer_overlapped_io_atomic but not s_overlapped_io_set → re-transition blocked
+                // → Engine stuck in mmap path with blocking page faults after memory pressure returns
+                // Solution: Use engine->overlapped_io_transition_done instead of static flag
+                // Impact: Enables re-transition to OVERLAPPED IO when memory pressure recurs
+                if (!mutable_engine->overlapped_io_transition_done.exchange(true, std::memory_order_acq_rel)) {
                     // BUGFIX 986: Write to atomic mirror first, then sync plain int ★★
                     mutable_engine->prefer_overlapped_io_atomic.store(true, std::memory_order_release);
                     mutable_engine->io_config.prefer_overlapped_io = 1;

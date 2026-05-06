@@ -72,34 +72,67 @@ static moe_tier_t prefetch_admitted_tier(
         target = moe_TIER_RAM;
     }
     if (target == moe_TIER_VRAM) {
-        uint64_t pending = engine->pending_vram_reservation.load(std::memory_order_relaxed);
-        // BUGFIX 996: CAS backoff for high-contention admission ★★ PERFORMANCE
-        uint32_t spin = 0;
-        for (;;) {
-            const uint64_t vram_budget = device_budget_bytes(engine);
+        // BUGFIX 1014: Atomic VRAM admission under vram_transition_mutex ★★★ CRITICAL
+        // Problem: device_budget_bytes() releases mutex, then CAS happens outside mutex
+        // → N threads read same budget, all CAS succeed → N × item.bytes over-allocated
+        // → GPU OOM when urgent items pile up
+        // Solution: Hold vram_transition_mutex for entire check-and-reserve operation
+        // Impact: Eliminates VRAM over-commit, prevents GPU OOM under load
+        std::unique_lock<std::shared_mutex> vram_lock(engine->vram_transition_mutex);
 
-            if (vram_budget == 0 || item.bytes > vram_budget) {
-                target = moe_TIER_RAM;
-                break;
-            }
-            // BUGFIX 899 follow-up: Remove device_allocated (used) double subtraction ★★
-            if (pending > vram_budget ||
-                item.bytes > vram_budget - pending) {
-                target = moe_TIER_RAM;
-                device_refresh_mem_info(engine, 1);
-                break;
-            }
-            if (engine->pending_vram_reservation.compare_exchange_weak(
-                    pending,
-                    pending + item.bytes,
-                    std::memory_order_relaxed,
-                    std::memory_order_relaxed)) {
-                break;
-            }
-            // Backoff: yield after 8 spins to reduce cache-line contention
-            if (++spin > 8) { std::this_thread::yield(); spin = 0; }
+        // Read all counters under mutex (consistent snapshot)
+        const uint64_t pending = engine->pending_vram_reservation.load(std::memory_order_relaxed);
+        const uint64_t in_flight = engine->vram_in_flight_bytes.load(std::memory_order_relaxed);
+        const uint64_t kv_actual = engine->device_kv_cache_bytes.load(std::memory_order_relaxed);
+        const uint64_t common_reserved = engine->common_vram_reserved_bytes.load(std::memory_order_relaxed);
+        const uint64_t device_allocated = engine->device_allocated_bytes.load(std::memory_order_relaxed);
+        const uint64_t device_free = engine->device_free_bytes.load(std::memory_order_relaxed);
+
+        // Calculate budget inline (same logic as device_budget_bytes)
+        const uint64_t kv_reserved = moe_kv_vram_attention_runtime_available(engine) ? kv_actual : 0;
+        uint64_t reserved_total = pending;
+        if (reserved_total <= UINT64_MAX - in_flight) reserved_total += in_flight;
+        if (reserved_total <= UINT64_MAX - kv_reserved) reserved_total += kv_reserved;
+        if (reserved_total <= UINT64_MAX - common_reserved) reserved_total += common_reserved;
+
+        uint64_t vram_budget = 0;
+        if (engine->config.vram_budget_bytes) {
+            vram_budget = engine->config.vram_budget_bytes > reserved_total
+                ? engine->config.vram_budget_bytes - reserved_total : 0;
+        } else if (engine->backend_caps.supports_unified_memory &&
+                   engine->backend_caps.backend == moe_BACKEND_METAL) {
+            const uint64_t sys = engine->backend_caps.system_memory_bytes > 0
+                ? engine->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
+            uint64_t pct = engine->io_config.metal_memory_budget_pct;
+            if (pct == 0 || pct < 50 || pct > 90) pct = 75ull;
+            const uint64_t raw_budget = (sys * pct) / 100ull;
+            const uint64_t cpu_ram_used = tier_used(engine, moe_TIER_RAM);
+            const uint64_t kv_in_ram = std::min(kv_actual, cpu_ram_used);
+            const uint64_t non_kv_ram = cpu_ram_used - kv_in_ram;
+            uint64_t total_reserved = reserved_total;
+            if (non_kv_ram < UINT64_MAX - total_reserved) total_reserved += non_kv_ram;
+            vram_budget = raw_budget > total_reserved ? raw_budget - total_reserved : 0;
+        } else {
+            int64_t s_free = (int64_t)device_free;
+            if (s_free < 0) s_free = 0;
+            const uint64_t raw_budget = device_allocated > UINT64_MAX - (uint64_t)s_free
+                ? UINT64_MAX : device_allocated + (uint64_t)s_free;
+            vram_budget = raw_budget > reserved_total ? raw_budget - reserved_total : 0;
+        }
+
+        // Check and reserve atomically under mutex
+        if (vram_budget == 0 || item.bytes > vram_budget ||
+            pending > vram_budget || item.bytes > vram_budget - pending) {
+            target = moe_TIER_RAM;
+            vram_lock.unlock();
+            device_refresh_mem_info(engine, 1);
+        } else {
+            // Reserve under mutex - no CAS needed, we hold exclusive lock
+            engine->pending_vram_reservation.store(pending + item.bytes, std::memory_order_relaxed);
+            vram_lock.unlock();
         }
     }
+    if (target == moe_TIER_RAM) {
     const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
     // BUGFIX 문제 1: Remove 85% threshold - use single 93% threshold ★★★
     // Problem: 85% and 93% dual thresholds create dead zone

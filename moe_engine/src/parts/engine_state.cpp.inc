@@ -150,10 +150,11 @@ struct moe_pc_engine {
     // Solution: Internal atomic bool is the source of truth. Reads use this;
     // writes update both this AND io_config.prefer_overlapped_io for external callers.
     std::atomic<bool> prefer_overlapped_io_atomic{false};
+    std::atomic<bool> overlapped_io_transition_done{false};
     // BUGFIX 989: Mutex for atomic pending→in_flight VRAM transition ★★★
     // Held only during the 2-atomic-op transition (~20ns). device_budget_bytes()
     // reads both counters under this mutex to get a consistent snapshot.
-    std::mutex vram_transition_mutex;
+    std::shared_mutex vram_transition_mutex;
     std::string topology_path;
     std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> topology_edges;
     std::mutex prefetch_plan_mutex;

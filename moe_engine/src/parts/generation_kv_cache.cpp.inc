@@ -212,7 +212,7 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
             const size_t peak_bytes = new_data_bytes + new_scales_bytes * 2;
             // old buffers still alive during malloc, so total transient = peak + old
             const size_t transient_total = peak_bytes + old_data_bytes + old_scales_bytes * 2;
-            const uint64_t avail = available_ram_bytes(engine);
+            const uint64_t avail = storagellm::available_ram_bytes();
             if (avail > 0 && transient_total > avail) {
                 return 0;  // Pre-reject: not enough RAM for safe resize
             }

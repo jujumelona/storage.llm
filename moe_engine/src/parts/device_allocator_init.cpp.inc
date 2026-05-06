@@ -743,9 +743,17 @@ static int device_allocator_init(moe_pc_engine* e) {
         CUdeviceptr d_a = 0;
         void* h_a = nullptr;
         int alloc_ok = 0;
-        if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemAlloc && e->cuda.cuMemAllocHost) {
-            alloc_ok = (e->cuda.cuMemAlloc(&d_a, h2d_bench_bytes) == 0 &&
-                        e->cuda.cuMemAllocHost(&h_a, h2d_bench_bytes) == 0) ? 1 : 0;
+        int cuda_host_registered = 0;
+        if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemAlloc) {
+            if (e->cuda.cuMemAlloc(&d_a, h2d_bench_bytes) == 0) {
+                h_a = std::malloc(h2d_bench_bytes);
+                if (h_a) {
+                    cuda_host_registered =
+                        e->cuda.cuMemHostRegister &&
+                        e->cuda.cuMemHostRegister(h_a, h2d_bench_bytes, 0) == 0;
+                    alloc_ok = 1;
+                }
+            }
         } else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipMalloc && e->hip.hipHostMalloc) {
             alloc_ok = (e->hip.hipMalloc(&d_a, h2d_bench_bytes) == 0 &&
                         e->hip.hipHostMalloc(&h_a, h2d_bench_bytes, 0) == 0) ? 1 : 0;
@@ -776,7 +784,12 @@ static int device_allocator_init(moe_pc_engine* e) {
             else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipFree) e->hip.hipFree(d_a);
         }
         if (h_a) {
-            if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemFreeHost) e->cuda.cuMemFreeHost(h_a);
+            if (e->backend_caps.backend == moe_BACKEND_CUDA) {
+                if (cuda_host_registered && e->cuda.cuMemHostUnregister) {
+                    e->cuda.cuMemHostUnregister(h_a);
+                }
+                std::free(h_a);
+            }
             else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipHostFree) e->hip.hipHostFree(h_a);
         }
     }

@@ -1,6 +1,7 @@
 // Device tensor copy stream management
 
 // DONE: BUGFIX 77 - CUDA stream pool is already implemented below to avoid cuStreamCreate/Destroy on worker resize.
+static void prefetch_release_pending_vram_reservation(moe_pc_engine* engine, uint64_t bytes);
 
 struct moe_deferred_staging_copy {
     uint32_t slot = UINT32_MAX;
@@ -135,7 +136,7 @@ static void device_defer_staging_copy(moe_pc_engine* e, uint32_t slot, uint64_t 
     // Contention: Minimal — this mutex is held for ~2 atomic ops (~20ns).
     //   DMA queuing is async and not on the critical compute path.
     if (vram_bytes > 0) {
-        std::lock_guard<std::mutex> tlock(e->vram_transition_mutex);
+        std::unique_lock<std::shared_mutex> tlock(e->vram_transition_mutex);
         prefetch_release_pending_vram_reservation(e, vram_bytes);
         e->vram_in_flight_bytes.fetch_add(vram_bytes, std::memory_order_relaxed);
     }

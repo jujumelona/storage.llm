@@ -36,6 +36,32 @@ int moe_pc_engine_plan_moe_prefetch(
         return 1; // Success with empty plan
     }
 
+    // BUGFIX 1013: Intel Level Zero iGPU unified memory early-out ★★★ CRITICAL
+    // Problem: Intel iGPU (Level Zero) has supports_unified_memory but doesn't get
+    // early-out like Metal UMA → full prefetch plan (staging → pinned → GPU copy)
+    // executed even though mmap is directly GPU-accessible → wasted CPU cycles + RAM
+    // Solution: Add Level Zero iGPU check (device_vram_bytes == 0) for early-out
+    // Impact: Eliminates unnecessary staging copies on Intel integrated GPUs
+    if ((engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
+         engine->backend_caps.backend == moe_BACKEND_SYCL) &&
+        engine->backend_caps.supports_unified_memory &&
+        engine->backend_caps.device_vram_bytes == 0) {
+        // iGPU unified memory: stats only, no staging copies
+        std::vector<moe_expert_prefetch_item_t> items;
+        prefetch_plan_clear_seen(engine);
+        prefetch_plan_add_selected(engine, items, current_layer, selected_experts, selected_count);
+        prefetch_plan_add_lookahead(engine, items, current_layer + 1, next_layer_candidates, next_count);
+        if (next_count == 0 && engine->io_config.enable_lookahead_prefetch) {
+            const int lookahead_layer = current_layer + 1;
+            const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
+            if (moe_layer_is_moe_runtime(engine, &runtime_c, lookahead_layer)) {
+                moe_juju_predict_co_activation(engine, lookahead_layer, 8);
+            }
+        }
+        *out_item_count = 0; // No explicit VRAM copies needed
+        return 1;
+    }
+
     if (engine->backend_caps.backend == moe_BACKEND_METAL &&
         engine->backend_caps.supports_unified_memory) {
         // UMA: VRAM/RAM 구분 없음, 기존 mmap path가 곧 최적
@@ -101,13 +127,11 @@ int moe_pc_engine_plan_moe_prefetch(
             // which may not be initialized yet (JUJU format not loaded, or GGUF offload format).
             // Solution: Check engine->juju_co_activation_bank_initialized before calling.
             // Impact: Prevents crash on early inference calls or non-JUJU formats.
-            if (engine->juju_co_activation_bank_initialized.load(std::memory_order_acquire)) {
-                std::vector<int> predicted = moe_juju_predict_co_activation(
-                    engine, lookahead_layer, 8);
-                if (!predicted.empty()) {
-                    prefetch_plan_add_lookahead(engine, items, lookahead_layer,
-                        predicted.data(), (uint32_t)predicted.size());
-                }
+            std::vector<int> predicted = moe_juju_predict_co_activation(
+                engine, lookahead_layer, 8);
+            if (!predicted.empty()) {
+                prefetch_plan_add_lookahead(engine, items, lookahead_layer,
+                    predicted.data(), (uint32_t)predicted.size());
             }
         }
     }
