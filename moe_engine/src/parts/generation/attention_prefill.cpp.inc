@@ -122,6 +122,26 @@ static int moe_layer_uses_unweighted_v_norm(
         moe_engine_has_common_tensor_suffix(engine, layer, "v_norm.weight")) {
         return 1;
     }
+    const int has_q_norm =
+        moe_engine_has_common_tensor_suffix(engine, layer, "attn_q_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "q_norm.weight");
+    const int has_k_norm =
+        moe_engine_has_common_tensor_suffix(engine, layer, "attn_k_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "k_norm.weight");
+    const int has_scaled_block_norms =
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_norm.weight") &&
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm.weight") &&
+        moe_engine_has_common_tensor_suffix(engine, layer, "layer_output_scale.weight");
+    int attention_k_eq_v = 0;
+    if (has_q_norm && has_k_norm && has_scaled_block_norms &&
+        moe_json_get_bool_local(engine->offload_gguf_metadata_json, "attention_k_eq_v", &attention_k_eq_v) &&
+        attention_k_eq_v &&
+        (moe_engine_graph_ir_mentions(engine, "value_norm") ||
+         moe_engine_graph_ir_mentions(engine, "v_norm") ||
+         moe_engine_metadata_mentions(engine, "value_norm") ||
+         moe_engine_metadata_mentions(engine, "v_norm"))) {
+        return 1;
+    }
     return 0;
 }
 
