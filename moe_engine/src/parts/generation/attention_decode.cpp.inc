@@ -284,8 +284,15 @@
         }
         moe_profile_log(
             "attn_standard_qkv_append",
-            "layer=%d pos=%u kv_heads=%u seq=%u cap=%u head_dim=%u scale=%.6g scale_source=%s ms=%.3f",
+            "layer=%d pos=%u kv_heads=%u seq=%u cap=%u head_dim=%u "
+            "k_bits=%d v_bits=%d outlier_channels=%d outlier_bits=%d normal_bits=%d "
+            "scale=%.6g scale_source=%s ms=%.3f",
             layer, position, num_kv_heads, seq_len, qkv_capacity_tokens, head_dim,
+            engine->qkv_cfg.k_bits,
+            engine->qkv_cfg.v_bits,
+            engine->qkv_cfg.outlier_channels,
+            engine->qkv_cfg.outlier_bits,
+            engine->qkv_cfg.normal_bits,
             (double)scale,
             scale_source ? scale_source : "unknown",
             moe_profile_elapsed_ms(qkv_append_start_us));
@@ -294,7 +301,9 @@
     std::fill(s->attn_value.begin(), s->attn_value.begin() + v_total_dim, 0.0f);
     {
         moe_profile_parallel_label_scope rows_label("attn_heads");
-        if (!moe_parallel_rows(engine, num_heads, 0, [&](uint32_t h) {
+        const uint32_t head_block_rows =
+            ((uint64_t)seq_len * (uint64_t)head_dim >= 1024ull && num_heads > 1u) ? 1u : 0u;
+        if (!moe_parallel_rows(engine, num_heads, head_block_rows, [&](uint32_t h) {
         const uint32_t kv_h = (uint32_t)(((uint64_t)h * (uint64_t)num_kv_heads) / (uint64_t)num_heads);
         const float* q = s->q_b.data() + (uint64_t)h * head_dim;
         float* out_h = s->attn_value.data() + (uint64_t)h * v_head_dim;
