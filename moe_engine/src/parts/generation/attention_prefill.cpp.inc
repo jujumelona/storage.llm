@@ -185,6 +185,8 @@ static float moe_standard_attention_score_scale(
         if ((moe_json_get_double_local(engine->offload_graph_ir_json, "attention_scale", &direct_scale) ||
              moe_json_get_double_local(engine->offload_graph_ir_json, "attn_scale", &direct_scale) ||
              moe_json_get_double_local(engine->offload_graph_ir_json, "attention_score_scale", &direct_scale) ||
+             moe_json_get_double_local(engine->offload_graph_ir_json, "f_attn_scale", &direct_scale) ||
+             moe_json_get_double_local(engine->offload_graph_ir_json, "gemma4.attention.scale", &direct_scale) ||
              moe_json_get_double_local(engine->offload_graph_ir_json, "qk_scale", &direct_scale)) &&
             direct_scale > 0.0 && direct_scale <= 1024.0 && std::isfinite(direct_scale)) {
             if (source_out) {
@@ -198,6 +200,8 @@ static float moe_standard_attention_score_scale(
         if ((moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_scale", &direct_scale) ||
              moe_json_get_double_local(engine->offload_gguf_metadata_json, "attn_scale", &direct_scale) ||
              moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_score_scale", &direct_scale) ||
+             moe_json_get_double_local(engine->offload_gguf_metadata_json, "f_attn_scale", &direct_scale) ||
+             moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.attention.scale", &direct_scale) ||
              moe_json_get_double_local(engine->offload_gguf_metadata_json, "qk_scale", &direct_scale)) &&
             direct_scale > 0.0 && direct_scale <= 1024.0 && std::isfinite(direct_scale)) {
             if (source_out) {
@@ -240,15 +244,18 @@ static float moe_standard_attention_score_scale(
         }
         return result;
     }
+    if (moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
+        if (source_out) {
+            *source_out = "qk_norm_unit_fallback";
+        }
+        return 1.0f;
+    }
     float result = 1.0f / std::sqrt((float)head_dim);
     if (!std::isfinite(result)) {
         if (source_out) {
             *source_out = "fallback";
         }
         return 1.0f;
-    }
-    if (source_out && moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
-        *source_out = "head_dim_qk_norm_fallback";
     }
     return result;
 }
