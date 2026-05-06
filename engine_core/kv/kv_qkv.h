@@ -214,6 +214,17 @@ int qkv_quantize(
     int n_tokens
 );
 
+// Quantize one appended token into an existing QKV state. This follows the
+// same split/QJL/raw-bit contract as qkv_quantize(), without requiring the
+// caller to rebuild the whole token range.
+int qkv_quantize_token(
+    qkv_state_t* state,
+    const qkv_config_t* config,
+    const float* key,          // [head_dim]
+    const float* value,        // [head_dim]
+    int token_idx
+);
+
 // Dequantize using QKV
 int qkv_dequantize(
     const qkv_state_t* state,

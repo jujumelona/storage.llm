@@ -376,6 +376,141 @@ static int qkv_quantize_split_vector_with_state(
     return 1;
 }
 
+static int qkv_store_qjl_residual_for_token(
+    qkv_state_t* state,
+    const qkv_config_t* config,
+    const float* input,
+    const uint8_t* mse_idx,
+    float norm,
+    uint8_t* qjl_base,
+    float* residual_norms,
+    int token_idx,
+    int total_bits
+) {
+    if (!state || !config || !input || !mse_idx || !qjl_base || !residual_norms ||
+        token_idx < 0 || token_idx >= state->n_tokens) {
+        return 0;
+    }
+    const int dim = config->head_dim;
+    const int mse_bits = total_bits - 1;
+    if (dim <= 0 || dim > 16384 || !qkv_bits_codebook(mse_bits) ||
+        !state->scratch_x_tilde || !state->scratch_indices ||
+        !state->scratch_y_tilde || !state->scratch_residual ||
+        !state->scratch_s_times_r || !state->qjl_matrix) {
+        return 0;
+    }
+    int* indices = state->scratch_indices;
+    float* y_tilde = state->scratch_y_tilde;
+    float* x_mse = state->scratch_x_tilde;
+    float* residual = state->scratch_residual;
+    float* s_times_r = state->scratch_s_times_r;
+    qkv_unpack_indices(mse_idx, indices, dim, mse_bits);
+    const float* centroids = qkv_codebook_for_bits(state, mse_bits);
+    if (!centroids) {
+        return 0;
+    }
+    const int max_idx = 1 << mse_bits;
+    for (int i = 0; i < dim; ++i) {
+        if (indices[i] < 0 || indices[i] >= max_idx) {
+            return 0;
+        }
+        y_tilde[i] = centroids[indices[i]];
+    }
+    if (config->enable_rotation && state->rotation_matrix) {
+        for (int i = 0; i < dim; ++i) {
+            float sum = 0.0f;
+            for (int j = 0; j < dim; ++j) {
+                sum += state->rotation_matrix[(size_t)j * (size_t)dim + (size_t)i] * y_tilde[j];
+            }
+            x_mse[i] = sum;
+        }
+    } else {
+        memcpy(x_mse, y_tilde, (size_t)dim * sizeof(float));
+    }
+    const float inv_norm = norm > 1e-12f ? 1.0f / norm : 0.0f;
+    float r_norm_sq = 0.0f;
+    for (int i = 0; i < dim; ++i) {
+        residual[i] = (inv_norm > 0.0f ? input[i] * inv_norm : 0.0f) - x_mse[i];
+        r_norm_sq += residual[i] * residual[i];
+    }
+    residual_norms[token_idx] = sqrtf(std::max(0.0f, r_norm_sq));
+    for (int i = 0; i < dim; ++i) {
+        float sum = 0.0f;
+        for (int j = 0; j < dim; ++j) {
+            sum += state->qjl_matrix[(size_t)i * (size_t)dim + (size_t)j] * residual[j];
+        }
+        s_times_r[i] = sum;
+    }
+    const size_t qjl_stride = ((size_t)dim + 7u) / 8u;
+    qkv_pack_signs(s_times_r, qjl_base + (size_t)token_idx * qjl_stride, dim);
+    return 1;
+}
+
+int qkv_quantize_token(
+    qkv_state_t* state,
+    const qkv_config_t* config,
+    const float* key,
+    const float* value,
+    int token_idx
+) {
+    if (!state || !config || !key || !value || token_idx < 0 ||
+        token_idx >= state->n_tokens) {
+        return 0;
+    }
+    const int dim = config->head_dim;
+    if (dim <= 0 || dim > 16384) {
+        return 0;
+    }
+    const bool use_qjl = config->enable_qjl && state->k_qjl && state->v_qjl &&
+        qkv_bits_codebook(state->k_bits) && qkv_bits_codebook(state->v_bits) &&
+        state->k_bits > 1 && state->v_bits > 1;
+    const int k_mse_bits = use_qjl ? state->k_bits - 1 : state->k_bits;
+    const int v_mse_bits = use_qjl ? state->v_bits - 1 : state->v_bits;
+    if (!qkv_bits_valid(k_mse_bits) || !qkv_bits_valid(v_mse_bits) ||
+        !state->k_idx || !state->v_idx || !state->k_norms || !state->v_norms) {
+        return 0;
+    }
+
+    const size_t k_stride = ((size_t)dim * (size_t)k_mse_bits + 7u) / 8u;
+    uint8_t* k_out = state->k_idx + (size_t)token_idx * k_stride;
+    const bool k_split = qkv_outlier_split_ready(state, config, QKV_TARGET_KEY);
+    if (k_split) {
+        if (!qkv_quantize_split_vector_with_state(
+                state, config, QKV_TARGET_KEY, key, token_idx,
+                &state->k_norms[token_idx], state->k_qjl, state->k_residual_norms)) {
+            return 0;
+        }
+    } else if (!qkv_quantize_vector_with_state(
+            state, config, key, k_out, &state->k_norms[token_idx], dim, k_mse_bits)) {
+        return 0;
+    } else if (use_qjl &&
+               !qkv_store_qjl_residual_for_token(
+                   state, config, key, k_out, state->k_norms[token_idx],
+                   state->k_qjl, state->k_residual_norms, token_idx, state->k_bits)) {
+        return 0;
+    }
+
+    const size_t v_stride = ((size_t)dim * (size_t)v_mse_bits + 7u) / 8u;
+    uint8_t* v_out = state->v_idx + (size_t)token_idx * v_stride;
+    const bool v_split = qkv_outlier_split_ready(state, config, QKV_TARGET_VALUE);
+    if (v_split) {
+        if (!qkv_quantize_split_vector_with_state(
+                state, config, QKV_TARGET_VALUE, value, token_idx,
+                &state->v_norms[token_idx], state->v_qjl, state->v_residual_norms)) {
+            return 0;
+        }
+    } else if (!qkv_quantize_vector_with_state(
+            state, config, value, v_out, &state->v_norms[token_idx], dim, v_mse_bits)) {
+        return 0;
+    } else if (use_qjl &&
+               !qkv_store_qjl_residual_for_token(
+                   state, config, value, v_out, state->v_norms[token_idx],
+                   state->v_qjl, state->v_residual_norms, token_idx, state->v_bits)) {
+        return 0;
+    }
+    return 1;
+}
+
 int qkv_quantize(
     qkv_state_t* state,
     const qkv_config_t* config,

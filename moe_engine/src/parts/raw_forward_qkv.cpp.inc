@@ -52,6 +52,30 @@ static void moe_qkv_free_head_states_locked(moe_pc_engine* engine) {
     engine->qkv_last_ctx = 0;
 }
 
+static int moe_qkv_env_bool_or_current(const char* name, int current) {
+    const char* env = name ? std::getenv(name) : nullptr;
+    if (!env || !*env) {
+        return current;
+    }
+    return std::atoi(env) != 0 ? 1 : 0;
+}
+
+static int moe_qkv_env_bits_or_current(const char* name, int current, int* changed) {
+    const uint32_t raw = moe_parse_env_u32(name);
+    if (raw == 0) {
+        return current;
+    }
+    const int bits = (int)raw;
+    if (!qkv_bits_valid(bits)) {
+        moe_profile_log("qkv_config_override_rejected", "name=%s value=%u current=%d", name, raw, current);
+        return current;
+    }
+    if (changed) {
+        *changed = 1;
+    }
+    return bits;
+}
+
 static qkv_config_t moe_qkv_contract_config_for_head_dim(
     const moe_pc_engine* engine,
     uint32_t head_dim
@@ -75,6 +99,31 @@ static qkv_config_t moe_qkv_contract_config_for_head_dim(
         if (cfg.sink_tokens == 0) {
             cfg.sink_tokens = 4;
         }
+    }
+    int bits_overridden = 0;
+    cfg.k_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_K_BITS", cfg.k_bits, &bits_overridden);
+    cfg.v_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_V_BITS", cfg.v_bits, &bits_overridden);
+    cfg.normal_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_NORMAL_BITS", cfg.normal_bits, &bits_overridden);
+    cfg.outlier_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_OUTLIER_BITS", cfg.outlier_bits, &bits_overridden);
+    const uint32_t outlier_channels_override = moe_parse_env_u32("STORAGELLM_QKV_OUTLIER_CHANNELS");
+    if (outlier_channels_override > 0 || std::getenv("STORAGELLM_QKV_OUTLIER_CHANNELS")) {
+        cfg.outlier_channels = (int)std::min<uint32_t>(outlier_channels_override, head_dim);
+    } else if (bits_overridden && (qkv_bits_raw(cfg.k_bits) || qkv_bits_raw(cfg.v_bits))) {
+        cfg.outlier_channels = 0;
+        cfg.normal_bits = cfg.v_bits;
+        cfg.outlier_bits = cfg.k_bits;
+    }
+    cfg.enable_rotation = moe_qkv_env_bool_or_current("STORAGELLM_QKV_ROTATION", cfg.enable_rotation ? 1 : 0) != 0;
+    cfg.enable_qjl = moe_qkv_env_bool_or_current("STORAGELLM_QKV_QJL", cfg.enable_qjl ? 1 : 0) != 0;
+    if (qkv_bits_raw(cfg.k_bits) || qkv_bits_raw(cfg.v_bits) ||
+        qkv_bits_raw(cfg.normal_bits) || qkv_bits_raw(cfg.outlier_bits)) {
+        cfg.enable_qjl = false;
+    }
+    if (cfg.outlier_channels < 0) {
+        cfg.outlier_channels = 0;
+    }
+    if (cfg.outlier_channels > (int)head_dim) {
+        cfg.outlier_channels = (int)head_dim;
     }
     cfg.engine_io_thread_count =
         runtime_disk_workers(engine) + runtime_pinned_workers(engine) + runtime_gpu_workers(engine);
@@ -118,7 +167,8 @@ static void moe_qkv_apply_contract_config_locked(
             "qkv_config",
             "head_dim=%u k_bits=%d v_bits=%d group=%u page=%u sink=%u "
             "rotation=%d rotation_seed=%llu qjl=%d qjl_seed=%llu "
-            "outlier_channels=%d outlier_bits=%d normal_bits=%d effective_bits=%.3f plain_kv=%d",
+            "outlier_channels=%d outlier_bits=%d normal_bits=%d effective_bits=%.3f plain_kv=%d "
+            "env_k=%u env_v=%u env_normal=%u env_outlier=%u",
             head_dim,
             desired.k_bits,
             desired.v_bits,
@@ -133,7 +183,11 @@ static void moe_qkv_apply_contract_config_locked(
             desired.outlier_bits,
             desired.normal_bits,
             (double)qkv_effective_bits(&desired),
-            desired.plain_kv_persistent_storage ? 1 : 0);
+            desired.plain_kv_persistent_storage ? 1 : 0,
+            moe_parse_env_u32("STORAGELLM_QKV_K_BITS"),
+            moe_parse_env_u32("STORAGELLM_QKV_V_BITS"),
+            moe_parse_env_u32("STORAGELLM_QKV_NORMAL_BITS"),
+            moe_parse_env_u32("STORAGELLM_QKV_OUTLIER_BITS"));
     }
 }
 
@@ -244,35 +298,8 @@ static int moe_qkv_quantize_current_token_mse(
         token_index >= (uint32_t)std::max(slot->n_tokens, 0)) {
         return 0;
     }
-    const int dim = (int)head_dim;
-    const int k_bits = cfg->enable_qjl ? slot->k_bits - 1 : slot->k_bits;
-    const int v_bits = cfg->enable_qjl ? slot->v_bits - 1 : slot->v_bits;
-    if (!qkv_bits_valid(k_bits) || !qkv_bits_valid(v_bits)) {
+    if (!qkv_quantize_token(slot, cfg, key, value, (int)token_index)) {
         return 0;
-    }
-    const size_t k_stride = ((size_t)dim * (size_t)k_bits + 7u) / 8u;
-    const size_t v_stride = ((size_t)dim * (size_t)v_bits + 7u) / 8u;
-    if (!slot->k_idx || !slot->v_idx || !slot->k_norms || !slot->v_norms) {
-        return 0;
-    }
-    uint8_t* k_out = slot->k_idx + (size_t)token_index * k_stride;
-    uint8_t* v_out = slot->v_idx + (size_t)token_index * v_stride;
-    if (!qkv_quantize_vector_with_state(
-            slot, cfg, key, k_out, &slot->k_norms[token_index], dim, k_bits) ||
-        !qkv_quantize_vector_with_state(
-            slot, cfg, value, v_out, &slot->v_norms[token_index], dim, v_bits)) {
-        return 0;
-    }
-    if (cfg->enable_qjl) {
-        const size_t qjl_stride = ((size_t)dim + 7u) / 8u;
-        if (slot->k_qjl && slot->k_residual_norms) {
-            std::memset(slot->k_qjl + (size_t)token_index * qjl_stride, 0, qjl_stride);
-            slot->k_residual_norms[token_index] = 0.0f;
-        }
-        if (slot->v_qjl && slot->v_residual_norms) {
-            std::memset(slot->v_qjl + (size_t)token_index * qjl_stride, 0, qjl_stride);
-            slot->v_residual_norms[token_index] = 0.0f;
-        }
     }
     return 1;
 }
