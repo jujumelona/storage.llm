@@ -192,9 +192,11 @@ static double moe_rt_slow_mem_bw_hint(const moe_pc_engine* engine) {
     // Problem: io_uring achieves 2.5-4 GB/s but only 2.2 GB/s hint given
     // Solution: Return 2.8 GB/s for io_uring (conservative middle of 2.5-4 range)
     // Impact: Better staging slot allocation, deeper prefetch pipeline
-    if (engine->io_config.enable_io_uring) {
+#if defined(__linux__) && defined(MOE_HAVE_LIBURING) && MOE_HAVE_LIBURING
+    if (engine->uring_state.initialized) {
         return 2.8;
     }
+#endif
     if (engine->io_config.enable_multistage_pipeline ||
         engine->io_config.enable_mmap_prefetch) {
         return 2.2;

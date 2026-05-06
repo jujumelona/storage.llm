@@ -53,7 +53,7 @@
                 } else if (retry_task.raw_span_index >= 0) {
                     const moe_storage_raw_span_spec_t* span = moe_storage_raw_span_at((uint32_t)retry_task.raw_span_index);
                     if (span) {
-                        task_bytes = span->byte_count;
+                        task_bytes = span->bytes;
                     }
                 }
                 if (task_bytes > 0) {
@@ -74,7 +74,7 @@
             } else if (pending.first.raw_span_index >= 0) {
                 const moe_storage_raw_span_spec_t* span = moe_storage_raw_span_at((uint32_t)pending.first.raw_span_index);
                 if (span) {
-                    task_bytes = span->byte_count;
+                    task_bytes = span->bytes;
                 }
             }
             if (io_worker_requeue_disk_task(engine, pending.first, pending.second, 5u, 1u)) {
@@ -112,7 +112,7 @@
             } else if (pending.first.raw_span_index >= 0) {
                 const moe_storage_raw_span_spec_t* span = moe_storage_raw_span_at((uint32_t)pending.first.raw_span_index);
                 if (span) {
-                    task_bytes = span->byte_count;
+                    task_bytes = span->bytes;
                 }
             }
             if (io_worker_requeue_disk_task(engine, pending.first, pending.second, 1u, 0u)) {

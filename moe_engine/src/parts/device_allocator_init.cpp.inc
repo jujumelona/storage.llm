@@ -222,6 +222,9 @@ static int vulkan_driver_load(moe_vulkan_driver_api* api, uint32_t device_id) {
     api->vkFreeCommandBuffers = (decltype(api->vkFreeCommandBuffers))vkGetDeviceProcAddr(device, "vkFreeCommandBuffers");
     api->vkQueueSubmit = (decltype(api->vkQueueSubmit))vkGetDeviceProcAddr(device, "vkQueueSubmit");
     api->vkQueueWaitIdle = (decltype(api->vkQueueWaitIdle))vkGetDeviceProcAddr(device, "vkQueueWaitIdle");
+    api->vkCreateFence = (decltype(api->vkCreateFence))vkGetDeviceProcAddr(device, "vkCreateFence");
+    api->vkGetFenceStatus = (decltype(api->vkGetFenceStatus))vkGetDeviceProcAddr(device, "vkGetFenceStatus");
+    api->vkDestroyFence = (decltype(api->vkDestroyFence))vkGetDeviceProcAddr(device, "vkDestroyFence");
     api->vkCreateBuffer = (decltype(api->vkCreateBuffer))vkGetDeviceProcAddr(device, "vkCreateBuffer");
     api->vkDestroyBuffer = (decltype(api->vkDestroyBuffer))vkGetDeviceProcAddr(device, "vkDestroyBuffer");
     api->vkGetBufferMemoryRequirements = (decltype(api->vkGetBufferMemoryRequirements))vkGetDeviceProcAddr(device, "vkGetBufferMemoryRequirements");

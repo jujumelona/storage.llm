@@ -63,8 +63,9 @@ static int qkv_dequant_one_split(
     const int n_norm = d - n_out;
     const int outlier_bits = qkv_outlier_bits_for_target(cfg, target);
     const int normal_bits = qkv_normal_bits_for_target(cfg, target);
-    const int out_mse_bits = qkv_mse_bits_for_total_bits_dequant(outlier_bits, use_qjl);
-    const int norm_mse_bits = qkv_mse_bits_for_total_bits_dequant(normal_bits, use_qjl);
+    const bool base_use_qjl = use_qjl && outlier_bits > 1 && normal_bits > 1;
+    const int out_mse_bits = qkv_mse_bits_for_total_bits_dequant(outlier_bits, base_use_qjl);
+    const int norm_mse_bits = qkv_mse_bits_for_total_bits_dequant(normal_bits, base_use_qjl);
     if (d <= 0 || d > 16384 || n_out <= 0 || n_out >= d || n_norm <= 0 ||
         !out_mse_bits || !norm_mse_bits) {
         return 0;

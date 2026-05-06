@@ -182,6 +182,9 @@ struct moe_vulkan_driver_api {
     void* (*vkCreateEvent)(void*, const void*, const void*, void**) = nullptr;
     void* (*vkDestroyEvent)(void*, void*, const void*) = nullptr;
     void* (*vkGetEventStatus)(void*, void*) = nullptr;
+    int (*vkCreateFence)(void*, const void*, const void*, void**) = nullptr;
+    int (*vkGetFenceStatus)(void*, void*) = nullptr;
+    void* (*vkDestroyFence)(void*, void*, const void*) = nullptr;
     void* (*vkGetPhysicalDeviceMemoryProperties2)(void*, void*) = nullptr;
     // BUGFIX Problem E: Add functions for H2D copy ★★★ FEATURE
     void* (*vkCreateBuffer)(void*, const void*, const void*, void**) = nullptr;

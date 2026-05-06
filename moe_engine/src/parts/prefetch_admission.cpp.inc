@@ -153,16 +153,20 @@ static moe_tier_t prefetch_admitted_tier(
     // Impact: Prevents RAM overflow, eliminates I/O stalls during long context generation
     const uint64_t ram_budget_raw = tier_budget(engine, moe_TIER_RAM);
     uint64_t reserved_kv_ram = 0;
-    if (engine->config.max_seq_len > 0 && engine->attn_config_valid.load(std::memory_order_acquire)) {
+    const uint32_t context_limit = engine->attn_config.max_seq_len > 0
+        ? engine->attn_config.max_seq_len
+        : engine->config.max_context_len;
+    if (context_limit > 0 && engine->attn_config_valid.load(std::memory_order_acquire)) {
+        const moe_storage_constants_t* storage = moe_storage_constants();
         const uint32_t num_layers = engine->dynamic_shape.num_hidden_layers > 0
             ? engine->dynamic_shape.num_hidden_layers
-            : (engine->attn_config.num_hidden_layers > 0 ? engine->attn_config.num_hidden_layers : 80);
-        const uint32_t num_kv_heads = engine->attn_config.num_key_value_heads > 0
-            ? engine->attn_config.num_key_value_heads : 8;
+            : (storage && storage->num_hidden_layers > 0 ? storage->num_hidden_layers : 80);
+        const uint32_t num_kv_heads = engine->attn_config.num_kv_heads > 0
+            ? engine->attn_config.num_kv_heads : 8;
         const uint32_t head_dim = engine->attn_config.head_dim > 0
             ? engine->attn_config.head_dim : 128;
         const uint64_t kv_bytes_per_token = (uint64_t)num_layers * num_kv_heads * head_dim * 2 * 2;  // K+V, FP16
-        reserved_kv_ram = engine->config.max_seq_len * kv_bytes_per_token;
+        reserved_kv_ram = (uint64_t)context_limit * kv_bytes_per_token;
         // Cap reservation at 20% of RAM budget to avoid over-reservation for short contexts
         const uint64_t max_reservation = (ram_budget_raw * 20ull) / 100ull;
         if (reserved_kv_ram > max_reservation) {

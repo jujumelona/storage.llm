@@ -402,9 +402,10 @@ static void demote_cold_until_impl(moe_pc_engine* engine, moe_tier_t tier, uint6
         // Collect candidates under map_mutex, then demote outside
         struct emergency_victim {
             size_t slot;
-            int layer;
-            int expert_id;
+            uint64_t bytes;
             double hot_score;
+            uint64_t last_touch_epoch;
+            uint64_t predicted_next_use_epoch;
         };
         std::vector<emergency_victim> candidates;
         {
@@ -413,7 +414,13 @@ static void demote_cold_until_impl(moe_pc_engine* engine, moe_tier_t tier, uint6
             for (size_t slot = 0; slot < engine->expert_states.size(); ++slot) {
                 const auto& state = engine->expert_states[slot];
                 if (state.active && state.tier == moe_TIER_VRAM && !state.pending_evict) {
-                    candidates.push_back({slot, state.layer, state.expert_id, state.hot_score});
+                    candidates.push_back({
+                        slot,
+                        state.bytes,
+                        state.hot_score,
+                        state.last_touch_epoch,
+                        state.predicted_next_use_epoch
+                    });
                 }
             }
         }
@@ -431,7 +438,10 @@ static void demote_cold_until_impl(moe_pc_engine* engine, moe_tier_t tier, uint6
                 if (cand.slot >= engine->expert_states.size()) continue;
                 const auto& state = engine->expert_states[cand.slot];
                 if (!state.active || state.tier != moe_TIER_VRAM || state.pending_evict) continue;
-                if (state.layer != cand.layer || state.expert_id != cand.expert_id) continue;
+                if (state.bytes != cand.bytes ||
+                    state.hot_score != cand.hot_score ||
+                    state.last_touch_epoch != cand.last_touch_epoch ||
+                    state.predicted_next_use_epoch != cand.predicted_next_use_epoch) continue;
                 victim.slot = cand.slot;
                 victim.bytes = state.bytes;
                 victim.hot_score = state.hot_score;
