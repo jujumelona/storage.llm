@@ -91,10 +91,22 @@ static void reset_staging_slots(moe_pc_engine* engine) {
         engine->ring_adapter.drain_without_free();
         engine->staging_slot_size = 0;  // Mark slots as invalid
         engine->staging_generation.fetch_add(1, std::memory_order_relaxed);
+        engine->staging_reinit_needed.store(true, std::memory_order_release);
         uint32_t free_slots = 0;
         for (auto& slot : engine->staging_slots) {
+            // BUGFIX 949: Preserve in-use slot events to prevent dangling handle ★★★ CRITICAL
+            // Problem: Destroying last_copy_event while GPU worker still references it
+            // → Worker calls cuStreamWaitEvent on freed handle → driver crash or UB
+            // Solution: Move in-use slot events to orphaned_events list for deferred cleanup.
+            // release_staging_slot drains orphaned_events when workers return their slots.
+            // Impact: Prevents GPU driver crash on staging timeout under high load.
             if (slot.last_copy_event) {
-                device_backend_event_destroy(engine, slot.last_copy_event);
+                if (!slot.in_use.load(std::memory_order_acquire)) {
+                    device_backend_event_destroy(engine, slot.last_copy_event);
+                } else {
+                    std::lock_guard<std::mutex> orphan_lock(engine->orphaned_events_mutex);
+                    engine->orphaned_events.push_back(slot.last_copy_event);
+                }
                 slot.last_copy_event = nullptr;
                 slot.last_copy_event_recorded.store(false, std::memory_order_release);
             }
@@ -189,6 +201,16 @@ static void moe_staging_slot_targets(
     }
     const uint32_t gpu_batch_eff = moe_gpu_stage_batch_max(engine);
     uint32_t pinned_target = pinned_workers > 0 ? std::max(1u, pinned_workers * 2u) : 0u;
+    // BUGFIX 987: Cap pinned slots with gpu_batch_eff ★★ IMPORTANT
+    // Problem: pinned_target = pinned_workers * 2 ignores PCIe bandwidth.
+    // On PCIe 3.0 x4 (1 copy stream), gpu_batch_eff=4 but pinned=6 (3 workers × 2)
+    // → 2 pinned slots go unused → wasted memory.
+    // On PCIe 5.0 x16 (8 streams), gpu_batch_eff=32 and pinned=2 → underprovision.
+    // Solution: Cap pinned_target at max(pinned_workers * 2, gpu_batch_eff) to align
+    // pinned pipeline depth with actual GPU consumption rate.
+    if (pinned_target > 0 && gpu_batch_eff > 0) {
+        pinned_target = std::min(pinned_target, std::max(pinned_workers * 2u, gpu_batch_eff));
+    }
     // BUGFIX 933: GPU staging slot cap to prevent memory explosion ★★ IMPORTANT
     // Problem: gpu_workers * gpu_batch_eff can be 4 * 32 = 128 slots
     // → 128 × 20MB = 2.56GB pinned staging → excessive memory pressure
@@ -511,8 +533,16 @@ static void update_staging_slot_split_for_workers(moe_pc_engine* engine) {
 }
 
 static void configure_staging_slots(moe_pc_engine* engine) {
-    if (engine && engine->max_tensor_stream_bytes.load(std::memory_order_relaxed) == 0) {
-        assert(false && "tensor index must be built before configure_staging_slots");
+    // BUGFIX 950: Replace assert with Release-safe early return ★★★ CRITICAL
+    // Problem: assert(false) is compiled out in NDEBUG → function continues with
+    // max_tensor_stream_bytes==0 → slot_size defaults to 4MB → NVFP4 triplets (~20MB)
+    // fail to stage → all prefetch silently breaks → inference runs from DB only.
+    // Solution: Unconditional if-return that works in all build configurations.
+    // Impact: Prevents silent staging failure in Release builds.
+    if (!engine || engine->max_tensor_stream_bytes.load(std::memory_order_relaxed) == 0) {
+        fprintf(stderr, "[storageLLM CRITICAL] configure_staging_slots: "
+            "tensor index not built (max_tensor_stream_bytes=0). Aborting slot setup.\n");
+        update_staging_slot_deficit(engine);
         return;
     }
     reset_staging_slots(engine);
