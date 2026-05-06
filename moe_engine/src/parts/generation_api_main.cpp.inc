@@ -34,7 +34,7 @@ int moe_pc_engine_generate_token_ids(
             engine->generation_token.store(0, std::memory_order_relaxed);
             engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
             engine->generation_phase.store(moe_GEN_PHASE_INIT, std::memory_order_relaxed);
-            reinit_staging_slots(engine);
+            reset_staging_slots(engine);
         }
         ~generation_scope_t() {
             if (!engine) return;
