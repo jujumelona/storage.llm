@@ -15,8 +15,7 @@ static int moe_profile_level() {
             std::strcmp(env, "false") == 0 ||
             std::strcmp(env, "none") == 0) {
             parsed = 0;
-        } else if (std::strcmp(env, "1") == 0 ||
-                   std::strcmp(env, "summary") == 0 ||
+        } else if (std::strcmp(env, "summary") == 0 ||
                    std::strcmp(env, "basic") == 0) {
             parsed = 1;
         } else {
