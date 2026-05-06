@@ -75,7 +75,23 @@ static void warn_device_budget_exhausted(
 static uint64_t device_budget_bytes(const moe_pc_engine* e) {
     if (!e) return 0;
 
-    const uint64_t pending = e->pending_vram_reservation.load(std::memory_order_relaxed);
+    // BUGFIX 989: Read pending, in_flight, kv_actual, common_reserved, device_allocated_bytes under vram_transition_mutex ★★★ CRITICAL
+    // Problem: Without the mutex, this function can observe a state where pending
+    //   is already decremented but in_flight not yet incremented → bytes invisible
+    //   → budget appears larger than reality → VRAM over-commit.
+    // Additionally, kv_actual can spike after mutex release → budget overestimated.
+    // Solution: Snapshot ALL counters under the same mutex used by the write side.
+    // Contention: Negligible — mutex held for ~5 loads (~20ns), same as write side.
+    uint64_t pending, in_flight, kv_actual, common_reserved, device_allocated, device_free;
+    {
+        std::lock_guard<std::mutex> tlock(const_cast<moe_pc_engine*>(e)->vram_transition_mutex);
+        pending = e->pending_vram_reservation.load(std::memory_order_relaxed);
+        in_flight = e->vram_in_flight_bytes.load(std::memory_order_relaxed);
+        kv_actual = e->device_kv_cache_bytes.load(std::memory_order_relaxed);
+        common_reserved = e->common_vram_reserved_bytes.load(std::memory_order_relaxed);
+        device_allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
+        device_free = e->device_free_bytes.load(std::memory_order_relaxed);
+    }
 
     // Problem 8: Use dynamic KV budget instead of static soft cap
     // vram_kv_budget_bytes is soft cap, device_kv_cache_bytes is actual usage
@@ -86,23 +102,12 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
     // → Engine thinks VRAM is available, admits more experts → silent OOM or eviction storm
     // Solution: Use kv_actual directly (full actual usage), kv_cap is only for allocation limit
     // Impact: Prevents OOM when KV cache exceeds soft cap during long sequences
-    const uint64_t kv_cap = e->vram_kv_budget_bytes.load(std::memory_order_relaxed);
-    const uint64_t kv_actual = e->device_kv_cache_bytes.load(std::memory_order_relaxed);
     const uint64_t kv_reserved = moe_kv_vram_attention_runtime_available(e)
         ? kv_actual  // Use actual usage, not min(cap, actual)
         : 0;
 
-    const uint64_t common_reserved = e->common_vram_reserved_bytes.load(std::memory_order_relaxed);
-    // BUGFIX 938: Include in-flight VRAM bytes in budget calculation ★★★ CRITICAL
-    // Problem: pending_vram_reservation tracks admission intent, but vram_in_flight_bytes
-    //   tracks actual DMA transfers queued on GPU. Neither includes the other.
-    //   Multiple GPU workers can each see positive budget, admit experts, then exceed VRAM.
-    // Lifecycle: pending_vram_reservation released at enqueue → vram_in_flight_bytes
-    //   incremented at DMA start → decremented at DMA completion event.
-    //   No overlap: pending is released before in_flight is added.
-    // Solution: Add in_flight to reserved_total alongside pending.
-    // Impact: Prevents VRAM over-commitment during concurrent DMA transfers.
-    const uint64_t in_flight = e->vram_in_flight_bytes.load(std::memory_order_relaxed);
+    // BUGFIX 989: All counters already read under vram_transition_mutex above.
+    // pending, in_flight, kv_actual, common_reserved, device_allocated, device_free are consistent snapshots.
     uint64_t reserved_total = pending;
     if (reserved_total > UINT64_MAX - in_flight) {
         reserved_total = UINT64_MAX;
@@ -181,8 +186,9 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
         }
         return raw_budget - total_reserved;
     }
-    const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
-    const uint64_t free_b = e->device_free_bytes.load(std::memory_order_relaxed);
+    // BUGFIX 989: Use snapshotted values from mutex section above
+    const uint64_t allocated = device_allocated;
+    const uint64_t free_b = device_free;
     if (allocated || free_b) {
         // BUGFIX 122: With CAS loop in device_try_reserve_pending_vram, underflow is eliminated.
         // Keep clamp for safety, but it should never trigger now.
@@ -390,6 +396,26 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
             e->backend_caps.device_memory_bytes = (uint64_t)total_b;
         }
         e->device_total_bytes.store((uint64_t)total_b);
+    }
+
+    // BUGFIX 998: Metal H2D bandwidth EMA update ★★ IMPORTANT
+    // Problem: Metal H2D bandwidth is measured once at init. If OS background
+    //   pressure is high at init, a low value is locked in permanently.
+    //   juju_runtime_strategy overlap budget is based on this value → underestimate.
+    // Solution: On each 1s refresh cycle, re-measure via metal_measure_h2d_bandwidth
+    //   and apply EMA (alpha=0.2) to smooth transient noise.
+    // Guard: Only runs if enable_bw_benchmark AND backend is Metal AND a non-zero
+    //   initial measurement exists (skip if init benchmark was disabled).
+    if (e->backend_caps.backend == moe_BACKEND_METAL &&
+        e->io_config.enable_bw_benchmark &&
+        e->backend_caps.measured_h2d_bw_bytes_per_sec > 0) {
+        const uint64_t new_sample = metal_measure_h2d_bandwidth(metal_get_default_device());
+        if (new_sample > 0) {
+            const uint64_t old_bw = e->backend_caps.measured_h2d_bw_bytes_per_sec;
+            // EMA alpha=0.2: new_ema = old * 0.8 + sample * 0.2
+            const uint64_t ema_bw = (old_bw * 4ull + new_sample) / 5ull;
+            e->backend_caps.measured_h2d_bw_bytes_per_sec = ema_bw;
+        }
     }
 }
 

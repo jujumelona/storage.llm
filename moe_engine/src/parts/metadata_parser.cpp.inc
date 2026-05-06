@@ -64,6 +64,42 @@ static int moe_json_get_bool_from_object_local(
     return moe_json_get_bool_local(text.substr(begin, end - begin), key, out);
 }
 
+static int moe_json_get_u64_from_first_object_local(
+    const std::string& text,
+    const char* const* object_keys,
+    size_t object_key_count,
+    const char* key,
+    uint64_t* out
+) {
+    if (!object_keys || !key || !out) {
+        return 0;
+    }
+    for (size_t i = 0; i < object_key_count; ++i) {
+        if (object_keys[i] && moe_json_get_u64_from_object_local(text, object_keys[i], key, out)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_json_get_bool_from_first_object_local(
+    const std::string& text,
+    const char* const* object_keys,
+    size_t object_key_count,
+    const char* key,
+    int* out
+) {
+    if (!object_keys || !key || !out) {
+        return 0;
+    }
+    for (size_t i = 0; i < object_key_count; ++i) {
+        if (object_keys[i] && moe_json_get_bool_from_object_local(text, object_keys[i], key, out)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void moe_parse_qkv_runtime_contract_json(
     moe_offload_gguf_file_t* meta,
     const std::string& json
@@ -74,6 +110,15 @@ static void moe_parse_qkv_runtime_contract_json(
     uint64_t value = 0;
     int bool_value = 0;
     std::string string_value;
+    const char* qkv_objects[] = {
+        "qkv_policy_contract",
+        "qkv_cache_schema_effective",
+        "qkv_contract",
+        "kv_layout_contract",
+        "runtime_cache_policy",
+        "attention",
+        "qkv_bits"
+    };
 
     if (json.find("qkv_quantized_per_layer_head_cache") != std::string::npos ||
         json.find("qkv_quantized_per_layer_head_page_major") != std::string::npos ||
@@ -99,6 +144,9 @@ static void moe_parse_qkv_runtime_contract_json(
     if (meta->contract.qkv_k_bits == 0 &&
         (moe_json_get_u64_local(json, "key_bits", &value) ||
          moe_json_get_u64_local(json, "k_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "key_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "k_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "key", &value) ||
          moe_json_get_u64_from_object_local(json, "key", "bits", &value) ||
          moe_json_get_u64_from_object_local(json, "k", "bits", &value))) {
         meta->contract.qkv_k_bits = moe_u64_to_u32_clamped(value, 0);
@@ -106,12 +154,17 @@ static void moe_parse_qkv_runtime_contract_json(
     if (meta->contract.qkv_v_bits == 0 &&
         (moe_json_get_u64_local(json, "value_bits", &value) ||
          moe_json_get_u64_local(json, "v_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "value_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "v_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "value", &value) ||
          moe_json_get_u64_from_object_local(json, "value", "bits", &value) ||
          moe_json_get_u64_from_object_local(json, "v", "bits", &value))) {
         meta->contract.qkv_v_bits = moe_u64_to_u32_clamped(value, 0);
     }
     if (meta->contract.qkv_normal_bits == 0 &&
         (moe_json_get_u64_local(json, "normal_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "normal_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "normal", &value) ||
          moe_json_get_u64_from_object_local(json, "normal", "bits", &value) ||
          moe_json_get_u64_from_object_local(json, "qkv_cache_schema", "normal_bits", &value) ||
          moe_json_get_u64_from_object_local(json, "qkv_cache_schema_effective", "normal_bits", &value) ||
@@ -120,6 +173,7 @@ static void moe_parse_qkv_runtime_contract_json(
     }
     if (meta->contract.qkv_group_size == 0 &&
         (moe_json_get_u64_local(json, "group_size", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "group_size", &value) ||
          moe_json_get_u64_from_object_local(json, "qkv_cache_schema", "group_size", &value) ||
          moe_json_get_u64_from_object_local(json, "qkv_cache_schema_effective", "group_size", &value) ||
          moe_json_get_u64_from_object_local(json, "kv_layout_contract", "group_size", &value))) {
@@ -127,6 +181,7 @@ static void moe_parse_qkv_runtime_contract_json(
     }
     if (meta->contract.qkv_page_size_tokens == 0 &&
         (moe_json_get_u64_local(json, "page_size_tokens", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "page_size_tokens", &value) ||
          moe_json_get_u64_from_object_local(json, "qkv_cache_schema", "page_size_tokens", &value) ||
          moe_json_get_u64_from_object_local(json, "qkv_cache_schema_effective", "page_size_tokens", &value) ||
          moe_json_get_u64_from_object_local(json, "kv_layout_contract", "page_size_tokens", &value))) {
@@ -134,34 +189,44 @@ static void moe_parse_qkv_runtime_contract_json(
     }
     if (meta->contract.qkv_sink_tokens == 0 &&
         (moe_json_get_u64_local(json, "sink_tokens", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "sink_tokens", &value) ||
          moe_json_get_u64_from_object_local(json, "residency", "sink_tokens", &value))) {
         meta->contract.qkv_sink_tokens = moe_u64_to_u32_clamped(value, 0);
     }
     if (meta->contract.qkv_outlier_channels == 0 &&
         (moe_json_get_u64_local(json, "outlier_channels", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "outlier_channels", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "outlier", &value) ||
          moe_json_get_u64_from_object_local(json, "outlier", "channels", &value))) {
         meta->contract.qkv_outlier_channels = moe_u64_to_u32_clamped(value, 0);
     }
     if (meta->contract.qkv_outlier_bits == 0 &&
         (moe_json_get_u64_local(json, "outlier_bits", &value) ||
+         moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "outlier_bits", &value) ||
          moe_json_get_u64_from_object_local(json, "outlier", "bits", &value))) {
         meta->contract.qkv_outlier_bits = moe_u64_to_u32_clamped(value, 0);
     }
     if (moe_json_get_u64_local(json, "rotation_seed", &value) ||
+        moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "rotation_seed", &value) ||
         moe_json_get_u64_from_object_local(json, "rotation", "seed", &value)) {
         meta->contract.qkv_rotation_seed = value;
     }
     if (moe_json_get_u64_local(json, "qjl_seed", &value) ||
+        moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "qjl_seed", &value) ||
         moe_json_get_u64_from_object_local(json, "qjl", "seed", &value)) {
         meta->contract.qkv_qjl_seed = value;
     }
     if (moe_json_get_bool_local(json, "enable_qjl", &bool_value) ||
         moe_json_get_bool_local(json, "qjl_enabled", &bool_value) ||
+        moe_json_get_bool_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "enable_qjl", &bool_value) ||
+        moe_json_get_bool_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "qjl_enabled", &bool_value) ||
         moe_json_get_bool_from_object_local(json, "qjl", "enabled", &bool_value)) {
         meta->contract.qkv_enable_qjl = bool_value != 0 ? 1 : 0;
     }
     if (moe_json_get_bool_local(json, "enable_rotation", &bool_value) ||
         moe_json_get_bool_local(json, "rotation_enabled", &bool_value) ||
+        moe_json_get_bool_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "enable_rotation", &bool_value) ||
+        moe_json_get_bool_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "rotation_enabled", &bool_value) ||
         moe_json_get_bool_from_object_local(json, "rotation", "enabled", &bool_value)) {
         meta->contract.qkv_enable_rotation = bool_value != 0 ? 1 : 0;
     }
@@ -178,6 +243,9 @@ static void moe_parse_qkv_runtime_contract_json(
     }
     if (meta->contract.qkv_required) {
         meta->contract.plain_kv_persistent_allowed = false;
+        if (meta->contract.qkv_enable_qjl < 0) {
+            meta->contract.qkv_enable_qjl = 0;
+        }
     }
 }
 
@@ -328,5 +396,11 @@ static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
     }
     if (meta->contract.weight_encoding == 0 && !meta->contract.weight_quant_family.empty()) {
         meta->contract.weight_encoding = moe_weight_encoding_from_family(meta->contract.weight_quant_family);
+    }
+    if (meta->contract.qkv_required) {
+        meta->contract.plain_kv_persistent_allowed = false;
+        if (meta->contract.qkv_enable_qjl < 0) {
+            meta->contract.qkv_enable_qjl = 0;
+        }
     }
 }

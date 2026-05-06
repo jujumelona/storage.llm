@@ -123,6 +123,9 @@ struct moe_hip_driver_api {
     moe_cu_event_query_fn hipEventQuery = nullptr;
     moe_cu_event_synchronize_fn hipEventSynchronize = nullptr;
     moe_cu_event_destroy_fn hipEventDestroy = nullptr;
+    // BUGFIX 952: hipHostMalloc/hipHostFree for IOMMU-registered pinned staging ★★★
+    int (*hipHostMalloc)(void**, size_t, unsigned int) = nullptr;
+    int (*hipHostFree)(void*) = nullptr;
 };
 
 // Level Zero basic API hooks

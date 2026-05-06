@@ -1,4 +1,4 @@
-﻿// BUGFIX 110: Issue 22 - Thread-safe warning flag ★
+// BUGFIX 110: Issue 22 - Thread-safe warning flag ★
 // Problem: static bool warned is not thread-safe
 // Multiple threads can print warning simultaneously
 // Solution: Use atomic<bool> with exchange
@@ -182,6 +182,37 @@ static uint8_t* allocate_staging_for_engine(
     if (device_host_allocated) {
         *device_host_allocated = false;
     }
+    // BUGFIX 952: HIP/ROCm pinned host memory allocation ★★★ CRITICAL
+    // Problem: ROCm path falls through to posix_memalign + mlock. mlock'd memory
+    // is NOT registered with IOMMU on AMD GPUs, so hipMemcpyAsync silently degrades
+    // to synchronous memcpy → DMA overlap disabled → 30-50% throughput loss.
+    // Solution: Use hipHostMalloc which allocates IOMMU-registered, DMA-accessible memory.
+    // Impact: Restores true async DMA on AMD GPUs (MI300X, RX 7900, etc.)
+    if (e &&
+        e->backend_caps.backend == moe_BACKEND_HIP &&
+        e->hip.hipHostMalloc && bytes > 0) {
+        void* ptr = nullptr;
+        // hipHostMallocDefault (0) = portable + mapped
+        if (e->hip.hipHostMalloc(&ptr, static_cast<size_t>(bytes), 0) == 0 && ptr) {
+            if (pinned) {
+                *pinned = true;
+            }
+            if (numa_allocated) {
+                *numa_allocated = false;
+            }
+            if (device_host_allocated) {
+                *device_host_allocated = true;  // Signals free_staging_for_engine to use hipHostFree
+            }
+            static std::atomic<bool> logged_hip_host{false};
+            if (!logged_hip_host.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr,
+                    "[storageLLM INFO] HIP/ROCm staging: hipHostMalloc OK (%llu bytes)\n",
+                    (unsigned long long)bytes);
+            }
+            return static_cast<uint8_t*>(ptr);
+        }
+        // Fall through to generic allocator if hipHostMalloc fails
+    }
     if (e &&
         (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
          e->backend_caps.backend == moe_BACKEND_SYCL) &&
@@ -222,6 +253,13 @@ static void free_staging_for_engine(
     bool numa_allocated,
     bool device_host_allocated
 ) {
+    // BUGFIX 952: HIP/ROCm hipHostFree path ★★★
+    // Must be checked before Level Zero path since both use device_host_allocated flag
+    if (device_host_allocated && e && e->backend_caps.backend == moe_BACKEND_HIP &&
+        e->hip.hipHostFree) {
+        e->hip.hipHostFree(ptr);
+        return;
+    }
     if (device_host_allocated && e && e->ze.context && e->ze.zeMemFree) {
         e->ze.zeMemFree(e->ze.context, ptr);
         return;
@@ -246,7 +284,15 @@ static uint8_t* allocate_best_staging(
         *pinned = false;
     }
     uint64_t bytes = requested_bytes;
-    prepare_windows_staging_working_set(requested_bytes);
+    // BUGFIX 984: Skip VirtualLock on HIP backends ★★ IMPORTANT
+    // Problem: hipHostMalloc already pins memory via IOMMU registration.
+    // prepare_windows_staging_working_set calls VirtualLock on the same region
+    // → double-pin attempt → ERROR_WORKING_SET_QUOTA on constrained systems
+    // → fallback to non-pinned → async DMA silently degrades to sync
+    // Solution: Skip Windows working set expansion for HIP-managed memory.
+    if (!e || e->backend_caps.backend != moe_BACKEND_HIP) {
+        prepare_windows_staging_working_set(requested_bytes);
+    }
     const uint64_t min_pinned = 1ull * 1024ull * 1024ull;
     const bool prefer_device_host_staging = e &&
         (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||

@@ -43,22 +43,56 @@ static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int
 // Impact: Eliminates blocking page faults on Windows non-DirectStorage path.
 static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, uint64_t bytes) {
 #ifdef _WIN32
-    if (engine && engine->io_config.enable_directstorage) {
-        return;
-    }
-    // BUGFIX 897: If prefer_overlapped_io enabled, skip mmap touch entirely.
-    // OVERLAPPED ReadFile path in prefetch_pinned.cpp.inc handles async I/O directly.
-    if (engine && engine->io_config.prefer_overlapped_io) {
-        // BUGFIX 936: Track bytes going through overlapped path for diagnostics ★★
-        // Problem: Early return without counter update makes this path invisible
-        // → I/O bottleneck analysis impossible when overlapped_io is the dominant path
-        // Solution: Update bytes_overlapped_io counter before returning
-        if (src && bytes > 0) {
+    // BUGFIX 963: Unify overlapped IO check at function entry ★★
+    // Problem: io_config_api.cpp.inc sets prefer_overlapped_io=1 at startup,
+    // but this function's VirtualLock path still runs → 8 useless VirtualLock
+    // failures accumulate → s_overlapped_io_set writes redundantly → duplicate log.
+    // Solution: Single early-return check covers both DirectStorage and overlapped IO.
+    // BUGFIX 936 byte counter is preserved.
+    // BUGFIX 986: Read from atomic mirror instead of plain int ★★
+    const bool overlapped = engine && engine->prefer_overlapped_io_atomic.load(std::memory_order_relaxed);
+    if (engine && (engine->io_config.enable_directstorage || overlapped)) {
+        // BUGFIX 1002: Periodic VirtualLock recovery probe ★★ PERFORMANCE
+        // Problem: Once OVERLAPPED IO is enabled, it never reverts even when
+        //   memory pressure subsides. OVERLAPPED is slower for large sequential
+        //   reads (extra kernel copy vs direct page access) → 10-30% throughput loss.
+        // Solution: Every 1024 calls, try VirtualLock on a small page. If it
+        //   succeeds, memory pressure has subsided → revert to mmap path.
+        // Overhead: One VirtualLock+Unlock per 1024 calls = negligible.
+        if (overlapped && !engine->io_config.enable_directstorage && src && bytes > 0) {
+            static thread_local uint32_t s_recovery_counter = 0;
+            if (++s_recovery_counter >= 1024) {
+                s_recovery_counter = 0;
+                const size_t probe_size = 4096;
+                if (VirtualLock(reinterpret_cast<LPVOID>(
+                        reinterpret_cast<uintptr_t>(src) & ~(uintptr_t)(probe_size - 1)),
+                        probe_size)) {
+                    VirtualUnlock(reinterpret_cast<LPVOID>(
+                        reinterpret_cast<uintptr_t>(src) & ~(uintptr_t)(probe_size - 1)),
+                        probe_size);
+                    // VirtualLock succeeded → working set pressure has subsided
+                    auto* mutable_engine = const_cast<moe_pc_engine*>(engine);
+                    mutable_engine->prefer_overlapped_io_atomic.store(false, std::memory_order_release);
+                    mutable_engine->io_config.prefer_overlapped_io = 0;
+                    fprintf(stderr,
+                        "[storageLLM INFO] VirtualLock recovery succeeded. "
+                        "Reverting to mmap path for better sequential read throughput.\n");
+                    // BUGFIX 1002: Count bytes in mmap_touch before falling through ★★ IMPORTANT
+                    // Problem: Recovery path jumps to do_virtuallock_path without counting bytes
+                    // → IO statistics have a hole → runtime_prefetch_window() underestimates bandwidth
+                    // Solution: Add bytes to mmap_touch counter before goto
+                    mutable_engine->io_atomic.bytes_mmap_touch.fetch_add(bytes, std::memory_order_relaxed);
+                    // Don't return — fall through to VirtualLock path for this call
+                    goto do_virtuallock_path;
+                }
+            }
+            const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_overlapped_io.fetch_add(bytes, std::memory_order_relaxed);
+        } else if (overlapped && src && bytes > 0) {
             const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_overlapped_io.fetch_add(bytes, std::memory_order_relaxed);
         }
-        // OVERLAPPED path bypasses mmap entirely - no touch needed
         return;
     }
+    do_virtuallock_path:
     // Try VirtualLock to bring pages into working set
     // This is a hint - failure is acceptable and common when working set limit reached
     if (src && bytes > 0) {
@@ -76,14 +110,24 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
             // BUGFIX 939: Auto-fallback to OVERLAPPED IO on VirtualLock failure ★★★
             // Problem: VirtualLock fails at ~1.5GB working set limit → memcpy page-faults
             //   → io_worker blocked 100-500ms per fault → pipeline stall
-            // Solution: Track consecutive failures. After 8 failures, dynamically switch
+            // Solution: Track consecutive failures. After 2 failures, dynamically switch
             //   to prefer_overlapped_io=true. OVERLAPPED ReadFile path already implemented.
             // Impact: Eliminates blocking page faults on Windows non-DirectStorage path.
             static thread_local uint32_t s_vlock_fail_count = 0;
-            if (++s_vlock_fail_count >= 8 && engine) {
+            // BUGFIX 990: Lower threshold from 8 to 2 ★★ IMPORTANT
+            // Problem: Each VirtualLock failure causes 100-500ms page fault stall.
+            // 8 failures = up to 4s wasted blocking before switching to OVERLAPPED IO.
+            // Solution: Switch after 2 failures. 1 retry handles transient OS contention;
+            // 2nd failure confirms working set limit is persistently reached.
+            if (++s_vlock_fail_count >= 2 && engine) {
                 auto* mutable_engine = const_cast<moe_pc_engine*>(engine);
-                if (!mutable_engine->io_config.prefer_overlapped_io) {
-                    mutable_engine->io_config.prefer_overlapped_io = true;
+                // BUGFIX 961: Race-safe prefer_overlapped_io transition ★★
+                // BUGFIX 1002: Use file-scope flag so recovery can reset it
+                static std::atomic<bool> s_overlapped_io_set{false};
+                if (!s_overlapped_io_set.exchange(true, std::memory_order_acq_rel)) {
+                    // BUGFIX 986: Write to atomic mirror first, then sync plain int ★★
+                    mutable_engine->prefer_overlapped_io_atomic.store(true, std::memory_order_release);
+                    mutable_engine->io_config.prefer_overlapped_io = 1;
                     fprintf(stderr,
                         "[storageLLM INFO] VirtualLock failed %u times, auto-enabling prefer_overlapped_io. "
                         "Subsequent I/O will use OVERLAPPED ReadFile to avoid page fault stalls.\n",
@@ -538,6 +582,23 @@ static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
         // BUGFIX 706: Removed staging_slot_cv.notify_one() ??        // All acquire_staging_slot paths now use type-specific CVs (staging_pinned_cv,
         // staging_gpu_cv, staging_direct_cv). No code path waits on staging_slot_cv.
         // The extra notify caused unnecessary context switches.
+
+        // BUGFIX 949: Drain orphaned events from staging timeout ★★
+        // Problem: Orphaned events accumulate if release_staging_slot never drains them
+        // Solution: Opportunistically drain when any slot is released (amortized cost)
+        // Impact: Prevents memory leak of CUevent handles after staging timeout
+        if (!engine->orphaned_events.empty()) {
+            std::vector<CUevent> to_destroy;
+            {
+                std::lock_guard<std::mutex> orphan_lock(engine->orphaned_events_mutex);
+                to_destroy.swap(engine->orphaned_events);
+            }
+            for (CUevent evt : to_destroy) {
+                if (evt) {
+                    device_backend_event_destroy(engine, evt);
+                }
+            }
+        }
 }
 
 static uint64_t copy_mapped_range_to_staging(

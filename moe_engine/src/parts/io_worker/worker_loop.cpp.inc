@@ -46,7 +46,13 @@
         if (!io_worker_requeue_disk_task(engine, retry_task, retry_stage, 3u, 1u)) {
             // Bug Fix: Cap local_requeues size to prevent unbounded growth
             // When both disk_stage and gpu_stage are full, local_requeues grows indefinitely
-            const uint32_t cap = std::max(8u, engine->disk_stage_depth_cap);
+            // BUGFIX 997: Reduce cap to limit untracked RAM ★★ IMPORTANT
+            // Problem: Old cap = disk_stage_depth_cap (2048). With 8 io_workers,
+            //   max 16,384 tasks × ~sizeof(pair) in heap, invisible to tier counters
+            //   → RAM tier admission sees hundreds of MB less than reality.
+            // Solution: Cap at min(64, depth_cap/8). 8 workers × 64 = 512 tasks max.
+            //   Still enough buffer for back-pressure transients, but bounded memory.
+            const uint32_t cap = std::max(8u, std::min(64u, engine->disk_stage_depth_cap / 8u));
             if (local_requeues.size() < cap) {
                 local_requeues.emplace_back(retry_task, retry_stage);
             } else {

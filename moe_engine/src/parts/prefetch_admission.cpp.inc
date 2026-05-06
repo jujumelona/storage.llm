@@ -73,6 +73,8 @@ static moe_tier_t prefetch_admitted_tier(
     }
     if (target == moe_TIER_VRAM) {
         uint64_t pending = engine->pending_vram_reservation.load(std::memory_order_relaxed);
+        // BUGFIX 996: CAS backoff for high-contention admission ★★ PERFORMANCE
+        uint32_t spin = 0;
         for (;;) {
             const uint64_t vram_budget = device_budget_bytes(engine);
 
@@ -94,6 +96,8 @@ static moe_tier_t prefetch_admitted_tier(
                     std::memory_order_relaxed)) {
                 break;
             }
+            // Backoff: yield after 8 spins to reduce cache-line contention
+            if (++spin > 8) { std::this_thread::yield(); spin = 0; }
         }
     }
     const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
@@ -109,13 +113,20 @@ static moe_tier_t prefetch_admitted_tier(
     // Fast prefetch can fill gap before eviction catches up → sudden DB routing
     // Solution: Calculate threshold as eviction_target + 10%p for consistent headroom
     // Impact: Better pipeline balance, smoother RAM→DB transition
-    if (target == moe_TIER_RAM && ram_budget > 0) {
-        const uint64_t eviction_pct = engine->io_config.ram_eviction_target_fill_pct > 0
-            ? engine->io_config.ram_eviction_target_fill_pct : 75ull;
-        const uint64_t admission_pct = std::min(95ull, eviction_pct + 10ull);
+        // BUGFIX 980: Clamp eviction_pct to 85% max for admission headroom ★★★
+        // Problem: ram_eviction_target_fill_pct ≥ 86 → admission_pct clamped to 95
+        // → only 5-9%p headroom → eviction can't catch up → DB fallback thrashing
+        // Solution: Cap eviction_pct at 85 so admission is always eviction + 10
+        const uint64_t eviction_pct = std::min(
+            engine->io_config.ram_eviction_target_fill_pct > 0
+                ? engine->io_config.ram_eviction_target_fill_pct : 75ull,
+            85ull);
+        const uint64_t admission_pct = eviction_pct + 10ull;  // always ≤ 95
         const uint64_t ram_threshold = (ram_budget * admission_pct) / 100ull;
 
         uint64_t ram_pending = engine->pending_ram_reservation.load(std::memory_order_relaxed);
+        // BUGFIX 996: CAS backoff for RAM admission ★★ PERFORMANCE
+        uint32_t ram_spin = 0;
         for (;;) {
             const uint64_t ram_used_with_pending =
                 tier_used(engine, moe_TIER_RAM) + ram_pending + item.bytes;
@@ -128,6 +139,7 @@ static moe_tier_t prefetch_admitted_tier(
                     std::memory_order_relaxed, std::memory_order_relaxed)) {
                 break;
             }
+            if (++ram_spin > 8) { std::this_thread::yield(); ram_spin = 0; }
         }
     }
     return target;
@@ -143,15 +155,20 @@ static void prefetch_release_pending_vram_reservation(moe_pc_engine* engine, uin
         return;
     }
     uint64_t expected = engine->pending_vram_reservation.load(std::memory_order_relaxed);
+    // BUGFIX 996: CAS backoff + underflow clamp-once ★★ PERFORMANCE
+    // Problem: Underflow path (expected < bytes) re-enters CAS loop instead of
+    // breaking. If another thread concurrently modifies the counter, the loop
+    // retries indefinitely with bytes > expected.
+    // Solution: On underflow, clamp bytes = expected and CAS once to 0.
+    uint32_t rel_spin = 0;
     while (true) {
         if (expected < bytes) {
-            // Underflow would occur - clamp to 0
-            if (engine->pending_vram_reservation.compare_exchange_weak(
+            // Underflow: clamp to 0 in one attempt, then break regardless
+            engine->pending_vram_reservation.compare_exchange_strong(
                     expected, 0,
                     std::memory_order_relaxed,
-                    std::memory_order_relaxed)) {
-                break;
-            }
+                    std::memory_order_relaxed);
+            break;  // Best-effort clamp — don't re-spin on underflow
         } else {
             // Normal case - subtract bytes
             if (engine->pending_vram_reservation.compare_exchange_weak(
@@ -160,6 +177,7 @@ static void prefetch_release_pending_vram_reservation(moe_pc_engine* engine, uin
                     std::memory_order_relaxed)) {
                 break;
             }
+            if (++rel_spin > 8) { std::this_thread::yield(); rel_spin = 0; }
         }
     }
 }

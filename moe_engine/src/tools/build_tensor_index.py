@@ -77,13 +77,40 @@ def main(argv):
             else:
                 kidx = 0xFFFFFFFF
                 flags = 0
+            # BUGFIX 968: Validate scale fields — disambiguate "no scale" from offset=0 ★★
+            # Problem: u64() returns 0 for empty string. offset=0 and length=0 is
+            # indistinguishable from "scale at file offset 0". FP4 dequant uses
+            # offset 0 → reads garbage → wrong output.
+            # Solution: Sentinel 0xFFFFFFFFFFFFFFFF means "no scale". Warn on
+            # weight with bytes > 0 but scale_byte_length == 0.
+            SENTINEL = 0xFFFFFFFFFFFFFFFF
+            w_off = u64(row, "weight_byte_offset")
+            w_len = u64(row, "weight_byte_length")
+            s_off = u64(row, "scale_byte_offset")
+            s_len = u64(row, "scale_byte_length")
+            s2_off = u64(row, "scale2_byte_offset")
+            s2_len = u64(row, "scale2_byte_length")
+            # Apply sentinel for missing scale/scale2
+            if s_len == 0:
+                if w_len > 0:
+                    print(
+                        f"WARNING: layer={row.get('layer')} expert={row.get('expert')} "
+                        f"proj={row.get('proj')} has weight_byte_length={w_len} but "
+                        f"scale_byte_length=0 — using sentinel (no scale)",
+                        file=sys.stderr,
+                    )
+                s_off = SENTINEL
+                s_len = SENTINEL
+            if s2_len == 0:
+                s2_off = SENTINEL
+                s2_len = SENTINEL
             records.append((
-                u64(row, "weight_byte_offset"),
-                u64(row, "weight_byte_length"),
-                u64(row, "scale_byte_offset"),
-                u64(row, "scale_byte_length"),
-                u64(row, "scale2_byte_offset"),
-                u64(row, "scale2_byte_length"),
+                w_off,
+                w_len,
+                s_off,
+                s_len,
+                s2_off,
+                s2_len,
                 u32(row, "part"),
                 u32(row, "shard"),
                 u32(row, "layer"),

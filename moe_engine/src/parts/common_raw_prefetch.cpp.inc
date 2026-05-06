@@ -1,4 +1,4 @@
-static constexpr uint32_t moe_RAW_ROLE_ROUTER = 1u;
+﻿static constexpr uint32_t moe_RAW_ROLE_ROUTER = 1u;
 static constexpr uint32_t moe_RAW_ROLE_ATTENTION = 2u;
 static constexpr uint32_t moe_RAW_ROLE_NORM = 4u;
 static constexpr uint32_t moe_RAW_ROLE_SHARED = 8u;
@@ -13,7 +13,6 @@ static uint64_t raw_phase_budget_left(const moe_pc_engine* e) {
     const uint64_t used = e->device_allocated_bytes.load();
     return e->config.vram_budget_bytes > used ? e->config.vram_budget_bytes - used : 0;
 }
-
 static int prefetch_one_raw_span(moe_pc_engine* e, const moe_storage_raw_span_spec_t& s, uint8_t pool, int allow_sync_fallback) {
     if (!e || e->model_root.empty() || s.bytes == 0) {
         return 0;
@@ -59,7 +58,6 @@ static int prefetch_one_raw_span(moe_pc_engine* e, const moe_storage_raw_span_sp
     e->io_atomic.disk_stage_done.fetch_add(1);
     return 1;
 }
-
 static int enqueue_raw_span_prefetch(moe_pc_engine* e, uint32_t span_index, uint8_t pool) {
     if (!e) {
         return 0;
@@ -103,7 +101,7 @@ static uint64_t prefetch_raw_layer_roles(
     uint64_t spans = 0;
     const uint32_t begin = moe_storage_raw_span_find_first(layer);
     const uint32_t end = moe_storage_raw_span_find_end(layer);
-    // BUGFIX 475: begin/end 범위 체크
+    // BUGFIX 475: begin/end 踰붿쐞 泥댄겕
     if (begin > end) return 0;
     std::vector<std::pair<const uint8_t*, uint64_t>> ranges_to_touch;
     for (uint32_t i = begin; i < end; ++i) {
@@ -125,7 +123,7 @@ static uint64_t prefetch_raw_layer_roles(
                     if (src) ranges_to_touch.push_back({src, s->bytes});
                 }
             }
-            // BUGFIX 476: bytes overflow 체크
+            // BUGFIX 476: bytes overflow 泥댄겕
             if (bytes > UINT64_MAX - s->bytes) break;
             bytes += s->bytes;
             ++spans;
@@ -135,7 +133,7 @@ static uint64_t prefetch_raw_layer_roles(
         std::sort(ranges_to_touch.begin(), ranges_to_touch.end());
         touch_mapped_ranges(e, ranges_to_touch);
     }
-    // BUGFIX 33: Separate queued vs transferred byte counters ?�★??    // Old: Both enqueue_only and actual transfer incremented common_raw_prefetched_bytes
+    // BUGFIX 33: Separate queued vs transferred byte counters ?占썩쁾??    // Old: Both enqueue_only and actual transfer incremented common_raw_prefetched_bytes
     // New: enqueue_only ??common_raw_queued_bytes, actual transfer ??common_raw_prefetched_bytes
     // Prevents stats confusion: "prefetched" now means actually in VRAM, "queued" means in pipeline
     if (bytes) {
@@ -409,7 +407,8 @@ static uint32_t runtime_prefetch_window(const moe_pc_engine* engine) {
         window = engine->io_config.prefetch_window_layers;
     }
     if (window == 0) {
-        window = 1u;
+        // BUGFIX 965: Hard fallback uses 4 instead of 1
+        window = 4u;
     }
     return std::min<uint32_t>(window, 8u);
 }
@@ -418,19 +417,10 @@ static int prefetch_moe_activation_raw(moe_pc_engine* e, int layer) {
     if (!e || layer < 0) {
         return 0;
     }
-    // BUGFIX 89: Issue 13 - Optimize last_activation_layer CAS loop ★
-    // Problem: CAS loop when multiple workers call prefetch_moe_activation_raw
-    // Contention when layer changes frequently (every token in some models)
-    // Solution: Early exit if layer already set (no CAS needed)
-    // Only CAS when layer actually needs to change
     int previous_layer = e->last_activation_layer.load(std::memory_order_acquire);
-
-    // Fast path: layer already set, no CAS needed
     if (previous_layer == layer) {
         return 1;
     }
-
-    // Slow path: CAS to update layer
     while (previous_layer != layer) {
         if (e->last_activation_layer.compare_exchange_weak(
                 previous_layer,
@@ -439,14 +429,14 @@ static int prefetch_moe_activation_raw(moe_pc_engine* e, int layer) {
                 std::memory_order_acquire)) {
             break;
         }
-        // After CAS failure, check if another thread already set it
         if (previous_layer == layer) {
             return 1;
         }
     }
-    const moe_storage_constants_t* c = moe_storage_constants();
-    const int is_moe = c && layer >= (int)c->first_moe_layer && layer <= (int)c->last_moe_layer;
-    const uint32_t roles = moe_RAW_ROLE_NORM | moe_RAW_ROLE_ATTENTION;
+    const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(e);
+    const int is_moe = moe_layer_is_moe_runtime(e, &runtime_c, layer);
+    const uint32_t roles = moe_RAW_ROLE_NORM | moe_RAW_ROLE_ATTENTION |
+        (is_moe ? moe_RAW_ROLE_ROUTER : 0u);
     const int ok = prefetch_raw_layer_roles(
         e,
         layer,
@@ -456,7 +446,6 @@ static int prefetch_moe_activation_raw(moe_pc_engine* e, int layer) {
         1
     ) > 0 ? 1 : 0;
     if (ok) {
-        // Bug #6: Single lock pass - activation_keys is small.
         {
             std::vector<std::pair<CUdeviceptr, uint64_t>> deferred_free_ptrs;
             {

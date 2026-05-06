@@ -216,19 +216,32 @@
             // Need strong confidence to increase depth (lower entropy)
             float thresh = depth == 2u ? 0.50f : (depth == 3u ? 0.30f : 0.15f);
             if (spec_entropy < thresh * 0.95f) {
-                if (session) session->session_adaptive_prefetch_depth = depth;
-                engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
+                // BUGFIX 955: Per-session depth isolation ★★★ CRITICAL
+                // Problem: Engine-global write always executed even with session present
+                // → Concurrent sessions overwrite each other's depth (code-gen resets chat)
+                // Solution: Write engine-global only when no session (legacy non-batched path)
+                if (session) {
+                    session->session_adaptive_prefetch_depth = depth;
+                } else {
+                    engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
+                }
             }
         } else if (depth < current_depth) {
             // Need strong lack of confidence to decrease depth (higher entropy)
             float thresh = depth == 1u ? 0.50f : (depth == 2u ? 0.30f : 0.15f);
             if (spec_entropy > thresh * 1.05f) {
-                if (session) session->session_adaptive_prefetch_depth = depth;
-                engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
+                if (session) {
+                    session->session_adaptive_prefetch_depth = depth;
+                } else {
+                    engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
+                }
             }
         } else {
-            if (session) session->session_adaptive_prefetch_depth = depth;
-            engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
+            if (session) {
+                session->session_adaptive_prefetch_depth = depth;
+            } else {
+                engine->adaptive_prefetch_depth.store(depth, std::memory_order_relaxed);
+            }
         }
     }
 }

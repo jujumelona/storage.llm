@@ -99,6 +99,20 @@ int moe_pc_engine_get_stats(const moe_pc_engine_t* engine, moe_pc_engine_stats_t
         engine->juju_fastmem_tensor_count.load(std::memory_order_relaxed);
     out_stats->juju_slowmem_tensor_count =
         engine->juju_slowmem_tensor_count.load(std::memory_order_relaxed);
+    out_stats->juju_io_section_hints_ready =
+        engine->juju_io_section_hints_ready.load(std::memory_order_relaxed);
+    out_stats->juju_runtime_mmap_allowed =
+        engine->juju_runtime_contract_mmap_allowed.load(std::memory_order_relaxed);
+    out_stats->juju_cold_mmap_friendly =
+        engine->juju_cold_mmap_friendly.load(std::memory_order_relaxed);
+    out_stats->juju_warm_mmap_friendly =
+        engine->juju_warm_mmap_friendly.load(std::memory_order_relaxed);
+    out_stats->juju_cold_sequential_block_size =
+        engine->juju_cold_sequential_block_size.load(std::memory_order_relaxed);
+    out_stats->juju_warm_sequential_block_size =
+        engine->juju_warm_sequential_block_size.load(std::memory_order_relaxed);
+    out_stats->juju_max_prefetch_distance =
+        engine->juju_max_prefetch_distance.load(std::memory_order_relaxed);
     if (!engine->offload_gguf_first_file.empty()) {
         std::strncpy(
             out_stats->offload_gguf_first_file,

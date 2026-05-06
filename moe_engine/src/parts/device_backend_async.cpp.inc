@@ -388,6 +388,21 @@ static int device_backend_async_h2d_available(moe_pc_engine* e, CUstream stream,
         return e->ze.zeCommandListAppendMemoryCopy != nullptr;
     }
     if (e && e->backend_caps.backend == moe_BACKEND_VULKAN) {
+        // BUGFIX 994: Document Vulkan sync limitation ★★ INFORMATIONAL
+        // Current state: vkCmdCopyBuffer is used for H2D, but stream_sync uses
+        // vkQueueWaitIdle (blocking) instead of fence-based async polling.
+        // This means Vulkan DMA is effectively synchronous — GPU upload workers
+        // block until each copy completes, losing pipeline overlap benefit.
+        // TODO: Replace vkQueueWaitIdle with vkCreateFence + vkWaitForFences
+        //   in device_backend_stream_sync, storing VkFence in deferred_staging_copy.
+        static std::atomic<bool> s_vulkan_sync_warned{false};
+        if (e->vk.vkCmdCopyBuffer && e->vk.vkBeginCommandBuffer &&
+            !s_vulkan_sync_warned.exchange(true, std::memory_order_relaxed)) {
+            fprintf(stderr,
+                "[storageLLM INFO] Vulkan backend: async command buffer DMA available, "
+                "but uses vkQueueWaitIdle (sync). Pipeline overlap is limited. "
+                "Fence-based async polling planned for future release.\n");
+        }
         return e->vk.vkCmdCopyBuffer != nullptr && e->vk.vkBeginCommandBuffer != nullptr;
     }
     // BUGFIX 125: Removed dummy async for Vulkan/SYCL
@@ -409,7 +424,31 @@ static int device_backend_copy_h2d_async(
         return e->hip.hipMemcpyHtoDAsync(dst, src, (size_t)bytes, stream) == 0;
     }
     if (e && e->backend_caps.backend == moe_BACKEND_METAL) {
-        return metal_copy_h2d_async((void*)dst, src, bytes, (void*)stream);
+        // BUGFIX 967: Metal H2D bandwidth EMA tracking ★★★ PERFORMANCE
+        // Problem: metal_measure_h2d_bandwidth called once at init → fixed value.
+        // SSD thermal throttling, background I/O, and load changes not reflected.
+        // prefetch_window_layers uses stale bandwidth → wrong prefetch depth.
+        // Solution: Measure wall time for transfers >= 10MiB, update EMA (0.8/0.2).
+        // Same formula as read_file_range_to_buffer in prefetch_pinned.cpp.inc.
+        // Impact: Adaptive prefetch depth on Apple Silicon under varying I/O load.
+        const bool measure = bytes >= 10ull * 1024ull * 1024ull;
+        auto t0 = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const int ok = metal_copy_h2d_async((void*)dst, src, bytes, (void*)stream);
+        if (ok && measure) {
+            auto t1 = std::chrono::steady_clock::now();
+            const double elapsed_sec = std::chrono::duration<double>(t1 - t0).count();
+            if (elapsed_sec > 0.0001) {
+                const uint64_t current_bw = (uint64_t)((double)bytes / elapsed_sec);
+                uint64_t old_bw = e->backend_caps.measured_storage_bw_bytes_per_sec;
+                if (old_bw == 0) {
+                    e->backend_caps.measured_storage_bw_bytes_per_sec = current_bw;
+                } else {
+                    const uint64_t new_bw = (uint64_t)(0.8 * (double)old_bw + 0.2 * (double)current_bw);
+                    e->backend_caps.measured_storage_bw_bytes_per_sec = new_bw;
+                }
+            }
+        }
+        return ok;
     }
     if (e && e->backend_caps.backend == moe_BACKEND_METAL) {
         // Issue 4: Metal uses MTLBuffer with newBufferWithBytesNoCopy natively.

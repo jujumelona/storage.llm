@@ -111,6 +111,8 @@ static void moe_ingest_juju_graph_ir(moe_pc_engine* engine, const std::string& i
     if (moe_json_get_u64_local(index_json, "split_count", &split_count) && split_count > 1) {
         engine->juju_split_group_count.fetch_add(1, std::memory_order_relaxed);
     }
+    moe_ingest_juju_moe_layer_bitmask_json(engine, index_json);
+    moe_ingest_juju_expert_tier_entries_json(engine, index_json);
     size_t graph_pos = index_json.find("\"graph_ir\"");
     if (graph_pos == std::string::npos ||
         index_json.find("JUJU_GRAPH_IR_V1", graph_pos) == std::string::npos) {
@@ -314,13 +316,42 @@ static int load_juju_tensor_index_as_tensor_index(
                 entry.shape[2] == 0) {
                 continue;
             }
-            const uint64_t expert_count64 = entry.shape[2];
+            const uint64_t expert_count64 = entry.expert_count ? entry.expert_count : entry.shape[2];
             const uint64_t effective_entry_bytes = moe_effective_juju_tensor_bytes(entry, contract);
-            const uint64_t per_expert = expert_count64 ? effective_entry_bytes / expert_count64 : 0;
+            const uint64_t per_expert = entry.per_expert_bytes ? entry.per_expert_bytes :
+                (expert_count64 ? effective_entry_bytes / expert_count64 : 0);
+            const uint64_t expert_base_offset = entry.expert_base_offset ? entry.expert_base_offset : entry.juju_offset;
             if (per_expert == 0 || expert_count64 > 4096ull) {
                 continue;
             }
-            if (combined_gate_up && ((entry.shape[1] & 1ull) != 0 || per_expert < 2ull)) {
+            const uint64_t entry_end = entry.juju_offset + entry.juju_bytes;
+            if (expert_base_offset < entry.juju_offset ||
+                expert_base_offset > file_bytes ||
+                expert_base_offset > entry_end ||
+                expert_count64 > (UINT64_MAX - expert_base_offset) / per_expert) {
+                std::fprintf(stderr,
+                    "[storagellm] invalid JUJU expert layout range: name=%s base=%llu per_expert=%llu experts=%llu file=%llu\n",
+                    entry.name.c_str(),
+                    (unsigned long long)expert_base_offset,
+                    (unsigned long long)per_expert,
+                    (unsigned long long)expert_count64,
+                    (unsigned long long)file_bytes);
+                return 0;
+            }
+            const uint64_t expert_total_bytes = expert_count64 * per_expert;
+            if (expert_base_offset + expert_total_bytes > file_bytes ||
+                expert_base_offset + expert_total_bytes > entry_end) {
+                std::fprintf(stderr,
+                    "[storagellm] invalid JUJU expert layout range: name=%s base=%llu per_expert=%llu experts=%llu file=%llu\n",
+                    entry.name.c_str(),
+                    (unsigned long long)expert_base_offset,
+                    (unsigned long long)per_expert,
+                    (unsigned long long)expert_count64,
+                    (unsigned long long)file_bytes);
+                return 0;
+            }
+            if (combined_gate_up && !entry.combined_gate_up_split_enabled &&
+                ((entry.shape[1] & 1ull) != 0 || per_expert < 2ull)) {
                 continue;
             }
             const uint32_t rows_total = (uint32_t)std::min<uint64_t>(entry.shape[1], UINT32_MAX);
@@ -339,11 +370,28 @@ static int load_juju_tensor_index_as_tensor_index(
                     rec.info.cols = cols;
                     rec.info.groups = cols >= 16u ? std::max<uint32_t>(1u, cols / 16u) : 1u;
                     rec.info.group_size = cols >= 16u ? 16u : cols;
-                    const uint64_t expert_offset = entry.juju_offset + expert * per_expert;
-                    const uint64_t split_bytes = combined_gate_up ? (per_expert / 2ull) : per_expert;
-                    rec.info.weight_byte_offset = expert_offset + (uint64_t)split * split_bytes;
-                    rec.info.weight_byte_length = combined_gate_up && split == 1u ?
-                        (per_expert - split_bytes) : split_bytes;
+                    const uint64_t expert_offset = expert_base_offset + expert * per_expert;
+                    uint64_t split_rel_offset = 0;
+                    uint64_t split_bytes = per_expert;
+                    if (combined_gate_up) {
+                        if (entry.combined_gate_up_split_enabled &&
+                            entry.gate_bytes > 0 && entry.up_bytes > 0 &&
+                            entry.gate_rel_offset <= per_expert &&
+                            entry.up_rel_offset <= per_expert &&
+                            entry.gate_bytes <= per_expert - entry.gate_rel_offset &&
+                            entry.up_bytes <= per_expert - entry.up_rel_offset) {
+                            split_rel_offset = split == 0u ? entry.gate_rel_offset : entry.up_rel_offset;
+                            split_bytes = split == 0u ? entry.gate_bytes : entry.up_bytes;
+                        } else {
+                            split_bytes = per_expert / 2ull;
+                            split_rel_offset = (uint64_t)split * split_bytes;
+                            if (split == 1u) {
+                                split_bytes = per_expert - split_bytes;
+                            }
+                        }
+                    }
+                    rec.info.weight_byte_offset = expert_offset + split_rel_offset;
+                    rec.info.weight_byte_length = split_bytes;
                     rec.info.scale_byte_offset = 0;
                     rec.info.scale_byte_length = 0;
                     rec.info.scale2_byte_offset = 0;

@@ -6,7 +6,7 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
     }
 
     // Problem 6 Fix: RAII guard to prevent CUDA stream leak on abnormal termination
-    // If gpu_worker exits via exception or forced termination (not normal pop_stage_task?�false),
+    // If gpu_worker exits via exception or forced termination (not normal pop_stage_task?false),
     // device_stream_destroy_current would not be called ??stream leak.
     // This guard ensures cleanup regardless of exit path.
     // BUG 4 FIX: Make 'e' mutable to prevent double-destroy on normal exit ??
@@ -18,6 +18,23 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
             }
         }
     } stream_guard{engine};
+
+    // BUGFIX 983: RAII guard for thread-local cleanup ★★★ CRITICAL
+    // Problem: device_cleanup_thread_locals() only called on normal exit paths.
+    // Exception or io_stop early return → stale s_tl_tensor_pending_keys and
+    // engine pointer key remain. If new engine allocated at same address,
+    // stale thread_local data is reused → silent corruption.
+    // Solution: RAII guard ensures cleanup on ALL exit paths.
+    // Double-call safety: device_cleanup_thread_locals checks find()==end()
+    // before erase, so calling twice is a safe no-op.
+    struct WorkerCleanupGuard {
+        moe_pc_engine* e;
+        ~WorkerCleanupGuard() {
+            if (e) {
+                device_cleanup_thread_locals(e);
+            }
+        }
+    } cleanup_guard{engine};
 
     for (;;) {
         moe_prefetch_task task{};
@@ -258,6 +275,22 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
             if (batch[i].staging_slot != UINT32_MAX && !ok[i]) {
                 // Copy failed before async enqueue ??slot was NOT deferred, safe to release
                 release_staging_slot(engine, batch[i].staging_slot);
+            }
+            // BUGFIX 956: Release VRAM reservation for failed bundle triplets ★★★ CRITICAL
+            // Problem: bundle_triplet failure only releases staging slot, not VRAM reservation.
+            // Each triplet (gate+up+down) is 20-80MB → reservation accumulates rapidly
+            // → pending_vram_reservation exhausts budget → all prefetch drops to DB tier.
+            // Solution: Calculate total bundle bytes and release reservation on failure.
+            // Only for terminal failures (not BACKPRESSURE re-queued items).
+            // Impact: Prevents VRAM budget exhaustion under expert triplet staging failures.
+            if (!ok[i] && terminal[i] && batch[i].bundle_triplet && batch[i].bundle_layer >= 0) {
+                uint64_t bundle_bytes = 0;
+                for (int p = 0; p < 3; ++p) {
+                    bundle_bytes += batch[i].bundle_bytes[p];
+                }
+                if (bundle_bytes > 0) {
+                    prefetch_release_pending_vram_reservation(engine, bundle_bytes);
+                }
             }
         }
         for (uint32_t i = 0; i < batch_count; ++i) {

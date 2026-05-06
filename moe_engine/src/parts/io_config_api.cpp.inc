@@ -32,10 +32,35 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
         const uint64_t vram = engine->backend_caps.device_memory_bytes ?
             engine->backend_caps.device_memory_bytes : engine->backend_caps.recommended_vram_cache_bytes;
         const uint64_t gib = 1024ull * 1024ull * 1024ull;
-        engine->io_config.prefetch_window_layers =
+        // BUGFIX 962: Bandwidth-aware prefetch_window_layers ★★★ CRITICAL
+        // Problem: VRAM-only tiers (2/4/8) ignore storage speed. 24GiB GPU with
+        // slow HDD gets window=8 → 8x prefetch concurrency overwhelms I/O → stalls.
+        // Solution: Compute window from overlap_ms/compute_ms ratio when
+        // measured_storage_bw_bytes_per_sec is available. Fall back to VRAM tiers.
+        // moe_rt_compute_tflops_hint is in juju_runtime_strategy.cpp.inc (included earlier).
+        // Impact: Window automatically adapts to actual I/O throughput.
+        uint32_t vram_cap =
             !engine->config.prefer_gpu || engine->backend_caps.backend == moe_BACKEND_CPU ? 4u :
             vram > 24ull * gib ? 8u :
             vram >= 12ull * gib ? 4u : 2u;
+
+        uint32_t computed_window = vram_cap; // default to VRAM-tier if no measurement
+        const uint64_t storage_bw = engine->backend_caps.measured_storage_bw_bytes_per_sec;
+        if (storage_bw > 0 && engine->config.prefer_gpu) {
+            const double tflops = moe_rt_compute_tflops_hint(engine->backend_caps);
+            const uint64_t expert_bytes = engine->max_tensor_stream_bytes.load(std::memory_order_relaxed);
+            const uint64_t safe_expert = expert_bytes > 0 ? expert_bytes : 20ull * 1024ull * 1024ull;
+            // overlap_ms: time to transfer one expert set from storage
+            const double overlap_ms = ((double)safe_expert / (double)storage_bw) * 1000.0;
+            // compute_ms: time for GPU to process one expert (rough TFLOP-based estimate)
+            // Conservative: 1 GFLOP per expert as baseline compute
+            const double compute_ms = tflops > 0.0 ? (1.0 / tflops) * 1000.0 : 1.0;
+            if (compute_ms > 0.001) {
+                const uint32_t bw_window = (uint32_t)std::ceil(overlap_ms / compute_ms) + 1u;
+                computed_window = std::max(1u, std::min(bw_window, vram_cap));
+            }
+        }
+        engine->io_config.prefetch_window_layers = computed_window;
     }
     if (engine->io_config.vram_eviction_threshold_pct == 0 && engine->config.prefer_gpu) {
         const uint64_t vram = engine->backend_caps.device_memory_bytes ?
@@ -53,8 +78,43 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
         staging_target = staging_target <= UINT64_MAX / 4ull ? staging_target * 4ull : UINT64_MAX;
         staging_target = std::max<uint64_t>(staging_target, engine->backend_caps.recommended_pinned_bytes);
         staging_target = std::max<uint64_t>(staging_target, (uint64_t)streams * 64ull * 1024ull * 1024ull);
+        // BUGFIX 964: Relax staging cap and add stream-based floor ★★ PERFORMANCE
+        // Problem: ram_budget/4 (15% system RAM) too tight for large triplet models
+        // (512MiB/triplet × 4 GPU workers = 2GiB needed). 4.8GiB cap on 32GiB system
+        // works for typical experts but chokes on 478B-class bundles.
+        // Solution: Raise cap to ram_budget/3, add floor = streams * max_tensor * 6
+        // to ensure enough staging for full pipeline depth. Absolute cap at 25% system RAM.
+        // Impact: ~5% more RAM for staging on large models; auto-suppressed on ≤16GiB.
+        if (max_tensor_bytes > 0) {
+            const uint64_t stream_floor = (uint64_t)streams * max_tensor_bytes * 6ull;
+            staging_target = std::max<uint64_t>(staging_target, stream_floor);
+        }
+        // BUGFIX 1004: GDS/DirectStorage active → reduce staging to fallback minimum ★★ IMPORTANT
+        // Problem: enable_directstorage=1, enable_gpudirect_storage=1 by default.
+        // GDS path bypasses staging buffers entirely, but slot_count = io_workers × gpu_workers × 2
+        // → 32-core machine: 8×4×2 = 64 slots × 32MB = 2GB pinned RAM wasted.
+        // Solution: If GDS is enabled AND backend supports it, reduce staging to normal_max × 4
+        // (minimum fallback for non-GDS paths). Only apply after GDS capability confirmed.
+        // Impact: Saves 1-2GB RAM on high-core-count systems with GDS hardware.
+        const bool gds_active = (engine->io_config.enable_gpudirect_storage &&
+                                 engine->backend_caps.supports_gpudirect_storage) ||
+                                (engine->io_config.enable_directstorage &&
+                                 engine->backend_caps.supports_directstorage) ||
+                                (engine->io_config.enable_bam_nvme &&
+                                 engine->backend_caps.supports_gpu_direct_file_io);
+        if (gds_active) {
+            const moe_storage_constants_t* storage = moe_storage_constants();
+            const uint64_t normal_max = storage ? storage->normal_bundle_max_bytes : 32ull * 1024ull * 1024ull;
+            const uint64_t gds_fallback = normal_max * 4ull;
+            staging_target = std::max<uint64_t>(gds_fallback, std::min<uint64_t>(staging_target, gds_fallback * 2ull));
+        }
         if (engine->config.ram_budget_bytes > 0) {
-            staging_target = std::min<uint64_t>(staging_target, engine->config.ram_budget_bytes / 4ull);
+            staging_target = std::min<uint64_t>(staging_target, engine->config.ram_budget_bytes / 3ull);
+        }
+        // Absolute cap: 25% of total system RAM to avoid starving KV cache
+        const uint64_t total_ram = storagellm::total_ram_bytes();
+        if (total_ram > 0) {
+            staging_target = std::min<uint64_t>(staging_target, total_ram / 4ull);
         }
         staging_target = moe_rt_align_4k(staging_target);
         if (staging_target > 0 &&
@@ -190,6 +250,7 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
 #ifdef _WIN32
     if (!engine->io_config.enable_directstorage && !engine->io_config.prefer_overlapped_io) {
         engine->io_config.prefer_overlapped_io = 1;
+        engine->prefer_overlapped_io_atomic.store(true, std::memory_order_release);
     }
 #endif
     if (engine->io_config.enable_pinned_host && engine->io_config.pinned_staging_bytes > 0) {

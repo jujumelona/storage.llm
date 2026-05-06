@@ -1,4 +1,4 @@
-﻿static void* moe_open_hip_driver_library() {
+static void* moe_open_hip_driver_library() {
 #ifdef _WIN32
     return (void*)LoadLibraryA("amdhip64.dll");
 #else
@@ -53,6 +53,9 @@ static int hip_driver_load(moe_hip_driver_api* api) {
     api->hipEventQuery = (moe_cu_event_query_fn)moe_find_shared_symbol(api->library, "hipEventQuery");
     api->hipEventSynchronize = (moe_cu_event_synchronize_fn)moe_find_shared_symbol(api->library, "hipEventSynchronize");
     api->hipEventDestroy = (moe_cu_event_destroy_fn)moe_find_hip_symbol(api->library, "hipEventDestroy_v2", "hipEventDestroy");
+    // BUGFIX 952: Load hipHostMalloc/hipHostFree for pinned staging ★★★
+    api->hipHostMalloc = (decltype(api->hipHostMalloc))moe_find_shared_symbol(api->library, "hipHostMalloc");
+    api->hipHostFree = (decltype(api->hipHostFree))moe_find_shared_symbol(api->library, "hipHostFree");
     return api->hipInit && api->hipDeviceGet && api->hipCtxSetCurrent &&
         api->hipDevicePrimaryCtxRetain && api->hipDevicePrimaryCtxRelease &&
         api->hipMalloc && api->hipFree && api->hipMemcpyHtoD && api->hipMemGetInfo;
@@ -119,7 +122,6 @@ static int hip_driver_get_numa_node(uint32_t device_id) {
     moe_close_shared_library(api.library);
     return numa_node;
 }
-
 
 static int hip_driver_get_async_engines(uint32_t device_id) {
     moe_hip_driver_api api{};

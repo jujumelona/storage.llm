@@ -163,6 +163,7 @@ JUJU_SECTION_WARM_EXPERTS = 0x0012
 JUJU_SECTION_COLD_EXPERTS = 0x0013
 JUJU_SECTION_LAYER_ORDER_INDEX = 0x0020
 JUJU_SECTION_QKV_POLICY = 0x0021
+JUJU_SECTION_RUNTIME_CONTRACT = 0x0022
 JUJU_SECTION_VISION_ENCODER = 0x0030
 JUJU_SECTION_VISION_PROJ = 0x0031
 JUJU_SECTION_AUDIO_ENCODER = 0x0040
@@ -636,6 +637,7 @@ def juju_tensor_index_record(tensor, bucket, tensor_offset, layout, contract):
             "row_stride_bytes_are_storage_extent": True,
         },
         **juju_tensor_segmentation_fields(tensor["name"], bucket, contract),
+        **juju_tensor_expert_layout_fields(tensor, tensor_offset, layout, contract),
         **execution_meta,
         **runtime_priority,
     }
@@ -940,6 +942,35 @@ def juju_precompute_stream_section_sha():
     return os.environ.get("JUJU_PRECOMPUTE_STREAM_SECTION_SHA", "0") != "0"
 
 
+def juju_fast_section_checksum_enabled():
+    return os.environ.get("JUJU_FAST_SECTION_CHECKSUM", "1") != "0"
+
+
+def juju_xxhash128_bytes(data):
+    # xxh3_128 is preferred when xxhash is installed; blake2b(16) is the
+    # deterministic stdlib fallback so the 16-byte section-table field is never
+    # populated from a truncated SHA256 contract by accident.
+    try:
+        import xxhash  # type: ignore
+        return xxhash.xxh3_128_digest(data)
+    except Exception:
+        return hashlib.blake2b(data, digest_size=16).digest()
+
+
+def juju_xxhash128_hex(data):
+    return juju_xxhash128_bytes(data).hex()
+
+
+def juju_new_checksum128_hasher():
+    try:
+        import xxhash  # type: ignore
+        h = xxhash.xxh3_128()
+        return h.update, lambda: h.digest().hex(), "xxh3_128"
+    except Exception:
+        h = hashlib.blake2b(digest_size=16)
+        return h.update, lambda: h.digest().hex(), "blake2b_128_fallback"
+
+
 def juju_estimated_tensor_payload_bytes(tensors, is_first_shard=True):
     total = JUJU_SPLIT_METADATA_RESERVE_BYTES if is_first_shard else 32 * 1024 * 1024
     for tensor in tensors:
@@ -1124,6 +1155,8 @@ def tensor_bucket(name):
 
 
 def assign_bootstrap_expert_tiers(tensors, contract=None, lock=False):
+    # Current rule: packed expert tensors stay streamable, while per-expert
+    # hot/warm/cold priorities are emitted into TIER_HINT and mutable idx data.
     # BUGFIX 976: All routed experts start cold, shared weights stay hot ★★★
     # Problem: Old logic assigned hot/warm/cold by layer index (0-1=hot, 2-9=warm, rest=cold).
     # MoE executes ALL layers every token — layer number has zero correlation with access
@@ -1133,6 +1166,10 @@ def assign_bootstrap_expert_tiers(tensors, contract=None, lock=False):
     # hot ones within ~100-200 tokens. shared_weights are already hot via bucket_for_name().
     # This "cold start → EMA warm-up" approach yields better steady-state VRAM utilization
     # because only truly hot experts occupy VRAM, not arbitrarily chosen low-layer ones.
+    contract = contract or {}
+    activation_source = _juju_activation_prior_source(contract)
+    hot_threshold = float(contract_value(contract, "expert_hot_threshold", "expert_tier_policy.hot_threshold", default=0.15) or 0.15)
+    warm_threshold = float(contract_value(contract, "expert_warm_threshold", "expert_tier_policy.warm_threshold", default=0.05) or 0.05)
     routed = []
     for tensor in tensors or []:
         if not tensor or not is_routed_expert_tensor_name(tensor.get("name")):
@@ -1147,7 +1184,23 @@ def assign_bootstrap_expert_tiers(tensors, contract=None, lock=False):
         return
 
     for layer, tensor in routed:
-        tensor["bucket"] = "cold_experts"
+        expert_count = _juju_expert_count_from_shape(tensor.get("shape"))
+        explicit_expert = _juju_expert_id_from_name(tensor.get("name"))
+        if explicit_expert is None or expert_count > 1 or activation_source == "structural_uniform_no_calibration":
+            tensor["bucket"] = "cold_experts"
+            tensor["_juju_tier_source"] = activation_source
+            if lock:
+                tensor["_juju_bootstrap_tier_locked"] = True
+            continue
+        prior = _juju_expert_activation_prior(contract, layer, explicit_expert, max(1, expert_count))
+        if prior >= hot_threshold:
+            tensor["bucket"] = "hot_experts"
+        elif prior >= warm_threshold:
+            tensor["bucket"] = "warm_experts"
+        else:
+            tensor["bucket"] = "cold_experts"
+        tensor["_juju_activation_prior"] = float(prior)
+        tensor["_juju_tier_source"] = activation_source
         if lock:
             tensor["_juju_bootstrap_tier_locked"] = True
 
@@ -1308,6 +1361,16 @@ def juju_modality_metadata(contract, tensors):
     }
 
 
+def juju_section_checksum16_hex(entry):
+    checksum = entry.get("xxhash128") or entry.get("checksum_xxhash128")
+    if checksum:
+        return str(checksum)[:32].ljust(32, "0")
+    sha = entry.get("sha256")
+    if sha:
+        return str(sha)[:32].ljust(32, "0")
+    return "0" * 32
+
+
 def pack_section(entry):
     payload = struct.pack(
         "<IIQQQII4B16s32s",
@@ -1322,7 +1385,7 @@ def pack_section(entry):
         int(entry.get("prefetch_distance", 0)),
         int(entry.get("mmap_friendly", 1)),
         0,
-        bytes.fromhex(entry.get("sha256", "0" * 64))[:16].ljust(16, b"\x00"),
+        bytes.fromhex(juju_section_checksum16_hex(entry))[:16].ljust(16, b"\x00"),
         fixed_bytes(entry.get("name", ""), 32),
     )
     if len(payload) > JUJU_SECTION_ENTRY_BYTES:
@@ -1489,6 +1552,58 @@ def sha256_juju_section_ranges(session, url, section_offset, section_size, range
     if section_end > cursor:
         digest.update(b"\x00" * (section_end - cursor))
     return digest.hexdigest()
+
+
+def checksum16_juju_section_ranges(session, url, section_offset, section_size, ranges, token=None, chunk_size=16 * 1024 * 1024):
+    update_checksum, checksum_hex, _checksum_kind = juju_new_checksum128_hasher()
+    cursor = int(section_offset)
+    section_end = int(section_offset) + int(section_size)
+    for item in sorted(ranges or [], key=lambda value: int(value["offset"])):
+        item_offset = int(item["offset"])
+        if item_offset > cursor:
+            update_checksum(b"\x00" * (item_offset - cursor))
+            cursor = item_offset
+        start = int(item["source_offset"])
+        size = int(item["size"])
+        if size <= 0:
+            continue
+        if item.get("kind") == "row_padded_source":
+            rows = int(item["rows"])
+            row_bytes = int(item["row_bytes"])
+            row_stride = int(item["row_stride_bytes"])
+            row_pad = row_stride - row_bytes
+            for _row, count, chunk in iter_source_row_batches(
+                session,
+                url,
+                start,
+                rows,
+                row_bytes,
+                token=token,
+                chunk_size=chunk_size,
+            ):
+                for idx in range(count):
+                    update_checksum(chunk[idx * row_bytes:(idx + 1) * row_bytes])
+                    if row_pad > 0:
+                        update_checksum(b"\x00" * row_pad)
+        else:
+            remaining = size
+            pos = start
+            while remaining > 0:
+                take = min(int(chunk_size), remaining)
+                resp = fetch_range(session, url, pos, pos + take - 1, token=token, stream=False)
+                try:
+                    chunk = resp.content
+                finally:
+                    resp.close()
+                if len(chunk) != take:
+                    raise EOFError(f"short checksum range read: expected {take}, got {len(chunk)}")
+                update_checksum(chunk)
+                pos += take
+                remaining -= take
+        cursor += size
+    if section_end > cursor:
+        update_checksum(b"\x00" * (section_end - cursor))
+    return checksum_hex()
 
 
 def u32(value):
@@ -1964,6 +2079,44 @@ def juju_research_offload_contract():
             "cpu_free_bytes",
             "pinned_staging_bytes",
         ],
+        "expert_prefetch_execution_policy": {
+            "format": "JUJU_EXPERT_PREFETCH_POLICY_V1",
+            "source": "runtime_tensor_table_plus_router_trace_not_model_name",
+            "activation_trace_required": True,
+            "proactive_prefetch_required": True,
+            "fine_grained_expert_segments_required": True,
+            "cache_miss_must_not_block_critical_path_when_prediction_available": True,
+            "planner_inputs": [
+                "runtime_priority",
+                "prefetch_priority",
+                "execution_layer",
+                "execution_order",
+                "file_locality_group",
+                "juju_offset",
+                "juju_bytes",
+                "expert_bundle_bytes",
+                "router_topk",
+                "router_score",
+                "router_entropy",
+                "coactivation_history",
+                "next_layer_candidates",
+                "device_free_bytes",
+                "ram_free_bytes",
+                "disk_queue_depth",
+                "pinned_queue_depth",
+                "gpu_queue_depth",
+            ],
+            "planner_outputs": [
+                "prefetch_distance",
+                "cache_priority",
+                "eviction_score",
+                "target_tier",
+                "expected_overlap_window_us",
+                "bytes",
+                "fallback_bundle_bytes_forbidden_when_profile_available",
+            ],
+            "fallback_policy": "use_measured_expert_bundle_bytes_or_fail_closed_for_zero_byte_items",
+        },
         "bottleneck_breaker_slots": {
             "critical_path_io": [
                 "prefetch_before_router_consumer",
@@ -2001,9 +2154,29 @@ def juju_research_offload_contract():
             ],
         },
         "research_method_slots": {
-            "moe_infinity": ["sequence_level_activation_trace", "activation_aware_prefetch", "activation_aware_cache"],
-            "promoe": ["proactive_expert_cache", "intermediate_result_prediction"],
-            "fmoe": ["fine_grained_expert_offload", "expert_selection_patterns", "semantic_prompt_hints"],
+            "moe_infinity": [
+                "sequence_level_activation_trace",
+                "activation_aware_prefetch",
+                "activation_aware_cache",
+                "temporal_locality_trace",
+                "prefetch_distance_by_activation_pattern",
+            ],
+            "promoe": [
+                "proactive_expert_cache",
+                "intermediate_result_prediction",
+                "stride_prefetch",
+                "chunked_prefetch",
+                "early_preemption",
+                "reordered_inference_optional",
+                "goodpred_metric",
+            ],
+            "fmoe": [
+                "fine_grained_expert_offload",
+                "expert_selection_patterns",
+                "semantic_prompt_hints",
+                "expert_hit_rate_target",
+                "fine_grained_expert_segment_policy",
+            ],
             "duoserve_moe": ["prefill_decode_split", "dual_phase_expert_prefetch", "cache_scheduling"],
             "expertflow": ["adaptive_expert_scheduling", "memory_coordination", "dynamic_token_ordering"],
             "fate_cross_layer_gate": ["cross_layer_expert_prediction", "prediction_confidence"],
@@ -2017,7 +2190,64 @@ def juju_research_offload_contract():
             "infinigen": ["essential_kv_prefetch", "cpu_kv_pool", "counter_based_eviction"],
             "kivi": ["key_per_channel_quant", "value_per_token_quant", "residual_window"],
             "kvquant": ["sub_4bit_kv_quant", "outlier_aware_quant"],
-            "turboquant": ["polarquant", "qjl_residual_correction", "online_vector_quantization"],
+            "qjl": ["jl_projection", "sign_bit_residual", "unbiased_inner_product_estimator", "zero_scale_overhead"],
+            "turboquant": [
+                "polarquant",
+                "qjl_residual_correction",
+                "online_vector_quantization",
+                "rotation_before_quantization",
+                "kv_cache_memory_reduction_target",
+                "attention_speedup_target",
+            ],
+        },
+        "research_derived_format_requirements": {
+            "expert_trace_keys": [
+                "sequence_id",
+                "token_position",
+                "layer_id",
+                "router_topk",
+                "router_scores",
+                "selected_experts",
+                "previous_layer_experts",
+                "previous_token_experts",
+            ],
+            "expert_prefetch_policy_keys": [
+                "prefetch_distance",
+                "cache_priority",
+                "eviction_score",
+                "hit_rate_ema",
+                "miss_latency_us",
+                "load_latency_us",
+                "compute_overlap_window_us",
+            ],
+            "kv_quant_policy_keys": [
+                "k_bits",
+                "v_bits",
+                "normal_bits",
+                "outlier_bits",
+                "outlier_channels",
+                "group_size",
+                "page_size_tokens",
+                "enable_rotation",
+                "rotation_seed",
+                "enable_qjl",
+                "qjl_seed",
+            ],
+            "required_runtime_metrics": [
+                "ppl",
+                "first_token_target_rank",
+                "first_token_target_logprob",
+                "tokens_per_second",
+                "time_to_first_token_ms",
+                "expert_hit_rate",
+                "expert_miss_latency_us",
+                "kv_cache_bytes",
+                "qkv_error_vs_plain",
+                "ram_used_bytes",
+                "vram_used_bytes",
+                "gpu_util_pct",
+                "cpu_pct",
+            ],
         },
         "metrics_required": [
             "expert_hit_rate",
@@ -2073,6 +2303,16 @@ def juju_contract_metadata(contract, source_name, source_repo_id, runtime_arch=N
         "validation_contract": juju_validation_contract(),
         "execution_correctness_contract": correctness,
         "research_offload_contract": juju_research_offload_contract(),
+        "runtime_contract_complete": True,
+        "runtime_contract_views": [
+            "root_metadata",
+            "qkv_policy",
+            "kv_layout",
+            "runtime_policy",
+            "graph_ir",
+            "execution_correctness",
+            "bottleneck_trace",
+        ],
         "runtime_adapter_contract": {
             "weight_source": "juju_tensor_index",
             "offset_unit": "absolute_file_byte_offset",
@@ -2094,6 +2334,7 @@ def juju_contract_metadata(contract, source_name, source_repo_id, runtime_arch=N
             "required_trace_fields": correctness["performance"]["trace_token_layer_phase_required"],
         },
     }
+    out.update(_juju_qkv_contract_fields(qkv))
     for src, dst in (
         ("k_bits", "k_bits"),
         ("v_bits", "v_bits"),
@@ -2420,10 +2661,15 @@ def juju_tensor_file_order_key(tensor, bucket):
     priority = tensor_runtime_priority(name, bucket, tensor.get("bytes"))
     meta = juju_tensor_execution_metadata(name, bucket, 0, layout, priority)
     section_rank = {name: idx for idx, name in enumerate(JUJU_TENSOR_BUCKET_ORDER)}.get(bucket, 99)
+    routed = is_routed_expert_tensor_name(name)
+    expert_id = _juju_expert_id_from_name(name)
+    projection_order = _juju_projection_order_value(name)
     return (
         section_rank,
         str(meta.get("file_locality_group") or ""),
         int(meta.get("execution_layer", -1)),
+        int(expert_id) if routed and expert_id is not None else -1,
+        int(projection_order) if routed else int(meta.get("execution_order", 500)),
         int(meta.get("execution_order", 500)),
         -int(priority.get("runtime_priority") or 0),
         name,
@@ -2459,13 +2705,18 @@ def _juju_runtime_tensor_ref(rec):
         "prefetch_priority": _juju_record_int(rec, "prefetch_priority", 0),
         "prefetch_class": rec.get("prefetch_class"),
         "residency_hint": rec.get("residency_hint"),
+        "expert_layout": rec.get("expert_layout"),
+        "combined_gate_up_split": rec.get("combined_gate_up_split"),
     }
 
 
 def _juju_execution_sort_key(rec):
+    name = rec.get("name")
     return (
         str(rec.get("file_locality_group") or ""),
         _juju_record_int(rec, "execution_layer", -1),
+        _juju_expert_id_from_name(name) if _juju_expert_id_from_name(name) is not None else -1,
+        _juju_projection_order_value(name) if is_routed_expert_tensor_name(name) else _juju_record_int(rec, "execution_order", 500),
         _juju_record_int(rec, "execution_order", 500),
         -_juju_record_int(rec, "prefetch_priority", 0),
         -_juju_record_int(rec, "runtime_priority", 0),
@@ -2711,6 +2962,10 @@ def _juju_qkv_runtime_policy(contract, qkv):
     qkv = dict(qkv or {})
     has_qkv = True
     qkv_required = _juju_qkv_required(contract, qkv)
+    enable_qjl = bool(_juju_bool_or_none(qkv.get("enable_qjl")))
+    enable_rotation = _juju_bool_or_none(qkv.get("enable_rotation"))
+    if enable_rotation is None:
+        enable_rotation = True
     return {
         "format": "JUJU_KV_RUNTIME_POLICY_V1",
         "available_backends": [
@@ -2725,6 +2980,23 @@ def _juju_qkv_runtime_policy(contract, qkv):
         "qkv_must_match_plain_within_eval_tolerance_before_ppl_accept": has_qkv,
         "decode_update_mode": qkv.get("runtime_update_mode") or "incremental_append_current_token_no_full_context_requantize",
         "persistent_plain_kv_cache_allowed": False,
+        "qkv_policy_contract": qkv,
+        "k_bits": _juju_int_or_none(qkv.get("k_bits")),
+        "v_bits": _juju_int_or_none(qkv.get("v_bits")),
+        "key_bits": _juju_int_or_none(qkv.get("k_bits")),
+        "value_bits": _juju_int_or_none(qkv.get("v_bits")),
+        "normal_bits": _juju_int_or_none(qkv.get("normal_bits")),
+        "outlier_channels": _juju_int_or_none(qkv.get("outlier_channels")),
+        "outlier_bits": _juju_int_or_none(qkv.get("outlier_bits")),
+        "group_size": _juju_int_or_none(qkv.get("group_size")),
+        "page_size_tokens": _juju_int_or_none(qkv.get("page_size_tokens")),
+        "sink_tokens": _juju_int_or_none(qkv.get("sink_tokens")),
+        "enable_qjl": enable_qjl,
+        "qjl_enabled": enable_qjl,
+        "enable_rotation": bool(enable_rotation),
+        "rotation_enabled": bool(enable_rotation),
+        "rotation_seed": _juju_int_or_none(qkv.get("rotation_seed")),
+        "qjl_seed": _juju_int_or_none(qkv.get("qjl_seed")),
         "qkv_state_key_scope": [
             "request_id",
             "layer",
@@ -2741,6 +3013,46 @@ def _juju_qkv_runtime_policy(contract, qkv):
             "different_policy",
         ],
         "executor_contract": "do_not_use_head_only_qkv_state_cache; layer_and_epoch_are_part_of_identity",
+    }
+
+
+def _juju_qkv_contract_fields(qkv):
+    qkv = _juju_effective_qkv_schema({"qkv_policy_contract": dict(qkv or {})}, {})
+    enable_qjl = bool(_juju_bool_or_none(qkv.get("enable_qjl")))
+    enable_rotation = _juju_bool_or_none(qkv.get("enable_rotation"))
+    if enable_rotation is None:
+        enable_rotation = True
+    return {
+        "qkv_policy_contract": qkv,
+        "qkv_cache_schema_effective": qkv,
+        "qkv_packed_cache_required": True,
+        "required_quantized_qkv": True,
+        "persistent_plain_kv_cache_allowed": False,
+        "plain_kv_persistent_storage": False,
+        "plain_fallback_allowed": False,
+        "plain_kv_runtime_allowed": False,
+        "k_bits": _juju_int_or_none(qkv.get("k_bits")),
+        "v_bits": _juju_int_or_none(qkv.get("v_bits")),
+        "key_bits": _juju_int_or_none(qkv.get("k_bits")),
+        "value_bits": _juju_int_or_none(qkv.get("v_bits")),
+        "normal_bits": _juju_int_or_none(qkv.get("normal_bits")),
+        "outlier_channels": _juju_int_or_none(qkv.get("outlier_channels")),
+        "outlier_bits": _juju_int_or_none(qkv.get("outlier_bits")),
+        "group_size": _juju_int_or_none(qkv.get("group_size")),
+        "page_size_tokens": _juju_int_or_none(qkv.get("page_size_tokens")),
+        "sink_tokens": _juju_int_or_none(qkv.get("sink_tokens")),
+        "enable_qjl": enable_qjl,
+        "qjl_enabled": enable_qjl,
+        "enable_rotation": bool(enable_rotation),
+        "rotation_enabled": bool(enable_rotation),
+        "rotation_seed": _juju_int_or_none(qkv.get("rotation_seed")),
+        "qjl_seed": _juju_int_or_none(qkv.get("qjl_seed")),
+        "qjl": dict(qkv.get("qjl") or {}),
+        "rotation": dict(qkv.get("rotation") or {}),
+        "normal": dict(qkv.get("normal") or {}),
+        "outlier": dict(qkv.get("outlier") or {}),
+        "residency": dict(qkv.get("residency") or {}),
+        "cache_layout": dict(qkv.get("cache_layout") or {}),
     }
 
 
@@ -2876,6 +3188,11 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
     qkv.setdefault("normal_bits", 8)
     qkv.setdefault("enable_qjl", False)
     qkv.setdefault("enable_rotation", True)
+    qkv.setdefault("rotation_seed", 1234)
+    qkv.setdefault("qjl_seed", 5678)
+    qkv.setdefault("outlier_channels", 32)
+    qkv.setdefault("outlier_bits", 3)
+    qkv.setdefault("sink_tokens", 4)
     qkv.setdefault("group_size", 64)
     qkv.setdefault("page_size_tokens", 16)
     qkv.setdefault("cache_dtype", "qkv_quantized_uint_packed")
@@ -2904,6 +3221,8 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         qkv["validation"]["required_quantized_qkv"] = True
         qkv["validation"]["plain_reference_is_eval_probe_only"] = True
         qkv["validation"]["reject_generation_if_qkv_backend_unavailable"] = True
+        qkv["validation"]["qkv_decode_requires_plain_comparison_probe"] = True
+        qkv["validation"]["ppl_must_use_plain_reference_or_validated_qkv"] = True
     fill("num_attention_heads", _juju_first_config_value(contract, "num_attention_heads", "n_heads"), runtime_arch.get("num_attention_heads"), runtime_arch.get("n_heads"))
     fill("num_key_value_heads", _juju_first_config_value(contract, "num_key_value_heads", "n_kv_heads"), runtime_arch.get("num_key_value_heads"), runtime_arch.get("n_kv_heads"))
     fill("num_global_key_value_heads", _juju_first_config_value(contract, "num_global_key_value_heads"), runtime_arch.get("num_global_key_value_heads"), qkv.get("num_key_value_heads"))
@@ -2912,11 +3231,59 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
     fill("global_head_dim", _juju_first_config_value(contract, "global_head_dim", "global_key_length"), runtime_arch.get("global_head_dim"), qkv.get("head_dim"))
     fill("global_value_head_dim", _juju_first_config_value(contract, "global_value_head_dim", "global_value_length"), runtime_arch.get("global_value_head_dim"), qkv.get("global_head_dim"))
     fill("max_seq_len", _juju_first_config_value(contract, "max_position_embeddings", "max_seq_len", "context_length"), runtime_arch.get("max_position_embeddings"), runtime_arch.get("context_length"))
+    k_bits = _juju_int_or_none(qkv.get("k_bits"))
+    v_bits = _juju_int_or_none(qkv.get("v_bits"))
+    normal_bits = _juju_int_or_none(qkv.get("normal_bits"))
+    outlier_channels = _juju_int_or_none(qkv.get("outlier_channels"))
+    outlier_bits = _juju_int_or_none(qkv.get("outlier_bits"))
+    group_size = _juju_int_or_none(qkv.get("group_size"))
+    page_tokens = _juju_int_or_none(qkv.get("page_size_tokens"))
+    sink_tokens = _juju_int_or_none(qkv.get("sink_tokens"))
+    enable_qjl = bool(_juju_bool_or_none(qkv.get("enable_qjl")))
+    enable_rotation = _juju_bool_or_none(qkv.get("enable_rotation"))
+    if enable_rotation is None:
+        enable_rotation = True
+    qkv.update({
+        "k_bits": k_bits,
+        "v_bits": v_bits,
+        "key_bits": k_bits,
+        "value_bits": v_bits,
+        "normal_bits": normal_bits,
+        "outlier_channels": outlier_channels,
+        "outlier_bits": outlier_bits,
+        "group_size": group_size,
+        "page_size_tokens": page_tokens,
+        "sink_tokens": sink_tokens,
+        "enable_qjl": enable_qjl,
+        "qjl_enabled": enable_qjl,
+        "enable_rotation": bool(enable_rotation),
+        "rotation_enabled": bool(enable_rotation),
+        "qkv_packed_cache_required": True,
+        "required_quantized_qkv": True,
+        "persistent_plain_kv_cache_allowed": False,
+        "plain_kv_persistent_storage": False,
+        "plain_fallback_allowed": False,
+        "plain_kv_runtime_allowed": False,
+    })
+    qkv["normal"] = {"bits": normal_bits}
+    qkv["outlier"] = {"channels": outlier_channels, "bits": outlier_bits}
+    qkv["residency"] = {"sink_tokens": sink_tokens, "policy": qkv.get("residency_policy")}
+    qkv["rotation"] = {"enabled": bool(enable_rotation), "seed": _juju_int_or_none(qkv.get("rotation_seed"))}
+    qkv["qjl"] = {"enabled": enable_qjl, "seed": _juju_int_or_none(qkv.get("qjl_seed"))}
+    qkv["cache_layout"] = {
+        "backend": qkv.get("backend"),
+        "dtype": qkv.get("cache_dtype"),
+        "group_size": group_size,
+        "page_size_tokens": page_tokens,
+        "sink_tokens": sink_tokens,
+        "state_identity": qkv.get("state_identity"),
+    }
     return qkv
 
 
 def _juju_execution_correctness_contract(contract, runtime_arch, qkv):
     runtime_arch = dict(runtime_arch or {})
+    qkv_fields = _juju_qkv_contract_fields(qkv)
     return {
         "format": "JUJU_EXECUTION_CORRECTNESS_CONTRACT_V1",
         "tokenizer": {
@@ -2943,8 +3310,14 @@ def _juju_execution_correctness_contract(contract, runtime_arch, qkv):
                 "key": _juju_int_or_none(qkv.get("k_bits")),
                 "value": _juju_int_or_none(qkv.get("v_bits")),
                 "normal": _juju_int_or_none(qkv.get("normal_bits")),
+                "outlier": _juju_int_or_none(qkv.get("outlier_bits")),
                 "group_size": _juju_int_or_none(qkv.get("group_size")),
+                "page_size_tokens": _juju_int_or_none(qkv.get("page_size_tokens")),
+                "sink_tokens": _juju_int_or_none(qkv.get("sink_tokens")),
+                "enable_qjl": bool(_juju_bool_or_none(qkv.get("enable_qjl"))),
+                "enable_rotation": bool(_juju_bool_or_none(qkv.get("enable_rotation"))),
             },
+            "qkv_contract": qkv_fields,
         },
         "tensor_layout": {
             "executor_must_use_tensor_index_shape_offset_size_row_stride": True,
@@ -3050,6 +3423,7 @@ def _juju_kv_layout_contract(contract, runtime_arch):
     )
     page_tokens = _juju_first_int(qkv.get("page_size_tokens"), qkv.get("block_size_tokens"), 16) or 16
     entry_dtype = _juju_scalar_value(qkv.get("dtype") or qkv.get("cache_dtype")) or "quantized_uint_packed"
+    qkv_fields = _juju_qkv_contract_fields(qkv)
     return {
         "format": "JUJU_KV_LAYOUT_CONTRACT_V1",
         "layout": "qkv_quantized_per_layer_head_page_major",
@@ -3074,6 +3448,23 @@ def _juju_kv_layout_contract(contract, runtime_arch):
         "key_bits": _juju_int_or_none(qkv.get("k_bits")),
         "value_bits": _juju_int_or_none(qkv.get("v_bits")),
         "normal_bits": _juju_int_or_none(qkv.get("normal_bits")),
+        "outlier_channels": _juju_int_or_none(qkv.get("outlier_channels")),
+        "outlier_bits": _juju_int_or_none(qkv.get("outlier_bits")),
+        "group_size": _juju_int_or_none(qkv.get("group_size")),
+        "sink_tokens": _juju_int_or_none(qkv.get("sink_tokens")),
+        "enable_qjl": bool(_juju_bool_or_none(qkv.get("enable_qjl"))),
+        "qjl_enabled": bool(_juju_bool_or_none(qkv.get("enable_qjl"))),
+        "enable_rotation": bool(_juju_bool_or_none(qkv.get("enable_rotation"))),
+        "rotation_enabled": bool(_juju_bool_or_none(qkv.get("enable_rotation"))),
+        "rotation_seed": _juju_int_or_none(qkv.get("rotation_seed")),
+        "qjl_seed": _juju_int_or_none(qkv.get("qjl_seed")),
+        "qjl": qkv_fields["qjl"],
+        "rotation": qkv_fields["rotation"],
+        "normal": qkv_fields["normal"],
+        "outlier": qkv_fields["outlier"],
+        "residency": qkv_fields["residency"],
+        "cache_layout": qkv_fields["cache_layout"],
+        "qkv_policy_contract": qkv_fields["qkv_policy_contract"],
         "scale_dtype": _juju_scalar_value(qkv.get("scale_dtype")) or "float32",
         "zero_dtype": _juju_scalar_value(qkv.get("zero_dtype")) or "float32",
         "entry_dim": entry_dim,
@@ -3165,6 +3556,10 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
 
     layer_prefetch_plan = _juju_build_layer_prefetch_plan(tensor_records, layers)
     kv_layout_contract = _juju_kv_layout_contract(contract, runtime_arch)
+    qkv_fields = _juju_qkv_contract_fields(_juju_effective_qkv_schema(contract, runtime_arch))
+    expert_tier_entries = _juju_expert_tier_entries(tensor_records, contract)
+    expert_offset_table = _juju_expert_offset_table(tensor_records, contract)
+    moe_layers, moe_layer_bitmask_words = _juju_moe_layer_bitmask_words(tensor_records)
     executor_tensor_table = [
         _juju_runtime_tensor_ref(rec)
         for rec in sorted(tensor_records or [], key=_juju_execution_sort_key)
@@ -3173,7 +3568,7 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
         "format": "JUJU_RUNTIME_ACCESS_PLAN_V1",
         "version": 2,
         "source": "tensor_index_execution_metadata",
-        "sort_key": ["file_locality_group", "execution_layer", "execution_order", "runtime_priority"],
+        "sort_key": ["file_locality_group", "execution_layer", "expert_id", "projection_order", "execution_order", "runtime_priority"],
         "executor_contract": {
             "tensor_table_required": True,
             "layer_prefetch_plan_required": True,
@@ -3213,6 +3608,12 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
         "file_locality_group_count": len(file_group_list),
         "file_locality_groups": file_group_list,
         "per_layer": per_layer,
+        "moe_layers": moe_layers,
+        "moe_layer_bitmask_words": moe_layer_bitmask_words,
+        "expert_tier_entries": expert_tier_entries,
+        "expert_offset_table": expert_offset_table,
+        "expert_offset_table_kind": "layer_expert_projection_o1_lookup",
+        "router_calibration_manifest": router_calibration_manifest_from_juju_idx({"tensors": tensor_records}),
         "layer_prefetch_plan_count": len(layer_prefetch_plan),
         "layer_prefetch_plan": layer_prefetch_plan,
         "prefetch_schedule": {
@@ -3235,7 +3636,13 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
             },
         },
         "kv_layout_contract": kv_layout_contract,
+        "qkv_policy_contract": qkv_fields["qkv_policy_contract"],
+        "qkv_cache_schema_effective": qkv_fields["qkv_cache_schema_effective"],
         "bottleneck_trace_contract": {
+            "contract_required": True,
+            "qkv_contract": qkv_fields,
+            "kv_layout_ref": "runtime_access_plan.kv_layout_contract",
+            "qkv_policy_ref": "runtime_access_plan.qkv_policy_contract",
             "token_level": ["forward_token_begin", "cpu_ram", "kv_cache", "io_pipeline", "forward_layer", "forward_token_end"],
             "stage_level": ["forward_embed", "attn_standard_qkv_norm", "mlp_moe_end", "lm_head_logprob_end"],
             "required_counters": [
@@ -3259,6 +3666,18 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
                 "queue_depth",
                 "inflight",
                 "kv_bytes",
+                "qkv_k_bits",
+                "qkv_v_bits",
+                "qkv_normal_bits",
+                "qkv_outlier_bits",
+                "qkv_group_size",
+                "qkv_page_size_tokens",
+                "qkv_qjl_enabled",
+                "qkv_rotation_enabled",
+                "process_rss_bytes",
+                "available_ram_bytes",
+                "device_total_bytes",
+                "device_free_bytes",
             ],
         },
     }
@@ -3295,6 +3714,341 @@ def _juju_expert_projection_name(name):
     if "ffn_down_exps.weight" in lower or "down_proj" in lower or "ffn_down" in lower:
         return "down"
     return "expert"
+
+
+def _juju_projection_order_value(name):
+    proj = _juju_expert_projection_name(name)
+    return {"gate_up": 0, "gate": 1, "up": 2, "down": 3}.get(proj, 9)
+
+
+def _juju_expert_id_from_name(name):
+    lower = str(name or "").lower()
+    patterns = (
+        r"(?:^|[._])experts?[._](\d+)(?:[._]|$)",
+        r"(?:^|[._])exps[._](\d+)(?:[._]|$)",
+        r"(?:^|[._])expert_(\d+)(?:[._]|$)",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, lower)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _juju_expert_count_from_shape(shape):
+    values = [int(v or 0) for v in (shape or [])]
+    if len(values) >= 3 and values[2] > 0:
+        return int(values[2])
+    return 0
+
+
+def _juju_expert_activation_prior(contract, layer, expert, expert_count):
+    stats = contract.get("expert_activation_stats") or contract.get("activation_stats") or {}
+    layer_keys = (str(layer), int(layer))
+    expert_keys = (str(expert), int(expert))
+    for layer_key in layer_keys:
+        layer_value = stats.get(layer_key) if isinstance(stats, dict) else None
+        if isinstance(layer_value, dict):
+            candidates = (
+                layer_value.get("experts"),
+                layer_value.get("expert_frequency"),
+                layer_value.get("activation_frequency"),
+                layer_value,
+            )
+            for candidate in candidates:
+                if isinstance(candidate, dict):
+                    for expert_key in expert_keys:
+                        value = candidate.get(expert_key)
+                        if isinstance(value, dict):
+                            value = (
+                                value.get("frequency") or
+                                value.get("activation_prior") or
+                                value.get("probability") or
+                                value.get("count")
+                            )
+                        if value is not None:
+                            try:
+                                return max(0.0, float(value))
+                            except Exception:
+                                pass
+                elif isinstance(candidate, list) and 0 <= int(expert) < len(candidate):
+                    try:
+                        return max(0.0, float(candidate[int(expert)]))
+                    except Exception:
+                        pass
+    flat = contract.get("expert_activation_priors")
+    if isinstance(flat, list):
+        for item in flat:
+            if not isinstance(item, dict):
+                continue
+            if int(item.get("layer", -1)) == int(layer) and int(item.get("expert", -1)) == int(expert):
+                try:
+                    return max(0.0, float(item.get("activation_prior") or item.get("frequency") or item.get("score") or 0.0))
+                except Exception:
+                    return 0.0
+    return 1.0 / max(1, int(expert_count or 1))
+
+
+def _juju_activation_prior_source(contract):
+    if contract.get("expert_activation_stats") or contract.get("activation_stats") or contract.get("expert_activation_priors"):
+        return "calibration_or_runtime_stats"
+    return "structural_uniform_no_calibration"
+
+
+def _juju_static_buddy_ids(expert, expert_count, max_buddies=MOE_JUJU_MAX_BUDDIES if "MOE_JUJU_MAX_BUDDIES" in globals() else 8):
+    n = int(expert_count or 0)
+    e = int(expert or 0)
+    if n <= 1:
+        return []
+    candidates = []
+    for delta in (1, -1, 2, -2, 4, -4, 8, -8):
+        buddy = (e + delta) % n
+        if buddy != e and buddy not in candidates:
+            candidates.append(buddy)
+        if len(candidates) >= int(max_buddies):
+            break
+    return candidates
+
+
+def _juju_expert_tier_entries(tensor_records, contract):
+    layer_to_experts = {}
+    for rec in tensor_records or []:
+        if not is_routed_expert_tensor_name(rec.get("name")):
+            continue
+        layer = _juju_layer_id_from_name(rec.get("name"))
+        if layer is None:
+            continue
+        count = _juju_expert_count_from_shape(rec.get("shape"))
+        explicit = _juju_expert_id_from_name(rec.get("name"))
+        if count <= 0 and explicit is not None:
+            count = explicit + 1
+        if count <= 0:
+            continue
+        layer_to_experts[int(layer)] = max(int(count), layer_to_experts.get(int(layer), 0))
+
+    hot_pct = float(contract_value(contract, "expert_tier_hot_percentile", "expert_tier_policy.hot_percentile", default=0.10) or 0.10)
+    warm_pct = float(contract_value(contract, "expert_tier_warm_percentile", "expert_tier_policy.warm_percentile", default=0.35) or 0.35)
+    hot_pct = min(max(hot_pct, 0.0), 1.0)
+    warm_pct = min(max(warm_pct, hot_pct), 1.0)
+    source = _juju_activation_prior_source(contract)
+    out = []
+    for layer in sorted(layer_to_experts):
+        expert_count = int(layer_to_experts[layer])
+        rows = []
+        total = 0.0
+        for expert in range(expert_count):
+            prior = _juju_expert_activation_prior(contract, layer, expert, expert_count)
+            rows.append([expert, prior])
+            total += prior
+        if total > 0.0:
+            rows = [[expert, prior / total] for expert, prior in rows]
+        rows.sort(key=lambda item: (-item[1], item[0]))
+        hot_n = int(math.ceil(expert_count * hot_pct)) if source != "structural_uniform_no_calibration" else 0
+        warm_n = int(math.ceil(expert_count * warm_pct)) if source != "structural_uniform_no_calibration" else 0
+        for rank, (expert, prior) in enumerate(rows):
+            if rank < hot_n:
+                tier = "hot"
+                residency = "FAST_MEM_STREAMABLE"
+                runtime_priority = 78
+                prefetch_priority = 94
+            elif rank < warm_n:
+                tier = "warm"
+                residency = "FAST_MEM_STREAMABLE"
+                runtime_priority = 70
+                prefetch_priority = 88
+            else:
+                tier = "cold"
+                residency = "SLOW_MEM"
+                runtime_priority = 65
+                prefetch_priority = 80
+            out.append({
+                "layer": int(layer),
+                "expert": int(expert),
+                "rank": int(rank),
+                "tier": tier,
+                "activation_prior": round(float(prior), 12),
+                "activation_prior_source": source,
+                "runtime_priority": int(runtime_priority),
+                "prefetch_priority": int(prefetch_priority),
+                "residency_hint": residency,
+                "buddy_expert_ids": _juju_static_buddy_ids(expert, expert_count),
+            })
+    return out
+
+
+def _juju_expert_tier_lookup(tensor_records, contract):
+    return {
+        (int(item["layer"]), int(item["expert"])): item
+        for item in _juju_expert_tier_entries(tensor_records, contract)
+    }
+
+
+def _juju_moe_layer_bitmask_words(tensor_records):
+    layers = sorted({
+        int(_juju_layer_id_from_name(rec.get("name")))
+        for rec in tensor_records or []
+        if is_routed_expert_tensor_name(rec.get("name")) and _juju_layer_id_from_name(rec.get("name")) is not None
+    })
+    if not layers:
+        return [], []
+    max_layer = max(layers)
+    words = [0] * ((max_layer // 64) + 1)
+    for layer in layers:
+        words[layer // 64] |= 1 << (layer % 64)
+    return layers, words
+
+
+def _juju_expert_offset_table(tensor_records, contract):
+    lookup = _juju_expert_tier_lookup(tensor_records, contract)
+    rows = []
+    for rec in tensor_records or []:
+        if not is_routed_expert_tensor_name(rec.get("name")):
+            continue
+        layout = rec.get("expert_layout") or {}
+        layer = layout.get("layer")
+        if layer is None:
+            layer = _juju_layer_id_from_name(rec.get("name"))
+        expert_count = int(layout.get("expert_count") or _juju_expert_count_from_shape(rec.get("shape")) or 0)
+        base_offset = int(layout.get("base_offset") or rec.get("juju_offset") or rec.get("offset") or 0)
+        total_bytes = int(rec.get("juju_bytes") or rec.get("bytes") or rec.get("source_bytes") or 0)
+        per_expert = int(layout.get("per_expert_bytes") or (total_bytes // max(1, expert_count) if expert_count > 0 else 0))
+        projection = layout.get("projection") or _juju_expert_projection_name(rec.get("name"))
+        if layer is None or expert_count <= 0 or per_expert <= 0:
+            continue
+        split = rec.get("combined_gate_up_split") or {}
+        for expert in range(expert_count):
+            tier = lookup.get((int(layer), int(expert)), {})
+            row = {
+                "layer": int(layer),
+                "expert": int(expert),
+                "projection": projection,
+                "offset": int(base_offset + expert * per_expert),
+                "bytes": int(per_expert),
+                "tier": tier.get("tier", "cold"),
+                "activation_prior": tier.get("activation_prior", 0.0),
+                "prefetch_priority": int(tier.get("prefetch_priority", rec.get("prefetch_priority") or 80)),
+                "runtime_priority": int(tier.get("runtime_priority", rec.get("runtime_priority") or 65)),
+                "residency_hint": tier.get("residency_hint", rec.get("residency_hint") or "SLOW_MEM"),
+            }
+            if split.get("enabled"):
+                row["combined_gate_up_split"] = {
+                    "gate_offset": int(row["offset"] + int(split.get("gate_rel_offset") or 0)),
+                    "gate_bytes": int(split.get("gate_bytes") or 0),
+                    "up_offset": int(row["offset"] + int(split.get("up_rel_offset") or 0)),
+                    "up_bytes": int(split.get("up_bytes") or 0),
+                }
+            rows.append(row)
+    rows.sort(key=lambda item: (item["layer"], item["expert"], _juju_projection_order_value(item["projection"])))
+    return rows
+
+
+def juju_section_priority(bucket):
+    table = {
+        "shared_weights": 100,
+        "hot_experts": 88,
+        "warm_experts": 76,
+        "cold_experts": 60,
+        "vision_projector": 58,
+        "vision_encoder": 48,
+        "audio_encoder": 46,
+        "video_encoder": 44,
+        "document_encoder": 42,
+    }
+    return int(table.get(str(bucket or ""), 50))
+
+
+def juju_section_io_hints(bucket, size=0, contract=None):
+    bucket = str(bucket or "")
+    hw = {}
+    if isinstance(contract, dict):
+        hw = (
+            contract.get("juju_hw") or
+            contract.get("hardware_profile") or
+            contract.get("hardware_probe") or
+            {}
+        )
+    nvme_block = int(contract_value(hw, "nvme.sequential_block_size", "storage.sequential_block_size", default=0) or 0)
+    if bucket == "cold_experts":
+        seq = nvme_block or 512 * 1024
+        rnd = 4096
+        mmap = 0
+        distance = 3 if int(size or 0) >= 512 * 1024 * 1024 else 2
+    elif bucket == "warm_experts":
+        seq = nvme_block or 64 * 1024
+        rnd = 4096
+        mmap = 0
+        distance = 2
+    elif bucket == "hot_experts":
+        seq = 64 * 1024
+        rnd = 4096
+        mmap = 1
+        distance = 1
+    elif bucket == "shared_weights":
+        seq = 4096
+        rnd = 4096
+        mmap = 1
+        distance = 0
+    else:
+        seq = 256 * 1024
+        rnd = 4096
+        mmap = 0
+        distance = 1
+    return {
+        "sequential_block_size": int(seq),
+        "random_block_size": int(rnd),
+        "mmap_friendly": int(mmap),
+        "prefetch_distance": int(distance),
+        "section_priority": juju_section_priority(bucket),
+    }
+
+
+def juju_tensor_expert_layout_fields(tensor, tensor_offset, layout, contract):
+    name = tensor.get("name")
+    if not is_routed_expert_tensor_name(name):
+        return {}
+    shape = [int(v or 0) for v in (tensor.get("shape") or [])]
+    expert_count = _juju_expert_count_from_shape(shape)
+    if expert_count <= 0:
+        explicit = _juju_expert_id_from_name(name)
+        expert_count = explicit + 1 if explicit is not None else 0
+    if expert_count <= 0:
+        return {"expert_layout": {"kind": "routed_expert_unknown_axis", "requires_tensor_index_lookup": True}}
+    total_bytes = int(layout.get("juju_bytes") or tensor.get("bytes") or 0)
+    per_expert = total_bytes // max(1, expert_count)
+    combined_gate_up = "ffn_gate_up_exps.weight" in str(name or "").lower() or _juju_expert_projection_name(name) == "gate_up"
+    split_bytes = per_expert // 2 if combined_gate_up else 0
+    segment_target = int(contract_value(
+        contract,
+        "preferred_segment_bytes",
+        "chunk_io_contract.preferred_segment_bytes",
+        "expert_segmentation_contract.preferred_segment_bytes",
+        default=1024 * 1024,
+    ) or (1024 * 1024))
+    segment_count = max(1, min(4, int(math.ceil(per_expert / max(1, segment_target)))))
+    return {
+        "expert_axis": 2 if len(shape) >= 3 else -1,
+        "expert_count": int(expert_count),
+        "per_expert_bytes": int(per_expert),
+        "expert_offset_formula": "juju_offset + expert_id * per_expert_bytes",
+        "expert_layout": {
+            "kind": "expert_contiguous_inside_tensor",
+            "layer": _juju_layer_id_from_name(name),
+            "projection": _juju_expert_projection_name(name),
+            "expert_axis": 2 if len(shape) >= 3 else -1,
+            "expert_count": int(expert_count),
+            "base_offset": int(tensor_offset),
+            "per_expert_bytes": int(per_expert),
+            "segment_count_per_expert": int(segment_count),
+            "segment_bytes_target": int(segment_target),
+        },
+        "combined_gate_up_split": {
+            "enabled": bool(combined_gate_up),
+            "gate_rel_offset": 0,
+            "gate_bytes": int(split_bytes) if combined_gate_up else 0,
+            "up_rel_offset": int(split_bytes) if combined_gate_up else 0,
+            "up_bytes": int(per_expert - split_bytes) if combined_gate_up else 0,
+        },
+    }
 
 
 def juju_tensor_segmentation_fields(name, bucket, contract):
@@ -3375,9 +4129,34 @@ def _juju_layer_expert_groups(tensor_records):
 
 def build_juju_predictor_section(tensor_records, contract, split_meta):
     expert_layers = _juju_layer_expert_groups(tensor_records)
+    tier_entries = _juju_expert_tier_entries(tensor_records, contract)
+    by_layer = {}
+    for item in tier_entries:
+        by_layer.setdefault(int(item["layer"]), []).append(item)
+    transitions = []
+    for layer in sorted(by_layer):
+        next_layer = layer + 1
+        if next_layer not in by_layer:
+            continue
+        src = sorted(by_layer[layer], key=lambda item: item["rank"])
+        dst = sorted(by_layer[next_layer], key=lambda item: item["rank"])
+        for rank, item in enumerate(src):
+            if not dst:
+                break
+            target = dst[min(rank, len(dst) - 1)]
+            transitions.append({
+                "from_layer": int(layer),
+                "from_expert": int(item["expert"]),
+                "to_layer": int(next_layer),
+                "to_expert": int(target["expert"]),
+                "probability": round(float(item.get("activation_prior") or 0.0), 12),
+                "source": item.get("activation_prior_source", "structural_uniform_no_calibration"),
+            })
+    source = _juju_activation_prior_source(contract)
     return {
         "format": "JUJU_PREDICTOR_BOOTSTRAP_V1",
-        "trained_weights_embedded": False,
+        "trained_weights_embedded": source != "structural_uniform_no_calibration",
+        "predictor_payload_embedded": True,
         "runtime_mutable": True,
         "scope": "layer_expert_prefetch",
         "split": split_meta,
@@ -3388,18 +4167,34 @@ def build_juju_predictor_section(tensor_records, contract, split_meta):
             "prefetch_miss_feedback",
         ],
         "fallback_policy": {
-            "when_no_history": "router_score_order",
-            "cold_start": "bootstrap_layer_order_then_runtime_hits",
+            "when_no_history": "activation_prior_then_router_score_order",
+            "cold_start": "calibration_prior_then_static_transition_then_runtime_hits",
             "avoid_model_specific_constants": True,
+        },
+        "activation_prior_source": source,
+        "expert_activation_priors": tier_entries,
+        "cross_layer_transition_prior": transitions,
+        "calibration_contract": {
+            "mutable_idx_update_only": True,
+            "requires_full_weight_rewrite": False,
+            "router_tensors_only": True,
+            "expert_weights_required": False,
+            "updates": [
+                "expert_activation_priors",
+                "cross_layer_transition_prior",
+                "buddy_expert_ids",
+                "expert_tier_entries",
+            ],
         },
         "expert_layer_count": len(expert_layers),
         "expert_tensor_count": sum(layer["tensor_count"] for layer in expert_layers),
-        "metadata_only": True,
+        "metadata_only": False,
     }
 
 
 def build_juju_buddy_map_section(tensor_records, contract, split_meta):
     expert_layers = _juju_layer_expert_groups(tensor_records)
+    tier_lookup = _juju_expert_tier_lookup(tensor_records, contract)
     buddy_units = []
     expert_bundles = []
     for layer in expert_layers:
@@ -3431,14 +4226,18 @@ def build_juju_buddy_map_section(tensor_records, contract, split_meta):
             projection_order = [p for p in ("gate_up", "gate", "up", "down") if p in per_projection_bytes]
             bundle_bytes = sum(per_projection_bytes.get(p, 0) for p in projection_order)
             for expert_id in range(max_experts):
+                tier = tier_lookup.get((int(layer["layer"]), int(expert_id)), {})
                 expert_bundles.append({
                     "layer": layer["layer"],
                     "expert": expert_id,
                     "unit": "routed_expert_projection_bundle",
                     "projection_order": projection_order,
                     "bytes": int(bundle_bytes),
-                    "buddy_expert_ids": [],
-                    "coactivation_source": "runtime_mutable",
+                    "activation_prior": tier.get("activation_prior", 0.0),
+                    "prefetch_priority": int(tier.get("prefetch_priority", 80)),
+                    "residency_hint": tier.get("residency_hint", "SLOW_MEM"),
+                    "buddy_expert_ids": tier.get("buddy_expert_ids") or _juju_static_buddy_ids(expert_id, max_experts),
+                    "coactivation_source": tier.get("activation_prior_source", "static_same_layer_ring"),
                 })
     return {
         "format": "JUJU_BUDDY_MAP_V1",
@@ -3459,30 +4258,220 @@ def build_juju_tier_hint_section(tensor_records, contract, split_meta):
         rec for rec in tensor_records or []
         if is_routed_expert_tensor_name(rec.get("name"))
     ]
+    tier_entries = _juju_expert_tier_entries(tensor_records, contract)
+    moe_layers, moe_layer_mask = _juju_moe_layer_bitmask_words(tensor_records)
+    expert_offset_table = _juju_expert_offset_table(tensor_records, contract)
+    tier_counts = {"hot": 0, "warm": 0, "cold": 0}
+    for item in tier_entries:
+        tier_counts[item.get("tier", "cold")] = tier_counts.get(item.get("tier", "cold"), 0) + 1
     return {
         "format": "JUJU_TIER_HINT_V1",
         "split": split_meta,
         "bootstrap_policy": {
-            "source": "tensor_name_layer_order",
+            "source": _juju_activation_prior_source(contract),
             "hot_layers_env": "JUJU_BOOTSTRAP_HOT_EXPERT_LAYERS",
             "warm_layers_env": "JUJU_BOOTSTRAP_WARM_EXPERT_LAYERS",
             "runtime_stats_override": True,
             "hardware_cache_override": True,
+            "name_pattern_is_fallback_only": True,
         },
         "bucket_stats": stats,
         "routed_expert_tensor_count": len(routed),
         "hot_expert_tensor_count": int(stats.get("hot_experts", {}).get("tensor_count") or 0),
         "warm_expert_tensor_count": int(stats.get("warm_experts", {}).get("tensor_count") or 0),
         "cold_expert_tensor_count": int(stats.get("cold_experts", {}).get("tensor_count") or 0),
+        "expert_tier_entries": tier_entries,
+        "expert_tier_counts": tier_counts,
+        "expert_offset_table": expert_offset_table,
+        "expert_offset_table_kind": "layer_expert_projection_o1_lookup",
+        "moe_layers": moe_layers,
+        "moe_layer_bitmask_words": moe_layer_mask,
+        "dense_layer_skip_ready": True,
+        "combined_gate_up_split_offsets_ready": any("combined_gate_up_split" in row for row in expert_offset_table),
         "qkv_policy_required": True,
     }
 
 
+def normalize_juju_expert_calibration_stats(stats):
+    out = []
+    if not stats:
+        return out
+    if isinstance(stats, dict):
+        iterable = stats.items()
+    elif isinstance(stats, list):
+        iterable = enumerate(stats)
+    else:
+        return out
+    for layer_key, layer_value in iterable:
+        try:
+            layer = int(str(layer_key).replace("layer_", "").replace("layer.", ""))
+        except Exception:
+            continue
+        if isinstance(layer_value, dict):
+            expert_values = (
+                layer_value.get("experts") or
+                layer_value.get("expert_frequency") or
+                layer_value.get("activation_frequency") or
+                layer_value.get("activation_counts") or
+                layer_value
+            )
+        else:
+            expert_values = layer_value
+        if isinstance(expert_values, dict):
+            pairs = expert_values.items()
+        elif isinstance(expert_values, list):
+            pairs = enumerate(expert_values)
+        else:
+            continue
+        rows = []
+        total = 0.0
+        for expert_key, value in pairs:
+            try:
+                expert = int(str(expert_key).replace("expert_", "").replace("expert.", ""))
+            except Exception:
+                continue
+            if isinstance(value, dict):
+                value = value.get("frequency") or value.get("activation_prior") or value.get("probability") or value.get("count")
+            try:
+                score = max(0.0, float(value))
+            except Exception:
+                continue
+            rows.append([expert, score])
+            total += score
+        if total > 0.0:
+            for expert, score in rows:
+                out.append({
+                    "layer": int(layer),
+                    "expert": int(expert),
+                    "activation_prior": round(float(score / total), 12),
+                })
+    return out
+
+
+def router_calibration_manifest_from_juju_idx(idx):
+    tensors = idx.get("tensors") or (idx.get("graph_ir") or {}).get("runtime_access_plan", {}).get("executor_tensor_table") or []
+    routers = []
+    for rec in tensors:
+        if str(rec.get("execution_op") or rec.get("op") or "").lower() not in {"moe_router", "moe_router_scale"}:
+            continue
+        routers.append({
+            "name": rec.get("name"),
+            "layer": _juju_layer_id_from_name(rec.get("name")),
+            "offset": int(rec.get("juju_offset") or rec.get("offset") or 0),
+            "bytes": int(rec.get("juju_bytes") or rec.get("bytes") or rec.get("source_bytes") or 0),
+            "row_stride_bytes": int(rec.get("row_stride_bytes") or 0),
+            "encoding": rec.get("weight_encoding") or rec.get("encoding"),
+            "shape": list(rec.get("shape") or []),
+        })
+    return {
+        "format": "JUJU_ROUTER_CALIBRATION_MANIFEST_V1",
+        "router_tensor_count": len(routers),
+        "requires_full_weight_download": False,
+        "requires_expert_weight_download": False,
+        "range_read_only": True,
+        "router_tensors": routers,
+    }
+
+
+def apply_juju_expert_calibration_to_idx(idx, calibration_stats):
+    if not isinstance(idx, dict):
+        raise TypeError("idx must be a dict")
+    priors = normalize_juju_expert_calibration_stats(calibration_stats)
+    if not priors:
+        raise ValueError("no calibration expert activation priors found")
+    contract = {
+        "expert_activation_priors": priors,
+        "expert_tier_policy": {
+            "hot_percentile": 0.10,
+            "warm_percentile": 0.35,
+            "hot_threshold": 0.15,
+            "warm_threshold": 0.05,
+        },
+    }
+    tensor_records = idx.get("tensors") or []
+    tier_entries = _juju_expert_tier_entries(tensor_records, contract)
+    offset_table = _juju_expert_offset_table(tensor_records, contract)
+    moe_layers, moe_mask = _juju_moe_layer_bitmask_words(tensor_records)
+    idx["expert_activation_priors"] = priors
+    idx["expert_tier_entries"] = tier_entries
+    idx["expert_offset_table"] = offset_table
+    idx["moe_layers"] = moe_layers
+    idx["moe_layer_bitmask_words"] = moe_mask
+    idx["router_calibration_manifest"] = router_calibration_manifest_from_juju_idx(idx)
+    idx["calibration_update"] = {
+        "format": "JUJU_IDX_CALIBRATION_UPDATE_V1",
+        "mutable_idx_only": True,
+        "requires_juju_weight_rewrite": False,
+        "requires_full_weight_download": False,
+        "activation_prior_count": len(priors),
+        "tier_entry_count": len(tier_entries),
+        "expert_offset_entry_count": len(offset_table),
+    }
+    graph_ir = idx.get("graph_ir")
+    if isinstance(graph_ir, dict):
+        graph_ir["expert_activation_priors"] = priors
+        graph_ir["expert_tier_entries"] = tier_entries
+        graph_ir["expert_offset_table"] = offset_table
+        graph_ir["moe_layer_bitmask_words"] = moe_mask
+        policy = graph_ir.setdefault("moe_offload_policy", {})
+        if isinstance(policy, dict):
+            prefetch = policy.setdefault("prefetch", {})
+            if isinstance(prefetch, dict):
+                prefetch["activation_prior_source"] = "calibration_or_runtime_stats"
+                prefetch["mutable_idx_calibration_applied"] = True
+    return idx
+
+
+def write_calibrated_juju_idx(index_path, calibration_stats, output_path=None):
+    index_path = Path(index_path)
+    output_path = Path(output_path) if output_path else index_path
+    idx = json.loads(index_path.read_text(encoding="utf-8"))
+    apply_juju_expert_calibration_to_idx(idx, calibration_stats)
+    output_path.write_text(json.dumps(idx, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    return {
+        "ok": True,
+        "index_path": str(index_path),
+        "output_path": str(output_path),
+        "activation_prior_count": len(idx.get("expert_activation_priors") or []),
+        "tier_entry_count": len(idx.get("expert_tier_entries") or []),
+    }
+
+
 def build_juju_runtime_metadata_sections(tensor_records, contract, split_meta):
+    qkv_fields = _juju_qkv_contract_fields(_juju_effective_qkv_schema(contract, dict(contract.get("arch_meta") or {})))
+    runtime_contract = {
+        "format": "JUJU_RUNTIME_CONTRACT_SUMMARY_V1",
+        "split": split_meta,
+        "qkv_contract": qkv_fields,
+        "required_views": [
+            "root_metadata",
+            "qkv_policy",
+            "kv_layout",
+            "runtime_policy",
+            "graph_ir",
+            "execution_correctness",
+            "bottleneck_trace",
+        ],
+        "tokenizer_contract": juju_tokenizer_contract(),
+        "validation_contract": juju_validation_contract(),
+        "runtime_loop": "tokenizer_contract_then_graph_ir_ops_then_tensor_layout_then_qkv_cache_then_lm_head",
+        "plain_kv_runtime_allowed": False,
+        "graph_ir_required": True,
+        "tensor_layout_records_required": True,
+        "trace_required": True,
+        "calibration_contract": {
+            "best_path": "runtime_or_router_activation_stats_update_mutable_idx",
+            "requires_juju_weight_rewrite": False,
+            "requires_full_weight_download": False,
+            "router_range_manifest": router_calibration_manifest_from_juju_idx({"tensors": tensor_records}),
+            "idx_update_function": "apply_juju_expert_calibration_to_idx",
+        },
+    }
     return [
         (JUJU_SECTION_PREDICTOR, "PREDICTOR", build_juju_predictor_section(tensor_records, contract, split_meta)),
         (JUJU_SECTION_BUDDY_MAP, "BUDDY_MAP", build_juju_buddy_map_section(tensor_records, contract, split_meta)),
         (JUJU_SECTION_TIER_HINT, "TIER_HINT", build_juju_tier_hint_section(tensor_records, contract, split_meta)),
+        (JUJU_SECTION_RUNTIME_CONTRACT, "RUNTIME_CONTRACT", runtime_contract),
     ]
 
 
@@ -3942,6 +4931,7 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
         rec.get("weight_encoding") is not None
         for rec in (tensor_records or [])
     )
+    qkv_fields = _juju_qkv_contract_fields(_juju_effective_qkv_schema(contract, runtime_arch))
     contract_out = {
         "format": "JUJU_GENERATION_CONTRACT_V1",
         "required_runtime_loop": "tokenizer_contract_then_graph_ir_ops_then_tensor_layout_then_lm_head",
@@ -3966,6 +4956,7 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
             "optional_missing_op_behavior": "documented_fallback_only",
             "tensor_layout_records_complete": bool(tensor_layout_records_complete),
             "kv_layout_contract_available": False,
+            "qkv_contract": qkv_fields,
         },
         "lm_head": {
             "tensor": lm_head,
@@ -3980,6 +4971,7 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
             "required": bool(output_norm),
         },
         "performance_contract": {
+            "qkv_contract": qkv_fields,
             "hot_startup_tensors": [x for x in [token_embd, lm_head, output_norm, _juju_first_tensor(tensor_records, "rope_freqs.weight")] if x],
             "protect_roles": ["token_embedding", "lm_head", "final_norm", "attention", "router", "norm"],
             "sidecar_upload_format": "structured_json_yaml_toml_only_no_generated_md_pdf",
@@ -4010,8 +5002,22 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
                 "io_wait_ms",
                 "queue_depth",
                 "inflight",
+                "qkv_k_bits",
+                "qkv_v_bits",
+                "qkv_normal_bits",
+                "qkv_outlier_bits",
+                "qkv_group_size",
+                "qkv_page_size_tokens",
+                "qkv_qjl_enabled",
+                "qkv_rotation_enabled",
+                "process_rss_bytes",
+                "available_ram_bytes",
+                "device_total_bytes",
+                "device_free_bytes",
             ],
         },
+        "qkv_policy_contract": qkv_fields["qkv_policy_contract"],
+        "qkv_cache_schema_effective": qkv_fields["qkv_cache_schema_effective"],
     }
     contract_out["forward_contract_validation"] = build_juju_forward_contract_validation(
         contract_out,
@@ -4105,10 +5111,14 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
         output_norm=output_norm,
     )
     runtime_access_plan = build_juju_runtime_access_plan(tensor_records, contract, runtime_arch)
+    qkv_fields = _juju_qkv_contract_fields(_juju_effective_qkv_schema(contract, runtime_arch))
     generation_contract["layers"]["kv_layout_contract_available"] = bool(runtime_access_plan.get("kv_layout_contract"))
     generation_contract["layers"]["kv_runtime_policy"] = dict(
         (runtime_access_plan.get("kv_layout_contract") or {}).get("runtime_cache_policy") or {}
     )
+    generation_contract["layers"]["qkv_contract"] = qkv_fields
+    generation_contract["qkv_policy_contract"] = qkv_fields["qkv_policy_contract"]
+    generation_contract["qkv_cache_schema_effective"] = qkv_fields["qkv_cache_schema_effective"]
     generation_contract["forward_contract_validation"] = build_juju_forward_contract_validation(
         generation_contract,
         runtime_arch,
@@ -4177,6 +5187,8 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
         "generation_contract": generation_contract,
         "runtime_access_plan": runtime_access_plan,
         "kv_layout_contract": runtime_access_plan["kv_layout_contract"],
+        "qkv_policy_contract": qkv_fields["qkv_policy_contract"],
+        "qkv_cache_schema_effective": qkv_fields["qkv_cache_schema_effective"],
         "tokenizer_contract": juju_tokenizer_contract(),
         "quantization": {
             "weight": contract.get("weight_quant_schema", {}),
@@ -4292,7 +5304,9 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             "io_policy": {
                 "read_unit": "tensor_span",
                 "alignment": 4096,
-                "mmap": True,
+                "mmap": False,
+                "mmap_scope": "shared_and_hot_sections_only",
+                "cold_experts_io": "direct_aligned_async_read",
                 "stream_large_slow_mem_tensors": True,
                 "protect_fastmem_roles": ["shared_core", "attention", "router", "norm"],
             },
@@ -4306,7 +5320,9 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                     "type": s.get("type", 0),
                     "prefetch_distance": s.get("prefetch_distance", 0),
                     "mmap_friendly": s.get("mmap_friendly", 0),
-                    "priority": 100 if s.get("name") == "SHARED_WEIGHTS" else 70,
+                    "sequential_block_size": s.get("sequential_block_size", 4096),
+                    "random_block_size": s.get("random_block_size", 4096),
+                    "priority": int(s.get("section_priority") or juju_section_priority(str(s.get("name", "")).lower())),
                 }
                 for s in sections
             ],
@@ -4372,7 +5388,14 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                 "enabled": True,
                 "condition": "expert_in_ram_and_decode_batch_le_4",
                 "decision": "cpu_ms < pcie_transfer_ms",
-                "cpu_gflops_default": 100.0,
+                "cpu_gflops_default": float(contract_value(
+                    contract,
+                    "juju_hw.cpu_gflops",
+                    "hardware_profile.cpu_gflops",
+                    "hardware_probe.cpu_gflops",
+                    default=1500.0,
+                ) or 1500.0),
+                "requires_runtime_cpu_probe_override": True,
             },
             "score_aware_precision": {
                 "enabled": True,
@@ -4462,6 +5485,9 @@ def build_juju_shard_plan_from_hf_url(
             "offset": offset,
             "size": len(raw),
             "sha256": hashlib.sha256(raw).hexdigest(),
+            "xxhash128": juju_xxhash128_hex(raw),
+            "checksum_algorithm": "xxh3_128_or_blake2b_128",
+            "hash_semantics": "json_section_payload_bytes",
             "mmap_friendly": 0,
         }
         sections.append(entry)
@@ -4565,7 +5591,7 @@ def build_juju_shard_plan_from_hf_url(
         )
         estimated_sections += non_empty_buckets
         # Runtime metadata sections (tier hint, predictor, etc.) — estimate conservatively
-        estimated_sections += 8  # typical runtime metadata section count
+        estimated_sections += 9  # runtime metadata plus runtime contract section
         if estimated_sections > JUJU_SECTION_TABLE_RESERVED_ENTRIES:
             raise RuntimeError(
                 f"JUJU section count will exceed limit: estimated {estimated_sections} > "
@@ -4594,29 +5620,46 @@ def build_juju_shard_plan_from_hf_url(
                 pos += int(layout["juju_bytes"])
             size = pos - section_offset
             section_type = section_type_for_bucket(bucket)
+            section_sha = JUJU_ZERO_SHA256
+            section_xxhash128 = "0" * 32
+            checksum_algorithm = "not_precomputed"
             if juju_precompute_stream_section_sha():
-                section_sha = sha256_juju_section_ranges(
-                    session,
-                    source_url,
-                    section_offset,
-                    size,
-                    section_source_ranges,
-                    token=token,
-                    chunk_size=chunk_size,
-                )
+                if juju_fast_section_checksum_enabled():
+                    section_xxhash128 = checksum16_juju_section_ranges(
+                        session,
+                        source_url,
+                        section_offset,
+                        size,
+                        section_source_ranges,
+                        token=token,
+                        chunk_size=chunk_size,
+                    )
+                    checksum_algorithm = "xxh3_128_or_blake2b_128"
+                else:
+                    section_sha = sha256_juju_section_ranges(
+                        session,
+                        source_url,
+                        section_offset,
+                        size,
+                        section_source_ranges,
+                        token=token,
+                        chunk_size=chunk_size,
+                    )
+                    checksum_algorithm = "sha256"
                 hash_semantics = "juju_section_bytes_including_alignment_padding"
             else:
-                section_sha = JUJU_ZERO_SHA256
                 hash_semantics = "not_precomputed_for_streamed_upload"
+            io_hints = juju_section_io_hints(bucket, size, contract)
             sections.append({
                 "type": section_type,
                 "name": bucket.upper()[:32],
                 "offset": section_offset,
                 "size": size,
                 "sha256": section_sha,
+                "xxhash128": section_xxhash128,
+                "checksum_algorithm": checksum_algorithm,
                 "hash_semantics": hash_semantics,
-                "prefetch_distance": 2 if bucket != "shared_weights" else 0,
-                "mmap_friendly": 1,
+                **io_hints,
             })
             section_sizes[section_type] = section_sizes.get(section_type, 0) + size
 
@@ -4661,7 +5704,7 @@ def build_juju_shard_plan_from_hf_url(
             **runtime_arch,
         }
         pos = add_json_section_at(pos, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
-        index_checksum = int(sections[-1].get("sha256", "0" * 64)[:16], 16) if sections else 0
+        index_checksum = int(juju_section_checksum16_hex(sections[-1])[:16], 16) if sections else 0
         file_size_value = pos
         if len(sections) > JUJU_SECTION_TABLE_RESERVED_ENTRIES:
             raise RuntimeError(
@@ -5091,6 +6134,9 @@ def write_juju_shard_from_hf_url(
             "offset": offset,
             "size": len(raw),
             "sha256": hashlib.sha256(raw).hexdigest(),
+            "xxhash128": juju_xxhash128_hex(raw),
+            "checksum_algorithm": "xxh3_128_or_blake2b_128",
+            "hash_semantics": "json_section_payload_bytes",
             "mmap_friendly": 0,
         }
         sections.append(entry)
@@ -5201,15 +6247,17 @@ def write_juju_shard_from_hf_url(
                     tensor_records.append(juju_tensor_index_record(tensor, bucket, tensor_offset, layout, contract))
                 size = out.tell() - offset
                 section_type = section_type_for_bucket(bucket)
+                io_hints = juju_section_io_hints(bucket, size, contract)
                 sections.append({
                     "type": section_type,
                     "name": bucket.upper()[:32],
                     "offset": offset,
                     "size": size,
                     "sha256": digest.hexdigest(),
+                    "xxhash128": "0" * 32,
+                    "checksum_algorithm": "sha256_streaming_write",
                     "hash_semantics": "juju_section_bytes_including_alignment_padding",
-                    "prefetch_distance": 2 if bucket != "shared_weights" else 0,
-                    "mmap_friendly": 1,
+                    **io_hints,
                 })
                 section_sizes[section_type] = section_sizes.get(section_type, 0) + size
 
@@ -5252,7 +6300,7 @@ def write_juju_shard_from_hf_url(
                 **runtime_arch,
             }
             add_json_section(out, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
-            index_checksum = int(sections[-1].get("sha256", "0" * 64)[:16], 16) if sections else 0
+            index_checksum = int(juju_section_checksum16_hex(sections[-1])[:16], 16) if sections else 0
             file_size_value = out.tell()
             if len(sections) > JUJU_SECTION_TABLE_RESERVED_ENTRIES:
                 raise RuntimeError(f"too many JUJU sections: {len(sections)}")

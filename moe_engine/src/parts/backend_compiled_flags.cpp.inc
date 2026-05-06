@@ -10,7 +10,27 @@ static int compiled_gpudirect_available() {
 #if defined(moe_ENABLE_GPUDIRECT_STORAGE) || defined(HAVE_GPUDIRECT_STORAGE)
     return 1;
 #else
-    return 0;
+    // BUGFIX 973: Runtime GDS detection via dynamic library loading ★★★ FEATURE
+    // Problem: GDS only available when compiled with HAVE_GPUDIRECT_STORAGE.
+    // Users with cuFile installed but building without the flag get no GDS.
+    // Solution: Try dlopen/LoadLibrary for cuFile library at runtime.
+    // If found, GDS path can be used (cuFile API loaded via function pointers).
+    // Impact: Enables NVMe→VRAM direct path without recompilation.
+    static int cached = -1;
+    if (cached >= 0) return cached;
+#ifdef _WIN32
+    HMODULE lib = LoadLibraryA("cufile.dll");
+    cached = lib ? 1 : 0;
+    if (lib) FreeLibrary(lib);
+#elif defined(__linux__)
+    void* lib = dlopen("libcufile.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (!lib) lib = dlopen("libcufile.so.0", RTLD_LAZY);
+    cached = lib ? 1 : 0;
+    if (lib) dlclose(lib);
+#else
+    cached = 0;
+#endif
+    return cached;
 #endif
 }
 

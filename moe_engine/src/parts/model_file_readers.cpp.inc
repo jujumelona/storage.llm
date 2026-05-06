@@ -48,6 +48,14 @@ static int moe_read_offload_juju_file(
         }
         out->metadata_json += qkv_json;
     }
+    std::string runtime_contract_json;
+    if (moe_read_juju_json_section(path, sections, moe_JUJU_SECTION_RUNTIME_CONTRACT, file_bytes, &runtime_contract_json)) {
+        out->contract.has_juju_contracts = true;
+        if (!out->metadata_json.empty()) {
+            out->metadata_json.push_back('\n');
+        }
+        out->metadata_json += runtime_contract_json;
+    }
     moe_parse_offload_metadata_json(out);
     out->contract.has_juju_contracts = true;
     if (out->contract.qkv_required) {

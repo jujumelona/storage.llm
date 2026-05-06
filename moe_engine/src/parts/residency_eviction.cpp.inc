@@ -101,16 +101,37 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
         heap_lock.unlock();  // Release heap_mutex before compact (it will re-acquire)
         compact_evict_heap(engine, idx);
 
-        // Retry up to 3 times after compact
-        for (int retry = 0; retry < 3; ++retry) {
+        // BUGFIX 982: Restructured retry loop for explicit lock state ★★ DEFENSIVE
+        // Problem: Old loop had heap_lock.unlock() inside nested if-branches making
+        // lock state at loop-top ambiguous on `continue`. Potential double-lock if
+        // future edits add branches that skip unlock.
+        // Solution: All paths explicitly unlock before reaching loop top. map_lock
+        // in its own block scope so RAII destructor is deterministic.
+        for (int retry = 0; retry < 6; ++retry) {
             heap_lock.lock();
-            if (!engine->evict_heaps[idx].empty()) {
+            if (engine->evict_heaps[idx].empty()) {
+                heap_lock.unlock();
+                break;
+            }
+            // BUGFIX 992: Batch scan on last retry to handle large stale heaps ★★★ CRITICAL
+            // Problem: 6 single-pop retries scan at most 6 entries after compact.
+            // GLM-5.1 (256 experts × 79 layers = 19,456 triplets) can generate
+            // thousands of stale entries per second. 6 entries is insufficient.
+            // Solution: On last retry (5), scan up to min(heap_size, 2048) entries
+            // in a batch within a single heap_lock hold. This is bounded (~2048 pops,
+            // ~100μs worst case) and acceptable vs. VRAM OOM which blocks all generation.
+            const int batch_limit = (retry < 5) ? 1 : (int)std::min((uint32_t)engine->evict_heaps[idx].size(), 2048u);
+            bool found = false;
+            for (int scan = 0; scan < batch_limit && !engine->evict_heaps[idx].empty(); ++scan) {
                 moe_evict_candidate victim = engine->evict_heaps[idx].top();
                 engine->evict_heaps[idx].pop();
                 engine->evict_heap_versions[idx].fetch_add(1, std::memory_order_release);
 
-                if (victim.slot < engine->expert_states.size()) {
-                    heap_lock.unlock();  // Release before acquiring map_lock
+                if (victim.slot >= engine->expert_states.size()) {
+                    continue;  // stale, try next in batch
+                }
+                heap_lock.unlock();  // Unlock before map check
+                {
                     std::lock_guard<std::mutex> map_lock(engine->map_mutex);
                     if (victim.slot < engine->expert_states.size()) {
                         const moe_block_state& state = engine->expert_states[victim.slot];
@@ -122,15 +143,19 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
                             return 1;
                         }
                     }
-                    // Stale entry, continue to next retry
-                    continue;
-                } else {
-                    heap_lock.unlock();
                 }
-            } else {
-                heap_lock.unlock();
-                break;  // Heap empty, no point retrying
+                // Re-lock for next scan iteration (batch mode)
+                if (scan + 1 < batch_limit) {
+                    heap_lock.lock();
+                    continue;
+                }
+                found = false;
+                goto next_retry;
             }
+            // All batch entries were stale (fell through without unlock)
+            heap_lock.unlock();
+            next_retry:;
+            // map_lock released by RAII, heap_lock already unlocked → next iteration
         }
         return 0;
     }
@@ -318,7 +343,7 @@ static void demote_cold_until_impl(moe_pc_engine* engine, moe_tier_t tier, uint6
     while (tier_used(engine, tier) + needed > budget && max_attempts-- > 0) {
         moe_evict_candidate victim{};
         if (!pop_valid_evict_candidate(engine, tier, &victim)) {
-            return;
+            break;  // BUGFIX 951: break instead of return to allow emergency fallback
         }
         moe_tier_t next_tier = moe_TIER_DB;
         if (tier == moe_TIER_VRAM) {
@@ -343,6 +368,65 @@ static void demote_cold_until_impl(moe_pc_engine* engine, moe_tier_t tier, uint6
                 demote_one_victim_to(engine, victim, tier, moe_TIER_DB, to_free);
             }
             continue;
+        }
+    }
+
+    // BUGFIX 951: Emergency linear scan fallback when heap is exhausted ★★★ CRITICAL
+    // Problem: Eviction heap can become entirely stale (all entries invalid after rapid
+    // expert rotation). pop_valid_evict_candidate returns 0, main loop breaks early.
+    // VRAM still over-budget → all new experts go to DB → inference speed collapses.
+    // Solution: Direct linear scan of expert_states as last resort.
+    // Only triggered when heap-based eviction failed AND VRAM is still over-budget.
+    // Impact: Guarantees eviction progress even with fully corrupted heap.
+    if (tier == moe_TIER_VRAM && tier_used(engine, tier) + needed > budget) {
+        engine->io_atomic.eviction_depth_exceeded.fetch_add(1, std::memory_order_relaxed);
+
+        // Collect candidates under map_mutex, then demote outside
+        struct emergency_victim {
+            size_t slot;
+            double hot_score;
+        };
+        std::vector<emergency_victim> candidates;
+        {
+            std::lock_guard<std::mutex> map_lock(engine->map_mutex);
+            candidates.reserve(64);
+            for (size_t slot = 0; slot < engine->expert_states.size(); ++slot) {
+                const auto& state = engine->expert_states[slot];
+                if (state.active && state.tier == moe_TIER_VRAM && !state.pending_evict) {
+                    candidates.push_back({slot, state.hot_score});
+                }
+            }
+        }
+        // Sort by hot_score ascending (coldest first)
+        std::sort(candidates.begin(), candidates.end(),
+            [](const emergency_victim& a, const emergency_victim& b) {
+                return a.hot_score < b.hot_score;
+            });
+
+        for (const auto& cand : candidates) {
+            if (tier_used(engine, tier) + needed <= budget) break;
+
+            moe_evict_candidate victim{};
+            {
+                std::lock_guard<std::mutex> map_lock(engine->map_mutex);
+                if (cand.slot >= engine->expert_states.size()) continue;
+                const auto& state = engine->expert_states[cand.slot];
+                if (!state.active || state.tier != moe_TIER_VRAM || state.pending_evict) continue;
+                victim.slot = cand.slot;
+                victim.bytes = state.bytes;
+                victim.hot_score = state.hot_score;
+                victim.last_touch_epoch = state.last_touch_epoch;
+                victim.predicted_next_use_epoch = state.predicted_next_use_epoch;
+            }
+            demote_one_victim_to(engine, victim, moe_TIER_VRAM, moe_TIER_DB, to_free);
+        }
+
+        if (tier_used(engine, tier) + needed > budget) {
+            fprintf(stderr,
+                "[storageLLM WARNING] Emergency eviction scan: VRAM still over-budget by %llu bytes "
+                "after scanning %zu candidates. DB fallback will be used.\n",
+                (unsigned long long)(tier_used(engine, tier) + needed - budget),
+                candidates.size());
         }
     }
 }

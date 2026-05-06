@@ -1,4 +1,4 @@
-static moe_io_path_t choose_active_io_path(const moe_pc_engine* engine) {
+﻿static moe_io_path_t choose_active_io_path(const moe_pc_engine* engine) {
     if (!engine) {
         return moe_IO_PATH_MMAP_PAGECACHE;
     }
@@ -37,10 +37,23 @@ static int engine_bypass_staging_pipeline(const moe_pc_engine* engine) {
 }
 
 static int engine_has_device_upload_workers(const moe_pc_engine* engine) {
-    return engine &&
-        engine->config.prefer_gpu &&
-        (engine->backend_caps.backend == moe_BACKEND_CUDA || engine->backend_caps.backend == moe_BACKEND_HIP) &&
-        engine->backend_caps.supports_backend_async_api;
+    if (!engine || !engine->config.prefer_gpu) {
+        return 0;
+    }
+    // BUGFIX 970: Apple Silicon 2-tier scheduler
+    // Metal unified memory: zero-copy path is optimal, no upload workers needed
+    if (engine->backend_caps.backend == moe_BACKEND_METAL &&
+        engine->backend_caps.supports_unified_memory) {
+        return 0;
+    }
+    // Level Zero with async API can use upload workers
+    if (engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO &&
+        engine->backend_caps.supports_backend_async_api) {
+        return 1;
+    }
+    return (engine->backend_caps.backend == moe_BACKEND_CUDA ||
+            engine->backend_caps.backend == moe_BACKEND_HIP) &&
+           engine->backend_caps.supports_backend_async_api;
 }
 
 static int caps_gpu_backend_available(const moe_backend_caps_t& caps) {

@@ -38,6 +38,15 @@ static void device_release_in_flight_vram_bytes(moe_pc_engine* e, uint64_t bytes
     uint64_t current = e->vram_in_flight_bytes.load(std::memory_order_relaxed);
     for (;;) {
         const uint64_t next = current > bytes ? current - bytes : 0;
+        // BUGFIX 966: Warn on underflow instead of silent clamp ★★ DIAGNOSTIC
+        // Problem: Silent clamp to 0 hides double-free and byte mismatch bugs.
+        // Solution: Log warning when underflow detected. No perf cost in normal path.
+        if (current < bytes) {
+            fprintf(stderr,
+                "[storageLLM WARNING] vram_in_flight_bytes underflow: current=%llu release=%llu "
+                "(possible double-free or byte mismatch)\n",
+                (unsigned long long)current, (unsigned long long)bytes);
+        }
         if (e->vram_in_flight_bytes.compare_exchange_weak(
                 current,
                 next,
@@ -117,34 +126,45 @@ static void device_defer_staging_copy(moe_pc_engine* e, uint32_t slot, uint64_t 
     if (!e) {
         return;
     }
+    // BUGFIX 989: Atomic pending→in_flight transition ★★★ CRITICAL
+    // Problem: BUGFIX 981 releases pending BEFORE incrementing in_flight.
+    //   Between these two atomics, device_budget_bytes() sees bytes in NEITHER counter
+    //   → VRAM appears to have more free space than reality → over-commit → OOM.
+    // Solution: Guard both operations under vram_transition_mutex so budget observers
+    //   always see the bytes in exactly one counter.
+    // Contention: Minimal — this mutex is held for ~2 atomic ops (~20ns).
+    //   DMA queuing is async and not on the critical compute path.
+    if (vram_bytes > 0) {
+        std::lock_guard<std::mutex> tlock(e->vram_transition_mutex);
+        prefetch_release_pending_vram_reservation(e, vram_bytes);
+        e->vram_in_flight_bytes.fetch_add(vram_bytes, std::memory_order_relaxed);
+    }
+
     // Check staging_slot_size > 0 to prevent use after timeout
-    // slot == UINT32_MAX is valid (no slot used, e.g., unified memory fast path)
     if (slot != UINT32_MAX && !staging_slot_valid(e, slot)) {
         fprintf(stderr,
             "[storageLLM ERROR] device_defer_staging_copy: staging_slot_size=0, "
             "slots are invalid after reset timeout. Rejecting deferred copy.\n");
+        device_release_in_flight_vram_bytes(e, vram_bytes);
         return;
     }
     moe_deferred_staging_copy copy{};
     copy.slot = slot;
     copy.key = key;
-    copy.bytes_for_vram_release = vram_bytes;  // BUGFIX 문제1: Track bytes for VRAM reservation release
+    copy.bytes_for_vram_release = vram_bytes;
     copy.event = device_take_copy_event(e);
-    if (copy.event) {
-        copy.event_recorded = device_backend_event_record(e, copy.event, stream) ? true : false;
-        if (!copy.event_recorded) {
-            device_recycle_copy_event(e, copy.event);
-            copy.event = nullptr;
-        }
+    if (!copy.event) {
+        device_release_in_flight_vram_bytes(e, vram_bytes);
+        return; // Return error/abort
+    }
+    copy.event_recorded = device_backend_event_record(e, copy.event, stream) ? true : false;
+    if (!copy.event_recorded) {
+        device_recycle_copy_event(e, copy.event);
+        copy.event = nullptr;
+        device_release_in_flight_vram_bytes(e, vram_bytes);
+        return; // Return error/abort
     }
     s_tl_deferred_staging_copies[e].push_back(copy);
-
-    // BUGFIX 875: Increment vram_in_flight_bytes when DMA queued ★★★ CRITICAL
-    // This byte count is subtracted from device_free in prefetch_plan trim calculation
-    // to prevent over-admission of experts while DMA is in-flight.
-    if (vram_bytes > 0) {
-        e->vram_in_flight_bytes.fetch_add(vram_bytes, std::memory_order_relaxed);
-    }
 }
 
 static size_t device_deferred_staging_copy_count(moe_pc_engine* e) {

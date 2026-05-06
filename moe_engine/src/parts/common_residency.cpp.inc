@@ -24,13 +24,25 @@ static uint64_t common_vram_wanted_bytes(const moe_pc_engine* engine) {
     if (s && s->runtime_state_bytes > 0) {
         runtime_overhead = s->runtime_state_bytes;
     } else {
+        // BUGFIX 1006: Realistic fallback for runtime_state_bytes ★★ IMPORTANT
+        // Problem: Old fallback (2*hidden + experts*4 + hidden) = ~19KB for typical models
+        // → 1000x smaller than actual runtime state (attention scratch, norm buffers, activation)
+        // → common_vram_wanted_bytes ≈ 0 → embedding/lm_head not pinned → reload every token
+        // Solution: Use 2 × hidden_size × max_seq_len × 2 (bf16) as minimum activation buffer
+        // This approximates KQ matrix size, which is the dominant runtime allocation.
+        // Fallback to 8192 if max_seq_len unavailable.
         const uint64_t hidden = s ? s->hidden_size : 6144ull;
-        const uint64_t experts = s ? s->experts_per_moe_layer : 256ull;
-        runtime_overhead = 2ull * hidden + experts * 4ull + hidden;
+        uint32_t max_seq = 8192u;
+        if (engine && engine->attn_config_valid.load(std::memory_order_relaxed) &&
+            engine->attn_config.max_seq_len > 0) {
+            max_seq = engine->attn_config.max_seq_len;
+        }
+        runtime_overhead = 2ull * hidden * (uint64_t)max_seq * 2ull; // bf16 = 2 bytes
         fprintf(stderr,
             "[storageLLM WARNING] runtime_state_bytes not set in moe_storage_constants. "
-            "Using calculated fallback: %llu bytes (2*hidden_size + num_experts*4 + hidden_size). "
-            "This may not match actual model requirements.\n",
+            "Using calculated fallback: %llu bytes (2 * hidden_size * max_seq_len * 2). "
+            "This approximates minimum activation buffer size. "
+            "Actual runtime state may be larger with MLA or vision encoders.\n",
             (unsigned long long)runtime_overhead);
     }
     const uint64_t core = (s ? s->raw_tensor_lm_head_bytes : 0ull) + runtime_overhead;

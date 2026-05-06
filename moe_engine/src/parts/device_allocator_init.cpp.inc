@@ -17,8 +17,21 @@ static std::atomic<uint64_t>* device_pool_counter(moe_pc_engine* e, uint8_t pool
     // Problem: Invalid pool returns stream_bytes, causing wrong accounting
     // Solution: Return nullptr for invalid pool
     if (pool == moe_DEVICE_POOL_STREAM) return &e->device_stream_bytes;
-    // BUGFIX 문제4: Add KV cache pool counter ★★★
-    if (pool == moe_DEVICE_POOL_KV_CACHE) return &e->device_kv_cache_bytes;
+    // BUGFIX 1007: KV cache pool counter — only count if actually in VRAM ★★★ CRITICAL
+    // Problem: moe_DEVICE_POOL_KV_CACHE added in BUGFIX 76, but KV can be in RAM or VRAM
+    // depending on backend. device_budget_bytes() subtracts device_kv_cache_bytes from VRAM budget.
+    // If KV is actually in RAM (CPU backend, or CUDA without device-side attention), this
+    // double-subtracts: once from RAM budget, once from VRAM budget → budget underflow.
+    // Solution: Only return device_kv_cache_bytes counter if KV is actually in VRAM.
+    // Check: backend is CUDA/HIP AND device-side KV attention is compiled in.
+    // Impact: Correct budget accounting for CPU and RAM-side KV configurations.
+    if (pool == moe_DEVICE_POOL_KV_CACHE) {
+        // Only count KV in VRAM budget if it's actually allocated in VRAM
+        const bool kv_in_vram = (e->backend_caps.backend == moe_BACKEND_CUDA ||
+                                 e->backend_caps.backend == moe_BACKEND_HIP) &&
+                                moe_kv_vram_attention_runtime_available(e);
+        return kv_in_vram ? &e->device_kv_cache_bytes : nullptr;
+    }
     return nullptr;
 }
 
@@ -723,6 +736,51 @@ static int device_allocator_init(moe_pc_engine* e) {
 
     // Fix 27: Run a quick microbenchmark to measure actual TFLOPS
     // The hardcoded fallbacks (22/35 TFLOPS) are wildly inaccurate for many GPUs.
+    // Also perform dynamic H2D bandwidth measurement calibration
+    if (e->backend_caps.measured_h2d_bw_bytes_per_sec == 0 &&
+        (e->backend_caps.backend == moe_BACKEND_CUDA || e->backend_caps.backend == moe_BACKEND_HIP)) {
+        const size_t h2d_bench_bytes = 16 * 1024 * 1024;
+        CUdeviceptr d_a = 0;
+        void* h_a = nullptr;
+        int alloc_ok = 0;
+        if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemAlloc && e->cuda.cuMemAllocHost) {
+            alloc_ok = (e->cuda.cuMemAlloc(&d_a, h2d_bench_bytes) == 0 &&
+                        e->cuda.cuMemAllocHost(&h_a, h2d_bench_bytes) == 0) ? 1 : 0;
+        } else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipMalloc && e->hip.hipHostMalloc) {
+            alloc_ok = (e->hip.hipMalloc(&d_a, h2d_bench_bytes) == 0 &&
+                        e->hip.hipHostMalloc(&h_a, h2d_bench_bytes, 0) == 0) ? 1 : 0;
+        }
+        if (alloc_ok && d_a && h_a) {
+            auto t0 = std::chrono::steady_clock::now();
+            const int iters = 10;
+            for (int i = 0; i < iters; ++i) {
+                if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemcpyHtoD)
+                    e->cuda.cuMemcpyHtoD(d_a, h_a, h2d_bench_bytes);
+                else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipMemcpyHtoD)
+                    e->hip.hipMemcpyHtoD(d_a, h_a, h2d_bench_bytes);
+            }
+            if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuCtxSynchronize)
+                e->cuda.cuCtxSynchronize();
+            else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipDeviceSynchronize)
+                e->hip.hipDeviceSynchronize();
+            auto t1 = std::chrono::steady_clock::now();
+            double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+            if (elapsed_s > 1e-6) {
+                uint64_t measured = (uint64_t)((double)(h2d_bench_bytes * iters) / elapsed_s);
+                e->backend_caps.measured_h2d_bw_bytes_per_sec = measured;
+                fprintf(stderr, "[storageLLM INFO] H2D bandwidth measured: %.1f GB/s\n", (double)measured / 1e9);
+            }
+        }
+        if (d_a) {
+            if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemFree) e->cuda.cuMemFree(d_a);
+            else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipFree) e->hip.hipFree(d_a);
+        }
+        if (h_a) {
+            if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemFreeHost) e->cuda.cuMemFreeHost(h_a);
+            else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipHostFree) e->hip.hipHostFree(h_a);
+        }
+    }
+
     if (e->backend_caps.tflops_hint <= 0.0 &&
         (e->backend_caps.backend == moe_BACKEND_CUDA || e->backend_caps.backend == moe_BACKEND_HIP)) {
         const size_t bench_bytes = 512 * 512 * sizeof(float);

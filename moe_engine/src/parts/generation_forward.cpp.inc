@@ -308,7 +308,7 @@ static int moe_forward_one_token_f32(
                 position, layer, moe_profile_elapsed_ms(split_residual_start_us));
             moe_forward_trace_vec("after_attention", position, layer, hidden, c->hidden_size);
             const double attention_ms = moe_profile_elapsed_ms(attn_start_us);
-            const int is_moe = layer >= c->first_moe_layer && layer <= c->last_moe_layer;
+            const int is_moe = moe_layer_is_moe_runtime(engine, c, (int32_t)layer);
             if (layer + 1u < c->num_hidden_layers &&
                 moe_can_enqueue_attention_lookahead(engine, (int32_t)(layer + 1u))) {
                 moe_enqueue_attention_prefetch(engine, (int32_t)(layer + 1u));
@@ -355,7 +355,7 @@ static int moe_forward_one_token_f32(
             return 0;
         }
         const double attention_ms = moe_profile_elapsed_ms(attn_start_us);
-        const int is_moe = layer >= c->first_moe_layer && layer <= c->last_moe_layer;
+        const int is_moe = moe_layer_is_moe_runtime(engine, c, (int32_t)layer);
 
         // Next-layer attention VRAM prefetch: enqueue layer+1 attention spans
         // so DMA overlaps with current layer's MLP compute.

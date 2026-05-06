@@ -276,7 +276,14 @@ static void log_engine_snapshot(const char* tag, moe_pc_engine_t* engine) {
                   << " storage_experts=" << stats.db_expert_count
                   << " weight_bits=" << stats.weight_quant_bits
                   << " weight_encoding=" << stats.weight_quant_encoding
-                  << " weight_kernel=" << stats.weight_kernel_family;
+                  << " weight_kernel=" << stats.weight_kernel_family
+                  << " juju_io_hints=" << stats.juju_io_section_hints_ready
+                  << " juju_runtime_mmap=" << stats.juju_runtime_mmap_allowed
+                  << " juju_cold_mmap=" << stats.juju_cold_mmap_friendly
+                  << " juju_warm_mmap=" << stats.juju_warm_mmap_friendly
+                  << " juju_cold_seq=" << stats.juju_cold_sequential_block_size
+                  << " juju_warm_seq=" << stats.juju_warm_sequential_block_size
+                  << " juju_prefetch_distance=" << stats.juju_max_prefetch_distance;
     }
     if (io_ok) {
         std::cerr << " io_queued=" << io.queued_requests

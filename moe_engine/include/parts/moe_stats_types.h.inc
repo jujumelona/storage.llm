@@ -84,6 +84,13 @@ typedef struct {
     uint64_t juju_priority_tensor_count;
     uint64_t juju_fastmem_tensor_count;
     uint64_t juju_slowmem_tensor_count;
+    uint32_t juju_io_section_hints_ready;
+    uint32_t juju_runtime_mmap_allowed;
+    uint32_t juju_cold_mmap_friendly;
+    uint32_t juju_warm_mmap_friendly;
+    uint32_t juju_cold_sequential_block_size;
+    uint32_t juju_warm_sequential_block_size;
+    uint32_t juju_max_prefetch_distance;
     char offload_gguf_first_file[260];
     char weight_quant_family[64];
     char weight_kernel_family[64];

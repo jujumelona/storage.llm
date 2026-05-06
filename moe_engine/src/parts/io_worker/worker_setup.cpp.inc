@@ -1,4 +1,4 @@
-﻿static int prefetch_one_raw_span(
+static int prefetch_one_raw_span(
     moe_pc_engine* e,
     const moe_storage_raw_span_spec_t& s,
     uint8_t pool,
@@ -71,7 +71,7 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         bool ram_eviction_flag = false;
         {
             std::unique_lock<std::mutex> lock(engine->vram_eviction_mutex);
-            engine->vram_eviction_cv.wait_for(lock, std::chrono::milliseconds(25), [&]() {
+            engine->vram_eviction_cv.wait_for(lock, std::chrono::milliseconds(10), [&]() {
                 return engine->vram_eviction_needed.load(std::memory_order_relaxed) ||
                        engine->ram_eviction_needed.load(std::memory_order_relaxed) ||
                        engine->io_stop.load(std::memory_order_relaxed);
@@ -176,7 +176,7 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         if ((retry_vram_eviction || retry_ram_eviction) &&
             !engine->io_stop.load(std::memory_order_relaxed)) {
             std::unique_lock<std::mutex> lock(engine->vram_eviction_mutex);
-            engine->vram_eviction_cv.wait_for(lock, std::chrono::milliseconds(25), [&]() {
+            engine->vram_eviction_cv.wait_for(lock, std::chrono::milliseconds(10), [&]() {
                 return engine->io_stop.load(std::memory_order_relaxed);
             });
         }

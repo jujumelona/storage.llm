@@ -153,6 +153,25 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
             data = nullptr;
             scales = nullptr;
             zeros = nullptr;
+        } else {
+            // BUGFIX 954: Update tracked_ram_bytes after successful init() ★★★ CRITICAL
+            // Problem: subtract_tier_usage(old) called above, but tracked_ram_bytes
+            // left at 0 after new allocation → destructor sees 0 → no subtract → RAM leak.
+            // Hundreds of MB of KV cache invisible to tier counter →
+            // prefetch_admitted_tier over-admits experts → RAM OOM.
+            // Solution: Compute new allocation size and register with tier system.
+            // Impact: RAM tier counter now accurate, eviction triggers correctly.
+            // BUGFIX 999: Set tracked_ram_bytes BEFORE add_tier_usage ★★★ CRITICAL
+            // Problem: If tracked_ram_bytes=0 when add_tier_usage runs, a concurrent
+            // moe_kv_cache_track_ram() call sees current > tracked(0) and calls
+            // add_tier_usage again → double-counting. Setting tracked_ram_bytes first
+            // makes the concurrent call see current == tracked → no-op.
+            const uint64_t new_total_entries = (uint64_t)max_seq_len * (uint64_t)num_layers;
+            const uint64_t new_bytes = new_total_entries * ((uint64_t)entry_dim + 2ull * sizeof(float));
+            if (engine && new_bytes > 0) {
+                tracked_ram_bytes = new_bytes;  // Set FIRST to prevent concurrent double-add
+                add_tier_usage(engine, moe_TIER_RAM, new_bytes);
+            }
         }
     }
 
@@ -177,6 +196,27 @@ struct moe_kv_cache {  // KV Asymmetric Compression (KVQuant / KIVI)
 
         const size_t new_data_bytes = new_entries * entry_dim;
         const size_t new_scales_bytes = new_entries * sizeof(float);
+
+        // BUGFIX 1006: Pre-check available RAM before triple malloc ★★★ CRITICAL
+        // Problem: malloc+memcpy+free pattern requires old + new buffers simultaneously.
+        //   Peak memory = old_data + old_scales*2 + new_data + new_scales*2.
+        //   Without pre-check, first malloc succeeds → OS RAM pressure spikes →
+        //   second/third malloc fails → partial free + return 0, but damage done.
+        // Solution: Compare required peak against available RAM before any malloc.
+        //   available_ram_bytes() is a snapshot (may be stale), but catches the
+        //   common case of insufficient headroom.
+        // Impact: Prevents cascading OOM in other components (staging, prefetch).
+        if (engine) {
+            const size_t old_data_bytes = old_entries * entry_dim;
+            const size_t old_scales_bytes = old_entries * sizeof(float);
+            const size_t peak_bytes = new_data_bytes + new_scales_bytes * 2;
+            // old buffers still alive during malloc, so total transient = peak + old
+            const size_t transient_total = peak_bytes + old_data_bytes + old_scales_bytes * 2;
+            const uint64_t avail = available_ram_bytes(engine);
+            if (avail > 0 && transient_total > avail) {
+                return 0;  // Pre-reject: not enough RAM for safe resize
+            }
+        }
 
         // BUGFIX 923: Use malloc+memcpy instead of realloc to avoid pointer leak ★★★ CRITICAL
         // Problem: realloc(data, ...) success invalidates original 'data' pointer.

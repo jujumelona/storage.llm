@@ -1,4 +1,4 @@
-﻿static int prefetch_tensor_disk_to_ram(
+static int prefetch_tensor_disk_to_ram(
     moe_pc_engine* engine,
     const moe_tensor_record& rec,
     int allow_registered_io_bypass = 0
@@ -116,10 +116,11 @@ static bool init_io_uring(moe_pc_engine* engine) {
 }
 
 static void disk_read_to_staging_uring(moe_pc_engine* engine, int fd, uint64_t offset, uint32_t slot_idx, uint64_t bytes) {
-    // BUGFIX 532: Check engine and slot_idx validity before use ★
-    // Problem: No validation of engine or slot_idx before array access
-    // Solution: Check engine and slot_idx < staging_slots.size()
-    if (!engine || slot_idx >= engine->staging_slots.size()) {
+    // BUGFIX 1001: Use staging_slot_valid() instead of raw .size() check ★★ DEFENSIVE
+    // Problem: After timeout reset, staging_slot_size=0 but staging_slots vector
+    // may not be cleared → slot_idx < staging_slots.size() passes → null deref.
+    // staging_slot_valid() checks staging_slot_size first.
+    if (!engine || !staging_slot_valid(engine, slot_idx)) {
         return;
     }
 

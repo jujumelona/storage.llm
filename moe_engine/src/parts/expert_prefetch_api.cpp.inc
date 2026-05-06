@@ -172,6 +172,9 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
         layer_count <= UINT64_MAX / (uint64_t)c->experts_per_moe_layer) {
         candidates.reserve((size_t)(layer_count * (uint64_t)c->experts_per_moe_layer));
         for (uint32_t layer = c->first_moe_layer; layer <= c->last_moe_layer; ++layer) {
+            if (!moe_layer_is_moe_runtime(engine, c, (int32_t)layer)) {
+                continue;
+            }
             for (uint32_t expert = 0; expert < c->experts_per_moe_layer; ++expert) {
                 const uint64_t bytes = expert_triplet_or_hardcoded_bytes(
                     engine,

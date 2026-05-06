@@ -21,7 +21,7 @@ static void moe_enqueue_attention_prefetch(moe_pc_engine* engine, int32_t layer)
 
     const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
     const moe_storage_constants_t* c = &runtime_c;
-    if (layer >= (int32_t)c->first_moe_layer && layer <= (int32_t)c->last_moe_layer) {
+    if (moe_layer_is_moe_runtime(engine, c, layer)) {
         const uint32_t router_si = moe_storage_router_span_index(layer);
         if (router_si != 0xFFFFFFFFu) {
             queued_spans[queued_count++] = router_si;
@@ -108,5 +108,4 @@ static int moe_can_enqueue_attention_lookahead(moe_pc_engine* engine, int32_t la
     const uint64_t threshold = (budget * (uint64_t)threshold_pct) / 100ull;
     return used < threshold && bytes <= threshold - used;
 }
-
 

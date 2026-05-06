@@ -347,6 +347,25 @@ struct moe_pc_engine {
     std::atomic<uint64_t> juju_tier_warm_expert_tensor_count{0};
     std::atomic<uint64_t> juju_tier_cold_expert_tensor_count{0};
     std::atomic<uint64_t> juju_partial_expert_tensor_count{0};
+    std::atomic<uint32_t> juju_moe_layer_bitmask_ready{0};
+    std::atomic<uint64_t> juju_moe_layer_count{0};
+    std::vector<uint64_t> juju_moe_layer_bitmask_words;
+    std::atomic<uint32_t> juju_io_section_hints_ready{0};
+    std::atomic<uint32_t> juju_runtime_contract_io_policy_ready{0};
+    std::atomic<uint32_t> juju_runtime_contract_mmap_allowed{1};
+    std::atomic<uint32_t> juju_shared_mmap_friendly{1};
+    std::atomic<uint32_t> juju_hot_mmap_friendly{1};
+    std::atomic<uint32_t> juju_warm_mmap_friendly{1};
+    std::atomic<uint32_t> juju_cold_mmap_friendly{1};
+    std::atomic<uint32_t> juju_shared_sequential_block_size{0};
+    std::atomic<uint32_t> juju_hot_sequential_block_size{0};
+    std::atomic<uint32_t> juju_warm_sequential_block_size{0};
+    std::atomic<uint32_t> juju_cold_sequential_block_size{0};
+    std::atomic<uint32_t> juju_max_prefetch_distance{0};
+    std::atomic<uint64_t> juju_shared_section_bytes{0};
+    std::atomic<uint64_t> juju_hot_section_bytes{0};
+    std::atomic<uint64_t> juju_warm_section_bytes{0};
+    std::atomic<uint64_t> juju_cold_section_bytes{0};
     std::string offload_gguf_first_file;
     std::string offload_gguf_metadata_json;
     std::string offload_weight_quant_family;
@@ -453,10 +472,36 @@ static moe_storage_constants_t moe_engine_storage_constants_or_static(const moe_
     if (shape.projection_count) out.expert_projection_count = shape.projection_count;
     if (out.num_hidden_layers && out.experts_per_moe_layer &&
         out.last_moe_layer >= out.first_moe_layer) {
-        out.total_expert_count =
-            (out.last_moe_layer - out.first_moe_layer + 1u) * out.experts_per_moe_layer;
+        uint64_t moe_layer_count = (uint64_t)out.last_moe_layer - (uint64_t)out.first_moe_layer + 1ull;
+        if (engine &&
+            engine->juju_moe_layer_bitmask_ready.load(std::memory_order_acquire) &&
+            engine->juju_moe_layer_count.load(std::memory_order_relaxed) > 0) {
+            moe_layer_count = engine->juju_moe_layer_count.load(std::memory_order_relaxed);
+        }
+        out.total_expert_count = moe_layer_count * out.experts_per_moe_layer;
     }
     return out;
+}
+
+static int moe_layer_is_moe_runtime(
+    const moe_pc_engine* engine,
+    const moe_storage_constants_t* c,
+    int32_t layer
+) {
+    if (layer < 0) {
+        return 0;
+    }
+    if (engine &&
+        engine->juju_moe_layer_bitmask_ready.load(std::memory_order_acquire) &&
+        !engine->juju_moe_layer_bitmask_words.empty()) {
+        const size_t word_index = (size_t)layer / 64u;
+        const uint32_t bit_index = (uint32_t)layer & 63u;
+        if (word_index < engine->juju_moe_layer_bitmask_words.size()) {
+            return ((engine->juju_moe_layer_bitmask_words[word_index] >> bit_index) & 1ull) ? 1 : 0;
+        }
+        return 0;
+    }
+    return c && layer >= (int32_t)c->first_moe_layer && layer <= (int32_t)c->last_moe_layer;
 }
 
 static uint32_t runtime_disk_workers(const moe_pc_engine* engine) {

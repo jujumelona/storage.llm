@@ -26,7 +26,12 @@ static uint64_t moe_default_pinned_staging_bytes(
 ) {
     const uint32_t gpu = std::max(1u, gpu_workers);
     uint64_t slot_count = (uint64_t)std::max(1u, io_workers) * (uint64_t)gpu * 2ull;
-    slot_count = std::max<uint64_t>(4ull, std::min<uint64_t>(slot_count, 64ull));
+    // BUGFIX 993: Cap default staging slots to prevent excessive pinned memory ★★ IMPORTANT
+    // Problem: 32-core machine → io=8, gpu=4 → slot_count=64 → 64 × 32MB = 2GB pinned
+    // This wastes RAM, especially with GDS (staging bypassed) or CPU-only (RAM > throughput).
+    // Solution: Cap at 16 slots (512MB). moe_ensure_staging_capacity grows if genuinely needed.
+    // 16 slots provides sufficient pipeline depth for 4 GPU workers × 4 batch.
+    slot_count = std::max<uint64_t>(4ull, std::min<uint64_t>(slot_count, 16ull));
     uint64_t desired = normal_max > 0 && slot_count <= UINT64_MAX / normal_max
         ? normal_max * slot_count : UINT64_MAX;
     const uint64_t ram_cap = storagellm::default_ram_budget_bytes(25);
@@ -67,7 +72,14 @@ moe_io_config_t moe_pc_default_io_config(void) {
     const uint64_t normal_max = storage ? storage->normal_bundle_max_bytes : normal_min;
     const uint32_t hw = moe_cpu_thread_count_hint();
     cfg.io_worker_threads = moe_default_io_worker_threads(hw);
-    cfg.prefetch_window_layers = 6;
+    // BUGFIX 965: Set default to 0 (auto-calculate) instead of 6 ★★
+    // Problem: Value 6 was immediately overwritten by io_config_api.cpp.inc VRAM-based
+    // logic. But if user calls moe_pc_default_io_config() without configure_io(),
+    // the stale 6 leaks through. 0 = "auto" is consistent with the documented
+    // (using_default_io_config || == 0) auto-calculation condition.
+    // Safety: common_raw_prefetch.cpp.inc::runtime_prefetch_window() already
+    // falls back to 1 when both runtime and config values are 0.
+    cfg.prefetch_window_layers = 0;
     cfg.max_prefetch_queue = 12288;
     cfg.topology_max_candidates = 2;
     cfg.topology_max_edges_per_source = 32;

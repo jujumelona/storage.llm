@@ -222,21 +222,32 @@ static int prefetch_tensor_file_to_pinned(
                 return 0;
             }
 
-            // Step 2: New buffer acquired successfully - now safe to release old buffer
+            // BUGFIX 979: Fix use-after-free in staging slot reallocation ★★★ CRITICAL
+            // Problem: slot.buf freed outside staging_slot_mutex. Another io_worker
+            // can pass staging_slot_valid() and read the freed pointer concurrently.
+            // Solution: Snapshot old values and swap to new buffer inside the lock.
+            // Free old buffer AFTER lock release — no thread can see old_buf anymore.
             moe_staging_slot& slot = engine->staging_slots[slot_index];
-            if (slot.buf) {
-                free_staging_for_engine(engine, slot.buf, slot.size, slot.pinned,
-                                        slot.numa_allocated, slot.device_host_allocated);
-            }
-
-            // Assign new buffer to current slot
+            uint8_t* old_buf = nullptr;
+            uint64_t old_size = 0;
+            bool old_pinned = false, old_numa = false, old_device_host = false;
             {
                 std::lock_guard<std::mutex> lock(engine->staging_slot_mutex);
-                slot.buf = new_buf;
-                slot.size = total_bytes;
-                slot.pinned = got_pinned;
-                slot.numa_allocated = got_numa;
+                old_buf           = slot.buf;
+                old_size          = slot.size;
+                old_pinned        = slot.pinned;
+                old_numa          = slot.numa_allocated;
+                old_device_host   = slot.device_host_allocated;
+                slot.buf                  = new_buf;
+                slot.size                 = total_bytes;
+                slot.pinned               = got_pinned;
+                slot.numa_allocated       = got_numa;
                 slot.device_host_allocated = got_device_host;
+            }
+            // Lock released — old_buf is now invisible to all other threads
+            if (old_buf) {
+                free_staging_for_engine(engine, old_buf, old_size, old_pinned,
+                                        old_numa, old_device_host);
             }
 
             // Check if reallocation succeeded

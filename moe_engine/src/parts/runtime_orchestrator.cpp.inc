@@ -39,7 +39,7 @@ static void refresh_external_gpu_memory_budget_if_due(moe_pc_engine* engine) {
 
         // Check if dropped_requests increased (indicates memory pressure)
         const uint64_t dropped_now = engine->io_atomic.dropped_requests.load(std::memory_order_relaxed);
-        const bool drops_increased = dropped_now > engine->last_dropped_requests_snapshot;
+        const bool drops_increased = dropped_now > engine->last_dropped_requests_snapshot.load(std::memory_order_relaxed);
 
         // Refresh immediately if high pressure or drops, otherwise use 10s cooldown
         const bool should_refresh = high_pressure || drops_increased || elapsed_ms >= 10000ull;
@@ -54,7 +54,7 @@ static void refresh_external_gpu_memory_budget_if_due(moe_pc_engine* engine) {
             // → GPU worker contention on device_mutex, performance degradation
             // Solution: Update snapshot after refresh to reset drops_increased flag
             // Impact: Correct throttling behavior, reduces unnecessary driver queries
-            engine->last_dropped_requests_snapshot = dropped_now;
+            engine->last_dropped_requests_snapshot.store(dropped_now, std::memory_order_relaxed);
         }
     } else if (engine->backend_caps.backend == moe_BACKEND_VULKAN ||
                engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
@@ -122,11 +122,18 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
     // Solution: Apply prefetch_depth as initial suggestion only if no pressure,
     //   then let dropped_requests independently reduce base_window
     // Impact: Dropped_requests hysteresis works correctly with juju strategy active
+    // BUGFIX 995: Don't override base_window with prefetch_depth ★★★ CRITICAL
+    // Problem: Setting base_window = min(prefetch_depth, max_window) before the
+    //   dropped_requests path causes hysteresis streak to reset every cycle when
+    //   juju strategy router recalculates prefetch_depth. The pending check at line 159
+    //   (prefetch_window_pending == base_window) fails because base_window keeps
+    //   changing → streak never reaches 3 → window oscillates between 1 and 6.
+    // Solution: juju depth sets max_window only (upper bound). base_window is policy-only.
+    //   prefetch_depth influence is applied through the max_window clamp at commit time.
+    // Impact: Stable window convergence; juju depth still limits maximum depth.
     const uint32_t max_window = juju_cfg ?
         std::max(8u, juju_cfg->prefetch_depth ? juju_cfg->prefetch_depth : 8u) : 8u;
-    if (juju_cfg && juju_cfg->prefetch_depth > 0) {
-        base_window = std::min(juju_cfg->prefetch_depth, max_window);
-    }
+    // base_window stays at policy value — juju depth only limits via max_window clamp
     if (juju_cfg && engine->generation_token.load(std::memory_order_relaxed) < 128u) {
         base_window = std::max(base_window, 4u);
     }
@@ -134,9 +141,9 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
     // BUGFIX 880: Step 1 - dropped_requests path with hysteresis
     if (engine) {
         const uint64_t dropped_now = engine->io_atomic.dropped_requests.load(std::memory_order_relaxed);
-        const uint64_t dropped_delta = dropped_now > engine->last_dropped_requests_snapshot
-            ? dropped_now - engine->last_dropped_requests_snapshot : 0;
-        engine->last_dropped_requests_snapshot = dropped_now;
+        const uint64_t dropped_delta = dropped_now > engine->last_dropped_requests_snapshot.load(std::memory_order_relaxed)
+            ? dropped_now - engine->last_dropped_requests_snapshot.load(std::memory_order_relaxed) : 0;
+        engine->last_dropped_requests_snapshot.store(dropped_now, std::memory_order_relaxed);
 
         const uint64_t dropped_expert_equiv = (dropped_delta + 2ull) / 3ull;
         if (dropped_expert_equiv > 0) {
@@ -144,7 +151,7 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
                 ? std::max(1u, base_window / 4u)
                 : std::max(1u, base_window / 2u);
             // Reset growth streak on drop detection
-            engine->prefetch_window_streak = 0;
+            engine->prefetch_window_streak.store(0, std::memory_order_relaxed);
         }
     }
 
@@ -156,23 +163,24 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
             current_window = base_window;
         }
         if (base_window != current_window) {
-            if (engine->prefetch_window_pending == base_window) {
-                ++engine->prefetch_window_streak;
+            // BUGFIX 1000: Use atomic load/store for window hysteresis fields
+            if (engine->prefetch_window_pending.load(std::memory_order_relaxed) == base_window) {
+                engine->prefetch_window_streak.fetch_add(1, std::memory_order_relaxed);
             } else {
-                engine->prefetch_window_pending = base_window;
-                engine->prefetch_window_streak = 1;
+                engine->prefetch_window_pending.store(base_window, std::memory_order_relaxed);
+                engine->prefetch_window_streak.store(1, std::memory_order_relaxed);
             }
             // Reduced from 5 to 3 for faster recovery
-            if (engine->prefetch_window_streak >= 3u) {
+            if (engine->prefetch_window_streak.load(std::memory_order_relaxed) >= 3u) {
                 committed_window = base_window;
-                engine->prefetch_window_streak = 0;
+                engine->prefetch_window_streak.store(0, std::memory_order_relaxed);
             } else {
                 // Keep current window until 3 consecutive same signals
                 committed_window = current_window;
             }
         } else {
             committed_window = base_window;
-            engine->prefetch_window_streak = 0;
+            engine->prefetch_window_streak.store(0, std::memory_order_relaxed);
         }
     }
 

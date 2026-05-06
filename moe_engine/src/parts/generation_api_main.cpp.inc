@@ -306,7 +306,7 @@ int moe_pc_engine_generate_token_ids(
                 }
 
                 engine->generation_phase.store(moe_GEN_PHASE_MLP, std::memory_order_relaxed);
-                const int is_moe = layer >= c->first_moe_layer && layer <= c->last_moe_layer;
+                const int is_moe = moe_layer_is_moe_runtime(engine, c, (int32_t)layer);
                 const uint64_t prefill_mlp_start_us = moe_profile_now_us();
                 int mlp_batch_ok = 0;
                 if (is_moe && prefill_count >= 2u) {

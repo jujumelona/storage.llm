@@ -122,9 +122,7 @@ static void prefetch_plan_add_item(
     if (bytes == 0) {
         const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
         if (runtime_c.experts_per_moe_layer == 0 ||
-            runtime_c.last_moe_layer < runtime_c.first_moe_layer ||
-            layer < (int)runtime_c.first_moe_layer ||
-            layer > (int)runtime_c.last_moe_layer ||
+            !moe_layer_is_moe_runtime(engine, &runtime_c, layer) ||
             expert >= (int)runtime_c.experts_per_moe_layer) {
             fprintf(stderr,
                 "[storageLLM ERROR] prefetch_plan_add_item: invalid expert layer=%d expert=%d; "

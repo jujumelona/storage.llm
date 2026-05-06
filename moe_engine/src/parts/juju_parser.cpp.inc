@@ -32,6 +32,15 @@ struct moe_juju_tensor_json_entry_t {
     uint8_t segment_policy = moe_JUJU_SEGMENT_POLICY_AUTO;
     uint8_t can_partial_exec = 0;
     uint16_t partial_accuracy_milli = 0;
+    uint8_t has_expert_layout = 0;
+    uint32_t expert_count = 0;
+    uint64_t expert_base_offset = 0;
+    uint64_t per_expert_bytes = 0;
+    uint8_t combined_gate_up_split_enabled = 0;
+    uint64_t gate_rel_offset = 0;
+    uint64_t gate_bytes = 0;
+    uint64_t up_rel_offset = 0;
+    uint64_t up_bytes = 0;
 };
 
 static uint8_t moe_juju_residency_hint_from_text(const std::string& text) {
@@ -224,6 +233,91 @@ static int moe_read_juju_json_section(
     return 0;
 }
 
+static uint32_t moe_max_u32_local(uint32_t a, uint32_t b) {
+    return a > b ? a : b;
+}
+
+static uint64_t moe_saturating_add_u64_local(uint64_t a, uint64_t b) {
+    return b > UINT64_MAX - a ? UINT64_MAX : a + b;
+}
+
+static void moe_ingest_juju_section_table_hints(
+    moe_pc_engine* engine,
+    const std::vector<moe_juju_section_entry_t>& sections
+) {
+    if (!engine || sections.empty()) {
+        return;
+    }
+    const uint32_t had_hints =
+        engine->juju_io_section_hints_ready.load(std::memory_order_acquire);
+    uint32_t shared_mmap = had_hints ? engine->juju_shared_mmap_friendly.load(std::memory_order_acquire) : 1u;
+    uint32_t hot_mmap = had_hints ? engine->juju_hot_mmap_friendly.load(std::memory_order_acquire) : 1u;
+    uint32_t warm_mmap = had_hints ? engine->juju_warm_mmap_friendly.load(std::memory_order_acquire) : 1u;
+    uint32_t cold_mmap = had_hints ? engine->juju_cold_mmap_friendly.load(std::memory_order_acquire) : 1u;
+    uint32_t shared_seq = had_hints ? engine->juju_shared_sequential_block_size.load(std::memory_order_acquire) : 0u;
+    uint32_t hot_seq = had_hints ? engine->juju_hot_sequential_block_size.load(std::memory_order_acquire) : 0u;
+    uint32_t warm_seq = had_hints ? engine->juju_warm_sequential_block_size.load(std::memory_order_acquire) : 0u;
+    uint32_t cold_seq = had_hints ? engine->juju_cold_sequential_block_size.load(std::memory_order_acquire) : 0u;
+    uint32_t max_prefetch_distance = had_hints ? engine->juju_max_prefetch_distance.load(std::memory_order_acquire) : 0u;
+    uint64_t shared_bytes = had_hints ? engine->juju_shared_section_bytes.load(std::memory_order_acquire) : 0ull;
+    uint64_t hot_bytes = had_hints ? engine->juju_hot_section_bytes.load(std::memory_order_acquire) : 0ull;
+    uint64_t warm_bytes = had_hints ? engine->juju_warm_section_bytes.load(std::memory_order_acquire) : 0ull;
+    uint64_t cold_bytes = had_hints ? engine->juju_cold_section_bytes.load(std::memory_order_acquire) : 0ull;
+    int found = 0;
+
+    for (const moe_juju_section_entry_t& entry : sections) {
+        const uint32_t seq = entry.sequential_block_size;
+        max_prefetch_distance = moe_max_u32_local(
+            max_prefetch_distance,
+            (uint32_t)entry.prefetch_distance);
+        switch (entry.type) {
+        case moe_JUJU_SECTION_SHARED_WEIGHTS:
+            found = 1;
+            shared_mmap = entry.mmap_friendly ? shared_mmap : 0u;
+            shared_seq = moe_max_u32_local(shared_seq, seq);
+            shared_bytes = moe_saturating_add_u64_local(shared_bytes, entry.size);
+            break;
+        case moe_JUJU_SECTION_HOT_EXPERTS:
+            found = 1;
+            hot_mmap = entry.mmap_friendly ? hot_mmap : 0u;
+            hot_seq = moe_max_u32_local(hot_seq, seq);
+            hot_bytes = moe_saturating_add_u64_local(hot_bytes, entry.size);
+            break;
+        case moe_JUJU_SECTION_WARM_EXPERTS:
+            found = 1;
+            warm_mmap = entry.mmap_friendly ? warm_mmap : 0u;
+            warm_seq = moe_max_u32_local(warm_seq, seq);
+            warm_bytes = moe_saturating_add_u64_local(warm_bytes, entry.size);
+            break;
+        case moe_JUJU_SECTION_COLD_EXPERTS:
+            found = 1;
+            cold_mmap = entry.mmap_friendly ? cold_mmap : 0u;
+            cold_seq = moe_max_u32_local(cold_seq, seq);
+            cold_bytes = moe_saturating_add_u64_local(cold_bytes, entry.size);
+            break;
+        default:
+            break;
+        }
+    }
+    if (!found) {
+        return;
+    }
+    engine->juju_shared_mmap_friendly.store(shared_mmap, std::memory_order_release);
+    engine->juju_hot_mmap_friendly.store(hot_mmap, std::memory_order_release);
+    engine->juju_warm_mmap_friendly.store(warm_mmap, std::memory_order_release);
+    engine->juju_cold_mmap_friendly.store(cold_mmap, std::memory_order_release);
+    engine->juju_shared_sequential_block_size.store(shared_seq, std::memory_order_release);
+    engine->juju_hot_sequential_block_size.store(hot_seq, std::memory_order_release);
+    engine->juju_warm_sequential_block_size.store(warm_seq, std::memory_order_release);
+    engine->juju_cold_sequential_block_size.store(cold_seq, std::memory_order_release);
+    engine->juju_max_prefetch_distance.store(max_prefetch_distance, std::memory_order_release);
+    engine->juju_shared_section_bytes.store(shared_bytes, std::memory_order_release);
+    engine->juju_hot_section_bytes.store(hot_bytes, std::memory_order_release);
+    engine->juju_warm_section_bytes.store(warm_bytes, std::memory_order_release);
+    engine->juju_cold_section_bytes.store(cold_bytes, std::memory_order_release);
+    engine->juju_io_section_hints_ready.store(1u, std::memory_order_release);
+}
+
 static int moe_read_text_file_local(const std::string& path, std::string* out) {
     if (!out) {
         return 0;
@@ -291,6 +385,125 @@ static uint8_t moe_juju_segment_policy_u8(uint64_t value) {
     return (uint8_t)value;
 }
 
+static int moe_json_get_u64_from_object_slice_local(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* object_key,
+    const char* key,
+    uint64_t* out
+) {
+    if (!object_key || !key || !out || begin >= end || end > text.size() || begin >= text.size()) {
+        return 0;
+    }
+    const std::string slice = text.substr(begin, end - begin);
+    size_t obj_begin = 0;
+    size_t obj_end = 0;
+    return moe_json_find_object_local(slice, object_key, &obj_begin, &obj_end) &&
+        moe_json_get_u64_slice(slice, obj_begin, obj_end, key, out);
+}
+
+static int moe_json_get_bool_from_object_slice_local(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* object_key,
+    const char* key,
+    int* out
+) {
+    if (!object_key || !key || !out || begin >= end || end > text.size() || begin >= text.size()) {
+        return 0;
+    }
+    const std::string slice = text.substr(begin, end - begin);
+    size_t obj_begin = 0;
+    size_t obj_end = 0;
+    return moe_json_find_object_local(slice, object_key, &obj_begin, &obj_end) &&
+        moe_json_get_bool_slice(slice, obj_begin, obj_end, key, out);
+}
+
+static int moe_json_get_bool_from_object_json_local(
+    const std::string& text,
+    const char* object_key,
+    const char* key,
+    int* out
+) {
+    if (!object_key || !key || !out || text.empty()) {
+        return 0;
+    }
+    size_t obj_begin = 0;
+    size_t obj_end = 0;
+    return moe_json_find_object_local(text, object_key, &obj_begin, &obj_end) &&
+        moe_json_get_bool_slice(text, obj_begin, obj_end, key, out);
+}
+
+static void moe_ingest_juju_runtime_contract_io_policy(moe_pc_engine* engine, const std::string& json) {
+    if (!engine || json.empty()) {
+        return;
+    }
+    int bool_value = 0;
+    if (moe_json_get_bool_from_object_json_local(json, "io_policy", "mmap", &bool_value) ||
+        moe_json_get_bool_from_object_json_local(json, "runtime_io_policy", "mmap", &bool_value) ||
+        moe_json_get_bool_from_object_json_local(json, "runtime_policy", "mmap", &bool_value) ||
+        moe_json_get_bool_local(json, "mmap", &bool_value)) {
+        engine->juju_runtime_contract_mmap_allowed.store(
+            bool_value != 0 ? 1u : 0u,
+            std::memory_order_release);
+        engine->juju_runtime_contract_io_policy_ready.store(1u, std::memory_order_release);
+    }
+}
+
+static void moe_ingest_juju_expert_tier_entries_array(
+    moe_pc_engine* engine,
+    const std::string& json,
+    const char* array_key
+);
+static void moe_ingest_juju_cross_layer_transition_prior(moe_pc_engine* engine, const std::string& json);
+
+static uint32_t moe_count_bits_u64_local(uint64_t value) {
+    uint32_t count = 0;
+    while (value) {
+        count += (uint32_t)(value & 1ull);
+        value >>= 1u;
+    }
+    return count;
+}
+
+static void moe_ingest_juju_moe_layer_bitmask_json(moe_pc_engine* engine, const std::string& json) {
+    if (!engine || json.empty()) {
+        return;
+    }
+    size_t arr_begin = 0;
+    size_t arr_end = 0;
+    if (!moe_json_find_array_local(json, "moe_layer_bitmask_words", &arr_begin, &arr_end)) {
+        return;
+    }
+    std::vector<uint64_t> words;
+    words.reserve(16);
+    uint64_t moe_layers = 0;
+    size_t pos = arr_begin + 1;
+    while (pos < arr_end && words.size() < 4096u) {
+        pos = json.find_first_not_of(" \t\r\n,", pos);
+        if (pos == std::string::npos || pos >= arr_end || json[pos] == ']') {
+            break;
+        }
+        char* parsed_end = nullptr;
+        const char* start = json.c_str() + pos;
+        const uint64_t value = std::strtoull(start, &parsed_end, 10);
+        if (!parsed_end || parsed_end == start) {
+            break;
+        }
+        words.push_back(value);
+        moe_layers += moe_count_bits_u64_local(value);
+        pos = (size_t)(parsed_end - json.c_str());
+    }
+    if (words.empty()) {
+        return;
+    }
+    engine->juju_moe_layer_bitmask_words = std::move(words);
+    engine->juju_moe_layer_count.store(moe_layers, std::memory_order_relaxed);
+    engine->juju_moe_layer_bitmask_ready.store(1u, std::memory_order_release);
+}
+
 static void moe_ingest_juju_predictor_section(moe_pc_engine* engine, const std::string& json) {
     if (!engine || json.empty()) {
         return;
@@ -307,6 +520,9 @@ static void moe_ingest_juju_predictor_section(moe_pc_engine* engine, const std::
     if (moe_json_get_u64_local(json, "expert_tensor_count", &value)) {
         engine->juju_predictor_expert_tensor_count.store(value, std::memory_order_relaxed);
     }
+    moe_ingest_juju_expert_tier_entries_array(engine, json, "expert_activation_priors");
+    moe_ingest_juju_expert_tier_entries_array(engine, json, "expert_tier_entries");
+    moe_ingest_juju_cross_layer_transition_prior(engine, json);
     engine->juju_predictor_metadata_ready.store(1, std::memory_order_release);
 }
 
@@ -359,6 +575,112 @@ static void moe_ingest_juju_buddy_map_section(moe_pc_engine* engine, const std::
     engine->juju_buddy_map_ready.store(1, std::memory_order_release);
 }
 
+static void moe_ingest_juju_expert_tier_entries_array(
+    moe_pc_engine* engine,
+    const std::string& json,
+    const char* array_key
+) {
+    if (!engine || json.empty() || !array_key || !array_key[0]) {
+        return;
+    }
+    size_t arr_begin = 0;
+    size_t arr_end = 0;
+    if (!moe_json_find_array_local(json, array_key, &arr_begin, &arr_end)) {
+        return;
+    }
+    size_t cursor = arr_begin + 1;
+    size_t obj_begin = 0;
+    size_t obj_end = 0;
+    while (moe_json_next_object_in_array(json, &cursor, arr_end, &obj_begin, &obj_end)) {
+        uint64_t layer64 = 0;
+        uint64_t expert64 = 0;
+        uint64_t runtime_priority64 = 0;
+        uint64_t prefetch_priority64 = 0;
+        uint64_t buddies64[MOE_JUJU_MAX_BUDDIES]{};
+        uint32_t buddy_count = 0;
+        std::string residency_text;
+        if (!moe_json_get_u64_slice(json, obj_begin, obj_end, "layer", &layer64) ||
+            !moe_json_get_u64_slice(json, obj_begin, obj_end, "expert", &expert64) ||
+            layer64 > (uint64_t)std::numeric_limits<int>::max() ||
+            expert64 > (uint64_t)std::numeric_limits<int>::max()) {
+            continue;
+        }
+        if (!moe_json_get_u64_slice(json, obj_begin, obj_end, "runtime_priority", &runtime_priority64)) {
+            runtime_priority64 = 65;
+        }
+        if (!moe_json_get_u64_slice(json, obj_begin, obj_end, "prefetch_priority", &prefetch_priority64)) {
+            prefetch_priority64 = 80;
+        }
+        const uint8_t residency =
+            moe_json_get_string_slice(json, obj_begin, obj_end, "residency_hint", &residency_text)
+                ? moe_juju_residency_hint_from_text(residency_text)
+                : moe_JUJU_RESIDENCY_AUTO;
+        expert_runtime_hints_update(
+            engine,
+            (int)layer64,
+            (int)expert64,
+            (uint16_t)std::min<uint64_t>(runtime_priority64, 65535ull),
+            (uint16_t)std::min<uint64_t>(prefetch_priority64, 65535ull),
+            residency);
+        if (moe_json_get_u64_array_slice(json, obj_begin, obj_end, "buddy_expert_ids",
+                buddies64, MOE_JUJU_MAX_BUDDIES, &buddy_count)) {
+            std::vector<int> buddies;
+            buddies.reserve(buddy_count);
+            for (uint32_t i = 0; i < buddy_count; ++i) {
+                if (buddies64[i] <= (uint64_t)std::numeric_limits<int>::max()) {
+                    buddies.push_back((int)buddies64[i]);
+                }
+            }
+            expert_buddy_hints_update(engine, (int)layer64, (int)expert64, buddies);
+        }
+    }
+}
+
+static void moe_ingest_juju_expert_tier_entries_json(moe_pc_engine* engine, const std::string& json) {
+    moe_ingest_juju_expert_tier_entries_array(engine, json, "expert_tier_entries");
+    moe_ingest_juju_expert_tier_entries_array(engine, json, "expert_activation_priors");
+}
+
+static void moe_ingest_juju_cross_layer_transition_prior(moe_pc_engine* engine, const std::string& json) {
+    if (!engine || json.empty()) {
+        return;
+    }
+    size_t arr_begin = 0;
+    size_t arr_end = 0;
+    if (!moe_json_find_array_local(json, "cross_layer_transition_prior", &arr_begin, &arr_end)) {
+        return;
+    }
+    std::unique_lock<std::shared_mutex> lock(engine->co_activation_mutex);
+    size_t cursor = arr_begin + 1;
+    size_t obj_begin = 0;
+    size_t obj_end = 0;
+    while (moe_json_next_object_in_array(json, &cursor, arr_end, &obj_begin, &obj_end)) {
+        uint64_t from_layer64 = 0;
+        uint64_t from_expert64 = 0;
+        uint64_t to_layer64 = 0;
+        uint64_t to_expert64 = 0;
+        double probability = 0.0;
+        if (!moe_json_get_u64_slice(json, obj_begin, obj_end, "from_layer", &from_layer64) ||
+            !moe_json_get_u64_slice(json, obj_begin, obj_end, "from_expert", &from_expert64) ||
+            !moe_json_get_u64_slice(json, obj_begin, obj_end, "to_layer", &to_layer64) ||
+            !moe_json_get_u64_slice(json, obj_begin, obj_end, "to_expert", &to_expert64) ||
+            from_layer64 > 9999ull ||
+            to_layer64 > 9999ull ||
+            from_expert64 > (uint64_t)std::numeric_limits<int>::max() ||
+            to_expert64 > (uint64_t)std::numeric_limits<int>::max()) {
+            continue;
+        }
+        moe_json_get_double_slice(json, obj_begin, obj_end, "probability", &probability);
+        const float score = (std::isfinite(probability) && probability > 0.0)
+            ? (float)std::max(0.001, probability)
+            : 0.001f;
+        if (engine->co_activation_stats.size() <= (size_t)to_layer64) {
+            engine->co_activation_stats.resize((size_t)to_layer64 + 1u);
+        }
+        engine->co_activation_stats[(size_t)to_layer64][(int)from_expert64][(int)to_expert64] += score;
+    }
+}
+
 static void moe_ingest_juju_tier_hint_section(moe_pc_engine* engine, const std::string& json) {
     if (!engine || json.empty()) {
         return;
@@ -378,6 +700,8 @@ static void moe_ingest_juju_tier_hint_section(moe_pc_engine* engine, const std::
     if (moe_json_get_u64_local(json, "cold_expert_tensor_count", &value)) {
         engine->juju_tier_cold_expert_tensor_count.store(value, std::memory_order_relaxed);
     }
+    moe_ingest_juju_moe_layer_bitmask_json(engine, json);
+    moe_ingest_juju_expert_tier_entries_json(engine, json);
     engine->juju_tier_hint_ready.store(1, std::memory_order_release);
 }
 
@@ -390,6 +714,7 @@ static void moe_ingest_juju_runtime_metadata_sections(
     if (!engine || path.empty()) {
         return;
     }
+    moe_ingest_juju_section_table_hints(engine, sections);
     std::string json;
     if (moe_read_juju_json_section(path, sections, moe_JUJU_SECTION_PREDICTOR, file_bytes, &json)) {
         moe_ingest_juju_predictor_section(engine, json);
@@ -399,6 +724,13 @@ static void moe_ingest_juju_runtime_metadata_sections(
     }
     if (moe_read_juju_json_section(path, sections, moe_JUJU_SECTION_TIER_HINT, file_bytes, &json)) {
         moe_ingest_juju_tier_hint_section(engine, json);
+    }
+    if (moe_read_juju_json_section(path, sections, moe_JUJU_SECTION_RUNTIME_CONTRACT, file_bytes, &json)) {
+        moe_ingest_juju_runtime_contract_io_policy(engine, json);
+        if (!engine->offload_gguf_metadata_json.empty()) {
+            engine->offload_gguf_metadata_json.push_back('\n');
+        }
+        engine->offload_gguf_metadata_json += json;
     }
 }
 
@@ -479,6 +811,37 @@ static int moe_parse_juju_tensor_index_json(
         if (moe_json_get_u64_slice(json, obj_begin, obj_end, "row_padding_bytes", &value)) {
             rec.row_padding_bytes = value;
         }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "expert_count", &value) ||
+            moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "expert_layout", "expert_count", &value)) {
+            rec.expert_count = moe_u64_to_u32_clamped(value, 0);
+            rec.has_expert_layout = 1;
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "per_expert_bytes", &value) ||
+            moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "expert_layout", "per_expert_bytes", &value)) {
+            rec.per_expert_bytes = value;
+            rec.has_expert_layout = 1;
+        }
+        if (moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "expert_layout", "base_offset", &value)) {
+            rec.expert_base_offset = value;
+            rec.has_expert_layout = 1;
+        }
+        int bool_value = 0;
+        if (moe_json_get_bool_from_object_slice_local(json, obj_begin, obj_end, "combined_gate_up_split", "enabled", &bool_value) ||
+            moe_json_get_bool_slice(json, obj_begin, obj_end, "combined_gate_up_split_enabled", &bool_value)) {
+            rec.combined_gate_up_split_enabled = bool_value ? 1 : 0;
+        }
+        if (moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "combined_gate_up_split", "gate_rel_offset", &value)) {
+            rec.gate_rel_offset = value;
+        }
+        if (moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "combined_gate_up_split", "gate_bytes", &value)) {
+            rec.gate_bytes = value;
+        }
+        if (moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "combined_gate_up_split", "up_rel_offset", &value)) {
+            rec.up_rel_offset = value;
+        }
+        if (moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "combined_gate_up_split", "up_bytes", &value)) {
+            rec.up_bytes = value;
+        }
         if (moe_json_get_u64_slice(json, obj_begin, obj_end, "weight_encoding", &value) ||
             moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_weight_encoding", &value) ||
             moe_json_get_u64_slice(json, obj_begin, obj_end, "source_weight_encoding", &value)) {
@@ -535,7 +898,6 @@ static int moe_parse_juju_tensor_index_json(
         if (moe_json_get_u64_slice(json, obj_begin, obj_end, "can_partial_exec", &value)) {
             rec.can_partial_exec = value != 0 ? 1 : 0;
         } else {
-            int bool_value = 0;
             if (moe_json_get_bool_slice(json, obj_begin, obj_end, "can_partial_exec", &bool_value)) {
                 rec.can_partial_exec = bool_value ? 1 : 0;
             }

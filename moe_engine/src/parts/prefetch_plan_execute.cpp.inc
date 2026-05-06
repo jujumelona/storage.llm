@@ -173,6 +173,19 @@ int moe_pc_engine_execute_prefetch_plan(
                         "tier=%d vram_pending=%d target=%d layer=%u expert=%u\n",
                         (int)admitted_tiers[i], (int)vram_pending_reserved[i],
                         (int)items[i].target_tier, items[i].layer, items[i].expert);
+                    // BUGFIX 948: Release reservation even for 0-byte items ★★★ CRITICAL
+                    // Problem: Warning printed but reservation not released → pending counter
+                    // accumulates over time → VRAM appears full → prefetch trim over-aggressive
+                    // → GPU utilization drops to near-zero under sustained load
+                    // Solution: Release the dangling reservation. 0-byte subtract is a safe no-op.
+                    // Impact: Prevents cumulative VRAM budget drift from zero-byte anomalies.
+                    if (vram_pending_reserved[i]) {
+                        prefetch_release_pending_vram_reservation(engine, 0);
+                    } else if (admitted_tiers[i] == moe_TIER_VRAM) {
+                        subtract_tier_usage(engine, moe_TIER_VRAM, 0);
+                    } else if (admitted_tiers[i] == moe_TIER_RAM) {
+                        prefetch_release_pending_ram_reservation(engine, 0);
+                    }
                 }
             } else if (admitted_tiers[i] == moe_TIER_VRAM && !vram_pending_reserved[i]) {
                 // Case 1: RAM→VRAM upgrade succeeded (try_add_tier_usage committed)

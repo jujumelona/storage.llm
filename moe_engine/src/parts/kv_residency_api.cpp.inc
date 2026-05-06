@@ -99,9 +99,12 @@ int moe_pc_engine_request_expert(
         }
         if (target == moe_TIER_RAM) {
             const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
-            const uint64_t eviction_pct = engine->io_config.ram_eviction_target_fill_pct > 0
-                ? engine->io_config.ram_eviction_target_fill_pct : 75ull;
-            const uint64_t admission_pct = std::min(95ull, eviction_pct + 10ull);
+            // BUGFIX 980: Clamp eviction_pct to 85% max (same as prefetch_admission)
+            const uint64_t eviction_pct = std::min(
+                engine->io_config.ram_eviction_target_fill_pct > 0
+                    ? engine->io_config.ram_eviction_target_fill_pct : 75ull,
+                85ull);
+            const uint64_t admission_pct = eviction_pct + 10ull;
             const uint64_t ram_limit = (ram_budget * admission_pct) / 100ull;
             const bool too_big = ram_budget > 0 && bytes > ram_budget;
             const bool over_limit = ram_budget > 0 &&
@@ -150,9 +153,12 @@ int moe_pc_engine_request_expert(
 
         moe_tier_t final_target = target;
         const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
-        const uint64_t eviction_pct = engine->io_config.ram_eviction_target_fill_pct > 0
-            ? engine->io_config.ram_eviction_target_fill_pct : 75ull;
-        const uint64_t admission_pct = std::min(95ull, eviction_pct + 10ull);
+        // BUGFIX 980: Clamp eviction_pct to 85% max (same as prefetch_admission)
+        const uint64_t eviction_pct = std::min(
+            engine->io_config.ram_eviction_target_fill_pct > 0
+                ? engine->io_config.ram_eviction_target_fill_pct : 75ull,
+            85ull);
+        const uint64_t admission_pct = eviction_pct + 10ull;
         const uint64_t ram_threshold = (ram_budget * admission_pct) / 100ull;
         if (final_target == moe_TIER_RAM && ram_budget > 0 &&
             tier_used(engine, moe_TIER_RAM) + bytes > ram_threshold) {
@@ -161,6 +167,9 @@ int moe_pc_engine_request_expert(
         if (try_add_tier_usage(engine, final_target, bytes, tier_budget(engine, final_target))) {
             state.tier = final_target;
             state.pending_evict = false;
+            // BUGFIX 1004: Verified — these fetch_add calls ARE inside map_mutex ★★ AUDIT
+            // Phase 3 lambda (line 144) re-acquires map_mutex via lock_guard.
+            // Phase 1's lock.unlock() at line 126 does NOT affect Phase 3 scope.
             if (final_target == moe_TIER_VRAM) engine->vram_expert_count.fetch_add(1);
             else if (final_target == moe_TIER_RAM) engine->ram_expert_count.fetch_add(1);
             else if (final_target == moe_TIER_DB) engine->db_expert_count.fetch_add(1);

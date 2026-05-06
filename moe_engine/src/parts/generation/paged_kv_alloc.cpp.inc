@@ -61,13 +61,14 @@ struct moe_paged_kv_manager_t {
     bool lru_heap_compact_needed = false;
     std::mutex mtx;
 
-    void init(uint32_t capacity_tokens, uint32_t b_size, uint32_t layers, uint32_t sink_tokens = 4) {
+    void init(uint32_t capacity_tokens, uint32_t b_size, uint32_t layers,
+              uint32_t sink_tokens = 4, uint32_t entry_dim_bytes = 512) {
         // BUGFIX 514: Check b_size > 0 to prevent division by zero ??        // Problem: max_blocks = capacity_tokens / block_size crashes if b_size == 0
         // Solution: Check b_size > 0 before division
         if (b_size == 0) {
             return;
         }
-        // BUGFIX 515: Check layers upper bound to prevent overflow ??        // Problem: block_size * layers * 512 can overflow in malloc
+        // BUGFIX 515: Check layers upper bound to prevent overflow ??        // Problem: block_size * layers * entry_dim_bytes can overflow in malloc
         // Solution: Add reasonable upper bound check (e.g., 1000 layers)
         if (layers > 1000) {
             return;
@@ -75,7 +76,15 @@ struct moe_paged_kv_manager_t {
         if (b_size > 65536u) {
             return;
         }
-        const uint64_t data_bytes64 = (uint64_t)b_size * (uint64_t)layers * 512ull;
+        // BUGFIX 959: Replace hardcoded 512 with entry_dim_bytes parameter ★★★ CRITICAL
+        // Problem: 512 assumes moe_MLA_KV_ENTRY_DIM (576 for MLA, 512 for standard attention).
+        // Models with k_dim + v_dim > 512 overwrite beyond block allocation in store_entry.
+        // Solution: Parameterize with backward-compatible default (512).
+        // Impact: Prevents heap corruption for non-MLA models with larger KV dimensions.
+        if (entry_dim_bytes == 0) {
+            entry_dim_bytes = 512;
+        }
+        const uint64_t data_bytes64 = (uint64_t)b_size * (uint64_t)layers * (uint64_t)entry_dim_bytes;
         const uint64_t aux_bytes64 = (uint64_t)b_size * (uint64_t)layers * (uint64_t)sizeof(float);
         if (data_bytes64 > (uint64_t)SIZE_MAX || aux_bytes64 > (uint64_t)SIZE_MAX) {
             return;

@@ -338,15 +338,19 @@ static int device_copy_tensor(
     // Old: worker_index=0, turn=0 fixed ??all workers compete for slot 0
     // New: thread-local turn counter ??workers spread across slot pool
     static thread_local uint32_t tl_device_copy_turn = 0;
-    // BUGFIX 935: Add staging_slot_size > 0 guard ★★★ CRITICAL
-    // Problem: After reset timeout, staging_slots.size() > 0 but staging_slot_size = 0
-    // → acquire_staging_slot may return valid index to slot with null buf
-    // Solution: Check staging_slot_size > 0 before attempting staging fast-path
-    uint32_t slot_idx = (e->staging_slots.size() > 0 && e->staging_slot_size > 0 && bytes <= e->staging_slot_size)
+    // BUGFIX 985: Use staging_slot_valid()-consistent guard ★★ DEFENSIVE
+    // Problem: Direct staging_slots.size() check doesn't catch slot.buf==nullptr
+    // after reset_staging_slots timeout (staging_slot_size=0 but vector not cleared).
+    // staging_slot_valid() enforces correct 3-step check: staging_slot_size > 0,
+    // slot_index < vector size, buf != nullptr.
+    // Note: We still do the size check first to avoid acquire_staging_slot overhead.
+    const bool staging_eligible = e->staging_slot_size > 0 &&
+        e->staging_slots.size() > 0 && bytes <= e->staging_slot_size;
+    uint32_t slot_idx = staging_eligible
         ? acquire_staging_slot(e, 0u, tl_device_copy_turn++, bytes, false) : UINT32_MAX;
 
     // BUGFIX: 슬롯 할당 실패 시 즉시 drain을 한 번 더 시도
-    if (slot_idx == UINT32_MAX && e->staging_slots.size() > 0 && e->staging_slot_size > 0 && bytes <= e->staging_slot_size) {
+    if (slot_idx == UINT32_MAX && staging_eligible) {
         device_drain_deferred_staging_copies(e, false); // 즉시 drain 재시도
         slot_idx = acquire_staging_slot(e, 0u, tl_device_copy_turn++, bytes, false);
     }
