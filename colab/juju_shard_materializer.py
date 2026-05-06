@@ -3500,6 +3500,59 @@ def build_layer_graph_ir(layer, tensors):
     }
 
 
+
+def build_juju_forward_contract_validation(generation_contract, runtime_arch, *, token_embd, lm_head, output_norm, layers):
+    embedding = dict((generation_contract or {}).get("embedding") or {})
+    tokenizer = dict((generation_contract or {}).get("tokenizer") or {})
+    lm = dict((generation_contract or {}).get("lm_head") or {})
+    final_norm = dict((generation_contract or {}).get("final_norm") or {})
+    layer_contract = dict((generation_contract or {}).get("layers") or {})
+    feature_counts = dict(layer_contract.get("feature_counts") or {})
+    layer_count = int(layer_contract.get("count") or len(layers or []))
+    moe_layers = int(feature_counts.get("layers_with_moe_experts") or 0)
+    dense_layers = int(feature_counts.get("layers_with_dense_ffn") or 0)
+    q_layers = int(feature_counts.get("layers_with_q_projection") or 0)
+    k_layers = int(feature_counts.get("layers_with_k_projection") or 0)
+    o_layers = int(feature_counts.get("layers_with_o_projection") or 0)
+    router_layers = int(feature_counts.get("layers_with_router") or 0)
+    required = {
+        "tokenizer_any_of": bool(tokenizer.get("required_any_of")),
+        "token_embedding_tensor": bool(token_embd),
+        "embedding_hidden_size": bool(embedding.get("hidden_size")),
+        "embedding_vocab_size": bool(embedding.get("vocab_size")),
+        "embedding_scale_contract": embedding.get("scale") is not None or embedding.get("scale_semantics") == "none",
+        "layer_count": layer_count > 0,
+        "tensor_layout_contract": bool(layer_contract.get("tensor_layout_records_complete")),
+        "attention_contract": layer_count > 0 and q_layers == layer_count and k_layers == layer_count and o_layers == layer_count,
+        "router_contract": moe_layers == 0 or router_layers == moe_layers,
+        "mlp_contract": (moe_layers + dense_layers) > 0,
+        "kv_layout_contract": bool(layer_contract.get("kv_layout_contract_available")),
+        "final_norm_tensor": bool(output_norm) or bool(final_norm.get("tensor")),
+        "lm_head_tensor": bool(lm_head) or bool(lm.get("tensor")) or bool(lm.get("tied_to_token_embedding")),
+    }
+    missing = sorted(k for k, ok in required.items() if not ok)
+    return {
+        "format": "JUJU_FORWARD_CONTRACT_VALIDATION_V1",
+        "contract_complete": not missing,
+        "required_status": required,
+        "missing": missing,
+        "fail_closed_if_contract_missing": True,
+        "source_priority": [
+            "source_config_explicit_values",
+            "gguf_runtime_kv",
+            "tensor_index_shapes_and_names",
+            "architecture_forward_contract_rules",
+            "documented_absent_contract",
+        ],
+        "embedding_scale": {
+            "value": embedding.get("scale"),
+            "source": embedding.get("scale_source"),
+            "semantics": embedding.get("scale_semantics"),
+        },
+        "layer_features": feature_counts,
+        "runtime_arch_keys": sorted(str(k) for k, v in (runtime_arch or {}).items() if v is not None),
+    }
+
 def build_generation_contract(*, contract, tensor_records, runtime_arch, token_embd, lm_head, output_norm):
     shape_map = _juju_tensor_shape_map(tensor_records)
     hidden_size = runtime_arch.get("hidden_size") or runtime_arch.get("hidden_dim")
@@ -3521,8 +3574,15 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
         "layers_with_post_ffw_norm_2": 0,
         "layers_with_layer_output_scale": 0,
         "layers_without_v_projection": 0,
+        "layers_with_q_projection": 0,
+        "layers_with_k_projection": 0,
+        "layers_with_v_projection": 0,
+        "layers_with_o_projection": 0,
         "layers_with_v_norm": 0,
+        "layers_with_router": 0,
         "layers_with_router_scale": 0,
+        "layers_with_moe_experts": 0,
+        "layers_with_dense_ffn": 0,
     }
     layers = sorted({
         layer for layer in (_juju_layer_id_from_name(t.get("name")) for t in tensor_records)
@@ -3544,11 +3604,34 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
             feature_counts["layers_with_layer_output_scale"] += 1
         if not any(x in suffixes for x in {"attn_v.weight", "attention.wv.weight", "v_proj.weight", "attn_kv_b_proj.weight"}):
             feature_counts["layers_without_v_projection"] += 1
+        if any(x in suffixes for x in {"attn_q.weight", "attention.wq.weight", "q_proj.weight", "attn_q_a_proj.weight", "attn_q_b_proj.weight"}):
+            feature_counts["layers_with_q_projection"] += 1
+        if any(x in suffixes for x in {"attn_k.weight", "attention.wk.weight", "k_proj.weight", "attn_kv_a_proj_with_mqa.weight"}):
+            feature_counts["layers_with_k_projection"] += 1
+        if any(x in suffixes for x in {"attn_v.weight", "attention.wv.weight", "v_proj.weight", "attn_kv_b_proj.weight"}):
+            feature_counts["layers_with_v_projection"] += 1
+        if any(x in suffixes for x in {"attn_output.weight", "attention.wo.weight", "o_proj.weight"}):
+            feature_counts["layers_with_o_projection"] += 1
         if any(x in suffixes for x in {"attn_v_norm.weight", "v_norm.weight", "value_norm.weight"}):
             feature_counts["layers_with_v_norm"] += 1
+        if any(x in suffixes for x in {"ffn_gate_inp.weight", "router.weight", "mlp.router.weight", "moe.gate.weight"}):
+            feature_counts["layers_with_router"] += 1
         if any(x in suffixes for x in {"ffn_gate_inp.scale", "router.scale", "mlp.router.scale", "moe.gate.scale"}):
             feature_counts["layers_with_router_scale"] += 1
-    return {
+        if any("exps." in x or "_exps." in x for x in suffixes):
+            feature_counts["layers_with_moe_experts"] += 1
+        if any(x in suffixes for x in {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"}):
+            feature_counts["layers_with_dense_ffn"] += 1
+    tensor_layout_records_complete = all(
+        rec.get("row_layout") is not None and
+        rec.get("row_stride_bytes") is not None and
+        rec.get("juju_offset") is not None and
+        rec.get("juju_bytes") is not None and
+        rec.get("shape") is not None and
+        rec.get("weight_encoding") is not None
+        for rec in (tensor_records or [])
+    )
+    contract_out = {
         "format": "JUJU_GENERATION_CONTRACT_V1",
         "required_runtime_loop": "tokenizer_contract_then_graph_ir_ops_then_tensor_layout_then_lm_head",
         "contract_source": "generated_from_source_tensor_table_and_config_not_model_name",
@@ -3570,6 +3653,8 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
             "op_order_is_authoritative": True,
             "unknown_required_op_behavior": "fail_closed",
             "optional_missing_op_behavior": "documented_fallback_only",
+            "tensor_layout_records_complete": bool(tensor_layout_records_complete),
+            "kv_layout_contract_available": False,
         },
         "lm_head": {
             "tensor": lm_head,
@@ -3617,6 +3702,15 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
             ],
         },
     }
+    contract_out["forward_contract_validation"] = build_juju_forward_contract_validation(
+        contract_out,
+        runtime_arch,
+        token_embd=token_embd,
+        lm_head=lm_head,
+        output_norm=output_norm,
+        layers=layers,
+    )
+    return contract_out
 
 
 def juju_expert_tensor_diagnostics(tensor_records):
@@ -3700,6 +3794,15 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
         output_norm=output_norm,
     )
     runtime_access_plan = build_juju_runtime_access_plan(tensor_records, contract, runtime_arch)
+    generation_contract["layers"]["kv_layout_contract_available"] = bool(runtime_access_plan.get("kv_layout_contract"))
+    generation_contract["forward_contract_validation"] = build_juju_forward_contract_validation(
+        generation_contract,
+        runtime_arch,
+        token_embd=token_embd,
+        lm_head=lm_head,
+        output_norm=output_norm,
+        layers=layers,
+    )
     priority_rules = [
         {"match": "token_embd.weight|output.weight|output_norm.weight|rope_freqs.weight", "priority": 100, "residency": "FAST_MEM", "prefetch": "startup_hot"},
         {"match": "attention/norm/router tensors", "priority": 85, "residency": "FAST_MEM", "prefetch": "layer_hot"},
