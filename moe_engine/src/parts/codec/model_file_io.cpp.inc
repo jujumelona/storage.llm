@@ -147,6 +147,8 @@ static void moe_append_runtime_sidecar_blob(
     engine->offload_gguf_metadata_json += moe_json_escape_runtime_path(rel_path);
     engine->offload_gguf_metadata_json += "\"}\n";
     engine->offload_gguf_metadata_json += data;
+    engine->cached_embedding_scale_hidden.store(0u, std::memory_order_release);
+    engine->cached_embedding_scale_bits.store(0u, std::memory_order_release);
 
     const std::string lower = moe_lower_ascii_copy(rel_path);
     const bool graph_hint =
@@ -174,6 +176,7 @@ static void moe_append_model_root_runtime_sidecars(
     }
     static const char* kRootSidecars[] = {
         "runtime_assets_manifest.json",
+        "storagellm_runtime_contract.json",
         "storagellm_performance_metadata_manifest.json",
         "generation_config.json",
         "tokenizer_config.json",
