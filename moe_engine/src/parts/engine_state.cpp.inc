@@ -432,6 +432,7 @@ struct moe_pc_engine {
     qkv_config_t qkv_cfg{};
     std::atomic<bool> qkv_cfg_initialized{false};
     uint32_t qkv_last_ctx = 0;  // Track context size for reallocation
+    std::atomic<uint32_t> eval_plain_kv_active{0};
     std::vector<CUstream> stream_pool;
     std::mutex stream_pool_mutex;
     std::atomic<uint32_t> stream_pool_available{0};

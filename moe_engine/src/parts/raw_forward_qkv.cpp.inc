@@ -161,6 +161,8 @@ static bool moe_qkv_config_matches_contract(
         current.group_size == desired.group_size &&
         current.page_size_tokens == desired.page_size_tokens &&
         current.sink_tokens == desired.sink_tokens &&
+        current.attention_score_scale == desired.attention_score_scale &&
+        current.attention_logit_softcap == desired.attention_logit_softcap &&
         current.plain_kv_persistent_storage == desired.plain_kv_persistent_storage;
 }
 
@@ -391,17 +393,7 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
         !engine->qkv_head_state_locks[slot_index]) {
         return 0;
     }
-    static thread_local std::vector<float> qkv_scaled_query;
-    const float internal_scale = 1.0f / std::sqrt((float)head_dim);
-    const float multiplier = internal_scale > 0.0f ? score_scale / internal_scale : 1.0f;
-    const float* q = query;
-    if (std::isfinite(multiplier) && std::fabs(multiplier - 1.0f) > 1e-6f) {
-        qkv_scaled_query.resize(head_dim);
-        for (uint32_t i = 0; i < head_dim; ++i) {
-            qkv_scaled_query[i] = query[i] * multiplier;
-        }
-        q = qkv_scaled_query.data();
-    } else if (!std::isfinite(multiplier)) {
+    if (!(score_scale > 0.0f) || !std::isfinite(score_scale)) {
         return 0;
     }
     std::lock_guard<std::mutex> head_guard(*engine->qkv_head_state_locks[slot_index]);
@@ -412,8 +404,9 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
         return 0;
     }
     qkv_config_t qkv_decode_cfg = engine->qkv_cfg;
+    qkv_decode_cfg.attention_score_scale = score_scale;
     qkv_decode_cfg.attention_logit_softcap = attn_logit_softcap;
-    return qkv_attention_decode(q, slot, &qkv_decode_cfg, context_tokens, head_dim, output);
+    return qkv_attention_decode(query, slot, &qkv_decode_cfg, context_tokens, head_dim, output);
 }
 
 static qkv_state_t* moe_qkv_ensure_head_state(

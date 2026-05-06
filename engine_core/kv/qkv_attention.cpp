@@ -91,7 +91,10 @@ int qkv_attention_decode_impl(
 
     // BUGFIX 352: d가 0일 때 division by zero 방지
     if (d <= 0) return 0;
-    const float sc = 1.0f / sqrtf((float)d);
+    float sc = 1.0f / sqrtf((float)d);
+    if (cfg->attention_score_scale > 0.0f && std::isfinite(cfg->attention_score_scale)) {
+        sc = cfg->attention_score_scale;
+    }
     const float attn_logit_softcap =
         (cfg->attention_logit_softcap > 0.0f && std::isfinite(cfg->attention_logit_softcap))
             ? cfg->attention_logit_softcap

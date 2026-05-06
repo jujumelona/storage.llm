@@ -83,12 +83,17 @@ enough.
 
 ## KV Modes
 
-Default KV is plain/original append/cache/reuse.
+> **Single source of truth:** `KV_MODES.md` in this directory.
 
-QKV is the only optional KV quantization mode in this tree:
+The runtime default is `moe_KV_MODE_QKV`. The legacy `moe_KV_MODE_PLAIN` enum
+remains in the C ABI for debug and backward-compatible callers, but
+`moe_pc_default_config()` returns `moe_KV_MODE_QKV`.
+
+QKV is the only KV quantization mode in this tree:
 
 - `../engine_core/kv/kv_qkv.h`
 - `../engine_core/kv/kv_qkv.cpp`
 
-If QKV is not explicitly selected, the runtime stays on plain KV. No archived
-KV compression variant may silently replace plain KV.
+Offload-native GGUF models that embed `qkv_packed_cache_required` force QKV;
+attempting to switch to plain KV after such a model is loaded is rejected.
+No archived KV compression variant may silently replace QKV.

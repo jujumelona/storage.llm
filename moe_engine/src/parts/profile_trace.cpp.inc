@@ -185,7 +185,35 @@ static void moe_profile_log(const char* tag, const char* fmt, ...) {
         proc_cpu_host_pct,
         (unsigned long long)rss_bytes,
         (unsigned long long)avail_ram_bytes);
-    std::fflush(stderr);
+    static std::atomic<uint64_t> last_flush_us{0};
+    static std::atomic<int> cached_flush_ms{-1};
+    int flush_ms = cached_flush_ms.load(std::memory_order_acquire);
+    if (flush_ms < 0) {
+        flush_ms = 1000;
+        const char* env = std::getenv("STORAGELLM_TRACE_FLUSH_MS");
+        if (env && env[0]) {
+            char* end = nullptr;
+            const long parsed = std::strtol(env, &end, 10);
+            if (end && *end == '\0' && parsed >= 0 && parsed <= 60000) {
+                flush_ms = (int)parsed;
+            }
+        }
+        cached_flush_ms.store(flush_ms, std::memory_order_release);
+    }
+    const int force_flush =
+        std::strcmp(tag ? tag : "", "generation_end") == 0 ||
+        std::strcmp(tag ? tag : "", "generation_engine_end") == 0 ||
+        std::strcmp(tag ? tag : "", "eval_done") == 0 ||
+        std::strcmp(tag ? tag : "", "eval_end") == 0;
+    const uint64_t flush_interval_us = (uint64_t)flush_ms * 1000ull;
+    const uint64_t prev_flush = last_flush_us.load(std::memory_order_relaxed);
+    if (force_flush ||
+        flush_ms == 0 ||
+        !prev_flush ||
+        (now_us >= prev_flush && now_us - prev_flush >= flush_interval_us)) {
+        last_flush_us.store(now_us, std::memory_order_relaxed);
+        std::fflush(stderr);
+    }
 }
 
 static std::atomic<uint64_t> g_moe_profile_generation_id{0};

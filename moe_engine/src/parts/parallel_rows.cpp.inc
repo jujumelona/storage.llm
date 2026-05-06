@@ -52,17 +52,22 @@ static inline void moe_cpu_apply_row_worker_qos() {
 }
 
 static uint32_t moe_cpu_row_min_block() {
-#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
-    if (__builtin_cpu_supports("avx512f")) return 64u;
-    if (__builtin_cpu_supports("avx2")) return 32u;
-#endif
-#if defined(__AVX512F__)
-    return 64u;
-#elif defined(__AVX2__)
-    return 32u;
-#else
+    const uint32_t override_block = moe_parse_env_u32("STORAGELLM_CPU_ROW_MIN_BLOCK");
+    if (override_block > 0) {
+        return std::min<uint32_t>(override_block, 4096u);
+    }
+    // Keep blocks small enough that MoE gate/up/down work can occupy all row
+    // workers. The persistent pool removes most per-dispatch thread overhead,
+    // so a 64-row AVX512 floor underutilizes CPU on 352-row expert tiles.
     return 16u;
-#endif
+}
+
+static uint32_t moe_cpu_row_blocks_per_worker() {
+    const uint32_t override_blocks = moe_parse_env_u32("STORAGELLM_CPU_ROW_BLOCKS_PER_WORKER");
+    if (override_blocks > 0) {
+        return std::min<uint32_t>(override_blocks, 64u);
+    }
+    return 8u;
 }
 
 // BUGFIX 710: Minimum block size to prevent excessive atomic fetch_add contention
@@ -74,7 +79,8 @@ static uint32_t auto_row_block(uint32_t rows, uint32_t workers) {
     if (workers == 0) {
         workers = 1;
     }
-    const uint32_t block = rows / (workers * 4u);
+    const uint32_t blocks_per_worker = moe_cpu_row_blocks_per_worker();
+    const uint32_t block = rows / (workers * blocks_per_worker);
     const uint32_t min_block = moe_cpu_row_min_block();
     return std::max(block ? block : 1u, min_block);
 }

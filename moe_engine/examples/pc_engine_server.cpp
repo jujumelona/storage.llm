@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -501,6 +502,7 @@ struct server_tokenizer {
     std::unordered_map<std::string, uint32_t> text_to_id;
     std::unordered_map<std::string, uint32_t> piece_to_id;
     std::unordered_map<std::string, uint32_t> bpe_rank;
+    std::unordered_map<std::string, double> unigram_score_by_piece;
     std::vector<std::pair<std::string, std::string>> normalizer_replacements;
     std::vector<std::pair<std::string, uint32_t>> special_token_pieces;
     std::unordered_set<uint32_t> special_ids;
@@ -514,7 +516,11 @@ struct server_tokenizer {
     bool has_eos = false;
     bool has_unk = false;
     bool add_bos_token = false;
+    bool add_bos_token_explicit = false;
+    bool add_eos_token = false;
+    bool add_space_prefix = false;
     bool byte_fallback = false;
+    bool has_unigram = false;
     std::string error;
 };
 
@@ -823,6 +829,24 @@ static bool json_read_u32_in_range(
     return true;
 }
 
+static bool json_read_double_at(
+    const std::string& text,
+    size_t pos,
+    size_t end,
+    double* out,
+    size_t* next
+) {
+    if (!out || pos >= end || end > text.size()) return false;
+    while (pos < end && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+    char* parse_end = nullptr;
+    const double value = std::strtod(text.c_str() + pos, &parse_end);
+    if (!parse_end || parse_end == text.c_str() + pos) return false;
+    if (parse_end < text.c_str() || static_cast<size_t>(parse_end - text.c_str()) > end) return false;
+    *out = value;
+    if (next) *next = static_cast<size_t>(parse_end - text.c_str());
+    return std::isfinite(value);
+}
+
 static bool json_read_string_in_range(
     const std::string& text,
     size_t begin,
@@ -1030,6 +1054,93 @@ static bool tokenizer_encode_bpe_piece(
     return true;
 }
 
+static bool tokenizer_encode_unigram_candidate(
+    const server_tokenizer& tok,
+    const std::string& normalized_text,
+    std::vector<int32_t>* out_ids,
+    double* out_score
+) {
+    if (!out_ids || normalized_text.empty() || !tok.has_unigram) return false;
+    const size_t n = normalized_text.size();
+    const double neg_inf = -std::numeric_limits<double>::infinity();
+    std::vector<double> best(n + 1u, neg_inf);
+    std::vector<size_t> prev(n + 1u, SIZE_MAX);
+    std::vector<uint32_t> prev_id(n + 1u, 0);
+    best[0] = 0.0;
+    for (size_t pos = 0; pos < n; ++pos) {
+        if (!std::isfinite(best[pos])) continue;
+        const size_t max_len = std::min(tok.max_piece_bytes ? tok.max_piece_bytes : n, n - pos);
+        for (size_t len = 1; len <= max_len; ++len) {
+            const std::string piece = normalized_text.substr(pos, len);
+            uint32_t id = 0;
+            auto text_it = tok.text_to_id.find(piece);
+            if (text_it != tok.text_to_id.end()) {
+                id = text_it->second;
+            } else {
+                auto piece_it = tok.piece_to_id.find(piece);
+                if (piece_it == tok.piece_to_id.end()) {
+                    continue;
+                }
+                id = piece_it->second;
+            }
+            if (id > INT32_MAX) {
+                continue;
+            }
+            auto score_it = tok.unigram_score_by_piece.find(piece);
+            const double score = score_it == tok.unigram_score_by_piece.end() ? -10.0 : score_it->second;
+            const double candidate = best[pos] + score;
+            if (candidate > best[pos + len]) {
+                best[pos + len] = candidate;
+                prev[pos + len] = pos;
+                prev_id[pos + len] = id;
+            }
+        }
+    }
+    if (!std::isfinite(best[n])) {
+        return false;
+    }
+    std::vector<int32_t> reversed;
+    for (size_t pos = n; pos > 0;) {
+        if (prev[pos] == SIZE_MAX) return false;
+        reversed.push_back(static_cast<int32_t>(prev_id[pos]));
+        pos = prev[pos];
+    }
+    out_ids->insert(out_ids->end(), reversed.rbegin(), reversed.rend());
+    if (out_score) *out_score = best[n];
+    return !reversed.empty();
+}
+
+static bool tokenizer_encode_unigram_text(
+    const server_tokenizer& tok,
+    const std::string& text,
+    std::vector<int32_t>* out_ids
+) {
+    if (!out_ids || !tok.has_unigram) return false;
+    const std::string normalized_text = tokenizer_normalize_text(tok, text);
+    std::vector<int32_t> best_ids;
+    double best_score = -std::numeric_limits<double>::infinity();
+    std::vector<int32_t> candidate;
+    double score = -std::numeric_limits<double>::infinity();
+    if (tokenizer_encode_unigram_candidate(tok, normalized_text, &candidate, &score)) {
+        best_ids = candidate;
+        best_score = score;
+    }
+    if (!normalized_text.empty() && normalized_text[0] != ' ') {
+        candidate.clear();
+        score = -std::numeric_limits<double>::infinity();
+        if (tokenizer_encode_unigram_candidate(tok, std::string(" ") + normalized_text, &candidate, &score) &&
+            (!std::isfinite(best_score) || tok.add_space_prefix || score > best_score)) {
+            best_ids = candidate;
+            best_score = score;
+        }
+    }
+    if (best_ids.empty()) {
+        return false;
+    }
+    out_ids->insert(out_ids->end(), best_ids.begin(), best_ids.end());
+    return true;
+}
+
 static bool tokenizer_is_control_token_text(const std::string& piece) {
     if (piece == "<bos>" || piece == "<eos>" || piece == "<pad>" || piece == "<unk>") {
         return true;
@@ -1093,6 +1204,52 @@ static void tokenizer_add_piece(server_tokenizer* tok, const std::string& raw_pi
     }
 }
 
+static void tokenizer_add_unigram_piece(server_tokenizer* tok, const std::string& raw_piece, uint32_t id, double score) {
+    if (!tok) return;
+    tokenizer_add_piece(tok, raw_piece, id);
+    tok->has_unigram = true;
+    tok->unigram_score_by_piece[raw_piece] = score;
+    const std::string text_piece = tokenizer_piece_to_text(raw_piece, tok->byte_level);
+    if (!text_piece.empty()) {
+        tok->unigram_score_by_piece[text_piece] = score;
+    }
+}
+
+static bool tokenizer_load_unigram_vocab_array(
+    server_tokenizer* tok,
+    const std::string& json,
+    size_t vocab_begin,
+    size_t vocab_end
+) {
+    if (!tok || vocab_begin >= vocab_end || vocab_end > json.size()) return false;
+    size_t pos = vocab_begin + 1u;
+    uint32_t id = 0;
+    uint32_t loaded = 0;
+    while (pos < vocab_end) {
+        while (pos < vocab_end && (std::isspace(static_cast<unsigned char>(json[pos])) || json[pos] == ',')) ++pos;
+        if (pos >= vocab_end) break;
+        const size_t entry_begin = json.find('[', pos);
+        if (entry_begin == std::string::npos || entry_begin >= vocab_end) break;
+        const size_t entry_end = json_find_matching(json, entry_begin, '[', ']');
+        if (entry_end == std::string::npos || entry_end > vocab_end) break;
+        std::string raw_piece;
+        size_t next = entry_begin + 1u;
+        while (next < entry_end && std::isspace(static_cast<unsigned char>(json[next]))) ++next;
+        if (next < entry_end && json[next] == '"' && parse_json_string_at(json, next, &raw_piece, &next)) {
+            const size_t comma = json.find(',', next);
+            double score = 0.0;
+            if (comma != std::string::npos && comma < entry_end) {
+                (void)json_read_double_at(json, comma + 1u, entry_end, &score, nullptr);
+            }
+            tokenizer_add_unigram_piece(tok, raw_piece, id, score);
+            ++loaded;
+        }
+        ++id;
+        pos = entry_end + 1u;
+    }
+    return loaded > 0;
+}
+
 static bool load_tokenizer_vocab(server_tokenizer* tok, const std::string& json) {
     if (!tok) return false;
     tok->byte_level = json.find("\"ByteLevel\"") != std::string::npos;
@@ -1111,47 +1268,60 @@ static bool load_tokenizer_vocab(server_tokenizer* tok, const std::string& json)
 
     size_t lbrace = 0;
     size_t rbrace = 0;
-    if (!json_find_key_object_range(json, "vocab", model_begin, &lbrace, &rbrace) || lbrace > model_end) {
-        tok->error = "tokenizer.json does not expose model.vocab";
-        return false;
-    }
-    if (lbrace == std::string::npos) {
-        tok->error = "tokenizer.json does not expose model.vocab";
-        return false;
-    }
-    size_t p = lbrace + 1;
-    while (p < rbrace) {
-        while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
-        if (p >= rbrace) break;
-        if (json[p] != '"') {
+    const bool vocab_is_object =
+        json_find_key_object_range(json, "vocab", model_begin, &lbrace, &rbrace) &&
+        lbrace < model_end && rbrace <= model_end;
+    if (vocab_is_object) {
+        size_t p = lbrace + 1;
+        while (p < rbrace) {
+            while (p < rbrace && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
+            if (p >= rbrace) break;
+            if (json[p] != '"') {
+                ++p;
+                continue;
+            }
+            std::string raw_piece;
+            size_t next = p;
+            if (!parse_json_string_at(json, p, &raw_piece, &next)) {
+                ++p;
+                continue;
+            }
+            p = next;
+            while (p < rbrace && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
+            if (p >= rbrace || json[p] != ':') {
+                continue;
+            }
             ++p;
-            continue;
-        }
-        std::string raw_piece;
-        size_t next = p;
-        if (!parse_json_string_at(json, p, &raw_piece, &next)) {
-            ++p;
-            continue;
-        }
-        p = next;
-        while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
-        if (p >= json.size() || json[p] != ':') {
-            continue;
-        }
-        ++p;
-        while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
-        char* end = nullptr;
-        const long id_long = std::strtol(json.c_str() + p, &end, 10);
+            while (p < rbrace && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
+            char* end = nullptr;
+            const char* value_begin = json.c_str() + p;
+            const long id_long = std::strtol(value_begin, &end, 10);
         // BUGFIX 459: strtol 결과 범위 체크
-        if (!end || end == json.c_str() + p || id_long < 0 || id_long > UINT32_MAX) {
-            continue;
-        }
+            if (!end || end == value_begin || id_long < 0 || id_long > UINT32_MAX) {
+                if (end && end > value_begin && static_cast<size_t>(end - json.c_str()) <= rbrace) {
+                    p = static_cast<size_t>(end - json.c_str());
+                } else {
+                    ++p;
+                }
+                continue;
+            }
         // BUGFIX 460: end - json.c_str() overflow 체크
-        if (end < json.c_str() || static_cast<size_t>(end - json.c_str()) > json.size()) {
-            continue;
+            if (end < json.c_str() || static_cast<size_t>(end - json.c_str()) > rbrace) {
+                ++p;
+                continue;
+            }
+            p = (size_t)(end - json.c_str());
+            tokenizer_add_piece(tok, raw_piece, (uint32_t)id_long);
         }
-        p = (size_t)(end - json.c_str());
-        tokenizer_add_piece(tok, raw_piece, (uint32_t)id_long);
+    } else if (json_find_key_array_range(json, "vocab", model_begin, &lbrace, &rbrace) &&
+               lbrace < model_end && rbrace <= model_end) {
+        if (!tokenizer_load_unigram_vocab_array(tok, json, lbrace, rbrace)) {
+            tok->error = "tokenizer.json model.vocab array parse produced no usable pieces";
+            return false;
+        }
+    } else {
+        tok->error = "tokenizer.json does not expose model.vocab";
+        return false;
     }
 
     size_t added_begin = 0;
@@ -1240,13 +1410,43 @@ static void tokenizer_apply_runtime_config(server_tokenizer* tok, const std::str
         return;
     }
     bool add_bos = false;
-    if (json_read_bool_in_range(json, 0, json.size(), "add_bos_token", &add_bos)) {
+    bool add_eos = false;
+    bool add_space = false;
+    if (json_read_bool_in_range(json, 0, json.size(), "add_bos_token", &add_bos) ||
+        json_read_bool_in_range(json, 0, json.size(), "tokenizer_add_bos_token", &add_bos) ||
+        json_read_bool_in_range(json, 0, json.size(), "tokenizer.ggml.add_bos_token", &add_bos)) {
         tok->add_bos_token = add_bos;
+        tok->add_bos_token_explicit = true;
+    }
+    if (json_read_bool_in_range(json, 0, json.size(), "add_eos_token", &add_eos) ||
+        json_read_bool_in_range(json, 0, json.size(), "tokenizer_add_eos_token", &add_eos) ||
+        json_read_bool_in_range(json, 0, json.size(), "tokenizer.ggml.add_eos_token", &add_eos)) {
+        tok->add_eos_token = add_eos;
+    }
+    if (json_read_bool_in_range(json, 0, json.size(), "add_space_prefix", &add_space) ||
+        json_read_bool_in_range(json, 0, json.size(), "tokenizer_add_space_prefix", &add_space) ||
+        json_read_bool_in_range(json, 0, json.size(), "add_prefix_space", &add_space) ||
+        json_read_bool_in_range(json, 0, json.size(), "tokenizer.ggml.add_space_prefix", &add_space)) {
+        tok->add_space_prefix = add_space;
     }
     uint32_t bos_id = 0;
-    if (json_read_u32_in_range(json, 0, json.size(), "bos_token_id", &bos_id)) {
+    if (json_read_u32_in_range(json, 0, json.size(), "bos_token_id", &bos_id) ||
+        json_read_u32_in_range(json, 0, json.size(), "tokenizer.ggml.bos_token_id", &bos_id)) {
         tok->bos_token_id = bos_id;
         tok->has_bos = true;
+    }
+    uint32_t eos_id = 0;
+    if (json_read_u32_in_range(json, 0, json.size(), "eos_token_id", &eos_id) ||
+        json_read_u32_in_range(json, 0, json.size(), "tokenizer.ggml.eos_token_id", &eos_id)) {
+        tok->eos_token_id = eos_id;
+        tok->has_eos = true;
+    }
+    uint32_t unk_id = 0;
+    if (json_read_u32_in_range(json, 0, json.size(), "unk_token_id", &unk_id) ||
+        json_read_u32_in_range(json, 0, json.size(), "unknown_token_id", &unk_id) ||
+        json_read_u32_in_range(json, 0, json.size(), "tokenizer.ggml.unknown_token_id", &unk_id)) {
+        tok->unk_token_id = unk_id;
+        tok->has_unk = true;
     }
     std::string bos_piece;
     if (json_read_string_value(json, "bos_token", &bos_piece) && !bos_piece.empty()) {
@@ -1269,6 +1469,48 @@ static void tokenizer_apply_runtime_config(server_tokenizer* tok, const std::str
             tok->has_bos = true;
         }
     }
+    std::string tokenizer_class;
+    std::string model_type;
+    std::string tokenizer_model;
+    std::string tokenizer_pre;
+    (void)json_read_string_in_range(json, 0, json.size(), "tokenizer_class", &tokenizer_class);
+    (void)json_read_string_in_range(json, 0, json.size(), "model_type", &model_type);
+    (void)json_read_string_in_range(json, 0, json.size(), "tokenizer_model", &tokenizer_model);
+    (void)json_read_string_in_range(json, 0, json.size(), "tokenizer.ggml.model", &tokenizer_model);
+    (void)json_read_string_in_range(json, 0, json.size(), "tokenizer_pre", &tokenizer_pre);
+    (void)json_read_string_in_range(json, 0, json.size(), "tokenizer.ggml.pre", &tokenizer_pre);
+    auto lower_contains = [](const std::string& s, const char* needle) {
+        if (!needle || !*needle) {
+            return false;
+        }
+        std::string lower = s;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+            return (char)std::tolower(c);
+        });
+        return lower.find(needle) != std::string::npos;
+    };
+    if (!tok->add_bos_token_explicit && tok->has_bos) {
+        const bool bpe_like =
+            lower_contains(tokenizer_model, "gpt") ||
+            lower_contains(tokenizer_model, "bpe") ||
+            lower_contains(tokenizer_model, "tiktoken") ||
+            lower_contains(tokenizer_model, "qwen") ||
+            lower_contains(tokenizer_pre, "gpt") ||
+            lower_contains(tokenizer_pre, "bpe") ||
+            lower_contains(tokenizer_pre, "tiktoken") ||
+            lower_contains(tokenizer_pre, "qwen");
+        const bool sentencepiece_like =
+            tok->has_unigram ||
+            lower_contains(tokenizer_model, "llama") ||
+            lower_contains(tokenizer_model, "sentencepiece") ||
+            lower_contains(tokenizer_model, "spm") ||
+            lower_contains(tokenizer_model, "unigram") ||
+            lower_contains(tokenizer_class, "gemma") ||
+            lower_contains(model_type, "gemma");
+        if (sentencepiece_like && !bpe_like) {
+            tok->add_bos_token = true;
+        }
+    }
 }
 
 static void tokenizer_prepend_bos_if_needed(const server_tokenizer& tok, std::vector<int32_t>* ids) {
@@ -1279,6 +1521,16 @@ static void tokenizer_prepend_bos_if_needed(const server_tokenizer& tok, std::ve
         return;
     }
     ids->insert(ids->begin(), static_cast<int32_t>(tok.bos_token_id));
+}
+
+static void tokenizer_append_eos_if_needed(const server_tokenizer& tok, std::vector<int32_t>* ids) {
+    if (!ids || !tok.add_eos_token || !tok.has_eos) {
+        return;
+    }
+    if (!ids->empty() && ids->back() == static_cast<int32_t>(tok.eos_token_id)) {
+        return;
+    }
+    ids->push_back(static_cast<int32_t>(tok.eos_token_id));
 }
 
 static server_tokenizer& get_server_tokenizer(const server_options& opts) {
@@ -1325,7 +1577,6 @@ static server_tokenizer& get_server_tokenizer(const server_options& opts) {
         const std::string path = join_model_file(opts.model_root, rel);
         if (read_text_file(path, &config_json) && !config_json.empty()) {
             tokenizer_apply_runtime_config(&tok, config_json);
-            break;
         }
     }
     std::cerr << "[storagellm tokenizer] load"
@@ -1333,10 +1584,13 @@ static server_tokenizer& get_server_tokenizer(const server_options& opts) {
               << " model_type=" << (tok.model_type.empty() ? "unknown" : tok.model_type)
               << " byte_level=" << (tok.byte_level ? 1 : 0)
               << " has_merges=" << (tok.has_merges ? 1 : 0)
+              << " has_unigram=" << (tok.has_unigram ? 1 : 0)
               << " byte_fallback=" << (tok.byte_fallback ? 1 : 0)
               << " pieces=" << tok.id_to_piece.size()
               << " specials=" << tok.special_ids.size()
               << " add_bos=" << (tok.add_bos_token ? 1 : 0)
+              << " add_eos=" << (tok.add_eos_token ? 1 : 0)
+              << " add_space_prefix=" << (tok.add_space_prefix ? 1 : 0)
               << " has_bos=" << (tok.has_bos ? 1 : 0)
               << " bos=" << tok.bos_token_id
               << " has_eos=" << (tok.has_eos ? 1 : 0)
@@ -1416,6 +1670,14 @@ static bool tokenizer_encode_regular_text(
 ) {
     if (!out_ids || text.empty()) return true;
     std::vector<int32_t> segment_ids;
+    if (tok.has_unigram) {
+        if (tokenizer_encode_unigram_text(tok, text, &segment_ids) && !segment_ids.empty()) {
+            out_ids->insert(out_ids->end(), segment_ids.begin(), segment_ids.end());
+            return true;
+        }
+        segment_ids.clear();
+    }
+
     if (tok.byte_level && tok.has_merges) {
         bool ok = true;
         const std::string normalized_text = tokenizer_normalize_text(tok, text);
@@ -1525,6 +1787,7 @@ static bool tokenizer_encode_greedy(const server_tokenizer& tok, const std::stri
         pos = next;
     }
     tokenizer_prepend_bos_if_needed(tok, out_ids);
+    tokenizer_append_eos_if_needed(tok, out_ids);
     return !out_ids->empty();
 }
 

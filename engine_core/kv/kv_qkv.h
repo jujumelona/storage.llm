@@ -74,6 +74,7 @@ typedef struct {
     uint32_t page_size_tokens;  // Offload GGUF qkv_cache_schema.page_size_tokens
     uint32_t sink_tokens;       // Attention sink tokens kept hot by residency policy
     bool plain_kv_persistent_storage; // Must stay false for offload-native GGUF
+    float attention_score_scale; // Optional model attention score scale; 0 = 1/sqrt(head_dim)
     float attention_logit_softcap; // Optional model attention-score softcap before softmax
 } qkv_config_t;
 
@@ -102,6 +103,7 @@ static inline qkv_config_t qkv_config_default(int head_dim) {
     cfg.page_size_tokens = 16;
     cfg.sink_tokens = 4;
     cfg.plain_kv_persistent_storage = false;
+    cfg.attention_score_scale = 0.0f;
     cfg.attention_logit_softcap = 0.0f;
     return cfg;
 }

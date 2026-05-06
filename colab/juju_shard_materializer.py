@@ -64,6 +64,7 @@ GGUF_RUNTIME_KV_KEY_HINTS = (
     "block_count",
     "vocab_size",
     "file_type",
+    "tokenizer",
 )
 
 GGUF_RUNTIME_KV_EXACT_KEYS = {
@@ -85,6 +86,8 @@ GGUF_RUNTIME_KV_EXACT_KEYS = {
 GGUF_RUNTIME_KV_ALIAS_MAP = {
     "general.architecture": ("architecture", "declared_architecture", "model_type"),
     "general.name": ("model_name",),
+    "tokenizer.ggml.model": ("tokenizer_model",),
+    "tokenizer.ggml.pre": ("tokenizer_pre",),
     "tokenizer.ggml.bos_token_id": ("bos_token_id",),
     "tokenizer.ggml.eos_token_id": ("eos_token_id",),
     "tokenizer.ggml.unknown_token_id": ("unk_token_id", "unknown_token_id"),
@@ -157,6 +160,41 @@ GGUF_RUNTIME_KV_ALIAS_MAP = {
 JUJU_EMBEDDING_SCALE_FAMILY_RULES = (
     (("gemma",), "sqrt_hidden_size", "hf_forward_gemma_sqrt_hidden_size"),
 )
+
+JUJU_ATTENTION_Q_SUFFIXES = (
+    "attn_q.weight",
+    "attention.wq.weight",
+    "q_proj.weight",
+    "self_attn.q_proj.weight",
+    "attn_q_a_proj.weight",
+    "attn_q_b_proj.weight",
+)
+JUJU_ATTENTION_K_SUFFIXES = (
+    "attn_k.weight",
+    "attention.wk.weight",
+    "k_proj.weight",
+    "self_attn.k_proj.weight",
+    "attn_kv_a_proj_with_mqa.weight",
+)
+JUJU_ATTENTION_V_SUFFIXES = (
+    "attn_v.weight",
+    "attention.wv.weight",
+    "v_proj.weight",
+    "self_attn.v_proj.weight",
+    "value_proj.weight",
+    "v_projection.weight",
+    "attn_kv_b_proj.weight",
+)
+JUJU_ATTENTION_O_SUFFIXES = (
+    "attn_output.weight",
+    "attention.wo.weight",
+    "o_proj.weight",
+    "self_attn.o_proj.weight",
+)
+JUJU_Q_NORM_SUFFIXES = ("attn_q_norm.weight", "q_norm.weight", "self_attn.q_norm.weight")
+JUJU_K_NORM_SUFFIXES = ("attn_k_norm.weight", "k_norm.weight", "self_attn.k_norm.weight")
+JUJU_V_NORM_SUFFIXES = ("attn_v_norm.weight", "v_norm.weight", "value_norm.weight", "self_attn.v_norm.weight")
+JUJU_QKV_SUPPORTED_CACHE_BITS = (2, 3, 4, 5, 6, 8, 16, 32)
 
 JUJU_HEADER_BYTES = 4096
 JUJU_SECTION_ENTRY_BYTES = 96
@@ -654,6 +692,10 @@ def juju_tensor_index_record(tensor, bucket, tensor_offset, layout, contract):
         **execution_meta,
         **runtime_priority,
     }
+    expert_segments = _juju_expert_source_segments_for_record(record)
+    if expert_segments:
+        record["expert_source_segments"] = expert_segments
+        record["expert_chunk_lookup_ready"] = True
     if "row_stride_overhead_pct" in layout:
         record["row_stride_overhead_pct"] = layout["row_stride_overhead_pct"]
     return record
@@ -1896,7 +1938,7 @@ def juju_format_extension_contract(contract):
             "logical_cols_are_math_extent": True,
             "row_stride_bytes_are_storage_extent": True,
             "padding_bytes_must_decode_as_zero_and_must_not_be_consumed_by_kernels": True,
-            "default_alignment_bytes": 64,
+            "default_alignment_bytes": juju_row_stride_alignment_bytes(),
             "env_enable": "JUJU_ENABLE_ROW_STRIDE_PADDING",
             "env_alignment": "JUJU_ROW_STRIDE_ALIGNMENT_BYTES",
             "env_max_overhead_pct": "JUJU_ROW_STRIDE_MAX_OVERHEAD_PCT",
@@ -2302,7 +2344,7 @@ def juju_contract_metadata(contract, source_name, source_repo_id, runtime_arch=N
         "source_weight_kernel_family": contract.get("source_weight_kernel_family") or contract.get("weight_kernel_family") or contract_value(contract, "weight_quant_schema.kernel_family", default=""),
         "source_weight_block_size": u32(contract_value(contract, "source_weight_block_size", "weight_block_size", "weight_quant_schema.block_size", default=0)),
         "qkv_packed_cache_required": qkv_required,
-        "persistent_plain_kv_cache_allowed": not qkv_required,
+        "persistent_plain_kv_cache_allowed": False,
         "final_model_structure_contract": contract.get("final_model_structure_contract", {}),
         "pipeline_budget_contract": contract.get("pipeline_budget_contract", {}),
         "execution_path_contract": contract.get("execution_path_contract", {}),
@@ -2311,9 +2353,11 @@ def juju_contract_metadata(contract, source_name, source_repo_id, runtime_arch=N
         "universal_tier_contract": contract.get("universal_tier_contract", {}),
         "qkv_policy_contract": qkv,
         "qkv_cache_schema_effective": qkv,
+        "eval_kv_policy": _juju_eval_kv_policy(qkv),
         "format_extension_contract": juju_format_extension_contract(contract),
         "kernel_registry_contract": juju_kernel_registry_contract(contract),
         "tokenizer_contract": juju_tokenizer_contract(),
+        "special_tokens": juju_runtime_special_tokens_metadata(runtime_arch or arch),
         "adapter_registry_contract": juju_adapter_registry_contract(),
         "validation_contract": juju_validation_contract(),
         "execution_correctness_contract": correctness,
@@ -2611,19 +2655,19 @@ def juju_tensor_execution_metadata(name, bucket, tensor_offset=0, layout=None, p
         hotset_rank = 100 + min(int(layer), 799)
         if suffix in {"attn_norm.weight", "input_layernorm.weight", "pre_attention_norm.weight"}:
             op, order = "attention_input_norm", 100
-        elif suffix in {"attn_q.weight", "attention.wq.weight", "q_proj.weight", "attn_q_a_proj.weight", "attn_q_b_proj.weight"}:
+        elif suffix in JUJU_ATTENTION_Q_SUFFIXES:
             op, order = "q_projection", 110
-        elif suffix in {"attn_k.weight", "attention.wk.weight", "k_proj.weight", "attn_kv_a_proj_with_mqa.weight"}:
+        elif suffix in JUJU_ATTENTION_K_SUFFIXES:
             op, order = "k_projection", 120
-        elif suffix in {"attn_v.weight", "attention.wv.weight", "v_proj.weight", "attn_kv_b_proj.weight"}:
+        elif suffix in JUJU_ATTENTION_V_SUFFIXES:
             op, order = "v_projection", 130
-        elif suffix in {"attn_q_norm.weight", "q_norm.weight"}:
+        elif suffix in JUJU_Q_NORM_SUFFIXES:
             op, order = "q_norm", 140
-        elif suffix in {"attn_k_norm.weight", "k_norm.weight"}:
+        elif suffix in JUJU_K_NORM_SUFFIXES:
             op, order = "k_norm", 150
-        elif suffix in {"attn_v_norm.weight", "v_norm.weight", "value_norm.weight"}:
+        elif suffix in JUJU_V_NORM_SUFFIXES:
             op, order = "v_norm", 160
-        elif suffix in {"attn_output.weight", "attention.wo.weight", "o_proj.weight"}:
+        elif suffix in JUJU_ATTENTION_O_SUFFIXES:
             op, order = "attention_output", 180
         elif suffix in {"post_attention_norm.weight", "post_attention_layernorm.weight", "post_attention_layer_norm.weight", "post_attn_norm.weight"}:
             op, order = "post_attention_norm", 190
@@ -2716,6 +2760,8 @@ def _juju_runtime_tensor_ref(rec):
         "row_stride_bytes": _juju_record_int(rec, "row_stride_bytes", 0),
         "offset": _juju_record_int(rec, "juju_offset", 0),
         "bytes": _juju_record_int(rec, "juju_bytes", rec.get("stream_bytes") or 0),
+        "source_offset": _juju_record_int(rec, "source_offset", 0),
+        "source_bytes": _juju_record_int(rec, "source_bytes", 0),
         "file_locality_group": rec.get("file_locality_group"),
         "runtime_priority": _juju_record_int(rec, "runtime_priority", 0),
         "prefetch_priority": _juju_record_int(rec, "prefetch_priority", 0),
@@ -2723,6 +2769,7 @@ def _juju_runtime_tensor_ref(rec):
         "residency_hint": rec.get("residency_hint"),
         "expert_layout": rec.get("expert_layout"),
         "combined_gate_up_split": rec.get("combined_gate_up_split"),
+        "expert_source_segments": rec.get("expert_source_segments"),
     }
 
 
@@ -2974,6 +3021,35 @@ def _juju_qkv_required(contract, qkv):
     )
 
 
+def _juju_eval_kv_policy(qkv=None):
+    qkv = dict(qkv or {})
+    return {
+        "format": "JUJU_EVAL_KV_POLICY_V1",
+        "generation_kv_backend": "qkv_quantized_per_layer_head_cache",
+        "ppl_kv_backend": "qkv_quantized_per_layer_head_cache",
+        "eval_kv_backend": "qkv_quantized_per_layer_head_cache",
+        "plain_reference_scope": "diagnostic_probe_only_never_default_runtime",
+        "eval_must_bypass_quantized_qkv": False,
+        "force_qkv_for_ppl": True,
+        "force_qkv_for_eval": True,
+        "allow_plain_reference": False,
+        "ppl_accepts_quantized_qkv_only_after_plain_comparison_probe": False,
+        "plain_comparison_probe_required": False,
+        "plain_comparison_probe": {
+            "format": "JUJU_QKV_PLAIN_COMPARE_PROBE_V1",
+            "required_before_accepting_quantized_qkv_ppl": False,
+            "compare_backend": "flat_position_major_layer_contiguous_cache",
+            "candidate_backend": qkv.get("backend") or "qkv_quantized_per_layer_head_cache",
+            "metrics": ["max_abs", "mean_abs", "rms", "logprob_delta", "ppl_delta"],
+            "fail_closed_if_missing": False,
+        },
+        "supported_cache_bits": list(JUJU_QKV_SUPPORTED_CACHE_BITS),
+        "query_cache_allowed": False,
+        "key_value_bits_may_differ": True,
+        "raw_plain_bits": [16, 32],
+    }
+
+
 def _juju_qkv_runtime_policy(contract, qkv):
     qkv = dict(qkv or {})
     has_qkv = True
@@ -2990,10 +3066,11 @@ def _juju_qkv_runtime_policy(contract, qkv):
         "preferred_backend": "qkv_quantized_per_layer_head_cache",
         "required_backend": "qkv_quantized_per_layer_head_cache" if qkv_required else "",
         "plain_reference_backend": "flat_position_major_layer_contiguous_cache_validation_only",
-        "plain_reference_required_for_ppl": True,
+        "plain_reference_required_for_ppl": False,
+        "evaluation_policy": _juju_eval_kv_policy(qkv),
         "plain_fallback_allowed": not qkv_required,
         "qkv_approximate_cache": has_qkv,
-        "qkv_must_match_plain_within_eval_tolerance_before_ppl_accept": has_qkv,
+        "qkv_must_match_plain_within_eval_tolerance_before_ppl_accept": False,
         "decode_update_mode": qkv.get("runtime_update_mode") or "incremental_append_current_token_no_full_context_requantize",
         "persistent_plain_kv_cache_allowed": False,
         "qkv_policy_contract": qkv,
@@ -3083,6 +3160,8 @@ def _juju_qkv_contract_fields(qkv):
         "rotation": dict(qkv.get("rotation") or {}),
         "normal": dict(qkv.get("normal") or {}),
         "outlier": dict(qkv.get("outlier") or {}),
+        "evaluation_policy": _juju_eval_kv_policy(qkv),
+        "supported_cache_bits": list(qkv.get("supported_cache_bits") or JUJU_QKV_SUPPORTED_CACHE_BITS),
         "query_policy": dict(qkv.get("query_policy") or {}),
         "key_cache_policy": dict(qkv.get("key") or {}),
         "value_cache_policy": dict(qkv.get("value") or {}),
@@ -3267,8 +3346,9 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         qkv["validation"]["required_quantized_qkv"] = True
         qkv["validation"]["plain_reference_is_eval_probe_only"] = True
         qkv["validation"]["reject_generation_if_qkv_backend_unavailable"] = True
-        qkv["validation"]["qkv_decode_requires_plain_comparison_probe"] = True
-        qkv["validation"]["ppl_must_use_plain_reference_or_validated_qkv"] = True
+        qkv["validation"]["qkv_decode_requires_plain_comparison_probe"] = False
+        qkv["validation"]["ppl_must_use_qkv_backend"] = True
+        qkv["validation"]["ppl_plain_reference_forbidden"] = True
     fill("num_attention_heads", _juju_first_config_value(contract, "num_attention_heads", "n_heads"), runtime_arch.get("num_attention_heads"), runtime_arch.get("n_heads"))
     fill("num_key_value_heads", _juju_first_config_value(contract, "num_key_value_heads", "n_kv_heads"), runtime_arch.get("num_key_value_heads"), runtime_arch.get("n_kv_heads"))
     fill("num_global_key_value_heads", _juju_first_config_value(contract, "num_global_key_value_heads"), runtime_arch.get("num_global_key_value_heads"), qkv.get("num_key_value_heads"))
@@ -3402,6 +3482,10 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         "mse_bits": _qjl_mse_bits(key_normal_bits),
         "outlier_mse_bits": _qjl_mse_bits(key_outlier_bits),
         "qjl_residual_bits": 1 if enable_qjl and not raw_qkv_bits else 0,
+        "quant_axis": "per_channel_head_dim",
+        "scale_axis": "head_dim_channel_group",
+        "group_axis": "head_dim",
+        "token_axis_independent": False,
         "estimator": "turboquantprod_inner_product",
     }
     value_cache_policy = {
@@ -3415,6 +3499,10 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         "mse_bits": _qjl_mse_bits(value_normal_bits),
         "outlier_mse_bits": _qjl_mse_bits(value_outlier_bits),
         "qjl_residual_bits": 1 if enable_qjl and not raw_qkv_bits else 0,
+        "quant_axis": "per_token_value_vector",
+        "scale_axis": "token_vector_group",
+        "group_axis": "value_head_dim",
+        "token_axis_independent": True,
         "estimator": "turboquantprod_vector_reconstruction",
     }
     turboquant_policy = {
@@ -3482,6 +3570,9 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         "qjl_required_for_codebook_bits": not raw_qkv_bits,
         "plain_or_raw_bits_present": raw_qkv_bits,
         "query_cached": False,
+        "key_quant_axis": key_cache_policy["quant_axis"],
+        "value_quant_axis": value_cache_policy["quant_axis"],
+        "key_value_quant_axes_may_differ": True,
     }
     if isinstance(qkv.get("validation"), dict):
         qkv["validation"]["normal_bits_semantics"] = "non_outlier_channel_quant_bits"
@@ -3507,6 +3598,8 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         "sink_tokens": sink_tokens,
         "state_identity": qkv.get("state_identity"),
     }
+    qkv["supported_cache_bits"] = list(qkv.get("supported_cache_bits") or JUJU_QKV_SUPPORTED_CACHE_BITS)
+    qkv["evaluation_policy"] = _juju_eval_kv_policy(qkv)
     return qkv
 
 
@@ -3734,6 +3827,13 @@ def _juju_kv_layout_contract(contract, runtime_arch):
         "rotation": qkv_fields["rotation"],
         "normal": qkv_fields["normal"],
         "outlier": qkv_fields["outlier"],
+        "quant_axis_contract": {
+            "key": qkv_fields["key_cache_policy"].get("quant_axis"),
+            "value": qkv_fields["value_cache_policy"].get("quant_axis"),
+            "key_scale_axis": qkv_fields["key_cache_policy"].get("scale_axis"),
+            "value_scale_axis": qkv_fields["value_cache_policy"].get("scale_axis"),
+            "key_value_quant_axes_may_differ": True,
+        },
         "query_policy": qkv_fields["query_policy"],
         "key_cache_policy": qkv_fields["key_cache_policy"],
         "value_cache_policy": qkv_fields["value_cache_policy"],
@@ -3777,9 +3877,11 @@ def _juju_kv_layout_contract(contract, runtime_arch):
             "sliding_window_size": _juju_first_config_value(contract, "sliding_window", "sliding_window_size", "attention.sliding_window"),
             "global_window_size": max_seq,
         },
+        "layer_attention_table_ref": "generation_contract.layers.attention_layer_table",
         "residency_policy": _juju_scalar_value(qkv.get("residency_policy")) or "ram_tracked_via_tier_usage_device_vram_when_enabled",
         "quantized": bool(qkv),
         "runtime_cache_policy": qkv_runtime_policy,
+        "evaluation_policy": _juju_eval_kv_policy(qkv),
         "cache_identity": {
             "position_major_entry_layout": True,
             "entry_scope": ["request_id", "position", "layer"],
@@ -3788,8 +3890,9 @@ def _juju_kv_layout_contract(contract, runtime_arch):
             "plain_kv_cache_is_not_runtime_identity": True,
         },
         "accuracy_contract": {
-            "ppl_must_use_plain_reference_or_validated_qkv": True,
-            "qkv_decode_requires_plain_comparison_probe": True,
+            "ppl_must_use_qkv_backend": True,
+            "ppl_plain_reference_forbidden": True,
+            "qkv_decode_requires_plain_comparison_probe": False,
             "qkv_fallback_allowed": qkv_runtime_policy["plain_fallback_allowed"],
         },
         "page_layout": "layer_head_position_page_major",
@@ -3866,6 +3969,7 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
     expert_tier_entries = _juju_expert_tier_entries(tensor_records, contract)
     expert_offset_table = _juju_expert_offset_table(tensor_records, contract)
     expert_bundle_table = _juju_expert_bundle_table(tensor_records, contract)
+    expert_chunk_table = _juju_expert_chunk_table(tensor_records, contract)
     moe_layers, moe_layer_bitmask_words = _juju_moe_layer_bitmask_words(tensor_records)
     executor_tensor_table = [
         _juju_runtime_tensor_ref(rec)
@@ -3892,6 +3996,9 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
                 "row_stride_bytes",
                 "offset",
                 "bytes",
+                "source_offset",
+                "source_bytes",
+                "expert_source_segments",
             ],
         },
         "executor_tensor_count": len(executor_tensor_table),
@@ -3920,7 +4027,9 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
         "expert_tier_entries": expert_tier_entries,
         "expert_offset_table": expert_offset_table,
         "expert_bundle_table": expert_bundle_table,
+        "expert_chunk_table": expert_chunk_table,
         "expert_offset_table_kind": "layer_expert_projection_o1_lookup",
+        "expert_chunk_table_kind": "layer_expert_projection_absolute_offset_lookup",
         "router_calibration_manifest": router_calibration_manifest_from_juju_idx({"tensors": tensor_records}),
         "layer_prefetch_plan_count": len(layer_prefetch_plan),
         "layer_prefetch_plan": layer_prefetch_plan,
@@ -3946,6 +4055,8 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
         "kv_layout_contract": kv_layout_contract,
         "qkv_policy_contract": qkv_fields["qkv_policy_contract"],
         "qkv_cache_schema_effective": qkv_fields["qkv_cache_schema_effective"],
+        "eval_kv_policy": qkv_fields["evaluation_policy"],
+        "attention_layer_contract_table": _juju_attention_layer_contract_table(tensor_records, runtime_arch),
         "bottleneck_trace_contract": {
             "contract_required": True,
             "qkv_contract": qkv_fields,
@@ -4196,6 +4307,108 @@ def _juju_expert_tier_lookup(tensor_records, contract):
     }
 
 
+def _juju_segment_ranges(offset, size, segment_count):
+    offset = int(offset or 0)
+    size = int(size or 0)
+    segment_count = max(1, int(segment_count or 1))
+    if size <= 0:
+        return []
+    target = int(math.ceil(size / float(segment_count)))
+    out = []
+    cursor = offset
+    remaining = size
+    for segment_id in range(segment_count):
+        if remaining <= 0:
+            break
+        take = min(remaining, target)
+        if segment_id == segment_count - 1:
+            take = remaining
+        out.append({
+            "segment": int(segment_id),
+            "offset": int(cursor),
+            "bytes": int(take),
+            "end": int(cursor + take),
+        })
+        cursor += take
+        remaining -= take
+    return out
+
+
+def _juju_expert_row_column_range(rec, expert, expert_count):
+    shape = [int(v or 0) for v in (rec.get("shape") or [])]
+    cols = int(shape[0]) if shape else int(rec.get("logical_cols") or 0)
+    rows = int(rec.get("logical_rows") or 0)
+    if len(shape) >= 3 and int(shape[2] or 0) > 0:
+        rows_per_expert = int(shape[1] or 0)
+        return {
+            "row_range": [int(expert) * rows_per_expert, (int(expert) + 1) * rows_per_expert],
+            "column_range": [0, cols],
+            "rows_per_expert": rows_per_expert,
+            "cols": cols,
+        }
+    return {
+        "row_range": [0, rows],
+        "column_range": [0, cols],
+        "rows_per_expert": rows,
+        "cols": cols,
+    }
+
+
+def _juju_expert_source_segments_for_record(rec):
+    if not is_routed_expert_tensor_name(rec.get("name")):
+        return []
+    layout = rec.get("expert_layout") or {}
+    layer = layout.get("layer")
+    if layer is None:
+        layer = _juju_layer_id_from_name(rec.get("name"))
+    expert_count = int(layout.get("expert_count") or _juju_expert_count_from_shape(rec.get("shape")) or 0)
+    if layer is None or expert_count <= 0:
+        return []
+    source_bytes = int(rec.get("source_bytes") or rec.get("bytes") or 0)
+    juju_bytes = int(rec.get("juju_bytes") or rec.get("stream_bytes") or 0)
+    source_base = int(rec.get("source_offset") or 0)
+    juju_base = int(rec.get("juju_offset") or rec.get("offset") or 0)
+    source_per_expert = source_bytes // max(1, expert_count)
+    juju_per_expert = int(layout.get("per_expert_bytes") or (juju_bytes // max(1, expert_count)))
+    segment_count = int(layout.get("segment_count_per_expert") or 1)
+    projection = layout.get("projection") or _juju_expert_projection_name(rec.get("name"))
+    out = []
+    for expert in range(expert_count):
+        juju_offset = juju_base + expert * juju_per_expert
+        source_offset = source_base + expert * source_per_expert
+        item = {
+            "layer": int(layer),
+            "expert": int(expert),
+            "projection": projection,
+            "tensor": rec.get("name"),
+            "juju_offset": int(juju_offset),
+            "juju_bytes": int(juju_per_expert),
+            "source_offset": int(source_offset),
+            "source_bytes": int(source_per_expert),
+            "segment_count": int(segment_count),
+            "juju_segments": _juju_segment_ranges(juju_offset, juju_per_expert, segment_count),
+            "source_segments": _juju_segment_ranges(source_offset, source_per_expert, segment_count),
+            **_juju_expert_row_column_range(rec, expert, expert_count),
+        }
+        split = rec.get("combined_gate_up_split") or {}
+        if split.get("enabled"):
+            gate_bytes = int(split.get("gate_bytes") or 0)
+            up_rel = int(split.get("up_rel_offset") or gate_bytes)
+            up_bytes = int(split.get("up_bytes") or 0)
+            item["combined_gate_up_split"] = {
+                "gate_offset": int(juju_offset + int(split.get("gate_rel_offset") or 0)),
+                "gate_bytes": gate_bytes,
+                "up_offset": int(juju_offset + up_rel),
+                "up_bytes": up_bytes,
+                "source_gate_offset": int(source_offset),
+                "source_gate_bytes": int(min(gate_bytes, source_per_expert)),
+                "source_up_offset": int(source_offset + up_rel),
+                "source_up_bytes": int(min(up_bytes, max(0, source_per_expert - up_rel))),
+            }
+        out.append(item)
+    return out
+
+
 def _juju_moe_layer_bitmask_words(tensor_records):
     layers = sorted({
         int(_juju_layer_id_from_name(rec.get("name")))
@@ -4223,25 +4436,40 @@ def _juju_expert_offset_table(tensor_records, contract):
             layer = _juju_layer_id_from_name(rec.get("name"))
         expert_count = int(layout.get("expert_count") or _juju_expert_count_from_shape(rec.get("shape")) or 0)
         base_offset = int(layout.get("base_offset") or rec.get("juju_offset") or rec.get("offset") or 0)
+        source_base_offset = int(rec.get("source_offset") or 0)
         total_bytes = int(rec.get("juju_bytes") or rec.get("bytes") or rec.get("source_bytes") or 0)
+        total_source_bytes = int(rec.get("source_bytes") or rec.get("bytes") or 0)
         per_expert = int(layout.get("per_expert_bytes") or (total_bytes // max(1, expert_count) if expert_count > 0 else 0))
+        source_per_expert = int(total_source_bytes // max(1, expert_count) if expert_count > 0 else 0)
         projection = layout.get("projection") or _juju_expert_projection_name(rec.get("name"))
+        segment_count = int(layout.get("segment_count_per_expert") or 1)
         if layer is None or expert_count <= 0 or per_expert <= 0:
             continue
         split = rec.get("combined_gate_up_split") or {}
         for expert in range(expert_count):
             tier = lookup.get((int(layer), int(expert)), {})
+            offset = int(base_offset + expert * per_expert)
+            source_offset = int(source_base_offset + expert * source_per_expert)
             row = {
                 "layer": int(layer),
                 "expert": int(expert),
                 "projection": projection,
-                "offset": int(base_offset + expert * per_expert),
+                "tensor": rec.get("name"),
+                "offset": offset,
                 "bytes": int(per_expert),
+                "end": int(offset + per_expert),
+                "source_offset": source_offset,
+                "source_bytes": int(source_per_expert),
+                "source_end": int(source_offset + source_per_expert),
+                "segment_count": segment_count,
+                "segments": _juju_segment_ranges(offset, per_expert, segment_count),
+                "source_segments": _juju_segment_ranges(source_offset, source_per_expert, segment_count),
                 "tier": tier.get("tier", "cold"),
                 "activation_prior": tier.get("activation_prior", 0.0),
                 "prefetch_priority": int(tier.get("prefetch_priority", rec.get("prefetch_priority") or 80)),
                 "runtime_priority": int(tier.get("runtime_priority", rec.get("runtime_priority") or 65)),
                 "residency_hint": tier.get("residency_hint", rec.get("residency_hint") or "SLOW_MEM"),
+                **_juju_expert_row_column_range(rec, expert, expert_count),
             }
             if split.get("enabled"):
                 row["combined_gate_up_split"] = {
@@ -4249,6 +4477,10 @@ def _juju_expert_offset_table(tensor_records, contract):
                     "gate_bytes": int(split.get("gate_bytes") or 0),
                     "up_offset": int(row["offset"] + int(split.get("up_rel_offset") or 0)),
                     "up_bytes": int(split.get("up_bytes") or 0),
+                    "source_gate_offset": int(row["source_offset"]),
+                    "source_gate_bytes": int(min(int(split.get("gate_bytes") or 0), source_per_expert)),
+                    "source_up_offset": int(row["source_offset"] + int(split.get("up_rel_offset") or 0)),
+                    "source_up_bytes": int(min(int(split.get("up_bytes") or 0), max(0, source_per_expert - int(split.get("up_rel_offset") or 0)))),
                 }
             rows.append(row)
     rows.sort(key=lambda item: (item["layer"], item["expert"], _juju_projection_order_value(item["projection"])))
@@ -4268,6 +4500,8 @@ def _juju_expert_bundle_table(tensor_records, contract):
             "bytes": 0,
             "projection_count": 0,
             "projections": [],
+            "fetch_ranges": [],
+            "segments": [],
             "tier": row.get("tier", "cold"),
             "activation_prior": row.get("activation_prior", 0.0),
             "prefetch_priority": int(row.get("prefetch_priority") or 80),
@@ -4285,14 +4519,23 @@ def _juju_expert_bundle_table(tensor_records, contract):
         item["runtime_priority"] = max(int(item["runtime_priority"]), int(row.get("runtime_priority") or 65))
         projection = {
             "name": row.get("projection"),
+            "tensor": row.get("tensor"),
             "offset": begin,
             "bytes": size,
             "end": end,
+            "source_offset": int(row.get("source_offset") or 0),
+            "source_bytes": int(row.get("source_bytes") or 0),
+            "source_end": int(row.get("source_end") or 0),
+            "row_range": row.get("row_range"),
+            "column_range": row.get("column_range"),
+            "segments": row.get("segments") or [],
+            "source_segments": row.get("source_segments") or [],
             "order": _juju_projection_order_value(row.get("projection")),
         }
         if row.get("combined_gate_up_split"):
             projection["combined_gate_up_split"] = row["combined_gate_up_split"]
         item["projections"].append(projection)
+        item["segments"].extend(row.get("segments") or [])
     bundles = []
     for item in grouped.values():
         item["offset"] = int(item["offset"] or 0)
@@ -4305,6 +4548,32 @@ def _juju_expert_bundle_table(tensor_records, contract):
             int(item["projections"][i]["end"]) == int(item["projections"][i + 1]["offset"])
             for i in range(max(0, len(item["projections"]) - 1))
         )
+        ranges = []
+        for projection in item["projections"]:
+            ranges.append({
+                "offset": int(projection["offset"]),
+                "bytes": int(projection["bytes"]),
+                "end": int(projection["end"]),
+                "projection": projection.get("name"),
+                "tensor": projection.get("tensor"),
+            })
+        ranges.sort(key=lambda row: (int(row["offset"]), str(row.get("projection") or "")))
+        merged = []
+        for row in ranges:
+            if merged and int(merged[-1]["end"]) == int(row["offset"]):
+                merged[-1]["bytes"] = int(merged[-1]["bytes"]) + int(row["bytes"])
+                merged[-1]["end"] = int(row["end"])
+                merged[-1].setdefault("projections", []).append(row.get("projection"))
+                continue
+            merged.append({
+                "offset": int(row["offset"]),
+                "bytes": int(row["bytes"]),
+                "end": int(row["end"]),
+                "projections": [row.get("projection")],
+            })
+        item["fetch_ranges"] = merged
+        item["fetch_range_count"] = len(merged)
+        item["segment_count"] = len(item.get("segments") or [])
         bundles.append(item)
     bundles.sort(key=lambda item: (int(item["layer"]), int(item["expert"])))
     return {
@@ -4312,8 +4581,51 @@ def _juju_expert_bundle_table(tensor_records, contract):
         "bundle_count": len(bundles),
         "lookup_key": ["layer", "expert"],
         "range_fields": ["offset", "bytes", "end"],
+        "source_range_fields": ["source_offset", "source_bytes", "source_end"],
         "projection_fields": ["projection_names", "projection_offsets", "projection_bytes"],
+        "fetch_range_semantics": "minimal_sorted_juju_ranges_per_layer_expert_bundle",
         "bundles": bundles,
+    }
+
+
+def _juju_expert_chunk_table(tensor_records, contract):
+    rows = _juju_expert_offset_table(tensor_records, contract)
+    chunks = []
+    for row in rows:
+        chunks.append({
+            "layer": int(row.get("layer") or 0),
+            "expert": int(row.get("expert") or 0),
+            "projection": row.get("projection"),
+            "tensor": row.get("tensor"),
+            "offset": int(row.get("offset") or 0),
+            "bytes": int(row.get("bytes") or 0),
+            "end": int(row.get("end") or 0),
+            "source_offset": int(row.get("source_offset") or 0),
+            "source_bytes": int(row.get("source_bytes") or 0),
+            "source_end": int(row.get("source_end") or 0),
+            "row_range": row.get("row_range"),
+            "column_range": row.get("column_range"),
+            "segment_count": int(row.get("segment_count") or 1),
+            "segments": row.get("segments") or [],
+            "source_segments": row.get("source_segments") or [],
+            "combined_gate_up_split": row.get("combined_gate_up_split"),
+            "tier": row.get("tier", "cold"),
+            "prefetch_priority": int(row.get("prefetch_priority") or 80),
+            "runtime_priority": int(row.get("runtime_priority") or 65),
+        })
+    chunks.sort(key=lambda item: (
+        int(item["layer"]),
+        int(item["expert"]),
+        _juju_projection_order_value(item.get("projection")),
+        int(item["offset"]),
+    ))
+    return {
+        "format": "JUJU_EXPERT_CHUNK_TABLE_V1",
+        "lookup_key": ["layer", "expert", "projection"],
+        "chunk_count": len(chunks),
+        "offset_unit": "absolute_juju_file_byte_offset",
+        "source_offset_unit": "absolute_source_gguf_file_byte_offset",
+        "chunks": chunks,
     }
 
 
@@ -4637,6 +4949,7 @@ def build_juju_tier_hint_section(tensor_records, contract, split_meta):
     moe_layers, moe_layer_mask = _juju_moe_layer_bitmask_words(tensor_records)
     expert_offset_table = _juju_expert_offset_table(tensor_records, contract)
     expert_bundle_table = _juju_expert_bundle_table(tensor_records, contract)
+    expert_chunk_table = _juju_expert_chunk_table(tensor_records, contract)
     tier_counts = {"hot": 0, "warm": 0, "cold": 0}
     for item in tier_entries:
         tier_counts[item.get("tier", "cold")] = tier_counts.get(item.get("tier", "cold"), 0) + 1
@@ -4660,7 +4973,9 @@ def build_juju_tier_hint_section(tensor_records, contract, split_meta):
         "expert_tier_counts": tier_counts,
         "expert_offset_table": expert_offset_table,
         "expert_bundle_table": expert_bundle_table,
+        "expert_chunk_table": expert_chunk_table,
         "expert_offset_table_kind": "layer_expert_projection_o1_lookup",
+        "expert_chunk_table_kind": "layer_expert_projection_absolute_offset_lookup",
         "moe_layers": moe_layers,
         "moe_layer_bitmask_words": moe_layer_mask,
         "dense_layer_skip_ready": True,
@@ -4814,12 +5129,31 @@ def write_calibrated_juju_idx(index_path, calibration_stats, output_path=None):
     }
 
 
-def build_juju_runtime_metadata_sections(tensor_records, contract, split_meta):
-    qkv_fields = _juju_qkv_contract_fields(_juju_effective_qkv_schema(contract, dict(contract.get("arch_meta") or {})))
+def juju_runtime_special_tokens_metadata(runtime_arch):
+    runtime_arch = dict(runtime_arch or {})
+    return {
+        "bos_token_id": runtime_arch.get("bos_token_id"),
+        "eos_token_id": runtime_arch.get("eos_token_id"),
+        "unk_token_id": runtime_arch.get("unk_token_id"),
+        "pad_token_id": runtime_arch.get("pad_token_id"),
+        "mask_token_id": runtime_arch.get("mask_token_id"),
+        "add_bos_token": runtime_arch.get("add_bos_token"),
+        "add_eos_token": runtime_arch.get("add_eos_token"),
+        "add_space_prefix": runtime_arch.get("add_space_prefix"),
+        "source": "source_config_or_gguf_runtime_metadata",
+        "source_by_field": runtime_arch.get("special_token_source_by_field") or {},
+        "defaulted_fields": runtime_arch.get("special_token_default_sources") or {},
+    }
+
+
+def build_juju_runtime_metadata_sections(tensor_records, contract, split_meta, runtime_arch=None):
+    runtime_arch = dict(runtime_arch or contract.get("arch_meta") or {})
+    qkv_fields = _juju_qkv_contract_fields(_juju_effective_qkv_schema(contract, runtime_arch))
     runtime_contract = {
         "format": "JUJU_RUNTIME_CONTRACT_SUMMARY_V1",
         "split": split_meta,
         "qkv_contract": qkv_fields,
+        "eval_kv_policy": qkv_fields["evaluation_policy"],
         "required_views": [
             "root_metadata",
             "qkv_policy",
@@ -4830,6 +5164,7 @@ def build_juju_runtime_metadata_sections(tensor_records, contract, split_meta):
             "bottleneck_trace",
         ],
         "tokenizer_contract": juju_tokenizer_contract(),
+        "special_tokens": juju_runtime_special_tokens_metadata(runtime_arch),
         "validation_contract": juju_validation_contract(),
         "runtime_loop": "tokenizer_contract_then_graph_ir_ops_then_tensor_layout_then_qkv_cache_then_lm_head",
         "runtime_execution_manifest": {
@@ -4951,6 +5286,51 @@ def _juju_infer_embedding_scale(contract, runtime):
     return None, "absent_no_embedding_scale"
 
 
+def _juju_default_special_token_bool(field, contract, runtime):
+    runtime = dict(runtime or {})
+    tokenizer_model = str(first_present(
+        runtime.get("tokenizer_model"),
+        runtime.get("tokenizer.ggml.model"),
+        runtime.get("tokenizer_pre"),
+        runtime.get("tokenizer.ggml.pre"),
+        _juju_first_config_value(contract, "tokenizer_model", "tokenizer_class"),
+    ) or "").lower()
+    if field == "add_eos_token":
+        return False, "default_false_when_source_tokenizer_policy_absent"
+    if field == "add_space_prefix":
+        explicit = first_present(
+            _juju_bool_or_none(runtime.get("add_prefix_space")),
+            _juju_bool_or_none(runtime.get("tokenizer_add_prefix_space")),
+            _juju_bool_or_none(_juju_first_config_value(contract, "add_prefix_space", "tokenizer_add_prefix_space")),
+        )
+        if explicit is not None:
+            return explicit, "source_add_prefix_space_alias"
+        return False, "default_false_when_source_tokenizer_policy_absent"
+    if field == "add_bos_token":
+        if any(name in tokenizer_model for name in ("llama", "sentencepiece", "spm", "unigram")) and runtime.get("bos_token_id") is not None:
+            return True, "tokenizer_backend_default_bos_for_sentencepiece_style_causal_lm"
+        if any(name in tokenizer_model for name in ("gpt2", "bpe", "tiktoken", "qwen")):
+            return False, "tokenizer_backend_default_false_for_bpe_style_causal_lm"
+        return False, "default_false_when_source_tokenizer_policy_absent"
+    return False, "default_false_unknown_special_token_policy"
+
+
+def _juju_apply_special_token_policy_defaults(contract, fields):
+    defaults = {}
+    sources = {}
+    for field in ("add_bos_token", "add_eos_token", "add_space_prefix"):
+        if fields.get(field) is None:
+            value, source = _juju_default_special_token_bool(field, contract, fields)
+            fields[field] = value
+            defaults[field] = source
+            sources[field] = source
+        else:
+            sources[field] = "source_config_or_gguf_runtime_metadata"
+    fields["special_token_default_sources"] = defaults
+    fields["special_token_source_by_field"] = sources
+    return fields
+
+
 def juju_runtime_arch_metadata(contract, directory=None):
     arch = dict(contract.get("arch_meta") or {})
     runtime = dict((directory or {}).get("gguf_runtime") or {})
@@ -4961,6 +5341,8 @@ def juju_runtime_arch_metadata(contract, directory=None):
         "declared_architecture": first_present(contract.get("architecture"), arch.get("architecture"), runtime.get("declared_architecture"), runtime.get("architecture")),
         "model_id": first_present(contract.get("model_id"), contract.get("model_name"), runtime.get("model_id")),
         "model_name": first_present(contract.get("model_name"), runtime.get("model_name")),
+        "tokenizer_model": first_present(runtime.get("tokenizer_model"), runtime.get("tokenizer.ggml.model"), arch.get("tokenizer_model"), cfg("tokenizer_model", "tokenizer_class")),
+        "tokenizer_pre": first_present(runtime.get("tokenizer_pre"), runtime.get("tokenizer.ggml.pre"), arch.get("tokenizer_pre"), cfg("tokenizer_pre")),
         "bos_token_id": first_present(runtime.get("bos_token_id"), arch.get("bos_token_id"), cfg("bos_token_id")),
         "eos_token_id": first_present(runtime.get("eos_token_id"), arch.get("eos_token_id"), cfg("eos_token_id")),
         "unk_token_id": first_present(runtime.get("unk_token_id"), runtime.get("unknown_token_id"), arch.get("unk_token_id"), cfg("unk_token_id")),
@@ -5026,6 +5408,7 @@ def juju_runtime_arch_metadata(contract, directory=None):
     fields["scale_emb"] = embedding_scale
     fields["embedding_scale_source"] = embedding_scale_source
     fields["embedding_scale_semantics"] = "multiply_token_embedding_before_first_layer" if embedding_scale is not None else "none"
+    _juju_apply_special_token_policy_defaults(contract, fields)
     for key, value in fields.items():
         if value is not None:
             out[key] = value
@@ -5057,13 +5440,13 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
         "mlp.down_proj.weight",
     )
     attention_norm_weights = bind("attn_norm.weight", "input_layernorm.weight", "pre_attention_norm.weight")
-    q_weights = bind("attn_q.weight", "attention.wq.weight", "q_proj.weight", "attn_q_a_proj.weight", "attn_q_b_proj.weight")
-    k_weights = bind("attn_k.weight", "attention.wk.weight", "k_proj.weight", "attn_kv_a_proj_with_mqa.weight")
-    v_weights = bind("attn_v.weight", "attention.wv.weight", "v_proj.weight", "attn_kv_b_proj.weight")
-    q_norm_weights = bind("attn_q_norm.weight", "q_norm.weight")
-    k_norm_weights = bind("attn_k_norm.weight", "k_norm.weight")
-    v_norm_weights = bind("attn_v_norm.weight", "v_norm.weight", "value_norm.weight")
-    o_weights = bind("attn_output.weight", "attention.wo.weight", "o_proj.weight")
+    q_weights = bind(*JUJU_ATTENTION_Q_SUFFIXES)
+    k_weights = bind(*JUJU_ATTENTION_K_SUFFIXES)
+    v_weights = bind(*JUJU_ATTENTION_V_SUFFIXES)
+    q_norm_weights = bind(*JUJU_Q_NORM_SUFFIXES)
+    k_norm_weights = bind(*JUJU_K_NORM_SUFFIXES)
+    v_norm_weights = bind(*JUJU_V_NORM_SUFFIXES)
+    o_weights = bind(*JUJU_ATTENTION_O_SUFFIXES)
     post_attention_norm_weights = bind(
         "post_attention_norm.weight",
         "post_attention_layernorm.weight",
@@ -5104,7 +5487,9 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
         "kv_cache": "qkv_quantized_per_layer_head_cache_required",
         "kv_layout_ref": "graph_ir.kv_layout_contract",
         "cache_backend_policy_ref": "graph_ir.kv_layout_contract.runtime_cache_policy",
-        "plain_reference_required_for_ppl": "validation_probe_only",
+        "plain_reference_required_for_ppl": False,
+        "ppl_kv_backend": "qkv_quantized_per_layer_head_cache",
+        "eval_kv_backend": "qkv_quantized_per_layer_head_cache",
         "qkv_state_scope": ["request_id", "layer", "kv_head", "head_dim", "context_epoch", "qkv_policy_hash"],
         "qkv_update_mode": "append_current_token_before_decode_no_full_context_requantize",
         "forbid_plain_kv_runtime_fallback": True,
@@ -5172,6 +5557,98 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
     }
 
 
+def _juju_layer_refs_by_suffix(names, suffixes):
+    wanted = {str(x or "").lower() for x in suffixes if x}
+    return sorted(
+        str(name or "")
+        for name in names or []
+        if _juju_layer_suffix(name) in wanted
+    )
+
+
+def _juju_attention_layer_contract_table(tensor_records, runtime_arch):
+    runtime_arch = dict(runtime_arch or {})
+    layers = sorted({
+        layer for layer in (_juju_layer_id_from_name(t.get("name")) for t in tensor_records or [])
+        if layer is not None
+    })
+    max_seq = _juju_first_int(
+        runtime_arch.get("max_position_embeddings"),
+        runtime_arch.get("context_length"),
+        runtime_arch.get("max_seq_len"),
+    )
+    sliding_window = _juju_first_int(
+        runtime_arch.get("sliding_window"),
+        runtime_arch.get("sliding_window_size"),
+    )
+    table = []
+    for layer in layers:
+        names = _juju_tensors_by_layer(tensor_records, layer)
+        q_refs = _juju_layer_refs_by_suffix(names, JUJU_ATTENTION_Q_SUFFIXES)
+        k_refs = _juju_layer_refs_by_suffix(names, JUJU_ATTENTION_K_SUFFIXES)
+        v_refs = _juju_layer_refs_by_suffix(names, JUJU_ATTENTION_V_SUFFIXES)
+        o_refs = _juju_layer_refs_by_suffix(names, JUJU_ATTENTION_O_SUFFIXES)
+        q_norm_refs = _juju_layer_refs_by_suffix(names, JUJU_Q_NORM_SUFFIXES)
+        k_norm_refs = _juju_layer_refs_by_suffix(names, JUJU_K_NORM_SUFFIXES)
+        v_norm_refs = _juju_layer_refs_by_suffix(names, JUJU_V_NORM_SUFFIXES)
+        kind = _juju_layer_attention_kind(layer, runtime_arch)
+        is_global = kind == "global_full_attention"
+        attention_k_eq_v = _juju_bool_or_none(runtime_arch.get("attention_k_eq_v")) is True
+        head_dim = _juju_first_int(
+            runtime_arch.get("global_head_dim") if is_global else runtime_arch.get("head_dim"),
+            runtime_arch.get("head_dim"),
+        )
+        value_head_dim = _juju_first_int(
+            runtime_arch.get("global_value_head_dim") if is_global else runtime_arch.get("value_head_dim"),
+            runtime_arch.get("value_head_dim"),
+            head_dim,
+        )
+        kv_heads = _juju_first_int(
+            runtime_arch.get("num_global_key_value_heads") if is_global else runtime_arch.get("num_key_value_heads"),
+            runtime_arch.get("num_key_value_heads"),
+        )
+        window_size = max_seq if is_global else _juju_first_int(sliding_window, max_seq)
+        value_source = "v_projection"
+        if not v_refs:
+            value_source = "raw_k_projection_before_k_norm" if attention_k_eq_v else "missing_value_projection"
+        missing = []
+        if not q_refs:
+            missing.append("q_projection")
+        if not k_refs:
+            missing.append("k_projection")
+        if not o_refs:
+            missing.append("attention_output")
+        if not v_refs and not attention_k_eq_v:
+            missing.append("v_projection_or_attention_k_eq_v_contract")
+        table.append({
+            "format": "JUJU_LAYER_ATTENTION_CONTRACT_V1",
+            "layer": int(layer),
+            "attention_kind": kind,
+            "window_size": window_size,
+            "num_attention_heads": _juju_first_int(runtime_arch.get("num_attention_heads")),
+            "num_key_value_heads": kv_heads,
+            "head_dim": head_dim,
+            "value_head_dim": value_head_dim,
+            "attention_k_eq_v": bool(attention_k_eq_v),
+            "value_projection_present": bool(v_refs),
+            "value_source": value_source,
+            "q_projection": q_refs,
+            "k_projection": k_refs,
+            "v_projection": v_refs,
+            "o_projection": o_refs,
+            "q_norm": q_norm_refs,
+            "k_norm": k_norm_refs,
+            "v_norm": v_norm_refs,
+            "rope_contract": _juju_layer_rope_contract(layer, runtime_arch),
+            "qkv_cache_backend": "qkv_quantized_per_layer_head_cache",
+            "ppl_kv_backend": "qkv_quantized_per_layer_head_cache",
+            "eval_kv_backend": "qkv_quantized_per_layer_head_cache",
+            "required_complete": not missing,
+            "missing": missing,
+        })
+    return table
+
+
 
 def build_juju_forward_contract_validation(generation_contract, runtime_arch, *, token_embd, lm_head, output_norm, layers):
     embedding = dict((generation_contract or {}).get("embedding") or {})
@@ -5196,6 +5673,7 @@ def build_juju_forward_contract_validation(generation_contract, runtime_arch, *,
         "layer_count": layer_count > 0,
         "tensor_layout_contract": bool(layer_contract.get("tensor_layout_records_complete")),
         "attention_contract": layer_count > 0 and q_layers == layer_count and k_layers == layer_count and o_layers == layer_count,
+        "attention_layer_table": bool(layer_contract.get("attention_layer_table_complete")),
         "router_contract": moe_layers == 0 or router_layers == moe_layers,
         "mlp_contract": (moe_layers + dense_layers) > 0,
         "kv_layout_contract": bool(layer_contract.get("kv_layout_contract_available")),
@@ -5263,6 +5741,7 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
         layer for layer in (_juju_layer_id_from_name(t.get("name")) for t in tensor_records)
         if layer is not None
     })
+    attention_layer_table = _juju_attention_layer_contract_table(tensor_records, runtime_arch)
     by_layer = {layer: {_juju_layer_suffix(n) for n in _juju_tensors_by_layer(tensor_records, layer)} for layer in layers}
     for layer, suffixes in by_layer.items():
         if any(x in suffixes for x in {"post_attention_norm.weight", "post_attention_layernorm.weight", "post_attention_layer_norm.weight", "post_attn_norm.weight"}):
@@ -5277,22 +5756,22 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
             feature_counts["layers_with_post_ffw_norm_2"] += 1
         if any(x in suffixes for x in {"layer_output_scale.weight", "layer_scalar.weight", "layer_scalar"}):
             feature_counts["layers_with_layer_output_scale"] += 1
-        if not any(x in suffixes for x in {"attn_v.weight", "attention.wv.weight", "v_proj.weight", "attn_kv_b_proj.weight"}):
+        if not any(x in suffixes for x in JUJU_ATTENTION_V_SUFFIXES):
             feature_counts["layers_without_v_projection"] += 1
-        if any(x in suffixes for x in {"attn_q.weight", "attention.wq.weight", "q_proj.weight", "attn_q_a_proj.weight", "attn_q_b_proj.weight"}):
+        if any(x in suffixes for x in JUJU_ATTENTION_Q_SUFFIXES):
             feature_counts["layers_with_q_projection"] += 1
-        if any(x in suffixes for x in {"attn_k.weight", "attention.wk.weight", "k_proj.weight", "attn_kv_a_proj_with_mqa.weight"}):
+        if any(x in suffixes for x in JUJU_ATTENTION_K_SUFFIXES):
             feature_counts["layers_with_k_projection"] += 1
-        if any(x in suffixes for x in {"attn_v.weight", "attention.wv.weight", "v_proj.weight", "attn_kv_b_proj.weight"}):
+        if any(x in suffixes for x in JUJU_ATTENTION_V_SUFFIXES):
             feature_counts["layers_with_v_projection"] += 1
-        if any(x in suffixes for x in {"attn_output.weight", "attention.wo.weight", "o_proj.weight"}):
+        if any(x in suffixes for x in JUJU_ATTENTION_O_SUFFIXES):
             feature_counts["layers_with_o_projection"] += 1
-        explicit_v_norm = any(x in suffixes for x in {"attn_v_norm.weight", "v_norm.weight", "value_norm.weight"})
+        explicit_v_norm = any(x in suffixes for x in JUJU_V_NORM_SUFFIXES)
         implicit_v_norm = (
-            not any(x in suffixes for x in {"attn_v.weight", "attention.wv.weight", "v_proj.weight", "attn_kv_b_proj.weight"}) and
+            not any(x in suffixes for x in JUJU_ATTENTION_V_SUFFIXES) and
             _juju_bool_or_none(runtime_arch.get("attention_k_eq_v")) is True and
-            any(x in suffixes for x in {"attn_q_norm.weight", "q_norm.weight"}) and
-            any(x in suffixes for x in {"attn_k_norm.weight", "k_norm.weight"})
+            any(x in suffixes for x in JUJU_Q_NORM_SUFFIXES) and
+            any(x in suffixes for x in JUJU_K_NORM_SUFFIXES)
         )
         if explicit_v_norm or implicit_v_norm:
             feature_counts["layers_with_v_norm"] += 1
@@ -5340,6 +5819,10 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
         "layers": {
             "count": len(layers),
             "feature_counts": feature_counts,
+            "attention_layer_table": attention_layer_table,
+            "attention_layer_table_complete": bool(attention_layer_table) and all(
+                bool(row.get("required_complete")) for row in attention_layer_table
+            ),
             "op_order_is_authoritative": True,
             "unknown_required_op_behavior": "fail_closed",
             "optional_missing_op_behavior": "documented_fallback_only",
@@ -5412,6 +5895,7 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
         },
         "qkv_policy_contract": qkv_fields["qkv_policy_contract"],
         "qkv_cache_schema_effective": qkv_fields["qkv_cache_schema_effective"],
+        "eval_kv_policy": qkv_fields["evaluation_policy"],
     }
     contract_out["forward_contract_validation"] = build_juju_forward_contract_validation(
         contract_out,
@@ -5547,17 +6031,21 @@ def build_juju_runtime_execution_manifest(*, generation_contract, runtime_access
             "add_eos_token": runtime_arch.get("add_eos_token"),
             "add_space_prefix": runtime_arch.get("add_space_prefix"),
             "source": "source_config_or_gguf_runtime_metadata",
+            "source_by_field": runtime_arch.get("special_token_source_by_field") or {},
+            "defaulted_fields": runtime_arch.get("special_token_default_sources") or {},
         },
         "embedding": generation_contract.get("embedding") or {},
         "attention": {
             "qkv_cache_required": True,
             "plain_kv_runtime_allowed": False,
+            "eval_kv_policy": generation_contract.get("eval_kv_policy") or qkv_fields.get("evaluation_policy") or {},
             "kv_layout_ref": "runtime_execution_manifest.kv_layout_contract",
             "qkv_policy_ref": "runtime_execution_manifest.qkv_policy_contract",
             "score_scale_source": "source_config_or_qk_norm_layout",
             "rope_source": "source_config_or_gguf_runtime_metadata",
             "head_layout": (kv_layout.get("head_layout") or {}),
             "window_contract": (kv_layout.get("attention_window_contract") or {}),
+            "layer_table": (generation_contract.get("layers") or {}).get("attention_layer_table") or [],
         },
         "router": {
             "execution_op": "moe_router",
@@ -5607,6 +6095,7 @@ def build_juju_runtime_execution_manifest(*, generation_contract, runtime_access
         "kv_layout_contract": kv_layout,
         "qkv_policy_contract": qkv_fields.get("qkv_policy_contract") or runtime_access_plan.get("qkv_policy_contract") or {},
         "qkv_cache_schema_effective": qkv_fields.get("qkv_cache_schema_effective") or runtime_access_plan.get("qkv_cache_schema_effective") or {},
+        "eval_kv_policy": qkv_fields.get("evaluation_policy") or generation_contract.get("eval_kv_policy") or {},
         "bottleneck_trace_contract": runtime_access_plan.get("bottleneck_trace_contract") or {
             "required_counters": perf.get("bottleneck_counters") or [],
             "trace_required_keys": perf.get("trace_required_keys") or [],
@@ -5629,6 +6118,8 @@ def juju_format_self_check(idx, sections, qkv_schema):
     qkv_schema = qkv_schema or {}
     errors = []
     warnings = []
+    split_meta = idx.get("split") if isinstance(idx.get("split"), dict) else {}
+    split_enabled = bool(split_meta.get("enabled"))
 
     def err(code, **fields):
         item = {"code": code}
@@ -5673,6 +6164,19 @@ def juju_format_self_check(idx, sections, qkv_schema):
             key_normal_bits=key_normal_bits,
             value_normal_bits=value_normal_bits,
         )
+    supported_bits = set(int(x) for x in (qkv_schema.get("supported_cache_bits") or JUJU_QKV_SUPPORTED_CACHE_BITS))
+    for name, value in (
+        ("k_bits", k_bits),
+        ("v_bits", v_bits),
+        ("normal_bits", normal_bits),
+        ("key_normal_bits", key_normal_bits),
+        ("value_normal_bits", value_normal_bits),
+        ("outlier_bits", outlier_bits),
+        ("key_outlier_bits", key_outlier_bits),
+        ("value_outlier_bits", value_outlier_bits),
+    ):
+        if value is not None and int(value) not in supported_bits:
+            err("qkv_bit_width_not_declared_supported", field=name, value=value, supported=sorted(supported_bits))
     if outlier_channels > 0 and (outlier_bits is None or key_outlier_bits is None or value_outlier_bits is None):
         err(
             "qkv_outlier_bits_incomplete",
@@ -5702,6 +6206,17 @@ def juju_format_self_check(idx, sections, qkv_schema):
     turboquant_policy = qkv_schema.get("turboquant") if isinstance(qkv_schema.get("turboquant"), dict) else qkv_schema.get("turboquant_policy")
     if not isinstance(turboquant_policy, dict) or turboquant_policy.get("query_cached") is not False:
         err("qkv_turboquant_policy_missing_or_query_cached")
+    eval_policy = qkv_schema.get("evaluation_policy") if isinstance(qkv_schema.get("evaluation_policy"), dict) else {}
+    if eval_policy.get("ppl_kv_backend") != "qkv_quantized_per_layer_head_cache":
+        err("qkv_eval_ppl_backend_not_qkv", backend=eval_policy.get("ppl_kv_backend"))
+    if eval_policy.get("eval_kv_backend") != "qkv_quantized_per_layer_head_cache":
+        err("qkv_eval_backend_not_qkv", backend=eval_policy.get("eval_kv_backend"))
+    if eval_policy.get("eval_must_bypass_quantized_qkv") is not False:
+        err("qkv_eval_bypasses_quantized_qkv")
+    if eval_policy.get("force_qkv_for_ppl") is not True or eval_policy.get("force_qkv_for_eval") is not True:
+        err("qkv_eval_force_qkv_missing")
+    if eval_policy.get("allow_plain_reference") is not False:
+        err("qkv_eval_allows_plain_reference")
 
     if idx.get("format") != "JUJU_IDX_JSON_V1":
         err("idx_format_missing_or_wrong")
@@ -5776,6 +6291,7 @@ def juju_format_self_check(idx, sections, qkv_schema):
             "runtime_access_plan",
             "kv_layout_contract",
             "qkv_policy_contract",
+            "eval_kv_policy",
             "bottleneck_trace_contract",
             "ppl_correctness_gates",
         ):
@@ -5786,6 +6302,36 @@ def juju_format_self_check(idx, sections, qkv_schema):
             err("runtime_execution_manifest_allows_model_name_fallback")
         if runtime_execution_manifest.get("ppl_correctness_gates", {}).get("bad_ppl_is_correctness_failure") is not True:
             err("runtime_execution_manifest_ppl_gate_missing")
+        special_tokens = runtime_execution_manifest.get("special_tokens") or {}
+        for field in ("add_bos_token", "add_eos_token", "add_space_prefix"):
+            if special_tokens.get(field) is None:
+                err("runtime_execution_manifest_special_token_missing", field=field)
+        if special_tokens.get("add_bos_token") is True and special_tokens.get("bos_token_id") is None:
+            err("runtime_execution_manifest_special_token_missing", field="bos_token_id")
+        if special_tokens.get("add_eos_token") is True and special_tokens.get("eos_token_id") is None:
+            err("runtime_execution_manifest_special_token_missing", field="eos_token_id")
+        attention = runtime_execution_manifest.get("attention") or {}
+        if attention.get("plain_kv_runtime_allowed") is not False:
+            err("runtime_execution_manifest_allows_plain_kv")
+        eval_policy = attention.get("eval_kv_policy") or runtime_execution_manifest.get("eval_kv_policy") or {}
+        if eval_policy.get("allow_plain_reference") is not False:
+            err("runtime_execution_manifest_eval_allows_plain_reference")
+        if eval_policy.get("force_qkv_for_ppl") is not True:
+            err("runtime_execution_manifest_eval_does_not_force_qkv")
+        layer_table = attention.get("layer_table") or []
+        if not layer_table:
+            if split_enabled:
+                warn("runtime_execution_manifest_attention_layer_table_missing_for_partial_split")
+            else:
+                err("runtime_execution_manifest_attention_layer_table_missing")
+        else:
+            for row in layer_table:
+                if row.get("required_complete") is not True:
+                    if split_enabled:
+                        warn("attention_layer_contract_incomplete_for_partial_split", layer=row.get("layer"), missing=row.get("missing") or [])
+                    else:
+                        err("attention_layer_contract_incomplete", layer=row.get("layer"), missing=row.get("missing") or [])
+                    break
     tokenizer = generation_contract.get("tokenizer") or {}
     if not tokenizer.get("required_any_of"):
         err("tokenizer_required_any_of_missing")
@@ -5795,7 +6341,16 @@ def juju_format_self_check(idx, sections, qkv_schema):
     if forward_validation.get("format") != "JUJU_FORWARD_CONTRACT_VALIDATION_V1":
         err("forward_contract_validation_missing")
     elif forward_validation.get("contract_complete") is not True:
-        err("forward_contract_incomplete", missing=forward_validation.get("missing") or [])
+        if split_enabled:
+            warn("forward_contract_incomplete_for_partial_split", missing=forward_validation.get("missing") or [])
+        else:
+            err("forward_contract_incomplete", missing=forward_validation.get("missing") or [])
+    layer_contract = generation_contract.get("layers") or {}
+    if layer_contract.get("attention_layer_table_complete") is not True:
+        if split_enabled:
+            warn("generation_attention_layer_table_incomplete_for_partial_split")
+        else:
+            err("generation_attention_layer_table_incomplete")
     runtime_access_plan = graph_ir.get("runtime_access_plan") or idx.get("runtime_access_plan") or {}
     if runtime_access_plan.get("format") != "JUJU_RUNTIME_ACCESS_PLAN_V1":
         err("runtime_access_plan_missing_or_wrong_format")
@@ -5997,9 +6552,11 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
         "generation_contract": generation_contract,
         "runtime_execution_manifest": runtime_execution_manifest,
         "runtime_access_plan": runtime_access_plan,
+        "attention_layer_contract_table": generation_contract.get("layers", {}).get("attention_layer_table") or [],
         "kv_layout_contract": runtime_access_plan["kv_layout_contract"],
         "qkv_policy_contract": qkv_fields["qkv_policy_contract"],
         "qkv_cache_schema_effective": qkv_fields["qkv_cache_schema_effective"],
+        "eval_kv_policy": qkv_fields["evaluation_policy"],
         "tokenizer_contract": juju_tokenizer_contract(),
         "quantization": {
             "weight": contract.get("weight_quant_schema", {}),
@@ -6310,7 +6867,7 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             "require_quant_schema_match": True,
             "require_qkv_policy_match": bool(contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract")),
             "require_qkv_layer_head_epoch_scope": bool(contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract")),
-            "allow_plain_kv_reference_for_ppl": not _juju_qkv_required(contract, contract.get("qkv_cache_schema") or contract.get("qkv_policy_contract") or {}),
+            "allow_plain_kv_reference_for_ppl": False,
             "allow_optional_ops_missing": True,
             "tensor_count": len(tensor_records),
             "section_count": len(sections),
@@ -6541,10 +7098,11 @@ def build_juju_shard_plan_from_hf_url(
             })
             section_sizes[section_type] = section_sizes.get(section_type, 0) + size
 
-        for section_type, name, payload in build_juju_runtime_metadata_sections(tensor_records, contract, split_meta):
+        runtime_arch = juju_runtime_arch_metadata(contract, directory)
+
+        for section_type, name, payload in build_juju_runtime_metadata_sections(tensor_records, contract, split_meta, runtime_arch):
             pos = add_json_section_at(pos, section_type, name, payload)
 
-        runtime_arch = juju_runtime_arch_metadata(contract, directory)
         graph_ir = build_juju_graph_ir(
             contract=contract,
             tensor_records=tensor_records,
@@ -6579,9 +7137,12 @@ def build_juju_shard_plan_from_hf_url(
             "runtime_execution_manifest": graph_ir["runtime_execution_manifest"],
             "qkv_policy_contract": graph_ir["runtime_access_plan"].get("qkv_policy_contract", {}),
             "qkv_cache_schema_effective": graph_ir["runtime_access_plan"].get("qkv_cache_schema_effective", {}),
+            "eval_kv_policy": graph_ir.get("eval_kv_policy", {}),
+            "attention_layer_contract_table": graph_ir.get("attention_layer_contract_table", []),
             "expert_tier_entries": graph_ir["runtime_access_plan"].get("expert_tier_entries", []),
             "expert_offset_table": graph_ir["runtime_access_plan"].get("expert_offset_table", []),
             "expert_bundle_table": graph_ir["runtime_access_plan"].get("expert_bundle_table", {}),
+            "expert_chunk_table": graph_ir["runtime_access_plan"].get("expert_chunk_table", {}),
             "moe_layer_bitmask_words": graph_ir["runtime_access_plan"].get("moe_layer_bitmask_words", []),
             "router_calibration_manifest": graph_ir["runtime_access_plan"].get("router_calibration_manifest", {}),
             "tensor_count": len(tensor_records),
@@ -7153,10 +7714,11 @@ def write_juju_shard_from_hf_url(
                 })
                 section_sizes[section_type] = section_sizes.get(section_type, 0) + size
 
-            for section_type, name, payload in build_juju_runtime_metadata_sections(tensor_records, contract, split_meta):
+            runtime_arch = juju_runtime_arch_metadata(contract, directory)
+
+            for section_type, name, payload in build_juju_runtime_metadata_sections(tensor_records, contract, split_meta, runtime_arch):
                 add_json_section(out, section_type, name, payload)
 
-            runtime_arch = juju_runtime_arch_metadata(contract, directory)
             graph_ir = build_juju_graph_ir(
                 contract=contract,
                 tensor_records=tensor_records,
@@ -7191,9 +7753,12 @@ def write_juju_shard_from_hf_url(
                 "runtime_execution_manifest": graph_ir["runtime_execution_manifest"],
                 "qkv_policy_contract": graph_ir["runtime_access_plan"].get("qkv_policy_contract", {}),
                 "qkv_cache_schema_effective": graph_ir["runtime_access_plan"].get("qkv_cache_schema_effective", {}),
+                "eval_kv_policy": graph_ir.get("eval_kv_policy", {}),
+                "attention_layer_contract_table": graph_ir.get("attention_layer_contract_table", []),
                 "expert_tier_entries": graph_ir["runtime_access_plan"].get("expert_tier_entries", []),
                 "expert_offset_table": graph_ir["runtime_access_plan"].get("expert_offset_table", []),
                 "expert_bundle_table": graph_ir["runtime_access_plan"].get("expert_bundle_table", {}),
+                "expert_chunk_table": graph_ir["runtime_access_plan"].get("expert_chunk_table", {}),
                 "moe_layer_bitmask_words": graph_ir["runtime_access_plan"].get("moe_layer_bitmask_words", []),
                 "router_calibration_manifest": graph_ir["runtime_access_plan"].get("router_calibration_manifest", {}),
                 "tensor_count": len(tensor_records),

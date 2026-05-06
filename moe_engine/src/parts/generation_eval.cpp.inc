@@ -176,7 +176,7 @@ int moe_pc_engine_eval_token_ids_from(
     const int pre_allocate_kv = 0;
     moe_profile_log(
         "eval_prepare_begin",
-        "input_tokens=%u first_target=%u layers=%u hidden=%u max_seq=%u rope_len=%u kv_entry=%u prealloc=%d",
+        "input_tokens=%u first_target=%u layers=%u hidden=%u max_seq=%u rope_len=%u kv_entry=%u prealloc=%d kv_backend=%s",
         input_token_count,
         first_target_index,
         c->num_hidden_layers,
@@ -184,7 +184,8 @@ int moe_pc_engine_eval_token_ids_from(
         attn_cfg.max_seq_len,
         attn_cfg.rope_table_len,
         moe_attn_kv_entry_dim(attn_cfg),
-        pre_allocate_kv);
+        pre_allocate_kv,
+        (engine->config.kv_mode == moe_KV_MODE_QKV && qkv_is_enabled()) ? "qkv_contract" : "plain_kv_cache");
     // BUGFIX 563: Check moe_decode_scratch_resize success ★
     // Problem: moe_decode_scratch_resize can fail on allocation
     // Solution: Check return value (assuming it returns int)

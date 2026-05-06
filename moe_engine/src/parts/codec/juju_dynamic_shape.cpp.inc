@@ -89,6 +89,9 @@ static int moe_juju_name_is_std_v(const std::string& lower) {
     return !moe_juju_name_is_mla_kv_a(lower) &&
         !moe_juju_name_is_mla_kv_b(lower) &&
         (moe_name_has(lower, "v_proj.weight") ||
+         moe_name_has(lower, "self_attn.v_proj.weight") ||
+         moe_name_has(lower, "value_proj.weight") ||
+         moe_name_has(lower, "v_projection.weight") ||
          moe_name_has(lower, "attn_v.weight") ||
          moe_name_has(lower, "attention.wv.weight"));
 }

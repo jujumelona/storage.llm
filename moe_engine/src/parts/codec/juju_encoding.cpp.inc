@@ -3,14 +3,24 @@ static uint8_t moe_weight_encoding_from_juju_entry(
     const moe_juju_tensor_json_entry_t& entry,
     const moe_offload_gguf_contract_t& contract
 ) {
+    uint8_t by_type = moe_WEIGHT_ENCODING_UNKNOWN;
     if (entry.has_gguf_type) {
-        const uint8_t by_type = moe_weight_encoding_from_gguf_type(entry.gguf_type, contract);
-        if (by_type != moe_WEIGHT_ENCODING_UNKNOWN) {
-            return by_type;
-        }
+        by_type = moe_weight_encoding_from_gguf_type(entry.gguf_type, contract);
     }
     if (entry.weight_encoding != moe_WEIGHT_ENCODING_UNKNOWN) {
+        if (by_type != moe_WEIGHT_ENCODING_UNKNOWN && by_type != entry.weight_encoding) {
+            moe_profile_log(
+                "juju_encoding_conflict",
+                "gguf_type=%u mapped=%u weight_encoding=%u using=0",
+                entry.gguf_type,
+                (uint32_t)by_type,
+                (uint32_t)entry.weight_encoding);
+            return moe_WEIGHT_ENCODING_UNKNOWN;
+        }
         return entry.weight_encoding;
+    }
+    if (by_type != moe_WEIGHT_ENCODING_UNKNOWN) {
+        return by_type;
     }
     if (contract.weight_encoding != moe_WEIGHT_ENCODING_UNKNOWN) {
         return (uint8_t)std::min<uint32_t>(contract.weight_encoding, 255u);

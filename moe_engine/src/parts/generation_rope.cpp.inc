@@ -245,8 +245,8 @@ static void moe_rope_rotate_half_partial_inplace(
         return;
     }
     active_dim = std::min<uint32_t>(active_dim, full_dim);
-    const uint32_t half_dim = full_dim / 2u;
-    const uint32_t active_pairs = std::min<uint32_t>(active_dim / 2u, half_dim);
+    const uint32_t active_half_dim = active_dim / 2u;
+    const uint32_t active_pairs = active_half_dim;
     if (active_pairs == 0u) {
         return;
     }
@@ -265,9 +265,9 @@ static void moe_rope_rotate_half_partial_inplace(
             const float cos_t = cos_row[j];
             const float sin_t = sin_row[j];
             const float x0 = data[j];
-            const float x1 = data[j + half_dim];
+            const float x1 = data[j + active_half_dim];
             data[j] = x0 * cos_t - x1 * sin_t;
-            data[j + half_dim] = x1 * cos_t + x0 * sin_t;
+            data[j + active_half_dim] = x1 * cos_t + x0 * sin_t;
         }
         return;
     }
@@ -278,9 +278,9 @@ static void moe_rope_rotate_half_partial_inplace(
             const float cos_t = cached_cos[j];
             const float sin_t = cached_sin[j];
             const float x0 = data[j];
-            const float x1 = data[j + half_dim];
+            const float x1 = data[j + active_half_dim];
             data[j] = x0 * cos_t - x1 * sin_t;
-            data[j + half_dim] = x1 * cos_t + x0 * sin_t;
+            data[j + active_half_dim] = x1 * cos_t + x0 * sin_t;
         }
         return;
     }
@@ -291,9 +291,9 @@ static void moe_rope_rotate_half_partial_inplace(
         const float cos_t = std::cos(theta);
         const float sin_t = std::sin(theta);
         const float x0 = data[j];
-        const float x1 = data[j + half_dim];
+        const float x1 = data[j + active_half_dim];
         data[j] = x0 * cos_t - x1 * sin_t;
-        data[j + half_dim] = x1 * cos_t + x0 * sin_t;
+        data[j + active_half_dim] = x1 * cos_t + x0 * sin_t;
         freq *= multiplier;
     }
 }
