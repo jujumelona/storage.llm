@@ -31,11 +31,6 @@ static float moe_embedding_scale_value(const moe_pc_engine* engine, uint32_t hid
         moe_engine_metadata_mentions(engine, "scale_embedding")) {
         scale = std::sqrt((float)hidden_size);
     }
-    else if (moe_engine_has_common_tensor_suffix(engine, 0, "layer_output_scale.weight") &&
-        moe_engine_has_common_tensor_suffix(engine, 0, "ffn_gate_inp.scale")) {
-        scale = std::sqrt((float)hidden_size);
-    }
-
     engine->cached_embedding_scale_hidden.store(hidden_size, std::memory_order_release);
     engine->cached_embedding_scale_bits.store(moe_f32_bits(scale), std::memory_order_release);
     return scale;
