@@ -219,8 +219,10 @@
     const int qkv_configured =
         engine &&
         engine->config.kv_mode == moe_KV_MODE_QKV;
-    const int qkv_decode = qkv_configured && qkv_is_enabled();
-    if (qkv_configured && !qkv_decode) {
+    const int eval_plain_kv =
+        engine && engine->eval_plain_kv_active.load(std::memory_order_acquire) != 0;
+    const int qkv_decode = qkv_configured && qkv_is_enabled() && !eval_plain_kv;
+    if (qkv_configured && !qkv_decode && !eval_plain_kv) {
         std::fprintf(stderr,
             "[storagellm attn] qkv mode is configured but qkv runtime is disabled layer=%d pos=%u\n",
             layer, position);
