@@ -50,7 +50,8 @@ typedef enum {
     moe_RAW_TENSOR_INDEXER_K_NORM_WEIGHT = 10,
     moe_RAW_TENSOR_INDEXER_WEIGHTS_PROJ = 11,
     moe_RAW_TENSOR_INDEXER_WK = 12,
-    moe_RAW_TENSOR_INDEXER_WQ_B = 13
+    moe_RAW_TENSOR_INDEXER_WQ_B = 13,
+    moe_RAW_TENSOR_V_A_LAYER_NORM = 14
 } moe_raw_tensor_kind_t;
 
 typedef struct {

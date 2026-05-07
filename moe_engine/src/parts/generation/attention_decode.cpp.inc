@@ -128,6 +128,9 @@
         layer, position, qkv_parallel_path, q_dim, k_dim, kv_v_dim, hidden_size,
         moe_profile_elapsed_ms(qkv_start_us));
     const uint64_t qkv_norm_start_us = moe_profile_now_us();
+    moe_raw_tensor_cache_entry v_norm_shape{};
+    const int has_v_norm =
+        has_v ? get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_V_A_LAYER_NORM, &v_norm_shape) : 0;
     if (!moe_apply_optional_head_rmsnorm_f32(
             engine, layer, moe_RAW_TENSOR_Q_A_LAYER_NORM,
             s->q_b.data(), num_heads, head_dim, cfg.rms_norm_eps) ||
@@ -138,18 +141,31 @@
             layer, num_heads, num_kv_heads, head_dim);
         return 0;
     }
-    const int use_v_norm = moe_layer_uses_unweighted_v_norm(engine, layer);
-    if (use_v_norm &&
-        !moe_apply_unweighted_head_rmsnorm_f32(
-            s->attn_value.data(), num_kv_heads, v_head_dim, cfg.rms_norm_eps)) {
-        std::fprintf(stderr, "[storagellm attn] v norm failed layer=%d kv_heads=%u v_head_dim=%u\n",
-            layer, num_kv_heads, v_head_dim);
-        return 0;
+    int v_norm_mode = 0;
+    if (has_v_norm) {
+        if (!moe_apply_optional_head_rmsnorm_f32(
+                engine, layer, moe_RAW_TENSOR_V_A_LAYER_NORM,
+                s->attn_value.data(), num_kv_heads, v_head_dim, cfg.rms_norm_eps)) {
+            std::fprintf(stderr, "[storagellm attn] weighted v norm failed layer=%d kv_heads=%u v_head_dim=%u\n",
+                layer, num_kv_heads, v_head_dim);
+            return 0;
+        }
+        v_norm_mode = 2;
+    } else if (moe_layer_uses_unweighted_v_norm(engine, layer)) {
+        if (!moe_apply_unweighted_head_rmsnorm_f32(
+                s->attn_value.data(), num_kv_heads, v_head_dim, cfg.rms_norm_eps)) {
+            std::fprintf(stderr, "[storagellm attn] unweighted v norm failed layer=%d kv_heads=%u v_head_dim=%u\n",
+                layer, num_kv_heads, v_head_dim);
+            return 0;
+        }
+        v_norm_mode = 1;
     }
     moe_profile_log(
         "attn_standard_qkv_norm",
-        "layer=%d pos=%u q_norm=%d k_norm=%d has_v=%d v_norm=%d ms=%.3f",
-        layer, position, has_q_norm, has_k_norm, has_v, use_v_norm,
+        "layer=%d pos=%u q_norm=%d k_norm=%d has_v=%d v_norm=%d v_norm_weighted=%d ms=%.3f",
+        layer, position, has_q_norm, has_k_norm, has_v,
+        v_norm_mode != 0 ? 1 : 0,
+        v_norm_mode == 2 ? 1 : 0,
         moe_profile_elapsed_ms(qkv_norm_start_us));
     const uint64_t rope_start_us = moe_profile_now_us();
     const int rope_rotate_half = moe_standard_rope_uses_rotate_half_cached(engine, cfg);

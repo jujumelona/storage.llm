@@ -284,6 +284,7 @@ static int moe_layer_ffn_norm_f32(
     static const char* const suffixes[] = {
         "ffn_norm.weight",
         "ffn_pre_norm.weight",
+        "pre_ffw_norm.weight",
         "mlp_norm.weight"
     };
     return moe_layer_rmsnorm_suffixes_f32(

@@ -307,6 +307,21 @@ static void moe_raw_tensor_kind_common_names(
             moe_push_layer_tensor_candidates(out, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
             break;
         }
+        case moe_RAW_TENSOR_V_A_LAYER_NORM: {
+            static const char* const suffixes[] = {
+                "attn_v_norm.weight",
+                "v_norm.weight",
+                "attn_value_norm.weight",
+                "value_norm.weight",
+                "attn_kv_b_norm.weight",
+                "kv_b_norm.weight",
+                "self_attn.v_norm.weight",
+                "self_attn.value_norm.weight",
+                "self_attn.kv_b_norm.weight"
+            };
+            moe_push_layer_tensor_candidates(out, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+            break;
+        }
         case moe_RAW_TENSOR_Q_A_PROJ: {
             static const char* const suffixes[] = {
                 "attn_q.weight",
@@ -539,6 +554,8 @@ static int raw_tensor_desc_for_kind(moe_raw_tensor_kind_t kind, moe_raw_tensor_d
         case moe_RAW_TENSOR_KV_A_LAYER_NORM:
             *out = {moe_RAW_ROLE_NORM, 1024ull, 0u, 0ull, 1024ull, 512u, 0u};
             return 1;
+        case moe_RAW_TENSOR_V_A_LAYER_NORM:
+            return 0;
         case moe_RAW_TENSOR_Q_A_PROJ:
             *out = {moe_RAW_ROLE_ATTENTION, 92274688ull, 0u, 0ull, 25165824ull, 2048u, 6144u};
             return 1;

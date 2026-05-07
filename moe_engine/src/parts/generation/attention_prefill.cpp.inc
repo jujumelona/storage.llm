@@ -114,13 +114,13 @@ static int moe_layer_uses_unweighted_v_norm(
     if (!engine || layer < 0) {
         return 0;
     }
-    // V norm is a layer-local execution contract. A global GraphIR string
-    // mention can come from another layer or metadata summary and must not
-    // silently change every attention value path.
+    // Weighted V norm tensors are handled through moe_RAW_TENSOR_V_A_LAYER_NORM.
+    // This fallback is only for contracts that explicitly imply an unweighted
+    // value RMSNorm.
     if (moe_engine_has_common_tensor_suffix(engine, layer, "attn_v_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "value_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "v_norm.weight")) {
-        return 1;
+        return 0;
     }
     const int has_q_norm =
         moe_engine_has_common_tensor_suffix(engine, layer, "attn_q_norm.weight") ||

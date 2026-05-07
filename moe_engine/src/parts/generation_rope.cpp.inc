@@ -253,6 +253,13 @@ static void moe_rope_rotate_half_partial_inplace(
     if (frequency_dim < active_dim || frequency_dim > full_dim) {
         frequency_dim = active_dim;
     }
+    const uint32_t partner_stride =
+        (frequency_dim > active_dim && frequency_dim <= full_dim)
+            ? (full_dim / 2u)
+            : active_half_dim;
+    if (partner_stride == 0u || (uint64_t)partner_stride + active_pairs > full_dim) {
+        return;
+    }
     const size_t row_offset = (size_t)position * (size_t)active_pairs;
     const size_t table_len = active_pairs ? cos_table.size() / active_pairs : 0;
     if (frequency_dim == active_dim &&
@@ -265,9 +272,9 @@ static void moe_rope_rotate_half_partial_inplace(
             const float cos_t = cos_row[j];
             const float sin_t = sin_row[j];
             const float x0 = data[j];
-            const float x1 = data[j + active_half_dim];
+            const float x1 = data[j + partner_stride];
             data[j] = x0 * cos_t - x1 * sin_t;
-            data[j + active_half_dim] = x1 * cos_t + x0 * sin_t;
+            data[j + partner_stride] = x1 * cos_t + x0 * sin_t;
         }
         return;
     }
@@ -278,9 +285,9 @@ static void moe_rope_rotate_half_partial_inplace(
             const float cos_t = cached_cos[j];
             const float sin_t = cached_sin[j];
             const float x0 = data[j];
-            const float x1 = data[j + active_half_dim];
+            const float x1 = data[j + partner_stride];
             data[j] = x0 * cos_t - x1 * sin_t;
-            data[j + active_half_dim] = x1 * cos_t + x0 * sin_t;
+            data[j + partner_stride] = x1 * cos_t + x0 * sin_t;
         }
         return;
     }
@@ -291,9 +298,9 @@ static void moe_rope_rotate_half_partial_inplace(
         const float cos_t = std::cos(theta);
         const float sin_t = std::sin(theta);
         const float x0 = data[j];
-        const float x1 = data[j + active_half_dim];
+        const float x1 = data[j + partner_stride];
         data[j] = x0 * cos_t - x1 * sin_t;
-        data[j + active_half_dim] = x1 * cos_t + x0 * sin_t;
+        data[j + partner_stride] = x1 * cos_t + x0 * sin_t;
         freq *= multiplier;
     }
 }
