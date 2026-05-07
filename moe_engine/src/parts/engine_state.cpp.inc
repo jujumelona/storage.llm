@@ -401,6 +401,8 @@ struct moe_pc_engine {
     mutable std::unordered_map<int32_t, uint64_t> raw_file_size_cache;
     mutable std::shared_mutex raw_tensor_cache_mutex;
     std::unordered_map<uint64_t, moe_raw_tensor_cache_entry> raw_tensor_cache;
+    mutable std::shared_mutex rmsnorm_unit_offset_cache_mutex;
+    mutable std::unordered_map<uint64_t, int> rmsnorm_unit_offset_cache;
     mutable std::shared_mutex common_tensor_suffix_cache_mutex;
     mutable std::unordered_map<std::string, int> common_tensor_suffix_cache;
     mutable std::shared_mutex text_mention_cache_mutex;

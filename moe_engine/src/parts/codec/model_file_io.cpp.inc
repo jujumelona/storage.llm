@@ -299,6 +299,10 @@ int moe_pc_engine_set_model_root(
         std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
         engine->raw_tensor_cache.clear();
     }
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->rmsnorm_unit_offset_cache_mutex);
+        engine->rmsnorm_unit_offset_cache.clear();
+    }
     moe_engine_reset_qkv_cache(engine);
     moe_engine_clear_offload_gguf_contract(engine);
     engine->gguf_common_tensors.clear();

@@ -99,12 +99,32 @@ static int moe_rmsnorm_unit_offset_from_weight_stats(
     return 0;
 }
 
+static uint64_t moe_rmsnorm_unit_offset_cache_key(
+    const moe_raw_tensor_cache_entry& raw
+) {
+    if (!raw.base || raw.rows == 0 || raw.cols != 0 || raw.bytes == 0) {
+        return 0;
+    }
+    uint64_t key = (uint64_t)(uintptr_t)raw.base;
+    key ^= raw.bytes + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+    key ^= ((uint64_t)raw.rows << 32) ^ ((uint64_t)raw.scalar_encoding << 24);
+    return key ? key : 1u;
+}
+
 static int moe_engine_rmsnorm_unit_offset(
     const moe_pc_engine* engine,
     const moe_raw_tensor_cache_entry& raw
 ) {
     if (!engine) {
         return 0;
+    }
+    const uint64_t cache_key = moe_rmsnorm_unit_offset_cache_key(raw);
+    if (cache_key) {
+        std::shared_lock<std::shared_mutex> lock(engine->rmsnorm_unit_offset_cache_mutex);
+        const auto found = engine->rmsnorm_unit_offset_cache.find(cache_key);
+        if (found != engine->rmsnorm_unit_offset_cache.end()) {
+            return found->second ? 1 : 0;
+        }
     }
     int value = 0;
     const char* source = "default";
@@ -129,14 +149,19 @@ static int moe_engine_rmsnorm_unit_offset(
     }
     moe_profile_log(
         "rmsnorm_unit_offset",
-        "source=%s value=%d samples=%u raw_mean=%.6g raw_rms=%.6g mean_abs_raw=%.6g mean_abs_plus_one=%.6g",
+        "source=%s value=%d samples=%u raw_mean=%.6g raw_rms=%.6g mean_abs_raw=%.6g mean_abs_plus_one=%.6g cache_key=%llu",
         source,
         value ? 1 : 0,
         samples,
         raw_mean,
         raw_rms,
         mean_abs_raw,
-        mean_abs_plus_one);
+        mean_abs_plus_one,
+        (unsigned long long)cache_key);
+    if (cache_key) {
+        std::unique_lock<std::shared_mutex> lock(engine->rmsnorm_unit_offset_cache_mutex);
+        engine->rmsnorm_unit_offset_cache[cache_key] = value ? 1 : 0;
+    }
     return value ? 1 : 0;
 }
 
