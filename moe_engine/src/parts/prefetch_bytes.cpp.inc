@@ -6,6 +6,27 @@ static int device_backend_event_sync(moe_pc_engine* e, CUevent event);
 static void device_backend_event_destroy(moe_pc_engine* e, CUevent event);
 static inline bool staging_slot_valid(const moe_pc_engine* e, uint32_t slot_index);
 
+#if defined(__linux__)
+static volatile uint8_t g_moe_mmap_touch_sink = 0;
+
+static void touch_linux_mapped_pages(const moe_pc_engine* engine, const uint8_t* src, uint64_t bytes) {
+    if (!src || bytes == 0) {
+        return;
+    }
+    madvise(const_cast<uint8_t*>(src), (size_t)bytes, MADV_WILLNEED);
+    const uint64_t page = 4096ull;
+    uint8_t acc = 0;
+    for (uint64_t offset = 0; offset < bytes; offset += page) {
+        acc ^= src[offset];
+    }
+    acc ^= src[bytes - 1u];
+    g_moe_mmap_touch_sink ^= acc;
+    if (engine) {
+        const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_mmap_touch.fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+#endif
+
 static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int expert) {
     const uint64_t cached = expert_bytes_get(engine, layer, expert);
     if (cached) {
@@ -171,7 +192,7 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
         }
     }
 #elif defined(__linux__)
-    madvise(const_cast<uint8_t*>(src), (size_t)bytes, MADV_WILLNEED);
+    touch_linux_mapped_pages(engine, src, bytes);
 #endif
 }
 
@@ -208,12 +229,12 @@ static void touch_mapped_ranges(const moe_pc_engine* engine, const std::vector<s
                 current_len = diff;
             }
         } else {
-            madvise(const_cast<uint8_t*>(current_start), (size_t)current_len, MADV_WILLNEED);
+            touch_linux_mapped_pages(engine, current_start, current_len);
             current_start = next_start;
             current_len = next_len;
         }
     }
-    madvise(const_cast<uint8_t*>(current_start), (size_t)current_len, MADV_WILLNEED);
+    touch_linux_mapped_pages(engine, current_start, current_len);
 #endif
 }
 

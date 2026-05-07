@@ -322,7 +322,7 @@ int moe_pc_engine_raw_rmsnorm_f32(
         return 0;
     }
     const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, raw);
-    if (moe_profile_enabled()) {
+    if (moe_profile_level() >= 2) {
         double weight_ss = 0.0;
         double weight_abs = 0.0;
         float weight_min = std::numeric_limits<float>::infinity();
@@ -369,7 +369,7 @@ int moe_pc_engine_raw_rmsnorm_f32(
         output[i] = result;
         return 1;
     });
-    if (ok && moe_profile_enabled()) {
+    if (ok && moe_profile_level() >= 2) {
         double output_ss = 0.0;
         double output_abs = 0.0;
         float output_max_abs = 0.0f;
