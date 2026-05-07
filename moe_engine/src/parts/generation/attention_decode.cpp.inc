@@ -243,7 +243,26 @@
             return 0;
         }
         seq_len = position + 1u;
-        qkv_capacity_tokens = seq_limit;
+        qkv_capacity_tokens = s->kv_cache.max_seq_len ? s->kv_cache.max_seq_len :
+            (cfg.max_seq_len ? std::min<uint32_t>(cfg.max_seq_len, moe_MLA_KV_INITIAL_CHUNK) : seq_len);
+        if (qkv_capacity_tokens == 0) {
+            qkv_capacity_tokens = seq_len;
+        }
+        while (qkv_capacity_tokens < seq_len && qkv_capacity_tokens < seq_limit) {
+            const uint32_t next_cap = qkv_capacity_tokens > UINT32_MAX / 2u
+                ? seq_limit
+                : std::min<uint32_t>(seq_limit, qkv_capacity_tokens * 2u);
+            if (next_cap <= qkv_capacity_tokens) {
+                break;
+            }
+            qkv_capacity_tokens = next_cap;
+        }
+        if (qkv_capacity_tokens < seq_len) {
+            std::fprintf(stderr,
+                "[storagellm attn] qkv capacity underflow layer=%d pos=%u seq=%u cap=%u limit=%u\n",
+                layer, position, seq_len, qkv_capacity_tokens, seq_limit);
+            return 0;
+        }
         s->kv_cache.seq_len = seq_len;
     } else {
         if (!moe_standard_kv_cache_ensure(engine, s, position, kv_entry_dim)) {
