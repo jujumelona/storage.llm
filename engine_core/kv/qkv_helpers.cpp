@@ -58,7 +58,12 @@ const float* qkv_thresholds_for_bits(const qkv_state_t* state, int bits) {
 }
 
 int qkv_target_from_buffers(const qkv_state_t* state, const uint8_t* idx, const float* norms) {
-    if (!state || !idx) return 0;
+    if (!state) return 0;
+    if (!idx) {
+        if (norms == state->k_norms) return QKV_TARGET_KEY;
+        if (norms == state->v_norms) return QKV_TARGET_VALUE;
+        return 0;
+    }
     if (idx == state->k_idx && (!norms || norms == state->k_norms)) return QKV_TARGET_KEY;
     if (idx == state->v_idx && (!norms || norms == state->v_norms)) return QKV_TARGET_VALUE;
     return 0;
