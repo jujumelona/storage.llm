@@ -165,6 +165,119 @@ static int moe_layer_has_qk_norm_scaled_standard_layout(
     return has_q_norm && has_k_norm && has_scaled_block_norms;
 }
 
+static uint32_t moe_attention_float_to_bits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static float moe_attention_bits_to_float(uint32_t bits) {
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static const char* moe_attention_scale_source_name(int source) {
+    switch (source) {
+    case 1: return "graph_ir_scale";
+    case 2: return "metadata_scale";
+    case 3: return "query_pre_attn_scalar";
+    default: return "head_dim";
+    }
+}
+
+struct moe_attention_runtime_cache_t {
+    const moe_pc_engine* engine = nullptr;
+    size_t graph_size = 0;
+    size_t metadata_size = 0;
+    uint32_t query_pre_attn_scalar_bits = 0;
+    int scale_source = -1;
+    uint32_t scale_bits = 0;
+    int softcap_state = -1;
+    uint32_t softcap_bits = 0;
+};
+
+static std::mutex g_moe_attention_runtime_cache_mutex;
+static moe_attention_runtime_cache_t g_moe_attention_runtime_cache;
+
+static void moe_attention_runtime_cache_prepare_locked(const moe_pc_engine* engine) {
+    const size_t graph_size = engine ? engine->offload_graph_ir_json.size() : 0;
+    const size_t metadata_size = engine ? engine->offload_gguf_metadata_json.size() : 0;
+    const uint32_t query_bits = engine
+        ? moe_attention_float_to_bits(engine->model_config_query_pre_attn_scalar)
+        : 0;
+    if (g_moe_attention_runtime_cache.engine != engine ||
+        g_moe_attention_runtime_cache.graph_size != graph_size ||
+        g_moe_attention_runtime_cache.metadata_size != metadata_size ||
+        g_moe_attention_runtime_cache.query_pre_attn_scalar_bits != query_bits) {
+        g_moe_attention_runtime_cache = moe_attention_runtime_cache_t{};
+        g_moe_attention_runtime_cache.engine = engine;
+        g_moe_attention_runtime_cache.graph_size = graph_size;
+        g_moe_attention_runtime_cache.metadata_size = metadata_size;
+        g_moe_attention_runtime_cache.query_pre_attn_scalar_bits = query_bits;
+    }
+}
+
+static int moe_attention_cached_global_scale(
+    const moe_pc_engine* engine,
+    int* out_source,
+    float* out_value
+) {
+    std::lock_guard<std::mutex> lock(g_moe_attention_runtime_cache_mutex);
+    moe_attention_runtime_cache_prepare_locked(engine);
+    if (g_moe_attention_runtime_cache.scale_source < 0) {
+        return 0;
+    }
+    if (out_source) {
+        *out_source = g_moe_attention_runtime_cache.scale_source;
+    }
+    if (out_value) {
+        *out_value = moe_attention_bits_to_float(g_moe_attention_runtime_cache.scale_bits);
+    }
+    return 1;
+}
+
+static void moe_attention_store_global_scale(
+    const moe_pc_engine* engine,
+    int source,
+    float value
+) {
+    std::lock_guard<std::mutex> lock(g_moe_attention_runtime_cache_mutex);
+    moe_attention_runtime_cache_prepare_locked(engine);
+    g_moe_attention_runtime_cache.scale_source = source;
+    g_moe_attention_runtime_cache.scale_bits = source > 0 ? moe_attention_float_to_bits(value) : 0;
+}
+
+static int moe_attention_cached_softcap(
+    const moe_pc_engine* engine,
+    int* out_state,
+    float* out_value
+) {
+    std::lock_guard<std::mutex> lock(g_moe_attention_runtime_cache_mutex);
+    moe_attention_runtime_cache_prepare_locked(engine);
+    if (g_moe_attention_runtime_cache.softcap_state < 0) {
+        return 0;
+    }
+    if (out_state) {
+        *out_state = g_moe_attention_runtime_cache.softcap_state;
+    }
+    if (out_value) {
+        *out_value = moe_attention_bits_to_float(g_moe_attention_runtime_cache.softcap_bits);
+    }
+    return 1;
+}
+
+static void moe_attention_store_softcap(
+    const moe_pc_engine* engine,
+    int state,
+    float value
+) {
+    std::lock_guard<std::mutex> lock(g_moe_attention_runtime_cache_mutex);
+    moe_attention_runtime_cache_prepare_locked(engine);
+    g_moe_attention_runtime_cache.softcap_state = state;
+    g_moe_attention_runtime_cache.softcap_bits = state == 1 ? moe_attention_float_to_bits(value) : 0;
+}
+
 static float moe_standard_attention_score_scale(
     const moe_pc_engine* engine,
     int32_t layer,
@@ -180,69 +293,84 @@ static float moe_standard_attention_score_scale(
         }
         return 1.0f;
     }
-    if (engine && !engine->offload_graph_ir_json.empty()) {
-        double direct_scale = 0.0;
-        if ((moe_json_get_double_local(engine->offload_graph_ir_json, "attention_scale", &direct_scale) ||
-             moe_json_get_double_local(engine->offload_graph_ir_json, "attn_scale", &direct_scale) ||
-             moe_json_get_double_local(engine->offload_graph_ir_json, "attention_score_scale", &direct_scale) ||
-             moe_json_get_double_local(engine->offload_graph_ir_json, "f_attn_scale", &direct_scale) ||
-             moe_json_get_double_local(engine->offload_graph_ir_json, "gemma4.attention.scale", &direct_scale) ||
-             moe_json_get_double_local(engine->offload_graph_ir_json, "qk_scale", &direct_scale)) &&
-            direct_scale > 0.0 && direct_scale <= 1024.0 && std::isfinite(direct_scale)) {
-            if (source_out) {
-                *source_out = "graph_ir_scale";
+    if (engine) {
+        int cached_source = -1;
+        float cached_value = 0.0f;
+        if (moe_attention_cached_global_scale(engine, &cached_source, &cached_value)) {
+            if (cached_source > 0) {
+                if (cached_value > 0.0f && std::isfinite(cached_value)) {
+                    if (source_out) {
+                        *source_out = moe_attention_scale_source_name(cached_source);
+                    }
+                    return cached_value;
+                }
             }
-            return (float)direct_scale;
-        }
-    }
-    if (engine && !engine->offload_gguf_metadata_json.empty()) {
-        double direct_scale = 0.0;
-        if ((moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_scale", &direct_scale) ||
-             moe_json_get_double_local(engine->offload_gguf_metadata_json, "attn_scale", &direct_scale) ||
-             moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_score_scale", &direct_scale) ||
-             moe_json_get_double_local(engine->offload_gguf_metadata_json, "f_attn_scale", &direct_scale) ||
-             moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.attention.scale", &direct_scale) ||
-             moe_json_get_double_local(engine->offload_gguf_metadata_json, "qk_scale", &direct_scale)) &&
-            direct_scale > 0.0 && direct_scale <= 1024.0 && std::isfinite(direct_scale)) {
-            if (source_out) {
-                *source_out = "metadata_scale";
+        } else {
+            int resolved_source = 0;
+            float resolved_value = 0.0f;
+            if (!engine->offload_graph_ir_json.empty()) {
+                double direct_scale = 0.0;
+                if ((moe_json_get_double_local(engine->offload_graph_ir_json, "attention_scale", &direct_scale) ||
+                     moe_json_get_double_local(engine->offload_graph_ir_json, "attn_scale", &direct_scale) ||
+                     moe_json_get_double_local(engine->offload_graph_ir_json, "attention_score_scale", &direct_scale) ||
+                     moe_json_get_double_local(engine->offload_graph_ir_json, "f_attn_scale", &direct_scale) ||
+                     moe_json_get_double_local(engine->offload_graph_ir_json, "gemma4.attention.scale", &direct_scale) ||
+                     moe_json_get_double_local(engine->offload_graph_ir_json, "qk_scale", &direct_scale)) &&
+                    direct_scale > 0.0 && direct_scale <= 1024.0 && std::isfinite(direct_scale)) {
+                    resolved_source = 1;
+                    resolved_value = (float)direct_scale;
+                }
             }
-            return (float)direct_scale;
-        }
-    }
-    float query_pre_attn_scalar = engine ? engine->model_config_query_pre_attn_scalar : 0.0f;
-    if (!(query_pre_attn_scalar > 0.0f) && engine && !engine->offload_graph_ir_json.empty()) {
-        double value = 0.0;
-        if (moe_json_get_double_local(engine->offload_graph_ir_json, "query_pre_attn_scalar", &value) ||
-            moe_json_get_double_local(engine->offload_graph_ir_json, "attention_query_pre_attn_scalar", &value) ||
-            moe_json_get_double_local(engine->offload_graph_ir_json, "attn_query_pre_attn_scalar", &value)) {
-            if (value > 0.0 && value <= 65536.0 && std::isfinite(value)) {
-                query_pre_attn_scalar = (float)value;
+            if (resolved_source == 0 && !engine->offload_gguf_metadata_json.empty()) {
+                double direct_scale = 0.0;
+                if ((moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_scale", &direct_scale) ||
+                     moe_json_get_double_local(engine->offload_gguf_metadata_json, "attn_scale", &direct_scale) ||
+                     moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_score_scale", &direct_scale) ||
+                     moe_json_get_double_local(engine->offload_gguf_metadata_json, "f_attn_scale", &direct_scale) ||
+                     moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.attention.scale", &direct_scale) ||
+                     moe_json_get_double_local(engine->offload_gguf_metadata_json, "qk_scale", &direct_scale)) &&
+                    direct_scale > 0.0 && direct_scale <= 1024.0 && std::isfinite(direct_scale)) {
+                    resolved_source = 2;
+                    resolved_value = (float)direct_scale;
+                }
             }
-        }
-    }
-    if (!(query_pre_attn_scalar > 0.0f) && engine && !engine->offload_gguf_metadata_json.empty()) {
-        double value = 0.0;
-        if (moe_json_get_double_local(engine->offload_gguf_metadata_json, "query_pre_attn_scalar", &value) ||
-            moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_query_pre_attn_scalar", &value) ||
-            moe_json_get_double_local(engine->offload_gguf_metadata_json, "attn_query_pre_attn_scalar", &value)) {
-            if (value > 0.0 && value <= 65536.0 && std::isfinite(value)) {
-                query_pre_attn_scalar = (float)value;
+            float query_pre_attn_scalar = engine->model_config_query_pre_attn_scalar;
+            if (resolved_source == 0 && !(query_pre_attn_scalar > 0.0f) && !engine->offload_graph_ir_json.empty()) {
+                double value = 0.0;
+                if (moe_json_get_double_local(engine->offload_graph_ir_json, "query_pre_attn_scalar", &value) ||
+                    moe_json_get_double_local(engine->offload_graph_ir_json, "attention_query_pre_attn_scalar", &value) ||
+                    moe_json_get_double_local(engine->offload_graph_ir_json, "attn_query_pre_attn_scalar", &value)) {
+                    if (value > 0.0 && value <= 65536.0 && std::isfinite(value)) {
+                        query_pre_attn_scalar = (float)value;
+                    }
+                }
             }
-        }
-    }
-    if (query_pre_attn_scalar > 0.0f && std::isfinite(query_pre_attn_scalar)) {
-        float result = 1.0f / std::sqrt(query_pre_attn_scalar);
-        if (!std::isfinite(result)) {
-            if (source_out) {
-                *source_out = "fallback";
+            if (resolved_source == 0 && !(query_pre_attn_scalar > 0.0f) && !engine->offload_gguf_metadata_json.empty()) {
+                double value = 0.0;
+                if (moe_json_get_double_local(engine->offload_gguf_metadata_json, "query_pre_attn_scalar", &value) ||
+                    moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_query_pre_attn_scalar", &value) ||
+                    moe_json_get_double_local(engine->offload_gguf_metadata_json, "attn_query_pre_attn_scalar", &value)) {
+                    if (value > 0.0 && value <= 65536.0 && std::isfinite(value)) {
+                        query_pre_attn_scalar = (float)value;
+                    }
+                }
             }
-            return 1.0f;
+            if (resolved_source == 0 && query_pre_attn_scalar > 0.0f && std::isfinite(query_pre_attn_scalar)) {
+                const float result = 1.0f / std::sqrt(query_pre_attn_scalar);
+                if (std::isfinite(result)) {
+                    resolved_source = 3;
+                    resolved_value = result;
+                }
+            }
+            if (resolved_source > 0) {
+                moe_attention_store_global_scale(engine, resolved_source, resolved_value);
+                if (source_out) {
+                    *source_out = moe_attention_scale_source_name(resolved_source);
+                }
+                return resolved_value;
+            }
+            moe_attention_store_global_scale(engine, 0, 0.0f);
         }
-        if (source_out) {
-            *source_out = "query_pre_attn_scalar";
-        }
-        return result;
     }
     if (moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
         if (source_out) {
@@ -285,6 +413,13 @@ static int moe_attention_score_scale_violates_qk_norm_contract(
 static float moe_attention_logit_softcap_value(
     const moe_pc_engine* engine
 ) {
+    if (engine) {
+        int cached_state = -1;
+        float cached_value = 0.0f;
+        if (moe_attention_cached_softcap(engine, &cached_state, &cached_value)) {
+            return cached_state == 1 ? cached_value : 0.0f;
+        }
+    }
     double value = 0.0;
     if (engine &&
         !engine->offload_graph_ir_json.empty() &&
@@ -293,6 +428,7 @@ static float moe_attention_logit_softcap_value(
          moe_json_get_double_local(engine->offload_graph_ir_json, "attention_logit_softcapping", &value) ||
          moe_json_get_double_local(engine->offload_graph_ir_json, "attention_logit_softcap", &value)) &&
         value > 0.0 && value <= 100000.0 && std::isfinite(value)) {
+        moe_attention_store_softcap(engine, 1, (float)value);
         return (float)value;
     }
     if (engine &&
@@ -302,7 +438,11 @@ static float moe_attention_logit_softcap_value(
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_logit_softcapping", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_logit_softcap", &value)) &&
         value > 0.0 && value <= 100000.0 && std::isfinite(value)) {
+        moe_attention_store_softcap(engine, 1, (float)value);
         return (float)value;
+    }
+    if (engine) {
+        moe_attention_store_softcap(engine, 0, 0.0f);
     }
     return 0.0f;
 }
