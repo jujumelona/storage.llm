@@ -3493,14 +3493,13 @@ static void load_server_model_background(
         return;
     }
     print_optimization_plan(engine);
+    set_model_load_stage(runtime, "warm_common_raw");
+    const int common_warm = moe_pc_engine_prefetch_common_raw(engine);
+    std::cerr << "[storagellm] common raw warm " << (common_warm ? "done" : "skipped") << "\n" << std::flush;
     set_model_load_stage(runtime, "startup_warm");
     std::cerr << "[storagellm] startup warm begin\n" << std::flush;
     const int warm_started = moe_pc_engine_startup_warm_model(engine);
     std::cerr << "[storagellm] startup warm " << (warm_started ? "queued" : "skipped") << "\n" << std::flush;
-    set_model_load_stage(runtime, "ready");
-    set_model_load_stage(runtime, "warm_common_raw");
-    const int common_warm = moe_pc_engine_prefetch_common_raw(engine);
-    std::cerr << "[storagellm] common raw warm " << (common_warm ? "done" : "skipped") << "\n" << std::flush;
     set_model_load_stage(runtime, "ready");
     runtime->model_ready.store(1, std::memory_order_release);
 }

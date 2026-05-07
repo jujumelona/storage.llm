@@ -23,10 +23,17 @@ static bool should_use_cpu_compute(const moe_pc_engine* engine, int layer, int e
     
     if (token_count <= 4) {
         const uint64_t bytes = expert_triplet_bytes(engine, layer, expert);
-        const float pcie_ms = bytes / (engine->backend_caps.dma_bandwidth_gbps * 1e9f / 1000.f);
+        const float dma_gbps = engine->backend_caps.dma_bandwidth_gbps > 0.0f ?
+            engine->backend_caps.dma_bandwidth_gbps : 12.0f;
+        if (dma_gbps <= 0.0f) return false;
+        const float pcie_ms = bytes / (dma_gbps * 1e9f / 1000.f);
         
         // Estimate CPU AMX / AVX-512 ms (rough heuristic)
-        const float cpu_gflops = 100.0f; // estimated sustained AMX/AVX512 GFLOPS
+        const uint32_t hw = std::max<uint32_t>(1u, moe_cpu_thread_count_hint());
+        const float cpu_gflops =
+            (engine->backend_caps.backend == moe_BACKEND_CPU && engine->backend_caps.tflops_hint > 0.0) ?
+            std::max(100.0f, (float)(engine->backend_caps.tflops_hint * 1000.0)) :
+            std::min(4000.0f, std::max(250.0f, (float)hw * 150.0f));
         const float compute_gflops = (bytes / 2.0f * 2.0f * token_count) / 1e9f;
         const float cpu_ms = (compute_gflops / cpu_gflops) * 1000.0f;
         

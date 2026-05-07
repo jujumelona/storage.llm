@@ -309,6 +309,73 @@ def juju_split_source_name(source_name, split_index, split_count):
     return f"{path.stem}.split{int(split_index):02d}-of-{int(split_count):02d}{suffix}"
 
 
+def juju_source_shard_info(source_name):
+    name = Path(str(source_name or "")).name
+    match = re.match(r"^(?P<prefix>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})(?P<suffix>\.[^.]+)?$", name)
+    if not match:
+        return {}
+    index = int(match.group("index"))
+    count = int(match.group("count"))
+    if index <= 0 or count <= 1 or index > count:
+        return {}
+    return {
+        "enabled": True,
+        "parent_source_name": match.group("prefix"),
+        "artifact_source_name": name,
+        "split_index": index,
+        "split_count": count,
+        "split_strategy": "source_gguf_physical_shard_set",
+        "source_shard_index": index,
+        "source_shard_count": count,
+    }
+
+
+def juju_effective_split_meta(source_name, artifact_source_name, tensor_count, tensor_bytes=0, split_info=None):
+    split_meta = dict(split_info or {})
+    source_shard = juju_source_shard_info(source_name)
+    if source_shard and not split_meta:
+        split_meta = source_shard
+    if not split_meta:
+        split_meta = {
+            "enabled": False,
+            "split_index": 1,
+            "split_count": 1,
+            "parent_source_name": source_name,
+            "artifact_source_name": artifact_source_name,
+        }
+    split_count = int(split_meta.get("split_count") or 1)
+    split_meta.setdefault("enabled", split_count > 1)
+    split_meta.setdefault("parent_source_name", source_shard.get("parent_source_name") or source_name)
+    split_meta.setdefault("artifact_source_name", artifact_source_name)
+    split_meta["tensor_count"] = int(tensor_count or 0)
+    if tensor_bytes:
+        split_meta["tensor_bytes"] = int(tensor_bytes)
+    return split_meta
+
+
+def juju_idx_split_top_level_fields(split_meta):
+    split_meta = split_meta if isinstance(split_meta, dict) else {}
+    out = {}
+    for key in (
+        "split_index",
+        "split_count",
+        "parent_source_name",
+        "artifact_source_name",
+        "source_shard_index",
+        "source_shard_count",
+        "split_strategy",
+    ):
+        value = split_meta.get(key)
+        if value not in (None, "", [], {}):
+            out[key] = value
+    split_count = int(out.get("split_count") or 0)
+    if split_count > 1:
+        out["split_enabled"] = True
+        out.setdefault("file_index", out.get("split_index"))
+        out.setdefault("file_count", out.get("split_count"))
+    return out
+
+
 def align_up(value, alignment=4096):
     rem = int(value) % int(alignment)
     return int(value) if rem == 0 else int(value) + int(alignment) - rem
@@ -6119,7 +6186,16 @@ def juju_format_self_check(idx, sections, qkv_schema):
     errors = []
     warnings = []
     split_meta = idx.get("split") if isinstance(idx.get("split"), dict) else {}
-    split_enabled = bool(split_meta.get("enabled"))
+    source_name = str(idx.get("source_name") or idx.get("source_path") or "")
+    split_count = _juju_int_or_none(split_meta.get("split_count")) or 0
+    split_enabled = bool(split_meta.get("enabled")) or split_count > 1
+    source_shard_match = re.search(r"(?:^|[-_.])\d{5}-of-\d{5}(?:\.gguf)?$", source_name, re.IGNORECASE)
+    source_shard_count = 0
+    if source_shard_match:
+        count_match = re.search(r"of-(\d{5})(?:\.gguf)?$", source_name, re.IGNORECASE)
+        source_shard_count = int(count_match.group(1)) if count_match else 0
+    partial_source_shard = bool(source_shard_count > 1)
+    partial_shard = bool(split_enabled or partial_source_shard)
 
     def err(code, **fields):
         item = {"code": code}
@@ -6269,9 +6345,15 @@ def juju_format_self_check(idx, sections, qkv_schema):
     if graph_ir.get("format") != "JUJU_GRAPH_IR_V1":
         err("graph_ir_missing_or_wrong_format")
     if not graph_ir.get("ops"):
-        err("graph_ir_root_ops_missing")
+        if partial_shard:
+            warn("graph_ir_root_ops_missing_for_partial_shard")
+        else:
+            err("graph_ir_root_ops_missing")
     if not graph_ir.get("layers"):
-        err("graph_ir_layer_ops_missing")
+        if partial_shard:
+            warn("graph_ir_layer_ops_missing_for_partial_shard")
+        else:
+            err("graph_ir_layer_ops_missing")
     generation_contract = graph_ir.get("generation_contract") or {}
     if generation_contract.get("format") != "JUJU_GENERATION_CONTRACT_V1":
         err("generation_contract_missing_or_wrong_format")
@@ -6320,15 +6402,15 @@ def juju_format_self_check(idx, sections, qkv_schema):
             err("runtime_execution_manifest_eval_does_not_force_qkv")
         layer_table = attention.get("layer_table") or []
         if not layer_table:
-            if split_enabled:
-                warn("runtime_execution_manifest_attention_layer_table_missing_for_partial_split")
+            if partial_shard:
+                warn("runtime_execution_manifest_attention_layer_table_missing_for_partial_shard")
             else:
                 err("runtime_execution_manifest_attention_layer_table_missing")
         else:
             for row in layer_table:
                 if row.get("required_complete") is not True:
-                    if split_enabled:
-                        warn("attention_layer_contract_incomplete_for_partial_split", layer=row.get("layer"), missing=row.get("missing") or [])
+                    if partial_shard:
+                        warn("attention_layer_contract_incomplete_for_partial_shard", layer=row.get("layer"), missing=row.get("missing") or [])
                     else:
                         err("attention_layer_contract_incomplete", layer=row.get("layer"), missing=row.get("missing") or [])
                     break
@@ -6341,14 +6423,14 @@ def juju_format_self_check(idx, sections, qkv_schema):
     if forward_validation.get("format") != "JUJU_FORWARD_CONTRACT_VALIDATION_V1":
         err("forward_contract_validation_missing")
     elif forward_validation.get("contract_complete") is not True:
-        if split_enabled:
-            warn("forward_contract_incomplete_for_partial_split", missing=forward_validation.get("missing") or [])
+        if partial_shard:
+            warn("forward_contract_incomplete_for_partial_shard", missing=forward_validation.get("missing") or [])
         else:
             err("forward_contract_incomplete", missing=forward_validation.get("missing") or [])
     layer_contract = generation_contract.get("layers") or {}
     if layer_contract.get("attention_layer_table_complete") is not True:
-        if split_enabled:
-            warn("generation_attention_layer_table_incomplete_for_partial_split")
+        if partial_shard:
+            warn("generation_attention_layer_table_incomplete_for_partial_shard")
         else:
             err("generation_attention_layer_table_incomplete")
     runtime_access_plan = graph_ir.get("runtime_access_plan") or idx.get("runtime_access_plan") or {}
@@ -6360,11 +6442,20 @@ def juju_format_self_check(idx, sections, qkv_schema):
         if field not in tensor_ref_fields:
             err("executor_tensor_ref_field_missing", field=field)
     if not runtime_access_plan.get("executor_tensor_table"):
-        err("executor_tensor_table_missing")
+        if partial_shard:
+            warn("executor_tensor_table_missing_for_partial_shard")
+        else:
+            err("executor_tensor_table_missing")
     if not runtime_access_plan.get("file_locality_groups"):
-        err("runtime_file_locality_groups_missing")
+        if partial_shard:
+            warn("runtime_file_locality_groups_missing_for_partial_shard")
+        else:
+            err("runtime_file_locality_groups_missing")
     if not runtime_access_plan.get("layer_prefetch_plan"):
-        err("layer_prefetch_plan_missing")
+        if partial_shard:
+            warn("layer_prefetch_plan_missing_for_partial_shard")
+        else:
+            err("layer_prefetch_plan_missing")
     kv_layout = runtime_access_plan.get("kv_layout_contract") or graph_ir.get("kv_layout_contract") or idx.get("kv_layout_contract") or {}
     if not kv_layout:
         err("kv_layout_contract_missing")
@@ -6392,16 +6483,25 @@ def juju_format_self_check(idx, sections, qkv_schema):
             if kv_layout.get(field) in (None, ""):
                 err("kv_layout_field_missing", field=field)
     if not runtime_access_plan.get("expert_offset_table"):
-        err("expert_offset_table_missing")
+        if partial_shard:
+            warn("expert_offset_table_missing_for_partial_shard")
+        else:
+            err("expert_offset_table_missing")
     bundle_table = runtime_access_plan.get("expert_bundle_table") or idx.get("expert_bundle_table") or {}
     if not bundle_table:
-        err("expert_bundle_table_missing")
+        if partial_shard:
+            warn("expert_bundle_table_missing_for_partial_shard")
+        else:
+            err("expert_bundle_table_missing")
     elif bundle_table.get("format") != "JUJU_EXPERT_BUNDLE_TABLE_V1":
         err("expert_bundle_table_wrong_format")
     if not runtime_access_plan.get("moe_layer_bitmask_words"):
         warn("moe_layer_bitmask_missing_or_empty")
     if not runtime_access_plan.get("router_calibration_manifest"):
-        err("router_calibration_manifest_missing")
+        if partial_shard:
+            warn("router_calibration_manifest_missing_for_partial_shard")
+        else:
+            err("router_calibration_manifest_missing")
     priority_tables = graph_ir.get("priority_tables") or idx.get("priority_tables") or {}
     if not priority_tables.get("section_priorities"):
         err("section_priority_table_missing")
@@ -6446,6 +6546,8 @@ def juju_format_self_check(idx, sections, qkv_schema):
         "warning_count": len(warnings),
         "errors": errors,
         "warnings": warnings,
+        "partial_shard": partial_shard,
+        "partial_source_shard": partial_source_shard,
     }
 
 
@@ -6952,14 +7054,13 @@ def build_juju_shard_plan_from_hf_url(
             if int(tensor.get("bytes") or 0) > 0 and (not allowset or tensor["name"] in allowset)
         ]
         assign_bootstrap_expert_tiers(active_tensors, contract)
-        split_meta = split_info or {
-            "enabled": False,
-            "split_index": 1,
-            "split_count": 1,
-            "parent_source_name": source_name,
-            "artifact_source_name": artifact_source_name,
-            "tensor_count": len(active_tensors),
-        }
+        split_meta = juju_effective_split_meta(
+            source_name,
+            artifact_source_name,
+            len(active_tensors),
+            sum(int(tensor.get("bytes") or 0) for tensor in active_tensors),
+            split_info=split_info,
+        )
         row_stride_stats = juju_row_stride_stats(active_tensors)
         modality_meta = juju_modality_metadata(contract, active_tensors)
         modality_flags = int(modality_meta["modality_flags"])
@@ -7124,6 +7225,7 @@ def build_juju_shard_plan_from_hf_url(
             "source_name": source_name,
             "artifact_source_name": artifact_source_name,
             "split": split_meta,
+            **juju_idx_split_top_level_fields(split_meta),
             "modality_flags": modality_flags,
             "multimodal_contract": modality_meta,
             "graph_ir_format": graph_ir["format"],
@@ -7611,14 +7713,13 @@ def write_juju_shard_from_hf_url(
             if int(tensor.get("bytes") or 0) > 0 and (not allowset or tensor["name"] in allowset)
         ]
         assign_bootstrap_expert_tiers(active_tensors, contract)
-        split_meta = split_info or {
-            "enabled": False,
-            "split_index": 1,
-            "split_count": 1,
-            "parent_source_name": source_name,
-            "artifact_source_name": artifact_source_name,
-            "tensor_count": len(active_tensors),
-        }
+        split_meta = juju_effective_split_meta(
+            source_name,
+            artifact_source_name,
+            len(active_tensors),
+            sum(int(tensor.get("bytes") or 0) for tensor in active_tensors),
+            split_info=split_info,
+        )
         row_stride_stats = juju_row_stride_stats(active_tensors)
         modality_meta = juju_modality_metadata(contract, active_tensors)
         modality_flags = int(modality_meta["modality_flags"])
@@ -7740,6 +7841,7 @@ def write_juju_shard_from_hf_url(
                 "source_name": source_name,
                 "artifact_source_name": artifact_source_name,
                 "split": split_meta,
+                **juju_idx_split_top_level_fields(split_meta),
                 "modality_flags": modality_flags,
                 "multimodal_contract": modality_meta,
                 "graph_ir_format": graph_ir["format"],

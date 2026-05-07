@@ -31,7 +31,11 @@ static moe_tier_t moe_hot_miss_preferred_tier(
     if (!std::isfinite(pcie_ms)) {
         return preferred_tier;
     }
-    constexpr float cpu_gflops = 100.0f;
+    const uint32_t hw = std::max<uint32_t>(1u, moe_cpu_thread_count_hint());
+    const float cpu_gflops =
+        (engine->backend_caps.backend == moe_BACKEND_CPU && engine->backend_caps.tflops_hint > 0.0) ?
+        std::max(100.0f, (float)(engine->backend_caps.tflops_hint * 1000.0)) :
+        std::min(4000.0f, std::max(250.0f, (float)hw * 150.0f));
     constexpr uint32_t token_count = 1u;
     const float compute_gflops = ((float)bytes / 2.0f * 2.0f * (float)token_count) / 1e9f;
     const float cpu_ms = (compute_gflops / cpu_gflops) * 1000.0f;
@@ -40,6 +44,72 @@ static moe_tier_t moe_hot_miss_preferred_tier(
         return preferred_tier;
     }
     return cpu_ms < pcie_ms ? moe_TIER_RAM : preferred_tier;
+}
+
+static void prefetch_adjust_expert_count(moe_pc_engine_t* engine, moe_tier_t tier, int delta) {
+    if (!engine || delta == 0) {
+        return;
+    }
+    std::atomic<uint32_t>* counter = nullptr;
+    if (tier == moe_TIER_VRAM) counter = &engine->vram_expert_count;
+    else if (tier == moe_TIER_RAM) counter = &engine->ram_expert_count;
+    else if (tier == moe_TIER_DB) counter = &engine->db_expert_count;
+    if (!counter) {
+        return;
+    }
+    if (delta > 0) {
+        counter->fetch_add((uint32_t)delta, std::memory_order_relaxed);
+    } else {
+        uint32_t cur = counter->load(std::memory_order_relaxed);
+        while (cur > 0) {
+            if (counter->compare_exchange_weak(
+                    cur, cur - 1u,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+        }
+    }
+}
+
+static void prefetch_rollback_unqueued_expert(
+    moe_pc_engine_t* engine,
+    int layer,
+    int expert,
+    const moe_block_state& before_state,
+    bool had_before_state
+) {
+    if (!engine || layer < 0 || expert < 0) {
+        return;
+    }
+    const size_t slot = expert_dense_slot(engine, layer, expert);
+    if (slot == tensor_slot_invalid() || slot >= engine->expert_states.size()) {
+        return;
+    }
+    moe_block_state restored{};
+    bool push_restored = false;
+    {
+        std::lock_guard<std::mutex> lock(engine->map_mutex);
+        moe_block_state& state = engine->expert_states[slot];
+        if (state.active) {
+            subtract_tier_usage(engine, state.tier, state.bytes);
+            prefetch_adjust_expert_count(engine, state.tier, -1);
+        }
+        if (had_before_state) {
+            state = before_state;
+            if (state.active) {
+                add_tier_usage(engine, state.tier, state.bytes);
+                prefetch_adjust_expert_count(engine, state.tier, 1);
+                restored = state;
+                push_restored = true;
+            }
+        } else {
+            state = moe_block_state{};
+        }
+    }
+    if (push_restored) {
+        replace_evict_candidate(engine, slot, restored);
+    }
 }
 
 static int moe_pc_engine_prefetch_expert_triplet_impl(
@@ -56,6 +126,16 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
     const uint64_t bytes = expert_triplet_or_hardcoded_bytes(engine, layer, expert);
     if (bytes == 0) {
         return 0;
+    }
+    moe_block_state before_state{};
+    bool had_before_state = false;
+    {
+        const size_t slot = expert_dense_slot(engine, layer, expert);
+        std::lock_guard<std::mutex> lock(engine->map_mutex);
+        if (slot < engine->expert_states.size() && engine->expert_states[slot].active) {
+            before_state = engine->expert_states[slot];
+            had_before_state = true;
+        }
     }
     preferred_tier = juju_hint_target_tier(
         engine,
@@ -115,7 +195,11 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
             engine->disk_stage.cv.notify_one();
         }
     }
-    return queued > 0 ? 1 : requested;
+    if (queued > 0) {
+        return 1;
+    }
+    prefetch_rollback_unqueued_expert(engine, layer, expert, before_state, had_before_state);
+    return 0;
 }
 
 int moe_pc_engine_prefetch_expert_triplet(
@@ -133,6 +217,11 @@ int moe_pc_engine_prefetch_expert_triplet(
     );
 }
 
+static uint32_t startup_warm_stage_load(const moe_stage_queue& stage) {
+    return stage.depth.load(std::memory_order_relaxed) +
+           stage.inflight.load(std::memory_order_relaxed);
+}
+
 int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
     if (!engine || engine->tensors.empty()) {
         return 0;
@@ -147,15 +236,23 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
     }
     // BUGFIX 99: Precompute percentage thresholds
     const uint64_t vram_limit = tier_budget(engine, moe_TIER_VRAM) ?
-        (tier_budget(engine, moe_TIER_VRAM) * 90ull) / 100ull : 0;
+        (tier_budget(engine, moe_TIER_VRAM) * 92ull) / 100ull : 0;
     const uint64_t ram_limit = tier_budget(engine, moe_TIER_RAM) ?
-        (tier_budget(engine, moe_TIER_RAM) * 90ull) / 100ull : 0;
+        (tier_budget(engine, moe_TIER_RAM) * 95ull) / 100ull : 0;
     uint64_t planned_vram = tier_used(engine, moe_TIER_VRAM);
     uint64_t planned_ram = tier_used(engine, moe_TIER_RAM);
     uint32_t queued = 0;
-    const uint32_t queue_cap = engine->io_config.max_prefetch_queue ?
+    const uint32_t total_queue_cap = engine->io_config.max_prefetch_queue ?
         engine->io_config.max_prefetch_queue : 4096u;
-    const uint32_t queue_high = queue_cap > 32u ? queue_cap - 32u : queue_cap;
+    const uint32_t disk_queue_cap = engine->disk_stage_depth_cap > 0 ?
+        engine->disk_stage_depth_cap : total_queue_cap;
+    const uint32_t queue_headroom = std::max<uint32_t>(
+        64u,
+        std::max<uint32_t>(runtime_disk_workers(engine), 1u) * 16u);
+    const uint32_t total_queue_high = total_queue_cap > queue_headroom ?
+        total_queue_cap - queue_headroom : total_queue_cap;
+    const uint32_t disk_queue_high = disk_queue_cap > queue_headroom ?
+        disk_queue_cap - queue_headroom : disk_queue_cap;
 
     struct startup_expert_candidate_t {
         uint32_t layer = 0;
@@ -225,15 +322,17 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
             // BUGFIX 95: Cache atomic loads in throttle loop
             while (true) {
                 const bool stop = engine->io_stop.load(std::memory_order_relaxed);
-                const uint32_t depth = engine->total_queue_depth.load(std::memory_order_relaxed);
-                if (stop || depth < queue_high) break;
+                const uint32_t total_depth = engine->total_queue_depth.load(std::memory_order_relaxed);
+                const uint32_t disk_depth = startup_warm_stage_load(engine->disk_stage);
+                if (stop || (total_depth < total_queue_high && disk_depth < disk_queue_high)) break;
                 // BUGFIX 24: Use cv wait instead of polling ?�★
                 // Old: 10ms sleep polling ??slow response, unnecessary wakeups
                 // New: io_done_cv wait ??immediate response when queue drains
                 std::unique_lock<std::mutex> lock(engine->done_mutex);
                 engine->io_done_cv.wait_for(lock, std::chrono::milliseconds(100), [&] {
                     return engine->io_stop.load(std::memory_order_relaxed) ||
-                           engine->total_queue_depth.load(std::memory_order_relaxed) < queue_high;
+                           (engine->total_queue_depth.load(std::memory_order_relaxed) < total_queue_high &&
+                            startup_warm_stage_load(engine->disk_stage) < disk_queue_high);
                 });
             }
             if (engine->io_stop.load(std::memory_order_relaxed)) {

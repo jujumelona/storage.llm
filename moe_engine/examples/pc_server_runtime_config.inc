@@ -1,9 +1,19 @@
 static uint64_t server_auto_ram_budget_bytes() {
     const uint64_t available = storagellm::available_ram_bytes();
     const uint64_t gib = 1024ull * 1024ull * 1024ull;
+    if (const char* env = std::getenv("STORAGELLM_RAM_RESERVE_BYTES")) {
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(env, &end, 10);
+        if (end && end != env && *end == '\0' && parsed > 0) {
+            const uint64_t reserve = (uint64_t)parsed;
+            if (available > reserve) {
+                return available - reserve;
+            }
+        }
+    }
     const uint64_t reserve =
         available >= 64ull * gib ? 3ull * gib :
-        available >= 32ull * gib ? 2ull * gib : 1ull * gib;
+        available >= 32ull * gib ? 2ull * gib : 768ull * 1024ull * 1024ull;
     if (available > reserve * 2ull) {
         return available - reserve;
     }
@@ -49,6 +59,8 @@ static moe_io_config_t make_server_io_config(const server_options& opts, const m
     // across CPU and GPU backends instead of assuming one device allocator path.
     io.enable_common_raw_vram_pin = 0;
     io.prefetch_window_layers = std::max<uint32_t>(2u, io.prefetch_window_layers);
+    io.ram_eviction_target_fill_pct = std::max<uint8_t>(io.ram_eviction_target_fill_pct, 85u);
+    io.ram_eviction_threshold_pct = std::max<uint8_t>(io.ram_eviction_threshold_pct, 90u);
     io.disk_worker_threads = 4;
     io.pinned_worker_threads = caps.copy_streams > 1 ? 4u : 2u;
     io.gpu_worker_threads = caps.copy_streams ? caps.copy_streams : 1u;
