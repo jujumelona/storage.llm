@@ -22,7 +22,7 @@ static void touch_linux_mapped_pages(const moe_pc_engine* engine, const uint8_t*
     acc ^= src[bytes - 1u];
     g_moe_mmap_touch_sink ^= acc;
     if (engine) {
-        const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_mmap_touch.fetch_add(bytes, std::memory_order_relaxed);
+        const_cast<moe_pc_engine*>(engine)->io_atomic.bytes_touch_fallback.fetch_add(bytes, std::memory_order_relaxed);
     }
 }
 #endif
