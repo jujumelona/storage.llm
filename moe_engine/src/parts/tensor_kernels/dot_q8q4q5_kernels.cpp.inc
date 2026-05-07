@@ -315,9 +315,8 @@ static float moe_mxfp4_value_from_code(uint8_t code) {
 }
 
 static uint8_t moe_mxfp4_code_at(const uint8_t* qs, uint32_t index) {
-    const uint32_t half = 16u;
-    const uint8_t byte = qs[(index < half) ? index : (index - half)];
-    return (index < half) ? (byte & 0x0fu) : (byte >> 4);
+    const uint8_t byte = qs[index >> 1u];
+    return (index & 1u) ? (byte >> 4) : (byte & 0x0fu);
 }
 
 static float moe_dot_gguf_mxfp4_row(
@@ -341,8 +340,7 @@ static float moe_dot_gguf_mxfp4_row(
         float low = 0.0f;
         float high = 0.0f;
 #if defined(__AVX2__) && defined(__FMA__)
-        // BUGFIX 705: AVX2 vectorized MXFP4 dot product ?끸쁾??
-        // 16-entry FP32 table (64B) always in L1. Gather throughput ~5cy on Haswell+.
+        // MXFP4 stores each value pair in one byte: even index in low nibble, odd index in high nibble.
         const __m256i lo_mask = _mm256_set1_epi32(0x0F);
         __m256 vacc_low = _mm256_setzero_ps();
         __m256 vacc_high = _mm256_setzero_ps();
@@ -353,16 +351,22 @@ static float moe_dot_gguf_mxfp4_row(
             __m256 lo_vals = _mm256_i32gather_ps(table, lo_idx, 4);
             __m256i hi_idx = _mm256_srli_epi32(bytes8, 4);
             __m256 hi_vals = _mm256_i32gather_ps(table, hi_idx, 4);
-            vacc_low = _mm256_fmadd_ps(lo_vals, _mm256_loadu_ps(xb + j), vacc_low);
-            vacc_high = _mm256_fmadd_ps(hi_vals, _mm256_loadu_ps(xb + j + 16u), vacc_high);
+            const __m256 x0 = _mm256_loadu_ps(xb + j * 2u);
+            const __m256 x1 = _mm256_loadu_ps(xb + j * 2u + 8u);
+            const __m256 even_tmp = _mm256_shuffle_ps(x0, x1, _MM_SHUFFLE(2, 0, 2, 0));
+            const __m256 odd_tmp = _mm256_shuffle_ps(x0, x1, _MM_SHUFFLE(3, 1, 3, 1));
+            const __m256 even_x = _mm256_castpd_ps(_mm256_permute4x64_pd(_mm256_castps_pd(even_tmp), _MM_SHUFFLE(3, 1, 2, 0)));
+            const __m256 odd_x = _mm256_castpd_ps(_mm256_permute4x64_pd(_mm256_castps_pd(odd_tmp), _MM_SHUFFLE(3, 1, 2, 0)));
+            vacc_low = _mm256_fmadd_ps(lo_vals, even_x, vacc_low);
+            vacc_high = _mm256_fmadd_ps(hi_vals, odd_x, vacc_high);
         }
         low = moe_dot_hsum256_ps(vacc_low);
         high = moe_dot_hsum256_ps(vacc_high);
 #else
         for (uint32_t j = 0; j < 16u; ++j) {
             const uint8_t byte = qs[j];
-            low += table[byte & 0x0fu] * xb[j];
-            high += table[byte >> 4] * xb[j + 16u];
+            low += table[byte & 0x0fu] * xb[j * 2u];
+            high += table[byte >> 4] * xb[j * 2u + 1u];
         }
 #endif
         acc += (low + high) * scale;
