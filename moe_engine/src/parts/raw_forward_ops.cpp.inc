@@ -133,18 +133,36 @@ static int moe_engine_rmsnorm_unit_offset(
     double raw_rms = 0.0;
     double mean_abs_raw = 0.0;
     double mean_abs_plus_one = 0.0;
-    if (moe_rmsnorm_unit_offset_from_json(engine->offload_gguf_metadata_json, &value)) {
-        source = "metadata";
-    } else if (moe_rmsnorm_unit_offset_from_json(engine->offload_graph_ir_json, &value)) {
-        source = "graph_ir";
-    } else if (moe_rmsnorm_unit_offset_from_weight_stats(
-                   raw,
-                   &value,
-                   &samples,
-                   &raw_mean,
-                   &raw_rms,
-                   &mean_abs_raw,
-                   &mean_abs_plus_one)) {
+    int metadata_done = 0;
+    int metadata_cache = engine->cached_rmsnorm_unit_offset.load(std::memory_order_acquire);
+    if (metadata_cache == 0 || metadata_cache == 1) {
+        value = metadata_cache;
+        source = "metadata_cache";
+        metadata_done = 1;
+    } else {
+        if (metadata_cache != 2) {
+            if (moe_rmsnorm_unit_offset_from_json(engine->offload_gguf_metadata_json, &value)) {
+                source = "metadata";
+                metadata_done = 1;
+                engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0, std::memory_order_release);
+            } else if (moe_rmsnorm_unit_offset_from_json(engine->offload_graph_ir_json, &value)) {
+                source = "graph_ir";
+                metadata_done = 1;
+                engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0, std::memory_order_release);
+            } else {
+                engine->cached_rmsnorm_unit_offset.store(2, std::memory_order_release);
+            }
+        }
+    }
+    if (!metadata_done &&
+        moe_rmsnorm_unit_offset_from_weight_stats(
+            raw,
+            &value,
+            &samples,
+            &raw_mean,
+            &raw_rms,
+            &mean_abs_raw,
+            &mean_abs_plus_one)) {
         source = "weight_stats";
     }
     moe_profile_log(
