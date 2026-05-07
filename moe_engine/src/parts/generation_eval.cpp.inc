@@ -26,7 +26,6 @@ int moe_pc_engine_eval_token_ids_from(
             start_us = moe_profile_now_us();
             engine->generation_started.fetch_add(1, std::memory_order_relaxed);
             moe_engine_reset_qkv_cache(engine);
-            engine->eval_plain_kv_active.fetch_add(1, std::memory_order_acq_rel);
             engine->generation_active.fetch_add(1, std::memory_order_relaxed);
             engine->generation_token.store(0, std::memory_order_relaxed);
             engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
@@ -34,15 +33,6 @@ int moe_pc_engine_eval_token_ids_from(
         }
         ~eval_scope_t() {
             if (!engine) return;
-            uint32_t plain_kv = engine->eval_plain_kv_active.load(std::memory_order_acquire);
-            while (plain_kv > 0) {
-                if (engine->eval_plain_kv_active.compare_exchange_weak(
-                        plain_kv, plain_kv - 1,
-                        std::memory_order_release,
-                        std::memory_order_acquire)) {
-                    break;
-                }
-            }
             if (ok) {
                 engine->generation_completed.fetch_add(1, std::memory_order_relaxed);
                 engine->generation_phase.store(moe_GEN_PHASE_DONE, std::memory_order_relaxed);
@@ -195,8 +185,7 @@ int moe_pc_engine_eval_token_ids_from(
         attn_cfg.rope_table_len,
         moe_attn_kv_entry_dim(attn_cfg),
         pre_allocate_kv,
-        engine->eval_plain_kv_active.load(std::memory_order_acquire) ? "eval_plain_kv_cache" :
-            ((engine->config.kv_mode == moe_KV_MODE_QKV && qkv_is_enabled()) ? "qkv_contract" : "plain_kv_cache"));
+        (engine->config.kv_mode == moe_KV_MODE_QKV && qkv_is_enabled()) ? "qkv_contract" : "plain_kv_cache");
     // BUGFIX 563: Check moe_decode_scratch_resize success ★
     // Problem: moe_decode_scratch_resize can fail on allocation
     // Solution: Check return value (assuming it returns int)
