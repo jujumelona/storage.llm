@@ -108,7 +108,7 @@ static int moe_apply_unweighted_head_rmsnorm_f32(
 }
 
 static int moe_layer_uses_unweighted_v_norm(
-    const moe_pc_engine* engine,
+    moe_pc_engine* engine,
     int32_t layer
 ) {
     if (!engine || layer < 0) {
