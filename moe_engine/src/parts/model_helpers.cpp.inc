@@ -92,8 +92,12 @@ static qkv_config_t moe_qkv_config_from_offload_contract(const moe_offload_gguf_
     if (contract.qkv_sink_tokens > 0) {
         cfg.sink_tokens = contract.qkv_sink_tokens;
     }
-    cfg.rotation_seed = contract.qkv_rotation_seed;
-    cfg.qjl_seed = contract.qkv_qjl_seed;
+    if (contract.qkv_rotation_seed != 0) {
+        cfg.rotation_seed = contract.qkv_rotation_seed;
+    }
+    if (contract.qkv_qjl_seed != 0) {
+        cfg.qjl_seed = contract.qkv_qjl_seed;
+    }
     if (contract.qkv_enable_qjl >= 0) {
         cfg.enable_qjl = contract.qkv_enable_qjl != 0;
     } else if (contract.qkv_required) {

@@ -106,10 +106,6 @@ static int moe_engine_rmsnorm_unit_offset(
     if (!engine) {
         return 0;
     }
-    const int cached = engine->cached_rmsnorm_unit_offset.load(std::memory_order_acquire);
-    if (cached >= 0) {
-        return cached ? 1 : 0;
-    }
     int value = 0;
     const char* source = "default";
     uint32_t samples = 0;
@@ -131,7 +127,6 @@ static int moe_engine_rmsnorm_unit_offset(
                    &mean_abs_plus_one)) {
         source = "weight_stats";
     }
-    engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0, std::memory_order_release);
     moe_profile_log(
         "rmsnorm_unit_offset",
         "source=%s value=%d samples=%u raw_mean=%.6g raw_rms=%.6g mean_abs_raw=%.6g mean_abs_plus_one=%.6g",

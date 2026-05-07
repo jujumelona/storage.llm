@@ -123,7 +123,7 @@ int moe_pc_engine_lm_head_top1_f32(
         tls_lm_head_entry = common;
         tls_lm_head_valid = true;
     }
-    if (tls_lm_head_valid && tls_lm_head_engine_generation == engine_generation) {
+    if (tls_lm_head_engine_ptr == engine && tls_lm_head_valid && tls_lm_head_engine_generation == engine_generation) {
         base = common.base;
         bytes = common.bytes;
         encoding = common.scalar_encoding;

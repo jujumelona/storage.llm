@@ -216,41 +216,71 @@
         rope_proportional_freq,
         use_dynamic_rope,
         moe_profile_elapsed_ms(rope_start_us));
-    const uint64_t kv_start_us = moe_profile_now_us();
-    if (!moe_standard_kv_cache_ensure(engine, s, position, kv_entry_dim)) {
-        std::fprintf(stderr, "[storagellm attn] kv ensure failed layer=%d pos=%u entry=%u\n", layer, position, kv_entry_dim);
+    const int qkv_configured =
+        engine &&
+        engine->config.kv_mode == moe_KV_MODE_QKV;
+    const int qkv_decode = qkv_configured && qkv_is_enabled();
+    if (qkv_configured && !qkv_decode) {
+        std::fprintf(stderr,
+            "[storagellm attn] qkv mode is configured but qkv runtime is disabled layer=%d pos=%u\n",
+            layer, position);
         return 0;
     }
-    if (s->kv_entry.size() < kv_entry_dim) {
-        s->kv_entry.resize(kv_entry_dim);
-    }
-    std::memcpy(s->kv_entry.data(), s->attn_kv_a.data(), (size_t)k_dim * sizeof(float));
-    std::memcpy(s->kv_entry.data() + k_dim, s->attn_value.data(), (size_t)kv_v_dim * sizeof(float));
-    s->kv_cache.store_entry((uint32_t)layer, position, s->kv_entry.data(), kv_entry_dim);
-    s->kv_cache.seq_len = std::min(position + 1u, s->kv_cache.max_seq_len);
-    const uint32_t seq_len = std::min(position + 1u, s->kv_cache.max_seq_len);
+
+    const uint64_t kv_start_us = moe_profile_now_us();
+    uint32_t seq_len = 0;
+    uint32_t qkv_capacity_tokens = 0;
 
     float* layer_decode = nullptr;
     uint32_t decode_start = 0;
-    if (position > 0 &&
-        !moe_kv_decode_layer_cache_prepare(
-            engine, s, (uint32_t)layer, position, &layer_decode, &decode_start)) {
-        std::fprintf(stderr, "[storagellm attn] kv decode cache failed layer=%d pos=%u entry=%u\n", layer, position, kv_entry_dim);
-        return 0;
-    }
-    if (position > 0) {
-        for (uint32_t p = decode_start; p < position && p < seq_len; ++p) {
-            s->kv_cache.load_entry((uint32_t)layer, p, layer_decode + (size_t)p * kv_entry_dim, kv_entry_dim);
+    if (qkv_decode) {
+        const uint32_t seq_limit = s->kv_cache.seq_limit ? s->kv_cache.seq_limit :
+            (cfg.max_seq_len ? cfg.max_seq_len : position + 1u);
+        if (position >= seq_limit) {
+            std::fprintf(stderr,
+                "[storagellm attn] qkv context exceeds seq_limit layer=%d pos=%u limit=%u\n",
+                layer, position, seq_limit);
+            return 0;
         }
-        if (s->kv_decoded_up_to.size() > (size_t)layer) {
-            s->kv_decoded_up_to[(uint32_t)layer] =
-                std::max(s->kv_decoded_up_to[(uint32_t)layer], std::min(position, seq_len));
+        seq_len = position + 1u;
+        qkv_capacity_tokens = seq_limit;
+        s->kv_cache.seq_len = seq_len;
+    } else {
+        if (!moe_standard_kv_cache_ensure(engine, s, position, kv_entry_dim)) {
+            std::fprintf(stderr, "[storagellm attn] kv ensure failed layer=%d pos=%u entry=%u\n", layer, position, kv_entry_dim);
+            return 0;
+        }
+        if (s->kv_entry.size() < kv_entry_dim) {
+            s->kv_entry.resize(kv_entry_dim);
+        }
+        std::memcpy(s->kv_entry.data(), s->attn_kv_a.data(), (size_t)k_dim * sizeof(float));
+        std::memcpy(s->kv_entry.data() + k_dim, s->attn_value.data(), (size_t)kv_v_dim * sizeof(float));
+        s->kv_cache.store_entry((uint32_t)layer, position, s->kv_entry.data(), kv_entry_dim);
+        s->kv_cache.seq_len = std::min(position + 1u, s->kv_cache.max_seq_len);
+        seq_len = std::min(position + 1u, s->kv_cache.max_seq_len);
+        if (position > 0 &&
+            !moe_kv_decode_layer_cache_prepare(
+                engine, s, (uint32_t)layer, position, &layer_decode, &decode_start)) {
+            std::fprintf(stderr, "[storagellm attn] kv decode cache failed layer=%d pos=%u entry=%u\n", layer, position, kv_entry_dim);
+            return 0;
+        }
+        if (position > 0) {
+            for (uint32_t p = decode_start; p < position && p < seq_len; ++p) {
+                s->kv_cache.load_entry((uint32_t)layer, p, layer_decode + (size_t)p * kv_entry_dim, kv_entry_dim);
+            }
+            if (s->kv_decoded_up_to.size() > (size_t)layer) {
+                s->kv_decoded_up_to[(uint32_t)layer] =
+                    std::max(s->kv_decoded_up_to[(uint32_t)layer], std::min(position, seq_len));
+            }
         }
     }
     moe_profile_log(
         "attn_standard_kv",
-        "layer=%d pos=%u seq=%u decode_start=%u entry=%u ms=%.3f",
+        "layer=%d pos=%u seq=%u decode_start=%u entry=%u backend=%s qkv_cap=%u plain_max_seq=%u ms=%.3f",
         layer, position, seq_len, decode_start, kv_entry_dim,
+        qkv_decode ? "qkv_only" : "plain_kv_cache",
+        qkv_capacity_tokens,
+        s->kv_cache.max_seq_len,
         moe_profile_elapsed_ms(kv_start_us));
 
     const char* scale_source = nullptr;
@@ -266,12 +296,7 @@
             scale_source ? scale_source : "unknown");
         return 0;
     }
-    const int qkv_decode =
-        engine &&
-        engine->config.kv_mode == moe_KV_MODE_QKV &&
-        qkv_is_enabled();
     const uint32_t qkv_head_stride = std::max<uint32_t>(num_heads, num_kv_heads);
-    const uint32_t qkv_capacity_tokens = std::max<uint32_t>(seq_len, s->kv_cache.max_seq_len);
     if (qkv_decode) {
         const uint64_t qkv_append_start_us = moe_profile_now_us();
         if (v_head_dim != head_dim) {

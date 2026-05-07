@@ -40,6 +40,20 @@ static int get_cached_raw_tensor(
             engine->raw_tensor_cache[key] = entry;
             *out_entry = entry;
         }
+        moe_profile_log(
+            "raw_tensor_map",
+            "source=common layer=%d kind=%d name=%s rows=%u cols=%u bytes=%llu scalar=%u fmt=%u row_bytes=%llu path=%u file_offset=%llu",
+            layer,
+            (int)kind,
+            rec->name.c_str(),
+            entry.rows,
+            entry.cols,
+            (unsigned long long)entry.bytes,
+            (unsigned)entry.scalar_encoding,
+            (unsigned)entry.weight_format,
+            (unsigned long long)entry.weight_row_bytes,
+            (unsigned)rec->resolved_path_index,
+            (unsigned long long)rec->file_offset);
         return 1;
     }
     if (engine->offload_gguf_valid.load(std::memory_order_relaxed)) {
