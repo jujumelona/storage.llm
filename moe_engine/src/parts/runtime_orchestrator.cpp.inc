@@ -6,6 +6,216 @@ static float policy_gpu_target(moe_execution_policy_t policy) {
     return policy == moe_EXECUTION_PERFORMANCE ? 96.0f : policy == moe_EXECUTION_LOW_IMPACT ? 60.0f : 85.0f;
 }
 
+static uint64_t moe_delta_u64(uint64_t now, std::atomic<uint64_t>& prev) {
+    const uint64_t old = prev.exchange(now, std::memory_order_acq_rel);
+    return now >= old ? now - old : 0;
+}
+
+static moe_runtime_perf_window collect_perf_window(moe_pc_engine* engine, uint64_t interval_ns) {
+    moe_runtime_perf_window m{};
+    if (!engine) {
+        return m;
+    }
+    m.tokens = moe_delta_u64(
+        engine->generation_completed.load(std::memory_order_relaxed),
+        engine->autotune_prev_tokens);
+    m.expert_hits = moe_delta_u64(
+        engine->expert_cache_hit_count.load(std::memory_order_relaxed),
+        engine->autotune_prev_hits);
+    m.expert_misses = moe_delta_u64(
+        engine->expert_cache_miss_count.load(std::memory_order_relaxed),
+        engine->autotune_prev_misses);
+    m.prefetch_used = moe_delta_u64(
+        engine->speculative_prefetch_planned_count.load(std::memory_order_relaxed),
+        engine->autotune_prev_prefetch_planned);
+    m.prefetch_wasted = moe_delta_u64(
+        engine->io_atomic.dropped_requests.load(std::memory_order_relaxed) +
+            engine->io_atomic.urgent_dropped_requests.load(std::memory_order_relaxed),
+        engine->autotune_prev_prefetch_wasted);
+    m.sync_h2d_fallbacks = moe_delta_u64(
+        engine->io_atomic.bytes_sync_h2d_fallback.load(std::memory_order_relaxed),
+        engine->autotune_prev_sync_h2d);
+    const uint64_t disk_bytes = moe_delta_u64(
+        engine->io_atomic.bytes_disk_to_ram.load(std::memory_order_relaxed) +
+            engine->io_atomic.bytes_directstorage_completed.load(std::memory_order_relaxed),
+        engine->autotune_prev_directstorage_bytes);
+    const uint64_t h2d_bytes = moe_delta_u64(
+        engine->io_atomic.bytes_pinned_to_gpu.load(std::memory_order_relaxed),
+        engine->autotune_prev_h2d_bytes);
+    const uint64_t staging_waits = moe_delta_u64(
+        engine->io_atomic.staging_slot_waits.load(std::memory_order_relaxed) +
+            engine->io_atomic.staging_slot_contention.load(std::memory_order_relaxed),
+        engine->autotune_prev_staging_waits);
+    m.directstorage_queue_wait_ns = moe_delta_u64(
+        engine->io_atomic.directstorage_queue_full_wait_ns.load(std::memory_order_relaxed),
+        engine->autotune_prev_directstorage_queue_wait);
+    const uint64_t storage_bw = engine->backend_caps.measured_storage_bw_bytes_per_sec
+        ? engine->backend_caps.measured_storage_bw_bytes_per_sec
+        : (3ull << 30);
+    uint64_t h2d_bw = engine->backend_caps.measured_h2d_bw_bytes_per_sec;
+    if (h2d_bw == 0 && engine->backend_caps.dma_bandwidth_gbps > 0.0) {
+        h2d_bw = (uint64_t)(engine->backend_caps.dma_bandwidth_gbps * 1000000000.0);
+    }
+    if (h2d_bw == 0) {
+        h2d_bw = 12ull * 1000ull * 1000ull * 1000ull;
+    }
+    m.disk_read_ns = storage_bw ? (disk_bytes * 1000000000ull) / storage_bw : 0;
+    m.h2d_copy_ns = h2d_bw ? (h2d_bytes * 1000000000ull) / h2d_bw : 0;
+    m.gpu_idle_ns = (interval_ns * engine->gpu_copy_idle_milli.load(std::memory_order_relaxed)) / 1000ull;
+    m.staging_wait_ns = staging_waits * 1000000ull;
+    return m;
+}
+
+static uint32_t expert_hit_rate_milli(const moe_runtime_perf_window& m) {
+    const uint64_t total = m.expert_hits + m.expert_misses;
+    return total ? (uint32_t)std::min<uint64_t>(1000ull, (m.expert_hits * 1000ull) / total) : 1000u;
+}
+
+static uint32_t prefetch_waste_milli(const moe_runtime_perf_window& m) {
+    return m.prefetch_used ?
+        (uint32_t)std::min<uint64_t>(1000ull, (m.prefetch_wasted * 1000ull) / m.prefetch_used) : 0u;
+}
+
+static uint64_t io_path_avg_wait_ns(const moe_io_path_perf& p) {
+    const uint64_t completed = p.completed.load(std::memory_order_relaxed);
+    const uint64_t wait = p.wait_ns.load(std::memory_order_relaxed);
+    return completed ? wait / completed : 0;
+}
+
+static uint32_t io_path_fail_rate_milli(const moe_io_path_perf& p) {
+    const uint64_t submitted = p.submitted.load(std::memory_order_relaxed);
+    const uint64_t failed = p.fail_count.load(std::memory_order_relaxed);
+    return submitted ? (uint32_t)std::min<uint64_t>(1000ull, (failed * 1000ull) / submitted) : 0u;
+}
+
+static void autotune_resize_io_workers(
+    moe_pc_engine* engine,
+    uint32_t disk,
+    uint32_t pinned,
+    uint32_t gpu
+) {
+    if (!engine || !engine->io_config.enable_compute_io_overlap) {
+        return;
+    }
+    moe_runtime_orchestrator_plan_t plan{};
+    plan.disk_workers = clamp_to_cap(disk, disk_worker_cap());
+    plan.pinned_workers = clamp_to_cap(pinned, pinned_worker_cap(engine));
+    plan.gpu_workers = clamp_to_cap(gpu, gpu_worker_cap(engine));
+    plan.prefetch_window_layers = engine->runtime_prefetch_window_layers.load(std::memory_order_relaxed);
+    orchestrator_resize_workers(engine, &plan);
+}
+
+static void moe_runtime_autotune_tick(moe_pc_engine* engine) {
+    if (!engine) {
+        return;
+    }
+    device_drain_directstorage_device_copies(engine);
+    const uint64_t now_ms = moe_profile_now_us() / 1000ull;
+    uint64_t last_ms = engine->autotune_last_tick_ms.load(std::memory_order_relaxed);
+    if (last_ms != 0 && now_ms < last_ms + 1000ull) {
+        return;
+    }
+    if (!engine->autotune_last_tick_ms.compare_exchange_strong(
+            last_ms,
+            now_ms,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+    const uint64_t interval_ns = last_ms == 0 ? 1000000000ull : (now_ms - last_ms) * 1000000ull;
+    moe_runtime_perf_window m = collect_perf_window(engine, interval_ns);
+    uint32_t window = engine->runtime_prefetch_window_layers.load(std::memory_order_relaxed);
+    if (window == 0) {
+        window = engine->io_config.prefetch_window_layers ? engine->io_config.prefetch_window_layers : 1u;
+    }
+    const uint32_t waste = prefetch_waste_milli(m);
+    const uint32_t hit = expert_hit_rate_milli(m);
+    const uint64_t wait_limit = interval_ns / 20ull;
+    const uint64_t idle_limit = interval_ns / 5ull;
+    const uint64_t disk_limit = interval_ns / 3ull;
+    const uint64_t pinned_wait = io_path_avg_wait_ns(engine->pinned_perf);
+    const uint64_t gds_wait = io_path_avg_wait_ns(engine->gds_perf);
+    const uint64_t ds_gpu_wait = io_path_avg_wait_ns(engine->ds_gpu_perf);
+    const uint64_t ds_staging_wait = io_path_avg_wait_ns(engine->ds_staging_perf);
+    const uint32_t gds_fail = io_path_fail_rate_milli(engine->gds_perf);
+    const uint32_t ds_gpu_fail = io_path_fail_rate_milli(engine->ds_gpu_perf);
+
+    if (m.sync_h2d_fallbacks > 0 || m.staging_wait_ns > wait_limit) {
+        const uint64_t current = engine->staging_size ? engine->staging_size : engine->io_config.pinned_staging_bytes;
+        const uint64_t target = current > 0 ? current + current / 4ull : moe_recommended_staging_bytes(engine);
+        if (target > current) {
+            moe_ensure_staging_capacity(engine, moe_rt_align_4k(target));
+        }
+        window = std::max(1u, window > 1u ? window - 1u : 1u);
+        autotune_resize_io_workers(
+            engine,
+            runtime_disk_workers(engine),
+            std::min<uint32_t>(pinned_worker_cap(engine), runtime_pinned_workers(engine) + 1u),
+            runtime_gpu_workers(engine));
+    }
+    if (m.directstorage_queue_wait_ns > wait_limit) {
+        window = std::max(1u, window > 1u ? window - 1u : 1u);
+        const uint32_t staging_cap = std::min<uint32_t>(
+            8192u,
+            std::max<uint32_t>(engine->io_config.directstorage_staging_queue_capacity, 1024u));
+        const uint32_t gpu_cap = std::min<uint32_t>(
+            8192u,
+            std::max<uint32_t>(engine->io_config.directstorage_gpu_queue_capacity, 1024u));
+        engine->io_config.directstorage_staging_queue_capacity = std::min<uint32_t>(
+            8192u,
+            staging_cap + (staging_cap < 8192u ? 256u : 0u));
+        engine->io_config.directstorage_gpu_queue_capacity = std::min<uint32_t>(
+            8192u,
+            gpu_cap + (gpu_cap < 8192u ? 256u : 0u));
+    }
+    if (hit < 850u && waste < 200u) {
+        window = std::min<uint32_t>(16u, window + 1u);
+    }
+    if (waste > 350u) {
+        window = std::max(1u, window / 2u);
+        uint32_t depth = engine->adaptive_prefetch_depth.load(std::memory_order_relaxed);
+        if (depth > 1u) {
+            engine->adaptive_prefetch_depth.store(depth - 1u, std::memory_order_relaxed);
+        }
+        engine->merge_map_rebuild_pending.store(true, std::memory_order_release);
+    }
+    if (m.gpu_idle_ns > idle_limit && m.disk_read_ns < disk_limit && waste < 250u) {
+        window = std::min<uint32_t>(16u, window + 1u);
+        uint32_t depth = engine->adaptive_prefetch_depth.load(std::memory_order_relaxed);
+        engine->adaptive_prefetch_depth.store(std::min<uint32_t>(8u, depth + 1u), std::memory_order_relaxed);
+        autotune_resize_io_workers(
+            engine,
+            std::min<uint32_t>(disk_worker_cap(), runtime_disk_workers(engine) + 1u),
+            runtime_pinned_workers(engine),
+            runtime_gpu_workers(engine));
+    }
+    if (m.disk_read_ns > disk_limit && m.prefetch_wasted > 0) {
+        window = std::max(1u, window / 2u);
+        const uint32_t disk = runtime_disk_workers(engine);
+        if (disk > 1u) {
+            autotune_resize_io_workers(
+                engine,
+                disk - 1u,
+                runtime_pinned_workers(engine),
+                runtime_gpu_workers(engine));
+        }
+    }
+    if (engine->runtime_gpudirect_ready.load(std::memory_order_acquire) &&
+        engine->gds_perf.submitted.load(std::memory_order_relaxed) >= 4u &&
+        (gds_fail > 50u ||
+         (pinned_wait > 0 && gds_wait > (pinned_wait * 12ull) / 10ull))) {
+        engine->runtime_gpudirect_ready.store(false, std::memory_order_release);
+    }
+    if (engine->runtime_directstorage_gpu_ready.load(std::memory_order_acquire) &&
+        engine->ds_gpu_perf.submitted.load(std::memory_order_relaxed) >= 4u &&
+        (engine->backend_caps.backend != moe_BACKEND_DIRECTML ||
+         ds_gpu_fail > 50u ||
+         (ds_staging_wait > 0 && ds_gpu_wait > ds_staging_wait))) {
+        engine->runtime_directstorage_gpu_ready.store(false, std::memory_order_release);
+    }
+    engine->runtime_prefetch_window_layers.store(window, std::memory_order_relaxed);
+}
+
 static void refresh_external_gpu_memory_budget_if_due(moe_pc_engine* engine) {
     if (!engine) {
         return;
@@ -39,10 +249,16 @@ static void refresh_external_gpu_memory_budget_if_due(moe_pc_engine* engine) {
         const int64_t last_ms = engine->last_mem_query_ms.load(std::memory_order_relaxed);
         const uint64_t elapsed_ms = now_ms > (uint64_t)last_ms ? now_ms - (uint64_t)last_ms : 0;
 
-        // Check if we're under memory pressure
-        const uint64_t allocated = engine->device_allocated_bytes.load(std::memory_order_relaxed);
-        const uint64_t budget = device_budget_bytes(engine);
-        const bool high_pressure = budget > 0 && allocated >= (budget * 80ull) / 100ull;  // Lowered from 85% to 80%
+        // Check if we're under memory pressure. device_budget_bytes() is already
+        // "available after used bytes", so compare used bytes against the raw budget.
+        const uint64_t raw_budget = device_raw_budget_bytes(engine);
+        const uint64_t used =
+            engine->vram_resident_bytes.load(std::memory_order_relaxed) +
+            engine->vram_inflight_bytes.load(std::memory_order_relaxed) +
+            engine->vram_kv_bytes.load(std::memory_order_relaxed) +
+            engine->vram_common_bytes.load(std::memory_order_relaxed);
+        const bool high_pressure =
+            raw_budget > 0 && used >= (raw_budget * 80ull) / 100ull;
 
         // Check if dropped_requests increased (indicates memory pressure)
         const uint64_t dropped_now = engine->io_atomic.dropped_requests.load(std::memory_order_relaxed);
@@ -467,6 +683,7 @@ int moe_pc_engine_orchestrate_moe_step(moe_pc_engine_t* engine, int current_laye
         return 0;
     }
     refresh_external_gpu_memory_budget_if_due(engine);
+    moe_runtime_autotune_tick(engine);
 
     // BUGFIX 문제8: Async merge map rebuild ★★★
     // Check if rebuild is pending and trigger it

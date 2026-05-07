@@ -27,6 +27,9 @@ static void moe_qkv_ensure_head_storage_locked(moe_pc_engine* engine, size_t slo
     if (engine->qkv_head_state_fingerprints.size() < slot_count) {
         engine->qkv_head_state_fingerprints.resize(slot_count, 0);
     }
+    if (engine->qkv_head_state_epochs.size() < slot_count) {
+        engine->qkv_head_state_epochs.resize(slot_count, 0);
+    }
     for (size_t i = 0; i < slot_count; ++i) {
         if (!engine->qkv_head_state_locks[i]) {
             engine->qkv_head_state_locks[i] = std::make_unique<std::mutex>();
@@ -49,6 +52,7 @@ static void moe_qkv_free_head_states_locked(moe_pc_engine* engine) {
     engine->qkv_head_state_layers.clear();
     engine->qkv_head_state_heads.clear();
     engine->qkv_head_state_fingerprints.clear();
+    engine->qkv_head_state_epochs.clear();
     engine->qkv_last_ctx = 0;
 }
 
@@ -74,6 +78,77 @@ static int moe_qkv_env_bits_or_current(const char* name, int current, int* chang
         *changed = 1;
     }
     return bits;
+}
+
+static uint32_t moe_qkv_rotation_backend_from_env_or_current(const char* name, uint32_t current) {
+    const char* env = name ? std::getenv(name) : nullptr;
+    if (!env || !*env) {
+        return current;
+    }
+    if (std::strcmp(env, "hadamard_sign_fast") == 0 ||
+        std::strcmp(env, "hadamard") == 0 ||
+        std::strcmp(env, "fast_hadamard") == 0) {
+        return QKV_ROTATION_BACKEND_HADAMARD_SIGN_FAST;
+    }
+    if (std::strcmp(env, "gaussian_qr_orthogonal") == 0 ||
+        std::strcmp(env, "gaussian_qr") == 0 ||
+        std::strcmp(env, "paper") == 0) {
+        return QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL;
+    }
+    return current;
+}
+
+static uint32_t moe_qkv_codebook_distribution_from_env_or_current(const char* name, uint32_t current) {
+    const char* env = name ? std::getenv(name) : nullptr;
+    if (!env || !*env) {
+        return current;
+    }
+    if (std::strcmp(env, "gaussian_approx") == 0 ||
+        std::strcmp(env, "gaussian") == 0 ||
+        std::strcmp(env, "normal_approx") == 0) {
+        return QKV_CODEBOOK_DISTRIBUTION_GAUSSIAN_APPROX;
+    }
+    if (std::strcmp(env, "exact_beta") == 0 ||
+        std::strcmp(env, "beta") == 0 ||
+        std::strcmp(env, "paper") == 0) {
+        return QKV_CODEBOOK_DISTRIBUTION_EXACT_BETA;
+    }
+    return current;
+}
+
+static uint64_t moe_qkv_mix_u64(uint64_t h, uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ull;
+    h ^= h >> 33;
+    return h;
+}
+
+static uint64_t moe_qkv_config_policy_hash(const qkv_config_t& cfg) {
+    uint64_t h = 0x51564b545152554eull;
+    h = moe_qkv_mix_u64(h, (uint64_t)(uint32_t)cfg.k_bits);
+    h = moe_qkv_mix_u64(h, (uint64_t)(uint32_t)cfg.v_bits);
+    h = moe_qkv_mix_u64(h, (uint64_t)(uint32_t)cfg.head_dim);
+    h = moe_qkv_mix_u64(h, cfg.enable_qjl ? 1ull : 0ull);
+    h = moe_qkv_mix_u64(h, cfg.enable_rotation ? 1ull : 0ull);
+    h = moe_qkv_mix_u64(h, cfg.rotation_seed);
+    h = moe_qkv_mix_u64(h, cfg.qjl_seed);
+    h = moe_qkv_mix_u64(h, cfg.rotation_backend);
+    h = moe_qkv_mix_u64(h, cfg.codebook_distribution);
+    h = moe_qkv_mix_u64(h, (uint64_t)(uint32_t)cfg.outlier_channels);
+    h = moe_qkv_mix_u64(h, (uint64_t)(uint32_t)cfg.outlier_bits);
+    h = moe_qkv_mix_u64(h, (uint64_t)(uint32_t)cfg.normal_bits);
+    h = moe_qkv_mix_u64(h, (uint64_t)(uint32_t)cfg.key_outlier_bits);
+    h = moe_qkv_mix_u64(h, (uint64_t)(uint32_t)cfg.key_normal_bits);
+    h = moe_qkv_mix_u64(h, (uint64_t)(uint32_t)cfg.value_outlier_bits);
+    h = moe_qkv_mix_u64(h, (uint64_t)(uint32_t)cfg.value_normal_bits);
+    h = moe_qkv_mix_u64(h, cfg.group_size);
+    h = moe_qkv_mix_u64(h, cfg.page_size_tokens);
+    h = moe_qkv_mix_u64(h, cfg.sink_tokens);
+    h = moe_qkv_mix_u64(h, cfg.plain_kv_persistent_storage ? 1ull : 0ull);
+    return h ? h : 1ull;
 }
 
 static qkv_config_t moe_qkv_contract_config_for_head_dim(
@@ -123,6 +198,10 @@ static qkv_config_t moe_qkv_contract_config_for_head_dim(
     }
     cfg.enable_rotation = moe_qkv_env_bool_or_current("STORAGELLM_QKV_ROTATION", cfg.enable_rotation ? 1 : 0) != 0;
     cfg.enable_qjl = moe_qkv_env_bool_or_current("STORAGELLM_QKV_QJL", cfg.enable_qjl ? 1 : 0) != 0;
+    cfg.rotation_backend = moe_qkv_rotation_backend_from_env_or_current(
+        "STORAGELLM_QKV_ROTATION_BACKEND", cfg.rotation_backend);
+    cfg.codebook_distribution = moe_qkv_codebook_distribution_from_env_or_current(
+        "STORAGELLM_QKV_CODEBOOK_DISTRIBUTION", cfg.codebook_distribution);
     if (qkv_bits_raw(cfg.k_bits) || qkv_bits_raw(cfg.v_bits) ||
         qkv_bits_raw(cfg.normal_bits) || qkv_bits_raw(cfg.outlier_bits) ||
         qkv_bits_raw(cfg.key_normal_bits) || qkv_bits_raw(cfg.value_normal_bits) ||
@@ -134,6 +213,17 @@ static qkv_config_t moe_qkv_contract_config_for_head_dim(
     }
     if (cfg.outlier_channels > (int)head_dim) {
         cfg.outlier_channels = (int)head_dim;
+    }
+    if (cfg.rotation_backend != QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL &&
+        cfg.rotation_backend != QKV_ROTATION_BACKEND_HADAMARD_SIGN_FAST) {
+        cfg.rotation_backend = QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL;
+    }
+    if (cfg.codebook_distribution != QKV_CODEBOOK_DISTRIBUTION_EXACT_BETA &&
+        cfg.codebook_distribution != QKV_CODEBOOK_DISTRIBUTION_GAUSSIAN_APPROX) {
+        cfg.codebook_distribution = QKV_CODEBOOK_DISTRIBUTION_EXACT_BETA;
+    }
+    if (cfg.policy_hash == 0) {
+        cfg.policy_hash = moe_qkv_config_policy_hash(cfg);
     }
     cfg.engine_io_thread_count =
         runtime_disk_workers(engine) + runtime_pinned_workers(engine) + runtime_gpu_workers(engine);
@@ -151,6 +241,9 @@ static bool moe_qkv_config_matches_contract(
         current.enable_rotation == desired.enable_rotation &&
         current.rotation_seed == desired.rotation_seed &&
         current.qjl_seed == desired.qjl_seed &&
+        current.rotation_backend == desired.rotation_backend &&
+        current.codebook_distribution == desired.codebook_distribution &&
+        current.policy_hash == desired.policy_hash &&
         current.outlier_channels == desired.outlier_channels &&
         current.outlier_bits == desired.outlier_bits &&
         current.normal_bits == desired.normal_bits &&
@@ -182,7 +275,8 @@ static void moe_qkv_apply_contract_config_locked(
         moe_profile_log(
             "qkv_config",
             "head_dim=%u k_bits=%d v_bits=%d group=%u page=%u sink=%u "
-            "rotation=%d rotation_seed=%llu qjl=%d qjl_seed=%llu "
+            "rotation=%d rotation_backend=%u rotation_seed=%llu qjl=%d qjl_seed=%llu "
+            "codebook_distribution=%u policy_hash=%llu "
             "outlier_channels=%d outlier_bits=%d normal_bits=%d "
             "key_outlier_bits=%d key_normal_bits=%d value_outlier_bits=%d value_normal_bits=%d "
             "effective_bits=%.3f plain_kv=%d "
@@ -195,9 +289,12 @@ static void moe_qkv_apply_contract_config_locked(
             desired.page_size_tokens,
             desired.sink_tokens,
             desired.enable_rotation ? 1 : 0,
+            desired.rotation_backend,
             (unsigned long long)desired.rotation_seed,
             desired.enable_qjl ? 1 : 0,
             (unsigned long long)desired.qjl_seed,
+            desired.codebook_distribution,
+            (unsigned long long)desired.policy_hash,
             desired.outlier_channels,
             desired.outlier_bits,
             desired.normal_bits,
@@ -218,17 +315,15 @@ static void moe_qkv_apply_contract_config_locked(
     }
 }
 
-static int moe_qkv_prepare_head_states(
+static int moe_qkv_prepare_runtime_config(
     moe_pc_engine* engine,
-    uint32_t slot_count,
     uint32_t head_dim
 ) {
-    if (!engine || slot_count == 0 || head_dim == 0) {
+    if (!engine || head_dim == 0) {
         return 0;
     }
     std::lock_guard<std::mutex> lock(engine->qkv_mutex);
     moe_qkv_apply_contract_config_locked(engine, head_dim);
-    moe_qkv_ensure_head_storage_locked(engine, slot_count);
     return 1;
 }
 
@@ -250,6 +345,36 @@ static int moe_qkv_slot_index(
     }
     *out_slot = (size_t)slot;
     return 1;
+}
+
+static void moe_qkv_note_context_progress_locked(moe_pc_engine* engine, uint32_t context_tokens) {
+    if (!engine || context_tokens == 0) {
+        return;
+    }
+    if (context_tokens == 1u && engine->qkv_last_ctx != 1u) {
+        ++engine->qkv_context_epoch;
+        if (engine->qkv_context_epoch == 0) {
+            engine->qkv_context_epoch = 1;
+        }
+    }
+    engine->qkv_last_ctx = context_tokens;
+}
+
+static uint64_t moe_qkv_layer_head_fingerprint(
+    uint32_t layer,
+    uint32_t head,
+    uint32_t capacity_tokens,
+    uint32_t head_dim,
+    uint64_t epoch,
+    uint64_t policy_hash
+) {
+    uint64_t h = policy_hash ? policy_hash : 0x51564b5354415445ull;
+    h = moe_qkv_mix_u64(h, layer);
+    h = moe_qkv_mix_u64(h, head);
+    h = moe_qkv_mix_u64(h, capacity_tokens);
+    h = moe_qkv_mix_u64(h, head_dim);
+    h = moe_qkv_mix_u64(h, epoch);
+    return h ? h : 1ull;
 }
 
 static qkv_state_t* moe_qkv_ensure_layer_head_state_locked(
@@ -282,6 +407,9 @@ static qkv_state_t* moe_qkv_ensure_layer_head_state_locked(
         *out_slot_index = slot_index;
     }
     qkv_state_t* slot = &engine->qkv_head_state_slots[slot_index];
+    const uint64_t epoch = engine->qkv_context_epoch ? engine->qkv_context_epoch : 1ull;
+    const uint64_t desired_fingerprint = moe_qkv_layer_head_fingerprint(
+        layer, head, capacity_tokens, head_dim, epoch, engine->qkv_cfg.policy_hash);
     const int valid =
         slot_index < engine->qkv_head_state_valid.size() &&
         engine->qkv_head_state_valid[slot_index] &&
@@ -290,7 +418,11 @@ static qkv_state_t* moe_qkv_ensure_layer_head_state_locked(
         slot_index < engine->qkv_head_state_layers.size() &&
         slot_index < engine->qkv_head_state_heads.size() &&
         engine->qkv_head_state_layers[slot_index] == layer &&
-        engine->qkv_head_state_heads[slot_index] == head;
+        engine->qkv_head_state_heads[slot_index] == head &&
+        slot_index < engine->qkv_head_state_fingerprints.size() &&
+        engine->qkv_head_state_fingerprints[slot_index] == desired_fingerprint &&
+        slot_index < engine->qkv_head_state_epochs.size() &&
+        engine->qkv_head_state_epochs[slot_index] == epoch;
     if (valid) {
         return slot;
     }
@@ -309,7 +441,8 @@ static qkv_state_t* moe_qkv_ensure_layer_head_state_locked(
     engine->qkv_head_state_valid[slot_index] = 1;
     engine->qkv_head_state_layers[slot_index] = layer;
     engine->qkv_head_state_heads[slot_index] = head;
-    engine->qkv_head_state_fingerprints[slot_index] = 0;
+    engine->qkv_head_state_fingerprints[slot_index] = desired_fingerprint;
+    engine->qkv_head_state_epochs[slot_index] = epoch;
     return slot;
 }
 
@@ -345,6 +478,10 @@ static int moe_qkv_append_layer_head_token(
     if (!engine || !key || !value || context_tokens == 0 || capacity_tokens < context_tokens) {
         return 0;
     }
+    {
+        std::lock_guard<std::mutex> lock(engine->qkv_mutex);
+        moe_qkv_note_context_progress_locked(engine, context_tokens);
+    }
     size_t slot_index = 0;
     qkv_state_t* slot = moe_qkv_ensure_layer_head_state_locked(
         engine, layer, head, head_stride, capacity_tokens, head_dim, &slot_index);
@@ -362,10 +499,6 @@ static int moe_qkv_append_layer_head_token(
     if (!moe_qkv_quantize_current_token_mse(
             slot, &engine->qkv_cfg, key, value, token_index, head_dim)) {
         return 0;
-    }
-    if (slot_index < engine->qkv_head_state_fingerprints.size()) {
-        engine->qkv_head_state_fingerprints[slot_index] =
-            ((uint64_t)layer << 48) ^ ((uint64_t)head << 32) ^ (uint64_t)context_tokens;
     }
     return 1;
 }
@@ -409,71 +542,6 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
     return qkv_attention_decode(query, slot, &qkv_decode_cfg, context_tokens, head_dim, output);
 }
 
-static qkv_state_t* moe_qkv_ensure_head_state(
-    moe_pc_engine* engine,
-    uint32_t head,
-    const float* head_keys,
-    const float* head_values,
-    uint32_t context_tokens,
-    uint32_t head_dim
-) {
-    if (!engine || !head_keys || !head_values || !context_tokens || !head_dim) return nullptr;
-    std::mutex* head_lock = nullptr;
-
-    if (head < engine->qkv_head_state_locks.size()) {
-        head_lock = engine->qkv_head_state_locks[head].get();
-    }
-    if (!head_lock) {
-        std::lock_guard<std::mutex> lock(engine->qkv_mutex);
-        moe_qkv_apply_contract_config_locked(engine, head_dim);
-        moe_qkv_ensure_head_storage_locked(engine, (size_t)head + 1u);
-        head_lock = engine->qkv_head_state_locks[head].get();
-    }
-    if (!head_lock) {
-        return nullptr;
-    }
-    std::lock_guard<std::mutex> head_guard(*head_lock);
-
-    qkv_state_t* slot = &engine->qkv_head_state_slots[head];
-    // BUGFIX 654: Add context change detection for QKV state reuse ★★
-    // Problem: Only checked n_tokens equality, not KV content changes
-    //          If context changes but token count same → stale quantized cache → PPL corruption
-    // Solution: Compare against last context epoch to detect content changes
-    // Impact: Forces re-quantization when context changes, fixes PPL accuracy
-    const bool token_count_matches = engine->qkv_head_state_valid[head] &&
-                                      slot->n_tokens == (int)context_tokens;
-    const bool context_unchanged = token_count_matches &&
-                                    (engine->qkv_last_ctx == context_tokens);
-
-    if (context_unchanged) {
-        // Context unchanged, reuse existing quantized state
-        if (!qkv_quantize(slot, &engine->qkv_cfg, head_keys, head_values, (int)context_tokens)) {
-            return nullptr;
-        }
-        return slot;
-    }
-
-    if (engine->qkv_head_state_valid[head]) {
-        qkv_free(slot);
-        *slot = qkv_state_t{};
-        engine->qkv_head_state_valid[head] = 0;
-    }
-
-    // Allocate new state
-    qkv_state_t st{};
-    if (!qkv_init(&st, &engine->qkv_cfg, (int)context_tokens)) {
-        return nullptr;
-    }
-    if (!qkv_quantize(&st, &engine->qkv_cfg, head_keys, head_values, (int)context_tokens)) {
-        qkv_free(&st);
-        return nullptr;
-    }
-    *slot = st;
-    engine->qkv_head_state_valid[head] = 1;
-    engine->qkv_last_ctx = context_tokens;  // BUGFIX 654: Track context epoch
-    return slot;
-}
-
 int moe_pc_engine_attention_decode_f32(
     moe_pc_engine_t* engine,
     const float* query,
@@ -510,7 +578,7 @@ int moe_pc_engine_attention_decode_f32(
         }
     }
     if (engine->config.kv_mode == moe_KV_MODE_QKV && qkv_is_enabled() &&
-        !moe_qkv_prepare_head_states(engine, head_count, head_dim)) {
+        !moe_qkv_prepare_runtime_config(engine, head_dim)) {
         return 0;
     }
     return moe_parallel_rows(engine, head_count, 0, [&](uint32_t head) {
@@ -518,12 +586,18 @@ int moe_pc_engine_attention_decode_f32(
         float* out = output + (uint64_t)head * (uint64_t)head_dim;
         const float* head_keys = key_cache + (uint64_t)head * (uint64_t)context_tokens * (uint64_t)head_dim;
         const float* head_values = value_cache + (uint64_t)head * (uint64_t)context_tokens * (uint64_t)head_dim;
-        // GAP 1A: QKV mode; quantize into persistent state, attention in quantized domain.
+        // Legacy flat API: use a per-call state so head-only slots cannot
+        // contaminate the layer/head persistent generation cache.
         if (engine->config.kv_mode == moe_KV_MODE_QKV && qkv_is_enabled()) {
-            qkv_state_t* st = moe_qkv_ensure_head_state(
-                engine, head, head_keys, head_values, context_tokens, head_dim);
-            if (!st) return 0;
-            return qkv_attention_decode(q, st, &engine->qkv_cfg, context_tokens, head_dim, out);
+            qkv_state_t st{};
+            if (context_tokens > (uint32_t)std::numeric_limits<int>::max() ||
+                !qkv_init(&st, &engine->qkv_cfg, (int)context_tokens)) {
+                return 0;
+            }
+            const int ok = qkv_quantize(&st, &engine->qkv_cfg, head_keys, head_values, (int)context_tokens) &&
+                qkv_attention_decode(q, &st, &engine->qkv_cfg, context_tokens, head_dim, out);
+            qkv_free(&st);
+            return ok;
         }
         float max_score = -std::numeric_limits<float>::infinity();
 
@@ -570,17 +644,7 @@ int moe_pc_engine_attention_decode_f32(
                 out[d] *= scale;
             }
         } else {
-            // Uniform distribution fallback when softmax sum is too small
-            const float uniform = 1.0f / (float)context_tokens;
-            for (uint32_t d = 0; d < head_dim; ++d) {
-                out[d] = 0.0f;
-            }
-            for (uint32_t t = 0; t < context_tokens; ++t) {
-                const float* v = head_values + (uint64_t)t * (uint64_t)head_dim;
-                for (uint32_t d = 0; d < head_dim; ++d) {
-                    out[d] += uniform * v[d];
-                }
-            }
+            return 0;
         }
         return 1;
     });

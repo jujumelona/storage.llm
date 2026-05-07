@@ -1,4 +1,77 @@
 // JUJU format parsing and dynamic shape inference
+static const char* moe_juju_expected_codec_id_from_gguf_type(uint32_t type) {
+    switch (type) {
+        case 0u: return "GGUF_F32_V1";
+        case 1u: return "GGUF_F16_V1";
+        case 2u: return "GGUF_Q4_0_V1";
+        case 3u: return "GGUF_Q4_1_V1";
+        case 6u: return "GGUF_Q5_0_V1";
+        case 7u: return "GGUF_Q5_1_V1";
+        case 8u: return "GGUF_Q8_0_V1";
+        case 9u: return "GGUF_Q8_1_V1";
+        case 10u: return "GGUF_Q2_K_V1";
+        case 11u: return "GGUF_Q3_K_V1";
+        case 12u: return "GGUF_Q4_K_V1";
+        case 13u: return "GGUF_Q5_K_V1";
+        case 14u: return "GGUF_Q6_K_V1";
+        case 15u: return "GGUF_Q8_K_V1";
+        case 16u: return "GGUF_IQ2_XXS_V1";
+        case 17u: return "GGUF_IQ2_XS_V1";
+        case 18u: return "GGUF_IQ3_XXS_V1";
+        case 19u: return "GGUF_IQ1_S_V1";
+        case 20u: return "GGUF_IQ4_NL_V1";
+        case 21u: return "GGUF_IQ3_S_V1";
+        case 22u: return "GGUF_IQ2_S_V1";
+        case 23u: return "GGUF_IQ4_XS_V1";
+        case 24u: return "GGUF_I8_V1";
+        case 25u: return "GGUF_I16_V1";
+        case 26u: return "GGUF_I32_V1";
+        case 27u: return "GGUF_I64_V1";
+        case 28u: return "GGUF_F64_V1";
+        case 29u: return "GGUF_IQ1_M_V1";
+        case 30u: return "GGUF_BF16_V1";
+        case 31u: return "GGUF_Q4_0_4_4_V1";
+        case 32u: return "GGUF_Q4_0_4_8_V1";
+        case 33u: return "GGUF_Q4_0_8_8_V1";
+        case 34u: return "GGUF_TQ1_0_V1";
+        case 35u: return "GGUF_TQ2_0_V1";
+        case 36u: return "GGUF_REMOVED_IQ4_NL_4_4";
+        case 37u: return "GGUF_REMOVED_IQ4_NL_4_8";
+        case 38u: return "GGUF_REMOVED_IQ4_NL_8_8";
+        case 39u: return "GGUF_MXFP4_V1";
+        default: return nullptr;
+    }
+}
+
+static int moe_juju_tensor_codec_contract_valid(
+    const moe_juju_tensor_json_entry_t& entry,
+    const moe_offload_gguf_contract_t& contract
+) {
+    if (entry.has_gguf_type &&
+        (entry.codec_id.empty() || entry.codec_registry_version.empty())) {
+        return 0;
+    }
+    if (!entry.codec_registry_version.empty() &&
+        entry.codec_registry_version != "GGUF_CODEC_REGISTRY_V1") {
+        return 0;
+    }
+    if (entry.has_gguf_type && !entry.codec_id.empty()) {
+        const char* expected_codec = moe_juju_expected_codec_id_from_gguf_type(entry.gguf_type);
+        if (!expected_codec || entry.codec_id != expected_codec) {
+            return 0;
+        }
+    }
+    const uint8_t mapped = entry.has_gguf_type ?
+        moe_weight_encoding_from_gguf_type(entry.gguf_type, contract) :
+        moe_WEIGHT_ENCODING_UNKNOWN;
+    if (mapped != moe_WEIGHT_ENCODING_UNKNOWN &&
+        entry.weight_encoding != moe_WEIGHT_ENCODING_UNKNOWN &&
+        entry.weight_encoding != mapped) {
+        return 0;
+    }
+    return 1;
+}
+
 static uint8_t moe_weight_encoding_from_juju_entry(
     const moe_juju_tensor_json_entry_t& entry,
     const moe_offload_gguf_contract_t& contract
@@ -43,13 +116,17 @@ static uint64_t moe_effective_juju_tensor_bytes(
     if (entry.dims > 8) {
         return entry.juju_bytes;
     }
-    const uint32_t cols = (uint32_t)std::min<uint64_t>(entry.shape[0], UINT32_MAX);
-    uint64_t rows64 = 1;
-    for (uint32_t i = 1; i < std::min<uint32_t>(entry.dims, 4u); ++i) {
-        if (entry.shape[i] == 0 || rows64 > UINT64_MAX / entry.shape[i]) {
-            return entry.juju_bytes;
+    const uint32_t cols = (uint32_t)std::min<uint64_t>(
+        entry.math_in_features ? entry.math_in_features : entry.shape[0],
+        UINT32_MAX);
+    uint64_t rows64 = entry.math_out_features ? entry.math_out_features : 1ull;
+    if (!entry.math_out_features) {
+        for (uint32_t i = 1; i < std::min<uint32_t>(entry.dims, 4u); ++i) {
+            if (entry.shape[i] == 0 || rows64 > UINT64_MAX / entry.shape[i]) {
+                return entry.juju_bytes;
+            }
+            rows64 *= entry.shape[i];
         }
-        rows64 *= entry.shape[i];
     }
     if (rows64 == 0 || rows64 > UINT32_MAX || cols == 0) {
         return entry.juju_bytes;

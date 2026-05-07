@@ -122,6 +122,9 @@ struct moe_offload_gguf_contract_t {
     uint32_t qkv_sink_tokens = 0;
     uint64_t qkv_rotation_seed = 42;
     uint64_t qkv_qjl_seed = 43;
+    uint32_t qkv_rotation_backend = QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL;
+    uint32_t qkv_codebook_distribution = QKV_CODEBOOK_DISTRIBUTION_EXACT_BETA;
+    uint64_t qkv_policy_hash = 0;
     int qkv_enable_qjl = -1;
     int qkv_enable_rotation = -1;
     uint32_t qkv_outlier_channels = 0;

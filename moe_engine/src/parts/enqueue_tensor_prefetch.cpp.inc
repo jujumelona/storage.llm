@@ -1,3 +1,27 @@
+static void moe_prefetch_task_apply_policy(
+    moe_pc_engine* engine,
+    moe_prefetch_task& task,
+    int requested_sync_fallback,
+    moe_prefetch_reason_t reason,
+    int urgent_required
+) {
+    const bool required_now =
+        reason == moe_PREFETCH_REASON_ROUTER_SELECTED ||
+        urgent_required != 0;
+    task.prefetch_reason = reason;
+    task.required_now = required_now ? 1u : 0u;
+    task.speculative = required_now ? 0u : 1u;
+    task.urgent_required = urgent_required ? 1u : 0u;
+    task.allow_sync_fallback =
+        required_now &&
+        requested_sync_fallback &&
+        engine &&
+        engine->io_config.allow_required_sync_fallback ? 1 : 0;
+    if (task.speculative) {
+        task.allow_sync_fallback = 0;
+    }
+}
+
 static int enqueue_tensor_prefetch(
     moe_pc_engine* engine,
     int layer,
@@ -6,7 +30,9 @@ static int enqueue_tensor_prefetch(
     moe_tier_t target_tier,
     int stream_state_prechecked = 0,
     const vram_reservation_token& reservation = vram_reservation_token{},
-    int allow_sync_fallback = 1
+    int allow_sync_fallback = 0,
+    moe_prefetch_reason_t prefetch_reason = moe_PREFETCH_REASON_LOOKAHEAD,
+    int urgent_required = 0
 ) {
     if (!engine) {
         return 0;
@@ -39,7 +65,12 @@ static int enqueue_tensor_prefetch(
             task.target_tier = target_tier;
             task.vram_token = reservation;
             task.urgent = 1; // Mark urgent since caller expects immediate completion
-            task.allow_sync_fallback = allow_sync_fallback;
+            moe_prefetch_task_apply_policy(
+                engine,
+                task,
+                allow_sync_fallback ? 1 : 0,
+                prefetch_reason,
+                urgent_required);
             if (enqueue_stage_or_retry(engine, engine->disk_stage, task)) {
                 engine->io_atomic.queued_requests.fetch_add(1);
                 return 1;
@@ -102,7 +133,12 @@ static int enqueue_tensor_prefetch(
         rec.prefetch_priority >= 95 ||
         rec.prefetch_class == moe_JUJU_PREFETCH_STARTUP_HOT ||
         rec.prefetch_class == moe_JUJU_PREFETCH_ROUTER_HOT) ? 1 : 0;
-    task.allow_sync_fallback = allow_sync_fallback;
+    moe_prefetch_task_apply_policy(
+        engine,
+        task,
+        allow_sync_fallback ? 1 : 0,
+        prefetch_reason,
+        urgent_required);
     const int queued = (task.urgent || target_tier == moe_TIER_VRAM) ?
         enqueue_stage_or_retry(engine, engine->disk_stage, task) :
         enqueue_stage(engine, engine->disk_stage, task);

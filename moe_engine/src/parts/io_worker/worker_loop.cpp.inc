@@ -110,6 +110,8 @@
     constexpr uint32_t MAX_REQUEUE_RETRIES = 100;
 
     for (;;) {
+        device_drain_deferred_staging_copies(engine, false);
+        drain_directstorage_staging_copies(engine);
         if (!local_requeues.empty()) {
             const auto pending = local_requeues.front();
             uint64_t task_bytes = 0;
@@ -278,6 +280,37 @@
                 } else {
                     ok = preserve_requeue(task, moe_TRANSFER_STAGE_RAM_TO_PINNED);
                     terminal = 0;
+                }
+            } else if (task.bundle_triplet &&
+                task.target_tier == moe_TIER_VRAM &&
+                (active_path == moe_IO_PATH_GPUDIRECT_STORAGE ||
+                 active_path == moe_IO_PATH_DIRECTSTORAGE_GPU)) {
+                ok = prefetch_expert_bundle_direct_to_gpu_bundle(engine, task, worker_index);
+                if (ok > 0) {
+                    task.vram_token.valid = false;
+                } else if (ok == moe_DEVICE_COPY_BACKPRESSURE) {
+                    ok = prefetch_tensor_direct_to_gpu(
+                        engine,
+                        rec,
+                        task.vram_token,
+                        task.allow_sync_fallback);
+                    if (ok != moe_DEVICE_COPY_BACKPRESSURE) {
+                        task.vram_token.valid = false;
+                    }
+                } else {
+                    task.vram_token.valid = false;
+                }
+                if (ok == moe_DEVICE_COPY_BACKPRESSURE) {
+                    task.urgent = 1;
+                    task.stage = moe_TRANSFER_STAGE_PINNED_TO_GPU;
+                    ok = enqueue_stage_or_retry(engine, engine->gpu_stage, task) ? 1 : 0;
+                    if (ok) {
+                        terminal = 0;
+                        engine->gpu_stage.cv.notify_one();
+                    } else if (task.vram_token.valid) {
+                        device_vram_release_reservation_token(engine, task.vram_token);
+                        task.vram_token.valid = false;
+                    }
                 }
             } else if (should_use_direct_device_path(engine, rec, task.target_tier, active_path)) {
                 ok = prefetch_tensor_direct_to_gpu(

@@ -52,6 +52,8 @@ typedef struct {
     uint32_t gpu_worker_threads;
     uint64_t pinned_staging_bytes;
     uint64_t direct_upload_min_bytes;
+    uint32_t directstorage_staging_queue_capacity;
+    uint32_t directstorage_gpu_queue_capacity;
     int enable_compute_io_overlap;
     int enable_multistage_pipeline;
     int enable_lookahead_prefetch;
@@ -63,6 +65,8 @@ typedef struct {
     int enable_gpudirect_storage;
     int enable_bam_nvme;
     int enable_common_raw_vram_pin;
+    int allow_required_sync_fallback;
+    int require_bundle_native_experts;
     float int4_fallback_threshold;
     uint8_t vram_eviction_threshold_pct;
     uint8_t ram_eviction_threshold_pct;

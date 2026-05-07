@@ -142,42 +142,8 @@ static int moe_effective_tensor_weight_format_for_row_bytes(
     if (rec->weight_row_bytes == moe_tensor_weight_format_row_bytes_for_cols((uint8_t)weight_format, rec->info.cols)) {
         return weight_format;
     }
-    static const uint8_t candidates[] = {
-        moe_WEIGHT_ENCODING_GGUF_Q8_0,
-        moe_WEIGHT_ENCODING_GGUF_Q8_1,
-        moe_WEIGHT_ENCODING_GGUF_Q8_K,
-        moe_WEIGHT_ENCODING_GGUF_Q4_0,
-        moe_WEIGHT_ENCODING_GGUF_Q4_1,
-        moe_WEIGHT_ENCODING_GGUF_Q5_0,
-        moe_WEIGHT_ENCODING_GGUF_Q5_1,
-        moe_WEIGHT_ENCODING_GGUF_Q2_K,
-        moe_WEIGHT_ENCODING_GGUF_Q3_K,
-        moe_WEIGHT_ENCODING_GGUF_Q4_K,
-        moe_WEIGHT_ENCODING_GGUF_Q5_K,
-        moe_WEIGHT_ENCODING_GGUF_Q6_K,
-        moe_WEIGHT_ENCODING_GGUF_IQ2_XXS,
-        moe_WEIGHT_ENCODING_GGUF_IQ2_XS,
-        moe_WEIGHT_ENCODING_GGUF_IQ2_S,
-        moe_WEIGHT_ENCODING_GGUF_IQ3_XXS,
-        moe_WEIGHT_ENCODING_GGUF_IQ3_S,
-        moe_WEIGHT_ENCODING_GGUF_IQ4_NL,
-        moe_WEIGHT_ENCODING_GGUF_IQ4_XS,
-        moe_WEIGHT_ENCODING_GGUF_IQ1_S,
-        moe_WEIGHT_ENCODING_GGUF_IQ1_M,
-        moe_WEIGHT_ENCODING_GGUF_TQ1_0,
-        moe_WEIGHT_ENCODING_GGUF_TQ2_0
-    };
-    int match = weight_format;
-    uint32_t matches = 0;
-    for (uint8_t candidate : candidates) {
-        if (rec->weight_row_bytes == moe_tensor_weight_format_row_bytes_for_cols(candidate, rec->info.cols)) {
-            match = (int)candidate;
-            ++matches;
-        }
-    }
-    if (matches == 1u) {
-        return match;
-    }
+    // The index codec is authoritative. Row-byte mismatches can be physical
+    // stride padding; they must not retag MXFP4 as another 4-bit family.
     return weight_format;
 }
 

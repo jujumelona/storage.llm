@@ -182,6 +182,112 @@ static void reset_staging_slots(moe_pc_engine* engine) {
     engine->staging_slot_cv.notify_all();
 }
 
+static bool moe_stage_idle_for_reconfigure(const moe_stage_queue& stage) {
+    return stage.depth.load(std::memory_order_acquire) == 0 &&
+           stage.inflight.load(std::memory_order_acquire) == 0;
+}
+
+static void configure_staging_slots(moe_pc_engine* engine);
+
+static void pause_new_prefetch_enqueue(moe_pc_engine* engine) {
+    if (!engine) {
+        return;
+    }
+    engine->io_reconfiguring.store(true, std::memory_order_release);
+    engine->disk_stage.cv.notify_all();
+    engine->pinned_stage.cv.notify_all();
+    engine->gpu_stage.cv.notify_all();
+}
+
+static void resume_prefetch_enqueue(moe_pc_engine* engine) {
+    if (!engine) {
+        return;
+    }
+    engine->io_reconfiguring.store(false, std::memory_order_release);
+    engine->disk_stage.cv.notify_all();
+    engine->pinned_stage.cv.notify_all();
+    engine->gpu_stage.cv.notify_all();
+}
+
+static void drain_stage_for_reconfigure(moe_pc_engine* engine, moe_stage_queue& stage) {
+    if (!engine) {
+        return;
+    }
+    while (!engine->io_stop.load(std::memory_order_relaxed) &&
+           !moe_stage_idle_for_reconfigure(stage)) {
+        std::unique_lock<std::mutex> lock(stage.mtx);
+        stage.pop_cv.wait_for(lock, std::chrono::milliseconds(2));
+    }
+}
+
+static void wait_until_all_staging_slots_released(moe_pc_engine* engine) {
+    if (!engine) {
+        return;
+    }
+    for (;;) {
+        bool all_released = true;
+        {
+            std::lock_guard<std::mutex> lock(engine->staging_slot_mutex);
+            for (const auto& slot : engine->staging_slots) {
+                if (slot.in_use.load(std::memory_order_acquire)) {
+                    all_released = false;
+                    break;
+                }
+            }
+        }
+        if (all_released || engine->io_stop.load(std::memory_order_relaxed)) {
+            return;
+        }
+        std::unique_lock<std::mutex> released_lock(engine->staging_slot_released_mutex);
+        engine->staging_slot_released_cv.wait_for(
+            released_lock,
+            std::chrono::milliseconds(2));
+    }
+}
+
+static int moe_reconfigure_staging_safely(moe_pc_engine* engine, uint64_t new_size) {
+    if (!engine) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> resize_lock(engine->staging_resize_mutex);
+    pause_new_prefetch_enqueue(engine);
+    drain_stage_for_reconfigure(engine, engine->disk_stage);
+    drain_stage_for_reconfigure(engine, engine->pinned_stage);
+    drain_stage_for_reconfigure(engine, engine->gpu_stage);
+    wait_until_all_staging_slots_released(engine);
+    reset_staging_slots(engine);
+
+    if (new_size > 0) {
+        free_staging_for_engine(
+            engine,
+            engine->staging,
+            engine->staging_size,
+            engine->staging_pinned,
+            engine->staging_numa_allocated,
+            engine->staging_device_host_allocated);
+        engine->staging = nullptr;
+        engine->staging_size = 0;
+        engine->staging_pinned = false;
+        engine->staging_numa_allocated = false;
+        engine->staging_device_host_allocated = false;
+        engine->staging = allocate_best_staging(
+            engine,
+            new_size,
+            &engine->staging_size,
+            &engine->staging_pinned,
+            &engine->staging_numa_allocated,
+            &engine->staging_device_host_allocated);
+        if (!engine->staging) {
+            resume_prefetch_enqueue(engine);
+            return 0;
+        }
+        engine->io_config.pinned_staging_bytes = engine->staging_size;
+        configure_staging_slots(engine);
+    }
+    resume_prefetch_enqueue(engine);
+    return 1;
+}
+
 static uint64_t moe_staging_min_slot_bytes(const moe_pc_engine* engine) {
     // Size slots to actual tensor data + small padding.
     // Old 64MB floor wasted ~44MB per slot for NVFP4 (~20MB triplets).
@@ -254,8 +360,7 @@ static void moe_staging_slot_targets(
     // Solution: Check unified memory flags instead of backend type
     const bool is_unified_zero_copy = engine && (
         engine->backend_caps.backend == moe_BACKEND_METAL ||
-        (engine->backend_caps.supports_unified_memory &&
-         engine->backend_caps.unified_mmap_gpu_accessible)
+        engine->true_zero_copy_validated.load(std::memory_order_acquire)
     );
 
     if (is_unified_zero_copy) {
@@ -468,67 +573,14 @@ static int moe_ensure_staging_capacity(moe_pc_engine* engine, uint64_t required_
     if (!engine->io_config.enable_pinned_host) {
         return 0;
     }
-
-    bool new_pinned = false;
-    bool new_numa = false;
-    bool new_device_host = false;
-    uint64_t actual_bytes = 0;
-    uint8_t* new_staging = allocate_best_staging(
-        engine,
-        required_bytes,
-        &actual_bytes,
-        &new_pinned,
-        &new_numa,
-        &new_device_host);
-    if (!new_staging) {
+    const int ok = moe_reconfigure_staging_safely(engine, required_bytes);
+    if (!ok) {
         fprintf(stderr,
             "[storageLLM WARNING] unable to grow staging from %llu to %llu bytes; keeping existing staging\n",
             (unsigned long long)engine->staging_size,
             (unsigned long long)required_bytes);
-        return 0;
     }
-
-    std::lock_guard<std::mutex> resize_lock(engine->staging_resize_mutex);
-    if (engine->staging_size >= required_bytes) {
-        free_staging_for_engine(
-            engine,
-            new_staging,
-            actual_bytes,
-            new_pinned,
-            new_numa,
-            new_device_host);
-        return 1;
-    }
-    reset_staging_slots(engine);
-    if (engine->staging_reinit_needed.load(std::memory_order_acquire)) {
-        free_staging_for_engine(
-            engine,
-            new_staging,
-            actual_bytes,
-            new_pinned,
-            new_numa,
-            new_device_host);
-        return 0;
-    }
-
-    free_staging_for_engine(engine, engine->staging, engine->staging_size, engine->staging_pinned,
-                            engine->staging_numa_allocated, engine->staging_device_host_allocated);
-    engine->staging = new_staging;
-    engine->staging_size = actual_bytes;
-    engine->staging_pinned = new_pinned;
-    engine->staging_numa_allocated = new_numa;
-    engine->staging_device_host_allocated = new_device_host;
-    engine->io_config.pinned_staging_bytes = actual_bytes;
-    if (!new_pinned) {
-        fprintf(stderr,
-            "[storageLLM WARNING] staging grew to %llu bytes as non-pinned memory; DMA uses sync fallback\n",
-            (unsigned long long)actual_bytes);
-    } else {
-        fprintf(stderr,
-            "[storageLLM INFO] staging grew to %llu bytes for worker slot budget\n",
-            (unsigned long long)actual_bytes);
-    }
-    return actual_bytes >= required_bytes ? 1 : 0;
+    return ok && engine->staging_size >= required_bytes ? 1 : 0;
 }
 
 static void update_staging_slot_deficit(moe_pc_engine* engine) {

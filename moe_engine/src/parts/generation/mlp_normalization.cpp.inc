@@ -127,19 +127,34 @@ static int moe_add_mlp_residual_f32(
         return 0;
     }
     const moe_attn_config_t cfg = moe_generation_attn_config(engine);
+    const int post_ffw_norm_required = moe_layer_has_post_ffw_norm_weight(engine, layer);
     if (moe_layer_post_ffw_norm_f32(
             engine, layer, s->mlp.data(), hidden_size, s->shared.data(), cfg.rms_norm_eps)) {
         for (uint32_t i = 0; i < hidden_size; ++i) {
-            if (std::isfinite(s->shared[i])) {
-                hidden[i] += s->shared[i];
+            if (!std::isfinite(s->shared[i])) {
+                std::fprintf(stderr,
+                    "[storagellm mlp] non-finite post-ffw norm output layer=%d index=%u\n",
+                    layer, i);
+                return 0;
             }
+            hidden[i] += s->shared[i];
         }
         return 1;
     }
+    if (post_ffw_norm_required) {
+        std::fprintf(stderr,
+            "[storagellm mlp] post-ffw norm tensor is required but could not be mapped layer=%d\n",
+            layer);
+        return 0;
+    }
     for (uint32_t i = 0; i < hidden_size; ++i) {
-        if (std::isfinite(s->mlp[i])) {
-            hidden[i] += s->mlp[i];
+        if (!std::isfinite(s->mlp[i])) {
+            std::fprintf(stderr,
+                "[storagellm mlp] non-finite mlp output layer=%d index=%u\n",
+                layer, i);
+            return 0;
         }
+        hidden[i] += s->mlp[i];
     }
     return 1;
 }
@@ -301,7 +316,7 @@ static int moe_layer_dense_mlp_f32(
     // Bug #5 Fix: Dense MLP should use DENSE_MLP role, not ROUTER.
     // Fall back to ROUTER for backward compatibility with old manifests.
     const moe_storage_raw_span_spec_t* span = find_raw_role_span_bytes(layer, moe_RAW_ROLE_DENSE_MLP, bytes, 0);
-    if (!span) {
+    if (!span && (!engine || !engine->offload_graph_ir_ready.load(std::memory_order_relaxed))) {
         span = find_raw_role_span_bytes(layer, moe_RAW_ROLE_ROUTER, bytes, 0);
     }
     if (!span) {
@@ -378,6 +393,11 @@ static int moe_layer_moe_mlp_f32(
         engine, layer, hidden, hidden_size, s->expert.data(), attn_cfg.rms_norm_eps);
     if (moe_norm_ok) {
         expert_input = s->expert.data();
+    } else if (moe_layer_has_moe_norm_weight(engine, layer)) {
+        std::fprintf(stderr,
+            "[storagellm mlp] expert ffn norm tensor is required but could not be mapped layer=%d\n",
+            layer);
+        return 0;
     }
     moe_profile_log("mlp_moe_norm", "layer=%d ok=%d ms=%.3f", layer, moe_norm_ok, moe_profile_elapsed_ms(norm_start_us));
 
@@ -404,6 +424,11 @@ static int moe_layer_moe_mlp_f32(
         if (moe_layer_post_ffw_norm1_f32(
                 engine, layer, s->shared.data(), hidden_size, s->residual.data(), attn_cfg.rms_norm_eps)) {
             shared_out = s->residual.data();
+        } else if (moe_layer_has_post_ffw_norm1_weight(engine, layer)) {
+            std::fprintf(stderr,
+                "[storagellm mlp] post-ffw norm1 tensor is required but could not be mapped layer=%d\n",
+                layer);
+            return 0;
         }
         for (uint32_t i = 0; i < hidden_size; ++i) {
             s->mlp[i] += shared_out[i] * shared_gate;

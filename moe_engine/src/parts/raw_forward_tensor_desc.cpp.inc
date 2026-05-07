@@ -172,6 +172,12 @@ static int moe_common_tensor_record_to_raw_desc(
     if (rec.dims == 1) {
         desc.rows = (uint32_t)std::min<uint64_t>(rec.shape[0], UINT32_MAX);
         desc.cols = 0;
+    } else if (rec.math_rows > 0 && rec.math_cols > 0) {
+        desc.rows = rec.math_rows;
+        desc.cols = rec.math_cols;
+    } else if (rec.math_rows > 0) {
+        desc.rows = rec.math_rows;
+        desc.cols = 0;
     } else {
         if (!rec.shape[1]) {
             return 0;
@@ -425,12 +431,129 @@ static const moe_gguf_common_tensor_record* moe_common_tensor_find_first_raw_com
     return nullptr;
 }
 
+static int moe_common_tensor_layer_matches(
+    const moe_gguf_common_tensor_record& rec,
+    int32_t layer
+) {
+    if (rec.execution_layer != INT32_MIN) {
+        return rec.execution_layer == layer ? 1 : 0;
+    }
+    uint32_t parsed_layer = 0;
+    return moe_parse_layer_from_gguf_name(rec.name, &parsed_layer) &&
+        (int32_t)parsed_layer == layer ? 1 : 0;
+}
+
+static int moe_common_tensor_op_role_matches(
+    const moe_gguf_common_tensor_record& rec,
+    const char* role
+) {
+    if (!role || !role[0] || rec.op_role.empty()) {
+        return 0;
+    }
+    return rec.op_role == role ? 1 : 0;
+}
+
+static void moe_raw_tensor_kind_op_roles(
+    moe_raw_tensor_kind_t kind,
+    std::vector<const char*>* out
+) {
+    if (!out) {
+        return;
+    }
+    out->clear();
+    switch (kind) {
+        case moe_RAW_TENSOR_INPUT_LAYER_NORM:
+            out->push_back("attention_input_norm");
+            break;
+        case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM:
+            out->push_back("post_attention_norm");
+            out->push_back("ffn_norm");
+            break;
+        case moe_RAW_TENSOR_Q_A_LAYER_NORM:
+            out->push_back("q_norm");
+            break;
+        case moe_RAW_TENSOR_KV_A_LAYER_NORM:
+            out->push_back("k_norm");
+            break;
+        case moe_RAW_TENSOR_V_A_LAYER_NORM:
+            out->push_back("v_norm");
+            break;
+        case moe_RAW_TENSOR_Q_A_PROJ:
+            out->push_back("q_projection");
+            break;
+        case moe_RAW_TENSOR_Q_B_PROJ:
+            out->push_back("q_b_projection");
+            break;
+        case moe_RAW_TENSOR_KV_A_PROJ_WITH_MQA:
+            out->push_back("k_projection");
+            out->push_back("kv_a_projection");
+            break;
+        case moe_RAW_TENSOR_KV_B_PROJ:
+            out->push_back("v_projection");
+            out->push_back("kv_b_projection");
+            break;
+        case moe_RAW_TENSOR_O_PROJ:
+            out->push_back("attention_output");
+            out->push_back("o_projection");
+            break;
+        default:
+            break;
+    }
+}
+
+static const moe_gguf_common_tensor_record* find_common_raw_tensor_record_by_role(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    moe_raw_tensor_kind_t kind,
+    moe_raw_tensor_desc* out_desc
+) {
+    if (!engine) {
+        return nullptr;
+    }
+    std::vector<const char*> roles;
+    moe_raw_tensor_kind_op_roles(kind, &roles);
+    if (roles.empty()) {
+        return nullptr;
+    }
+    for (const moe_gguf_common_tensor_record& rec : engine->gguf_common_tensors) {
+        if (!moe_common_tensor_layer_matches(rec, layer)) {
+            continue;
+        }
+        int role_match = 0;
+        for (const char* role : roles) {
+            if (moe_common_tensor_op_role_matches(rec, role)) {
+                role_match = 1;
+                break;
+            }
+        }
+        if (!role_match) {
+            continue;
+        }
+        moe_raw_tensor_desc desc{};
+        if (!moe_common_tensor_record_to_raw_desc(rec, &desc)) {
+            continue;
+        }
+        if (!moe_common_tensor_record_raw_compatible(rec, desc)) {
+            continue;
+        }
+        if (out_desc) {
+            *out_desc = desc;
+        }
+        return &rec;
+    }
+    return nullptr;
+}
+
 static const moe_gguf_common_tensor_record* find_common_raw_tensor_record(
     const moe_pc_engine* engine,
     int32_t layer,
     moe_raw_tensor_kind_t kind,
     moe_raw_tensor_desc* out_desc
 ) {
+    if (const moe_gguf_common_tensor_record* rec =
+            find_common_raw_tensor_record_by_role(engine, layer, kind, out_desc)) {
+        return rec;
+    }
     std::vector<std::string> names;
     moe_raw_tensor_kind_common_names(layer, kind, &names);
     return moe_common_tensor_find_first_raw_compatible(engine, names, out_desc);
@@ -459,6 +582,38 @@ static const moe_gguf_common_tensor_record* find_common_tensor_by_names(
             }
             return rec;
         }
+    }
+    return nullptr;
+}
+
+static const moe_gguf_common_tensor_record* find_common_tensor_by_op_role(
+    const moe_pc_engine* engine,
+    const char* role,
+    int32_t layer,
+    moe_raw_tensor_desc* out_desc
+) {
+    if (!engine || !role || !role[0]) {
+        return nullptr;
+    }
+    for (const moe_gguf_common_tensor_record& rec : engine->gguf_common_tensors) {
+        if (!moe_common_tensor_op_role_matches(rec, role)) {
+            continue;
+        }
+        if (layer != INT32_MIN && rec.execution_layer != INT32_MIN &&
+            rec.execution_layer != layer) {
+            continue;
+        }
+        moe_raw_tensor_desc desc{};
+        if (!moe_common_tensor_record_to_raw_desc(rec, &desc)) {
+            continue;
+        }
+        if (!moe_common_tensor_record_raw_compatible(rec, desc)) {
+            continue;
+        }
+        if (out_desc) {
+            *out_desc = desc;
+        }
+        return &rec;
     }
     return nullptr;
 }

@@ -243,7 +243,7 @@
     s->head_max.assign(num_heads, -1e30f);
     s->head_denom.assign(num_heads, 0.0f);
 
-    moe_parallel_rows(engine, num_heads, 0, [&](uint32_t h) {
+    if (!moe_parallel_rows(engine, num_heads, 0, [&](uint32_t h) {
         const float* qa_h = s->q_absorbed.data() + h * cdim;
         const float* q_rope_h = s->q_b.data() + h * head_dim + nope_dim;
         float* cw_h = s->c_weighted.data() + h * cdim;
@@ -274,6 +274,9 @@
             float score = moe_dot_f32(qa_h, c_kv, cdim);
             score += moe_dot_f32(q_rope_h, p_k_rope, rope_dim);
             score *= scale;
+            if (!std::isfinite(score)) {
+                return 0;
+            }
 
             if (score > h_max) {
                 // BUGFIX 652: Prevent numerical underflow in softmax rescaling ★★
@@ -301,28 +304,31 @@
             const float inv = 1.0f / h_denom;
             moe_scale_f32(cw_h, inv, cdim);
         } else {
-            // Uniform fallback when denominator too small (should be rare after rescaling fix)
-            const float uniform = 1.0f / (float)loop_end;
-            for (uint32_t i = 0; i < cdim; ++i) {
-                cw_h[i] = uniform;
-            }
+            return 0;
         }
         s->head_max[h] = h_max;
         s->head_denom[h] = h_denom;
         return 1;
-    });
+    })) {
+        return 0;
+    }
 
     // --- V-side absorption: head-parallel expansion ---
     const uint8_t* kv_b_v_base = kv_b_base + kv_b_row_bytes * k_nope_total_dim;
-    moe_parallel_rows(engine, num_heads, 0, [&](uint32_t h) {
+    if (!moe_parallel_rows(engine, num_heads, 0, [&](uint32_t h) {
         float* out_h = s->attn_value.data() + h * v_head_dim;
         const float* cw_h = s->c_weighted.data() + h * cdim;
         for (uint32_t d = 0; d < v_head_dim; ++d) {
             const uint8_t* w_row = kv_b_v_base + kv_b_row_bytes * (h * v_head_dim + d);
             out_h[d] = moe_dot_bf16_row(w_row, cw_h, cdim);
+            if (!std::isfinite(out_h[d])) {
+                return 0;
+            }
         }
         return 1;
-    });
+    })) {
+        return 0;
+    }
 
     // --- O projection: attention value width -> hidden_size ---
     if (!moe_pc_engine_raw_linear_f32(
@@ -335,9 +341,10 @@
     // Impact: NaN in attention output propagates to hidden state
     // Solution: Check for NaN in residual values
     for (uint32_t i = 0; i < hidden_size; ++i) {
-        if (std::isfinite(s->attn[i])) {
-            hidden[i] += s->attn[i];
+        if (!std::isfinite(s->attn[i])) {
+            return 0;
         }
+        hidden[i] += s->attn[i];
     }
     return 1;
 }

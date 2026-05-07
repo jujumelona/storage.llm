@@ -259,10 +259,7 @@ static int moe_router_topk_f32(
             if (v > max_logit) max_logit = v;
         }
         if (has_invalid || !std::isfinite(max_logit)) {
-            const float uniform = 1.0f / (float)experts;
-            for (float& v : *scratch_logits) {
-                v = uniform;
-            }
+            return 0;
         } else {
             double exp_denom = 0.0;
             std::vector<float> exp_values(scratch_logits->size());
@@ -271,10 +268,7 @@ static int moe_router_topk_f32(
                 exp_denom += (double)exp_values[i];
             }
             if (!(exp_denom > 0.0) || !std::isfinite(exp_denom)) {
-                const float uniform = 1.0f / (float)experts;
-                for (float& v : *scratch_logits) {
-                    v = uniform;
-                }
+                return 0;
             } else {
                 const float inv = (float)(1.0 / exp_denom);
                 for (size_t i = 0; i < scratch_logits->size(); ++i) {
@@ -340,10 +334,7 @@ static int moe_router_topk_f32(
         // Problem: denom <= 0 → set to 1e-8f → weights explode by 1e8x → PPL corruption
         // Solution: Use uniform distribution fallback when denom too small
         if (denom <= 1e-6f) {
-            const float uniform = 1.0f / (float)top_k;
-            for (float& w : *out_weights) {
-                w = uniform;
-            }
+            return 0;
         } else {
             for (float& w : *out_weights) {
                 w /= denom;

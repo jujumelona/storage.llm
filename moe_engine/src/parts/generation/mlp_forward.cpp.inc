@@ -309,15 +309,16 @@
     // Impact: 1 missing expert out of 8 causes full token generation failure
     // Solution: Renormalize weights for available experts and continue
     // Only fail if ALL experts are missing
-    if (mapped_experts == 0) {
+    const uint32_t failed_experts = missing_experts + shape_mismatch_experts + map_failed_experts;
+    if (failed_experts > 0) {
         const uint32_t expected_intermediate = gate_rows ? gate_rows : configured_expert_intermediate;
         const uint32_t expected_gate_cols = gate_cols ? gate_cols : hidden_size;
         const uint32_t expected_up_cols = up_cols ? up_cols : hidden_size;
         const uint32_t expected_down_rows = down_rows ? down_rows : hidden_size;
         const uint32_t expected_down_cols = down_cols ? down_cols : configured_expert_intermediate;
         std::fprintf(stderr,
-            "[storagellm mlp] no selected expert shards mapped layer=%d selected=%zu first=%d missing=%u shape_mismatch=%u map_failed=%u expected gate=%ux%u up=%ux%u down=%ux%u first_bad=%d got gate=%ux%u up=%ux%u down=%ux%u\n",
-            layer, num_selected, work[0].expert_id,
+            "[storagellm mlp] selected expert shard contract failed layer=%d selected=%zu mapped=%u first=%d missing=%u shape_mismatch=%u map_failed=%u expected gate=%ux%u up=%ux%u down=%ux%u first_bad=%d got gate=%ux%u up=%ux%u down=%ux%u\n",
+            layer, num_selected, mapped_experts, work[0].expert_id,
             missing_experts, shape_mismatch_experts, map_failed_experts,
             expected_intermediate, expected_gate_cols,
             expected_intermediate, expected_up_cols,
@@ -333,36 +334,6 @@
     // Renormalize weights regardless of router normalization settings (norm_topk)
     // or whether experts failed to map. This guarantees stable output scales.
     // Correctness: only normalized top-k routers may absorb missing expert weight.
-    const uint32_t failed_experts = missing_experts + shape_mismatch_experts + map_failed_experts;
-    if (failed_experts > 0) {
-        const int use_sigmoid = moe_router_uses_sigmoid_scores(engine);
-        const int norm_topk = moe_router_norm_topk_prob(engine, use_sigmoid);
-        float weight_sum = 0.0f;
-        for (size_t e = 0; e < num_selected; ++e) {
-            if (expert_ok[e].load(std::memory_order_acquire)) {
-                weight_sum += work[e].weight;
-            }
-        }
-        if (norm_topk && weight_sum > 1e-9f) {
-            const float scale = 1.0f / weight_sum;
-            for (size_t e = 0; e < num_selected; ++e) {
-                if (expert_ok[e].load(std::memory_order_acquire)) {
-                    work[e].weight *= scale;
-                } else {
-                    work[e].weight = 0.0f;
-                }
-            }
-            std::fprintf(stderr,
-                "[storagellm mlp] renormalized weights layer=%d selected=%zu mapped=%u missing=%u weight_sum=%.6f scale=%.6f\n",
-                layer, num_selected, mapped_experts, failed_experts, weight_sum, scale);
-        } else {
-            for (size_t e = 0; e < num_selected; ++e) {
-                if (!expert_ok[e].load(std::memory_order_acquire)) {
-                    work[e].weight = 0.0f;
-                }
-            }
-        }
-    }
     const uint32_t expert_intermediate = gate_rows;
     if (expert_intermediate == 0) {
         std::fprintf(stderr, "[storagellm mlp] invalid intermediate size layer=%d intermediate=%u\n",
@@ -574,13 +545,13 @@
         if (!std::isfinite(work[e].weight)) {
             std::fprintf(stderr, "[storagellm mlp] invalid expert weight layer=%d expert=%d weight=%f\n",
                 layer, work[e].expert_id, work[e].weight);
-            continue;
+            return 0;
         }
         // BUGFIX 848: Check work[e].out for NULL before axpy ★★★
         if (!work[e].out) {
             std::fprintf(stderr, "[storagellm mlp] NULL expert output layer=%d expert=%d\n",
                 layer, work[e].expert_id);
-            continue;
+            return 0;
         }
         moe_axpy_f32(s->residual.data(), work[e].out, work[e].weight, hidden_size);
     }
@@ -588,6 +559,11 @@
     if (moe_layer_post_ffw_norm2_f32(
             engine, layer, s->residual.data(), hidden_size, s->expert.data(), attn_cfg.rms_norm_eps)) {
         expert_branch = s->expert.data();
+    } else if (moe_layer_has_post_ffw_norm2_weight(engine, layer)) {
+        std::fprintf(stderr,
+            "[storagellm mlp] post-ffw norm2 tensor is required but could not be mapped layer=%d\n",
+            layer);
+        return 0;
     }
     // BUGFIX 768: Check for NaN/Inf in expert_branch before addition ★★★
     // BUGFIX 849: Check expert_branch for NULL before loop ★★★
@@ -596,9 +572,13 @@
         return 0;
     }
     for (uint32_t i = 0; i < hidden_size; ++i) {
-        if (std::isfinite(expert_branch[i])) {
-            s->mlp[i] += expert_branch[i];
+        if (!std::isfinite(expert_branch[i])) {
+            std::fprintf(stderr,
+                "[storagellm mlp] non-finite expert branch layer=%d index=%u\n",
+                layer, i);
+            return 0;
         }
+        s->mlp[i] += expert_branch[i];
     }
     const double accumulate_ms = moe_profile_elapsed_ms(accumulate_start_us);
 
@@ -814,6 +794,11 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                 batch_expert_norm.data() + (size_t)t * hidden_size,
                 attn_cfg.rms_norm_eps)) {
             expert_input = batch_expert_norm.data() + (size_t)t * hidden_size;
+        } else if (moe_layer_has_moe_norm_weight(engine, layer)) {
+            std::fprintf(stderr,
+                "[storagellm mlp] batch expert ffn norm tensor is required but could not be mapped layer=%d token=%u\n",
+                layer, t);
+            return 0;
         }
         expert_inputs[t] = expert_input;
 
@@ -838,6 +823,11 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                     engine, layer, shared_out_buf, hidden_size,
                     local.residual.data(), attn_cfg.rms_norm_eps)) {
                 shared_branch = local.residual.data();
+            } else if (moe_layer_has_post_ffw_norm1_weight(engine, layer)) {
+                std::fprintf(stderr,
+                    "[storagellm mlp] batch post-ffw norm1 tensor is required but could not be mapped layer=%d token=%u\n",
+                    layer, t);
+                return 0;
             }
             for (uint32_t i = 0; i < hidden_size; ++i) {
                 mlp_out[i] += shared_branch[i] * shared_gate;
@@ -948,21 +938,32 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         if (success_count[t] == 0) {
             return 0;
         }
-        float* expert_sum = batch_expert_sum.data() + (size_t)t * hidden_size;
-        if (failed_count[t] > 0 && norm_topk && success_weight_sum[t] > 1e-9f) {
-            const float scale = 1.0f / success_weight_sum[t];
-            for (uint32_t i = 0; i < hidden_size; ++i) {
-                expert_sum[i] *= scale;
-            }
+        if (failed_count[t] > 0) {
+            std::fprintf(stderr,
+                "[storagellm mlp] batch selected expert contract failed layer=%d token=%u failed=%u success=%u\n",
+                layer, t, failed_count[t], success_count[t]);
+            return 0;
         }
+        float* expert_sum = batch_expert_sum.data() + (size_t)t * hidden_size;
         const float* expert_branch = expert_sum;
         if (moe_layer_post_ffw_norm2_f32(
                 engine, layer, expert_sum, hidden_size,
                 local.expert.data(), attn_cfg.rms_norm_eps)) {
             expert_branch = local.expert.data();
+        } else if (moe_layer_has_post_ffw_norm2_weight(engine, layer)) {
+            std::fprintf(stderr,
+                "[storagellm mlp] batch post-ffw norm2 tensor is required but could not be mapped layer=%d token=%u\n",
+                layer, t);
+            return 0;
         }
         float* mlp_out = batch_mlp.data() + (size_t)t * hidden_size;
         for (uint32_t i = 0; i < hidden_size; ++i) {
+            if (!std::isfinite(expert_branch[i])) {
+                std::fprintf(stderr,
+                    "[storagellm mlp] batch non-finite expert branch layer=%d token=%u index=%u\n",
+                    layer, t, i);
+                return 0;
+            }
             mlp_out[i] += expert_branch[i];
         }
         float* hidden = batch_hidden + (size_t)t * hidden_size;
@@ -974,16 +975,30 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
             // Impact: NaN in MLP output propagates to hidden state
             // Solution: Check for NaN in residual values
             for (uint32_t i = 0; i < hidden_size; ++i) {
-                if (std::isfinite(local.shared[i])) {
-                    hidden[i] += local.shared[i];
+                if (!std::isfinite(local.shared[i])) {
+                    std::fprintf(stderr,
+                        "[storagellm mlp] batch non-finite post-ffw norm output layer=%d token=%u index=%u\n",
+                        layer, t, i);
+                    return 0;
                 }
+                hidden[i] += local.shared[i];
             }
         } else {
+            if (moe_layer_has_post_ffw_norm_weight(engine, layer)) {
+                std::fprintf(stderr,
+                    "[storagellm mlp] batch post-ffw norm tensor is required but could not be mapped layer=%d token=%u\n",
+                    layer, t);
+                return 0;
+            }
             // BUGFIX 715: MLP residual addition NaN handling ★★
             for (uint32_t i = 0; i < hidden_size; ++i) {
-                if (std::isfinite(mlp_out[i])) {
-                    hidden[i] += mlp_out[i];
+                if (!std::isfinite(mlp_out[i])) {
+                    std::fprintf(stderr,
+                        "[storagellm mlp] batch non-finite mlp output layer=%d token=%u index=%u\n",
+                        layer, t, i);
+                    return 0;
                 }
+                hidden[i] += mlp_out[i];
             }
         }
     }

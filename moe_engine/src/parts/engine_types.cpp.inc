@@ -1,3 +1,6 @@
+struct moe_pc_engine;
+static int validate_true_zero_copy_mmap(moe_pc_engine* engine, void* mapped_file_ptr, size_t bytes);
+
 struct moe_block_state {
     uint64_t bytes = 0;
     moe_tier_t tier = moe_TIER_DB;
@@ -81,9 +84,19 @@ enum moe_raw_scalar_encoding_t : uint8_t {
 
 struct moe_gguf_common_tensor_record {
     std::string name;
+    std::string op_role;
+    std::string codec_id;
+    std::string codec_registry_version;
+    std::string storage_layout;
     uint16_t resolved_path_index = 0xFFFF;
     uint32_t dims = 0;
     uint64_t shape[4]{};
+    uint32_t source_dims = 0;
+    uint64_t source_shape[4]{};
+    int32_t execution_layer = INT32_MIN;
+    uint32_t math_rows = 0;
+    uint32_t math_cols = 0;
+    uint8_t math_transposed = 0;
     uint32_t type = 0;
     uint8_t weight_encoding = moe_WEIGHT_ENCODING_UNKNOWN;
     uint64_t file_offset = 0;
@@ -145,6 +158,10 @@ struct moe_prefetch_task {
     int bundle_triplet = 0;
     int urgent = 0;
     int allow_sync_fallback = 0;
+    moe_prefetch_reason_t prefetch_reason = moe_PREFETCH_REASON_LOOKAHEAD;
+    uint8_t required_now = 0;
+    uint8_t speculative = 1;
+    uint8_t urgent_required = 0;
     uint8_t requeue_count = 0;
     vram_reservation_token vram_token{};
 };
@@ -157,6 +174,59 @@ struct moe_stage_queue {
     std::deque<moe_prefetch_task> urgent_queue;  // Fix 12: separate deque for O(1) urgent insertion
     std::atomic<uint32_t> depth{0};
     std::atomic<uint32_t> inflight{0};
+};
+
+struct moe_runtime_perf_window {
+    uint64_t tokens = 0;
+    uint64_t expert_hits = 0;
+    uint64_t expert_misses = 0;
+    uint64_t prefetch_used = 0;
+    uint64_t prefetch_wasted = 0;
+    uint64_t sync_h2d_fallbacks = 0;
+    uint64_t disk_read_ns = 0;
+    uint64_t h2d_copy_ns = 0;
+    uint64_t gpu_idle_ns = 0;
+    uint64_t staging_wait_ns = 0;
+    uint64_t directstorage_queue_wait_ns = 0;
+};
+
+struct moe_io_path_perf {
+    std::atomic<uint64_t> submitted{0};
+    std::atomic<uint64_t> completed{0};
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<uint64_t> wait_ns{0};
+    std::atomic<uint64_t> fail_count{0};
+};
+
+static void moe_io_path_perf_submit(moe_io_path_perf& p, uint64_t bytes) {
+    p.submitted.fetch_add(1, std::memory_order_relaxed);
+    p.bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+static void moe_io_path_perf_complete(moe_io_path_perf& p, uint64_t wait_ns) {
+    p.completed.fetch_add(1, std::memory_order_relaxed);
+    p.wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+}
+
+static void moe_io_path_perf_fail(moe_io_path_perf& p, uint64_t wait_ns) {
+    p.fail_count.fetch_add(1, std::memory_order_relaxed);
+    p.wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+}
+
+struct moe_directstorage_device_pending {
+    moe_dstorage_pending_copy io{};
+    uint64_t keys[4]{};
+    uint64_t bytes[4]{};
+    vram_reservation_token tokens[4]{};
+    bool mark_resident[4]{};
+    uint8_t count = 0;
+};
+
+struct moe_directstorage_staging_pending {
+    moe_dstorage_pending_copy io{};
+    uint32_t staging_slot = UINT32_MAX;
+    moe_prefetch_task next_task{};
+    uint64_t expected_bytes = 0;
 };
 
 struct moe_staging_slot {

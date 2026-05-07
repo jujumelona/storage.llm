@@ -21,10 +21,12 @@ typedef enum {
 typedef enum {
     moe_IO_PATH_MMAP_PAGECACHE = 0,
     moe_IO_PATH_PINNED_HOST = 1,
-    moe_IO_PATH_DIRECTSTORAGE = 2,
+    moe_IO_PATH_DIRECTSTORAGE_STAGING = 2,
+    moe_IO_PATH_DIRECTSTORAGE = moe_IO_PATH_DIRECTSTORAGE_STAGING,
     moe_IO_PATH_GPUDIRECT_STORAGE = 3,
     moe_IO_PATH_BAM_NVME = 4,
-    moe_IO_PATH_ZERO_COPY_HOST = 5
+    moe_IO_PATH_ZERO_COPY_HOST = 5,
+    moe_IO_PATH_DIRECTSTORAGE_GPU = 6
 } moe_io_path_t;
 
 typedef enum {

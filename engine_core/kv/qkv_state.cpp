@@ -29,10 +29,18 @@ static uint64_t qkv_cache_key(int dim, uint64_t tag) {
     return x;
 }
 
-static std::shared_ptr<std::vector<float>> qkv_cached_codebook(int dim, int bits, bool thresholds) {
+static std::shared_ptr<std::vector<float>> qkv_cached_codebook(
+    int dim,
+    int bits,
+    bool thresholds,
+    unsigned distribution
+) {
     static std::mutex mutex;
     static std::unordered_map<uint64_t, std::shared_ptr<std::vector<float>>> cache;
-    const uint64_t key = qkv_cache_key(dim, (uint64_t)bits | (thresholds ? 0x10000ull : 0ull));
+    const uint64_t tag = (uint64_t)bits |
+        (thresholds ? 0x10000ull : 0ull) |
+        ((uint64_t)distribution << 24);
+    const uint64_t key = qkv_cache_key(dim, tag);
     std::lock_guard<std::mutex> lock(mutex);
     auto found = cache.find(key);
     if (found != cache.end()) return found->second;
@@ -40,21 +48,25 @@ static std::shared_ptr<std::vector<float>> qkv_cached_codebook(int dim, int bits
     const int levels = 1 << bits;
     auto codebook = std::make_shared<std::vector<float>>((size_t)levels);
     auto thresh = std::make_shared<std::vector<float>>((size_t)levels + 1u);
-    qkv_compute_lloyd_max_codebook(codebook->data(), thresh->data(), bits, dim);
-    cache[qkv_cache_key(dim, (uint64_t)bits)] = codebook;
-    cache[qkv_cache_key(dim, (uint64_t)bits | 0x10000ull)] = thresh;
+    qkv_compute_lloyd_max_codebook_ex(codebook->data(), thresh->data(), bits, dim, distribution);
+    cache[qkv_cache_key(dim, (uint64_t)bits | ((uint64_t)distribution << 24))] = codebook;
+    cache[qkv_cache_key(dim, (uint64_t)bits | 0x10000ull | ((uint64_t)distribution << 24))] = thresh;
     return thresholds ? thresh : codebook;
 }
 
-static std::shared_ptr<std::vector<float>> qkv_cached_rotation(int dim, uint64_t seed) {
+static std::shared_ptr<std::vector<float>> qkv_cached_rotation(
+    int dim,
+    uint64_t seed,
+    unsigned rotation_backend
+) {
     static std::mutex mutex;
     static std::unordered_map<uint64_t, std::shared_ptr<std::vector<float>>> cache;
-    const uint64_t key = qkv_cache_key(dim, seed);
+    const uint64_t key = qkv_cache_key(dim, seed ^ ((uint64_t)rotation_backend << 56));
     std::lock_guard<std::mutex> lock(mutex);
     auto found = cache.find(key);
     if (found != cache.end()) return found->second;
     auto matrix = std::make_shared<std::vector<float>>((size_t)dim * (size_t)dim);
-    qkv_generate_rotation_matrix(matrix->data(), dim, seed);
+    qkv_generate_rotation_matrix_ex(matrix->data(), dim, seed, rotation_backend);
     cache[key] = matrix;
     return matrix;
 }
@@ -72,12 +84,12 @@ static std::shared_ptr<std::vector<float>> qkv_cached_qjl(int dim, uint64_t seed
     return matrix;
 }
 
-static int qkv_state_assign_codebook(qkv_state_t* state, int dim, int bits) {
+static int qkv_state_assign_codebook(qkv_state_t* state, int dim, int bits, unsigned distribution) {
     if (!state) return 0;
     if (qkv_bits_raw(bits)) return 1;
     if (!qkv_bits_codebook(bits)) return 0;
-    auto codebook = qkv_cached_codebook(dim, bits, false);
-    auto thresholds = qkv_cached_codebook(dim, bits, true);
+    auto codebook = qkv_cached_codebook(dim, bits, false, distribution);
+    auto thresholds = qkv_cached_codebook(dim, bits, true, distribution);
     if (!codebook || !thresholds || codebook->empty() || thresholds->empty()) {
         return 0;
     }
@@ -116,6 +128,14 @@ int qkv_state_init(
         !qkv_bits_valid(k_bits) || !qkv_bits_valid(v_bits) ||
         !qkv_bits_valid(k_outlier_bits) || !qkv_bits_valid(k_normal_bits) ||
         !qkv_bits_valid(v_outlier_bits) || !qkv_bits_valid(v_normal_bits)) {
+        return 0;
+    }
+    if (config->rotation_backend != QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL &&
+        config->rotation_backend != QKV_ROTATION_BACKEND_HADAMARD_SIGN_FAST) {
+        return 0;
+    }
+    if (config->codebook_distribution != QKV_CODEBOOK_DISTRIBUTION_EXACT_BETA &&
+        config->codebook_distribution != QKV_CODEBOOK_DISTRIBUTION_GAUSSIAN_APPROX) {
         return 0;
     }
     // BUGFIX 405: n_tokens 범위 체크
@@ -173,7 +193,7 @@ int qkv_state_init(
     }
 
     if (config->enable_rotation) {
-        auto matrix = qkv_cached_rotation(dim, config->rotation_seed);
+        auto matrix = qkv_cached_rotation(dim, config->rotation_seed, config->rotation_backend);
         // BUGFIX 409: matrix 유효성 체크 강화
         if (!matrix || matrix->empty() || matrix->size() != (size_t)dim * (size_t)dim) {
             qkv_state_free(state);
@@ -186,8 +206,10 @@ int qkv_state_init(
         }
 
         // BUGFIX Issue 9: Extract sign vector for Hadamard structure (power-of-2 dims)
-        const bool is_power_of_2 = (dim & (dim - 1)) == 0;
-        if (is_power_of_2) {
+        const bool is_hadamard_backend =
+            config->rotation_backend == QKV_ROTATION_BACKEND_HADAMARD_SIGN_FAST &&
+            ((dim & (dim - 1)) == 0);
+        if (is_hadamard_backend) {
             state->rotation_signs = (float*)std::malloc((size_t)dim * sizeof(float));
             if (!state->rotation_signs) {
                 qkv_state_free(state);
@@ -215,12 +237,13 @@ int qkv_state_init(
         }
     }
 
-    if (!qkv_state_assign_codebook(state, dim, k_storage_bits) ||
-        !qkv_state_assign_codebook(state, dim, v_storage_bits) ||
-        !qkv_state_assign_codebook(state, dim, k_outlier_bits) ||
-        !qkv_state_assign_codebook(state, dim, k_normal_bits) ||
-        !qkv_state_assign_codebook(state, dim, v_outlier_bits) ||
-        !qkv_state_assign_codebook(state, dim, v_normal_bits)) {
+    const unsigned codebook_distribution = config->codebook_distribution;
+    if (!qkv_state_assign_codebook(state, dim, k_storage_bits, codebook_distribution) ||
+        !qkv_state_assign_codebook(state, dim, v_storage_bits, codebook_distribution) ||
+        !qkv_state_assign_codebook(state, dim, k_outlier_bits, codebook_distribution) ||
+        !qkv_state_assign_codebook(state, dim, k_normal_bits, codebook_distribution) ||
+        !qkv_state_assign_codebook(state, dim, v_outlier_bits, codebook_distribution) ||
+        !qkv_state_assign_codebook(state, dim, v_normal_bits, codebook_distribution)) {
         qkv_state_free(state);
         return 0;
     }
@@ -283,10 +306,10 @@ int qkv_state_init(
         // BUGFIX 411: bits 범위 체크
         if (!qkv_bits_valid(k_out_storage_bits) || !qkv_bits_valid(k_norm_storage_bits) ||
             !qkv_bits_valid(v_out_storage_bits) || !qkv_bits_valid(v_norm_storage_bits) ||
-            !qkv_state_assign_codebook(state, dim, k_out_storage_bits) ||
-            !qkv_state_assign_codebook(state, dim, k_norm_storage_bits) ||
-            !qkv_state_assign_codebook(state, dim, v_out_storage_bits) ||
-            !qkv_state_assign_codebook(state, dim, v_norm_storage_bits)) {
+            !qkv_state_assign_codebook(state, dim, k_out_storage_bits, codebook_distribution) ||
+            !qkv_state_assign_codebook(state, dim, k_norm_storage_bits, codebook_distribution) ||
+            !qkv_state_assign_codebook(state, dim, v_out_storage_bits, codebook_distribution) ||
+            !qkv_state_assign_codebook(state, dim, v_norm_storage_bits, codebook_distribution)) {
             qkv_state_free(state);
             return 0;
         }

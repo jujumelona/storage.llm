@@ -144,7 +144,12 @@ static int moe_map_embedding_tensor(
         "transformer.wte.weight"
     };
     moe_raw_tensor_desc desc{};
-    const moe_gguf_common_tensor_record* rec =
+    const moe_gguf_common_tensor_record* rec = find_common_tensor_by_op_role(
+        engine, "token_embedding", -1, &desc);
+    if (rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size) {
+        return map_common_tensor_record(engine, *rec, desc, out);
+    }
+    rec =
         find_common_tensor_by_names(engine, embedding_names, sizeof(embedding_names) / sizeof(embedding_names[0]), &desc);
     if (!rec || desc.cols != c->hidden_size || desc.rows < c->vocab_size) {
         return 0;

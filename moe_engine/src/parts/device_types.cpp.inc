@@ -19,6 +19,7 @@ typedef int (*moe_cu_mem_free_fn)(uint64_t);
 typedef int (*moe_cu_memcpy_htod_fn)(uint64_t, const void*, size_t);
 typedef int (*moe_cu_memcpy_htod_async_fn)(uint64_t, const void*, size_t, void*);
 typedef int (*moe_cu_memcpy_dtod_fn)(uint64_t, uint64_t, size_t);
+typedef int (*moe_cu_memcpy_dtoh_fn)(void*, uint64_t, size_t);
 typedef int (*moe_cu_mem_get_info_fn)(size_t*, size_t*);
 typedef int (*moe_cu_stream_create_fn)(void**, unsigned int);
 typedef int (*moe_cu_stream_synchronize_fn)(void*);
@@ -33,6 +34,15 @@ struct moe_cufile_error_t {
     int cu_err;
 };
 typedef long long (*moe_cufile_read_fn)(void*, void*, size_t, int64_t, int64_t);
+typedef moe_cufile_error_t (*moe_cufile_read_async_fn)(
+    void*,
+    void*,
+    size_t*,
+    int64_t*,
+    int64_t*,
+    void*
+);
+typedef moe_cufile_error_t (*moe_cufile_stream_register_fn)(void*, unsigned int);
 typedef int (*moe_hip_device_get_attribute_fn)(int*, int, int);
 typedef int (*moe_ze_init_fn)(uint32_t);
 typedef int (*moe_ze_driver_get_fn)(uint32_t*, void**);
@@ -91,6 +101,8 @@ struct moe_cuda_driver_api {
     moe_cufile_error_t (*cuFileBufRegister)(void*, size_t, int) = nullptr; // (devPtr, size, flags)
     moe_cufile_error_t (*cuFileBufDeregister)(void*) = nullptr;            // (devPtr)
     moe_cufile_read_fn cuFileRead = nullptr;  // (handle, devPtr, size, file_off, buf_off)
+    moe_cufile_read_async_fn cuFileReadAsync = nullptr;
+    moe_cufile_stream_register_fn cuFileStreamRegister = nullptr;
     bool cufile_available = false;
 
     // cuMemHostRegister ??for io_uring registered buffer integration
@@ -115,6 +127,7 @@ struct moe_hip_driver_api {
     moe_cu_memcpy_htod_fn hipMemcpyHtoD = nullptr;
     moe_cu_memcpy_htod_async_fn hipMemcpyHtoDAsync = nullptr;
     moe_cu_memcpy_dtod_fn hipMemcpyDtoD = nullptr;
+    moe_cu_memcpy_dtoh_fn hipMemcpyDtoH = nullptr;
     moe_cu_mem_get_info_fn hipMemGetInfo = nullptr;
     moe_cu_stream_create_fn hipStreamCreate = nullptr;
     moe_cu_stream_synchronize_fn hipStreamSynchronize = nullptr;
@@ -127,6 +140,9 @@ struct moe_hip_driver_api {
     // hipHostMalloc/hipHostFree for IOMMU-registered pinned staging.
     int (*hipHostMalloc)(void**, size_t, unsigned int) = nullptr;
     int (*hipHostFree)(void*) = nullptr;
+    int (*hipHostRegister)(void*, size_t, unsigned int) = nullptr;
+    int (*hipHostGetDevicePointer)(void**, void*, unsigned int) = nullptr;
+    int (*hipHostUnregister)(void*) = nullptr;
 };
 
 // Level Zero basic API hooks
@@ -207,9 +223,13 @@ struct moe_device_allocation {
     uint64_t ptr = 0;
     uint64_t bytes = 0;
     uint64_t last_touch_epoch = 0;
+    uint64_t owner_key = 0;
+    uint64_t view_offset = 0;
     uint32_t inflight_copies = 0;
+    uint32_t bundle_view_ref_count = 0;
     bool pending_free = false;
     bool resident_accounted = false;
+    bool is_view = false;
     uint8_t pool = 0;
     uint8_t backend_kind = 0;
     uint64_t backend_aux = 0;
@@ -237,6 +257,29 @@ enum {
     moe_DEVICE_ALLOC_D3D12_RESOURCE = 2
 };
 
+static constexpr uint32_t moe_DSTORAGE_STATUS_SLOTS = 1024u;
+
+struct moe_dstorage_status_slot {
+    std::atomic<bool> in_use{false};
+    void* array = nullptr;
+    uint32_t index = 0;
+    uint64_t generation = 0;
+};
+
+struct moe_dstorage_pending_copy {
+    void* status_array = nullptr;
+    uint32_t status_index = 0;
+    moe_dstorage_status_slot* slots = nullptr;
+    int slot_index = -1;
+    uint64_t generation = 0;
+    uint64_t key = 0;
+    uint64_t bytes = 0;
+    void* resource = nullptr;
+    void* file = nullptr;
+    uint64_t submitted_us = 0;
+    bool direct_to_gpu = false;
+};
+
 struct moe_directstorage_state {
     void* factory = nullptr;
     void* queue = nullptr;
@@ -244,9 +287,12 @@ struct moe_directstorage_state {
     void* status_array = nullptr;
     void* gpu_status_array = nullptr;
     void* event_handle = nullptr;
+    void* completion_wait_handle = nullptr;
     void* d3d12_device = nullptr;
     uint32_t status_index = 0;
     uint32_t gpu_status_index = 0;
+    moe_dstorage_status_slot status_slots[moe_DSTORAGE_STATUS_SLOTS]{};
+    moe_dstorage_status_slot gpu_status_slots[moe_DSTORAGE_STATUS_SLOTS]{};
     bool initialized = false;
     bool available = false;
     bool gpu_available = false;
@@ -264,4 +310,22 @@ struct vram_reservation_token {
     uint64_t bytes = 0;
     uint8_t pool = moe_DEVICE_POOL_EXPERT;
     bool valid = false;
+};
+
+enum {
+    moe_GDS_BLOCKING_TENSOR = 1,
+    moe_GDS_BLOCKING_BUNDLE = 2
+};
+
+struct moe_gds_blocking_copy {
+    uint32_t kind = 0;
+    void* file_handle = nullptr;
+    CUdeviceptr dst = 0;
+    uint64_t bytes = 0;
+    uint64_t ranges[3][2]{};
+    uint32_t range_count = 0;
+    uint64_t key = 0;
+    vram_reservation_token token{};
+    uint64_t view_keys[3]{};
+    uint32_t view_count = 0;
 };

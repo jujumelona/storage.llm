@@ -381,6 +381,35 @@ static int level_zero_driver_load(moe_level_zero_driver_api* api, uint32_t devic
     return 1;
 }
 
+static void apply_unified_memory_budget_if_needed(moe_pc_engine* e) {
+    if (!e) {
+        return;
+    }
+    if (!(e->backend_caps.supports_unified_memory || e->backend_caps.is_integrated_gpu)) {
+        return;
+    }
+    const uint64_t sys = e->backend_caps.system_memory_bytes > 0
+        ? e->backend_caps.system_memory_bytes
+        : storagellm::total_ram_bytes();
+    if (sys == 0) {
+        return;
+    }
+    uint64_t pct = e->io_config.metal_memory_budget_pct;
+    if (pct == 0 || pct < 50 || pct > 90) {
+        pct = 75;
+    }
+    const uint64_t budget = (sys * pct) / 100ull;
+    e->backend_caps.device_memory_bytes = budget;
+    e->device_total_bytes.store(sys, std::memory_order_release);
+    e->device_free_bytes.store(budget, std::memory_order_release);
+    e->config.ram_budget_bytes = 0;
+    e->true_zero_copy_validated.store(
+        (e->backend_caps.backend == moe_BACKEND_METAL &&
+         e->backend_caps.supports_unified_memory &&
+         e->backend_caps.unified_mmap_gpu_accessible) != 0,
+        std::memory_order_release);
+}
+
 static int device_allocator_init(moe_pc_engine* e) {
     if (!e || e->device_allocator_ready.load() != 0) return e && e->device_allocator_ready.load() > 0;
     if (!e->config.prefer_gpu) return 0;
@@ -437,8 +466,7 @@ static int device_allocator_init(moe_pc_engine* e) {
     // BUGFIX Issue 5: Generalize to all unified memory backends ★★★
     } else if (e->backend_caps.backend == moe_BACKEND_METAL ||
                (e->backend_caps.supports_unified_memory &&
-                (e->backend_caps.backend == moe_BACKEND_HIP ||
-                 e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO))) {
+                e->backend_caps.backend == moe_BACKEND_HIP)) {
         // Unified memory: reserve 25% for OS (Metal, AMD APU, Intel integrated)
         const uint64_t sys = e->backend_caps.system_memory_bytes > 0
             ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
@@ -559,6 +587,7 @@ static int device_allocator_init(moe_pc_engine* e) {
                 // Only set for actual iGPUs (Iris Xe), NOT for Arc dGPUs with ReBAR
                 if (props.flags & 1u) {
                     e->backend_caps.supports_unified_memory = true;
+                    e->backend_caps.is_integrated_gpu = true;
                     fprintf(stderr,
                         "[storageLLM INFO] Level Zero integrated GPU detected, enabling unified memory mode\n");
                 }
@@ -791,6 +820,7 @@ static int device_allocator_init(moe_pc_engine* e) {
         e->device_free_bytes.store(free_mem);
         e->device_total_bytes.store(total_mem);
     }
+    apply_unified_memory_budget_if_needed(e);
     device_refresh_mem_info(e);
 
     // CRITICAL ORDER: init_kv_vram_budget MUST precede common_vram_wanted_bytes.

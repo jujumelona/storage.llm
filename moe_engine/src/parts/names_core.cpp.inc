@@ -43,14 +43,16 @@ const char* moe_io_path_name(moe_io_path_t path) {
             return "mmap_pagecache";
         case moe_IO_PATH_PINNED_HOST:
             return "pinned_host";
-        case moe_IO_PATH_DIRECTSTORAGE:
-            return "directstorage";
+        case moe_IO_PATH_DIRECTSTORAGE_STAGING:
+            return "directstorage_staging";
         case moe_IO_PATH_GPUDIRECT_STORAGE:
             return "gpudirect_storage";
         case moe_IO_PATH_BAM_NVME:
             return "bam_nvme";
         case moe_IO_PATH_ZERO_COPY_HOST:
             return "zero_copy_host";
+        case moe_IO_PATH_DIRECTSTORAGE_GPU:
+            return "directstorage_gpu";
         default:
             return "unknown";
     }

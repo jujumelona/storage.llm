@@ -49,6 +49,19 @@ bool qkv_is_enabled(void);
 // QKV Configuration
 // ============================================================
 
+#ifndef QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL
+#define QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL 0u
+#endif
+#ifndef QKV_ROTATION_BACKEND_HADAMARD_SIGN_FAST
+#define QKV_ROTATION_BACKEND_HADAMARD_SIGN_FAST 1u
+#endif
+#ifndef QKV_CODEBOOK_DISTRIBUTION_EXACT_BETA
+#define QKV_CODEBOOK_DISTRIBUTION_EXACT_BETA 0u
+#endif
+#ifndef QKV_CODEBOOK_DISTRIBUTION_GAUSSIAN_APPROX
+#define QKV_CODEBOOK_DISTRIBUTION_GAUSSIAN_APPROX 1u
+#endif
+
 typedef struct {
     int k_bits;               // Key bits (default: 3)
     int v_bits;               // Value bits (default: 2)
@@ -57,6 +70,9 @@ typedef struct {
     bool enable_rotation;     // Enable random rotation (recommended: true)
     uint64_t rotation_seed;   // Seed for random rotation matrix
     uint64_t qjl_seed;        // Seed for QJL random matrix
+    uint32_t rotation_backend; // 0 = paper Gaussian QR, 1 = Hadamard+sign fast path
+    uint32_t codebook_distribution; // 0 = exact Beta, 1 = Gaussian approximation
+    uint64_t policy_hash;     // Hash of the QKV_POLICY contract, 0 = derive from config
     // Fix 4: Outlier channel support (paper Table 1, Section 4.3)
     // The paper labels this as a 2.5-bit setup, but 32 @ 3-bit + 96 @ 2-bit
     // over 128 channels computes to 2.25 bits/channel. Keep budgets arithmetic-based.
@@ -88,6 +104,9 @@ static inline qkv_config_t qkv_config_default(int head_dim) {
     cfg.enable_rotation = true;
     cfg.rotation_seed = 42;
     cfg.qjl_seed = 43;
+    cfg.rotation_backend = QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL;
+    cfg.codebook_distribution = QKV_CODEBOOK_DISTRIBUTION_EXACT_BETA;
+    cfg.policy_hash = 0;
     // Fix 4: Default to no outlier separation (backward compatible)
     cfg.outlier_channels = 0;
     cfg.outlier_bits = 3;

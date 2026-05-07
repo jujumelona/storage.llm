@@ -24,6 +24,12 @@ struct moe_pc_engine {
     moe_backend_caps_t backend_caps{};
     moe_io_ring_adapter ring_adapter{};
     moe_directstorage_state directstorage{};
+    std::atomic<bool> runtime_gpudirect_ready{false};
+    std::atomic<bool> runtime_directstorage_staging_ready{false};
+    std::atomic<bool> runtime_directstorage_gpu_ready{false};
+    std::atomic<bool> true_zero_copy_validated{false};
+    std::atomic<bool> juju_bundle_4k_aligned{false};
+    std::atomic<bool> io_reconfiguring{false};
 #if defined(__linux__) && defined(MOE_HAVE_LIBURING) && MOE_HAVE_LIBURING
     io_uring_state_t uring_state{};
 #endif
@@ -208,6 +214,17 @@ struct moe_pc_engine {
     std::atomic<uint32_t> prefetch_waste_ratio_milli{0};
     std::atomic<uint32_t> gpu_copy_idle_milli{0};
     std::atomic<uint32_t> adaptive_prefetch_window_last{0};
+    std::atomic<uint64_t> autotune_last_tick_ms{0};
+    std::atomic<uint64_t> autotune_prev_tokens{0};
+    std::atomic<uint64_t> autotune_prev_hits{0};
+    std::atomic<uint64_t> autotune_prev_misses{0};
+    std::atomic<uint64_t> autotune_prev_prefetch_planned{0};
+    std::atomic<uint64_t> autotune_prev_prefetch_wasted{0};
+    std::atomic<uint64_t> autotune_prev_sync_h2d{0};
+    std::atomic<uint64_t> autotune_prev_directstorage_bytes{0};
+    std::atomic<uint64_t> autotune_prev_directstorage_queue_wait{0};
+    std::atomic<uint64_t> autotune_prev_h2d_bytes{0};
+    std::atomic<uint64_t> autotune_prev_staging_waits{0};
     mutable std::atomic<int> cached_gelu_activation_mode{-1};
     mutable std::atomic<int> cached_router_use_sigmoid{-1};
     mutable std::atomic<int> cached_router_norm_topk_prob{-1};
@@ -268,6 +285,24 @@ struct moe_pc_engine {
     std::mutex cufile_cache_mutex;
     std::unordered_map<moe_cufile_handle_key, void*, moe_cufile_handle_key_hash> cufile_file_handle_cache;
     std::unordered_map<uint64_t, uint64_t> cufile_buffer_registration_cache;
+    std::mutex directstorage_pending_mutex;
+    std::vector<moe_directstorage_device_pending> directstorage_pending_device_copies;
+    std::mutex directstorage_staging_pending_mutex;
+    std::vector<moe_directstorage_staging_pending> directstorage_pending_staging_copies;
+    std::atomic<uint32_t> directstorage_pending_count{0};
+    std::mutex directstorage_gpu_submit_mutex;
+    std::mutex directstorage_staging_submit_mutex;
+    std::mutex gds_stream_cache_mutex;
+    std::unordered_set<CUstream> gds_registered_streams;
+    std::mutex gds_blocking_mutex;
+    std::condition_variable gds_blocking_cv;
+    std::deque<moe_gds_blocking_copy> gds_blocking_queue;
+    std::thread gds_blocking_worker;
+    std::atomic<uint32_t> gds_blocking_pending{0};
+    moe_io_path_perf gds_perf{};
+    moe_io_path_perf ds_gpu_perf{};
+    moe_io_path_perf ds_staging_perf{};
+    moe_io_path_perf pinned_perf{};
     std::atomic<uint64_t> device_total_bytes{0};
     std::atomic<uint64_t> device_free_bytes{0};
     std::atomic<uint64_t> pending_ram_reservation{0};
@@ -451,9 +486,11 @@ struct moe_pc_engine {
     std::vector<uint32_t> qkv_head_state_layers;
     std::vector<uint32_t> qkv_head_state_heads;
     std::vector<uint64_t> qkv_head_state_fingerprints;
+    std::vector<uint64_t> qkv_head_state_epochs;
     qkv_config_t qkv_cfg{};
     std::atomic<bool> qkv_cfg_initialized{false};
     uint32_t qkv_last_ctx = 0;  // Track context size for reallocation
+    uint64_t qkv_context_epoch = 1;
     std::atomic<uint32_t> eval_plain_kv_active{0};
     std::vector<CUstream> stream_pool;
     std::mutex stream_pool_mutex;
@@ -556,7 +593,7 @@ static uint32_t runtime_pinned_workers(const moe_pc_engine* engine) {
     if (!engine) {
         return 1u;
     }
-    if (engine->backend_caps.supports_zero_copy_host ||
+    if (engine->true_zero_copy_validated.load(std::memory_order_acquire) ||
         !engine->io_config.enable_pinned_host ||
         !engine->io_config.enable_multistage_pipeline) {
         return 0u;
@@ -572,10 +609,16 @@ static uint32_t runtime_gpu_workers(const moe_pc_engine* engine) {
     if (!engine) {
         return 1u;
     }
-    if (engine->backend_caps.supports_zero_copy_host ||
-        !engine->config.prefer_gpu ||
-        (engine->backend_caps.backend != moe_BACKEND_CUDA &&
-         engine->backend_caps.backend != moe_BACKEND_HIP)) {
+    if (engine->true_zero_copy_validated.load(std::memory_order_acquire) ||
+        !engine->config.prefer_gpu) {
+        return 0u;
+    }
+    const bool upload_backend =
+        engine->backend_caps.backend == moe_BACKEND_CUDA ||
+        engine->backend_caps.backend == moe_BACKEND_HIP ||
+        (engine->backend_caps.backend == moe_BACKEND_DIRECTML &&
+         engine->runtime_directstorage_gpu_ready.load(std::memory_order_acquire));
+    if (!upload_backend) {
         return 0u;
     }
     uint32_t workers = engine->runtime_gpu_worker_threads.load(std::memory_order_relaxed);

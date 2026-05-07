@@ -43,7 +43,7 @@ static int prefetch_tensor_pinned_to_gpu(
     uint32_t staging_slot = UINT32_MAX,
     uint64_t staging_bytes = 0,
     int sync_after = 1,
-    int allow_sync_fallback = 1,
+    int allow_sync_fallback = 0,
     const vram_reservation_token& reservation = vram_reservation_token{}
 ) {
     if (!engine) {
@@ -64,7 +64,8 @@ static int prefetch_tensor_pinned_to_gpu(
             staging_bytes,
             owned_slot,
             1,
-            reservation
+            reservation,
+            allow_sync_fallback ? 1 : 0
         );
     } else {
         if (staging_slot != UINT32_MAX) {
@@ -142,7 +143,8 @@ static int prefetch_expert_triplet_pinned_to_gpu_bundle(
             task.bundle_bytes[i],
             task.staging_slot,
             0,
-            sub_token);
+            sub_token,
+            task.allow_sync_fallback ? 1 : 0);
         if (sub_token.valid) {
             token_bytes_consumed += sub_token.bytes;
         }
@@ -164,6 +166,77 @@ static int prefetch_expert_triplet_pinned_to_gpu_bundle(
     return 1;
 }
 
+static int is_moe_expert_tensor_record(const moe_pc_engine* engine, const moe_tensor_record& rec) {
+    if (rec.info.proj != moe_PROJ_GATE &&
+        rec.info.proj != moe_PROJ_UP &&
+        rec.info.proj != moe_PROJ_DOWN) {
+        return 0;
+    }
+    return tensor_dense_slot(
+        engine,
+        static_cast<int>(rec.info.layer),
+        static_cast<int>(rec.info.expert),
+        rec.info.proj) != tensor_slot_invalid() ? 1 : 0;
+}
+
+static int prefetch_expert_bundle_direct_to_gpu_bundle(
+    moe_pc_engine* engine,
+    const moe_prefetch_task& task,
+    uint32_t worker_index = UINT32_MAX
+) {
+    if (!engine || !task.bundle_triplet ||
+        task.bundle_layer < 0 || task.bundle_expert < 0) {
+        return moe_DEVICE_COPY_BACKPRESSURE;
+    }
+    const moe_projection_t projs[3] = {moe_PROJ_GATE, moe_PROJ_UP, moe_PROJ_DOWN};
+    const moe_tensor_record* recs[3] = {};
+    for (uint32_t i = 0; i < 3u; ++i) {
+        recs[i] = find_tensor_record(
+            engine,
+            task.bundle_layer,
+            task.bundle_expert,
+            projs[i]);
+    }
+    uint64_t bundle_offset = 0;
+    uint64_t bundle_size = 0;
+    if (!expert_bundle_is_contiguous_4k_aligned(recs, &bundle_offset, &bundle_size)) {
+        return moe_DEVICE_COPY_BACKPRESSURE;
+    }
+    (void)bundle_offset;
+    const moe_io_path_t path = choose_active_io_path(engine);
+    int copied = 0;
+    if (path == moe_IO_PATH_DIRECTSTORAGE_GPU) {
+        copied = device_copy_expert_bundle_directstorage_gpu(
+            engine,
+            recs,
+            moe_DEVICE_POOL_EXPERT,
+            task.vram_token,
+            worker_index);
+    } else if (path == moe_IO_PATH_GPUDIRECT_STORAGE) {
+        copied = device_copy_expert_bundle_gpudirect_storage(
+            engine,
+            recs,
+            moe_DEVICE_POOL_EXPERT,
+            task.vram_token,
+            worker_index,
+            task.allow_sync_fallback ? 1 : 0);
+    } else {
+        return moe_DEVICE_COPY_BACKPRESSURE;
+    }
+    if (copied == moe_DEVICE_COPY_BACKPRESSURE) {
+        return moe_DEVICE_COPY_BACKPRESSURE;
+    }
+    if (!copied) {
+        return 0;
+    }
+    device_drain_deferred_staging_copies(engine, false);
+    device_drain_directstorage_device_copies(engine);
+    engine->io_atomic.direct_stage_done.fetch_add(1, std::memory_order_relaxed);
+    engine->io_atomic.gpu_stage_done.fetch_add(1, std::memory_order_relaxed);
+    (void)bundle_size;
+    return 1;
+}
+
 static int prefetch_tensor_direct_to_gpu(
     moe_pc_engine* engine,
     const moe_tensor_record& rec,
@@ -174,8 +247,25 @@ static int prefetch_tensor_direct_to_gpu(
         return 0;
     }
     const uint64_t bytes = tensor_stream_bytes(rec);
-    int copied = device_copy_tensor_gpudirect_storage(engine, rec, moe_DEVICE_POOL_EXPERT, reservation);
+    const moe_io_path_t active_path = choose_active_io_path(engine);
+    int copied = device_copy_tensor_directstorage_gpu(engine, rec, moe_DEVICE_POOL_EXPERT, reservation);
+    const bool directstorage_gpu_submitted =
+        copied == moe_DEVICE_COPY_PENDING_ASYNC && active_path == moe_IO_PATH_DIRECTSTORAGE_GPU;
     if (!copied) {
+        copied = device_copy_tensor_gpudirect_storage(
+            engine,
+            rec,
+            moe_DEVICE_POOL_EXPERT,
+            reservation,
+            allow_sync_fallback ? 1 : 0);
+    }
+    if (!copied) {
+        if ((active_path == moe_IO_PATH_GPUDIRECT_STORAGE ||
+             active_path == moe_IO_PATH_DIRECTSTORAGE_GPU) &&
+            is_moe_expert_tensor_record(engine, rec) &&
+            !rec.bundle_native) {
+            return moe_DEVICE_COPY_BACKPRESSURE;
+        }
         copied = device_copy_tensor(
             engine,
             rec,
@@ -190,9 +280,11 @@ static int prefetch_tensor_direct_to_gpu(
         demote_failed_device_expert(engine, rec);
         return 0;
     }
-    device_stream_sync_current(engine);
+    const bool async_pending = copied == moe_DEVICE_COPY_PENDING_ASYNC;
     // BUGFIX 153: Add memory_order_relaxed for statistics counters
-    engine->io_atomic.bytes_direct_to_gpu.fetch_add(bytes, std::memory_order_relaxed);
+    if (!directstorage_gpu_submitted && !async_pending) {
+        engine->io_atomic.bytes_direct_to_gpu.fetch_add(bytes, std::memory_order_relaxed);
+    }
     engine->io_atomic.direct_stage_done.fetch_add(1, std::memory_order_relaxed);
     return 1;
 }

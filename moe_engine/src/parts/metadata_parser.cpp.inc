@@ -64,6 +64,21 @@ static int moe_json_get_bool_from_object_local(
     return moe_json_get_bool_local(text.substr(begin, end - begin), key, out);
 }
 
+static int moe_json_get_string_from_object_local(
+    const std::string& text,
+    const char* object_key,
+    const char* key,
+    std::string* out
+) {
+    size_t begin = 0;
+    size_t end = 0;
+    if (!out || !moe_json_find_object_local(text, object_key, &begin, &end) ||
+        begin >= end || end > text.size() || begin >= text.size()) {
+        return 0;
+    }
+    return moe_json_get_string_local(text.substr(begin, end - begin), key, out);
+}
+
 static int moe_json_get_u64_from_first_object_local(
     const std::string& text,
     const char* const* object_keys,
@@ -98,6 +113,38 @@ static int moe_json_get_bool_from_first_object_local(
         }
     }
     return 0;
+}
+
+static int moe_json_get_string_from_first_object_local(
+    const std::string& text,
+    const char* const* object_keys,
+    size_t object_key_count,
+    const char* key,
+    std::string* out
+) {
+    if (!object_keys || !key || !out) {
+        return 0;
+    }
+    for (size_t i = 0; i < object_key_count; ++i) {
+        if (object_keys[i] && moe_json_get_string_from_object_local(text, object_keys[i], key, out)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uint32_t moe_qkv_rotation_backend_from_string(const std::string& value) {
+    if (value == "hadamard_sign_fast" || value == "hadamard" || value == "fast_hadamard") {
+        return QKV_ROTATION_BACKEND_HADAMARD_SIGN_FAST;
+    }
+    return QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL;
+}
+
+static uint32_t moe_qkv_codebook_distribution_from_string(const std::string& value) {
+    if (value == "gaussian_approx" || value == "gaussian" || value == "normal_approx") {
+        return QKV_CODEBOOK_DISTRIBUTION_GAUSSIAN_APPROX;
+    }
+    return QKV_CODEBOOK_DISTRIBUTION_EXACT_BETA;
 }
 
 static void moe_parse_qkv_runtime_contract_json(
@@ -264,6 +311,20 @@ static void moe_parse_qkv_runtime_contract_json(
         moe_json_get_u64_from_object_local(json, "qjl", "seed", &value)) {
         meta->contract.qkv_qjl_seed = value;
     }
+    if (moe_json_get_u64_local(json, "qkv_policy_hash", &value) ||
+        moe_json_get_u64_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "qkv_policy_hash", &value)) {
+        meta->contract.qkv_policy_hash = value;
+    }
+    if (moe_json_get_string_local(json, "rotation_backend", &string_value) ||
+        moe_json_get_string_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "rotation_backend", &string_value) ||
+        moe_json_get_string_from_object_local(json, "rotation", "backend", &string_value)) {
+        meta->contract.qkv_rotation_backend = moe_qkv_rotation_backend_from_string(string_value);
+    }
+    if (moe_json_get_string_local(json, "codebook_distribution", &string_value) ||
+        moe_json_get_string_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "codebook_distribution", &string_value) ||
+        moe_json_get_string_from_object_local(json, "codebook", "distribution", &string_value)) {
+        meta->contract.qkv_codebook_distribution = moe_qkv_codebook_distribution_from_string(string_value);
+    }
     if (moe_json_get_bool_local(json, "enable_qjl", &bool_value) ||
         moe_json_get_bool_local(json, "qjl_enabled", &bool_value) ||
         moe_json_get_bool_from_first_object_local(json, qkv_objects, sizeof(qkv_objects) / sizeof(qkv_objects[0]), "enable_qjl", &bool_value) ||
@@ -373,6 +434,17 @@ static void moe_parse_offload_metadata_json(moe_offload_gguf_file_t* meta) {
     if (moe_json_get_u64_local(meta->metadata_json, "qjl_seed", &value) ||
         moe_json_get_u64_from_object_local(meta->metadata_json, "qjl", "seed", &value)) {
         meta->contract.qkv_qjl_seed = value;
+    }
+    if (moe_json_get_u64_local(meta->metadata_json, "qkv_policy_hash", &value)) {
+        meta->contract.qkv_policy_hash = value;
+    }
+    if (moe_json_get_string_local(meta->metadata_json, "rotation_backend", &string_value) ||
+        moe_json_get_string_from_object_local(meta->metadata_json, "rotation", "backend", &string_value)) {
+        meta->contract.qkv_rotation_backend = moe_qkv_rotation_backend_from_string(string_value);
+    }
+    if (moe_json_get_string_local(meta->metadata_json, "codebook_distribution", &string_value) ||
+        moe_json_get_string_from_object_local(meta->metadata_json, "codebook", "distribution", &string_value)) {
+        meta->contract.qkv_codebook_distribution = moe_qkv_codebook_distribution_from_string(string_value);
     }
     if (moe_json_get_bool_local(meta->metadata_json, "enable_qjl", &bool_value) ||
         moe_json_get_bool_from_object_local(meta->metadata_json, "qjl", "enabled", &bool_value)) {

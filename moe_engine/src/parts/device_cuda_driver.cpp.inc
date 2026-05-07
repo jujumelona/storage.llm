@@ -109,6 +109,8 @@ static int cuda_driver_load(moe_cuda_driver_api* api) {
         api->cuFileBufRegister = (moe_cufile_error_t (*)(void*, size_t, int))moe_find_shared_symbol(api->cufile_library, "cuFileBufRegister");
         api->cuFileBufDeregister = (moe_cufile_error_t (*)(void*))moe_find_shared_symbol(api->cufile_library, "cuFileBufDeregister");
         api->cuFileRead = (moe_cufile_read_fn)moe_find_shared_symbol(api->cufile_library, "cuFileRead");
+        api->cuFileReadAsync = (moe_cufile_read_async_fn)moe_find_shared_symbol(api->cufile_library, "cuFileReadAsync");
+        api->cuFileStreamRegister = (moe_cufile_stream_register_fn)moe_find_shared_symbol(api->cufile_library, "cuFileStreamRegister");
         api->cufile_available = api->cuFileDriverOpen && api->cuFileRead && api->cuFileBufRegister;
         if (api->cufile_available) {
             std::fprintf(stderr, "[storageLLM INFO] GPUDirect Storage (cuFile) API loaded successfully.\n");

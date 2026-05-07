@@ -92,6 +92,8 @@ moe_io_config_t moe_pc_default_io_config(void) {
         cfg.io_worker_threads,
         cfg.gpu_worker_threads);
     cfg.direct_upload_min_bytes = normal_min;
+    cfg.directstorage_staging_queue_capacity = 1024;
+    cfg.directstorage_gpu_queue_capacity = 1024;
     cfg.enable_compute_io_overlap = 1;
     cfg.enable_multistage_pipeline = 1;
     cfg.enable_lookahead_prefetch = 1;
@@ -102,6 +104,8 @@ moe_io_config_t moe_pc_default_io_config(void) {
     cfg.enable_gpudirect_storage = 1;
     cfg.enable_bam_nvme = 1;
     cfg.enable_common_raw_vram_pin = 1;
+    cfg.allow_required_sync_fallback = 1;
+    cfg.require_bundle_native_experts = 1;
     cfg.int4_fallback_threshold = 0.50f;
     cfg.metal_memory_budget_pct = 0;
     cfg.madv_cold_threshold_pct = 30;

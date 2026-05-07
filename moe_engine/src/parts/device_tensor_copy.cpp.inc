@@ -3,6 +3,7 @@
 
 static void device_complete_pending_copies(moe_pc_engine* e);
 static void device_complete_pending_copy_key(moe_pc_engine* e, uint64_t key);
+static void device_touch_allocation(moe_pc_engine* e, uint64_t key);
 
 #include "device_backend_async.cpp.inc"
 #include "device_tensor_copy_stream.cpp.inc"

@@ -34,7 +34,8 @@
                         contiguous_bundle_size = bundle_recs[0]->bundle_size;
                         bundle_bytes = contiguous_bundle_size;
                     }
-                    if (active_path == moe_IO_PATH_PINNED_HOST &&
+                    if ((active_path == moe_IO_PATH_PINNED_HOST ||
+                         active_path == moe_IO_PATH_DIRECTSTORAGE_STAGING) &&
                         engine_has_device_upload_workers(engine) &&
                         engine->backend_caps.supports_fixed_read_staging &&
                         engine->io_config.enable_multistage_pipeline &&
@@ -66,7 +67,7 @@
                                 int bundle_ok = 1;
                                 if (contiguous_bundle) {
                                     mmap_context_t* shard = get_or_map_tensor_shard(engine, *bundle_recs[0]);
-                                    if (!shard || !mmap_get_ptr(shard, 0)) {
+                                    if (!shard) {
                                         bundle_ok = 0;
                                     } else {
                                         const uint64_t file_size = static_cast<uint64_t>(mmap_get_size(shard));
@@ -75,27 +76,86 @@
                                             contiguous_bundle_size > engine->staging_slots[slot].size) {
                                             bundle_ok = 0;
                                         } else {
-                                            const uint8_t* src = static_cast<const uint8_t*>(
-                                                mmap_get_ptr(shard, static_cast<size_t>(contiguous_bundle_offset)));
-                                            if (!src) {
-                                                bundle_ok = 0;
-                                            } else {
-                                                const uint64_t copied = copy_mapped_range_to_staging_linear(
-                                                    engine, src, contiguous_bundle_size, slot, &staging_offset);
-                                                if (copied != contiguous_bundle_size ||
-                                                    staging_offset != contiguous_bundle_size) {
-                                                    bundle_ok = 0;
-                                                } else {
-                                                    engine->io_atomic.bytes_ram_to_pinned.fetch_add(copied, std::memory_order_relaxed);
-                                                    for (uint32_t p = 0; p < 3u; ++p) {
-                                                        next.bundle_offsets[p] = bundle_recs[p]->bundle_member_offset;
-                                                        next.bundle_bytes[p] = tensor_stream_bytes(*bundle_recs[p]);
-                                                        if (next.bundle_offsets[p] > contiguous_bundle_size ||
-                                                            next.bundle_bytes[p] > contiguous_bundle_size - next.bundle_offsets[p]) {
-                                                            bundle_ok = 0;
-                                                        }
+                                            int copied_contiguous = 0;
+                                            int async_contiguous_submitted = 0;
+#if defined(_WIN32)
+                                            if (active_path == moe_IO_PATH_DIRECTSTORAGE_STAGING) {
+                                                const std::string ds_path =
+                                                    bundle_recs[0]->resolved_path_index < engine->tensor_paths.size()
+                                                        ? engine->tensor_paths[bundle_recs[0]->resolved_path_index]
+                                                        : std::string();
+                                                const std::wstring wide_path = storagellm::wide_path_from_utf8(ds_path);
+                                                const uint64_t ds_range[1][2] = {
+                                                    {contiguous_bundle_offset, contiguous_bundle_size}
+                                                };
+                                                for (uint32_t p = 0; p < 3u; ++p) {
+                                                    next.bundle_offsets[p] = bundle_recs[p]->bundle_member_offset;
+                                                    next.bundle_bytes[p] = tensor_stream_bytes(*bundle_recs[p]);
+                                                    if (next.bundle_offsets[p] > contiguous_bundle_size ||
+                                                        next.bundle_bytes[p] > contiguous_bundle_size - next.bundle_offsets[p]) {
+                                                        bundle_ok = 0;
                                                     }
                                                 }
+                                                moe_dstorage_pending_copy pending{};
+                                                if (bundle_ok && !wide_path.empty() &&
+                                                    directstorage_submit_ranges_to_staging(
+                                                        engine,
+                                                        wide_path.c_str(),
+                                                        ds_range,
+                                                        1,
+                                                        engine->staging_slots[slot].buf.load(std::memory_order_acquire),
+                                                        contiguous_bundle_size,
+                                                        file_size,
+                                                        &pending)) {
+                                                    next.staging_slot = slot;
+                                                    next.staging_bytes = 0;
+                                                    next.staging_valid = 0;
+                                                    if (enqueue_directstorage_staging_pending(
+                                                            engine,
+                                                            pending,
+                                                            slot,
+                                                            next,
+                                                            contiguous_bundle_size)) {
+                                                        ok = 1;
+                                                        terminal = 0;
+                                                        staged_direct_to_gpu = true;
+                                                        async_contiguous_submitted = 1;
+                                                    } else {
+                                                        directstorage_release_pending_copy_resources(&pending);
+                                                    }
+                                                }
+                                            }
+#endif
+                                            if (!async_contiguous_submitted && !copied_contiguous) {
+                                                const uint8_t* src = static_cast<const uint8_t*>(
+                                                    mmap_get_ptr(shard, static_cast<size_t>(contiguous_bundle_offset)));
+                                                if (!src) {
+                                                    bundle_ok = 0;
+                                                } else {
+                                                    const uint64_t copied = copy_mapped_range_to_staging_linear(
+                                                        engine, src, contiguous_bundle_size, slot, &staging_offset);
+                                                    if (copied != contiguous_bundle_size ||
+                                                        staging_offset != contiguous_bundle_size) {
+                                                        bundle_ok = 0;
+                                                    } else {
+                                                        engine->io_atomic.bytes_ram_to_pinned.fetch_add(copied, std::memory_order_relaxed);
+                                                        copied_contiguous = 1;
+                                                    }
+                                                }
+                                            }
+                                            if (!async_contiguous_submitted && copied_contiguous) {
+                                                for (uint32_t p = 0; p < 3u; ++p) {
+                                                    next.bundle_offsets[p] = bundle_recs[p]->bundle_member_offset;
+                                                    next.bundle_bytes[p] = tensor_stream_bytes(*bundle_recs[p]);
+                                                    if (next.bundle_offsets[p] > contiguous_bundle_size ||
+                                                        next.bundle_bytes[p] > contiguous_bundle_size - next.bundle_offsets[p]) {
+                                                        bundle_ok = 0;
+                                                    }
+                                                }
+                                            }
+                                            if (async_contiguous_submitted) {
+                                                bundle_ok = 1;
+                                                staging_offset = bundle_bytes;
                                             }
                                         }
                                     }
@@ -123,7 +183,10 @@
                                         next.bundle_bytes[p] = 0;
                                     }
                                 }
-                                if (bundle_ok && staging_offset == bundle_bytes) {
+                                if (bundle_ok && staged_direct_to_gpu) {
+                                    // DirectStorage staging is pending; drain_directstorage_staging_copies
+                                    // will enqueue the GPU stage after the status slot completes.
+                                } else if (bundle_ok && staging_offset == bundle_bytes) {
                                     next.staging_bytes = staging_offset;
                                     next.staging_valid = 1;
                                     engine->io_atomic.pinned_stage_done.fetch_add(1, std::memory_order_relaxed);
@@ -158,7 +221,8 @@
                 }
                 if (!staged_direct_to_gpu &&
                     task.target_tier == moe_TIER_VRAM &&
-                    active_path == moe_IO_PATH_PINNED_HOST &&
+                    (active_path == moe_IO_PATH_PINNED_HOST ||
+                     active_path == moe_IO_PATH_DIRECTSTORAGE_STAGING) &&
                     engine_has_device_upload_workers(engine) &&
                     engine->backend_caps.supports_fixed_read_staging &&
                     engine->io_config.enable_multistage_pipeline &&
@@ -189,12 +253,26 @@
                         );
                         if (slot != UINT32_MAX) {
                             uint64_t staging_bytes = 0;
-                            if (prefetch_tensor_file_to_pinned(engine, rec, &slot, &staging_bytes)) {
-                                moe_prefetch_task next = task;
-                                next.stage = moe_TRANSFER_STAGE_PINNED_TO_GPU;
+                            moe_prefetch_task next = task;
+                            next.stage = moe_TRANSFER_STAGE_PINNED_TO_GPU;
+                            next.staging_slot = slot;
+                            next.staging_bytes = 0;
+                            next.staging_valid = 0;
+                            const uint64_t expected_bytes = tensor_stream_bytes(rec);
+                            if (active_path == moe_IO_PATH_DIRECTSTORAGE_STAGING &&
+                                prefetch_tensor_file_to_pinned_directstorage_async(
+                                    engine,
+                                    rec,
+                                    slot,
+                                    next,
+                                    expected_bytes)) {
+                                ok = 1;
+                                terminal = 0;
+                                staged_direct_to_gpu = true;
+                            } else if (prefetch_tensor_file_to_pinned(engine, rec, &slot, &staging_bytes)) {
                                 next.staging_slot = slot;
                                 next.staging_bytes = staging_bytes;
-                                next.staging_valid = staging_bytes == tensor_stream_bytes(rec) ? 1 : 0;
+                                next.staging_valid = staging_bytes == expected_bytes ? 1 : 0;
                                 if (next.staging_valid &&
                                     enqueue_stage_or_retry(engine, engine->gpu_stage, next)) {
                                     ok = 1;

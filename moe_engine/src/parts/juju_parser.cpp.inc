@@ -7,8 +7,20 @@ struct moe_juju_tensor_json_entry_t {
     std::string graph_role_text;
     std::string prefetch_class_text;
     std::string residency_hint_text;
+    std::string codec_id;
+    std::string codec_registry_version;
+    std::string storage_layout;
+    std::string op_role;
+    std::string execution_op;
+    std::string split_policy;
     uint64_t shape[4]{};
     uint32_t dims = 0;
+    uint64_t source_shape[4]{};
+    uint32_t source_dims = 0;
+    uint64_t math_out_features = 0;
+    uint64_t math_in_features = 0;
+    uint8_t math_transposed = 0;
+    int32_t execution_layer = INT32_MIN;
     uint32_t gguf_type = 0;
     uint8_t has_gguf_type = 0;
     uint8_t weight_encoding = moe_WEIGHT_ENCODING_UNKNOWN;
@@ -185,6 +197,12 @@ static int moe_juju_index_matches_weight_file(const std::string& index_json, con
     std::string weight_file;
     if (!moe_json_get_string_local(index_json, "weight_file", &weight_file) || weight_file.empty()) {
         return 0;
+    }
+    if (index_json.find("\"JUJU_IDX_JSON_V2\"") != std::string::npos) {
+        std::string artifact_uid;
+        if (!moe_json_get_string_local(index_json, "artifact_uid", &artifact_uid) || artifact_uid.empty()) {
+            return 0;
+        }
     }
     return weight_file == moe_juju_path_basename_local(juju_path);
 }
@@ -431,18 +449,28 @@ static int moe_read_juju_tensor_index_json(
                 moe_juju_path_basename_local(path).c_str());
             return 0;
         }
+        std::string embedded;
+        if (moe_read_juju_json_section(
+                path, entries, moe_JUJU_SECTION_LAYER_ORDER_INDEX, file_bytes, &embedded)) {
+            std::string sidecar_uid;
+            std::string embedded_uid;
+            if (!moe_json_get_string_local(sidecar, "artifact_uid", &sidecar_uid) ||
+                !moe_json_get_string_local(embedded, "artifact_uid", &embedded_uid) ||
+                sidecar_uid.empty() || embedded_uid.empty() ||
+                sidecar_uid != embedded_uid) {
+                std::fprintf(stderr,
+                    "[storagellm] JUJU sidecar idx rejected: artifact_uid mismatch idx=%s weight=%s\n",
+                    (path + ".idx").c_str(),
+                    moe_juju_path_basename_local(path).c_str());
+                return 0;
+            }
+        }
         if (out) {
             *out = std::move(sidecar);
         }
         return 1;
     }
     if (moe_read_juju_json_section(path, entries, moe_JUJU_SECTION_LAYER_ORDER_INDEX, file_bytes, out)) {
-        return 1;
-    }
-    if (!sidecar.empty()) {
-        if (out) {
-            *out = std::move(sidecar);
-        }
         return 1;
     }
     return 0;
@@ -873,6 +901,7 @@ static int moe_parse_juju_tensor_index_json(
         uint64_t value = 0;
         uint64_t shape[4]{};
         uint32_t shape_count = 0;
+        int bool_value = 0;
         if (!moe_json_get_string_slice(json, obj_begin, obj_end, "name", &rec.name) ||
             !moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_offset", &rec.juju_offset) ||
             !moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_bytes", &rec.juju_bytes)) {
@@ -891,6 +920,14 @@ static int moe_parse_juju_tensor_index_json(
             rec.gguf_type = moe_u64_to_u32_clamped(value, 0);
             rec.has_gguf_type = 1;
         }
+        moe_json_get_string_slice(json, obj_begin, obj_end, "codec_id", &rec.codec_id);
+        moe_json_get_string_slice(json, obj_begin, obj_end, "codec_registry_version", &rec.codec_registry_version);
+        moe_json_get_string_slice(json, obj_begin, obj_end, "storage_layout", &rec.storage_layout);
+        moe_json_get_string_slice(json, obj_begin, obj_end, "split_policy", &rec.split_policy);
+        if (!moe_json_get_string_slice(json, obj_begin, obj_end, "op_role", &rec.op_role)) {
+            moe_json_get_string_slice(json, obj_begin, obj_end, "execution_op", &rec.op_role);
+        }
+        moe_json_get_string_slice(json, obj_begin, obj_end, "execution_op", &rec.execution_op);
         if (moe_json_get_u64_slice(json, obj_begin, obj_end, "source_bytes", &value)) {
             rec.source_bytes = value;
         }
@@ -916,6 +953,23 @@ static int moe_parse_juju_tensor_index_json(
         if (moe_json_get_u64_slice(json, obj_begin, obj_end, "row_padding_bytes", &value)) {
             rec.row_padding_bytes = value;
         }
+        uint64_t source_shape[4]{};
+        uint32_t source_shape_count = 0;
+        if (moe_json_get_u64_array_slice(json, obj_begin, obj_end, "source_shape", source_shape, 4, &source_shape_count)) {
+            rec.source_dims = std::min<uint32_t>(source_shape_count, 4u);
+            for (uint32_t i = 0; i < rec.source_dims; ++i) {
+                rec.source_shape[i] = source_shape[i];
+            }
+        }
+        if (moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "math_shape", "out_features", &value)) {
+            rec.math_out_features = value;
+        }
+        if (moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "math_shape", "in_features", &value)) {
+            rec.math_in_features = value;
+        }
+        if (moe_json_get_bool_from_object_slice_local(json, obj_begin, obj_end, "math_shape", "transposed", &bool_value)) {
+            rec.math_transposed = bool_value ? 1 : 0;
+        }
         if (moe_json_get_u64_slice(json, obj_begin, obj_end, "expert_count", &value) ||
             moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "expert_layout", "expert_count", &value)) {
             rec.expert_count = moe_u64_to_u32_clamped(value, 0);
@@ -930,7 +984,6 @@ static int moe_parse_juju_tensor_index_json(
             rec.expert_base_offset = value;
             rec.has_expert_layout = 1;
         }
-        int bool_value = 0;
         if (moe_json_get_bool_from_object_slice_local(json, obj_begin, obj_end, "combined_gate_up_split", "enabled", &bool_value) ||
             moe_json_get_bool_slice(json, obj_begin, obj_end, "combined_gate_up_split_enabled", &bool_value)) {
             rec.combined_gate_up_split_enabled = bool_value ? 1 : 0;
@@ -1052,6 +1105,21 @@ static int moe_parse_juju_tensor_index_json(
             rec.dims = rec.dims ? std::min<uint32_t>(rec.dims, 4u) : shape_count;
             for (uint32_t i = 0; i < std::min<uint32_t>(shape_count, 4u); ++i) {
                 rec.shape[i] = shape[i];
+            }
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "execution_layer", &value)) {
+            rec.execution_layer = (int32_t)std::min<uint64_t>(value, (uint64_t)INT32_MAX);
+        }
+        if (rec.execution_layer == INT32_MIN) {
+            uint32_t parsed_layer = 0;
+            if (moe_parse_layer_from_gguf_name(rec.name, &parsed_layer)) {
+                rec.execution_layer = (int32_t)std::min<uint32_t>(parsed_layer, (uint32_t)INT32_MAX);
+            } else {
+                const std::string role = moe_lower_ascii_copy(!rec.op_role.empty() ? rec.op_role : rec.execution_op);
+                if (role == "token_embedding" || role == "lm_head" || role == "final_norm" ||
+                    role == "rope" || role == "weight") {
+                    rec.execution_layer = -1;
+                }
             }
         }
         ++tensor_count;

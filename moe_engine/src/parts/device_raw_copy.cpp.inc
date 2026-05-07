@@ -17,7 +17,7 @@ static int device_copy_raw_span(
     moe_pc_engine* e,
     const moe_storage_raw_span_spec_t& s,
     uint8_t pool,
-    int allow_sync_fallback = 1
+    int allow_sync_fallback = 0
 ) {
     if (!e || s.bytes == 0 || !device_allocator_init(e) || !device_set_current(e)) {
         return 0;
@@ -64,12 +64,14 @@ static int device_copy_raw_span(
         extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t bytes);
         void* metal_buffer = metal_zero_copy_map(nullptr, (void*)src, s.bytes);
         if (metal_buffer) {
-            // Register the Metal buffer as device allocation
-            CUdeviceptr dst = (CUdeviceptr)metal_buffer;
-            if (device_prepare_tensor_allocation(e, key, s.bytes, pool, 0, &dst)) {
-                device_complete_pending_copy_key(e, key);
-                device_vram_mark_allocation_resident(e, key);
-                device_touch_allocation(e, key);
+            if (device_register_external_resident_allocation(
+                    e,
+                    key,
+                    s.bytes,
+                    pool,
+                    (CUdeviceptr)metal_buffer,
+                    moe_DEVICE_ALLOC_NATIVE_PTR,
+                    0)) {
                 e->io_atomic.bytes_prefetched.fetch_add(s.bytes);
                 e->io_atomic.bytes_pinned_to_gpu.fetch_add(s.bytes);
                 e->io_atomic.gpu_stage_done.fetch_add(1);
@@ -112,6 +114,10 @@ static int device_copy_raw_span(
             e, stream, slot.pinned ? 1 : 0);
         if (!async_copy && e->backend_caps.supports_backend_async_api) {
             e->io_atomic.backend_async_fallback.fetch_add(s.bytes, std::memory_order_relaxed);
+        }
+        if (!async_copy && !allow_sync_fallback) {
+            release_staging_slot(e, slot_idx);
+            return moe_DEVICE_COPY_BACKPRESSURE;
         }
         CUdeviceptr dst = 0;
         if (!device_prepare_tensor_allocation(e, key, s.bytes, pool, async_copy, &dst)) {

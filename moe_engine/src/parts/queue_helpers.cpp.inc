@@ -37,6 +37,10 @@ static int enqueue_stage(
     if (!engine) {
         return 0;
     }
+    if (engine->io_reconfiguring.load(std::memory_order_acquire)) {
+        engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
     {
         std::lock_guard<std::mutex> lock(stage.mtx);
         // BUGFIX 97: Issue 18 - Cache queue size calculations ★
@@ -80,6 +84,10 @@ static int enqueue_stage_or_retry(
     const moe_prefetch_task& task
 ) {
     if (!engine) {
+        return 0;
+    }
+    if (engine->io_reconfiguring.load(std::memory_order_acquire)) {
+        engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
     moe_prefetch_task queued = task;
@@ -158,6 +166,85 @@ static int enqueue_stage_or_retry(
     return 1;
 }
 
+static int enqueue_directstorage_staging_pending(
+    moe_pc_engine* engine,
+    const moe_dstorage_pending_copy& pending,
+    uint32_t staging_slot,
+    const moe_prefetch_task& next_task,
+    uint64_t expected_bytes
+) {
+    if (!engine || staging_slot == UINT32_MAX || expected_bytes == 0 || !pending.status_array) {
+        return 0;
+    }
+    moe_directstorage_staging_pending item{};
+    item.io = pending;
+    item.staging_slot = staging_slot;
+    item.next_task = next_task;
+    item.expected_bytes = expected_bytes;
+    std::lock_guard<std::mutex> lock(engine->directstorage_staging_pending_mutex);
+    engine->directstorage_pending_staging_copies.push_back(item);
+    engine->directstorage_pending_count.fetch_add(1, std::memory_order_release);
+    return 1;
+}
+
+static size_t drain_directstorage_staging_copies(moe_pc_engine* engine) {
+    if (!engine) {
+        return 0;
+    }
+    size_t drained = 0;
+    std::vector<moe_directstorage_staging_pending> ready;
+    std::vector<moe_directstorage_staging_pending> failed;
+    {
+        std::lock_guard<std::mutex> lock(engine->directstorage_staging_pending_mutex);
+        auto& pending = engine->directstorage_pending_staging_copies;
+        for (size_t i = 0; i < pending.size();) {
+            moe_directstorage_staging_pending& item = pending[i];
+            const int state = directstorage_poll_pending_copy(engine, &item.io);
+            if (state == 0) {
+                ++i;
+                continue;
+            }
+            if (state > 0) {
+                ready.push_back(item);
+            } else {
+                failed.push_back(item);
+            }
+            pending[i] = pending.back();
+            pending.pop_back();
+            engine->directstorage_pending_count.fetch_sub(1, std::memory_order_acq_rel);
+            ++drained;
+        }
+    }
+    for (moe_directstorage_staging_pending& item : ready) {
+        moe_prefetch_task next = item.next_task;
+        next.staging_slot = item.staging_slot;
+        next.staging_bytes = item.expected_bytes;
+        next.staging_valid = 1;
+        if (enqueue_stage_or_retry(engine, engine->gpu_stage, next)) {
+            engine->io_atomic.bytes_prefetched.fetch_add(item.expected_bytes, std::memory_order_relaxed);
+            engine->io_atomic.bytes_disk_to_ram.fetch_add(item.expected_bytes, std::memory_order_relaxed);
+            engine->io_atomic.pinned_stage_done.fetch_add(1, std::memory_order_relaxed);
+            engine->gpu_stage.cv.notify_one();
+        } else {
+            release_staging_slot(engine, item.staging_slot);
+            if (next.vram_token.valid) {
+                device_vram_release_reservation_token(engine, next.vram_token);
+                next.vram_token.valid = false;
+            }
+            engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    for (moe_directstorage_staging_pending& item : failed) {
+        release_staging_slot(engine, item.staging_slot);
+        if (item.next_task.vram_token.valid) {
+            device_vram_release_reservation_token(engine, item.next_task.vram_token);
+            item.next_task.vram_token.valid = false;
+        }
+        engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+    }
+    return drained;
+}
+
 static bool pop_stage_task(
     moe_pc_engine* engine,
     moe_stage_queue& stage,
@@ -171,15 +258,35 @@ static bool pop_stage_task(
     // If there are pending deferred copies (event completions), their slots are
     // locked until the next task arrives and wakes the worker, causing staging
     // memory leaks/starvation.
-    // Solution: Use wait_for(2ms) and periodically drain while waiting.
+    // Solution: Use adaptive micro-polling while DirectStorage work is pending
+    // and fall back to the old low-frequency wait when queues are empty.
     if (&stage == &engine->gpu_stage) {
-        while (!stage.cv.wait_for(lock, std::chrono::milliseconds(2), [&] {
+        for (;;) {
             const bool retiring = worker_target && worker_index >= worker_target->load();
-            return engine->io_stop.load() || retiring || !stage.queue.empty() || !stage.urgent_queue.empty();
-        })) {
+            if (engine->io_stop.load() || retiring || !stage.queue.empty() || !stage.urgent_queue.empty()) {
+                break;
+            }
+            const uint32_t wait_us =
+                engine->directstorage_pending_count.load(std::memory_order_acquire) > 0 ? 100u : 2000u;
+            stage.cv.wait_for(lock, std::chrono::microseconds(wait_us));
             lock.unlock();
             device_drain_deferred_staging_copies(engine, false);
+            device_drain_directstorage_device_copies(engine);
             device_refresh_mem_info(engine, 0);
+            lock.lock();
+        }
+    } else if (&stage == &engine->disk_stage) {
+        for (;;) {
+            const bool retiring = worker_target && worker_index >= worker_target->load();
+            if (engine->io_stop.load() || retiring || !stage.queue.empty() || !stage.urgent_queue.empty()) {
+                break;
+            }
+            const uint32_t wait_us =
+                engine->directstorage_pending_count.load(std::memory_order_acquire) > 0 ? 100u : 2000u;
+            stage.cv.wait_for(lock, std::chrono::microseconds(wait_us));
+            lock.unlock();
+            device_drain_deferred_staging_copies(engine, false);
+            drain_directstorage_staging_copies(engine);
             lock.lock();
         }
     } else {
@@ -299,7 +406,7 @@ static int should_use_direct_device_path(
     if (!engine || target != moe_TIER_VRAM) {
         return 0;
     }
-    if (path != moe_IO_PATH_DIRECTSTORAGE &&
+    if (path != moe_IO_PATH_DIRECTSTORAGE_GPU &&
         path != moe_IO_PATH_GPUDIRECT_STORAGE &&
         path != moe_IO_PATH_BAM_NVME) {
         return 0;

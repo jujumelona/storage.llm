@@ -296,7 +296,10 @@ static void moe_dequant_gguf_iq4_xs_row(const uint8_t* packed, float* out, uint3
     (void)moe_gguf_iq4_xs_row_impl(packed, nullptr, out, cols);
 }
 static float moe_e8m0_to_f32_half(uint8_t v) {
-    uint32_t bits = v < 2u ? (0x00200000u << v) : ((uint32_t)(v - 1u) << 23u);
+    if (v == 0u) {
+        return 0.0f;
+    }
+    uint32_t bits = (uint32_t)(v - 1u) << 23u;
     float out = 0.0f;
     std::memcpy(&out, &bits, sizeof(out));
     return out;
@@ -340,7 +343,8 @@ static float moe_dot_gguf_mxfp4_row(
         float low = 0.0f;
         float high = 0.0f;
 #if defined(__AVX2__) && defined(__FMA__)
-        // MXFP4 stores each value pair in one byte: even index in low nibble, odd index in high nibble.
+        // This JUJU MXFP4 artifact stores each value pair in one byte: even index
+        // in low nibble, odd index in high nibble.
         const __m256i lo_mask = _mm256_set1_epi32(0x0F);
         __m256 vacc_low = _mm256_setzero_ps();
         __m256 vacc_high = _mm256_setzero_ps();

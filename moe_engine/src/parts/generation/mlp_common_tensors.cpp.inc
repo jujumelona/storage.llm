@@ -292,6 +292,17 @@ static int moe_layer_ffn_norm_f32(
         input, hidden_size, output, eps);
 }
 
+static int moe_layer_has_ffn_norm_weight(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    return
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_pre_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "pre_ffw_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "mlp_norm.weight");
+}
+
 static int moe_layer_moe_norm_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -308,6 +319,16 @@ static int moe_layer_moe_norm_f32(
     return moe_layer_rmsnorm_suffixes_f32(
         engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
         input, hidden_size, output, eps);
+}
+
+static int moe_layer_has_moe_norm_weight(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    return
+        moe_engine_has_common_tensor_suffix(engine, layer, "pre_ffw_norm_2.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_pre_norm_2.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "moe_norm.weight");
 }
 
 static int moe_layer_post_attention_output_norm_f32(
@@ -327,6 +348,17 @@ static int moe_layer_post_attention_output_norm_f32(
     return moe_layer_rmsnorm_suffixes_f32(
         engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
         input, hidden_size, output, eps);
+}
+
+static int moe_layer_has_post_attention_norm_weight(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    return
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_layernorm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_layer_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_attn_norm.weight");
 }
 
 static int moe_final_norm_f32(
@@ -372,6 +404,18 @@ static int moe_final_norm_f32(
         "norm.weight",
         "transformer.ln_f.weight"
     };
+    {
+        moe_raw_tensor_desc desc{};
+        const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_op_role(engine, "final_norm", -1, &desc);
+        if (rec && desc.rows >= hidden_size) {
+            moe_raw_tensor_cache_entry raw{};
+            if (!map_common_tensor_record(engine, *rec, desc, &raw)) {
+                return 0;
+            }
+            return moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
+        }
+    }
     return moe_layer_rmsnorm_suffixes_f32(
         engine, (int32_t)c->num_hidden_layers, suffixes,
         sizeof(suffixes) / sizeof(suffixes[0]),
@@ -518,6 +562,15 @@ static int moe_layer_post_ffw_norm_f32(
         input, hidden_size, output, eps);
 }
 
+static int moe_layer_has_post_ffw_norm_weight(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    return
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_post_norm.weight");
+}
+
 static int moe_layer_post_ffw_norm1_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -535,6 +588,15 @@ static int moe_layer_post_ffw_norm1_f32(
         input, hidden_size, output, eps);
 }
 
+static int moe_layer_has_post_ffw_norm1_weight(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    return
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_1.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_post_norm_1.weight");
+}
+
 static int moe_layer_post_ffw_norm2_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -550,6 +612,15 @@ static int moe_layer_post_ffw_norm2_f32(
     return moe_layer_post_ffw_norm_suffixes_f32(
         engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
         input, hidden_size, output, eps);
+}
+
+static int moe_layer_has_post_ffw_norm2_weight(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    return
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_2.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_post_norm_2.weight");
 }
 
 static int moe_layer_output_scale_f32(

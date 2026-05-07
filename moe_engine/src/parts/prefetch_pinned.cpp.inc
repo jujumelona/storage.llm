@@ -1,3 +1,10 @@
+static int enqueue_directstorage_staging_pending(
+    moe_pc_engine* engine,
+    const moe_dstorage_pending_copy& pending,
+    uint32_t staging_slot,
+    const moe_prefetch_task& next_task,
+    uint64_t expected_bytes
+);
 static int read_file_range_to_buffer(
     moe_pc_engine* engine,
     std::ifstream& input,
@@ -307,27 +314,6 @@ static int prefetch_tensor_file_to_pinned(
     }
     void* io_gen_ptr = (void*)(uintptr_t)current_io_gen;
 
-#if defined(_WIN32)
-    if (engine->io_config.enable_directstorage &&
-        engine->backend_caps.supports_directstorage &&
-        engine->backend_caps.supports_backend_async_api &&
-        compiled_directstorage_available()) {
-        const std::string ds_path = rec.resolved_path_index < engine->tensor_paths.size()
-            ? engine->tensor_paths[rec.resolved_path_index] : std::string();
-        const std::wstring wide_path = storagellm::wide_path_from_utf8(ds_path);
-        if (!wide_path.empty() &&
-            directstorage_read_ranges_to_staging(
-                engine,
-                wide_path.c_str(),
-                ranges,
-                sizeof(ranges) / sizeof(ranges[0]),
-                engine->staging_slots[slot_index].buf.load(std::memory_order_acquire),
-                total_bytes,
-                file_size)) {
-            staging_offset = total_bytes;
-        }
-    }
-#endif
     // Check if we can use IORing/io_uring registered buffer I/O
     if (staging_offset != total_bytes && engine->ring_adapter.initialized) {
         int submits = 0;
@@ -501,6 +487,68 @@ static int prefetch_tensor_file_to_pinned(
     return 1;
 }
 
+static int prefetch_tensor_file_to_pinned_directstorage_async(
+    moe_pc_engine* engine,
+    const moe_tensor_record& rec,
+    uint32_t slot_index,
+    const moe_prefetch_task& next_task,
+    uint64_t expected_bytes
+) {
+#if defined(_WIN32)
+    if (!engine ||
+        slot_index == UINT32_MAX ||
+        expected_bytes == 0 ||
+        !staging_slot_valid(engine, slot_index) ||
+        !engine->io_config.enable_directstorage ||
+        !engine->backend_caps.supports_directstorage ||
+        !compiled_directstorage_available()) {
+        return 0;
+    }
+    mmap_context_t* shard = get_or_map_tensor_shard(engine, rec);
+    if (!shard) {
+        return 0;
+    }
+    const uint64_t file_size = static_cast<uint64_t>(mmap_get_size(shard));
+    const uint64_t ranges[][2] = {
+        {rec.info.weight_byte_offset, rec.info.weight_byte_length},
+        {rec.info.scale_byte_offset, rec.info.scale_byte_length},
+        {rec.info.scale2_byte_offset, rec.info.scale2_byte_length},
+    };
+    const std::string ds_path = rec.resolved_path_index < engine->tensor_paths.size()
+        ? engine->tensor_paths[rec.resolved_path_index] : std::string();
+    const std::wstring wide_path = storagellm::wide_path_from_utf8(ds_path);
+    moe_dstorage_pending_copy pending{};
+    if (wide_path.empty() ||
+        !directstorage_submit_ranges_to_staging(
+            engine,
+            wide_path.c_str(),
+            ranges,
+            sizeof(ranges) / sizeof(ranges[0]),
+            engine->staging_slots[slot_index].buf.load(std::memory_order_acquire),
+            expected_bytes,
+            file_size,
+            &pending)) {
+        return 0;
+    }
+    if (!enqueue_directstorage_staging_pending(
+            engine,
+            pending,
+            slot_index,
+            next_task,
+            expected_bytes)) {
+        directstorage_release_pending_copy_resources(&pending);
+        return 0;
+    }
+    return 1;
+#else
+    (void)engine;
+    (void)rec;
+    (void)slot_index;
+    (void)next_task;
+    (void)expected_bytes;
+    return 0;
+#endif
+}
 static int prefetch_tensor_ram_to_pinned(
     moe_pc_engine* engine,
     const moe_tensor_record& rec,

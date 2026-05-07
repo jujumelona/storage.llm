@@ -127,6 +127,14 @@ static mmap_context_t* get_or_map_shard(moe_pc_engine* engine, const std::string
     if (cv) {
         cv->notify_all();
     }
+    if (!engine->true_zero_copy_validated.load(std::memory_order_acquire) &&
+        engine->backend_caps.supports_unified_memory &&
+        engine->backend_caps.supports_zero_copy_mmap) {
+        void* mapped_ptr = mmap_get_ptr(ctx, 0);
+        const size_t mapped_bytes = mmap_get_size(ctx);
+        const int validated = validate_true_zero_copy_mmap(engine, mapped_ptr, mapped_bytes);
+        engine->true_zero_copy_validated.store(validated != 0, std::memory_order_release);
+    }
     return ctx;
 }
 

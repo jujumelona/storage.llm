@@ -357,17 +357,22 @@ int qkv_attention_decode_impl(
     // BUGFIX 361: n이 0일 때 방지 (이미 위에서 체크했지만 명시적으로)
     if (n <= 0) return 0;
     float mx = att[0];
+    if (!std::isfinite(mx)) return 0;
     for (int t = 1; t < n; t++) if (att[t] > mx) mx = att[t];
+    if (!std::isfinite(mx)) return 0;
     float se = 0;
-    for (int t = 0; t < n; t++) { att[t] = expf(att[t] - mx); se += att[t]; }
+    for (int t = 0; t < n; t++) {
+        if (!std::isfinite(att[t])) return 0;
+        att[t] = expf(att[t] - mx);
+        if (!std::isfinite(att[t])) return 0;
+        se += att[t];
+    }
     // BUGFIX 362: softmax sum이 0일 때 division by zero 방지
-    if (se > 1e-10f) {
+    if (se > 1e-10f && std::isfinite(se)) {
         float iv = 1.0f / se;
         for (int t = 0; t < n; t++) att[t] *= iv;
     } else {
-        // Uniform distribution fallback
-        float uniform = 1.0f / (float)n;
-        for (int t = 0; t < n; t++) att[t] = uniform;
+        return 0;
     }
 
     // Phase 2: V weighted sum — need full dequant (with inverse rotation)

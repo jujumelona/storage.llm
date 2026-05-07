@@ -150,7 +150,7 @@ static double moe_rt_fast_mem_bw_hint(const moe_pc_engine* engine) {
         const double measured = (double)engine->backend_caps.measured_h2d_bw_bytes_per_sec / 1e9;
         return measured > 1.0 ? measured : 1.0;
     }
-    if (engine->backend_caps.supports_zero_copy_host ||
+    if (engine->true_zero_copy_validated.load(std::memory_order_acquire) ||
         engine->backend_caps.supports_unified_memory) {
         return 120.0;
     }
@@ -279,15 +279,16 @@ static void moe_rt_build_tiers(
     tier0->compute_tflops = moe_rt_compute_tflops_hint(caps);
     tier0->supports_async = gpu_available ? caps.supports_backend_async_api : 1;
     tier0->supports_dma = gpu_available ? caps.supports_async_copy : 0;
-    tier0->is_unified_memory = caps.supports_unified_memory || caps.supports_zero_copy_host;
+    const int true_zero_copy = engine->true_zero_copy_validated.load(std::memory_order_acquire) ? 1 : 0;
+    tier0->is_unified_memory = caps.supports_unified_memory || true_zero_copy;
 
-    tier1->capacity_bytes = caps.supports_zero_copy_host ? tier0->capacity_bytes : ram_budget;
+    tier1->capacity_bytes = true_zero_copy ? tier0->capacity_bytes : ram_budget;
     tier1->bandwidth_gbps = moe_rt_fast_mem_bw_hint(engine);
-    tier1->latency_us = caps.supports_zero_copy_host ? tier0->latency_us : 2.0;
+    tier1->latency_us = true_zero_copy ? tier0->latency_us : 2.0;
     tier1->compute_tflops = 0.0;
     tier1->supports_async = engine->io_config.enable_multistage_pipeline || caps.supports_pinned_host;
-    tier1->supports_dma = caps.supports_pinned_host || caps.supports_zero_copy_host;
-    tier1->is_unified_memory = caps.supports_unified_memory || caps.supports_zero_copy_host;
+    tier1->supports_dma = caps.supports_pinned_host || true_zero_copy;
+    tier1->is_unified_memory = caps.supports_unified_memory || true_zero_copy;
 
     tier2->capacity_bytes = engine->config.db_budget_bytes ? engine->config.db_budget_bytes : UINT64_MAX / 4ull;
     tier2->bandwidth_gbps = moe_rt_slow_mem_bw_hint(engine);

@@ -120,7 +120,9 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
     int notify_workers,
     int stream_state_prechecked = 0,
     const vram_reservation_token& reservation = vram_reservation_token{},
-    int allow_sync_fallback = 1
+    int allow_sync_fallback = 0,
+    moe_prefetch_reason_t prefetch_reason = moe_PREFETCH_REASON_LOOKAHEAD,
+    int urgent_required = 0
 ) {
     if (!engine || layer < 0 || expert < 0) {
         return 0;
@@ -139,12 +141,18 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
             had_before_state = true;
         }
     }
+    (void)notify_workers;
+    const int required_now =
+        prefetch_reason == moe_PREFETCH_REASON_ROUTER_SELECTED ||
+        urgent_required != 0 ? 1 : 0;
+    const int effective_allow_sync_fallback =
+        required_now && engine->io_config.allow_required_sync_fallback ? 1 : 0;
     preferred_tier = juju_hint_target_tier(
         engine,
         layer,
         expert,
         preferred_tier,
-        notify_workers ? moe_PREFETCH_REASON_ROUTER_SELECTED : moe_PREFETCH_REASON_LOOKAHEAD);
+        prefetch_reason);
     preferred_tier = moe_hot_miss_preferred_tier(engine, layer, expert, bytes, preferred_tier);
     vram_reservation_token effective_reservation = reservation;
     if (preferred_tier == moe_TIER_VRAM && !effective_reservation.valid) {
@@ -171,13 +179,19 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
     }
 
     const moe_projection_t projs[3] = {moe_PROJ_GATE, moe_PROJ_UP, moe_PROJ_DOWN};
-    if (preferred_tier == moe_TIER_VRAM &&
-        engine->io_config.enable_compute_io_overlap &&
+    const moe_io_path_t active_io_path = choose_active_io_path(engine);
+    const bool direct_bundle_io =
+        active_io_path == moe_IO_PATH_GPUDIRECT_STORAGE ||
+        active_io_path == moe_IO_PATH_DIRECTSTORAGE_GPU;
+    const bool pinned_bundle_io =
+        active_io_path == moe_IO_PATH_PINNED_HOST &&
         engine->io_config.enable_multistage_pipeline &&
         engine->staging &&
-        engine->staging_slot_size >= bytes &&
+        engine->staging_slot_size >= bytes;
+    if (preferred_tier == moe_TIER_VRAM &&
+        engine->io_config.enable_compute_io_overlap &&
         engine_has_device_upload_workers(engine) &&
-        choose_active_io_path(engine) == moe_IO_PATH_PINNED_HOST &&
+        (direct_bundle_io || pinned_bundle_io) &&
         ensure_io_ready(engine)) {
         const size_t gate_index = find_tensor_record_index(engine, layer, expert, moe_PROJ_GATE);
         const size_t up_index = find_tensor_record_index(engine, layer, expert, moe_PROJ_UP);
@@ -186,7 +200,7 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
             up_index != tensor_slot_invalid() && up_index < engine->tensors.size() &&
             down_index != tensor_slot_invalid() && down_index < engine->tensors.size()) {
             engine->io_atomic.active_path.store(
-                static_cast<uint32_t>(moe_IO_PATH_PINNED_HOST),
+                static_cast<uint32_t>(active_io_path),
                 std::memory_order_relaxed);
             moe_prefetch_task task{};
             task.tensor_index = gate_index;
@@ -196,7 +210,11 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
             task.bundle_layer = layer;
             task.bundle_expert = expert;
             task.urgent = 1;
-            task.allow_sync_fallback = allow_sync_fallback;
+            task.allow_sync_fallback = effective_allow_sync_fallback;
+            task.prefetch_reason = prefetch_reason;
+            task.required_now = required_now ? 1u : 0u;
+            task.speculative = required_now ? 0u : 1u;
+            task.urgent_required = required_now ? 1u : 0u;
             if (enqueue_stage_or_retry(engine, engine->disk_stage, task)) {
                 engine->io_atomic.queued_requests.fetch_add(1, std::memory_order_relaxed);
                 if (notify_workers) {
@@ -227,7 +245,9 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
             preferred_tier,
             stream_state_prechecked,
             sub_token,
-            allow_sync_fallback);
+            effective_allow_sync_fallback,
+            prefetch_reason,
+            required_now);
     }
     if (effective_reservation.valid && effective_reservation.bytes > token_bytes_assigned) {
         vram_reservation_token rest = effective_reservation;
@@ -257,6 +277,11 @@ int moe_pc_engine_prefetch_expert_triplet(
         layer,
         expert,
         preferred_tier,
+        1,
+        0,
+        vram_reservation_token{},
+        1,
+        moe_PREFETCH_REASON_ROUTER_SELECTED,
         1
     );
 }
@@ -437,7 +462,8 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
             const bool all_idle =
                 engine->disk_stage.inflight.load(std::memory_order_acquire) == 0 &&
                 engine->pinned_stage.inflight.load(std::memory_order_acquire) == 0 &&
-                engine->gpu_stage.inflight.load(std::memory_order_acquire) == 0;
+                engine->gpu_stage.inflight.load(std::memory_order_acquire) == 0 &&
+                engine->gds_blocking_pending.load(std::memory_order_acquire) == 0;
 
             // Check if all queued experts are processed
             if (depth == 0 && all_idle && processed >= queued) {
@@ -475,7 +501,8 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
                 const bool all_idle =
                     engine->disk_stage.inflight.load(std::memory_order_acquire) == 0 &&
                     engine->pinned_stage.inflight.load(std::memory_order_acquire) == 0 &&
-                    engine->gpu_stage.inflight.load(std::memory_order_acquire) == 0;
+                    engine->gpu_stage.inflight.load(std::memory_order_acquire) == 0 &&
+                    engine->gds_blocking_pending.load(std::memory_order_acquire) == 0;
                 return engine->io_stop.load(std::memory_order_relaxed) ||
                        (depth == 0 && all_idle && processed >= queued);
             });
@@ -491,7 +518,9 @@ static int prefetch_expert_batch_raw(
     const int* experts,
     uint32_t expert_count,
     moe_tier_t preferred_tier,
-    int allow_sync_fallback = 1
+    int allow_sync_fallback = 0,
+    moe_prefetch_reason_t prefetch_reason = moe_PREFETCH_REASON_LOOKAHEAD,
+    int urgent_required = 0
 ) {
     if (!engine || !experts || expert_count == 0) {
         return 0;
@@ -521,7 +550,9 @@ static int prefetch_expert_batch_raw(
             1,
             1,
             vram_reservation_token{},
-            allow_sync_fallback
+            allow_sync_fallback,
+            prefetch_reason,
+            urgent_required
         ) ? 1 : 0;
     }
     return ok_count > 0 ? 1 : 0;
@@ -551,7 +582,10 @@ int moe_pc_engine_prefetch_moe_lookahead(
             current_layer,
             selected_experts,
             selected_count,
-            vram_expert_budget_bytes(engine) > 0 ? moe_TIER_VRAM : moe_TIER_RAM
+            vram_expert_budget_bytes(engine) > 0 ? moe_TIER_VRAM : moe_TIER_RAM,
+            1,
+            moe_PREFETCH_REASON_ROUTER_SELECTED,
+            1
         ) ? 1 : 0;
     }
     const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
@@ -581,6 +615,8 @@ int moe_pc_engine_prefetch_moe_lookahead(
                 vram_candidates.data(),
                 (uint32_t)vram_candidates.size(),
                 moe_TIER_VRAM,
+                0,
+                moe_PREFETCH_REASON_LOOKAHEAD,
                 0
             ) ? 1 : 0;
         }
@@ -590,7 +626,10 @@ int moe_pc_engine_prefetch_moe_lookahead(
                 current_layer + 1,
                 ram_candidates.data(),
                 (uint32_t)ram_candidates.size(),
-                moe_TIER_RAM
+                moe_TIER_RAM,
+                0,
+                moe_PREFETCH_REASON_LOOKAHEAD,
+                0
             ) ? 1 : 0;
         }
         if (!vram_candidates.empty() || !ram_candidates.empty()) {

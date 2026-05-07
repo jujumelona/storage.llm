@@ -154,16 +154,12 @@ static int moe_engine_rmsnorm_unit_offset(
             }
         }
     }
-    if (!metadata_done &&
-        moe_rmsnorm_unit_offset_from_weight_stats(
-            raw,
-            &value,
-            &samples,
-            &raw_mean,
-            &raw_rms,
-            &mean_abs_raw,
-            &mean_abs_plus_one)) {
-        source = "weight_stats";
+    if (!metadata_done) {
+        // Unit-offset RMSNorm changes math, so it must come from the runtime
+        // contract. Weight statistics are ambiguous for q/k norms and small
+        // learned scales; default to plain weights until metadata says otherwise.
+        value = 0;
+        source = "contract_default";
     }
     moe_profile_log(
         "rmsnorm_unit_offset",

@@ -37,6 +37,7 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
     for (;;) {
         moe_prefetch_task task{};
         device_refresh_mem_info(engine, 0);
+        device_drain_directstorage_device_copies(engine);
         if (!pop_stage_task(engine, engine->gpu_stage, &task, &engine->gpu_worker_target, worker_index)) {
             stream_guard.e = nullptr;  // BUG 4 FIX: Prevent double-destroy
             device_stream_destroy_current(engine);
@@ -263,6 +264,7 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         }
 
         device_drain_deferred_staging_copies(engine, true);
+        device_drain_directstorage_device_copies(engine);
 
 
 

@@ -2,6 +2,8 @@
 
 static uint64_t device_raw_budget_bytes(const moe_pc_engine* e);
 static uint64_t device_budget_bytes(const moe_pc_engine* e);
+static void device_vram_release_reservation_token(moe_pc_engine* e, const vram_reservation_token& token);
+static void device_finish_prepared_copy_failure(moe_pc_engine* e, uint64_t key);
 
 // BUGFIX 76: Issue 11 - Document KV cache vs VRAM budget separation ??筌뤾쑨猿?
 // Clarification: There are two distinct KV cache concepts:
@@ -49,22 +51,46 @@ static void device_cufile_cleanup_caches(moe_pc_engine* e) {
     if (!e) {
         return;
     }
-    std::lock_guard<std::mutex> lock(e->cufile_cache_mutex);
-    if (e->cuda.cuFileBufDeregister) {
-        for (const auto& item : e->cufile_buffer_registration_cache) {
-            void* ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(item.first));
-            e->cuda.cuFileBufDeregister(ptr);
+    {
+        std::lock_guard<std::mutex> lock(e->cufile_cache_mutex);
+        if (e->cuda.cuFileBufDeregister) {
+            for (const auto& item : e->cufile_buffer_registration_cache) {
+                void* ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(item.first));
+                e->cuda.cuFileBufDeregister(ptr);
+            }
         }
+        e->cufile_buffer_registration_cache.clear();
+        if (e->cuda.cuFileHandleDeregister) {
+            for (const auto& item : e->cufile_file_handle_cache) {
+                if (item.second) {
+                    e->cuda.cuFileHandleDeregister(item.second);
+                }
+            }
+        }
+        e->cufile_file_handle_cache.clear();
     }
-    e->cufile_buffer_registration_cache.clear();
-    if (e->cuda.cuFileHandleDeregister) {
-        for (const auto& item : e->cufile_file_handle_cache) {
-            if (item.second) {
-                e->cuda.cuFileHandleDeregister(item.second);
+
+    std::lock_guard<std::mutex> pending_lock(e->directstorage_pending_mutex);
+    for (moe_directstorage_device_pending& pending : e->directstorage_pending_device_copies) {
+        directstorage_release_pending_copy_resources(&pending.io);
+        for (uint8_t i = 0; i < pending.count; ++i) {
+            device_finish_prepared_copy_failure(e, pending.keys[i]);
+            if (pending.tokens[i].valid) {
+                device_vram_release_reservation_token(e, pending.tokens[i]);
+                pending.tokens[i].valid = false;
             }
         }
     }
-    e->cufile_file_handle_cache.clear();
+    e->directstorage_pending_device_copies.clear();
+    {
+        std::lock_guard<std::mutex> staging_pending_lock(e->directstorage_staging_pending_mutex);
+        for (moe_directstorage_staging_pending& pending : e->directstorage_pending_staging_copies) {
+            directstorage_release_pending_copy_resources(&pending.io);
+            release_staging_slot(e, pending.staging_slot);
+        }
+        e->directstorage_pending_staging_copies.clear();
+    }
+    e->directstorage_pending_count.store(0, std::memory_order_release);
 }
 
 static std::atomic<uint64_t>* device_vram_resident_counter_for_pool(moe_pc_engine* e, uint8_t pool) {
@@ -103,6 +129,10 @@ static void device_vram_mark_allocation_resident(moe_pc_engine* e, uint64_t key)
     }
     std::lock_guard<std::mutex> lock(e->device_mutex);
     auto it = e->device_allocations.find(key);
+    if (it != e->device_allocations.end() && it->second.is_view) {
+        it->second.resident_accounted = false;
+        return;
+    }
     if (it != e->device_allocations.end() && !it->second.resident_accounted) {
         it->second.resident_accounted = true;
         device_vram_add_resident_bytes(e, it->second.pool, it->second.bytes);
@@ -297,10 +327,6 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
     const auto now = std::chrono::steady_clock::now();
     int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     int64_t last = e->last_mem_query_ms.load(std::memory_order_relaxed);
-    const bool external_budget_backend =
-        e->backend_caps.backend == moe_BACKEND_VULKAN ||
-        e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
-        e->backend_caps.backend == moe_BACKEND_SYCL;
     // BUGFIX 891: Unify throttle to 1s for all paths ??筌뤾쑨猿??CRITICAL
     // Problem: 5s throttle for non-external backends causes stale VRAM estimates.
     // With top-k=8 experts loading/unloading per token, 5s gap allows hundreds of MB drift.
@@ -424,37 +450,12 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
         // "accounting drift" and adds them back to device_free_bytes every 1 second.
         // This causes VRAM budget to "magically" grow beyond physical limits.
         // calculating delta. This ensures pending reservations are not double-counted.
-        const uint64_t pending = e->vram_inflight_bytes.load(std::memory_order_relaxed);
-        if (free_b > pending) {
-            free_b -= pending;
-        } else {
-            free_b = 0;
-        }
-
-        // Delta sync for device_free_bytes to recover from accounting drift
-        const uint64_t tracked_free = e->device_free_bytes.load(std::memory_order_relaxed);
-        const int64_t delta = (int64_t)free_b - (int64_t)tracked_free;
-        const uint64_t abs_delta = delta < 0 ? (uint64_t)(-delta) : (uint64_t)delta;
-        const uint64_t sync_threshold = std::max<uint64_t>(
-            64ull * 1024ull * 1024ull,
-            ((uint64_t)total_b) / 100ull);
-        if (!retry_path && abs_delta < sync_threshold) {
-            e->device_total_bytes.store((uint64_t)total_b);
-            return;
-        }
-        if (delta > 0) {
-            e->device_free_bytes.fetch_add((uint64_t)delta, std::memory_order_relaxed);
-        } else if (delta < 0) {
-            const uint64_t neg_delta = (uint64_t)(-delta);
-            const uint64_t old = e->device_free_bytes.fetch_sub(neg_delta, std::memory_order_relaxed);
-            if (old < neg_delta) {
-                e->device_free_bytes.fetch_add(neg_delta - old, std::memory_order_relaxed);
-            }
-        }
+        (void)retry_path;
+        e->device_free_bytes.store((uint64_t)free_b, std::memory_order_release);
         if (total_b > 0) {
             e->backend_caps.device_memory_bytes = (uint64_t)total_b;
         }
-        e->device_total_bytes.store((uint64_t)total_b);
+        e->device_total_bytes.store((uint64_t)total_b, std::memory_order_release);
     }
 
     // BUGFIX 998: Metal H2D bandwidth EMA update ??筌뤾쑨猿?IMPORTANT
@@ -588,6 +589,31 @@ static void device_release_allocation_locked(
 ) {
     if (!e || it == e->device_allocations.end()) return;
     const moe_device_allocation a = it->second;
+    if (a.is_view) {
+        if (a.resident_accounted) {
+            device_vram_sub_resident_bytes(e, a.pool, a.bytes);
+        }
+        const uint64_t owner_key = a.owner_key;
+        e->device_allocations.erase(it);
+        auto owner_it = e->device_allocations.find(owner_key);
+        if (owner_it != e->device_allocations.end()) {
+            if (owner_it->second.bundle_view_ref_count > 0) {
+                --owner_it->second.bundle_view_ref_count;
+            }
+            if (owner_it->second.bundle_view_ref_count == 0) {
+                if (owner_it->second.inflight_copies == 0) {
+                    device_release_allocation_locked(e, owner_it, deferred_free_ptrs);
+                } else {
+                    owner_it->second.pending_free = true;
+                }
+            }
+        }
+        return;
+    }
+    if (a.bundle_view_ref_count > 0) {
+        it->second.pending_free = true;
+        return;
+    }
     if (a.ptr) {
         if (a.backend_kind == moe_DEVICE_ALLOC_NATIVE_PTR) {
             device_cufile_unregister_buffer(e, reinterpret_cast<void*>(static_cast<uintptr_t>(a.ptr)));
@@ -612,6 +638,9 @@ static void device_release_allocation_locked(
                         e,
                         reinterpret_cast<void*>(static_cast<uintptr_t>(a.ptr)),
                         reinterpret_cast<void*>(static_cast<uintptr_t>(a.backend_aux)));
+                } else if (a.backend_kind == moe_DEVICE_ALLOC_D3D12_RESOURCE) {
+                    directstorage_release_d3d12_resource(
+                        reinterpret_cast<void*>(static_cast<uintptr_t>(a.ptr)));
                 } else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipFree) {
                     e->hip.hipFree(a.ptr);
                 } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemFree) {
@@ -674,6 +703,65 @@ static void device_release_allocation_locked(
     // Fix 50: Removed device_refresh_mem_info from under device_mutex
     // cuMemGetInfo is a slow driver call that blocks all alloc/free while held.
     // Callers should invoke device_refresh_mem_info() after releasing mutex.
+}
+
+static int device_register_external_resident_allocation(
+    moe_pc_engine* e,
+    uint64_t key,
+    uint64_t bytes,
+    uint8_t pool,
+    CUdeviceptr ptr,
+    uint32_t backend_kind,
+    uint64_t backend_aux
+) {
+    if (!e || key == 0 || bytes == 0 || ptr == 0) {
+        return 0;
+    }
+    std::vector<std::pair<CUdeviceptr, uint64_t>> deferred_free_ptrs;
+    int ok = 1;
+    {
+        std::lock_guard<std::mutex> lock(e->device_mutex);
+        auto old = e->device_allocations.find(key);
+        if (old != e->device_allocations.end()) {
+            if (old->second.inflight_copies != 0) {
+                return 0;
+            }
+            device_release_allocation_locked(e, old, &deferred_free_ptrs);
+            if (e->device_allocations.find(key) != e->device_allocations.end()) {
+                ok = 0;
+            }
+        }
+
+        if (ok) {
+            moe_device_allocation a{};
+            a.key = key;
+            a.bytes = bytes;
+            a.pool = pool;
+            a.ptr = ptr;
+            a.backend_kind = static_cast<uint8_t>(backend_kind);
+            a.backend_aux = backend_aux;
+            a.inflight_copies = 0;
+            a.pending_free = false;
+            a.resident_accounted = true;
+            a.is_view = false;
+            a.last_touch_epoch = e->expert_touch_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+
+            e->device_allocations.emplace(key, a);
+            e->device_allocated_bytes.fetch_add(bytes, std::memory_order_relaxed);
+            e->device_allocation_count.fetch_add(1, std::memory_order_relaxed);
+            device_account_free_bytes_sub(e, bytes);
+            if (auto* c = device_pool_counter(e, pool)) {
+                c->fetch_add(bytes, std::memory_order_relaxed);
+            }
+            if (pool == moe_DEVICE_POOL_ACTIVATION) {
+                e->activation_keys.insert(key);
+                e->device_activation_count.fetch_add(1, std::memory_order_relaxed);
+            }
+            device_vram_add_resident_bytes(e, pool, bytes);
+        }
+    }
+    device_free_deferred_ptrs(e, deferred_free_ptrs);
+    return ok;
 }
 
 static void device_free_locked(

@@ -44,9 +44,8 @@ int moe_pc_engine_plan_moe_prefetch(
     // dGPU: vram>0 → don't skip regardless of mmap_accessible (correct)
     if ((engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
          engine->backend_caps.backend == moe_BACKEND_SYCL) &&
-        engine->backend_caps.supports_unified_memory &&
-        (engine->backend_caps.device_memory_bytes == 0 &&
-         engine->backend_caps.unified_mmap_gpu_accessible)) {
+        engine->true_zero_copy_validated.load(std::memory_order_acquire) &&
+        engine->backend_caps.device_memory_bytes == 0) {
         // iGPU unified memory: stats only, no staging copies
         std::vector<moe_expert_prefetch_item_t> items;
         prefetch_plan_clear_seen(engine);

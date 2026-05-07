@@ -6894,6 +6894,24 @@ def juju_runtime_arch_metadata(contract, directory=None):
         "expert_intermediate_size": first_present(arch.get("expert_intermediate_size"), arch.get("expert_intermediate_dim"), runtime.get("expert_intermediate_size"), runtime.get("expert_intermediate_dim")),
         "rms_norm_eps": first_present(arch.get("rms_norm_eps"), arch.get("norm_eps"), runtime.get("rms_norm_eps"), runtime.get("norm_eps")),
         "norm_eps": first_present(arch.get("norm_eps"), arch.get("rms_norm_eps"), runtime.get("norm_eps"), runtime.get("rms_norm_eps")),
+        "rms_norm_unit_offset": first_present(
+            _juju_bool_or_none(arch.get("rms_norm_unit_offset")),
+            _juju_bool_or_none(arch.get("rmsnorm_unit_offset")),
+            _juju_bool_or_none(arch.get("rms_norm_weight_unit_offset")),
+            _juju_bool_or_none(runtime.get("rms_norm_unit_offset")),
+            _juju_bool_or_none(runtime.get("rmsnorm_unit_offset")),
+            _juju_bool_or_none(runtime.get("rms_norm_weight_unit_offset")),
+            False,
+        ),
+        "rmsnorm_unit_offset": first_present(
+            _juju_bool_or_none(arch.get("rms_norm_unit_offset")),
+            _juju_bool_or_none(arch.get("rmsnorm_unit_offset")),
+            _juju_bool_or_none(arch.get("rms_norm_weight_unit_offset")),
+            _juju_bool_or_none(runtime.get("rms_norm_unit_offset")),
+            _juju_bool_or_none(runtime.get("rmsnorm_unit_offset")),
+            _juju_bool_or_none(runtime.get("rms_norm_weight_unit_offset")),
+            False,
+        ),
         "rope_theta": first_present(arch.get("rope_theta"), runtime.get("rope_theta"), runtime.get("theta")),
         "theta": first_present(arch.get("rope_theta"), runtime.get("theta"), runtime.get("rope_theta")),
         "sliding_window": first_present(arch.get("sliding_window"), runtime.get("sliding_window")),
@@ -6999,10 +7017,9 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
     )
     attention_k_eq_v = _juju_bool_or_none(runtime_arch.get("attention_k_eq_v")) is True
     value_uses_k = not bool(v_weights)
-    implicit_unweighted_v_norm = bool(value_uses_k and attention_k_eq_v and q_norm_weights and k_norm_weights)
+    implicit_unweighted_v_norm = False
     value_norm_mode = (
         "weighted_rmsnorm" if v_norm_weights else
-        "unweighted_rmsnorm_contract" if implicit_unweighted_v_norm else
         "identity"
     )
     rope_contract = _juju_layer_rope_contract(layer, runtime_arch)
@@ -7019,35 +7036,35 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
     }
 
     ops = [
-        {"op": "rms_norm", "name": "attention_input_norm", "inputs": ["hidden"], "weights": attention_norm_weights, "output": "attention_norm", "optional_behavior": "pass_hidden_when_weight_absent", "required": False},
+        {"op": "rms_norm", "name": "attention_input_norm", "inputs": ["hidden"], "weights": attention_norm_weights, "output": "attention_norm", "optional_behavior": "pass_hidden_when_weight_absent", "required": bool(attention_norm_weights)},
         {"op": "linear", "name": "q_projection", "inputs": ["attention_norm"], "weights": q_weights, "output": "q_raw", "required": bool(q_weights)},
         {"op": "linear", "name": "k_projection", "inputs": ["attention_norm"], "weights": k_weights, "output": "k_raw", "required": bool(k_weights)},
         {"op": "linear", "name": "v_projection", "inputs": ["attention_norm"], "weights": v_weights, "output": "v_raw", "fallback_output": "k_raw", "fallback_semantics": "when_no_v_projection_value_uses_raw_k_projection_before_k_norm", "required": False},
-        {"op": "rms_norm", "name": "q_norm", "inputs": ["q_raw"], "weights": q_norm_weights, "output": "q", "optional_behavior": "pass_q_raw_when_weight_absent", "required": False},
-        {"op": "rms_norm", "name": "k_norm", "inputs": ["k_raw"], "weights": k_norm_weights, "output": "k", "optional_behavior": "pass_k_raw_when_weight_absent", "required": False},
-        *([{"op": "rms_norm", "name": "v_norm", "inputs": ["v_raw" if v_weights else "k_raw"], "weights": v_norm_weights, "output": "v", "norm_mode": value_norm_mode, "required": False}]
-          if v_norm_weights or implicit_unweighted_v_norm else
+        {"op": "rms_norm", "name": "q_norm", "inputs": ["q_raw"], "weights": q_norm_weights, "output": "q", "optional_behavior": "pass_q_raw_when_weight_absent", "required": bool(q_norm_weights)},
+        {"op": "rms_norm", "name": "k_norm", "inputs": ["k_raw"], "weights": k_norm_weights, "output": "k", "optional_behavior": "pass_k_raw_when_weight_absent", "required": bool(k_norm_weights)},
+        *([{"op": "rms_norm", "name": "v_norm", "inputs": ["v_raw" if v_weights else "k_raw"], "weights": v_norm_weights, "output": "v", "norm_mode": value_norm_mode, "required": True}]
+          if v_norm_weights else
           [{"op": "identity", "name": "value_passthrough", "inputs": ["v_raw" if v_weights else "k_raw"], "weights": [], "output": "v", "required": False}]),
         {"op": "rope", "name": "rotary_embedding", "inputs": ["q", "k"], "weights": bind("rope_freqs.weight"), "rope_contract": rope_contract, "required": False},
         {"op": "attention", "name": "attention", "inputs": ["q", "k", "v"], **attention_cache_contract, "attention_scale": "metadata_or_qk_norm_contract", "required": bool(q_weights and k_weights and (v_weights or k_weights))},
         {"op": "linear", "name": "attention_output", "inputs": ["attention"], "weights": o_weights, "output": "attention_out", "required": bool(o_weights)},
-        {"op": "rms_norm", "name": "post_attention_norm", "inputs": ["attention_out"], "weights": post_attention_norm_weights, "output": "attention_branch", "optional_behavior": "pass_attention_out_when_weight_absent", "required": False},
+        {"op": "rms_norm", "name": "post_attention_norm", "inputs": ["attention_out"], "weights": post_attention_norm_weights, "output": "attention_branch", "optional_behavior": "pass_attention_out_when_weight_absent", "required": bool(post_attention_norm_weights)},
         {"op": "residual", "name": "attention_residual", "inputs": ["hidden", "attention_branch"], "output": "hidden", "required": True},
-        {"op": "rms_norm", "name": "ffn_norm", "inputs": ["hidden"], "weights": ffn_norm_weights, "output": "shared_ffn_input", "optional_behavior": "pass_hidden_when_weight_absent", "required": False},
-        {"op": "rms_norm", "name": "expert_ffn_norm", "inputs": ["hidden"], "weights": expert_norm_weights, "output": "expert_ffn_input", "optional_behavior": "use_shared_ffn_input_when_weight_absent", "required": False},
+        {"op": "rms_norm", "name": "ffn_norm", "inputs": ["hidden"], "weights": ffn_norm_weights, "output": "shared_ffn_input", "optional_behavior": "pass_hidden_when_weight_absent", "required": bool(ffn_norm_weights)},
+        {"op": "rms_norm", "name": "expert_ffn_norm", "inputs": ["hidden"], "weights": expert_norm_weights, "output": "expert_ffn_input", "optional_behavior": "use_shared_ffn_input_when_weight_absent", "required": bool(expert_norm_weights)},
         {"op": "select", "name": "router_input", "inputs": ["hidden", "expert_ffn_input"], "output": "router_input", "rule": "use_hidden_when_router_has_internal_scale_else_expert_ffn_input", "scale": router_scale_weights, "required": False},
         {"op": "hidden_snapshot", "name": "fate_gate_input_snapshot", "inputs": ["router_input"], "target": "engine_state.gate_input_snapshots[layer]", "required": False},
         {"op": "linear", "name": "moe_router", "inputs": ["router_input"], "weights": router_weights, "scale": router_scale_weights, "output": "expert_scores", "required": bool(router_weights)},
-        {"op": "topk", "name": "expert_select", "inputs": ["expert_scores"], "config_key": "adaptive_seq_topk_entropy", "required": False},
+        {"op": "topk", "name": "expert_select", "inputs": ["expert_scores"], "config_key": "adaptive_seq_topk_entropy", "required": bool(router_weights)},
         {"op": "shared_expert_mlp", "name": "shared_experts", "inputs": ["shared_ffn_input"], "weights": shared_expert_weights, "gate": shared_gate_weights, "output": "shared_branch_raw", "required": bool(shared_expert_weights)},
-        {"op": "rms_norm", "name": "post_ffw_norm_1", "inputs": ["shared_branch_raw"], "weights": post_ffw_norm1_weights, "output": "shared_branch", "optional_behavior": "pass_shared_branch_raw_when_weight_absent", "required": False},
+        {"op": "rms_norm", "name": "post_ffw_norm_1", "inputs": ["shared_branch_raw"], "weights": post_ffw_norm1_weights, "output": "shared_branch", "optional_behavior": "pass_shared_branch_raw_when_weight_absent", "required": bool(post_ffw_norm1_weights)},
         {"op": "moe_expert_mlp", "name": "moe_experts", "inputs": ["expert_ffn_input", "selected_experts"], "weights": moe_weights, "per_expert_output_scale": expert_down_scale_weights, "output": "expert_sum_raw", "required": bool(moe_weights)},
-        {"op": "rms_norm", "name": "post_ffw_norm_2", "inputs": ["expert_sum_raw"], "weights": post_ffw_norm2_weights, "output": "expert_branch", "optional_behavior": "pass_expert_sum_raw_when_weight_absent", "required": False},
+        {"op": "rms_norm", "name": "post_ffw_norm_2", "inputs": ["expert_sum_raw"], "weights": post_ffw_norm2_weights, "output": "expert_branch", "optional_behavior": "pass_expert_sum_raw_when_weight_absent", "required": bool(post_ffw_norm2_weights)},
         {"op": "dense_mlp", "name": "dense_ffn_fallback", "inputs": ["shared_ffn_input"], "weights": dense_weights, "output": "dense_branch", "required": bool(dense_weights and not moe_weights and not shared_expert_weights)},
         {"op": "add", "name": "ffn_branch_sum", "inputs": ["shared_branch", "expert_branch", "dense_branch"], "output": "ffn_out", "missing_input": "zero", "required": bool(moe_weights or shared_expert_weights or dense_weights)},
-        {"op": "rms_norm", "name": "post_ffw_norm", "inputs": ["ffn_out"], "weights": post_ffw_norm_weights, "output": "ffn_branch", "optional_behavior": "pass_ffn_out_when_weight_absent", "required": False},
+        {"op": "rms_norm", "name": "post_ffw_norm", "inputs": ["ffn_out"], "weights": post_ffw_norm_weights, "output": "ffn_branch", "optional_behavior": "pass_ffn_out_when_weight_absent", "required": bool(post_ffw_norm_weights)},
         {"op": "residual", "name": "ffn_residual", "inputs": ["hidden", "ffn_branch"], "output": "hidden", "required": True},
-        {"op": "scale", "name": "layer_output_scale", "inputs": ["hidden"], "weights": layer_output_scale_weights, "output": "hidden", "required": False},
+        {"op": "scale", "name": "layer_output_scale", "inputs": ["hidden"], "weights": layer_output_scale_weights, "output": "hidden", "required": bool(layer_output_scale_weights)},
     ]
     return {
         "layer": int(layer),
@@ -7290,12 +7307,7 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
         if any(x in suffixes for x in JUJU_ATTENTION_O_SUFFIXES):
             feature_counts["layers_with_o_projection"] += 1
         explicit_v_norm = any(x in suffixes for x in JUJU_V_NORM_SUFFIXES)
-        implicit_v_norm = (
-            not any(x in suffixes for x in JUJU_ATTENTION_V_SUFFIXES) and
-            _juju_bool_or_none(runtime_arch.get("attention_k_eq_v")) is True and
-            any(x in suffixes for x in JUJU_Q_NORM_SUFFIXES) and
-            any(x in suffixes for x in JUJU_K_NORM_SUFFIXES)
-        )
+        implicit_v_norm = False
         if explicit_v_norm or implicit_v_norm:
             feature_counts["layers_with_v_norm"] += 1
         if implicit_v_norm:

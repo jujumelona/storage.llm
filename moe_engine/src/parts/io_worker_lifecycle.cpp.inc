@@ -16,6 +16,7 @@ static void stop_io_workers_locked(moe_pc_engine* engine) {
     engine->disk_stage.cv.notify_all();
     engine->pinned_stage.cv.notify_all();
     engine->gpu_stage.cv.notify_all();
+    engine->gds_blocking_cv.notify_all();
     engine->disk_stage.pop_cv.notify_all();
     engine->pinned_stage.pop_cv.notify_all();
     engine->gpu_stage.pop_cv.notify_all();
@@ -41,6 +42,9 @@ static void stop_io_workers_locked(moe_pc_engine* engine) {
             worker.join();
         }
     }
+    if (engine->gds_blocking_worker.joinable()) {
+        engine->gds_blocking_worker.join();
+    }
     if (engine->eviction_worker.joinable()) {
         engine->eviction_worker.join();
     }
@@ -50,6 +54,11 @@ static void stop_io_workers_locked(moe_pc_engine* engine) {
     engine->io_workers.clear();
     engine->pinned_workers.clear();
     engine->gpu_workers.clear();
+    {
+        std::lock_guard<std::mutex> lock(engine->gds_blocking_mutex);
+        engine->gds_blocking_queue.clear();
+        engine->gds_blocking_pending.store(0, std::memory_order_release);
+    }
     engine->total_queue_depth.store(0, std::memory_order_relaxed);
     // BUGFIX NEW-9: Move io_stop.store(false) to start_io_workers() ★★★ CRITICAL
     // Problem: io_stop=false set here → ensure_io_ready() starts threads immediately after
@@ -126,6 +135,11 @@ static void start_io_workers(moe_pc_engine* engine) {
     }
     if (!engine->eviction_worker.joinable()) {
         engine->eviction_worker = std::thread(proactive_eviction_worker_loop, engine);
+    }
+    if (engine->backend_caps.backend == moe_BACKEND_CUDA &&
+        engine->io_config.enable_gpudirect_storage &&
+        !engine->gds_blocking_worker.joinable()) {
+        engine->gds_blocking_worker = std::thread(gds_blocking_worker_loop, engine);
     }
 }
 

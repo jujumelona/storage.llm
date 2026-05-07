@@ -100,6 +100,7 @@ static inline __m256 moe_madd_ps(__m256 a, __m256 b, __m256 c) {
 #include "parts/json_parser.cpp.inc"
 #include "parts/model_contract_types.cpp.inc"
 #include "parts/gguf_tensor_reader.cpp.inc"
+static int moe_parse_layer_from_gguf_name(const std::string& name, uint32_t* layer);
 #include "parts/juju_parser.cpp.inc"
 #include "parts/metadata_parser.cpp.inc"
 #include "parts/model_file_readers.cpp.inc"

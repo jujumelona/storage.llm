@@ -32,6 +32,7 @@ static void reset_io_stats_for_config(moe_pc_engine* engine) {
     engine->io_atomic.bytes_directstorage_submitted.store(0, std::memory_order_relaxed);
     engine->io_atomic.bytes_directstorage_completed.store(0, std::memory_order_relaxed);
     engine->io_atomic.bytes_directstorage_failed.store(0, std::memory_order_relaxed);
+    engine->io_atomic.directstorage_queue_full_wait_ns.store(0, std::memory_order_relaxed);
     engine->io_atomic.backend_async_submitted.store(0, std::memory_order_relaxed);
     engine->io_atomic.backend_async_completed.store(0, std::memory_order_relaxed);
     engine->io_atomic.backend_async_fallback.store(0, std::memory_order_relaxed);
@@ -43,7 +44,10 @@ static void reset_io_stats_for_config(moe_pc_engine* engine) {
     const moe_io_path_t active_path = choose_active_io_path(engine);
     engine->io_atomic.active_path.store(static_cast<uint32_t>(active_path), std::memory_order_relaxed);
     engine->io_atomic.pinned_host_active.store(engine->staging_pinned ? 1u : 0u, std::memory_order_relaxed);
-    engine->io_atomic.directstorage_active.store(active_path == moe_IO_PATH_DIRECTSTORAGE ? 1u : 0u, std::memory_order_relaxed);
+    engine->io_atomic.directstorage_active.store(
+        (active_path == moe_IO_PATH_DIRECTSTORAGE_STAGING ||
+         active_path == moe_IO_PATH_DIRECTSTORAGE_GPU) ? 1u : 0u,
+        std::memory_order_relaxed);
     engine->io_atomic.gpudirect_storage_active.store(active_path == moe_IO_PATH_GPUDIRECT_STORAGE ? 1u : 0u, std::memory_order_relaxed);
     engine->io_atomic.bam_nvme_active.store(active_path == moe_IO_PATH_BAM_NVME ? 1u : 0u, std::memory_order_relaxed);
 }
@@ -87,6 +91,7 @@ static void snapshot_io_stats(const moe_pc_engine* engine, moe_io_stats_t* out) 
     out->bytes_directstorage_submitted = engine->io_atomic.bytes_directstorage_submitted.load(std::memory_order_relaxed);
     out->bytes_directstorage_completed = engine->io_atomic.bytes_directstorage_completed.load(std::memory_order_relaxed);
     out->bytes_directstorage_failed = engine->io_atomic.bytes_directstorage_failed.load(std::memory_order_relaxed);
+    out->directstorage_queue_full_wait_ns = engine->io_atomic.directstorage_queue_full_wait_ns.load(std::memory_order_relaxed);
     out->backend_async_submitted = engine->io_atomic.backend_async_submitted.load(std::memory_order_relaxed);
     out->backend_async_completed = engine->io_atomic.backend_async_completed.load(std::memory_order_relaxed);
     out->backend_async_fallback = engine->io_atomic.backend_async_fallback.load(std::memory_order_relaxed);

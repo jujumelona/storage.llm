@@ -188,8 +188,8 @@ static void moe_juju_probe_note_tensor(
     if (entry.dims < 2 || !entry.shape[1]) {
         return;
     }
-    const uint64_t cols = entry.shape[0];
-    const uint64_t rows = entry.shape[1];
+    const uint64_t cols = entry.math_in_features ? entry.math_in_features : entry.shape[0];
+    const uint64_t rows = entry.math_out_features ? entry.math_out_features : entry.shape[1];
     if (lower == "token_embd.weight") {
         probe->shape.hidden_size = (uint32_t)std::min<uint64_t>(cols, UINT32_MAX);
         probe->shape.vocab_size = (uint32_t)std::min<uint64_t>(rows, UINT32_MAX);

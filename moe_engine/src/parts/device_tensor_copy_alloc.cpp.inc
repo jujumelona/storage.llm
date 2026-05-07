@@ -156,6 +156,15 @@ static int device_prepare_tensor_allocation(
                         next.backend_aux = reinterpret_cast<uint64_t>(memory);
                         return 1;
                     }
+                } else if (e->backend_caps.backend == moe_BACKEND_DIRECTML &&
+                           e->runtime_directstorage_gpu_ready.load(std::memory_order_acquire)) {
+                    void* resource = nullptr;
+                    if (directstorage_create_d3d12_buffer_resource(e, bytes, &resource) && resource) {
+                        next.ptr = reinterpret_cast<CUdeviceptr>(resource);
+                        next.backend_kind = moe_DEVICE_ALLOC_D3D12_RESOURCE;
+                        next.backend_aux = 0;
+                        return 1;
+                    }
                 }
                 return 0;
             };

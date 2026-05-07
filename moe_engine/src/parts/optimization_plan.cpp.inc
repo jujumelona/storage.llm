@@ -13,7 +13,7 @@ int moe_pc_engine_get_optimization_plan(
     const int gpu_available = caps_gpu_backend_available(caps);
     const moe_io_path_t active_path = choose_active_io_path(engine);
     const int direct_to_gpu =
-        active_path == moe_IO_PATH_DIRECTSTORAGE ||
+        active_path == moe_IO_PATH_DIRECTSTORAGE_GPU ||
         active_path == moe_IO_PATH_GPUDIRECT_STORAGE ||
         active_path == moe_IO_PATH_BAM_NVME;
 

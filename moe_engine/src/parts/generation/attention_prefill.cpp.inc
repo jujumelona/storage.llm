@@ -107,6 +107,43 @@ static int moe_apply_unweighted_head_rmsnorm_f32(
     return 1;
 }
 
+static int moe_layer_attention_value_source_is_raw_k_before_k_norm(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    char layer_key[32];
+    std::snprintf(layer_key, sizeof(layer_key), "%d", (int)layer);
+    const std::string* docs[] = {
+        &engine->offload_graph_ir_json,
+        &engine->offload_gguf_metadata_json,
+    };
+    for (const std::string* doc : docs) {
+        if (!doc || doc->empty()) {
+            continue;
+        }
+        size_t table_begin = 0;
+        size_t table_end = 0;
+        if (!moe_json_find_object_local(*doc, "attention_layer_contract_table", &table_begin, &table_end)) {
+            continue;
+        }
+        const std::string table = doc->substr(table_begin, table_end - table_begin);
+        size_t layer_begin = 0;
+        size_t layer_end = 0;
+        if (!moe_json_find_object_local(table, layer_key, &layer_begin, &layer_end)) {
+            continue;
+        }
+        std::string value_source;
+        if (moe_json_get_string_slice(table, layer_begin, layer_end, "value_source", &value_source) &&
+            value_source == "raw_k_projection_before_k_norm") {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int moe_layer_uses_unweighted_v_norm(
     moe_pc_engine* engine,
     int32_t layer
@@ -126,26 +163,12 @@ static int moe_layer_uses_unweighted_v_norm(
     if (get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_KV_B_PROJ, &v_shape)) {
         return 0;
     }
-    const int has_q_norm =
-        moe_engine_has_common_tensor_suffix(engine, layer, "attn_q_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "q_norm.weight");
-    const int has_k_norm =
-        moe_engine_has_common_tensor_suffix(engine, layer, "attn_k_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "k_norm.weight");
-    const int has_scaled_block_norms =
-        moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_norm.weight") &&
-        moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm.weight") &&
-        moe_engine_has_common_tensor_suffix(engine, layer, "layer_output_scale.weight");
-    int attention_k_eq_v = 0;
-    if (has_q_norm && has_k_norm && has_scaled_block_norms &&
-        moe_json_get_bool_local(engine->offload_gguf_metadata_json, "attention_k_eq_v", &attention_k_eq_v) &&
-        attention_k_eq_v &&
-        (moe_engine_graph_ir_mentions(engine, "value_norm") ||
-         moe_engine_graph_ir_mentions(engine, "v_norm") ||
-         moe_engine_metadata_mentions(engine, "value_norm") ||
-         moe_engine_metadata_mentions(engine, "v_norm"))) {
-        return 1;
+    if (moe_layer_attention_value_source_is_raw_k_before_k_norm(engine, layer)) {
+        return 0;
     }
+    // Do not infer a layer-local V norm from graph-wide substring matches. A
+    // missing V projection plus q/k norm means K==V only when the layer contract
+    // says so; unweighted V norm requires an explicit per-layer contract.
     return 0;
 }
 
@@ -493,10 +516,14 @@ static void moe_standard_attention_rope_params(
     double sliding_theta = 0.0;
     const int has_full_theta =
         moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_rope_theta", &full_theta) ||
-        moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_attention_rope_theta", &full_theta);
+        moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_attention_rope_theta", &full_theta) ||
+        moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.rope.freq_base", &full_theta) ||
+        moe_json_get_double_local(engine->offload_gguf_metadata_json, "rope.freq_base", &full_theta);
     const int has_sliding_theta =
         moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_rope_theta", &sliding_theta) ||
-        moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_attention_rope_theta", &sliding_theta);
+        moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_attention_rope_theta", &sliding_theta) ||
+        moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.rope.freq_base_swa", &sliding_theta) ||
+        moe_json_get_double_local(engine->offload_gguf_metadata_json, "rope.freq_base_swa", &sliding_theta);
     const int full_attention_layout =
         !has_v ||
         (head_dim > 256u) ||

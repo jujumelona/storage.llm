@@ -261,42 +261,10 @@ static uint8_t moe_effective_weight_format_for_row_bytes(
     if (actual == moe_weight_format_row_bytes_for_cols(raw.weight_format, cols)) {
         return raw.weight_format;
     }
-    static const uint8_t candidates[] = {
-        moe_WEIGHT_ENCODING_GGUF_Q8_0,
-        moe_WEIGHT_ENCODING_GGUF_Q8_1,
-        moe_WEIGHT_ENCODING_GGUF_Q8_K,
-        moe_WEIGHT_ENCODING_GGUF_Q4_0,
-        moe_WEIGHT_ENCODING_GGUF_Q4_1,
-        moe_WEIGHT_ENCODING_GGUF_Q5_0,
-        moe_WEIGHT_ENCODING_GGUF_Q5_1,
-        moe_WEIGHT_ENCODING_GGUF_Q2_K,
-        moe_WEIGHT_ENCODING_GGUF_Q3_K,
-        moe_WEIGHT_ENCODING_GGUF_Q4_K,
-        moe_WEIGHT_ENCODING_GGUF_Q5_K,
-        moe_WEIGHT_ENCODING_GGUF_Q6_K,
-        moe_WEIGHT_ENCODING_GGUF_IQ2_XXS,
-        moe_WEIGHT_ENCODING_GGUF_IQ2_XS,
-        moe_WEIGHT_ENCODING_GGUF_IQ2_S,
-        moe_WEIGHT_ENCODING_GGUF_IQ3_XXS,
-        moe_WEIGHT_ENCODING_GGUF_IQ3_S,
-        moe_WEIGHT_ENCODING_GGUF_IQ4_NL,
-        moe_WEIGHT_ENCODING_GGUF_IQ4_XS,
-        moe_WEIGHT_ENCODING_GGUF_IQ1_S,
-        moe_WEIGHT_ENCODING_GGUF_IQ1_M,
-        moe_WEIGHT_ENCODING_GGUF_TQ1_0,
-        moe_WEIGHT_ENCODING_GGUF_TQ2_0
-    };
-    uint8_t match = raw.weight_format;
-    uint32_t matches = 0;
-    for (uint8_t candidate : candidates) {
-        if (actual == moe_weight_format_row_bytes_for_cols(candidate, cols)) {
-            match = candidate;
-            ++matches;
-        }
-    }
-    if (matches == 1u) {
-        return match;
-    }
+    (void)actual;
+    // Row stride can differ from logical codec row bytes when the JUJU index
+    // uses physical row padding. The codec itself is contractual; never infer a
+    // different quant family from byte counts.
     return raw.weight_format;
 }
 

@@ -133,6 +133,14 @@ static int moe_raw_embedding_ready(const moe_pc_engine* engine) {
         "embed_tokens.weight",
         "transformer.wte.weight"
     };
+    {
+        moe_raw_tensor_desc desc{};
+        const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_op_role(engine, "token_embedding", -1, &desc);
+        if (rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size) {
+            return common_tensor_backing_file_ready(engine, rec);
+        }
+    }
     if (const moe_gguf_common_tensor_record* rec =
             find_common_tensor_by_names(engine, embedding_names, sizeof(embedding_names) / sizeof(embedding_names[0]), nullptr)) {
         return common_tensor_backing_file_ready(engine, rec);
@@ -169,6 +177,14 @@ static int moe_raw_lm_head_ready(const moe_pc_engine* engine) {
         "model.embed_tokens.weight",
         "embed_tokens.weight"
     };
+    {
+        moe_raw_tensor_desc desc{};
+        const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_op_role(engine, "lm_head", -1, &desc);
+        if (rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size) {
+            return common_tensor_backing_file_ready(engine, rec);
+        }
+    }
     for (size_t i = 0; i < sizeof(lm_head_names) / sizeof(lm_head_names[0]); ++i) {
         moe_raw_tensor_desc desc{};
         const moe_gguf_common_tensor_record* rec =

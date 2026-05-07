@@ -2,7 +2,7 @@ static int prefetch_one_raw_span(
     moe_pc_engine* e,
     const moe_storage_raw_span_spec_t& s,
     uint8_t pool,
-    int allow_sync_fallback = 1
+    int allow_sync_fallback = 0
 );
 
 // BUGFIX 62: Forward declaration for dynamic batch_max function ??†Ïç©??static uint32_t moe_gpu_stage_batch_max(const moe_pc_engine* engine);

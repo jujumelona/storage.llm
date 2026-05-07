@@ -59,7 +59,8 @@ static int moe_engine_load_offload_gguf_contract(
         "[storagellm] offload %s contract loaded: files=%u first=%s qkv=%s "
         "k_bits=%d v_bits=%d normal_bits=%d outlier_bits=%d "
         "key_normal_bits=%d value_normal_bits=%d key_outlier_bits=%d value_outlier_bits=%d "
-        "group=%u page=%u qjl=%d rotation=%d weight=%s/%ub catalog=%u plain_kv=%d\n",
+        "group=%u page=%u qjl=%d rotation=%d rotation_backend=%u codebook=%u "
+        "policy_hash=%llu weight=%s/%ub catalog=%u plain_kv=%d\n",
         scan.juju_format ? "JUJU" : "GGUF",
         scan.expected_count,
         primary.path.c_str(),
@@ -76,6 +77,9 @@ static int moe_engine_load_offload_gguf_contract(
         engine->offload_qkv_cfg.page_size_tokens,
         engine->offload_qkv_cfg.enable_qjl ? 1 : 0,
         engine->offload_qkv_cfg.enable_rotation ? 1 : 0,
+        engine->offload_qkv_cfg.rotation_backend,
+        engine->offload_qkv_cfg.codebook_distribution,
+        (unsigned long long)engine->offload_qkv_cfg.policy_hash,
         primary.contract.weight_quant_family.empty() ? "unknown" : primary.contract.weight_quant_family.c_str(),
         primary.contract.weight_bits,
         primary.contract.optimization_catalog_count,

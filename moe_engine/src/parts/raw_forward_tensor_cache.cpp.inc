@@ -42,10 +42,11 @@ static int get_cached_raw_tensor(
         }
         moe_profile_log(
             "raw_tensor_map",
-            "source=common layer=%d kind=%d name=%s rows=%u cols=%u bytes=%llu scalar=%u fmt=%u row_bytes=%llu path=%u file_offset=%llu",
+            "source=common layer=%d kind=%d name=%s op_role=%s rows=%u cols=%u bytes=%llu scalar=%u fmt=%u row_bytes=%llu path=%u file_offset=%llu",
             layer,
             (int)kind,
             rec->name.c_str(),
+            rec->op_role.c_str(),
             entry.rows,
             entry.cols,
             (unsigned long long)entry.bytes,

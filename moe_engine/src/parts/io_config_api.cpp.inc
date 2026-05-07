@@ -1,3 +1,166 @@
+static int validate_true_zero_copy_mmap_hip(
+    moe_pc_engine* engine,
+    void* mapped_file_ptr,
+    size_t bytes
+) {
+    static constexpr unsigned int hipHostRegisterMappedFlag = 2u;
+    if (!engine ||
+        engine->backend_caps.backend != moe_BACKEND_HIP ||
+        !mapped_file_ptr ||
+        bytes < 4096 ||
+        !engine->hip.hipHostRegister ||
+        !engine->hip.hipHostGetDevicePointer ||
+        !engine->hip.hipMemcpyDtoH ||
+        !engine->hip.hipHostUnregister) {
+        return 0;
+    }
+    if (engine->hip.hipHostRegister(mapped_file_ptr, bytes, hipHostRegisterMappedFlag) != 0) {
+        return 0;
+    }
+    void* device_ptr = nullptr;
+    if (engine->hip.hipHostGetDevicePointer(&device_ptr, mapped_file_ptr, 0) != 0 || !device_ptr) {
+        engine->hip.hipHostUnregister(mapped_file_ptr);
+        return 0;
+    }
+    const uint8_t* cpu_base = static_cast<const uint8_t*>(mapped_file_ptr);
+    const uint64_t gpu_base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(device_ptr));
+    const size_t sample = std::min<size_t>(4096, bytes);
+    const size_t offsets[3] = {
+        0,
+        bytes > sample ? ((bytes - sample) / 2u) : 0,
+        bytes > sample ? (bytes - sample) : 0
+    };
+    std::vector<uint8_t> gpu_sample(sample);
+    int ok = 1;
+    for (size_t i = 0; i < 3; ++i) {
+        const size_t off = offsets[i];
+        if (off > bytes || sample > bytes - off) {
+            ok = 0;
+            break;
+        }
+        if (engine->hip.hipMemcpyDtoH(
+                gpu_sample.data(),
+                gpu_base + static_cast<uint64_t>(off),
+                sample) != 0) {
+            ok = 0;
+            break;
+        }
+        if (std::memcmp(gpu_sample.data(), cpu_base + off, sample) != 0) {
+            ok = 0;
+            break;
+        }
+    }
+    engine->hip.hipHostUnregister(mapped_file_ptr);
+    return ok ? 1 : 0;
+}
+
+static int validate_true_zero_copy_mmap_level_zero(
+    moe_pc_engine* engine,
+    void* mapped_file_ptr,
+    size_t bytes
+) {
+    if (!engine ||
+        (engine->backend_caps.backend != moe_BACKEND_LEVEL_ZERO &&
+         engine->backend_caps.backend != moe_BACKEND_SYCL) ||
+        !mapped_file_ptr ||
+        bytes < 4096 ||
+        !engine->ze.context ||
+        !engine->ze.device ||
+        !level_zero_async_runtime_ready(engine) ||
+        !engine->ze.zeMemAllocDevice ||
+        !engine->ze.zeMemFree) {
+        return 0;
+    }
+    struct ze_device_mem_alloc_desc_t_local {
+        uint32_t stype;
+        const void* pNext;
+        uint32_t flags;
+        uint32_t ordinal;
+    } desc{0x00010002u, nullptr, 0u, 0u};
+    const size_t sample = std::min<size_t>(4096, bytes);
+    void* device_scratch = nullptr;
+    if (engine->ze.zeMemAllocDevice(
+            engine->ze.context,
+            &desc,
+            sample,
+            4096u,
+            engine->ze.device,
+            &device_scratch) != 0 || !device_scratch) {
+        return 0;
+    }
+    void* cmd = level_zero_create_command_list(engine);
+    if (!cmd) {
+        engine->ze.zeMemFree(engine->ze.context, device_scratch);
+        return 0;
+    }
+    const uint8_t* cpu_base = static_cast<const uint8_t*>(mapped_file_ptr);
+    const size_t offsets[3] = {
+        0,
+        bytes > sample ? ((bytes - sample) / 2u) : 0,
+        bytes > sample ? (bytes - sample) : 0
+    };
+    std::vector<uint8_t> gpu_sample(sample);
+    int ok = 1;
+    for (size_t i = 0; i < 3; ++i) {
+        const size_t off = offsets[i];
+        if (off > bytes || sample > bytes - off ||
+            (i > 0 && engine->ze.zeCommandListReset(cmd) != 0) ||
+            engine->ze.zeCommandListAppendMemoryCopy(
+                cmd,
+                device_scratch,
+                cpu_base + off,
+                sample,
+                nullptr,
+                0,
+                nullptr) != 0 ||
+            engine->ze.zeCommandListAppendMemoryCopy(
+                cmd,
+                gpu_sample.data(),
+                device_scratch,
+                sample,
+                nullptr,
+                0,
+                nullptr) != 0 ||
+            engine->ze.zeCommandListClose(cmd) != 0 ||
+            engine->ze.zeCommandQueueExecuteCommandLists(
+                engine->ze.command_queue,
+                1,
+                &cmd,
+                nullptr) != 0 ||
+            engine->ze.zeCommandQueueSynchronize(engine->ze.command_queue, UINT64_MAX) != 0 ||
+            std::memcmp(gpu_sample.data(), cpu_base + off, sample) != 0) {
+            ok = 0;
+            break;
+        }
+    }
+    level_zero_destroy_command_list(engine, cmd);
+    engine->ze.zeMemFree(engine->ze.context, device_scratch);
+    return ok ? 1 : 0;
+}
+
+static int validate_true_zero_copy_mmap(moe_pc_engine* engine, void* mapped_file_ptr, size_t bytes) {
+    if (!engine) {
+        return 0;
+    }
+    if (engine->backend_caps.backend == moe_BACKEND_METAL &&
+        engine->backend_caps.supports_unified_memory) {
+        return 1;
+    }
+    if (!mapped_file_ptr || bytes < 4096 ||
+        !engine->backend_caps.supports_unified_memory ||
+        !engine->backend_caps.supports_zero_copy_mmap) {
+        return 0;
+    }
+    if (engine->backend_caps.backend == moe_BACKEND_HIP) {
+        return validate_true_zero_copy_mmap_hip(engine, mapped_file_ptr, bytes);
+    }
+    if (engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
+        engine->backend_caps.backend == moe_BACKEND_SYCL) {
+        return validate_true_zero_copy_mmap_level_zero(engine, mapped_file_ptr, bytes);
+    }
+    return 0;
+}
+
 int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* config) {
     if (!engine) {
         return 0;
@@ -15,9 +178,34 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
 
     const int using_default_io_config = config ? 0 : 1;
     engine->io_config = config ? *config : moe_pc_default_io_config();
+    if (engine->io_config.directstorage_staging_queue_capacity == 0) {
+        engine->io_config.directstorage_staging_queue_capacity = 1024;
+    }
+    if (engine->io_config.directstorage_gpu_queue_capacity == 0) {
+        engine->io_config.directstorage_gpu_queue_capacity = 1024;
+    }
+    if (using_default_io_config) {
+        engine->io_config.allow_required_sync_fallback = 1;
+        engine->io_config.require_bundle_native_experts = 1;
+    }
     if (engine->backend_caps.backend == moe_BACKEND_METAL) {
         engine->io_config.enable_pinned_host = 0;
     }
+    engine->true_zero_copy_validated.store(
+        validate_true_zero_copy_mmap(engine, nullptr, 0) != 0,
+        std::memory_order_release);
+#if defined(_WIN32)
+    if (engine->io_config.enable_directstorage &&
+        engine->backend_caps.supports_directstorage &&
+        compiled_directstorage_available()) {
+        directstorage_queue_ensure(engine);
+    } else {
+        engine->runtime_directstorage_staging_ready.store(false, std::memory_order_release);
+        engine->runtime_directstorage_gpu_ready.store(false, std::memory_order_release);
+    }
+#else
+    device_gpudirect_storage_runtime_probe(engine);
+#endif
     const int staging_bypass = engine_bypass_staging_pipeline(engine);
     const int dma_gpu_backend =
         engine->backend_caps.backend == moe_BACKEND_CUDA ||
@@ -96,17 +284,19 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
         // Solution: If GDS is enabled AND backend supports it, reduce staging to normal_max × 4
         // (minimum fallback for non-GDS paths). Only apply after GDS capability confirmed.
         // Impact: Saves 1-2GB RAM on high-core-count systems with GDS hardware.
-        const bool gds_active = (engine->io_config.enable_gpudirect_storage &&
-                                 engine->backend_caps.supports_gpudirect_storage) ||
-                                (engine->io_config.enable_directstorage &&
-                                 engine->backend_caps.supports_directstorage) ||
-                                (engine->io_config.enable_bam_nvme &&
-                                 engine->backend_caps.supports_gpu_direct_file_io);
-        if (gds_active) {
+        const bool direct_io_runtime_active =
+            engine->runtime_gpudirect_ready.load(std::memory_order_acquire) ||
+            engine->runtime_directstorage_gpu_ready.load(std::memory_order_acquire);
+        const bool staging_still_needed =
+            !direct_io_runtime_active ||
+            engine->runtime_directstorage_staging_ready.load(std::memory_order_acquire);
+        if (direct_io_runtime_active && !staging_still_needed) {
             const moe_storage_constants_t* storage = moe_storage_constants();
             const uint64_t normal_max = storage ? storage->normal_bundle_max_bytes : 32ull * 1024ull * 1024ull;
-            const uint64_t gds_fallback = normal_max * 4ull;
-            staging_target = std::max<uint64_t>(gds_fallback, std::min<uint64_t>(staging_target, gds_fallback * 2ull));
+            const uint64_t minimal_control_staging = normal_max * 2ull;
+            staging_target = std::max<uint64_t>(
+                minimal_control_staging,
+                std::min<uint64_t>(staging_target, minimal_control_staging));
         }
         if (engine->config.ram_budget_bytes > 0) {
             staging_target = std::min<uint64_t>(staging_target, engine->config.ram_budget_bytes / 3ull);
@@ -311,7 +501,8 @@ int moe_pc_engine_wait_io(moe_pc_engine_t* engine) {
     engine->io_done_cv.wait(lock, [&] {
         return stage_idle(engine->disk_stage) &&
                stage_idle(engine->pinned_stage) &&
-               stage_idle(engine->gpu_stage);
+               stage_idle(engine->gpu_stage) &&
+               engine->gds_blocking_pending.load(std::memory_order_acquire) == 0;
     });
     return 1;
 }

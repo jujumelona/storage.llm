@@ -44,6 +44,7 @@ static int hip_driver_load(moe_hip_driver_api* api) {
     api->hipMemGetInfo = (moe_cu_mem_get_info_fn)moe_find_hip_symbol(api->library, "hipMemGetInfo_v2", "hipMemGetInfo");
     api->hipMemcpyHtoDAsync = (moe_cu_memcpy_htod_async_fn)moe_find_hip_symbol(api->library, "hipMemcpyHtoDAsync_v2", "hipMemcpyHtoDAsync");
     api->hipMemcpyDtoD = (moe_cu_memcpy_dtod_fn)moe_find_hip_symbol(api->library, "hipMemcpyDtoD_v2", "hipMemcpyDtoD");
+    api->hipMemcpyDtoH = (moe_cu_memcpy_dtoh_fn)moe_find_hip_symbol(api->library, "hipMemcpyDtoH_v2", "hipMemcpyDtoH");
     api->hipStreamCreate = (moe_cu_stream_create_fn)moe_find_shared_symbol(api->library, "hipStreamCreate");
     api->hipStreamSynchronize = (moe_cu_stream_synchronize_fn)moe_find_shared_symbol(api->library, "hipStreamSynchronize");
     api->hipStreamDestroy = (moe_cu_stream_destroy_fn)moe_find_hip_symbol(api->library, "hipStreamDestroy_v2", "hipStreamDestroy");
@@ -53,9 +54,12 @@ static int hip_driver_load(moe_hip_driver_api* api) {
     api->hipEventQuery = (moe_cu_event_query_fn)moe_find_shared_symbol(api->library, "hipEventQuery");
     api->hipEventSynchronize = (moe_cu_event_synchronize_fn)moe_find_shared_symbol(api->library, "hipEventSynchronize");
     api->hipEventDestroy = (moe_cu_event_destroy_fn)moe_find_hip_symbol(api->library, "hipEventDestroy_v2", "hipEventDestroy");
-    // BUGFIX 952: Load hipHostMalloc/hipHostFree for pinned staging ★★★
+    // Load HIP host allocation/register hooks for pinned and mmap probes.
     api->hipHostMalloc = (decltype(api->hipHostMalloc))moe_find_shared_symbol(api->library, "hipHostMalloc");
     api->hipHostFree = (decltype(api->hipHostFree))moe_find_shared_symbol(api->library, "hipHostFree");
+    api->hipHostRegister = (decltype(api->hipHostRegister))moe_find_shared_symbol(api->library, "hipHostRegister");
+    api->hipHostGetDevicePointer = (decltype(api->hipHostGetDevicePointer))moe_find_shared_symbol(api->library, "hipHostGetDevicePointer");
+    api->hipHostUnregister = (decltype(api->hipHostUnregister))moe_find_shared_symbol(api->library, "hipHostUnregister");
     return api->hipInit && api->hipDeviceGet && api->hipCtxSetCurrent &&
         api->hipDevicePrimaryCtxRetain && api->hipDevicePrimaryCtxRelease &&
         api->hipMalloc && api->hipFree && api->hipMemcpyHtoD && api->hipMemGetInfo;

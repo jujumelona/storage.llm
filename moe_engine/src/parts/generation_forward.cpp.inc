@@ -288,10 +288,16 @@ static int moe_forward_one_token_f32(
             const float* attn_residual = s->attn.data();
             const int graph_residual_first =
                 moe_graph_ir_attention_residual_before_ffn_norm(engine, (int32_t)layer);
+            const int post_attention_norm_required =
+                moe_layer_has_post_attention_norm_weight(engine, (int32_t)layer);
             const int post_norm_used = graph_residual_first ? 0 :
                 moe_layer_post_attention_output_norm_f32(
                     engine, (int32_t)layer, s->attn.data(), c->hidden_size,
                     s->norm.data(), layer_attn_cfg.rms_norm_eps);
+            if (!graph_residual_first && post_attention_norm_required && !post_norm_used) {
+                moe_generation_set_error(stats, "post-attention norm tensor is required but could not be mapped");
+                return 0;
+            }
             if (post_norm_used) {
                 attn_residual = s->norm.data();
             }
@@ -318,6 +324,10 @@ static int moe_forward_one_token_f32(
             if (!moe_layer_ffn_norm_f32(
                     engine, (int32_t)layer, hidden, c->hidden_size,
                     s->norm.data(), layer_attn_cfg.rms_norm_eps)) {
+                if (moe_layer_has_ffn_norm_weight(engine, (int32_t)layer)) {
+                    moe_generation_set_error(stats, "ffn norm tensor is required but could not be mapped");
+                    return 0;
+                }
                 std::memcpy(s->norm.data(), hidden, (size_t)c->hidden_size * sizeof(float));
             }
             save_gate_input_snapshot(engine, layer, s->norm.data(), c->hidden_size);

@@ -4,6 +4,9 @@
 
 // Random Matrix Generation for QKV Quantization
 
+#define QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL 0u
+#define QKV_ROTATION_BACKEND_HADAMARD_SIGN_FAST 1u
+
 bool qkv_dim_is_power_of_two(int dim);
 
 void qkv_fwht_inplace(float* data, int dim);
@@ -22,13 +25,18 @@ int qkv_apply_hadamard_rotation_inverse(
     int dim
 );
 
-// Generate random rotation matrix Pi via QR decomposition
-// For power-of-2 dimensions: use fast Hadamard-like construction
-// For non-power-of-2: use QR decomposition of Gaussian random matrix
+// Generate paper-conformant random rotation matrix Pi via Gaussian QR.
 void qkv_generate_rotation_matrix(
     float* Pi,
     int dim,
     uint64_t seed
+);
+
+void qkv_generate_rotation_matrix_ex(
+    float* Pi,
+    int dim,
+    uint64_t seed,
+    unsigned rotation_backend
 );
 
 // Generate QJL (Quantized Johnson-Lindenstrauss) matrix

@@ -61,6 +61,14 @@ static int moe_map_lm_head_tensor(
         "model.embed_tokens.weight",
         "embed_tokens.weight"
     };
+    {
+        moe_raw_tensor_desc desc{};
+        const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_op_role(engine, "lm_head", -1, &desc);
+        if (rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size) {
+            return map_common_tensor_record(engine, *rec, desc, out);
+        }
+    }
     for (size_t i = 0; i < sizeof(lm_head_names) / sizeof(lm_head_names[0]); ++i) {
         moe_raw_tensor_desc desc{};
         const moe_gguf_common_tensor_record* rec =

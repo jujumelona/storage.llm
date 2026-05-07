@@ -171,6 +171,37 @@ static void moe_ingest_juju_graph_ir(moe_pc_engine* engine, const std::string& i
     engine->offload_graph_ir_version.store((uint32_t)std::min<uint64_t>(schema_version, UINT32_MAX), std::memory_order_relaxed);
 }
 
+static int moe_juju_validate_required_bundle_native_experts(moe_pc_engine* engine) {
+    if (!engine || !engine->io_config.require_bundle_native_experts) {
+        return 1;
+    }
+    for (const moe_tensor_record& rec : engine->tensors) {
+        if (rec.info.proj != moe_PROJ_GATE &&
+            rec.info.proj != moe_PROJ_UP &&
+            rec.info.proj != moe_PROJ_DOWN) {
+            continue;
+        }
+        if (tensor_dense_slot(
+                engine,
+                static_cast<int>(rec.info.layer),
+                static_cast<int>(rec.info.expert),
+                rec.info.proj) == tensor_slot_invalid()) {
+            continue;
+        }
+        if (rec.bundle_native) {
+            continue;
+        }
+        std::fprintf(stderr,
+            "[storagellm] JUJU MoE expert tensor is not bundle-native: layer=%u expert=%u proj=%u. "
+            "Regenerate with bundle_native_required=true or disable require_bundle_native_experts for compatibility mode.\n",
+            (unsigned)rec.info.layer,
+            (unsigned)rec.info.expert,
+            (unsigned)rec.info.proj);
+        return 0;
+    }
+    return 1;
+}
+
 static int load_juju_tensor_index_as_tensor_index(
     moe_pc_engine* engine,
     const std::string& root,
@@ -279,6 +310,16 @@ static int load_juju_tensor_index_as_tensor_index(
                 entry.juju_bytes > file_bytes - entry.juju_offset) {
                 continue;
             }
+            if (!moe_juju_tensor_codec_contract_valid(entry, contract)) {
+                std::fprintf(stderr,
+                    "[storagellm] JUJU tensor codec contract rejected: name=%s gguf_type=%u codec_id=%s registry=%s weight_encoding=%u\n",
+                    entry.name.c_str(),
+                    (unsigned)entry.gguf_type,
+                    entry.codec_id.c_str(),
+                    entry.codec_registry_version.c_str(),
+                    (unsigned)entry.weight_encoding);
+                return 0;
+            }
             if (entry.runtime_priority != 50 || entry.prefetch_priority != 50 ||
                 entry.residency_hint != moe_JUJU_RESIDENCY_AUTO ||
                 entry.graph_role != moe_JUJU_ROLE_UNKNOWN ||
@@ -307,7 +348,7 @@ static int load_juju_tensor_index_as_tensor_index(
                 common.weight_encoding = moe_weight_encoding_from_juju_entry(entry, contract);
                 common.file_offset = entry.juju_offset;
                 common.bytes = moe_effective_juju_tensor_bytes(entry, contract);
-                common.weight_row_bytes = entry.row_stride_bytes;
+                common.weight_row_bytes = entry.row_stride_bytes ? entry.row_stride_bytes : entry.row_bytes;
                 for (uint32_t i = 0; i < std::min<uint32_t>(entry.dims, 4u); ++i) {
                     common.shape[i] = entry.shape[i];
                 }
@@ -317,6 +358,20 @@ static int load_juju_tensor_index_as_tensor_index(
                 if (common_it != engine->gguf_common_tensor_slots.end() &&
                     common_it->second < engine->gguf_common_tensors.size()) {
                     moe_gguf_common_tensor_record& common_rec = engine->gguf_common_tensors[common_it->second];
+                    common_rec.op_role = moe_lower_ascii_copy(!entry.op_role.empty() ? entry.op_role : entry.execution_op);
+                    common_rec.codec_id = entry.codec_id;
+                    common_rec.codec_registry_version = entry.codec_registry_version;
+                    common_rec.storage_layout = entry.storage_layout;
+                    common_rec.source_dims = std::min<uint32_t>(entry.source_dims, 4u);
+                    for (uint32_t i = 0; i < common_rec.source_dims; ++i) {
+                        common_rec.source_shape[i] = entry.source_shape[i];
+                    }
+                    common_rec.execution_layer = entry.execution_layer;
+                    common_rec.math_rows = entry.math_out_features ?
+                        (uint32_t)std::min<uint64_t>(entry.math_out_features, UINT32_MAX) : 0u;
+                    common_rec.math_cols = entry.math_in_features ?
+                        (uint32_t)std::min<uint64_t>(entry.math_in_features, UINT32_MAX) : 0u;
+                    common_rec.math_transposed = entry.math_transposed;
                     common_rec.runtime_priority = entry.runtime_priority;
                     common_rec.prefetch_priority = entry.prefetch_priority;
                     common_rec.execution_order = entry.execution_order;
@@ -382,17 +437,29 @@ static int load_juju_tensor_index_as_tensor_index(
                     entry.name.c_str());
                 return 0;
             }
+            if (combined_gate_up) {
+                const std::string split_policy = moe_lower_ascii_copy(entry.split_policy);
+                if (!split_policy.empty() && split_policy != "contiguous_rows") {
+                    std::fprintf(stderr,
+                        "[storagellm] JUJU combined gate/up tensor has unsupported split policy: name=%s policy=%s\n",
+                        entry.name.c_str(),
+                        entry.split_policy.c_str());
+                    return 0;
+                }
+            }
+            const uint64_t math_rows_total64 = entry.math_out_features ? entry.math_out_features : entry.shape[1];
+            const uint64_t math_cols64 = entry.math_in_features ? entry.math_in_features : entry.shape[0];
             if (combined_gate_up &&
-                ((entry.shape[1] & 1ull) != 0 || per_expert < 2ull)) {
+                ((math_rows_total64 & 1ull) != 0 || per_expert < 2ull)) {
                 std::fprintf(stderr,
                     "[storagellm] JUJU combined gate/up tensor has invalid split shape: name=%s rows=%llu per_expert=%llu\n",
                     entry.name.c_str(),
-                    (unsigned long long)entry.shape[1],
+                    (unsigned long long)math_rows_total64,
                     (unsigned long long)per_expert);
                 return 0;
             }
-            const uint32_t rows_total = (uint32_t)std::min<uint64_t>(entry.shape[1], UINT32_MAX);
-            const uint32_t cols = (uint32_t)std::min<uint64_t>(entry.shape[0], UINT32_MAX);
+            const uint32_t rows_total = (uint32_t)std::min<uint64_t>(math_rows_total64, UINT32_MAX);
+            const uint32_t cols = (uint32_t)std::min<uint64_t>(math_cols64, UINT32_MAX);
             for (uint64_t expert = 0; expert < expert_count64; ++expert) {
                 const uint32_t split_count = combined_gate_up ? 2u : 1u;
                 for (uint32_t split = 0; split < split_count; ++split) {
@@ -504,6 +571,9 @@ static int load_juju_tensor_index_as_tensor_index(
         }
     }
     if (!records && !common_records) {
+        return 0;
+    }
+    if (!moe_juju_validate_required_bundle_native_experts(engine)) {
         return 0;
     }
     bool saw_bundle_native = false;

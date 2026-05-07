@@ -98,6 +98,17 @@ static qkv_config_t moe_qkv_config_from_offload_contract(const moe_offload_gguf_
     if (contract.qkv_qjl_seed != 0) {
         cfg.qjl_seed = contract.qkv_qjl_seed;
     }
+    cfg.rotation_backend = contract.qkv_rotation_backend;
+    cfg.codebook_distribution = contract.qkv_codebook_distribution;
+    cfg.policy_hash = contract.qkv_policy_hash;
+    if (cfg.rotation_backend != QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL &&
+        cfg.rotation_backend != QKV_ROTATION_BACKEND_HADAMARD_SIGN_FAST) {
+        cfg.rotation_backend = QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL;
+    }
+    if (cfg.codebook_distribution != QKV_CODEBOOK_DISTRIBUTION_EXACT_BETA &&
+        cfg.codebook_distribution != QKV_CODEBOOK_DISTRIBUTION_GAUSSIAN_APPROX) {
+        cfg.codebook_distribution = QKV_CODEBOOK_DISTRIBUTION_EXACT_BETA;
+    }
     if (contract.qkv_enable_qjl >= 0) {
         cfg.enable_qjl = contract.qkv_enable_qjl != 0;
     } else if (contract.qkv_required) {

@@ -1,13 +1,19 @@
 // Device tensor copy stream management
 
+static size_t device_drain_directstorage_device_copies(moe_pc_engine* e);
+
 // DONE: BUGFIX 77 - CUDA stream pool is already implemented below to avoid cuStreamCreate/Destroy on worker resize.
 struct moe_deferred_staging_copy {
     uint32_t slot = UINT32_MAX;
     uint64_t key = 0;
+    uint64_t extra_keys[3]{};
     uint64_t copy_bytes = 0;
     uint64_t bytes_for_vram_release = 0;
     vram_reservation_token vram_token{};
     CUevent event = nullptr;
+    uint64_t submitted_us = 0;
+    moe_io_path_t path = moe_IO_PATH_PINNED_HOST;
+    uint8_t extra_key_count = 0;
     bool event_recorded = false;
 };
 
@@ -31,6 +37,7 @@ static thread_local std::unordered_map<moe_pc_engine*, std::vector<uint64_t>> s_
 static thread_local std::unordered_map<moe_pc_engine*, std::deque<moe_deferred_staging_copy>> s_tl_deferred_staging_copies;
 static thread_local std::unordered_map<moe_pc_engine*, std::vector<CUevent>> s_tl_copy_event_pool;
 static constexpr int moe_DEVICE_COPY_BACKPRESSURE = -2;
+static constexpr int moe_DEVICE_COPY_PENDING_ASYNC = 2;
 
 static void device_release_inflight_vram_bytes(moe_pc_engine* e, uint64_t bytes) {
     if (!e || bytes == 0) {
@@ -129,7 +136,10 @@ static int device_defer_staging_copy(
     uint64_t copy_bytes,
     uint64_t vram_bytes,
     CUstream stream,
-    vram_reservation_token token = vram_reservation_token{}
+    vram_reservation_token token = vram_reservation_token{},
+    moe_io_path_t path = moe_IO_PATH_PINNED_HOST,
+    const uint64_t* extra_keys = nullptr,
+    uint8_t extra_key_count = 0
 ) {
     // BUGFIX Issue 6: Use staging_slot_valid() helper for correct check order ?끸쁾??
     if (!e) {
@@ -150,6 +160,12 @@ static int device_defer_staging_copy(
     copy.copy_bytes = copy_bytes;
     copy.bytes_for_vram_release = vram_bytes;
     copy.vram_token = token;
+    copy.submitted_us = moe_profile_now_us();
+    copy.path = path;
+    copy.extra_key_count = std::min<uint8_t>(extra_key_count, static_cast<uint8_t>(3));
+    for (uint8_t i = 0; i < copy.extra_key_count; ++i) {
+        copy.extra_keys[i] = extra_keys ? extra_keys[i] : 0;
+    }
     copy.event = device_take_copy_event(e);
     if (!copy.event) {
         return 0;
@@ -228,9 +244,23 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
         if (copy.key != 0) {
             device_complete_pending_copy_key(e, copy.key);
         }
+        for (uint8_t extra_i = 0; extra_i < copy.extra_key_count; ++extra_i) {
+            if (copy.extra_keys[extra_i] != 0) {
+                device_complete_pending_copy_key(e, copy.extra_keys[extra_i]);
+            }
+        }
         if (copy.copy_bytes > 0) {
             e->io_atomic.backend_async_completed.fetch_add(
                 copy.copy_bytes, std::memory_order_relaxed);
+            const uint64_t now_us = moe_profile_now_us();
+            const uint64_t wait_ns = now_us > copy.submitted_us ?
+                (now_us - copy.submitted_us) * 1000ull : 0ull;
+            if (copy.path == moe_IO_PATH_GPUDIRECT_STORAGE) {
+                e->io_atomic.bytes_direct_to_gpu.fetch_add(copy.copy_bytes, std::memory_order_relaxed);
+                moe_io_path_perf_complete(e->gds_perf, wait_ns);
+            } else {
+                moe_io_path_perf_complete(e->pinned_perf, wait_ns);
+            }
         }
 
         // BUGFIX 193: Slot already released in device_copy_tensor_from_host ?끸쁾??
@@ -247,6 +277,12 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
         } else {
             vram_guard.release();
             device_vram_mark_allocation_resident(e, copy.key);
+        }
+        for (uint8_t extra_i = 0; extra_i < copy.extra_key_count; ++extra_i) {
+            if (copy.extra_keys[extra_i] != 0) {
+                device_vram_mark_allocation_resident(e, copy.extra_keys[extra_i]);
+                device_touch_allocation(e, copy.extra_keys[extra_i]);
+            }
         }
 
         // BUGFIX 67: Issue 2 - Use pop_front() instead of erase(begin()).
@@ -272,6 +308,7 @@ static void device_stream_sync_current(moe_pc_engine* e) {
     }
     device_complete_pending_copies(e);
     device_drain_deferred_staging_copies(e, true);
+    device_drain_directstorage_device_copies(e);
 }
 
 // BUGFIX 79: Issue 1 - Fix stream destroy wrong map reference.

@@ -68,6 +68,7 @@ struct alignas(64) moe_io_atomic_stats {
     alignas(64) std::atomic<uint64_t> bytes_directstorage_submitted{0};
     std::atomic<uint64_t> bytes_directstorage_completed{0};
     std::atomic<uint64_t> bytes_directstorage_failed{0};
+    std::atomic<uint64_t> directstorage_queue_full_wait_ns{0};
     std::atomic<uint64_t> backend_async_submitted{0};
     std::atomic<uint64_t> backend_async_completed{0};
     std::atomic<uint64_t> backend_async_fallback{0};

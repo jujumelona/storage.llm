@@ -156,6 +156,7 @@ typedef struct {
     uint64_t bytes_directstorage_submitted;
     uint64_t bytes_directstorage_completed;
     uint64_t bytes_directstorage_failed;
+    uint64_t directstorage_queue_full_wait_ns;
     uint64_t backend_async_submitted;
     uint64_t backend_async_completed;
     uint64_t backend_async_fallback;
