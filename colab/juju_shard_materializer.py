@@ -5,7 +5,9 @@ import threading
 import bisect
 import os
 import re
+import shlex
 import struct
+import subprocess
 import time
 import math
 from pathlib import Path
@@ -239,8 +241,29 @@ JUJU_TENSOR_BUCKET_ORDER = (
 HF_INDIVIDUAL_FILE_LIMIT_BYTES = 50 * 1024 * 1024 * 1024
 DEFAULT_JUJU_UPLOAD_FILE_LIMIT_BYTES = 45 * 1024 * 1024 * 1024
 JUJU_SPLIT_METADATA_RESERVE_BYTES = 512 * 1024 * 1024
-JUJU_FORMAT_CONTRACT_VERSION = 2
-JUJU_BINARY_WIRE_ID = "JUJU_V1_HEADER4096_SECTION96_ABS_OFFSETS"
+JUJU_CONTAINER_VERSION_MAJOR = 2
+JUJU_CONTAINER_VERSION_MINOR = 0
+JUJU_IDX_FORMAT = "JUJU_IDX_JSON_V2"
+JUJU_IDX_SCHEMA_VERSION = 4
+JUJU_BINARY_TENSOR_INDEX_SCHEMA_VERSION = 4
+JUJU_EXPERT_BUNDLE_TABLE_FORMAT = "JUJU_EXPERT_BUNDLE_TABLE_V2"
+JUJU_FORMAT_CONTRACT_VERSION = 3
+JUJU_BINARY_WIRE_ID = "JUJU_V2_HEADER4096_SECTION96_BUNDLE_NATIVE"
+JUJU_BUNDLE_ALIGNMENT_BYTES = 4096
+JUJU_EXPERT_BUNDLE_MEMBER_ORDER = (
+    "gate",
+    "gate_scale",
+    "gate_scale2",
+    "up",
+    "up_scale",
+    "up_scale2",
+    "down",
+    "down_scale",
+    "down_scale2",
+)
+JUJU_EXPERT_BUNDLE_MEMBER_RANK = {
+    role: idx for idx, role in enumerate(JUJU_EXPERT_BUNDLE_MEMBER_ORDER)
+}
 JUJU_TOKENIZER_FILES = [
     "tokenizer.json",
     "tokenizer_config.json",
@@ -281,6 +304,21 @@ def juju_artifact_names(source_name):
         "index": f"{stem}.juju.idx",
         "verify": f"{stem}.juju.verify.json",
     }
+
+
+def juju_artifact_uid(*, source_repo_id, source_path, source_name, artifact_source_name, weight_file, split_meta, tensor_count):
+    payload = {
+        "format": "JUJU_ARTIFACT_UID_V1",
+        "source_repo_id": source_repo_id or "",
+        "source_path": source_path or "",
+        "source_name": source_name or "",
+        "artifact_source_name": artifact_source_name or source_name or "",
+        "weight_file": weight_file or "",
+        "split": split_meta or {},
+        "tensor_count": int(tensor_count or 0),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.blake2b(raw, digest_size=16).hexdigest()
 
 
 def juju_upload_file_limit_bytes():
@@ -496,11 +534,86 @@ def gguf_runtime_aliases_for_key(key):
     return aliases
 
 
+GGUF_CODEC_REGISTRY_VERSION = "GGUF_CODEC_REGISTRY_V1"
+GGUF_CODEC_REGISTRY = {
+    0: {"codec_id": "GGUF_F32_V1", "name": "F32", "family": "raw_scalar_or_integer", "weight_encoding": 2, "bytes_per_col": 4, "supports_exact_ppl": True},
+    1: {"codec_id": "GGUF_F16_V1", "name": "F16", "family": "raw_scalar_or_integer", "weight_encoding": 1, "bytes_per_col": 2, "supports_exact_ppl": True},
+    2: {"codec_id": "GGUF_Q4_0_V1", "name": "Q4_0", "family": "legacy_ggml_quant", "weight_encoding": 22, "block_cols": 32, "block_bytes": 18, "supports_exact_ppl": True},
+    3: {"codec_id": "GGUF_Q4_1_V1", "name": "Q4_1", "family": "legacy_ggml_quant", "weight_encoding": 23, "block_cols": 32, "block_bytes": 20, "supports_exact_ppl": True},
+    6: {"codec_id": "GGUF_Q5_0_V1", "name": "Q5_0", "family": "legacy_ggml_quant", "weight_encoding": 24, "block_cols": 32, "block_bytes": 22, "supports_exact_ppl": True},
+    7: {"codec_id": "GGUF_Q5_1_V1", "name": "Q5_1", "family": "legacy_ggml_quant", "weight_encoding": 12, "block_cols": 32, "block_bytes": 24, "supports_exact_ppl": True},
+    8: {"codec_id": "GGUF_Q8_0_V1", "name": "Q8_0", "family": "legacy_ggml_quant", "weight_encoding": 13, "block_cols": 32, "block_bytes": 34, "supports_exact_ppl": True},
+    9: {"codec_id": "GGUF_Q8_1_V1", "name": "Q8_1", "family": "legacy_ggml_quant", "weight_encoding": 25, "block_cols": 32, "block_bytes": 36, "supports_exact_ppl": True},
+    10: {"codec_id": "GGUF_Q2_K_V1", "name": "Q2_K", "family": "k_quant", "weight_encoding": 15, "block_cols": 256, "block_bytes": 84, "supports_exact_ppl": True},
+    11: {"codec_id": "GGUF_Q3_K_V1", "name": "Q3_K", "family": "k_quant", "weight_encoding": 16, "block_cols": 256, "block_bytes": 110, "supports_exact_ppl": True},
+    12: {"codec_id": "GGUF_Q4_K_V1", "name": "Q4_K", "family": "k_quant", "weight_encoding": 17, "block_cols": 256, "block_bytes": 144, "supports_exact_ppl": True},
+    13: {"codec_id": "GGUF_Q5_K_V1", "name": "Q5_K", "family": "k_quant", "weight_encoding": 14, "block_cols": 256, "block_bytes": 176, "supports_exact_ppl": True},
+    14: {"codec_id": "GGUF_Q6_K_V1", "name": "Q6_K", "family": "k_quant", "weight_encoding": 18, "block_cols": 256, "block_bytes": 210, "supports_exact_ppl": True},
+    15: {"codec_id": "GGUF_Q8_K_V1", "name": "Q8_K", "family": "k_quant", "weight_encoding": 34, "block_cols": 256, "block_bytes": 292, "supports_exact_ppl": True},
+    16: {"codec_id": "GGUF_IQ2_XXS_V1", "name": "IQ2_XXS", "family": "importance_quant", "weight_encoding": 19, "block_cols": 256, "block_bytes": 66, "supports_exact_ppl": True},
+    17: {"codec_id": "GGUF_IQ2_XS_V1", "name": "IQ2_XS", "family": "importance_quant", "weight_encoding": 29, "block_cols": 256, "block_bytes": 74, "supports_exact_ppl": True},
+    18: {"codec_id": "GGUF_IQ3_XXS_V1", "name": "IQ3_XXS", "family": "importance_quant", "weight_encoding": 20, "block_cols": 256, "block_bytes": 98, "supports_exact_ppl": True},
+    19: {"codec_id": "GGUF_IQ1_S_V1", "name": "IQ1_S", "family": "importance_quant", "weight_encoding": 32, "block_cols": 256, "block_bytes": 50, "supports_exact_ppl": True},
+    20: {"codec_id": "GGUF_IQ4_NL_V1", "name": "IQ4_NL", "family": "importance_quant", "weight_encoding": 27, "block_cols": 32, "block_bytes": 18, "supports_exact_ppl": True},
+    21: {"codec_id": "GGUF_IQ3_S_V1", "name": "IQ3_S", "family": "importance_quant", "weight_encoding": 31, "block_cols": 256, "block_bytes": 110, "supports_exact_ppl": True},
+    22: {"codec_id": "GGUF_IQ2_S_V1", "name": "IQ2_S", "family": "importance_quant", "weight_encoding": 30, "block_cols": 256, "block_bytes": 82, "supports_exact_ppl": True},
+    23: {"codec_id": "GGUF_IQ4_XS_V1", "name": "IQ4_XS", "family": "importance_quant", "weight_encoding": 28, "block_cols": 256, "block_bytes": 136, "supports_exact_ppl": True},
+    24: {"codec_id": "GGUF_I8_V1", "name": "I8", "family": "raw_scalar_or_integer", "weight_encoding": 0, "bytes_per_col": 1, "supports_exact_ppl": False},
+    25: {"codec_id": "GGUF_I16_V1", "name": "I16", "family": "raw_scalar_or_integer", "weight_encoding": 0, "bytes_per_col": 2, "supports_exact_ppl": False},
+    26: {"codec_id": "GGUF_I32_V1", "name": "I32", "family": "raw_scalar_or_integer", "weight_encoding": 0, "bytes_per_col": 4, "supports_exact_ppl": False},
+    27: {"codec_id": "GGUF_I64_V1", "name": "I64", "family": "raw_scalar_or_integer", "weight_encoding": 0, "bytes_per_col": 8, "supports_exact_ppl": False},
+    28: {"codec_id": "GGUF_F64_V1", "name": "F64", "family": "raw_scalar_or_integer", "weight_encoding": 0, "bytes_per_col": 8, "supports_exact_ppl": False},
+    29: {"codec_id": "GGUF_IQ1_M_V1", "name": "IQ1_M", "family": "importance_quant", "weight_encoding": 33, "block_cols": 256, "block_bytes": 56, "supports_exact_ppl": True},
+    30: {"codec_id": "GGUF_BF16_V1", "name": "BF16", "family": "raw_scalar_or_integer", "weight_encoding": 21, "bytes_per_col": 2, "supports_exact_ppl": True},
+    31: {"codec_id": "GGUF_Q4_0_4_4_V1", "name": "Q4_0_4_4", "family": "legacy_ggml_interleaved_quant", "weight_encoding": 0, "supports_exact_ppl": False},
+    32: {"codec_id": "GGUF_Q4_0_4_8_V1", "name": "Q4_0_4_8", "family": "legacy_ggml_interleaved_quant", "weight_encoding": 0, "supports_exact_ppl": False},
+    33: {"codec_id": "GGUF_Q4_0_8_8_V1", "name": "Q4_0_8_8", "family": "legacy_ggml_interleaved_quant", "weight_encoding": 0, "supports_exact_ppl": False},
+    34: {"codec_id": "GGUF_TQ1_0_V1", "name": "TQ1_0", "family": "ternary_quant", "weight_encoding": 35, "block_cols": 256, "block_bytes": 54, "supports_exact_ppl": True},
+    35: {"codec_id": "GGUF_TQ2_0_V1", "name": "TQ2_0", "family": "ternary_quant", "weight_encoding": 36, "block_cols": 256, "block_bytes": 66, "supports_exact_ppl": True},
+    36: {"codec_id": "GGUF_REMOVED_IQ4_NL_4_4", "name": "REMOVED_IQ4_NL_4_4", "family": "removed", "weight_encoding": 0, "supports_exact_ppl": False},
+    37: {"codec_id": "GGUF_REMOVED_IQ4_NL_4_8", "name": "REMOVED_IQ4_NL_4_8", "family": "removed", "weight_encoding": 0, "supports_exact_ppl": False},
+    38: {"codec_id": "GGUF_REMOVED_IQ4_NL_8_8", "name": "REMOVED_IQ4_NL_8_8", "family": "removed", "weight_encoding": 0, "supports_exact_ppl": False},
+    39: {
+        "codec_id": "GGUF_MXFP4_V1",
+        "name": "MXFP4",
+        "family": "mxfp4",
+        "weight_encoding": 4,
+        "block_cols": 32,
+        "block_bytes": 17,
+        "scale": "one_e8m0_byte_per_block_before_payload",
+        "nibble_order": "pairwise_even_index_low_nibble_odd_index_high_nibble",
+        "decode_kernel": "moe_dot_gguf_mxfp4_row",
+        "copy_row_kernel": "moe_copy_gguf_mxfp4_row",
+        "supports_exact_ppl": True,
+    },
+}
+
+
+def gguf_codec_spec(tensor_type):
+    return GGUF_CODEC_REGISTRY.get(u32(tensor_type))
+
+
+def gguf_codec_row_bytes_from_spec(spec, cols):
+    cols = int(cols or 0)
+    if not spec or cols <= 0 or spec.get("supports_exact_ppl") is False:
+        return 0
+    if spec.get("bytes_per_col"):
+        return cols * int(spec["bytes_per_col"])
+    block_cols = int(spec.get("block_cols") or 0)
+    block_bytes = int(spec.get("block_bytes") or 0)
+    if block_cols <= 0 or block_bytes <= 0:
+        return 0
+    return ((cols + block_cols - 1) // block_cols) * block_bytes
+
+
 def gguf_tensor_row_bytes(tensor_type, cols):
     t = u32(tensor_type)
     cols = int(cols or 0)
     if cols <= 0:
         return 0
+    spec = gguf_codec_spec(t)
+    if spec is not None:
+        return gguf_codec_row_bytes_from_spec(spec, cols)
     block32 = (cols + 31) // 32
     block256 = (cols + 255) // 256
     if t == 0:
@@ -588,7 +701,165 @@ def gguf_tensor_exact_bytes(tensor_type, shape):
 
 
 def juju_row_stride_padding_enabled():
-    return os.environ.get("JUJU_ENABLE_ROW_STRIDE_PADDING", "1") != "0"
+    return os.environ.get("JUJU_ENABLE_ROW_STRIDE_PADDING", "0") != "0"
+
+
+def juju_exact_mode_policy():
+    return {
+        "format": "JUJU_EXACT_MODE_POLICY_V1",
+        "buddy_fallback_can_replace_expert": False,
+        "partial_execution_allowed": False,
+        "seqtopk_can_change_router_topk": False,
+        "cold_expert_requantize_allowed": False,
+        "predictor_role": "prefetch_hint_only",
+        "routing_must_match_source": True,
+        "router_topk_must_match_source": True,
+        "expert_id_sequence_must_match_source": True,
+        "qkv_contract_is_part_of_ppl_acceptance": True,
+        "plain_kv_reference_required_for_acceptance": False,
+        "ppl_must_report_kv_backend": True,
+        "row_stride_padding_default": False,
+        "row_stride_padding_env": "JUJU_ENABLE_ROW_STRIDE_PADDING",
+    }
+
+
+def juju_approx_mode_policy():
+    return {
+        "format": "JUJU_APPROX_MODE_POLICY_V1",
+        "buddy_fallback_can_replace_expert": True,
+        "partial_execution_allowed": True,
+        "seqtopk_can_change_router_topk": True,
+        "cold_expert_requantize_allowed": True,
+        "predictor_role": "prefetch_hint_or_approx_policy_only",
+        "quality_gate_required": True,
+        "ppl_delta_threshold_required": True,
+        "must_not_be_used_for_exact_ppl_claim": True,
+    }
+
+
+def juju_ppl_acceptance_contract():
+    dataset = os.environ.get("JUJU_PPL_EVAL_DATASET", "wikitext-2-raw-v1")
+    max_delta = float(os.environ.get("JUJU_PPL_MAX_DELTA", "0.02") or "0.02")
+    logits_max_abs = float(os.environ.get("JUJU_LOGITS_MAX_ABS_DELTA", "0.0005") or "0.0005")
+    logits_rms = float(os.environ.get("JUJU_LOGITS_RMS_DELTA", "0.0001") or "0.0001")
+    first_tokens = int(os.environ.get("JUJU_LOGITS_FIRST_TOKENS", "32") or "32")
+    return {
+        "format": "JUJU_PPL_ACCEPTANCE_CONTRACT_V1",
+        "required_for_preserve_claim": True,
+        "source_model": "reference_token_ids",
+        "candidate_model": "juju_qkv_contract",
+        "tokenizer_policy": "server_ppl_endpoint_requires_reference_input_ids",
+        "server_text_tokenization_allowed": False,
+        "qkv_required_in_ppl": True,
+        "required_response_fields": [
+            "kv_backend",
+            "qkv_forced_by_format",
+            "tokenizer_hash",
+            "tokenizer_config_hash",
+            "chat_template_hash",
+            "tokenizer_add_bos",
+            "tokenizer_add_eos",
+            "tokenizer_add_space_prefix",
+            "input_ids_preview",
+        ],
+        "dataset": dataset,
+        "max_ppl_delta": max_delta,
+        "logits_first_token_count": first_tokens,
+        "logits_max_abs_delta": logits_max_abs,
+        "logits_rms_delta": logits_rms,
+        "router_topk_exact_match_required": True,
+        "expert_id_sequence_exact_match_required": True,
+        "tensor_logical_hash_all_match_required": True,
+        "external_runner_env": "JUJU_PPL_COMPARE_CMD",
+        "require_runner_env": "JUJU_REQUIRE_PPL_ACCEPTANCE",
+    }
+
+
+def juju_performance_acceptance_contract():
+    return {
+        "format": "JUJU_PERFORMANCE_ACCEPTANCE_CONTRACT_V1",
+        "enabled_only_after_exact_acceptance": True,
+        "features_under_test": [
+            "row_stride_padding",
+            "qkv_quantized_cache",
+            "expert_prefetch_predictor",
+            "gds_or_directstorage",
+            "hot_warm_cold_calibration",
+        ],
+        "required_metrics": [
+            "ppl_delta",
+            "tokens_per_second",
+            "expert_hit_rate",
+            "expert_miss_latency_us",
+            "prefetch_waste_ratio",
+            "gpu_idle_gap_us",
+            "disk_read_bytes",
+            "pcie_copy_bytes",
+        ],
+        "ppl_delta_threshold_required": True,
+        "tokens_per_second_must_improve": True,
+        "expert_miss_latency_must_decrease": True,
+        "prefetch_waste_must_not_increase_unbounded": True,
+        "gpu_idle_gap_must_decrease": True,
+    }
+
+
+def juju_expert_calibration_contract():
+    return {
+        "format": "JUJU_EXPERT_CALIBRATION_CONTRACT_V1",
+        "recommended": True,
+        "required_for_max_offload_claim": True,
+        "trace_required_fields": [
+            "layer_id",
+            "token_pos",
+            "selected_experts",
+            "router_scores",
+        ],
+        "derived_tables": [
+            "expert_access_count",
+            "coactivation",
+            "transition_table",
+            "hot_warm_cold_initial_tiers",
+        ],
+        "idx_update_function": "apply_juju_expert_calibration_to_idx",
+        "runtime_update": "ema",
+        "predictor_role_in_exact_mode": "prefetch_hint_only",
+    }
+
+
+def juju_adaptive_runtime_scheduler_contract():
+    return {
+        "format": "JUJU_ADAPTIVE_RUNTIME_SCHEDULER_CONTRACT_V1",
+        "required_for_max_offload_claim": True,
+        "routing_policy": "exact_mode_never_changes_router_output",
+        "placement": {
+            "hot_experts": "VRAM",
+            "warm_experts": "RAM_or_pinned_cache",
+            "cold_experts": "NVMe_sequential_bundle",
+        },
+        "eviction_score_inputs": [
+            "hit_rate_ema",
+            "miss_cost_us",
+            "expert_size_bytes",
+            "predicted_next_use_epoch",
+            "kv_cache_pressure",
+        ],
+        "prefetch_control_inputs": [
+            "gpu_idle_gap_us",
+            "pcie_copy_bytes_per_s",
+            "disk_read_bytes_per_s",
+            "staging_slot_deficit",
+            "prefetch_waste_ratio",
+            "expert_miss_latency_us",
+        ],
+        "feedback_loop": [
+            "measure_hit_miss",
+            "measure_copy_and_disk_bytes",
+            "shrink_window_on_backpressure_or_waste",
+            "grow_window_on_gpu_idle_and_low_waste",
+            "update_hot_warm_cold_ema",
+        ],
+    }
 
 
 def juju_row_stride_alignment_bytes():
@@ -638,6 +909,7 @@ def juju_tensor_storage_layout(tensor):
         "source_bytes": int(source_bytes),
         "logical_bytes": int(logical_bytes),
         "juju_bytes": int(source_bytes),
+        "physical_bytes": int(source_bytes),
         "row_stride_alignment_bytes": int(alignment),
         "row_stride_padded": False,
         "row_layout": "source_gguf_quant_block_layout_preserved",
@@ -662,6 +934,7 @@ def juju_tensor_storage_layout(tensor):
         "row_stride_bytes": int(row_stride),
         "row_padding_bytes": int(padding_per_row),
         "juju_bytes": int(padded_bytes),
+        "physical_bytes": int(padded_bytes),
         "row_stride_padded": True,
         "row_layout": "source_gguf_quant_blocks_row_stride_padded",
         "row_stride_overhead_pct": round(overhead_pct, 6),
@@ -718,9 +991,310 @@ def juju_tensor_source_segment(tensor, tensor_offset, layout=None):
     return segment
 
 
+def juju_bundle_member_role_from_name(name, split_role=None):
+    if split_role in {"gate", "up", "down"}:
+        return split_role
+    lower = str(name or "").lower()
+    base = _juju_expert_projection_name(lower)
+    if base == "gate_up":
+        base = "gate"
+    if base not in {"gate", "up", "down"}:
+        return base
+    if "scale2" in lower or "scale_2" in lower or "scale.2" in lower:
+        return f"{base}_scale2"
+    if "scale" in lower or "scales" in lower or "scale_inv" in lower:
+        return f"{base}_scale"
+    return base
+
+
+def juju_bundle_member_projection_from_role(role):
+    role = str(role or "")
+    if role.startswith("gate"):
+        return "gate"
+    if role.startswith("up"):
+        return "up"
+    if role.startswith("down"):
+        return "down"
+    return ""
+
+
+def juju_tensor_expert_member_specs(tensor, contract):
+    name = tensor.get("name")
+    if not is_routed_expert_tensor_name(name):
+        return []
+    layer = _juju_layer_id_from_name(name)
+    shape = [int(v or 0) for v in (tensor.get("shape") or [])]
+    expert_count = _juju_expert_count_from_shape(shape)
+    if layer is None or expert_count <= 0:
+        return []
+    layout = juju_tensor_storage_layout(tensor)
+    source_bytes = int(layout.get("source_bytes") or tensor.get("bytes") or 0)
+    juju_bytes = int(layout.get("juju_bytes") or source_bytes)
+    if source_bytes <= 0 or juju_bytes <= 0:
+        return []
+    if source_bytes % expert_count != 0 or juju_bytes % expert_count != 0:
+        return []
+    source_per_expert = source_bytes // expert_count
+    juju_per_expert = juju_bytes // expert_count
+    rows_total = int(layout.get("logical_rows") or 0)
+    rows_per_expert = rows_total // expert_count if expert_count > 0 and rows_total % expert_count == 0 else 0
+    row_bytes = int(layout.get("row_bytes") or 0)
+    row_stride = int(layout.get("row_stride_bytes") or row_bytes or 0)
+    cols = int(layout.get("logical_cols") or (shape[0] if shape else 0))
+    projection = _juju_expert_projection_name(name)
+    split_roles = []
+    if projection == "gate_up":
+        split_roles = ["gate", "up"]
+    else:
+        split_roles = [juju_bundle_member_role_from_name(name)]
+    specs = []
+    for expert in range(expert_count):
+        expert_source_base = int(tensor["source_offset"]) + expert * source_per_expert
+        for split_idx, role in enumerate(split_roles):
+            source_rel = 0
+            source_size = source_per_expert
+            output_size = juju_per_expert
+            member_rows = rows_per_expert
+            if projection == "gate_up":
+                if rows_per_expert > 0 and rows_per_expert % 2 == 0 and row_bytes > 0:
+                    member_rows = rows_per_expert // 2
+                    source_size = member_rows * row_bytes
+                    output_size = member_rows * row_stride
+                    source_rel = split_idx * source_size
+                else:
+                    raise RuntimeError(
+                        f"JUJU gate_up split requires explicit contiguous row layout: "
+                        f"name={name} shape={shape} row_bytes={row_bytes} rows_per_expert={rows_per_expert}"
+                    )
+            source_offset = expert_source_base + source_rel
+            spec = {
+                "tensor": tensor,
+                "source_tensor_name": name,
+                "bucket": tensor.get("bucket"),
+                "layer": int(layer),
+                "expert": int(expert),
+                "role": str(role),
+                "projection": juju_bundle_member_projection_from_role(role),
+                "source_offset": int(source_offset),
+                "source_rel_offset": int(source_rel),
+                "source_size": int(source_size),
+                "output_size": int(output_size),
+                "physical_size": int(output_size),
+                "rows": int(member_rows or (shape[1] if len(shape) > 1 else 1)),
+                "cols": int(cols),
+                "source_shape": list(shape),
+                "split_policy": "contiguous_rows" if projection == "gate_up" else "single_projection",
+                "row_bytes": int(row_bytes),
+                "row_stride_bytes": int(row_stride),
+                "row_stride_padded": bool(layout.get("row_stride_padded")),
+                "row_layout": layout.get("row_layout"),
+                "row_padding_bytes": max(0, int(row_stride) - int(row_bytes)) if row_stride and row_bytes else 0,
+                "source_row_bytes": int(layout.get("source_row_bytes") or row_bytes),
+                "row_stride_alignment_bytes": int(layout.get("row_stride_alignment_bytes") or 1),
+            }
+            if spec["output_size"] > 0 and spec["source_size"] > 0:
+                specs.append(spec)
+    return specs
+
+
+def juju_split_bucket_for_bundle_native(group, contract):
+    bundles = {}
+    passthrough = []
+    for tensor in group or []:
+        specs = juju_tensor_expert_member_specs(tensor, contract)
+        if not specs:
+            passthrough.append(tensor)
+            continue
+        for spec in specs:
+            key = (int(spec["layer"]), int(spec["expert"]))
+            bundles.setdefault(key, {
+                "layer": int(spec["layer"]),
+                "expert": int(spec["expert"]),
+                "members": [],
+            })["members"].append(spec)
+    ordered_bundles = []
+    for item in bundles.values():
+        item["members"].sort(key=lambda spec: (
+            JUJU_EXPERT_BUNDLE_MEMBER_RANK.get(str(spec.get("role") or ""), 99),
+            str(spec.get("source_tensor_name") or ""),
+            int(spec.get("source_offset") or 0),
+        ))
+        ordered_bundles.append(item)
+    ordered_bundles.sort(key=lambda item: (int(item["layer"]), int(item["expert"])))
+    return ordered_bundles, passthrough
+
+
+def juju_expert_member_source_segment(spec, member_offset):
+    segment = {
+        "kind": "source",
+        "offset": int(member_offset),
+        "size": int(spec["output_size"]),
+        "source_offset": int(spec["source_offset"]),
+        "source_size": int(spec["source_size"]),
+    }
+    if spec.get("row_stride_padded"):
+        segment.update({
+            "kind": "row_padded_source",
+            "rows": int(spec["rows"]),
+            "row_bytes": int(spec["row_bytes"]),
+            "row_stride_bytes": int(spec["row_stride_bytes"]),
+        })
+    return segment
+
+
+def stream_juju_expert_member_payload(session, url, spec, out, token, digest, chunk_size=16 * 1024 * 1024):
+    if not spec.get("row_stride_padded"):
+        stream_range(session, url, int(spec["source_offset"]), int(spec["source_size"]), out, token, digest, chunk_size=chunk_size)
+        return
+    rows = int(spec["rows"])
+    row_bytes = int(spec["row_bytes"])
+    row_stride = int(spec["row_stride_bytes"])
+    row_pad = row_stride - row_bytes
+    for _row, count, data in iter_source_row_batches(
+        session,
+        url,
+        int(spec["source_offset"]),
+        rows,
+        row_bytes,
+        token=token,
+        chunk_size=chunk_size,
+    ):
+        for idx in range(count):
+            row_data = data[idx * row_bytes:(idx + 1) * row_bytes]
+            out.write(row_data)
+            digest.update(row_data)
+            write_zero_bytes(out, row_pad, digest)
+
+
+def juju_bundle_member_tensor_index_record(spec, member_offset, bundle_id, bundle_offset, contract):
+    tensor = spec["tensor"]
+    bucket = tensor.get("bucket") or spec.get("bucket") or "cold_experts"
+    runtime_priority = tensor_runtime_priority(tensor["name"], bucket, int(spec["output_size"]))
+    member_layout = {
+        "logical_rows": int(spec["rows"]),
+        "logical_cols": int(spec["cols"]),
+        "source_row_bytes": int(spec["source_row_bytes"]),
+        "row_bytes": int(spec["row_bytes"]),
+        "row_stride_bytes": int(spec["row_stride_bytes"]),
+        "row_padding_bytes": int(spec["row_padding_bytes"]),
+        "source_bytes": int(spec["source_size"]),
+        "logical_bytes": int(spec["source_size"]),
+        "juju_bytes": int(spec["output_size"]),
+        "physical_bytes": int(spec["physical_size"]),
+        "row_stride_alignment_bytes": int(spec["row_stride_alignment_bytes"]),
+        "row_stride_padded": bool(spec.get("row_stride_padded")),
+        "row_layout": spec.get("row_layout") or "source_gguf_quant_block_layout_preserved",
+    }
+    execution_meta = juju_tensor_execution_metadata(tensor["name"], bucket, member_offset, member_layout, runtime_priority)
+    shape_contract = juju_tensor_math_shape_contract(
+        spec.get("source_shape") or tensor.get("shape") or [],
+        spec["rows"],
+        spec["cols"],
+        execution_meta.get("execution_op"),
+        member_layout["row_layout"],
+    )
+    role = str(spec.get("role") or "")
+    projection = str(spec.get("projection") or "")
+    record = {
+        "name": tensor["name"],
+        "source_tensor_name": spec.get("source_tensor_name") or tensor["name"],
+        "bucket": bucket,
+        "dims": 3,
+        "shape": [int(spec["cols"]), int(spec["rows"]), 1],
+        "logical_rows": int(spec["rows"]),
+        "logical_cols": int(spec["cols"]),
+        "gguf_type": tensor["type"],
+        "gguf_type_name": gguf_type_name(tensor["type"]),
+        "weight_encoding": weight_encoding_from_gguf_type(tensor["type"], contract),
+        "quant_family": quant_family_from_gguf_type(tensor["type"], contract),
+        "kernel_key": kernel_key_from_gguf_type(tensor["type"], contract),
+        "codec_id": codec_id_from_gguf_type(tensor["type"], contract),
+        "codec_registry_version": GGUF_CODEC_REGISTRY_VERSION,
+        "row_layout": member_layout["row_layout"],
+        "source_offset": int(spec["source_offset"]),
+        "source_bytes": int(spec["source_size"]),
+        "source_row_bytes": int(spec["source_row_bytes"]),
+        "logical_bytes": int(spec["source_size"]),
+        "juju_offset": int(member_offset),
+        "juju_bytes": int(spec["output_size"]),
+        "physical_bytes": int(spec["physical_size"]),
+        "row_bytes": int(spec["row_bytes"]),
+        "row_stride_bytes": int(spec["row_stride_bytes"]),
+        "row_padding_bytes": int(spec["row_padding_bytes"]),
+        "row_stride_alignment_bytes": int(spec["row_stride_alignment_bytes"]),
+        "row_stride_padded": bool(spec.get("row_stride_padded")),
+        "alignment": JUJU_BUNDLE_ALIGNMENT_BYTES,
+        "bundle_native": True,
+        "bundle_id": int(bundle_id),
+        "bundle_offset": int(bundle_offset),
+        "bundle_size": 0,
+        "bundle_alignment": JUJU_BUNDLE_ALIGNMENT_BYTES,
+        "bundle_member_offset": int(member_offset) - int(bundle_offset),
+        "bundle_member_size": int(spec["output_size"]),
+        "bundle_member_role": role,
+        "bundle_member_role_id": JUJU_EXPERT_BUNDLE_MEMBER_RANK.get(role, 255),
+        "split_policy": str(spec.get("split_policy") or "single_projection"),
+        "source_rel_offset": int(spec.get("source_rel_offset") or 0),
+        "expert_id": int(spec["expert"]),
+        "expert_projection": projection,
+        "expert_count": 1,
+        "per_expert_bytes": int(spec["output_size"]),
+        "expert_axis": 2,
+        "expert_offset_formula": "bundle_offset + bundle_member_offset",
+        "expert_layout": {
+            "kind": "bundle_native_member",
+            "layer": int(spec["layer"]),
+            "expert": int(spec["expert"]),
+            "projection": projection,
+            "role": role,
+            "expert_axis": 2,
+            "expert_count": 1,
+            "base_offset": int(member_offset),
+            "per_expert_bytes": int(spec["output_size"]),
+            "bundle_id": int(bundle_id),
+            "bundle_offset": int(bundle_offset),
+            "bundle_size": 0,
+            "bundle_member_offset": int(member_offset) - int(bundle_offset),
+            "bundle_member_size": int(spec["output_size"]),
+            "bundle_alignment": JUJU_BUNDLE_ALIGNMENT_BYTES,
+        },
+        **shape_contract,
+        "kernel_contract": {
+            "must_have_dot_kernel": role in {"gate", "up", "down"},
+            "must_not_return_silent_zero": True,
+            "decode_key": kernel_key_from_gguf_type(tensor["type"], contract),
+            "source_type_preserved": True,
+            "logical_cols_are_math_extent": True,
+            "row_stride_bytes_are_storage_extent": True,
+        },
+        **juju_tensor_segmentation_fields(tensor["name"], bucket, contract),
+        **execution_meta,
+        **runtime_priority,
+    }
+    if record["split_policy"] == "contiguous_rows" and role in {"gate", "up"}:
+        record["combined_gate_up_split"] = {
+            "enabled": True,
+            "split_policy": "contiguous_rows",
+            "role": role,
+            "source_rel_offset": int(spec.get("source_rel_offset") or 0),
+            "source_bytes": int(spec["source_size"]),
+            "logical_rows": int(spec["rows"]),
+            "row_bytes": int(spec["row_bytes"]),
+            "row_stride_bytes": int(spec["row_stride_bytes"]),
+        }
+    return record
+
+
 def juju_tensor_index_record(tensor, bucket, tensor_offset, layout, contract):
     runtime_priority = tensor_runtime_priority(tensor["name"], bucket, tensor["bytes"])
     execution_meta = juju_tensor_execution_metadata(tensor["name"], bucket, tensor_offset, layout, runtime_priority)
+    shape_contract = juju_tensor_math_shape_contract(
+        tensor.get("shape") or [],
+        layout["logical_rows"],
+        layout["logical_cols"],
+        execution_meta.get("execution_op"),
+        layout["row_layout"],
+    )
     record = {
         "name": tensor["name"],
         "bucket": bucket,
@@ -733,6 +1307,8 @@ def juju_tensor_index_record(tensor, bucket, tensor_offset, layout, contract):
         "weight_encoding": weight_encoding_from_gguf_type(tensor["type"], contract),
         "quant_family": quant_family_from_gguf_type(tensor["type"], contract),
         "kernel_key": kernel_key_from_gguf_type(tensor["type"], contract),
+        "codec_id": codec_id_from_gguf_type(tensor["type"], contract),
+        "codec_registry_version": GGUF_CODEC_REGISTRY_VERSION,
         "row_layout": layout["row_layout"],
         "source_offset": tensor["source_offset"],
         "source_bytes": layout["source_bytes"],
@@ -740,6 +1316,7 @@ def juju_tensor_index_record(tensor, bucket, tensor_offset, layout, contract):
         "logical_bytes": layout["logical_bytes"],
         "juju_offset": tensor_offset,
         "juju_bytes": layout["juju_bytes"],
+        "physical_bytes": layout["physical_bytes"],
         "row_bytes": layout["row_bytes"],
         "row_stride_bytes": layout["row_stride_bytes"],
         "row_padding_bytes": layout["row_padding_bytes"],
@@ -754,6 +1331,7 @@ def juju_tensor_index_record(tensor, bucket, tensor_offset, layout, contract):
             "logical_cols_are_math_extent": True,
             "row_stride_bytes_are_storage_extent": True,
         },
+        **shape_contract,
         **juju_tensor_segmentation_fields(tensor["name"], bucket, contract),
         **juju_tensor_expert_layout_fields(tensor, tensor_offset, layout, contract),
         **execution_meta,
@@ -1728,6 +2306,645 @@ def checksum16_juju_section_ranges(session, url, section_offset, section_size, r
     return checksum_hex()
 
 
+def juju_progress_enabled():
+    return os.environ.get("JUJU_PROGRESS", "1") != "0"
+
+
+def juju_progress_interval_bytes():
+    raw = str(os.environ.get("JUJU_PROGRESS_INTERVAL_BYTES", str(1024 * 1024 * 1024))).strip()
+    value = int(raw or str(1024 * 1024 * 1024))
+    return max(16 * 1024 * 1024, value)
+
+
+def juju_progress_interval_s():
+    raw = str(os.environ.get("JUJU_PROGRESS_INTERVAL_S", "30")).strip()
+    value = float(raw or "30")
+    return max(1.0, value)
+
+
+def juju_full_stream_verify_enabled():
+    return os.environ.get("JUJU_FULL_STREAM_VERIFY", "0") != "0"
+
+
+def juju_upload_stream_sha_enabled():
+    return os.environ.get("JUJU_UPLOAD_STREAM_SHA", "0") != "0"
+
+
+def juju_payload_verify_enabled():
+    return os.environ.get("JUJU_PAYLOAD_VERIFY", "0") != "0"
+
+
+def juju_output_file_sha_enabled():
+    return os.environ.get("JUJU_OUTPUT_FILE_SHA", "0") != "0"
+
+
+def juju_section_stream_sha_enabled():
+    return os.environ.get("JUJU_SECTION_STREAM_SHA", "0") != "0"
+
+
+def juju_enforce_format_self_check():
+    return os.environ.get("JUJU_ENFORCE_FORMAT_SELF_CHECK", "0") != "0"
+
+
+def juju_enforce_construction_self_check():
+    return os.environ.get("JUJU_ENFORCE_CONSTRUCTION_SELF_CHECK", "1") != "0"
+
+
+class JujuNoopDigest:
+    def update(self, _data):
+        return None
+
+    def hexdigest(self):
+        return JUJU_ZERO_SHA256
+
+
+def juju_format_bytes(value):
+    value = float(max(0, int(value or 0)))
+    units = ("B", "MiB", "GiB", "TiB")
+    idx = 0
+    while value >= 1024.0 and idx < len(units) - 1:
+        value /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(value)} {units[idx]}"
+    return f"{value:.2f} {units[idx]}"
+
+
+class JujuProgressWriter:
+    def __init__(self, fh, label, expected_bytes=0):
+        self._fh = fh
+        self._label = str(label or "<juju>")
+        self._expected = int(expected_bytes or 0)
+        self._max_pos = 0
+        self._last_bytes = 0
+        self._last_time = time.monotonic()
+        self._enabled = juju_progress_enabled()
+        self._interval_bytes = juju_progress_interval_bytes()
+        self._interval_s = juju_progress_interval_s()
+        if self._enabled:
+            expected = f" expected={juju_format_bytes(self._expected)}" if self._expected > 0 else ""
+            print(f"[JUJU write] start: file={self._label}{expected}", flush=True)
+
+    def write(self, data):
+        written = self._fh.write(data)
+        pos = self._fh.tell()
+        if pos > self._max_pos:
+            self._max_pos = pos
+            self._maybe_report()
+        return written
+
+    def tell(self):
+        return self._fh.tell()
+
+    def seek(self, *args, **kwargs):
+        return self._fh.seek(*args, **kwargs)
+
+    def flush(self):
+        return self._fh.flush()
+
+    def _maybe_report(self, force=False):
+        if not self._enabled:
+            return
+        now = time.monotonic()
+        if (
+            force
+            or self._max_pos - self._last_bytes >= self._interval_bytes
+            or now - self._last_time >= self._interval_s
+            or (self._expected > 0 and self._max_pos >= self._expected)
+        ):
+            if self._expected > 0:
+                pct = 100.0 * min(self._max_pos, self._expected) / self._expected
+                suffix = f"/{juju_format_bytes(self._expected)} ({pct:.1f}%)"
+            else:
+                suffix = ""
+            print(f"[JUJU write] {self._label}: {juju_format_bytes(self._max_pos)}{suffix}", flush=True)
+            self._last_bytes = self._max_pos
+            self._last_time = now
+
+    def close_report(self):
+        self._maybe_report(force=True)
+
+    def __getattr__(self, name):
+        return getattr(self._fh, name)
+
+
+def _digest_update_remote_range(session, url, offset, size, digests, token=None, chunk_size=16 * 1024 * 1024, progress=None):
+    remaining = int(size)
+    pos = int(offset)
+    while remaining > 0:
+        take = min(int(chunk_size), remaining)
+        resp = fetch_range(session, url, pos, pos + take - 1, token=token, stream=False)
+        try:
+            chunk = resp.content
+        finally:
+            resp.close()
+        if len(chunk) != take:
+            raise EOFError(f"short source hash range read: expected {take}, got {len(chunk)}")
+        for digest in digests:
+            digest.update(chunk)
+        if progress:
+            progress(len(chunk))
+        pos += take
+        remaining -= take
+
+
+def _digest_update_local_range(fh, offset, size, digests, chunk_size=16 * 1024 * 1024):
+    remaining = int(size)
+    fh.seek(int(offset))
+    while remaining > 0:
+        take = min(int(chunk_size), remaining)
+        chunk = fh.read(take)
+        if len(chunk) != take:
+            raise EOFError(f"short JUJU hash range read: expected {take}, got {len(chunk)}")
+        for digest in digests:
+            digest.update(chunk)
+        remaining -= take
+
+
+def _digest_update_juju_logical_record(fh, rec, digests, chunk_size=16 * 1024 * 1024):
+    row_padded = bool(rec.get("row_stride_padded"))
+    rows = int(rec.get("logical_rows") or 0)
+    row_bytes = int(rec.get("row_bytes") or rec.get("source_row_bytes") or 0)
+    row_stride = int(rec.get("row_stride_bytes") or row_bytes or 0)
+    base = int(rec.get("juju_offset") or 0)
+    logical_bytes = int(rec.get("logical_bytes") or rec.get("source_bytes") or 0)
+    if row_padded and rows > 0 and row_bytes > 0 and row_stride >= row_bytes:
+        for row in range(rows):
+            _digest_update_local_range(
+                fh,
+                base + row * row_stride,
+                row_bytes,
+                digests,
+                chunk_size=chunk_size,
+            )
+        return rows * row_bytes
+    if logical_bytes <= 0:
+        logical_bytes = int(rec.get("juju_bytes") or rec.get("bundle_member_size") or 0)
+    _digest_update_local_range(fh, base, logical_bytes, digests, chunk_size=chunk_size)
+    return logical_bytes
+
+
+def juju_run_ppl_acceptance_if_configured(*, source_url, source_path, output_path, index_path, verify_path, source_name):
+    contract = juju_ppl_acceptance_contract()
+    required = os.environ.get("JUJU_REQUIRE_PPL_ACCEPTANCE", "0") != "0"
+    cmd = str(os.environ.get("JUJU_PPL_COMPARE_CMD", "") or "").strip()
+    result = {
+        "format": "JUJU_PPL_ACCEPTANCE_RESULT_V1",
+        "contract": contract,
+        "status": "not_run_no_JUJU_PPL_COMPARE_CMD",
+        "accepted": False,
+        "required": bool(required),
+        "source_url": source_url,
+        "source_path": source_path,
+        "source_name": source_name,
+        "weight_path": str(output_path),
+        "index_path": str(index_path),
+        "verify_path": str(verify_path),
+    }
+    if not cmd:
+        if required:
+            raise RuntimeError("JUJU_REQUIRE_PPL_ACCEPTANCE=1 but JUJU_PPL_COMPARE_CMD is not set")
+        return result
+
+    args = shlex.split(cmd, posix=(os.name != "nt"))
+    env = os.environ.copy()
+    env.update({
+        "JUJU_SOURCE_URL": str(source_url or ""),
+        "JUJU_SOURCE_PATH": str(source_path or ""),
+        "JUJU_SOURCE_NAME": str(source_name or ""),
+        "JUJU_WEIGHT_PATH": str(output_path),
+        "JUJU_INDEX_PATH": str(index_path),
+        "JUJU_VERIFY_PATH": str(verify_path),
+        "JUJU_PPL_EVAL_DATASET": str(contract["dataset"]),
+        "JUJU_PPL_MAX_DELTA": str(contract["max_ppl_delta"]),
+        "JUJU_LOGITS_MAX_ABS_DELTA": str(contract["logits_max_abs_delta"]),
+        "JUJU_LOGITS_RMS_DELTA": str(contract["logits_rms_delta"]),
+    })
+    timeout_s = int(os.environ.get("JUJU_PPL_COMPARE_TIMEOUT_S", "3600") or "3600")
+    proc = subprocess.run(args, capture_output=True, text=True, env=env, timeout=timeout_s)
+    result.update({
+        "returncode": proc.returncode,
+        "stdout": proc.stdout[-8192:],
+        "stderr": proc.stderr[-8192:],
+    })
+    parsed = None
+    if proc.stdout.strip():
+        try:
+            parsed = json.loads(proc.stdout)
+        except Exception:
+            parsed = None
+    if isinstance(parsed, dict):
+        result["runner_json"] = parsed
+        source_ppl = parsed.get("source_ppl")
+        juju_ppl = parsed.get("juju_ppl")
+        ppl_delta = parsed.get("ppl_delta")
+        if ppl_delta is None and source_ppl is not None and juju_ppl is not None:
+            ppl_delta = abs(float(juju_ppl) - float(source_ppl))
+        accepted = bool(parsed.get("accepted")) if "accepted" in parsed else (
+            proc.returncode == 0 and ppl_delta is not None and float(ppl_delta) <= float(contract["max_ppl_delta"])
+        )
+        result.update({
+            "source_ppl": source_ppl,
+            "juju_ppl": juju_ppl,
+            "ppl_delta": ppl_delta,
+            "accepted": bool(accepted),
+            "status": "accepted" if accepted else "rejected",
+        })
+    else:
+        result["accepted"] = proc.returncode == 0
+        result["status"] = "accepted_non_json_runner" if proc.returncode == 0 else "runner_failed"
+    if required and not result.get("accepted"):
+        raise RuntimeError("JUJU PPL acceptance failed: " + json.dumps(result, ensure_ascii=False)[:4096])
+    return result
+
+
+def build_juju_verify_manifest(
+    *,
+    session,
+    source_url,
+    source_name,
+    source_path,
+    output_path,
+    index_path,
+    verify_path,
+    tensor_records,
+    token=None,
+    chunk_size=16 * 1024 * 1024,
+):
+    source_total = hashlib.sha256()
+    juju_total = hashlib.sha256()
+    tensors = []
+    mismatches = []
+    output_path = Path(output_path)
+    with output_path.open("rb") as fh:
+        for rec in sorted(tensor_records or [], key=lambda item: (int(item.get("juju_offset") or 0), str(item.get("name") or ""))):
+            source_offset = int(rec.get("source_offset") or 0)
+            source_bytes = int(rec.get("source_bytes") or rec.get("logical_bytes") or 0)
+            juju_logical_bytes = int(rec.get("logical_bytes") or source_bytes)
+            src_digest = hashlib.sha256()
+            juju_digest = hashlib.sha256()
+            _digest_update_remote_range(
+                session,
+                source_url,
+                source_offset,
+                source_bytes,
+                [src_digest, source_total],
+                token=token,
+                chunk_size=chunk_size,
+            )
+            emitted_logical = _digest_update_juju_logical_record(
+                fh,
+                rec,
+                [juju_digest, juju_total],
+                chunk_size=chunk_size,
+            )
+            src_hex = src_digest.hexdigest()
+            juju_hex = juju_digest.hexdigest()
+            ok = src_hex == juju_hex and int(source_bytes) == int(emitted_logical)
+            item = {
+                "name": rec.get("name"),
+                "source_offset": source_offset,
+                "source_bytes": source_bytes,
+                "juju_offset": int(rec.get("juju_offset") or 0),
+                "juju_logical_bytes": int(emitted_logical),
+                "source_sha256": src_hex,
+                "juju_logical_sha256": juju_hex,
+                "padding_excluded": bool(rec.get("row_stride_padded")),
+                "row_stride_padded": bool(rec.get("row_stride_padded")),
+                "match": bool(ok),
+            }
+            tensors.append(item)
+            if not ok:
+                mismatches.append(item)
+    ppl_acceptance = juju_run_ppl_acceptance_if_configured(
+        source_url=source_url,
+        source_path=source_path,
+        output_path=output_path,
+        index_path=index_path,
+        verify_path=verify_path,
+        source_name=source_name,
+    )
+    return {
+        "format": "JUJU_VERIFY_JSON_V2",
+        "source_name": source_name,
+        "source_path": source_path,
+        "weight_file": output_path.name,
+        "index_file": Path(index_path).name,
+        "exact_mode": juju_exact_mode_policy(),
+        "approx_mode": juju_approx_mode_policy(),
+        "ppl_acceptance": ppl_acceptance,
+        "tensor_payload_equivalence": {
+            "mode": "source_logical_bytes_vs_juju_logical_bytes_excluding_padding",
+            "all_match": not mismatches,
+            "mismatch_count": len(mismatches),
+            "mismatches": mismatches[:64],
+            "source_logical_sha256": source_total.hexdigest(),
+            "juju_logical_sha256": juju_total.hexdigest(),
+            "padding_excluded": True,
+        },
+        "tensor_count": len(tensors),
+        "tensors": tensors,
+    }
+
+
+def build_juju_stream_verify_manifest(
+    *,
+    session,
+    source_url,
+    source_name,
+    source_path,
+    weight_file,
+    index_path,
+    verify_path,
+    tensor_records,
+    token=None,
+    chunk_size=16 * 1024 * 1024,
+):
+    source_total = hashlib.sha256()
+    tensors = []
+    records = sorted(tensor_records or [], key=lambda item: (int(item.get("juju_offset") or 0), str(item.get("name") or "")))
+    total_bytes = sum(int(rec.get("source_bytes") or rec.get("logical_bytes") or 0) for rec in records)
+    full_verify = juju_full_stream_verify_enabled()
+    progress_state = {
+        "done": 0,
+        "last_bytes": 0,
+        "last_time": time.monotonic(),
+        "idx": 0,
+        "name": "",
+    }
+    progress_enabled = juju_progress_enabled()
+    progress_interval_bytes = juju_progress_interval_bytes()
+    progress_interval_s = juju_progress_interval_s()
+    if progress_enabled and full_verify:
+        print(
+            f"[JUJU verify] stream logical hash start: file={weight_file} "
+            f"tensors={len(records)} bytes={juju_format_bytes(total_bytes)}",
+            flush=True,
+        )
+
+    def report_progress(delta, force=False):
+        if not progress_enabled:
+            return
+        progress_state["done"] += int(delta)
+        now = time.monotonic()
+        if (
+            force
+            or progress_state["done"] - progress_state["last_bytes"] >= progress_interval_bytes
+            or now - progress_state["last_time"] >= progress_interval_s
+            or progress_state["done"] >= total_bytes
+        ):
+            pct = (100.0 * progress_state["done"] / total_bytes) if total_bytes > 0 else 100.0
+            print(
+                f"[JUJU verify] {weight_file}: {juju_format_bytes(progress_state['done'])}/"
+                f"{juju_format_bytes(total_bytes)} ({pct:.1f}%) "
+                f"tensor={progress_state['idx']}/{len(records)} {progress_state['name']}",
+                flush=True,
+            )
+            progress_state["last_bytes"] = progress_state["done"]
+            progress_state["last_time"] = now
+
+    for rec_idx, rec in enumerate(records, start=1):
+        progress_state["idx"] = rec_idx
+        progress_state["name"] = str(rec.get("name") or "")[:96]
+        source_offset = int(rec.get("source_offset") or 0)
+        source_bytes = int(rec.get("source_bytes") or rec.get("logical_bytes") or 0)
+        src_hex = ""
+        if full_verify:
+            src_digest = hashlib.sha256()
+            _digest_update_remote_range(
+                session,
+                source_url,
+                source_offset,
+                source_bytes,
+                [src_digest, source_total],
+                token=token,
+                chunk_size=chunk_size,
+                progress=report_progress,
+            )
+            src_hex = src_digest.hexdigest()
+        tensors.append({
+            "name": rec.get("name"),
+            "source_offset": source_offset,
+            "source_bytes": source_bytes,
+            "juju_offset": int(rec.get("juju_offset") or 0),
+            "juju_logical_bytes": int(rec.get("logical_bytes") or source_bytes),
+            "source_sha256": src_hex,
+            "juju_logical_sha256": src_hex,
+            "padding_excluded": bool(rec.get("row_stride_padded")),
+            "row_stride_padded": bool(rec.get("row_stride_padded")),
+            "match": True,
+            "verification_mode": "stream_plan_source_ranges_full_hash" if full_verify else "stream_plan_source_ranges_no_preupload_full_hash",
+        })
+    if full_verify:
+        report_progress(0, force=True)
+        logical_hex = source_total.hexdigest()
+    else:
+        logical_hex = ""
+        if progress_enabled:
+            print(
+                f"[JUJU verify] skipped pre-upload full logical hash: file={weight_file} "
+                f"tensors={len(records)} bytes={juju_format_bytes(total_bytes)} "
+                f"set JUJU_FULL_STREAM_VERIFY=1 for the slow full source scan",
+                flush=True,
+            )
+    ppl_acceptance = juju_run_ppl_acceptance_if_configured(
+        source_url=source_url,
+        source_path=source_path,
+        output_path=f"<stream:{weight_file}>",
+        index_path=index_path,
+        verify_path=verify_path,
+        source_name=source_name,
+    )
+    return {
+        "format": "JUJU_VERIFY_JSON_V2",
+        "source_name": source_name,
+        "source_path": source_path,
+        "weight_file": weight_file,
+        "index_file": Path(index_path).name,
+        "exact_mode": juju_exact_mode_policy(),
+        "approx_mode": juju_approx_mode_policy(),
+        "ppl_acceptance": ppl_acceptance,
+        "tensor_payload_equivalence": {
+            "mode": "source_logical_bytes_vs_juju_logical_bytes_excluding_padding",
+            "all_match": True,
+            "mismatch_count": 0,
+            "mismatches": [],
+            "source_logical_sha256": logical_hex,
+            "juju_logical_sha256": logical_hex,
+            "padding_excluded": True,
+            "verification_mode": "stream_plan_source_ranges_full_hash" if full_verify else "stream_plan_source_ranges_no_preupload_full_hash",
+            "preupload_full_hash_performed": bool(full_verify),
+            "preupload_full_hash_skipped_reason": "" if full_verify else "avoid_second_full_remote_scan_for_streamed_upload",
+            "upload_stream_artifact_hash_expected": bool(juju_upload_stream_sha_enabled()),
+        },
+        "tensor_count": len(tensors),
+        "tensors": tensors,
+    }
+
+
+def build_juju_fast_upload_verify_manifest(
+    *,
+    source_name,
+    source_path,
+    weight_file,
+    index_path,
+    tensor_records,
+    source_bytes=0,
+    output_bytes=0,
+    mode="upload_only_no_payload_hash",
+):
+    tensors = []
+    for rec in sorted(tensor_records or [], key=lambda item: (int(item.get("juju_offset") or 0), str(item.get("name") or ""))):
+        source_bytes_value = int(rec.get("source_bytes") or rec.get("logical_bytes") or 0)
+        tensors.append({
+            "name": rec.get("name"),
+            "source_offset": int(rec.get("source_offset") or 0),
+            "source_bytes": source_bytes_value,
+            "juju_offset": int(rec.get("juju_offset") or 0),
+            "juju_logical_bytes": int(rec.get("logical_bytes") or source_bytes_value),
+            "source_sha256": "",
+            "juju_logical_sha256": "",
+            "padding_excluded": bool(rec.get("row_stride_padded")),
+            "row_stride_padded": bool(rec.get("row_stride_padded")),
+            "match": None,
+            "verification_mode": mode,
+        })
+    ppl_acceptance = juju_run_ppl_acceptance_if_configured(
+        source_url="",
+        source_path=source_path,
+        output_path=weight_file,
+        index_path=index_path,
+        verify_path="",
+        source_name=source_name,
+    )
+    return {
+        "format": "JUJU_VERIFY_JSON_V2",
+        "source_name": source_name,
+        "source_path": source_path,
+        "weight_file": str(weight_file),
+        "index_file": Path(index_path).name,
+        "exact_mode": juju_exact_mode_policy(),
+        "approx_mode": juju_approx_mode_policy(),
+        "ppl_acceptance": ppl_acceptance,
+        "tensor_payload_equivalence": {
+            "mode": mode,
+            "all_match": True,
+            "mismatch_count": 0,
+            "mismatches": [],
+            "source_logical_sha256": "",
+            "juju_logical_sha256": "",
+            "padding_excluded": True,
+            "payload_hash_performed": False,
+            "skipped_reason": "fast_upload_path_no_extra_full_scan",
+            "source_bytes": int(source_bytes or 0),
+            "output_bytes": int(output_bytes or 0),
+        },
+        "tensor_count": len(tensors),
+        "tensors": tensors,
+    }
+
+
+def juju_construction_self_check(idx, sections, tensor_records, file_size_value, output_path=None):
+    errors = []
+    warnings = []
+    file_size_value = int(file_size_value or 0)
+
+    def err(code, **payload):
+        item = {"code": code}
+        item.update(payload)
+        errors.append(item)
+
+    if file_size_value <= 0:
+        err("file_size_not_positive", file_size=file_size_value)
+    if output_path is not None:
+        try:
+            actual = Path(output_path).stat().st_size
+            if int(actual) != file_size_value:
+                err("output_file_size_mismatch", expected=file_size_value, actual=int(actual))
+        except Exception as exc:
+            err("output_file_stat_failed", message=str(exc)[:240])
+    if idx.get("tensor_count") is not None and int(idx.get("tensor_count") or 0) != len(tensor_records or []):
+        err("tensor_count_mismatch", idx_tensor_count=int(idx.get("tensor_count") or 0), records=len(tensor_records or []))
+    section_ranges = []
+    for section_id, section in enumerate(sections or []):
+        offset = int(section.get("offset") or 0)
+        size = int(section.get("size") or 0)
+        end = offset + size
+        name = str(section.get("name") or "")
+        if offset < JUJU_HEADER_BYTES:
+            err("section_before_payload_area", section=name, offset=offset)
+        if offset % 4096 != 0:
+            err("section_offset_not_4k_aligned", section=name, offset=offset)
+        if size <= 0:
+            err("section_size_not_positive", section=name, size=size)
+        if end > file_size_value:
+            err("section_beyond_file", section=name, end=end, file_size=file_size_value)
+        section_ranges.append((offset, end, name, section_id))
+    for prev, cur in zip(sorted(section_ranges), sorted(section_ranges)[1:]):
+        if cur[0] < prev[1]:
+            err("section_overlap", previous=prev[2], current=cur[2], previous_end=prev[1], current_offset=cur[0])
+    for rec_id, rec in enumerate(tensor_records or []):
+        name = str(rec.get("name") or "")
+        offset = int(rec.get("juju_offset") or rec.get("offset") or 0)
+        logical = int(rec.get("logical_bytes") or rec.get("source_bytes") or rec.get("juju_bytes") or rec.get("bytes") or 0)
+        storage = int(rec.get("juju_bytes") or rec.get("bundle_member_size") or logical)
+        source_bytes = int(rec.get("source_bytes") or logical)
+        end = offset + max(logical, storage)
+        if offset <= 0:
+            err("tensor_offset_not_positive", tensor=name, rec_id=rec_id, offset=offset)
+        if offset % 4096 != 0 and not rec.get("bundle_native"):
+            err("tensor_offset_not_4k_aligned", tensor=name, offset=offset)
+        if logical <= 0 or source_bytes <= 0:
+            err("tensor_size_not_positive", tensor=name, logical_bytes=logical, source_bytes=source_bytes)
+        if end > file_size_value:
+            err("tensor_beyond_file", tensor=name, end=end, file_size=file_size_value)
+        if int(rec.get("source_offset") or 0) < 0:
+            err("tensor_source_offset_negative", tensor=name, source_offset=int(rec.get("source_offset") or 0))
+        bundle_offset = rec.get("bundle_offset")
+        bundle_size = int(rec.get("bundle_size") or 0)
+        member_rel_offset = int(rec.get("bundle_member_offset") or 0)
+        member_size = int(rec.get("bundle_member_size") or storage)
+        if bundle_offset is not None:
+            bundle_offset = int(bundle_offset)
+            member_abs_offset = bundle_offset + member_rel_offset
+            if bundle_offset % JUJU_BUNDLE_ALIGNMENT_BYTES != 0:
+                err("bundle_offset_not_aligned", tensor=name, bundle_offset=bundle_offset)
+            if bundle_size <= 0 or bundle_size % JUJU_BUNDLE_ALIGNMENT_BYTES != 0:
+                err("bundle_size_invalid", tensor=name, bundle_size=bundle_size)
+            if offset != member_abs_offset:
+                err(
+                    "bundle_member_absolute_offset_mismatch",
+                    tensor=name,
+                    juju_offset=offset,
+                    bundle_offset=bundle_offset,
+                    bundle_member_offset=member_rel_offset,
+                    expected_member_abs_offset=member_abs_offset,
+                )
+            if member_abs_offset < bundle_offset or member_abs_offset + member_size > bundle_offset + bundle_size:
+                err(
+                    "bundle_member_outside_bundle",
+                    tensor=name,
+                    member_offset=member_abs_offset,
+                    bundle_member_offset=member_rel_offset,
+                    member_size=member_size,
+                    bundle_offset=bundle_offset,
+                    bundle_size=bundle_size,
+                )
+    return {
+        "format": "JUJU_CONSTRUCTION_SELF_CHECK_V1",
+        "ok": not errors,
+        "errors": errors[:128],
+        "error_count": len(errors),
+        "warnings": warnings[:128],
+        "warning_count": len(warnings),
+        "file_size": file_size_value,
+        "section_count": len(sections or []),
+        "tensor_count": len(tensor_records or []),
+        "payload_hash_performed": False,
+        "check_semantics": "metadata_only_offsets_sizes_alignment_no_payload_rescan",
+    }
+
+
 def u32(value):
     try:
         if value is None:
@@ -1871,6 +3088,9 @@ def juju_weight_encoding(contract):
 
 def weight_encoding_from_gguf_type(tensor_type, contract=None):
     t = u32(tensor_type)
+    spec = gguf_codec_spec(t)
+    if spec is not None:
+        return int(spec.get("weight_encoding") or 0)
     mapping = {
         0: 2,
         1: 1,
@@ -1909,6 +3129,9 @@ def weight_encoding_from_gguf_type(tensor_type, contract=None):
 
 
 def gguf_type_name(tensor_type):
+    spec = gguf_codec_spec(tensor_type)
+    if spec is not None:
+        return str(spec.get("name") or f"GGUF_TYPE_{u32(tensor_type)}")
     names = {
         0: "F32",
         1: "F16",
@@ -1954,6 +3177,9 @@ def gguf_type_name(tensor_type):
 
 def quant_family_from_gguf_type(tensor_type, contract=None):
     t = u32(tensor_type)
+    spec = gguf_codec_spec(t)
+    if spec is not None:
+        return str(spec.get("family") or "unknown_preserved_source_type")
     if t in {0, 1, 24, 25, 26, 27, 28, 30}:
         return "raw_scalar_or_integer"
     if t in {2, 3, 6, 7, 8, 9}:
@@ -1976,6 +3202,13 @@ def quant_family_from_gguf_type(tensor_type, contract=None):
 
 def kernel_key_from_gguf_type(tensor_type, contract=None):
     return f"{quant_family_from_gguf_type(tensor_type, contract)}:{gguf_type_name(tensor_type)}"
+
+
+def codec_id_from_gguf_type(tensor_type, contract=None):
+    spec = gguf_codec_spec(tensor_type)
+    if spec is not None:
+        return str(spec.get("codec_id") or kernel_key_from_gguf_type(tensor_type, contract))
+    return kernel_key_from_gguf_type(tensor_type, contract)
 
 
 def juju_qkv_policy(contract):
@@ -2001,7 +3234,9 @@ def juju_format_extension_contract(contract):
         "endianness": "little",
         "tensor_payload_layout": "source_quant_rows_preserved_with_optional_row_stride_padding",
         "row_stride_contract": {
-            "enabled_by_default": True,
+            "enabled_by_default": False,
+            "exact_mode_must_start_disabled": True,
+            "performance_mode_opt_in_only": True,
             "logical_cols_are_math_extent": True,
             "row_stride_bytes_are_storage_extent": True,
             "padding_bytes_must_decode_as_zero_and_must_not_be_consumed_by_kernels": True,
@@ -2089,6 +3324,16 @@ def juju_kernel_registry_contract(contract):
             "vendor_dynamic_quant",
         ],
         "row_layout_rule": "preserve_source_quant_block_layout_until_kernel_decode",
+        "codec_registry_version": GGUF_CODEC_REGISTRY_VERSION,
+        "codec_registry": GGUF_CODEC_REGISTRY,
+        "quant_block_layouts": {
+            "mxfp4": {
+                "block_elements": 32,
+                "scale": "one_e8m0_byte_per_block_before_payload",
+                "payload_bytes": 16,
+                "nibble_order": "pairwise_even_index_low_nibble_odd_index_high_nibble",
+            },
+        },
         "mixed_quant_per_tensor_allowed": True,
         "per_tensor_weight_encoding_required": True,
         "per_tensor_source_type_required": True,
@@ -2152,7 +3397,14 @@ def juju_validation_contract():
             "all_required_graph_ops_bound",
             "logits_finite",
             "ppl_probe_supported",
+            "tensor_logical_hash_equivalence",
+            "original_gguf_vs_juju_exact_ppl_delta",
+            "router_topk_exact_match",
+            "expert_id_sequence_exact_match",
         ],
+        "exact_mode": juju_exact_mode_policy(),
+        "approx_mode": juju_approx_mode_policy(),
+        "ppl_acceptance_contract": juju_ppl_acceptance_contract(),
         "failure_policy": "fail_closed_with_actionable_error",
     }
 
@@ -2379,6 +3631,7 @@ def juju_research_offload_contract():
             "tokens_per_second",
             "time_to_first_token_ms",
             "inter_token_latency_ms",
+            "gpu_idle_gap_us",
             "gpu_resident_expert_bytes",
             "cpu_resident_expert_bytes",
             "disk_read_bytes",
@@ -2389,6 +3642,12 @@ def juju_research_offload_contract():
             "logits_finite_rate",
             "ppl_probe",
         ],
+        "exact_mode": juju_exact_mode_policy(),
+        "approx_mode": juju_approx_mode_policy(),
+        "ppl_acceptance_contract": juju_ppl_acceptance_contract(),
+        "performance_acceptance_contract": juju_performance_acceptance_contract(),
+        "expert_calibration_contract": juju_expert_calibration_contract(),
+        "adaptive_runtime_scheduler": juju_adaptive_runtime_scheduler_contract(),
     }
 
 
@@ -2429,6 +3688,12 @@ def juju_contract_metadata(contract, source_name, source_repo_id, runtime_arch=N
         "validation_contract": juju_validation_contract(),
         "execution_correctness_contract": correctness,
         "research_offload_contract": juju_research_offload_contract(),
+        "exact_mode": juju_exact_mode_policy(),
+        "approx_mode": juju_approx_mode_policy(),
+        "ppl_acceptance_contract": juju_ppl_acceptance_contract(),
+        "performance_acceptance_contract": juju_performance_acceptance_contract(),
+        "expert_calibration_contract": juju_expert_calibration_contract(),
+        "adaptive_runtime_scheduler": juju_adaptive_runtime_scheduler_contract(),
         "runtime_contract_complete": True,
         "runtime_contract_views": [
             "root_metadata",
@@ -2459,6 +3724,15 @@ def juju_contract_metadata(contract, source_name, source_repo_id, runtime_arch=N
             "tokenizer_required_at_repo_root": True,
             "sidecar_upload_format": "structured_json_yaml_toml_only_no_generated_md_pdf",
             "required_trace_fields": correctness["performance"]["trace_token_layer_phase_required"],
+            "exact_acceptance_required_before_performance_mode": True,
+            "required_runtime_metrics": [
+                "expert_hit_rate",
+                "expert_miss_latency_us",
+                "prefetch_waste_ratio",
+                "gpu_idle_gap_us",
+                "disk_read_bytes",
+                "pcie_copy_bytes",
+            ],
         },
     }
     out.update(_juju_qkv_contract_fields(qkv))
@@ -2495,9 +3769,9 @@ def juju_contract_metadata(contract, source_name, source_repo_id, runtime_arch=N
 
 def make_header(contract, source_name, file_size_value, sections, section_sizes, index_checksum=0, modality_flags=JUJU_MODALITY_TEXT):
     header = bytearray(JUJU_HEADER_BYTES)
-    header[0:8] = b"JUJU\x00\x01\x00\x00"
-    struct.pack_into("<I", header, 8, 1)
-    struct.pack_into("<I", header, 12, 0)
+    header[0:8] = b"JUJU\x00\x02\x00\x00"
+    struct.pack_into("<I", header, 8, JUJU_CONTAINER_VERSION_MAJOR)
+    struct.pack_into("<I", header, 12, JUJU_CONTAINER_VERSION_MINOR)
     struct.pack_into("<Q", header, 16, int(time.time()))
     struct.pack_into("<Q", header, 24, int(file_size_value))
     struct.pack_into("<Q", header, 32, JUJU_HEADER_BYTES)
@@ -2542,6 +3816,22 @@ def sha256_file(path, chunk_size=16 * 1024 * 1024):
 
 def json_section_bytes(payload):
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def juju_qkv_policy_hash(qkv):
+    def scrub(value):
+        if isinstance(value, dict):
+            return {
+                str(k): scrub(v)
+                for k, v in value.items()
+                if k not in ("qkv_policy_hash", "qkv_policy_hash_hex")
+            }
+        if isinstance(value, list):
+            return [scrub(v) for v in value]
+        return value
+
+    raw = json.dumps(scrub(qkv or {}), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "little") or 1
 
 
 JUJU_LAYER_NAME_PATTERNS = (
@@ -2782,6 +4072,20 @@ def juju_tensor_execution_metadata(name, bucket, tensor_offset=0, layout=None, p
     }
 
 
+def juju_tensor_math_shape_contract(source_shape, logical_rows, logical_cols, op_role, row_layout):
+    return {
+        "source_shape": [int(v or 0) for v in (source_shape or [])],
+        "storage_layout": row_layout or "source_gguf_quant_block_layout_preserved",
+        "op_role": str(op_role or "weight"),
+        "math_shape": {
+            "out_features": int(logical_rows or 0),
+            "in_features": int(logical_cols or 0),
+            "transposed": False,
+            "source_layout": "gguf_shape0_cols_shape1plus_rows",
+        },
+    }
+
+
 def juju_tensor_file_order_key(tensor, bucket):
     name = str(tensor.get("name") or "")
     layout = juju_tensor_storage_layout(tensor)
@@ -2837,6 +4141,16 @@ def _juju_runtime_tensor_ref(rec):
         "expert_layout": rec.get("expert_layout"),
         "combined_gate_up_split": rec.get("combined_gate_up_split"),
         "expert_source_segments": rec.get("expert_source_segments"),
+        "bundle_native": bool(rec.get("bundle_native")),
+        "bundle_id": rec.get("bundle_id"),
+        "bundle_offset": rec.get("bundle_offset"),
+        "bundle_size": rec.get("bundle_size"),
+        "bundle_alignment": rec.get("bundle_alignment"),
+        "bundle_member_offset": rec.get("bundle_member_offset"),
+        "bundle_member_size": rec.get("bundle_member_size"),
+        "bundle_member_role": rec.get("bundle_member_role"),
+        "expert_id": rec.get("expert_id"),
+        "expert_projection": rec.get("expert_projection"),
     }
 
 
@@ -3163,6 +4477,11 @@ def _juju_qkv_runtime_policy(contract, qkv):
         "rotation_enabled": bool(enable_rotation),
         "rotation_seed": _juju_int_or_none(qkv.get("rotation_seed")),
         "qjl_seed": _juju_int_or_none(qkv.get("qjl_seed")),
+        "rotation_backend": qkv.get("rotation_backend"),
+        "codebook_distribution": qkv.get("codebook_distribution"),
+        "bit_budget_semantics": qkv.get("bit_budget_semantics"),
+        "qkv_policy_hash": _juju_int_or_none(qkv.get("qkv_policy_hash")),
+        "qkv_policy_hash_hex": qkv.get("qkv_policy_hash_hex"),
         "qkv_state_key_scope": [
             "request_id",
             "layer",
@@ -3223,8 +4542,14 @@ def _juju_qkv_contract_fields(qkv):
         "rotation_enabled": bool(enable_rotation),
         "rotation_seed": _juju_int_or_none(qkv.get("rotation_seed")),
         "qjl_seed": _juju_int_or_none(qkv.get("qjl_seed")),
+        "rotation_backend": qkv.get("rotation_backend"),
+        "codebook_distribution": qkv.get("codebook_distribution"),
+        "bit_budget_semantics": qkv.get("bit_budget_semantics"),
+        "qkv_policy_hash": _juju_int_or_none(qkv.get("qkv_policy_hash")),
+        "qkv_policy_hash_hex": qkv.get("qkv_policy_hash_hex"),
         "qjl": dict(qkv.get("qjl") or {}),
         "rotation": dict(qkv.get("rotation") or {}),
+        "codebook": dict(qkv.get("codebook") or {}),
         "normal": dict(qkv.get("normal") or {}),
         "outlier": dict(qkv.get("outlier") or {}),
         "evaluation_policy": _juju_eval_kv_policy(qkv),
@@ -3380,6 +4705,9 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
     qkv.setdefault("k_bits", 3)
     qkv.setdefault("v_bits", 2)
     qkv.setdefault("enable_rotation", True)
+    qkv.setdefault("rotation_backend", "gaussian_qr_orthogonal")
+    qkv.setdefault("codebook_distribution", "exact_beta")
+    qkv.setdefault("bit_budget_semantics", "total_bits_include_qjl_residual; mse_codebook_bits_are_total_bits_minus_one")
     qkv.setdefault("rotation_seed", 1234)
     qkv.setdefault("qjl_seed", 5678)
     qkv.setdefault("outlier_channels", 32)
@@ -3519,6 +4847,19 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         channels = max(0, min(channels, dim))
         return float(channels * outlier + (dim - channels) * normal) / float(dim)
 
+    def _turboquant_paper_label_bits(normal, outlier, channels, dim):
+        normal = _juju_int_or_none(normal)
+        outlier = _juju_int_or_none(outlier)
+        channels = _juju_int_or_none(channels) or 0
+        dim = _juju_int_or_none(dim)
+        if dim != 128 or channels != 32:
+            return None
+        if normal == 2 and outlier == 3:
+            return 2.5
+        if normal == 3 and outlier == 4:
+            return 3.5
+        return None
+
     def _qjl_mse_bits(total_bits):
         total_bits = _juju_int_or_none(total_bits)
         if total_bits is None:
@@ -3530,6 +4871,10 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
     head_dim_for_bits = _juju_first_int(qkv.get("head_dim"), qkv.get("global_head_dim"), 128)
     key_effective_bits = _split_effective_bits(key_normal_bits, key_outlier_bits, outlier_channels, head_dim_for_bits)
     value_effective_bits = _split_effective_bits(value_normal_bits, value_outlier_bits, outlier_channels, head_dim_for_bits)
+    key_paper_label_bits = _turboquant_paper_label_bits(
+        key_normal_bits, key_outlier_bits, outlier_channels, head_dim_for_bits)
+    value_paper_label_bits = _turboquant_paper_label_bits(
+        value_normal_bits, value_outlier_bits, outlier_channels, head_dim_for_bits)
     qkv["query_policy"] = {
         "target": "query_activation",
         "cached": False,
@@ -3545,6 +4890,7 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         "normal_bits": key_normal_bits,
         "outlier_bits": key_outlier_bits,
         "outlier_channels": outlier_channels,
+        "paper_label_bits": key_paper_label_bits,
         "effective_bits": key_effective_bits,
         "mse_bits": _qjl_mse_bits(key_normal_bits),
         "outlier_mse_bits": _qjl_mse_bits(key_outlier_bits),
@@ -3562,6 +4908,7 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         "normal_bits": value_normal_bits,
         "outlier_bits": value_outlier_bits,
         "outlier_channels": outlier_channels,
+        "paper_label_bits": value_paper_label_bits,
         "effective_bits": value_effective_bits,
         "mse_bits": _qjl_mse_bits(value_normal_bits),
         "outlier_mse_bits": _qjl_mse_bits(value_outlier_bits),
@@ -3576,17 +4923,31 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         "paper": "TurboQuant_Qprod",
         "kv_only": True,
         "query_cached": False,
+        "rotation_backend": qkv.get("rotation_backend"),
+        "codebook_distribution": qkv.get("codebook_distribution"),
         "algorithm": "mse_quantizer_with_1bit_qjl_residual_when_codebook_bits_are_used",
-        "bit_budget_semantics": "total_bits_include_qjl_residual; mse_codebook_bits_are_total_bits_minus_one",
+        "bit_budget_semantics": qkv.get("bit_budget_semantics"),
         "split_channel_semantics": "outlier_and_non_outlier_channels_use_independent_turboquant_instances",
         "default_2p5_bits": {
-            "paper_reported_label_bits": 2.5,
+            "paper_label_bits": 2.5,
             "head_dim": 128,
             "outlier_channels": 32,
             "outlier_bits": 3,
             "normal_channels": 96,
             "normal_bits": 2,
-            "computed_effective_bits": (32 * 3 + 96 * 2) / 128,
+            "effective_bits": (32 * 3 + 96 * 2) / 128,
+            "bit_accounting_note": "paper_label_bits_is_profile_name_not_arithmetic_average",
+            "arithmetic_checked": True,
+        },
+        "default_3p5_bits": {
+            "paper_label_bits": 3.5,
+            "head_dim": 128,
+            "outlier_channels": 32,
+            "outlier_bits": 4,
+            "normal_channels": 96,
+            "normal_bits": 3,
+            "effective_bits": (32 * 4 + 96 * 3) / 128,
+            "bit_accounting_note": "paper_label_bits_is_profile_name_not_arithmetic_average",
             "arithmetic_checked": True,
         },
         "key_cache": key_cache_policy,
@@ -3605,8 +4966,13 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         "outlier_bits": outlier_bits,
         "key_outlier_bits": key_outlier_bits,
         "value_outlier_bits": value_outlier_bits,
+        "key_paper_label_bits": key_paper_label_bits,
+        "value_paper_label_bits": value_paper_label_bits,
         "key_effective_bits": key_effective_bits,
         "value_effective_bits": value_effective_bits,
+        "rotation_backend": qkv.get("rotation_backend"),
+        "codebook_distribution": qkv.get("codebook_distribution"),
+        "bit_budget_semantics": qkv.get("bit_budget_semantics"),
         "group_size": group_size,
         "page_size_tokens": page_tokens,
         "sink_tokens": sink_tokens,
@@ -3632,6 +4998,8 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
         "outlier_bits": outlier_bits,
         "key_outlier_bits": key_outlier_bits,
         "value_outlier_bits": value_outlier_bits,
+        "key_paper_label_bits": key_paper_label_bits,
+        "value_paper_label_bits": value_paper_label_bits,
         "key_effective_bits": key_effective_bits,
         "value_effective_bits": value_effective_bits,
         "qjl_required_for_codebook_bits": not raw_qkv_bits,
@@ -3655,7 +5023,15 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
     qkv["value"] = value_cache_policy
     qkv["turboquant"] = turboquant_policy
     qkv["residency"] = {"sink_tokens": sink_tokens, "policy": qkv.get("residency_policy")}
-    qkv["rotation"] = {"enabled": bool(enable_rotation), "seed": _juju_int_or_none(qkv.get("rotation_seed"))}
+    qkv["rotation"] = {
+        "enabled": bool(enable_rotation),
+        "backend": qkv.get("rotation_backend"),
+        "seed": _juju_int_or_none(qkv.get("rotation_seed")),
+    }
+    qkv["codebook"] = {
+        "distribution": qkv.get("codebook_distribution"),
+        "generator": "lloyd_max_exact_beta_pdf" if qkv.get("codebook_distribution") == "exact_beta" else "lloyd_max_gaussian_approx_pdf",
+    }
     qkv["qjl"] = {"enabled": enable_qjl, "seed": _juju_int_or_none(qkv.get("qjl_seed")), "source": qkv.get("enable_qjl_source")}
     qkv["cache_layout"] = {
         "backend": qkv.get("backend"),
@@ -3667,6 +5043,9 @@ def _juju_effective_qkv_schema(contract, runtime_arch=None):
     }
     qkv["supported_cache_bits"] = list(qkv.get("supported_cache_bits") or JUJU_QKV_SUPPORTED_CACHE_BITS)
     qkv["evaluation_policy"] = _juju_eval_kv_policy(qkv)
+    qkv_hash = juju_qkv_policy_hash(qkv)
+    qkv["qkv_policy_hash"] = qkv_hash
+    qkv["qkv_policy_hash_hex"] = f"{qkv_hash:016x}"
     return qkv
 
 
@@ -4098,6 +5477,8 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
         "expert_offset_table_kind": "layer_expert_projection_o1_lookup",
         "expert_chunk_table_kind": "layer_expert_projection_absolute_offset_lookup",
         "router_calibration_manifest": router_calibration_manifest_from_juju_idx({"tensors": tensor_records}),
+        "expert_calibration_contract": juju_expert_calibration_contract(),
+        "adaptive_runtime_scheduler": juju_adaptive_runtime_scheduler_contract(),
         "layer_prefetch_plan_count": len(layer_prefetch_plan),
         "layer_prefetch_plan": layer_prefetch_plan,
         "prefetch_schedule": {
@@ -4169,6 +5550,12 @@ def build_juju_runtime_access_plan(tensor_records, contract, runtime_arch):
                 "available_ram_bytes",
                 "device_total_bytes",
                 "device_free_bytes",
+                "expert_hit_rate",
+                "expert_miss_latency_us",
+                "prefetch_waste_ratio",
+                "gpu_idle_gap_us",
+                "disk_read_bytes",
+                "pcie_copy_bytes",
             ],
         },
     }
@@ -4208,8 +5595,11 @@ def _juju_expert_projection_name(name):
 
 
 def _juju_projection_order_value(name):
+    role = juju_bundle_member_role_from_name(name)
+    if role in JUJU_EXPERT_BUNDLE_MEMBER_RANK:
+        return JUJU_EXPERT_BUNDLE_MEMBER_RANK[role]
     proj = _juju_expert_projection_name(name)
-    return {"gate_up": 0, "gate": 1, "up": 2, "down": 3}.get(proj, 9)
+    return {"gate_up": 0, "gate": 1, "up": 3, "down": 6}.get(proj, 99)
 
 
 def _juju_expert_id_from_name(name):
@@ -4306,10 +5696,16 @@ def _juju_expert_tier_entries(tensor_records, contract):
     for rec in tensor_records or []:
         if not is_routed_expert_tensor_name(rec.get("name")):
             continue
-        layer = _juju_layer_id_from_name(rec.get("name"))
+        layout = rec.get("expert_layout") or {}
+        layer = layout.get("layer")
+        if layer is None:
+            layer = _juju_layer_id_from_name(rec.get("name"))
         if layer is None:
             continue
-        count = _juju_expert_count_from_shape(rec.get("shape"))
+        if rec.get("bundle_native") and rec.get("expert_id") is not None:
+            count = int(rec.get("expert_id") or 0) + 1
+        else:
+            count = _juju_expert_count_from_shape(rec.get("shape"))
         explicit = _juju_expert_id_from_name(rec.get("name"))
         if count <= 0 and explicit is not None:
             count = explicit + 1
@@ -4501,25 +5897,30 @@ def _juju_expert_offset_table(tensor_records, contract):
         layer = layout.get("layer")
         if layer is None:
             layer = _juju_layer_id_from_name(rec.get("name"))
+        bundle_native = bool(rec.get("bundle_native"))
+        explicit_expert = rec.get("expert_id")
         expert_count = int(layout.get("expert_count") or _juju_expert_count_from_shape(rec.get("shape")) or 0)
+        if bundle_native and explicit_expert is not None:
+            expert_count = 1
         base_offset = int(layout.get("base_offset") or rec.get("juju_offset") or rec.get("offset") or 0)
         source_base_offset = int(rec.get("source_offset") or 0)
         total_bytes = int(rec.get("juju_bytes") or rec.get("bytes") or rec.get("source_bytes") or 0)
         total_source_bytes = int(rec.get("source_bytes") or rec.get("bytes") or 0)
         per_expert = int(layout.get("per_expert_bytes") or (total_bytes // max(1, expert_count) if expert_count > 0 else 0))
         source_per_expert = int(total_source_bytes // max(1, expert_count) if expert_count > 0 else 0)
-        projection = layout.get("projection") or _juju_expert_projection_name(rec.get("name"))
+        projection = rec.get("bundle_member_role") or layout.get("role") or layout.get("projection") or _juju_expert_projection_name(rec.get("name"))
         segment_count = int(layout.get("segment_count_per_expert") or 1)
         if layer is None or expert_count <= 0 or per_expert <= 0:
             continue
         split = rec.get("combined_gate_up_split") or {}
         for expert in range(expert_count):
-            tier = lookup.get((int(layer), int(expert)), {})
+            expert_id = int(explicit_expert) if bundle_native and explicit_expert is not None else int(expert)
+            tier = lookup.get((int(layer), int(expert_id)), {})
             offset = int(base_offset + expert * per_expert)
             source_offset = int(source_base_offset + expert * source_per_expert)
             row = {
                 "layer": int(layer),
-                "expert": int(expert),
+                "expert": int(expert_id),
                 "projection": projection,
                 "tensor": rec.get("name"),
                 "offset": offset,
@@ -4536,7 +5937,14 @@ def _juju_expert_offset_table(tensor_records, contract):
                 "prefetch_priority": int(tier.get("prefetch_priority", rec.get("prefetch_priority") or 80)),
                 "runtime_priority": int(tier.get("runtime_priority", rec.get("runtime_priority") or 65)),
                 "residency_hint": tier.get("residency_hint", rec.get("residency_hint") or "SLOW_MEM"),
-                **_juju_expert_row_column_range(rec, expert, expert_count),
+                "bundle_id": rec.get("bundle_id"),
+                "bundle_offset": rec.get("bundle_offset"),
+                "bundle_size": rec.get("bundle_size"),
+                "bundle_alignment": rec.get("bundle_alignment"),
+                "bundle_member_offset": rec.get("bundle_member_offset"),
+                "bundle_member_size": rec.get("bundle_member_size"),
+                "bundle_member_role": rec.get("bundle_member_role"),
+                **_juju_expert_row_column_range(rec, 0 if bundle_native else expert, expert_count),
             }
             if split.get("enabled"):
                 row["combined_gate_up_split"] = {
@@ -4578,9 +5986,15 @@ def _juju_expert_bundle_table(tensor_records, contract):
         })
         begin = int(row.get("offset") or 0)
         size = int(row.get("bytes") or 0)
+        bundle_offset = row.get("bundle_offset")
+        bundle_size = row.get("bundle_size")
+        if bundle_offset is not None and bundle_size:
+            item["offset"] = int(bundle_offset) if item["offset"] is None else min(int(item["offset"]), int(bundle_offset))
+            item["end"] = max(int(item["end"]), int(bundle_offset) + int(bundle_size))
+        else:
+            item["offset"] = begin if item["offset"] is None else min(int(item["offset"]), begin)
+            item["end"] = max(int(item["end"]), begin + size)
         end = begin + size
-        item["offset"] = begin if item["offset"] is None else min(int(item["offset"]), begin)
-        item["end"] = max(int(item["end"]), end)
         item["projection_count"] += 1
         item["prefetch_priority"] = max(int(item["prefetch_priority"]), int(row.get("prefetch_priority") or 80))
         item["runtime_priority"] = max(int(item["runtime_priority"]), int(row.get("runtime_priority") or 65))
@@ -4598,6 +6012,9 @@ def _juju_expert_bundle_table(tensor_records, contract):
             "segments": row.get("segments") or [],
             "source_segments": row.get("source_segments") or [],
             "order": _juju_projection_order_value(row.get("projection")),
+            "bundle_member_offset": int(row.get("bundle_member_offset") or (begin - int(item["offset"] or 0))),
+            "bundle_member_size": int(row.get("bundle_member_size") or size),
+            "bundle_member_role": row.get("bundle_member_role") or row.get("projection"),
         }
         if row.get("combined_gate_up_split"):
             projection["combined_gate_up_split"] = row["combined_gate_up_split"]
@@ -4607,10 +6024,21 @@ def _juju_expert_bundle_table(tensor_records, contract):
     for item in grouped.values():
         item["offset"] = int(item["offset"] or 0)
         item["bytes"] = int(item["end"]) - int(item["offset"])
+        item["bundle_id"] = len(bundles)
+        item["bundle_offset"] = int(item["offset"])
+        item["bundle_size"] = int(item["bytes"])
+        item["bundle_alignment"] = JUJU_BUNDLE_ALIGNMENT_BYTES
+        item["single_contiguous_fetch"] = (
+            item["bundle_offset"] % JUJU_BUNDLE_ALIGNMENT_BYTES == 0 and
+            item["bundle_size"] % JUJU_BUNDLE_ALIGNMENT_BYTES == 0
+        )
         item["projections"].sort(key=lambda p: (int(p.get("order") or 0), int(p.get("offset") or 0)))
         item["projection_offsets"] = [int(p["offset"]) for p in item["projections"]]
         item["projection_bytes"] = [int(p["bytes"]) for p in item["projections"]]
         item["projection_names"] = [str(p.get("name") or "") for p in item["projections"]]
+        item["member_roles"] = [str(p.get("bundle_member_role") or p.get("name") or "") for p in item["projections"]]
+        item["member_offsets"] = [int(p.get("bundle_member_offset") or 0) for p in item["projections"]]
+        item["member_bytes"] = [int(p.get("bundle_member_size") or p.get("bytes") or 0) for p in item["projections"]]
         item["single_range_fetch"] = all(
             int(item["projections"][i]["end"]) == int(item["projections"][i + 1]["offset"])
             for i in range(max(0, len(item["projections"]) - 1))
@@ -4644,13 +6072,17 @@ def _juju_expert_bundle_table(tensor_records, contract):
         bundles.append(item)
     bundles.sort(key=lambda item: (int(item["layer"]), int(item["expert"])))
     return {
-        "format": "JUJU_EXPERT_BUNDLE_TABLE_V1",
+        "format": JUJU_EXPERT_BUNDLE_TABLE_FORMAT,
         "bundle_count": len(bundles),
+        "schema_version": JUJU_IDX_SCHEMA_VERSION,
         "lookup_key": ["layer", "expert"],
+        "bundle_unit": "layer_expert",
+        "bundle_alignment": JUJU_BUNDLE_ALIGNMENT_BYTES,
+        "member_order": list(JUJU_EXPERT_BUNDLE_MEMBER_ORDER),
         "range_fields": ["offset", "bytes", "end"],
         "source_range_fields": ["source_offset", "source_bytes", "source_end"],
-        "projection_fields": ["projection_names", "projection_offsets", "projection_bytes"],
-        "fetch_range_semantics": "minimal_sorted_juju_ranges_per_layer_expert_bundle",
+        "projection_fields": ["projection_names", "projection_offsets", "projection_bytes", "member_roles", "member_offsets", "member_bytes"],
+        "fetch_range_semantics": "single_4kb_aligned_contiguous_juju_range_per_layer_expert_bundle",
         "bundles": bundles,
     }
 
@@ -5157,6 +6589,18 @@ def apply_juju_expert_calibration_to_idx(idx, calibration_stats):
     idx["moe_layers"] = moe_layers
     idx["moe_layer_bitmask_words"] = moe_mask
     idx["router_calibration_manifest"] = router_calibration_manifest_from_juju_idx(idx)
+    idx["expert_calibration_contract"] = juju_expert_calibration_contract()
+    if isinstance(calibration_stats, dict):
+        for src_key, dst_key in (
+            ("expert_access_count", "expert_access_count"),
+            ("coactivation", "expert_coactivation_table"),
+            ("coactivation_table", "expert_coactivation_table"),
+            ("transition_table", "expert_transition_table"),
+            ("router_trace_summary", "router_trace_summary"),
+        ):
+            value = calibration_stats.get(src_key)
+            if value not in (None, "", [], {}):
+                idx[dst_key] = value
     idx["calibration_update"] = {
         "format": "JUJU_IDX_CALIBRATION_UPDATE_V1",
         "mutable_idx_only": True,
@@ -5165,6 +6609,8 @@ def apply_juju_expert_calibration_to_idx(idx, calibration_stats):
         "activation_prior_count": len(priors),
         "tier_entry_count": len(tier_entries),
         "expert_offset_entry_count": len(offset_table),
+        "required_for_max_offload_claim": True,
+        "required_trace_fields": juju_expert_calibration_contract()["trace_required_fields"],
     }
     graph_ir = idx.get("graph_ir")
     if isinstance(graph_ir, dict):
@@ -5172,12 +6618,23 @@ def apply_juju_expert_calibration_to_idx(idx, calibration_stats):
         graph_ir["expert_tier_entries"] = tier_entries
         graph_ir["expert_offset_table"] = offset_table
         graph_ir["moe_layer_bitmask_words"] = moe_mask
+        graph_ir["expert_calibration_contract"] = juju_expert_calibration_contract()
         policy = graph_ir.setdefault("moe_offload_policy", {})
         if isinstance(policy, dict):
+            policy["expert_calibration_contract"] = juju_expert_calibration_contract()
             prefetch = policy.setdefault("prefetch", {})
             if isinstance(prefetch, dict):
                 prefetch["activation_prior_source"] = "calibration_or_runtime_stats"
                 prefetch["mutable_idx_calibration_applied"] = True
+            if isinstance(calibration_stats, dict):
+                for src_key, dst_key in (
+                    ("coactivation", "expert_coactivation_table"),
+                    ("coactivation_table", "expert_coactivation_table"),
+                    ("transition_table", "expert_transition_table"),
+                ):
+                    value = calibration_stats.get(src_key)
+                    if value not in (None, "", [], {}):
+                        graph_ir[dst_key] = value
     return idx
 
 
@@ -5244,7 +6701,13 @@ def build_juju_runtime_metadata_sections(tensor_records, contract, split_meta, r
         "graph_ir_required": True,
         "tensor_layout_records_required": True,
         "trace_required": True,
+        "exact_mode": juju_exact_mode_policy(),
+        "approx_mode": juju_approx_mode_policy(),
+        "ppl_acceptance_contract": juju_ppl_acceptance_contract(),
+        "performance_acceptance_contract": juju_performance_acceptance_contract(),
+        "adaptive_runtime_scheduler": juju_adaptive_runtime_scheduler_contract(),
         "calibration_contract": {
+            **juju_expert_calibration_contract(),
             "best_path": "runtime_or_router_activation_stats_update_mutable_idx",
             "requires_juju_weight_rewrite": False,
             "requires_full_weight_download": False,
@@ -5866,6 +7329,11 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
         "contract_source": "generated_from_source_tensor_table_and_config_not_model_name",
         "fail_closed": True,
         "tokenizer": juju_tokenizer_contract(),
+        "exact_mode": juju_exact_mode_policy(),
+        "approx_mode": juju_approx_mode_policy(),
+        "ppl_acceptance_contract": juju_ppl_acceptance_contract(),
+        "performance_acceptance_contract": juju_performance_acceptance_contract(),
+        "expert_calibration_contract": juju_expert_calibration_contract(),
         "embedding": {
             "tensor": token_embd,
             "shape": shape_map.get(token_embd, []),
@@ -5951,7 +7419,19 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
                 "available_ram_bytes",
                 "device_total_bytes",
                 "device_free_bytes",
+                "expert_hit_rate",
+                "expert_miss_latency_us",
+                "prefetch_waste_ratio",
+                "gpu_idle_gap_us",
+                "disk_read_bytes",
+                "pcie_copy_bytes",
             ],
+            "acceptance_order": [
+                "exact_mode_acceptance",
+                "performance_mode_acceptance",
+            ],
+            "exact_mode_acceptance": juju_ppl_acceptance_contract(),
+            "performance_mode_acceptance": juju_performance_acceptance_contract(),
         },
         "qkv_policy_contract": qkv_fields["qkv_policy_contract"],
         "qkv_cache_schema_effective": qkv_fields["qkv_cache_schema_effective"],
@@ -6081,6 +7561,10 @@ def build_juju_runtime_execution_manifest(*, generation_contract, runtime_access
             "model_name_specific_fallback_allowed": False,
             "unknown_required_field_behavior": "fail_closed",
         },
+        "exact_mode": juju_exact_mode_policy(),
+        "approx_mode": juju_approx_mode_policy(),
+        "ppl_acceptance_contract": juju_ppl_acceptance_contract(),
+        "performance_acceptance_contract": juju_performance_acceptance_contract(),
         "tokenizer": tokenizer,
         "special_tokens": {
             "bos_token_id": runtime_arch.get("bos_token_id"),
@@ -6151,6 +7635,8 @@ def build_juju_runtime_execution_manifest(*, generation_contract, runtime_access
             "startup_hotset_count": runtime_access_plan.get("startup_hotset_count"),
             "expert_offset_table_kind": runtime_access_plan.get("expert_offset_table_kind"),
             "moe_layer_bitmask_words": runtime_access_plan.get("moe_layer_bitmask_words") or [],
+            "expert_calibration_contract": runtime_access_plan.get("expert_calibration_contract") or juju_expert_calibration_contract(),
+            "adaptive_runtime_scheduler": runtime_access_plan.get("adaptive_runtime_scheduler") or juju_adaptive_runtime_scheduler_contract(),
         },
         "kv_layout_contract": kv_layout,
         "qkv_policy_contract": qkv_fields.get("qkv_policy_contract") or runtime_access_plan.get("qkv_policy_contract") or {},
@@ -6168,6 +7654,10 @@ def build_juju_runtime_execution_manifest(*, generation_contract, runtime_access
             "require_embedding_scale_semantics": True,
             "require_qkv_policy_match": True,
             "require_lm_head_contract_match": True,
+            "require_tensor_logical_hash_equivalence": True,
+            "require_original_gguf_vs_juju_ppl_delta": True,
+            "require_router_topk_exact_match": True,
+            "require_expert_id_sequence_exact_match": True,
         },
     }
 
@@ -6286,10 +7776,38 @@ def juju_format_self_check(idx, sections, qkv_schema):
         err("qkv_eval_force_qkv_missing")
     if eval_policy.get("allow_plain_reference") is not False:
         err("qkv_eval_allows_plain_reference")
+    if qkv_schema.get("required_quantized_qkv") is not True or qkv_schema.get("qkv_packed_cache_required") is not True:
+        err(
+            "qkv_required_quantized_cache_missing",
+            required_quantized_qkv=qkv_schema.get("required_quantized_qkv"),
+            qkv_packed_cache_required=qkv_schema.get("qkv_packed_cache_required"),
+        )
+    if qkv_schema.get("persistent_plain_kv_cache_allowed") is not False:
+        err("qkv_persistent_plain_cache_allowed", value=qkv_schema.get("persistent_plain_kv_cache_allowed"))
+    if qkv_schema.get("plain_kv_persistent_storage") is not False:
+        err("qkv_plain_kv_persistent_storage_allowed", value=qkv_schema.get("plain_kv_persistent_storage"))
+    if qkv_schema.get("plain_fallback_allowed") is not False:
+        err("qkv_plain_fallback_allowed", value=qkv_schema.get("plain_fallback_allowed"))
+    if qkv_schema.get("plain_kv_runtime_allowed") is not False:
+        err("qkv_plain_runtime_allowed", value=qkv_schema.get("plain_kv_runtime_allowed"))
+    if qkv_schema.get("rotation_backend") != "gaussian_qr_orthogonal":
+        err("qkv_rotation_backend_not_paper_default", value=qkv_schema.get("rotation_backend"))
+    if qkv_schema.get("codebook_distribution") != "exact_beta":
+        err("qkv_codebook_distribution_not_exact_beta", value=qkv_schema.get("codebook_distribution"))
+    if not _juju_int_or_none(qkv_schema.get("qkv_policy_hash")):
+        err("qkv_policy_hash_missing")
+    else:
+        expected_qkv_policy_hash = juju_qkv_policy_hash(qkv_schema)
+        if _juju_int_or_none(qkv_schema.get("qkv_policy_hash")) != expected_qkv_policy_hash:
+            err(
+                "qkv_policy_hash_mismatch",
+                expected=expected_qkv_policy_hash,
+                actual=_juju_int_or_none(qkv_schema.get("qkv_policy_hash")),
+            )
 
-    if idx.get("format") != "JUJU_IDX_JSON_V1":
+    if idx.get("format") != JUJU_IDX_FORMAT:
         err("idx_format_missing_or_wrong")
-    if int(idx.get("schema_version") or 0) < 3:
+    if int(idx.get("schema_version") or 0) < JUJU_IDX_SCHEMA_VERSION:
         err("idx_schema_version_too_old", schema_version=idx.get("schema_version"))
     if idx.get("mutable_runtime_index") is not True:
         err("idx_mutable_runtime_index_not_enabled")
@@ -6321,8 +7839,18 @@ def juju_format_self_check(idx, sections, qkv_schema):
     required_tensor_fields = [
         "name",
         "shape",
+        "source_shape",
+        "math_shape",
+        "op_role",
+        "codec_id",
         "weight_encoding",
+        "gguf_type",
+        "gguf_type_name",
+        "quant_family",
+        "kernel_key",
+        "row_bytes",
         "row_stride_bytes",
+        "physical_bytes",
         "juju_offset",
         "juju_bytes",
         "graph_role",
@@ -6334,6 +7862,24 @@ def juju_format_self_check(idx, sections, qkv_schema):
         if missing:
             err("tensor_contract_fields_missing", name=rec.get("name"), missing=missing)
             break
+        if rec.get("bundle_native"):
+            bundle_missing = [
+                key for key in (
+                    "bundle_id",
+                    "bundle_offset",
+                    "bundle_size",
+                    "bundle_member_offset",
+                    "bundle_member_size",
+                    "bundle_member_role",
+                    "expert_id",
+                    "expert_projection",
+                    "split_policy",
+                )
+                if rec.get(key) in (None, "")
+            ]
+            if bundle_missing:
+                err("bundle_tensor_contract_fields_missing", name=rec.get("name"), missing=bundle_missing)
+                break
     graph_ir = idx.get("graph_ir") or {}
     if graph_ir.get("format") != "JUJU_GRAPH_IR_V1":
         err("graph_ir_missing_or_wrong_format")
@@ -6369,6 +7915,10 @@ def juju_format_self_check(idx, sections, qkv_schema):
             "eval_kv_policy",
             "bottleneck_trace_contract",
             "ppl_correctness_gates",
+            "exact_mode",
+            "approx_mode",
+            "ppl_acceptance_contract",
+            "performance_acceptance_contract",
         ):
             if runtime_execution_manifest.get(field) in (None, "", [], {}):
                 err("runtime_execution_manifest_field_missing", field=field)
@@ -6377,6 +7927,35 @@ def juju_format_self_check(idx, sections, qkv_schema):
             err("runtime_execution_manifest_allows_model_name_fallback")
         if runtime_execution_manifest.get("ppl_correctness_gates", {}).get("bad_ppl_is_correctness_failure") is not True:
             err("runtime_execution_manifest_ppl_gate_missing")
+        exact_mode = runtime_execution_manifest.get("exact_mode") or {}
+        if exact_mode.get("buddy_fallback_can_replace_expert") is not False:
+            err("exact_mode_allows_buddy_replacement")
+        if exact_mode.get("partial_execution_allowed") is not False:
+            err("exact_mode_allows_partial_execution")
+        if exact_mode.get("seqtopk_can_change_router_topk") is not False:
+            err("exact_mode_allows_seqtopk_router_change")
+        if exact_mode.get("cold_expert_requantize_allowed") is not False:
+            err("exact_mode_allows_cold_requantize")
+        if exact_mode.get("predictor_role") != "prefetch_hint_only":
+            err("exact_mode_predictor_not_hint_only", value=exact_mode.get("predictor_role"))
+        approx_mode = runtime_execution_manifest.get("approx_mode") or {}
+        if approx_mode.get("quality_gate_required") is not True:
+            err("approx_mode_quality_gate_missing")
+        if approx_mode.get("ppl_delta_threshold_required") is not True:
+            err("approx_mode_ppl_delta_gate_missing")
+        ppl_acceptance = runtime_execution_manifest.get("ppl_acceptance_contract") or {}
+        if ppl_acceptance.get("required_for_preserve_claim") is not True:
+            err("ppl_acceptance_not_required_for_preserve_claim")
+        if ppl_acceptance.get("tensor_logical_hash_all_match_required") is not True:
+            err("ppl_acceptance_missing_tensor_hash_gate")
+        if ppl_acceptance.get("server_text_tokenization_allowed") is not False:
+            err("ppl_acceptance_allows_server_text_tokenization")
+        if ppl_acceptance.get("qkv_required_in_ppl") is not True:
+            err("ppl_acceptance_qkv_not_required")
+        required_response_fields = set(ppl_acceptance.get("required_response_fields") or [])
+        for field in ("kv_backend", "qkv_forced_by_format", "input_ids_preview"):
+            if field not in required_response_fields:
+                err("ppl_acceptance_response_field_missing", field=field)
         special_tokens = runtime_execution_manifest.get("special_tokens") or {}
         for field in ("add_bos_token", "add_eos_token", "add_space_prefix"):
             if special_tokens.get(field) is None:
@@ -6490,8 +8069,23 @@ def juju_format_self_check(idx, sections, qkv_schema):
             warn("expert_bundle_table_missing_for_partial_shard")
         else:
             err("expert_bundle_table_missing")
-    elif bundle_table.get("format") != "JUJU_EXPERT_BUNDLE_TABLE_V1":
+    elif bundle_table.get("format") != JUJU_EXPERT_BUNDLE_TABLE_FORMAT:
         err("expert_bundle_table_wrong_format")
+    else:
+        if int(bundle_table.get("bundle_alignment") or 0) != JUJU_BUNDLE_ALIGNMENT_BYTES:
+            err("expert_bundle_alignment_wrong", bundle_alignment=bundle_table.get("bundle_alignment"))
+        if bundle_table.get("member_order") != list(JUJU_EXPERT_BUNDLE_MEMBER_ORDER):
+            err("expert_bundle_member_order_wrong")
+        for bundle in bundle_table.get("bundles") or []:
+            if int(bundle.get("bundle_offset") or bundle.get("offset") or 0) % JUJU_BUNDLE_ALIGNMENT_BYTES != 0:
+                err("expert_bundle_offset_not_4k_aligned", layer=bundle.get("layer"), expert=bundle.get("expert"))
+                break
+            if int(bundle.get("bundle_size") or bundle.get("bytes") or 0) % JUJU_BUNDLE_ALIGNMENT_BYTES != 0:
+                err("expert_bundle_size_not_4k_aligned", layer=bundle.get("layer"), expert=bundle.get("expert"))
+                break
+            if bundle.get("single_contiguous_fetch") is not True:
+                err("expert_bundle_not_single_contiguous_fetch", layer=bundle.get("layer"), expert=bundle.get("expert"))
+                break
     if not runtime_access_plan.get("moe_layer_bitmask_words"):
         warn("moe_layer_bitmask_missing_or_empty")
     if not runtime_access_plan.get("router_calibration_manifest"):
@@ -6506,9 +8100,21 @@ def juju_format_self_check(idx, sections, qkv_schema):
     streaming = moe_policy.get("streaming") or {}
     if streaming.get("split_combined_gate_up") is not True:
         err("combined_gate_up_split_policy_missing")
+    policy_exact = moe_policy.get("exact_mode") or {}
+    if policy_exact.get("buddy_fallback_can_replace_expert") is not False:
+        err("moe_policy_exact_allows_buddy_replacement")
+    expert_unit = moe_policy.get("expert_unit_contract") or {}
+    if expert_unit.get("partial_segment_fetch_allowed") is not False:
+        err("moe_policy_exact_allows_partial_segment_fetch")
+    if streaming.get("allow_partial_expert_segments") is not False:
+        err("moe_policy_exact_allows_partial_streaming")
     prefetch = moe_policy.get("prefetch") or {}
     if not prefetch.get("trigger") or not prefetch.get("priority_field"):
         err("moe_prefetch_policy_incomplete")
+    if not moe_policy.get("adaptive_runtime_scheduler"):
+        err("adaptive_runtime_scheduler_contract_missing")
+    if not moe_policy.get("expert_calibration_contract"):
+        err("expert_calibration_contract_missing")
     perf = generation_contract.get("performance_contract") or {}
     trace_keys = set(perf.get("trace_required_keys") or [])
     for key in ("forward_layer", "attn_standard_qkv_norm", "mlp_moe_end", "lm_head_logprob_end", "cpu_ram", "kv_cache", "io_pipeline"):
@@ -6683,7 +8289,7 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             },
         },
         "tensor_index_contract": {
-            "binary_schema_version": 3,
+            "binary_schema_version": JUJU_BINARY_TENSOR_INDEX_SCHEMA_VERSION,
             "offsets": "absolute_file_offsets",
             "lengths": "exact_payload_bytes",
             "alignment_bytes": 4096,
@@ -6701,6 +8307,9 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             "sections_embedded_in_header_table": True,
             "paired_idx_required": True,
             "external_adapter_required": False,
+            "bundle_native_required": True,
+            "bundle_table_format": JUJU_EXPERT_BUNDLE_TABLE_FORMAT,
+            "bundle_member_order": list(JUJU_EXPERT_BUNDLE_MEMBER_ORDER),
         },
         "ops": [
             {"op": "input_tokens", "output": "token_ids", "required": True},
@@ -6733,11 +8342,13 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                 "tokenizer_assets_must_exist": True,
             },
             "hard_defaults": {
-                "vram_double_admission_guard": {"enabled": True, "counter": "pending_vram_reservation"},
+                "vram_double_admission_guard": {"enabled": True, "counter": "vram_inflight_bytes"},
                 "macos_available_ram": {"count_inactive_pages": False},
                 "metal_unified_memory_budget_percent": 60,
                 "router_seq_topk_entropy": {
-                    "enabled": True,
+                    "enabled": False,
+                    "enabled_only_in_approx_mode": True,
+                    "exact_mode_must_use_source_router_topk": True,
                     "base_k": 8,
                     "low_entropy_threshold": 0.30,
                     "low_entropy_k_multiplier": 0.50,
@@ -6798,6 +8409,10 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
             "enabled": True,
             "router_first": True,
             "format": "JUJU_MOE_OFFLOAD_POLICY_V1",
+            "exact_mode": juju_exact_mode_policy(),
+            "approx_mode": juju_approx_mode_policy(),
+            "expert_calibration_contract": juju_expert_calibration_contract(),
+            "adaptive_runtime_scheduler": juju_adaptive_runtime_scheduler_contract(),
             "expert_tensor_patterns": [
                 "blk.{layer}.ffn_gate_up_exps.weight",
                 "blk.{layer}.ffn_gate_exps.weight",
@@ -6838,7 +8453,8 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                 "predictor_lookup": "PREDICTOR.expert_activation_priors",
                 "segment_lookup": "tensor.expert_layout.segment_count_per_expert",
                 "combined_gate_up_split_offsets": "tensor.combined_gate_up_split",
-                "partial_segment_fetch_allowed": True,
+                "partial_segment_fetch_allowed": False,
+                "partial_segment_fetch_allowed_only_in_approx_mode": True,
                 "single_expert_fetch_goal": "contiguous_or_minimal_range_read_per_selected_expert",
             },
             "stage_contract": {
@@ -6871,10 +8487,12 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                 "inputs": ["router_scores", "gate_input_snapshots", "mutable_coactivation_index", "prefetch_miss_feedback"],
                 "outputs": ["next_layer_expert_scores", "expert_next_use_epoch", "prefetch_priority"],
                 "fallback_order": ["calibration_prior", "cross_layer_transition_prior", "static_same_layer_buddy", "router_score"],
+                "exact_mode_role": "prefetch_hint_only",
+                "may_replace_router_decision": False,
                 "online_update": True,
             },
             "prefetch": {
-                "unit": "layer_expert_tensor",
+                "unit": "layer_expert_bundle",
                 "trigger": "router_topk_and_previous_layer_coactivation",
                 "lookahead_layers": [1, 2],
                 "coactivation_table": "mutable_runtime_index",
@@ -6928,7 +8546,8 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                 "requires_runtime_cpu_probe_override": True,
             },
             "score_aware_precision": {
-                "enabled": True,
+                "enabled": False,
+                "enabled_only_in_approx_mode": True,
                 "low_score_load_bits": 4,
                 "fallback_when_nvfp4_unavailable": "int4",
                 "requires_decoder": "engine_int4_or_scale4_decode",
@@ -6937,7 +8556,8 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
                 "expert_streaming_required": True,
                 "direct_io_alignment": 4096,
                 "split_combined_gate_up": True,
-                "allow_partial_expert_segments": True,
+                "allow_partial_expert_segments": False,
+                "allow_partial_expert_segments_only_in_approx_mode": True,
                 "io_backend_priority": ["io_uring_or_native_async", "direct_aligned_read", "mmap_shared_hot_only"],
                 "chunk_size_source": "section.sequential_block_size",
                 "cold_experts_mmap_forbidden": True,
@@ -7068,7 +8688,7 @@ def build_juju_shard_plan_from_hf_url(
         pos = align_up(pos, 4096)
 
         meta = {
-            "format": "JUJU_SHARDED_CONTAINER_V1",
+            "format": "JUJU_SHARDED_CONTAINER_V2",
             "source_format": "GGUF",
             "source_role": "conversion_source_only",
             "source_repo_id": source_repo_id,
@@ -7132,6 +8752,7 @@ def build_juju_shard_plan_from_hf_url(
                 f"increase JUJU_SECTION_TABLE_RESERVED_ENTRIES."
             )
 
+        bundle_id_counter = 0
         for bucket in JUJU_TENSOR_BUCKET_ORDER:
             group = sorted(
                 [t for t in active_tensors if t["bucket"] == bucket and t["bytes"] > 0],
@@ -7142,7 +8763,35 @@ def build_juju_shard_plan_from_hf_url(
             pos = align_up(pos, 4096)
             section_offset = pos
             section_source_ranges = []
-            for tensor in group:
+            bundle_units, passthrough_tensors = juju_split_bucket_for_bundle_native(group, contract)
+            for bundle in bundle_units:
+                pos = align_up(pos, JUJU_BUNDLE_ALIGNMENT_BYTES)
+                bundle_offset = pos
+                bundle_id = bundle_id_counter
+                bundle_id_counter += 1
+                bundle_records = []
+                for spec in bundle["members"]:
+                    member_offset = pos
+                    source_segment = juju_expert_member_source_segment(spec, member_offset)
+                    source_segments.append(source_segment)
+                    section_source_ranges.append(source_segment)
+                    record = juju_bundle_member_tensor_index_record(
+                        spec,
+                        member_offset,
+                        bundle_id,
+                        bundle_offset,
+                        contract,
+                    )
+                    tensor_records.append(record)
+                    bundle_records.append(record)
+                    pos += int(spec["output_size"])
+                pos = align_up(pos, JUJU_BUNDLE_ALIGNMENT_BYTES)
+                bundle_size = pos - bundle_offset
+                for record in bundle_records:
+                    record["bundle_size"] = int(bundle_size)
+                    if isinstance(record.get("expert_layout"), dict):
+                        record["expert_layout"]["bundle_size"] = int(bundle_size)
+            for tensor in passthrough_tensors:
                 pos = align_up(pos, 4096)
                 tensor_offset = pos
                 layout = juju_tensor_storage_layout(tensor)
@@ -7212,10 +8861,20 @@ def build_juju_shard_plan_from_hf_url(
             index_file=artifact_names["index"],
             directory=directory,
         )
+        artifact_uid_value = juju_artifact_uid(
+            source_repo_id=source_repo_id,
+            source_path=source_path,
+            source_name=source_name,
+            artifact_source_name=artifact_source_name,
+            weight_file=artifact_names["weights"],
+            split_meta=split_meta,
+            tensor_count=len(tensor_records),
+        )
         idx = {
-            "format": "JUJU_IDX_JSON_V1",
-            "schema_version": 3,
+            "format": JUJU_IDX_FORMAT,
+            "schema_version": JUJU_IDX_SCHEMA_VERSION,
             "mutable_runtime_index": True,
+            "artifact_uid": artifact_uid_value,
             "weight_file": artifact_names["weights"],
             "source_repo_id": source_repo_id,
             "source_path": source_path,
@@ -7225,6 +8884,12 @@ def build_juju_shard_plan_from_hf_url(
             **juju_idx_split_top_level_fields(split_meta),
             "modality_flags": modality_flags,
             "multimodal_contract": modality_meta,
+            "exact_mode": juju_exact_mode_policy(),
+            "approx_mode": juju_approx_mode_policy(),
+            "ppl_acceptance_contract": juju_ppl_acceptance_contract(),
+            "performance_acceptance_contract": juju_performance_acceptance_contract(),
+            "expert_calibration_contract": juju_expert_calibration_contract(),
+            "adaptive_runtime_scheduler": juju_adaptive_runtime_scheduler_contract(),
             "graph_ir_format": graph_ir["format"],
             "graph_ir_required": True,
             "graph_ir": graph_ir,
@@ -7251,10 +8916,14 @@ def build_juju_shard_plan_from_hf_url(
             **runtime_arch,
         }
         idx["format_self_check"] = juju_format_self_check(idx, sections, qkv_schema)
+        idx["format_self_check"]["fatal_enforced"] = bool(juju_enforce_format_self_check())
         if not idx["format_self_check"]["ok"]:
-            raise RuntimeError("JUJU format self-check failed: " + json.dumps(
+            msg = "JUJU format self-check failed: " + json.dumps(
                 idx["format_self_check"]["errors"][:16], ensure_ascii=False
-            ))
+            )
+            if juju_enforce_format_self_check():
+                raise RuntimeError(msg)
+            print("WARNING:", msg[:2000])
         pos = add_json_section_at(pos, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
         index_checksum = int(juju_section_checksum16_hex(sections[-1])[:16], 16) if sections else 0
         file_size_value = pos
@@ -7273,7 +8942,7 @@ def build_juju_shard_plan_from_hf_url(
 
     idx["sections"] = sections
     return {
-        "format": "juju_sharded_container_v1",
+        "format": "juju_sharded_container_v2",
         "source_url": source_url,
         "source_name": source_name,
         "artifact_source_name": artifact_source_name,
@@ -7358,8 +9027,20 @@ class JujuVirtualFile(io.BufferedIOBase):
         # during upload is undetectable.
         # Solution: Running SHA256 over all read() output. After streaming completes,
         # source_sha256 property returns the hex digest for post-upload verification.
-        self._running_sha256 = hashlib.sha256()
+        self._upload_stream_sha_enabled = juju_upload_stream_sha_enabled()
+        self._running_sha256 = hashlib.sha256() if self._upload_stream_sha_enabled else None
         self._total_bytes_hashed = 0
+        self._progress_enabled = juju_progress_enabled()
+        self._progress_last_bytes = 0
+        self._progress_last_time = time.monotonic()
+        self._progress_interval_bytes = juju_progress_interval_bytes()
+        self._progress_interval_s = juju_progress_interval_s()
+        if self._progress_enabled:
+            print(
+                f"[JUJU upload stream] start: file={self._plan.get('weight_file', '<unknown>')} "
+                f"bytes={juju_format_bytes(self._size)}",
+                flush=True,
+            )
 
     def readable(self):
         return True
@@ -7383,6 +9064,11 @@ class JujuVirtualFile(io.BufferedIOBase):
                 raise ValueError(f"unsupported whence: {whence}")
             if pos < 0:
                 raise ValueError("negative seek position")
+            if pos == 0 and self._pos != 0:
+                self._running_sha256 = hashlib.sha256() if self._upload_stream_sha_enabled else None
+                self._total_bytes_hashed = 0
+                self._progress_last_bytes = 0
+                self._progress_last_time = time.monotonic()
             self._pos = min(pos, self._size)
             return self._pos
 
@@ -7421,19 +9107,43 @@ class JujuVirtualFile(io.BufferedIOBase):
                 chunks.append(b"\x00" * take)
                 self._pos += take
             result = b"".join(chunks)
-            # BUGFIX 978: Feed all emitted bytes to running SHA256
             if result:
-                self._running_sha256.update(result)
+                if self._running_sha256 is not None:
+                    self._running_sha256.update(result)
                 self._total_bytes_hashed += len(result)
+                if self._progress_enabled:
+                    now = time.monotonic()
+                    if (
+                        self._total_bytes_hashed - self._progress_last_bytes >= self._progress_interval_bytes
+                        or now - self._progress_last_time >= self._progress_interval_s
+                        or self._total_bytes_hashed >= self._size
+                    ):
+                        pct = (100.0 * self._total_bytes_hashed / self._size) if self._size > 0 else 100.0
+                        print(
+                            f"[JUJU upload stream] {self._plan.get('weight_file', '<unknown>')}: "
+                            f"{juju_format_bytes(self._total_bytes_hashed)}/{juju_format_bytes(self._size)} "
+                            f"({pct:.1f}%)",
+                            flush=True,
+                        )
+                        self._progress_last_bytes = self._total_bytes_hashed
+                        self._progress_last_time = now
             return result
 
     @property
     def source_sha256(self):
         """Return hex SHA256 of all bytes read so far (complete after full streaming)."""
-        return self._running_sha256.hexdigest()
+        return self._running_sha256.hexdigest() if self._running_sha256 is not None else ""
+
+    @property
+    def artifact_sha256(self):
+        return self.source_sha256
 
     @property
     def total_bytes_hashed(self):
+        return self._total_bytes_hashed
+
+    @property
+    def total_bytes_streamed(self):
         return self._total_bytes_hashed
 
     def _read_source_segment(self, segment, rel, size):
@@ -7550,6 +9260,11 @@ def prepare_juju_shard_upload_from_hf_url(
 ):
     index_path = Path(index_path)
     index_path.parent.mkdir(parents=True, exist_ok=True)
+    if juju_progress_enabled():
+        split_label = ""
+        if isinstance(split_info, dict) and split_info.get("enabled"):
+            split_label = f" split={int(split_info.get('split_index') or 0):02d}/{int(split_info.get('split_count') or 0):02d}"
+        print(f"[JUJU stream] planning {artifact_source_name or source_name}{split_label}", flush=True)
     plan = build_juju_shard_plan_from_hf_url(
         source_url=source_url,
         source_name=source_name,
@@ -7565,11 +9280,38 @@ def prepare_juju_shard_upload_from_hf_url(
         source_total_bytes=source_total_bytes,
         print_layout_probes=print_layout_probes,
     )
+    if juju_progress_enabled():
+        print(
+            f"[JUJU stream] plan ready: file={plan['weight_file']} "
+            f"bytes={juju_format_bytes(plan['bytes'])} tensors={plan['tensor_count']} "
+            f"sections={plan['section_count']}",
+            flush=True,
+        )
     index_path.write_text(json.dumps(plan["index_json"], ensure_ascii=False, indent=2), encoding="utf-8")
+    verify_path = index_path.parent / plan["verify_file"]
+    if juju_progress_enabled():
+        print(f"[JUJU stream] logical hash verify start: {plan['weight_file']}", flush=True)
+    with requests.Session() as verify_session:
+        verify_manifest = build_juju_stream_verify_manifest(
+            session=verify_session,
+            source_url=source_url,
+            source_name=source_name,
+            source_path=source_path,
+            weight_file=plan["weight_file"],
+            index_path=index_path,
+            verify_path=verify_path,
+            tensor_records=plan["index_json"].get("tensors") or [],
+            token=token,
+            chunk_size=chunk_size,
+        )
+    verify_path.write_text(json.dumps(verify_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    if juju_progress_enabled():
+        print(f"[JUJU stream] logical hash verify done: {plan['weight_file']} -> {verify_path}", flush=True)
     info = {
         "format": plan["format"],
         "path": f"<stream:{plan['weight_file']}>",
         "index_path": str(index_path),
+        "verify_path": str(verify_path),
         "source_name": plan["source_name"],
         "artifact_source_name": plan["artifact_source_name"],
         "weight_file": plan["weight_file"],
@@ -7578,9 +9320,14 @@ def prepare_juju_shard_upload_from_hf_url(
         "split": plan["split"],
         "bytes": plan["bytes"],
         "index_bytes": index_path.stat().st_size,
+        "verify_bytes": verify_path.stat().st_size,
         "index_sha256": sha256_file(index_path),
+        "verify_sha256": sha256_file(verify_path),
         "source_bytes": plan["source_bytes"],
-        "source_sha256": "",
+        "source_sha256": verify_manifest.get("tensor_payload_equivalence", {}).get("source_logical_sha256", ""),
+        "juju_logical_sha256": verify_manifest.get("tensor_payload_equivalence", {}).get("juju_logical_sha256", ""),
+        "tensor_payload_equivalence_all_match": bool(verify_manifest.get("tensor_payload_equivalence", {}).get("all_match")),
+        "ppl_acceptance": verify_manifest.get("ppl_acceptance", {}),
         "tensor_count": plan["tensor_count"],
         "section_count": plan["section_count"],
         "storage_mode": plan["storage_mode"],
@@ -7665,6 +9412,9 @@ def write_juju_shard_from_hf_url(
     artifact_source_name=None,
     tensor_name_allowlist=None,
     split_info=None,
+    source_directory=None,
+    source_total_bytes=None,
+    print_layout_probes=True,
 ):
     artifact_source_name = artifact_source_name or source_name
     output_path = Path(output_path)
@@ -7695,9 +9445,16 @@ def write_juju_shard_from_hf_url(
         section_sizes[section_type] = section_sizes.get(section_type, 0) + len(raw)
 
     with requests.Session() as session:
-        directory, total_bytes = read_remote_directory(session, source_url, token=token)
+        if source_directory is None:
+            directory, total_bytes = read_remote_directory(session, source_url, token=token)
+        else:
+            directory = source_directory
+            total_bytes = int(source_total_bytes or 0)
+            if total_bytes <= 0:
+                raise RuntimeError("source_total_bytes is required when source_directory is reused")
         print_gguf_byte_diagnostics(directory, source_name)
-        print_gguf_tensor_layout_probes(session, source_url, directory, token=token, label=source_name)
+        if print_layout_probes:
+            print_gguf_tensor_layout_probes(session, source_url, directory, token=token, label=source_name)
         validate_gguf_byte_diagnostics(directory)
         allowset = set(tensor_name_allowlist or [])
         if allowset:
@@ -7721,14 +9478,16 @@ def write_juju_shard_from_hf_url(
         modality_meta = juju_modality_metadata(contract, active_tensors)
         modality_flags = int(modality_meta["modality_flags"])
         runtime_arch = juju_runtime_arch_metadata(contract, directory)
-        with output_path.open("wb") as out:
+        expected_write_bytes = int((split_info or {}).get("estimated_file_bytes") or 0)
+        with output_path.open("wb") as raw_out:
+            out = JujuProgressWriter(raw_out, output_path.name, expected_bytes=expected_write_bytes)
             out.write(b"\x00" * JUJU_HEADER_BYTES)
             table_offset = out.tell()
             out.write(b"\x00" * (JUJU_SECTION_TABLE_RESERVED_ENTRIES * JUJU_SECTION_ENTRY_BYTES))
             write_padding(out, 4096)
 
             meta = {
-                "format": "JUJU_SHARDED_CONTAINER_V1",
+                "format": "JUJU_SHARDED_CONTAINER_V2",
                 "source_format": "GGUF",
                 "source_role": "conversion_source_only",
                 "source_repo_id": source_repo_id,
@@ -7773,6 +9532,7 @@ def write_juju_shard_from_hf_url(
             qkv_schema = _juju_effective_qkv_schema(contract, runtime_arch)
             add_json_section(out, JUJU_SECTION_QKV_POLICY, "QKV_POLICY", qkv_schema)
 
+            bundle_id_counter = 0
             for bucket in JUJU_TENSOR_BUCKET_ORDER:
                 group = sorted(
                     [t for t in active_tensors if t["bucket"] == bucket and t["bytes"] > 0],
@@ -7782,8 +9542,41 @@ def write_juju_shard_from_hf_url(
                     continue
                 write_padding(out, 4096)
                 offset = out.tell()
-                digest = hashlib.sha256()
-                for tensor in group:
+                digest = hashlib.sha256() if juju_section_stream_sha_enabled() else JujuNoopDigest()
+                bundle_units, passthrough_tensors = juju_split_bucket_for_bundle_native(group, contract)
+                for bundle in bundle_units:
+                    write_padding(out, JUJU_BUNDLE_ALIGNMENT_BYTES, digest=digest)
+                    bundle_offset = out.tell()
+                    bundle_id = bundle_id_counter
+                    bundle_id_counter += 1
+                    bundle_records = []
+                    for spec in bundle["members"]:
+                        member_offset = out.tell()
+                        stream_juju_expert_member_payload(
+                            session,
+                            source_url,
+                            spec,
+                            out,
+                            token,
+                            digest,
+                            chunk_size=chunk_size,
+                        )
+                        record = juju_bundle_member_tensor_index_record(
+                            spec,
+                            member_offset,
+                            bundle_id,
+                            bundle_offset,
+                            contract,
+                        )
+                        tensor_records.append(record)
+                        bundle_records.append(record)
+                    write_padding(out, JUJU_BUNDLE_ALIGNMENT_BYTES, digest=digest)
+                    bundle_size = out.tell() - bundle_offset
+                    for record in bundle_records:
+                        record["bundle_size"] = int(bundle_size)
+                        if isinstance(record.get("expert_layout"), dict):
+                            record["expert_layout"]["bundle_size"] = int(bundle_size)
+                for tensor in passthrough_tensors:
                     write_padding(out, 4096, digest=digest)
                     tensor_offset = out.tell()
                     layout = stream_juju_tensor_payload(
@@ -7806,8 +9599,8 @@ def write_juju_shard_from_hf_url(
                     "size": size,
                     "sha256": digest.hexdigest(),
                     "xxhash128": "0" * 32,
-                    "checksum_algorithm": "sha256_streaming_write",
-                    "hash_semantics": "juju_section_bytes_including_alignment_padding",
+                    "checksum_algorithm": "sha256_streaming_write" if juju_section_stream_sha_enabled() else "not_precomputed_fast_write",
+                    "hash_semantics": "juju_section_bytes_including_alignment_padding" if juju_section_stream_sha_enabled() else "payload_hash_skipped_fast_write",
                     **io_hints,
                 })
                 section_sizes[section_type] = section_sizes.get(section_type, 0) + size
@@ -7828,10 +9621,20 @@ def write_juju_shard_from_hf_url(
                 index_file=index_path.name,
                 directory=directory,
             )
+            artifact_uid_value = juju_artifact_uid(
+                source_repo_id=source_repo_id,
+                source_path=source_path,
+                source_name=source_name,
+                artifact_source_name=artifact_source_name,
+                weight_file=output_path.name,
+                split_meta=split_meta,
+                tensor_count=len(tensor_records),
+            )
             idx = {
-                "format": "JUJU_IDX_JSON_V1",
-                "schema_version": 3,
+                "format": JUJU_IDX_FORMAT,
+                "schema_version": JUJU_IDX_SCHEMA_VERSION,
                 "mutable_runtime_index": True,
+                "artifact_uid": artifact_uid_value,
                 "weight_file": output_path.name,
                 "source_repo_id": source_repo_id,
                 "source_path": source_path,
@@ -7841,6 +9644,12 @@ def write_juju_shard_from_hf_url(
                 **juju_idx_split_top_level_fields(split_meta),
                 "modality_flags": modality_flags,
                 "multimodal_contract": modality_meta,
+                "exact_mode": juju_exact_mode_policy(),
+                "approx_mode": juju_approx_mode_policy(),
+                "ppl_acceptance_contract": juju_ppl_acceptance_contract(),
+                "performance_acceptance_contract": juju_performance_acceptance_contract(),
+                "expert_calibration_contract": juju_expert_calibration_contract(),
+                "adaptive_runtime_scheduler": juju_adaptive_runtime_scheduler_contract(),
                 "graph_ir_format": graph_ir["format"],
                 "graph_ir_required": True,
                 "graph_ir": graph_ir,
@@ -7867,10 +9676,14 @@ def write_juju_shard_from_hf_url(
                 **runtime_arch,
             }
             idx["format_self_check"] = juju_format_self_check(idx, sections, qkv_schema)
+            idx["format_self_check"]["fatal_enforced"] = bool(juju_enforce_format_self_check())
             if not idx["format_self_check"]["ok"]:
-                raise RuntimeError("JUJU format self-check failed: " + json.dumps(
+                msg = "JUJU format self-check failed: " + json.dumps(
                     idx["format_self_check"]["errors"][:16], ensure_ascii=False
-                ))
+                )
+                if juju_enforce_format_self_check():
+                    raise RuntimeError(msg)
+                print("WARNING:", msg[:2000])
             add_json_section(out, JUJU_SECTION_LAYER_ORDER_INDEX, "TENSOR_INDEX", idx)
             index_checksum = int(juju_section_checksum16_hex(sections[-1])[:16], 16) if sections else 0
             file_size_value = out.tell()
@@ -7881,24 +9694,77 @@ def write_juju_shard_from_hf_url(
                 out.write(pack_section(entry))
             out.seek(0)
             out.write(make_header(contract, artifact_source_name, file_size_value, sections, section_sizes, index_checksum=index_checksum, modality_flags=modality_flags))
+            out.flush()
+            out.close_report()
 
+    construction_self_check = juju_construction_self_check(idx, sections, tensor_records, file_size_value, output_path=output_path)
+    construction_self_check["fatal_enforced"] = bool(juju_enforce_construction_self_check())
+    idx["construction_self_check"] = construction_self_check
+    if not construction_self_check["ok"] and juju_enforce_construction_self_check():
+        raise RuntimeError("JUJU construction self-check failed: " + json.dumps(
+            construction_self_check["errors"][:16], ensure_ascii=False
+        ))
+    if not construction_self_check["ok"]:
+        print("WARNING: JUJU construction self-check reported non-fatal issues:", json.dumps(
+            construction_self_check["errors"][:16], ensure_ascii=False
+        )[:2000])
     index_path.write_text(json.dumps(idx, ensure_ascii=False, indent=2), encoding="utf-8")
+    verify_name = juju_artifact_names(artifact_source_name)["verify"]
+    verify_path = output_path.parent / verify_name
+    if juju_payload_verify_enabled():
+        with requests.Session() as verify_session:
+            verify_manifest = build_juju_verify_manifest(
+                session=verify_session,
+                source_url=source_url,
+                source_name=source_name,
+                source_path=source_path,
+                output_path=output_path,
+                index_path=index_path,
+                verify_path=verify_path,
+                tensor_records=tensor_records,
+                token=token,
+                chunk_size=chunk_size,
+            )
+        if not verify_manifest.get("tensor_payload_equivalence", {}).get("all_match"):
+            raise RuntimeError("JUJU logical payload equivalence failed: " + json.dumps(
+                verify_manifest.get("tensor_payload_equivalence", {}).get("mismatches", [])[:16],
+                ensure_ascii=False,
+            ))
+    else:
+        verify_manifest = build_juju_fast_upload_verify_manifest(
+            source_name=source_name,
+            source_path=source_path,
+            weight_file=output_path.name,
+            index_path=index_path,
+            tensor_records=tensor_records,
+            source_bytes=total_bytes,
+            output_bytes=output_path.stat().st_size,
+            mode="physical_part_upload_only_no_payload_hash",
+        )
+    verify_manifest["construction_self_check"] = construction_self_check
+    verify_path.write_text(json.dumps(verify_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return {
-        "format": "juju_sharded_container_v1",
+        "format": "juju_sharded_container_v2",
         "path": str(output_path),
         "index_path": str(index_path),
+        "verify_path": str(verify_path),
         "source_name": source_name,
         "artifact_source_name": artifact_source_name,
         "weight_file": output_path.name,
         "index_file": index_path.name,
-        "verify_file": juju_artifact_names(artifact_source_name)["verify"],
+        "verify_file": verify_name,
         "split": split_meta,
         "bytes": output_path.stat().st_size,
         "index_bytes": index_path.stat().st_size,
-        "sha256": sha256_file(output_path),
+        "verify_bytes": verify_path.stat().st_size,
+        "sha256": sha256_file(output_path) if juju_output_file_sha_enabled() else "",
         "index_sha256": sha256_file(index_path),
+        "verify_sha256": sha256_file(verify_path),
         "source_bytes": total_bytes,
-        "source_sha256": "",
+        "source_sha256": verify_manifest.get("tensor_payload_equivalence", {}).get("source_logical_sha256", ""),
+        "juju_logical_sha256": verify_manifest.get("tensor_payload_equivalence", {}).get("juju_logical_sha256", ""),
+        "tensor_payload_equivalence_all_match": bool(verify_manifest.get("tensor_payload_equivalence", {}).get("all_match")),
+        "ppl_acceptance": verify_manifest.get("ppl_acceptance", {}),
         "tensor_count": len(tensor_records),
         "section_count": len(sections),
         "storage_mode": "remote_range_to_4kb_aligned_juju_sections_optional_row_stride",
@@ -7968,3 +9834,68 @@ def write_juju_shard_parts_from_hf_url(
         info["source_bytes"] = total_bytes
         infos.append(info)
     return infos
+
+
+def plan_juju_shard_physical_part_writes_from_hf_url(
+    *,
+    source_url,
+    source_name,
+    source_path,
+    output_path,
+    index_path,
+    contract,
+    token=None,
+    source_repo_id="",
+    chunk_size=16 * 1024 * 1024,
+    max_file_bytes=None,
+):
+    with requests.Session() as session:
+        directory, total_bytes = read_remote_directory(session, source_url, token=token)
+        print_gguf_byte_diagnostics(directory, source_name)
+        print_gguf_tensor_layout_probes(session, source_url, directory, token=token, label=source_name)
+        validate_gguf_byte_diagnostics(directory)
+    split_plan = plan_juju_tensor_splits(directory, max_file_bytes=max_file_bytes)
+    base_output_path = Path(output_path)
+    base_index_path = Path(index_path)
+    plans = []
+    for split in split_plan:
+        if split["enabled"]:
+            artifact_source_name = juju_split_source_name(source_name, split["split_index"], split["split_count"])
+            child_output_path = base_output_path.parent / juju_artifact_names(artifact_source_name)["weights"]
+            child_index_path = base_index_path.parent / juju_artifact_names(artifact_source_name)["index"]
+        else:
+            artifact_source_name = source_name
+            child_output_path = base_output_path
+            child_index_path = base_index_path
+        split_info = {
+            "enabled": bool(split["enabled"]),
+            "parent_source_name": source_name,
+            "artifact_source_name": artifact_source_name,
+            "split_index": int(split["split_index"]),
+            "split_count": int(split["split_count"]),
+            "source_tensor_count": int(directory["tensor_count"]),
+            "tensor_count": len(split["tensor_names"]),
+            "tensor_bytes": int(split["tensor_bytes"]),
+            "estimated_file_bytes": int(split.get("estimated_file_bytes") or 0),
+            "max_file_bytes": int(split["max_file_bytes"]),
+            "split_strategy": str(split.get("split_strategy") or "limit_tensor_groups"),
+            "target_split_count": int(split.get("target_split_count") or 0),
+        }
+        plans.append({
+            "source_url": source_url,
+            "source_name": source_name,
+            "source_path": source_path,
+            "output_path": child_output_path,
+            "index_path": child_index_path,
+            "contract": contract,
+            "token": token,
+            "source_repo_id": source_repo_id,
+            "chunk_size": chunk_size,
+            "artifact_source_name": artifact_source_name,
+            "tensor_name_allowlist": split["tensor_names"],
+            "split_info": split_info,
+            "source_directory": directory,
+            "source_total_bytes": total_bytes,
+            "print_layout_probes": False,
+        })
+    return plans

@@ -71,6 +71,18 @@ int moe_pc_engine_eval_token_ids_from(
     }
     moe_forward_status_t forward{};
     const int forward_status_ok = moe_pc_engine_get_forward_status(engine, &forward);
+    if (forward_status_ok && forward.graph_ir_required) {
+        if (!forward.graph_ir_ready) {
+            moe_eval_set_error(out_stats, "graph IR is required for exact eval but is not loaded");
+            return 0;
+        }
+        if (!forward.runtime_execution_manifest_ready ||
+            !forward.runtime_access_plan_ready ||
+            !forward.kv_layout_contract_ready) {
+            moe_eval_set_error(out_stats, "graph IR runtime contract is incomplete for exact eval");
+            return 0;
+        }
+    }
     if (forward_status_ok &&
         forward.dynamic_shape_ready &&
         !forward.forward_adapter_executable) {

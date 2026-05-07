@@ -87,10 +87,9 @@ static uint8_t infer_weight_format(const moe_tensor_info_t& info, uint8_t gguf_e
         return moe_WEIGHT_ENCODING_LINEAR_Q8;
     }
     if (info.weight_byte_length == q4_bytes) {
-        // AMBIGUOUS: Could be NVFP4, MXFP4, or LINEAR_Q4
-        // Default to NVFP4 for backward compatibility, but caller should check
-        // weight_format_inferred flag and validate with GGUF metadata
-        return moe_WEIGHT_ENCODING_NVFP4;
+        // Ambiguous: NVFP4, MXFP4, and linear Q4 can have the same byte count.
+        // Do not guess the codec from size; require GGUF/JUJU metadata.
+        return moe_WEIGHT_ENCODING_UNKNOWN;
     }
     if (info.weight_byte_length == q3_bytes) {
         return moe_WEIGHT_ENCODING_LINEAR_Q3;

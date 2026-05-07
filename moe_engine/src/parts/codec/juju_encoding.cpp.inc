@@ -36,6 +36,9 @@ static uint64_t moe_effective_juju_tensor_bytes(
     if (entry.juju_bytes == 0 || entry.dims == 0 || entry.shape[0] == 0) {
         return entry.juju_bytes;
     }
+    if (entry.physical_bytes > 0 && entry.physical_bytes <= entry.juju_bytes) {
+        return entry.physical_bytes;
+    }
     // BUGFIX 804: Check dims for reasonable upper bound.
     if (entry.dims > 8) {
         return entry.juju_bytes;

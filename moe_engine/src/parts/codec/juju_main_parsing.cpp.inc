@@ -376,8 +376,20 @@ static int load_juju_tensor_index_as_tensor_index(
                 return 0;
             }
             if (combined_gate_up && !entry.combined_gate_up_split_enabled &&
+                entry.bundle_member_role.empty()) {
+                std::fprintf(stderr,
+                    "[storagellm] JUJU combined gate/up tensor missing explicit split policy: name=%s\n",
+                    entry.name.c_str());
+                return 0;
+            }
+            if (combined_gate_up &&
                 ((entry.shape[1] & 1ull) != 0 || per_expert < 2ull)) {
-                continue;
+                std::fprintf(stderr,
+                    "[storagellm] JUJU combined gate/up tensor has invalid split shape: name=%s rows=%llu per_expert=%llu\n",
+                    entry.name.c_str(),
+                    (unsigned long long)entry.shape[1],
+                    (unsigned long long)per_expert);
+                return 0;
             }
             const uint32_t rows_total = (uint32_t)std::min<uint64_t>(entry.shape[1], UINT32_MAX);
             const uint32_t cols = (uint32_t)std::min<uint64_t>(entry.shape[0], UINT32_MAX);
@@ -410,11 +422,10 @@ static int load_juju_tensor_index_as_tensor_index(
                             split_rel_offset = split == 0u ? entry.gate_rel_offset : entry.up_rel_offset;
                             split_bytes = split == 0u ? entry.gate_bytes : entry.up_bytes;
                         } else {
-                            split_bytes = per_expert / 2ull;
-                            split_rel_offset = (uint64_t)split * split_bytes;
-                            if (split == 1u) {
-                                split_bytes = per_expert - split_bytes;
-                            }
+                            std::fprintf(stderr,
+                                "[storagellm] JUJU combined gate/up tensor missing explicit split offsets: name=%s\n",
+                                entry.name.c_str());
+                            return 0;
                         }
                     }
                     rec.info.weight_byte_offset = expert_offset + split_rel_offset;
@@ -495,6 +506,23 @@ static int load_juju_tensor_index_as_tensor_index(
     if (!records && !common_records) {
         return 0;
     }
+    bool saw_bundle_native = false;
+    bool all_bundle_4k_aligned = true;
+    for (const moe_tensor_record& rec : engine->tensors) {
+        if (!rec.bundle_native) {
+            continue;
+        }
+        saw_bundle_native = true;
+        if (rec.bundle_size == 0 ||
+            ((rec.bundle_offset | rec.bundle_size) & 4095ull) != 0 ||
+            (rec.bundle_alignment && rec.bundle_alignment != 4096ull)) {
+            all_bundle_4k_aligned = false;
+            break;
+        }
+    }
+    engine->juju_bundle_4k_aligned.store(
+        saw_bundle_native && all_bundle_4k_aligned,
+        std::memory_order_release);
     moe_juju_probe_apply(engine, &probe);
     finish_tensor_index_load(engine);
     moe_dynamic_shape_finalize_adapter(engine);
