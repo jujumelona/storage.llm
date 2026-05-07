@@ -22,8 +22,7 @@ static int device_copy_raw_span(
     if (!e || s.bytes == 0 || !device_allocator_init(e) || !device_set_current(e)) {
         return 0;
     }
-    // BUGFIX 595: Check s.bytes upper bound ★
-    // Problem: s.bytes can be corrupted (very large value)
+    // Check s.bytes upper bound; corrupt spans can be very large.
     // Solution: Validate before processing
     if (s.bytes > 10ull * 1024 * 1024 * 1024) { // 10GB sanity check for raw span
         return 0;
@@ -42,7 +41,7 @@ static int device_copy_raw_span(
     if (!mapped || !mmap_get_ptr(mapped, 0)) {
         return 0;
     }
-    // BUGFIX 263: Check for negative mmap_get_size return value ★★
+    // BUGFIX 263: Check for negative mmap_get_size return value ?끸쁾
     const uint64_t file_size = static_cast<uint64_t>(mmap_get_size(mapped));
     if (s.bytes > file_size) {
         return 0;
@@ -54,9 +53,8 @@ static int device_copy_raw_span(
         return 0;
     }
 
-    // OPTIMIZATION: Metal zero-copy fast path - bypass staging entirely ★★★
-    // Problem: Metal unified memory allows GPU to read mmap'd data directly
-    // Current path: mmap → staging slot → metal_copy_h2d_async → unnecessary memcpy
+    // Metal zero-copy fast path: bypass staging on unified memory.
+    // Current path otherwise is mmap -> staging slot -> Metal copy.
     // Solution: Use metal_zero_copy_map to wrap mmap pointer in MTLBuffer directly
     // Trade-off: Metal-specific code path, but eliminates full copy on Apple Silicon
     // Impact: 2x faster H2D transfer on Metal (zero-copy vs memcpy)
@@ -69,6 +67,7 @@ static int device_copy_raw_span(
             // Register the Metal buffer as device allocation
             CUdeviceptr dst = (CUdeviceptr)metal_buffer;
             if (device_prepare_tensor_allocation(e, key, s.bytes, pool, 0, &dst)) {
+                device_vram_mark_allocation_resident(e, key);
                 device_touch_allocation(e, key);
                 e->io_atomic.bytes_prefetched.fetch_add(s.bytes);
                 e->io_atomic.bytes_pinned_to_gpu.fetch_add(s.bytes);
@@ -83,18 +82,16 @@ static int device_copy_raw_span(
     }
 #endif
 
-    // BUGFIX 596: Check staging_slot_size > 0 before comparison ★
-    // Problem: staging_slot_size can be 0
+    // Check staging_slot_size > 0 before comparing span size.
     // Solution: Check before comparison
     CUstream stream = device_tensor_stream_current(e);
     // Bug #10: QKV attention weights (raw spans) use pinned slot pool (for_pinned = true)
     // This prevents attention DMA from blocking MoE weight DMA in the GPU direct pool.
-    const uint32_t slot_idx = (e->staging_slots.size() > 0 && e->staging_slot_size > 0 && s.bytes <= e->staging_slot_size)
+    const uint32_t slot_idx = (e->staging_slot_size > 0 && s.bytes <= e->staging_slot_size)
         ? acquire_staging_slot(e, 0u, s_raw_span_acquire_turn++, s.bytes, true) : UINT32_MAX;
 
     if (slot_idx != UINT32_MAX) {
         moe_staging_slot& slot = e->staging_slots[slot_idx];
-        // BUGFIX 935: Use staging_slot_valid() for thread-safe buf access ★★★
         if (!staging_slot_valid(e, slot_idx)) {
             release_staging_slot(e, slot_idx);
             return 0;
@@ -121,7 +118,7 @@ static int device_copy_raw_span(
             device_backend_copy_h2d_async(e, dst, buf_ptr, s.bytes, stream) :
             device_backend_copy_h2d_sync(e, dst, buf_ptr, s.bytes);
         if (ok && async_copy) {
-            device_defer_staging_copy(e, slot_idx, key, s.bytes, stream);  // BUGFIX 문제1: Track bytes for VRAM
+            device_defer_staging_copy(e, slot_idx, key, 0, stream);
         } else {
             release_staging_slot(e, slot_idx);
         }
@@ -149,6 +146,7 @@ static int device_copy_raw_span(
         device_free_key(e, key);
         return 0;
     }
+    device_vram_mark_allocation_resident(e, key);
     device_touch_allocation(e, key);
     return 1;
 }

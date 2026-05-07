@@ -1,23 +1,180 @@
 // Device memory management and accounting
 
-// BUGFIX 76: Issue 11 - Document KV cache vs VRAM budget separation ★★
-// Clarification: KV cache is RAM-only, NOT included in VRAM budget
-// - KV cache: CPU RAM (moe_kv_cache in generation_kv_cache.cpp.inc)
-// - VRAM budget: GPU memory for expert weights only (device_allocations map)
-// - QKV state (engine_core/kv/kv_qkv.cpp): Also CPU RAM, ~0.69 GiB
-// - device_budget_bytes() calculates VRAM for experts, does NOT include KV/QKV
-// - Separate accounting: tier_used(moe_TIER_RAM) for KV, device_allocated_bytes for VRAM
-// - No interaction: KV growth does not reduce expert cache space
+static uint64_t device_budget_bytes(const moe_pc_engine* e);
+
+// BUGFIX 76: Issue 11 - Document KV cache vs VRAM budget separation ??筌뤾쑨猿?
+// Clarification: There are two distinct KV cache concepts:
+// 1. KV cache pool (CPU RAM, moe_kv_cache): tracked by tier_used(moe_TIER_RAM)
+// 2. GPU-side KV cache VRAM allocation: tracked by device_kv_cache_bytes
+// - device_budget_bytes() DOES subtract device_kv_cache_bytes from VRAM budget.
+// - GPU-side KV growth DOES reduce expert cache space dynamically.
 
 // Helper to encapsulate VRAM budget accounting.
 // Do not modify engine->device_free_bytes directly.
+static void device_atomic_sub_saturating(std::atomic<uint64_t>& counter, uint64_t bytes) {
+    if (bytes == 0) {
+        return;
+    }
+    uint64_t cur = counter.load(std::memory_order_acquire);
+    while (cur > 0) {
+        const uint64_t next = cur > bytes ? cur - bytes : 0;
+        if (counter.compare_exchange_weak(
+                cur,
+                next,
+                std::memory_order_release,
+                std::memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
+static void device_cufile_unregister_buffer(moe_pc_engine* e, void* ptr) {
+    if (!e || !ptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(e->cufile_cache_mutex);
+    const uint64_t key = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr));
+    auto it = e->cufile_buffer_registration_cache.find(key);
+    if (it == e->cufile_buffer_registration_cache.end()) {
+        return;
+    }
+    if (e->cuda.cuFileBufDeregister) {
+        e->cuda.cuFileBufDeregister(ptr);
+    }
+    e->cufile_buffer_registration_cache.erase(it);
+}
+
+static void device_cufile_cleanup_caches(moe_pc_engine* e) {
+    if (!e) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(e->cufile_cache_mutex);
+    if (e->cuda.cuFileBufDeregister) {
+        for (const auto& item : e->cufile_buffer_registration_cache) {
+            void* ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(item.first));
+            e->cuda.cuFileBufDeregister(ptr);
+        }
+    }
+    e->cufile_buffer_registration_cache.clear();
+    if (e->cuda.cuFileHandleDeregister) {
+        for (const auto& item : e->cufile_file_handle_cache) {
+            if (item.second) {
+                e->cuda.cuFileHandleDeregister(item.second);
+            }
+        }
+    }
+    e->cufile_file_handle_cache.clear();
+}
+
+static std::atomic<uint64_t>* device_vram_resident_counter_for_pool(moe_pc_engine* e, uint8_t pool) {
+    if (!e) {
+        return nullptr;
+    }
+    if (pool == moe_DEVICE_POOL_EXPERT) {
+        return &e->vram_resident_bytes;
+    }
+    if (pool == moe_DEVICE_POOL_FIXED ||
+        pool == moe_DEVICE_POOL_ACTIVATION ||
+        pool == moe_DEVICE_POOL_STREAM) {
+        return &e->vram_common_bytes;
+    }
+    if (pool == moe_DEVICE_POOL_KV_CACHE) {
+        return &e->vram_kv_bytes;
+    }
+    return nullptr;
+}
+
+static void device_vram_add_resident_bytes(moe_pc_engine* e, uint8_t pool, uint64_t bytes) {
+    if (auto* counter = device_vram_resident_counter_for_pool(e, pool)) {
+        counter->fetch_add(bytes, std::memory_order_release);
+    }
+}
+
+static void device_vram_sub_resident_bytes(moe_pc_engine* e, uint8_t pool, uint64_t bytes) {
+    if (auto* counter = device_vram_resident_counter_for_pool(e, pool)) {
+        device_atomic_sub_saturating(*counter, bytes);
+    }
+}
+
+static void device_vram_mark_allocation_resident(moe_pc_engine* e, uint64_t key) {
+    if (!e || key == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(e->device_mutex);
+    auto it = e->device_allocations.find(key);
+    if (it != e->device_allocations.end() && !it->second.resident_accounted) {
+        it->second.resident_accounted = true;
+        device_vram_add_resident_bytes(e, it->second.pool, it->second.bytes);
+    }
+}
+
+static void device_vram_release_reservation_token(moe_pc_engine* e, const vram_reservation_token& token) {
+    if (!e || !token.valid || token.bytes == 0) {
+        return;
+    }
+    device_atomic_sub_saturating(e->vram_inflight_bytes, token.bytes);
+}
+
+static void device_vram_complete_reservation_token(
+    moe_pc_engine* e,
+    const vram_reservation_token& token,
+    uint64_t key
+) {
+    if (!e || !token.valid || token.bytes == 0) {
+        return;
+    }
+    device_vram_release_reservation_token(e, token);
+    device_vram_mark_allocation_resident(e, key);
+}
+
+static int device_vram_try_reserve_token(
+    moe_pc_engine* e,
+    uint64_t bytes,
+    uint8_t pool,
+    vram_reservation_token* out_token
+) {
+    if (out_token) {
+        *out_token = vram_reservation_token{};
+    }
+    if (!e || bytes == 0) {
+        return 0;
+    }
+    uint64_t cur = e->vram_inflight_bytes.load(std::memory_order_relaxed);
+    uint32_t spin = 0;
+    for (;;) {
+        const uint64_t budget = device_budget_bytes(e);
+        if (budget == 0 || bytes > budget) {
+            return 0;
+        }
+        if (cur > UINT64_MAX - bytes) {
+            return 0;
+        }
+        if (e->vram_inflight_bytes.compare_exchange_weak(
+                cur,
+                cur + bytes,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            if (out_token) {
+                out_token->bytes = bytes;
+                out_token->pool = pool;
+                out_token->valid = true;
+            }
+            return 1;
+        }
+        if (++spin > 8) {
+            std::this_thread::yield();
+            spin = 0;
+        }
+    }
+}
+
 static void device_account_bytes_freed(moe_pc_engine* e, uint64_t bytes) {
     if (!e) return;
     if (e->backend_caps.backend == moe_BACKEND_METAL) return; // budget computed dynamically
     e->device_free_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
-// BUGFIX 124: Issue 29 - Metal unified memory budget double-counted ★★
+// BUGFIX 124: Issue 29 - Metal unified memory budget double-counted ??筌뤾쑨猿?
 // Problem: Metal VRAM budget subtracts ram_used_bytes, but RAM budget also tracks ram_used_bytes.
 // Same 4GB data consumes 4GB from VRAM budget + 4GB from RAM budget = 8GB total.
 // Solution: Metal should use unified budget only. Set RAM budget to 0 in device_allocator_init.
@@ -25,18 +182,10 @@ static void device_account_bytes_freed(moe_pc_engine* e, uint64_t bytes) {
 // Trade-off: Relies on OS unified memory pressure management instead of explicit RAM eviction.
 // Metal handles this natively, so no functional loss.
 
-// BUGFIX 199: Metal VRAM budget configurable ★
-// Problem: 60% hardcoded → M3 Max 128GB wastes 25GB (60%=76.8GB vs 80%=102.4GB)
+// BUGFIX 199: Metal VRAM budget configurable ??// Problem: 60% hardcoded ??M3 Max 128GB wastes 25GB (60%=76.8GB vs 80%=102.4GB)
 // Solution: Use io_config.metal_memory_budget_pct (0=auto, safe range 50-90)
-// Trade-off: >85% risks macOS memory pressure → swapping or app termination
-static void warn_device_budget_exhausted(
-    const moe_pc_engine* e,
-    uint64_t raw_budget,
-    uint64_t reserved_total,
-    uint64_t pending,
-    uint64_t kv_reserved,
-    uint64_t common_reserved
-) {
+// Trade-off: >85% risks macOS memory pressure ??swapping or app termination
+static void warn_device_budget_exhausted(const moe_pc_engine* e, uint64_t raw_budget, uint64_t reserved_total, uint64_t inflight_reserved, uint64_t kv_reserved, uint64_t common_reserved) {
     if (!e || e->backend_caps.backend == moe_BACKEND_CPU) {
         return;
     }
@@ -45,8 +194,7 @@ static void warn_device_budget_exhausted(
         e->device_free_bytes.load(std::memory_order_relaxed) == 0) {
         return;
     }
-    // BUGFIX Issue 4: Move static timer to engine member to prevent cross-engine suppression ★★★
-    // Problem: static s_last_warn_ms shared across all engine instances
+    // Use per-engine timer state so one engine cannot suppress another engine's warnings.
     // One engine's warning suppresses other engine's warnings in multi-engine process
     // Solution: Use e->last_budget_warn_ms instead of static variable
     const auto now = std::chrono::steady_clock::now();
@@ -64,7 +212,7 @@ static void warn_device_budget_exhausted(
         e ? (int)e->backend_caps.backend : -1,
         (unsigned long long)raw_budget,
         (unsigned long long)reserved_total,
-        (unsigned long long)pending,
+        (unsigned long long)inflight_reserved,
         (unsigned long long)kv_reserved,
         (unsigned long long)common_reserved,
         (unsigned long long)(e ? e->device_allocated_bytes.load(std::memory_order_relaxed) : 0),
@@ -74,213 +222,71 @@ static void warn_device_budget_exhausted(
 
 static uint64_t device_budget_bytes(const moe_pc_engine* e) {
     if (!e) return 0;
-
-    // BUGFIX NEW-3: Metal fast-path without mutex ★★★ PERFORMANCE
-    // Problem: Metal unified memory doesn't need atomic counter snapshot (single memory pool)
-    // → shared_lock adds unnecessary serialization for Metal backends
-    // Solution: Early-return for Metal with direct atomic loads (memory_order_acquire)
-    // Impact: Eliminates mutex contention for Metal, no change for CUDA/HIP/Vulkan
+    auto add_sat = [](uint64_t acc, uint64_t value) -> uint64_t {
+        return value > UINT64_MAX - acc ? UINT64_MAX : acc + value;
+    };
+    uint64_t raw_budget = 0;
     if (e->backend_caps.backend == moe_BACKEND_METAL &&
         e->backend_caps.supports_unified_memory) {
-        // Metal unified memory: calculate budget without mutex
         const uint64_t sys = e->backend_caps.system_memory_bytes > 0
-            ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
+            ? e->backend_caps.system_memory_bytes : 16ull * 1024ull * 1024ull * 1024ull;
         uint64_t pct = e->io_config.metal_memory_budget_pct;
-        if (pct == 0 || pct < 50 || pct > 90) pct = 75ull;
-        const uint64_t raw_budget = (sys * pct) / 100ull;
-
-        // Read counters with acquire semantics (no mutex needed for Metal)
-        const uint64_t pending = e->pending_vram_reservation.load(std::memory_order_acquire);
-        const uint64_t in_flight = e->vram_in_flight_bytes.load(std::memory_order_acquire);
-        const uint64_t kv_actual = e->device_kv_cache_bytes.load(std::memory_order_acquire);
-        const uint64_t common_reserved = e->common_vram_reserved_bytes.load(std::memory_order_acquire);
-
-        const uint64_t kv_reserved = e->kv_actually_in_vram.load(std::memory_order_acquire) ? kv_actual : 0;
-
-        const uint64_t cpu_ram_used = tier_used(e, moe_TIER_RAM);
-
-        // BUGFIX Problem 1: Metal KV cache double-counting ★★★ CRITICAL
-        // Problem: cpu_ram_used includes KV cache, kv_reserved also includes KV cache
-        // → KV counted twice when kv_actually_in_vram=true
-        // Solution: Subtract min(kv_actual, cpu_ram_used) from cpu_ram_used before adding
-        // Impact: Correct VRAM budget on Metal, prevents over-conservative allocation
-        const uint64_t kv_in_ram = std::min(kv_actual, cpu_ram_used);
-        const uint64_t non_kv_ram = cpu_ram_used - kv_in_ram;
-
-        uint64_t total_reserved = pending;
-        if (total_reserved <= UINT64_MAX - in_flight) total_reserved += in_flight;
-        if (total_reserved <= UINT64_MAX - kv_reserved) total_reserved += kv_reserved;
-        if (total_reserved <= UINT64_MAX - common_reserved) total_reserved += common_reserved;
-        if (non_kv_ram < UINT64_MAX - total_reserved) total_reserved += non_kv_ram;
-
-        if (raw_budget <= total_reserved) {
-            warn_device_budget_exhausted(e, raw_budget, total_reserved, pending, kv_reserved, common_reserved);
-            return 0;
+        if (pct == 0 || pct < 50 || pct > 90) {
+            pct = 75ull;
         }
-        return raw_budget - total_reserved;
+        raw_budget = (sys * pct) / 100ull;
+    } else if (e->config.vram_budget_bytes) {
+        raw_budget = e->config.vram_budget_bytes;
+    } else {
+        const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
+        const uint64_t free_b = e->device_free_bytes.load(std::memory_order_relaxed);
+        raw_budget = (allocated || free_b)
+            ? (allocated > UINT64_MAX - free_b ? UINT64_MAX : allocated + free_b)
+            : (e->backend_caps.device_memory_bytes
+                ? e->backend_caps.device_memory_bytes
+                : e->backend_caps.recommended_vram_cache_bytes);
     }
-
-    // BUGFIX 989: Read pending, in_flight, kv_actual, common_reserved, device_allocated_bytes under vram_transition_mutex ★★★ CRITICAL
-    // Problem: Without the mutex, this function can observe a state where pending
-    //   is already decremented but in_flight not yet incremented → bytes invisible
-    //   → budget appears larger than reality → VRAM over-commit.
-    // Additionally, kv_actual can spike after mutex release → budget overestimated.
-    // Solution: Snapshot ALL counters under the same mutex used by the write side.
-    // Contention: Negligible — mutex held for ~5 loads (~20ns), same as write side.
-    // BUGFIX 1011: Use shared_lock for read-only access ★★★ CRITICAL
-    // Problem: device_budget_bytes() called dozens of times per token from multiple threads
-    // (prefetch_admission, common_residency, juju_runtime_strategy, etc.)
-    // All readers block each other with exclusive lock → serialization bottleneck
-    // Solution: Use std::shared_lock for readers, unique_lock only for writers
-    // Impact: Eliminates reader-reader contention, 3-5x throughput on multi-threaded prefetch
-    uint64_t pending, in_flight, kv_actual, common_reserved, device_allocated, device_free;
-    {
-        std::shared_lock<std::shared_mutex> tlock(const_cast<moe_pc_engine*>(e)->vram_transition_mutex);
-        pending = e->pending_vram_reservation.load(std::memory_order_relaxed);
-        in_flight = e->vram_in_flight_bytes.load(std::memory_order_relaxed);
-        kv_actual = e->device_kv_cache_bytes.load(std::memory_order_relaxed);
-        common_reserved = e->common_vram_reserved_bytes.load(std::memory_order_relaxed);
-        device_allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
-        device_free = e->device_free_bytes.load(std::memory_order_relaxed);
+    if (raw_budget == 0) {
+        return 0;
     }
-
-    // Problem 8: Use dynamic KV budget instead of static soft cap
-    // vram_kv_budget_bytes is soft cap, device_kv_cache_bytes is actual usage
-    // Use min(cap, actual) to avoid wasting budget when KV is empty
-    // BUGFIX 905: Remove std::min - use actual KV usage ★★★ CRITICAL
-    // Problem: std::min(kv_cap, kv_actual) hides KV overflow from budget calculation
-    // → When kv_actual > kv_cap, overflow is not subtracted from device_budget
-    // → Engine thinks VRAM is available, admits more experts → silent OOM or eviction storm
-    // Solution: Use kv_actual directly (full actual usage), kv_cap is only for allocation limit
-    // Impact: Prevents OOM when KV cache exceeds soft cap during long sequences
-    const uint64_t kv_reserved = e->kv_actually_in_vram.load(std::memory_order_acquire)
-        ? kv_actual
+    const uint64_t resident = e->vram_resident_bytes.load(std::memory_order_relaxed);
+    const uint64_t inflight = e->vram_inflight_bytes.load(std::memory_order_relaxed);
+    const uint64_t kv_actual = e->kv_actually_in_vram.load(std::memory_order_acquire)
+        ? e->device_kv_cache_bytes.load(std::memory_order_relaxed)
         : 0;
-
-    // BUGFIX 989: All counters already read under vram_transition_mutex above.
-    // pending, in_flight, kv_actual, common_reserved, device_allocated, device_free are consistent snapshots.
-    uint64_t reserved_total = pending;
-    if (reserved_total > UINT64_MAX - in_flight) {
-        reserved_total = UINT64_MAX;
-    } else {
-        reserved_total += in_flight;
+    const uint64_t kv_reserved = std::max(
+        e->vram_kv_bytes.load(std::memory_order_relaxed),
+        kv_actual);
+    uint64_t common_reserved = e->vram_common_bytes.load(std::memory_order_relaxed);
+    if (!e->common_vram_upload_complete.load(std::memory_order_acquire)) {
+        common_reserved = std::max(
+            common_reserved,
+            e->common_vram_reserved_bytes.load(std::memory_order_relaxed));
     }
-    if (reserved_total > UINT64_MAX - kv_reserved) {
-        reserved_total = UINT64_MAX;
-    } else {
-        reserved_total += kv_reserved;
+    uint64_t safety_margin = raw_budget >= 512ull * 1024ull * 1024ull
+        ? 64ull * 1024ull * 1024ull
+        : raw_budget / 16ull;
+    if (safety_margin > 256ull * 1024ull * 1024ull) {
+        safety_margin = 256ull * 1024ull * 1024ull;
     }
-    if (reserved_total > UINT64_MAX - common_reserved) {
-        reserved_total = UINT64_MAX;
-    } else {
-        reserved_total += common_reserved;
-    }
-
-    if (e->config.vram_budget_bytes) {
-        if (e->config.vram_budget_bytes <= reserved_total) {
-            warn_device_budget_exhausted(e, e->config.vram_budget_bytes, reserved_total, pending, kv_reserved, common_reserved);
-            return 0;
-        }
-        return e->config.vram_budget_bytes - reserved_total;
-    }
-    if (e->backend_caps.supports_unified_memory &&
-        e->backend_caps.backend == moe_BACKEND_METAL) {
-        // Metal unified memory must avoid RAM double-counting.
-        // Metal unified memory is accounted through the VRAM budget here. RAM
-        // budget is set to 0 during device allocator init for this backend.
-        const uint64_t sys = e->backend_caps.system_memory_bytes > 0
-            ? e->backend_caps.system_memory_bytes : 16ull * 1024 * 1024 * 1024;
-        // BUGFIX 199: Use configurable percentage (0=auto from device_allocator_init)
-        // BUGFIX 232: Ensure pct is never 0 to prevent zero budget
-        // BUGFIX 274: Simplify zero budget check - pct validation already ensures non-zero
-        uint64_t pct = e->io_config.metal_memory_budget_pct;
-        if (pct == 0) {
-            pct = 75ull;
-        }
-        if (pct < 50 || pct > 90) {
-            if (pct != 0) {
-                fprintf(stderr,
-                    "[storageLLM WARNING] metal_memory_budget_pct=%llu out of safe range [50,90], clamping\n",
-                    (unsigned long long)pct);
-            }
-            pct = 75ull;
-        }
-        const uint64_t raw_budget = (sys * pct) / 100ull;
-
-        // BUGFIX 893/906/937: Metal UMA KV budget — single source of truth ★★★ CRITICAL
-        // Problem: BUGFIX 893 added tier_used(RAM) to account for CPU KV in UMA budget.
-        //   BUGFIX 906 tried to fix double-counting by subtracting kv_reserved first.
-        //   But tier_used(RAM) includes ALL RAM usage (KV + vision encoder + MLA buffers),
-        //   while kv_reserved is only device_kv_cache_bytes (GPU-side KV).
-        //   On Apple Silicon these can differ (vision encoder allocates RAM but not GPU KV).
-        //   Subtracting kv_reserved from reserved_total then adding full tier_used(RAM)
-        //   double-counts the non-KV RAM portion and can cause uint64_t underflow.
-        // Solution: Use device_kv_cache_bytes as the sole KV source (already in reserved_total).
-        //   For non-KV RAM usage, compute: tier_used(RAM) - min(kv_actual, tier_used(RAM))
-        //   This isolates non-KV RAM contributions (vision, MLA, scratch) cleanly.
-        // Impact: Correct budget on Apple Silicon with mixed workloads, no underflow.
-        const uint64_t cpu_ram_used = tier_used(e, moe_TIER_RAM);
-        // Estimate how much of tier_used(RAM) is KV: at most kv_actual (which is already
-        // counted in reserved_total via kv_reserved). Subtract it to avoid double-count.
-        const uint64_t kv_in_ram = std::min(kv_actual, cpu_ram_used);
-        const uint64_t non_kv_ram = cpu_ram_used - kv_in_ram;
-        uint64_t total_reserved = reserved_total;
-        if (non_kv_ram < UINT64_MAX - total_reserved) {
-            total_reserved += non_kv_ram;
-        } else {
-            total_reserved = UINT64_MAX;
-        }
-
-        if (raw_budget <= total_reserved) {
-            warn_device_budget_exhausted(e, raw_budget, total_reserved, pending, kv_reserved, common_reserved);
-            return 0;
-        }
-        return raw_budget - total_reserved;
-    }
-    // BUGFIX 989: Use snapshotted values from mutex section above
-    const uint64_t allocated = device_allocated;
-    const uint64_t free_b = device_free;
-    if (allocated || free_b) {
-        // BUGFIX 122: With CAS loop in device_try_reserve_pending_vram, underflow is eliminated.
-        // Keep clamp for safety, but it should never trigger now.
-        int64_t s_free = (int64_t)free_b;
-        if (s_free < 0) s_free = 0;
-        const uint64_t raw_budget = allocated > UINT64_MAX - (uint64_t)s_free ? UINT64_MAX : allocated + (uint64_t)s_free;
-        if (raw_budget <= reserved_total) {
-            warn_device_budget_exhausted(e, raw_budget, reserved_total, pending, kv_reserved, common_reserved);
-            return 0;
-        }
-        return raw_budget - reserved_total;
-    }
-    const uint64_t raw_budget = e->backend_caps.device_memory_bytes ? e->backend_caps.device_memory_bytes : e->backend_caps.recommended_vram_cache_bytes;
+    uint64_t reserved_total = 0;
+    reserved_total = add_sat(reserved_total, resident);
+    reserved_total = add_sat(reserved_total, inflight);
+    reserved_total = add_sat(reserved_total, kv_reserved);
+    reserved_total = add_sat(reserved_total, common_reserved);
+    reserved_total = add_sat(reserved_total, safety_margin);
     if (raw_budget <= reserved_total) {
-        warn_device_budget_exhausted(e, raw_budget, reserved_total, pending, kv_reserved, common_reserved);
+        warn_device_budget_exhausted(e, raw_budget, reserved_total, inflight, kv_reserved, common_reserved);
         return 0;
     }
     return raw_budget - reserved_total;
 }
-
 static uint64_t device_memory_headroom_pct(uint8_t configured) {
     if (configured == 0 || configured > 90) {
         return 10ull;
     }
     return configured;
 }
-
-// BUGFIX 122: Issue 27 - pending VRAM reservation TOCTOU race ★★★
-// Problem: Two threads can both pass check at step 2, then both fetch_add at step 3.
-// If both exceed budget at step 4, both fetch_sub, causing transient underflow.
-// device_budget_bytes() clamps underflow to 0, but this is a workaround, not a fix.
-// Solution: Replace check-then-add with CAS loop for atomic reservation.
-// Trade-off: CAS contention possible, but VRAM allocation is infrequent (expert triplet granularity).
-// Max 8 GPU workers, so contention is low. Eliminates underflow bug permanently.
-
-// BUGFIX 문제6: Removed deprecated reservation functions ★★
-// Problem: device_try_reserve_pending_vram() and device_release_pending_vram_reservation()
-// marked [[deprecated]] but still linked. They share pending_vram_reservation atomic with
-// prefetch_admission.cpp.inc CAS loop, risking double-counting if accidentally called.
-// Solution: Completely removed both functions. Only call site (device_tensor_copy_alloc.cpp.inc:91)
-// was already commented out. prefetch_admission.cpp.inc CAS loop is the sole reservation mechanism.
 
 static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
     if (!e) return;
@@ -291,7 +297,7 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
         e->backend_caps.backend == moe_BACKEND_VULKAN ||
         e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
         e->backend_caps.backend == moe_BACKEND_SYCL;
-    // BUGFIX 891: Unify throttle to 1s for all paths ★★★ CRITICAL
+    // BUGFIX 891: Unify throttle to 1s for all paths ??筌뤾쑨猿??CRITICAL
     // Problem: 5s throttle for non-external backends causes stale VRAM estimates.
     // With top-k=8 experts loading/unloading per token, 5s gap allows hundreds of MB drift.
     // Solution: Use 1s throttle for all paths. CAS guard prevents concurrent driver calls.
@@ -338,7 +344,7 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
         e->vk.vkGetPhysicalDeviceMemoryProperties2(e->vk.physicalDevice, &props);
         uint64_t calc_free = 0;
         uint64_t calc_total = 0;
-        // BUGFIX 472: memoryHeapCount 범위 체크 (최대 16개)
+        // BUGFIX 472: memoryHeapCount ?類????癲ル슪???띿물?(癲ル슔?됭짆? 16??
         uint32_t heap_count = props.memoryProperties.memoryHeapCount;
         if (heap_count > 16) heap_count = 16;
         for (uint32_t i = 0; i < heap_count; ++i) {
@@ -346,7 +352,7 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
                 calc_total += props.memoryProperties.memoryHeaps[i].size;
                 if (budget.heapBudget[i] > 0) {
                     uint64_t avail = (budget.heapBudget[i] > budget.heapUsage[i]) ? (budget.heapBudget[i] - budget.heapUsage[i]) : 0;
-                    // BUGFIX 895: Remove headroom application here ★★★ CRITICAL
+                    // BUGFIX 895: Remove headroom application here ??筌뤾쑨猿??CRITICAL
                     // Problem: Headroom applied here, then again in prefetch_admission.cpp.inc
                     // Double headroom: (avail * 90%) * 90% = avail * 81% instead of 90%
                     // Solution: Use raw avail, let prefetch_admission apply single headroom
@@ -391,7 +397,7 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
         uint32_t count = 1;
         if (e->ze.zeDeviceGetMemoryProperties(e->ze.device, &count, &mem_props) == 0) {
             total_b = mem_props.totalSize;
-            // BUGFIX 926: Remove headroom application here ★★★ CRITICAL
+            // BUGFIX 926: Remove headroom application here ??筌뤾쑨猿??CRITICAL
             // Problem: Headroom applied here, then again in prefetch_admission.cpp.inc
             // Double headroom: (avail * 80%) * 80% = avail * 64% instead of 80%
             // Solution: Use raw avail, let prefetch_admission apply single headroom
@@ -408,15 +414,13 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
         }
     }
     if (mem_queried) {
-        // BUGFIX 239: Subtract pending_vram_reservation from driver-reported free memory ★★★
-        // Problem: Driver reports memory that is "not yet allocated" as free, but our
-        // pending_vram_reservation already committed this memory to in-flight prefetch tasks.
+        // BUGFIX 239: Subtract vram_inflight_bytes from driver-reported free memory ??筌뤾쑨猿??        // Problem: Driver reports memory that is "not yet allocated" as free, but our
+        // vram_inflight_bytes already committed this memory to in-flight prefetch tasks.
         // Without this correction, device_refresh_mem_info treats pending reservations as
         // "accounting drift" and adds them back to device_free_bytes every 1 second.
         // This causes VRAM budget to "magically" grow beyond physical limits.
-        // Solution: Subtract pending_vram_reservation from driver-reported free_b before
         // calculating delta. This ensures pending reservations are not double-counted.
-        const uint64_t pending = e->pending_vram_reservation.load(std::memory_order_relaxed);
+        const uint64_t pending = e->vram_inflight_bytes.load(std::memory_order_relaxed);
         if (free_b > pending) {
             free_b -= pending;
         } else {
@@ -449,17 +453,24 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
         e->device_total_bytes.store((uint64_t)total_b);
     }
 
-    // BUGFIX 998: Metal H2D bandwidth EMA update ★★ IMPORTANT
+    // BUGFIX 998: Metal H2D bandwidth EMA update ??筌뤾쑨猿?IMPORTANT
     // Problem: Metal H2D bandwidth is measured once at init. If OS background
     //   pressure is high at init, a low value is locked in permanently.
-    //   juju_runtime_strategy overlap budget is based on this value → underestimate.
+    //   juju_runtime_strategy overlap budget is based on this value ??underestimate.
     // Solution: On each 1s refresh cycle, re-measure via metal_measure_h2d_bandwidth
     //   and apply EMA (alpha=0.2) to smooth transient noise.
     // Guard: Only runs if enable_bw_benchmark AND backend is Metal AND a non-zero
     //   initial measurement exists (skip if init benchmark was disabled).
+    // BUGFIX NEW-25: Skip Metal H2D bandwidth measurement during active inference ??筌뤾쑨猿??    // Problem: metal_measure_h2d_bandwidth() submits a blit command to the Metal command
+    // queue. During inference, forward pass commands occupy the queue ??measurement blit
+    // waits behind them ??measured latency includes inference delay ??EMA corrupted.
+    // Solution: Check total_queue_depth > 0 as proxy for active inference. If tokens are
+    // queued, skip this cycle. EMA retains last valid value (juju_runtime_strategy is safe).
+    // Impact: Clean bandwidth samples, accurate overlap budget, no measurement stalls.
     if (e->backend_caps.backend == moe_BACKEND_METAL &&
         e->io_config.enable_bw_benchmark &&
-        e->backend_caps.measured_h2d_bw_bytes_per_sec > 0) {
+        e->backend_caps.measured_h2d_bw_bytes_per_sec > 0 &&
+        e->total_queue_depth.load(std::memory_order_relaxed) == 0) {
         const uint64_t new_sample = metal_measure_h2d_bandwidth(metal_get_default_device());
         if (new_sample > 0) {
             const uint64_t old_bw = e->backend_caps.measured_h2d_bw_bytes_per_sec;
@@ -470,7 +481,7 @@ static void device_refresh_mem_info(moe_pc_engine* e, int retry_path) {
     }
 }
 
-// BUGFIX 54: Issue 29 - Replace CAS spin with fetch_sub ?�★
+// BUGFIX 54: Issue 29 - Replace CAS spin with fetch_sub ???ル∥???
 // Problem: device_account_free_bytes_sub uses CAS loop for saturating subtract.
 // Called on every allocation ??high-frequency contention. Same issue as total_queue_depth.
 // Solution: Use fetch_sub with post-correction. device_refresh_mem_info runs every 1s
@@ -501,8 +512,7 @@ static void device_free_deferred_ptrs(moe_pc_engine* e, std::vector<std::pair<CU
         ptrs.clear();
         return;
     }
-    // BUGFIX 521: Check ptrs.size() upper bound to prevent excessive iteration ★
-    // Problem: ptrs can contain arbitrarily many entries if eviction is aggressive
+    // Bound ptrs.size() to prevent excessive iteration if eviction is aggressive.
     // Loop can run billions of iterations
     // Solution: Add reasonable upper bound check (e.g., 100000)
     if (ptrs.size() > 100000) {
@@ -513,8 +523,7 @@ static void device_free_deferred_ptrs(moe_pc_engine* e, std::vector<std::pair<CU
     }
     device_set_current(e);
     for (auto& pair : ptrs) {
-        // BUGFIX 592: Check pair.second (bytes) is reasonable ★
-        // Problem: pair.second can be corrupted (very large value)
+                // Check pair.second; corrupted byte counts can be extremely large.
         // Solution: Validate bytes before processing
         if (pair.second > 100ull * 1024 * 1024 * 1024) { // 100GB sanity check
             fprintf(stderr, "[storageLLM ERROR] device_free_deferred_ptrs: suspicious bytes %llu\n",
@@ -529,9 +538,9 @@ static void device_free_deferred_ptrs(moe_pc_engine* e, std::vector<std::pair<CU
             } else
 #endif
             if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipFree) {
-                // BUGFIX 928: Check hipFree return value ★★ IMPORTANT
+                // BUGFIX 928: Check hipFree return value ??筌뤾쑨猿?IMPORTANT
                 // Problem: hipFree can fail if context lost or pointer already freed
-                // → Memory leak tracked in device_allocated_bytes but not actually freed
+                // ??Memory leak tracked in device_allocated_bytes but not actually freed
                 // Solution: Log error on failure (best-effort, continue loop)
                 // Impact: Enables debugging of VRAM accounting mismatches
                 const int hip_err = e->hip.hipFree(pair.first);
@@ -540,9 +549,9 @@ static void device_free_deferred_ptrs(moe_pc_engine* e, std::vector<std::pair<CU
                         (void*)pair.first, (unsigned long long)pair.second, hip_err);
                 }
             } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemFree) {
-                // BUGFIX 928: Check cuMemFree return value ★★ IMPORTANT
+                // BUGFIX 928: Check cuMemFree return value ??筌뤾쑨猿?IMPORTANT
                 // Problem: cuMemFree can fail if context lost or pointer already freed
-                // → Memory leak tracked in device_allocated_bytes but not actually freed
+                // ??Memory leak tracked in device_allocated_bytes but not actually freed
                 // Solution: Log error on failure (best-effort, continue loop)
                 // Impact: Enables debugging of VRAM accounting mismatches
                 const int cuda_err = e->cuda.cuMemFree(pair.first);
@@ -567,6 +576,7 @@ static void device_release_allocation_locked(
     if (!e || it == e->device_allocations.end()) return;
     const moe_device_allocation a = it->second;
     if (a.ptr) {
+        device_cufile_unregister_buffer(e, reinterpret_cast<void*>(static_cast<uintptr_t>(a.ptr)));
         if (deferred_free_ptrs) {
             deferred_free_ptrs->push_back({a.ptr, a.bytes});
             // Bug 2: Update device_free_bytes immediately to maintain accurate budget
@@ -590,8 +600,10 @@ static void device_release_allocation_locked(
             }
         }
     }
-    // BUGFIX 620: Check device_allocated_bytes > 0 before fetch_sub to prevent underflow ★
-    // Problem: If device_allocated_bytes is 0, fetch_sub causes underflow
+    if (a.resident_accounted) {
+        device_vram_sub_resident_bytes(e, a.pool, a.bytes);
+    }
+    // BUGFIX 620: Check device_allocated_bytes > 0 before fetch_sub to prevent underflow ??    // Problem: If device_allocated_bytes is 0, fetch_sub causes underflow
     // Solution: Only decrement if > 0
     uint64_t current_allocated = e->device_allocated_bytes.load(std::memory_order_acquire);
     while (current_allocated > 0 && current_allocated >= a.bytes) {
@@ -602,7 +614,6 @@ static void device_release_allocation_locked(
             break;
         }
     }
-    // BUGFIX 620: Check device_allocation_count > 0 before fetch_sub to prevent underflow ★
     uint64_t current_count = e->device_allocation_count.load(std::memory_order_acquire);
     while (current_count > 0) {
         if (e->device_allocation_count.compare_exchange_weak(
@@ -625,7 +636,6 @@ static void device_release_allocation_locked(
     }
     if (a.pool == moe_DEVICE_POOL_ACTIVATION) {
         e->activation_keys.erase(it->first);
-        // BUGFIX 621: Check device_activation_count > 0 before fetch_sub to prevent underflow ★
         uint64_t current_activation = e->device_activation_count.load(std::memory_order_acquire);
         while (current_activation > 0) {
             if (e->device_activation_count.compare_exchange_weak(

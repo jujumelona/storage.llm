@@ -370,6 +370,7 @@ static int prefetch_common_raw_storage(moe_pc_engine* e) {
     }
     if (!ok) {
         e->common_vram_reserved_bytes.store(0, std::memory_order_release);
+        e->vram_common_bytes.store(0, std::memory_order_release);
     }
     trigger_ram_expert_promotion(e);
     return ok;

@@ -65,6 +65,7 @@ struct moe_paged_kv_manager_t {
 
 static void device_account_bytes_freed(moe_pc_engine* e, uint64_t bytes);
 static void device_account_free_bytes_sub(moe_pc_engine* e, uint64_t bytes);
+static void device_atomic_sub_saturating(std::atomic<uint64_t>& counter, uint64_t bytes);
 
 static uint32_t evict_cold_kv_blocks(
     moe_pc_engine* engine,
@@ -152,7 +153,7 @@ static int promote_kv_block_to_vram(
 
     // Check VRAM KV budget
     const uint64_t kv_budget = engine->vram_kv_budget_bytes.load(std::memory_order_relaxed);
-    const uint64_t kv_used = engine->vram_kv_used_bytes.load(std::memory_order_relaxed);
+    const uint64_t kv_used = engine->vram_kv_bytes.load(std::memory_order_relaxed);
 
     if (kv_budget == 0 || total_size > kv_budget) {
         return 0;  // No KV budget or block too large
@@ -164,7 +165,7 @@ static int promote_kv_block_to_vram(
         return 0;
     }
     while (current_used + total_size <= kv_budget) {
-        if (engine->vram_kv_used_bytes.compare_exchange_weak(
+        if (engine->vram_kv_bytes.compare_exchange_weak(
                 current_used, current_used + total_size,
                 std::memory_order_acq_rel, std::memory_order_acquire)) {
             break;
@@ -183,11 +184,11 @@ static int promote_kv_block_to_vram(
         }
 
         // Retry budget allocation after eviction
-        current_used = engine->vram_kv_used_bytes.load(std::memory_order_relaxed);
+        current_used = engine->vram_kv_bytes.load(std::memory_order_relaxed);
         if (current_used + total_size > kv_budget) {
             return 0;
         }
-        if (!engine->vram_kv_used_bytes.compare_exchange_strong(
+        if (!engine->vram_kv_bytes.compare_exchange_strong(
                 current_used, current_used + total_size,
                 std::memory_order_acq_rel, std::memory_order_acquire)) {
             return 0;
@@ -203,7 +204,7 @@ static int promote_kv_block_to_vram(
     // Allocate data buffer
     if (data_size > 0) {
         if (data_size > 10ull * 1024 * 1024 * 1024 || data_size > SIZE_MAX) {
-            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            device_atomic_sub_saturating(engine->vram_kv_bytes, total_size);
             return 0;
         }
         if (engine->backend_caps.backend == moe_BACKEND_HIP && engine->hip.hipMalloc) {
@@ -212,7 +213,7 @@ static int promote_kv_block_to_vram(
             alloc_ok = (engine->cuda.cuMemAlloc(&vram_data_ptr, (size_t)data_size) == 0) ? 1 : 0;
         }
         if (!alloc_ok) {
-            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            device_atomic_sub_saturating(engine->vram_kv_bytes, total_size);
             return 0;
         }
     }
@@ -224,7 +225,7 @@ static int promote_kv_block_to_vram(
                 if (engine->backend_caps.backend == moe_BACKEND_HIP) engine->hip.hipFree(vram_data_ptr);
                 else if (engine->backend_caps.backend == moe_BACKEND_CUDA) engine->cuda.cuMemFree(vram_data_ptr);
             }
-            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            device_atomic_sub_saturating(engine->vram_kv_bytes, total_size);
             return 0;
         }
         alloc_ok = 0;
@@ -238,7 +239,7 @@ static int promote_kv_block_to_vram(
                 if (engine->backend_caps.backend == moe_BACKEND_HIP) engine->hip.hipFree(vram_data_ptr);
                 else if (engine->backend_caps.backend == moe_BACKEND_CUDA) engine->cuda.cuMemFree(vram_data_ptr);
             }
-            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            device_atomic_sub_saturating(engine->vram_kv_bytes, total_size);
             return 0;
         }
     }
@@ -254,7 +255,7 @@ static int promote_kv_block_to_vram(
                 if (engine->backend_caps.backend == moe_BACKEND_HIP) engine->hip.hipFree(vram_scales_ptr);
                 else if (engine->backend_caps.backend == moe_BACKEND_CUDA) engine->cuda.cuMemFree(vram_scales_ptr);
             }
-            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            device_atomic_sub_saturating(engine->vram_kv_bytes, total_size);
             return 0;
         }
         alloc_ok = 0;
@@ -272,7 +273,7 @@ static int promote_kv_block_to_vram(
                 if (engine->backend_caps.backend == moe_BACKEND_HIP) engine->hip.hipFree(vram_scales_ptr);
                 else if (engine->backend_caps.backend == moe_BACKEND_CUDA) engine->cuda.cuMemFree(vram_scales_ptr);
             }
-            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            device_atomic_sub_saturating(engine->vram_kv_bytes, total_size);
             return 0;
         }
     }
@@ -293,7 +294,7 @@ static int promote_kv_block_to_vram(
     if (host_data && vram_data_ptr) {
         if (data_size > SIZE_MAX) {
             moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr, device_accounted ? total_size : 0);
-            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            device_atomic_sub_saturating(engine->vram_kv_bytes, total_size);
             return 0;
         }
         // Try async path first, fall back to sync
@@ -314,7 +315,7 @@ static int promote_kv_block_to_vram(
         }
         if (res != 0) {
             moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr, device_accounted ? total_size : 0);
-            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            device_atomic_sub_saturating(engine->vram_kv_bytes, total_size);
             return 0;
         }
     }

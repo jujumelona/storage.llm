@@ -477,12 +477,17 @@ static int device_allocator_init(moe_pc_engine* e) {
                 "backend=vulkan for Intel GPUs without Level Zero runtime.\n");
         }
 
-        // BUGFIX 896: Detect integrated GPU and enable unified memory handling ★★★ CRITICAL
+        // BUGFIX 896 + Bug #13: Detect integrated GPU and enable unified memory handling ★★★ CRITICAL
         // Problem: Intel iGPU shares system RAM but allocatedSize==0 fallback uses totalSize (16GB).
         // This overestimates available VRAM → OOM when actual GPU buffer space is much smaller.
-        // Solution: Query zeDeviceGetProperties to detect integrated GPU, set supports_unified_memory.
+        // BUGFIX Bug #13: Intel Arc dGPU with ReBAR shows supports_unified_memory=true incorrectly
+        // → device_memory_bytes uses PCIe BAR size instead of actual VRAM
+        // Solution: Query zeDeviceGetProperties to detect integrated GPU using ZE_DEVICE_PROPERTY_FLAG_INTEGRATED
+        // → Only set supports_unified_memory for actual iGPUs (Iris Xe)
+        // → Arc A770/B580 with ReBAR will NOT have this flag set
         // Apply Metal-style unified memory budget calculation (same as HIP APU).
-        // Impact: Correct memory budget for Intel integrated GPUs, prevents OOM.
+        // Impact: Correct memory budget for Intel integrated GPUs, prevents OOM
+        // Impact: Correct VRAM detection for Intel Arc discrete GPUs
         if (e->ze.zeDeviceGetProperties && e->ze.device) {
             struct ze_device_properties_local {
                 uint32_t stype; void* pNext; uint32_t type;
@@ -495,11 +500,14 @@ static int device_allocator_init(moe_pc_engine* e) {
                 uint8_t uuid[16]; char name[256];
             } props{};
             props.stype = 0x00010003; // ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES
-            if (e->ze.zeDeviceGetProperties(e->ze.device, &props) == 0 && (props.flags & 1u)) {
-                // ZE_DEVICE_PROPERTY_FLAG_INTEGRATED (bit 0) set → integrated GPU
-                e->backend_caps.supports_unified_memory = true;
-                fprintf(stderr,
-                    "[storageLLM INFO] Level Zero integrated GPU detected, enabling unified memory mode\n");
+            if (e->ze.zeDeviceGetProperties(e->ze.device, &props) == 0) {
+                // ZE_DEVICE_PROPERTY_FLAG_INTEGRATED (bit 0) = integrated GPU
+                // Only set for actual iGPUs (Iris Xe), NOT for Arc dGPUs with ReBAR
+                if (props.flags & 1u) {
+                    e->backend_caps.supports_unified_memory = true;
+                    fprintf(stderr,
+                        "[storageLLM INFO] Level Zero integrated GPU detected, enabling unified memory mode\n");
+                }
             }
         }
 
@@ -740,7 +748,9 @@ static int device_allocator_init(moe_pc_engine* e) {
            e->backend_caps.backend == moe_BACKEND_METAL ||
            !moe_kv_vram_attention_runtime_available(e));
 
-    e->common_vram_reserved_bytes.store(common_vram_wanted_bytes(e), std::memory_order_relaxed);
+    const uint64_t common_vram_bytes = common_vram_wanted_bytes(e);
+    e->common_vram_reserved_bytes.store(common_vram_bytes, std::memory_order_relaxed);
+    e->vram_common_bytes.store(0, std::memory_order_relaxed);
 
     // Fix 27: Run a quick microbenchmark to measure actual TFLOPS
     // The hardcoded fallbacks (22/35 TFLOPS) are wildly inaccurate for many GPUs.

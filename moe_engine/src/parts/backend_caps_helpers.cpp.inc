@@ -340,6 +340,23 @@ static void fill_cuda_backend_caps(moe_backend_caps_t* caps) {
             64ull * 1024ull * 1024ull);
     }
 #endif
+    int integrated_gpu = 0;
+    moe_cuda_driver_api api{};
+    if (cuda_driver_load(&api) && api.cuInit(0) == 0) {
+        int dev = 0;
+        if (api.cuDeviceGet && api.cuDeviceGet(&dev, static_cast<int>(caps->device_id)) == 0) {
+            if (api.cuDeviceGetAttribute) {
+                int is_integrated = 0;
+                constexpr int CU_DEVICE_ATTRIBUTE_INTEGRATED = 18; // CU_DEVICE_ATTRIBUTE_INTEGRATED
+                if (api.cuDeviceGetAttribute(&is_integrated, CU_DEVICE_ATTRIBUTE_INTEGRATED, dev) == 0) {
+                    integrated_gpu = is_integrated;
+                }
+            }
+        }
+        moe_close_shared_library(api.library);
+    }
+    caps->is_integrated_gpu = integrated_gpu;
+
     uint64_t total_bytes = 0;
     const uint64_t free_bytes = cuda_driver_detect_free_memory_bytes(caps->device_id, &total_bytes);
 
@@ -406,6 +423,7 @@ static void fill_hip_backend_caps(moe_backend_caps_t* caps) {
         }
         moe_close_shared_library(api.library);
     }
+    caps->is_integrated_gpu = integrated_gpu;
 
     uint64_t total_bytes = 0;
     const uint64_t free_bytes = hip_driver_detect_free_memory_bytes(caps->device_id, &total_bytes);
@@ -550,15 +568,15 @@ static void fill_metal_backend_caps(moe_backend_caps_t* caps) {
     // No validation needed unlike AMD APU
     caps->unified_mmap_gpu_accessible = caps->supports_unified_memory;
 
-    caps->supports_pinned_host = 1;
-    caps->supports_fixed_read_staging = 1;
-    caps->supports_backend_async_api = 1;
+    caps->supports_pinned_host = 0;
+    caps->supports_fixed_read_staging = 0;
+    caps->supports_backend_async_api = 0;
     caps->supports_gpu_direct_file_io = 0;
     caps->recommended_vram_cache_bytes = cache_with_common_for_experts(32);
     caps->tflops_hint = 0.0;  // Let strategy calculate device-specific value (20.0 for Metal)
-    caps->recommended_pinned_bytes = 64ull * 1024ull * 1024ull;
-    caps->copy_streams = std::max<uint32_t>(caps->copy_streams, 1u);
-    caps->prefetch_streams = std::max<uint32_t>(caps->prefetch_streams, 2u);
+    caps->recommended_pinned_bytes = 0;
+    caps->copy_streams = 0;
+    caps->prefetch_streams = std::max<uint32_t>(caps->prefetch_streams, 1u);
 }
 
 static void fill_basic_gpu_caps(moe_backend_caps_t* caps, int available, int* feature_flag) {
@@ -813,17 +831,31 @@ static void fill_levelzero_backend_caps(moe_backend_caps_t* caps) {
                                 uint8_t uuid[16]; char name[256];
                             } props{};
                             props.stype = 0x00010003; // ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES
-                            if (zeDeviceGetProperties(dev, &props) == 0 && (props.flags & 1u)) {
-                                integrated_gpu = 1;
+                            // BUGFIX Bug #13: Fix Intel Level Zero ReBAR false positive ★★ IMPORTANT
+                            // Problem: Intel Arc dGPU with ReBAR shows supports_unified_memory=true
+                            // → device_memory_bytes uses PCIe BAR size instead of actual VRAM
+                            // Solution: Use ZE_DEVICE_PROPERTY_FLAG_INTEGRATED to detect iGPU vs dGPU
+                            // → Only set integrated_gpu=1 for actual integrated GPUs (Iris Xe)
+                            // → Arc A770/B580 with ReBAR will NOT have this flag set
+                            // Impact: Correct VRAM detection for Intel Arc, prevents budget miscalculation
+                            if (zeDeviceGetProperties(dev, &props) == 0) {
+                                // ZE_DEVICE_PROPERTY_FLAG_INTEGRATED (bit 0) = integrated GPU
+                                if (props.flags & 1u) {
+                                    integrated_gpu = 1;
+                                }
                             }
                         }
 
-                        // BUGFIX: Use zeDeviceGetMemoryProperties to query actual VRAM size
+                        // BUGFIX Bug #13: Use zeDeviceGetMemoryProperties to query actual VRAM size ★★ IMPORTANT
+                        // For dGPUs: Query ZE_MEMORY_TYPE_DEVICE (actual VRAM)
+                        // For iGPUs: integrated_gpu flag already set above, skip memory query
                         typedef int (*pfn_zeDeviceGetMemoryProperties)(void*, uint32_t*, void*);
                         pfn_zeDeviceGetMemoryProperties zeDeviceGetMemoryProperties =
                             (pfn_zeDeviceGetMemoryProperties)get_sym("zeDeviceGetMemoryProperties");
 
-                        if (zeDeviceGetMemoryProperties) {
+                        if (zeDeviceGetMemoryProperties && !integrated_gpu) {
+                            // Only query memory properties for discrete GPUs
+                            // Integrated GPUs use unified memory budget calculation
                             uint32_t mem_count = 0;
                             if (zeDeviceGetMemoryProperties(dev, &mem_count, nullptr) == 0 && mem_count > 0) {
                                 // ze_device_memory_properties_t: sType(u32), pNext(ptr), flags(u32), maxClockRate(u32), maxBusWidth(u32), totalSize(u64), name[256]
@@ -889,6 +921,7 @@ static void fill_levelzero_backend_caps(moe_backend_caps_t* caps) {
     } else {
         caps->device_memory_bytes = caps->recommended_vram_cache_bytes;
     }
+    caps->is_integrated_gpu = integrated_gpu;
     if (integrated_gpu) {
         caps->supports_unified_memory = 1;
         caps->supports_zero_copy_host = 1;

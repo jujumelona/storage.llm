@@ -2,7 +2,7 @@
         if (res != 0) {
             moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr,
                 device_accounted ? total_size : 0);
-            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            device_atomic_sub_saturating(engine->vram_kv_bytes, total_size);
             return 0;
         }
     }
@@ -16,7 +16,7 @@
         if (res != 0) {
             moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr,
                 device_accounted ? total_size : 0);
-            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            device_atomic_sub_saturating(engine->vram_kv_bytes, total_size);
             return 0;
         }
     }
@@ -30,7 +30,7 @@
         if (res != 0) {
             moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr,
                 device_accounted ? total_size : 0);
-            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            device_atomic_sub_saturating(engine->vram_kv_bytes, total_size);
             return 0;
         }
     }
@@ -41,14 +41,14 @@
         if (block_id >= manager->max_blocks || manager->is_free[block_id]) {
             moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr,
                 device_accounted ? total_size : 0);
-            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            device_atomic_sub_saturating(engine->vram_kv_bytes, total_size);
             return 0;
         }
         moe_paged_kv_block_t& block = manager->blocks[block_id];
         if (block.tier == moe_TIER_VRAM && block.vram_data) {
             moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr,
                 device_accounted ? total_size : 0);
-            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            device_atomic_sub_saturating(engine->vram_kv_bytes, total_size);
             return 1;
         }
         if (block.compressed_data != host_data ||
@@ -56,17 +56,18 @@
             block.zeros != host_zeros) {
             moe_free_kv_vram_allocations(engine, vram_data_ptr, vram_scales_ptr, vram_zeros_ptr,
                 device_accounted ? total_size : 0);
-            engine->vram_kv_used_bytes.fetch_sub(total_size, std::memory_order_relaxed);
+            device_atomic_sub_saturating(engine->vram_kv_bytes, total_size);
             return 0;
         }
         block.vram_data = (void*)vram_data_ptr;
         block.vram_scales = (void*)vram_scales_ptr;
         block.vram_zeros = (void*)vram_zeros_ptr;
         block.tier = moe_TIER_VRAM;
-        engine->kv_actually_in_vram.store(true, std::memory_order_release);
+        block.tier = moe_TIER_VRAM;
     }
 
     engine->device_kv_cache_bytes.fetch_add(total_size, std::memory_order_relaxed);
+    engine->kv_actually_in_vram.store(true, std::memory_order_release);
 
     return 1;
 }
@@ -188,18 +189,18 @@ static uint32_t evict_cold_kv_blocks(
         device_account_bytes_freed(engine, block_size);
         freed += block_size;
         evicted_count++;
-        engine->vram_kv_used_bytes.fetch_sub(block_size, std::memory_order_relaxed);
-        engine->device_kv_cache_bytes.fetch_sub(block_size, std::memory_order_relaxed);
+        device_atomic_sub_saturating(engine->device_kv_cache_bytes, block_size);
+        device_atomic_sub_saturating(engine->vram_kv_bytes, block_size);
+        if (engine->vram_kv_bytes.load(std::memory_order_acquire) == 0) {
+            engine->kv_actually_in_vram.store(false, std::memory_order_release);
+        }
     }
 
     if (evicted_count > 0) {
         fprintf(stderr, "[storageLLM INFO] Evicted %u cold KV blocks from VRAM, freed %llu MB\n",
             evicted_count, (unsigned long long)(freed / (1024*1024)));
 
-        const uint64_t remaining_kv = engine->device_kv_cache_bytes.load(std::memory_order_relaxed);
-        if (remaining_kv == 0) {
-            engine->kv_actually_in_vram.store(false, std::memory_order_release);
-        }
+
     }
 
     return evicted_count;

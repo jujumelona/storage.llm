@@ -46,6 +46,7 @@ typedef struct {
     int supports_sycl;
     int supports_webgpu;
     int supports_gpu_direct_file_io;
+    int is_integrated_gpu;
     int preferred_numa_node;
     double dma_bandwidth_gbps;
     double tflops_hint;

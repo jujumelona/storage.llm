@@ -139,21 +139,20 @@ static uint32_t device_collect_activation_victims_locked(
     // Impact: Heap rebuild now triggers correctly, preventing stale entry accumulation
     uint32_t actual_active_count = 0;
     if (should_rebuild) {
-        for (auto& [key, alloc] : e->device_allocations) {
-            if (alloc.pool == moe_DEVICE_POOL_ACTIVATION && !alloc.pending_free && alloc.bytes > 0) {
-                ++actual_active_count;
-            }
-        }
-        // BUGFIX 471: active_count * 2u overflow 체크
-        // BUGFIX 570: Check heap size > 0 before stale check ★
-        // Problem: Empty heap causes division issues
-        // Solution: Check size > 0
-        const bool was_stale = e->activation_evict_heap.size() > 0 &&
+        const size_t old_heap_size = e->activation_evict_heap.size();
+        // BUGFIX NEW-24: Eliminate double scan by rebuilding and counting in one pass ★★★
+        // Problem: Previous code pre-scanned device_allocations to check was_stale,
+        // then scanned AGAIN inside device_rebuild_activation_heap_unlocked.
+        // Solution: Call rebuild unconditionally if should_rebuild is true. Rebuild returns
+        // the active count. Use old_heap_size to check was_stale and reset the stale counter.
+        // Impact: Reduces O(N) map scans from 2 to 1 on the critical eviction path.
+        actual_active_count = device_rebuild_activation_heap_unlocked(e, device_lock);
+
+        const bool was_stale = old_heap_size > 0 &&
                                actual_active_count > 0 &&
                                actual_active_count <= UINT32_MAX / 2u &&
-                               e->activation_evict_heap.size() > actual_active_count * 2u;
+                               old_heap_size > actual_active_count * 2u;
         if (was_stale) {
-            device_rebuild_activation_heap_unlocked(e, device_lock);
             stale = 0;  // Reset stale counter after rebuild
         }
     }

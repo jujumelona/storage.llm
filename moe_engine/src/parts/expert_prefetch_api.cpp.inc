@@ -118,7 +118,9 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
     int expert,
     moe_tier_t preferred_tier,
     int notify_workers,
-    int stream_state_prechecked = 0
+    int stream_state_prechecked = 0,
+    const vram_reservation_token& reservation = vram_reservation_token{},
+    int allow_sync_fallback = 1
 ) {
     if (!engine || layer < 0 || expert < 0) {
         return 0;
@@ -144,11 +146,27 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
         preferred_tier,
         notify_workers ? moe_PREFETCH_REASON_ROUTER_SELECTED : moe_PREFETCH_REASON_LOOKAHEAD);
     preferred_tier = moe_hot_miss_preferred_tier(engine, layer, expert, bytes, preferred_tier);
+    vram_reservation_token effective_reservation = reservation;
+    if (preferred_tier == moe_TIER_VRAM && !effective_reservation.valid) {
+        if (!device_vram_try_reserve_token(
+                engine,
+                bytes,
+                moe_DEVICE_POOL_EXPERT,
+                &effective_reservation)) {
+            preferred_tier = moe_TIER_RAM;
+        }
+    }
     const int requested = moe_pc_engine_request_expert(engine, layer, expert, bytes, preferred_tier);
     if (!requested) {
+        if (effective_reservation.valid) {
+            device_vram_release_reservation_token(engine, effective_reservation);
+        }
         return 0;
     }
     if (preferred_tier == moe_TIER_DB || preferred_tier == moe_TIER_STREAM) {
+        if (effective_reservation.valid) {
+            device_vram_release_reservation_token(engine, effective_reservation);
+        }
         return requested;
     }
 
@@ -173,10 +191,12 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
             moe_prefetch_task task{};
             task.tensor_index = gate_index;
             task.target_tier = preferred_tier;
+            task.vram_token = effective_reservation;
             task.bundle_triplet = 1;
             task.bundle_layer = layer;
             task.bundle_expert = expert;
             task.urgent = 1;
+            task.allow_sync_fallback = allow_sync_fallback;
             if (enqueue_stage_or_retry(engine, engine->disk_stage, task)) {
                 engine->io_atomic.queued_requests.fetch_add(1, std::memory_order_relaxed);
                 if (notify_workers) {
@@ -187,8 +207,32 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
         }
     }
     int queued = 0;
+    uint64_t token_bytes_assigned = 0;
     for (auto proj : projs) {
-        queued += enqueue_tensor_prefetch(engine, layer, expert, proj, preferred_tier, stream_state_prechecked);
+        vram_reservation_token sub_token{};
+        if (effective_reservation.valid) {
+            const moe_tensor_record* rec = find_tensor_record(engine, layer, expert, proj);
+            const uint64_t rec_bytes = rec ? tensor_stream_bytes(*rec) : 0;
+            if (rec_bytes > 0 && token_bytes_assigned < effective_reservation.bytes) {
+                sub_token = effective_reservation;
+                sub_token.bytes = std::min<uint64_t>(rec_bytes, effective_reservation.bytes - token_bytes_assigned);
+                token_bytes_assigned += sub_token.bytes;
+            }
+        }
+        queued += enqueue_tensor_prefetch(
+            engine,
+            layer,
+            expert,
+            proj,
+            preferred_tier,
+            stream_state_prechecked,
+            sub_token,
+            allow_sync_fallback);
+    }
+    if (effective_reservation.valid && effective_reservation.bytes > token_bytes_assigned) {
+        vram_reservation_token rest = effective_reservation;
+        rest.bytes -= token_bytes_assigned;
+        device_vram_release_reservation_token(engine, rest);
     }
     if (notify_workers) {
         for (int i = 0; i < queued; ++i) {
@@ -344,7 +388,9 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
                     (int)expert,
                     target,
                     0,
-                    1)) {
+                    1,
+                    vram_reservation_token{},
+                    0)) {
                 ++queued;
                 if ((queued & 31u) == 0u) {
                     engine->disk_stage.cv.notify_all();

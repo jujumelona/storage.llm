@@ -14,6 +14,60 @@ static uint64_t device_key_tensor(const moe_tensor_record& r) {
         ((uint64_t)r.info.shard & 0xFFFFFFull);
 }
 
+struct device_vram_token_guard {
+    moe_pc_engine* engine = nullptr;
+    vram_reservation_token token{};
+    bool active = false;
+
+    device_vram_token_guard(moe_pc_engine* e, const vram_reservation_token& t)
+        : engine(e), token(t), active(t.valid) {}
+
+    ~device_vram_token_guard() {
+        if (active) {
+            device_vram_release_reservation_token(engine, token);
+        }
+    }
+
+    void disarm() {
+        active = false;
+    }
+
+    void complete(uint64_t key) {
+        if (active) {
+            device_vram_complete_reservation_token(engine, token, key);
+            active = false;
+        }
+    }
+};
+
+static int device_resolve_vram_token(
+    moe_pc_engine* e,
+    uint8_t pool,
+    uint64_t bytes,
+    const vram_reservation_token& provided,
+    vram_reservation_token* out
+) {
+    if (!out) {
+        return 0;
+    }
+    *out = provided;
+    if (pool != moe_DEVICE_POOL_EXPERT) {
+        return 1;
+    }
+    if (provided.valid && provided.pool == pool && provided.bytes >= bytes) {
+        return 1;
+    }
+    if (provided.valid) {
+        device_vram_release_reservation_token(e, provided);
+        *out = vram_reservation_token{};
+    }
+    return 0;
+}
+
+static bool device_range_4k_aligned(uint64_t offset, uint64_t size) {
+    return ((offset | size) & 4095ull) == 0;
+}
+
 // Fix 49: _locked version ??caller already holds device_mutex
 static void device_free_expert_locked(
     moe_pc_engine* e,
@@ -77,10 +131,10 @@ static int device_copy_tensor_from_host(
     const uint8_t* host,
     uint64_t host_bytes,
     uint32_t staging_slot = UINT32_MAX,
-    int release_slot_on_submit = 1
+    int release_slot_on_submit = 1,
+    const vram_reservation_token& reservation = vram_reservation_token{}
 ) {
     const uint64_t bytes = tensor_stream_bytes(r);
-    // BUGFIX Issue 6: Use staging_slot_valid() helper for correct check order ★★★
     if (!e || !host || host_bytes < bytes || bytes == 0 ||
         !device_allocator_init(e) || !device_set_current(e)) {
         return 0;
@@ -95,8 +149,16 @@ static int device_copy_tensor_from_host(
     CUstream stream = device_tensor_stream_current(e);
     bool is_host_pinned = true; if (staging_slot != UINT32_MAX && staging_slot_valid(e, staging_slot)) { is_host_pinned = e->staging_slots[staging_slot].pinned; } if (!is_host_pinned) { e->io_atomic.nonpinned_fallback_count.fetch_add(1, std::memory_order_relaxed); } const int async_copy = is_host_pinned && device_backend_async_h2d_available(e, stream, 1);
     const uint64_t key = device_key_tensor(r);
+    vram_reservation_token effective_token{};
+    if (!device_resolve_vram_token(e, pool, bytes, reservation, &effective_token)) {
+        if (staging_slot != UINT32_MAX && release_slot_on_submit) {
+            release_staging_slot(e, staging_slot);
+        }
+        return 0;
+    }
+    device_vram_token_guard token_guard(e, effective_token);
     CUdeviceptr dst = 0;
-    if (!device_prepare_tensor_allocation(e, key, bytes, pool, async_copy, &dst, host)) {
+    if (!device_prepare_tensor_allocation(e, key, bytes, pool, async_copy, &dst, host, effective_token)) {
         if (staging_slot != UINT32_MAX && release_slot_on_submit) {
             release_staging_slot(e, staging_slot);
         }
@@ -121,12 +183,10 @@ static int device_copy_tensor_from_host(
         return 0;
     }
 
-    // BUGFIX 문제 2: Record event and set recorded flag BEFORE releasing slot ★★★ CRITICAL
-    // Problem: Old sequence "record event → release slot" has race condition
-    // → Slot released → Other worker acquires → Reads last_copy_event before record completes
-    // → cuStreamWaitEvent waits on incomplete event → undefined behavior
+    // Record the slot event before release so the next acquirer can fence correctly.
+    // Problem: "record event, release slot" ordering can race with a new acquirer.
     // Solution: Set event_recorded flag atomically AFTER successful record
-    // → Acquirer checks event_recorded flag before waiting
+    // Acquirer checks event_recorded before waiting.
     // Impact: Eliminates race condition, ensures DMA fence correctness
     bool event_ok = false;
     if (async_copy) {
@@ -139,20 +199,28 @@ static int device_copy_tensor_from_host(
             if (slot.last_copy_event) {
                 event_ok = device_backend_event_record(e, slot.last_copy_event, stream) != 0;
                 slot.last_copy_stream = event_ok ? stream : nullptr;
-                // BUGFIX 문제 2: Set event_recorded flag AFTER successful record ★★★
                 slot.last_copy_event_recorded.store(event_ok, std::memory_order_release);
             }
-            // Release slot immediately — acquirer will wait on last_copy_event
+            // Release slot immediately ??acquirer will wait on last_copy_event
             if (release_slot_on_submit) {
                 release_staging_slot(e, staging_slot);
             }
             // Defer only the key completion tracking, no slot to release later
-            device_defer_staging_copy(e, UINT32_MAX, key, 0, stream);  // 0 bytes - not VRAM target
+            device_defer_staging_copy(e, UINT32_MAX, key, effective_token.valid ? bytes : 0, stream, effective_token);
+            token_guard.disarm();
         } else {
-            s_tl_tensor_pending_keys[e].push_back(key);
+            device_defer_staging_copy(e, UINT32_MAX, key, effective_token.valid ? bytes : 0, stream, effective_token);
+            token_guard.disarm();
         }
     } else if (staging_slot != UINT32_MAX && release_slot_on_submit) {
         release_staging_slot(e, staging_slot);
+    }
+    if (!async_copy) {
+        if (effective_token.valid) {
+            token_guard.complete(key);
+        } else {
+            device_vram_mark_allocation_resident(e, key);
+        }
     }
     device_touch_allocation(e, key);
     return 1;
@@ -162,59 +230,15 @@ static int device_copy_tensor_from_host(
 static std::once_flag g_cufile_open_once;
 static std::atomic<int> g_cufile_open_ok{0};
 
-static int device_copy_tensor_gpudirect_storage(
-    moe_pc_engine* e,
-    const moe_tensor_record& r,
-    uint8_t pool
-) {
 #if defined(__linux__)
-    if (!e || e->backend_caps.backend != moe_BACKEND_CUDA ||
-        !e->io_config.enable_gpudirect_storage ||
-        !e->cuda.cufile_available ||
-        !e->cuda.cuFileHandleRegister ||
-        !e->cuda.cuFileHandleDeregister ||
-        !e->cuda.cuFileRead) {
-        return 0;
+static void* device_cufile_get_cached_file_handle(moe_pc_engine* e, mmap_context_t* shard) {
+    if (!e || !shard || shard->fd < 0 || !e->cuda.cuFileHandleRegister) {
+        return nullptr;
     }
-    const uint64_t bytes = tensor_stream_bytes(r);
-    if (bytes == 0 || !device_allocator_init(e) || !device_set_current(e)) {
-        return 0;
-    }
-    mmap_context_t* shard = get_or_map_tensor_shard(e, r);
-    if (!shard || shard->fd < 0) {
-        return 0;
-    }
-    const uint64_t ranges[3][2] = {
-        {r.info.weight_byte_offset, r.info.weight_byte_length},
-        {r.info.scale_byte_offset, r.info.scale_byte_length},
-        {r.info.scale2_byte_offset, r.info.scale2_byte_length}
-    };
-    const uint64_t file_size = static_cast<uint64_t>(mmap_get_size(shard));
-    for (const auto& range : ranges) {
-        if (range[1] && (range[0] > file_size || range[1] > file_size - range[0])) {
-            return 0;
-        }
-    }
-
-    if (e->cuda.cuFileDriverOpen) {
-        std::call_once(g_cufile_open_once, [&]() {
-            const moe_cufile_error_t st = e->cuda.cuFileDriverOpen();
-            g_cufile_open_ok.store(st.err == 0 ? 1 : -1, std::memory_order_release);
-        });
-        if (g_cufile_open_ok.load(std::memory_order_acquire) < 0) {
-            static std::atomic<bool> warned{false};
-            if (!warned.exchange(true, std::memory_order_relaxed)) {
-                fprintf(stderr,
-                    "[storageLLM WARNING] GPUDirect Storage driver open failed; falling back to staged H2D\n");
-            }
-            return 0;
-        }
-    }
-
-    const uint64_t key = device_key_tensor(r);
-    CUdeviceptr dst = 0;
-    if (!device_prepare_tensor_allocation(e, key, bytes, pool, 0, &dst, nullptr)) {
-        return 0;
+    std::lock_guard<std::mutex> lock(e->cufile_cache_mutex);
+    auto cached = e->cufile_file_handle_cache.find(shard->fd);
+    if (cached != e->cufile_file_handle_cache.end()) {
+        return cached->second;
     }
 
     struct moe_cufile_descr_local {
@@ -238,6 +262,110 @@ static int device_copy_tensor_gpudirect_storage(
                 "falling back to pinned staging. Check nvidia-fs, filesystem support, and O_DIRECT mode.\n",
                 hst.err);
         }
+        return nullptr;
+    }
+    e->cufile_file_handle_cache[shard->fd] = file_handle;
+    return file_handle;
+}
+
+static int device_cufile_ensure_buffer_registered(moe_pc_engine* e, void* ptr, uint64_t bytes) {
+    if (!e || !ptr || bytes == 0 || !e->cuda.cuFileBufRegister) {
+        return 0;
+    }
+    const uint64_t key = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr));
+    std::lock_guard<std::mutex> lock(e->cufile_cache_mutex);
+    auto cached = e->cufile_buffer_registration_cache.find(key);
+    if (cached != e->cufile_buffer_registration_cache.end() && cached->second >= bytes) {
+        return 1;
+    }
+    if (cached != e->cufile_buffer_registration_cache.end()) {
+        if (e->cuda.cuFileBufDeregister) {
+            e->cuda.cuFileBufDeregister(ptr);
+        }
+        e->cufile_buffer_registration_cache.erase(cached);
+    }
+    const moe_cufile_error_t bst = e->cuda.cuFileBufRegister(ptr, (size_t)bytes, 0);
+    if (bst.err != 0) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            fprintf(stderr,
+                "[storageLLM WARNING] cuFileBufRegister failed (err=%d); falling back to pinned staging.\n",
+                bst.err);
+        }
+        return 0;
+    }
+    e->cufile_buffer_registration_cache[key] = bytes;
+    return 1;
+}
+#endif
+
+static int device_copy_tensor_gpudirect_storage(
+    moe_pc_engine* e,
+    const moe_tensor_record& r,
+    uint8_t pool,
+    const vram_reservation_token& reservation = vram_reservation_token{}
+) {
+#if defined(__linux__)
+    if (!e || e->backend_caps.backend != moe_BACKEND_CUDA ||
+        !e->io_config.enable_gpudirect_storage ||
+        !e->cuda.cufile_available ||
+        !e->cuda.cuFileHandleRegister ||
+        !e->cuda.cuFileHandleDeregister ||
+        !e->cuda.cuFileBufDeregister ||
+        !e->cuda.cuFileRead) {
+        return 0;
+    }
+    const uint64_t bytes = tensor_stream_bytes(r);
+    if (bytes == 0 || !device_allocator_init(e) || !device_set_current(e)) {
+        return 0;
+    }
+    mmap_context_t* shard = get_or_map_tensor_shard(e, r);
+    if (!shard || shard->fd < 0) {
+        return 0;
+    }
+    const uint64_t ranges[3][2] = {
+        {r.info.weight_byte_offset, r.info.weight_byte_length},
+        {r.info.scale_byte_offset, r.info.scale_byte_length},
+        {r.info.scale2_byte_offset, r.info.scale2_byte_length}
+    };
+    const uint64_t file_size = static_cast<uint64_t>(mmap_get_size(shard));
+    for (const auto& range : ranges) {
+        if (range[1] && (range[0] > file_size || range[1] > file_size - range[0])) {
+            return 0;
+        }
+        if (range[1] && !device_range_4k_aligned(range[0], range[1])) {
+            return 0;
+        }
+    }
+
+    if (e->cuda.cuFileDriverOpen) {
+        std::call_once(g_cufile_open_once, [&]() {
+            const moe_cufile_error_t st = e->cuda.cuFileDriverOpen();
+            g_cufile_open_ok.store(st.err == 0 ? 1 : -1, std::memory_order_release);
+        });
+        if (g_cufile_open_ok.load(std::memory_order_acquire) < 0) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr,
+                    "[storageLLM WARNING] GPUDirect Storage driver open failed; falling back to staged H2D\n");
+            }
+            return 0;
+        }
+    }
+
+    const uint64_t key = device_key_tensor(r);
+    vram_reservation_token effective_token{};
+    if (!device_resolve_vram_token(e, pool, bytes, reservation, &effective_token)) {
+        return 0;
+    }
+    device_vram_token_guard token_guard(e, effective_token);
+    CUdeviceptr dst = 0;
+    if (!device_prepare_tensor_allocation(e, key, bytes, pool, 0, &dst, nullptr, effective_token)) {
+        return 0;
+    }
+
+    void* file_handle = device_cufile_get_cached_file_handle(e, shard);
+    if (!file_handle) {
         device_free_key(e, key);
         return 0;
     }
@@ -245,20 +373,8 @@ static int device_copy_tensor_gpudirect_storage(
     int ok = 1;
     uint64_t dst_offset = 0;
     void* dst_base = reinterpret_cast<void*>(static_cast<uintptr_t>(dst));
-    int buf_registered = 0;
-    if (e->cuda.cuFileBufRegister) {
-        const moe_cufile_error_t bst = e->cuda.cuFileBufRegister(dst_base, (size_t)bytes, 0);
-        if (bst.err == 0) {
-            buf_registered = 1;
-        } else {
-            static std::atomic<bool> warned{false};
-            if (!warned.exchange(true, std::memory_order_relaxed)) {
-                fprintf(stderr,
-                    "[storageLLM WARNING] cuFileBufRegister failed (err=%d); falling back to pinned staging.\n",
-                    bst.err);
-            }
-            ok = 0;
-        }
+    if (!device_cufile_ensure_buffer_registered(e, dst_base, bytes)) {
+        ok = 0;
     }
 
     if (ok) {
@@ -278,17 +394,15 @@ static int device_copy_tensor_gpudirect_storage(
         }
     }
 
-    if (buf_registered && e->cuda.cuFileBufDeregister) {
-        e->cuda.cuFileBufDeregister(dst_base);
-    }
-    if (file_handle && e->cuda.cuFileHandleDeregister) {
-        e->cuda.cuFileHandleDeregister(file_handle);
-    }
-
     if (!ok || dst_offset != bytes) {
         e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
         device_free_key(e, key);
         return 0;
+    }
+    if (effective_token.valid) {
+        token_guard.complete(key);
+    } else {
+        device_vram_mark_allocation_resident(e, key);
     }
     device_touch_allocation(e, key);
     return 1;
@@ -304,7 +418,8 @@ static int device_copy_tensor(
     moe_pc_engine* e,
     const moe_tensor_record& r,
     uint8_t pool,
-    int allow_sync_fallback = 1
+    int allow_sync_fallback = 1,
+    const vram_reservation_token& reservation = vram_reservation_token{}
 ) {
     if (!e || tensor_stream_bytes(r) == 0 || !device_allocator_init(e) || !device_set_current(e)) {
         return 0;
@@ -327,6 +442,11 @@ static int device_copy_tensor(
         }
     }
 
+    vram_reservation_token effective_token{};
+    if (!device_resolve_vram_token(e, pool, bytes, reservation, &effective_token)) {
+        return 0;
+    }
+    device_vram_token_guard token_guard(e, effective_token);
 
     CUstream stream = device_tensor_stream_current(e);
     CUdeviceptr dst = 0;
@@ -334,31 +454,30 @@ static int device_copy_tensor(
     // Fix 55: Try staging fast-path ??consolidate 3 ranges into pinned buffer
     // for single true-async DMA instead of 3 false-async non-pinned copies
     // Bug #9: GPU direct uses second half of slot pool (for_pinned = false)
-    // PIPELINE FIX 17: Use thread-local turn counter to reduce slot contention ?�★
+    // PIPELINE FIX 17: Use thread-local turn counter to reduce slot contention ??좎뜦??
     // Old: worker_index=0, turn=0 fixed ??all workers compete for slot 0
     // New: thread-local turn counter ??workers spread across slot pool
     static thread_local uint32_t tl_device_copy_turn = 0;
-    // BUGFIX 985: Use staging_slot_valid()-consistent guard ★★ DEFENSIVE
+    // BUGFIX 985: Use staging_slot_valid()-consistent guard ??몄겲 DEFENSIVE
     // Problem: Direct staging_slots.size() check doesn't catch slot.buf==nullptr
     // after reset_staging_slots timeout (staging_slot_size=0 but vector not cleared).
     // staging_slot_valid() enforces correct 3-step check: staging_slot_size > 0,
     // slot_index < vector size, buf != nullptr.
     // Note: We still do the size check first to avoid acquire_staging_slot overhead.
     const bool staging_eligible = e->staging_slot_size > 0 &&
-        e->staging_slots.size() > 0 && bytes <= e->staging_slot_size;
+        bytes <= e->staging_slot_size;
     uint32_t slot_idx = staging_eligible
         ? acquire_staging_slot(e, 0u, tl_device_copy_turn++, bytes, false) : UINT32_MAX;
 
-    // BUGFIX: 슬롯 할당 실패 시 즉시 drain을 한 번 더 시도
+    // If slot acquisition fails, drain completed async copies once and retry.
     if (slot_idx == UINT32_MAX && staging_eligible) {
-        device_drain_deferred_staging_copies(e, false); // 즉시 drain 재시도
+        device_drain_deferred_staging_copies(e, false);
         slot_idx = acquire_staging_slot(e, 0u, tl_device_copy_turn++, bytes, false);
     }
 
     if (slot_idx != UINT32_MAX) {
         // Staging fast-path: memcpy ranges ??pinned staging ??single H2D async
         moe_staging_slot& slot = e->staging_slots[slot_idx];
-        // BUGFIX 935: Use staging_slot_valid() for thread-safe buf access ★★★
         if (!staging_slot_valid(e, slot_idx)) {
             release_staging_slot(e, slot_idx);
             return 0;
@@ -368,10 +487,10 @@ static int device_copy_tensor(
             release_staging_slot(e, slot_idx);
             return 0;
         }
-        // PIPELINE FIX 16: Use AVX2 non-temporal copy instead of plain memcpy ?�★??
+        // PIPELINE FIX 16: Use AVX2 non-temporal copy instead of plain memcpy ??좎뜦???
         // Old: plain memcpy ??L1/L2 cache pollution, ~1.5-2x slower
         // New: copy_mapped_range_to_staging_linear ??AVX2 streaming stores
-        // Matches io_worker performance for mmap?�pinned copies
+        // Matches io_worker performance for mmap??좏릪inned copies
         uint64_t offset = 0;
         int copy_ok = 1;
         for (const auto& range : ranges) {
@@ -393,24 +512,24 @@ static int device_copy_tensor(
         }
         const int async_copy = device_backend_async_h2d_available(
             e, stream, e->staging_slots[slot_idx].pinned ? 1 : 0);
-        if (!device_prepare_tensor_allocation(e, key, bytes, pool, async_copy, &dst, staging_buf)) {
+        if (!device_prepare_tensor_allocation(e, key, bytes, pool, async_copy, &dst, staging_buf, effective_token)) {
             release_staging_slot(e, slot_idx);
             return 0;
         }
         int ok = 0;
         if (async_copy) {
             ok = device_backend_copy_h2d_async(e, dst, staging_buf, bytes, stream);
-            // BUGFIX 193: Release slot immediately after async copy starts ★★★
-            // Fix 63: Do NOT sync here → defer only key completion
+            // Release slot immediately after async copy starts; completion is deferred.
             // Slot released right after DMA starts, not after completion
         } else {
             ok = device_backend_copy_h2d_sync(e, dst, staging_buf, bytes);
         }
         if (ok && async_copy) {
-            // slot도 defer에 포함시켜 event 완료 후 해제
-            // BUGFIX 문제1: Pass bytes for VRAM reservation release at completion
-            device_defer_staging_copy(e, slot_idx, key, bytes, stream);
-            // staging_slot을 여기서 해제하지 않음
+            // slot??defer????釉??뽱룖 event ?袁⑥┷ ????곸젫
+            // BUGFIX ?얜챷??: Pass bytes for VRAM reservation release at completion
+            device_defer_staging_copy(e, slot_idx, key, effective_token.valid ? bytes : 0, stream, effective_token);
+            token_guard.disarm();
+            // staging_slot????由????곸젫??? ??놁벉
         } else {
             release_staging_slot(e, slot_idx);
         }
@@ -422,24 +541,29 @@ static int device_copy_tensor(
         }
         if (async_copy) {
             // Staged async copies are completed by their per-copy event.
+        } else if (effective_token.valid) {
+            token_guard.complete(key);
+        } else {
+            device_vram_mark_allocation_resident(e, key);
         }
         device_touch_allocation(e, key);
         return 1;
     }
 
     // Fix 55: No staging ??use explicit synchronous cuMemcpyHtoD (no false async)
-    // BUGFIX 935: Add staging_slot_size > 0 guard ★★★
-    if (device_backend_is_metal(e) && e->staging_slots.size() > 0 && e->staging_slot_size > 0 && bytes <= e->staging_slot_size) {
+    if (device_backend_is_metal(e)) {
+        token_guard.disarm();
         return moe_DEVICE_COPY_BACKPRESSURE;
     }
-    if (!allow_sync_fallback && e->staging_slots.size() > 0 && e->staging_slot_size > 0 && bytes <= e->staging_slot_size) {
+    if (!allow_sync_fallback) {
+        token_guard.disarm();
         return moe_DEVICE_COPY_BACKPRESSURE;
     }
     if (e) {
         e->io_atomic.bytes_sync_h2d_fallback.fetch_add(bytes);
     }
     const void* host_ptr = shard ? mmap_get_ptr(shard, static_cast<size_t>(ranges[0][0])) : nullptr;
-    if (!device_prepare_tensor_allocation(e, key, bytes, pool, 0 /*sync*/, &dst, host_ptr)) {
+    if (!device_prepare_tensor_allocation(e, key, bytes, pool, 0 /*sync*/, &dst, host_ptr, effective_token)) {
         return 0;
     }
     CUdeviceptr cur = dst;
@@ -450,8 +574,7 @@ static int device_copy_tensor(
             device_free_key(e, key);
             return 0;
         }
-        // BUGFIX 289: Check cur + range[1] doesn't overflow before copy ★
-        // Problem: cur += range[1] can overflow CUdeviceptr if ranges are malformed
+        // Check cur + range[1] before copy; malformed ranges can overflow CUdeviceptr.
         // Solution: Check that cur + range[1] stays within dst + bytes bounds
         if (range[1] > bytes || cur - dst > bytes - range[1]) {
             e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
@@ -473,6 +596,11 @@ static int device_copy_tensor(
         }
     }
 #endif
+    if (effective_token.valid) {
+        token_guard.complete(key);
+    } else {
+        device_vram_mark_allocation_resident(e, key);
+    }
     device_touch_allocation(e, key);
     return 1;
 }

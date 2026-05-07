@@ -36,16 +36,16 @@ int moe_pc_engine_plan_moe_prefetch(
         return 1; // Success with empty plan
     }
 
-    // BUGFIX 1013: Intel Level Zero iGPU unified memory early-out ★★★ CRITICAL
-    // Problem: Intel iGPU (Level Zero) has supports_unified_memory but doesn't get
-    // early-out like Metal UMA → full prefetch plan (staging → pinned → GPU copy)
-    // executed even though mmap is directly GPU-accessible → wasted CPU cycles + RAM
-    // Solution: Add Level Zero iGPU check (device_vram_bytes == 0) for early-out
-    // Impact: Eliminates unnecessary staging copies on Intel integrated GPUs
+    // BUGFIX NEW-26: Fix dGPU prefetch skip with AND condition ★★★ CRITICAL
+    // Problem: || condition means EITHER device_memory_bytes==0 OR unified_mmap_gpu_accessible
+    // → Intel Arc dGPU with PCIe BAR1 mapped region has unified_mmap_gpu_accessible=true
+    // → Prefetch skipped entirely despite having discrete VRAM → GPU sits idle
+    // Solution: Use && so BOTH must be true. iGPU: vram==0 && mmap_accessible → skip (correct)
+    // dGPU: vram>0 → don't skip regardless of mmap_accessible (correct)
     if ((engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
          engine->backend_caps.backend == moe_BACKEND_SYCL) &&
         engine->backend_caps.supports_unified_memory &&
-        (engine->backend_caps.device_memory_bytes == 0 ||
+        (engine->backend_caps.device_memory_bytes == 0 &&
          engine->backend_caps.unified_mmap_gpu_accessible)) {
         // iGPU unified memory: stats only, no staging copies
         std::vector<moe_expert_prefetch_item_t> items;

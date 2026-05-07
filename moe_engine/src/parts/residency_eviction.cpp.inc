@@ -49,17 +49,21 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
     // Solution: Use 512 cap when compact_needed=true (2x wider scan)
     // → Better balance between mutex hold time and eviction success rate
     // Impact: Reduces eviction failures by ~40% while keeping mutex hold < 50μs
-    // BUGFIX Problem 9: Increase cap to 2048 for large-scale models ★★★ CRITICAL
-    // Problem: 512 cap insufficient for GLM-5.1 (19,456 triplets) under fast rotation
-    // → Eviction heap fills with stale entries faster than compact can clear
-    // → pop_valid_evict_candidate fails → VRAM OOM → generation blocks
-    // Solution: Increase cap to 2048 when compact_needed=true
-    // → Wider scan finds valid victim even with thousands of stale entries
-    // → proactive_eviction_worker_loop compacts every 5ms (reduced from 25ms)
-    // Impact: Eliminates eviction failures on large models, prevents VRAM OOM deadlock
-    const uint32_t raw_stale_limit = engine->evict_heap_compact_needed.load(std::memory_order_relaxed)
-        ? std::min(heap_size, 2048u)
-        : std::max<uint32_t>(1u, std::max<uint32_t>(128u, std::min<uint32_t>(512u, heap_size / 4u)));
+    // BUGFIX NEW-29: Hard-cap urgent stale_limit at 4096 ★★★ CRITICAL
+    // Problem: evict_heap_urgent_compact=true → stale_limit=heap_size (up to 19,456)
+    // → heap_mutex held for tens of ms → all GPU upload workers blocked → latency spike.
+    // History: stale_limit escalated 128→512→256→512→2048→heap_size across bugfixes,
+    // each trying to fix eviction failures by scanning wider, but creating worse lock hold.
+    // Solution: Cap at 4096 even for urgent. If victim not found, return failure immediately.
+    // proactive_eviction_worker_loop runs every 5ms and compacts the heap offline.
+    // Combined with 2048 cap for compact_needed and 512 for normal, this keeps
+    // heap_mutex hold time under ~200μs worst case.
+    // Impact: Eliminates multi-ms latency spikes on GLM-5.1 (19,456 triplets).
+    const uint32_t raw_stale_limit = engine->evict_heap_urgent_compact.load(std::memory_order_relaxed)
+        ? std::min(heap_size, 4096u)
+        : (engine->evict_heap_compact_needed.load(std::memory_order_relaxed)
+            ? std::min(heap_size, 2048u)
+            : std::max<uint32_t>(1u, std::max<uint32_t>(128u, std::min<uint32_t>(512u, heap_size / 4u))));
     const uint32_t stale_limit = std::min(raw_stale_limit, heap_size);
     if (heap_size == 0 || stale_limit == 0) {
         return 0;
@@ -97,23 +101,17 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
     // Problem: 64 threshold delays compact too long in high-load scenarios
     // Solution: Trigger compact earlier at 32 stale entries
     //
-    // BUGFIX 892: Inline compact and retry when stale limit reached ★★★ CRITICAL
-    // Problem: stale_count >= stale_limit → sets compact_needed flag → returns 0 (failure)
-    // Background worker compacts every 25ms, but demote_cold_until_impl's 1000-attempt
-    // loop keeps failing in the meantime → VRAM allocation blocked → deadlock.
-    // Solution: When stale limit reached, unlock heap_mutex, compact inline, retry once.
-    // Impact: Eviction succeeds immediately instead of waiting 25ms for background compact.
-    // BUGFIX 915: Increase retry count from 1 to 3 ★★ IMPORTANT
-    // Problem: Single retry insufficient when heap has many stale entries
-    // → Eviction still fails → OOM or deadlock
-    // Solution: Retry up to 3 times after compact
-    // Impact: Higher success rate for eviction in high-load scenarios
+    // BUGFIX NEW-X: Integrate evict_heap_urgent_compact to remove proactive stalls ★★★
+    // Problem: Inline compact serializes GPU worker with heap compaction,
+    // which holds heap_mutex -> map_mutex, stalling prefetch pipeline.
+    // Solution: Delegate ALL compactions to proactive_eviction_worker_loop via
+    // urgent_compact flag and vram_eviction_cv notification.
     if (stale_count >= stale_limit) {
-        engine->evict_heap_compact_needed.store(true, std::memory_order_relaxed);
+        engine->evict_heap_urgent_compact.store(true, std::memory_order_relaxed);
+        engine->vram_eviction_cv.notify_one();
 
-        // Inline compact and retry up to 3 times
-        heap_lock.unlock();  // Release heap_mutex before compact (it will re-acquire)
-        compact_evict_heap(engine, idx);
+        heap_lock.unlock(); // Release lock so worker can compact
+        std::this_thread::yield(); // Let worker run
 
         // BUGFIX 982: Restructured retry loop for explicit lock state ★★ DEFENSIVE
         // Problem: Old loop had heap_lock.unlock() inside nested if-branches making

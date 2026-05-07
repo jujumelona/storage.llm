@@ -50,6 +50,7 @@ void moe_pc_engine_destroy(moe_pc_engine_t* engine) {
     engine->qkv_head_state_heads.clear();
     engine->qkv_head_state_fingerprints.clear();
     device_stream_pool_destroy(engine);
+    device_cufile_cleanup_caches(engine);
     device_allocator_shutdown(engine);
     model_lib_unload(engine);
     {

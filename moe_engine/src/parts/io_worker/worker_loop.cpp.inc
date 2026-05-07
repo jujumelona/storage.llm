@@ -3,9 +3,9 @@
 
     // BUGFIX 129: Add InflightGuard to prevent inflight count leaks ?끸쁾
     // Problem: Worker terminates (worker_index >= worker_target) while task is popped
-    // inflight incremented ??worker exits ??finish_stage_task never called ??inflight stuck
+    // If a worker exits after pop, finish_stage_task must still run.
     // Solution: RAII guard ensures finish_stage_task on all exit paths
-    // BUGFIX 251: Guard must be activated AFTER pop_stage_task succeeds ?끸쁾??    // Problem: Guard created before pop_stage_task ??if pop fails, inflight not incremented
+    // Guard must be activated after pop_stage_task succeeds.
     // but destructor tries to decrement ??underflow
     // Solution: Create guard inactive, activate only after successful pop
     struct InflightGuard {
@@ -60,6 +60,9 @@
                     add_tier_usage(engine, moe_TIER_RAM, task_bytes);
                 }
             } else {
+                if (retry_task.vram_token.valid) {
+                    device_vram_release_reservation_token(engine, retry_task.vram_token);
+                }
                 engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -83,6 +86,9 @@
                     subtract_tier_usage(engine, moe_TIER_RAM, task_bytes);
                 }
             } else {
+                if (pending.first.vram_token.valid) {
+                    device_vram_release_reservation_token(engine, pending.first.vram_token);
+                }
                 engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
                 local_requeues.pop_front();
                 if (task_bytes > 0) {
@@ -125,6 +131,9 @@
             }
 
             if (++requeue_retry_count >= MAX_REQUEUE_RETRIES) {
+                if (pending.first.vram_token.valid) {
+                    device_vram_release_reservation_token(engine, pending.first.vram_token);
+                }
                 engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
                 local_requeues.pop_front();
                 if (task_bytes > 0) {
@@ -205,11 +214,11 @@
                 }
                 const moe_tensor_record& next_rec = engine->tensors[tensor_index];
                 mmap_context_t* next_shard = get_or_map_tensor_shard(engine, next_rec);
-                // BUGFIX 323: Check next_shard validity before accessing ??                // Problem: get_or_map_tensor_shard can return null
+                // Check next_shard validity before accessing it.
                 // Solution: Check next_shard before use
                 if (next_shard) {
                     const uint8_t* next_src = static_cast<const uint8_t*>(mmap_get_ptr(next_shard, 0));
-                    // BUGFIX 565: Check tensor_stream_bytes before touch_mapped_range ??                    // Problem: tensor_stream_bytes can return 0, causing invalid touch
+                    // Check tensor_stream_bytes before touch_mapped_range.
                     // Solution: Check size > 0 before touch
                     const uint64_t touch_size = tensor_stream_bytes(next_rec);
                     if (next_src && touch_size > 0) {
@@ -271,7 +280,14 @@
                     terminal = 0;
                 }
             } else if (should_use_direct_device_path(engine, rec, task.target_tier, active_path)) {
-                ok = prefetch_tensor_direct_to_gpu(engine, rec);
+                ok = prefetch_tensor_direct_to_gpu(
+                    engine,
+                    rec,
+                    task.vram_token,
+                    task.allow_sync_fallback);
+                if (ok != moe_DEVICE_COPY_BACKPRESSURE) {
+                    task.vram_token.valid = false;
+                }
                 if (ok == moe_DEVICE_COPY_BACKPRESSURE) {
                     task.urgent = 1;
                     task.stage = moe_TRANSFER_STAGE_PINNED_TO_GPU;

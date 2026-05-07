@@ -172,12 +172,17 @@ static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                         std::unique_lock<std::mutex> lock(engine->gpu_stage.mtx);
                         engine->gpu_stage.pop_cv.wait_for(lock, std::chrono::milliseconds(1));
                     }
-                    // Bug 22 Fix: Sync fallback when gpu_stage is saturated
-                    // Without this, staging data is discarded and must be re-fetched from disk
-                    if (!queued_retry && next.staging_valid && next.staging_slot != UINT32_MAX) {
+                    if (!queued_retry &&
+                        next.allow_sync_fallback &&
+                        next.staging_valid &&
+                        next.staging_slot != UINT32_MAX) {
                         const moe_tensor_record& rec = engine->tensors[task.tensor_index];
                         const int sync_ok = prefetch_tensor_pinned_to_gpu(
-                            engine, rec, next.staging_slot, next.staging_bytes, 1, 1);
+                            engine, rec, next.staging_slot, next.staging_bytes, 1, 1, next.vram_token);
+                        if (sync_ok == moe_DEVICE_COPY_BACKPRESSURE && next.vram_token.valid) {
+                            device_vram_release_reservation_token(engine, next.vram_token);
+                        }
+                        next.vram_token.valid = false;
                         if (sync_ok) {
                             ok = 1;
                             queued_retry = true;
@@ -196,6 +201,10 @@ static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                         }
                     } else if (!queued_retry) {
                         ok = 0;
+                        if (next.vram_token.valid) {
+                            device_vram_release_reservation_token(engine, next.vram_token);
+                            next.vram_token.valid = false;
+                        }
                         if (next.staging_slot != UINT32_MAX) {
                             release_staging_slot(engine, next.staging_slot);
                         }
@@ -214,4 +223,3 @@ static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         }
     }
 }
-

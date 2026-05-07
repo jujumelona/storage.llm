@@ -1,5 +1,3 @@
-static void prefetch_release_pending_vram_reservation(moe_pc_engine* engine, uint64_t bytes);
-
 static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
     if (!engine) {
         return;
@@ -53,6 +51,36 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         int ok[batch_capacity] = {};
         int terminal[batch_capacity] = {};
         uint32_t batch_count = 0;
+
+        // BUGFIX NEW-Y: Explicit RAII for GPU worker loop batch cleanup ★★★
+        // Problem: If an exception or early exit occurs mid-loop, tasks in `batch` leak their
+        // VRAM reservations and staging slots, leading to eventual VRAM deadlock.
+        // Solution: Wrap the batch in an RAII guard that automatically releases pending
+        // reservations and staging slots for failed/terminal tasks, and calls finish_stage_task.
+        struct BatchGuard {
+            moe_pc_engine* engine;
+            moe_prefetch_task* batch;
+            int* ok;
+            int* terminal;
+            uint32_t* count;
+            ~BatchGuard() {
+                if (!engine || !count || *count == 0) return;
+                for (uint32_t i = 0; i < *count; ++i) {
+                    if (!ok[i] && terminal[i]) {
+                        if (batch[i].vram_token.valid) {
+                            device_vram_release_reservation_token(engine, batch[i].vram_token);
+                            batch[i].vram_token.valid = false;
+                        }
+                    }
+                    if (!ok[i] && batch[i].staging_slot != UINT32_MAX) {
+                        release_staging_slot(engine, batch[i].staging_slot);
+                        batch[i].staging_slot = UINT32_MAX;
+                    }
+                    finish_stage_task(engine, engine->gpu_stage, ok[i], terminal[i]);
+                }
+            }
+        } batch_guard{engine, batch, ok, terminal, &batch_count};
+
         batch[batch_count++] = task;
 
         uint64_t batch_bytes = 0;
@@ -136,6 +164,9 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                 ok[i] = span ? prefetch_one_raw_span(engine, *span, batch[i].raw_pool, 1) : 0;
             } else if (batch[i].bundle_triplet) {
                 ok[i] = prefetch_expert_triplet_pinned_to_gpu_bundle(engine, batch[i], 0);
+                if (ok[i] != moe_DEVICE_COPY_BACKPRESSURE) {
+                    batch[i].vram_token.valid = false;
+                }
                 if (ok[i] == moe_DEVICE_COPY_BACKPRESSURE) {
                     moe_prefetch_task once_more = batch[i];
                     once_more.stage = moe_TRANSFER_STAGE_PINNED_TO_GPU;
@@ -145,10 +176,6 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                         terminal[i] = 0;
                         engine->gpu_stage.cv.notify_one();
                     } else {
-                        if (batch[i].staging_slot != UINT32_MAX) {
-                            release_staging_slot(engine, batch[i].staging_slot);
-                            batch[i].staging_slot = UINT32_MAX;
-                        }
                         engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
                         ok[i] = 0;
                         terminal[i] = 1;
@@ -176,8 +203,12 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                     batch[i].staging_valid ? batch[i].staging_slot : UINT32_MAX,
                     batch[i].staging_bytes,
                     0,
-                    0
+                    0,
+                    batch[i].vram_token
                 );
+                if (ok[i] != moe_DEVICE_COPY_BACKPRESSURE) {
+                    batch[i].vram_token.valid = false;
+                }
                 if (ok[i] == moe_DEVICE_COPY_BACKPRESSURE) {
                     // PIPELINE FIX 4: Release staging slot immediately if no data ?�★??
                     // Old: Hold slot during 5ms wait ??blocks pinned_worker/io_worker
@@ -206,26 +237,6 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                             terminal[i] = 0;
                             engine->gpu_stage.cv.notify_one();
                         } else {
-                            // BUGFIX 238: Release pending_vram_reservation on task drop ★★★
-                            // Problem: When GPU backpressure causes task drop, staging_slot is released
-                            // but pending_vram_reservation is NOT. Over time, "ghost reservations" accumulate
-                            // and available VRAM converges to 0, blocking all prefetch.
-                            // Solution: Release VRAM reservation when dropping task.
-                            // Last resort: discard staging slot after retry failed
-                            if (batch[i].staging_slot != UINT32_MAX) {
-                                release_staging_slot(engine, batch[i].staging_slot);
-                                batch[i].staging_slot = UINT32_MAX;
-                            }
-                            // Release VRAM reservation for dropped task
-                            // BUGFIX 581: Check tensor_index bounds before accessing ★
-                            // Problem: tensor_index can be out of bounds
-                            // Solution: Check before access
-                            if (batch[i].tensor_index >= 0 && (size_t)batch[i].tensor_index < engine->tensors.size()) {
-                                const uint64_t bytes = tensor_stream_bytes(engine->tensors[batch[i].tensor_index]);
-                                if (bytes > 0) {
-                                    prefetch_release_pending_vram_reservation(engine, bytes);
-                                }
-                            }
                             engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
                             ok[i] = 0;
                             terminal[i] = 1; // Drop it, avoid ping-pong livelock
@@ -241,21 +252,6 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                             terminal[i] = 0;
                             engine->gpu_stage.cv.notify_one();
                         } else {
-                            // BUGFIX 238: Release pending_vram_reservation on task drop ★★★
-                            if (batch[i].staging_slot != UINT32_MAX) {
-                                release_staging_slot(engine, batch[i].staging_slot);
-                                batch[i].staging_slot = UINT32_MAX;
-                            }
-                            // Release VRAM reservation for dropped task
-                            // BUGFIX 582: Check tensor_index bounds before accessing ★
-                            // Problem: tensor_index can be out of bounds
-                            // Solution: Check before access
-                            if (batch[i].tensor_index >= 0 && (size_t)batch[i].tensor_index < engine->tensors.size()) {
-                                const uint64_t bytes = tensor_stream_bytes(engine->tensors[batch[i].tensor_index]);
-                                if (bytes > 0) {
-                                    prefetch_release_pending_vram_reservation(engine, bytes);
-                                }
-                            }
                             engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
                             ok[i] = 0;
                             terminal[i] = 1; // Drop it, avoid ping-pong livelock
@@ -269,33 +265,7 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         device_drain_deferred_staging_copies(engine, true);
 
 
-        // Successful async copies release their staging slot through per-copy events.
-        // Failed copies never registered an event, so they are safe to release here.
-        for (uint32_t i = 0; i < batch_count; ++i) {
-            if (batch[i].staging_slot != UINT32_MAX && !ok[i]) {
-                // Copy failed before async enqueue ??slot was NOT deferred, safe to release
-                release_staging_slot(engine, batch[i].staging_slot);
-            }
-            // BUGFIX 956: Release VRAM reservation for failed bundle triplets ★★★ CRITICAL
-            // Problem: bundle_triplet failure only releases staging slot, not VRAM reservation.
-            // Each triplet (gate+up+down) is 20-80MB → reservation accumulates rapidly
-            // → pending_vram_reservation exhausts budget → all prefetch drops to DB tier.
-            // Solution: Calculate total bundle bytes and release reservation on failure.
-            // Only for terminal failures (not BACKPRESSURE re-queued items).
-            // Impact: Prevents VRAM budget exhaustion under expert triplet staging failures.
-            if (!ok[i] && terminal[i] && batch[i].bundle_triplet && batch[i].bundle_layer >= 0) {
-                uint64_t bundle_bytes = 0;
-                for (int p = 0; p < 3; ++p) {
-                    bundle_bytes += batch[i].bundle_bytes[p];
-                }
-                if (bundle_bytes > 0) {
-                    prefetch_release_pending_vram_reservation(engine, bundle_bytes);
-                }
-            }
-        }
-        for (uint32_t i = 0; i < batch_count; ++i) {
-            finish_stage_task(engine, engine->gpu_stage, ok[i], terminal[i]);
-        }
+
 
         if (worker_index >= engine->gpu_worker_target.load()) {
             // BUGFIX 111: Prevent CUDA stream double-destroy on dynamic worker downscaling

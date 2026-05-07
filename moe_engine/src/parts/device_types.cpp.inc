@@ -78,9 +78,9 @@ struct moe_cuda_driver_api {
     void* (*cuStreamBeginCapture)(void*, int) = nullptr;
     void* (*cuStreamEndCapture)(void*, void**) = nullptr;
 
-    // GPUDirect Storage (cuFile) API — NVMe → GPU zero-copy DMA
+    // GPUDirect Storage (cuFile) API ??NVMe ??GPU zero-copy DMA
     // Research: GPUDirect Storage (NVIDIA, 2023-25)
-    // Eliminates CPU memcpy in the disk → pinned → GPU path by reading
+    // Eliminates CPU memcpy in the disk ??pinned ??GPU path by reading
     // directly from NVMe into GPU memory via RDMA engine.
     void* cufile_library = nullptr;
     moe_cufile_error_t (*cuFileDriverOpen)() = nullptr;
@@ -92,7 +92,7 @@ struct moe_cuda_driver_api {
     moe_cufile_read_fn cuFileRead = nullptr;  // (handle, devPtr, size, file_off, buf_off)
     bool cufile_available = false;
 
-    // cuMemHostRegister — for io_uring registered buffer integration
+    // cuMemHostRegister ??for io_uring registered buffer integration
     int (*cuMemHostRegister)(void*, size_t, unsigned int) = nullptr;
     int (*cuMemHostUnregister)(void*) = nullptr;
 };
@@ -123,7 +123,7 @@ struct moe_hip_driver_api {
     moe_cu_event_query_fn hipEventQuery = nullptr;
     moe_cu_event_synchronize_fn hipEventSynchronize = nullptr;
     moe_cu_event_destroy_fn hipEventDestroy = nullptr;
-    // BUGFIX 952: hipHostMalloc/hipHostFree for IOMMU-registered pinned staging ★★★
+    // hipHostMalloc/hipHostFree for IOMMU-registered pinned staging.
     int (*hipHostMalloc)(void**, size_t, unsigned int) = nullptr;
     int (*hipHostFree)(void*) = nullptr;
 };
@@ -134,7 +134,7 @@ struct moe_level_zero_driver_api {
     void* driver = nullptr;
     void* context = nullptr;
     void* device = nullptr;
-    void* command_queue = nullptr; // OPTIMIZATION: Add command queue handle ★★★
+    void* command_queue = nullptr;
     moe_ze_init_fn zeInit = nullptr;
     moe_ze_driver_get_fn zeDriverGet = nullptr;
     moe_ze_device_get_fn zeDeviceGet = nullptr;
@@ -145,23 +145,23 @@ struct moe_level_zero_driver_api {
     void* (*zeCommandQueueCreate)(void*, void*, void*, void**) = nullptr;
     void* (*zeCommandQueueDestroy)(void*) = nullptr;
     void* (*zeCommandQueueSynchronize)(void*, uint64_t) = nullptr;
-    void* (*zeCommandQueueExecuteCommandLists)(void*, uint32_t, void**, void*) = nullptr; // OPTIMIZATION: Execute command lists ★★★
+    void* (*zeCommandQueueExecuteCommandLists)(void*, uint32_t, void**, void*) = nullptr;
     void* (*zeEventCreate)(void*, void*, void**) = nullptr;
     void* (*zeEventDestroy)(void*) = nullptr;
     void* (*zeEventHostSynchronize)(void*, uint64_t) = nullptr;
     void* (*zeEventQueryStatus)(void*) = nullptr;
-    void* (*zeCommandListCreate)(void*, void*, void*, void**) = nullptr; // OPTIMIZATION: Create command list ★★★
-    void* (*zeCommandListDestroy)(void*) = nullptr; // OPTIMIZATION: Destroy command list ★★★
-    void* (*zeCommandListClose)(void*) = nullptr; // OPTIMIZATION: Close command list ★★★
-    void* (*zeCommandListReset)(void*) = nullptr; // OPTIMIZATION: Reset command list ★★★
+    void* (*zeCommandListCreate)(void*, void*, void*, void**) = nullptr;
+    void* (*zeCommandListDestroy)(void*) = nullptr;
+    void* (*zeCommandListClose)(void*) = nullptr;
+    void* (*zeCommandListReset)(void*) = nullptr;
     void* (*zeCommandListAppendMemoryCopy)(void*, void*, const void*, size_t, void*, uint32_t, void**) = nullptr;
-    void* (*zeCommandListAppendSignalEvent)(void*, void*) = nullptr; // OPTIMIZATION: Signal event in command list ★★★
-    void* (*zeCommandListAppendWaitOnEvents)(void*, uint32_t, void**) = nullptr; // OPTIMIZATION: Wait on events ★★★
-    int (*zeFenceCreate)(void*, void*, void**) = nullptr; // OPTIMIZATION: Create fence for sync ★★★
-    int (*zeFenceDestroy)(void*) = nullptr; // OPTIMIZATION: Destroy fence ★★★
-    int (*zeFenceHostSynchronize)(void*, uint64_t) = nullptr; // OPTIMIZATION: Fence host sync ★★★
-    int (*zeFenceQueryStatus)(void*) = nullptr; // OPTIMIZATION: Query fence status ★★★
-    int (*zeDeviceGetProperties)(void*, void*) = nullptr; // OPTIMIZATION: Get device properties ★★★
+    void* (*zeCommandListAppendSignalEvent)(void*, void*) = nullptr;
+    void* (*zeCommandListAppendWaitOnEvents)(void*, uint32_t, void**) = nullptr;
+    int (*zeFenceCreate)(void*, void*, void**) = nullptr;
+    int (*zeFenceDestroy)(void*) = nullptr;
+    int (*zeFenceHostSynchronize)(void*, uint64_t) = nullptr;
+    int (*zeFenceQueryStatus)(void*) = nullptr;
+    int (*zeDeviceGetProperties)(void*, void*) = nullptr;
     moe_ze_device_get_memory_properties_fn zeDeviceGetMemoryProperties = nullptr;
 };
 
@@ -171,8 +171,8 @@ struct moe_vulkan_driver_api {
     void* instance = nullptr;
     void* physicalDevice = nullptr;
     void* device = nullptr;
-    void* queue = nullptr;  // BUGFIX Problem E: Add queue handle for command submission ★★★
-    void* commandPool = nullptr;  // BUGFIX Problem E: Add command pool for command buffers ★★★
+    void* queue = nullptr;
+    void* commandPool = nullptr;
     void* (*vkCreateCommandPool)(void*, const void*, const void*, void**) = nullptr;
     void* (*vkDestroyCommandPool)(void*, void*, const void*) = nullptr;
     void* (*vkAllocateCommandBuffers)(void*, const void*, void**) = nullptr;
@@ -186,7 +186,7 @@ struct moe_vulkan_driver_api {
     int (*vkGetFenceStatus)(void*, void*) = nullptr;
     void* (*vkDestroyFence)(void*, void*, const void*) = nullptr;
     void* (*vkGetPhysicalDeviceMemoryProperties2)(void*, void*) = nullptr;
-    // BUGFIX Problem E: Add functions for H2D copy ★★★ FEATURE
+    // BUGFIX Problem E: Add functions for H2D copy ?끸쁾??FEATURE
     void* (*vkCreateBuffer)(void*, const void*, const void*, void**) = nullptr;
     void* (*vkDestroyBuffer)(void*, void*, const void*) = nullptr;
     void* (*vkGetBufferMemoryRequirements)(void*, void*, void*) = nullptr;
@@ -208,6 +208,7 @@ struct moe_device_allocation {
     uint64_t last_touch_epoch = 0;
     uint32_t inflight_copies = 0;
     bool pending_free = false;
+    bool resident_accounted = false;
     uint8_t pool = 0;
 };
 
@@ -216,5 +217,11 @@ enum {
     moe_DEVICE_POOL_ACTIVATION = 1,
     moe_DEVICE_POOL_EXPERT = 2,
     moe_DEVICE_POOL_STREAM = 3,
-    moe_DEVICE_POOL_KV_CACHE = 4  // BUGFIX 문제4: Add KV cache pool ★★★
+    moe_DEVICE_POOL_KV_CACHE = 4
+};
+
+struct vram_reservation_token {
+    uint64_t bytes = 0;
+    uint8_t pool = moe_DEVICE_POOL_EXPERT;
+    bool valid = false;
 };

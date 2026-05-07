@@ -1,12 +1,11 @@
 // Device tensor copy stream management
 
 // DONE: BUGFIX 77 - CUDA stream pool is already implemented below to avoid cuStreamCreate/Destroy on worker resize.
-static void prefetch_release_pending_vram_reservation(moe_pc_engine* engine, uint64_t bytes);
-
 struct moe_deferred_staging_copy {
     uint32_t slot = UINT32_MAX;
     uint64_t key = 0;
-    uint64_t bytes_for_vram_release = 0;  // BUGFIX 문제1: Track VRAM reservation to release at completion
+    uint64_t bytes_for_vram_release = 0;
+    vram_reservation_token vram_token{};
     CUevent event = nullptr;
     bool event_recorded = false;
 };
@@ -15,40 +14,40 @@ struct ThreadStreamGuard {
     moe_pc_engine* engine = nullptr;
     CUstream stream = nullptr;
     ~ThreadStreamGuard();
-        // BUGFIX 886: ThreadStreamGuard 소멸자 구현 완료 ★★★ CRITICAL
-        // Problem: GPU worker 비정상 종료 시 CUDA/HIP 스트림이 stream pool에 반환되지 않음
-        // Solution: 소멸자에서 device_stream_destroy_current 호출하여 스트림 반환
-        // Note: 정상 종료 경로(gpu_worker_loop 마지막)에서는 stream_guard.e = nullptr로 설정하여 중복 방지
+        // BUGFIX 886: ThreadStreamGuard ?뚮㈇??援ы쁽 ?꾨즺 ?끸쁾??CRITICAL
+        // Problem: GPU worker 鍮꾩젙??醫낅즺 ??CUDA/HIP ?ㅽ듃由쇱씠 stream pool??諛섑솚?섏? ?딆쓬
+        // Solution: ?뚮㈇?먯뿉??device_stream_destroy_current ?몄텧?섏뿬 ?ㅽ듃由?諛섑솚
+        // Note: ?뺤긽 醫낅즺 寃쎈줈(gpu_worker_loop 留덉?留??먯꽌??stream_guard.e = nullptr濡??ㅼ젙?섏뿬 以묐났 諛⑹?
         // Implementation: See destructor below - calls device_stream_destroy_current + releases in-flight bytes
 };
 static thread_local std::unordered_map<moe_pc_engine*, ThreadStreamGuard> s_tl_stream_guards;
 static thread_local std::unordered_map<moe_pc_engine*, std::vector<uint64_t>> s_tl_tensor_pending_keys;
 // BUGFIX 67: Issue 2 - Change deferred_staging_copies from vector to deque.
 // Problem: copies.erase(copies.begin()) is O(n) on vector
-// With 8-16 concurrent copies, drain loop becomes O(n²)
+// With 8-16 concurrent copies, drain loop becomes O(n짼)
 // Solution: Use std::deque for O(1) pop_front()
-// Impact: Drain performance improves from O(n²) to O(n)
+// Impact: Drain performance improves from O(n짼) to O(n)
 static thread_local std::unordered_map<moe_pc_engine*, std::deque<moe_deferred_staging_copy>> s_tl_deferred_staging_copies;
 static thread_local std::unordered_map<moe_pc_engine*, std::vector<CUevent>> s_tl_copy_event_pool;
 static constexpr int moe_DEVICE_COPY_BACKPRESSURE = -2;
 
-static void device_release_in_flight_vram_bytes(moe_pc_engine* e, uint64_t bytes) {
+static void device_release_inflight_vram_bytes(moe_pc_engine* e, uint64_t bytes) {
     if (!e || bytes == 0) {
         return;
     }
-    uint64_t current = e->vram_in_flight_bytes.load(std::memory_order_relaxed);
+    uint64_t current = e->vram_inflight_bytes.load(std::memory_order_relaxed);
     for (;;) {
         const uint64_t next = current > bytes ? current - bytes : 0;
-        // BUGFIX 966: Warn on underflow instead of silent clamp ★★ DIAGNOSTIC
+        // BUGFIX 966: Warn on underflow instead of silent clamp ?끸쁾 DIAGNOSTIC
         // Problem: Silent clamp to 0 hides double-free and byte mismatch bugs.
         // Solution: Log warning when underflow detected. No perf cost in normal path.
         if (current < bytes) {
             fprintf(stderr,
-                "[storageLLM WARNING] vram_in_flight_bytes underflow: current=%llu release=%llu "
+                "[storageLLM WARNING] vram_inflight_bytes underflow: current=%llu release=%llu "
                 "(possible double-free or byte mismatch)\n",
                 (unsigned long long)current, (unsigned long long)bytes);
         }
-        if (e->vram_in_flight_bytes.compare_exchange_weak(
+        if (e->vram_inflight_bytes.compare_exchange_weak(
                 current,
                 next,
                 std::memory_order_relaxed,
@@ -122,47 +121,55 @@ static void device_destroy_copy_event_pool(moe_pc_engine* e) {
     s_tl_copy_event_pool.erase(it);
 }
 
-static void device_defer_staging_copy(moe_pc_engine* e, uint32_t slot, uint64_t key, uint64_t vram_bytes, CUstream stream) {
-    // BUGFIX Issue 6: Use staging_slot_valid() helper for correct check order ★★★
+static void device_defer_staging_copy(
+    moe_pc_engine* e,
+    uint32_t slot,
+    uint64_t key,
+    uint64_t vram_bytes,
+    CUstream stream,
+    vram_reservation_token token = vram_reservation_token{}
+) {
+    // BUGFIX Issue 6: Use staging_slot_valid() helper for correct check order ?끸쁾??
     if (!e) {
         return;
     }
-    // BUGFIX 989: Atomic pending→in_flight transition ★★★ CRITICAL
-    // Problem: BUGFIX 981 releases pending BEFORE incrementing in_flight.
-    //   Between these two atomics, device_budget_bytes() sees bytes in NEITHER counter
-    //   → VRAM appears to have more free space than reality → over-commit → OOM.
-    // Solution: Guard both operations under vram_transition_mutex so budget observers
-    //   always see the bytes in exactly one counter.
-    // Contention: Minimal — this mutex is held for ~2 atomic ops (~20ns).
-    //   DMA queuing is async and not on the critical compute path.
-    if (vram_bytes > 0) {
-        std::unique_lock<std::shared_mutex> tlock(e->vram_transition_mutex);
-        prefetch_release_pending_vram_reservation(e, vram_bytes);
-        e->vram_in_flight_bytes.fetch_add(vram_bytes, std::memory_order_relaxed);
-    }
+
 
     // Check staging_slot_size > 0 to prevent use after timeout
     if (slot != UINT32_MAX && !staging_slot_valid(e, slot)) {
         fprintf(stderr,
             "[storageLLM ERROR] device_defer_staging_copy: staging_slot_size=0, "
             "slots are invalid after reset timeout. Rejecting deferred copy.\n");
-        device_release_in_flight_vram_bytes(e, vram_bytes);
+        if (token.valid) {
+            device_vram_release_reservation_token(e, token);
+        } else {
+            device_release_inflight_vram_bytes(e, vram_bytes);
+        }
         return;
     }
     moe_deferred_staging_copy copy{};
     copy.slot = slot;
     copy.key = key;
     copy.bytes_for_vram_release = vram_bytes;
+    copy.vram_token = token;
     copy.event = device_take_copy_event(e);
     if (!copy.event) {
-        device_release_in_flight_vram_bytes(e, vram_bytes);
+        if (token.valid) {
+            device_vram_release_reservation_token(e, token);
+        } else {
+            device_release_inflight_vram_bytes(e, vram_bytes);
+        }
         return; // Return error/abort
     }
     copy.event_recorded = device_backend_event_record(e, copy.event, stream) ? true : false;
     if (!copy.event_recorded) {
         device_recycle_copy_event(e, copy.event);
         copy.event = nullptr;
-        device_release_in_flight_vram_bytes(e, vram_bytes);
+        if (token.valid) {
+            device_vram_release_reservation_token(e, token);
+        } else {
+            device_release_inflight_vram_bytes(e, vram_bytes);
+        }
         return; // Return error/abort
     }
     s_tl_deferred_staging_copies[e].push_back(copy);
@@ -191,9 +198,9 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
     size_t released = 0;
     auto& copies = it->second;
 
-    // BUGFIX 898: RAII guard for vram_in_flight_bytes release ★★★ CRITICAL
+    // BUGFIX 898: RAII guard for vram_in_flight_bytes release ?끸쁾??CRITICAL
     // Problem: DMA failure or staging slot invalidation skips device_release_in_flight_vram_bytes
-    // → vram_in_flight_bytes accumulates → prefetch_plan trim sees device_free=0 → no prefetch
+    // ??vram_in_flight_bytes accumulates ??prefetch_plan trim sees device_free=0 ??no prefetch
     // Solution: RAII guard ensures bytes are released on all exit paths (success, failure, exception)
     // Impact: Prevents VRAM budget deadlock from leaked in-flight bytes
     struct VramReleaseGuard {
@@ -201,22 +208,22 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
         uint64_t bytes;
         bool released;
         VramReleaseGuard(moe_pc_engine* e, uint64_t b) : engine(e), bytes(b), released(false) {}
-        ~VramReleaseGuard() { if (!released && bytes > 0) device_release_in_flight_vram_bytes(engine, bytes); }
-        void release() { if (!released) { device_release_in_flight_vram_bytes(engine, bytes); released = true; } }
+        ~VramReleaseGuard() { if (!released && bytes > 0) device_release_inflight_vram_bytes(engine, bytes); }
+        void release() { if (!released) { device_release_inflight_vram_bytes(engine, bytes); released = true; } }
     };
 
     while (!copies.empty()) {
         moe_deferred_staging_copy& copy = copies.front();
-        VramReleaseGuard vram_guard(e, copy.bytes_for_vram_release);
+        VramReleaseGuard vram_guard(e, copy.vram_token.valid ? 0 : copy.bytes_for_vram_release);
 
         bool ready = false;
         if (copy.event && copy.event_recorded) {
             ready = wait_all ?
                 (device_backend_event_sync(e, copy.event) != 0) :
                 (device_backend_event_query(e, copy.event) != 0);
-            // BUGFIX NEW-7: Check supports_backend_async_api before stream operations ★★★ CRITICAL
+            // BUGFIX NEW-7: Check supports_backend_async_api before stream operations ?끸쁾??CRITICAL
             // Problem: Vulkan sets supports_backend_async_api=false but stream != nullptr check passes
-            // → Code tries async path with sync-only backend → double-buffering activated incorrectly
+            // ??Code tries async path with sync-only backend ??double-buffering activated incorrectly
             // Solution: Check both supports_backend_async_api AND stream != nullptr
             // Impact: Ensures Vulkan uses correct sync-only path, prevents false async assumptions
             if (!ready && wait_all && e->backend_caps.supports_backend_async_api && stream && !stream_synced) {
@@ -236,7 +243,7 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
             device_complete_pending_copy_key(e, copy.key);
         }
 
-        // BUGFIX 193: Slot already released in device_copy_tensor_from_host ★★★
+        // BUGFIX 193: Slot already released in device_copy_tensor_from_host ?끸쁾??
         // Only release if slot is still valid (UINT32_MAX means already released)
         if (copy.slot != UINT32_MAX) {
             release_staging_slot(e, copy.slot);
@@ -245,12 +252,16 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
             device_recycle_copy_event(e, copy.event);
         }
 
-        // BUGFIX 898: Explicit release via RAII guard (replaces old manual call)
-        vram_guard.release();
+        if (copy.vram_token.valid) {
+            device_vram_complete_reservation_token(e, copy.vram_token, copy.key);
+        } else {
+            vram_guard.release();
+            device_vram_mark_allocation_resident(e, copy.key);
+        }
 
         // BUGFIX 67: Issue 2 - Use pop_front() instead of erase(begin()).
-        // Old: copies.erase(copies.begin()) → O(n) on vector
-        // New: copies.pop_front() → O(1) on deque
+        // Old: copies.erase(copies.begin()) ??O(n) on vector
+        // New: copies.pop_front() ??O(1) on deque
         copies.pop_front();
         ++released;
     }
@@ -277,10 +288,10 @@ static void device_stream_sync_current(moe_pc_engine* e) {
 // Problem: Same as sync - finds in s_tl_stream_guards, checks s_tl_tensor_streams
 // Stream never returned to pool -> pool exhaustion -> cuStreamCreate fallback.
 // Solution: Check s_tl_stream_guards.end() and return it->second.stream to pool
-// BUGFIX 888: Remove deferred_staging_copies.erase() from here ★★★ CRITICAL
+// BUGFIX 888: Remove deferred_staging_copies.erase() from here ?끸쁾??CRITICAL
 // Problem: ThreadStreamGuard destructor calls this function, then tries to access
 // s_tl_deferred_staging_copies again to release in-flight bytes. But this function
-// already erased it, so destructor's cleanup code becomes dead code → VRAM deadlock.
+// already erased it, so destructor's cleanup code becomes dead code ??VRAM deadlock.
 // Solution: Only erase deferred_staging_copies in destructor, not here.
 static void device_stream_destroy_current(moe_pc_engine* e) {
     device_stream_sync_current(e);
@@ -308,9 +319,9 @@ ThreadStreamGuard::~ThreadStreamGuard() {
     engine = nullptr;
     stream = nullptr;
 
-    // BUGFIX 888: Clean up deferred copies BEFORE calling device_stream_destroy_current ★★★ CRITICAL
+    // BUGFIX 888: Clean up deferred copies BEFORE calling device_stream_destroy_current ?끸쁾??CRITICAL
     // Problem: device_stream_destroy_current() used to erase s_tl_deferred_staging_copies,
-    // so the cleanup code below became dead code. In-flight bytes were never released → VRAM deadlock.
+    // so the cleanup code below became dead code. In-flight bytes were never released ??VRAM deadlock.
     // Solution: Clean up deferred copies first, then call device_stream_destroy_current.
     // Impact: Fixes VRAM budget deadlock on worker crash, ensures in-flight bytes are released.
     auto dit = s_tl_deferred_staging_copies.find(e);
@@ -319,7 +330,11 @@ ThreadStreamGuard::~ThreadStreamGuard() {
             if (copy.event) device_backend_event_destroy(e, copy.event);
             if (copy.slot != UINT32_MAX) release_staging_slot(e, copy.slot);
             // Release in-flight bytes for this copy
-            device_release_in_flight_vram_bytes(e, copy.bytes_for_vram_release);
+            if (copy.vram_token.valid) {
+                device_vram_release_reservation_token(e, copy.vram_token);
+            } else {
+                device_release_inflight_vram_bytes(e, copy.bytes_for_vram_release);
+            }
         }
         s_tl_deferred_staging_copies.erase(dit);
     }
@@ -367,17 +382,17 @@ static void device_stream_pool_init(moe_pc_engine* e) {
 }
 
 // Fix 2: Thread-local cleanup function to prevent memory leak/dangling pointers
-// BUGFIX 문제 7: Add thread-local map cleanup for gpu_worker_loop ★★★ CRITICAL
+// BUGFIX 臾몄젣 7: Add thread-local map cleanup for gpu_worker_loop ?끸쁾??CRITICAL
 // Problem: s_tl_deferred_staging_copies, s_tl_tensor_pending_keys use engine* as key
-// → Engine destroyed → dangling pointer in thread_local map
-// → New engine at same address reuses stale data → corruption
+// ??Engine destroyed ??dangling pointer in thread_local map
+// ??New engine at same address reuses stale data ??corruption
 // Solution: GPU worker calls this function on exit to erase engine from all thread_local maps
 // Impact: Prevents use-after-free and memory corruption in multi-engine processes
 extern "C" {
 void device_cleanup_thread_locals(moe_pc_engine* engine) {
     if (!engine) return;
 
-    // BUGFIX 문제 7: Clean up all thread_local maps ★★★
+    // BUGFIX 臾몄젣 7: Clean up all thread_local maps ?끸쁾??
     auto it = s_tl_deferred_staging_copies.find(engine);
     if (it != s_tl_deferred_staging_copies.end()) {
         it->second.clear();
@@ -391,7 +406,7 @@ void device_cleanup_thread_locals(moe_pc_engine* engine) {
         s_tl_tensor_pending_keys.erase(pending_it);
     }
 
-    // BUGFIX 문제 7: Also clean up s_tl_stream_guards ★★★
+    // BUGFIX 臾몄젣 7: Also clean up s_tl_stream_guards ?끸쁾??
     auto stream_it = s_tl_stream_guards.find(engine);
     if (stream_it != s_tl_stream_guards.end()) {
         s_tl_stream_guards.erase(stream_it);

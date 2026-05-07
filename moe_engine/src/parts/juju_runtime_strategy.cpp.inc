@@ -90,17 +90,11 @@ static double moe_rt_compute_tflops_hint(const moe_backend_caps_t& caps) {
         // Solution: Use 8GB threshold - no iGPU has 8GB+, all Arc dGPUs have 6GB+
         // → A380/A580 get 40 TFLOPS, A770 gets 100 TFLOPS, B580 gets 200 TFLOPS
         // Impact: More robust classification, better prefetch depth for entry-level Arc
+        // BUGFIX Issue 5: Use explicit is_integrated_gpu flag instead of memory threshold
+        if (caps.is_integrated_gpu) return 10.0;
+        // Fallback for old backends that don't set is_integrated_gpu
         if (caps.device_memory_bytes <= 8ull * 1024ull * 1024ull * 1024ull) return 10.0; // iGPU (Xe integrated)
-        // BUGFIX 1003: Raise Arc TFLOPS closer to real INT8 throughput ★★ PERFORMANCE
-        // B580=256 TFLOPS(INT8), A770=128 TFLOPS(INT8). Old values (100/80) were
-        // 2-2.5x too low → overlap budget overestimated → shallow prefetch.
-        // Conservative estimates accounting for memory bandwidth limitations.
-        // BUGFIX Problem 4: Adjust thresholds after 8GB iGPU cutoff ★★ IMPORTANT
-        // discrete Arc: >8GB → A770/B580 class (10-16GB range)
-        // → Use single 100 TFLOPS estimate for all discrete Arc (conservative)
-        // Impact: Simpler classification, avoids fragile 12GB threshold
-        if (caps.device_memory_bytes > 8ull * 1024ull * 1024ull * 1024ull) return 100.0;  // All discrete Arc
-        return 10.0;  // iGPU (should not reach here due to early return above)
+        return 100.0;  // All discrete Arc
     case moe_BACKEND_OPENCL:
     case moe_BACKEND_WEBGPU:
         return 5.0;
@@ -332,7 +326,10 @@ static void moe_rt_apply_juju_io_flags(
         io->enable_mmap_prefetch = 0;
 #ifdef _WIN32
         io->prefer_overlapped_io = 1;
-        engine->prefer_overlapped_io_atomic.store(true, std::memory_order_release);
+        uint32_t current_gen = engine->prefer_overlapped_io_generation.load(std::memory_order_relaxed);
+        if ((current_gen & 1) == 0) {
+            engine->prefer_overlapped_io_generation.fetch_add(1, std::memory_order_release);
+        }
 #endif
     }
     io->prefetch_window_layers = cfg.prefetch_depth ? cfg.prefetch_depth : io->prefetch_window_layers;

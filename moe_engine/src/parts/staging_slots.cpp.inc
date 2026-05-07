@@ -29,7 +29,11 @@ static uint32_t moe_gpu_stage_batch_max(const moe_pc_engine* engine) {
     }
     const uint32_t streams = engine->backend_caps.copy_streams;
     const uint32_t derived = streams > UINT32_MAX / 4u ? UINT32_MAX : streams * 4u;
-    return std::max(4u, std::min(derived, 32u));
+    uint32_t batch_max = std::max(4u, std::min(derived, 32u));
+    if (engine->staging_slots.size() > 0) {
+        batch_max = std::min(batch_max, static_cast<uint32_t>(engine->staging_slots.size()));
+    }
+    return batch_max;
 }
 
 static void reset_staging_slots(moe_pc_engine* engine) {
@@ -43,6 +47,9 @@ static void reset_staging_slots(moe_pc_engine* engine) {
 
     // Step 1: Block new slot acquisitions
     engine->staging_free_slot_count.store(0, std::memory_order_release);
+    engine->staging_free_pinned_slots.store(0, std::memory_order_release);
+    engine->staging_free_gpu_slots.store(0, std::memory_order_release);
+    engine->staging_free_direct_slots.store(0, std::memory_order_release);
 
     // Step 2: Wait for all slots to be released (in_use == false)
     // Timeout after 5 seconds to prevent deadlock if workers are stuck
@@ -92,7 +99,6 @@ static void reset_staging_slots(moe_pc_engine* engine) {
         engine->staging_slot_size = 0;  // Mark slots as invalid
         engine->staging_generation.fetch_add(1, std::memory_order_relaxed);
         engine->staging_reinit_needed.store(true, std::memory_order_release);
-        uint32_t free_slots = 0;
         for (auto& slot : engine->staging_slots) {
             // BUGFIX 949: Preserve in-use slot events to prevent dangling handle ★★★ CRITICAL
             // Problem: Destroying last_copy_event while GPU worker still references it
@@ -116,11 +122,11 @@ static void reset_staging_slots(moe_pc_engine* engine) {
             // Solution: Nullify buf for all slots, workers check staging_generation
             // Impact: Prevents use-after-free when workers complete after timeout
             slot.buf = nullptr;
-            if (!slot.in_use.load(std::memory_order_acquire)) {
-                ++free_slots;
-            }
         }
-        engine->staging_free_slot_count.store(free_slots, std::memory_order_release);
+        engine->staging_free_slot_count.store(0, std::memory_order_release);
+        engine->staging_free_pinned_slots.store(0, std::memory_order_release);
+        engine->staging_free_gpu_slots.store(0, std::memory_order_release);
+        engine->staging_free_direct_slots.store(0, std::memory_order_release);
         return;
     }
 
@@ -145,6 +151,11 @@ static void reset_staging_slots(moe_pc_engine* engine) {
     engine->staging_pinned_slot_count.store(0, std::memory_order_release);
     engine->staging_gpu_slot_count.store(0, std::memory_order_release);
     engine->staging_direct_slot_count.store(0, std::memory_order_release);
+    engine->staging_free_slot_count.store(0, std::memory_order_release);
+    engine->staging_free_pinned_slots.store(0, std::memory_order_release);
+    engine->staging_free_gpu_slots.store(0, std::memory_order_release);
+    engine->staging_free_direct_slots.store(0, std::memory_order_release);
+    engine->staging_reinit_needed.store(false, std::memory_order_release);
     // BUGFIX 204: Add memory_order_relaxed for statistics counter ★
     engine->io_atomic.staging_slot_deficit.store(0, std::memory_order_relaxed);
     // BUGFIX 68: Issue 5 - Notify all 3 CVs on reset ??
@@ -460,6 +471,29 @@ static int moe_ensure_staging_capacity(moe_pc_engine* engine, uint64_t required_
         return 0;
     }
 
+    std::lock_guard<std::mutex> resize_lock(engine->staging_resize_mutex);
+    if (engine->staging_size >= required_bytes) {
+        free_staging_for_engine(
+            engine,
+            new_staging,
+            actual_bytes,
+            new_pinned,
+            new_numa,
+            new_device_host);
+        return 1;
+    }
+    reset_staging_slots(engine);
+    if (engine->staging_reinit_needed.load(std::memory_order_acquire)) {
+        free_staging_for_engine(
+            engine,
+            new_staging,
+            actual_bytes,
+            new_pinned,
+            new_numa,
+            new_device_host);
+        return 0;
+    }
+
     free_staging_for_engine(engine, engine->staging, engine->staging_size, engine->staging_pinned,
                             engine->staging_numa_allocated, engine->staging_device_host_allocated);
     engine->staging = new_staging;
@@ -756,7 +790,18 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
             slot_count,
             (unsigned long long)engine->staging_size);
     }
+    update_staging_slot_split_for_workers(engine);
     engine->staging_free_slot_count.store(slot_count, std::memory_order_release);
+    engine->staging_free_pinned_slots.store(
+        engine->staging_pinned_slot_count.load(std::memory_order_acquire),
+        std::memory_order_release);
+    engine->staging_free_gpu_slots.store(
+        engine->staging_gpu_slot_count.load(std::memory_order_acquire),
+        std::memory_order_release);
+    engine->staging_free_direct_slots.store(
+        engine->staging_direct_slot_count.load(std::memory_order_acquire),
+        std::memory_order_release);
+    engine->staging_reinit_needed.store(false, std::memory_order_release);
 
     // Register staging slots with IORing/io_uring
     if (engine->backend_caps.supports_registered_io_buffers && slot_count > 0 && engine->staging_pinned) {
@@ -782,7 +827,6 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
         }
     }
 
-    update_staging_slot_split_for_workers(engine);
     const uint32_t warning_slot_target = pinned_slot_target + gpu_slot_target + direct_slot_target;
     if (slot_count < warning_slot_target) {
         fprintf(stderr, "[WARNING] Insufficient staging slots: %u < %u. Expect pipeline stalls.\n",

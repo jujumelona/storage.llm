@@ -264,7 +264,14 @@ static moe_attn_config_t moe_generation_layer_attn_config(
             engine->model_config_partial_rotary_factor :
             (moe_json_get_double_local(engine->offload_gguf_metadata_json, "partial_rotary_factor", &dvalue) &&
             dvalue > 0.0 && dvalue <= 1.0 ? (float)dvalue : 0.0f);
-        if (partial > 0.0f) {
+        const int proportional_full_head_rope =
+            moe_engine_metadata_mentions(engine, "proportional") ||
+            moe_engine_graph_ir_mentions(engine, "proportional_frequency_dim_uses_full_head_dim") ||
+            moe_engine_graph_ir_mentions(engine, "\"rope_type\":\"proportional\"") ||
+            moe_engine_graph_ir_mentions(engine, "\"rope_type\": \"proportional\"");
+        if (proportional_full_head_rope && cfg.head_dim > 0) {
+            cfg.qk_rope_head_dim = cfg.head_dim;
+        } else if (partial > 0.0f) {
             cfg.qk_rope_head_dim = std::max<uint32_t>(2u, (uint32_t)std::round((float)cfg.head_dim * partial));
         }
         if (engine->model_config_full_rope_theta > 0.0f) {

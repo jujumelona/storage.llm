@@ -1,4 +1,4 @@
-// io_iocp_adapter.cpp.inc — IOCP-based async I/O for Windows pre-Win11 22H2
+// io_iocp_adapter.cpp.inc ??IOCP-based async I/O for Windows pre-Win11 22H2
 // Provides the same read interface as io_ring_adapter but uses
 // CreateFile + ReadFile + IOCP instead of IORing.
 // This eliminates the synchronous ifstream fallback that blocks io_worker threads.
@@ -51,9 +51,9 @@ struct moe_iocp_adapter_t {
 
         uint32_t slot = request_head % MAX_CONCURRENT;
 
-        // BUGFIX 918: Check if slot is still in use before reusing ★★★ CRITICAL
+        // BUGFIX 918: Check if slot is still in use before reusing ?�★??CRITICAL
         // Problem: When request_head wraps around (>64 requests), slot reuse happens
-        // without checking if previous request completed → OVERLAPPED struct corruption
+        // without checking if previous request completed ??OVERLAPPED struct corruption
         // Solution: Check completed flag, poll IOCP if not completed, fail if still busy
         // Impact: Prevents memory corruption on Windows non-DirectStorage path
         iocp_request_t& req = requests[slot];
@@ -90,14 +90,52 @@ struct moe_iocp_adapter_t {
         req.bytes_requested = bytes;
         req.completed = false;
 
-        // BUGFIX Platform Issue: IOCP + VirtualLock pinned memory ★★★
-        // Windows IOCP ReadFile works correctly with VirtualLock pinned memory
+        // BUGFIX Platform Issue: IOCP + VirtualLock pinned memory ?�★??        // Windows IOCP ReadFile works correctly with VirtualLock pinned memory
         // staging_alloc.cpp.inc already calls VirtualLock on staging buffers
         // No additional configuration needed - IOCP automatically uses pinned pages
         // This provides optimal DMA performance on Windows
         BOOL ok = ReadFile(hFile, dst, bytes, nullptr, &req.overlapped);
         if (!ok) {
             DWORD err = GetLastError();
+
+            // BUGFIX NEW-Z: Sector Alignment Fallback for ERROR_INVALID_PARAMETER ?�★??CRITICAL
+            // Problem: Non-DirectStorage environments with certain filesystem filters or
+            // device drivers enforce sector alignment (4KB) even without FILE_FLAG_NO_BUFFERING,
+            // causing async ReadFile to return ERROR_INVALID_PARAMETER (87).
+            // Solution: Fallback to a sector-aligned synchronous read using a temporary buffer,
+            // then copy to the destination and post a fake completion event to keep the async pipeline moving.
+            if (err == ERROR_INVALID_PARAMETER) {
+                const uint32_t sector_size = 4096;
+                uint64_t aligned_offset = (file_offset / sector_size) * sector_size;
+                uint32_t offset_diff = (uint32_t)(file_offset - aligned_offset);
+                uint32_t aligned_bytes = ((bytes + offset_diff + sector_size - 1) / sector_size) * sector_size;
+
+                void* aligned_buf = _aligned_malloc(aligned_bytes, sector_size);
+                if (aligned_buf) {
+                    OVERLAPPED sync_ov{};
+                    sync_ov.Offset = (DWORD)(aligned_offset & 0xFFFFFFFF);
+                    sync_ov.OffsetHigh = (DWORD)(aligned_offset >> 32);
+                    sync_ov.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+
+                    BOOL fallback_ok = ReadFile(hFile, aligned_buf, aligned_bytes, nullptr, &sync_ov);
+                    if (!fallback_ok && GetLastError() == ERROR_IO_PENDING) {
+                        DWORD transferred = 0;
+                        fallback_ok = GetOverlappedResult(hFile, &sync_ov, &transferred, TRUE);
+                    }
+
+                    if (fallback_ok) {
+                        memcpy(dst, (uint8_t*)aligned_buf + offset_diff, bytes);
+                        // Post fake completion to keep the async state machine consistent
+                        req.completed = true;
+                        PostQueuedCompletionStatus(iocp, bytes, (ULONG_PTR)hFile, &req.overlapped);
+                        err = ERROR_IO_PENDING; // Prevent failure return
+                    }
+
+                    if (sync_ov.hEvent) CloseHandle(sync_ov.hEvent);
+                    _aligned_free(aligned_buf);
+                }
+            }
+
             if (err != ERROR_IO_PENDING) {
                 // Synchronous completion or actual error
                 return err == ERROR_SUCCESS;

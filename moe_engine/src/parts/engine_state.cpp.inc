@@ -70,7 +70,7 @@ struct moe_pc_engine {
     mutable std::shared_mutex topology_mutex;
     mutable std::mutex topology_queue_mutex;
     // BUGFIX 166: Use std::deque instead of std::vector to prevent iterator invalidation
-    // std::vector::emplace_back() can trigger reallocation → all iterators invalidated
+    // std::vector::emplace_back() can trigger reallocation ??all iterators invalidated
     // std::deque never invalidates iterators on push_back (except end())
     std::deque<std::pair<uint64_t, uint64_t>> topology_update_queue;
     mutable std::mutex done_mutex;
@@ -79,7 +79,7 @@ struct moe_pc_engine {
     moe_stage_queue pinned_stage;
     moe_stage_queue gpu_stage;
 
-    // BUGFIX 32: Separate hot atomic variables into different cachelines ?�★??
+    // BUGFIX 32: Separate hot atomic variables into different cachelines ?占썩쁾??
     // Old: total_queue_depth, io_stop, worker_targets in consecutive memory ??false sharing
     // New: Group by access pattern, align each group to 64-byte cacheline
     // Group 1: Read-mostly by all workers (io_stop + total_queue_depth)
@@ -107,17 +107,17 @@ struct moe_pc_engine {
     uint32_t worker_resize_pending_gpu{0};
     int worker_resize_pending_direction{0};
     uint32_t worker_resize_streak{0};
-    // BUGFIX 958: Use atomic for thread-safe access ★★
+    // BUGFIX 958: Use atomic for thread-safe access ?끸쁾
     // Problem: Plain uint64_t written from orchestration loop which can be called
-    // from multiple threads → data race (C++ UB). Value is always same (monotonic
+    // from multiple threads ??data race (C++ UB). Value is always same (monotonic
     // snapshot of dropped_requests), but undefined behavior nonetheless.
     // Solution: std::atomic<uint64_t> with relaxed ordering (no perf impact).
     std::atomic<uint64_t> last_dropped_requests_snapshot{0};
 
-    // BUG 3 FIX: Prefetch window hysteresis (same pattern as worker resize) ?�★
-    // BUGFIX 1000: Make window hysteresis fields atomic ★★ DEFENSIVE
+    // BUG 3 FIX: Prefetch window hysteresis (same pattern as worker resize) ?占썩쁾
+    // BUGFIX 1000: Make window hysteresis fields atomic ?끸쁾 DEFENSIVE
     // Problem: Non-atomic uint32_t accessed from fill_orchestrator_plan which can
-    // be called from multiple threads → data race per C++ standard (UB).
+    // be called from multiple threads ??data race per C++ standard (UB).
     // Solution: std::atomic<uint32_t> with relaxed ordering. Zero perf cost on x86.
     std::atomic<uint32_t> prefetch_window_pending{0};
     std::atomic<uint32_t> prefetch_window_streak{0};
@@ -134,7 +134,7 @@ struct moe_pc_engine {
     std::mutex staging_slot_mutex;
     std::condition_variable staging_slot_cv;
     std::atomic<uint64_t> staging_generation{0};
-    // BUGFIX 949: Orphaned events from staging timeout ★★★
+    // BUGFIX 949: Orphaned events from staging timeout ?끸쁾??
     // When reset_staging_slots times out, in-use slots' last_copy_event handles
     // are moved here instead of being destroyed (GPU workers may still reference them).
     // release_staging_slot drains this list to prevent unbounded growth.
@@ -144,29 +144,27 @@ struct moe_pc_engine {
     std::condition_variable staging_gpu_cv;
     std::condition_variable staging_direct_cv;
     std::atomic<bool> staging_reinit_needed{false};
-    // BUGFIX 986: Atomic mirror for prefer_overlapped_io ★★ IMPORTANT
+    // BUGFIX 986: Atomic mirror for prefer_overlapped_io ?끸쁾 IMPORTANT
     // Problem: io_config.prefer_overlapped_io is plain int (public C ABI).
-    // Multiple io_worker threads write it concurrently → UB (data race on non-atomic int).
+    // Multiple io_worker threads write it concurrently ??UB (data race on non-atomic int).
     // Solution: Internal atomic bool is the source of truth. Reads use this;
     // writes update both this AND io_config.prefer_overlapped_io for external callers.
     std::atomic<bool> prefer_overlapped_io_atomic{false};
+    std::atomic<uint32_t> prefer_overlapped_io_generation{0};
     std::atomic<bool> overlapped_io_transition_done{false};
     std::atomic<bool> vlock_recovery_reset_pending{false};
-    // BUGFIX Problem 3: Engine-wide VirtualLock recovery counters ★★★ CRITICAL
-    // Problem: thread_local counters → each worker tracks independently
-    // → Recovery transition races with in-flight OVERLAPPED operations
+    // BUGFIX Problem 3: Engine-wide VirtualLock recovery counters ?끸쁾??CRITICAL
+    // Problem: thread_local counters ??each worker tracks independently
+    // ??Recovery transition races with in-flight OVERLAPPED operations
     // Solution: Engine-wide atomic counters shared by all IO workers
     // Impact: Consistent recovery state, proper synchronization
     std::atomic<uint32_t> vlock_recovery_counter{0};
     std::atomic<uint32_t> vlock_fail_counter{0};
-    // BUGFIX 989: Mutex for atomic pending→in_flight VRAM transition ★★★
-    // Held only during the 2-atomic-op transition (~20ns). device_budget_bytes()
-    // reads both counters under this mutex to get a consistent snapshot.
-    std::shared_mutex vram_transition_mutex;
+
     std::string topology_path;
     std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> topology_edges;
     std::mutex prefetch_plan_mutex;
-    // PIPELINE FIX 9: Replace unordered_set with generation counter ?�★
+    // PIPELINE FIX 9: Replace unordered_set with generation counter ?占썩쁾
     // Old: prefetch_plan_seen_set cleared every orchestrate (O(bucket_count))
     // New: generation counter + map (O(1) clear, bounded growth ~20k entries)
     uint64_t prefetch_plan_generation{0};
@@ -174,12 +172,12 @@ struct moe_pc_engine {
 
     // Co-activation Speculative Prefetch statistics
     // [layer][expert_n_minus_2][expert_n] -> frequency
-    // BUGFIX 문제9: Add mutex to protect co_activation data structures ★★★ CRITICAL
+    // BUGFIX 臾몄젣9: Add mutex to protect co_activation data structures ?끸쁾??CRITICAL
     std::shared_mutex co_activation_mutex;
     std::vector<std::unordered_map<int, std::unordered_map<int, float>>> co_activation_stats;
     std::vector<std::unordered_map<int, std::unordered_map<int, float>>> co_activation_stats_snapshot;
     std::vector<std::vector<int>> last_selected_experts;
-    // BUGFIX 701: Sliding window token counters to bound co_activation_stats memory ★★
+    // BUGFIX 701: Sliding window token counters to bound co_activation_stats memory ?끸쁾
     // co_activation_token_count: total update calls since last stats reset
     // last_merge_build_token_count: snapshot at last moe_build_expert_merge_map
     // Stats are cleared after merge map rebuild so only post-rebuild data accumulates.
@@ -206,32 +204,28 @@ struct moe_pc_engine {
     mutable std::atomic<uint32_t> cached_embedding_scale_bits{0};
     mutable std::atomic<int> cached_rmsnorm_unit_offset{-1};
     alignas(64) std::atomic<uint64_t> vram_used_bytes{0};
+    alignas(64) std::atomic<uint64_t> vram_resident_bytes{0};
+    alignas(64) std::atomic<uint64_t> vram_inflight_bytes{0};
+    alignas(64) std::atomic<uint64_t> vram_kv_bytes{0};
+    alignas(64) std::atomic<uint64_t> vram_common_bytes{0};
     alignas(64) std::atomic<uint64_t> ram_used_bytes{0};
     alignas(64) std::atomic<uint64_t> db_used_bytes{0};
 
-    // BUGFIX 875: Track VRAM in-flight bytes (DMA queued but not completed) ★★★ CRITICAL
-    // Problem: prefetch_plan trim calculation only sees tier_used(VRAM), missing bytes
-    // already queued to GPU DMA but not yet completed. GPU workers keep queueing new
-    // experts while old transfers are in-flight, causing VRAM overflow → eviction storm.
-    // Solution: Atomic counter incremented when DMA queued, decremented when event completes.
-    // prefetch_plan.cpp.inc subtracts this from device_free to prevent over-admission.
-    // Impact: Eliminates VRAM overflow, stabilizes token latency, prevents eviction thrashing.
-    alignas(64) std::atomic<uint64_t> vram_in_flight_bytes{0};
 
-    // BUGFIX 문제4: Add KV cache VRAM budget tracking ★★★
+
+    // BUGFIX 臾몄젣4: Add KV cache VRAM budget tracking ?끸쁾??
     // Problem: VRAM budget shared between experts and KV, no separation
     // Solution: Split VRAM budget into expert and KV portions
     // Default: 80% experts, 20% KV (configurable)
-    alignas(64) std::atomic<uint64_t> vram_kv_used_bytes{0};
     std::atomic<uint64_t> vram_kv_budget_bytes{0};  // Set during init
 
-    // BUGFIX Issue 4: Add per-engine warning timers ★★★
+    // BUGFIX Issue 4: Add per-engine warning timers ?끸쁾??
     // Problem: Static timers shared across all engines suppress warnings
     // Solution: Per-engine atomic timers for independent warning rate-limiting
     std::atomic<int64_t> last_budget_warn_ms{0};
     std::atomic<uint64_t> last_expert_budget_warn_ms{0};
 
-    // BUGFIX 문제8: Merge map rebuild trigger ★★★
+    // BUGFIX 臾몄젣8: Merge map rebuild trigger ?끸쁾??
     std::atomic<bool> merge_map_rebuild_pending{false};
 
     std::atomic<uint32_t> vram_expert_count{0};
@@ -241,7 +235,7 @@ struct moe_pc_engine {
     std::atomic<uint64_t> common_vram_reserved_bytes{0};
     std::atomic<uint64_t> common_raw_prefetched_bytes{0};
     std::atomic<uint64_t> common_raw_prefetched_spans{0};
-    // BUGFIX 33: Separate counter for queued vs actually transferred bytes ?�★??
+    // BUGFIX 33: Separate counter for queued vs actually transferred bytes ?占썩쁾??
     // Old: common_raw_prefetched_bytes mixed enqueue_only and actual transfer
     // New: common_raw_queued_bytes tracks enqueue_only, prefetched_bytes tracks actual transfer
     // Prevents stats confusion where "prefetched bytes" includes queued-but-not-transferred
@@ -254,14 +248,17 @@ struct moe_pc_engine {
     std::atomic<uint64_t> device_activation_count{0};
     std::atomic<uint64_t> device_expert_bytes{0};
     std::atomic<uint64_t> device_stream_bytes{0};
-    std::atomic<uint64_t> device_kv_cache_bytes{0};  // BUGFIX 문제4: KV cache pool counter ★★★
+    std::atomic<uint64_t> device_kv_cache_bytes{0};
+    std::atomic<bool> kv_actually_in_vram{false};
+    std::mutex cufile_cache_mutex;
+    std::unordered_map<int, void*> cufile_file_handle_cache;
+    std::unordered_map<uint64_t, uint64_t> cufile_buffer_registration_cache;
     std::atomic<uint64_t> device_total_bytes{0};
     std::atomic<uint64_t> device_free_bytes{0};
     std::atomic<uint64_t> pending_ram_reservation{0};
-    std::atomic<uint64_t> pending_vram_reservation{0}; // Fix 15: VRAM double admission prevention
     std::atomic<int64_t> last_mem_query_ms{0};  // Fix 41: per-engine cuMemGetInfo throttle
     std::atomic<int> device_allocator_ready{0};
-    std::atomic<bool> kv_actually_in_vram{false};
+
     std::atomic<bool> lifecycle_terminated{false};
     std::atomic<bool> juju_co_activation_bank_initialized{false};
     std::unordered_set<uint64_t> activation_keys;
@@ -275,6 +272,7 @@ struct moe_pc_engine {
     std::mutex heap_mutexes[3];  // Per-tier evict heap locks: VRAM, RAM, DB.
     std::atomic<uint64_t> evict_heap_versions[3]{};
     std::atomic<bool> evict_heap_compact_needed{false};
+    std::atomic<bool> evict_heap_urgent_compact{false};
     [[deprecated("DO NOT USE: causes deadlock. Use heap_mutexes[0/1/2] via evict_heap_mutex()")]]
     std::mutex heap_mutex_abi_compat_unused;  // DEAD LOCK: do not use. Use heap_mutexes[0/1/2] via evict_heap_mutex(); ABI layout only.
     std::atomic<bool> vram_eviction_in_progress{false};
@@ -285,6 +283,13 @@ struct moe_pc_engine {
     std::condition_variable ram_eviction_cv;
     std::atomic<bool> ram_eviction_needed{false};
     alignas(64) std::atomic<uint32_t> staging_free_slot_count{0};
+    std::atomic<uint32_t> staging_free_pinned_slots{0};
+    std::atomic<uint32_t> staging_free_gpu_slots{0};
+    std::atomic<uint32_t> staging_free_direct_slots{0};
+    std::atomic<uint64_t> staging_allocated_bytes{0};
+    std::mutex staging_resize_mutex;
+    std::mutex staging_slot_released_mutex;
+    std::condition_variable staging_slot_released_cv;
     std::mutex io_start_mutex;
     std::mutex cpu_row_mutex;
     std::condition_variable cpu_row_cv;

@@ -104,7 +104,7 @@
                         terminal = 0;
                         staged_direct_to_gpu = true;
                     } else {
-                        // BUGFIX 566: Check tensor_stream_bytes before acquire_staging_slot ??                        // Problem: tensor_stream_bytes can return 0, causing invalid slot allocation
+                        // Check tensor_stream_bytes before acquire_staging_slot.
                         // Solution: Check size > 0 before acquiring slot
                         const uint64_t stream_bytes = tensor_stream_bytes(rec);
                         if (stream_bytes == 0) {
@@ -167,7 +167,7 @@
                         ok = preserve_requeue(task, moe_TRANSFER_STAGE_DISK_TO_RAM);
                         terminal = 0;
                         finish_stage_task(engine, engine->disk_stage, ok, terminal);
-                        inflight_guard.mark_finished();  // BUGFIX 285: Mark as finished before continue ??                        if (worker_index >= engine->disk_worker_target.load()) {
+                        inflight_guard.mark_finished();
                         if (worker_index >= engine->disk_worker_target.load()) {
                             exit_worker();
                             return;
@@ -179,7 +179,7 @@
                         ok = preserve_requeue(task, moe_TRANSFER_STAGE_DISK_TO_RAM);
                         terminal = 0;
                         finish_stage_task(engine, engine->disk_stage, ok, terminal);
-                        inflight_guard.mark_finished();  // BUGFIX 285: Mark as finished before continue ??                        if (worker_index >= engine->disk_worker_target.load()) {
+                        inflight_guard.mark_finished();
                         if (worker_index >= engine->disk_worker_target.load()) {
                             exit_worker();
                             return;
@@ -222,7 +222,10 @@
                     }
                 } else if (ok && task.target_tier == moe_TIER_VRAM &&
                     engine_has_device_upload_workers(engine)) {
-                    ok = prefetch_tensor_pinned_to_gpu(engine, rec, UINT32_MAX, 0, 1, 0);
+                    ok = prefetch_tensor_pinned_to_gpu(engine, rec, UINT32_MAX, 0, 1, 0, task.vram_token);
+                    if (ok != moe_DEVICE_COPY_BACKPRESSURE) {
+                        task.vram_token.valid = false;
+                    }
                     if (ok == moe_DEVICE_COPY_BACKPRESSURE) {
                         // Bug #4: GPU full, re-enqueue to gpu_stage not disk_stage
                         task.urgent = 1;
@@ -231,6 +234,9 @@
                         if (ok) {
                             terminal = 0;
                             engine->gpu_stage.cv.notify_one();
+                        } else if (task.vram_token.valid) {
+                            device_vram_release_reservation_token(engine, task.vram_token);
+                            task.vram_token.valid = false;
                         }
                     }
                 }

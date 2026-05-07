@@ -1,30 +1,16 @@
-// BUGFIX 110: Issue 22 - Thread-safe warning flag ★
-// Problem: static bool warned is not thread-safe
+// BUGFIX 110: Issue 22 - Thread-safe warning flag ??// Problem: static bool warned is not thread-safe
 // Multiple threads can print warning simultaneously
 // Solution: Use atomic<bool> with exchange
 #ifdef _WIN32
+static std::mutex ws_mutex;
+static std::atomic<SIZE_T> reserved_total_ws{0};
+
 static void prepare_windows_staging_working_set(uint64_t bytes) {
     if (bytes == 0) {
         return;
     }
     const SIZE_T min_ws = (SIZE_T)(bytes + 16ull * 1024ull * 1024ull);
     const SIZE_T max_ws = (SIZE_T)(bytes + 64ull * 1024ull * 1024ull);
-    static std::mutex ws_mutex;
-    // BUGFIX 932: Windows staging working set data race ★★ IMPORTANT
-    // Problem: reserved_min_ws is non-atomic but read outside mutex → data race (C++ UB)
-    // Solution: Use std::atomic<SIZE_T> with relaxed memory order
-    // Impact: Eliminates undefined behavior, no performance change
-    // BUGFIX 1012: Track cumulative staging allocation, not maximum ★★★ CRITICAL
-    // Problem: reserved_min_ws tracks max single allocation, not total allocated
-    // → Second 4GB staging buffer not included in working set → page faults on memcpy
-    // Solution: Accumulate all staging allocations in reserved_total_ws
-    // Impact: Eliminates blocking page faults on multi-buffer staging
-    // BUGFIX NEW-2: Fix race condition in cumulative tracking ★★★ CRITICAL
-    // Problem: new_total calculated outside mutex → another thread can modify reserved_total_ws
-    // between load and store → lost updates or incorrect overflow check
-    // Solution: Move all calculation inside mutex, use single atomic snapshot
-    // Impact: Eliminates race condition, ensures correct cumulative tracking
-    static std::atomic<SIZE_T> reserved_total_ws{0};
 
     std::lock_guard<std::mutex> lock(ws_mutex);
     const SIZE_T current_total = reserved_total_ws.load(std::memory_order_relaxed);
@@ -50,9 +36,30 @@ static void prepare_windows_staging_working_set(uint64_t bytes) {
         }
     }
 }
+
+static void release_windows_staging_working_set(uint64_t bytes) {
+    if (bytes == 0) return;
+    const SIZE_T min_ws = (SIZE_T)(bytes + 16ull * 1024ull * 1024ull);
+
+    std::lock_guard<std::mutex> lock(ws_mutex);
+    const SIZE_T current_total = reserved_total_ws.load(std::memory_order_relaxed);
+    if (current_total >= min_ws) {
+        const SIZE_T updated_total = current_total - min_ws;
+        const SIZE_T updated_max = updated_total + 64ull * 1024ull * 1024ull;
+
+        // Optionally adjust the OS limit downwards, though not strictly required,
+        // it frees up the quota tracking.
+        SetProcessWorkingSetSize(GetCurrentProcess(), updated_total, updated_max);
+        reserved_total_ws.store(updated_total, std::memory_order_relaxed);
+    } else {
+        reserved_total_ws.store(0, std::memory_order_relaxed);
+    }
+}
 #else
 static void prepare_windows_staging_working_set(uint64_t) {}
+static void release_windows_staging_working_set(uint64_t) {}
 #endif
+
 
 static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* pinned, bool* numa_allocated) {
     if (pinned) {
@@ -66,10 +73,9 @@ static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* 
     }
 
 #ifdef _WIN32
-    // BUGFIX 100: Issue 16 - Windows large page support ★★★
-    // Problem: VirtualAlloc uses 4KB pages, causing TLB misses for large buffers
+    // BUGFIX 100: Issue 16 - Windows large page support ?�★??    // Problem: VirtualAlloc uses 4KB pages, causing TLB misses for large buffers
     // Solution: Try MEM_LARGE_PAGES (2MB pages) first, fallback to regular pages
-    // Impact: +5-10% DMA bandwidth, 95% → 99%+ TLB hit rate
+    // Impact: +5-10% DMA bandwidth, 95% ??99%+ TLB hit rate
     // Requires: "Lock pages in memory" privilege (SeLockMemoryPrivilege)
     void* ptr = nullptr;
     bool large_page = false;
@@ -142,7 +148,7 @@ static uint8_t* allocate_staging(int preferred_numa_node, uint64_t bytes, bool* 
             return nullptr;
         }
     }
-    // BUGFIX 101: Issue 17 - Linux transparent huge pages hint ★★
+    // BUGFIX 101: Issue 17 - Linux transparent huge pages hint ?�★
     // Problem: posix_memalign uses 4KB pages, causing TLB misses for large buffers
     // Solution: Use madvise(MADV_HUGEPAGE) to hint kernel to use 2MB huge pages
     // Impact: +3-5% TLB hit rate, -30% page fault overhead for buffers >= 2MB
@@ -169,6 +175,7 @@ static void free_staging(uint8_t* ptr, uint64_t bytes, bool pinned, bool numa_al
         VirtualUnlock(ptr, (SIZE_T)bytes);
     }
     VirtualFree(ptr, 0, MEM_RELEASE);
+    release_windows_staging_working_set(bytes);
 #else
     if (pinned) {
         munlock(ptr, static_cast<size_t>(bytes));
@@ -195,10 +202,10 @@ static uint8_t* allocate_staging_for_engine(
     if (device_host_allocated) {
         *device_host_allocated = false;
     }
-    // BUGFIX 952: HIP/ROCm pinned host memory allocation ★★★ CRITICAL
+    // BUGFIX 952: HIP/ROCm pinned host memory allocation ?�★??CRITICAL
     // Problem: ROCm path falls through to posix_memalign + mlock. mlock'd memory
     // is NOT registered with IOMMU on AMD GPUs, so hipMemcpyAsync silently degrades
-    // to synchronous memcpy → DMA overlap disabled → 30-50% throughput loss.
+    // to synchronous memcpy ??DMA overlap disabled ??30-50% throughput loss.
     // Solution: Use hipHostMalloc which allocates IOMMU-registered, DMA-accessible memory.
     // Impact: Restores true async DMA on AMD GPUs (MI300X, RX 7900, etc.)
     if (e &&
@@ -222,6 +229,7 @@ static uint8_t* allocate_staging_for_engine(
                     "[storageLLM INFO] HIP/ROCm staging: hipHostMalloc OK (%llu bytes)\n",
                     (unsigned long long)bytes);
             }
+            e->staging_allocated_bytes.fetch_add(bytes, std::memory_order_relaxed);
             return static_cast<uint8_t*>(ptr);
         }
         // Fall through to generic allocator if hipHostMalloc fails
@@ -252,10 +260,15 @@ static uint8_t* allocate_staging_for_engine(
                     "[storageLLM INFO] Level Zero/SYCL staging: zeMemAllocHost OK (%llu bytes)\n",
                     (unsigned long long)bytes);
             }
+            e->staging_allocated_bytes.fetch_add(bytes, std::memory_order_relaxed);
             return static_cast<uint8_t*>(ptr);
         }
     }
-    return allocate_staging(preferred_numa_node, bytes, pinned, numa_allocated);
+    uint8_t* result = allocate_staging(preferred_numa_node, bytes, pinned, numa_allocated);
+    if (result && e) {
+        e->staging_allocated_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    return result;
 }
 
 static void free_staging_for_engine(
@@ -266,8 +279,10 @@ static void free_staging_for_engine(
     bool numa_allocated,
     bool device_host_allocated
 ) {
-    // BUGFIX 952: HIP/ROCm hipHostFree path ★★★
-    // Must be checked before Level Zero path since both use device_host_allocated flag
+    if (e && ptr) {
+        e->staging_allocated_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+    }
+    // BUGFIX 952: HIP/ROCm hipHostFree path ?�★??    // Must be checked before Level Zero path since both use device_host_allocated flag
     if (device_host_allocated && e && e->backend_caps.backend == moe_BACKEND_HIP &&
         e->hip.hipHostFree) {
         e->hip.hipHostFree(ptr);
@@ -297,11 +312,11 @@ static uint8_t* allocate_best_staging(
         *pinned = false;
     }
     uint64_t bytes = requested_bytes;
-    // BUGFIX 984: Skip VirtualLock on HIP backends ★★ IMPORTANT
+    // BUGFIX 984: Skip VirtualLock on HIP backends ?�★ IMPORTANT
     // Problem: hipHostMalloc already pins memory via IOMMU registration.
     // prepare_windows_staging_working_set calls VirtualLock on the same region
-    // → double-pin attempt → ERROR_WORKING_SET_QUOTA on constrained systems
-    // → fallback to non-pinned → async DMA silently degrades to sync
+    // ??double-pin attempt ??ERROR_WORKING_SET_QUOTA on constrained systems
+    // ??fallback to non-pinned ??async DMA silently degrades to sync
     // Solution: Skip Windows working set expansion for HIP-managed memory.
     if (!e || e->backend_caps.backend != moe_BACKEND_HIP) {
         prepare_windows_staging_working_set(requested_bytes);
@@ -378,9 +393,9 @@ static uint8_t* allocate_best_staging(
         }
     }
 #endif
-    // BUGFIX 253: Add iteration limit to prevent excessive retries ★★
+    // BUGFIX 253: Add iteration limit to prevent excessive retries ?�★
     // Problem: bytes /= 2 loop can iterate many times for large initial values
-    // Example: 16GB → 8GB → 4GB → ... → 1MB = 14 iterations
+    // Example: 16GB ??8GB ??4GB ??... ??1MB = 14 iterations
     // Solution: Limit to 10 iterations (covers 1024x reduction)
     uint32_t retry_count = 0;
     constexpr uint32_t MAX_PINNED_RETRIES = 10;
@@ -410,7 +425,7 @@ static uint8_t* allocate_best_staging(
             }
             return ptr;
         }
-        // Bug 12 Fix: Non-pinned success → free and try smaller pinned allocation.
+        // Bug 12 Fix: Non-pinned success ??free and try smaller pinned allocation.
         // Non-pinned staging defeats async DMA (cuMemcpyHtoDAsync becomes sync).
         // This ensures allocate_best_staging only returns pinned memory or NULL,
         // preventing silent sync DMA disguised as async.

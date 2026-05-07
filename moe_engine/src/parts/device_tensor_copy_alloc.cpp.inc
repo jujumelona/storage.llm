@@ -7,22 +7,27 @@ static int device_prepare_tensor_allocation(
     uint8_t pool,
     int async_copy,
     CUdeviceptr* out_dst,
-    const void* host_ptr = nullptr
+    const void* host_ptr = nullptr,
+    const vram_reservation_token& reservation = vram_reservation_token{}
 ) {
-    // BUGFIX Issue 6: Validate staging_slot_size before any staging slot access ★★★
-    // Problem: After reset_staging_slots timeout, staging_slot_size = 0 but vector not cleared
+    // Validate staging state before any slot access.
+    // Problem: after reset_staging_slots timeout, staging_slot_size is 0 but vector entries may remain.
     // Code that checks slot_index < staging_slots.size() passes, but slot.buf may be nullptr
     // Solution: Check staging_slot_size > 0 before using any slot
-    // BUGFIX 760: Check bytes for SIZE_MAX overflow ★★★
+    // BUGFIX 760: Check bytes for SIZE_MAX overflow.
     if (!e || !out_dst || bytes > SIZE_MAX) {
         return 0;
     }
-    // BUGFIX 761: Check bytes for zero ★★
+    // BUGFIX 761: Check bytes for zero ??紐꾧께
     if (bytes == 0) {
         return 0;
     }
-    // BUGFIX 847: Check key for zero ★★
+    // BUGFIX 847: Check key for zero ??紐꾧께
     if (key == 0) {
+        return 0;
+    }
+    if (pool == moe_DEVICE_POOL_EXPERT &&
+        (!reservation.valid || reservation.pool != pool || reservation.bytes < bytes)) {
         return 0;
     }
     *out_dst = 0;
@@ -99,21 +104,6 @@ static int device_prepare_tensor_allocation(
                 }
             }
         }
-        // BUGFIX 243: Remove VRAM double-counting ★★★
-        // Problem: prefetch_admitted_tier already reserved VRAM via pending_vram_reservation CAS loop.
-        // Calling device_try_reserve_pending_vram here AGAIN causes double-counting:
-        // Same expert reserves VRAM twice → budget depletes 2x faster → false "VRAM full" errors.
-        // Solution: Remove device_try_reserve_pending_vram call entirely. Admission layer already reserved.
-        // Trade-off: Relies on admission layer to always reserve before calling this function.
-        // This is guaranteed by prefetch_plan_execute.cpp.inc Pass 1 admission logic.
-        // Note: BUGFIX 198 already flagged this as "Dead code - DO NOT CALL".
-        // Original code:
-        //   if (!a && !device_try_reserve_pending_vram(e, bytes)) {
-        //       e->io_atomic.device_alloc_failures.fetch_add(1, std::memory_order_relaxed);
-        //       e->io_atomic.staging_wraps.fetch_add(1);
-        //       return 0;
-        //   }
-        // Removed to prevent double-counting.
         if (!a) {
             moe_device_allocation next;
             next.key = key;
@@ -158,8 +148,6 @@ static int device_prepare_tensor_allocation(
                 alloc_ok = try_device_alloc();
             }
             if (!alloc_ok) {
-                // NOTE: pending_vram_reservation은 prefetch_plan_execute의 Pass 2에서
-                // 이미 해제됨. 여기서 별도 해제 불필요 (BUGFIX 243 참고)
                 e->io_atomic.device_alloc_failures.fetch_add(1, std::memory_order_relaxed);
                 lock.unlock();
                 device_refresh_mem_info(e, 1);

@@ -250,7 +250,10 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
 #ifdef _WIN32
     if (!engine->io_config.enable_directstorage && !engine->io_config.prefer_overlapped_io) {
         engine->io_config.prefer_overlapped_io = 1;
-        engine->prefer_overlapped_io_atomic.store(true, std::memory_order_release);
+        uint32_t current_gen = engine->prefer_overlapped_io_generation.load(std::memory_order_relaxed);
+        if ((current_gen & 1) == 0) {
+            engine->prefer_overlapped_io_generation.fetch_add(1, std::memory_order_release);
+        }
     }
 #endif
     if (engine->io_config.enable_pinned_host && engine->io_config.pinned_staging_bytes > 0) {

@@ -5,8 +5,7 @@ static int prefetch_one_raw_span(
     int allow_sync_fallback = 1
 );
 
-// BUGFIX 62: Forward declaration for dynamic batch_max function ?占썩쁾
-static uint32_t moe_gpu_stage_batch_max(const moe_pc_engine* engine);
+// BUGFIX 62: Forward declaration for dynamic batch_max function ??�썩??static uint32_t moe_gpu_stage_batch_max(const moe_pc_engine* engine);
 
 static int io_worker_requeue_disk_task(
     moe_pc_engine* engine,
@@ -63,7 +62,7 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
     // Solution: Cache load, re-check only after CV wakeup
     const auto should_stop = [&]() { return engine->io_stop.load(std::memory_order_relaxed); };
     while (!should_stop()) {
-        // BUGFIX 81: Problem 6 - Replace 5ms polling with event-driven CV ?끸쁾
+        // BUGFIX 81: Problem 6 - Replace 5ms polling with event-driven CV ??�쁾
         // Old: 5ms sleep caused CPU overhead and potential oscillation.
         // New: Wait on vram_eviction_cv. Triggered instantly when allocation > 85%.
         // Fallback to 50ms wait to periodically check RAM eviction.
@@ -74,10 +73,11 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
             engine->vram_eviction_cv.wait_for(lock, std::chrono::milliseconds(10), [&]() {
                 return engine->vram_eviction_needed.load(std::memory_order_relaxed) ||
                        engine->ram_eviction_needed.load(std::memory_order_relaxed) ||
+                       engine->evict_heap_urgent_compact.load(std::memory_order_relaxed) ||
                        engine->io_stop.load(std::memory_order_relaxed);
             });
-            // BUGFIX 臾몄젣2: proactive_eviction_worker_loop?먯꽌 ?뚮옒洹몃? eviction ?꾩뿉 clear ?끸쁾??            // Problem: CV 源⑥뼱??吏곹썑 ?뚮옒洹몃? false濡??명똿 ??eviction ?ㅽ뙣 ???ъ떆???놁쓬
-            // Solution: ?뚮옒洹몃? ?쎌뼱??濡쒖뺄 蹂?섏뿉 ??ν븯怨? eviction ?꾨즺 ?꾩뿉留?clear
+            // BUGFIX ?�몄??: proactive_eviction_worker_loop?�?�� ???��洹몃? eviction ?꾩뿉 clear ??�쁾??            // Problem: CV 源⑥�??吏곹?????��洹몃? false�??명똿 ??eviction ??�뙣 ?????????�쓬
+            // Solution: ???��洹몃? ??�뼱??濡쒖�?蹂??�뿉 ???ν�?�? eviction ?꾨즺 ?꾩뿉�?clear
             vram_eviction_flag = engine->vram_eviction_needed.load(std::memory_order_relaxed);
             ram_eviction_flag = engine->ram_eviction_needed.load(std::memory_order_relaxed);
         }
@@ -89,7 +89,7 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         const uint64_t ram_used = tier_budget(engine, moe_TIER_RAM) > 0 ? tier_used(engine, moe_TIER_RAM) : 0;
         const uint64_t vram_used = tier_used(engine, moe_TIER_VRAM);
 
-        // BUGFIX 57: Issue 2 - Lower proactive eviction trigger to 85% ?끸쁾
+        // BUGFIX 57: Issue 2 - Lower proactive eviction trigger to 85% ??�쁾
         // Problem: Attention prefetch cutoff at 87%, proactive eviction at 90%
         // ??% dead zone where attention blocked but eviction not started
         // ?묬PU fallback or mmap streaming for attention weights
@@ -107,8 +107,8 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
             demote_cold_until(engine, moe_TIER_VRAM, vram_bud - vram_target, freed);
             if (!freed.empty() && !engine->io_stop.load(std::memory_order_relaxed)) {
                 // BUGFIX 36: Reduce batch_size from 8 to 4 to lower mutex hold time ????
-                // Old: 8 횞 cuMemFree (100쨉s each) = 800쨉s device_mutex hold
-                // New: 4 횞 cuMemFree = 400쨉s device_mutex hold
+                // Old: 8 ??cuMemFree (100쨉s each) = 800쨉s device_mutex hold
+                // New: 4 ??cuMemFree = 400쨉s device_mutex hold
                 // All device_copy_tensor calls wait on device_mutex ??halving hold time improves throughput
                 // Trade-off: More batches needed for large evictions, but each batch blocks less
                 const size_t free_batch_size =
@@ -119,12 +119,12 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
             }
         }
 
-        // BUGFIX 臾몄젣2: eviction ?꾨즺 ???뚮옒洹?clear (?깃났 ?쒖뿉留?
-        // ?ㅽ뙣??寃쎌슦 ?뚮옒洹몃? ?좎??섏뿬 ?ㅼ쓬 ?ъ씠?댁뿉???ъ떆?
+        // BUGFIX ?�몄??: eviction ?꾨즺 ?????���?clear (?깃났 ??�뿉�?
+        // ??�뙣??寃쎌?????��洹몃? ?�???�뿬 ??�쓬 ?????�뿉??????
         bool retry_vram_eviction = false;
         if (vram_eviction_flag) {
             const uint64_t vram_used_after = tier_used(engine, moe_TIER_VRAM);
-            // eviction???깃났?덇굅???ъ슜瑜좎씠 紐⑺몴 ?댄븯濡??⑥뼱吏?寃쎌슦?먮쭔 ?뚮옒洹?clear
+            // eviction???깃났??�굅?????�瑜좎씠 紐⑺�???�븯�???�뼱�?寃쎌??�?�� ???���?clear
             if (vram_used_after > vram_threshold_85 && vram_used_after > vram_target) {
                 if (vram_eviction_succeeded) {
                     engine->vram_eviction_needed.store(true, std::memory_order_relaxed);
@@ -137,7 +137,7 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
             }
         }
 
-        // BUGFIX 124: Issue 29 - Skip RAM eviction for Metal unified memory ?끸쁾
+        // BUGFIX 124: Issue 29 - Skip RAM eviction for Metal unified memory ??�쁾
         // Metal uses unified memory budget tracked in VRAM only (ram_budget_bytes = 0).
         // RAM eviction would interfere with OS's native unified memory pressure management.
         // Metal automatically pages out to backing store when needed.
@@ -157,7 +157,7 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
             }
         }
 
-        // BUGFIX 臾몄젣2: RAM eviction ?꾨즺 ???뚮옒洹?clear (?깃났 ?쒖뿉留?
+        // BUGFIX ?�몄??: RAM eviction ?꾨즺 ?????���?clear (?깃났 ??�뿉�?
         bool retry_ram_eviction = false;
         if (ram_eviction_flag) {
             const uint64_t ram_used_after = tier_used(engine, moe_TIER_RAM);
@@ -177,7 +177,8 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
             !engine->io_stop.load(std::memory_order_relaxed)) {
             std::unique_lock<std::mutex> lock(engine->vram_eviction_mutex);
             engine->vram_eviction_cv.wait_for(lock, std::chrono::milliseconds(10), [&]() {
-                return engine->io_stop.load(std::memory_order_relaxed);
+                return engine->io_stop.load(std::memory_order_relaxed) ||
+                       engine->evict_heap_urgent_compact.load(std::memory_order_relaxed);
             });
         }
 
@@ -186,14 +187,16 @@ static void proactive_eviction_worker_loop(moe_pc_engine* engine) {
         // but proactive_eviction_worker_loop never checks this flag to actually compact the heap
         // Solution: Check flag and compact all heaps periodically
         // Impact: Prevents heap from accumulating stale entries
-        if (engine->evict_heap_compact_needed.load(std::memory_order_relaxed)) {
+        if (engine->evict_heap_urgent_compact.load(std::memory_order_relaxed) ||
+            engine->evict_heap_compact_needed.load(std::memory_order_relaxed)) {
+            engine->evict_heap_urgent_compact.store(false, std::memory_order_relaxed);
             engine->evict_heap_compact_needed.store(false, std::memory_order_relaxed);
             for (int idx = 0; idx < 3; ++idx) {
                 compact_evict_heap(engine, idx);
             }
         }
 
-        // BUGFIX 臾몄젣B: Adaptive queue depth adjustment ?끸쁾
+        // BUGFIX ?�몄?�B: Adaptive queue depth adjustment ??�쁾
         // Problem: Static queue depth caps don't adapt to runtime bottlenecks
         // pinned_stage saturation ??disk_stage should reduce cap
         // gpu_stage idle ??pinned_stage can increase cap
@@ -240,8 +243,7 @@ static void io_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         return;
     }
 
-    // BUGFIX 27: Add StreamGuard to prevent CUDA stream leak ?占썩쁾
-    // Old: device_stream_destroy_current only on normal exit paths
+    // BUGFIX 27: Add StreamGuard to prevent CUDA stream leak ??�썩??    // Old: device_stream_destroy_current only on normal exit paths
     // New: RAII guard ensures cleanup on exception/abnormal termination
     // Matches gpu_worker_loop pattern for consistency
     struct StreamGuard {

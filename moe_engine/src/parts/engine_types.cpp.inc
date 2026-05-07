@@ -136,7 +136,9 @@ struct moe_prefetch_task {
     int staging_valid = 0;
     int bundle_triplet = 0;
     int urgent = 0;
+    int allow_sync_fallback = 0;
     uint8_t requeue_count = 0;
+    vram_reservation_token vram_token{};
 };
 
 struct moe_stage_queue {
@@ -159,6 +161,7 @@ struct moe_staging_slot {
     std::atomic<bool> in_use{false};
     // BUGFIX 912: Add generation field for timeout detection ★★ IMPORTANT
     uint32_t generation = 0;
+    uint32_t io_generation = 0;
     // BUGFIX: Per-slot DMA fence for immediate release after cuMemcpyAsync
     // Acquirer must cuStreamWaitEvent on this before writing to buf
     CUevent last_copy_event = nullptr;
@@ -177,6 +180,7 @@ struct moe_staging_slot {
         device_host_allocated = other.device_host_allocated;
         in_use.store(other.in_use.load());
         generation = other.generation;
+        io_generation = other.io_generation;
         last_copy_event = other.last_copy_event;
         last_copy_stream = other.last_copy_stream;
         last_copy_event_recorded.store(
@@ -190,6 +194,7 @@ struct moe_staging_slot {
         other.device_host_allocated = false;
         other.in_use.store(false);
         other.generation = 0;
+        other.io_generation = 0;
         other.last_copy_event = nullptr;
         other.last_copy_stream = nullptr;
         other.last_copy_event_recorded.store(false, std::memory_order_relaxed);
@@ -203,6 +208,7 @@ struct moe_staging_slot {
         device_host_allocated = other.device_host_allocated;
         in_use.store(other.in_use.load());
         generation = other.generation;
+        io_generation = other.io_generation;
         last_copy_event = other.last_copy_event;
         last_copy_stream = other.last_copy_stream;
         last_copy_event_recorded.store(
@@ -216,6 +222,7 @@ struct moe_staging_slot {
         other.device_host_allocated = false;
         other.in_use.store(false);
         other.generation = 0;
+        other.io_generation = 0;
         other.last_copy_event = nullptr;
         other.last_copy_stream = nullptr;
         other.last_copy_event_recorded.store(false, std::memory_order_relaxed);

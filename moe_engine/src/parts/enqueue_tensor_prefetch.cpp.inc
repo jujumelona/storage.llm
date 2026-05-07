@@ -4,7 +4,9 @@ static int enqueue_tensor_prefetch(
     int expert,
     moe_projection_t proj,
     moe_tier_t target_tier,
-    int stream_state_prechecked = 0
+    int stream_state_prechecked = 0,
+    const vram_reservation_token& reservation = vram_reservation_token{},
+    int allow_sync_fallback = 1
 ) {
     if (!engine) {
         return 0;
@@ -20,6 +22,9 @@ static int enqueue_tensor_prefetch(
         std::lock_guard<std::mutex> lock(engine->map_mutex);
         if (eslot < engine->expert_states.size() && engine->expert_states[eslot].active &&
             engine->expert_states[eslot].tier == moe_TIER_STREAM) {
+            if (reservation.valid) {
+                device_vram_release_reservation_token(engine, reservation);
+            }
             return 1;  // Already being transferred ??skip silently
         }
     }
@@ -32,10 +37,15 @@ static int enqueue_tensor_prefetch(
             moe_prefetch_task task{};
             task.tensor_index = tensor_index;
             task.target_tier = target_tier;
+            task.vram_token = reservation;
             task.urgent = 1; // Mark urgent since caller expects immediate completion
+            task.allow_sync_fallback = allow_sync_fallback;
             if (enqueue_stage_or_retry(engine, engine->disk_stage, task)) {
                 engine->io_atomic.queued_requests.fetch_add(1);
                 return 1;
+            }
+            if (task.vram_token.valid) {
+                device_vram_release_reservation_token(engine, task.vram_token);
             }
         }
         // Fallback: truly synchronous (no IO workers)
@@ -43,11 +53,30 @@ static int enqueue_tensor_prefetch(
         const int ok = prefetch_tensor_record(engine, engine->tensors[tensor_index]);
         if (ok && target_tier == moe_TIER_VRAM &&
             engine_has_device_upload_workers(engine)) {
-            const int gpu_ok = prefetch_tensor_pinned_to_gpu(engine, engine->tensors[tensor_index]);
+            const int gpu_ok = prefetch_tensor_pinned_to_gpu(
+                engine,
+                engine->tensors[tensor_index],
+                UINT32_MAX,
+                0,
+                1,
+                allow_sync_fallback ? 1 : 0,
+                reservation);
             device_stream_destroy_current(engine);
-            if (!gpu_ok) {
+            if (gpu_ok == moe_DEVICE_COPY_BACKPRESSURE) {
+                if (reservation.valid) {
+                    device_vram_release_reservation_token(engine, reservation);
+                }
+                demote_failed_device_expert(engine, engine->tensors[tensor_index]);
+            } else if (!gpu_ok) {
                 demote_failed_device_expert(engine, engine->tensors[tensor_index]);
             }
+        } else if (ok && target_tier == moe_TIER_VRAM) {
+            if (reservation.valid) {
+                device_vram_release_reservation_token(engine, reservation);
+            }
+            demote_failed_device_expert(engine, engine->tensors[tensor_index]);
+        } else if (!ok && reservation.valid) {
+            device_vram_release_reservation_token(engine, reservation);
         }
         if (ok) {
             engine->io_atomic.queued_requests.fetch_add(1);
@@ -58,21 +87,29 @@ static int enqueue_tensor_prefetch(
         return ok;
     }
     if (!ensure_io_ready(engine)) {
+        if (reservation.valid) {
+            device_vram_release_reservation_token(engine, reservation);
+        }
         return 0;
     }
     engine->io_atomic.active_path.store(static_cast<uint32_t>(choose_active_io_path(engine)));
     moe_prefetch_task task{};
     task.tensor_index = tensor_index;
     task.target_tier = target_tier;
+    task.vram_token = reservation;
     const moe_tensor_record& rec = engine->tensors[tensor_index];
     task.urgent = (target_tier == moe_TIER_VRAM ||
         rec.prefetch_priority >= 95 ||
         rec.prefetch_class == moe_JUJU_PREFETCH_STARTUP_HOT ||
         rec.prefetch_class == moe_JUJU_PREFETCH_ROUTER_HOT) ? 1 : 0;
+    task.allow_sync_fallback = allow_sync_fallback;
     const int queued = (task.urgent || target_tier == moe_TIER_VRAM) ?
         enqueue_stage_or_retry(engine, engine->disk_stage, task) :
         enqueue_stage(engine, engine->disk_stage, task);
     if (!queued) {
+        if (task.vram_token.valid) {
+            device_vram_release_reservation_token(engine, task.vram_token);
+        }
         // BUGFIX 237: Track prefetch admission failures
         // Problem: enqueue failure returns 0 without updating statistics
         // Impact: /health monitoring shows incorrect hit rate (failures not counted)

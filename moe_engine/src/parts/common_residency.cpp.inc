@@ -115,8 +115,8 @@ static uint64_t vram_expert_budget_bytes_checked(const moe_pc_engine* engine) {
             // Old message: "Consider reducing vram_kv_ratio"
             // New message: Reflect that KV is soft cap, show actual usage
             const uint64_t kv_cap = engine->vram_kv_budget_bytes.load(std::memory_order_relaxed);
-            const uint64_t kv_actual = engine->device_kv_cache_bytes.load(std::memory_order_relaxed);
-            const uint64_t pending = engine->pending_vram_reservation.load(std::memory_order_relaxed);
+            const uint64_t kv_actual = engine->vram_kv_bytes.load(std::memory_order_relaxed);
+            const uint64_t pending = engine->vram_inflight_bytes.load(std::memory_order_relaxed);
             fprintf(stderr,
                 "[storageLLM WARNING] Expert VRAM budget exhausted: "
                 "total=%llu MB, KV cap=%llu MB (actual=%llu MB), common=%llu MB, pending=%llu MB. "
@@ -156,8 +156,10 @@ void init_kv_vram_budget(moe_pc_engine* engine) {
     if (!engine || engine->config.vram_budget_bytes == 0) {
         if (engine) {
             engine->vram_kv_budget_bytes.store(0, std::memory_order_relaxed);
-            engine->vram_kv_used_bytes.store(0, std::memory_order_relaxed);
+            engine->vram_kv_bytes.store(0, std::memory_order_relaxed);
+            engine->vram_kv_bytes.store(0, std::memory_order_relaxed);
             engine->device_kv_cache_bytes.store(0, std::memory_order_relaxed);
+            engine->kv_actually_in_vram.store(false, std::memory_order_release);
         }
         return;
     }
@@ -169,8 +171,10 @@ void init_kv_vram_budget(moe_pc_engine* engine) {
     // Impact: Eliminates double-counting, KV managed by macOS memory pressure system
     if (engine->backend_caps.backend == moe_BACKEND_METAL) {
         engine->vram_kv_budget_bytes.store(0, std::memory_order_relaxed);
-        engine->vram_kv_used_bytes.store(0, std::memory_order_relaxed);
+        engine->vram_kv_bytes.store(0, std::memory_order_relaxed);
+        engine->vram_kv_bytes.store(0, std::memory_order_relaxed);
         engine->device_kv_cache_bytes.store(0, std::memory_order_relaxed);
+        engine->kv_actually_in_vram.store(false, std::memory_order_release);
         fprintf(stderr,
             "[storageLLM INFO] Metal unified memory: KV budget set to 0, delegated to OS memory pressure\n");
         return;
@@ -178,8 +182,10 @@ void init_kv_vram_budget(moe_pc_engine* engine) {
 
     if (!moe_kv_vram_attention_runtime_available(engine)) {
         engine->vram_kv_budget_bytes.store(0, std::memory_order_relaxed);
-        engine->vram_kv_used_bytes.store(0, std::memory_order_relaxed);
+        engine->vram_kv_bytes.store(0, std::memory_order_relaxed);
+        engine->vram_kv_bytes.store(0, std::memory_order_relaxed);
         engine->device_kv_cache_bytes.store(0, std::memory_order_relaxed);
+        engine->kv_actually_in_vram.store(false, std::memory_order_release);
         fprintf(stderr,
             "[storageLLM INFO] KV VRAM tier disabled: no compiled device-side KV attention consumer; "
             "flat/QKV KV remains RAM-resident.\n");
@@ -248,9 +254,11 @@ void init_kv_vram_budget(moe_pc_engine* engine) {
     // device_budget_bytes() will use device_kv_cache_bytes.load() for real-time accounting
     const uint64_t kv_budget = (uint64_t)(engine->config.vram_budget_bytes * kv_ratio);
     engine->vram_kv_budget_bytes.store(kv_budget, std::memory_order_relaxed);
-    engine->vram_kv_used_bytes.store(0, std::memory_order_relaxed);
+    engine->vram_kv_bytes.store(0, std::memory_order_relaxed);
+    engine->vram_kv_bytes.store(0, std::memory_order_relaxed);
     // OPTIMIZATION: Initialize device_kv_cache_bytes for dynamic tracking
     engine->device_kv_cache_bytes.store(0, std::memory_order_relaxed);
+    engine->kv_actually_in_vram.store(false, std::memory_order_release);
 
     fprintf(stderr,
         "[storageLLM INFO] VRAM budget split: Total=%llu MB, KV soft cap=%llu MB (%.0f%%), Experts=%llu MB (dynamic)\n",
@@ -270,6 +278,7 @@ static void apply_common_vram_reservation(moe_pc_engine* engine) {
     // Solution: Add memory_order_relaxed to all atomic stores (initialization doesn't need synchronization)
     // Impact: 40-200x performance improvement in VRAM reservation setup
     engine->common_vram_reserved_bytes.store(0, std::memory_order_relaxed);
+    engine->vram_common_bytes.store(0, std::memory_order_relaxed);
     engine->vram_used_bytes.store(0, std::memory_order_relaxed);
 
     // BUGFIX 문제4: Initialize KV VRAM budget
@@ -285,6 +294,7 @@ static void apply_common_vram_reservation(moe_pc_engine* engine) {
         engine->config.vram_budget_bytes
     );
     engine->common_vram_reserved_bytes.store(reserve, std::memory_order_relaxed);
+    engine->vram_common_bytes.store(0, std::memory_order_relaxed);
     engine->vram_used_bytes.store(0, std::memory_order_relaxed);
     engine->common_vram_upload_complete.store(reserve == 0, std::memory_order_release);
 }

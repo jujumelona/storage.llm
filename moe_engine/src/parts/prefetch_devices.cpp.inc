@@ -43,7 +43,8 @@ static int prefetch_tensor_pinned_to_gpu(
     uint32_t staging_slot = UINT32_MAX,
     uint64_t staging_bytes = 0,
     int sync_after = 1,
-    int allow_sync_fallback = 1
+    int allow_sync_fallback = 1,
+    const vram_reservation_token& reservation = vram_reservation_token{}
 ) {
     if (!engine) {
         return 0;
@@ -58,10 +59,12 @@ static int prefetch_tensor_pinned_to_gpu(
             moe_DEVICE_POOL_EXPERT,
             engine->staging_slots[staging_slot].buf.load(std::memory_order_acquire),
             staging_bytes,
-            staging_slot
+            staging_slot,
+            1,
+            reservation
         );
     } else {
-        copied = device_copy_tensor(engine, rec, moe_DEVICE_POOL_EXPERT, allow_sync_fallback);
+        copied = device_copy_tensor(engine, rec, moe_DEVICE_POOL_EXPERT, allow_sync_fallback, reservation);
     }
     if (copied == moe_DEVICE_COPY_BACKPRESSURE) {
         return moe_DEVICE_COPY_BACKPRESSURE;
@@ -92,6 +95,15 @@ static int prefetch_expert_triplet_pinned_to_gpu_bundle(
     }
     const moe_projection_t projs[3] = {moe_PROJ_GATE, moe_PROJ_UP, moe_PROJ_DOWN};
     uint64_t copied_total = 0;
+    uint64_t token_bytes_consumed = 0;
+    auto release_unconsumed_token = [&]() {
+        if (task.vram_token.valid && task.vram_token.bytes > token_bytes_consumed) {
+            vram_reservation_token rest = task.vram_token;
+            rest.bytes -= token_bytes_consumed;
+            device_vram_release_reservation_token(engine, rest);
+            token_bytes_consumed = task.vram_token.bytes;
+        }
+    };
     for (uint32_t i = 0; i < 3u; ++i) {
         const moe_tensor_record* rec = find_tensor_record(
             engine,
@@ -104,10 +116,17 @@ static int prefetch_expert_triplet_pinned_to_gpu_bundle(
             if (rec) {
                 demote_failed_device_expert(engine, *rec);
             }
+            release_unconsumed_token();
             release_staging_slot(engine, task.staging_slot);
             return 0;
         }
         const uint8_t* host = engine->staging_slots[task.staging_slot].buf.load(std::memory_order_acquire) + task.bundle_offsets[i];
+        vram_reservation_token sub_token{};
+        if (task.vram_token.valid) {
+            sub_token.bytes = task.bundle_bytes[i];
+            sub_token.pool = task.vram_token.pool;
+            sub_token.valid = task.bundle_bytes[i] > 0;
+        }
         const int ok = device_copy_tensor_from_host(
             engine,
             *rec,
@@ -115,14 +134,20 @@ static int prefetch_expert_triplet_pinned_to_gpu_bundle(
             host,
             task.bundle_bytes[i],
             task.staging_slot,
-            0);
+            0,
+            sub_token);
+        if (sub_token.valid) {
+            token_bytes_consumed += sub_token.bytes;
+        }
         if (!ok) {
             demote_failed_device_expert(engine, *rec);
+            release_unconsumed_token();
             release_staging_slot(engine, task.staging_slot);
             return 0;
         }
         copied_total += task.bundle_bytes[i];
     }
+    release_unconsumed_token();
     release_staging_slot(engine, task.staging_slot);
     if (sync_after) {
         device_stream_sync_current(engine);
@@ -132,18 +157,24 @@ static int prefetch_expert_triplet_pinned_to_gpu_bundle(
     return 1;
 }
 
-static int prefetch_tensor_direct_to_gpu(moe_pc_engine* engine, const moe_tensor_record& rec) {
+static int prefetch_tensor_direct_to_gpu(
+    moe_pc_engine* engine,
+    const moe_tensor_record& rec,
+    const vram_reservation_token& reservation = vram_reservation_token{},
+    int allow_sync_fallback = 0
+) {
     if (!engine) {
         return 0;
     }
     const uint64_t bytes = tensor_stream_bytes(rec);
-    int copied = device_copy_tensor_gpudirect_storage(engine, rec, moe_DEVICE_POOL_EXPERT);
+    int copied = device_copy_tensor_gpudirect_storage(engine, rec, moe_DEVICE_POOL_EXPERT, reservation);
     if (!copied) {
-        // CRITICAL FIX: Allow sync fallback when staging slots are exhausted.
-        // Before: allow_sync_fallback=0 caused infinite BACKPRESSURE loop when slots unavailable.
-        // After: allow_sync_fallback=1 enables sync DMA as last resort, ensuring forward progress.
-        // Sync DMA blocks IO worker but completes the transfer; BACKPRESSURE blocks forever.
-        copied = device_copy_tensor(engine, rec, moe_DEVICE_POOL_EXPERT, 1);
+        copied = device_copy_tensor(
+            engine,
+            rec,
+            moe_DEVICE_POOL_EXPERT,
+            allow_sync_fallback ? 1 : 0,
+            reservation);
     }
     if (copied == moe_DEVICE_COPY_BACKPRESSURE) {
         return moe_DEVICE_COPY_BACKPRESSURE;
