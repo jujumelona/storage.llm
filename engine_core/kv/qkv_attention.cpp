@@ -100,6 +100,38 @@ int qkv_attention_decode_impl(
             ? cfg->attention_logit_softcap
             : 0.0f;
 
+    if ((uint32_t)n <= s->sink_tokens && s->k_sink && s->v_sink) {
+        float max_score = -INFINITY;
+        for (int t = 0; t < n; ++t) {
+            const float* k = s->k_sink + (size_t)t * (size_t)d;
+            float dot = 0.0f;
+            for (int i = 0; i < d; ++i) {
+                dot += query[i] * k[i];
+            }
+            att[t] = qkv_attention_apply_logit_softcap(attn_logit_softcap, dot * sc);
+            if (!std::isfinite(att[t])) return 0;
+            if (att[t] > max_score) max_score = att[t];
+        }
+        if (!std::isfinite(max_score)) return 0;
+        float denom = 0.0f;
+        for (int t = 0; t < n; ++t) {
+            att[t] = expf(att[t] - max_score);
+            if (!std::isfinite(att[t])) return 0;
+            denom += att[t];
+        }
+        if (!(denom > 1e-10f) || !std::isfinite(denom)) return 0;
+        memset(output, 0, (size_t)d * sizeof(float));
+        const float inv_denom = 1.0f / denom;
+        for (int t = 0; t < n; ++t) {
+            const float w = att[t] * inv_denom;
+            const float* v = s->v_sink + (size_t)t * (size_t)d;
+            for (int i = 0; i < d; ++i) {
+                output[i] += w * v[i];
+            }
+        }
+        return 1;
+    }
+
     // Bug 2 Fix: Use pre-computed worker limit instead of OS call
     const int max_workers = s->computed_workers > 0 ? s->computed_workers : 1;
     // BUGFIX 353: workers 계산 시 division by zero 방지
