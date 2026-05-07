@@ -13,10 +13,16 @@ static void stop_io_workers_locked(moe_pc_engine* engine) {
     engine->disk_worker_target.store(0);
     engine->pinned_worker_target.store(0);
     engine->gpu_worker_target.store(0);
+    engine->gds_blocking_worker_target.store(0);
     engine->disk_stage.cv.notify_all();
     engine->pinned_stage.cv.notify_all();
     engine->gpu_stage.cv.notify_all();
     engine->gds_blocking_cv.notify_all();
+#ifdef _WIN32
+    if (engine->directstorage.event_handle) {
+        SetEvent(static_cast<HANDLE>(engine->directstorage.event_handle));
+    }
+#endif
     engine->disk_stage.pop_cv.notify_all();
     engine->pinned_stage.pop_cv.notify_all();
     engine->gpu_stage.pop_cv.notify_all();
@@ -42,8 +48,13 @@ static void stop_io_workers_locked(moe_pc_engine* engine) {
             worker.join();
         }
     }
-    if (engine->gds_blocking_worker.joinable()) {
-        engine->gds_blocking_worker.join();
+    if (engine->directstorage_completion_worker.joinable()) {
+        engine->directstorage_completion_worker.join();
+    }
+    for (std::thread& worker : engine->gds_blocking_workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
     }
     if (engine->eviction_worker.joinable()) {
         engine->eviction_worker.join();
@@ -54,6 +65,7 @@ static void stop_io_workers_locked(moe_pc_engine* engine) {
     engine->io_workers.clear();
     engine->pinned_workers.clear();
     engine->gpu_workers.clear();
+    engine->gds_blocking_workers.clear();
     {
         std::lock_guard<std::mutex> lock(engine->gds_blocking_mutex);
         engine->gds_blocking_queue.clear();
@@ -136,10 +148,22 @@ static void start_io_workers(moe_pc_engine* engine) {
     if (!engine->eviction_worker.joinable()) {
         engine->eviction_worker = std::thread(proactive_eviction_worker_loop, engine);
     }
+    if (engine->io_config.enable_directstorage &&
+        !engine->directstorage_completion_worker.joinable()) {
+        engine->directstorage_completion_worker = std::thread(directstorage_completion_worker_loop, engine);
+    }
     if (engine->backend_caps.backend == moe_BACKEND_CUDA &&
         engine->io_config.enable_gpudirect_storage &&
-        !engine->gds_blocking_worker.joinable()) {
-        engine->gds_blocking_worker = std::thread(gds_blocking_worker_loop, engine);
+        engine->gds_blocking_workers.empty()) {
+        uint32_t gds_workers = runtime_disk_workers(engine);
+        if (gds_workers == 0) {
+            gds_workers = engine->io_config.disk_worker_threads ? engine->io_config.disk_worker_threads : 1u;
+        }
+        gds_workers = std::max<uint32_t>(1u, std::min<uint32_t>(4u, gds_workers));
+        engine->gds_blocking_worker_target.store(gds_workers, std::memory_order_release);
+        for (uint32_t i = 0; i < gds_workers; ++i) {
+            engine->gds_blocking_workers.emplace_back(gds_blocking_worker_loop, engine);
+        }
     }
 }
 

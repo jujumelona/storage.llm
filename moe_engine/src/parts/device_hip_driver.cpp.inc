@@ -7,6 +7,15 @@ static void* moe_open_hip_driver_library() {
 #endif
 }
 
+static void* moe_open_hiprtc_library() {
+#ifdef _WIN32
+    return (void*)LoadLibraryA("hiprtc.dll");
+#else
+    void* lib = dlopen("libhiprtc.so.6", RTLD_LAZY | RTLD_LOCAL);
+    return lib ? lib : dlopen("libhiprtc.so", RTLD_LAZY | RTLD_LOCAL);
+#endif
+}
+
 static void* moe_find_hip_symbol(void* lib, const char* a, const char* b = nullptr) {
     void* sym = moe_find_shared_symbol(lib, a);
     return sym ? sym : moe_find_shared_symbol(lib, b);
@@ -60,6 +69,18 @@ static int hip_driver_load(moe_hip_driver_api* api) {
     api->hipHostRegister = (decltype(api->hipHostRegister))moe_find_shared_symbol(api->library, "hipHostRegister");
     api->hipHostGetDevicePointer = (decltype(api->hipHostGetDevicePointer))moe_find_shared_symbol(api->library, "hipHostGetDevicePointer");
     api->hipHostUnregister = (decltype(api->hipHostUnregister))moe_find_shared_symbol(api->library, "hipHostUnregister");
+    api->hipModuleLoadData = (moe_hip_module_load_data_fn)moe_find_shared_symbol(api->library, "hipModuleLoadData");
+    api->hipModuleUnload = (moe_hip_module_unload_fn)moe_find_shared_symbol(api->library, "hipModuleUnload");
+    api->hipModuleGetFunction = (moe_hip_module_get_function_fn)moe_find_shared_symbol(api->library, "hipModuleGetFunction");
+    api->hipModuleLaunchKernel = (moe_hip_module_launch_kernel_fn)moe_find_shared_symbol(api->library, "hipModuleLaunchKernel");
+    api->hiprtc_library = moe_open_hiprtc_library();
+    if (api->hiprtc_library) {
+        api->hiprtcCreateProgram = (moe_hiprtc_create_program_fn)moe_find_shared_symbol(api->hiprtc_library, "hiprtcCreateProgram");
+        api->hiprtcCompileProgram = (moe_hiprtc_compile_program_fn)moe_find_shared_symbol(api->hiprtc_library, "hiprtcCompileProgram");
+        api->hiprtcGetCodeSize = (moe_hiprtc_get_code_size_fn)moe_find_shared_symbol(api->hiprtc_library, "hiprtcGetCodeSize");
+        api->hiprtcGetCode = (moe_hiprtc_get_code_fn)moe_find_shared_symbol(api->hiprtc_library, "hiprtcGetCode");
+        api->hiprtcDestroyProgram = (moe_hiprtc_destroy_program_fn)moe_find_shared_symbol(api->hiprtc_library, "hiprtcDestroyProgram");
+    }
     return api->hipInit && api->hipDeviceGet && api->hipCtxSetCurrent &&
         api->hipDevicePrimaryCtxRetain && api->hipDevicePrimaryCtxRelease &&
         api->hipMalloc && api->hipFree && api->hipMemcpyHtoD && api->hipMemGetInfo;
@@ -71,6 +92,7 @@ static uint64_t hip_driver_detect_free_memory_bytes(uint32_t device_id, uint64_t
     }
     moe_hip_driver_api api{};
     if (!hip_driver_load(&api) || api.hipInit(0) != 0) {
+        moe_close_shared_library(api.hiprtc_library);
         moe_close_shared_library(api.library);
         return 0;
     }
@@ -80,6 +102,7 @@ static uint64_t hip_driver_detect_free_memory_bytes(uint32_t device_id, uint64_t
         if (api.hipDevicePrimaryCtxRelease && api.context) {
             api.hipDevicePrimaryCtxRelease(api.device);
         }
+        moe_close_shared_library(api.hiprtc_library);
         moe_close_shared_library(api.library);
         return 0;
     }
@@ -89,6 +112,7 @@ static uint64_t hip_driver_detect_free_memory_bytes(uint32_t device_id, uint64_t
     if (api.hipDevicePrimaryCtxRelease && api.context) {
         api.hipDevicePrimaryCtxRelease(api.device);
     }
+    moe_close_shared_library(api.hiprtc_library);
     moe_close_shared_library(api.library);
     if (!ok) {
         return 0;
@@ -102,6 +126,7 @@ static uint64_t hip_driver_detect_free_memory_bytes(uint32_t device_id, uint64_t
 static int hip_driver_get_numa_node(uint32_t device_id) {
     moe_hip_driver_api api{};
     if (!hip_driver_load(&api) || api.hipInit(0) != 0) {
+        moe_close_shared_library(api.hiprtc_library);
         moe_close_shared_library(api.library);
         return -1;
     }
@@ -123,6 +148,7 @@ static int hip_driver_get_numa_node(uint32_t device_id) {
             }
         }
     }
+    moe_close_shared_library(api.hiprtc_library);
     moe_close_shared_library(api.library);
     return numa_node;
 }
@@ -130,6 +156,7 @@ static int hip_driver_get_numa_node(uint32_t device_id) {
 static int hip_driver_get_async_engines(uint32_t device_id) {
     moe_hip_driver_api api{};
     if (!hip_driver_load(&api) || api.hipInit(0) != 0) {
+        moe_close_shared_library(api.hiprtc_library);
         moe_close_shared_library(api.library);
         return 1; // fallback
     }
@@ -143,6 +170,7 @@ static int hip_driver_get_async_engines(uint32_t device_id) {
             }
         }
     }
+    moe_close_shared_library(api.hiprtc_library);
     moe_close_shared_library(api.library);
     return std::max<int>(1, async_engines);
 }

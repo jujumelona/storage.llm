@@ -290,6 +290,9 @@ struct moe_pc_engine {
     std::mutex directstorage_staging_pending_mutex;
     std::vector<moe_directstorage_staging_pending> directstorage_pending_staging_copies;
     std::atomic<uint32_t> directstorage_pending_count{0};
+    std::atomic<bool> directstorage_recreate_requested{false};
+    std::atomic<bool> directstorage_completion_event_supported{false};
+    std::thread directstorage_completion_worker;
     std::mutex directstorage_gpu_submit_mutex;
     std::mutex directstorage_staging_submit_mutex;
     std::mutex gds_stream_cache_mutex;
@@ -297,7 +300,8 @@ struct moe_pc_engine {
     std::mutex gds_blocking_mutex;
     std::condition_variable gds_blocking_cv;
     std::deque<moe_gds_blocking_copy> gds_blocking_queue;
-    std::thread gds_blocking_worker;
+    std::vector<std::thread> gds_blocking_workers;
+    std::atomic<uint32_t> gds_blocking_worker_target{0};
     std::atomic<uint32_t> gds_blocking_pending{0};
     moe_io_path_perf gds_perf{};
     moe_io_path_perf ds_gpu_perf{};

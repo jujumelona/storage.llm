@@ -167,6 +167,7 @@ static void moe_runtime_autotune_tick(moe_pc_engine* engine) {
         engine->io_config.directstorage_gpu_queue_capacity = std::min<uint32_t>(
             8192u,
             gpu_cap + (gpu_cap < 8192u ? 256u : 0u));
+        engine->directstorage_recreate_requested.store(true, std::memory_order_release);
     }
     if (hit < 850u && waste < 200u) {
         window = std::min<uint32_t>(16u, window + 1u);

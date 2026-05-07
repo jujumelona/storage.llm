@@ -443,6 +443,7 @@ static int device_allocator_init(moe_pc_engine* e) {
             e->hip.hipDeviceGet(&e->hip.device, (int)e->backend_caps.device_id) != 0 ||
             e->hip.hipDevicePrimaryCtxRetain(&e->hip.context, e->hip.device) != 0 ||
             e->hip.hipCtxSetCurrent(e->hip.context) != 0) {
+            moe_close_shared_library(e->hip.hiprtc_library);
             moe_close_shared_library(e->hip.library);
             e->hip = moe_hip_driver_api{};
             e->device_allocator_ready.store(-1);
@@ -1019,6 +1020,7 @@ static void device_allocator_shutdown(moe_pc_engine* e) {
         e->cuda = moe_cuda_driver_api{};
     } else if (e->backend_caps.backend == moe_BACKEND_HIP) {
         if (e->hip.hipDevicePrimaryCtxRelease && e->hip.context) e->hip.hipDevicePrimaryCtxRelease(e->hip.device);
+        moe_close_shared_library(e->hip.hiprtc_library);
         moe_close_shared_library(e->hip.library);
         e->hip = moe_hip_driver_api{};
     } else if (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||

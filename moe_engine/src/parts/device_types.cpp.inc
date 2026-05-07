@@ -29,6 +29,19 @@ typedef int (*moe_cu_event_record_fn)(void*, void*);
 typedef int (*moe_cu_event_query_fn)(void*);
 typedef int (*moe_cu_event_synchronize_fn)(void*);
 typedef int (*moe_cu_event_destroy_fn)(void*);
+typedef int (*moe_hip_module_load_data_fn)(void**, const void*);
+typedef int (*moe_hip_module_unload_fn)(void*);
+typedef int (*moe_hip_module_get_function_fn)(void**, void*, const char*);
+typedef int (*moe_hip_module_launch_kernel_fn)(
+    void*, unsigned int, unsigned int, unsigned int,
+    unsigned int, unsigned int, unsigned int,
+    unsigned int, void*, void**, void**);
+typedef void* moe_hiprtc_program;
+typedef int (*moe_hiprtc_create_program_fn)(moe_hiprtc_program*, const char*, const char*, int, const char**, const char**);
+typedef int (*moe_hiprtc_compile_program_fn)(moe_hiprtc_program, int, const char**);
+typedef int (*moe_hiprtc_get_code_size_fn)(moe_hiprtc_program, size_t*);
+typedef int (*moe_hiprtc_get_code_fn)(moe_hiprtc_program, char*);
+typedef int (*moe_hiprtc_destroy_program_fn)(moe_hiprtc_program*);
 struct moe_cufile_error_t {
     int err;
     int cu_err;
@@ -112,6 +125,7 @@ struct moe_cuda_driver_api {
 
 struct moe_hip_driver_api {
     void* library = nullptr;
+    void* hiprtc_library = nullptr;
     void* context = nullptr;
     int device = 0;
     moe_cu_init_fn hipInit = nullptr;
@@ -143,6 +157,15 @@ struct moe_hip_driver_api {
     int (*hipHostRegister)(void*, size_t, unsigned int) = nullptr;
     int (*hipHostGetDevicePointer)(void**, void*, unsigned int) = nullptr;
     int (*hipHostUnregister)(void*) = nullptr;
+    moe_hip_module_load_data_fn hipModuleLoadData = nullptr;
+    moe_hip_module_unload_fn hipModuleUnload = nullptr;
+    moe_hip_module_get_function_fn hipModuleGetFunction = nullptr;
+    moe_hip_module_launch_kernel_fn hipModuleLaunchKernel = nullptr;
+    moe_hiprtc_create_program_fn hiprtcCreateProgram = nullptr;
+    moe_hiprtc_compile_program_fn hiprtcCompileProgram = nullptr;
+    moe_hiprtc_get_code_size_fn hiprtcGetCodeSize = nullptr;
+    moe_hiprtc_get_code_fn hiprtcGetCode = nullptr;
+    moe_hiprtc_destroy_program_fn hiprtcDestroyProgram = nullptr;
 };
 
 // Level Zero basic API hooks

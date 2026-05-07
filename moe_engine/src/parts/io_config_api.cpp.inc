@@ -1,3 +1,128 @@
+static uint64_t zero_copy_mmap_checksum_cpu(const void* ptr, uint64_t bytes) {
+    if (!ptr || bytes == 0) {
+        return 0;
+    }
+    const uint8_t* p = static_cast<const uint8_t*>(ptr);
+    uint64_t v = 1469598103934665603ull;
+    const uint64_t stride = bytes >= 64ull ? bytes / 64ull : 1ull;
+    for (uint64_t i = 0; i < 64ull; ++i) {
+        const uint64_t off = (i * stride + i * 1315423911ull) % bytes;
+        v ^= static_cast<uint64_t>(p[off]);
+        v *= 1099511628211ull;
+    }
+    return v;
+}
+
+static int validate_true_zero_copy_mmap_hip_kernel(
+    moe_pc_engine* engine,
+    void* device_ptr,
+    void* mapped_file_ptr,
+    size_t bytes
+) {
+    if (!engine ||
+        !device_ptr ||
+        !mapped_file_ptr ||
+        bytes == 0 ||
+        !engine->hip.hiprtcCreateProgram ||
+        !engine->hip.hiprtcCompileProgram ||
+        !engine->hip.hiprtcGetCodeSize ||
+        !engine->hip.hiprtcGetCode ||
+        !engine->hip.hiprtcDestroyProgram ||
+        !engine->hip.hipModuleLoadData ||
+        !engine->hip.hipModuleGetFunction ||
+        !engine->hip.hipModuleLaunchKernel ||
+        !engine->hip.hipModuleUnload ||
+        !engine->hip.hipMalloc ||
+        !engine->hip.hipFree ||
+        !engine->hip.hipDeviceSynchronize ||
+        !engine->hip.hipMemcpyDtoH) {
+        return 0;
+    }
+
+    static const char source[] = R"MOE_HIP(
+extern "C" __global__ void storagellm_mmap_checksum(
+    const unsigned char* p,
+    unsigned long long n,
+    unsigned long long* out
+) {
+    unsigned long long v = 1469598103934665603ULL;
+    unsigned long long stride = n >= 64ULL ? n / 64ULL : 1ULL;
+    for (unsigned long long i = 0; i < 64ULL; ++i) {
+        unsigned long long off = (i * stride + i * 1315423911ULL) % n;
+        v ^= (unsigned long long)p[off];
+        v *= 1099511628211ULL;
+    }
+    *out = v;
+}
+)MOE_HIP";
+
+    moe_hiprtc_program prog = nullptr;
+    void* module = nullptr;
+    void* kernel = nullptr;
+    uint64_t out_dev = 0;
+    int ok = 0;
+
+    if (engine->hip.hiprtcCreateProgram(
+            &prog,
+            source,
+            "storagellm_mmap_checksum.hip",
+            0,
+            nullptr,
+            nullptr) == 0 && prog &&
+        engine->hip.hiprtcCompileProgram(prog, 0, nullptr) == 0) {
+        size_t code_size = 0;
+        if (engine->hip.hiprtcGetCodeSize(prog, &code_size) == 0 && code_size > 0) {
+            std::vector<char> code(code_size);
+            if (engine->hip.hiprtcGetCode(prog, code.data()) == 0 &&
+                engine->hip.hipModuleLoadData(&module, code.data()) == 0 &&
+                module &&
+                engine->hip.hipModuleGetFunction(
+                    &kernel,
+                    module,
+                    "storagellm_mmap_checksum") == 0 &&
+                kernel &&
+                engine->hip.hipMalloc(&out_dev, sizeof(uint64_t)) == 0 &&
+                out_dev != 0) {
+                void* device_arg = device_ptr;
+                uint64_t n_arg = static_cast<uint64_t>(bytes);
+                void* out_arg = reinterpret_cast<void*>(static_cast<uintptr_t>(out_dev));
+                void* args[] = {&device_arg, &n_arg, &out_arg};
+                if (engine->hip.hipModuleLaunchKernel(
+                        kernel,
+                        1,
+                        1,
+                        1,
+                        1,
+                        1,
+                        1,
+                        0,
+                        nullptr,
+                        args,
+                        nullptr) == 0 &&
+                    engine->hip.hipDeviceSynchronize() == 0) {
+                    uint64_t gpu_sum = 0;
+                    if (engine->hip.hipMemcpyDtoH(&gpu_sum, out_dev, sizeof(gpu_sum)) == 0) {
+                        const uint64_t cpu_sum =
+                            zero_copy_mmap_checksum_cpu(mapped_file_ptr, static_cast<uint64_t>(bytes));
+                        ok = (gpu_sum == cpu_sum) ? 1 : 0;
+                    }
+                }
+            }
+        }
+    }
+
+    if (out_dev != 0) {
+        engine->hip.hipFree(out_dev);
+    }
+    if (module) {
+        engine->hip.hipModuleUnload(module);
+    }
+    if (prog) {
+        engine->hip.hiprtcDestroyProgram(&prog);
+    }
+    return ok;
+}
+
 static int validate_true_zero_copy_mmap_hip(
     moe_pc_engine* engine,
     void* mapped_file_ptr,
@@ -10,46 +135,18 @@ static int validate_true_zero_copy_mmap_hip(
         bytes < 4096 ||
         !engine->hip.hipHostRegister ||
         !engine->hip.hipHostGetDevicePointer ||
-        !engine->hip.hipMemcpyDtoH ||
-        !engine->hip.hipHostUnregister) {
+        !engine->hip.hipHostUnregister ||
+        !device_set_current(engine)) {
         return 0;
     }
     if (engine->hip.hipHostRegister(mapped_file_ptr, bytes, hipHostRegisterMappedFlag) != 0) {
         return 0;
     }
     void* device_ptr = nullptr;
-    if (engine->hip.hipHostGetDevicePointer(&device_ptr, mapped_file_ptr, 0) != 0 || !device_ptr) {
-        engine->hip.hipHostUnregister(mapped_file_ptr);
-        return 0;
-    }
-    const uint8_t* cpu_base = static_cast<const uint8_t*>(mapped_file_ptr);
-    const uint64_t gpu_base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(device_ptr));
-    const size_t sample = std::min<size_t>(4096, bytes);
-    const size_t offsets[3] = {
-        0,
-        bytes > sample ? ((bytes - sample) / 2u) : 0,
-        bytes > sample ? (bytes - sample) : 0
-    };
-    std::vector<uint8_t> gpu_sample(sample);
-    int ok = 1;
-    for (size_t i = 0; i < 3; ++i) {
-        const size_t off = offsets[i];
-        if (off > bytes || sample > bytes - off) {
-            ok = 0;
-            break;
-        }
-        if (engine->hip.hipMemcpyDtoH(
-                gpu_sample.data(),
-                gpu_base + static_cast<uint64_t>(off),
-                sample) != 0) {
-            ok = 0;
-            break;
-        }
-        if (std::memcmp(gpu_sample.data(), cpu_base + off, sample) != 0) {
-            ok = 0;
-            break;
-        }
-    }
+    const int got_device_ptr =
+        engine->hip.hipHostGetDevicePointer(&device_ptr, mapped_file_ptr, 0) == 0 && device_ptr;
+    const int ok = got_device_ptr ?
+        validate_true_zero_copy_mmap_hip_kernel(engine, device_ptr, mapped_file_ptr, bytes) : 0;
     engine->hip.hipHostUnregister(mapped_file_ptr);
     return ok ? 1 : 0;
 }
@@ -59,83 +156,13 @@ static int validate_true_zero_copy_mmap_level_zero(
     void* mapped_file_ptr,
     size_t bytes
 ) {
-    if (!engine ||
-        (engine->backend_caps.backend != moe_BACKEND_LEVEL_ZERO &&
-         engine->backend_caps.backend != moe_BACKEND_SYCL) ||
-        !mapped_file_ptr ||
-        bytes < 4096 ||
-        !engine->ze.context ||
-        !engine->ze.device ||
-        !level_zero_async_runtime_ready(engine) ||
-        !engine->ze.zeMemAllocDevice ||
-        !engine->ze.zeMemFree) {
-        return 0;
-    }
-    struct ze_device_mem_alloc_desc_t_local {
-        uint32_t stype;
-        const void* pNext;
-        uint32_t flags;
-        uint32_t ordinal;
-    } desc{0x00010002u, nullptr, 0u, 0u};
-    const size_t sample = std::min<size_t>(4096, bytes);
-    void* device_scratch = nullptr;
-    if (engine->ze.zeMemAllocDevice(
-            engine->ze.context,
-            &desc,
-            sample,
-            4096u,
-            engine->ze.device,
-            &device_scratch) != 0 || !device_scratch) {
-        return 0;
-    }
-    void* cmd = level_zero_create_command_list(engine);
-    if (!cmd) {
-        engine->ze.zeMemFree(engine->ze.context, device_scratch);
-        return 0;
-    }
-    const uint8_t* cpu_base = static_cast<const uint8_t*>(mapped_file_ptr);
-    const size_t offsets[3] = {
-        0,
-        bytes > sample ? ((bytes - sample) / 2u) : 0,
-        bytes > sample ? (bytes - sample) : 0
-    };
-    std::vector<uint8_t> gpu_sample(sample);
-    int ok = 1;
-    for (size_t i = 0; i < 3; ++i) {
-        const size_t off = offsets[i];
-        if (off > bytes || sample > bytes - off ||
-            (i > 0 && engine->ze.zeCommandListReset(cmd) != 0) ||
-            engine->ze.zeCommandListAppendMemoryCopy(
-                cmd,
-                device_scratch,
-                cpu_base + off,
-                sample,
-                nullptr,
-                0,
-                nullptr) != 0 ||
-            engine->ze.zeCommandListAppendMemoryCopy(
-                cmd,
-                gpu_sample.data(),
-                device_scratch,
-                sample,
-                nullptr,
-                0,
-                nullptr) != 0 ||
-            engine->ze.zeCommandListClose(cmd) != 0 ||
-            engine->ze.zeCommandQueueExecuteCommandLists(
-                engine->ze.command_queue,
-                1,
-                &cmd,
-                nullptr) != 0 ||
-            engine->ze.zeCommandQueueSynchronize(engine->ze.command_queue, UINT64_MAX) != 0 ||
-            std::memcmp(gpu_sample.data(), cpu_base + off, sample) != 0) {
-            ok = 0;
-            break;
-        }
-    }
-    level_zero_destroy_command_list(engine, cmd);
-    engine->ze.zeMemFree(engine->ze.context, device_scratch);
-    return ok ? 1 : 0;
+    (void)engine;
+    (void)mapped_file_ptr;
+    (void)bytes;
+    // A copy engine round-trip is not proof that shader/compute code can
+    // directly load mmap-backed pages. Keep Level Zero/SYCL fail-closed until
+    // a backend kernel checksum path is available.
+    return 0;
 }
 
 static int validate_true_zero_copy_mmap(moe_pc_engine* engine, void* mapped_file_ptr, size_t bytes) {
