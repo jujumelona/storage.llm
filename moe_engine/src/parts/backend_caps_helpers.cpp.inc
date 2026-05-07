@@ -293,6 +293,7 @@ static void fill_gpu_backend_base(moe_backend_caps_t* caps) {
     caps->supports_weight_q8 = 0;
     caps->supports_weight_iq2 = 0;
     caps->supports_weight_mxfp4 = 0;
+    caps->supports_directstorage = compiled_directstorage_available();
     caps->recommended_vram_common_bytes = working_common_cache_bytes();
     caps->recommended_pinned_bytes = std::max<uint64_t>(512ull * 1024ull * 1024ull, cache_for_experts(12));
 }
@@ -743,27 +744,27 @@ static void fill_vulkan_backend_caps(moe_backend_caps_t* caps) {
         caps->device_memory_bytes = caps->recommended_vram_cache_bytes;
     }
 
-    // BUGFIX Problem E: Enable Vulkan async API support ?끸쁾??FEATURE
-    // Problem: Vulkan was using sync-only path, no async H2D copy
-    // Solution: Enable async API now that command buffer infrastructure is implemented
-    // Impact: Enables async DMA overlap on Vulkan backend
-    caps->supports_backend_async_api = 1;
+    // Static caps stay conservative. device_allocator_init enables true Vulkan
+    // async after VkBuffer allocation, staging, and submit fences are live.
+    caps->supports_backend_async_api = 0;
+    caps->supports_async_copy = 0;
+    caps->copy_streams = 0;
     caps->supports_pinned_host = 1;
     caps->supports_fixed_read_staging = 1;
+    caps->supports_directstorage = compiled_directstorage_available();
 }
 
 static void fill_levelzero_backend_caps(moe_backend_caps_t* caps) {
     caps->supports_pinned_host = 1;
     caps->supports_fixed_read_staging = 1;
     caps->supports_registered_io_buffers = 1;
-    // OPTIMIZATION: Enable LevelZero async API support ?끸쁾??
-    // Problem: LevelZero was hardcoded to async=false, forcing sync-only path
-    // This eliminates DMA overlap and makes it perform like CPU-only
-    // Solution: Enable async API flag to allow zeCommandListAppendMemoryCopy usage
-    // The actual async implementation already exists in device_backend_async.cpp.inc
-    // Trade-off: Requires proper command list management, but enables true async DMA
-    // Impact: Restores DMA overlap on Intel Arc/Flex GPUs, ~30-50% throughput gain
-    caps->supports_backend_async_api = 1;
+    caps->supports_directstorage = compiled_directstorage_available();
+    // Level Zero H2D async capability gate
+    // Static caps stay conservative. device_allocator_init enables true async
+    // only after zeMemAllocDevice, queue/list, and queue-submit fences are live.
+    caps->supports_backend_async_api = 0;
+    caps->supports_async_copy = 0;
+    caps->copy_streams = 0;
     caps->supports_unified_memory = 0;
     caps->supports_zero_copy_host = 0;
     caps->supports_zero_copy_mmap = 0;

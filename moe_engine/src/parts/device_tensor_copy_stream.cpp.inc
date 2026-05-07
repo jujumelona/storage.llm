@@ -4,6 +4,7 @@
 struct moe_deferred_staging_copy {
     uint32_t slot = UINT32_MAX;
     uint64_t key = 0;
+    uint64_t copy_bytes = 0;
     uint64_t bytes_for_vram_release = 0;
     vram_reservation_token vram_token{};
     CUevent event = nullptr;
@@ -121,17 +122,18 @@ static void device_destroy_copy_event_pool(moe_pc_engine* e) {
     s_tl_copy_event_pool.erase(it);
 }
 
-static void device_defer_staging_copy(
+static int device_defer_staging_copy(
     moe_pc_engine* e,
     uint32_t slot,
     uint64_t key,
+    uint64_t copy_bytes,
     uint64_t vram_bytes,
     CUstream stream,
     vram_reservation_token token = vram_reservation_token{}
 ) {
     // BUGFIX Issue 6: Use staging_slot_valid() helper for correct check order ?끸쁾??
     if (!e) {
-        return;
+        return 0;
     }
 
 
@@ -140,39 +142,26 @@ static void device_defer_staging_copy(
         fprintf(stderr,
             "[storageLLM ERROR] device_defer_staging_copy: staging_slot_size=0, "
             "slots are invalid after reset timeout. Rejecting deferred copy.\n");
-        if (token.valid) {
-            device_vram_release_reservation_token(e, token);
-        } else {
-            device_release_inflight_vram_bytes(e, vram_bytes);
-        }
-        return;
+        return 0;
     }
     moe_deferred_staging_copy copy{};
     copy.slot = slot;
     copy.key = key;
+    copy.copy_bytes = copy_bytes;
     copy.bytes_for_vram_release = vram_bytes;
     copy.vram_token = token;
     copy.event = device_take_copy_event(e);
     if (!copy.event) {
-        if (token.valid) {
-            device_vram_release_reservation_token(e, token);
-        } else {
-            device_release_inflight_vram_bytes(e, vram_bytes);
-        }
-        return; // Return error/abort
+        return 0;
     }
     copy.event_recorded = device_backend_event_record(e, copy.event, stream) ? true : false;
     if (!copy.event_recorded) {
         device_recycle_copy_event(e, copy.event);
         copy.event = nullptr;
-        if (token.valid) {
-            device_vram_release_reservation_token(e, token);
-        } else {
-            device_release_inflight_vram_bytes(e, vram_bytes);
-        }
-        return; // Return error/abort
+        return 0;
     }
     s_tl_deferred_staging_copies[e].push_back(copy);
+    return 1;
 }
 
 static size_t device_deferred_staging_copy_count(moe_pc_engine* e) {
@@ -221,11 +210,8 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
             ready = wait_all ?
                 (device_backend_event_sync(e, copy.event) != 0) :
                 (device_backend_event_query(e, copy.event) != 0);
-            // BUGFIX NEW-7: Check supports_backend_async_api before stream operations ?끸쁾??CRITICAL
-            // Problem: Vulkan sets supports_backend_async_api=false but stream != nullptr check passes
-            // ??Code tries async path with sync-only backend ??double-buffering activated incorrectly
-            // Solution: Check both supports_backend_async_api AND stream != nullptr
-            // Impact: Ensures Vulkan uses correct sync-only path, prevents false async assumptions
+            // Check both supports_backend_async_api and stream before forcing a stream wait.
+            // Backends without a real async API must not drive async counters.
             if (!ready && wait_all && e->backend_caps.supports_backend_async_api && stream && !stream_synced) {
                 ready = device_backend_stream_sync(e, stream) != 0;
                 stream_synced = ready;
@@ -241,6 +227,10 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
         }
         if (copy.key != 0) {
             device_complete_pending_copy_key(e, copy.key);
+        }
+        if (copy.copy_bytes > 0) {
+            e->io_atomic.backend_async_completed.fetch_add(
+                copy.copy_bytes, std::memory_order_relaxed);
         }
 
         // BUGFIX 193: Slot already released in device_copy_tensor_from_host ?끸쁾??
@@ -316,6 +306,8 @@ ThreadStreamGuard::~ThreadStreamGuard() {
     if (!engine) return;
 
     moe_pc_engine* e = engine;
+    CUstream owned_stream = stream;
+    device_stream_sync_current(e);
     engine = nullptr;
     stream = nullptr;
 
@@ -341,8 +333,11 @@ ThreadStreamGuard::~ThreadStreamGuard() {
 
     device_destroy_copy_event_pool(e);
 
-    // Now safe to call device_stream_destroy_current (won't double-erase deferred_staging_copies)
-    device_stream_destroy_current(e);
+    if (owned_stream) {
+        std::lock_guard<std::mutex> lock(e->stream_pool_mutex);
+        e->stream_pool.push_back(owned_stream);
+        e->stream_pool_available.store(static_cast<uint32_t>(e->stream_pool.size()), std::memory_order_release);
+    }
 }
 
 static void device_stream_pool_destroy(moe_pc_engine* e) {
@@ -393,13 +388,7 @@ void device_cleanup_thread_locals(moe_pc_engine* engine) {
     if (!engine) return;
 
     // BUGFIX 臾몄젣 7: Clean up all thread_local maps ?끸쁾??
-    auto it = s_tl_deferred_staging_copies.find(engine);
-    if (it != s_tl_deferred_staging_copies.end()) {
-        it->second.clear();
-        s_tl_deferred_staging_copies.erase(it);
-    }
-
-    device_destroy_copy_event_pool(engine);
+    device_stream_destroy_current(engine);
 
     auto pending_it = s_tl_tensor_pending_keys.find(engine);
     if (pending_it != s_tl_tensor_pending_keys.end()) {
@@ -407,9 +396,5 @@ void device_cleanup_thread_locals(moe_pc_engine* engine) {
     }
 
     // BUGFIX 臾몄젣 7: Also clean up s_tl_stream_guards ?끸쁾??
-    auto stream_it = s_tl_stream_guards.find(engine);
-    if (stream_it != s_tl_stream_guards.end()) {
-        s_tl_stream_guards.erase(stream_it);
-    }
 }
 }

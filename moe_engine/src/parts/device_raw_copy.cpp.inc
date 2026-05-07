@@ -67,6 +67,7 @@ static int device_copy_raw_span(
             // Register the Metal buffer as device allocation
             CUdeviceptr dst = (CUdeviceptr)metal_buffer;
             if (device_prepare_tensor_allocation(e, key, s.bytes, pool, 0, &dst)) {
+                device_complete_pending_copy_key(e, key);
                 device_vram_mark_allocation_resident(e, key);
                 device_touch_allocation(e, key);
                 e->io_atomic.bytes_prefetched.fetch_add(s.bytes);
@@ -109,6 +110,9 @@ static int device_copy_raw_span(
 
         const int async_copy = device_backend_async_h2d_available(
             e, stream, slot.pinned ? 1 : 0);
+        if (!async_copy && e->backend_caps.supports_backend_async_api) {
+            e->io_atomic.backend_async_fallback.fetch_add(s.bytes, std::memory_order_relaxed);
+        }
         CUdeviceptr dst = 0;
         if (!device_prepare_tensor_allocation(e, key, s.bytes, pool, async_copy, &dst)) {
             release_staging_slot(e, slot_idx);
@@ -118,16 +122,32 @@ static int device_copy_raw_span(
             device_backend_copy_h2d_async(e, dst, buf_ptr, s.bytes, stream) :
             device_backend_copy_h2d_sync(e, dst, buf_ptr, s.bytes);
         if (ok && async_copy) {
-            device_defer_staging_copy(e, slot_idx, key, 0, stream);
+            if (!device_defer_staging_copy(e, slot_idx, key, s.bytes, 0, stream)) {
+                const int sync_ok = device_backend_stream_sync(e, stream);
+                if (sync_ok) {
+                    e->io_atomic.backend_async_completed.fetch_add(s.bytes, std::memory_order_relaxed);
+                    device_complete_pending_copy_key(e, key);
+                    device_vram_mark_allocation_resident(e, key);
+                    release_staging_slot(e, slot_idx);
+                } else {
+                    e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
+                    device_cancel_pending_copy(e, key);
+                    device_free_key(e, key);
+                    release_staging_slot(e, slot_idx);
+                    return 0;
+                }
+            }
         } else {
             release_staging_slot(e, slot_idx);
         }
         if (!ok) {
-            if (async_copy) {
-                device_cancel_pending_copy(e, key);
-            }
+            device_cancel_pending_copy(e, key);
             device_free_key(e, key);
             return 0;
+        }
+        if (!async_copy) {
+            device_complete_pending_copy_key(e, key);
+            device_vram_mark_allocation_resident(e, key);
         }
         device_touch_allocation(e, key);
         return 1;
@@ -137,15 +157,20 @@ static int device_copy_raw_span(
         return moe_DEVICE_COPY_BACKPRESSURE;
     }
     e->io_atomic.bytes_sync_h2d_fallback.fetch_add(s.bytes);
+    if (e->backend_caps.supports_backend_async_api) {
+        e->io_atomic.backend_async_fallback.fetch_add(s.bytes, std::memory_order_relaxed);
+    }
 
     CUdeviceptr dst = 0;
     if (!device_prepare_tensor_allocation(e, key, s.bytes, pool, 0, &dst)) {
         return 0;
     }
     if (!device_backend_copy_h2d_sync(e, dst, src, s.bytes)) {
+        device_cancel_pending_copy(e, key);
         device_free_key(e, key);
         return 0;
     }
+    device_complete_pending_copy_key(e, key);
     device_vram_mark_allocation_resident(e, key);
     device_touch_allocation(e, key);
     return 1;

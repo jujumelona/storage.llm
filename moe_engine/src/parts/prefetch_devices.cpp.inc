@@ -51,19 +51,26 @@ static int prefetch_tensor_pinned_to_gpu(
     }
     const uint64_t bytes = tensor_stream_bytes(rec);
     int copied = 0;
-    if (staging_slot != UINT32_MAX && staging_slot_valid(engine, staging_slot) &&
+    if (staging_slot != UINT32_MAX &&
+        staging_slot_valid(engine, staging_slot) &&
         staging_bytes >= bytes) {
+        const uint32_t owned_slot = staging_slot;
+        staging_slot = UINT32_MAX;
         copied = device_copy_tensor_from_host(
             engine,
             rec,
             moe_DEVICE_POOL_EXPERT,
-            engine->staging_slots[staging_slot].buf.load(std::memory_order_acquire),
+            engine->staging_slots[owned_slot].buf.load(std::memory_order_acquire),
             staging_bytes,
-            staging_slot,
+            owned_slot,
             1,
             reservation
         );
     } else {
+        if (staging_slot != UINT32_MAX) {
+            release_staging_slot(engine, staging_slot);
+            staging_slot = UINT32_MAX;
+        }
         copied = device_copy_tensor(engine, rec, moe_DEVICE_POOL_EXPERT, allow_sync_fallback, reservation);
     }
     if (copied == moe_DEVICE_COPY_BACKPRESSURE) {

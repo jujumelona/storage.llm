@@ -192,13 +192,9 @@ static void pinned_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                             // prefetch_tensor_pinned_to_gpu with sync_after=1 does NOT release
                             // the slot internally. Progressive pool exhaustion results.
                             // Solution: Release explicitly, then invalidate to prevent double-free.
-                            release_staging_slot(engine, next.staging_slot);
                             next.staging_slot = UINT32_MAX;
                         }
-                        // If sync failed, release unconditionally
-                        if (next.staging_slot != UINT32_MAX) {
-                            release_staging_slot(engine, next.staging_slot);
-                        }
+                        next.staging_slot = UINT32_MAX;
                     } else if (!queued_retry) {
                         ok = 0;
                         if (next.vram_token.valid) {

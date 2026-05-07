@@ -10,8 +10,7 @@ static uint64_t raw_phase_budget_left(const moe_pc_engine* e) {
     if (!e || e->config.vram_budget_bytes == 0) {
         return UINT64_MAX;
     }
-    const uint64_t used = e->device_allocated_bytes.load();
-    return e->config.vram_budget_bytes > used ? e->config.vram_budget_bytes - used : 0;
+    return device_budget_bytes(e);
 }
 static int prefetch_one_raw_span(moe_pc_engine* e, const moe_storage_raw_span_spec_t& s, uint8_t pool, int allow_sync_fallback) {
     if (!e || e->model_root.empty() || s.bytes == 0) {
@@ -253,7 +252,10 @@ static uint64_t prefetch_common_tensor_records_to_ram(moe_pc_engine* e, uint64_t
 
 static void trigger_ram_expert_promotion(moe_pc_engine* e);
 static int prefetch_fixed_core_raw(moe_pc_engine* e) {
-    uint64_t budget = e ? e->common_vram_reserved_bytes.load() : 0;
+    uint64_t budget = e ? e->vram_common_bytes.load(std::memory_order_relaxed) : 0;
+    if (budget == 0 && e) {
+        budget = e->common_vram_reserved_bytes.load(std::memory_order_relaxed);
+    }
     uint64_t bytes = 0;
     if (!e) {
         return 0;
@@ -318,14 +320,7 @@ static int prefetch_fixed_core_raw(moe_pc_engine* e) {
 
 static void trigger_ram_expert_promotion(moe_pc_engine* e) {
     if (!e) return;
-    const uint64_t common_reserved = e->common_vram_reserved_bytes.load(std::memory_order_relaxed);
-    if (common_reserved > 0) {
-        e->vram_used_bytes.fetch_add(common_reserved, std::memory_order_release);
-    }
     const bool was_incomplete = !e->common_vram_upload_complete.exchange(true, std::memory_order_acq_rel);
-    if (!was_incomplete && common_reserved > 0) {
-        e->vram_used_bytes.fetch_sub(common_reserved, std::memory_order_release);
-    }
     if (!was_incomplete) return;
 
     const uint64_t vram_budget = tier_budget(e, moe_TIER_VRAM);

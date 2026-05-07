@@ -30,6 +30,7 @@ static int device_prepare_tensor_allocation(
         (!reservation.valid || reservation.pool != pool || reservation.bytes < bytes)) {
         return 0;
     }
+    (void)async_copy;
     *out_dst = 0;
     device_refresh_mem_info(e);
     std::vector<std::pair<CUdeviceptr, uint64_t>> deferred_free_ptrs;
@@ -110,6 +111,8 @@ static int device_prepare_tensor_allocation(
             next.bytes = bytes;
             next.pool = pool;
             next.ptr = 0;
+            next.backend_kind = moe_DEVICE_ALLOC_NATIVE_PTR;
+            next.backend_aux = 0;
             auto try_device_alloc = [&]() -> int {
                 next.ptr = 0;
 #if defined(__APPLE__) && defined(__MACH__)
@@ -123,6 +126,36 @@ static int device_prepare_tensor_allocation(
                     return (e->hip.hipMalloc(&next.ptr, (size_t)bytes) == 0) ? 1 : 0;
                 } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemAlloc) {
                     return (e->cuda.cuMemAlloc(&next.ptr, (size_t)bytes) == 0) ? 1 : 0;
+                } else if (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO &&
+                           e->ze.context && e->ze.device && e->ze.zeMemAllocDevice) {
+                    struct ze_device_mem_alloc_desc_t_local {
+                        uint32_t stype;
+                        const void* pNext;
+                        uint32_t flags;
+                        uint32_t ordinal;
+                    } desc{0x00010002u, nullptr, 0u, 0u};
+                    void* ptr = nullptr;
+                    if (e->ze.zeMemAllocDevice(
+                            e->ze.context,
+                            &desc,
+                            static_cast<size_t>(bytes),
+                            4096u,
+                            e->ze.device,
+                            &ptr) == 0 && ptr) {
+                        next.ptr = reinterpret_cast<CUdeviceptr>(ptr);
+                        return 1;
+                    }
+                } else if (e->backend_caps.backend == moe_BACKEND_VULKAN &&
+                           moe_vulkan_transfer_runtime_ready(e)) {
+                    void* buffer = nullptr;
+                    void* memory = nullptr;
+                    if (moe_vulkan_create_device_buffer(e, bytes, &buffer, &memory) &&
+                        buffer && memory) {
+                        next.ptr = reinterpret_cast<CUdeviceptr>(buffer);
+                        next.backend_kind = moe_DEVICE_ALLOC_VULKAN_BUFFER;
+                        next.backend_aux = reinterpret_cast<uint64_t>(memory);
+                        return 1;
+                    }
                 }
                 return 0;
             };
@@ -168,27 +201,35 @@ static int device_prepare_tensor_allocation(
     } else {
         a = &it->second;
     }
-    const uint64_t allocated_snapshot = e->device_allocated_bytes.load(std::memory_order_relaxed);
-    lock.unlock();
-
-    const uint64_t bud = device_budget_bytes(e);
-    const uint64_t bud_threshold_85 = (bud * 85ull) / 100ull;
-    if (bud > 0 && allocated_snapshot > bud_threshold_85) {
-        e->vram_eviction_needed.store(true, std::memory_order_relaxed);
-        e->vram_eviction_cv.notify_one();
-    }
-
-    if (!a) {
+    auto final_it = e->device_allocations.find(key);
+    if (!a ||
+        final_it == e->device_allocations.end() ||
+        final_it->second.pending_free ||
+        final_it->second.bytes < bytes ||
+        final_it->second.ptr == 0) {
         return 0;
     }
-
-    lock.lock();
-    if (async_copy && !device_mark_copy_pending_locked(e, key)) {
+    if (!device_mark_copy_pending_locked(e, key)) {
         device_free_locked(e, key, &deferred_free_ptrs);
         lock.unlock();
         device_free_deferred_ptrs(e, deferred_free_ptrs);
         return 0;
     }
-    *out_dst = a->ptr;
-    return 1;
+    const CUdeviceptr ptr_snapshot = final_it->second.ptr;
+    lock.unlock();
+
+    const uint64_t raw_budget = device_raw_budget_bytes(e);
+    const uint64_t used =
+        e->vram_resident_bytes.load(std::memory_order_relaxed) +
+        e->vram_inflight_bytes.load(std::memory_order_relaxed) +
+        e->vram_kv_bytes.load(std::memory_order_relaxed) +
+        e->vram_common_bytes.load(std::memory_order_relaxed);
+    const uint64_t threshold_85 = (raw_budget / 100ull) * 85ull;
+    if (raw_budget > 0 && threshold_85 > 0 && used >= threshold_85) {
+        e->vram_eviction_needed.store(true, std::memory_order_relaxed);
+        e->vram_eviction_cv.notify_one();
+    }
+
+    *out_dst = ptr_snapshot;
+    return ptr_snapshot != 0;
 }

@@ -36,6 +36,10 @@ static void orchestrator_append_item(
     item.reason = reason;
     item.priority = priority;
     items[(*count)++] = item;
+    if (engine && reason != moe_PREFETCH_REASON_ROUTER_SELECTED) {
+        engine->speculative_prefetch_planned_count.fetch_add(1, std::memory_order_relaxed);
+        engine->speculative_prefetch_planned_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
 }
 
 static void orchestrator_append_topology(

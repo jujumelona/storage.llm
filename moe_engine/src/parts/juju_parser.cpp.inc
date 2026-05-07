@@ -41,7 +41,68 @@ struct moe_juju_tensor_json_entry_t {
     uint64_t gate_bytes = 0;
     uint64_t up_rel_offset = 0;
     uint64_t up_bytes = 0;
+    uint8_t bundle_native = 0;
+    uint32_t bundle_id = 0;
+    uint32_t explicit_expert = 0;
+    uint8_t has_explicit_expert = 0;
+    std::string bundle_member_role;
+    std::string expert_projection;
+    uint64_t bundle_offset = 0;
+    uint64_t bundle_size = 0;
+    uint64_t bundle_member_offset = 0;
+    uint64_t bundle_member_size = 0;
+    uint64_t bundle_alignment = 0;
 };
+
+static int moe_juju_bundle_member_projection(
+    const moe_juju_tensor_json_entry_t& entry,
+    moe_projection_t* proj
+) {
+    if (!proj) {
+        return 0;
+    }
+    const std::string role = moe_lower_ascii_copy(entry.bundle_member_role);
+    if (role == "gate") {
+        *proj = moe_PROJ_GATE;
+        return 1;
+    }
+    if (role == "up") {
+        *proj = moe_PROJ_UP;
+        return 1;
+    }
+    if (role == "down") {
+        *proj = moe_PROJ_DOWN;
+        return 1;
+    }
+    const std::string explicit_proj = moe_lower_ascii_copy(entry.expert_projection);
+    if (explicit_proj == "gate" && role.empty()) {
+        *proj = moe_PROJ_GATE;
+        return 1;
+    }
+    if (explicit_proj == "up" && role.empty()) {
+        *proj = moe_PROJ_UP;
+        return 1;
+    }
+    if (explicit_proj == "down" && role.empty()) {
+        *proj = moe_PROJ_DOWN;
+        return 1;
+    }
+    return 0;
+}
+
+static uint8_t moe_juju_bundle_member_role_id(const std::string& role_text) {
+    const std::string role = moe_lower_ascii_copy(role_text);
+    if (role == "gate") return 0;
+    if (role == "gate_scale") return 1;
+    if (role == "gate_scale2") return 2;
+    if (role == "up") return 3;
+    if (role == "up_scale") return 4;
+    if (role == "up_scale2") return 5;
+    if (role == "down") return 6;
+    if (role == "down_scale") return 7;
+    if (role == "down_scale2") return 8;
+    return 255;
+}
 
 static uint8_t moe_juju_residency_hint_from_text(const std::string& text) {
     const std::string value = moe_lower_ascii_copy(text);
@@ -341,7 +402,7 @@ static int moe_read_juju_tensor_index_json(
 ) {
     std::string sidecar;
     if (moe_read_text_file_local(path + ".idx", &sidecar) &&
-        sidecar.find("\"JUJU_IDX_JSON_V1\"") != std::string::npos &&
+        sidecar.find("\"JUJU_IDX_JSON_V2\"") != std::string::npos &&
         sidecar.find("\"tensors\"") != std::string::npos) {
         if (out) {
             *out = std::move(sidecar);
@@ -358,6 +419,20 @@ static int moe_read_juju_tensor_index_json(
         return 1;
     }
     return 0;
+}
+
+static int moe_juju_index_schema_supported(const std::string& json) {
+    if (json.empty() ||
+        json.find("\"JUJU_IDX_JSON_V2\"") == std::string::npos ||
+        json.find("\"JUJU_EXPERT_BUNDLE_TABLE_V2\"") == std::string::npos) {
+        return 0;
+    }
+    uint64_t schema_version = 0;
+    if (!moe_json_get_u64_local(json, "schema_version", &schema_version) ||
+        schema_version < 4u) {
+        return 0;
+    }
+    return 1;
 }
 
 static uint16_t moe_juju_accuracy_to_milli(double value) {
@@ -841,6 +916,40 @@ static int moe_parse_juju_tensor_index_json(
         }
         if (moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "combined_gate_up_split", "up_bytes", &value)) {
             rec.up_bytes = value;
+        }
+        if (moe_json_get_bool_slice(json, obj_begin, obj_end, "bundle_native", &bool_value)) {
+            rec.bundle_native = bool_value ? 1 : 0;
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "bundle_id", &value)) {
+            rec.bundle_id = moe_u64_to_u32_clamped(value, 0);
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "expert_id", &value)) {
+            rec.explicit_expert = moe_u64_to_u32_clamped(value, 0);
+            rec.has_explicit_expert = 1;
+        }
+        if (moe_json_get_string_slice(json, obj_begin, obj_end, "bundle_member_role", &rec.bundle_member_role)) {
+            rec.bundle_native = 1;
+        }
+        moe_json_get_string_slice(json, obj_begin, obj_end, "expert_projection", &rec.expert_projection);
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "bundle_offset", &value) ||
+            moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "expert_layout", "bundle_offset", &value)) {
+            rec.bundle_offset = value;
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "bundle_size", &value) ||
+            moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "expert_layout", "bundle_size", &value)) {
+            rec.bundle_size = value;
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "bundle_member_offset", &value) ||
+            moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "expert_layout", "bundle_member_offset", &value)) {
+            rec.bundle_member_offset = value;
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "bundle_member_size", &value) ||
+            moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "expert_layout", "bundle_member_size", &value)) {
+            rec.bundle_member_size = value;
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "bundle_alignment", &value) ||
+            moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "expert_layout", "bundle_alignment", &value)) {
+            rec.bundle_alignment = value;
         }
         if (moe_json_get_u64_slice(json, obj_begin, obj_end, "weight_encoding", &value) ||
             moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_weight_encoding", &value) ||

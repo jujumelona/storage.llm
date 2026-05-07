@@ -117,6 +117,39 @@ int moe_pc_engine_get_stats(const moe_pc_engine_t* engine, moe_pc_engine_stats_t
         engine->juju_warm_sequential_block_size.load(std::memory_order_relaxed);
     out_stats->juju_max_prefetch_distance =
         engine->juju_max_prefetch_distance.load(std::memory_order_relaxed);
+    out_stats->expert_cache_request_count =
+        engine->expert_cache_request_count.load(std::memory_order_relaxed);
+    out_stats->expert_cache_hit_count =
+        engine->expert_cache_hit_count.load(std::memory_order_relaxed);
+    out_stats->expert_cache_vram_hit_count =
+        engine->expert_cache_vram_hit_count.load(std::memory_order_relaxed);
+    out_stats->expert_cache_ram_hit_count =
+        engine->expert_cache_ram_hit_count.load(std::memory_order_relaxed);
+    out_stats->expert_cache_miss_count =
+        engine->expert_cache_miss_count.load(std::memory_order_relaxed);
+    out_stats->expert_cache_miss_bytes =
+        engine->expert_cache_miss_bytes.load(std::memory_order_relaxed);
+    out_stats->expert_miss_latency_us_total =
+        engine->expert_miss_latency_us_total.load(std::memory_order_relaxed);
+    out_stats->expert_hit_rate_milli =
+        engine->expert_hit_rate_milli.load(std::memory_order_relaxed);
+    out_stats->speculative_prefetch_planned_count =
+        engine->speculative_prefetch_planned_count.load(std::memory_order_relaxed);
+    out_stats->speculative_prefetch_planned_bytes =
+        engine->speculative_prefetch_planned_bytes.load(std::memory_order_relaxed);
+    out_stats->prefetch_waste_ratio_milli =
+        engine->prefetch_waste_ratio_milli.load(std::memory_order_relaxed);
+    out_stats->gpu_copy_idle_milli =
+        engine->gpu_copy_idle_milli.load(std::memory_order_relaxed);
+    out_stats->adaptive_prefetch_window_last =
+        engine->adaptive_prefetch_window_last.load(std::memory_order_relaxed);
+    out_stats->disk_read_bytes =
+        engine->io_atomic.bytes_disk_to_ram.load(std::memory_order_relaxed) +
+        engine->io_atomic.bytes_direct_to_gpu.load(std::memory_order_relaxed);
+    out_stats->pcie_copy_bytes =
+        engine->io_atomic.bytes_pinned_to_gpu.load(std::memory_order_relaxed) +
+        engine->io_atomic.bytes_sync_h2d_fallback.load(std::memory_order_relaxed) +
+        engine->io_atomic.backend_async_submitted.load(std::memory_order_relaxed);
     if (!engine->offload_gguf_first_file.empty()) {
         std::strncpy(
             out_stats->offload_gguf_first_file,

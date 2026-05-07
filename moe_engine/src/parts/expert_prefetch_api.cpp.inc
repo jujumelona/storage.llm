@@ -490,7 +490,8 @@ static int prefetch_expert_batch_raw(
     int layer,
     const int* experts,
     uint32_t expert_count,
-    moe_tier_t preferred_tier
+    moe_tier_t preferred_tier,
+    int allow_sync_fallback = 1
 ) {
     if (!engine || !experts || expert_count == 0) {
         return 0;
@@ -518,7 +519,9 @@ static int prefetch_expert_batch_raw(
             experts[i],
             preferred_tier,
             1,
-            1
+            1,
+            vram_reservation_token{},
+            allow_sync_fallback
         ) ? 1 : 0;
     }
     return ok_count > 0 ? 1 : 0;
@@ -577,7 +580,8 @@ int moe_pc_engine_prefetch_moe_lookahead(
                 current_layer + 1,
                 vram_candidates.data(),
                 (uint32_t)vram_candidates.size(),
-                moe_TIER_VRAM
+                moe_TIER_VRAM,
+                0
             ) ? 1 : 0;
         }
         if (!ram_candidates.empty()) {

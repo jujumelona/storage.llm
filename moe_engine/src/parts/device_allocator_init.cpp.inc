@@ -79,13 +79,15 @@ static int vulkan_driver_load(moe_vulkan_driver_api* api, uint32_t device_id) {
     }
 
     // Load core Vulkan functions
-    typedef int (*PFN_vkGetInstanceProcAddr)(void*, const char*);
+    typedef void* (*PFN_vkGetInstanceProcAddr)(void*, const char*);
     typedef int (*PFN_vkCreateInstance)(const void*, const void*, void**);
     typedef int (*PFN_vkEnumeratePhysicalDevices)(void*, uint32_t*, void**);
     typedef int (*PFN_vkGetPhysicalDeviceProperties)(void*, void*);
     typedef int (*PFN_vkGetPhysicalDeviceQueueFamilyProperties)(void*, uint32_t*, void*);
     typedef int (*PFN_vkCreateDevice)(void*, const void*, const void*, void**);
     typedef void (*PFN_vkGetDeviceQueue)(void*, uint32_t, uint32_t, void**);
+    typedef void (*PFN_vkDestroyInstance)(void*, const void*);
+    typedef void (*PFN_vkDestroyDevice)(void*, const void*);
 
     auto vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)moe_find_shared_symbol(api->library, "vkGetInstanceProcAddr");
     auto vkCreateInstance = (PFN_vkCreateInstance)moe_find_shared_symbol(api->library, "vkCreateInstance");
@@ -110,6 +112,8 @@ static int vulkan_driver_load(moe_vulkan_driver_api* api, uint32_t device_id) {
 
     void* instance = nullptr;
     if (vkCreateInstance(&create_info, nullptr, &instance) != 0 || !instance) {
+        auto vkDestroyInstance = (PFN_vkDestroyInstance)vkGetInstanceProcAddr(instance, "vkDestroyInstance");
+        if (vkDestroyInstance) vkDestroyInstance(instance, nullptr);
         moe_close_shared_library(api->library);
         *api = moe_vulkan_driver_api{};
         return 0;
@@ -123,6 +127,8 @@ static int vulkan_driver_load(moe_vulkan_driver_api* api, uint32_t device_id) {
     auto vkCreateDevice = (PFN_vkCreateDevice)vkGetInstanceProcAddr(instance, "vkCreateDevice");
 
     if (!vkEnumeratePhysicalDevices || !vkCreateDevice) {
+        auto vkDestroyInstance = (PFN_vkDestroyInstance)vkGetInstanceProcAddr(instance, "vkDestroyInstance");
+        if (vkDestroyInstance) vkDestroyInstance(instance, nullptr);
         moe_close_shared_library(api->library);
         *api = moe_vulkan_driver_api{};
         return 0;
@@ -131,6 +137,8 @@ static int vulkan_driver_load(moe_vulkan_driver_api* api, uint32_t device_id) {
     // Enumerate physical devices
     uint32_t device_count = 0;
     if (vkEnumeratePhysicalDevices(instance, &device_count, nullptr) != 0 || device_count == 0) {
+        auto vkDestroyInstance = (PFN_vkDestroyInstance)vkGetInstanceProcAddr(instance, "vkDestroyInstance");
+        if (vkDestroyInstance) vkDestroyInstance(instance, nullptr);
         moe_close_shared_library(api->library);
         *api = moe_vulkan_driver_api{};
         return 0;
@@ -138,6 +146,8 @@ static int vulkan_driver_load(moe_vulkan_driver_api* api, uint32_t device_id) {
 
     std::vector<void*> physical_devices(device_count, nullptr);
     if (vkEnumeratePhysicalDevices(instance, &device_count, physical_devices.data()) != 0) {
+        auto vkDestroyInstance = (PFN_vkDestroyInstance)vkGetInstanceProcAddr(instance, "vkDestroyInstance");
+        if (vkDestroyInstance) vkDestroyInstance(instance, nullptr);
         moe_close_shared_library(api->library);
         *api = moe_vulkan_driver_api{};
         return 0;
@@ -166,6 +176,8 @@ static int vulkan_driver_load(moe_vulkan_driver_api* api, uint32_t device_id) {
     }
 
     if (queue_family_index == UINT32_MAX) {
+        auto vkDestroyInstance = (PFN_vkDestroyInstance)vkGetInstanceProcAddr(instance, "vkDestroyInstance");
+        if (vkDestroyInstance) vkDestroyInstance(instance, nullptr);
         moe_close_shared_library(api->library);
         *api = moe_vulkan_driver_api{};
         return 0;
@@ -187,11 +199,16 @@ static int vulkan_driver_load(moe_vulkan_driver_api* api, uint32_t device_id) {
 
     void* device = nullptr;
     if (vkCreateDevice(physical_device, &device_create_info, nullptr, &device) != 0 || !device) {
+        auto vkDestroyInstance = (PFN_vkDestroyInstance)vkGetInstanceProcAddr(instance, "vkDestroyInstance");
+        if (vkDestroyInstance) vkDestroyInstance(instance, nullptr);
         moe_close_shared_library(api->library);
         *api = moe_vulkan_driver_api{};
         return 0;
     }
     api->device = device;
+    api->queueFamilyIndex = queue_family_index;
+    api->vkDestroyInstance = (PFN_vkDestroyInstance)vkGetInstanceProcAddr(instance, "vkDestroyInstance");
+    api->vkDestroyDevice = (PFN_vkDestroyDevice)vkGetInstanceProcAddr(instance, "vkDestroyDevice");
 
     // Get device queue
     auto vkGetDeviceQueue = (PFN_vkGetDeviceQueue)vkGetInstanceProcAddr(instance, "vkGetDeviceQueue");
@@ -211,10 +228,13 @@ static int vulkan_driver_load(moe_vulkan_driver_api* api, uint32_t device_id) {
     typedef void* (*PFN_vkGetDeviceProcAddr)(void*, const char*);
     auto vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)vkGetInstanceProcAddr(instance, "vkGetDeviceProcAddr");
     if (!vkGetDeviceProcAddr) {
+        if (api->vkDestroyDevice) api->vkDestroyDevice(device, nullptr);
+        if (api->vkDestroyInstance) api->vkDestroyInstance(instance, nullptr);
         moe_close_shared_library(api->library);
         *api = moe_vulkan_driver_api{};
         return 0;
     }
+    api->vkGetDeviceProcAddr = vkGetDeviceProcAddr;
 
     api->vkCreateCommandPool = (decltype(api->vkCreateCommandPool))vkGetDeviceProcAddr(device, "vkCreateCommandPool");
     api->vkDestroyCommandPool = (decltype(api->vkDestroyCommandPool))vkGetDeviceProcAddr(device, "vkDestroyCommandPool");
@@ -224,6 +244,8 @@ static int vulkan_driver_load(moe_vulkan_driver_api* api, uint32_t device_id) {
     api->vkQueueWaitIdle = (decltype(api->vkQueueWaitIdle))vkGetDeviceProcAddr(device, "vkQueueWaitIdle");
     api->vkCreateFence = (decltype(api->vkCreateFence))vkGetDeviceProcAddr(device, "vkCreateFence");
     api->vkGetFenceStatus = (decltype(api->vkGetFenceStatus))vkGetDeviceProcAddr(device, "vkGetFenceStatus");
+    api->vkWaitForFences = (decltype(api->vkWaitForFences))vkGetDeviceProcAddr(device, "vkWaitForFences");
+    api->vkResetFences = (decltype(api->vkResetFences))vkGetDeviceProcAddr(device, "vkResetFences");
     api->vkDestroyFence = (decltype(api->vkDestroyFence))vkGetDeviceProcAddr(device, "vkDestroyFence");
     api->vkCreateBuffer = (decltype(api->vkCreateBuffer))vkGetDeviceProcAddr(device, "vkCreateBuffer");
     api->vkDestroyBuffer = (decltype(api->vkDestroyBuffer))vkGetDeviceProcAddr(device, "vkDestroyBuffer");
@@ -238,6 +260,7 @@ static int vulkan_driver_load(moe_vulkan_driver_api* api, uint32_t device_id) {
     api->vkCmdCopyBuffer = (decltype(api->vkCmdCopyBuffer))vkGetDeviceProcAddr(device, "vkCmdCopyBuffer");
     api->vkResetCommandBuffer = (decltype(api->vkResetCommandBuffer))vkGetDeviceProcAddr(device, "vkResetCommandBuffer");
     // vkGetPhysicalDeviceMemoryProperties2 is instance-level, keep vkGetInstanceProcAddr
+    api->vkGetPhysicalDeviceMemoryProperties = (decltype(api->vkGetPhysicalDeviceMemoryProperties))vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceMemoryProperties");
     api->vkGetPhysicalDeviceMemoryProperties2 = (decltype(api->vkGetPhysicalDeviceMemoryProperties2))vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceMemoryProperties2");
 
     // Create command pool
@@ -252,7 +275,14 @@ static int vulkan_driver_load(moe_vulkan_driver_api* api, uint32_t device_id) {
         }
     }
 
-    return api->device && api->commandPool;
+    if (!api->device || !api->commandPool) {
+        if (api->vkDestroyDevice && api->device) api->vkDestroyDevice(api->device, nullptr);
+        if (api->vkDestroyInstance && api->instance) api->vkDestroyInstance(api->instance, nullptr);
+        moe_close_shared_library(api->library);
+        *api = moe_vulkan_driver_api{};
+        return 0;
+    }
+    return 1;
 }
 
 static int level_zero_driver_load(moe_level_zero_driver_api* api, uint32_t device_id) {
@@ -272,6 +302,7 @@ static int level_zero_driver_load(moe_level_zero_driver_api* api, uint32_t devic
     api->zeContextCreate = (moe_ze_context_create_fn)moe_find_shared_symbol(api->library, "zeContextCreate");
     api->zeContextDestroy = (moe_ze_context_destroy_fn)moe_find_shared_symbol(api->library, "zeContextDestroy");
     api->zeMemAllocHost = (moe_ze_mem_alloc_host_fn)moe_find_shared_symbol(api->library, "zeMemAllocHost");
+    api->zeMemAllocDevice = (moe_ze_mem_alloc_device_fn)moe_find_shared_symbol(api->library, "zeMemAllocDevice");
     api->zeMemFree = (moe_ze_mem_free_fn)moe_find_shared_symbol(api->library, "zeMemFree");
     api->zeDeviceGetMemoryProperties = (moe_ze_device_get_memory_properties_fn)moe_find_shared_symbol(api->library, "zeDeviceGetMemoryProperties");
 
@@ -285,17 +316,16 @@ static int level_zero_driver_load(moe_level_zero_driver_api* api, uint32_t devic
     api->zeCommandListClose = (decltype(api->zeCommandListClose))moe_find_shared_symbol(api->library, "zeCommandListClose");
     api->zeCommandListReset = (decltype(api->zeCommandListReset))moe_find_shared_symbol(api->library, "zeCommandListReset");
     api->zeCommandListAppendMemoryCopy = (decltype(api->zeCommandListAppendMemoryCopy))moe_find_shared_symbol(api->library, "zeCommandListAppendMemoryCopy");
-    api->zeCommandListAppendSignalEvent = (decltype(api->zeCommandListAppendSignalEvent))moe_find_shared_symbol(api->library, "zeCommandListAppendSignalEvent");
-    api->zeCommandListAppendWaitOnEvents = (decltype(api->zeCommandListAppendWaitOnEvents))moe_find_shared_symbol(api->library, "zeCommandListAppendWaitOnEvents");
     api->zeFenceCreate = (decltype(api->zeFenceCreate))moe_find_shared_symbol(api->library, "zeFenceCreate");
     api->zeFenceDestroy = (decltype(api->zeFenceDestroy))moe_find_shared_symbol(api->library, "zeFenceDestroy");
     api->zeFenceHostSynchronize = (decltype(api->zeFenceHostSynchronize))moe_find_shared_symbol(api->library, "zeFenceHostSynchronize");
     api->zeFenceQueryStatus = (decltype(api->zeFenceQueryStatus))moe_find_shared_symbol(api->library, "zeFenceQueryStatus");
+    api->zeFenceReset = (decltype(api->zeFenceReset))moe_find_shared_symbol(api->library, "zeFenceReset");
     api->zeDeviceGetProperties = (decltype(api->zeDeviceGetProperties))moe_find_shared_symbol(api->library, "zeDeviceGetProperties");
 
     if (!api->zeInit || !api->zeDriverGet || !api->zeDeviceGet ||
         !api->zeContextCreate || !api->zeContextDestroy ||
-        !api->zeMemAllocHost || !api->zeMemFree) {
+        !api->zeMemAllocHost || !api->zeMemAllocDevice || !api->zeMemFree) {
         moe_close_shared_library(api->library);
         *api = moe_level_zero_driver_api{};
         return 0;
@@ -470,12 +500,36 @@ static int device_allocator_init(moe_pc_engine* e) {
         // Problem: level_zero_driver_load fails silently → user thinks L0 is active
         //   but actual path falls back to Vulkan or CPU without any indication
         // Solution: Warn on failure, suggest Vulkan fallback
-        if (!level_zero_driver_load(&e->ze, e->backend_caps.device_id)) {
+        const int level_zero_loaded = level_zero_driver_load(&e->ze, e->backend_caps.device_id);
+        if (!level_zero_loaded) {
             fprintf(stderr,
                 "[storageLLM WARNING] Level Zero driver initialization failed. "
                 "H2D copy will use synchronous fallback. Consider setting "
                 "backend=vulkan for Intel GPUs without Level Zero runtime.\n");
         }
+        const bool level_zero_async_ready =
+            level_zero_loaded &&
+            e->ze.context &&
+            e->ze.device &&
+            e->ze.command_queue &&
+            e->ze.zeMemAllocDevice &&
+            e->ze.zeMemFree &&
+            e->ze.zeCommandListCreate &&
+            e->ze.zeCommandListDestroy &&
+            e->ze.zeCommandListClose &&
+            e->ze.zeCommandListReset &&
+            e->ze.zeCommandListAppendMemoryCopy &&
+            e->ze.zeCommandQueueExecuteCommandLists &&
+            e->ze.zeCommandQueueSynchronize &&
+            e->ze.zeFenceCreate &&
+            e->ze.zeFenceDestroy &&
+            e->ze.zeFenceHostSynchronize &&
+            e->ze.zeFenceQueryStatus;
+        e->backend_caps.supports_backend_async_api = level_zero_async_ready ? 1 : 0;
+        e->backend_caps.supports_async_copy = level_zero_async_ready ? 1 : 0;
+        e->backend_caps.copy_streams = level_zero_async_ready
+            ? std::max<uint32_t>(2u, moe_copy_streams_for_pcie_bandwidth(0.0, caps_hw_threads()))
+            : 0u;
 
         // BUGFIX 896 + Bug #13: Detect integrated GPU and enable unified memory handling ★★★ CRITICAL
         // Problem: Intel iGPU shares system RAM but allocatedSize==0 fallback uses totalSize (16GB).
@@ -613,16 +667,17 @@ static int device_allocator_init(moe_pc_engine* e) {
             return 0;
         }
 
-        // BUGFIX 934: Vulkan async H2D copy status ★★ FEATURE
-        // Problem: Vulkan H2D copy not implemented, forcing sync-only path
-        // → GPU idle during expert loading → tok/s degradation
-        // Solution (short-term): Set copy_streams=1 to signal sync-only mode
-        // → Caller code uses sync path, reduces staging slot allocation
-        // Solution (long-term): Implement vkCmdCopyBuffer + vkQueueSubmit + vkFence
-        // → Replace CUevent abstraction with VkFence in device_tensor_copy_ops.cpp.inc
-        // Impact: Explicit sync-only mode prevents false async expectations
-        e->backend_caps.copy_streams = 1;  // Sync-only until async H2D implemented
-        e->backend_caps.supports_backend_async_api = false;  // Disable async path
+        const bool vulkan_async_ready = moe_vulkan_transfer_runtime_ready(e) != 0;
+        e->backend_caps.supports_backend_async_api = vulkan_async_ready ? 1 : 0;
+        e->backend_caps.supports_async_copy = vulkan_async_ready ? 1 : 0;
+        e->backend_caps.copy_streams = vulkan_async_ready
+            ? std::max<uint32_t>(2u, moe_copy_streams_for_pcie_bandwidth(0.0, caps_hw_threads()))
+            : 0u;
+        if (!vulkan_async_ready) {
+            fprintf(stderr,
+                "[storageLLM WARNING] Vulkan transfer backend unavailable: "
+                "VkBuffer allocation, staging, or fence API missing.\n");
+        }
 
         if (e->backend_caps.device_memory_bytes == 0) {
             e->backend_caps.device_memory_bytes = e->backend_caps.system_memory_bytes > 0
@@ -907,6 +962,11 @@ static int device_set_current(moe_pc_engine* e) {
         if (e->hip.hipCtxSetCurrent(e->hip.context) != 0) return 0;
         tls_ctx = e->hip.context;
         return 1;
+    } else if (e->backend_caps.backend == moe_BACKEND_METAL ||
+               e->backend_caps.backend == moe_BACKEND_VULKAN ||
+               e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
+               e->backend_caps.backend == moe_BACKEND_SYCL) {
+        return 1;
     }
     return 0;
 }
@@ -933,9 +993,18 @@ static void device_allocator_shutdown(moe_pc_engine* e) {
         e->hip = moe_hip_driver_api{};
     } else if (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
                e->backend_caps.backend == moe_BACKEND_SYCL) {
+        if (e->ze.zeCommandQueueDestroy && e->ze.command_queue) e->ze.zeCommandQueueDestroy(e->ze.command_queue);
         if (e->ze.zeContextDestroy && e->ze.context) e->ze.zeContextDestroy(e->ze.context);
         moe_close_shared_library(e->ze.library);
         e->ze = moe_level_zero_driver_api{};
+    } else if (e->backend_caps.backend == moe_BACKEND_VULKAN) {
+        if (e->vk.vkDestroyCommandPool && e->vk.device && e->vk.commandPool) {
+            e->vk.vkDestroyCommandPool(e->vk.device, e->vk.commandPool, nullptr);
+        }
+        if (e->vk.vkDestroyDevice && e->vk.device) e->vk.vkDestroyDevice(e->vk.device, nullptr);
+        if (e->vk.vkDestroyInstance && e->vk.instance) e->vk.vkDestroyInstance(e->vk.instance, nullptr);
+        moe_close_shared_library(e->vk.library);
+        e->vk = moe_vulkan_driver_api{};
     }
     e->device_allocator_ready.store(0);
 }

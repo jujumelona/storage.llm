@@ -64,6 +64,137 @@ static void refresh_external_gpu_memory_budget_if_due(moe_pc_engine* engine) {
     }
 }
 
+static uint64_t orchestrator_transfer_us(uint64_t bytes, uint64_t bytes_per_second) {
+    if (bytes == 0 || bytes_per_second == 0) {
+        return 0;
+    }
+    return (bytes * 1000000ull + bytes_per_second - 1ull) / bytes_per_second;
+}
+
+static uint64_t orchestrator_estimated_expert_miss_latency_us(
+    const moe_pc_engine* engine,
+    uint64_t bytes,
+    moe_tier_t current_tier,
+    moe_tier_t target_tier
+) {
+    if (!engine || bytes == 0) {
+        return 0;
+    }
+    const uint64_t storage_bw =
+        engine->backend_caps.measured_storage_bw_bytes_per_sec ?
+        engine->backend_caps.measured_storage_bw_bytes_per_sec : (3ull << 30);
+    uint64_t h2d_bw = engine->backend_caps.measured_h2d_bw_bytes_per_sec;
+    if (h2d_bw == 0 && engine->backend_caps.dma_bandwidth_gbps > 0.0) {
+        h2d_bw = (uint64_t)(engine->backend_caps.dma_bandwidth_gbps * 1000000000.0);
+    }
+    if (h2d_bw == 0) {
+        h2d_bw = 12ull * 1000ull * 1000ull * 1000ull;
+    }
+    uint64_t us = 0;
+    if (current_tier == moe_TIER_DB || current_tier == moe_TIER_STREAM) {
+        us += orchestrator_transfer_us(bytes, storage_bw);
+    }
+    if (target_tier == moe_TIER_VRAM && current_tier != moe_TIER_VRAM) {
+        us += orchestrator_transfer_us(bytes, h2d_bw);
+    }
+    return us;
+}
+
+static moe_tier_t orchestrator_expert_tier_snapshot(
+    moe_pc_engine* engine,
+    int layer,
+    int expert,
+    uint64_t* out_bytes
+) {
+    if (out_bytes) {
+        *out_bytes = 0;
+    }
+    if (!engine || layer < 0 || expert < 0) {
+        return moe_TIER_DB;
+    }
+    const size_t slot = expert_dense_slot(engine, layer, expert);
+    if (slot == tensor_slot_invalid() || slot >= engine->expert_states.size()) {
+        return moe_TIER_DB;
+    }
+    std::lock_guard<std::mutex> lock(engine->map_mutex);
+    const moe_block_state& state = engine->expert_states[slot];
+    if (!state.active) {
+        return moe_TIER_DB;
+    }
+    if (out_bytes) {
+        *out_bytes = state.bytes;
+    }
+    return state.tier;
+}
+
+static void orchestrator_record_selected_expert_metrics(
+    moe_pc_engine* engine,
+    int layer,
+    const int* selected_experts,
+    uint32_t selected_count,
+    moe_tier_t target_tier
+) {
+    if (!engine || !selected_experts || selected_count == 0) {
+        return;
+    }
+    for (uint32_t i = 0; i < selected_count; ++i) {
+        const int expert = selected_experts[i];
+        const uint64_t bytes = orchestrator_expert_bytes(engine, layer, expert);
+        uint64_t resident_bytes = 0;
+        const moe_tier_t current = orchestrator_expert_tier_snapshot(engine, layer, expert, &resident_bytes);
+        engine->expert_cache_request_count.fetch_add(1, std::memory_order_relaxed);
+        if (current == moe_TIER_VRAM || current == moe_TIER_RAM) {
+            engine->expert_cache_hit_count.fetch_add(1, std::memory_order_relaxed);
+            if (current == moe_TIER_VRAM) {
+                engine->expert_cache_vram_hit_count.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                engine->expert_cache_ram_hit_count.fetch_add(1, std::memory_order_relaxed);
+            }
+            continue;
+        }
+        engine->expert_cache_miss_count.fetch_add(1, std::memory_order_relaxed);
+        engine->expert_cache_miss_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        engine->expert_miss_latency_us_total.fetch_add(
+            orchestrator_estimated_expert_miss_latency_us(engine, bytes ? bytes : resident_bytes, current, target_tier),
+            std::memory_order_relaxed);
+    }
+}
+
+static void orchestrator_update_feedback_metrics(moe_pc_engine* engine, uint32_t* committed_window, uint32_t max_window) {
+    if (!engine || !committed_window || *committed_window == 0) {
+        return;
+    }
+    const uint64_t requests = engine->expert_cache_request_count.load(std::memory_order_relaxed);
+    const uint64_t hits = engine->expert_cache_hit_count.load(std::memory_order_relaxed);
+    const uint64_t misses = engine->expert_cache_miss_count.load(std::memory_order_relaxed);
+    const uint32_t hit_milli = requests ? (uint32_t)std::min<uint64_t>(1000ull, (hits * 1000ull) / requests) : 0u;
+    const uint32_t miss_milli = requests ? (uint32_t)std::min<uint64_t>(1000ull, (misses * 1000ull) / requests) : 0u;
+    engine->expert_hit_rate_milli.store(hit_milli, std::memory_order_relaxed);
+
+    const uint64_t speculative = engine->speculative_prefetch_planned_count.load(std::memory_order_relaxed);
+    const uint64_t dropped =
+        engine->io_atomic.dropped_requests.load(std::memory_order_relaxed) +
+        engine->io_atomic.urgent_dropped_requests.load(std::memory_order_relaxed);
+    const uint32_t waste_milli = speculative ?
+        (uint32_t)std::min<uint64_t>(1000ull, (dropped * 1000ull) / speculative) : 0u;
+    engine->prefetch_waste_ratio_milli.store(waste_milli, std::memory_order_relaxed);
+
+    const uint32_t gpu_workers = std::max(1u, runtime_gpu_workers(engine));
+    const uint32_t gpu_active = engine->gpu_stage.inflight.load(std::memory_order_relaxed);
+    const uint32_t gpu_busy_milli = (uint32_t)std::min<uint64_t>(
+        1000ull,
+        ((uint64_t)gpu_active * 1000ull) / gpu_workers);
+    const uint32_t gpu_idle_milli = gpu_busy_milli >= 1000u ? 0u : 1000u - gpu_busy_milli;
+    engine->gpu_copy_idle_milli.store(gpu_idle_milli, std::memory_order_relaxed);
+
+    if (waste_milli >= 350u || engine->io_atomic.staging_slot_deficit.load(std::memory_order_relaxed) > 0u) {
+        *committed_window = std::max(1u, *committed_window / 2u);
+    } else if (gpu_idle_milli >= 300u && miss_milli >= 120u && waste_milli <= 200u) {
+        *committed_window = std::min(max_window, *committed_window + 1u);
+    }
+    engine->adaptive_prefetch_window_last.store(*committed_window, std::memory_order_relaxed);
+}
+
 static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orchestrator_state_t* state,
     moe_runtime_orchestrator_plan_t* plan) {
     const moe_execution_policy_t policy = state ? state->policy : moe_EXECUTION_BALANCED;
@@ -204,6 +335,7 @@ static void fill_orchestrator_plan(moe_pc_engine* engine, const moe_runtime_orch
         }
     }
 
+    orchestrator_update_feedback_metrics(engine, &committed_window, max_window);
     plan->prefetch_window_layers = committed_window;
     float cpu = state ? state->cpu_load_pct : 0.0f;
     float gpu = state ? state->gpu_load_pct : 0.0f;
@@ -348,6 +480,12 @@ int moe_pc_engine_orchestrate_moe_step(moe_pc_engine_t* engine, int current_laye
     }
 
     fill_orchestrator_plan(engine, state, out_plan);
+    orchestrator_record_selected_expert_metrics(
+        engine,
+        current_layer,
+        selected_experts,
+        selected_count,
+        out_plan->selected_tier);
 
     // BUGFIX 29: Release plan_lock before calling execute_prefetch_plan ★★
     // Old: plan_lock held during execute_prefetch_plan → enqueue_stage_or_retry → disk_stage.mtx

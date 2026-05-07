@@ -63,4 +63,15 @@ struct alignas(64) moe_io_atomic_stats {
     std::atomic<uint32_t> gpudirect_storage_active{0};
     std::atomic<uint32_t> bam_nvme_active{0};
     std::atomic<uint32_t> staging_slot_deficit{0};
+
+    // --- Cache line 10: async backend/DirectStorage diagnostics ---
+    alignas(64) std::atomic<uint64_t> bytes_directstorage_submitted{0};
+    std::atomic<uint64_t> bytes_directstorage_completed{0};
+    std::atomic<uint64_t> bytes_directstorage_failed{0};
+    std::atomic<uint64_t> backend_async_submitted{0};
+    std::atomic<uint64_t> backend_async_completed{0};
+    std::atomic<uint64_t> backend_async_fallback{0};
+    std::atomic<uint64_t> backend_fence_waits{0};
+    std::atomic<uint64_t> vulkan_fence_waits{0};
+    std::atomic<uint64_t> level_zero_fence_waits{0};
 };

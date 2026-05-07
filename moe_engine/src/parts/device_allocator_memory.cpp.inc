@@ -1,5 +1,6 @@
 // Device memory management and accounting
 
+static uint64_t device_raw_budget_bytes(const moe_pc_engine* e);
 static uint64_t device_budget_bytes(const moe_pc_engine* e);
 
 // BUGFIX 76: Issue 11 - Document KV cache vs VRAM budget separation ??筌뤾쑨猿?
@@ -220,12 +221,8 @@ static void warn_device_budget_exhausted(const moe_pc_engine* e, uint64_t raw_bu
         (unsigned long long)(e ? e->config.vram_budget_bytes : 0));
 }
 
-static uint64_t device_budget_bytes(const moe_pc_engine* e) {
+static uint64_t device_raw_budget_bytes(const moe_pc_engine* e) {
     if (!e) return 0;
-    auto add_sat = [](uint64_t acc, uint64_t value) -> uint64_t {
-        return value > UINT64_MAX - acc ? UINT64_MAX : acc + value;
-    };
-    uint64_t raw_budget = 0;
     if (e->backend_caps.backend == moe_BACKEND_METAL &&
         e->backend_caps.supports_unified_memory) {
         const uint64_t sys = e->backend_caps.system_memory_bytes > 0
@@ -234,18 +231,25 @@ static uint64_t device_budget_bytes(const moe_pc_engine* e) {
         if (pct == 0 || pct < 50 || pct > 90) {
             pct = 75ull;
         }
-        raw_budget = (sys * pct) / 100ull;
+        return (sys * pct) / 100ull;
     } else if (e->config.vram_budget_bytes) {
-        raw_budget = e->config.vram_budget_bytes;
-    } else {
-        const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
-        const uint64_t free_b = e->device_free_bytes.load(std::memory_order_relaxed);
-        raw_budget = (allocated || free_b)
-            ? (allocated > UINT64_MAX - free_b ? UINT64_MAX : allocated + free_b)
-            : (e->backend_caps.device_memory_bytes
-                ? e->backend_caps.device_memory_bytes
-                : e->backend_caps.recommended_vram_cache_bytes);
+        return e->config.vram_budget_bytes;
     }
+    const uint64_t allocated = e->device_allocated_bytes.load(std::memory_order_relaxed);
+    const uint64_t free_b = e->device_free_bytes.load(std::memory_order_relaxed);
+    return (allocated || free_b)
+        ? (allocated > UINT64_MAX - free_b ? UINT64_MAX : allocated + free_b)
+        : (e->backend_caps.device_memory_bytes
+            ? e->backend_caps.device_memory_bytes
+            : e->backend_caps.recommended_vram_cache_bytes);
+}
+
+static uint64_t device_budget_bytes(const moe_pc_engine* e) {
+    if (!e) return 0;
+    auto add_sat = [](uint64_t acc, uint64_t value) -> uint64_t {
+        return value > UINT64_MAX - acc ? UINT64_MAX : acc + value;
+    };
+    const uint64_t raw_budget = device_raw_budget_bytes(e);
     if (raw_budget == 0) {
         return 0;
     }
@@ -559,6 +563,15 @@ static void device_free_deferred_ptrs(moe_pc_engine* e, std::vector<std::pair<CU
                     fprintf(stderr, "[storageLLM ERROR] cuMemFree failed: ptr=%p bytes=%llu err=%d\n",
                         (void*)pair.first, (unsigned long long)pair.second, cuda_err);
                 }
+            } else if (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO &&
+                       e->ze.context && e->ze.zeMemFree) {
+                const int ze_err = e->ze.zeMemFree(
+                    e->ze.context,
+                    reinterpret_cast<void*>(static_cast<uintptr_t>(pair.first)));
+                if (ze_err != 0) {
+                    fprintf(stderr, "[storageLLM ERROR] zeMemFree failed: ptr=%p bytes=%llu err=%d\n",
+                        (void*)pair.first, (unsigned long long)pair.second, ze_err);
+                }
             }
             // Bug 2: device_free_bytes already updated in device_release_allocation_locked
             // Do NOT double-add here
@@ -576,8 +589,10 @@ static void device_release_allocation_locked(
     if (!e || it == e->device_allocations.end()) return;
     const moe_device_allocation a = it->second;
     if (a.ptr) {
-        device_cufile_unregister_buffer(e, reinterpret_cast<void*>(static_cast<uintptr_t>(a.ptr)));
-        if (deferred_free_ptrs) {
+        if (a.backend_kind == moe_DEVICE_ALLOC_NATIVE_PTR) {
+            device_cufile_unregister_buffer(e, reinterpret_cast<void*>(static_cast<uintptr_t>(a.ptr)));
+        }
+        if (deferred_free_ptrs && a.backend_kind == moe_DEVICE_ALLOC_NATIVE_PTR) {
             deferred_free_ptrs->push_back({a.ptr, a.bytes});
             // Bug 2: Update device_free_bytes immediately to maintain accurate budget
             // Without this, device_budget_bytes() underestimates during deferred free window
@@ -591,10 +606,19 @@ static void device_release_allocation_locked(
                     metal_zero_copy_unmap((void*)a.ptr);
                 } else
 #endif
-                if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipFree) {
+                if (e->backend_caps.backend == moe_BACKEND_VULKAN &&
+                    a.backend_kind == moe_DEVICE_ALLOC_VULKAN_BUFFER) {
+                    moe_vulkan_destroy_buffer_allocation(
+                        e,
+                        reinterpret_cast<void*>(static_cast<uintptr_t>(a.ptr)),
+                        reinterpret_cast<void*>(static_cast<uintptr_t>(a.backend_aux)));
+                } else if (e->backend_caps.backend == moe_BACKEND_HIP && e->hip.hipFree) {
                     e->hip.hipFree(a.ptr);
                 } else if (e->backend_caps.backend == moe_BACKEND_CUDA && e->cuda.cuMemFree) {
                     e->cuda.cuMemFree(a.ptr);
+                } else if (e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO &&
+                           e->ze.context && e->ze.zeMemFree) {
+                    e->ze.zeMemFree(e->ze.context, reinterpret_cast<void*>(static_cast<uintptr_t>(a.ptr)));
                 }
                 device_account_bytes_freed(e, a.bytes);
             }

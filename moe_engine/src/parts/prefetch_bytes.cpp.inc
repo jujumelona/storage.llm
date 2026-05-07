@@ -401,7 +401,9 @@ static uint32_t acquire_staging_slot(
     bool for_pinned = true,
     bool for_direct = false
 ) {
-    if (!engine || engine->staging_slots.empty()) {
+    if (!engine ||
+        engine->staging_slots.empty() ||
+        engine->staging_reset_in_progress.load(std::memory_order_acquire)) {
         return UINT32_MAX;
     }
     const uint32_t total_count = static_cast<uint32_t>(engine->staging_slots.size());
@@ -442,7 +444,9 @@ static uint32_t acquire_staging_slot(
 }
 
 static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t start_idx, uint32_t count, uint32_t worker_index, uint32_t turn, uint64_t required_bytes) {
-    if (count == 0) {
+    if (count == 0 ||
+        !engine ||
+        engine->staging_reset_in_progress.load(std::memory_order_acquire)) {
         return UINT32_MAX;
     }
     const uint32_t preferred = count > 1 ? (worker_index * 2u + turn) % count : 0u;
@@ -487,6 +491,10 @@ static uint32_t acquire_staging_slot_internal(moe_pc_engine* engine, uint32_t st
                             next,
                             std::memory_order_acq_rel,
                             std::memory_order_acquire)) {
+                        if (engine->staging_reset_in_progress.load(std::memory_order_acquire)) {
+                            engine->staging_slot_free_mask.fetch_or(bit, std::memory_order_release);
+                            return UINT32_MAX;
+                        }
                         if (!staging_slot_valid(engine, idx)) {
                             engine->staging_slot_free_mask.fetch_or(bit, std::memory_order_release);
                             available &= ~bit;
@@ -603,6 +611,10 @@ try_next_lockfree_slot:
                     true,
                     std::memory_order_acquire,
                     std::memory_order_relaxed)) {
+                if (engine->staging_reset_in_progress.load(std::memory_order_acquire)) {
+                    engine->staging_slots[idx].in_use.store(false, std::memory_order_release);
+                    return UINT32_MAX;
+                }
                 if (required_bytes > 0 && engine->staging_slots[idx].size < required_bytes) {
                     engine->staging_slots[idx].in_use.store(false, std::memory_order_release);
                     continue;
@@ -698,7 +710,7 @@ static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
     // Keep a single staging_slot_valid check; invalid slots return immediately.
     // so second check is always true (dead code)
     // Solution: Remove redundant second check
-    if (!staging_slot_valid(engine, slot_index)) {
+    if (!engine || slot_index == UINT32_MAX || slot_index >= engine->staging_slots.size()) {
         return;
     }
 
@@ -706,16 +718,22 @@ static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
     // Problem: Worker completes after timeout ??releases slot with stale buf pointer
     // Solution: Check if generation changed (timeout occurred), skip release if stale
     // Impact: Prevents use-after-free when workers complete after staging reset
+    moe_staging_slot& slot = engine->staging_slots[slot_index];
+    const bool was_in_use = slot.in_use.exchange(false, std::memory_order_acq_rel);
     const uint32_t current_gen = engine->staging_generation.load(std::memory_order_acquire);
-    const uint32_t slot_gen = engine->staging_slots[slot_index].generation;
-    if (slot_gen != current_gen) {
-        // Slot is from old generation (timeout occurred), don't release
-        // Just mark as not in_use to prevent further access
-        engine->staging_slots[slot_index].in_use.store(false, std::memory_order_release);
-        return;
-    }
-
-    engine->staging_slots[slot_index].in_use.store(false, std::memory_order_release);
+    const uint32_t slot_gen = slot.generation;
+    const bool reusable =
+        was_in_use &&
+        !engine->staging_reset_in_progress.load(std::memory_order_acquire) &&
+        engine->staging_slot_size > 0 &&
+        slot_gen == current_gen &&
+        slot.buf.load(std::memory_order_acquire) != nullptr;
+    if (!reusable) {
+        engine->staging_pinned_cv.notify_all();
+        engine->staging_gpu_cv.notify_all();
+        engine->staging_direct_cv.notify_all();
+        engine->staging_slot_cv.notify_all();
+    } else {
 #ifdef ENABLE_LOCKFREE_STAGING
         if (engine->staging_slots.size() <= 64u) {
             engine->staging_slot_free_mask.fetch_or(1ull << slot_index, std::memory_order_release);
@@ -748,6 +766,7 @@ static void release_staging_slot(moe_pc_engine* engine, uint32_t slot_index) {
         // Problem: Orphaned events accumulate if release_staging_slot never drains them
         // Solution: Opportunistically drain when any slot is released (amortized cost)
         // Impact: Prevents memory leak of CUevent handles after staging timeout
+    }
         if (!engine->orphaned_events.empty()) {
             std::vector<CUevent> to_destroy;
             {

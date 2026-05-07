@@ -64,6 +64,25 @@ static int device_resolve_vram_token(
     return 0;
 }
 
+static void device_finish_prepared_copy_success(
+    moe_pc_engine* e,
+    uint64_t key,
+    device_vram_token_guard& token_guard,
+    const vram_reservation_token& effective_token
+) {
+    device_complete_pending_copy_key(e, key);
+    if (effective_token.valid) {
+        token_guard.complete(key);
+    } else {
+        device_vram_mark_allocation_resident(e, key);
+    }
+}
+
+static void device_finish_prepared_copy_failure(moe_pc_engine* e, uint64_t key) {
+    device_cancel_pending_copy(e, key);
+    device_free_key(e, key);
+}
+
 static bool device_range_4k_aligned(uint64_t offset, uint64_t size) {
     return ((offset | size) & 4095ull) == 0;
 }
@@ -148,6 +167,9 @@ static int device_copy_tensor_from_host(
     }
     CUstream stream = device_tensor_stream_current(e);
     bool is_host_pinned = true; if (staging_slot != UINT32_MAX && staging_slot_valid(e, staging_slot)) { is_host_pinned = e->staging_slots[staging_slot].pinned; } if (!is_host_pinned) { e->io_atomic.nonpinned_fallback_count.fetch_add(1, std::memory_order_relaxed); } const int async_copy = is_host_pinned && device_backend_async_h2d_available(e, stream, 1);
+    if (!async_copy && e->backend_caps.supports_backend_async_api) {
+        e->io_atomic.backend_async_fallback.fetch_add(bytes, std::memory_order_relaxed);
+    }
     const uint64_t key = device_key_tensor(r);
     vram_reservation_token effective_token{};
     if (!device_resolve_vram_token(e, pool, bytes, reservation, &effective_token)) {
@@ -173,10 +195,7 @@ static int device_copy_tensor_from_host(
         if (async_copy) {
             device_backend_stream_sync(e, stream);
         }
-        if (async_copy) {
-            device_cancel_pending_copy(e, key);
-        }
-        device_free_key(e, key);
+        device_finish_prepared_copy_failure(e, key);
         if (staging_slot != UINT32_MAX && release_slot_on_submit) {
             release_staging_slot(e, staging_slot);
         }
@@ -190,37 +209,59 @@ static int device_copy_tensor_from_host(
     // Impact: Eliminates race condition, ensures DMA fence correctness
     bool event_ok = false;
     if (async_copy) {
+        uint32_t slot_for_defer = UINT32_MAX;
         if (staging_slot != UINT32_MAX && staging_slot_valid(e, staging_slot)) {
             auto& slot = e->staging_slots[staging_slot];
+            const bool uses_submit_fence =
+                e->backend_caps.backend == moe_BACKEND_LEVEL_ZERO ||
+                e->backend_caps.backend == moe_BACKEND_VULKAN;
             // Record fence event on the slot itself
-            if (!slot.last_copy_event) {
+            if (!uses_submit_fence && !slot.last_copy_event) {
                 slot.last_copy_event = device_take_copy_event(e);
             }
-            if (slot.last_copy_event) {
+            if (!uses_submit_fence && slot.last_copy_event) {
                 event_ok = device_backend_event_record(e, slot.last_copy_event, stream) != 0;
                 slot.last_copy_stream = event_ok ? stream : nullptr;
                 slot.last_copy_event_recorded.store(event_ok, std::memory_order_release);
             }
-            // Release slot immediately ??acquirer will wait on last_copy_event
-            if (release_slot_on_submit) {
+            // Release immediately only when the slot has its own DMA fence.
+            if (event_ok && release_slot_on_submit) {
                 release_staging_slot(e, staging_slot);
+            } else {
+                slot_for_defer = staging_slot;
             }
-            // Defer only the key completion tracking, no slot to release later
-            device_defer_staging_copy(e, UINT32_MAX, key, effective_token.valid ? bytes : 0, stream, effective_token);
+        }
+        if (device_defer_staging_copy(
+                e,
+                slot_for_defer,
+                key,
+                bytes,
+                effective_token.valid ? bytes : 0,
+                stream,
+                effective_token)) {
             token_guard.disarm();
         } else {
-            device_defer_staging_copy(e, UINT32_MAX, key, effective_token.valid ? bytes : 0, stream, effective_token);
-            token_guard.disarm();
+            const int sync_ok = device_backend_stream_sync(e, stream);
+            if (sync_ok) {
+                e->io_atomic.backend_async_completed.fetch_add(bytes, std::memory_order_relaxed);
+                device_finish_prepared_copy_success(e, key, token_guard, effective_token);
+                if (slot_for_defer != UINT32_MAX) {
+                    release_staging_slot(e, slot_for_defer);
+                }
+            } else {
+                e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
+                device_finish_prepared_copy_failure(e, key);
+                if (slot_for_defer != UINT32_MAX) {
+                    release_staging_slot(e, slot_for_defer);
+                }
+                return 0;
+            }
         }
     } else if (staging_slot != UINT32_MAX && release_slot_on_submit) {
         release_staging_slot(e, staging_slot);
     }
     if (!async_copy) {
-        if (effective_token.valid) {
-            token_guard.complete(key);
-        } else {
-            device_vram_mark_allocation_resident(e, key);
-        }
+        device_finish_prepared_copy_success(e, key, token_guard, effective_token);
     }
     device_touch_allocation(e, key);
     return 1;
@@ -235,8 +276,19 @@ static void* device_cufile_get_cached_file_handle(moe_pc_engine* e, mmap_context
     if (!e || !shard || shard->fd < 0 || !e->cuda.cuFileHandleRegister) {
         return nullptr;
     }
+#if defined(_WIN32)
+    return nullptr;
+#else
+    struct stat st {};
+    if (fstat(shard->fd, &st) != 0) {
+        return nullptr;
+    }
+    const moe_cufile_handle_key cache_key{
+        static_cast<uint64_t>(st.st_dev),
+        static_cast<uint64_t>(st.st_ino)
+    };
     std::lock_guard<std::mutex> lock(e->cufile_cache_mutex);
-    auto cached = e->cufile_file_handle_cache.find(shard->fd);
+    auto cached = e->cufile_file_handle_cache.find(cache_key);
     if (cached != e->cufile_file_handle_cache.end()) {
         return cached->second;
     }
@@ -264,8 +316,9 @@ static void* device_cufile_get_cached_file_handle(moe_pc_engine* e, mmap_context
         }
         return nullptr;
     }
-    e->cufile_file_handle_cache[shard->fd] = file_handle;
+    e->cufile_file_handle_cache[cache_key] = file_handle;
     return file_handle;
+#endif
 }
 
 static int device_cufile_ensure_buffer_registered(moe_pc_engine* e, void* ptr, uint64_t bytes) {
@@ -366,6 +419,7 @@ static int device_copy_tensor_gpudirect_storage(
 
     void* file_handle = device_cufile_get_cached_file_handle(e, shard);
     if (!file_handle) {
+        device_cancel_pending_copy(e, key);
         device_free_key(e, key);
         return 0;
     }
@@ -396,14 +450,11 @@ static int device_copy_tensor_gpudirect_storage(
 
     if (!ok || dst_offset != bytes) {
         e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
+        device_cancel_pending_copy(e, key);
         device_free_key(e, key);
         return 0;
     }
-    if (effective_token.valid) {
-        token_guard.complete(key);
-    } else {
-        device_vram_mark_allocation_resident(e, key);
-    }
+    device_finish_prepared_copy_success(e, key, token_guard, effective_token);
     device_touch_allocation(e, key);
     return 1;
 #else
@@ -512,6 +563,9 @@ static int device_copy_tensor(
         }
         const int async_copy = device_backend_async_h2d_available(
             e, stream, e->staging_slots[slot_idx].pinned ? 1 : 0);
+        if (!async_copy && e->backend_caps.supports_backend_async_api) {
+            e->io_atomic.backend_async_fallback.fetch_add(bytes, std::memory_order_relaxed);
+        }
         if (!device_prepare_tensor_allocation(e, key, bytes, pool, async_copy, &dst, staging_buf, effective_token)) {
             release_staging_slot(e, slot_idx);
             return 0;
@@ -527,30 +581,47 @@ static int device_copy_tensor(
         if (ok && async_copy) {
             // slot??defer????釉??뽱룖 event ?袁⑥┷ ????곸젫
             // BUGFIX ?얜챷??: Pass bytes for VRAM reservation release at completion
-            device_defer_staging_copy(e, slot_idx, key, effective_token.valid ? bytes : 0, stream, effective_token);
-            token_guard.disarm();
+            if (device_defer_staging_copy(
+                    e,
+                    slot_idx,
+                    key,
+                    bytes,
+                    effective_token.valid ? bytes : 0,
+                    stream,
+                    effective_token)) {
+                token_guard.disarm();
+            } else {
+                const int sync_ok = device_backend_stream_sync(e, stream);
+                if (sync_ok) {
+                    e->io_atomic.backend_async_completed.fetch_add(bytes, std::memory_order_relaxed);
+                    device_finish_prepared_copy_success(e, key, token_guard, effective_token);
+                    release_staging_slot(e, slot_idx);
+                } else {
+                    e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
+                    device_finish_prepared_copy_failure(e, key);
+                    release_staging_slot(e, slot_idx);
+                    return 0;
+                }
+            }
             // staging_slot????由????곸젫??? ??놁벉
         } else {
             release_staging_slot(e, slot_idx);
         }
         if (!ok) {
             e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
-            if (async_copy) device_cancel_pending_copy(e, key);
-            device_free_key(e, key);
+            device_finish_prepared_copy_failure(e, key);
             return 0;
         }
         if (async_copy) {
             // Staged async copies are completed by their per-copy event.
-        } else if (effective_token.valid) {
-            token_guard.complete(key);
         } else {
-            device_vram_mark_allocation_resident(e, key);
+            device_finish_prepared_copy_success(e, key, token_guard, effective_token);
         }
         device_touch_allocation(e, key);
         return 1;
     }
 
-    // Fix 55: No staging ??use explicit synchronous cuMemcpyHtoD (no false async)
+    // No staging: use explicit synchronous H2D copy.
     if (device_backend_is_metal(e)) {
         token_guard.disarm();
         return moe_DEVICE_COPY_BACKPRESSURE;
@@ -561,6 +632,9 @@ static int device_copy_tensor(
     }
     if (e) {
         e->io_atomic.bytes_sync_h2d_fallback.fetch_add(bytes);
+        if (e->backend_caps.supports_backend_async_api) {
+            e->io_atomic.backend_async_fallback.fetch_add(bytes, std::memory_order_relaxed);
+        }
     }
     const void* host_ptr = shard ? mmap_get_ptr(shard, static_cast<size_t>(ranges[0][0])) : nullptr;
     if (!device_prepare_tensor_allocation(e, key, bytes, pool, 0 /*sync*/, &dst, host_ptr, effective_token)) {
@@ -571,6 +645,7 @@ static int device_copy_tensor(
         if (!range[1]) continue;
         const void* src = mmap_get_ptr(shard, static_cast<size_t>(range[0]));
         if (!src) {
+            device_cancel_pending_copy(e, key);
             device_free_key(e, key);
             return 0;
         }
@@ -578,11 +653,13 @@ static int device_copy_tensor(
         // Solution: Check that cur + range[1] stays within dst + bytes bounds
         if (range[1] > bytes || cur - dst > bytes - range[1]) {
             e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
+            device_cancel_pending_copy(e, key);
             device_free_key(e, key);
             return 0;
         }
         if (!device_backend_copy_h2d_sync(e, cur, src, range[1])) {
             e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
+            device_cancel_pending_copy(e, key);
             device_free_key(e, key);
             return 0;
         }
@@ -596,11 +673,7 @@ static int device_copy_tensor(
         }
     }
 #endif
-    if (effective_token.valid) {
-        token_guard.complete(key);
-    } else {
-        device_vram_mark_allocation_resident(e, key);
-    }
+    device_finish_prepared_copy_success(e, key, token_guard, effective_token);
     device_touch_allocation(e, key);
     return 1;
 }

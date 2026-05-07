@@ -40,6 +40,7 @@ typedef int (*moe_ze_device_get_fn)(void*, uint32_t*, void**);
 typedef int (*moe_ze_context_create_fn)(void*, const void*, void**);
 typedef int (*moe_ze_context_destroy_fn)(void*);
 typedef int (*moe_ze_mem_alloc_host_fn)(void*, const void*, size_t, size_t, void**);
+typedef int (*moe_ze_mem_alloc_device_fn)(void*, const void*, size_t, size_t, void*, void**);
 typedef int (*moe_ze_mem_free_fn)(void*, void*);
 typedef int (*moe_ze_device_get_memory_properties_fn)(void*, uint32_t*, void*);
 
@@ -141,26 +142,22 @@ struct moe_level_zero_driver_api {
     moe_ze_context_create_fn zeContextCreate = nullptr;
     moe_ze_context_destroy_fn zeContextDestroy = nullptr;
     moe_ze_mem_alloc_host_fn zeMemAllocHost = nullptr;
+    moe_ze_mem_alloc_device_fn zeMemAllocDevice = nullptr;
     moe_ze_mem_free_fn zeMemFree = nullptr;
-    void* (*zeCommandQueueCreate)(void*, void*, void*, void**) = nullptr;
-    void* (*zeCommandQueueDestroy)(void*) = nullptr;
-    void* (*zeCommandQueueSynchronize)(void*, uint64_t) = nullptr;
-    void* (*zeCommandQueueExecuteCommandLists)(void*, uint32_t, void**, void*) = nullptr;
-    void* (*zeEventCreate)(void*, void*, void**) = nullptr;
-    void* (*zeEventDestroy)(void*) = nullptr;
-    void* (*zeEventHostSynchronize)(void*, uint64_t) = nullptr;
-    void* (*zeEventQueryStatus)(void*) = nullptr;
-    void* (*zeCommandListCreate)(void*, void*, void*, void**) = nullptr;
-    void* (*zeCommandListDestroy)(void*) = nullptr;
-    void* (*zeCommandListClose)(void*) = nullptr;
-    void* (*zeCommandListReset)(void*) = nullptr;
-    void* (*zeCommandListAppendMemoryCopy)(void*, void*, const void*, size_t, void*, uint32_t, void**) = nullptr;
-    void* (*zeCommandListAppendSignalEvent)(void*, void*) = nullptr;
-    void* (*zeCommandListAppendWaitOnEvents)(void*, uint32_t, void**) = nullptr;
+    int (*zeCommandQueueCreate)(void*, void*, void*, void**) = nullptr;
+    int (*zeCommandQueueDestroy)(void*) = nullptr;
+    int (*zeCommandQueueSynchronize)(void*, uint64_t) = nullptr;
+    int (*zeCommandQueueExecuteCommandLists)(void*, uint32_t, void**, void*) = nullptr;
+    int (*zeCommandListCreate)(void*, void*, void*, void**) = nullptr;
+    int (*zeCommandListDestroy)(void*) = nullptr;
+    int (*zeCommandListClose)(void*) = nullptr;
+    int (*zeCommandListReset)(void*) = nullptr;
+    int (*zeCommandListAppendMemoryCopy)(void*, void*, const void*, size_t, void*, uint32_t, void**) = nullptr;
     int (*zeFenceCreate)(void*, void*, void**) = nullptr;
     int (*zeFenceDestroy)(void*) = nullptr;
     int (*zeFenceHostSynchronize)(void*, uint64_t) = nullptr;
     int (*zeFenceQueryStatus)(void*) = nullptr;
+    int (*zeFenceReset)(void*) = nullptr;
     int (*zeDeviceGetProperties)(void*, void*) = nullptr;
     moe_ze_device_get_memory_properties_fn zeDeviceGetMemoryProperties = nullptr;
 };
@@ -173,32 +170,36 @@ struct moe_vulkan_driver_api {
     void* device = nullptr;
     void* queue = nullptr;
     void* commandPool = nullptr;
-    void* (*vkCreateCommandPool)(void*, const void*, const void*, void**) = nullptr;
-    void* (*vkDestroyCommandPool)(void*, void*, const void*) = nullptr;
-    void* (*vkAllocateCommandBuffers)(void*, const void*, void**) = nullptr;
-    void* (*vkFreeCommandBuffers)(void*, void*, uint32_t, const void**) = nullptr;
-    void* (*vkQueueSubmit)(void*, uint32_t, const void*, void*) = nullptr;
-    void* (*vkQueueWaitIdle)(void*) = nullptr;
-    void* (*vkCreateEvent)(void*, const void*, const void*, void**) = nullptr;
-    void* (*vkDestroyEvent)(void*, void*, const void*) = nullptr;
-    void* (*vkGetEventStatus)(void*, void*) = nullptr;
+    uint32_t queueFamilyIndex = UINT32_MAX;
+    void (*vkDestroyInstance)(void*, const void*) = nullptr;
+    void (*vkDestroyDevice)(void*, const void*) = nullptr;
+    void* (*vkGetDeviceProcAddr)(void*, const char*) = nullptr;
+    int (*vkCreateCommandPool)(void*, const void*, const void*, void**) = nullptr;
+    void (*vkDestroyCommandPool)(void*, void*, const void*) = nullptr;
+    int (*vkAllocateCommandBuffers)(void*, const void*, void**) = nullptr;
+    void (*vkFreeCommandBuffers)(void*, void*, uint32_t, const void**) = nullptr;
+    int (*vkQueueSubmit)(void*, uint32_t, const void*, void*) = nullptr;
+    int (*vkQueueWaitIdle)(void*) = nullptr;
     int (*vkCreateFence)(void*, const void*, const void*, void**) = nullptr;
     int (*vkGetFenceStatus)(void*, void*) = nullptr;
-    void* (*vkDestroyFence)(void*, void*, const void*) = nullptr;
-    void* (*vkGetPhysicalDeviceMemoryProperties2)(void*, void*) = nullptr;
+    int (*vkWaitForFences)(void*, uint32_t, const void**, uint32_t, uint64_t) = nullptr;
+    int (*vkResetFences)(void*, uint32_t, const void**) = nullptr;
+    void (*vkDestroyFence)(void*, void*, const void*) = nullptr;
+    void (*vkGetPhysicalDeviceMemoryProperties)(void*, void*) = nullptr;
+    void (*vkGetPhysicalDeviceMemoryProperties2)(void*, void*) = nullptr;
     // BUGFIX Problem E: Add functions for H2D copy ?끸쁾??FEATURE
-    void* (*vkCreateBuffer)(void*, const void*, const void*, void**) = nullptr;
-    void* (*vkDestroyBuffer)(void*, void*, const void*) = nullptr;
-    void* (*vkGetBufferMemoryRequirements)(void*, void*, void*) = nullptr;
-    void* (*vkAllocateMemory)(void*, const void*, const void*, void**) = nullptr;
-    void* (*vkFreeMemory)(void*, void*, const void*) = nullptr;
-    void* (*vkBindBufferMemory)(void*, void*, void*, uint64_t) = nullptr;
-    void* (*vkMapMemory)(void*, void*, uint64_t, uint64_t, uint32_t, void**) = nullptr;
-    void* (*vkUnmapMemory)(void*, void*) = nullptr;
-    void* (*vkBeginCommandBuffer)(void*, const void*) = nullptr;
-    void* (*vkEndCommandBuffer)(void*) = nullptr;
-    void* (*vkCmdCopyBuffer)(void*, void*, void*, uint32_t, const void*) = nullptr;
-    void* (*vkResetCommandBuffer)(void*, uint32_t) = nullptr;
+    int (*vkCreateBuffer)(void*, const void*, const void*, void**) = nullptr;
+    void (*vkDestroyBuffer)(void*, void*, const void*) = nullptr;
+    void (*vkGetBufferMemoryRequirements)(void*, void*, void*) = nullptr;
+    int (*vkAllocateMemory)(void*, const void*, const void*, void**) = nullptr;
+    void (*vkFreeMemory)(void*, void*, const void*) = nullptr;
+    int (*vkBindBufferMemory)(void*, void*, void*, uint64_t) = nullptr;
+    int (*vkMapMemory)(void*, void*, uint64_t, uint64_t, uint32_t, void**) = nullptr;
+    void (*vkUnmapMemory)(void*, void*) = nullptr;
+    int (*vkBeginCommandBuffer)(void*, const void*) = nullptr;
+    int (*vkEndCommandBuffer)(void*) = nullptr;
+    void (*vkCmdCopyBuffer)(void*, void*, void*, uint32_t, const void*) = nullptr;
+    int (*vkResetCommandBuffer)(void*, uint32_t) = nullptr;
 };
 
 struct moe_device_allocation {
@@ -210,6 +211,45 @@ struct moe_device_allocation {
     bool pending_free = false;
     bool resident_accounted = false;
     uint8_t pool = 0;
+    uint8_t backend_kind = 0;
+    uint64_t backend_aux = 0;
+};
+
+struct moe_cufile_handle_key {
+    uint64_t dev = 0;
+    uint64_t ino = 0;
+
+    bool operator==(const moe_cufile_handle_key& other) const {
+        return dev == other.dev && ino == other.ino;
+    }
+};
+
+struct moe_cufile_handle_key_hash {
+    size_t operator()(const moe_cufile_handle_key& key) const {
+        const uint64_t mixed = key.dev ^ (key.ino + 0x9e3779b97f4a7c15ull + (key.dev << 6) + (key.dev >> 2));
+        return static_cast<size_t>(mixed ^ (mixed >> 32));
+    }
+};
+
+enum {
+    moe_DEVICE_ALLOC_NATIVE_PTR = 0,
+    moe_DEVICE_ALLOC_VULKAN_BUFFER = 1,
+    moe_DEVICE_ALLOC_D3D12_RESOURCE = 2
+};
+
+struct moe_directstorage_state {
+    void* factory = nullptr;
+    void* queue = nullptr;
+    void* gpu_queue = nullptr;
+    void* status_array = nullptr;
+    void* gpu_status_array = nullptr;
+    void* event_handle = nullptr;
+    void* d3d12_device = nullptr;
+    uint32_t status_index = 0;
+    uint32_t gpu_status_index = 0;
+    bool initialized = false;
+    bool available = false;
+    bool gpu_available = false;
 };
 
 enum {

@@ -49,6 +49,7 @@ void moe_pc_engine_destroy(moe_pc_engine_t* engine) {
     engine->qkv_head_state_layers.clear();
     engine->qkv_head_state_heads.clear();
     engine->qkv_head_state_fingerprints.clear();
+    directstorage_queue_cleanup(engine);
     device_stream_pool_destroy(engine);
     device_cufile_cleanup_caches(engine);
     device_allocator_shutdown(engine);

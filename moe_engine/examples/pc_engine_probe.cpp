@@ -516,7 +516,7 @@ static int probe_main(int argc, char** argv) {
             moe_io_stats_t io_stats;
             if (moe_pc_engine_get_io_stats(engine, &io_stats)) {
                 printf(
-                    "io path=%s queued=%llu done=%llu failed=%llu dropped=%llu hint=%llu disk=%llu pinned=%llu gpu=%llu direct=%llu q=%u/%u/%u topology=%llu pinned_active=%d staging_deficit=%u recommended_staging=%llu\n",
+                    "io path=%s queued=%llu done=%llu failed=%llu dropped=%llu hint=%llu disk=%llu pinned=%llu gpu=%llu direct=%llu ds=%llu/%llu/%llu backend_async=%llu/%llu fallback=%llu fence=%llu l0_fence=%llu q=%u/%u/%u topology=%llu pinned_active=%d staging_deficit=%u recommended_staging=%llu\n",
                     moe_io_path_name(io_stats.active_path),
                     (unsigned long long)io_stats.queued_requests,
                     (unsigned long long)io_stats.completed_requests,
@@ -527,6 +527,14 @@ static int probe_main(int argc, char** argv) {
                     (unsigned long long)io_stats.bytes_ram_to_pinned,
                     (unsigned long long)io_stats.bytes_pinned_to_gpu,
                     (unsigned long long)io_stats.bytes_direct_to_gpu,
+                    (unsigned long long)io_stats.bytes_directstorage_submitted,
+                    (unsigned long long)io_stats.bytes_directstorage_completed,
+                    (unsigned long long)io_stats.bytes_directstorage_failed,
+                    (unsigned long long)io_stats.backend_async_submitted,
+                    (unsigned long long)io_stats.backend_async_completed,
+                    (unsigned long long)io_stats.backend_async_fallback,
+                    (unsigned long long)io_stats.backend_fence_waits,
+                    (unsigned long long)io_stats.level_zero_fence_waits,
                     io_stats.disk_queue_depth,
                     io_stats.pinned_queue_depth,
                     io_stats.gpu_queue_depth,

@@ -25,7 +25,7 @@ int moe_juju_header_valid(const moe_juju_header_t* header) {
     if (header->header_size != MOE_JUJU_HEADER_BYTES) {
         return 0;
     }
-    if (header->version_major == 0) {
+    if (header->version_major < 2u) {
         return 0;
     }
     if (header->section_count == 0 || header->section_count > 65536u) {

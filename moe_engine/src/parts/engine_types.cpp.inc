@@ -62,6 +62,14 @@ struct moe_tensor_record {
     uint8_t graph_role = moe_JUJU_ROLE_UNKNOWN;
     uint8_t prefetch_class = moe_JUJU_PREFETCH_AUTO;
     uint8_t juju_section_type = 0;
+    uint8_t bundle_native = 0;
+    uint8_t bundle_member_role = 0;
+    uint32_t bundle_id = UINT32_MAX;
+    uint64_t bundle_offset = 0;
+    uint64_t bundle_size = 0;
+    uint64_t bundle_member_offset = 0;
+    uint64_t bundle_member_size = 0;
+    uint64_t bundle_alignment = 0;
 };
 
 enum moe_raw_scalar_encoding_t : uint8_t {

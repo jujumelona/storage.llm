@@ -11,6 +11,7 @@ static inline bool staging_slot_valid(
     const moe_pc_engine* e, uint32_t slot_index
 ) {
     if (!e) return false;
+    if (e->staging_reset_in_progress.load(std::memory_order_acquire)) return false;
     if (e->staging_slot_size == 0) return false;  // MUST check first
     if (slot_index >= e->staging_slots.size()) return false;
     return e->staging_slots[slot_index].buf.load(std::memory_order_acquire) != nullptr;
@@ -38,6 +39,14 @@ static uint32_t moe_gpu_stage_batch_max(const moe_pc_engine* engine) {
 
 static void reset_staging_slots(moe_pc_engine* engine) {
     if (!engine) {
+        return;
+    }
+    bool expected_reset = false;
+    if (!engine->staging_reset_in_progress.compare_exchange_strong(
+            expected_reset,
+            true,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
         return;
     }
     // BUGFIX 168: Prevent concurrent access during clear()
@@ -121,12 +130,19 @@ static void reset_staging_slots(moe_pc_engine* engine) {
             // → GPU worker completes later, returns slot with stale buf → use-after-free
             // Solution: Nullify buf for all slots, workers check staging_generation
             // Impact: Prevents use-after-free when workers complete after timeout
-            slot.buf = nullptr;
+            if (!slot.in_use.load(std::memory_order_acquire)) {
+                slot.buf = nullptr;
+            }
         }
         engine->staging_free_slot_count.store(0, std::memory_order_release);
         engine->staging_free_pinned_slots.store(0, std::memory_order_release);
         engine->staging_free_gpu_slots.store(0, std::memory_order_release);
         engine->staging_free_direct_slots.store(0, std::memory_order_release);
+        engine->staging_reset_in_progress.store(false, std::memory_order_release);
+        engine->staging_pinned_cv.notify_all();
+        engine->staging_gpu_cv.notify_all();
+        engine->staging_direct_cv.notify_all();
+        engine->staging_slot_cv.notify_all();
         return;
     }
 
@@ -159,6 +175,7 @@ static void reset_staging_slots(moe_pc_engine* engine) {
     // BUGFIX 204: Add memory_order_relaxed for statistics counter ★
     engine->io_atomic.staging_slot_deficit.store(0, std::memory_order_relaxed);
     // BUGFIX 68: Issue 5 - Notify all 3 CVs on reset ??
+    engine->staging_reset_in_progress.store(false, std::memory_order_release);
     engine->staging_pinned_cv.notify_all();
     engine->staging_gpu_cv.notify_all();
     engine->staging_direct_cv.notify_all();

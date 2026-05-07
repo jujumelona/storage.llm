@@ -5,6 +5,13 @@
     if (engine->backend_caps.supports_zero_copy_host) {
         return moe_IO_PATH_ZERO_COPY_HOST;
     }
+    if (engine->backend_caps.supports_directstorage &&
+        engine->backend_caps.supports_backend_async_api &&
+        engine->io_config.enable_directstorage &&
+        compiled_directstorage_available() &&
+        directstorage_runtime_available()) {
+        return moe_IO_PATH_DIRECTSTORAGE;
+    }
     if (engine->backend_caps.backend != moe_BACKEND_CUDA) {
         return engine->staging && engine->staging_pinned ?
             moe_IO_PATH_PINNED_HOST : moe_IO_PATH_MMAP_PAGECACHE;
@@ -16,10 +23,6 @@
     if (engine->backend_caps.supports_registered_io_buffers &&
         engine->io_config.enable_gpudirect_storage && compiled_gpudirect_available()) {
         return moe_IO_PATH_GPUDIRECT_STORAGE;
-    }
-    if (engine->backend_caps.supports_registered_io_buffers &&
-        engine->io_config.enable_directstorage && compiled_directstorage_available()) {
-        return moe_IO_PATH_DIRECTSTORAGE;
     }
     if (engine->staging && engine->staging_pinned) {
         return moe_IO_PATH_PINNED_HOST;
@@ -48,6 +51,10 @@ static int engine_has_device_upload_workers(const moe_pc_engine* engine) {
     }
     // Level Zero with async API can use upload workers
     if (engine->backend_caps.backend == moe_BACKEND_LEVEL_ZERO &&
+        engine->backend_caps.supports_backend_async_api) {
+        return 1;
+    }
+    if (engine->backend_caps.backend == moe_BACKEND_VULKAN &&
         engine->backend_caps.supports_backend_async_api) {
         return 1;
     }

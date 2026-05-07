@@ -29,6 +29,15 @@ static void reset_io_stats_for_config(moe_pc_engine* engine) {
     engine->io_atomic.staging_slot_waits.store(0, std::memory_order_relaxed);
     engine->io_atomic.staging_slot_contention.store(0, std::memory_order_relaxed);
     engine->io_atomic.bytes_overlapped_io.store(0, std::memory_order_relaxed);  // BUGFIX 936
+    engine->io_atomic.bytes_directstorage_submitted.store(0, std::memory_order_relaxed);
+    engine->io_atomic.bytes_directstorage_completed.store(0, std::memory_order_relaxed);
+    engine->io_atomic.bytes_directstorage_failed.store(0, std::memory_order_relaxed);
+    engine->io_atomic.backend_async_submitted.store(0, std::memory_order_relaxed);
+    engine->io_atomic.backend_async_completed.store(0, std::memory_order_relaxed);
+    engine->io_atomic.backend_async_fallback.store(0, std::memory_order_relaxed);
+    engine->io_atomic.backend_fence_waits.store(0, std::memory_order_relaxed);
+    engine->io_atomic.vulkan_fence_waits.store(0, std::memory_order_relaxed);
+    engine->io_atomic.level_zero_fence_waits.store(0, std::memory_order_relaxed);
     engine->io_atomic.topology_predictions.store(0, std::memory_order_relaxed);
     engine->io_atomic.topology_updates.store(0, std::memory_order_relaxed);
     const moe_io_path_t active_path = choose_active_io_path(engine);
@@ -75,6 +84,15 @@ static void snapshot_io_stats(const moe_pc_engine* engine, moe_io_stats_t* out) 
     out->topology_predictions = engine->io_atomic.topology_predictions.load(std::memory_order_relaxed);
     out->topology_updates = engine->io_atomic.topology_updates.load(std::memory_order_relaxed);
     out->bytes_overlapped_io = engine->io_atomic.bytes_overlapped_io.load(std::memory_order_relaxed);  // BUGFIX 936
+    out->bytes_directstorage_submitted = engine->io_atomic.bytes_directstorage_submitted.load(std::memory_order_relaxed);
+    out->bytes_directstorage_completed = engine->io_atomic.bytes_directstorage_completed.load(std::memory_order_relaxed);
+    out->bytes_directstorage_failed = engine->io_atomic.bytes_directstorage_failed.load(std::memory_order_relaxed);
+    out->backend_async_submitted = engine->io_atomic.backend_async_submitted.load(std::memory_order_relaxed);
+    out->backend_async_completed = engine->io_atomic.backend_async_completed.load(std::memory_order_relaxed);
+    out->backend_async_fallback = engine->io_atomic.backend_async_fallback.load(std::memory_order_relaxed);
+    out->backend_fence_waits = engine->io_atomic.backend_fence_waits.load(std::memory_order_relaxed);
+    out->vulkan_fence_waits = engine->io_atomic.vulkan_fence_waits.load(std::memory_order_relaxed);
+    out->level_zero_fence_waits = engine->io_atomic.level_zero_fence_waits.load(std::memory_order_relaxed);
     out->disk_queue_depth = engine->disk_stage.depth.load(std::memory_order_relaxed);
     out->pinned_queue_depth = engine->pinned_stage.depth.load(std::memory_order_relaxed);
     out->gpu_queue_depth = engine->gpu_stage.depth.load(std::memory_order_relaxed);

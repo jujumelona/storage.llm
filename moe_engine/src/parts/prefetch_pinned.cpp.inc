@@ -307,8 +307,29 @@ static int prefetch_tensor_file_to_pinned(
     }
     void* io_gen_ptr = (void*)(uintptr_t)current_io_gen;
 
+#if defined(_WIN32)
+    if (engine->io_config.enable_directstorage &&
+        engine->backend_caps.supports_directstorage &&
+        engine->backend_caps.supports_backend_async_api &&
+        compiled_directstorage_available()) {
+        const std::string ds_path = rec.resolved_path_index < engine->tensor_paths.size()
+            ? engine->tensor_paths[rec.resolved_path_index] : std::string();
+        const std::wstring wide_path = storagellm::wide_path_from_utf8(ds_path);
+        if (!wide_path.empty() &&
+            directstorage_read_ranges_to_staging(
+                engine,
+                wide_path.c_str(),
+                ranges,
+                sizeof(ranges) / sizeof(ranges[0]),
+                engine->staging_slots[slot_index].buf.load(std::memory_order_acquire),
+                total_bytes,
+                file_size)) {
+            staging_offset = total_bytes;
+        }
+    }
+#endif
     // Check if we can use IORing/io_uring registered buffer I/O
-    if (engine->ring_adapter.initialized) {
+    if (staging_offset != total_bytes && engine->ring_adapter.initialized) {
         int submits = 0;
         for (const auto& range : ranges) {
             const uint64_t offset = range[0];
@@ -349,7 +370,7 @@ static int prefetch_tensor_file_to_pinned(
                 } else break;
             }
         }
-    } else if (shard && mmap_get_ptr(shard, 0)) {
+    } else if (staging_offset != total_bytes && shard && mmap_get_ptr(shard, 0)) {
         // Fallback to mmap direct memcpy to avoid dual caching
         for (const auto& range : ranges) {
             const uint64_t offset = range[0];
@@ -364,7 +385,7 @@ static int prefetch_tensor_file_to_pinned(
             memcpy(engine->staging_slots[slot_index].buf + staging_offset, static_cast<const uint8_t*>(mmap_get_ptr(shard, static_cast<size_t>(offset))), static_cast<size_t>(length));
             staging_offset += length;
         }
-    } else {
+    } else if (staging_offset != total_bytes) {
 #if defined(_WIN32)
         // BUGFIX: IOCP-based async I/O for Windows without IORing (pre-Win11 22H2)
         // Avoids blocking io_worker threads with synchronous ifstream reads

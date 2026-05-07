@@ -1,6 +1,10 @@
 static int compiled_directstorage_available() {
-#if defined(moe_ENABLE_DIRECTSTORAGE) || defined(HAVE_DIRECTSTORAGE)
+#if defined(_WIN32) && (defined(moe_ENABLE_DIRECTSTORAGE) || defined(HAVE_DIRECTSTORAGE)) && defined(__has_include)
+#if __has_include(<dstorage.h>) && __has_include(<d3d12.h>)
     return 1;
+#else
+    return 0;
+#endif
 #else
     return 0;
 #endif

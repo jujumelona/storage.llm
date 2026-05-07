@@ -5,8 +5,35 @@
             } else {
                 bool staged_direct_to_gpu = false;
                 if (task.bundle_triplet && task.target_tier == moe_TIER_VRAM) {
-                    const uint64_t bundle_bytes = expert_triplet_or_hardcoded_bytes(
+                    const moe_projection_t bundle_projs[3] = {moe_PROJ_GATE, moe_PROJ_UP, moe_PROJ_DOWN};
+                    const moe_tensor_record* bundle_recs[3] = {};
+                    for (uint32_t p = 0; p < 3u; ++p) {
+                        bundle_recs[p] = find_tensor_record(
+                            engine, task.bundle_layer, task.bundle_expert, bundle_projs[p]);
+                    }
+                    uint64_t bundle_bytes = expert_triplet_or_hardcoded_bytes(
                         engine, task.bundle_layer, task.bundle_expert);
+                    int contiguous_bundle = 0;
+                    uint64_t contiguous_bundle_offset = 0;
+                    uint64_t contiguous_bundle_size = 0;
+                    if (bundle_recs[0] && bundle_recs[1] && bundle_recs[2] &&
+                        bundle_recs[0]->bundle_native &&
+                        bundle_recs[1]->bundle_native &&
+                        bundle_recs[2]->bundle_native &&
+                        bundle_recs[0]->resolved_path_index == bundle_recs[1]->resolved_path_index &&
+                        bundle_recs[0]->resolved_path_index == bundle_recs[2]->resolved_path_index &&
+                        bundle_recs[0]->bundle_id == bundle_recs[1]->bundle_id &&
+                        bundle_recs[0]->bundle_id == bundle_recs[2]->bundle_id &&
+                        bundle_recs[0]->bundle_offset == bundle_recs[1]->bundle_offset &&
+                        bundle_recs[0]->bundle_offset == bundle_recs[2]->bundle_offset &&
+                        bundle_recs[0]->bundle_size == bundle_recs[1]->bundle_size &&
+                        bundle_recs[0]->bundle_size == bundle_recs[2]->bundle_size &&
+                        bundle_recs[0]->bundle_size > 0) {
+                        contiguous_bundle = 1;
+                        contiguous_bundle_offset = bundle_recs[0]->bundle_offset;
+                        contiguous_bundle_size = bundle_recs[0]->bundle_size;
+                        bundle_bytes = contiguous_bundle_size;
+                    }
                     if (active_path == moe_IO_PATH_PINNED_HOST &&
                         engine_has_device_upload_workers(engine) &&
                         engine->backend_caps.supports_fixed_read_staging &&
@@ -37,23 +64,64 @@
                                 next.staging_valid = 0;
                                 uint64_t staging_offset = 0;
                                 int bundle_ok = 1;
-                                const moe_projection_t projs[3] = {moe_PROJ_GATE, moe_PROJ_UP, moe_PROJ_DOWN};
-                                for (uint32_t p = 0; p < 3u; ++p) {
-                                    const moe_tensor_record* brec = find_tensor_record(
-                                        engine, task.bundle_layer, task.bundle_expert, projs[p]);
-                                    if (!brec) {
+                                if (contiguous_bundle) {
+                                    mmap_context_t* shard = get_or_map_tensor_shard(engine, *bundle_recs[0]);
+                                    if (!shard || !mmap_get_ptr(shard, 0)) {
                                         bundle_ok = 0;
-                                        break;
+                                    } else {
+                                        const uint64_t file_size = static_cast<uint64_t>(mmap_get_size(shard));
+                                        if (contiguous_bundle_offset > file_size ||
+                                            contiguous_bundle_size > file_size - contiguous_bundle_offset ||
+                                            contiguous_bundle_size > engine->staging_slots[slot].size) {
+                                            bundle_ok = 0;
+                                        } else {
+                                            const uint8_t* src = static_cast<const uint8_t*>(
+                                                mmap_get_ptr(shard, static_cast<size_t>(contiguous_bundle_offset)));
+                                            if (!src) {
+                                                bundle_ok = 0;
+                                            } else {
+                                                const uint64_t copied = copy_mapped_range_to_staging_linear(
+                                                    engine, src, contiguous_bundle_size, slot, &staging_offset);
+                                                if (copied != contiguous_bundle_size ||
+                                                    staging_offset != contiguous_bundle_size) {
+                                                    bundle_ok = 0;
+                                                } else {
+                                                    engine->io_atomic.bytes_ram_to_pinned.fetch_add(copied, std::memory_order_relaxed);
+                                                    for (uint32_t p = 0; p < 3u; ++p) {
+                                                        next.bundle_offsets[p] = bundle_recs[p]->bundle_member_offset;
+                                                        next.bundle_bytes[p] = tensor_stream_bytes(*bundle_recs[p]);
+                                                        if (next.bundle_offsets[p] > contiguous_bundle_size ||
+                                                            next.bundle_bytes[p] > contiguous_bundle_size - next.bundle_offsets[p]) {
+                                                            bundle_ok = 0;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
-                                    next.bundle_offsets[p] = staging_offset;
-                                    uint64_t copied = 0;
-                                    if (!prefetch_tensor_ram_to_pinned_at(
-                                            engine, *brec, slot, &staging_offset, &copied, task.target_tier) ||
-                                        copied != tensor_stream_bytes(*brec)) {
-                                        bundle_ok = 0;
-                                        break;
+                                } else {
+                                    for (uint32_t p = 0; p < 3u; ++p) {
+                                        const moe_tensor_record* brec = bundle_recs[p];
+                                        if (!brec) {
+                                            bundle_ok = 0;
+                                            break;
+                                        }
+                                        next.bundle_offsets[p] = staging_offset;
+                                        uint64_t copied = 0;
+                                        if (!prefetch_tensor_ram_to_pinned_at(
+                                                engine, *brec, slot, &staging_offset, &copied, task.target_tier) ||
+                                            copied != tensor_stream_bytes(*brec)) {
+                                            bundle_ok = 0;
+                                            break;
+                                        }
+                                        next.bundle_bytes[p] = copied;
                                     }
-                                    next.bundle_bytes[p] = copied;
+                                }
+                                if (!bundle_ok) {
+                                    for (uint32_t p = 0; p < 3u; ++p) {
+                                        next.bundle_offsets[p] = 0;
+                                        next.bundle_bytes[p] = 0;
+                                    }
                                 }
                                 if (bundle_ok && staging_offset == bundle_bytes) {
                                     next.staging_bytes = staging_offset;

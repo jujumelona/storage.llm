@@ -207,6 +207,12 @@ static int load_juju_tensor_index_as_tensor_index(
         if (!moe_read_juju_tensor_index_json(path, sections, file_bytes, &index_json)) {
             continue;
         }
+        if (!moe_juju_index_schema_supported(index_json)) {
+            std::fprintf(stderr,
+                "[storagellm] stale JUJU artifact rejected: %s. Regenerate .juju/.juju.idx with JUJU v2 bundle-native Colab notebooks.\n",
+                path.c_str());
+            return 0;
+        }
         moe_juju_probe_note_index_json(&probe, index_json);
         std::vector<moe_juju_tensor_json_entry_t> tensors;
         if (!moe_parse_juju_tensor_index_json(index_json, &tensors, nullptr, nullptr, nullptr)) {
@@ -236,6 +242,12 @@ static int load_juju_tensor_index_as_tensor_index(
         std::string index_json;
         if (!moe_read_juju_tensor_index_json(path, sections, file_bytes, &index_json)) {
             continue;
+        }
+        if (!moe_juju_index_schema_supported(index_json)) {
+            std::fprintf(stderr,
+                "[storagellm] stale JUJU artifact rejected: %s. Regenerate .juju/.juju.idx with JUJU v2 bundle-native Colab notebooks.\n",
+                path.c_str());
+            return 0;
         }
         moe_juju_probe_note_index_json(&probe, index_json);
         moe_ingest_juju_graph_ir(engine, index_json);
@@ -282,6 +294,11 @@ static int load_juju_tensor_index_as_tensor_index(
             } else if (entry.residency_hint == moe_JUJU_RESIDENCY_SLOW_MEM) {
                 engine->juju_slowmem_tensor_count.fetch_add(1, std::memory_order_relaxed);
             }
+            moe_projection_t bundle_projection_probe = moe_PROJ_GATE;
+            if (entry.bundle_native &&
+                !moe_juju_bundle_member_projection(entry, &bundle_projection_probe)) {
+                continue;
+            }
             if (moe_gguf_tensor_name_executable(entry.name)) {
                 moe_gguf_tensor_dir_entry_t common{};
                 common.name = entry.name;
@@ -311,16 +328,20 @@ static int load_juju_tensor_index_as_tensor_index(
             }
             const std::string lower_name = moe_lower_ascii_copy(entry.name);
             const bool combined_gate_up =
+                !entry.bundle_native &&
                 lower_name.find("ffn_gate_up_exps.weight") != std::string::npos;
             uint32_t layer = 0;
             moe_projection_t proj = moe_PROJ_GATE;
+            const int explicit_projection = moe_juju_bundle_member_projection(entry, &proj);
             if (!moe_parse_layer_from_gguf_name(entry.name, &layer) ||
-                (!combined_gate_up && !moe_gguf_expert_projection(entry.name, &proj)) ||
+                (!combined_gate_up && !explicit_projection && !moe_gguf_expert_projection(entry.name, &proj)) ||
                 entry.dims < 3 ||
                 entry.shape[2] == 0) {
                 continue;
             }
-            const uint64_t expert_count64 = entry.expert_count ? entry.expert_count : entry.shape[2];
+            const uint64_t expert_count64 =
+                (entry.bundle_native && entry.has_explicit_expert) ? 1ull :
+                (entry.expert_count ? entry.expert_count : entry.shape[2]);
             const uint64_t effective_entry_bytes = moe_effective_juju_tensor_bytes(entry, contract);
             const uint64_t per_expert = entry.per_expert_bytes ? entry.per_expert_bytes :
                 (expert_count64 ? effective_entry_bytes / expert_count64 : 0);
@@ -367,7 +388,9 @@ static int load_juju_tensor_index_as_tensor_index(
                     rec.info.part = part_id;
                     rec.info.shard = shard_id;
                     rec.info.layer = layer;
-                    rec.info.expert = (uint32_t)expert;
+                    rec.info.expert = entry.has_explicit_expert ?
+                        entry.explicit_expert :
+                        (uint32_t)expert;
                     rec.info.proj = combined_gate_up ?
                         (split == 0 ? moe_PROJ_GATE : moe_PROJ_UP) : proj;
                     rec.info.rows = combined_gate_up ? (rows_total / 2u) : rows_total;
@@ -409,6 +432,14 @@ static int load_juju_tensor_index_as_tensor_index(
                     rec.graph_role = entry.graph_role;
                     rec.prefetch_class = entry.prefetch_class;
                     rec.juju_section_type = entry.juju_section_type;
+                    rec.bundle_native = entry.bundle_native;
+                    rec.bundle_member_role = moe_juju_bundle_member_role_id(entry.bundle_member_role);
+                    rec.bundle_id = entry.bundle_id;
+                    rec.bundle_offset = entry.bundle_offset;
+                    rec.bundle_size = entry.bundle_size;
+                    rec.bundle_member_offset = entry.bundle_member_offset;
+                    rec.bundle_member_size = entry.bundle_member_size;
+                    rec.bundle_alignment = entry.bundle_alignment;
                     const uint8_t rec_encoding = moe_weight_encoding_from_juju_entry(entry, contract);
                     finalize_tensor_layout(&rec, rec_encoding);
                     if (entry.row_stride_bytes >= rec.weight_row_bytes &&

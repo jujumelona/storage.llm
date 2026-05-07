@@ -23,6 +23,7 @@ struct moe_pc_engine {
     moe_io_atomic_stats io_atomic{};
     moe_backend_caps_t backend_caps{};
     moe_io_ring_adapter ring_adapter{};
+    moe_directstorage_state directstorage{};
 #if defined(__linux__) && defined(MOE_HAVE_LIBURING) && MOE_HAVE_LIBURING
     io_uring_state_t uring_state{};
 #endif
@@ -134,6 +135,7 @@ struct moe_pc_engine {
     std::mutex staging_slot_mutex;
     std::condition_variable staging_slot_cv;
     std::atomic<uint64_t> staging_generation{0};
+    std::atomic<bool> staging_reset_in_progress{false};
     // BUGFIX 949: Orphaned events from staging timeout ?끸쁾??
     // When reset_staging_slots times out, in-use slots' last_copy_event handles
     // are moved here instead of being destroyed (GPU workers may still reference them).
@@ -193,6 +195,19 @@ struct moe_pc_engine {
     std::mutex gate_input_snapshot_mutex;
     std::atomic<uint32_t> adaptive_prefetch_depth{2};
     std::atomic<uint32_t> last_router_entropy_milli{0};
+    std::atomic<uint64_t> expert_cache_request_count{0};
+    std::atomic<uint64_t> expert_cache_hit_count{0};
+    std::atomic<uint64_t> expert_cache_vram_hit_count{0};
+    std::atomic<uint64_t> expert_cache_ram_hit_count{0};
+    std::atomic<uint64_t> expert_cache_miss_count{0};
+    std::atomic<uint64_t> expert_cache_miss_bytes{0};
+    std::atomic<uint64_t> expert_miss_latency_us_total{0};
+    std::atomic<uint64_t> speculative_prefetch_planned_count{0};
+    std::atomic<uint64_t> speculative_prefetch_planned_bytes{0};
+    std::atomic<uint32_t> expert_hit_rate_milli{0};
+    std::atomic<uint32_t> prefetch_waste_ratio_milli{0};
+    std::atomic<uint32_t> gpu_copy_idle_milli{0};
+    std::atomic<uint32_t> adaptive_prefetch_window_last{0};
     mutable std::atomic<int> cached_gelu_activation_mode{-1};
     mutable std::atomic<int> cached_router_use_sigmoid{-1};
     mutable std::atomic<int> cached_router_norm_topk_prob{-1};
@@ -251,7 +266,7 @@ struct moe_pc_engine {
     std::atomic<uint64_t> device_kv_cache_bytes{0};
     std::atomic<bool> kv_actually_in_vram{false};
     std::mutex cufile_cache_mutex;
-    std::unordered_map<int, void*> cufile_file_handle_cache;
+    std::unordered_map<moe_cufile_handle_key, void*, moe_cufile_handle_key_hash> cufile_file_handle_cache;
     std::unordered_map<uint64_t, uint64_t> cufile_buffer_registration_cache;
     std::atomic<uint64_t> device_total_bytes{0};
     std::atomic<uint64_t> device_free_bytes{0};
