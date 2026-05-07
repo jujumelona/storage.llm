@@ -7,6 +7,7 @@
 #include <chrono>
 #include <csignal>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -461,6 +462,21 @@ static bool read_text_file(const std::string& path, std::string* out) {
     return true;
 }
 
+static uint64_t fnv1a64_bytes(const std::string& text) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char ch : text) {
+        h ^= (uint64_t)ch;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static std::string hex_u64(uint64_t value) {
+    char buf[17]{};
+    std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)value);
+    return std::string(buf);
+}
+
 static bool file_exists_utf8(const std::string& path) {
     if (path.empty()) return false;
     std::ifstream input(path, std::ios::binary);
@@ -521,6 +537,8 @@ struct server_tokenizer {
     bool add_space_prefix = false;
     bool byte_fallback = false;
     bool has_unigram = false;
+    std::string tokenizer_hash;
+    std::string tokenizer_config_hash;
     std::string error;
 };
 
@@ -1564,7 +1582,9 @@ static server_tokenizer& get_server_tokenizer(const server_options& opts) {
         return tok;
     }
     load_tokenizer_vocab(&tok, json);
+    tok.tokenizer_hash = hex_u64(fnv1a64_bytes(json));
     tokenizer_apply_runtime_config(&tok, json);
+    std::string tokenizer_config_fingerprint;
     const char* config_candidates[] = {
         "tokenizer_config.json",
         "tokenizer/tokenizer_config.json",
@@ -1576,8 +1596,15 @@ static server_tokenizer& get_server_tokenizer(const server_options& opts) {
         std::string config_json;
         const std::string path = join_model_file(opts.model_root, rel);
         if (read_text_file(path, &config_json) && !config_json.empty()) {
+            tokenizer_config_fingerprint.append(rel);
+            tokenizer_config_fingerprint.push_back('\0');
+            tokenizer_config_fingerprint.append(config_json);
+            tokenizer_config_fingerprint.push_back('\0');
             tokenizer_apply_runtime_config(&tok, config_json);
         }
+    }
+    if (!tokenizer_config_fingerprint.empty()) {
+        tok.tokenizer_config_hash = hex_u64(fnv1a64_bytes(tokenizer_config_fingerprint));
     }
     std::cerr << "[storagellm tokenizer] load"
               << " loaded=" << (tok.loaded ? 1 : 0)
@@ -2317,6 +2344,20 @@ struct server_eval_result {
     double nll = 0.0;
     double mean_nll = 0.0;
     double perplexity = 0.0;
+    uint32_t first_target_index = 1;
+    std::vector<int32_t> input_ids_preview;
+    std::string kv_backend;
+    uint32_t qkv_forced_by_format = 0;
+    std::string tokenizer_hash;
+    std::string tokenizer_config_hash;
+    std::string chat_template_hash;
+    bool tokenizer_add_bos = false;
+    bool tokenizer_add_eos = false;
+    bool tokenizer_add_space_prefix = false;
+    bool tokenizer_has_bos = false;
+    bool tokenizer_has_eos = false;
+    uint32_t tokenizer_bos_id = 0;
+    uint32_t tokenizer_eos_id = 0;
 };
 
 static server_eval_result run_server_eval(
@@ -2330,6 +2371,26 @@ static server_eval_result run_server_eval(
     std::vector<int32_t> input_ids;
     uint32_t first_target_index = 1u;
     server_tokenizer& tok = get_server_tokenizer(opts);
+    result.tokenizer_hash = tok.tokenizer_hash;
+    result.tokenizer_config_hash = tok.tokenizer_config_hash;
+    result.tokenizer_add_bos = tok.add_bos_token;
+    result.tokenizer_add_eos = tok.add_eos_token;
+    result.tokenizer_add_space_prefix = tok.add_space_prefix;
+    result.tokenizer_has_bos = tok.has_bos;
+    result.tokenizer_has_eos = tok.has_eos;
+    result.tokenizer_bos_id = tok.bos_token_id;
+    result.tokenizer_eos_id = tok.eos_token_id;
+    std::string chat_template;
+    if (load_chat_template_text(opts, &chat_template) && !chat_template.empty()) {
+        result.chat_template_hash = hex_u64(fnv1a64_bytes(chat_template));
+    }
+    moe_pc_engine_stats_t engine_stats{};
+    if (moe_pc_engine_get_stats(engine, &engine_stats)) {
+        result.kv_backend = engine_stats.kv_mode == moe_KV_MODE_QKV ? "qkv_contract" : "plain_kv_cache";
+        result.qkv_forced_by_format = engine_stats.qkv_forced_by_format;
+    } else {
+        result.kv_backend = moe_pc_engine_get_kv_mode(engine) == moe_KV_MODE_QKV ? "qkv_contract" : "plain_kv_cache";
+    }
     if (!request_ids.empty()) {
         input_ids.reserve(request_ids.size());
         for (int id : request_ids) {
@@ -2340,38 +2401,10 @@ static server_eval_result run_server_eval(
             first_target_index = static_cast<uint32_t>(parsed_first_target);
         }
     } else {
-        if (tok.loaded && encode_chat_response_only_eval(opts, tok, body, &input_ids, &first_target_index)) {
-            // Chat eval with a final assistant message scores only the assistant
-            // response while still forwarding the full prompt as context.
-        } else {
-            if (body_requests_response_only_chat_eval(body)) {
-                result.http_status = 422;
-                result.error_code = "chat_template_required";
-                result.error_message =
-                    "response-only chat eval requires a valid chat_template.jinja or tokenizer_config.json chat_template; "
-                    "use input_ids with first_target_index, or prompt/input for raw text eval";
-                return result;
-            }
-            const std::string text = extract_generation_text(opts, body, false);
-            if (text.empty()) {
-                result.http_status = 400;
-                result.error_code = "invalid_request_error";
-                result.error_message = "eval request must include input, prompt, messages/content, or input_ids";
-                return result;
-            }
-            if (!tok.loaded) {
-                result.http_status = 503;
-                result.error_code = "tokenizer_unavailable";
-                result.error_message = tok.error.empty() ? "tokenizer.json is not loaded" : tok.error;
-                return result;
-            }
-            if (!tokenizer_encode_greedy(tok, text, &input_ids)) {
-                result.http_status = 422;
-                result.error_code = "tokenization_failed";
-                result.error_message = "tokenizer vocab could not encode the eval text";
-                return result;
-            }
-        }
+        result.http_status = 400;
+        result.error_code = "input_ids_required";
+        result.error_message = "perplexity requires reference-tokenized input_ids; server text tokenization is not used for PPL";
+        return result;
     }
     int parsed_first_target = 0;
     if (storagellm::json_read_int(body, "first_target_index", &parsed_first_target) &&
@@ -2392,6 +2425,9 @@ static server_eval_result run_server_eval(
         }
     }
     log_token_ids_preview("eval_input_ids", tok, input_ids, first_target_index);
+    result.first_target_index = first_target_index;
+    const size_t preview_count = std::min<size_t>(input_ids.size(), 32u);
+    result.input_ids_preview.assign(input_ids.begin(), input_ids.begin() + preview_count);
     if (input_ids.size() < 2) {
         result.http_status = 400;
         result.error_code = "invalid_request_error";
@@ -2937,6 +2973,17 @@ static std::string json_double(double value) {
     return out.str();
 }
 
+static void append_int32_array_json(std::ostringstream& out, const std::vector<int32_t>& values) {
+    out << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i) {
+            out << ",";
+        }
+        out << values[i];
+    }
+    out << "]";
+}
+
 static std::string make_eval_json(
     const server_options& opts,
     const server_eval_result& evaluated
@@ -2947,6 +2994,22 @@ static std::string make_eval_json(
         << "\"model\":\"" << json_escape(opts.model_id) << "\","
         << "\"input_tokens\":" << evaluated.input_tokens << ","
         << "\"evaluated_tokens\":" << evaluated.evaluated_tokens << ","
+        << "\"first_target_index\":" << evaluated.first_target_index << ","
+        << "\"kv_backend\":\"" << json_escape(evaluated.kv_backend) << "\","
+        << "\"qkv_forced_by_format\":" << (evaluated.qkv_forced_by_format ? "true" : "false") << ","
+        << "\"tokenizer_hash\":\"" << json_escape(evaluated.tokenizer_hash) << "\","
+        << "\"tokenizer_config_hash\":\"" << json_escape(evaluated.tokenizer_config_hash) << "\","
+        << "\"chat_template_hash\":\"" << json_escape(evaluated.chat_template_hash) << "\","
+        << "\"tokenizer_add_bos\":" << (evaluated.tokenizer_add_bos ? "true" : "false") << ","
+        << "\"tokenizer_add_eos\":" << (evaluated.tokenizer_add_eos ? "true" : "false") << ","
+        << "\"tokenizer_add_space_prefix\":" << (evaluated.tokenizer_add_space_prefix ? "true" : "false") << ","
+        << "\"tokenizer_has_bos\":" << (evaluated.tokenizer_has_bos ? "true" : "false") << ","
+        << "\"tokenizer_has_eos\":" << (evaluated.tokenizer_has_eos ? "true" : "false") << ","
+        << "\"tokenizer_bos_id\":" << evaluated.tokenizer_bos_id << ","
+        << "\"tokenizer_eos_id\":" << evaluated.tokenizer_eos_id << ","
+        << "\"input_ids_preview\":";
+    append_int32_array_json(out, evaluated.input_ids_preview);
+    out << ","
         << "\"nll\":" << json_double(evaluated.nll) << ","
         << "\"mean_nll\":" << json_double(evaluated.mean_nll) << ","
         << "\"ppl\":" << json_double(evaluated.perplexity) << ","
