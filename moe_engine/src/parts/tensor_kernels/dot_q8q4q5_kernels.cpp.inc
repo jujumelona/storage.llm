@@ -304,8 +304,8 @@ static float moe_e8m0_to_f32_half(uint8_t v) {
 
 static const float* moe_mxfp4_value_table() {
     static constexpr float kMxfp4Table[16] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+        0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
+        -0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f,
     };
     return kMxfp4Table;
 }

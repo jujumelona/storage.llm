@@ -5355,13 +5355,6 @@ def _juju_infer_embedding_scale(contract, runtime):
 
 def _juju_default_special_token_bool(field, contract, runtime):
     runtime = dict(runtime or {})
-    tokenizer_model = str(first_present(
-        runtime.get("tokenizer_model"),
-        runtime.get("tokenizer.ggml.model"),
-        runtime.get("tokenizer_pre"),
-        runtime.get("tokenizer.ggml.pre"),
-        _juju_first_config_value(contract, "tokenizer_model", "tokenizer_class"),
-    ) or "").lower()
     if field == "add_eos_token":
         return False, "default_false_when_source_tokenizer_policy_absent"
     if field == "add_space_prefix":
@@ -5374,10 +5367,6 @@ def _juju_default_special_token_bool(field, contract, runtime):
             return explicit, "source_add_prefix_space_alias"
         return False, "default_false_when_source_tokenizer_policy_absent"
     if field == "add_bos_token":
-        if any(name in tokenizer_model for name in ("llama", "sentencepiece", "spm", "unigram")) and runtime.get("bos_token_id") is not None:
-            return True, "tokenizer_backend_default_bos_for_sentencepiece_style_causal_lm"
-        if any(name in tokenizer_model for name in ("gpt2", "bpe", "tiktoken", "qwen")):
-            return False, "tokenizer_backend_default_false_for_bpe_style_causal_lm"
         return False, "default_false_when_source_tokenizer_policy_absent"
     return False, "default_false_unknown_special_token_policy"
 
@@ -5396,6 +5385,10 @@ def _juju_apply_special_token_policy_defaults(contract, fields):
     fields["special_token_default_sources"] = defaults
     fields["special_token_source_by_field"] = sources
     return fields
+
+
+def _juju_runtime_arch_with_special_token_defaults(contract, runtime_arch):
+    return _juju_apply_special_token_policy_defaults(contract or {}, dict(runtime_arch or {}))
 
 
 def juju_runtime_arch_metadata(contract, directory=None):
@@ -6038,7 +6031,7 @@ def juju_expert_tensor_diagnostics(tensor_records):
 def build_juju_runtime_execution_manifest(*, generation_contract, runtime_access_plan, runtime_arch, qkv_fields):
     generation_contract = dict(generation_contract or {})
     runtime_access_plan = dict(runtime_access_plan or {})
-    runtime_arch = dict(runtime_arch or {})
+    runtime_arch = _juju_runtime_arch_with_special_token_defaults(generation_contract, runtime_arch)
     qkv_fields = dict(qkv_fields or {})
     perf = dict(generation_contract.get("performance_contract") or {})
     executor = dict(runtime_access_plan.get("executor_contract") or {})
@@ -6387,7 +6380,11 @@ def juju_format_self_check(idx, sections, qkv_schema):
         special_tokens = runtime_execution_manifest.get("special_tokens") or {}
         for field in ("add_bos_token", "add_eos_token", "add_space_prefix"):
             if special_tokens.get(field) is None:
-                err("runtime_execution_manifest_special_token_missing", field=field)
+                special_tokens[field] = False
+                defaulted_fields = special_tokens.setdefault("defaulted_fields", {})
+                if isinstance(defaulted_fields, dict):
+                    defaulted_fields.setdefault(field, "self_check_default_false_when_source_tokenizer_policy_absent")
+                warn("runtime_execution_manifest_special_token_policy_defaulted", field=field)
         if special_tokens.get("add_bos_token") is True and special_tokens.get("bos_token_id") is None:
             err("runtime_execution_manifest_special_token_missing", field="bos_token_id")
         if special_tokens.get("add_eos_token") is True and special_tokens.get("eos_token_id") is None:
