@@ -201,6 +201,15 @@ int qkv_attention_decode_impl(
                 float norm_k = s->k_norms[t];
                 float dot = 0.0f;
 
+                if ((uint32_t)t < s->sink_tokens && s->k_sink) {
+                    const float* exact_k = s->k_sink + (size_t)t * (size_t)d;
+                    for (int i = 0; i < d; ++i) {
+                        dot += query[i] * exact_k[i];
+                    }
+                    att[t] = qkv_attention_apply_logit_softcap(attn_logit_softcap, dot * sc);
+                    continue;
+                }
+
                 if (k_split) {
                     if (!outlier_channels || !split_outlier || !split_normal ||
                         (!out_raw && !out_centroids) || (!norm_raw && !norm_centroids)) {
@@ -294,6 +303,15 @@ int qkv_attention_decode_impl(
         for (int t = 0; t < n; t++) {
             float norm_k = s->k_norms[t];
             float dot = 0.0f;
+
+            if ((uint32_t)t < s->sink_tokens && s->k_sink) {
+                const float* exact_k = s->k_sink + (size_t)t * (size_t)d;
+                for (int i = 0; i < d; ++i) {
+                    dot += query[i] * exact_k[i];
+                }
+                att[t] = qkv_attention_apply_logit_softcap(attn_logit_softcap, dot * sc);
+                continue;
+            }
 
             if (k_split) {
                 if (!qkv_dot_mse_split_rotated_token(s, cfg, QKV_TARGET_KEY, t, q_eff, &dot)) return 0;

@@ -146,6 +146,9 @@ typedef struct {
     uint8_t* v_idx;
     float* k_norms;
     float* v_norms;
+    float* k_sink;
+    float* v_sink;
+    uint32_t sink_tokens;
 
     // QJL residual streams.
     uint8_t* k_qjl;

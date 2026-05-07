@@ -440,14 +440,20 @@ static int moe_standard_rope_uses_rotate_half(
         return 1;
     }
 
-    if (engine &&
-        !engine->offload_gguf_metadata_json.empty() &&
-        (moe_engine_metadata_mentions(engine, "partial_rotary_factor") ||
-         moe_engine_metadata_mentions(engine, "rope_scaling"))) {
+    if (cfg.type != moe_ATTN_TYPE_MLA) {
         return 1;
     }
-
-    return cfg.type != moe_ATTN_TYPE_MLA ? 1 : 0;
+    if (engine && !engine->offload_gguf_metadata_json.empty()) {
+        double partial_rotary_factor = 0.0;
+        if (moe_json_get_double_local(
+                engine->offload_gguf_metadata_json,
+                "partial_rotary_factor",
+                &partial_rotary_factor) &&
+            partial_rotary_factor > 0.0 && partial_rotary_factor <= 1.0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 struct moe_rope_layout_cache_entry {

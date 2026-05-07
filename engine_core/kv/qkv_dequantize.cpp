@@ -242,6 +242,15 @@ int qkv_dequant_one(
     if (d <= 0 || d > 16384) {
         return 0;
     }
+    if ((uint32_t)token_idx < s->sink_tokens) {
+        const int target = qkv_target_from_buffers(s, idx, norms);
+        const float* exact = target == QKV_TARGET_KEY ? s->k_sink :
+            target == QKV_TARGET_VALUE ? s->v_sink : nullptr;
+        if (exact) {
+            memcpy(output, exact + (size_t)token_idx * (size_t)d, (size_t)d * sizeof(float));
+            return 1;
+        }
+    }
     const bool base_use_qjl = use_qjl && bits > 1;
     const int mse_bits = base_use_qjl ? bits - 1 : bits;
     if (!qkv_bits_valid(mse_bits)) {

@@ -225,6 +225,23 @@ int qkv_state_init(
         return 0;
     }
 
+    const uint32_t sink_tokens = std::min<uint32_t>(
+        config->sink_tokens,
+        (uint32_t)std::max(n_tokens, 0));
+    if (sink_tokens > 0) {
+        if ((size_t)sink_tokens > SIZE_MAX / ((size_t)dim * sizeof(float))) {
+            qkv_state_free(state);
+            return 0;
+        }
+        state->k_sink = (float*)malloc((size_t)sink_tokens * (size_t)dim * sizeof(float));
+        state->v_sink = (float*)malloc((size_t)sink_tokens * (size_t)dim * sizeof(float));
+        if (!state->k_sink || !state->v_sink) {
+            qkv_state_free(state);
+            return 0;
+        }
+        state->sink_tokens = sink_tokens;
+    }
+
     // Allocate scratch buffers
     state->scratch_qjl_signs = (float*)malloc((size_t)dim * sizeof(float));
     state->scratch_s_t_qjl = (float*)malloc((size_t)dim * sizeof(float));
@@ -400,6 +417,7 @@ int qkv_state_init(
     // Impact: Eliminates blocking page faults on Windows during attention
     uint64_t total_qkv_bytes = k_packed_size + v_packed_size +
         (size_t)n_tokens * sizeof(float) * 2; // k_norms + v_norms
+    total_qkv_bytes += (uint64_t)state->sink_tokens * (uint64_t)dim * (uint64_t)sizeof(float) * 2ull;
     if (qjl_streams) {
         total_qkv_bytes += ((size_t)n_tokens * (size_t)dim + 7) / 8 * 2; // k_qjl + v_qjl
         total_qkv_bytes += (size_t)n_tokens * sizeof(float) * 2; // residual_norms
@@ -435,6 +453,8 @@ void qkv_state_free(qkv_state_t* state) {
     free(state->v_idx);
     free(state->k_norms);
     free(state->v_norms);
+    free(state->k_sink);
+    free(state->v_sink);
     free(state->k_qjl);
     free(state->k_residual_norms);
     free(state->v_qjl);

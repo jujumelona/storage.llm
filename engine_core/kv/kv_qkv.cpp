@@ -486,6 +486,10 @@ int qkv_quantize_token(
     if (dim <= 0 || dim > 16384) {
         return 0;
     }
+    if ((uint32_t)token_idx < state->sink_tokens && state->k_sink && state->v_sink) {
+        memcpy(state->k_sink + (size_t)token_idx * (size_t)dim, key, (size_t)dim * sizeof(float));
+        memcpy(state->v_sink + (size_t)token_idx * (size_t)dim, value, (size_t)dim * sizeof(float));
+    }
     const bool use_qjl = config->enable_qjl && state->k_qjl && state->v_qjl &&
         qkv_bits_codebook(state->k_bits) && qkv_bits_codebook(state->v_bits) &&
         state->k_bits > 1 && state->v_bits > 1;
@@ -562,6 +566,12 @@ int qkv_quantize(
     }
 
     for (int t = 0; t < n_tokens; t++) {
+        if ((uint32_t)t < state->sink_tokens && state->k_sink && state->v_sink) {
+            memcpy(state->k_sink + (size_t)t * (size_t)dim, key_data + (size_t)t * (size_t)dim,
+                (size_t)dim * sizeof(float));
+            memcpy(state->v_sink + (size_t)t * (size_t)dim, value_data + (size_t)t * (size_t)dim,
+                (size_t)dim * sizeof(float));
+        }
         // ===== Quantize K =====
         // Paper Algorithm 1: MSE-optimal quantization
         // BUGFIX 342: k_idx null 체크 및 overflow 방지
