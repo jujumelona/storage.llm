@@ -122,6 +122,10 @@ static int moe_layer_uses_unweighted_v_norm(
         moe_engine_has_common_tensor_suffix(engine, layer, "v_norm.weight")) {
         return 0;
     }
+    moe_raw_tensor_cache_entry v_shape{};
+    if (get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_KV_B_PROJ, &v_shape)) {
+        return 0;
+    }
     const int has_q_norm =
         moe_engine_has_common_tensor_suffix(engine, layer, "attn_q_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "q_norm.weight");
