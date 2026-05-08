@@ -764,4 +764,3 @@ static int moe_layer_output_scale_f32(
         (unsigned long long)count,
         hidden_size);
     return 1;
-}
