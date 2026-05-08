@@ -643,45 +643,16 @@ static int moe_layer_output_scale_f32(
     if (hidden_size > 100000) {
         return 0;
     }
-    static const char* const model_scalar_suffixes[] = {
+    static const char* const suffixes[] = {
+        "layer_output_scale.weight",
         "layer_scalar.weight",
         "layer_scalar"
     };
     moe_raw_tensor_cache_entry raw{};
-    const char* source = "layer_scalar";
-    int legacy_output_scale = 0;
-    if (!moe_map_layer_common_tensor(
-            engine,
-            layer,
-            model_scalar_suffixes,
-            sizeof(model_scalar_suffixes) / sizeof(model_scalar_suffixes[0]),
-            &raw)) {
-        static const char* const legacy_suffixes[] = {
-            "layer_output_scale.weight"
-        };
-        if (!moe_map_layer_common_tensor(
-                engine,
-                layer,
-                legacy_suffixes,
-                sizeof(legacy_suffixes) / sizeof(legacy_suffixes[0]),
-                &raw)) {
-            return 1;
-        }
-        source = "layer_output_scale.weight";
-        legacy_output_scale = 1;
+    if (!moe_map_layer_common_tensor(engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]), &raw)) {
+        return 1;
     }
     const uint64_t count = moe_raw_tensor_scalar_count(raw);
-    moe_profile_log(
-        "layer_output_scale_map",
-        "layer=%d source=%s legacy=%d rows=%u cols=%u count=%llu hidden=%u scalar=%u",
-        layer,
-        source,
-        legacy_output_scale,
-        raw.rows,
-        raw.cols,
-        (unsigned long long)count,
-        hidden_size,
-        (unsigned)raw.scalar_encoding);
     if (count == 1u) {
         float scale = 1.0f;
         if (!moe_raw_tensor_scalar_at_f32(raw, 0, &scale)) {
@@ -691,58 +662,11 @@ static int moe_layer_output_scale_f32(
         if (!std::isfinite(scale)) {
             scale = 1.0f;
         }
-        if (legacy_output_scale && (scale < 0.5f || scale > 2.0f)) {
-            moe_profile_log(
-                "layer_output_scale_skip",
-                "layer=%d source=%s reason=legacy_scalar_out_of_model_range scale=%.9g hidden=%u",
-                layer,
-                source,
-                (double)scale,
-                hidden_size);
-            return 1;
-        }
         moe_scale_f32(hidden, scale, hidden_size);
-        moe_profile_log(
-            "layer_output_scale_apply",
-            "layer=%d source=%s legacy=%d mode=scalar scale=%.9g hidden=%u",
-            layer,
-            source,
-            legacy_output_scale,
-            (double)scale,
-            hidden_size);
         return 1;
     }
     if (count < hidden_size) {
         return 0;
-    }
-    if (legacy_output_scale) {
-        float min_scale = 0.0f;
-        float max_scale = 0.0f;
-        for (uint32_t i = 0; i < hidden_size; ++i) {
-            float scale = 1.0f;
-            if (!moe_raw_tensor_scalar_at_f32(raw, i, &scale)) {
-                return 0;
-            }
-            if (i == 0 || scale < min_scale) {
-                min_scale = scale;
-            }
-            if (i == 0 || scale > max_scale) {
-                max_scale = scale;
-            }
-            if (!std::isfinite(scale) || scale < 0.5f || scale > 2.0f) {
-                moe_profile_log(
-                    "layer_output_scale_skip",
-                    "layer=%d source=%s reason=legacy_vector_out_of_model_range index=%u scale=%.9g min=%.9g max=%.9g hidden=%u",
-                    layer,
-                    source,
-                    i,
-                    (double)scale,
-                    (double)min_scale,
-                    (double)max_scale,
-                    hidden_size);
-                return 1;
-            }
-        }
     }
     for (uint32_t i = 0; i < hidden_size; ++i) {
         float scale = 1.0f;
@@ -755,12 +679,4 @@ static int moe_layer_output_scale_f32(
         }
         hidden[i] *= scale;
     }
-    moe_profile_log(
-        "layer_output_scale_apply",
-        "layer=%d source=%s legacy=%d mode=vector count=%llu hidden=%u",
-        layer,
-        source,
-        legacy_output_scale,
-        (unsigned long long)count,
-        hidden_size);
     return 1;
