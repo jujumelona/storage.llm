@@ -539,7 +539,24 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
     qkv_config_t qkv_decode_cfg = engine->qkv_cfg;
     qkv_decode_cfg.attention_score_scale = score_scale;
     qkv_decode_cfg.attention_logit_softcap = attn_logit_softcap;
-    return qkv_attention_decode(query, slot, &qkv_decode_cfg, context_tokens, head_dim, output);
+    const int ok = qkv_attention_decode(query, slot, &qkv_decode_cfg, context_tokens, head_dim, output);
+    if (!ok) {
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+        storagellm_ppl_diag_qkv_decode_failed(
+            layer,
+            kv_head,
+            head_stride,
+            query,
+            slot,
+            &qkv_decode_cfg,
+            context_tokens,
+            capacity_tokens,
+            head_dim,
+            score_scale,
+            attn_logit_softcap);
+#endif
+    }
+    return ok;
 }
 
 int moe_pc_engine_attention_decode_f32(

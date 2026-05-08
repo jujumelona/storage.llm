@@ -180,6 +180,9 @@ static int moe_parse_layer_from_gguf_name(const std::string& name, uint32_t* lay
 #include "parts/gguf_iq_tables.cpp.inc"
 #include "parts/tensor_dot_cpu_kernels.cpp.inc"
 #include "parts/tensor_dot.cpp.inc"
+#if defined(__has_include) && __has_include("parts/ppl_diag_hooks.cpp.inc")
+#include "parts/ppl_diag_hooks.cpp.inc"
+#endif
 #include "parts/raw_forward_cpu.cpp.inc"
 #include "parts/generation_api.cpp.inc"
 #include "parts/generation_api_batch.cpp.inc"

@@ -418,6 +418,19 @@
         }
         return 1;
         })) {
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+            storagellm_ppl_diag_attention_heads_failed(
+                layer,
+                position,
+                num_heads,
+                num_kv_heads,
+                seq_len,
+                head_dim,
+                v_head_dim,
+                qkv_decode,
+                scale,
+                attn_logit_softcap);
+#endif
             return 0;
         }
     }
