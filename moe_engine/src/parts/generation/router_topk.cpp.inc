@@ -1,6 +1,4 @@
 // Router top-K selection
-    return 1;
-}
 
 static int moe_router_uses_sigmoid_scores(const moe_pc_engine* engine) {
     if (!engine || engine->offload_gguf_metadata_json.empty()) {
