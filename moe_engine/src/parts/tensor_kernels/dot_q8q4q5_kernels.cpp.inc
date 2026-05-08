@@ -297,9 +297,12 @@ static void moe_dequant_gguf_iq4_xs_row(const uint8_t* packed, float* out, uint3
 }
 static float moe_e8m0_to_f32_half(uint8_t v) {
     if (v == 0u) {
-        return 0.0f;
+        uint32_t bits = 0x00400000u;
+        float out = 0.0f;
+        std::memcpy(&out, &bits, sizeof(out));
+        return out;
     }
-    uint32_t bits = (uint32_t)(v - 1u) << 23u;
+    uint32_t bits = (uint32_t)v << 23u;
     float out = 0.0f;
     std::memcpy(&out, &bits, sizeof(out));
     return out;
@@ -307,8 +310,8 @@ static float moe_e8m0_to_f32_half(uint8_t v) {
 
 static const float* moe_mxfp4_value_table() {
     static constexpr float kMxfp4Table[16] = {
-        0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
-        -0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f,
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
     };
     return kMxfp4Table;
 }
@@ -318,8 +321,8 @@ static float moe_mxfp4_value_from_code(uint8_t code) {
 }
 
 static uint8_t moe_mxfp4_code_at(const uint8_t* qs, uint32_t index) {
-    const uint8_t byte = qs[index >> 1u];
-    return (index & 1u) ? (byte >> 4) : (byte & 0x0fu);
+    const uint8_t byte = qs[index & 15u];
+    return (index < 16u) ? (byte & 0x0fu) : (byte >> 4);
 }
 
 static float moe_dot_gguf_mxfp4_row(
@@ -343,8 +346,8 @@ static float moe_dot_gguf_mxfp4_row(
         float low = 0.0f;
         float high = 0.0f;
 #if defined(__AVX2__) && defined(__FMA__)
-        // This JUJU MXFP4 artifact stores each value pair in one byte: even index
-        // in low nibble, odd index in high nibble.
+        // GGUF block_mxfp4 stores the first 16 values in low nibbles and the
+        // next 16 values in high nibbles of the same 16 payload bytes.
         const __m256i lo_mask = _mm256_set1_epi32(0x0F);
         __m256 vacc_low = _mm256_setzero_ps();
         __m256 vacc_high = _mm256_setzero_ps();
@@ -355,22 +358,18 @@ static float moe_dot_gguf_mxfp4_row(
             __m256 lo_vals = _mm256_i32gather_ps(table, lo_idx, 4);
             __m256i hi_idx = _mm256_srli_epi32(bytes8, 4);
             __m256 hi_vals = _mm256_i32gather_ps(table, hi_idx, 4);
-            const __m256 even_x = _mm256_set_ps(
-                xb[(j + 7u) * 2u], xb[(j + 6u) * 2u], xb[(j + 5u) * 2u], xb[(j + 4u) * 2u],
-                xb[(j + 3u) * 2u], xb[(j + 2u) * 2u], xb[(j + 1u) * 2u], xb[j * 2u]);
-            const __m256 odd_x = _mm256_set_ps(
-                xb[(j + 7u) * 2u + 1u], xb[(j + 6u) * 2u + 1u], xb[(j + 5u) * 2u + 1u], xb[(j + 4u) * 2u + 1u],
-                xb[(j + 3u) * 2u + 1u], xb[(j + 2u) * 2u + 1u], xb[(j + 1u) * 2u + 1u], xb[j * 2u + 1u]);
-            vacc_low = _mm256_fmadd_ps(lo_vals, even_x, vacc_low);
-            vacc_high = _mm256_fmadd_ps(hi_vals, odd_x, vacc_high);
+            const __m256 low_x = _mm256_loadu_ps(xb + j);
+            const __m256 high_x = _mm256_loadu_ps(xb + 16u + j);
+            vacc_low = _mm256_fmadd_ps(lo_vals, low_x, vacc_low);
+            vacc_high = _mm256_fmadd_ps(hi_vals, high_x, vacc_high);
         }
         low = moe_dot_hsum256_ps(vacc_low);
         high = moe_dot_hsum256_ps(vacc_high);
 #else
         for (uint32_t j = 0; j < 16u; ++j) {
             const uint8_t byte = qs[j];
-            low += table[byte & 0x0fu] * xb[j * 2u];
-            high += table[byte >> 4] * xb[j * 2u + 1u];
+            low += table[byte & 0x0fu] * xb[j];
+            high += table[byte >> 4] * xb[16u + j];
         }
 #endif
         acc += (low + high) * scale;
