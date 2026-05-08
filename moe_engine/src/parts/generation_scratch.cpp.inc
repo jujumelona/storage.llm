@@ -33,6 +33,8 @@ struct moe_decode_scratch {
     std::vector<float> expert_gate_pool;
     std::vector<float> expert_up_pool;
     std::vector<float> expert_out_pool;
+    std::vector<float> ple_inputs;
+    std::vector<float> ple_projected;
     moe_kv_cache kv_cache;
     uint32_t position = 0;
     // Per-session router EMA state (BUGFIX Problem F, stage 2: wiring) ★★★ PERFORMANCE
@@ -157,6 +159,8 @@ static void moe_decode_scratch_drop_transient_buffers(moe_pc_engine* engine, moe
     std::vector<float>().swap(s->expert_gate_pool);
     std::vector<float>().swap(s->expert_up_pool);
     std::vector<float>().swap(s->expert_out_pool);
+    std::vector<float>().swap(s->ple_inputs);
+    std::vector<float>().swap(s->ple_projected);
     std::vector<float>().swap(s->q_a);
     std::vector<float>().swap(s->q_a_norm);
     std::vector<float>().swap(s->q_b);

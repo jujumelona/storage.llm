@@ -137,6 +137,364 @@ static inline float moe_generation_gated_activation_cached(int activation_mode, 
     return result;
 }
 
+static int moe_apply_rmsnorm_common_weight_f32(
+    const moe_pc_engine* engine,
+    const moe_raw_tensor_cache_entry& raw,
+    const float* input,
+    uint32_t count,
+    float* output,
+    float eps
+);
+
+static int moe_layer_rmsnorm_suffixes_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* suffixes,
+    size_t suffix_count,
+    const float* input,
+    uint32_t hidden_size,
+    float* output,
+    float eps
+);
+
+struct moe_ple_binding_t {
+    moe_raw_tensor_cache_entry token_embedding{};
+    moe_raw_tensor_cache_entry model_projection{};
+    moe_raw_tensor_cache_entry projection_norm{};
+    uint32_t total_dim = 0;
+    uint32_t layer_dim = 0;
+    int has_token_embedding = 0;
+};
+
+static const moe_gguf_common_tensor_record* moe_find_common_tensor_by_roles_or_names(
+    moe_pc_engine* engine,
+    const char* const* roles,
+    size_t role_count,
+    const char* const* names,
+    size_t name_count,
+    moe_raw_tensor_desc* out_desc
+) {
+    if (!engine) {
+        return nullptr;
+    }
+    if (roles) {
+        for (size_t i = 0; i < role_count; ++i) {
+            if (!roles[i] || !roles[i][0]) {
+                continue;
+            }
+            if (const moe_gguf_common_tensor_record* rec =
+                    find_common_tensor_by_op_role(engine, roles[i], INT32_MIN, out_desc)) {
+                return rec;
+            }
+        }
+    }
+    return find_common_tensor_by_names(engine, names, name_count, out_desc);
+}
+
+static int moe_map_common_tensor_by_roles_or_names(
+    moe_pc_engine* engine,
+    const char* const* roles,
+    size_t role_count,
+    const char* const* names,
+    size_t name_count,
+    moe_raw_tensor_cache_entry* out,
+    moe_raw_tensor_desc* out_desc = nullptr
+) {
+    moe_raw_tensor_desc desc{};
+    const moe_gguf_common_tensor_record* rec =
+        moe_find_common_tensor_by_roles_or_names(engine, roles, role_count, names, name_count, &desc);
+    if (!rec) {
+        return 0;
+    }
+    if (!map_common_tensor_record(engine, *rec, desc, out)) {
+        return 0;
+    }
+    if (out_desc) {
+        *out_desc = desc;
+    }
+    return 1;
+}
+
+static int moe_map_ple_binding(
+    moe_pc_engine* engine,
+    const moe_storage_constants_t* c,
+    moe_ple_binding_t* out
+) {
+    if (!engine || !c || !out || c->hidden_size == 0 || c->num_hidden_layers == 0) {
+        return 0;
+    }
+    static const char* const proj_roles[] = {
+        "per_layer_model_projection",
+        "per_layer_model_proj"
+    };
+    static const char* const proj_names[] = {
+        "per_layer_model_proj.weight",
+        "per_layer_model_projection.weight",
+        "model.per_layer_model_projection.weight",
+        "model.per_layer_model_proj.weight"
+    };
+    moe_raw_tensor_desc proj_desc{};
+    moe_raw_tensor_cache_entry model_projection{};
+    if (!moe_map_common_tensor_by_roles_or_names(
+            engine, proj_roles, sizeof(proj_roles) / sizeof(proj_roles[0]),
+            proj_names, sizeof(proj_names) / sizeof(proj_names[0]),
+            &model_projection, &proj_desc)) {
+        return 0;
+    }
+    if (proj_desc.cols != c->hidden_size ||
+        proj_desc.rows == 0 ||
+        (proj_desc.rows % c->num_hidden_layers) != 0u) {
+        moe_profile_log(
+            "ple_model_projection_rejected",
+            "rows=%u cols=%u layers=%u hidden=%u",
+            proj_desc.rows, proj_desc.cols, c->num_hidden_layers, c->hidden_size);
+        return 0;
+    }
+    const uint32_t total_dim = proj_desc.rows;
+    const uint32_t layer_dim = total_dim / c->num_hidden_layers;
+    if (layer_dim == 0 || layer_dim > 100000u || total_dim > 10000000u) {
+        return 0;
+    }
+
+    static const char* const norm_roles[] = {
+        "per_layer_projection_norm",
+        "per_layer_proj_norm"
+    };
+    static const char* const norm_names[] = {
+        "per_layer_proj_norm.weight",
+        "per_layer_projection_norm.weight",
+        "model.per_layer_projection_norm.weight",
+        "model.per_layer_proj_norm.weight"
+    };
+    moe_raw_tensor_desc norm_desc{};
+    moe_raw_tensor_cache_entry projection_norm{};
+    if (!moe_map_common_tensor_by_roles_or_names(
+            engine, norm_roles, sizeof(norm_roles) / sizeof(norm_roles[0]),
+            norm_names, sizeof(norm_names) / sizeof(norm_names[0]),
+            &projection_norm, &norm_desc) ||
+        norm_desc.rows < layer_dim) {
+        moe_profile_log(
+            "ple_projection_norm_missing",
+            "layer_dim=%u norm_rows=%u",
+            layer_dim, norm_desc.rows);
+        return 0;
+    }
+
+    static const char* const token_roles[] = {
+        "per_layer_token_embedding",
+        "per_layer_token_embd",
+        "embed_tokens_per_layer"
+    };
+    static const char* const token_names[] = {
+        "per_layer_token_embd.weight",
+        "embed_tokens_per_layer.weight",
+        "model.embed_tokens_per_layer.weight",
+        "model.per_layer_token_embd.weight"
+    };
+    moe_raw_tensor_desc token_desc{};
+    moe_raw_tensor_cache_entry token_embedding{};
+    const int has_token = moe_map_common_tensor_by_roles_or_names(
+        engine, token_roles, sizeof(token_roles) / sizeof(token_roles[0]),
+        token_names, sizeof(token_names) / sizeof(token_names[0]),
+        &token_embedding, &token_desc);
+    if (has_token &&
+        (token_desc.cols != total_dim || token_desc.rows < c->vocab_size)) {
+        moe_profile_log(
+            "ple_token_embedding_rejected",
+            "rows=%u cols=%u vocab=%u total_dim=%u",
+            token_desc.rows, token_desc.cols, c->vocab_size, total_dim);
+        return 0;
+    }
+
+    out->token_embedding = token_embedding;
+    out->model_projection = model_projection;
+    out->projection_norm = projection_norm;
+    out->total_dim = total_dim;
+    out->layer_dim = layer_dim;
+    out->has_token_embedding = has_token ? 1 : 0;
+    return 1;
+}
+
+static int moe_prepare_ple_inputs_f32(
+    moe_pc_engine* engine,
+    const moe_storage_constants_t* c,
+    moe_decode_scratch* s,
+    uint32_t token_id
+) {
+    if (!engine || !c || !s) {
+        return 0;
+    }
+    moe_ple_binding_t ple{};
+    if (!moe_map_ple_binding(engine, c, &ple)) {
+        s->ple_inputs.clear();
+        s->ple_projected.clear();
+        return 1;
+    }
+    if (token_id >= c->vocab_size) {
+        return 0;
+    }
+    try {
+        s->ple_inputs.resize(ple.total_dim);
+        s->ple_projected.resize(ple.total_dim);
+    } catch (const std::bad_alloc&) {
+        return 0;
+    }
+
+    if (ple.has_token_embedding) {
+        if (!moe_raw_tensor_copy_row_f32(
+                ple.token_embedding, token_id, s->ple_inputs.data(), ple.total_dim)) {
+            return 0;
+        }
+        const float token_scale = std::sqrt((float)ple.layer_dim);
+        if (std::isfinite(token_scale) && token_scale != 1.0f) {
+            moe_scale_f32(s->ple_inputs.data(), token_scale, ple.total_dim);
+        }
+    } else {
+        std::fill(s->ple_inputs.begin(), s->ple_inputs.end(), 0.0f);
+    }
+
+    const float projection_scale = 1.0f / std::sqrt((float)c->hidden_size);
+    const int projected_ok = moe_parallel_rows(engine, ple.total_dim, 0, [&](uint32_t row) {
+        float v = moe_raw_tensor_dot_row(ple.model_projection, row, s->hidden.data(), c->hidden_size);
+        if (!std::isfinite(v)) {
+            v = 0.0f;
+        }
+        s->ple_projected[row] = v * projection_scale;
+        return 1;
+    });
+    if (!projected_ok) {
+        return 0;
+    }
+    for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
+        float* slice = s->ple_projected.data() + (size_t)layer * (size_t)ple.layer_dim;
+        if (!moe_apply_rmsnorm_common_weight_f32(
+                engine, ple.projection_norm, slice, ple.layer_dim, slice,
+                engine->config.rms_norm_eps > 0.0f ? engine->config.rms_norm_eps : 1.0e-6f)) {
+            return 0;
+        }
+    }
+    const float combine_scale = ple.has_token_embedding ? 0.7071067811865476f : 1.0f;
+    for (uint32_t i = 0; i < ple.total_dim; ++i) {
+        s->ple_inputs[i] = (s->ple_inputs[i] + s->ple_projected[i]) * combine_scale;
+    }
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) == 0) {
+        moe_profile_log(
+            "ple_prepare",
+            "total_dim=%u layer_dim=%u layers=%u token_embedding=%d projection_scale=%.9g",
+            ple.total_dim, ple.layer_dim, c->num_hidden_layers, ple.has_token_embedding,
+            (double)projection_scale);
+    }
+    return 1;
+}
+
+static int moe_layer_has_ple_tensors(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    return
+        (moe_engine_has_common_tensor_suffix(engine, layer, "inp_gate.weight") ||
+         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_input_gate.weight")) &&
+        (moe_engine_has_common_tensor_suffix(engine, layer, "proj.weight") ||
+         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_projection.weight")) &&
+        (moe_engine_has_common_tensor_suffix(engine, layer, "post_norm.weight") ||
+         moe_engine_has_common_tensor_suffix(engine, layer, "post_per_layer_input_norm.weight"));
+}
+
+static int moe_layer_apply_ple_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    moe_decode_scratch* s,
+    float* hidden,
+    uint32_t hidden_size,
+    uint32_t num_layers,
+    float eps
+) {
+    if (!engine || !s || !hidden || layer < 0 || hidden_size == 0 ||
+        s->ple_inputs.empty()) {
+        return 1;
+    }
+    if (num_layers == 0 ||
+        (s->ple_inputs.size() % (size_t)num_layers) != 0u ||
+        (uint32_t)layer >= num_layers) {
+        return 0;
+    }
+    const uint32_t expected_layer_dim =
+        (uint32_t)(s->ple_inputs.size() / (size_t)num_layers);
+    static const char* const gate_suffixes[] = {
+        "inp_gate.weight",
+        "per_layer_input_gate.weight"
+    };
+    static const char* const proj_suffixes[] = {
+        "proj.weight",
+        "per_layer_projection.weight"
+    };
+    static const char* const norm_suffixes[] = {
+        "post_norm.weight",
+        "post_per_layer_input_norm.weight"
+    };
+    moe_raw_tensor_cache_entry gate_raw{};
+    moe_raw_tensor_cache_entry proj_raw{};
+    if (!moe_map_layer_common_tensor(
+            engine, layer, gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0]), &gate_raw) ||
+        !moe_map_layer_common_tensor(
+            engine, layer, proj_suffixes, sizeof(proj_suffixes) / sizeof(proj_suffixes[0]), &proj_raw)) {
+        if (moe_layer_has_ple_tensors(engine, layer)) {
+            moe_profile_log("ple_layer_map_failed", "layer=%d hidden=%u", layer, hidden_size);
+            return 0;
+        }
+        return 1;
+    }
+    const uint32_t layer_dim = gate_raw.rows;
+    const size_t offset = (size_t)layer * (size_t)layer_dim;
+    if (gate_raw.cols != hidden_size ||
+        layer_dim != expected_layer_dim ||
+        proj_raw.cols != layer_dim ||
+        proj_raw.rows != hidden_size ||
+        layer_dim == 0 ||
+        offset > s->ple_inputs.size() ||
+        layer_dim > s->ple_inputs.size() - offset ||
+        layer_dim > s->gate.size()) {
+        moe_profile_log(
+            "ple_layer_shape_mismatch",
+            "layer=%d gate=%ux%u proj=%ux%u hidden=%u ple_size=%llu offset=%llu",
+            layer, gate_raw.rows, gate_raw.cols, proj_raw.rows, proj_raw.cols, hidden_size,
+            (unsigned long long)s->ple_inputs.size(), (unsigned long long)offset);
+        return 0;
+    }
+    std::memcpy(s->residual.data(), hidden, (size_t)hidden_size * sizeof(float));
+    const int activation_mode = moe_engine_gelu_activation_mode(engine);
+    const float* ple_layer = s->ple_inputs.data() + offset;
+    const int gate_ok = moe_parallel_rows(engine, layer_dim, 0, [&](uint32_t row) {
+        float v = moe_raw_tensor_dot_row(gate_raw, row, hidden, hidden_size);
+        v = moe_generation_gated_activation_cached(activation_mode, v, 1.0f);
+        if (!std::isfinite(v)) {
+            v = 0.0f;
+        }
+        s->gate[row] = v * ple_layer[row];
+        return 1;
+    });
+    if (!gate_ok) {
+        return 0;
+    }
+    if (!moe_common_linear_f32(engine, proj_raw, s->gate.data(), layer_dim, s->norm.data(), hidden_size)) {
+        return 0;
+    }
+    if (!moe_layer_rmsnorm_suffixes_f32(
+            engine, layer, norm_suffixes, sizeof(norm_suffixes) / sizeof(norm_suffixes[0]),
+            s->norm.data(), hidden_size, s->attn.data(), eps)) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < hidden_size; ++i) {
+        hidden[i] = s->residual[i] + s->attn[i];
+    }
+    moe_profile_log(
+        "ple_layer_apply",
+        "layer=%d hidden=%u layer_dim=%u",
+        layer, hidden_size, layer_dim);
+    return 1;
+}
+
 static int moe_raw_tensor_scalar_at_f32(
     const moe_raw_tensor_cache_entry& raw,
     uint64_t offset,

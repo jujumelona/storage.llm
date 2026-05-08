@@ -249,6 +249,10 @@ static int moe_forward_one_token_f32(
         position, token_id, c->hidden_size, (double)embedding_scale,
         moe_profile_elapsed_ms(embed_start_us));
     moe_forward_trace_vec("embed", position, 0xffffffffu, hidden, c->hidden_size);
+    if (!moe_prepare_ple_inputs_f32(engine, c, s, token_id)) {
+        moe_generation_set_error(stats, "per-layer input prepare failed");
+        return 0;
+    }
 
     for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
         const uint64_t layer_start_us = moe_profile_now_us();
@@ -345,6 +349,13 @@ static int moe_forward_one_token_f32(
             }
             const double mlp_ms = moe_profile_elapsed_ms(mlp_start_us);
             moe_forward_trace_vec("after_mlp", position, layer, hidden, c->hidden_size);
+            if (!moe_layer_apply_ple_f32(
+                    engine, (int32_t)layer, s, hidden, c->hidden_size,
+                    c->num_hidden_layers, layer_attn_cfg.rms_norm_eps)) {
+                moe_generation_set_error(stats, "per-layer input block failed");
+                return 0;
+            }
+            moe_forward_trace_vec("after_ple", position, layer, hidden, c->hidden_size);
             if (!moe_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
                 moe_generation_set_error(stats, "layer output scale failed");
                 return 0;
@@ -394,6 +405,13 @@ static int moe_forward_one_token_f32(
             return 0;
         }
         moe_forward_trace_vec("after_mlp", position, layer, hidden, c->hidden_size);
+        if (!moe_layer_apply_ple_f32(
+                engine, (int32_t)layer, s, hidden, c->hidden_size,
+                c->num_hidden_layers, layer_attn_cfg.rms_norm_eps)) {
+            moe_generation_set_error(stats, "per-layer input block failed");
+            return 0;
+        }
+        moe_forward_trace_vec("after_ple", position, layer, hidden, c->hidden_size);
         // BUGFIX: Missing output scale in standard path
         // Problem: split_post_norm path applied moe_layer_output_scale_f32 but
         // standard path did NOT. Models with layer_output_scale.weight (Gemma4)
