@@ -99,6 +99,36 @@ static int moe_rmsnorm_unit_offset_from_weight_stats(
     return 0;
 }
 
+static int moe_rmsnorm_unit_offset_from_architecture(
+    const moe_pc_engine* engine,
+    int* out
+) {
+    if (!engine || !out) {
+        return 0;
+    }
+    std::string name = engine->dynamic_architecture;
+    if (!engine->dynamic_model_id.empty()) {
+        if (!name.empty()) {
+            name.push_back(' ');
+        }
+        name += engine->dynamic_model_id;
+    }
+    if (name.empty()) {
+        return 0;
+    }
+    const std::string lower = moe_lower_ascii_copy(name);
+    if (lower.find("gemma3n") != std::string::npos ||
+        lower.find("gemma-3n") != std::string::npos) {
+        *out = 0;
+        return 1;
+    }
+    if (lower.find("gemma") != std::string::npos) {
+        *out = 1;
+        return 1;
+    }
+    return 0;
+}
+
 static uint64_t moe_rmsnorm_unit_offset_cache_key(
     const moe_raw_tensor_cache_entry& raw
 ) {
@@ -152,6 +182,11 @@ static int moe_engine_rmsnorm_unit_offset(
             } else {
                 engine->cached_rmsnorm_unit_offset.store(2, std::memory_order_release);
             }
+        }
+        if (!metadata_done && moe_rmsnorm_unit_offset_from_architecture(engine, &value)) {
+            source = value ? "architecture_gemma" : "architecture";
+            metadata_done = 1;
+            engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0, std::memory_order_release);
         }
     }
     if (!metadata_done) {

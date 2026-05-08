@@ -17,19 +17,42 @@ int moe_pc_engine_eval_token_ids_from(
     }
     struct eval_scope_t {
         moe_pc_engine_t* engine = nullptr;
+        std::unique_lock<std::mutex> api_lock;
         int ok = 0;
         uint64_t id = 0;
         uint64_t start_us = 0;
         explicit eval_scope_t(moe_pc_engine_t* e) : engine(e) {
             if (!engine) return;
+            api_lock = std::unique_lock<std::mutex>(engine->generation_api_mutex);
             id = moe_profile_next_generation_id();
             start_us = moe_profile_now_us();
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+            const uint32_t active_before =
+                engine->generation_active.load(std::memory_order_acquire);
+            const size_t qkv_slots_before = engine->qkv_head_state_slots.size();
+            const size_t qkv_valid_before = engine->qkv_head_state_valid.size();
+            const size_t qkv_epochs_before = engine->qkv_head_state_epochs.size();
+            const uint64_t qkv_epoch_before = engine->qkv_context_epoch;
+            const uint32_t qkv_last_ctx_before = engine->qkv_last_ctx;
+#endif
             engine->generation_started.fetch_add(1, std::memory_order_relaxed);
             moe_engine_reset_qkv_cache(engine);
             engine->generation_active.fetch_add(1, std::memory_order_relaxed);
             engine->generation_token.store(0, std::memory_order_relaxed);
             engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
             engine->generation_phase.store(moe_GEN_PHASE_INIT, std::memory_order_relaxed);
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+            moe_profile_log(
+                "eval_begin",
+                "id=%llu active_before=%u qkv_slots_before=%zu qkv_valid_before=%zu qkv_epochs_before=%zu qkv_epoch_before=%llu qkv_last_ctx_before=%u",
+                (unsigned long long)id,
+                active_before,
+                qkv_slots_before,
+                qkv_valid_before,
+                qkv_epochs_before,
+                (unsigned long long)qkv_epoch_before,
+                qkv_last_ctx_before);
+#endif
         }
         ~eval_scope_t() {
             if (!engine) return;
