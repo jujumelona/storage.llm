@@ -38,10 +38,6 @@ static float qkv_attention_apply_logit_softcap(float cap, float score) {
     return tanhf(score / cap) * cap;
 }
 
-static float qkv_finite_or_zero(float v) {
-    return std::isfinite(v) ? v : 0.0f;
-}
-
 // Paper: Attention decode directly on quantized KV cache
 // Avoids full dequantize → attention → discard cycle
 int qkv_attention_decode_impl(
@@ -83,32 +79,27 @@ int qkv_attention_decode_impl(
             const float* k = s->k_sink + (size_t)t * (size_t)d;
             float dot = 0.0f;
             for (int i = 0; i < d; ++i) {
-                dot += qkv_finite_or_zero(query[i]) * qkv_finite_or_zero(k[i]);
+                dot += query[i] * k[i];
             }
             att[t] = qkv_attention_apply_logit_softcap(sink_logit_softcap, dot * sink_sc);
-            if (!std::isfinite(att[t])) att[t] = 0.0f;
+            if (!std::isfinite(att[t])) return 0;
             if (att[t] > max_score) max_score = att[t];
         }
-        if (!std::isfinite(max_score)) max_score = 0.0f;
+        if (!std::isfinite(max_score)) return 0;
         float denom = 0.0f;
         for (int t = 0; t < n; ++t) {
             att[t] = expf(att[t] - max_score);
-            if (!std::isfinite(att[t])) att[t] = 0.0f;
+            if (!std::isfinite(att[t])) return 0;
             denom += att[t];
         }
-        if (!(denom > 1e-10f) || !std::isfinite(denom)) {
-            const float uniform = 1.0f / (float)n;
-            for (int t = 0; t < n; ++t) att[t] = uniform;
-        } else {
-            const float inv_denom = 1.0f / denom;
-            for (int t = 0; t < n; ++t) att[t] *= inv_denom;
-        }
+        if (!(denom > 1e-10f) || !std::isfinite(denom)) return 0;
         memset(output, 0, (size_t)d * sizeof(float));
+        const float inv_denom = 1.0f / denom;
         for (int t = 0; t < n; ++t) {
-            const float w = att[t];
+            const float w = att[t] * inv_denom;
             const float* v = s->v_sink + (size_t)t * (size_t)d;
             for (int i = 0; i < d; ++i) {
-                output[i] += w * qkv_finite_or_zero(v[i]);
+                output[i] += w * v[i];
             }
         }
         return 1;
