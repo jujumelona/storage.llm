@@ -370,6 +370,14 @@
         return 0;
     }
     const uint32_t qkv_head_stride = std::max<uint32_t>(num_heads, num_kv_heads);
+    if (qkv_decode &&
+        !moe_qkv_prepare_layer_head_storage(
+            engine, (uint32_t)layer, qkv_head_stride, head_dim)) {
+        std::fprintf(stderr,
+            "[storagellm attn] qkv storage prepare failed layer=%d stride=%u head_dim=%u\n",
+            layer, qkv_head_stride, head_dim);
+        return 0;
+    }
 #ifdef STORAGELLM_PPL_DIAG_ENABLED
     storagellm_ppl_diag_attention_config(
         "before_attention_heads",

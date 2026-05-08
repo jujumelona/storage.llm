@@ -327,6 +327,30 @@ static int moe_qkv_prepare_runtime_config(
     return 1;
 }
 
+static int moe_qkv_prepare_layer_head_storage(
+    moe_pc_engine* engine,
+    uint32_t layer,
+    uint32_t head_stride,
+    uint32_t head_dim
+) {
+    if (!engine || head_stride == 0 || head_dim == 0) {
+        return 0;
+    }
+    const uint64_t layers = (uint64_t)layer + 1ull;
+    if (layers > (UINT64_MAX / (uint64_t)head_stride)) {
+        return 0;
+    }
+    const uint64_t slot_count_u64 = layers * (uint64_t)head_stride;
+    if (slot_count_u64 > (uint64_t)SIZE_MAX) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(engine->qkv_mutex);
+    moe_qkv_apply_contract_config_locked(engine, head_dim);
+    moe_qkv_ensure_head_storage_locked(engine, (size_t)slot_count_u64);
+    return engine->qkv_head_state_slots.size() >= (size_t)slot_count_u64 &&
+        engine->qkv_head_state_locks.size() >= (size_t)slot_count_u64;
+}
+
 static int moe_qkv_slot_index(
     uint32_t layer,
     uint32_t head,

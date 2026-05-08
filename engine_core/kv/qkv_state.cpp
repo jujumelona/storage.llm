@@ -262,6 +262,8 @@ int qkv_state_init(
             qkv_state_free(state);
             return 0;
         }
+        memset(state->k_sink, 0, (size_t)sink_tokens * (size_t)dim * sizeof(float));
+        memset(state->v_sink, 0, (size_t)sink_tokens * (size_t)dim * sizeof(float));
         state->sink_tokens = sink_tokens;
     }
 
