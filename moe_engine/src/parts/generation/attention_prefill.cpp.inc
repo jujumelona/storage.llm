@@ -497,13 +497,13 @@ static void moe_standard_attention_rope_params(
     if (!io_rope_dim || !io_rope_theta || head_dim == 0) {
         return;
     }
-    if (engine &&
-        engine->model_config_attention_valid.load(std::memory_order_relaxed) &&
-        *io_rope_dim > 0 && *io_rope_dim <= head_dim &&
-        *io_rope_theta > 0.0f) {
-        return;
-    }
     if (!moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
+        if (engine &&
+            engine->model_config_attention_valid.load(std::memory_order_relaxed) &&
+            *io_rope_dim > 0 && *io_rope_dim <= head_dim &&
+            *io_rope_theta > 0.0f) {
+            return;
+        }
         return;
     }
     double partial_value = 0.0;
