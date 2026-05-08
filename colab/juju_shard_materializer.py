@@ -4629,6 +4629,133 @@ def _juju_layer_rope_contract(layer, runtime_arch):
     }
 
 
+def _juju_value_norm_mode_is_unweighted(value):
+    if value in (None, ""):
+        return False
+    text = str(value).strip().lower().replace("-", "_")
+    return text in {
+        "unweighted_rmsnorm_contract",
+        "unweighted_rms_norm_contract",
+        "unweighted_rmsnorm",
+        "parameter_free_rmsnorm",
+        "parameter_free_rms_norm",
+        "rmsnorm_no_weight",
+        "rms_norm_no_weight",
+    }
+
+
+def _juju_layer_selector_matches(value, layer):
+    if value in (None, "", False):
+        return False
+    if value is True:
+        return True
+    try:
+        layer_i = int(layer)
+    except Exception:
+        return False
+    if isinstance(value, dict):
+        for key in ("layers", "layer_ids", "indices", "attention_layers", "value_norm_layers"):
+            if _juju_layer_selector_matches(value.get(key), layer_i):
+                return True
+        for key in (layer_i, str(layer_i)):
+            if key in value:
+                mapped = value.get(key)
+                return mapped is True or _juju_value_norm_mode_is_unweighted(mapped)
+        return False
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            if isinstance(item, dict):
+                item_layer = _juju_first_int(item.get("layer"), item.get("layer_id"), item.get("index"))
+                if item_layer == layer_i and (
+                    item.get("unweighted_value_norm_is_contractual_when_declared") is True or
+                    _juju_value_norm_mode_is_unweighted(item.get("value_norm_mode")) or
+                    _juju_value_norm_mode_is_unweighted(item.get("v_norm_mode")) or
+                    _juju_value_norm_mode_is_unweighted(item.get("norm_mode"))
+                ):
+                    return True
+            else:
+                try:
+                    if int(item) == layer_i:
+                        return True
+                except Exception:
+                    pass
+        return False
+    if isinstance(value, str):
+        for part in re.split(r"[,\\s]+", value.strip()):
+            if not part:
+                continue
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                try:
+                    if int(lo) <= layer_i <= int(hi):
+                        return True
+                except Exception:
+                    pass
+            else:
+                try:
+                    if int(part) == layer_i:
+                        return True
+                except Exception:
+                    pass
+    return False
+
+
+def _juju_runtime_declares_unweighted_v_norm(layer, runtime_arch):
+    runtime_arch = dict(runtime_arch or {})
+    for key in (
+        "value_norm_mode",
+        "v_norm_mode",
+        "attention_value_norm_mode",
+        "attention.value_norm_mode",
+    ):
+        if _juju_value_norm_mode_is_unweighted(runtime_arch.get(key)):
+            return True
+    for key in (
+        "unweighted_value_norm",
+        "unweighted_v_norm",
+        "attention_unweighted_value_norm",
+        "attention_unweighted_v_norm",
+    ):
+        if _juju_bool_or_none(runtime_arch.get(key)) is True:
+            return True
+    for key in (
+        "unweighted_value_norm_layers",
+        "unweighted_v_norm_layers",
+        "layers_with_unweighted_v_norm",
+        "layers_with_unweighted_v_norm_contract",
+        "value_norm_layers",
+    ):
+        if _juju_layer_selector_matches(runtime_arch.get(key), layer):
+            return True
+    for table_key in ("attention_layer_contract_table", "attention_layer_table", "layers"):
+        rows = runtime_arch.get(table_key)
+        if not isinstance(rows, list):
+            continue
+        if _juju_layer_selector_matches(rows, layer):
+            return True
+    return False
+
+
+def _juju_layer_has_implicit_unweighted_v_norm(layer, suffixes, runtime_arch):
+    suffixes = {str(x or "").lower() for x in (suffixes or set())}
+    if any(x in suffixes for x in JUJU_V_NORM_SUFFIXES):
+        return False
+    if _juju_runtime_declares_unweighted_v_norm(layer, runtime_arch):
+        return True
+    attention_k_eq_v = _juju_bool_or_none((runtime_arch or {}).get("attention_k_eq_v")) is True
+    has_q_norm = any(x in suffixes for x in JUJU_Q_NORM_SUFFIXES)
+    has_k_norm = any(x in suffixes for x in JUJU_K_NORM_SUFFIXES)
+    return bool(attention_k_eq_v and has_q_norm and has_k_norm)
+
+
+def _juju_value_raw_input_name(value_projection_present, attention_k_eq_v):
+    if value_projection_present:
+        return "v_raw"
+    if attention_k_eq_v:
+        return "k_raw"
+    return "missing_value_projection"
+
+
 def _juju_contract_source_config(contract):
     arch = dict(contract.get("arch_meta") or {})
     for value in (
@@ -6885,6 +7012,10 @@ def juju_runtime_arch_metadata(contract, directory=None):
         "num_key_value_heads": first_present(cfg("num_key_value_heads", "n_kv_heads"), arch.get("n_kv_heads"), arch.get("num_key_value_heads"), runtime.get("num_key_value_heads"), runtime.get("n_kv_heads")),
         "num_global_key_value_heads": first_present(cfg("num_global_key_value_heads"), arch.get("num_global_key_value_heads"), runtime.get("num_global_key_value_heads")),
         "attention_k_eq_v": first_present(_juju_bool_or_none(cfg("attention_k_eq_v")), arch.get("attention_k_eq_v"), runtime.get("attention_k_eq_v")),
+        "value_norm_mode": first_present(cfg("value_norm_mode", "v_norm_mode", "attention_value_norm_mode", "attention.value_norm_mode"), arch.get("value_norm_mode"), arch.get("v_norm_mode"), arch.get("attention_value_norm_mode"), runtime.get("value_norm_mode"), runtime.get("v_norm_mode"), runtime.get("attention_value_norm_mode")),
+        "v_norm_mode": first_present(cfg("v_norm_mode", "value_norm_mode", "attention_value_norm_mode", "attention.value_norm_mode"), arch.get("v_norm_mode"), arch.get("value_norm_mode"), arch.get("attention_value_norm_mode"), runtime.get("v_norm_mode"), runtime.get("value_norm_mode"), runtime.get("attention_value_norm_mode")),
+        "unweighted_value_norm": first_present(_juju_bool_or_none(cfg("unweighted_value_norm", "unweighted_v_norm", "attention_unweighted_value_norm", "attention_unweighted_v_norm")), _juju_bool_or_none(arch.get("unweighted_value_norm")), _juju_bool_or_none(arch.get("unweighted_v_norm")), _juju_bool_or_none(runtime.get("unweighted_value_norm")), _juju_bool_or_none(runtime.get("unweighted_v_norm"))),
+        "unweighted_value_norm_layers": first_present(cfg("unweighted_value_norm_layers", "unweighted_v_norm_layers", "layers_with_unweighted_v_norm", "layers_with_unweighted_v_norm_contract"), arch.get("unweighted_value_norm_layers"), arch.get("unweighted_v_norm_layers"), arch.get("layers_with_unweighted_v_norm"), arch.get("layers_with_unweighted_v_norm_contract"), runtime.get("unweighted_value_norm_layers"), runtime.get("unweighted_v_norm_layers"), runtime.get("layers_with_unweighted_v_norm"), runtime.get("layers_with_unweighted_v_norm_contract")),
         "kv_lora_rank": first_present(arch.get("kv_lora_rank"), runtime.get("kv_lora_rank")),
         "q_lora_rank": first_present(arch.get("q_lora_rank"), runtime.get("q_lora_rank")),
         "qk_nope_head_dim": first_present(arch.get("qk_nope_head_dim"), runtime.get("qk_nope_head_dim")),
@@ -7016,10 +7147,13 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
         "moe.gate.per_expert_scale",
     )
     attention_k_eq_v = _juju_bool_or_none(runtime_arch.get("attention_k_eq_v")) is True
-    value_uses_k = not bool(v_weights)
-    implicit_unweighted_v_norm = False
+    value_projection_present = bool(v_weights)
+    value_raw_input = _juju_value_raw_input_name(value_projection_present, attention_k_eq_v)
+    layer_suffixes = {_juju_layer_suffix(name) for name in names}
+    implicit_unweighted_v_norm = _juju_layer_has_implicit_unweighted_v_norm(layer, layer_suffixes, runtime_arch)
     value_norm_mode = (
         "weighted_rmsnorm" if v_norm_weights else
+        "unweighted_rmsnorm_contract" if implicit_unweighted_v_norm else
         "identity"
     )
     rope_contract = _juju_layer_rope_contract(layer, runtime_arch)
@@ -7042,9 +7176,9 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
         {"op": "linear", "name": "v_projection", "inputs": ["attention_norm"], "weights": v_weights, "output": "v_raw", "fallback_output": "k_raw", "fallback_semantics": "when_no_v_projection_value_uses_raw_k_projection_before_k_norm", "required": False},
         {"op": "rms_norm", "name": "q_norm", "inputs": ["q_raw"], "weights": q_norm_weights, "output": "q", "optional_behavior": "pass_q_raw_when_weight_absent", "required": bool(q_norm_weights)},
         {"op": "rms_norm", "name": "k_norm", "inputs": ["k_raw"], "weights": k_norm_weights, "output": "k", "optional_behavior": "pass_k_raw_when_weight_absent", "required": bool(k_norm_weights)},
-        *([{"op": "rms_norm", "name": "v_norm", "inputs": ["v_raw" if v_weights else "k_raw"], "weights": v_norm_weights, "output": "v", "norm_mode": value_norm_mode, "required": True}]
-          if v_norm_weights else
-          [{"op": "identity", "name": "value_passthrough", "inputs": ["v_raw" if v_weights else "k_raw"], "weights": [], "output": "v", "required": False}]),
+        *([{"op": "rms_norm", "name": "v_norm", "inputs": [value_raw_input], "weights": v_norm_weights, "output": "v", "norm_mode": value_norm_mode, "required": False}]
+          if v_norm_weights or implicit_unweighted_v_norm else
+          [{"op": "identity", "name": "value_passthrough", "inputs": [value_raw_input], "weights": [], "output": "v", "required": False}]),
         {"op": "rope", "name": "rotary_embedding", "inputs": ["q", "k"], "weights": bind("rope_freqs.weight"), "rope_contract": rope_contract, "required": False},
         {"op": "attention", "name": "attention", "inputs": ["q", "k", "v"], **attention_cache_contract, "attention_scale": "metadata_or_qk_norm_contract", "required": bool(q_weights and k_weights and (v_weights or k_weights))},
         {"op": "linear", "name": "attention_output", "inputs": ["attention"], "weights": o_weights, "output": "attention_out", "required": bool(o_weights)},
@@ -7084,6 +7218,9 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
             "expert_branch_uses_expert_ffn_norm": bool(expert_norm_weights),
             "router_uses_hidden_when_internal_scale_present": bool(router_scale_weights),
             "value_uses_raw_k_projection_when_v_projection_missing": not bool(v_weights),
+            "value_projection_present": value_projection_present,
+            "value_source": "v_projection" if value_projection_present else ("raw_k_projection_before_k_norm" if attention_k_eq_v else "missing_value_projection"),
+            "value_norm_input": value_raw_input,
             "value_norm_mode": value_norm_mode,
             "value_norm_requires_layer_local_weight_tensor": bool(v_norm_weights),
             "unweighted_value_norm_is_contractual_when_declared": bool(implicit_unweighted_v_norm),
@@ -7131,6 +7268,13 @@ def _juju_attention_layer_contract_table(tensor_records, runtime_arch):
         q_norm_refs = _juju_layer_refs_by_suffix(names, JUJU_Q_NORM_SUFFIXES)
         k_norm_refs = _juju_layer_refs_by_suffix(names, JUJU_K_NORM_SUFFIXES)
         v_norm_refs = _juju_layer_refs_by_suffix(names, JUJU_V_NORM_SUFFIXES)
+        layer_suffixes = {_juju_layer_suffix(name) for name in names}
+        implicit_unweighted_v_norm = _juju_layer_has_implicit_unweighted_v_norm(layer, layer_suffixes, runtime_arch)
+        value_norm_mode = (
+            "weighted_rmsnorm" if v_norm_refs else
+            "unweighted_rmsnorm_contract" if implicit_unweighted_v_norm else
+            "identity"
+        )
         kind = _juju_layer_attention_kind(layer, runtime_arch)
         is_global = kind == "global_full_attention"
         attention_k_eq_v = _juju_bool_or_none(runtime_arch.get("attention_k_eq_v")) is True
@@ -7151,6 +7295,7 @@ def _juju_attention_layer_contract_table(tensor_records, runtime_arch):
         value_source = "v_projection"
         if not v_refs:
             value_source = "raw_k_projection_before_k_norm" if attention_k_eq_v else "missing_value_projection"
+        value_norm_input = _juju_value_raw_input_name(bool(v_refs), attention_k_eq_v)
         missing = []
         if not q_refs:
             missing.append("q_projection")
@@ -7172,6 +7317,7 @@ def _juju_attention_layer_contract_table(tensor_records, runtime_arch):
             "attention_k_eq_v": bool(attention_k_eq_v),
             "value_projection_present": bool(v_refs),
             "value_source": value_source,
+            "value_norm_input": value_norm_input,
             "q_projection": q_refs,
             "k_projection": k_refs,
             "v_projection": v_refs,
@@ -7179,6 +7325,10 @@ def _juju_attention_layer_contract_table(tensor_records, runtime_arch):
             "q_norm": q_norm_refs,
             "k_norm": k_norm_refs,
             "v_norm": v_norm_refs,
+            "value_norm_mode": value_norm_mode,
+            "value_norm_declared": bool(v_norm_refs or implicit_unweighted_v_norm),
+            "value_norm_requires_layer_local_weight_tensor": bool(v_norm_refs),
+            "unweighted_value_norm_is_contractual_when_declared": bool(implicit_unweighted_v_norm),
             "rope_contract": _juju_layer_rope_contract(layer, runtime_arch),
             "qkv_cache_backend": "qkv_quantized_per_layer_head_cache",
             "ppl_kv_backend": "qkv_quantized_per_layer_head_cache",
@@ -7187,6 +7337,144 @@ def _juju_attention_layer_contract_table(tensor_records, runtime_arch):
             "missing": missing,
         })
     return table
+
+
+def _juju_layer_execution_contract_table(tensor_records, runtime_arch):
+    runtime_arch = dict(runtime_arch or {})
+    layers = sorted({
+        layer for layer in (_juju_layer_id_from_name(t.get("name")) for t in tensor_records or [])
+        if layer is not None
+    })
+    out = []
+    for layer in layers:
+        names = _juju_tensors_by_layer(tensor_records, layer)
+        suffixes = {_juju_layer_suffix(name) for name in names}
+        refs = lambda candidates: _juju_layer_refs_by_suffix(names, candidates)
+        attention_kind = _juju_layer_attention_kind(layer, runtime_arch)
+        is_global = attention_kind == "global_full_attention"
+        v_refs = refs(JUJU_ATTENTION_V_SUFFIXES)
+        v_norm_refs = refs(JUJU_V_NORM_SUFFIXES)
+        implicit_unweighted_v_norm = _juju_layer_has_implicit_unweighted_v_norm(layer, suffixes, runtime_arch)
+        value_norm_mode = (
+            "weighted_rmsnorm" if v_norm_refs else
+            "unweighted_rmsnorm_contract" if implicit_unweighted_v_norm else
+            "identity"
+        )
+        router_scale_refs = refs({"ffn_gate_inp.scale", "router.scale", "mlp.router.scale", "moe.gate.scale"})
+        post_ffw_norm1_refs = refs({"post_ffw_norm_1.weight", "ffn_post_norm_1.weight"})
+        post_ffw_norm2_refs = refs({"post_ffw_norm_2.weight", "ffn_post_norm_2.weight"})
+        post_ffw_norm_refs = refs({"post_ffw_norm.weight", "ffn_post_norm.weight"})
+        layer_output_scale_refs = refs({"layer_output_scale.weight", "layer_scalar.weight", "layer_scalar"})
+        q_norm_refs = refs(JUJU_Q_NORM_SUFFIXES)
+        k_norm_refs = refs(JUJU_K_NORM_SUFFIXES)
+        attention_k_eq_v = _juju_bool_or_none(runtime_arch.get("attention_k_eq_v")) is True
+        value_norm_input = _juju_value_raw_input_name(bool(v_refs), attention_k_eq_v)
+        out.append({
+            "format": "JUJU_LAYER_EXECUTION_CONTRACT_V1",
+            "layer": int(layer),
+            "attention_kind": attention_kind,
+            "head_dim": _juju_first_int(
+                runtime_arch.get("global_head_dim") if is_global else runtime_arch.get("head_dim"),
+                runtime_arch.get("head_dim"),
+            ),
+            "value_head_dim": _juju_first_int(
+                runtime_arch.get("global_value_head_dim") if is_global else runtime_arch.get("value_head_dim"),
+                runtime_arch.get("value_head_dim"),
+                runtime_arch.get("global_head_dim") if is_global else runtime_arch.get("head_dim"),
+                runtime_arch.get("head_dim"),
+            ),
+            "num_attention_heads": _juju_first_int(runtime_arch.get("num_attention_heads")),
+            "num_key_value_heads": _juju_first_int(
+                runtime_arch.get("num_global_key_value_heads") if is_global else runtime_arch.get("num_key_value_heads"),
+                runtime_arch.get("num_key_value_heads"),
+            ),
+            "attention_k_eq_v": bool(attention_k_eq_v),
+            "value_projection_present": bool(v_refs),
+            "value_source": "v_projection" if v_refs else ("raw_k_projection_before_k_norm" if attention_k_eq_v else "missing_value_projection"),
+            "value_norm_input": value_norm_input,
+            "value_norm_mode": value_norm_mode,
+            "value_norm_declared": bool(v_norm_refs or implicit_unweighted_v_norm),
+            "value_norm_requires_layer_local_weight_tensor": bool(v_norm_refs),
+            "unweighted_value_norm_is_contractual_when_declared": bool(implicit_unweighted_v_norm),
+            "attention": {
+                "q_projection": refs(JUJU_ATTENTION_Q_SUFFIXES),
+                "k_projection": refs(JUJU_ATTENTION_K_SUFFIXES),
+                "v_projection": v_refs,
+                "o_projection": refs(JUJU_ATTENTION_O_SUFFIXES),
+                "q_norm": q_norm_refs,
+                "k_norm": k_norm_refs,
+                "v_norm": v_norm_refs,
+                "value_norm_input": value_norm_input,
+                "value_norm_mode": value_norm_mode,
+                "value_norm_declared": bool(v_norm_refs or implicit_unweighted_v_norm),
+                "value_norm_requires_layer_local_weight_tensor": bool(v_norm_refs),
+                "unweighted_value_norm_is_contractual_when_declared": bool(implicit_unweighted_v_norm),
+                "rope_contract": _juju_layer_rope_contract(layer, runtime_arch),
+                "attention_scale": first_present(runtime_arch.get("attention_scale"), runtime_arch.get("attn_scale"), runtime_arch.get("attention_score_scale"), runtime_arch.get("f_attn_scale"), runtime_arch.get("qk_scale")),
+                "query_pre_attn_scalar": first_present(runtime_arch.get("query_pre_attn_scalar"), runtime_arch.get("attention_query_pre_attn_scalar"), runtime_arch.get("attn_query_pre_attn_scalar")),
+                "attn_logit_softcap": first_present(runtime_arch.get("attn_logit_softcap"), runtime_arch.get("attn_logit_softcapping"), runtime_arch.get("attention_logit_softcap"), runtime_arch.get("attention_logit_softcapping")),
+            },
+            "norms": {
+                "attention_input_norm": refs({"attn_norm.weight", "input_layernorm.weight", "pre_attention_norm.weight"}),
+                "post_attention_norm": refs({"post_attention_norm.weight", "post_attention_layernorm.weight", "post_attention_layer_norm.weight", "post_attn_norm.weight"}),
+                "ffn_norm": refs({"ffn_norm.weight", "ffn_pre_norm.weight", "pre_ffw_norm.weight", "mlp_norm.weight"}),
+                "expert_ffn_norm": refs({"pre_ffw_norm_2.weight", "ffn_pre_norm_2.weight", "moe_norm.weight"}),
+                "post_ffw_norm_1": post_ffw_norm1_refs,
+                "post_ffw_norm_2": post_ffw_norm2_refs,
+                "post_ffw_norm": post_ffw_norm_refs,
+                "rms_norm_eps": first_present(runtime_arch.get("norm_eps"), runtime_arch.get("rms_norm_eps")),
+                "rms_norm_unit_offset": _juju_bool_or_none(runtime_arch.get("rms_norm_unit_offset")),
+            },
+            "router": {
+                "router": refs({"ffn_gate_inp.weight", "router.weight", "mlp.router.weight", "moe.gate.weight"}),
+                "router_scale": router_scale_refs,
+                "router_uses_hidden_when_internal_scale_present": bool(router_scale_refs),
+                "routed_experts_per_token": runtime_arch.get("routed_experts_per_token"),
+                "experts_per_moe_layer": runtime_arch.get("experts_per_moe_layer"),
+                "norm_topk_prob": runtime_arch.get("norm_topk_prob"),
+                "scoring_func": runtime_arch.get("scoring_func"),
+                "routed_scaling_factor": runtime_arch.get("routed_scaling_factor"),
+            },
+            "mlp": {
+                "shared_experts": sorted(name for name in names if is_shared_expert_tensor_name(name)),
+                "routed_experts": sorted(name for name in names if is_routed_expert_tensor_name(name)),
+                "dense_mlp": refs({"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"}),
+                "shared_and_expert_post_norms_apply_before_branch_sum": bool(post_ffw_norm1_refs or post_ffw_norm2_refs),
+                "post_ffw_norm_applies_to_combined_ffn_before_residual": bool(post_ffw_norm_refs),
+            },
+            "tail": {
+                "layer_output_scale": layer_output_scale_refs,
+                "layer_output_scale_after_ffn_residual": bool(layer_output_scale_refs),
+            },
+        })
+    return out
+
+
+def _juju_value_norm_contract_table(layer_execution_contract_table):
+    out = []
+    for row in layer_execution_contract_table or []:
+        if not isinstance(row, dict):
+            continue
+        attention = row.get("attention") if isinstance(row.get("attention"), dict) else {}
+        mode = row.get("value_norm_mode") or attention.get("value_norm_mode") or "identity"
+        declared = bool(row.get("value_norm_declared") or attention.get("value_norm_declared"))
+        requires_weight = bool(row.get("value_norm_requires_layer_local_weight_tensor") or attention.get("value_norm_requires_layer_local_weight_tensor"))
+        out.append({
+            "format": "JUJU_VALUE_NORM_CONTRACT_V1",
+            "layer": row.get("layer"),
+            "attention_kind": row.get("attention_kind"),
+            "value_projection_present": bool(row.get("value_projection_present")),
+            "value_source": row.get("value_source"),
+            "value_norm_input": row.get("value_norm_input") or attention.get("value_norm_input"),
+            "value_norm_mode": mode,
+            "value_norm_declared": declared,
+            "v_norm": attention.get("v_norm") or [],
+            "requires_layer_local_weight_tensor": requires_weight,
+            "value_norm_requires_layer_local_weight_tensor": requires_weight,
+            "unweighted_value_norm_is_contractual_when_declared": bool(row.get("unweighted_value_norm_is_contractual_when_declared") or attention.get("unweighted_value_norm_is_contractual_when_declared")),
+            "executor_must_not_skip_when_declared": bool(declared),
+        })
+    return out
 
 
 
@@ -7214,6 +7502,8 @@ def build_juju_forward_contract_validation(generation_contract, runtime_arch, *,
         "tensor_layout_contract": bool(layer_contract.get("tensor_layout_records_complete")),
         "attention_contract": layer_count > 0 and q_layers == layer_count and k_layers == layer_count and o_layers == layer_count,
         "attention_layer_table": bool(layer_contract.get("attention_layer_table_complete")),
+        "layer_execution_contract_table": bool(layer_contract.get("layer_execution_contract_table_complete")),
+        "value_norm_contract_table": bool(layer_contract.get("value_norm_contract_table_complete")),
         "router_contract": moe_layers == 0 or router_layers == moe_layers,
         "mlp_contract": (moe_layers + dense_layers) > 0,
         "kv_layout_contract": bool(layer_contract.get("kv_layout_contract_available")),
@@ -7282,6 +7572,23 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
         if layer is not None
     })
     attention_layer_table = _juju_attention_layer_contract_table(tensor_records, runtime_arch)
+    layer_execution_contract_table = _juju_layer_execution_contract_table(tensor_records, runtime_arch)
+    value_norm_contract_table = _juju_value_norm_contract_table(layer_execution_contract_table)
+    value_norm_layers = sorted(
+        int(row.get("layer"))
+        for row in value_norm_contract_table
+        if row.get("layer") is not None and row.get("value_norm_mode") != "identity"
+    )
+    weighted_value_norm_layers = sorted(
+        int(row.get("layer"))
+        for row in value_norm_contract_table
+        if row.get("layer") is not None and row.get("value_norm_requires_layer_local_weight_tensor") is True
+    )
+    unweighted_value_norm_layers = sorted(
+        int(row.get("layer"))
+        for row in value_norm_contract_table
+        if row.get("layer") is not None and row.get("unweighted_value_norm_is_contractual_when_declared") is True
+    )
     by_layer = {layer: {_juju_layer_suffix(n) for n in _juju_tensors_by_layer(tensor_records, layer)} for layer in layers}
     for layer, suffixes in by_layer.items():
         if any(x in suffixes for x in {"post_attention_norm.weight", "post_attention_layernorm.weight", "post_attention_layer_norm.weight", "post_attn_norm.weight"}):
@@ -7307,7 +7614,7 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
         if any(x in suffixes for x in JUJU_ATTENTION_O_SUFFIXES):
             feature_counts["layers_with_o_projection"] += 1
         explicit_v_norm = any(x in suffixes for x in JUJU_V_NORM_SUFFIXES)
-        implicit_v_norm = False
+        implicit_v_norm = _juju_layer_has_implicit_unweighted_v_norm(layer, suffixes, runtime_arch)
         if explicit_v_norm or implicit_v_norm:
             feature_counts["layers_with_v_norm"] += 1
         if implicit_v_norm:
@@ -7363,6 +7670,13 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
             "attention_layer_table_complete": bool(attention_layer_table) and all(
                 bool(row.get("required_complete")) for row in attention_layer_table
             ),
+            "layer_execution_contract_table": layer_execution_contract_table,
+            "layer_execution_contract_table_complete": len(layer_execution_contract_table) == len(layers),
+            "value_norm_contract_table": value_norm_contract_table,
+            "value_norm_contract_table_complete": len(value_norm_contract_table) == len(layers),
+            "value_norm_layers": value_norm_layers,
+            "weighted_value_norm_layers": weighted_value_norm_layers,
+            "unweighted_value_norm_layers": unweighted_value_norm_layers,
             "op_order_is_authoritative": True,
             "unknown_required_op_behavior": "fail_closed",
             "optional_missing_op_behavior": "documented_fallback_only",
@@ -7602,7 +7916,11 @@ def build_juju_runtime_execution_manifest(*, generation_contract, runtime_access
             "head_layout": (kv_layout.get("head_layout") or {}),
             "window_contract": (kv_layout.get("attention_window_contract") or {}),
             "layer_table": (generation_contract.get("layers") or {}).get("attention_layer_table") or [],
+            "value_norm_contract_table": (generation_contract.get("layers") or {}).get("value_norm_contract_table") or [],
+            "value_norm_layers": (generation_contract.get("layers") or {}).get("value_norm_layers") or [],
+            "unweighted_value_norm_layers": (generation_contract.get("layers") or {}).get("unweighted_value_norm_layers") or [],
         },
+        "layer_execution_contract_table": (generation_contract.get("layers") or {}).get("layer_execution_contract_table") or [],
         "router": {
             "execution_op": "moe_router",
             "topk_source_fields": ["routed_experts_per_token", "experts_per_moe_layer", "norm_topk_prob", "scoring_func"],
@@ -7621,6 +7939,10 @@ def build_juju_runtime_execution_manifest(*, generation_contract, runtime_access
             "eps": runtime_arch.get("norm_eps") or runtime_arch.get("rms_norm_eps"),
             "source": "source_config_or_gguf_runtime_metadata",
             "optional_missing_op_behavior": generation_contract.get("layers", {}).get("optional_missing_op_behavior"),
+            "value_norm_contract_table": (generation_contract.get("layers") or {}).get("value_norm_contract_table") or [],
+            "value_norm_layers": (generation_contract.get("layers") or {}).get("value_norm_layers") or [],
+            "weighted_value_norm_layers": (generation_contract.get("layers") or {}).get("weighted_value_norm_layers") or [],
+            "unweighted_value_norm_layers": (generation_contract.get("layers") or {}).get("unweighted_value_norm_layers") or [],
         },
         "lm_head": generation_contract.get("lm_head") or {},
         "final_norm": generation_contract.get("final_norm") or {},
@@ -7917,6 +8239,8 @@ def juju_format_self_check(idx, sections, qkv_schema):
             "special_tokens",
             "embedding",
             "attention",
+            "layer_execution_contract_table",
+            "norms",
             "router",
             "lm_head",
             "graph_ir",
@@ -8021,6 +8345,52 @@ def juju_format_self_check(idx, sections, qkv_schema):
             warn("generation_attention_layer_table_incomplete_for_partial_shard")
         else:
             err("generation_attention_layer_table_incomplete")
+    layer_execution_table = layer_contract.get("layer_execution_contract_table") or graph_ir.get("layer_execution_contract_table") or idx.get("layer_execution_contract_table") or []
+    if not layer_execution_table:
+        if partial_shard:
+            warn("layer_execution_contract_table_missing_for_partial_shard")
+        else:
+            err("layer_execution_contract_table_missing")
+    if layer_contract.get("layer_execution_contract_table_complete") is not True:
+        if partial_shard:
+            warn("layer_execution_contract_table_incomplete_for_partial_shard")
+        else:
+            err("layer_execution_contract_table_incomplete")
+    value_norm_table = (
+        layer_contract.get("value_norm_contract_table") or
+        (runtime_execution_manifest.get("attention") or {}).get("value_norm_contract_table") or
+        (runtime_execution_manifest.get("norms") or {}).get("value_norm_contract_table") or
+        graph_ir.get("value_norm_contract_table") or
+        idx.get("value_norm_contract_table") or
+        []
+    )
+    if layer_contract.get("value_norm_contract_table_complete") is not True:
+        if partial_shard:
+            warn("value_norm_contract_table_incomplete_for_partial_shard")
+        else:
+            err("value_norm_contract_table_incomplete")
+    feature_counts = layer_contract.get("feature_counts") or {}
+    if int(feature_counts.get("layers_with_unweighted_v_norm_contract") or 0) > 0:
+        execution_rows = [row for row in layer_execution_table if isinstance(row, dict)]
+        attention_rows = [row for row in (layer_contract.get("attention_layer_table") or []) if isinstance(row, dict)]
+        value_norm_rows = [row for row in value_norm_table if isinstance(row, dict)]
+        if not any(row.get("unweighted_value_norm_is_contractual_when_declared") is True for row in execution_rows):
+            err("unweighted_v_norm_contract_not_lifted_to_layer_execution_table")
+        if not any(row.get("unweighted_value_norm_is_contractual_when_declared") is True for row in attention_rows):
+            err("unweighted_v_norm_contract_not_lifted_to_attention_layer_table")
+        if not any(row.get("unweighted_value_norm_is_contractual_when_declared") is True for row in value_norm_rows):
+            err("unweighted_v_norm_contract_not_lifted_to_value_norm_table")
+        for row in value_norm_rows:
+            if row.get("unweighted_value_norm_is_contractual_when_declared") is True:
+                if row.get("value_norm_mode") != "unweighted_rmsnorm_contract":
+                    err("unweighted_v_norm_mode_not_explicit", layer=row.get("layer"), value=row.get("value_norm_mode"))
+                    break
+                if row.get("value_norm_input") not in ("v_raw", "k_raw"):
+                    err("unweighted_v_norm_input_missing", layer=row.get("layer"), value=row.get("value_norm_input"))
+                    break
+                if row.get("value_projection_present") is True and row.get("value_norm_input") != "v_raw":
+                    err("unweighted_v_norm_v_projection_input_not_v_raw", layer=row.get("layer"), value=row.get("value_norm_input"))
+                    break
     runtime_access_plan = graph_ir.get("runtime_access_plan") or idx.get("runtime_access_plan") or {}
     if runtime_access_plan.get("format") != "JUJU_RUNTIME_ACCESS_PLAN_V1":
         err("runtime_access_plan_missing_or_wrong_format")
@@ -8270,6 +8640,8 @@ def build_juju_graph_ir(*, contract, tensor_records, sections, source_name, sour
         "runtime_execution_manifest": runtime_execution_manifest,
         "runtime_access_plan": runtime_access_plan,
         "attention_layer_contract_table": generation_contract.get("layers", {}).get("attention_layer_table") or [],
+        "layer_execution_contract_table": generation_contract.get("layers", {}).get("layer_execution_contract_table") or [],
+        "value_norm_contract_table": generation_contract.get("layers", {}).get("value_norm_contract_table") or [],
         "kv_layout_contract": runtime_access_plan["kv_layout_contract"],
         "qkv_policy_contract": qkv_fields["qkv_policy_contract"],
         "qkv_cache_schema_effective": qkv_fields["qkv_cache_schema_effective"],
