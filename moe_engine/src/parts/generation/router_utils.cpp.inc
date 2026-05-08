@@ -384,3 +384,5 @@ static int moe_prepare_scaled_router_input_f32(
         }
         (*out)[i] = result;
     }
+    return 1;
+}
