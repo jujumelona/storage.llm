@@ -396,9 +396,7 @@ int qkv_attention_decode_impl(
             }
 
             if (k_split) {
-                if (!qkv_dot_mse_split_rotated_token(s, cfg, QKV_TARGET_KEY, t, q_eff, &dot)) {
-                    dot = 0.0f;
-                }
+                if (!qkv_dot_mse_split_rotated_token(s, cfg, QKV_TARGET_KEY, t, q_eff, &dot)) return 0;
             } else if (k_raw) {
                 const uint8_t* tidx = s->k_idx + t * k_stride;
                 for (int i = 0; i < d; i++) {
@@ -433,30 +431,22 @@ int qkv_attention_decode_impl(
                     }
                 }
             }
-            att[t] = qkv_attention_apply_logit_softcap(
-                attn_logit_softcap,
-                qkv_finite_or_zero(dot) * qkv_finite_or_zero(norm_k) * sc);
-            if (!std::isfinite(att[t])) {
-                att[t] = 0.0f;
-            }
+            att[t] = qkv_attention_apply_logit_softcap(attn_logit_softcap, dot * norm_k * sc);
         }
     }
 
     // Softmax
     // BUGFIX 361: n이 0일 때 방지 (이미 위에서 체크했지만 명시적으로)
     if (n <= 0) return 0;
-    float mx = std::isfinite(att[0]) ? att[0] : 0.0f;
-    for (int t = 1; t < n; t++) {
-        if (!std::isfinite(att[t])) {
-            att[t] = 0.0f;
-        }
-        if (att[t] > mx) mx = att[t];
-    }
-    if (!std::isfinite(mx)) mx = 0.0f;
+    float mx = att[0];
+    if (!std::isfinite(mx)) return 0;
+    for (int t = 1; t < n; t++) if (att[t] > mx) mx = att[t];
+    if (!std::isfinite(mx)) return 0;
     float se = 0;
     for (int t = 0; t < n; t++) {
+        if (!std::isfinite(att[t])) return 0;
         att[t] = expf(att[t] - mx);
-        if (!std::isfinite(att[t])) att[t] = 0.0f;
+        if (!std::isfinite(att[t])) return 0;
         se += att[t];
     }
     // BUGFIX 362: softmax sum이 0일 때 division by zero 방지
@@ -464,8 +454,7 @@ int qkv_attention_decode_impl(
         float iv = 1.0f / se;
         for (int t = 0; t < n; t++) att[t] *= iv;
     } else {
-        const float uniform = 1.0f / (float)n;
-        for (int t = 0; t < n; t++) att[t] = uniform;
+        return 0;
     }
 
     // Phase 2: V weighted sum — need full dequant (with inverse rotation)
@@ -534,11 +523,10 @@ int qkv_attention_decode_impl(
     memset(output, 0, d * sizeof(float));
     for (int t = 0; t < n; t++) {
         if (!qkv_dequant_one(s, cfg, s->v_idx, s->v_qjl,
-                s->v_residual_norms, s->v_norms, t, s->v_bits, qjl, row)) {
-            memset(row, 0, (size_t)d * sizeof(float));
-        }
+                s->v_residual_norms, s->v_norms, t, s->v_bits, qjl, row))
+            return 0;
         float w = att[t];
-        for (int i = 0; i < d; i++) output[i] += w * qkv_finite_or_zero(row[i]);
+        for (int i = 0; i < d; i++) output[i] += w * row[i];
     }
     return 1;
 }
