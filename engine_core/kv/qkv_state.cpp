@@ -165,8 +165,8 @@ int qkv_state_init(
 
     state->k_idx = (uint8_t*)calloc(k_packed_size, 1);
     state->v_idx = (uint8_t*)calloc(v_packed_size, 1);
-    state->k_norms = (float*)malloc((size_t)n_tokens * sizeof(float));
-    state->v_norms = (float*)malloc((size_t)n_tokens * sizeof(float));
+    state->k_norms = (float*)calloc((size_t)n_tokens, sizeof(float));
+    state->v_norms = (float*)calloc((size_t)n_tokens, sizeof(float));
 
     if (!state->k_idx || !state->v_idx || !state->k_norms || !state->v_norms) {
         qkv_state_free(state);
@@ -181,9 +181,9 @@ int qkv_state_init(
             return 0;
         }
         state->k_qjl = (uint8_t*)calloc(((size_t)n_tokens * (size_t)dim + 7) / 8, 1);
-        state->k_residual_norms = (float*)malloc((size_t)n_tokens * sizeof(float));
+        state->k_residual_norms = (float*)calloc((size_t)n_tokens, sizeof(float));
         state->v_qjl = (uint8_t*)calloc(((size_t)n_tokens * (size_t)dim + 7) / 8, 1);
-        state->v_residual_norms = (float*)malloc((size_t)n_tokens * sizeof(float));
+        state->v_residual_norms = (float*)calloc((size_t)n_tokens, sizeof(float));
 
         if (!state->k_qjl || !state->k_residual_norms ||
             !state->v_qjl || !state->v_residual_norms) {
@@ -346,10 +346,10 @@ int qkv_state_init(
         state->k_idx_normal = (uint8_t*)calloc(k_norm_size, 1);
         state->v_idx_outlier = (uint8_t*)calloc(v_out_size, 1);
         state->v_idx_normal = (uint8_t*)calloc(v_norm_size, 1);
-        state->k_norms_outlier = (float*)malloc((size_t)n_tokens * sizeof(float));
-        state->k_norms_normal = (float*)malloc((size_t)n_tokens * sizeof(float));
-        state->v_norms_outlier = (float*)malloc((size_t)n_tokens * sizeof(float));
-        state->v_norms_normal = (float*)malloc((size_t)n_tokens * sizeof(float));
+        state->k_norms_outlier = (float*)calloc((size_t)n_tokens, sizeof(float));
+        state->k_norms_normal = (float*)calloc((size_t)n_tokens, sizeof(float));
+        state->v_norms_outlier = (float*)calloc((size_t)n_tokens, sizeof(float));
+        state->v_norms_normal = (float*)calloc((size_t)n_tokens, sizeof(float));
 
         if (!state->outlier_indices || !state->k_outlier_indices || !state->v_outlier_indices ||
             !state->k_is_outlier || !state->v_is_outlier ||
