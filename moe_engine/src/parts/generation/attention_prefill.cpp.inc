@@ -107,6 +107,46 @@ static int moe_apply_unweighted_head_rmsnorm_f32(
     return 1;
 }
 
+static size_t moe_json_find_next_array_for_key_local(
+    const std::string& text,
+    const char* key,
+    size_t search_pos,
+    size_t* begin,
+    size_t* end
+) {
+    if (begin) {
+        *begin = 0;
+    }
+    if (end) {
+        *end = 0;
+    }
+    if (!key || !key[0] || !begin || !end || search_pos >= text.size()) {
+        return std::string::npos;
+    }
+    const size_t key_len = std::strlen(key);
+    size_t pos = search_pos;
+    while ((pos = text.find('"', pos)) != std::string::npos) {
+        if (pos + 1u + key_len < text.size() &&
+            text.compare(pos + 1u, key_len, key) == 0 &&
+            text[pos + 1u + key_len] == '"') {
+            const size_t colon = text.find_first_not_of(" \t\r\n", pos + key_len + 2u);
+            if (colon != std::string::npos && colon < text.size() && text[colon] == ':') {
+                const size_t value = text.find_first_not_of(" \t\r\n", colon + 1u);
+                if (value != std::string::npos && value < text.size() && text[value] == '[') {
+                    const size_t close = moe_json_match_bracket_local(text, value, '[', ']');
+                    if (close != std::string::npos) {
+                        *begin = value;
+                        *end = close;
+                        return pos;
+                    }
+                }
+            }
+        }
+        ++pos;
+    }
+    return std::string::npos;
+}
+
 static int moe_layer_contract_declares_unweighted_v_norm(
     const std::string& doc,
     const char* array_key,
@@ -115,38 +155,44 @@ static int moe_layer_contract_declares_unweighted_v_norm(
     if (doc.empty() || !array_key || layer < 0) {
         return 0;
     }
-    size_t arr_begin = 0;
-    size_t arr_end = 0;
-    if (!moe_json_find_array_local(doc, array_key, &arr_begin, &arr_end)) {
-        return 0;
-    }
-    size_t cursor = arr_begin + 1;
-    while (cursor < arr_end) {
-        size_t obj_begin = 0;
-        size_t obj_end = 0;
-        if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+    size_t search_pos = 0;
+    while (search_pos < doc.size()) {
+        size_t arr_begin = 0;
+        size_t arr_end = 0;
+        const size_t key_pos = moe_json_find_next_array_for_key_local(
+            doc, array_key, search_pos, &arr_begin, &arr_end);
+        if (key_pos == std::string::npos) {
             break;
         }
-        uint64_t parsed_layer = UINT64_MAX;
-        if (!moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed_layer) ||
-            parsed_layer != (uint64_t)layer) {
-            continue;
-        }
-        int declared = 0;
-        if (moe_json_get_bool_slice(
-                doc, obj_begin, obj_end,
-                "unweighted_value_norm_is_contractual_when_declared", &declared) &&
-            declared) {
-            return 1;
-        }
-        std::string mode;
-        if (moe_json_get_string_slice(doc, obj_begin, obj_end, "value_norm_mode", &mode) &&
-            mode == "unweighted_rmsnorm_contract") {
-            return 1;
-        }
-        if (moe_json_get_string_slice(doc, obj_begin, obj_end, "norm_mode", &mode) &&
-            mode == "unweighted_rmsnorm_contract") {
-            return 1;
+        search_pos = arr_end > key_pos ? arr_end : key_pos + 1u;
+        size_t cursor = arr_begin + 1u;
+        while (cursor < arr_end) {
+            size_t obj_begin = 0;
+            size_t obj_end = 0;
+            if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+                break;
+            }
+            uint64_t parsed_layer = UINT64_MAX;
+            if (!moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed_layer) ||
+                parsed_layer != (uint64_t)layer) {
+                continue;
+            }
+            int declared = 0;
+            if (moe_json_get_bool_slice(
+                    doc, obj_begin, obj_end,
+                    "unweighted_value_norm_is_contractual_when_declared", &declared) &&
+                declared) {
+                return 1;
+            }
+            std::string mode;
+            if (moe_json_get_string_slice(doc, obj_begin, obj_end, "value_norm_mode", &mode) &&
+                mode == "unweighted_rmsnorm_contract") {
+                return 1;
+            }
+            if (moe_json_get_string_slice(doc, obj_begin, obj_end, "norm_mode", &mode) &&
+                mode == "unweighted_rmsnorm_contract") {
+                return 1;
+            }
         }
     }
     return 0;
@@ -179,14 +225,23 @@ static int moe_layer_uses_unweighted_v_norm(
     }
     static thread_local const moe_pc_engine* tls_cached_engine = nullptr;
     static thread_local uint64_t tls_cached_generation = 0;
+    static thread_local size_t tls_cached_graph_size = 0;
+    static thread_local size_t tls_cached_metadata_size = 0;
     static thread_local std::vector<int8_t> tls_cached_results;
     const uint64_t generation = engine->engine_generation;
+    const size_t graph_size = engine->offload_graph_ir_json.size();
+    const size_t metadata_size = engine->offload_gguf_metadata_json.size();
     const size_t layer_index = (size_t)layer;
     int8_t* cached = nullptr;
     if (layer_index < 10000u) {
-        if (tls_cached_engine != engine || tls_cached_generation != generation) {
+        if (tls_cached_engine != engine ||
+            tls_cached_generation != generation ||
+            tls_cached_graph_size != graph_size ||
+            tls_cached_metadata_size != metadata_size) {
             tls_cached_engine = engine;
             tls_cached_generation = generation;
+            tls_cached_graph_size = graph_size;
+            tls_cached_metadata_size = metadata_size;
             tls_cached_results.clear();
         }
         if (tls_cached_results.size() <= layer_index) {
@@ -213,21 +268,47 @@ static int moe_layer_uses_unweighted_v_norm(
         &engine->offload_graph_ir_json,
         &engine->offload_gguf_metadata_json,
     };
-    for (const std::string* doc : docs) {
+    const char* doc_names[] = {
+        "graph_ir",
+        "metadata",
+    };
+    const char* array_keys[] = {
+        "value_norm_contract_table",
+        "layer_execution_contract_table",
+        "attention_layer_contract_table",
+        "attention_layer_table",
+        "layers",
+    };
+    const char* matched_doc = "";
+    const char* matched_array = "";
+    for (size_t doc_i = 0; doc_i < sizeof(docs) / sizeof(docs[0]); ++doc_i) {
+        const std::string* doc = docs[doc_i];
         if (!doc || doc->empty()) {
             continue;
         }
-        if (moe_layer_object_contract_declares_unweighted_v_norm(*doc, "graph_ir", "layers", layer) ||
-            moe_layer_contract_declares_unweighted_v_norm(*doc, "layers", layer) ||
-            moe_layer_contract_declares_unweighted_v_norm(*doc, "attention_layer_contract_table", layer) ||
-            moe_layer_contract_declares_unweighted_v_norm(*doc, "attention_layer_table", layer)) {
-            result = 1;
+        for (size_t key_i = 0; key_i < sizeof(array_keys) / sizeof(array_keys[0]); ++key_i) {
+            if (moe_layer_contract_declares_unweighted_v_norm(*doc, array_keys[key_i], layer)) {
+                result = 1;
+                matched_doc = doc_names[doc_i];
+                matched_array = array_keys[key_i];
+                break;
+            }
+        }
+        if (result) {
             break;
         }
     }
     // Do not infer a layer-local V norm from graph-wide substring matches.
     // Unweighted V norm is applied only when a per-layer contract declares it,
     // regardless of whether the value source is v_projection or raw K.
+    if (result) {
+        moe_profile_log(
+            "attn_value_norm_contract",
+            "layer=%d mode=unweighted_rmsnorm_contract source=%s array=%s",
+            layer,
+            matched_doc,
+            matched_array);
+    }
     if (cached) {
         *cached = result ? 1 : 0;
     }

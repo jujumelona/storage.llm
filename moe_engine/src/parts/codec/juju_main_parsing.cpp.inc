@@ -518,6 +518,10 @@ static int load_juju_tensor_index_as_tensor_index(
                     rec.bundle_member_offset = entry.bundle_member_offset;
                     rec.bundle_member_size = entry.bundle_member_size;
                     rec.bundle_alignment = entry.bundle_alignment;
+                    rec.expert_gpu_layout_kind = moe_juju_gpu_layout_kind_id(entry.expert_gpu_layout);
+                    rec.expert_gpu_layout_offset = entry.expert_gpu_layout_offset;
+                    rec.expert_gpu_layout_size = entry.expert_gpu_layout_size;
+                    rec.expert_gpu_layout_row_bytes = entry.expert_gpu_layout_row_bytes;
                     const uint8_t rec_encoding = moe_weight_encoding_from_juju_entry(entry, contract);
                     finalize_tensor_layout(&rec, rec_encoding);
                     if (entry.row_stride_bytes >= rec.weight_row_bytes &&

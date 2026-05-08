@@ -257,6 +257,7 @@ static size_t device_drain_deferred_staging_copies(moe_pc_engine* e, bool wait_a
                 (now_us - copy.submitted_us) * 1000ull : 0ull;
             if (copy.path == moe_IO_PATH_GPUDIRECT_STORAGE) {
                 e->io_atomic.bytes_direct_to_gpu.fetch_add(copy.copy_bytes, std::memory_order_relaxed);
+                e->gds_async_completed.fetch_add(1, std::memory_order_relaxed);
                 moe_io_path_perf_complete(e->gds_perf, wait_ns);
             } else {
                 moe_io_path_perf_complete(e->pinned_perf, wait_ns);

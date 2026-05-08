@@ -316,6 +316,12 @@ int moe_pc_engine_generate_token_ids(
                         batch_hidden.data(), batch_norm.data(),
                         prefill_count, c);
                 }
+                if (mlp_batch_ok == moe_PREFILL_BATCH_MLP_FAST_KERNEL_REQUIRED) {
+                    moe_generation_set_error(
+                        out_stats,
+                        "fast mode requires moe_model_lib_run_expert_triplet_batch_f32");
+                    return 0;
+                }
                 if (!mlp_batch_ok) {
                     for (uint32_t t = 0; t < prefill_count; ++t) {
                         const uint64_t prefill_step_start_us = moe_profile_now_us();

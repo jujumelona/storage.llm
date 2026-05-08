@@ -276,6 +276,7 @@ static int enqueue_gds_blocking_copy(moe_pc_engine* e, const moe_gds_blocking_co
         std::lock_guard<std::mutex> lock(e->gds_blocking_mutex);
         e->gds_blocking_queue.push_back(copy);
         e->gds_blocking_pending.fetch_add(1, std::memory_order_release);
+        e->gds_blocking_fallback_count.fetch_add(1, std::memory_order_relaxed);
     }
     e->gds_blocking_cv.notify_one();
     return 1;
@@ -902,6 +903,7 @@ static int device_copy_tensor_gpudirect_storage(
             uint64_t async_dst_offset = 0;
             int async_ok = 1;
             moe_io_path_perf_submit(e->gds_perf, bytes);
+            e->gds_async_attempted.fetch_add(1, std::memory_order_relaxed);
             for (const auto& range : ranges) {
                 if (range[1] == 0) {
                     continue;
@@ -932,6 +934,7 @@ static int device_copy_tensor_gpudirect_storage(
                         stream,
                         effective_token,
                         moe_IO_PATH_GPUDIRECT_STORAGE)) {
+                    e->gds_async_submitted.fetch_add(1, std::memory_order_relaxed);
                     token_guard.disarm();
                     return moe_DEVICE_COPY_PENDING_ASYNC;
                 }
@@ -1097,6 +1100,7 @@ static int device_copy_expert_bundle_gpudirect_storage(
             int64_t file_off = static_cast<int64_t>(bundle_offset);
             int64_t buf_off = 0;
             moe_io_path_perf_submit(e->gds_perf, bundle_size);
+            e->gds_async_attempted.fetch_add(1, std::memory_order_relaxed);
             const moe_cufile_error_t ast = e->cuda.cuFileReadAsync(
                 file_handle,
                 bundle_ptr,
@@ -1121,6 +1125,7 @@ static int device_copy_expert_bundle_gpudirect_storage(
                     view_keys,
                     3u);
                 if (deferred_ok) {
+                    e->gds_async_submitted.fetch_add(1, std::memory_order_relaxed);
                     return moe_DEVICE_COPY_PENDING_ASYNC;
                 }
                 if (!allow_sync_fallback) {

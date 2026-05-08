@@ -606,6 +606,432 @@ static int moe_mlp_prefill_batch_enabled() {
     return !(env && env[0] == '0');
 }
 
+static constexpr int moe_PREFILL_BATCH_MLP_FAST_KERNEL_REQUIRED = -2;
+
+struct moe_device_tensor_batch_view_t {
+    const moe_tensor_record* rec = nullptr;
+    uint64_t key = 0;
+    uint64_t ptr = 0;
+    uint64_t bytes = 0;
+    uint32_t weight_format = 0;
+    uint32_t backend_kind = 0;
+    uint64_t backend_aux = 0;
+    uint32_t rows = 0;
+    uint32_t cols = 0;
+    uint64_t weight_row_bytes = 0;
+    uint64_t weight_bytes = 0;
+    uint64_t stream_bytes = 0;
+    uint32_t expert_gpu_layout_kind = 0;
+    uint64_t expert_gpu_layout_offset = 0;
+    uint64_t expert_gpu_layout_size = 0;
+    uint64_t expert_gpu_layout_row_bytes = 0;
+};
+
+using moe_model_lib_expert_batch_f32_fn = int (*)(
+    uint32_t abi_version,
+    int32_t backend,
+    int32_t layer,
+    int32_t expert,
+    const void* gate,
+    const void* up,
+    const void* down,
+    const float* const* batch_hidden,
+    uint32_t batch_size,
+    uint32_t hidden_size,
+    uint32_t intermediate_size,
+    float* out_pool,
+    uint32_t out_count,
+    int activation_mode);
+
+using moe_model_lib_expert_batch_contiguous_f32_fn = int (*)(
+    uint32_t abi_version,
+    int32_t backend,
+    int32_t layer,
+    int32_t expert,
+    const void* gate,
+    const void* up,
+    const void* down,
+    const float* batch_hidden_contiguous,
+    uint32_t batch_stride,
+    uint32_t batch_size,
+    uint32_t hidden_size,
+    uint32_t intermediate_size,
+    float* out_pool,
+    uint32_t out_count,
+    int activation_mode);
+
+using moe_model_lib_expert_batch_device_f32_fn = int (*)(
+    uint32_t abi_version,
+    int32_t backend,
+    int32_t layer,
+    int32_t expert,
+    const void* gate,
+    const void* up,
+    const void* down,
+    const void* d_batch_hidden,
+    uint32_t batch_stride,
+    uint32_t batch_size,
+    uint32_t hidden_size,
+    uint32_t intermediate_size,
+    void* d_out,
+    uint32_t out_stride,
+    int activation_mode);
+
+struct moe_model_lib_grouped_expert_task_t {
+    int32_t layer = 0;
+    int32_t expert = 0;
+    const void* gate = nullptr;
+    const void* up = nullptr;
+    const void* down = nullptr;
+    const float* x = nullptr;
+    float* out = nullptr;
+    uint32_t batch = 0;
+    uint32_t hidden = 0;
+    uint32_t intermediate = 0;
+};
+
+using moe_model_lib_grouped_expert_triplets_f32_fn = int (*)(
+    uint32_t abi_version,
+    int32_t backend,
+    const moe_model_lib_grouped_expert_task_t* tasks,
+    uint32_t task_count);
+
+struct moe_model_lib_grouped_expert_device_task_t {
+    int32_t layer = 0;
+    int32_t expert = 0;
+    const void* gate = nullptr;
+    const void* up = nullptr;
+    const void* down = nullptr;
+    const void* d_x = nullptr;
+    void* d_out = nullptr;
+    uint32_t batch_stride = 0;
+    uint32_t out_stride = 0;
+    uint32_t batch = 0;
+    uint32_t hidden = 0;
+    uint32_t intermediate = 0;
+};
+
+using moe_model_lib_grouped_expert_triplets_device_f32_fn = int (*)(
+    uint32_t abi_version,
+    int32_t backend,
+    const moe_model_lib_grouped_expert_device_task_t* tasks,
+    uint32_t task_count);
+
+struct moe_model_lib_indexed_expert_task_t {
+    int32_t layer = 0;
+    int32_t expert = 0;
+    const void* gate = nullptr;
+    const void* up = nullptr;
+    const void* down = nullptr;
+    uint32_t token_offset = 0;
+    uint32_t batch = 0;
+    uint32_t hidden = 0;
+    uint32_t intermediate = 0;
+};
+
+using moe_model_lib_grouped_expert_triplets_indexed_f32_fn = int (*)(
+    uint32_t abi_version,
+    int32_t backend,
+    const moe_model_lib_indexed_expert_task_t* tasks,
+    uint32_t task_count,
+    const float* batch_input,
+    uint32_t input_stride,
+    uint32_t input_count,
+    const uint32_t* token_indices,
+    const float* token_weights,
+    uint32_t assignment_count,
+    float* batch_accum,
+    uint32_t accum_stride);
+
+using moe_model_lib_grouped_expert_triplets_indexed_device_f32_fn = int (*)(
+    uint32_t abi_version,
+    int32_t backend,
+    const moe_model_lib_indexed_expert_task_t* tasks,
+    uint32_t task_count,
+    const void* d_batch_input,
+    uint32_t input_stride,
+    uint32_t input_count,
+    const void* d_token_indices,
+    const void* d_token_weights,
+    uint32_t assignment_count,
+    void* d_batch_accum,
+    uint32_t accum_stride);
+
+using moe_model_lib_prefill_activation_acquire_f32_fn = int (*)(
+    uint32_t abi_version,
+    int32_t backend,
+    const float* batch_input,
+    uint32_t input_stride,
+    uint32_t input_count,
+    const uint32_t* token_indices,
+    const float* token_weights,
+    uint32_t assignment_count,
+    const float* batch_accum,
+    uint32_t accum_stride,
+    uint64_t* out_handle,
+    const void** out_d_batch_input,
+    const void** out_d_token_indices,
+    const void** out_d_token_weights,
+    void** out_d_batch_accum);
+
+using moe_model_lib_prefill_activation_release_f32_fn = int (*)(
+    uint32_t abi_version,
+    int32_t backend,
+    uint64_t handle,
+    float* batch_accum,
+    uint32_t input_count,
+    uint32_t accum_stride,
+    int copy_back);
+
+static int moe_get_resident_device_tensor_view(
+    moe_pc_engine* engine,
+    const moe_tensor_record* rec,
+    moe_device_tensor_batch_view_t* out
+) {
+    if (out) {
+        *out = moe_device_tensor_batch_view_t{};
+    }
+    if (!engine || !rec || !out || engine->device_allocator_ready.load(std::memory_order_acquire) <= 0) {
+        return 0;
+    }
+    const uint64_t key = device_key_tensor(*rec);
+    std::lock_guard<std::mutex> lock(engine->device_mutex);
+    auto it = engine->device_allocations.find(key);
+    if (it == engine->device_allocations.end() ||
+        it->second.pending_free ||
+        it->second.inflight_copies != 0 ||
+        it->second.ptr == 0 ||
+        it->second.bytes < tensor_stream_bytes(*rec)) {
+        return 0;
+    }
+    out->rec = rec;
+    out->key = key;
+    out->ptr = it->second.ptr;
+    out->bytes = it->second.bytes;
+    out->weight_format = static_cast<uint32_t>(tensor_weight_format(*rec));
+    out->backend_kind = it->second.backend_kind;
+    out->backend_aux = it->second.backend_aux;
+    out->rows = rec->info.rows;
+    out->cols = rec->info.cols;
+    out->weight_row_bytes = rec->weight_row_bytes;
+    out->weight_bytes = rec->info.weight_byte_length;
+    out->stream_bytes = tensor_stream_bytes(*rec);
+    out->expert_gpu_layout_kind = rec->expert_gpu_layout_kind;
+    out->expert_gpu_layout_offset = rec->expert_gpu_layout_offset;
+    out->expert_gpu_layout_size = rec->expert_gpu_layout_size;
+    out->expert_gpu_layout_row_bytes = rec->expert_gpu_layout_row_bytes;
+    return 1;
+}
+
+static int moe_expert_triplet_resident_in_vram(
+    moe_pc_engine* engine,
+    int32_t layer,
+    int expert,
+    moe_device_tensor_batch_view_t views[3] = nullptr
+) {
+    if (!engine || layer < 0 || expert < 0) {
+        return 0;
+    }
+    const moe_tensor_record* gate = find_tensor_record(engine, layer, expert, moe_PROJ_GATE);
+    const moe_tensor_record* up = find_tensor_record(engine, layer, expert, moe_PROJ_UP);
+    const moe_tensor_record* down = find_tensor_record(engine, layer, expert, moe_PROJ_DOWN);
+    if (!gate || !up || !down) {
+        return 0;
+    }
+    moe_device_tensor_batch_view_t local[3]{};
+    if (!moe_get_resident_device_tensor_view(engine, gate, &local[0]) ||
+        !moe_get_resident_device_tensor_view(engine, up, &local[1]) ||
+        !moe_get_resident_device_tensor_view(engine, down, &local[2])) {
+        return 0;
+    }
+    if (views) {
+        views[0] = local[0];
+        views[1] = local[1];
+        views[2] = local[2];
+    }
+    return 1;
+}
+
+static moe_model_lib_expert_batch_f32_fn moe_gpu_batch_expert_kernel_fn(moe_pc_engine* engine) {
+    if (!engine || !engine->model_lib_handle || !engine->model_lib_expert_batch_f32) {
+        return nullptr;
+    }
+    return reinterpret_cast<moe_model_lib_expert_batch_f32_fn>(engine->model_lib_expert_batch_f32);
+}
+
+static moe_model_lib_expert_batch_contiguous_f32_fn moe_gpu_batch_expert_contiguous_kernel_fn(moe_pc_engine* engine) {
+    if (!engine || !engine->model_lib_handle || !engine->model_lib_expert_batch_contiguous_f32) {
+        return nullptr;
+    }
+    return reinterpret_cast<moe_model_lib_expert_batch_contiguous_f32_fn>(
+        engine->model_lib_expert_batch_contiguous_f32);
+}
+
+static moe_model_lib_expert_batch_device_f32_fn moe_gpu_batch_expert_device_kernel_fn(moe_pc_engine* engine) {
+    if (!engine || !engine->model_lib_handle || !engine->model_lib_expert_batch_device_f32) {
+        return nullptr;
+    }
+    return reinterpret_cast<moe_model_lib_expert_batch_device_f32_fn>(
+        engine->model_lib_expert_batch_device_f32);
+}
+
+static moe_model_lib_grouped_expert_triplets_f32_fn moe_gpu_grouped_expert_kernel_fn(moe_pc_engine* engine) {
+    if (!engine || !engine->model_lib_handle || !engine->model_lib_grouped_expert_triplets_f32) {
+        return nullptr;
+    }
+    return reinterpret_cast<moe_model_lib_grouped_expert_triplets_f32_fn>(
+        engine->model_lib_grouped_expert_triplets_f32);
+}
+
+static moe_model_lib_grouped_expert_triplets_device_f32_fn moe_gpu_grouped_expert_device_kernel_fn(
+    moe_pc_engine* engine
+) {
+    if (!engine || !engine->model_lib_handle || !engine->model_lib_grouped_expert_triplets_device_f32) {
+        return nullptr;
+    }
+    return reinterpret_cast<moe_model_lib_grouped_expert_triplets_device_f32_fn>(
+        engine->model_lib_grouped_expert_triplets_device_f32);
+}
+
+static moe_model_lib_grouped_expert_triplets_indexed_f32_fn moe_gpu_grouped_expert_indexed_kernel_fn(
+    moe_pc_engine* engine
+) {
+    if (!engine || !engine->model_lib_handle || !engine->model_lib_grouped_expert_triplets_indexed_f32) {
+        return nullptr;
+    }
+    return reinterpret_cast<moe_model_lib_grouped_expert_triplets_indexed_f32_fn>(
+        engine->model_lib_grouped_expert_triplets_indexed_f32);
+}
+
+static moe_model_lib_grouped_expert_triplets_indexed_device_f32_fn
+moe_gpu_grouped_expert_indexed_device_kernel_fn(moe_pc_engine* engine) {
+    if (!engine || !engine->model_lib_handle ||
+        !engine->model_lib_grouped_expert_triplets_indexed_device_f32) {
+        return nullptr;
+    }
+    return reinterpret_cast<moe_model_lib_grouped_expert_triplets_indexed_device_f32_fn>(
+        engine->model_lib_grouped_expert_triplets_indexed_device_f32);
+}
+
+static moe_model_lib_prefill_activation_acquire_f32_fn
+moe_gpu_prefill_activation_acquire_fn(moe_pc_engine* engine) {
+    if (!engine || !engine->model_lib_handle || !engine->model_lib_prefill_activation_acquire_f32) {
+        return nullptr;
+    }
+    return reinterpret_cast<moe_model_lib_prefill_activation_acquire_f32_fn>(
+        engine->model_lib_prefill_activation_acquire_f32);
+}
+
+static moe_model_lib_prefill_activation_release_f32_fn
+moe_gpu_prefill_activation_release_fn(moe_pc_engine* engine) {
+    if (!engine || !engine->model_lib_handle || !engine->model_lib_prefill_activation_release_f32) {
+        return nullptr;
+    }
+    return reinterpret_cast<moe_model_lib_prefill_activation_release_f32_fn>(
+        engine->model_lib_prefill_activation_release_f32);
+}
+
+static int moe_gpu_batch_expert_kernel_available(moe_pc_engine* engine) {
+    return moe_gpu_batch_expert_kernel_fn(engine) ? 1 : 0;
+}
+
+static int moe_run_expert_triplet_gpu_batch_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    int expert,
+    const float** batch_hidden,
+    uint32_t batch_size,
+    uint32_t hidden_size,
+    uint32_t intermediate_size,
+    float* out_pool,
+    uint32_t out_count,
+    int activation_mode
+) {
+    if (!engine || !batch_hidden || !out_pool || batch_size == 0 ||
+        hidden_size == 0 || intermediate_size == 0 || out_count != hidden_size) {
+        return 0;
+    }
+    auto fn = moe_gpu_batch_expert_kernel_fn(engine);
+    if (!fn) {
+        return 0;
+    }
+    moe_device_tensor_batch_view_t views[3]{};
+    if (!moe_expert_triplet_resident_in_vram(engine, layer, expert, views)) {
+        return 0;
+    }
+    const int ok = fn(
+        engine->model_lib_abi_version,
+        static_cast<int32_t>(engine->backend_caps.backend),
+        layer,
+        expert,
+        &views[0],
+        &views[1],
+        &views[2],
+        batch_hidden,
+        batch_size,
+        hidden_size,
+        intermediate_size,
+        out_pool,
+        out_count,
+        activation_mode);
+    if (ok) {
+        device_touch_allocation(engine, views[0].key);
+        device_touch_allocation(engine, views[1].key);
+        device_touch_allocation(engine, views[2].key);
+    }
+    return ok ? 1 : 0;
+}
+
+static int moe_run_expert_triplet_gpu_batch_contiguous_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    int expert,
+    const float* batch_hidden_contiguous,
+    uint32_t batch_stride,
+    uint32_t batch_size,
+    uint32_t hidden_size,
+    uint32_t intermediate_size,
+    float* out_pool,
+    uint32_t out_count,
+    int activation_mode
+) {
+    if (!engine || !batch_hidden_contiguous || !out_pool || batch_size == 0 ||
+        batch_stride < hidden_size || hidden_size == 0 ||
+        intermediate_size == 0 || out_count != hidden_size) {
+        return 0;
+    }
+    auto fn = moe_gpu_batch_expert_contiguous_kernel_fn(engine);
+    if (!fn) {
+        return 0;
+    }
+    moe_device_tensor_batch_view_t views[3]{};
+    if (!moe_expert_triplet_resident_in_vram(engine, layer, expert, views)) {
+        return 0;
+    }
+    const int ok = fn(
+        engine->model_lib_abi_version,
+        static_cast<int32_t>(engine->backend_caps.backend),
+        layer,
+        expert,
+        &views[0],
+        &views[1],
+        &views[2],
+        batch_hidden_contiguous,
+        batch_stride,
+        batch_size,
+        hidden_size,
+        intermediate_size,
+        out_pool,
+        out_count,
+        activation_mode);
+    if (ok) {
+        device_touch_allocation(engine, views[0].key);
+        device_touch_allocation(engine, views[1].key);
+        device_touch_allocation(engine, views[2].key);
+    }
+    return ok ? 1 : 0;
+}
+
 static int moe_run_expert_triplet_row_batch_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -640,6 +1066,26 @@ static int moe_run_expert_triplet_row_batch_f32(
         up->info.rows != intermediate_size || up->info.cols != hidden_size ||
         down->info.rows != hidden_size || down->info.cols != intermediate_size) {
         return 0;
+    }
+    const int gpu_kernel_available = moe_gpu_batch_expert_kernel_available(engine);
+    const int resident_in_vram = moe_expert_triplet_resident_in_vram(engine, layer, expert);
+    if (gpu_kernel_available && resident_in_vram) {
+        if (moe_run_expert_triplet_gpu_batch_f32(
+                engine,
+                layer,
+                expert,
+                batch_hidden,
+                batch_size,
+                hidden_size,
+                intermediate_size,
+                out_pool,
+                out_count,
+                activation_mode)) {
+            return 1;
+        }
+        if (engine->io_config.require_gpu_expert_batch_kernel_for_fast_mode) {
+            return 0;
+        }
     }
     mmap_context_t* gate_shard = get_or_map_tensor_shard(engine, *gate);
     mmap_context_t* up_shard = get_or_map_tensor_shard(engine, *up);
@@ -729,6 +1175,160 @@ struct moe_mlp_batch_assignment_t {
     float weight = 0.0f;
 };
 
+struct moe_active_expert_group_t {
+    uint32_t expert = 0;
+    uint32_t assignment_count = 0;
+    float weight_sum = 0.0f;
+    moe_tier_t current_tier = moe_TIER_DB;
+};
+
+static void moe_build_active_expert_groups(
+    moe_pc_engine* engine,
+    int layer,
+    const std::vector<std::vector<moe_mlp_batch_assignment_t>>& grouped,
+    std::vector<moe_active_expert_group_t>* out
+) {
+    if (!out) {
+        return;
+    }
+    out->clear();
+    if (!engine) {
+        return;
+    }
+    for (uint32_t expert = 0; expert < grouped.size(); ++expert) {
+        const auto& assignments = grouped[expert];
+        if (assignments.empty()) {
+            continue;
+        }
+        float weight_sum = 0.0f;
+        for (const auto& assignment : assignments) {
+            weight_sum += assignment.weight;
+        }
+        moe_tier_t tier = moe_TIER_DB;
+        const size_t slot = expert_dense_slot(engine, layer, (int)expert);
+        if (slot != tensor_slot_invalid() &&
+            slot < engine->expert_states.size() &&
+            engine->expert_states[slot].active) {
+            tier = engine->expert_states[slot].tier;
+        }
+        out->push_back({
+            expert,
+            static_cast<uint32_t>(assignments.size()),
+            weight_sum,
+            tier
+        });
+    }
+    std::sort(out->begin(), out->end(), [](const auto& a, const auto& b) {
+        if (a.assignment_count != b.assignment_count) {
+            return a.assignment_count > b.assignment_count;
+        }
+        return a.weight_sum > b.weight_sum;
+    });
+}
+
+static void moe_wait_ready_for_top_active_experts(
+    moe_pc_engine* engine,
+    int layer,
+    const std::vector<moe_active_expert_group_t>& active_experts,
+    uint32_t wait_us
+) {
+    if (!engine || wait_us == 0 || active_experts.empty()) {
+        return;
+    }
+    const uint32_t min_assignments =
+        std::max<uint32_t>(1u, engine->io_config.expert_group_gpu_min_assignments);
+    std::vector<uint32_t> target_experts;
+    target_experts.reserve(std::min<size_t>(active_experts.size(), 8u));
+    for (const auto& group : active_experts) {
+        if (group.assignment_count >= min_assignments) {
+            target_experts.push_back(group.expert);
+            if (target_experts.size() >= 8u) {
+                break;
+            }
+        }
+    }
+    if (target_experts.empty()) {
+        return;
+    }
+
+    const uint64_t deadline_us = moe_profile_now_us() + wait_us;
+    while (moe_profile_now_us() < deadline_us) {
+        device_drain_deferred_staging_copies(engine, false);
+        device_drain_directstorage_device_copies(engine);
+
+        bool all_ready = true;
+        for (uint32_t expert : target_experts) {
+            if (!moe_expert_triplet_resident_in_vram(engine, layer, (int)expert)) {
+                all_ready = false;
+                break;
+            }
+        }
+        if (all_ready) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(25));
+    }
+}
+
+static int moe_layer_expert_down_scalar_scale_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    int expert_id,
+    uint32_t experts,
+    uint32_t hidden_size,
+    float* out_scale,
+    int* out_scalar_supported
+) {
+    if (out_scale) {
+        *out_scale = 1.0f;
+    }
+    if (out_scalar_supported) {
+        *out_scalar_supported = 1;
+    }
+    if (!engine || expert_id < 0 || hidden_size == 0 || !out_scale || !out_scalar_supported) {
+        return 0;
+    }
+    if (experts > 10000u || (uint32_t)expert_id >= experts) {
+        return 0;
+    }
+
+    static const char* const suffixes[] = {
+        "ffn_down_exps.scale",
+        "ffn_gate_inp.per_expert_scale",
+        "router.per_expert_scale",
+        "mlp.router.per_expert_scale",
+        "moe.gate.per_expert_scale"
+    };
+    moe_raw_tensor_cache_entry raw{};
+    if (!moe_map_layer_common_tensor(engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]), &raw)) {
+        return 1;
+    }
+    const uint64_t count = moe_raw_tensor_scalar_count(raw);
+    if (count == 1u) {
+        float scale = 1.0f;
+        if (!moe_raw_tensor_scalar_at_f32(raw, 0, &scale) || !std::isfinite(scale)) {
+            return 0;
+        }
+        *out_scale = scale;
+        return 1;
+    }
+    if (experts && count == experts) {
+        float scale = 1.0f;
+        if (!moe_raw_tensor_scalar_at_f32(raw, (uint64_t)expert_id, &scale) || !std::isfinite(scale)) {
+            return 0;
+        }
+        *out_scale = scale;
+        return 1;
+    }
+
+    const uint64_t base = (uint64_t)expert_id * (uint64_t)hidden_size;
+    if (base <= count && (uint64_t)hidden_size <= count - base) {
+        *out_scalar_supported = 0;
+        return 1;
+    }
+    return 1;
+}
+
 static int moe_layer_moe_mlp_prefill_batch_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -742,6 +1342,14 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         c->hidden_size == 0 || c->expert_intermediate_size == 0 ||
         c->experts_per_moe_layer == 0 || c->experts_per_moe_layer > 10000u) {
         return 0;
+    }
+    if (engine->io_config.require_gpu_expert_batch_kernel_for_fast_mode &&
+        !moe_gpu_batch_expert_kernel_available(engine)) {
+        std::fprintf(stderr,
+            "[storagellm mlp] fast mode requires moe_model_lib_run_expert_triplet_batch_f32 "
+            "with moe_model_lib_has_expert_triplet_batch_f32()==1; disable "
+            "require_gpu_expert_batch_kernel_for_fast_mode for compatibility fallback\n");
+        return moe_PREFILL_BATCH_MLP_FAST_KERNEL_REQUIRED;
     }
     const uint64_t total_start_us = moe_profile_now_us();
     const uint32_t hidden_size = c->hidden_size;
@@ -873,10 +1481,42 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         layer, batch_size, c->experts_per_moe_layer, top_k,
         moe_profile_elapsed_ms(prepare_start_us));
 
+    std::vector<moe_active_expert_group_t> active_experts;
+    moe_build_active_expert_groups(engine, layer, grouped, &active_experts);
+    const bool gpu_batch_ready = moe_gpu_batch_expert_kernel_available(engine) != 0;
+    for (const auto& group : active_experts) {
+        if (group.current_tier == moe_TIER_VRAM) {
+            continue;
+        }
+        if (group.assignment_count < engine->io_config.expert_group_gpu_min_assignments) {
+            continue;
+        }
+        const moe_tier_t target_tier = gpu_batch_ready ? moe_TIER_VRAM : moe_TIER_RAM;
+        moe_pc_engine_prefetch_expert_triplet_impl(
+            engine,
+            layer,
+            (int)group.expert,
+            target_tier,
+            1,
+            1,
+            vram_reservation_token{},
+            0,
+            moe_PREFETCH_REASON_BATCH_SELECTED,
+            0);
+    }
+    if (gpu_batch_ready) {
+        moe_wait_ready_for_top_active_experts(
+            engine,
+            layer,
+            active_experts,
+            engine->io_config.prefill_group_wait_us);
+    }
+
     // Fetch dynamic expert batch limit instead of hardcoded 64
     const uint32_t expert_batch_limit = moe_mlp_prefill_expert_batch_limit();
     const int activation_mode = moe_engine_gelu_activation_mode(engine);
     std::vector<const float*> input_ptrs(expert_batch_limit, nullptr);
+    std::vector<float> group_input_pool((size_t)expert_batch_limit * hidden_size);
     std::vector<float> gate_pool((size_t)expert_batch_limit * intermediate_size);
     std::vector<float> up_pool((size_t)expert_batch_limit * intermediate_size);
     std::vector<float> out_pool((size_t)expert_batch_limit * hidden_size);
@@ -884,7 +1524,402 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
     uint32_t total_assignments = 0;
     uint32_t failed_assignments = 0;
     const uint64_t expert_start_us = moe_profile_now_us();
-    for (uint32_t expert = 0; expert < c->experts_per_moe_layer; ++expert) {
+    auto grouped_chunk_key = [](uint32_t expert, size_t begin) -> uint64_t {
+        return (uint64_t(expert) << 32) ^ (uint64_t(begin) & 0xffffffffull);
+    };
+    std::unordered_set<uint64_t> grouped_done_chunks;
+    if (gpu_batch_ready) {
+        auto grouped_fn = moe_gpu_grouped_expert_kernel_fn(engine);
+        struct moe_prefill_grouped_gpu_chunk_t {
+            uint32_t expert = 0;
+            size_t begin = 0;
+            uint32_t chunk = 0;
+            size_t input_offset = 0;
+            size_t output_offset = 0;
+            moe_device_tensor_batch_view_t views[3]{};
+        };
+        std::vector<moe_prefill_grouped_gpu_chunk_t> grouped_chunks;
+        size_t grouped_input_floats = 0;
+        size_t grouped_output_floats = 0;
+        if (grouped_fn) {
+            for (const auto& group : active_experts) {
+                const uint32_t expert = group.expert;
+                if (expert >= c->experts_per_moe_layer) {
+                    continue;
+                }
+                const auto& assignments = grouped[expert];
+                if (assignments.empty()) {
+                    continue;
+                }
+                moe_device_tensor_batch_view_t views[3]{};
+                if (!moe_expert_triplet_resident_in_vram(engine, layer, (int)expert, views)) {
+                    continue;
+                }
+                for (size_t begin = 0; begin < assignments.size(); begin += expert_batch_limit) {
+                    const uint32_t chunk =
+                        (uint32_t)std::min<size_t>(expert_batch_limit, assignments.size() - begin);
+                    moe_prefill_grouped_gpu_chunk_t item{};
+                    item.expert = expert;
+                    item.begin = begin;
+                    item.chunk = chunk;
+                    item.input_offset = grouped_input_floats;
+                    item.output_offset = grouped_output_floats;
+                    item.views[0] = views[0];
+                    item.views[1] = views[1];
+                    item.views[2] = views[2];
+                    grouped_input_floats += (size_t)chunk * hidden_size;
+                    grouped_output_floats += (size_t)chunk * hidden_size;
+                    grouped_chunks.push_back(item);
+                }
+            }
+        }
+        if (!grouped_chunks.empty()) {
+            auto indexed_fn = moe_gpu_grouped_expert_indexed_kernel_fn(engine);
+            auto indexed_device_fn = moe_gpu_grouped_expert_indexed_device_kernel_fn(engine);
+            auto activation_acquire_fn = moe_gpu_prefill_activation_acquire_fn(engine);
+            auto activation_release_fn = moe_gpu_prefill_activation_release_fn(engine);
+            const float* indexed_input_base = expert_inputs.empty() ? nullptr : expert_inputs[0];
+            int indexed_inputs_contiguous = indexed_input_base ? 1 : 0;
+            for (uint32_t t = 0; t < batch_size && indexed_inputs_contiguous; ++t) {
+                if (expert_inputs[t] != indexed_input_base + (size_t)t * hidden_size) {
+                    indexed_inputs_contiguous = 0;
+                }
+            }
+            if ((indexed_fn || indexed_device_fn) && indexed_inputs_contiguous) {
+                std::vector<uint8_t> attempted(grouped_chunks.size(), 0);
+                for (size_t seed = 0; seed < grouped_chunks.size(); ++seed) {
+                    if (attempted[seed] ||
+                        grouped_done_chunks.find(grouped_chunk_key(
+                            grouped_chunks[seed].expert,
+                            grouped_chunks[seed].begin)) != grouped_done_chunks.end()) {
+                        continue;
+                    }
+                    const uint32_t batch_for_group = grouped_chunks[seed].chunk;
+                    std::vector<moe_model_lib_indexed_expert_task_t> indexed_tasks;
+                    std::vector<size_t> indexed_chunk_indices;
+                    std::vector<uint32_t> indexed_token_indices;
+                    std::vector<float> indexed_token_weights;
+                    indexed_tasks.reserve(grouped_chunks.size() - seed);
+                    indexed_chunk_indices.reserve(grouped_chunks.size() - seed);
+                    for (size_t j = seed; j < grouped_chunks.size(); ++j) {
+                        const auto& chunk_info = grouped_chunks[j];
+                        if (attempted[j] ||
+                            chunk_info.chunk != batch_for_group ||
+                            grouped_done_chunks.find(grouped_chunk_key(
+                                chunk_info.expert, chunk_info.begin)) != grouped_done_chunks.end()) {
+                            continue;
+                        }
+                        float down_scale = 1.0f;
+                        int scalar_scale_supported = 1;
+                        if (!moe_layer_expert_down_scalar_scale_f32(
+                                engine, layer, (int)chunk_info.expert, c->experts_per_moe_layer,
+                                hidden_size, &down_scale, &scalar_scale_supported) ||
+                            !scalar_scale_supported || !std::isfinite(down_scale)) {
+                            attempted[j] = 1;
+                            continue;
+                        }
+                        const uint32_t token_offset =
+                            static_cast<uint32_t>(indexed_token_indices.size());
+                        const auto& assignments = grouped[chunk_info.expert];
+                        int chunk_ok = 1;
+                        for (uint32_t b = 0; b < chunk_info.chunk; ++b) {
+                            const moe_mlp_batch_assignment_t& a = assignments[chunk_info.begin + b];
+                            if (a.token >= batch_size || !std::isfinite(a.weight)) {
+                                chunk_ok = 0;
+                                break;
+                            }
+                            indexed_token_indices.push_back(a.token);
+                            indexed_token_weights.push_back(a.weight * down_scale);
+                        }
+                        if (!chunk_ok) {
+                            indexed_token_indices.resize(token_offset);
+                            indexed_token_weights.resize(token_offset);
+                            attempted[j] = 1;
+                            continue;
+                        }
+                        moe_model_lib_indexed_expert_task_t task{};
+                        task.layer = layer;
+                        task.expert = (int32_t)chunk_info.expert;
+                        task.gate = &chunk_info.views[0];
+                        task.up = &chunk_info.views[1];
+                        task.down = &chunk_info.views[2];
+                        task.token_offset = token_offset;
+                        task.batch = chunk_info.chunk;
+                        task.hidden = hidden_size;
+                        task.intermediate = intermediate_size;
+                        indexed_tasks.push_back(task);
+                        indexed_chunk_indices.push_back(j);
+                    }
+                    for (size_t j : indexed_chunk_indices) {
+                        attempted[j] = 1;
+                    }
+                    if (indexed_tasks.size() < 2u || indexed_token_indices.empty()) {
+                        continue;
+                    }
+                    int device_indexed_ok = 0;
+                    if (indexed_device_fn && activation_acquire_fn && activation_release_fn) {
+                        uint64_t activation_handle = 0;
+                        const void* d_batch_input = nullptr;
+                        const void* d_token_indices = nullptr;
+                        const void* d_token_weights = nullptr;
+                        void* d_batch_accum = nullptr;
+                        if (activation_acquire_fn(
+                                engine->model_lib_abi_version,
+                                static_cast<int32_t>(engine->backend_caps.backend),
+                                indexed_input_base,
+                                hidden_size,
+                                batch_size,
+                                indexed_token_indices.data(),
+                                indexed_token_weights.data(),
+                                (uint32_t)indexed_token_indices.size(),
+                                batch_expert_sum.data(),
+                                hidden_size,
+                                &activation_handle,
+                                &d_batch_input,
+                                &d_token_indices,
+                                &d_token_weights,
+                                &d_batch_accum)) {
+                            engine->io_atomic.gpu_grouped_indexed_device_submitted.fetch_add(
+                                indexed_token_indices.size(), std::memory_order_relaxed);
+                            if (indexed_device_fn(
+                                    engine->model_lib_abi_version,
+                                    static_cast<int32_t>(engine->backend_caps.backend),
+                                    indexed_tasks.data(),
+                                    (uint32_t)indexed_tasks.size(),
+                                    d_batch_input,
+                                    hidden_size,
+                                    batch_size,
+                                    d_token_indices,
+                                    d_token_weights,
+                                    (uint32_t)indexed_token_indices.size(),
+                                    d_batch_accum,
+                                    hidden_size)) {
+                                const int release_ok = activation_release_fn(
+                                    engine->model_lib_abi_version,
+                                    static_cast<int32_t>(engine->backend_caps.backend),
+                                    activation_handle,
+                                    batch_expert_sum.data(),
+                                    batch_size,
+                                    hidden_size,
+                                    1);
+                                activation_handle = 0;
+                                if (release_ok) {
+                                    engine->io_atomic.gpu_grouped_indexed_device_completed.fetch_add(
+                                        indexed_token_indices.size(), std::memory_order_relaxed);
+                                    device_indexed_ok = 1;
+                                }
+                            }
+                            if (activation_handle != 0) {
+                                activation_release_fn(
+                                    engine->model_lib_abi_version,
+                                    static_cast<int32_t>(engine->backend_caps.backend),
+                                    activation_handle,
+                                    nullptr,
+                                    0,
+                                    0,
+                                    0);
+                            }
+                        }
+                    }
+                    if (device_indexed_ok) {
+                        for (size_t chunk_index : indexed_chunk_indices) {
+                            const auto& chunk_info = grouped_chunks[chunk_index];
+                            device_touch_allocation(engine, chunk_info.views[0].key);
+                            device_touch_allocation(engine, chunk_info.views[1].key);
+                            device_touch_allocation(engine, chunk_info.views[2].key);
+                            const auto& assignments = grouped[chunk_info.expert];
+                            for (uint32_t b = 0; b < chunk_info.chunk; ++b) {
+                                const moe_mlp_batch_assignment_t& a = assignments[chunk_info.begin + b];
+                                success_weight_sum[a.token] += a.weight;
+                                ++success_count[a.token];
+                            }
+                            grouped_done_chunks.insert(grouped_chunk_key(chunk_info.expert, chunk_info.begin));
+                        }
+                        continue;
+                    }
+                    if (engine->io_config.require_gpu_expert_batch_kernel_for_fast_mode) {
+                        engine->io_atomic.gpu_grouped_host_fallback_count.fetch_add(
+                            1, std::memory_order_relaxed);
+                        return 0;
+                    }
+                    if (!indexed_fn) {
+                        continue;
+                    }
+                    engine->io_atomic.gpu_grouped_indexed_host_submitted.fetch_add(
+                        indexed_token_indices.size(), std::memory_order_relaxed);
+                    if (!indexed_fn(
+                            engine->model_lib_abi_version,
+                            static_cast<int32_t>(engine->backend_caps.backend),
+                            indexed_tasks.data(),
+                            (uint32_t)indexed_tasks.size(),
+                            indexed_input_base,
+                            hidden_size,
+                            batch_size,
+                            indexed_token_indices.data(),
+                            indexed_token_weights.data(),
+                            (uint32_t)indexed_token_indices.size(),
+                            batch_expert_sum.data(),
+                            hidden_size)) {
+                        continue;
+                    }
+                    engine->io_atomic.gpu_grouped_indexed_host_completed.fetch_add(
+                        indexed_token_indices.size(), std::memory_order_relaxed);
+                    for (size_t chunk_index : indexed_chunk_indices) {
+                        const auto& chunk_info = grouped_chunks[chunk_index];
+                        device_touch_allocation(engine, chunk_info.views[0].key);
+                        device_touch_allocation(engine, chunk_info.views[1].key);
+                        device_touch_allocation(engine, chunk_info.views[2].key);
+                        const auto& assignments = grouped[chunk_info.expert];
+                        for (uint32_t b = 0; b < chunk_info.chunk; ++b) {
+                            const moe_mlp_batch_assignment_t& a = assignments[chunk_info.begin + b];
+                            success_weight_sum[a.token] += a.weight;
+                            ++success_count[a.token];
+                        }
+                        grouped_done_chunks.insert(grouped_chunk_key(chunk_info.expert, chunk_info.begin));
+                    }
+                }
+            }
+        }
+        if (!grouped_chunks.empty()) {
+            int has_host_grouped_remainder = 0;
+            for (const auto& chunk_info : grouped_chunks) {
+                if (grouped_done_chunks.find(grouped_chunk_key(chunk_info.expert, chunk_info.begin)) ==
+                    grouped_done_chunks.end()) {
+                    has_host_grouped_remainder = 1;
+                    break;
+                }
+            }
+            if (!has_host_grouped_remainder) {
+                grouped_chunks.clear();
+            } else {
+                engine->io_atomic.gpu_grouped_host_fallback_count.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (engine->io_config.require_gpu_expert_batch_kernel_for_fast_mode) {
+                    return 0;
+                }
+            }
+        }
+        if (!grouped_chunks.empty()) {
+            std::vector<float> grouped_inputs(grouped_input_floats);
+            std::vector<float> grouped_outputs(grouped_output_floats);
+            std::vector<moe_model_lib_grouped_expert_task_t> grouped_tasks;
+            std::vector<size_t> grouped_task_chunk_indices;
+            grouped_tasks.reserve(grouped_chunks.size());
+            grouped_task_chunk_indices.reserve(grouped_chunks.size());
+            int grouped_pack_ok = 1;
+            for (size_t chunk_index = 0; chunk_index < grouped_chunks.size(); ++chunk_index) {
+                const auto& chunk_info = grouped_chunks[chunk_index];
+                if (grouped_done_chunks.find(grouped_chunk_key(chunk_info.expert, chunk_info.begin)) !=
+                    grouped_done_chunks.end()) {
+                    continue;
+                }
+                const auto& assignments = grouped[chunk_info.expert];
+                float* chunk_input = grouped_inputs.data() + chunk_info.input_offset;
+                float* chunk_output = grouped_outputs.data() + chunk_info.output_offset;
+                for (uint32_t b = 0; b < chunk_info.chunk; ++b) {
+                    const float* src = expert_inputs[assignments[chunk_info.begin + b].token];
+                    if (!src) {
+                        grouped_pack_ok = 0;
+                        break;
+                    }
+                    std::memcpy(
+                        chunk_input + (size_t)b * hidden_size,
+                        src,
+                        (size_t)hidden_size * sizeof(float));
+                }
+                if (!grouped_pack_ok) {
+                    break;
+                }
+                moe_model_lib_grouped_expert_task_t task{};
+                task.layer = layer;
+                task.expert = (int32_t)chunk_info.expert;
+                task.gate = &chunk_info.views[0];
+                task.up = &chunk_info.views[1];
+                task.down = &chunk_info.views[2];
+                task.x = chunk_input;
+                task.out = chunk_output;
+                task.batch = chunk_info.chunk;
+                task.hidden = hidden_size;
+                task.intermediate = intermediate_size;
+                grouped_tasks.push_back(task);
+                grouped_task_chunk_indices.push_back(chunk_index);
+            }
+            if (grouped_pack_ok && !grouped_tasks.empty()) {
+                std::vector<uint8_t> attempted(grouped_tasks.size(), 0);
+                for (size_t seed = 0; seed < grouped_tasks.size(); ++seed) {
+                    if (attempted[seed]) {
+                        continue;
+                    }
+                    std::vector<moe_model_lib_grouped_expert_task_t> same_shape_tasks;
+                    std::vector<size_t> same_shape_indices;
+                    same_shape_tasks.reserve(grouped_tasks.size() - seed);
+                    same_shape_indices.reserve(grouped_tasks.size() - seed);
+                    const uint32_t batch_for_group = grouped_tasks[seed].batch;
+                    for (size_t j = seed; j < grouped_tasks.size(); ++j) {
+                        if (attempted[j] ||
+                            grouped_tasks[j].batch != batch_for_group ||
+                            grouped_tasks[j].hidden != grouped_tasks[seed].hidden ||
+                            grouped_tasks[j].intermediate != grouped_tasks[seed].intermediate) {
+                            continue;
+                        }
+                        same_shape_tasks.push_back(grouped_tasks[j]);
+                        same_shape_indices.push_back(j);
+                    }
+                    for (size_t j : same_shape_indices) {
+                        attempted[j] = 1;
+                    }
+                    if (same_shape_tasks.size() < 2u) {
+                        continue;
+                    }
+                    if (!grouped_fn(
+                            engine->model_lib_abi_version,
+                            static_cast<int32_t>(engine->backend_caps.backend),
+                            same_shape_tasks.data(),
+                            (uint32_t)same_shape_tasks.size())) {
+                        continue;
+                    }
+                    uint64_t grouped_d2h_bytes = 0;
+                    for (size_t task_index : same_shape_indices) {
+                        const auto& chunk_info = grouped_chunks[grouped_task_chunk_indices[task_index]];
+                        grouped_d2h_bytes +=
+                            (uint64_t)chunk_info.chunk * (uint64_t)hidden_size * (uint64_t)sizeof(float);
+                    }
+                    engine->io_atomic.gpu_grouped_d2h_expert_output_bytes.fetch_add(
+                        grouped_d2h_bytes, std::memory_order_relaxed);
+                    for (size_t task_index : same_shape_indices) {
+                        const auto& chunk_info = grouped_chunks[grouped_task_chunk_indices[task_index]];
+                        device_touch_allocation(engine, chunk_info.views[0].key);
+                        device_touch_allocation(engine, chunk_info.views[1].key);
+                        device_touch_allocation(engine, chunk_info.views[2].key);
+                        const auto& assignments = grouped[chunk_info.expert];
+                        for (uint32_t b = 0; b < chunk_info.chunk; ++b) {
+                            const moe_mlp_batch_assignment_t& a = assignments[chunk_info.begin + b];
+                            float* expert_out =
+                                grouped_outputs.data() + chunk_info.output_offset + (size_t)b * hidden_size;
+                            if (!moe_layer_apply_expert_down_scale_f32(
+                                    engine, layer, (int)chunk_info.expert, c->experts_per_moe_layer,
+                                    expert_out, hidden_size)) {
+                                ++failed_count[a.token];
+                                ++failed_assignments;
+                                continue;
+                            }
+                            moe_axpy_f32(
+                                batch_expert_sum.data() + (size_t)a.token * hidden_size,
+                                expert_out, a.weight, hidden_size);
+                            success_weight_sum[a.token] += a.weight;
+                            ++success_count[a.token];
+                        }
+                        grouped_done_chunks.insert(grouped_chunk_key(chunk_info.expert, chunk_info.begin));
+                    }
+                }
+            }
+        }
+    }
+    for (const auto& group : active_experts) {
+        const uint32_t expert = group.expert;
+        if (expert >= c->experts_per_moe_layer) {
+            continue;
+        }
         const auto& assignments = grouped[expert];
         if (assignments.empty()) {
             continue;
@@ -892,15 +1927,56 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         ++active_groups;
         total_assignments += (uint32_t)assignments.size();
         for (size_t begin = 0; begin < assignments.size(); begin += expert_batch_limit) {
+            if (grouped_done_chunks.find(grouped_chunk_key(expert, begin)) != grouped_done_chunks.end()) {
+                continue;
+            }
             const uint32_t chunk = (uint32_t)std::min<size_t>(expert_batch_limit, assignments.size() - begin);
             for (uint32_t b = 0; b < chunk; ++b) {
                 input_ptrs[b] = expert_inputs[assignments[begin + b].token];
             }
-            if (!moe_run_expert_triplet_row_batch_f32(
+            const float* contiguous_inputs = input_ptrs[0];
+            uint32_t contiguous_stride = hidden_size;
+            int inputs_are_contiguous = contiguous_inputs ? 1 : 0;
+            for (uint32_t b = 0; b < chunk; ++b) {
+                if (!input_ptrs[b] ||
+                    input_ptrs[b] != contiguous_inputs + (size_t)b * hidden_size) {
+                    inputs_are_contiguous = 0;
+                    break;
+                }
+            }
+            if (!inputs_are_contiguous) {
+                for (uint32_t b = 0; b < chunk; ++b) {
+                    if (!input_ptrs[b]) {
+                        continue;
+                    }
+                    std::memcpy(
+                        group_input_pool.data() + (size_t)b * hidden_size,
+                        input_ptrs[b],
+                        (size_t)hidden_size * sizeof(float));
+                }
+                contiguous_inputs = group_input_pool.data();
+            }
+            int expert_ok = 0;
+            if (gpu_batch_ready && moe_expert_triplet_resident_in_vram(engine, layer, (int)expert)) {
+                expert_ok = moe_run_expert_triplet_gpu_batch_contiguous_f32(
+                    engine, layer, (int)expert,
+                    contiguous_inputs, contiguous_stride,
+                    chunk, hidden_size, intermediate_size,
+                    out_pool.data(), hidden_size, activation_mode);
+                if (expert_ok) {
+                    engine->io_atomic.gpu_grouped_d2h_expert_output_bytes.fetch_add(
+                        (uint64_t)chunk * (uint64_t)hidden_size * (uint64_t)sizeof(float),
+                        std::memory_order_relaxed);
+                }
+            }
+            if (!expert_ok) {
+                expert_ok = moe_run_expert_triplet_row_batch_f32(
                     engine, layer, (int)expert,
                     input_ptrs.data(), chunk, hidden_size,
                     gate_pool.data(), up_pool.data(), intermediate_size,
-                    out_pool.data(), hidden_size, activation_mode)) {
+                    out_pool.data(), hidden_size, activation_mode);
+            }
+            if (!expert_ok) {
                 failed_assignments += chunk;
                 for (uint32_t b = 0; b < chunk; ++b) {
                     ++failed_count[assignments[begin + b].token];

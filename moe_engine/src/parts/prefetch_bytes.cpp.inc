@@ -211,10 +211,15 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
             // ??Inconsistent transition timing, recovery reset doesn't reach all workers
             // Solution: Use engine->vlock_fail_counter atomic, all workers share same state
             // Impact: Consistent failure tracking, proper recovery reset propagation
-            if (engine && engine->vlock_recovery_reset_pending.exchange(false, std::memory_order_acquire)) {
-                const_cast<moe_pc_engine*>(engine)->vlock_fail_counter.store(0, std::memory_order_relaxed);
+            auto* mutable_engine = const_cast<moe_pc_engine*>(engine);
+            if (mutable_engine &&
+                mutable_engine->vlock_recovery_reset_pending.exchange(false, std::memory_order_acquire)) {
+                mutable_engine->vlock_fail_counter.store(0, std::memory_order_relaxed);
             }
-            uint32_t fail_count = const_cast<moe_pc_engine*>(engine)->vlock_fail_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (!mutable_engine) {
+                return;
+            }
+            uint32_t fail_count = mutable_engine->vlock_fail_counter.fetch_add(1, std::memory_order_relaxed) + 1;
             // BUGFIX Problem 4: Lower VirtualLock failure threshold ??몄겲 PERFORMANCE
             // Problem: 16 failures (8 workers ??2) = 1.6-8 seconds of blocking page faults
             // Solution: Lower threshold to 8 failures (workers ??1), add proactive working set check

@@ -29,7 +29,18 @@ static size_t device_drain_directstorage_device_copies(moe_pc_engine* e);
 #include <dstorage.h>
 #include <unknwn.h>
 
-static constexpr uint32_t moe_DIRECTSTORAGE_STATUS_CAPACITY = moe_DSTORAGE_STATUS_SLOTS;
+static uint32_t directstorage_clamp_queue_capacity(uint32_t requested) {
+    return std::max<uint32_t>(
+        moe_DSTORAGE_MIN_STATUS_SLOTS,
+        std::min<uint32_t>(
+            requested ? requested : moe_DSTORAGE_DEFAULT_STATUS_SLOTS,
+            moe_DSTORAGE_MAX_STATUS_SLOTS));
+}
+
+static uint32_t directstorage_status_slot_count(const std::vector<moe_dstorage_status_slot>& slots) {
+    return static_cast<uint32_t>(
+        std::min<size_t>(slots.size(), static_cast<size_t>(UINT32_MAX)));
+}
 using moe_dstorage_get_factory_fn = HRESULT (WINAPI*)(REFIID, void**);
 
 static void CALLBACK directstorage_completion_event_callback(PVOID ctx, BOOLEAN) {
@@ -47,6 +58,10 @@ static void directstorage_release_unknown(void*& ptr) {
         ptr = nullptr;
     }
 }
+
+static int directstorage_queue_supports_completion_event(
+    moe_pc_engine* engine,
+    IDStorageQueue* queue);
 
 static moe_dstorage_get_factory_fn directstorage_get_factory_proc() {
     static std::mutex s_load_mutex;
@@ -77,13 +92,18 @@ static int directstorage_runtime_available() {
 }
 
 static void directstorage_status_slots_bind(
-    moe_dstorage_status_slot* slots,
-    void* status_array
+    std::vector<moe_dstorage_status_slot>& slots,
+    void* status_array,
+    uint32_t capacity
 ) {
-    if (!slots) {
+    if (!status_array || capacity == 0) {
+        slots.clear();
         return;
     }
-    for (uint32_t i = 0; i < moe_DIRECTSTORAGE_STATUS_CAPACITY; ++i) {
+    capacity = directstorage_clamp_queue_capacity(capacity);
+    slots.clear();
+    slots.resize(capacity);
+    for (uint32_t i = 0; i < capacity; ++i) {
         slots[i].in_use.store(false, std::memory_order_release);
         slots[i].array = status_array;
         slots[i].index = i;
@@ -93,15 +113,16 @@ static void directstorage_status_slots_bind(
 
 static int acquire_dstorage_status_slot(
     moe_pc_engine* engine,
-    moe_dstorage_status_slot* slots,
+    std::vector<moe_dstorage_status_slot>& slots,
     bool nonblocking = true
 ) {
-    if (!engine || !slots) {
+    if (!engine || slots.empty()) {
         return -1;
     }
+    const uint32_t capacity = directstorage_status_slot_count(slots);
     const uint32_t retries = nonblocking ? 2u : 64u;
     for (uint32_t retry = 0; retry < retries; ++retry) {
-        for (uint32_t i = 0; i < moe_DIRECTSTORAGE_STATUS_CAPACITY; ++i) {
+        for (uint32_t i = 0; i < capacity; ++i) {
             bool expected = false;
             if (slots[i].in_use.compare_exchange_strong(
                     expected,
@@ -122,8 +143,8 @@ static int acquire_dstorage_status_slot(
     return -1;
 }
 
-static void release_dstorage_status_slot(moe_dstorage_status_slot* slots, int i) {
-    if (!slots || i < 0 || i >= static_cast<int>(moe_DIRECTSTORAGE_STATUS_CAPACITY)) {
+static void release_dstorage_status_slot(moe_dstorage_status_slot* slots, uint32_t capacity, int i) {
+    if (!slots || i < 0 || static_cast<uint32_t>(i) >= capacity) {
         return;
     }
     ++slots[i].generation;
@@ -132,15 +153,16 @@ static void release_dstorage_status_slot(moe_dstorage_status_slot* slots, int i)
 
 struct moe_dstorage_status_guard {
     moe_dstorage_status_slot* slots = nullptr;
+    uint32_t capacity = 0;
     int slot = -1;
     bool release_on_destroy = true;
 
-    moe_dstorage_status_guard(moe_dstorage_status_slot* s, int i)
-        : slots(s), slot(i) {}
+    moe_dstorage_status_guard(moe_dstorage_status_slot* s, uint32_t c, int i)
+        : slots(s), capacity(c), slot(i) {}
 
     ~moe_dstorage_status_guard() {
         if (release_on_destroy) {
-            release_dstorage_status_slot(slots, slot);
+            release_dstorage_status_slot(slots, capacity, slot);
         }
     }
 
@@ -165,9 +187,10 @@ static void directstorage_release_pending_copy_resources(moe_dstorage_pending_co
         static_cast<IUnknown*>(pending->file)->Release();
         pending->file = nullptr;
     }
-    release_dstorage_status_slot(pending->slots, pending->slot_index);
+    release_dstorage_status_slot(pending->slots, pending->slot_capacity, pending->slot_index);
     pending->status_array = nullptr;
     pending->slot_index = -1;
+    pending->slot_capacity = 0;
     pending->slots = nullptr;
 }
 
@@ -211,9 +234,9 @@ static int directstorage_queue_ensure(moe_pc_engine* engine) {
 
     DSTORAGE_QUEUE_DESC queue_desc{};
     queue_desc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-    queue_desc.Capacity = std::max<uint32_t>(
-        256u,
+    const uint32_t queue_capacity = directstorage_clamp_queue_capacity(
         engine->io_config.directstorage_staging_queue_capacity);
+    queue_desc.Capacity = queue_capacity;
     queue_desc.Priority = DSTORAGE_PRIORITY_NORMAL;
     queue_desc.Device = nullptr;
     queue_desc.Name = "storageLLM staging queue";
@@ -228,7 +251,7 @@ static int directstorage_queue_ensure(moe_pc_engine* engine) {
 
     IDStorageStatusArray* status_array = nullptr;
     hr = factory->CreateStatusArray(
-        moe_DIRECTSTORAGE_STATUS_CAPACITY,
+        queue_capacity,
         "storageLLM staging statuses",
         __uuidof(IDStorageStatusArray),
         reinterpret_cast<void**>(&status_array));
@@ -258,7 +281,26 @@ static int directstorage_queue_ensure(moe_pc_engine* engine) {
             engine->directstorage.completion_wait_handle = wait_handle;
         }
     }
-    directstorage_status_slots_bind(engine->directstorage.status_slots, status_array);
+    if (engine->io_config.directstorage_require_completion_event &&
+        !directstorage_queue_supports_completion_event(engine, queue)) {
+        status_array->Release();
+        queue->Release();
+        factory->Release();
+        if (engine->directstorage.completion_wait_handle) {
+            UnregisterWaitEx(
+                static_cast<HANDLE>(engine->directstorage.completion_wait_handle),
+                INVALID_HANDLE_VALUE);
+            engine->directstorage.completion_wait_handle = nullptr;
+        }
+        if (engine->directstorage.event_handle) {
+            CloseHandle(static_cast<HANDLE>(engine->directstorage.event_handle));
+            engine->directstorage.event_handle = nullptr;
+        }
+        engine->directstorage.initialized = false;
+        engine->runtime_directstorage_staging_ready.store(false, std::memory_order_release);
+        return 0;
+    }
+    directstorage_status_slots_bind(engine->directstorage.status_slots, status_array, queue_capacity);
     engine->directstorage.available = true;
     engine->runtime_directstorage_staging_ready.store(true, std::memory_order_release);
     return 1;
@@ -273,12 +315,14 @@ static void directstorage_queue_cleanup(moe_pc_engine* engine) {
         for (moe_directstorage_device_pending& pending : engine->directstorage_pending_device_copies) {
             directstorage_release_pending_copy_resources(&pending.io);
         }
+        engine->directstorage_pending_device_copies.clear();
     }
     {
         std::lock_guard<std::mutex> lock(engine->directstorage_staging_pending_mutex);
         for (moe_directstorage_staging_pending& pending : engine->directstorage_pending_staging_copies) {
             directstorage_release_pending_copy_resources(&pending.io);
         }
+        engine->directstorage_pending_staging_copies.clear();
     }
     engine->directstorage_pending_count.store(0, std::memory_order_release);
     directstorage_release_unknown(engine->directstorage.gpu_status_array);
@@ -300,11 +344,12 @@ static void directstorage_queue_cleanup(moe_pc_engine* engine) {
     engine->directstorage.initialized = false;
     engine->directstorage.available = false;
     engine->directstorage.gpu_available = false;
+    engine->directstorage_submission_paused.store(false, std::memory_order_release);
     engine->directstorage_completion_event_supported.store(false, std::memory_order_release);
     engine->directstorage.status_index = 0;
     engine->directstorage.gpu_status_index = 0;
-    directstorage_status_slots_bind(engine->directstorage.status_slots, nullptr);
-    directstorage_status_slots_bind(engine->directstorage.gpu_status_slots, nullptr);
+    directstorage_status_slots_bind(engine->directstorage.status_slots, nullptr, 0);
+    directstorage_status_slots_bind(engine->directstorage.gpu_status_slots, nullptr, 0);
     engine->runtime_directstorage_staging_ready.store(false, std::memory_order_release);
     engine->runtime_directstorage_gpu_ready.store(false, std::memory_order_release);
 }
@@ -327,7 +372,7 @@ MOE_MAYBE_UNUSED static int directstorage_bind_d3d12_device(moe_pc_engine* engin
     engine->directstorage.d3d12_device = d3d12_device;
     engine->directstorage.gpu_available = false;
     engine->directstorage.gpu_status_index = 0;
-    directstorage_status_slots_bind(engine->directstorage.gpu_status_slots, nullptr);
+    directstorage_status_slots_bind(engine->directstorage.gpu_status_slots, nullptr, 0);
     engine->runtime_directstorage_gpu_ready.store(false, std::memory_order_release);
     if (engine->backend_caps.backend == moe_BACKEND_DIRECTML) {
         directstorage_gpu_queue_ensure(engine);
@@ -371,9 +416,9 @@ static int directstorage_gpu_queue_ensure(moe_pc_engine* engine) {
 
     DSTORAGE_QUEUE_DESC queue_desc{};
     queue_desc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-    queue_desc.Capacity = std::max<uint32_t>(
-        256u,
+    const uint32_t queue_capacity = directstorage_clamp_queue_capacity(
         engine->io_config.directstorage_gpu_queue_capacity);
+    queue_desc.Capacity = queue_capacity;
     queue_desc.Priority = DSTORAGE_PRIORITY_NORMAL;
     queue_desc.Device = static_cast<ID3D12Device*>(engine->directstorage.d3d12_device);
     queue_desc.Name = "storageLLM GPU resource queue";
@@ -388,7 +433,7 @@ static int directstorage_gpu_queue_ensure(moe_pc_engine* engine) {
 
     IDStorageStatusArray* status_array = nullptr;
     hr = factory->CreateStatusArray(
-        moe_DIRECTSTORAGE_STATUS_CAPACITY,
+        queue_capacity,
         "storageLLM GPU resource statuses",
         __uuidof(IDStorageStatusArray),
         reinterpret_cast<void**>(&status_array));
@@ -398,11 +443,19 @@ static int directstorage_gpu_queue_ensure(moe_pc_engine* engine) {
         engine->runtime_directstorage_gpu_ready.store(false, std::memory_order_release);
         return 0;
     }
+    if (engine->io_config.directstorage_require_completion_event &&
+        !directstorage_queue_supports_completion_event(engine, queue)) {
+        status_array->Release();
+        queue->Release();
+        engine->directstorage.gpu_available = false;
+        engine->runtime_directstorage_gpu_ready.store(false, std::memory_order_release);
+        return 0;
+    }
 
     engine->directstorage.gpu_queue = queue;
     engine->directstorage.gpu_status_array = status_array;
     engine->directstorage.gpu_status_index = 0;
-    directstorage_status_slots_bind(engine->directstorage.gpu_status_slots, status_array);
+    directstorage_status_slots_bind(engine->directstorage.gpu_status_slots, status_array, queue_capacity);
     engine->directstorage.gpu_available = true;
     engine->runtime_directstorage_gpu_ready.store(
         engine->backend_caps.backend == moe_BACKEND_DIRECTML,
@@ -416,11 +469,17 @@ MOE_MAYBE_UNUSED static int directstorage_direct_gpu_available(moe_pc_engine* en
 
 static void directstorage_maybe_recreate_queues(moe_pc_engine* engine) {
     if (!engine ||
-        !engine->directstorage_recreate_requested.load(std::memory_order_acquire) ||
-        engine->directstorage_pending_count.load(std::memory_order_acquire) != 0) {
+        !engine->directstorage_recreate_requested.load(std::memory_order_acquire)) {
+        return;
+    }
+    engine->directstorage_submission_paused.store(true, std::memory_order_release);
+    if (engine->directstorage_pending_count.load(std::memory_order_acquire) != 0) {
+        engine->runtime_prefetch_window_layers.store(1u, std::memory_order_relaxed);
+        engine->adaptive_prefetch_window_last.store(1u, std::memory_order_relaxed);
         return;
     }
     if (!engine->directstorage_recreate_requested.exchange(false, std::memory_order_acq_rel)) {
+        engine->directstorage_submission_paused.store(false, std::memory_order_release);
         return;
     }
     void* d3d12_device = engine->directstorage.d3d12_device;
@@ -433,6 +492,7 @@ static void directstorage_maybe_recreate_queues(moe_pc_engine* engine) {
         directstorage_bind_d3d12_device(engine, d3d12_device);
         static_cast<IUnknown*>(d3d12_device)->Release();
     }
+    engine->directstorage_submission_paused.store(false, std::memory_order_release);
 }
 
 MOE_MAYBE_UNUSED static int directstorage_create_d3d12_buffer_resource(
@@ -492,6 +552,24 @@ MOE_MAYBE_UNUSED static void directstorage_release_d3d12_resource(void* resource
     if (resource) {
         static_cast<IUnknown*>(resource)->Release();
     }
+}
+
+static int directstorage_queue_supports_completion_event(
+    moe_pc_engine* engine,
+    IDStorageQueue* queue
+) {
+    if (!engine || !queue || !engine->directstorage.event_handle) {
+        return 0;
+    }
+#if defined(DSTORAGE_ENQUEUE_REQUEST_FLAG_NONE) && defined(__IDStorageQueue3_INTERFACE_DEFINED__)
+    IDStorageQueue3* queue3 = nullptr;
+    if (SUCCEEDED(queue->QueryInterface(__uuidof(IDStorageQueue3), reinterpret_cast<void**>(&queue3))) &&
+        queue3) {
+        queue3->Release();
+        return 1;
+    }
+#endif
+    return 0;
 }
 
 static void directstorage_enqueue_requests_status_and_event(
@@ -556,6 +634,7 @@ MOE_MAYBE_UNUSED static int directstorage_submit_ranges_to_gpu_buffer(
     }
     if (!engine || !path || !path[0] || !ranges || !d3d12_resource || !out ||
         total_bytes == 0 ||
+        engine->directstorage_submission_paused.load(std::memory_order_acquire) ||
         !engine->io_config.enable_directstorage ||
         !engine->backend_caps.supports_directstorage ||
         !directstorage_gpu_queue_ensure(engine)) {
@@ -568,6 +647,13 @@ MOE_MAYBE_UNUSED static int directstorage_submit_ranges_to_gpu_buffer(
         static_cast<IDStorageStatusArray*>(engine->directstorage.gpu_status_array);
     auto* resource = static_cast<ID3D12Resource*>(d3d12_resource);
     if (!factory || !queue || !status_array || !resource) {
+        return 0;
+    }
+
+    if (engine->io_config.directstorage_require_completion_event &&
+        !directstorage_queue_supports_completion_event(engine, queue)) {
+        engine->runtime_directstorage_gpu_ready.store(false, std::memory_order_release);
+        moe_io_path_perf_fail(engine->ds_gpu_perf, 0);
         return 0;
     }
 
@@ -594,8 +680,12 @@ MOE_MAYBE_UNUSED static int directstorage_submit_ranges_to_gpu_buffer(
         moe_io_path_perf_fail(engine->ds_gpu_perf, 0);
         return 0;
     }
+    moe_dstorage_status_slot* gpu_status_slots = engine->directstorage.gpu_status_slots.data();
+    const uint32_t gpu_status_capacity = directstorage_status_slot_count(
+        engine->directstorage.gpu_status_slots);
     moe_dstorage_status_guard status_guard(
-        engine->directstorage.gpu_status_slots,
+        gpu_status_slots,
+        gpu_status_capacity,
         acquired_status_slot);
     const uint32_t status_index = status_guard.index();
     uint64_t checked_gpu_offset = 0;
@@ -694,9 +784,10 @@ MOE_MAYBE_UNUSED static int directstorage_submit_ranges_to_gpu_buffer(
     status_guard.keep_reserved();
     out->status_array = status_array;
     out->status_index = status_index;
-    out->slots = engine->directstorage.gpu_status_slots;
+    out->slots = gpu_status_slots;
+    out->slot_capacity = gpu_status_capacity;
     out->slot_index = acquired_status_slot;
-    out->generation = engine->directstorage.gpu_status_slots[acquired_status_slot].generation;
+    out->generation = gpu_status_slots[acquired_status_slot].generation;
     out->bytes = total_bytes;
     out->resource = resource;
     out->file = file;
@@ -785,6 +876,7 @@ static int directstorage_submit_ranges_to_staging(
         *out = moe_dstorage_pending_copy{};
     }
     if (!engine || !path || !path[0] || !ranges || !dst || !out || total_bytes == 0 ||
+        engine->directstorage_submission_paused.load(std::memory_order_acquire) ||
         !engine->io_config.enable_directstorage ||
         !engine->backend_caps.supports_directstorage ||
         !directstorage_queue_ensure(engine)) {
@@ -796,6 +888,13 @@ static int directstorage_submit_ranges_to_staging(
     IDStorageStatusArray* status_array =
         static_cast<IDStorageStatusArray*>(engine->directstorage.status_array);
     if (!factory || !queue || !status_array) {
+        return 0;
+    }
+
+    if (engine->io_config.directstorage_require_completion_event &&
+        !directstorage_queue_supports_completion_event(engine, queue)) {
+        engine->runtime_directstorage_staging_ready.store(false, std::memory_order_release);
+        moe_io_path_perf_fail(engine->ds_staging_perf, 0);
         return 0;
     }
 
@@ -820,8 +919,12 @@ static int directstorage_submit_ranges_to_staging(
         moe_io_path_perf_fail(engine->ds_staging_perf, 0);
         return 0;
     }
+    moe_dstorage_status_slot* status_slots = engine->directstorage.status_slots.data();
+    const uint32_t status_capacity = directstorage_status_slot_count(
+        engine->directstorage.status_slots);
     moe_dstorage_status_guard status_guard(
-        engine->directstorage.status_slots,
+        status_slots,
+        status_capacity,
         acquired_status_slot);
     const uint32_t status_index = status_guard.index();
     uint64_t checked_staging_offset = 0;
@@ -906,9 +1009,10 @@ static int directstorage_submit_ranges_to_staging(
     status_guard.keep_reserved();
     out->status_array = status_array;
     out->status_index = status_index;
-    out->slots = engine->directstorage.status_slots;
+    out->slots = status_slots;
+    out->slot_capacity = status_capacity;
     out->slot_index = acquired_status_slot;
-    out->generation = engine->directstorage.status_slots[acquired_status_slot].generation;
+    out->generation = status_slots[acquired_status_slot].generation;
     out->bytes = total_bytes;
     out->file = file;
     out->submitted_us = moe_profile_now_us();
@@ -922,6 +1026,10 @@ static int directstorage_runtime_available() {
     return 0;
 }
 
+static int directstorage_queue_ensure(moe_pc_engine*) {
+    return 0;
+}
+
 static void directstorage_queue_cleanup(moe_pc_engine*) {}
 
 static void directstorage_maybe_recreate_queues(moe_pc_engine*) {}
@@ -932,6 +1040,7 @@ static void directstorage_release_pending_copy_resources(moe_dstorage_pending_co
     if (pending) {
         pending->status_array = nullptr;
         pending->slot_index = -1;
+        pending->slot_capacity = 0;
         pending->slots = nullptr;
         pending->resource = nullptr;
         pending->file = nullptr;

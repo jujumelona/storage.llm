@@ -13,6 +13,7 @@ struct alignas(64) moe_io_atomic_stats {
     // --- Cache line 2: disk worker counters ---
     alignas(64) std::atomic<uint64_t> bytes_disk_to_ram{0};
     std::atomic<uint64_t> bytes_disk_hint_issued{0};
+    std::atomic<uint64_t> bytes_mmap_touch{0};
     std::atomic<uint64_t> disk_stage_done{0};
     std::atomic<uint64_t> bytes_touch_fallback{0};  // Fix 38: fallback touch bytes
 
@@ -75,4 +76,12 @@ struct alignas(64) moe_io_atomic_stats {
     std::atomic<uint64_t> backend_fence_waits{0};
     std::atomic<uint64_t> vulkan_fence_waits{0};
     std::atomic<uint64_t> level_zero_fence_waits{0};
+
+    // --- Cache line 11: GPU expert grouped-kernel diagnostics ---
+    alignas(64) std::atomic<uint64_t> gpu_grouped_host_fallback_count{0};
+    std::atomic<uint64_t> gpu_grouped_indexed_host_submitted{0};
+    std::atomic<uint64_t> gpu_grouped_indexed_host_completed{0};
+    std::atomic<uint64_t> gpu_grouped_indexed_device_submitted{0};
+    std::atomic<uint64_t> gpu_grouped_indexed_device_completed{0};
+    std::atomic<uint64_t> gpu_grouped_d2h_expert_output_bytes{0};
 };

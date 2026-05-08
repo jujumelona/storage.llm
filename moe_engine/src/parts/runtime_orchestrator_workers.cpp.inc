@@ -26,7 +26,8 @@ static void flush_deferred_joins_locked(moe_pc_engine* engine, bool force_blocki
         }
 #ifdef _WIN32
         // Non-blocking: check if thread has exited (0ms timeout).
-        DWORD result = WaitForSingleObject(it->native_handle(), 0);
+        HANDLE native = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(it->native_handle()));
+        DWORD result = WaitForSingleObject(native, 0);
         if (result == WAIT_OBJECT_0) {
             it->join();
             it = engine->deferred_joins.erase(it);

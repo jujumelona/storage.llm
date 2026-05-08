@@ -6,6 +6,11 @@
 } moe_kv_mode_t;
 
 typedef enum {
+    moe_KV_OFFLOAD_DISABLED = 0,
+    moe_KV_OFFLOAD_COMPAT = 1
+} moe_kv_offload_mode_t;
+
+typedef enum {
     moe_TIER_VRAM = 0,
     moe_TIER_RAM = 1,
     moe_TIER_DB = 2,
@@ -61,7 +66,8 @@ typedef enum {
 typedef enum {
     moe_PREFETCH_REASON_ROUTER_SELECTED = 0,
     moe_PREFETCH_REASON_LOOKAHEAD = 1,
-    moe_PREFETCH_REASON_TOPOLOGY = 2
+    moe_PREFETCH_REASON_TOPOLOGY = 2,
+    moe_PREFETCH_REASON_BATCH_SELECTED = 3
 } moe_prefetch_reason_t;
 
 typedef enum {

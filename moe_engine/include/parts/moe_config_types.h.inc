@@ -14,7 +14,10 @@ typedef struct {
     int enable_model_lib_jit;
     float vram_kv_ratio;  // BUGFIX 문제F: KV/expert VRAM split ratio (0.0=auto, 0.1-0.3 recommended) ★★
     int32_t device_id;  // BUGFIX Problem 5: GPU device index for multi-GPU systems (-1=auto, default 0) ★★
-    uint32_t max_context_len;  // BUGFIX Problem 7: Override KV cache context length (0=use default 8192) ★★★
+    uint32_t max_context_len;  // BUGFIX Problem 7: Override KV cache context length (0=use default 8192)
+    moe_kv_offload_mode_t kv_offload_mode;
+    int kv_offload_enable_for_long_context_only;
+    uint32_t kv_offload_min_context_tokens;
 } moe_pc_engine_config_t;
 
 typedef enum {
@@ -50,10 +53,15 @@ typedef struct {
     uint32_t disk_worker_threads;
     uint32_t pinned_worker_threads;
     uint32_t gpu_worker_threads;
+    uint32_t gpu_expert_scratch_slots;
     uint64_t pinned_staging_bytes;
     uint64_t direct_upload_min_bytes;
+    uint64_t vram_safety_margin_bytes;
     uint32_t directstorage_staging_queue_capacity;
     uint32_t directstorage_gpu_queue_capacity;
+    int directstorage_require_completion_event;
+    uint32_t prefill_group_wait_us;
+    int require_gpu_expert_batch_kernel_for_fast_mode;
     int enable_compute_io_overlap;
     int enable_multistage_pipeline;
     int enable_lookahead_prefetch;
@@ -76,7 +84,10 @@ typedef struct {
     uint8_t metal_memory_budget_pct;  // Metal unified-memory budget percentage (0=auto, safe range 50-90)
     uint8_t vulkan_memory_headroom_pct;  // Vulkan free-memory headroom percentage (0=default 10)
     uint8_t level_zero_memory_headroom_pct;  // Level Zero free-memory headroom percentage (0=default 10)
-    int prefer_overlapped_io;  // BUGFIX 897: Windows non-DirectStorage async I/O (0=mmap+VirtualLock, 1=OVERLAPPED ReadFile) ★★★
+    int prefer_overlapped_io;  // BUGFIX 897: Windows non-DirectStorage async I/O (0=mmap+VirtualLock, 1=OVERLAPPED ReadFile)
+    int enable_cold_expert_cpu_fallback;
+    uint32_t cpu_fallback_max_tokens;
+    uint32_t expert_group_gpu_min_assignments;
 } moe_io_config_t;
 
 typedef struct {

@@ -316,6 +316,13 @@ static int level_zero_driver_load(moe_level_zero_driver_api* api, uint32_t devic
     api->zeCommandListClose = (decltype(api->zeCommandListClose))moe_find_shared_symbol(api->library, "zeCommandListClose");
     api->zeCommandListReset = (decltype(api->zeCommandListReset))moe_find_shared_symbol(api->library, "zeCommandListReset");
     api->zeCommandListAppendMemoryCopy = (decltype(api->zeCommandListAppendMemoryCopy))moe_find_shared_symbol(api->library, "zeCommandListAppendMemoryCopy");
+    api->zeModuleCreate = (decltype(api->zeModuleCreate))moe_find_shared_symbol(api->library, "zeModuleCreate");
+    api->zeModuleDestroy = (decltype(api->zeModuleDestroy))moe_find_shared_symbol(api->library, "zeModuleDestroy");
+    api->zeKernelCreate = (decltype(api->zeKernelCreate))moe_find_shared_symbol(api->library, "zeKernelCreate");
+    api->zeKernelDestroy = (decltype(api->zeKernelDestroy))moe_find_shared_symbol(api->library, "zeKernelDestroy");
+    api->zeKernelSetArgumentValue = (decltype(api->zeKernelSetArgumentValue))moe_find_shared_symbol(api->library, "zeKernelSetArgumentValue");
+    api->zeKernelSetGroupSize = (decltype(api->zeKernelSetGroupSize))moe_find_shared_symbol(api->library, "zeKernelSetGroupSize");
+    api->zeCommandListAppendLaunchKernel = (decltype(api->zeCommandListAppendLaunchKernel))moe_find_shared_symbol(api->library, "zeCommandListAppendLaunchKernel");
     api->zeFenceCreate = (decltype(api->zeFenceCreate))moe_find_shared_symbol(api->library, "zeFenceCreate");
     api->zeFenceDestroy = (decltype(api->zeFenceDestroy))moe_find_shared_symbol(api->library, "zeFenceDestroy");
     api->zeFenceHostSynchronize = (decltype(api->zeFenceHostSynchronize))moe_find_shared_symbol(api->library, "zeFenceHostSynchronize");

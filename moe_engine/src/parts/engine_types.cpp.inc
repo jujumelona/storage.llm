@@ -73,6 +73,10 @@ struct moe_tensor_record {
     uint64_t bundle_member_offset = 0;
     uint64_t bundle_member_size = 0;
     uint64_t bundle_alignment = 0;
+    uint8_t expert_gpu_layout_kind = 0;
+    uint64_t expert_gpu_layout_offset = 0;
+    uint64_t expert_gpu_layout_size = 0;
+    uint64_t expert_gpu_layout_row_bytes = 0;
 };
 
 enum moe_raw_scalar_encoding_t : uint8_t {

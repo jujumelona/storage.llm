@@ -65,7 +65,21 @@ struct moe_juju_tensor_json_entry_t {
     uint64_t bundle_member_offset = 0;
     uint64_t bundle_member_size = 0;
     uint64_t bundle_alignment = 0;
+    std::string expert_gpu_layout;
+    uint64_t expert_gpu_layout_offset = 0;
+    uint64_t expert_gpu_layout_size = 0;
+    uint64_t expert_gpu_layout_row_bytes = 0;
 };
+
+static uint8_t moe_juju_gpu_layout_kind_id(const std::string& text) {
+    const std::string v = moe_lower_ascii_copy(text);
+    if (v == "fp16_rowmajor" || v == "f16_rowmajor") return 1;
+    if (v == "bf16_rowmajor") return 2;
+    if (v == "fp32_rowmajor" || v == "f32_rowmajor") return 3;
+    if (v == "fp16_col32" || v == "f16_col32" || v == "col32") return 4;
+    if (v == "fp8_col32" || v == "e4m3_col32" || v == "e5m2_col32") return 5;
+    return 0;
+}
 
 static int moe_juju_bundle_member_projection(
     const moe_juju_tensor_json_entry_t& entry,
@@ -1033,6 +1047,16 @@ static int moe_parse_juju_tensor_index_json(
         if (moe_json_get_u64_slice(json, obj_begin, obj_end, "bundle_alignment", &value) ||
             moe_json_get_u64_from_object_slice_local(json, obj_begin, obj_end, "expert_layout", "bundle_alignment", &value)) {
             rec.bundle_alignment = value;
+        }
+        moe_json_get_string_slice(json, obj_begin, obj_end, "expert_gpu_layout", &rec.expert_gpu_layout);
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "expert_gpu_layout_offset", &value)) {
+            rec.expert_gpu_layout_offset = value;
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "expert_gpu_layout_size", &value)) {
+            rec.expert_gpu_layout_size = value;
+        }
+        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "expert_gpu_layout_row_bytes", &value)) {
+            rec.expert_gpu_layout_row_bytes = value;
         }
         if (moe_json_get_u64_slice(json, obj_begin, obj_end, "weight_encoding", &value) ||
             moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_weight_encoding", &value) ||

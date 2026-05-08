@@ -127,6 +127,7 @@ typedef struct {
     uint64_t bytes_pinned_to_gpu;
     uint64_t bytes_direct_to_gpu;
     uint64_t bytes_touch_fallback;
+    uint64_t bytes_mmap_touch;
     uint64_t bytes_sync_h2d_fallback;
     uint64_t device_alloc_failures;
     uint64_t device_copy_failures;
@@ -163,4 +164,10 @@ typedef struct {
     uint64_t backend_fence_waits;
     uint64_t vulkan_fence_waits;
     uint64_t level_zero_fence_waits;
+    uint64_t gpu_grouped_host_fallback_count;
+    uint64_t gpu_grouped_indexed_host_submitted;
+    uint64_t gpu_grouped_indexed_host_completed;
+    uint64_t gpu_grouped_indexed_device_submitted;
+    uint64_t gpu_grouped_indexed_device_completed;
+    uint64_t gpu_grouped_d2h_expert_output_bytes;
 } moe_io_stats_t;

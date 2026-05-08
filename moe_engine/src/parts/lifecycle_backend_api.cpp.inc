@@ -5,6 +5,19 @@ moe_pc_engine_t* moe_pc_engine_create(const moe_pc_engine_config_t* config) {
     if (!engine) return nullptr;
     engine->engine_generation = g_moe_engine_generation.fetch_add(1u, std::memory_order_relaxed) + 1u;
     engine->config = config ? *config : moe_pc_default_config();
+    if (engine->config.kv_offload_min_context_tokens == 0) {
+        engine->config.kv_offload_min_context_tokens = 32768;
+    }
+    if (engine->io_config.prefill_group_wait_us == 0) {
+        engine->io_config.prefill_group_wait_us = 200;
+    }
+    if (engine->io_config.require_gpu_expert_batch_kernel_for_fast_mode == 0) {
+        engine->io_config.require_gpu_expert_batch_kernel_for_fast_mode = 1;
+    }
+    if (engine->config.kv_offload_mode != moe_KV_OFFLOAD_DISABLED &&
+        engine->config.kv_offload_mode != moe_KV_OFFLOAD_COMPAT) {
+        engine->config.kv_offload_mode = moe_KV_OFFLOAD_DISABLED;
+    }
     qkv_set_mode(engine->config.kv_mode == moe_KV_MODE_QKV);
     engine->expert_states.assign(expert_slot_count(engine), moe_block_state{});
     tensor_slots_reset(engine);

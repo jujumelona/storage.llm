@@ -192,6 +192,13 @@ struct moe_level_zero_driver_api {
     int (*zeCommandListClose)(void*) = nullptr;
     int (*zeCommandListReset)(void*) = nullptr;
     int (*zeCommandListAppendMemoryCopy)(void*, void*, const void*, size_t, void*, uint32_t, void**) = nullptr;
+    int (*zeModuleCreate)(void*, void*, const void*, void**, void**) = nullptr;
+    int (*zeModuleDestroy)(void*) = nullptr;
+    int (*zeKernelCreate)(void*, const void*, void**) = nullptr;
+    int (*zeKernelDestroy)(void*) = nullptr;
+    int (*zeKernelSetArgumentValue)(void*, uint32_t, size_t, const void*) = nullptr;
+    int (*zeKernelSetGroupSize)(void*, uint32_t, uint32_t, uint32_t) = nullptr;
+    int (*zeCommandListAppendLaunchKernel)(void*, void*, const void*, void*, uint32_t, void**) = nullptr;
     int (*zeFenceCreate)(void*, void*, void**) = nullptr;
     int (*zeFenceDestroy)(void*) = nullptr;
     int (*zeFenceHostSynchronize)(void*, uint64_t) = nullptr;
@@ -280,19 +287,54 @@ enum {
     moe_DEVICE_ALLOC_D3D12_RESOURCE = 2
 };
 
-static constexpr uint32_t moe_DSTORAGE_STATUS_SLOTS = 1024u;
+static constexpr uint32_t moe_DSTORAGE_MIN_STATUS_SLOTS = 256u;
+static constexpr uint32_t moe_DSTORAGE_DEFAULT_STATUS_SLOTS = 1024u;
+static constexpr uint32_t moe_DSTORAGE_MAX_STATUS_SLOTS = 8192u;
 
 struct moe_dstorage_status_slot {
     std::atomic<bool> in_use{false};
     void* array = nullptr;
     uint32_t index = 0;
     uint64_t generation = 0;
+
+    moe_dstorage_status_slot() = default;
+    moe_dstorage_status_slot(const moe_dstorage_status_slot& other)
+        : array(other.array),
+          index(other.index),
+          generation(other.generation) {
+        in_use.store(other.in_use.load(std::memory_order_acquire), std::memory_order_release);
+    }
+    moe_dstorage_status_slot& operator=(const moe_dstorage_status_slot& other) {
+        if (this != &other) {
+            in_use.store(other.in_use.load(std::memory_order_acquire), std::memory_order_release);
+            array = other.array;
+            index = other.index;
+            generation = other.generation;
+        }
+        return *this;
+    }
+    moe_dstorage_status_slot(moe_dstorage_status_slot&& other) noexcept
+        : array(other.array),
+          index(other.index),
+          generation(other.generation) {
+        in_use.store(other.in_use.load(std::memory_order_acquire), std::memory_order_release);
+    }
+    moe_dstorage_status_slot& operator=(moe_dstorage_status_slot&& other) noexcept {
+        if (this != &other) {
+            in_use.store(other.in_use.load(std::memory_order_acquire), std::memory_order_release);
+            array = other.array;
+            index = other.index;
+            generation = other.generation;
+        }
+        return *this;
+    }
 };
 
 struct moe_dstorage_pending_copy {
     void* status_array = nullptr;
     uint32_t status_index = 0;
     moe_dstorage_status_slot* slots = nullptr;
+    uint32_t slot_capacity = 0;
     int slot_index = -1;
     uint64_t generation = 0;
     uint64_t key = 0;
@@ -314,8 +356,8 @@ struct moe_directstorage_state {
     void* d3d12_device = nullptr;
     uint32_t status_index = 0;
     uint32_t gpu_status_index = 0;
-    moe_dstorage_status_slot status_slots[moe_DSTORAGE_STATUS_SLOTS]{};
-    moe_dstorage_status_slot gpu_status_slots[moe_DSTORAGE_STATUS_SLOTS]{};
+    std::vector<moe_dstorage_status_slot> status_slots;
+    std::vector<moe_dstorage_status_slot> gpu_status_slots;
     bool initialized = false;
     bool available = false;
     bool gpu_available = false;

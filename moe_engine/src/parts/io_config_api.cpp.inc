@@ -156,13 +156,172 @@ static int validate_true_zero_copy_mmap_level_zero(
     void* mapped_file_ptr,
     size_t bytes
 ) {
-    (void)engine;
-    (void)mapped_file_ptr;
-    (void)bytes;
-    // A copy engine round-trip is not proof that shader/compute code can
-    // directly load mmap-backed pages. Keep Level Zero/SYCL fail-closed until
-    // a backend kernel checksum path is available.
-    return 0;
+    if (!engine ||
+        !mapped_file_ptr ||
+        bytes < 4096 ||
+        !engine->ze.context ||
+        !engine->ze.device ||
+        !engine->ze.command_queue ||
+        !engine->model_lib_l0_mmap_checksum_spv ||
+        engine->model_lib_l0_mmap_checksum_spv_size == 0 ||
+        !engine->model_lib_l0_mmap_checksum_kernel_name ||
+        !engine->ze.zeModuleCreate ||
+        !engine->ze.zeModuleDestroy ||
+        !engine->ze.zeKernelCreate ||
+        !engine->ze.zeKernelDestroy ||
+        !engine->ze.zeKernelSetArgumentValue ||
+        !engine->ze.zeKernelSetGroupSize ||
+        !engine->ze.zeCommandListCreate ||
+        !engine->ze.zeCommandListDestroy ||
+        !engine->ze.zeCommandListClose ||
+        !engine->ze.zeCommandQueueExecuteCommandLists ||
+        !engine->ze.zeCommandQueueSynchronize ||
+        !engine->ze.zeCommandListAppendLaunchKernel ||
+        !engine->ze.zeMemAllocHost ||
+        !engine->ze.zeMemFree) {
+        return 0;
+    }
+
+    struct ze_module_desc_t_local {
+        uint32_t stype;
+        const void* pNext;
+        uint32_t format;
+        size_t inputSize;
+        const uint8_t* pInputModule;
+        const char* pBuildFlags;
+        const void* pConstants;
+    };
+    struct ze_kernel_desc_t_local {
+        uint32_t stype;
+        const void* pNext;
+        uint32_t flags;
+        const char* pKernelName;
+    };
+    struct ze_command_list_desc_t_local {
+        uint32_t stype;
+        const void* pNext;
+        uint32_t commandQueueGroupOrdinal;
+        uint32_t flags;
+    };
+    struct ze_host_mem_alloc_desc_t_local {
+        uint32_t stype;
+        const void* pNext;
+        uint32_t flags;
+    };
+    struct ze_group_count_t_local {
+        uint32_t groupCountX;
+        uint32_t groupCountY;
+        uint32_t groupCountZ;
+    };
+
+    static constexpr uint32_t ze_STRUCTURE_TYPE_COMMAND_LIST_DESC = 0x7u;
+    static constexpr uint32_t ze_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC = 0x16u;
+    static constexpr uint32_t ze_STRUCTURE_TYPE_MODULE_DESC = 0x1Bu;
+    static constexpr uint32_t ze_STRUCTURE_TYPE_KERNEL_DESC = 0x1Du;
+    static constexpr uint32_t ze_MODULE_FORMAT_IL_SPIRV = 0u;
+
+    void* module = nullptr;
+    void* kernel = nullptr;
+    void* command_list = nullptr;
+    void* out_host = nullptr;
+    int ok = 0;
+
+    ze_host_mem_alloc_desc_t_local host_desc{
+        ze_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC,
+        nullptr,
+        0u
+    };
+    if (engine->ze.zeMemAllocHost(
+            engine->ze.context,
+            &host_desc,
+            sizeof(uint64_t),
+            alignof(uint64_t),
+            &out_host) != 0 || !out_host) {
+        return 0;
+    }
+    *static_cast<uint64_t*>(out_host) = 0;
+
+    ze_module_desc_t_local module_desc{
+        ze_STRUCTURE_TYPE_MODULE_DESC,
+        nullptr,
+        ze_MODULE_FORMAT_IL_SPIRV,
+        static_cast<size_t>(engine->model_lib_l0_mmap_checksum_spv_size),
+        static_cast<const uint8_t*>(engine->model_lib_l0_mmap_checksum_spv),
+        "",
+        nullptr
+    };
+    ze_kernel_desc_t_local kernel_desc{
+        ze_STRUCTURE_TYPE_KERNEL_DESC,
+        nullptr,
+        0u,
+        engine->model_lib_l0_mmap_checksum_kernel_name
+    };
+    ze_command_list_desc_t_local list_desc{
+        ze_STRUCTURE_TYPE_COMMAND_LIST_DESC,
+        nullptr,
+        0u,
+        0u
+    };
+    ze_group_count_t_local groups{1u, 1u, 1u};
+
+    if (engine->ze.zeModuleCreate(
+            engine->ze.context,
+            engine->ze.device,
+            &module_desc,
+            &module,
+            nullptr) == 0 && module &&
+        engine->ze.zeKernelCreate(module, &kernel_desc, &kernel) == 0 && kernel &&
+        engine->ze.zeKernelSetGroupSize(kernel, 1u, 1u, 1u) == 0 &&
+        engine->ze.zeCommandListCreate(
+            engine->ze.context,
+            engine->ze.device,
+            &list_desc,
+            &command_list) == 0 && command_list) {
+        void* mapped_arg = mapped_file_ptr;
+        uint64_t n_arg = static_cast<uint64_t>(bytes);
+        void* out_arg = out_host;
+        if (engine->ze.zeKernelSetArgumentValue(
+                kernel, 0u, sizeof(mapped_arg), &mapped_arg) == 0 &&
+            engine->ze.zeKernelSetArgumentValue(
+                kernel, 1u, sizeof(n_arg), &n_arg) == 0 &&
+            engine->ze.zeKernelSetArgumentValue(
+                kernel, 2u, sizeof(out_arg), &out_arg) == 0 &&
+            engine->ze.zeCommandListAppendLaunchKernel(
+                command_list,
+                kernel,
+                &groups,
+                nullptr,
+                0u,
+                nullptr) == 0 &&
+            engine->ze.zeCommandListClose(command_list) == 0) {
+            void* lists[] = {command_list};
+            if (engine->ze.zeCommandQueueExecuteCommandLists(
+                    engine->ze.command_queue,
+                    1u,
+                    lists,
+                    nullptr) == 0 &&
+                engine->ze.zeCommandQueueSynchronize(
+                    engine->ze.command_queue,
+                    UINT64_MAX) == 0) {
+                const uint64_t gpu_sum = *static_cast<uint64_t*>(out_host);
+                const uint64_t cpu_sum =
+                    zero_copy_mmap_checksum_cpu(mapped_file_ptr, static_cast<uint64_t>(bytes));
+                ok = (gpu_sum == cpu_sum) ? 1 : 0;
+            }
+        }
+    }
+
+    if (command_list) {
+        engine->ze.zeCommandListDestroy(command_list);
+    }
+    if (kernel) {
+        engine->ze.zeKernelDestroy(kernel);
+    }
+    if (module) {
+        engine->ze.zeModuleDestroy(module);
+    }
+    engine->ze.zeMemFree(engine->ze.context, out_host);
+    return ok;
 }
 
 static int validate_true_zero_copy_mmap(moe_pc_engine* engine, void* mapped_file_ptr, size_t bytes) {
@@ -211,9 +370,30 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
     if (engine->io_config.directstorage_gpu_queue_capacity == 0) {
         engine->io_config.directstorage_gpu_queue_capacity = 1024;
     }
+    if (engine->io_config.prefill_group_wait_us == 0) {
+        engine->io_config.prefill_group_wait_us = 200;
+    }
+    if (engine->io_config.vram_safety_margin_bytes == 0) {
+        engine->io_config.vram_safety_margin_bytes = 256ull * 1024ull * 1024ull;
+    }
+    if (engine->io_config.cpu_fallback_max_tokens == 0) {
+        engine->io_config.cpu_fallback_max_tokens = 1;
+    }
+    if (engine->io_config.expert_group_gpu_min_assignments == 0) {
+        engine->io_config.expert_group_gpu_min_assignments = 2;
+    }
+    if (engine->config.kv_offload_min_context_tokens == 0) {
+        engine->config.kv_offload_min_context_tokens = 32768;
+    }
     if (using_default_io_config) {
-        engine->io_config.allow_required_sync_fallback = 1;
+        engine->io_config.allow_required_sync_fallback = 0;
         engine->io_config.require_bundle_native_experts = 1;
+        engine->io_config.enable_cold_expert_cpu_fallback = 0;
+        engine->io_config.cpu_fallback_max_tokens = 1;
+        engine->io_config.expert_group_gpu_min_assignments = 2;
+        engine->io_config.directstorage_require_completion_event = 1;
+        engine->io_config.prefill_group_wait_us = 200;
+        engine->io_config.require_gpu_expert_batch_kernel_for_fast_mode = 1;
     }
     if (engine->backend_caps.backend == moe_BACKEND_METAL) {
         engine->io_config.enable_pinned_host = 0;
@@ -424,6 +604,17 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
     }
     engine->io_config.gpu_worker_threads =
         clamp_to_cap(engine->io_config.gpu_worker_threads, gpu_worker_cap(engine));
+    if (engine->io_config.gpu_expert_scratch_slots == 0) {
+        engine->io_config.gpu_expert_scratch_slots =
+            std::max<uint32_t>(16u, engine->io_config.gpu_worker_threads * 2u);
+    } else {
+        const uint32_t scratch_cap =
+            std::max<uint32_t>(16u, std::max<uint32_t>(engine->io_config.gpu_worker_threads * 4u, 64u));
+        engine->io_config.gpu_expert_scratch_slots =
+            std::max<uint32_t>(
+                16u,
+                std::min<uint32_t>(engine->io_config.gpu_expert_scratch_slots, scratch_cap));
+    }
     if (using_default_io_config) {
         const uint32_t final_balanced_disk_workers = moe_balanced_disk_worker_threads(
             hw_threads,

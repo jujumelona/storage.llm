@@ -18,6 +18,7 @@ static void reset_io_stats_for_config(moe_pc_engine* engine) {
     engine->io_atomic.bytes_pinned_to_gpu.store(0, std::memory_order_relaxed);
     engine->io_atomic.bytes_direct_to_gpu.store(0, std::memory_order_relaxed);
     engine->io_atomic.bytes_touch_fallback.store(0, std::memory_order_relaxed);
+    engine->io_atomic.bytes_mmap_touch.store(0, std::memory_order_relaxed);
     engine->io_atomic.bytes_sync_h2d_fallback.store(0, std::memory_order_relaxed);
     engine->io_atomic.device_alloc_failures.store(0, std::memory_order_relaxed);
     engine->io_atomic.device_copy_failures.store(0, std::memory_order_relaxed);
@@ -39,6 +40,12 @@ static void reset_io_stats_for_config(moe_pc_engine* engine) {
     engine->io_atomic.backend_fence_waits.store(0, std::memory_order_relaxed);
     engine->io_atomic.vulkan_fence_waits.store(0, std::memory_order_relaxed);
     engine->io_atomic.level_zero_fence_waits.store(0, std::memory_order_relaxed);
+    engine->io_atomic.gpu_grouped_host_fallback_count.store(0, std::memory_order_relaxed);
+    engine->io_atomic.gpu_grouped_indexed_host_submitted.store(0, std::memory_order_relaxed);
+    engine->io_atomic.gpu_grouped_indexed_host_completed.store(0, std::memory_order_relaxed);
+    engine->io_atomic.gpu_grouped_indexed_device_submitted.store(0, std::memory_order_relaxed);
+    engine->io_atomic.gpu_grouped_indexed_device_completed.store(0, std::memory_order_relaxed);
+    engine->io_atomic.gpu_grouped_d2h_expert_output_bytes.store(0, std::memory_order_relaxed);
     engine->io_atomic.topology_predictions.store(0, std::memory_order_relaxed);
     engine->io_atomic.topology_updates.store(0, std::memory_order_relaxed);
     const moe_io_path_t active_path = choose_active_io_path(engine);
@@ -73,6 +80,7 @@ static void snapshot_io_stats(const moe_pc_engine* engine, moe_io_stats_t* out) 
     out->bytes_pinned_to_gpu = engine->io_atomic.bytes_pinned_to_gpu.load(std::memory_order_relaxed);
     out->bytes_direct_to_gpu = engine->io_atomic.bytes_direct_to_gpu.load(std::memory_order_relaxed);
     out->bytes_touch_fallback = engine->io_atomic.bytes_touch_fallback.load(std::memory_order_relaxed);
+    out->bytes_mmap_touch = engine->io_atomic.bytes_mmap_touch.load(std::memory_order_relaxed);
     out->bytes_sync_h2d_fallback = engine->io_atomic.bytes_sync_h2d_fallback.load(std::memory_order_relaxed);
     out->device_alloc_failures = engine->io_atomic.device_alloc_failures.load(std::memory_order_relaxed);
     out->device_copy_failures = engine->io_atomic.device_copy_failures.load(std::memory_order_relaxed);
@@ -98,6 +106,18 @@ static void snapshot_io_stats(const moe_pc_engine* engine, moe_io_stats_t* out) 
     out->backend_fence_waits = engine->io_atomic.backend_fence_waits.load(std::memory_order_relaxed);
     out->vulkan_fence_waits = engine->io_atomic.vulkan_fence_waits.load(std::memory_order_relaxed);
     out->level_zero_fence_waits = engine->io_atomic.level_zero_fence_waits.load(std::memory_order_relaxed);
+    out->gpu_grouped_host_fallback_count =
+        engine->io_atomic.gpu_grouped_host_fallback_count.load(std::memory_order_relaxed);
+    out->gpu_grouped_indexed_host_submitted =
+        engine->io_atomic.gpu_grouped_indexed_host_submitted.load(std::memory_order_relaxed);
+    out->gpu_grouped_indexed_host_completed =
+        engine->io_atomic.gpu_grouped_indexed_host_completed.load(std::memory_order_relaxed);
+    out->gpu_grouped_indexed_device_submitted =
+        engine->io_atomic.gpu_grouped_indexed_device_submitted.load(std::memory_order_relaxed);
+    out->gpu_grouped_indexed_device_completed =
+        engine->io_atomic.gpu_grouped_indexed_device_completed.load(std::memory_order_relaxed);
+    out->gpu_grouped_d2h_expert_output_bytes =
+        engine->io_atomic.gpu_grouped_d2h_expert_output_bytes.load(std::memory_order_relaxed);
     out->disk_queue_depth = engine->disk_stage.depth.load(std::memory_order_relaxed);
     out->pinned_queue_depth = engine->pinned_stage.depth.load(std::memory_order_relaxed);
     out->gpu_queue_depth = engine->gpu_stage.depth.load(std::memory_order_relaxed);

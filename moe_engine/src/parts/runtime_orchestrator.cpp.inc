@@ -155,19 +155,34 @@ static void moe_runtime_autotune_tick(moe_pc_engine* engine) {
     }
     if (m.directstorage_queue_wait_ns > wait_limit) {
         window = std::max(1u, window > 1u ? window - 1u : 1u);
-        const uint32_t staging_cap = std::min<uint32_t>(
-            8192u,
-            std::max<uint32_t>(engine->io_config.directstorage_staging_queue_capacity, 1024u));
-        const uint32_t gpu_cap = std::min<uint32_t>(
-            8192u,
-            std::max<uint32_t>(engine->io_config.directstorage_gpu_queue_capacity, 1024u));
-        engine->io_config.directstorage_staging_queue_capacity = std::min<uint32_t>(
-            8192u,
-            staging_cap + (staging_cap < 8192u ? 256u : 0u));
-        engine->io_config.directstorage_gpu_queue_capacity = std::min<uint32_t>(
-            8192u,
-            gpu_cap + (gpu_cap < 8192u ? 256u : 0u));
-        engine->directstorage_recreate_requested.store(true, std::memory_order_release);
+        const uint32_t pressure_windows =
+            engine->directstorage_queue_pressure_windows.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        const uint64_t last_recreate_ms =
+            engine->directstorage_last_recreate_ms.load(std::memory_order_relaxed);
+        if (pressure_windows >= 3u &&
+            (last_recreate_ms == 0 || now_ms >= last_recreate_ms + 5000ull)) {
+            const uint32_t staging_cap = std::min<uint32_t>(
+                8192u,
+                std::max<uint32_t>(engine->io_config.directstorage_staging_queue_capacity, 1024u));
+            const uint32_t gpu_cap = std::min<uint32_t>(
+                8192u,
+                std::max<uint32_t>(engine->io_config.directstorage_gpu_queue_capacity, 1024u));
+            engine->io_config.directstorage_staging_queue_capacity = std::min<uint32_t>(
+                8192u,
+                staging_cap + (staging_cap < 8192u ? 256u : 0u));
+            engine->io_config.directstorage_gpu_queue_capacity = std::min<uint32_t>(
+                8192u,
+                gpu_cap + (gpu_cap < 8192u ? 256u : 0u));
+            window = 1u;
+            engine->runtime_prefetch_window_layers.store(1u, std::memory_order_relaxed);
+            engine->adaptive_prefetch_window_last.store(1u, std::memory_order_relaxed);
+            engine->directstorage_submission_paused.store(true, std::memory_order_release);
+            engine->directstorage_recreate_requested.store(true, std::memory_order_release);
+            engine->directstorage_last_recreate_ms.store(now_ms, std::memory_order_relaxed);
+            engine->directstorage_queue_pressure_windows.store(0u, std::memory_order_relaxed);
+        }
+    } else {
+        engine->directstorage_queue_pressure_windows.store(0u, std::memory_order_relaxed);
     }
     if (hit < 850u && waste < 200u) {
         window = std::min<uint32_t>(16u, window + 1u);
@@ -201,9 +216,24 @@ static void moe_runtime_autotune_tick(moe_pc_engine* engine) {
                 runtime_gpu_workers(engine));
         }
     }
+    const uint64_t gds_async_attempted =
+        engine->gds_async_attempted.load(std::memory_order_relaxed);
+    const uint64_t gds_async_submitted =
+        engine->gds_async_submitted.load(std::memory_order_relaxed);
+    const uint64_t gds_blocking_fallbacks =
+        engine->gds_blocking_fallback_count.load(std::memory_order_relaxed);
+    const uint64_t gds_total_reads = gds_async_submitted + gds_blocking_fallbacks;
+    const bool gds_async_success_low =
+        gds_async_attempted >= 20u &&
+        gds_async_submitted * 100ull < gds_async_attempted * 95ull;
+    const bool gds_blocking_ratio_high =
+        gds_total_reads >= 20u &&
+        gds_blocking_fallbacks * 100ull > gds_total_reads * 3ull;
     if (engine->runtime_gpudirect_ready.load(std::memory_order_acquire) &&
         engine->gds_perf.submitted.load(std::memory_order_relaxed) >= 4u &&
         (gds_fail > 50u ||
+         gds_async_success_low ||
+         gds_blocking_ratio_high ||
          (pinned_wait > 0 && gds_wait > (pinned_wait * 12ull) / 10ull))) {
         engine->runtime_gpudirect_ready.store(false, std::memory_order_release);
     }
