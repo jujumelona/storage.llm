@@ -58,53 +58,12 @@ int qkv_attention_decode_impl(
 
     // Use scratch buffers
     float* row = s->scratch_residual;
-    if (s->head_dim != d) return 0;
+    if (!row || s->head_dim != d) return 0;
 
     // BUGFIX 350: n_tokens 범위 체크
     if (n > s->n_tokens || n < 0) return 0;
     float* att = s->scratch_attention;
     if (!att) return 0;
-
-    float sink_sc = 1.0f / sqrtf((float)d);
-    if (cfg->attention_score_scale > 0.0f && std::isfinite(cfg->attention_score_scale)) {
-        sink_sc = cfg->attention_score_scale;
-    }
-    const float sink_logit_softcap =
-        (cfg->attention_logit_softcap > 0.0f && std::isfinite(cfg->attention_logit_softcap))
-            ? cfg->attention_logit_softcap
-            : 0.0f;
-    if ((uint32_t)n <= s->sink_tokens && s->k_sink && s->v_sink) {
-        float max_score = -INFINITY;
-        for (int t = 0; t < n; ++t) {
-            const float* k = s->k_sink + (size_t)t * (size_t)d;
-            float dot = 0.0f;
-            for (int i = 0; i < d; ++i) {
-                dot += query[i] * k[i];
-            }
-            att[t] = qkv_attention_apply_logit_softcap(sink_logit_softcap, dot * sink_sc);
-            if (!std::isfinite(att[t])) return 0;
-            if (att[t] > max_score) max_score = att[t];
-        }
-        if (!std::isfinite(max_score)) return 0;
-        float denom = 0.0f;
-        for (int t = 0; t < n; ++t) {
-            att[t] = expf(att[t] - max_score);
-            if (!std::isfinite(att[t])) return 0;
-            denom += att[t];
-        }
-        if (!(denom > 1e-10f) || !std::isfinite(denom)) return 0;
-        memset(output, 0, (size_t)d * sizeof(float));
-        const float inv_denom = 1.0f / denom;
-        for (int t = 0; t < n; ++t) {
-            const float w = att[t] * inv_denom;
-            const float* v = s->v_sink + (size_t)t * (size_t)d;
-            for (int i = 0; i < d; ++i) {
-                output[i] += w * v[i];
-            }
-        }
-        return 1;
-    }
-    if (!row) return 0;
 
     // Paper optimization: Pre-rotate query ONCE with Pi (O(d²) × 1)
     // Then dequant uses codebook-only path (skip inverse rotation) — O(d) × N
