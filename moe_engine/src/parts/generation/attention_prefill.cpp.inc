@@ -107,41 +107,67 @@ static int moe_apply_unweighted_head_rmsnorm_f32(
     return 1;
 }
 
-static int moe_layer_attention_value_source_is_raw_k_before_k_norm(
-    const moe_pc_engine* engine,
+static int moe_layer_contract_declares_unweighted_v_norm(
+    const std::string& doc,
+    const char* array_key,
     int32_t layer
 ) {
-    if (!engine || layer < 0) {
+    if (doc.empty() || !array_key || layer < 0) {
         return 0;
     }
-    char layer_key[32];
-    std::snprintf(layer_key, sizeof(layer_key), "%d", (int)layer);
-    const std::string* docs[] = {
-        &engine->offload_graph_ir_json,
-        &engine->offload_gguf_metadata_json,
-    };
-    for (const std::string* doc : docs) {
-        if (!doc || doc->empty()) {
+    size_t arr_begin = 0;
+    size_t arr_end = 0;
+    if (!moe_json_find_array_local(doc, array_key, &arr_begin, &arr_end)) {
+        return 0;
+    }
+    size_t cursor = arr_begin + 1;
+    while (cursor < arr_end) {
+        size_t obj_begin = 0;
+        size_t obj_end = 0;
+        if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+            break;
+        }
+        uint64_t parsed_layer = UINT64_MAX;
+        if (!moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed_layer) ||
+            parsed_layer != (uint64_t)layer) {
             continue;
         }
-        size_t table_begin = 0;
-        size_t table_end = 0;
-        if (!moe_json_find_object_local(*doc, "attention_layer_contract_table", &table_begin, &table_end)) {
-            continue;
+        int declared = 0;
+        if (moe_json_get_bool_slice(
+                doc, obj_begin, obj_end,
+                "unweighted_value_norm_is_contractual_when_declared", &declared) &&
+            declared) {
+            return 1;
         }
-        const std::string table = doc->substr(table_begin, table_end - table_begin);
-        size_t layer_begin = 0;
-        size_t layer_end = 0;
-        if (!moe_json_find_object_local(table, layer_key, &layer_begin, &layer_end)) {
-            continue;
+        std::string mode;
+        if (moe_json_get_string_slice(doc, obj_begin, obj_end, "value_norm_mode", &mode) &&
+            mode == "unweighted_rmsnorm_contract") {
+            return 1;
         }
-        std::string value_source;
-        if (moe_json_get_string_slice(table, layer_begin, layer_end, "value_source", &value_source) &&
-            value_source == "raw_k_projection_before_k_norm") {
+        if (moe_json_get_string_slice(doc, obj_begin, obj_end, "norm_mode", &mode) &&
+            mode == "unweighted_rmsnorm_contract") {
             return 1;
         }
     }
     return 0;
+}
+
+static int moe_layer_object_contract_declares_unweighted_v_norm(
+    const std::string& doc,
+    const char* object_key,
+    const char* array_key,
+    int32_t layer
+) {
+    if (doc.empty() || !object_key || !array_key) {
+        return 0;
+    }
+    size_t object_begin = 0;
+    size_t object_end = 0;
+    if (!moe_json_find_object_local(doc, object_key, &object_begin, &object_end)) {
+        return 0;
+    }
+    return moe_layer_contract_declares_unweighted_v_norm(
+        doc.substr(object_begin, object_end - object_begin), array_key, layer);
 }
 
 static int moe_layer_uses_unweighted_v_norm(
@@ -151,25 +177,61 @@ static int moe_layer_uses_unweighted_v_norm(
     if (!engine || layer < 0) {
         return 0;
     }
+    static thread_local const moe_pc_engine* tls_cached_engine = nullptr;
+    static thread_local uint64_t tls_cached_generation = 0;
+    static thread_local std::vector<int8_t> tls_cached_results;
+    const uint64_t generation = engine->engine_generation;
+    const size_t layer_index = (size_t)layer;
+    int8_t* cached = nullptr;
+    if (layer_index < 10000u) {
+        if (tls_cached_engine != engine || tls_cached_generation != generation) {
+            tls_cached_engine = engine;
+            tls_cached_generation = generation;
+            tls_cached_results.clear();
+        }
+        if (tls_cached_results.size() <= layer_index) {
+            tls_cached_results.resize(layer_index + 1u, -1);
+        }
+        cached = &tls_cached_results[layer_index];
+        if (*cached >= 0) {
+            return *cached ? 1 : 0;
+        }
+    }
+    int result = 0;
     // Weighted V norm tensors are handled through moe_RAW_TENSOR_V_A_LAYER_NORM.
     // This fallback is only for contracts that explicitly imply an unweighted
     // value RMSNorm.
     if (moe_engine_has_common_tensor_suffix(engine, layer, "attn_v_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "value_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "v_norm.weight")) {
+        if (cached) {
+            *cached = 0;
+        }
         return 0;
     }
-    moe_raw_tensor_cache_entry v_shape{};
-    if (get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_KV_B_PROJ, &v_shape)) {
-        return 0;
+    const std::string* docs[] = {
+        &engine->offload_graph_ir_json,
+        &engine->offload_gguf_metadata_json,
+    };
+    for (const std::string* doc : docs) {
+        if (!doc || doc->empty()) {
+            continue;
+        }
+        if (moe_layer_object_contract_declares_unweighted_v_norm(*doc, "graph_ir", "layers", layer) ||
+            moe_layer_contract_declares_unweighted_v_norm(*doc, "layers", layer) ||
+            moe_layer_contract_declares_unweighted_v_norm(*doc, "attention_layer_contract_table", layer) ||
+            moe_layer_contract_declares_unweighted_v_norm(*doc, "attention_layer_table", layer)) {
+            result = 1;
+            break;
+        }
     }
-    if (moe_layer_attention_value_source_is_raw_k_before_k_norm(engine, layer)) {
-        return 0;
+    // Do not infer a layer-local V norm from graph-wide substring matches.
+    // Unweighted V norm is applied only when a per-layer contract declares it,
+    // regardless of whether the value source is v_projection or raw K.
+    if (cached) {
+        *cached = result ? 1 : 0;
     }
-    // Do not infer a layer-local V norm from graph-wide substring matches. A
-    // missing V projection plus q/k norm means K==V only when the layer contract
-    // says so; unweighted V norm requires an explicit per-layer contract.
-    return 0;
+    return result;
 }
 
 static int moe_layer_has_qk_norm_scaled_standard_layout(
