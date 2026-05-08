@@ -496,10 +496,18 @@ static int moe_qkv_append_layer_head_token(
         return 0;
     }
     const uint32_t token_index = context_tokens - 1u;
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+    storagellm_ppl_diag_qkv_append_probe(
+        layer, head, token_index, head_dim, key, value, slot, "before_quantize");
+#endif
     if (!moe_qkv_quantize_current_token_mse(
             slot, &engine->qkv_cfg, key, value, token_index, head_dim)) {
         return 0;
     }
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+    storagellm_ppl_diag_qkv_append_probe(
+        layer, head, token_index, head_dim, key, value, slot, "after_quantize");
+#endif
     return 1;
 }
 
@@ -539,6 +547,20 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
     qkv_config_t qkv_decode_cfg = engine->qkv_cfg;
     qkv_decode_cfg.attention_score_scale = score_scale;
     qkv_decode_cfg.attention_logit_softcap = attn_logit_softcap;
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+    storagellm_ppl_diag_qkv_decode_enter(
+        layer,
+        kv_head,
+        context_tokens - 1u,
+        context_tokens,
+        capacity_tokens,
+        head_dim,
+        score_scale,
+        attn_logit_softcap,
+        query,
+        slot,
+        &qkv_decode_cfg);
+#endif
     const int ok = qkv_attention_decode(query, slot, &qkv_decode_cfg, context_tokens, head_dim, output);
     if (!ok) {
 #ifdef STORAGELLM_PPL_DIAG_ENABLED

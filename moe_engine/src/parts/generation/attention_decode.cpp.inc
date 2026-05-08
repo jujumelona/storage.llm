@@ -38,6 +38,12 @@
         "layer=%d pos=%u supplied=%d ms=%.3f",
         layer, position, input_norm_supplied,
         moe_profile_elapsed_ms(input_norm_start_us));
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+    storagellm_ppl_diag_print_vec_stats(
+        "attn_input", layer, position, 0, "hidden", hidden, hidden_size);
+    storagellm_ppl_diag_print_vec_stats(
+        "attn_input", layer, position, 0, "attn_input", attn_input, hidden_size);
+#endif
 
     // BUGFIX 164: Parallelize Q, K, V projections ?끸쁾
     // Problem: Q, K, V projections run serially, leaving CPU cores idle
@@ -127,6 +133,22 @@
         "layer=%d pos=%u parallel=%d q_rows=%u k_rows=%u v_rows=%u input=%u ms=%.3f",
         layer, position, qkv_parallel_path, q_dim, k_dim, kv_v_dim, hidden_size,
         moe_profile_elapsed_ms(qkv_start_us));
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+    storagellm_ppl_diag_qkv_block(
+        "after_qkv_proj",
+        layer,
+        position,
+        s->q_b.data(),
+        q_dim,
+        s->attn_kv_a.data(),
+        k_dim,
+        s->attn_value.data(),
+        kv_v_dim,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        v_head_dim);
+#endif
     const uint64_t qkv_norm_start_us = moe_profile_now_us();
     moe_raw_tensor_cache_entry v_norm_shape{};
     const int has_v_norm =
@@ -167,6 +189,22 @@
         v_norm_mode != 0 ? 1 : 0,
         v_norm_mode == 2 ? 1 : 0,
         moe_profile_elapsed_ms(qkv_norm_start_us));
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+    storagellm_ppl_diag_qkv_block(
+        "after_qkv_norm",
+        layer,
+        position,
+        s->q_b.data(),
+        q_dim,
+        s->attn_kv_a.data(),
+        k_dim,
+        s->attn_value.data(),
+        kv_v_dim,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        v_head_dim);
+#endif
     const uint64_t rope_start_us = moe_profile_now_us();
     const int rope_rotate_half = moe_standard_rope_uses_rotate_half_cached(engine, cfg);
     const int rope_partial_half_split = (rope_rotate_half && rope_dim < head_dim) ? 1 : 0;
@@ -216,6 +254,22 @@
         rope_proportional_freq,
         use_dynamic_rope,
         moe_profile_elapsed_ms(rope_start_us));
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+    storagellm_ppl_diag_qkv_block(
+        "after_rope",
+        layer,
+        position,
+        s->q_b.data(),
+        q_dim,
+        s->attn_kv_a.data(),
+        k_dim,
+        s->attn_value.data(),
+        kv_v_dim,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        v_head_dim);
+#endif
     const int qkv_configured =
         engine &&
         engine->config.kv_mode == moe_KV_MODE_QKV;
@@ -316,6 +370,27 @@
         return 0;
     }
     const uint32_t qkv_head_stride = std::max<uint32_t>(num_heads, num_kv_heads);
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+    storagellm_ppl_diag_attention_config(
+        "before_attention_heads",
+        layer,
+        position,
+        hidden_size,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        v_head_dim,
+        q_dim,
+        k_dim,
+        kv_v_dim,
+        seq_len,
+        qkv_capacity_tokens,
+        rope_dim,
+        rope_frequency_dim,
+        qkv_decode,
+        scale,
+        attn_logit_softcap);
+#endif
     if (qkv_decode) {
         const uint64_t qkv_append_start_us = moe_profile_now_us();
         if (v_head_dim != head_dim) {
@@ -444,6 +519,10 @@
         scale_source ? scale_source : "unknown",
         (double)attn_logit_softcap,
         moe_profile_elapsed_ms(heads_start_us));
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+    storagellm_ppl_diag_print_vec_stats(
+        "after_attention_heads", layer, position, 0, "attn_value_all", s->attn_value.data(), v_total_dim);
+#endif
 
     const uint64_t o_start_us = moe_profile_now_us();
     if (!moe_pc_engine_raw_linear_f32(
@@ -457,6 +536,10 @@
         "layer=%d pos=%u in=%u out=%u ms=%.3f",
         layer, position, v_total_dim, hidden_size,
         moe_profile_elapsed_ms(o_start_us));
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+    storagellm_ppl_diag_print_vec_stats(
+        "after_o_proj", layer, position, 0, "attn_output", s->attn.data(), hidden_size);
+#endif
     const uint64_t residual_start_us = moe_profile_now_us();
     if (add_residual) {
         for (uint32_t i = 0; i < hidden_size; ++i) {
