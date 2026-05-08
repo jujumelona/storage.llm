@@ -16,6 +16,10 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+// Do not patch this path as a PPL root-cause guess. QKV changes must be
+// justified against QKV.pdf / TurboQuant semantics, not by fallbacking failed
+// attention math to zeros, uniform softmax, or exact-cache bypasses.
+
 static float qkv_attention_load_raw_scalar(const uint8_t* src, int index, int bits) {
     if (!src || index < 0) return 0.0f;
     if (bits == 16) {

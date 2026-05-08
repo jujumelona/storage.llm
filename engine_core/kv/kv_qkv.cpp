@@ -1,5 +1,8 @@
 // QKV Implementation - Faithful to TurboQuant Paper (2504.19874v1)
 // 100% Complete Implementation
+// Guardrail: do not alter QKV to chase PPL unless the change is backed by
+// QKV.pdf / TurboQuant semantics. PPL correctness debugging should first stay
+// in API, GraphIR, RoPE, norm/residual, MLP/router, final-norm, and LM-head.
 
 #include "kv_qkv.h"
 #include "qkv_state.h"
