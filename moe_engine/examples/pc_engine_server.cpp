@@ -2400,11 +2400,39 @@ static server_eval_result run_server_eval(
         if (storagellm::json_read_int(body, "first_target_index", &parsed_first_target) && parsed_first_target > 0) {
             first_target_index = static_cast<uint32_t>(parsed_first_target);
         }
+    } else if (body_requests_response_only_chat_eval(body)) {
+        if (!tok.loaded) {
+            result.http_status = 503;
+            result.error_code = "tokenizer_unavailable";
+            result.error_message = tok.error.empty() ? "tokenizer.json is not loaded" : tok.error;
+            return result;
+        }
+        if (!encode_chat_response_only_eval(opts, tok, body, &input_ids, &first_target_index)) {
+            result.http_status = 422;
+            result.error_code = "chat_eval_tokenization_failed";
+            result.error_message = "could not tokenize response-only chat eval; send input_ids instead";
+            return result;
+        }
     } else {
-        result.http_status = 400;
-        result.error_code = "input_ids_required";
-        result.error_message = "perplexity requires reference-tokenized input_ids; server text tokenization is not used for PPL";
-        return result;
+        const std::string text = extract_generation_text(opts, body, false);
+        if (text.empty()) {
+            result.http_status = 400;
+            result.error_code = "input_ids_required";
+            result.error_message = "perplexity requires input_ids, messages with final assistant response, or input/prompt text";
+            return result;
+        }
+        if (!tok.loaded) {
+            result.http_status = 503;
+            result.error_code = "tokenizer_unavailable";
+            result.error_message = tok.error.empty() ? "tokenizer.json is not loaded" : tok.error;
+            return result;
+        }
+        if (!tokenizer_encode_greedy(tok, text, &input_ids)) {
+            result.http_status = 422;
+            result.error_code = "tokenization_failed";
+            result.error_message = "tokenizer vocab could not encode PPL request text";
+            return result;
+        }
     }
     int parsed_first_target = 0;
     if (storagellm::json_read_int(body, "first_target_index", &parsed_first_target) &&
