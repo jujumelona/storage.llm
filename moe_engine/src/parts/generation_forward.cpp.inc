@@ -249,7 +249,7 @@ static int moe_forward_one_token_f32(
         position, token_id, c->hidden_size, (double)embedding_scale,
         moe_profile_elapsed_ms(embed_start_us));
     moe_forward_trace_vec("embed", position, 0xffffffffu, hidden, c->hidden_size);
-    if (!moe_prepare_ple_inputs_f32(engine, c, s, token_id)) {
+    if (!moe_prepare_ple_inputs_f32(engine, c, s, token_id, attn_cfg.rms_norm_eps)) {
         moe_generation_set_error(stats, "per-layer input prepare failed");
         return 0;
     }

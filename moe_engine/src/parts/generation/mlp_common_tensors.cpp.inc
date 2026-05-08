@@ -319,7 +319,8 @@ static int moe_prepare_ple_inputs_f32(
     moe_pc_engine* engine,
     const moe_storage_constants_t* c,
     moe_decode_scratch* s,
-    uint32_t token_id
+    uint32_t token_id,
+    float eps
 ) {
     if (!engine || !c || !s) {
         return 0;
@@ -369,7 +370,7 @@ static int moe_prepare_ple_inputs_f32(
         float* slice = s->ple_projected.data() + (size_t)layer * (size_t)ple.layer_dim;
         if (!moe_apply_rmsnorm_common_weight_f32(
                 engine, ple.projection_norm, slice, ple.layer_dim, slice,
-                engine->config.rms_norm_eps > 0.0f ? engine->config.rms_norm_eps : 1.0e-6f)) {
+                eps > 0.0f ? eps : 1.0e-6f)) {
             return 0;
         }
     }
