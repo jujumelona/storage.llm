@@ -230,7 +230,7 @@ int qkv_dequant_one(
     bool use_qjl,
     float* output
 ) {
-    if (!s || !cfg || !norms || !output || token_idx < 0) {
+    if (!s || !cfg || !idx || !norms || !output || token_idx < 0) {
         return 0;
     }
     if (token_idx >= s->n_tokens) {
@@ -250,9 +250,6 @@ int qkv_dequant_one(
             memcpy(output, exact + (size_t)token_idx * (size_t)d, (size_t)d * sizeof(float));
             return 1;
         }
-    }
-    if (!idx) {
-        return 0;
     }
     const bool base_use_qjl = use_qjl && bits > 1;
     const int mse_bits = base_use_qjl ? bits - 1 : bits;
