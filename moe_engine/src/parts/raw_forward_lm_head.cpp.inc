@@ -398,6 +398,19 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     if (!std::isfinite(target_score_precomputed)) {
         return 0;
     }
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+    storagellm_ppl_diag_lm_head_begin(
+        target_token_id,
+        c->vocab_size,
+        c->hidden_size,
+        raw.weight_format,
+        effective_weight_format,
+        raw.scalar_encoding,
+        row_bytes,
+        bytes,
+        logit_softcap,
+        hidden);
+#endif
     moe_profile_log(
         "lm_head_logprob_begin",
         "target=%u vocab=%u hidden=%u fmt=%u eff_fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.6g row_workers=%u chunk_size=%u chunks=%u",
@@ -569,6 +582,19 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     }
     const uint64_t target_rank = greater_than_target + 1ull;
     const double best_gap = (double)best_score - (double)target_score;
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+    storagellm_ppl_diag_lm_head_end(
+        target_token_id,
+        target_score,
+        best_token,
+        best_score,
+        target_rank,
+        best_gap,
+        global_max,
+        logsumexp,
+        logprob,
+        logit_softcap);
+#endif
     moe_profile_log(
         "lm_head_logprob_end",
         "target=%u target_score=%.6g best=%u best_score=%.6g target_rank=%llu best_gap=%.6g global_max=%.6g logsumexp=%.6g logprob=%.6g softcap=%.6g",

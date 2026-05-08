@@ -5,6 +5,9 @@ static void moe_forward_trace_vec(
     const float* values,
     uint32_t count
 ) {
+#ifdef STORAGELLM_PPL_DIAG_ENABLED
+    storagellm_ppl_diag_forward_vec(stage, position, layer, values, count);
+#endif
     if (!moe_profile_enabled() || !values || count == 0) {
         return;
     }

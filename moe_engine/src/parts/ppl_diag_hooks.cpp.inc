@@ -115,6 +115,81 @@ static void storagellm_ppl_diag_print_vec_stats(
         (double)st.first[3]);
 }
 
+static void storagellm_ppl_diag_forward_vec(
+    const char* stage,
+    uint32_t position,
+    uint32_t layer,
+    const float* values,
+    uint32_t count
+) {
+    const int32_t signed_layer =
+        layer == 0xffffffffu ? -1 : static_cast<int32_t>(layer);
+    storagellm_ppl_diag_print_vec_stats(
+        "forward", signed_layer, position, 0, stage ? stage : "unknown", values, count);
+}
+
+static void storagellm_ppl_diag_lm_head_begin(
+    uint32_t target_token_id,
+    uint32_t vocab_size,
+    uint32_t hidden_count,
+    uint8_t weight_format,
+    uint8_t effective_weight_format,
+    uint8_t scalar_encoding,
+    uint64_t row_bytes,
+    uint64_t bytes,
+    float logit_softcap,
+    const float* hidden
+) {
+    if (!storagellm_ppl_diag_verbose_enabled()) {
+        return;
+    }
+    std::fprintf(stderr,
+        "[storagellm ppl_diag] lm_head_begin target=%u vocab=%u hidden=%u "
+        "fmt=%u eff_fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.9g\n",
+        target_token_id,
+        vocab_size,
+        hidden_count,
+        (unsigned)weight_format,
+        (unsigned)effective_weight_format,
+        (unsigned)scalar_encoding,
+        (unsigned long long)row_bytes,
+        (unsigned long long)bytes,
+        (double)logit_softcap);
+    storagellm_ppl_diag_print_vec_stats(
+        "lm_head", -1, 0, target_token_id, "hidden", hidden, hidden_count);
+}
+
+static void storagellm_ppl_diag_lm_head_end(
+    uint32_t target_token_id,
+    float target_score,
+    uint32_t best_token,
+    float best_score,
+    uint64_t target_rank,
+    double best_gap,
+    float global_max,
+    double logsumexp,
+    double logprob,
+    float logit_softcap
+) {
+    if (!storagellm_ppl_diag_verbose_enabled()) {
+        return;
+    }
+    std::fprintf(stderr,
+        "[storagellm ppl_diag] lm_head_end target=%u target_score=%.9g "
+        "best=%u best_score=%.9g target_rank=%llu best_gap=%.9g "
+        "global_max=%.9g logsumexp=%.9g logprob=%.9g softcap=%.9g\n",
+        target_token_id,
+        (double)target_score,
+        best_token,
+        (double)best_score,
+        (unsigned long long)target_rank,
+        best_gap,
+        (double)global_max,
+        logsumexp,
+        logprob,
+        (double)logit_softcap);
+}
+
 static void storagellm_ppl_diag_attention_config(
     const char* tag,
     int32_t layer,
