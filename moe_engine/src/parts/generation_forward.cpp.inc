@@ -186,54 +186,6 @@ struct moe_cuda_graph_cache_t {
     bool is_captured = false;
 };
 
-static int moe_forward_layer_output_scale_full_stream_enabled(const moe_pc_engine* engine) {
-    if (!engine) {
-        return 0;
-    }
-    const uint32_t env = moe_parse_env_u32("STORAGELLM_LAYER_OUTPUT_SCALE_FULL_STREAM");
-    if (env == 1u) {
-        return 1;
-    }
-    if (env > 1u) {
-        return 0;
-    }
-    return
-        moe_engine_graph_ir_mentions(engine, "layer_output_scale_full_stream") ||
-        moe_engine_graph_ir_mentions(engine, "residual_stream_output_scale") ||
-        moe_engine_metadata_mentions(engine, "layer_output_scale_full_stream") ||
-        moe_engine_metadata_mentions(engine, "residual_stream_output_scale");
-}
-
-static int moe_forward_has_layer_output_scale_tensor(const moe_pc_engine* engine, int32_t layer) {
-    return
-        moe_engine_has_common_tensor_suffix(engine, layer, "layer_output_scale.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "output_scale.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "layer_scale.weight");
-}
-
-static int moe_forward_apply_layer_output_scale_f32(
-    moe_pc_engine* engine,
-    int32_t layer,
-    float* hidden,
-    uint32_t hidden_size
-) {
-    if (moe_forward_layer_output_scale_full_stream_enabled(engine)) {
-        return moe_layer_output_scale_f32(engine, layer, hidden, hidden_size);
-    }
-    if (moe_forward_has_layer_output_scale_tensor(engine, layer)) {
-        static std::atomic<uint32_t> logged{0};
-        const uint32_t seen = logged.fetch_add(1, std::memory_order_relaxed);
-        if (seen < 16u) {
-            moe_profile_log(
-                "layer_output_scale_full_stream_skipped",
-                "layer=%d hidden=%u reason=branch_scale_not_residual_stream env=STORAGELLM_LAYER_OUTPUT_SCALE_FULL_STREAM",
-                layer,
-                hidden_size);
-        }
-    }
-    return 1;
-}
-
 static int moe_forward_one_token_f32(
     moe_pc_engine* engine,
     uint32_t token_id,
@@ -260,7 +212,7 @@ static int moe_forward_one_token_f32(
         moe_generation_set_error(stats, "decode scratch allocation failed");
         return 0;
     }
-    moe_kv_cache_track_ram(engine, &s->kv_cache);  // ensure_capacity delta tracking
+    moe_kv_cache_track_ram(engine, &s->kv_cache);
     moe_forward_trace_runtime_resources(engine, s, position, 0xffffffffu, "after_scratch");
     const int allow_forward_lookahead_prefetch = pre_allocate_kv != 0;
     float* hidden = s->hidden.data();
@@ -268,21 +220,11 @@ static int moe_forward_one_token_f32(
     engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
     engine->generation_token.store(position, std::memory_order_relaxed);
 
-    // Fix 4: Reset adaptive prefetch depth for the new token.
-    // Eval/PPL deliberately calls this path with pre_allocate_kv=0.  In that
-    // mode, speculative expert/attention lookahead only pollutes timing and can
-    // issue impossible storage-tier requests, so keep the exact scorer quiet.
     const uint32_t forward_prefetch_depth = allow_forward_lookahead_prefetch ? 2u : 0u;
     engine->adaptive_prefetch_depth.store(forward_prefetch_depth, std::memory_order_relaxed);
-    // BUGFIX Problem F stage 2: Reset per-session depth too ★★★
     s->session_adaptive_prefetch_depth = forward_prefetch_depth;
     s->session_router_entropy_milli = 0u;
 
-    // Fix 10: Safely resize co_activation structures here (single-threaded forward loop)
-    // BUGFIX 499: num_hidden_layers 범위 체크
-    // BUGFIX 597: Check position == 0 before resize ★
-    // Problem: Resize happens every token, causing memory allocation overhead
-    // Solution: Only resize on first token (position == 0)
     if (position == 0 && c->num_hidden_layers > 0 &&
         c->num_hidden_layers < 10000 &&
         engine->co_activation_stats.size() < c->num_hidden_layers) {
@@ -294,7 +236,6 @@ static int moe_forward_one_token_f32(
         moe_generation_set_error(stats, "failed to read token embedding");
         return 0;
     }
-    // moe_pc_engine_embed_token_f32 returns an already scaled embedding row.
     const float embedding_scale = moe_embedding_scale_value(engine, c->hidden_size);
     moe_profile_log(
         "forward_embed",
@@ -309,9 +250,6 @@ static int moe_forward_one_token_f32(
 
     for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
         const uint64_t layer_start_us = moe_profile_now_us();
-        // Pipeline Fix 2: Removed layer+2 lookahead to eliminate duplicate attention prefetch
-        // layer+2 prefetch here + layer+1 prefetch after attention = same layer queued twice.
-        // layer+1 prefetch alone provides sufficient DMA overlap during MLP compute.
         engine->generation_layer.store(layer, std::memory_order_relaxed);
         engine->generation_phase.store(moe_GEN_PHASE_ATTENTION, std::memory_order_relaxed);
         const int split_post_norm_block =
@@ -377,8 +315,7 @@ static int moe_forward_one_token_f32(
             moe_forward_trace_vec("after_attention", position, layer, hidden, c->hidden_size);
             const double attention_ms = moe_profile_elapsed_ms(attn_start_us);
             const int is_moe = moe_layer_is_moe_runtime(engine, c, (int32_t)layer);
-            if (allow_forward_lookahead_prefetch &&
-                layer + 1u < c->num_hidden_layers &&
+            if (allow_forward_lookahead_prefetch && layer + 1u < c->num_hidden_layers &&
                 moe_can_enqueue_attention_lookahead(engine, (int32_t)(layer + 1u))) {
                 moe_enqueue_attention_prefetch(engine, (int32_t)(layer + 1u));
             }
@@ -410,7 +347,7 @@ static int moe_forward_one_token_f32(
                 return 0;
             }
             moe_forward_trace_vec("after_ple", position, layer, hidden, c->hidden_size);
-            if (!moe_forward_apply_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
+            if (!moe_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
                 moe_generation_set_error(stats, "layer output scale failed");
                 return 0;
             }
@@ -437,17 +374,11 @@ static int moe_forward_one_token_f32(
         const double attention_ms = moe_profile_elapsed_ms(attn_start_us);
         const int is_moe = moe_layer_is_moe_runtime(engine, c, (int32_t)layer);
 
-        // Next-layer attention VRAM prefetch: enqueue layer+1 attention spans
-        // so DMA overlaps with current layer's MLP compute.
-        // Pipeline Fix 4: Add VRAM budget check to prevent evicting expert prefetch
-        if (allow_forward_lookahead_prefetch &&
-            layer + 1u < c->num_hidden_layers &&
+        if (allow_forward_lookahead_prefetch && layer + 1u < c->num_hidden_layers &&
             moe_can_enqueue_attention_lookahead(engine, (int32_t)(layer + 1u))) {
             moe_enqueue_attention_prefetch(engine, (int32_t)(layer + 1u));
         }
 
-        // Save hidden state snapshot for FATE predictor (gate input)
-        // Note: s->norm holds the post-attention rmsnorm output which is the input to the gate
         save_gate_input_snapshot(engine, layer, s->norm.data(), c->hidden_size);
 
         engine->generation_phase.store(moe_GEN_PHASE_MLP, std::memory_order_relaxed);
@@ -467,13 +398,7 @@ static int moe_forward_one_token_f32(
             return 0;
         }
         moe_forward_trace_vec("after_ple", position, layer, hidden, c->hidden_size);
-        // Gemma-family layer_output_scale tensors are branch scales in the graph
-        // contract, not a multiplier for the whole residual stream.  Scaling the
-        // full stream collapses the hidden direction toward the just-forwarded
-        // token embedding when lm_head is tied, producing current-token copy bias.
-        // Keep a full-stream escape hatch for legacy artifacts via
-        // STORAGELLM_LAYER_OUTPUT_SCALE_FULL_STREAM=1.
-        if (!moe_forward_apply_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
+        if (!moe_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
             moe_generation_set_error(stats, "layer output scale failed");
             return 0;
         }
