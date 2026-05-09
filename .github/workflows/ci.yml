@@ -50,9 +50,10 @@ jobs:
           set -euo pipefail
           ninja -C build -t targets all | sed 's/:.*//' | sort -u > build/targets.txt
           echo "Available focused-related targets:"
-          grep -E '^(test_json_parser|test_loader_manifest_examples|test_weight_contract_examples|test_ppl_math_contract_examples|test_ppl_diag_contract_examples|test_qkv_contract_examples|test_qkv_parity)$' build/targets.txt || true
+          grep -E '^(test_bug_fixes|test_json_parser|test_loader_manifest_examples|test_weight_contract_examples|test_ppl_math_contract_examples|test_ppl_diag_contract_examples|test_qkv_contract_examples|test_qkv_parity)$' build/targets.txt || true
 
           candidates=(
+            test_bug_fixes
             test_json_parser
             test_loader_manifest_examples
             test_weight_contract_examples
@@ -80,7 +81,7 @@ jobs:
       - name: Run available focused module tests
         run: >
           ctest --test-dir build --output-on-failure --timeout 120
-          -R '^(JSONParser|test_loader_manifest_examples|test_weight_contract_examples|test_ppl_math_contract_examples|test_ppl_diag_contract_examples|test_qkv_contract_examples|QKVParity)$'
+          -R '^(BugFixes|JSONParser|test_loader_manifest_examples|test_weight_contract_examples|test_ppl_math_contract_examples|test_ppl_diag_contract_examples|test_qkv_contract_examples|QKVParity)$'
 
       - name: Upload test logs on failure
         if: failure()
@@ -126,6 +127,7 @@ jobs:
           ## What this verifies
 
           - CMake configure with optional hardware backends disabled.
+          - Engine-linked bug fix tests that compile and link storagellm_engine.
           - Available focused tests among JSON, loader, weight, PPL, and QKV contracts.
           - Missing optional test targets are skipped only after checking Ninja's real target graph.
 
