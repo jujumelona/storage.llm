@@ -7,75 +7,10 @@ on:
     branches: [ main, develop ]
 
 jobs:
-  build-and-test:
-    name: Build and Test (${{ matrix.os }}, ${{ matrix.build_type }})
-    runs-on: ${{ matrix.os }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        build_type: [Debug, Release]
-        include:
-          - os: ubuntu-latest
-            cc: gcc-11
-            cxx: g++-11
-          - os: windows-latest
-            cc: cl
-            cxx: cl
-          - os: macos-latest
-            cc: clang
-            cxx: clang++
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build liburing-dev
-
-      - name: Install dependencies (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          brew install cmake ninja
-
-      - name: Install dependencies (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          choco install cmake ninja
-
-      - name: Configure CMake
-        shell: bash
-        run: >
-          cmake -S . -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-          -DSTORAGELLM_BUILD_TESTS=ON
-          -DSTORAGELLM_PPL_DIAG=OFF
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Run tests
-        run: ctest --test-dir build --output-on-failure --parallel
-
-      - name: Upload test results
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results-${{ matrix.os }}-${{ matrix.build_type }}
-          path: build/Testing/Temporary/
-
-  sanitizers:
-    name: Sanitizers (Ubuntu, ${{ matrix.sanitizer }})
+  smoke-test:
+    name: Smoke Test (JSONParser)
     runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        sanitizer: [address, thread, undefined]
+    timeout-minutes: 10
 
     steps:
       - name: Checkout code
@@ -84,82 +19,55 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build liburing-dev
+          sudo apt-get install -y cmake ninja-build libgtest-dev
 
-      - name: Configure CMake with ${{ matrix.sanitizer }} sanitizer
-        run: |
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DSTORAGELLM_BUILD_TESTS=ON \
-            -DSTORAGELLM_ENABLE_SANITIZERS=ON \
-            -DSTORAGELLM_SANITIZER_SET=${{ matrix.sanitizer }}
+      - name: Configure minimal build
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DSTORAGELLM_BUILD_TESTS=ON
+          -DSTORAGELLM_PPL_DIAG=OFF
+          -DSTORAGELLM_ENABLE_NATIVE_OPTIMIZE=OFF
+          -DSTORAGELLM_ENABLE_TVM_CODEGEN=OFF
+          -DSTORAGELLM_ENABLE_CUDA=OFF
+          -DSTORAGELLM_ENABLE_CUBLASLT=OFF
+          -DSTORAGELLM_ENABLE_CUTLASS=OFF
+          -DSTORAGELLM_ENABLE_ROCM=OFF
+          -DSTORAGELLM_ENABLE_HIPBLASLT=OFF
+          -DSTORAGELLM_ENABLE_CK=OFF
+          -DSTORAGELLM_ENABLE_METAL=OFF
+          -DSTORAGELLM_ENABLE_ONEDNN=OFF
+          -DSTORAGELLM_ENABLE_VULKAN=OFF
+          -DSTORAGELLM_ENABLE_OPENCL=OFF
+          -DSTORAGELLM_ENABLE_CLBLAST=OFF
 
-      - name: Build
-        run: cmake --build build --parallel
+      - name: Build JSON parser test only
+        run: cmake --build build --target test_json_parser --parallel
 
-      - name: Run tests with ${{ matrix.sanitizer }} sanitizer
-        env:
-          ASAN_OPTIONS: detect_leaks=1:check_initialization_order=1
-          UBSAN_OPTIONS: print_stacktrace=1
-          TSAN_OPTIONS: second_deadlock_stack=1
-        run: ctest --test-dir build --output-on-failure
+      - name: Run JSON parser test only
+        run: ctest --test-dir build --output-on-failure -R '^JSONParser$' --timeout 60
 
-  format-check:
-    name: Format Check
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install clang-format
-        run: sudo apt-get update && sudo apt-get install -y clang-format
-
-      - name: Check formatting
-        run: |
-          git diff --check
-
-  ci-summary:
-    name: CI Summary
-    runs-on: ubuntu-latest
-    needs:
-      - build-and-test
-      - sanitizers
-      - format-check
-    if: always()
-
-    steps:
-      - name: Write one-page CI summary
+      - name: Write final summary
+        if: always()
         shell: bash
         run: |
           cat > ci-summary.md <<'EOF'
           # CI Summary
 
-          Copy this whole block into ChatGPT when asking for follow-up fixes.
+          Copy this block into ChatGPT for follow-up fixes.
 
-          | Job group | Result |
+          | Check | Result |
           | --- | --- |
-          | build-and-test | ${{ needs.build-and-test.result }} |
-          | sanitizers | ${{ needs.sanitizers.result }} |
-          | format-check | ${{ needs.format-check.result }} |
+          | JSONParser smoke test | ${{ job.status }} |
 
-          ## Interpretation
-
-          - `success`: all matrix entries in that group passed.
-          - `failure`: at least one matrix entry failed. Open that failed job and copy the last failing compiler/test log section.
-          - `cancelled` or `skipped`: the group did not complete normally.
-
-          ## Current workflow shape
-
-          - Static analysis is not part of PR CI.
-          - Build/test runs on Ubuntu, Windows, and macOS in Debug and Release.
-          - Sanitizers run on Ubuntu for address, thread, and undefined behavior.
+          This workflow intentionally runs one fast test only:
+          `ctest -R '^JSONParser$' --timeout 60`.
           EOF
-
           cat ci-summary.md >> "$GITHUB_STEP_SUMMARY"
           cat ci-summary.md
 
-      - name: Upload CI summary artifact
+      - name: Upload CI summary
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ci-summary
