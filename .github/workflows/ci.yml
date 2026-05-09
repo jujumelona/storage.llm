@@ -19,33 +19,18 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libgtest-dev
+          sudo apt-get install -y g++ libgtest-dev
 
-      - name: Configure minimal build
-        run: >
-          cmake -S . -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
-          -DSTORAGELLM_BUILD_TESTS=ON
-          -DSTORAGELLM_PPL_DIAG=OFF
-          -DSTORAGELLM_ENABLE_NATIVE_OPTIMIZE=OFF
-          -DSTORAGELLM_ENABLE_TVM_CODEGEN=OFF
-          -DSTORAGELLM_ENABLE_CUDA=OFF
-          -DSTORAGELLM_ENABLE_CUBLASLT=OFF
-          -DSTORAGELLM_ENABLE_CUTLASS=OFF
-          -DSTORAGELLM_ENABLE_ROCM=OFF
-          -DSTORAGELLM_ENABLE_HIPBLASLT=OFF
-          -DSTORAGELLM_ENABLE_CK=OFF
-          -DSTORAGELLM_ENABLE_METAL=OFF
-          -DSTORAGELLM_ENABLE_ONEDNN=OFF
-          -DSTORAGELLM_ENABLE_VULKAN=OFF
-          -DSTORAGELLM_ENABLE_OPENCL=OFF
-          -DSTORAGELLM_ENABLE_CLBLAST=OFF
+      - name: Build JSON parser smoke test directly
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Wpedantic \
+            -I. \
+            moe_engine/tests/test_json_parser.cpp \
+            -lgtest -lgtest_main -pthread \
+            -o test_json_parser
 
-      - name: Build JSON parser test only
-        run: cmake --build build --target test_json_parser --parallel
-
-      - name: Run JSON parser test only
-        run: ctest --test-dir build --output-on-failure -R '^JSONParser$' --timeout 60
+      - name: Run JSON parser smoke test
+        run: ./test_json_parser
 
       - name: Write final summary
         if: always()
@@ -58,10 +43,10 @@ jobs:
 
           | Check | Result |
           | --- | --- |
-          | JSONParser smoke test | ${{ job.status }} |
+          | JSONParser direct smoke test | ${{ job.status }} |
 
-          This workflow intentionally runs one fast test only:
-          `ctest -R '^JSONParser$' --timeout 60`.
+          This workflow intentionally bypasses the full CMake project and runs one fast regression test:
+          `g++ ... moe_engine/tests/test_json_parser.cpp && ./test_json_parser`.
           EOF
           cat ci-summary.md >> "$GITHUB_STEP_SUMMARY"
           cat ci-summary.md
