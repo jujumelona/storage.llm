@@ -2,9 +2,16 @@
 // Tests for Bug #7-13 fixes
 
 #include <gtest/gtest.h>
+
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
 #include <thread>
 #include <vector>
+
 #include "../include/moe_pc_engine.h"
 
 // Mock functions for testing
