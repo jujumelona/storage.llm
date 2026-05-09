@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.24)
-project(storagellm LANGUAGES CXX)
+if(APPLE)
+    project(storagellm LANGUAGES CXX OBJCXX)
+else()
+    project(storagellm LANGUAGES CXX)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -97,7 +101,7 @@ add_library(storagellm_mmap STATIC
 )
 
 # Main MOE engine library
-add_library(storagellm_engine STATIC
+set(STORAGELLM_ENGINE_SOURCES
     moe_engine/src/moe_pc_engine.cpp
     moe_engine/src/hardcode_constants.cpp
     moe_engine/src/hardcode_layers.cpp
@@ -109,6 +113,10 @@ add_library(storagellm_engine STATIC
     moe_engine/native/scale4.cpp
     moe_engine/src/tools/storage_f8.cpp
 )
+if(APPLE)
+    list(APPEND STORAGELLM_ENGINE_SOURCES moe_engine/src/parts/metal_adapter.mm)
+endif()
+add_library(storagellm_engine STATIC ${STORAGELLM_ENGINE_SOURCES})
 
 target_link_libraries(storagellm_engine
     PRIVATE storagellm_loader
@@ -191,7 +199,7 @@ elseif(UNIX AND NOT APPLE)
         target_compile_definitions(storagellm_engine PRIVATE MOE_HAVE_LIBURING=1)
     endif()
 elseif(APPLE)
-    target_link_libraries(storagellm_engine PRIVATE pthread)
+    target_link_libraries(storagellm_engine PRIVATE pthread "-framework Metal" "-framework Foundation")
 endif()
 
 
