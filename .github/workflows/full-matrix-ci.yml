@@ -1,0 +1,129 @@
+name: Full Matrix CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ main, develop ]
+
+permissions:
+  contents: read
+
+jobs:
+  cmake-build-test:
+    name: ${{ matrix.os }} / ${{ matrix.build_type }} / ppl=${{ matrix.ppl_diag }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        build_type: [Debug, Release]
+        ppl_diag: [OFF, ON]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies on Ubuntu
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ libgtest-dev
+
+      - name: Install dependencies on macOS
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install cmake ninja googletest
+
+      - name: Install dependencies on Windows
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install cmake ninja -y
+
+      - name: Configure CMake
+        shell: bash
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DSTORAGELLM_BUILD_TESTS=ON
+          -DSTORAGELLM_PPL_DIAG=${{ matrix.ppl_diag }}
+          -DSTORAGELLM_ENABLE_NATIVE_OPTIMIZE=OFF
+          -DSTORAGELLM_ENABLE_TVM_CODEGEN=OFF
+          -DSTORAGELLM_ENABLE_CUDA=OFF
+          -DSTORAGELLM_ENABLE_CUBLASLT=OFF
+          -DSTORAGELLM_ENABLE_CUTLASS=OFF
+          -DSTORAGELLM_ENABLE_ROCM=OFF
+          -DSTORAGELLM_ENABLE_HIPBLASLT=OFF
+          -DSTORAGELLM_ENABLE_CK=OFF
+          -DSTORAGELLM_ENABLE_METAL=OFF
+          -DSTORAGELLM_ENABLE_ONEDNN=OFF
+          -DSTORAGELLM_ENABLE_VULKAN=OFF
+          -DSTORAGELLM_ENABLE_OPENCL=OFF
+          -DSTORAGELLM_ENABLE_CLBLAST=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run CTest
+        run: ctest --test-dir build --output-on-failure --parallel 2
+
+      - name: Upload CTest logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-logs-${{ matrix.os }}-${{ matrix.build_type }}-ppl-${{ matrix.ppl_diag }}
+          path: build/Testing/Temporary/
+
+  sanitizer-smoke:
+    name: Ubuntu sanitizer / ${{ matrix.sanitizer }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, undefined]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ libgtest-dev
+
+      - name: Configure sanitizer build
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DSTORAGELLM_BUILD_TESTS=ON
+          -DSTORAGELLM_PPL_DIAG=OFF
+          -DSTORAGELLM_ENABLE_SANITIZERS=ON
+          -DSTORAGELLM_SANITIZER_SET=${{ matrix.sanitizer }}
+          -DSTORAGELLM_ENABLE_NATIVE_OPTIMIZE=OFF
+          -DSTORAGELLM_ENABLE_TVM_CODEGEN=OFF
+          -DSTORAGELLM_ENABLE_CUDA=OFF
+          -DSTORAGELLM_ENABLE_CUBLASLT=OFF
+          -DSTORAGELLM_ENABLE_CUTLASS=OFF
+          -DSTORAGELLM_ENABLE_ROCM=OFF
+          -DSTORAGELLM_ENABLE_HIPBLASLT=OFF
+          -DSTORAGELLM_ENABLE_CK=OFF
+          -DSTORAGELLM_ENABLE_METAL=OFF
+          -DSTORAGELLM_ENABLE_ONEDNN=OFF
+          -DSTORAGELLM_ENABLE_VULKAN=OFF
+          -DSTORAGELLM_ENABLE_OPENCL=OFF
+          -DSTORAGELLM_ENABLE_CLBLAST=OFF
+
+      - name: Build sanitizer target
+        run: cmake --build build --parallel
+
+      - name: Run sanitizer tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:check_initialization_order=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure --parallel 2
