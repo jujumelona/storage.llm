@@ -15,7 +15,9 @@ __pycache__/
 *.backup
 
 # Local conversion notebooks/scripts do not belong in this runtime repo.
-/tools/
+/tools/*
+!/tools/autotune/
+!/tools/autotune/**
 /glm51_runtime_colab/
 /colab/
 *.ipynb

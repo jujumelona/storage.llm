@@ -48,11 +48,12 @@ jobs:
           choco install cmake ninja
 
       - name: Configure CMake
-        run: |
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DSTORAGELLM_BUILD_TESTS=ON \
-            -DSTORAGELLM_PPL_DIAG=OFF
+        shell: bash
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DSTORAGELLM_BUILD_TESTS=ON
+          -DSTORAGELLM_PPL_DIAG=OFF
 
       - name: Build
         run: cmake --build build --parallel
@@ -151,7 +152,4 @@ jobs:
 
       - name: Check formatting
         run: |
-          find . -name '*.cpp' -o -name '*.h' -o -name '*.inc' | \
-            grep -v 'build/' | \
-            xargs clang-format --dry-run --Werror || \
-            (echo "Code formatting issues found. Run: clang-format -i \$(find . -name '*.cpp' -o -name '*.h' -o -name '*.inc')" && exit 1)
+          git diff --check
