@@ -2,7 +2,14 @@
 // Tests for Bug #7-13 fixes
 
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include "../include/moe_pc_engine.h"
@@ -12,6 +19,30 @@ extern "C" {
     uint64_t tier_budget(void* engine, int tier);
     uint64_t tier_used(void* engine, int tier);
 }
+
+namespace {
+
+float virtual_fp4_weight_at(uint32_t row, uint32_t col, uint32_t projection_seed) {
+    const uint32_t code = (row * 131u + col * 17u + projection_seed * 7u) & 0x0Fu;
+    const int signed_code = static_cast<int>(code) - 8;
+    return static_cast<float>(signed_code) / 8.0f;
+}
+
+float virtual_projection_prefix_dot(
+    const moe_projection_shape_spec_t* shape,
+    uint32_t row,
+    uint32_t projection_seed
+) {
+    const uint32_t cols = std::min<uint32_t>(shape->cols, 32u);
+    double acc = 0.0;
+    for (uint32_t col = 0; col < cols; ++col) {
+        const float activation = (static_cast<float>(col % 5u) - 2.0f) * 0.25f;
+        acc += static_cast<double>(virtual_fp4_weight_at(row, col, projection_seed)) * activation;
+    }
+    return static_cast<float>(acc);
+}
+
+}  // namespace
 
 // ============================================================================
 // Bug #7: RAM Budget Calculation Test
@@ -252,6 +283,86 @@ TEST(BugFix, Bug13_IntelArcDetection) {
 
     is_integrated = (iris_props.flags & 1u) != 0;
     EXPECT_TRUE(is_integrated);  // Iris Xe should be integrated
+}
+
+// ============================================================================
+// Module contract tests: model shape + virtual weights
+// ============================================================================
+TEST(ModuleContract, ModelShapeMatchesStorageConstants) {
+    const moe_storage_constants_t* constants = moe_storage_constants();
+    ASSERT_NE(constants, nullptr);
+
+    const moe_model_shape_t shape = moe_pc_Moe1_model_shape();
+    EXPECT_EQ(shape.num_hidden_layers, constants->num_hidden_layers);
+    EXPECT_EQ(shape.first_moe_layer, constants->first_moe_layer);
+    EXPECT_EQ(shape.last_moe_layer, constants->last_moe_layer);
+    EXPECT_EQ(shape.experts_per_moe_layer, constants->experts_per_moe_layer);
+    EXPECT_EQ(shape.hidden_size, constants->hidden_size);
+    EXPECT_EQ(shape.expert_intermediate_size, constants->expert_intermediate_size);
+    EXPECT_EQ(shape.vocab_size, constants->vocab_size);
+    EXPECT_EQ(shape.projection_count, constants->expert_projection_count);
+
+    ASSERT_LE(shape.first_moe_layer, shape.last_moe_layer);
+    ASSERT_LT(shape.last_moe_layer, shape.num_hidden_layers);
+    const uint64_t moe_layer_count =
+        static_cast<uint64_t>(shape.last_moe_layer - shape.first_moe_layer + 1u);
+    EXPECT_EQ(constants->total_expert_count,
+              moe_layer_count * static_cast<uint64_t>(shape.experts_per_moe_layer));
+    EXPECT_EQ(shape.projection_count, 3u);
+}
+
+TEST(ModuleContract, ProjectionShapesCoverGateUpDownContracts) {
+    const moe_model_shape_t shape = moe_pc_Moe1_model_shape();
+
+    const moe_projection_shape_spec_t* gate = moe_storage_projection_shape(moe_PROJ_GATE);
+    const moe_projection_shape_spec_t* up = moe_storage_projection_shape(moe_PROJ_UP);
+    const moe_projection_shape_spec_t* down = moe_storage_projection_shape(moe_PROJ_DOWN);
+    ASSERT_NE(gate, nullptr);
+    ASSERT_NE(up, nullptr);
+    ASSERT_NE(down, nullptr);
+
+    EXPECT_EQ(gate->rows, shape.expert_intermediate_size);
+    EXPECT_EQ(gate->cols, shape.hidden_size);
+    EXPECT_EQ(up->rows, shape.expert_intermediate_size);
+    EXPECT_EQ(up->cols, shape.hidden_size);
+    EXPECT_EQ(down->rows, shape.hidden_size);
+    EXPECT_EQ(down->cols, shape.expert_intermediate_size);
+
+    for (const moe_projection_shape_spec_t* spec : {gate, up, down}) {
+        EXPECT_GT(spec->rows, 0u);
+        EXPECT_GT(spec->cols, 0u);
+        EXPECT_GT(spec->group_size, 0u);
+        EXPECT_EQ(spec->scale_groups * spec->group_size, spec->cols)
+            << "scale groups must exactly cover the projection input width";
+    }
+
+    EXPECT_EQ(moe_storage_projection_shape(static_cast<moe_projection_t>(-1)), nullptr);
+    EXPECT_EQ(moe_storage_projection_shape(static_cast<moe_projection_t>(3)), nullptr);
+}
+
+TEST(ModuleContract, VirtualWeightDotsStayFiniteAcrossProjectionShapes) {
+    const std::array<moe_projection_t, 3> projections = {
+        moe_PROJ_GATE,
+        moe_PROJ_UP,
+        moe_PROJ_DOWN,
+    };
+
+    for (size_t i = 0; i < projections.size(); ++i) {
+        const moe_projection_shape_spec_t* spec = moe_storage_projection_shape(projections[i]);
+        ASSERT_NE(spec, nullptr);
+
+        const std::array<uint32_t, 3> sampled_rows = {
+            0u,
+            spec->rows / 2u,
+            spec->rows - 1u,
+        };
+        for (uint32_t row : sampled_rows) {
+            SCOPED_TRACE(::testing::Message() << "projection=" << i << " row=" << row);
+            const float dot = virtual_projection_prefix_dot(spec, row, static_cast<uint32_t>(i + 1u));
+            EXPECT_TRUE(std::isfinite(dot));
+            EXPECT_LT(std::fabs(dot), 32.0f);
+        }
+    }
 }
 
 // ============================================================================
