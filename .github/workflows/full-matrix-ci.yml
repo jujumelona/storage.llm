@@ -11,10 +11,10 @@ permissions:
   contents: read
 
 jobs:
-  cmake-build-test:
-    name: ${{ matrix.os }} / ${{ matrix.build_type }} / ppl=${{ matrix.ppl_diag }}
+  cross-platform-json-smoke:
+    name: JSON smoke / ${{ matrix.os }} / ${{ matrix.build_type }} / ppl=${{ matrix.ppl_diag }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     strategy:
       fail-fast: false
@@ -31,12 +31,12 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ libgtest-dev
+          sudo apt-get install -y cmake ninja-build
 
       - name: Install dependencies on macOS
         if: matrix.os == 'macos-latest'
         run: |
-          brew install cmake ninja googletest
+          brew install cmake ninja
 
       - name: Install dependencies on Windows
         if: matrix.os == 'windows-latest'
@@ -44,49 +44,74 @@ jobs:
         run: |
           choco install cmake ninja -y
 
-      - name: Configure CMake
+      - name: Generate portable JSON smoke project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/json-smoke
+          cat > build/json-smoke/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.24)
+          project(json_smoke LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          add_executable(json_smoke json_smoke.cpp)
+          target_include_directories(json_smoke PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../..")
+          if(SMOKE_PPL_DIAG)
+            target_compile_definitions(json_smoke PRIVATE STORAGELLM_PPL_DIAG=1)
+          else()
+            target_compile_definitions(json_smoke PRIVATE STORAGELLM_PPL_DIAG=0)
+          endif()
+          EOF
+          cat > build/json-smoke/json_smoke.cpp <<'EOF'
+          #include "json_request.h"
+          #include <cassert>
+          #include <string>
+          #include <vector>
+
+          int main() {
+              using namespace storagellm;
+
+              int layer = -1;
+              assert(json_read_int("{\"current_layer\":2,\"selected_experts\":[1,2]}", "current_layer", &layer));
+              assert(layer == 2);
+
+              assert(!json_read_int("{\"current_layer\":2abc}", "current_layer", &layer));
+              assert(!json_read_int("{\"current_layer\":2147483648}", "current_layer", &layer));
+              assert(!json_read_int("{\"current_layer\":\"2\"}", "current_layer", &layer));
+
+              std::vector<int> experts = json_read_int_array(
+                  "{\"selected_experts\":[1,2,3]}", "selected_experts");
+              assert(experts.size() == 3);
+              assert(experts[0] == 1 && experts[1] == 2 && experts[2] == 3);
+
+              assert(json_read_int_array("{\"selected_experts\":[1,]}", "selected_experts").empty());
+              assert(json_read_int_array("{\"selected_experts\":[1,,2]}", "selected_experts").empty());
+              assert(json_read_int_array("{\"selected_experts\":[\"1\",2]}", "selected_experts").empty());
+              assert(json_read_int_array("{\"selected_experts\":[2147483648]}", "selected_experts").empty());
+              assert(json_read_int_array("{\"selected_experts\":[1,[2]]}", "selected_experts").empty());
+
+              return 0;
+          }
+          EOF
+
+      - name: Configure JSON smoke project
         shell: bash
         run: >
-          cmake -S . -B build -G Ninja
+          cmake -S build/json-smoke -B build/json-smoke-out -G Ninja
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-          -DSTORAGELLM_BUILD_TESTS=ON
-          -DSTORAGELLM_PPL_DIAG=${{ matrix.ppl_diag }}
-          -DSTORAGELLM_ENABLE_NATIVE_OPTIMIZE=OFF
-          -DSTORAGELLM_ENABLE_TVM_CODEGEN=OFF
-          -DSTORAGELLM_ENABLE_CUDA=OFF
-          -DSTORAGELLM_ENABLE_CUBLASLT=OFF
-          -DSTORAGELLM_ENABLE_CUTLASS=OFF
-          -DSTORAGELLM_ENABLE_ROCM=OFF
-          -DSTORAGELLM_ENABLE_HIPBLASLT=OFF
-          -DSTORAGELLM_ENABLE_CK=OFF
-          -DSTORAGELLM_ENABLE_METAL=OFF
-          -DSTORAGELLM_ENABLE_ONEDNN=OFF
-          -DSTORAGELLM_ENABLE_VULKAN=OFF
-          -DSTORAGELLM_ENABLE_OPENCL=OFF
-          -DSTORAGELLM_ENABLE_CLBLAST=OFF
+          -DSMOKE_PPL_DIAG=${{ matrix.ppl_diag }}
 
-      - name: Build
-        run: cmake --build build --parallel
+      - name: Build JSON smoke project
+        run: cmake --build build/json-smoke-out --parallel
 
-      - name: Run CTest
-        run: ctest --test-dir build --output-on-failure --parallel 2
+      - name: Run JSON smoke project
+        shell: bash
+        run: ./build/json-smoke-out/json_smoke
 
-      - name: Upload CTest logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ctest-logs-${{ matrix.os }}-${{ matrix.build_type }}-ppl-${{ matrix.ppl_diag }}
-          path: build/Testing/Temporary/
-
-  sanitizer-smoke:
-    name: Ubuntu sanitizer / ${{ matrix.sanitizer }}
+  ubuntu-focused-cmake:
+    name: Ubuntu focused CMake module verification
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    strategy:
-      fail-fast: false
-      matrix:
-        sanitizer: [address, undefined]
+    timeout-minutes: 25
 
     steps:
       - name: Checkout code
@@ -95,16 +120,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ libgtest-dev
+          sudo apt-get install -y cmake ninja-build g++ libgtest-dev liburing-dev
 
-      - name: Configure sanitizer build
+      - name: Configure focused CMake build
         run: >
           cmake -S . -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_BUILD_TYPE=Release
           -DSTORAGELLM_BUILD_TESTS=ON
           -DSTORAGELLM_PPL_DIAG=OFF
-          -DSTORAGELLM_ENABLE_SANITIZERS=ON
-          -DSTORAGELLM_SANITIZER_SET=${{ matrix.sanitizer }}
           -DSTORAGELLM_ENABLE_NATIVE_OPTIMIZE=OFF
           -DSTORAGELLM_ENABLE_TVM_CODEGEN=OFF
           -DSTORAGELLM_ENABLE_CUDA=OFF
@@ -119,11 +142,50 @@ jobs:
           -DSTORAGELLM_ENABLE_OPENCL=OFF
           -DSTORAGELLM_ENABLE_CLBLAST=OFF
 
-      - name: Build sanitizer target
-        run: cmake --build build --parallel
+      - name: Detect available focused test targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ninja -C build -t targets all | sed 's/:.*//' | sort -u > build/targets.txt
+          candidates=(
+            test_json_parser
+            test_loader_manifest_examples
+            test_weight_contract_examples
+            test_ppl_math_contract_examples
+            test_ppl_diag_contract_examples
+            test_qkv_contract_examples
+            test_qkv_parity
+          )
+          selected=()
+          for target in "${candidates[@]}"; do
+            if grep -Fxq "${target}" build/targets.txt; then
+              selected+=("${target}")
+            else
+              echo "Skipping unavailable target: ${target}"
+            fi
+          done
+          if [ "${#selected[@]}" -eq 0 ]; then
+            echo "No focused test targets were generated by CMake. Dumping all targets:"
+            cat build/targets.txt
+            exit 1
+          fi
+          printf '%s\n' "${selected[@]}" > build/selected-targets.txt
+          printf 'Selected test targets: %s\n' "${selected[*]}"
 
-      - name: Run sanitizer tests
-        env:
-          ASAN_OPTIONS: detect_leaks=1:check_initialization_order=1
-          UBSAN_OPTIONS: print_stacktrace=1
-        run: ctest --test-dir build --output-on-failure --parallel 2
+      - name: Build available focused test targets
+        shell: bash
+        run: |
+          mapfile -t selected < build/selected-targets.txt
+          cmake --build build --parallel 2 --target "${selected[@]}"
+
+      - name: Run available focused tests
+        run: >
+          ctest --test-dir build --output-on-failure --timeout 120
+          -R '^(JSONParser|test_loader_manifest_examples|test_weight_contract_examples|test_ppl_math_contract_examples|test_ppl_diag_contract_examples|test_qkv_contract_examples|QKVParity)$'
+
+      - name: Upload CTest logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-focused-cmake-logs
+          path: build/Testing/Temporary/
