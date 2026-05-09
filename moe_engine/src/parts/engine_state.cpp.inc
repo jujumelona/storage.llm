@@ -70,6 +70,7 @@ struct moe_pc_engine {
     void* model_lib_prefill_activation_release_f32 = nullptr;
     void* model_lib_gpu_expert_scratch_wait_ns = nullptr;
     void* model_lib_gpu_expert_scratch_backpressure_count = nullptr;
+    void* model_lib_fast_backend_mask = nullptr;
     const void* model_lib_l0_mmap_checksum_spv = nullptr;
     uint32_t model_lib_l0_mmap_checksum_spv_size = 0;
     const char* model_lib_l0_mmap_checksum_kernel_name = nullptr;

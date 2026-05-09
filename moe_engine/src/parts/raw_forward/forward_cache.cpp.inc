@@ -1,51 +1,3 @@
-        return moe_dot_gguf_q3_k_row(row_ptr, hidden, hidden_count);
-    }
-    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_K) {
-        return moe_dot_gguf_q4_k_row(row_ptr, hidden, hidden_count);
-    }
-    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
-        return moe_dot_gguf_q5_k_row(row_ptr, hidden, hidden_count);
-    }
-    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q6_K) {
-        return moe_dot_gguf_q6_k_row(row_ptr, hidden, hidden_count);
-    }
-    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS) {
-        return moe_dot_gguf_iq2_xxs_row(row_ptr, hidden, hidden_count);
-    }
-    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XS) {
-        return moe_dot_gguf_iq2_xs_row(row_ptr, hidden, hidden_count);
-    }
-    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_S) {
-        return moe_dot_gguf_iq2_s_row(row_ptr, hidden, hidden_count);
-    }
-    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS) {
-        return moe_dot_gguf_iq3_xxs_row(row_ptr, hidden, hidden_count);
-    }
-    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_S) {
-        return moe_dot_gguf_iq3_s_row(row_ptr, hidden, hidden_count);
-    }
-    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_NL) {
-        return moe_dot_gguf_iq4_nl_row(row_ptr, hidden, hidden_count);
-    }
-    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_XS) {
-        return moe_dot_gguf_iq4_xs_row(row_ptr, hidden, hidden_count);
-    }
-    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_S) {
-        return moe_dot_gguf_iq1_s_row(row_ptr, hidden, hidden_count);
-    }
-    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_M) {
-        return moe_dot_gguf_iq1_m_row(row_ptr, hidden, hidden_count);
-    }
-    if (effective_weight_format != moe_WEIGHT_ENCODING_UNKNOWN &&
-        effective_weight_format != moe_WEIGHT_ENCODING_RAW_FP16 &&
-        effective_weight_format != moe_WEIGHT_ENCODING_RAW_BF16 &&
-        effective_weight_format != moe_WEIGHT_ENCODING_RAW_FP32) {
-        moe_trace_raw_dot_unsupported(raw);
-        return 0.0f;
-    }
-    return moe_dot_raw_row(row_ptr, raw.scalar_encoding, hidden, hidden_count);
-}
-
 static int moe_raw_tensor_copy_row_f32(
     const moe_raw_tensor_cache_entry& raw,
     uint32_t row,
@@ -60,7 +12,6 @@ static int moe_raw_tensor_copy_row_f32(
     }
     const uint32_t stride_cols = raw.cols ? raw.cols : out_count;
     const uint64_t row_bytes = moe_raw_tensor_row_bytes(raw, stride_cols);
-    // BUGFIX 493: row * row_bytes overflow 泥댄겕
     if (!raw.base || !out || row >= raw.rows || row_bytes == 0 ||
         row > UINT64_MAX / row_bytes ||
         (uint64_t)row * row_bytes > raw.bytes ||

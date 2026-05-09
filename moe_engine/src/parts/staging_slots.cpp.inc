@@ -427,7 +427,6 @@ static void moe_scale_staging_slot_counts(
         } else {
             // Largest remainder method for fair distribution
             // Step 1: Allocate integer parts
-            // BUGFIX 282: Recheck desired_total > 0 for defense in depth ★
             if (desired_total == 0) {
                 // Should never happen, but prevents UB
                 if (pinned_out) *pinned_out = 0;

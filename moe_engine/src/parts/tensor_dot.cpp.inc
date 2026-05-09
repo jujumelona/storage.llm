@@ -164,7 +164,6 @@ static int moe_dot_tensor_record_row(
     if (!shard || !mmap_get_ptr(shard, 0)) {
         return 0;
     }
-    // BUGFIX 859: Check x_count for zero to prevent division by zero ★★★
     if (x_count == 0) {
         return 0;
     }
@@ -185,7 +184,6 @@ static int moe_dot_tensor_record_row(
     }
     if (weight_format == moe_WEIGHT_ENCODING_RAW_FP16) {
         *out_value = moe_dot_raw_fp16_row(packed, x, rec->info.cols);
-        // BUGFIX 860: Check result for NaN/Inf ★★★
         if (!std::isfinite(*out_value)) {
             return 0;
         }
@@ -193,7 +191,6 @@ static int moe_dot_tensor_record_row(
     }
     if (weight_format == moe_WEIGHT_ENCODING_RAW_BF16) {
         *out_value = moe_dot_raw_bf16_row(packed, x, rec->info.cols);
-        // BUGFIX 861: Check result for NaN/Inf ★★★
         if (!std::isfinite(*out_value)) {
             return 0;
         }
@@ -201,7 +198,6 @@ static int moe_dot_tensor_record_row(
     }
     if (weight_format == moe_WEIGHT_ENCODING_RAW_FP32) {
         *out_value = moe_dot_raw_fp32_row(packed, x, rec->info.cols);
-        // BUGFIX 862: Check result for NaN/Inf ★★★
         if (!std::isfinite(*out_value)) {
             return 0;
         }

@@ -81,4 +81,3 @@ int moe_pc_group_tokens_by_expert(
     *out_batch_count = batch_count;
     return (!out_batches || batch_count <= max_batches) ? 1 : 0;
 }
-

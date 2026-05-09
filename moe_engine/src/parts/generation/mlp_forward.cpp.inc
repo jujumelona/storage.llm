@@ -746,16 +746,9 @@ using moe_model_lib_grouped_expert_triplets_indexed_f32_fn = int (*)(
 using moe_model_lib_grouped_expert_triplets_indexed_device_f32_fn = int (*)(
     uint32_t abi_version,
     int32_t backend,
-    const moe_model_lib_indexed_expert_task_t* tasks,
+    const moe_grouped_expert_device_task_t* tasks,
     uint32_t task_count,
-    const void* d_batch_input,
-    uint32_t input_stride,
-    uint32_t input_count,
-    const void* d_token_indices,
-    const void* d_token_weights,
-    uint32_t assignment_count,
-    void* d_batch_accum,
-    uint32_t accum_stride);
+    void* stream_or_queue);
 
 using moe_model_lib_prefill_activation_acquire_f32_fn = int (*)(
     uint32_t abi_version,
@@ -931,6 +924,10 @@ moe_gpu_prefill_activation_release_fn(moe_pc_engine* engine) {
         engine->model_lib_prefill_activation_release_f32);
 }
 
+static int moe_prefill_host_activation_bridge_allowed(const moe_pc_engine* engine) {
+    return engine && !moe_verified_backend_required(engine);
+}
+
 static int moe_gpu_batch_expert_kernel_available(moe_pc_engine* engine) {
     return moe_gpu_batch_expert_kernel_fn(engine) ? 1 : 0;
 }
@@ -1046,13 +1043,11 @@ static int moe_run_expert_triplet_row_batch_f32(
     uint32_t out_count,
     int activation_mode
 ) {
-    // BUGFIX 769: Check batch_hidden for NULL pointers ★★★
     if (!engine || !batch_hidden || !gate_pool || !up_pool || !out_pool ||
         batch_size == 0 || batch_size > 4096u ||
         hidden_size == 0 || intermediate_size == 0 || out_count != hidden_size) {
         return 0;
     }
-    // BUGFIX 770: Check each batch_hidden[i] for NULL ★★★
     for (uint32_t i = 0; i < batch_size; ++i) {
         if (!batch_hidden[i]) {
             return 0;
@@ -1083,7 +1078,7 @@ static int moe_run_expert_triplet_row_batch_f32(
                 activation_mode)) {
             return 1;
         }
-        if (engine->io_config.require_gpu_expert_batch_kernel_for_fast_mode) {
+        if (engine->io_config.internal_require_gpu_expert_batch_kernel) {
             return 0;
         }
     }
@@ -1343,12 +1338,23 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         c->experts_per_moe_layer == 0 || c->experts_per_moe_layer > 10000u) {
         return 0;
     }
-    if (engine->io_config.require_gpu_expert_batch_kernel_for_fast_mode &&
+    if (engine->io_config.internal_require_gpu_expert_batch_kernel &&
         !moe_gpu_batch_expert_kernel_available(engine)) {
         std::fprintf(stderr,
-            "[storagellm mlp] fast mode requires moe_model_lib_run_expert_triplet_batch_f32 "
-            "with moe_model_lib_has_expert_triplet_batch_f32()==1; disable "
-            "require_gpu_expert_batch_kernel_for_fast_mode for compatibility fallback\n");
+            "[storagellm mlp] internal backend policy requires moe_model_lib_run_expert_triplet_batch_f32 "
+            "with moe_model_lib_has_expert_triplet_batch_f32()==1 and a true architecture-specific "
+            "MoE backend; internal fallback is disabled\n");
+        return moe_PREFILL_BATCH_MLP_FAST_KERNEL_REQUIRED;
+    }
+    if (moe_verified_backend_required(engine) &&
+        !moe_fast_backend_available(engine)) {
+        engine->io_atomic.gpu_grouped_host_fallback_count.fetch_add(
+            1, std::memory_order_relaxed);
+        std::fprintf(stderr,
+            "[storagellm mlp] internal backend policy requires a verified "
+            "architecture-specific MoE backend (CUDA CUTLASS/cuBLASLt/TVM, "
+            "ROCm hipBLASLt/CK, Metal MPS/TVM, oneDNN SYCL, Vulkan cooperative "
+            "matrix/TVM, CLBlast/TVM, or CPU oneDNN/TVM); internal fallback is disabled\n");
         return moe_PREFILL_BATCH_MLP_FAST_KERNEL_REQUIRED;
     }
     const uint64_t total_start_us = moe_profile_now_us();
@@ -1585,6 +1591,137 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                     indexed_inputs_contiguous = 0;
                 }
             }
+            if (indexed_device_fn && activation_acquire_fn && activation_release_fn &&
+                moe_prefill_host_activation_bridge_allowed(engine) &&
+                indexed_inputs_contiguous && moe_fast_backend_available(engine)) {
+                std::vector<moe_grouped_expert_device_task_t> fast_tasks;
+                std::vector<size_t> fast_chunk_indices;
+                std::vector<uint32_t> fast_token_indices;
+                std::vector<float> fast_token_weights;
+                fast_tasks.reserve(grouped_chunks.size());
+                fast_chunk_indices.reserve(grouped_chunks.size());
+                for (size_t chunk_index = 0; chunk_index < grouped_chunks.size(); ++chunk_index) {
+                    const auto& chunk_info = grouped_chunks[chunk_index];
+                    if (grouped_done_chunks.find(grouped_chunk_key(chunk_info.expert, chunk_info.begin)) !=
+                        grouped_done_chunks.end()) {
+                        continue;
+                    }
+                    float down_scale = 1.0f;
+                    int scalar_scale_supported = 1;
+                    if (!moe_layer_expert_down_scalar_scale_f32(
+                            engine, layer, (int)chunk_info.expert, c->experts_per_moe_layer,
+                            hidden_size, &down_scale, &scalar_scale_supported) ||
+                        !scalar_scale_supported || !std::isfinite(down_scale)) {
+                        continue;
+                    }
+                    const uint32_t token_offset = static_cast<uint32_t>(fast_token_indices.size());
+                    const auto& assignments = grouped[chunk_info.expert];
+                    int chunk_ok = 1;
+                    for (uint32_t b = 0; b < chunk_info.chunk; ++b) {
+                        const moe_mlp_batch_assignment_t& a = assignments[chunk_info.begin + b];
+                        if (a.token >= batch_size || !std::isfinite(a.weight)) {
+                            chunk_ok = 0;
+                            break;
+                        }
+                        fast_token_indices.push_back(a.token);
+                        fast_token_weights.push_back(a.weight * down_scale);
+                    }
+                    if (!chunk_ok) {
+                        fast_token_indices.resize(token_offset);
+                        fast_token_weights.resize(token_offset);
+                        continue;
+                    }
+                    moe_grouped_expert_device_task_t task{};
+                    task.layer = layer;
+                    task.expert = static_cast<int32_t>(chunk_info.expert);
+                    task.gate_weight = &chunk_info.views[0];
+                    task.up_weight = &chunk_info.views[1];
+                    task.down_weight = &chunk_info.views[2];
+                    task.input_stride = hidden_size;
+                    task.assignment_offset = token_offset;
+                    task.assignment_count = chunk_info.chunk;
+                    task.accum_stride = hidden_size;
+                    task.hidden_size = hidden_size;
+                    task.intermediate_size = intermediate_size;
+                    task.activation_mode = static_cast<uint32_t>(activation_mode);
+                    fast_tasks.push_back(task);
+                    fast_chunk_indices.push_back(chunk_index);
+                }
+                if (fast_tasks.size() >= 2u && !fast_token_indices.empty()) {
+                    uint64_t activation_handle = 0;
+                    const void* d_batch_input = nullptr;
+                    const void* d_token_indices = nullptr;
+                    const void* d_token_weights = nullptr;
+                    void* d_batch_accum = nullptr;
+                    if (activation_acquire_fn(
+                            engine->model_lib_abi_version,
+                            static_cast<int32_t>(engine->backend_caps.backend),
+                            indexed_input_base,
+                            hidden_size,
+                            batch_size,
+                            fast_token_indices.data(),
+                            fast_token_weights.data(),
+                            static_cast<uint32_t>(fast_token_indices.size()),
+                            batch_expert_sum.data(),
+                            hidden_size,
+                            &activation_handle,
+                            &d_batch_input,
+                            &d_token_indices,
+                            &d_token_weights,
+                            &d_batch_accum)) {
+                        for (auto& task : fast_tasks) {
+                            task.d_input = d_batch_input;
+                            task.d_token_indices = static_cast<const uint32_t*>(d_token_indices);
+                            task.d_token_weights = static_cast<const float*>(d_token_weights);
+                            task.d_accum = d_batch_accum;
+                        }
+                        engine->io_atomic.gpu_grouped_indexed_device_submitted.fetch_add(
+                            fast_token_indices.size(), std::memory_order_relaxed);
+                        const int run_ok = indexed_device_fn(
+                            engine->model_lib_abi_version,
+                            static_cast<int32_t>(engine->backend_caps.backend),
+                            fast_tasks.data(),
+                            static_cast<uint32_t>(fast_tasks.size()),
+                            nullptr);
+                        const int release_ok = activation_release_fn(
+                            engine->model_lib_abi_version,
+                            static_cast<int32_t>(engine->backend_caps.backend),
+                            activation_handle,
+                            batch_expert_sum.data(),
+                            batch_size,
+                            hidden_size,
+                            run_ok ? 1 : 0);
+                        activation_handle = 0;
+                        if (run_ok && release_ok) {
+                            engine->io_atomic.gpu_grouped_indexed_device_completed.fetch_add(
+                                fast_token_indices.size(), std::memory_order_relaxed);
+                            for (size_t chunk_index : fast_chunk_indices) {
+                                const auto& chunk_info = grouped_chunks[chunk_index];
+                                device_touch_allocation(engine, chunk_info.views[0].key);
+                                device_touch_allocation(engine, chunk_info.views[1].key);
+                                device_touch_allocation(engine, chunk_info.views[2].key);
+                                const auto& assignments = grouped[chunk_info.expert];
+                                for (uint32_t b = 0; b < chunk_info.chunk; ++b) {
+                                    const moe_mlp_batch_assignment_t& a =
+                                        assignments[chunk_info.begin + b];
+                                    success_weight_sum[a.token] += a.weight;
+                                    ++success_count[a.token];
+                                }
+                                grouped_done_chunks.insert(
+                                    grouped_chunk_key(chunk_info.expert, chunk_info.begin));
+                            }
+                        } else if (engine->io_config.internal_require_gpu_expert_batch_kernel) {
+                            engine->io_atomic.gpu_grouped_host_fallback_count.fetch_add(
+                                1, std::memory_order_relaxed);
+                            return 0;
+                        }
+                    } else if (engine->io_config.internal_require_gpu_expert_batch_kernel) {
+                        engine->io_atomic.gpu_grouped_host_fallback_count.fetch_add(
+                            1, std::memory_order_relaxed);
+                        return 0;
+                    }
+                }
+            }
             if ((indexed_fn || indexed_device_fn) && indexed_inputs_contiguous) {
                 std::vector<uint8_t> attempted(grouped_chunks.size(), 0);
                 for (size_t seed = 0; seed < grouped_chunks.size(); ++seed) {
@@ -1657,7 +1794,8 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                         continue;
                     }
                     int device_indexed_ok = 0;
-                    if (indexed_device_fn && activation_acquire_fn && activation_release_fn) {
+                    if (indexed_device_fn && activation_acquire_fn && activation_release_fn &&
+                        moe_prefill_host_activation_bridge_allowed(engine)) {
                         uint64_t activation_handle = 0;
                         const void* d_batch_input = nullptr;
                         const void* d_token_indices = nullptr;
@@ -1679,21 +1817,38 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                                 &d_token_indices,
                                 &d_token_weights,
                                 &d_batch_accum)) {
+                            std::vector<moe_grouped_expert_device_task_t> fast_tasks;
+                            fast_tasks.reserve(indexed_tasks.size());
+                            for (const auto& task : indexed_tasks) {
+                                moe_grouped_expert_device_task_t fast_task{};
+                                fast_task.layer = task.layer;
+                                fast_task.expert = task.expert;
+                                fast_task.gate_weight = task.gate;
+                                fast_task.up_weight = task.up;
+                                fast_task.down_weight = task.down;
+                                fast_task.d_input = d_batch_input;
+                                fast_task.input_stride = hidden_size;
+                                fast_task.d_token_indices =
+                                    static_cast<const uint32_t*>(d_token_indices);
+                                fast_task.d_token_weights =
+                                    static_cast<const float*>(d_token_weights);
+                                fast_task.assignment_offset = task.token_offset;
+                                fast_task.assignment_count = task.batch;
+                                fast_task.d_accum = d_batch_accum;
+                                fast_task.accum_stride = hidden_size;
+                                fast_task.hidden_size = hidden_size;
+                                fast_task.intermediate_size = intermediate_size;
+                                fast_task.activation_mode = static_cast<uint32_t>(activation_mode);
+                                fast_tasks.push_back(fast_task);
+                            }
                             engine->io_atomic.gpu_grouped_indexed_device_submitted.fetch_add(
                                 indexed_token_indices.size(), std::memory_order_relaxed);
                             if (indexed_device_fn(
                                     engine->model_lib_abi_version,
                                     static_cast<int32_t>(engine->backend_caps.backend),
-                                    indexed_tasks.data(),
-                                    (uint32_t)indexed_tasks.size(),
-                                    d_batch_input,
-                                    hidden_size,
-                                    batch_size,
-                                    d_token_indices,
-                                    d_token_weights,
-                                    (uint32_t)indexed_token_indices.size(),
-                                    d_batch_accum,
-                                    hidden_size)) {
+                                    fast_tasks.data(),
+                                    (uint32_t)fast_tasks.size(),
+                                    nullptr)) {
                                 const int release_ok = activation_release_fn(
                                     engine->model_lib_abi_version,
                                     static_cast<int32_t>(engine->backend_caps.backend),
@@ -1737,7 +1892,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                         }
                         continue;
                     }
-                    if (engine->io_config.require_gpu_expert_batch_kernel_for_fast_mode) {
+                    if (engine->io_config.internal_require_gpu_expert_batch_kernel) {
                         engine->io_atomic.gpu_grouped_host_fallback_count.fetch_add(
                             1, std::memory_order_relaxed);
                         return 0;
@@ -1794,7 +1949,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
             } else {
                 engine->io_atomic.gpu_grouped_host_fallback_count.fetch_add(
                     1, std::memory_order_relaxed);
-                if (engine->io_config.require_gpu_expert_batch_kernel_for_fast_mode) {
+                if (engine->io_config.internal_require_gpu_expert_batch_kernel) {
                     return 0;
                 }
             }

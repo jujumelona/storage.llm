@@ -852,7 +852,7 @@ static void prescope_compute_global_plan(
     const float compute_ms_per_layer = 1.0f; // engine->profile.avg_layer_compute_ms;
 
     for (uint32_t d = 0; d < depth; ++d) {
-        // BUGFIX 281: Double-check bounds before access (defense in depth) ★
+        // Double-check bounds before access.
         if (d >= predicted_experts.size()) {
             break;
         }

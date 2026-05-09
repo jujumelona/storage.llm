@@ -29,4 +29,3 @@ const moe_scale4_entry_t* moe_scale4_find(const moe_scale4_file_t* file, const c
     }
     return NULL;
 }
-

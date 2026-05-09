@@ -319,7 +319,7 @@ int moe_pc_engine_generate_token_ids(
                 if (mlp_batch_ok == moe_PREFILL_BATCH_MLP_FAST_KERNEL_REQUIRED) {
                     moe_generation_set_error(
                         out_stats,
-                        "fast mode requires moe_model_lib_run_expert_triplet_batch_f32");
+                        "internal backend policy requires moe_model_lib_run_expert_triplet_batch_f32");
                     return 0;
                 }
                 if (!mlp_batch_ok) {

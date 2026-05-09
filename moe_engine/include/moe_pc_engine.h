@@ -13,6 +13,7 @@ typedef struct moe_pc_engine moe_pc_engine_t;
 #include "parts/moe_config_types.h.inc"
 #include "parts/moe_stats_types.h.inc"
 #include "parts/moe_backend_types.h.inc"
+#include "parts/moe_fast_backend_types.h.inc"
 #include "parts/moe_model_types.h.inc"
 #include "parts/moe_hardcode_types.h.inc"
 #include "parts/moe_tensor_types.h.inc"

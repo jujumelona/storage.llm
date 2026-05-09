@@ -772,21 +772,12 @@ static int device_backend_copy_h2d_async(
             const double elapsed_sec = std::chrono::duration<double>(t1 - t0).count();
             if (elapsed_sec > 0.0001) {
                 const uint64_t current_bw = (uint64_t)((double)bytes / elapsed_sec);
-                uint64_t old_bw = __atomic_load_n(
-                    &e->backend_caps.measured_storage_bw_bytes_per_sec, __ATOMIC_ACQUIRE);
-                while (true) {
-                    uint64_t new_bw = old_bw == 0 ? current_bw :
-                        (uint64_t)(0.8 * (double)old_bw + 0.2 * (double)current_bw);
-                    if (__atomic_compare_exchange_n(
-                            &e->backend_caps.measured_storage_bw_bytes_per_sec,
-                            &old_bw,
-                            new_bw,
-                            false,
-                            __ATOMIC_RELEASE,
-                            __ATOMIC_ACQUIRE)) {
-                        break;
-                    }
-                }
+                static std::mutex s_storage_bw_update_mutex;
+                std::lock_guard<std::mutex> bw_lock(s_storage_bw_update_mutex);
+                const uint64_t old_bw = e->backend_caps.measured_storage_bw_bytes_per_sec;
+                const uint64_t new_bw = old_bw == 0 ? current_bw :
+                    (uint64_t)(0.8 * (double)old_bw + 0.2 * (double)current_bw);
+                e->backend_caps.measured_storage_bw_bytes_per_sec = new_bw;
             }
         }
         return ok;

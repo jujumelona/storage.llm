@@ -26,6 +26,7 @@ static void model_lib_unload(moe_pc_engine* e) {
     e->model_lib_prefill_activation_release_f32 = nullptr;
     e->model_lib_gpu_expert_scratch_wait_ns = nullptr;
     e->model_lib_gpu_expert_scratch_backpressure_count = nullptr;
+    e->model_lib_fast_backend_mask = nullptr;
     e->model_lib_l0_mmap_checksum_spv = nullptr;
     e->model_lib_l0_mmap_checksum_spv_size = 0;
     e->model_lib_l0_mmap_checksum_kernel_name = nullptr;
@@ -71,9 +72,25 @@ static int model_lib_load(moe_pc_engine* e) {
         moe_find_shared_symbol(lib, "moe_model_lib_gpu_expert_scratch_wait_ns");
     void* scratch_backpressure =
         moe_find_shared_symbol(lib, "moe_model_lib_gpu_expert_scratch_backpressure_count");
+    void* fast_backend_mask =
+        moe_find_shared_symbol(lib, "moe_model_lib_fast_backend_mask");
     auto expert_batch_available =
         (moe_model_lib_u32_fn)moe_find_shared_symbol(lib, "moe_model_lib_has_expert_triplet_batch_f32");
     if (expert_batch_available && expert_batch_available() == 0u) {
+        expert_batch = nullptr;
+        expert_batch_contiguous = nullptr;
+        expert_batch_device = nullptr;
+        grouped_expert_triplets = nullptr;
+        grouped_expert_triplets_device = nullptr;
+        grouped_expert_triplets_indexed = nullptr;
+        grouped_expert_triplets_indexed_device = nullptr;
+        prefill_activation_acquire = nullptr;
+        prefill_activation_release = nullptr;
+    }
+    const uint32_t fast_mask =
+        fast_backend_mask ? ((moe_model_lib_u32_fn)fast_backend_mask)() : 0u;
+    if (e->io_config.internal_verified_backend_only &&
+        !moe_fast_backend_mask_supports_backend(e->backend_caps.backend, fast_mask)) {
         expert_batch = nullptr;
         expert_batch_contiguous = nullptr;
         expert_batch_device = nullptr;
@@ -95,6 +112,7 @@ static int model_lib_load(moe_pc_engine* e) {
     e->model_lib_prefill_activation_release_f32 = prefill_activation_release;
     e->model_lib_gpu_expert_scratch_wait_ns = scratch_wait_ns;
     e->model_lib_gpu_expert_scratch_backpressure_count = scratch_backpressure;
+    e->model_lib_fast_backend_mask = fast_backend_mask;
     auto l0_spv_size =
         (moe_model_lib_u32_fn)moe_find_shared_symbol(lib, "moe_model_lib_l0_mmap_checksum_spv_size");
     auto l0_spv =

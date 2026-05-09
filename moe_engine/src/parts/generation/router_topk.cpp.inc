@@ -310,7 +310,11 @@ static int moe_router_topk_f32(
     }
 
     auto cmp = [&](uint32_t a, uint32_t b) {
-        return (*scratch_logits)[a] > (*scratch_logits)[b];
+        const float av = (*scratch_logits)[a];
+        const float bv = (*scratch_logits)[b];
+        if (av > bv) return true;
+        if (av < bv) return false;
+        return a < b;  // deterministic source-compatible tie break for exact PPL
     };
     if (top_k < experts) {
         std::nth_element(order, order + top_k, order + experts, cmp);

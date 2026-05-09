@@ -33,4 +33,3 @@ float moe_scale4_get_scale(
     }
     return value;
 }
-

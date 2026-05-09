@@ -3,7 +3,6 @@ static float moe_dot_raw_fp16_row(const uint8_t* packed, const float* x, uint32_
     // Problem: No validation of packed FP16 data or x input
     // Impact: NaN/Inf in weights or activations propagate to PPL
     // Solution: Check for NaN/Inf in result and return 0.0f
-    // BUGFIX 787: Check cols for zero ★★★
     if (!packed || !x || cols == 0) {
         return 0.0f;
     }
@@ -143,7 +142,6 @@ static float moe_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32_
     // Problem: No validation of packed FP32 data or x input
     // Impact: NaN/Inf in weights or activations propagate to PPL
     // Solution: Check for NaN/Inf in result and return 0.0f
-    // BUGFIX 789: Check cols for zero ★★★
     if (!packed || !x || cols == 0) {
         return 0.0f;
     }
@@ -284,7 +282,6 @@ static float moe_dot_raw_bf16_row(const uint8_t* packed, const float* x, uint32_
     // Problem: No validation of packed BF16 data or x input
     // Impact: NaN/Inf in weights or activations propagate to PPL
     // Solution: Check for NaN/Inf in result and return 0.0f
-    // BUGFIX 785: Check cols for zero ★★★
     if (!packed || !x || cols == 0) {
         return 0.0f;
     }
@@ -306,11 +303,9 @@ static float moe_dot_raw_bf16_row(const uint8_t* packed, const float* x, uint32_
 }
 
 static uint32_t moe_packed_lsb_code_at(const uint8_t* packed, uint32_t element_index, uint32_t bits) {
-    // BUGFIX 796: Check packed for NULL ★★★
     if (!packed) {
         return 0;
     }
-    // BUGFIX 797: Check bits for valid range ★★★
     if (bits == 0 || bits > 8) {
         return 0;
     }

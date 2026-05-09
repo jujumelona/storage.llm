@@ -3,6 +3,54 @@ struct grouped_request_tokens {
     uint32_t active_tokens = 0;
 };
 
+// Semantic validation for prefetch requests (Bug B2)
+static bool validate_prefetch_request(
+    moe_pc_engine_t* engine,
+    int current_layer,
+    std::vector<int>& selected_experts,
+    std::vector<int>& next_experts,
+    std::string* err
+) {
+    // Get model shape
+    const auto shape = moe_pc_Moe1_model_shape();
+    const int layer_count = static_cast<int>(shape.num_hidden_layers);
+
+    // Validate layer range
+    if (current_layer < 0 || current_layer >= layer_count) {
+        if (err) *err = "current_layer out of range [0, " + std::to_string(layer_count) + ")";
+        return false;
+    }
+
+    // Get expert count for this layer
+    const int expert_count = static_cast<int>(shape.experts_per_moe_layer);
+
+    auto normalize = [&](std::vector<int>& ids, const char* field) -> bool {
+        // Sort and deduplicate
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+
+        // Check array length limit (policy: max 64 experts)
+        if (ids.size() > 64) {
+            if (err) *err = std::string(field) + " too long (max 64)";
+            return false;
+        }
+
+        // Validate each expert ID
+        for (int id : ids) {
+            if (id < 0 || id >= expert_count) {
+                if (err) *err = std::string(field) + " contains invalid expert id " +
+                                std::to_string(id) + " (valid range: [0, " +
+                                std::to_string(expert_count) + "))";
+                return false;
+            }
+        }
+        return true;
+    };
+
+    return normalize(selected_experts, "selected_experts") &&
+           normalize(next_experts, "next_experts");
+}
+
 static grouped_request_tokens group_request_tokens(int layer, const std::vector<int>& experts) {
     grouped_request_tokens grouped{};
     if (layer < 0 || experts.empty()) {
@@ -45,6 +93,14 @@ static void server_orchestrate_request_prefetch(
     storagellm::json_read_int(body, "current_layer", &layer);
     std::vector<int> selected = storagellm::json_read_int_array(body, "selected_experts");
     std::vector<int> next = storagellm::json_read_int_array(body, "next_experts");
+
+    // Validate request (Bug B2: semantic validation)
+    std::string validation_error;
+    if (!validate_prefetch_request(engine, layer, selected, next, &validation_error)) {
+        fprintf(stderr, "[storageLLM ERROR] Invalid prefetch request: %s\n", validation_error.c_str());
+        return;  // Reject invalid request
+    }
+
     grouped_request_tokens grouped = group_request_tokens(layer, selected);
     if (grouped.experts.empty()) return;
     moe_pc_engine_prepare_moe_activation(engine, layer);

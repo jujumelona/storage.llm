@@ -11,8 +11,11 @@ moe_pc_engine_t* moe_pc_engine_create(const moe_pc_engine_config_t* config) {
     if (engine->io_config.prefill_group_wait_us == 0) {
         engine->io_config.prefill_group_wait_us = 200;
     }
-    if (engine->io_config.require_gpu_expert_batch_kernel_for_fast_mode == 0) {
-        engine->io_config.require_gpu_expert_batch_kernel_for_fast_mode = 1;
+    if (engine->io_config.internal_require_gpu_expert_batch_kernel == 0) {
+        engine->io_config.internal_require_gpu_expert_batch_kernel = 1;
+    }
+    if (engine->io_config.internal_verified_backend_only == 0) {
+        engine->io_config.internal_verified_backend_only = 1;
     }
     if (engine->config.kv_offload_mode != moe_KV_OFFLOAD_DISABLED &&
         engine->config.kv_offload_mode != moe_KV_OFFLOAD_COMPAT) {

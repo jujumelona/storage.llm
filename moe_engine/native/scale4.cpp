@@ -14,4 +14,3 @@
 #include "parts/scale4_find.cpp.inc"
 #include "parts/scale4_get_scale.cpp.inc"
 #include "parts/scale4_decode_row.cpp.inc"
-

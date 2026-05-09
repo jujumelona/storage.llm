@@ -93,6 +93,7 @@ static inline __m256 moe_madd_ps(__m256 a, __m256 b, __m256 c) {
 #include "parts/tensor_slots.cpp.inc"
 #include "parts/tensor_paths.cpp.inc"
 #include "parts/platform_utils.cpp.inc"
+#include "parts/autotune_env.cpp.inc"
 #include "parts/platform_dir.cpp.inc"
 #include "parts/binary_reader.cpp.inc"
 #include "parts/file_collector.cpp.inc"
@@ -101,6 +102,7 @@ static inline __m256 moe_madd_ps(__m256 a, __m256 b, __m256 c) {
 #include "parts/model_contract_types.cpp.inc"
 #include "parts/gguf_tensor_reader.cpp.inc"
 static int moe_parse_layer_from_gguf_name(const std::string& name, uint32_t* layer);
+static int moe_gguf_expert_projection(const std::string& name, moe_projection_t* proj);
 #include "parts/juju_parser.cpp.inc"
 #include "parts/metadata_parser.cpp.inc"
 #include "parts/model_file_readers.cpp.inc"
@@ -123,6 +125,8 @@ static int moe_parse_layer_from_gguf_name(const std::string& name, uint32_t* lay
 #include "parts/device_vulkan_transfer.cpp.inc"
 #include "parts/model_library_paths.cpp.inc"
 #include "parts/model_library_source.cpp.inc"
+#include "parts/fast_backend_policy.cpp.inc"
+#include "parts/tvm_codegen_profile.cpp.inc"
 #include "parts/model_library_load.cpp.inc"
 #include "parts/directstorage_queue.cpp.inc"
 #include "parts/io_path.cpp.inc"

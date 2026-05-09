@@ -381,22 +381,18 @@ static int load_juju_tensor_index_as_tensor_index(
                     common_rec.prefetch_class = entry.prefetch_class;
                 }
             }
-            const std::string lower_name = moe_lower_ascii_copy(entry.name);
-            const bool combined_gate_up =
-                !entry.bundle_native &&
-                lower_name.find("ffn_gate_up_exps.weight") != std::string::npos;
+            const bool combined_gate_up = moe_juju_entry_is_combined_gate_up(entry) && !entry.bundle_native;
             uint32_t layer = 0;
             moe_projection_t proj = moe_PROJ_GATE;
-            const int explicit_projection = moe_juju_bundle_member_projection(entry, &proj);
-            if (!moe_parse_layer_from_gguf_name(entry.name, &layer) ||
-                (!combined_gate_up && !explicit_projection && !moe_gguf_expert_projection(entry.name, &proj)) ||
-                entry.dims < 3 ||
-                entry.shape[2] == 0) {
+            const int explicit_projection = moe_juju_entry_projection(entry, &proj);
+            if (!moe_juju_entry_layer(entry, &layer) ||
+                (!combined_gate_up && !explicit_projection)) {
                 continue;
             }
-            const uint64_t expert_count64 =
-                (entry.bundle_native && entry.has_explicit_expert) ? 1ull :
-                (entry.expert_count ? entry.expert_count : entry.shape[2]);
+            const uint64_t expert_count64 = moe_juju_entry_expert_count(entry);
+            if (expert_count64 == 0) {
+                continue;
+            }
             const uint64_t effective_entry_bytes = moe_effective_juju_tensor_bytes(entry, contract);
             const uint64_t per_expert = entry.per_expert_bytes ? entry.per_expert_bytes :
                 (expert_count64 ? effective_entry_bytes / expert_count64 : 0);
@@ -447,8 +443,16 @@ static int load_juju_tensor_index_as_tensor_index(
                     return 0;
                 }
             }
-            const uint64_t math_rows_total64 = entry.math_out_features ? entry.math_out_features : entry.shape[1];
-            const uint64_t math_cols64 = entry.math_in_features ? entry.math_in_features : entry.shape[0];
+            const uint64_t math_rows_total64 = moe_juju_entry_rows_total(entry);
+            const uint64_t math_cols64 = moe_juju_entry_cols(entry);
+            if (math_rows_total64 == 0 || math_cols64 == 0) {
+                std::fprintf(stderr,
+                    "[storagellm] JUJU expert tensor missing math shape: name=%s rows=%llu cols=%llu\n",
+                    entry.name.c_str(),
+                    (unsigned long long)math_rows_total64,
+                    (unsigned long long)math_cols64);
+                return 0;
+            }
             if (combined_gate_up &&
                 ((math_rows_total64 & 1ull) != 0 || per_expert < 2ull)) {
                 std::fprintf(stderr,

@@ -13,4 +13,3 @@ int moe_scale4_decode_row(
     }
     return 1;
 }
-

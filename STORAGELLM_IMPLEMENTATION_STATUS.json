@@ -1,0 +1,36 @@
+{
+  "cpp_engine_policy": "C++ engine/runtime first. Automatic host-local backend selection is owned by the C++ executable storagellm_host_autotune.",
+  "python_policy": "Python is not the runtime orchestrator. It remains only where unavoidable for pip and TVM Python API codegen helpers: scripts/install_tvm_dependency.py and moe_engine/backends/tvm_codegen/*.py.",
+  "cmake_policy": "CMake is build configuration only. Default path is automatic; users do not manually choose backend options.",
+  "default_entry": "apply_patch.ps1 configures CMake, builds storagellm_host_autotune, runs C++ host autotune, writes build/selected_backend.env, then builds the project.",
+  "cpp_autotune_modules": [
+    "tools/autotune/process.cpp",
+    "tools/autotune/files.cpp",
+    "tools/autotune/host_detect.cpp",
+    "tools/autotune/tvm_pipeline.cpp",
+    "tools/autotune/benchmark.cpp",
+    "tools/autotune/select.cpp",
+    "tools/autotune/main.cpp"
+  ],
+  "colab_policy": "preserved only; colab is not treated as the target runtime environment.",
+  "tests_preserved": true,
+  "benchmarks_preserved": true,
+  "third_party_tvm": "removed; TVM dependency is pip-based",
+  "truth": "C++ auto pipeline is wired and fail-closed. Native CUTLASS/Metal/Vulkan/OpenCL/ROCm MoE kernels are not counted as complete unless implemented, built, and measured on the user's machine.",
+  "bottleneck_fixes": [
+    "CPU native grouped-MoE split into tensor-view, activation, assignment-kernel, and parallel modules so one file is not doing every role.",
+    "CPU native path reuses one mid buffer per worker instead of allocating std::vector<float> per assignment.",
+    "CPU native path uses contiguous chunk scheduling and OpenMP runtime pooling when available, with thread fallback otherwise.",
+    "CPU dot loops are unrolled by 4 for the gate/up and down projections.",
+    "CMake enables host-native optimization for local C++ CPU kernels by default during the automatic build.",
+    "CUDA/cuBLASLt path now uses a thread-local reusable device workspace instead of cudaMalloc/cudaFree for every invocation.",
+    "C++ autotune measurement now uses warmup plus adaptive iterations instead of a tiny fixed iteration count."
+  ],
+  "cpp_cpu_modules": [
+    "moe_engine/backends/cpu_onednn/cpu_tensor_view.h",
+    "moe_engine/backends/cpu_onednn/cpu_activation.h",
+    "moe_engine/backends/cpu_onednn/cpu_assignment_kernel.h",
+    "moe_engine/backends/cpu_onednn/cpu_parallel.h",
+    "moe_engine/backends/cpu_onednn/onednn_moe_adapter.cpp"
+  ]
+}

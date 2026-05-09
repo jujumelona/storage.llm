@@ -393,7 +393,8 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
         engine->io_config.expert_group_gpu_min_assignments = 2;
         engine->io_config.directstorage_require_completion_event = 1;
         engine->io_config.prefill_group_wait_us = 200;
-        engine->io_config.require_gpu_expert_batch_kernel_for_fast_mode = 1;
+        engine->io_config.internal_require_gpu_expert_batch_kernel = 1;
+        engine->io_config.internal_verified_backend_only = 1;
     }
     if (engine->backend_caps.backend == moe_BACKEND_METAL) {
         engine->io_config.enable_pinned_host = 0;
@@ -655,6 +656,10 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
     // → Uses OVERLAPPED ReadFile (io_iocp_adapter.cpp.inc) instead of mmap
     // → Eliminates blocking page faults, async I/O completion via IOCP
     // Impact: Safe async I/O on Windows without DirectStorage, no page fault stalls
+    // Apply host-local movement profile produced by C++ autotune after internal auto-sizing.
+    // This is process-env or selected_backend.env driven and keeps the runtime C++-owned.
+    moe_apply_autotune_io_env(engine);
+
 #ifdef _WIN32
     if (!engine->io_config.enable_directstorage && !engine->io_config.prefer_overlapped_io) {
         engine->io_config.prefer_overlapped_io = 1;

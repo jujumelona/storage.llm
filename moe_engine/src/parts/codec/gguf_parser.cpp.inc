@@ -1,17 +1,17 @@
 // GGUF format parsing utilities
 static int moe_parse_layer_from_gguf_name(const std::string& name, uint32_t* layer) {
-    if (!layer) {
-        return 0;
-    }
-    // BUGFIX 771: Check name for empty string ★★
-    if (name.empty()) {
+    if (!layer || name.empty()) {
         return 0;
     }
     const char* needles[] = {
         "blk.",
+        "blocks.",
+        "block.",
         "model.layers.",
         "layers.",
+        "decoder.layers.",
         "transformer.h.",
+        "transformer.blocks.",
         "h."
     };
     size_t pos = std::string::npos;
@@ -28,14 +28,12 @@ static int moe_parse_layer_from_gguf_name(const std::string& name, uint32_t* lay
         return 0;
     }
     size_t p = pos + needle_len;
-    // BUGFIX 772: Check p bounds before loop ★★
     if (p >= name.size()) {
         return 0;
     }
     uint64_t value = 0;
     bool any = false;
     while (p < name.size() && name[p] >= '0' && name[p] <= '9') {
-        // BUGFIX 773: Check for overflow in value calculation ★★★
         if (value > UINT64_MAX / 10ull) {
             return 0;
         }
@@ -51,26 +49,37 @@ static int moe_parse_layer_from_gguf_name(const std::string& name, uint32_t* lay
 }
 
 static int moe_gguf_expert_projection(const std::string& name, moe_projection_t* proj) {
-    if (!proj) {
-        return 0;
-    }
-    // BUGFIX 774: Check name for empty string ★★
-    if (name.empty()) {
+    if (!proj || name.empty()) {
         return 0;
     }
     const std::string value = moe_lower_ascii_copy(name);
     if (value.find("ffn_gate_exps.weight") != std::string::npos ||
-        value.find("gate_proj.weight") != std::string::npos) {
+        value.find("gate_proj.weight") != std::string::npos ||
+        value.find("experts.w1.weight") != std::string::npos ||
+        value.find("experts.w1") != std::string::npos ||
+        value.find("feed_forward.w1.weight") != std::string::npos ||
+        value.find("ffn.w1.weight") != std::string::npos ||
+        value.find("mlp.w1.weight") != std::string::npos) {
         *proj = moe_PROJ_GATE;
         return 1;
     }
     if (value.find("ffn_up_exps.weight") != std::string::npos ||
-        value.find("up_proj.weight") != std::string::npos) {
+        value.find("up_proj.weight") != std::string::npos ||
+        value.find("experts.w3.weight") != std::string::npos ||
+        value.find("experts.w3") != std::string::npos ||
+        value.find("feed_forward.w3.weight") != std::string::npos ||
+        value.find("ffn.w3.weight") != std::string::npos ||
+        value.find("mlp.w3.weight") != std::string::npos) {
         *proj = moe_PROJ_UP;
         return 1;
     }
     if (value.find("ffn_down_exps.weight") != std::string::npos ||
-        value.find("down_proj.weight") != std::string::npos) {
+        value.find("down_proj.weight") != std::string::npos ||
+        value.find("experts.w2.weight") != std::string::npos ||
+        value.find("experts.w2") != std::string::npos ||
+        value.find("feed_forward.w2.weight") != std::string::npos ||
+        value.find("ffn.w2.weight") != std::string::npos ||
+        value.find("mlp.w2.weight") != std::string::npos) {
         *proj = moe_PROJ_DOWN;
         return 1;
     }

@@ -10,4 +10,3 @@ static int moe_scale4_bounds_ok(const moe_scale4_file_t* file, uint64_t offset, 
     }
     return 1;
 }
-

@@ -16,7 +16,6 @@ static size_t find_value(const JsonSlice& slice, const char* key) {
         if (key_pos == std::string::npos || key_pos >= slice.end) {
             return std::string::npos;
         }
-        // Verify the key is followed by ':'; otherwise this was text inside a string value.
         const size_t colon = slice.text->find_first_not_of(" \t\r\n", key_pos + needle.size());
         if (colon != std::string::npos && colon < slice.end && (*slice.text)[colon] == ':') {
             return colon + 1;
@@ -30,20 +29,22 @@ bool json_get_u64(const JsonSlice& slice, const char* key, uint64_t* out) {
     if (value == std::string::npos || !out) {
         return false;
     }
-    if (value >= slice.end) return false;
-    // BUGFIX 462: errno 체크 추가
+    if (value >= slice.end) {
+        return false;
+    }
+
     errno = 0;
     char* end = nullptr;
     const char* begin = slice.text->c_str() + value;
     const char* limit = slice.text->c_str() + slice.end;
-    // BUGFIX 805: Check begin for NULL ★★★
     if (!begin || !limit || begin >= limit) {
         return false;
     }
+
     *out = std::strtoull(begin, &end, 10);
-    // Bug 1: Verify strtoull didn't read past slice boundary
-    // BUGFIX 463: errno == ERANGE 체크 추가
-    if (!end || end == begin || end > limit || errno == ERANGE) return false;
+    if (!end || end == begin || end > limit || errno == ERANGE) {
+        return false;
+    }
     return true;
 }
 
@@ -53,21 +54,20 @@ bool json_get_string(const JsonSlice& slice, const char* key, std::string* out) 
         return false;
     }
     const size_t begin = slice.text->find('"', value);
-    // Check bounds
     if (begin == std::string::npos || begin >= slice.end) {
         return false;
     }
-    // Bug 5: Handle escaped quotes inside string
+
     size_t end = begin + 1;
-    // BUGFIX 806: Check end bounds before loop ★★
     if (end >= slice.end) {
         return false;
     }
     while (end < slice.end) {
         if ((*slice.text)[end] == '\\') {
-            // BUGFIX 464: end + 2 범위 체크
-            if (end + 1 >= slice.end) break;
-            end += 2;  // Skip escape sequence
+            if (end + 1 >= slice.end) {
+                break;
+            }
+            end += 2;
             continue;
         }
         if ((*slice.text)[end] == '"') {
@@ -78,7 +78,6 @@ bool json_get_string(const JsonSlice& slice, const char* key, std::string* out) 
     if (end >= slice.end) {
         return false;
     }
-    // BUGFIX 465: substr 범위 체크
     if (begin + 1 > end || end > slice.text->size()) {
         return false;
     }

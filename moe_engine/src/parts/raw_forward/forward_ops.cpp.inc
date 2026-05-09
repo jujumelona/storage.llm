@@ -1,10 +1,3 @@
-    {
-        std::unique_lock<std::shared_mutex> lock(engine->text_mention_cache_mutex);
-        engine->metadata_mention_cache.emplace(key, result);
-    }
-    return result;
-}
-
 static float moe_embedding_scale_value(const moe_pc_engine* engine, uint32_t hidden_size) {
     if (!engine || hidden_size == 0 || hidden_size > 100000u) {
         return 1.0f;
@@ -291,7 +284,6 @@ static float moe_raw_tensor_dot_row(
 ) {
     const uint32_t stride_cols = raw.cols ? raw.cols : hidden_count;
     const uint64_t row_bytes = moe_raw_tensor_row_bytes(raw, stride_cols);
-    // BUGFIX 494: row * row_bytes overflow 泥댄겕
     if (!raw.base || !hidden || row >= raw.rows || row_bytes == 0 ||
         row > UINT64_MAX / row_bytes ||
         (uint64_t)row * row_bytes > raw.bytes ||
@@ -328,3 +320,50 @@ static float moe_raw_tensor_dot_row(
         return moe_dot_gguf_q2_k_row(row_ptr, hidden, hidden_count);
     }
     if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q3_K) {
+        return moe_dot_gguf_q3_k_row(row_ptr, hidden, hidden_count);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_K) {
+        return moe_dot_gguf_q4_k_row(row_ptr, hidden, hidden_count);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
+        return moe_dot_gguf_q5_k_row(row_ptr, hidden, hidden_count);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q6_K) {
+        return moe_dot_gguf_q6_k_row(row_ptr, hidden, hidden_count);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XXS) {
+        return moe_dot_gguf_iq2_xxs_row(row_ptr, hidden, hidden_count);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_XS) {
+        return moe_dot_gguf_iq2_xs_row(row_ptr, hidden, hidden_count);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ2_S) {
+        return moe_dot_gguf_iq2_s_row(row_ptr, hidden, hidden_count);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_XXS) {
+        return moe_dot_gguf_iq3_xxs_row(row_ptr, hidden, hidden_count);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ3_S) {
+        return moe_dot_gguf_iq3_s_row(row_ptr, hidden, hidden_count);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_NL) {
+        return moe_dot_gguf_iq4_nl_row(row_ptr, hidden, hidden_count);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ4_XS) {
+        return moe_dot_gguf_iq4_xs_row(row_ptr, hidden, hidden_count);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_S) {
+        return moe_dot_gguf_iq1_s_row(row_ptr, hidden, hidden_count);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_IQ1_M) {
+        return moe_dot_gguf_iq1_m_row(row_ptr, hidden, hidden_count);
+    }
+    if (effective_weight_format != moe_WEIGHT_ENCODING_UNKNOWN &&
+        effective_weight_format != moe_WEIGHT_ENCODING_RAW_FP16 &&
+        effective_weight_format != moe_WEIGHT_ENCODING_RAW_BF16 &&
+        effective_weight_format != moe_WEIGHT_ENCODING_RAW_FP32) {
+        moe_trace_raw_dot_unsupported(raw);
+        return 0.0f;
+    }
+    return moe_dot_raw_row(row_ptr, raw.scalar_encoding, hidden, hidden_count);
+}

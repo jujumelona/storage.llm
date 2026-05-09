@@ -138,7 +138,6 @@ static uint64_t vram_expert_budget_bytes_checked(const moe_pc_engine* engine) {
 // Problem: Fixed KV budget wastes VRAM in short conversations, causes RAM spill in long ones
 // Solution: Track actual KV VRAM usage via device_kv_cache_bytes atomic
 // vram_kv_budget_bytes becomes soft cap, device_budget_bytes() uses real usage
-// BUGFIX Problem C: Changed from static to extern for device_allocator_init() ★★★
 static int moe_kv_vram_attention_runtime_available(const moe_pc_engine* engine) {
     if (!engine) {
         return 0;

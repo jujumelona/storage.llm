@@ -1,4 +1,4 @@
-﻿// Raw forward - Utility functions
+// Raw forward - Utility functions
 
 static float moe_raw_bf16_to_f32(uint16_t v) {
     const uint32_t bits = (uint32_t)v << 16u;
@@ -343,3 +343,9 @@ static int moe_engine_metadata_mentions(const moe_pc_engine* engine, const char*
         }
     }
     const int result = moe_ascii_contains_ci(engine->offload_gguf_metadata_json, needle);
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->text_mention_cache_mutex);
+        engine->metadata_mention_cache.emplace(key, result);
+    }
+    return result;
+}

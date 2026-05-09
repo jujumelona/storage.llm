@@ -61,7 +61,8 @@ typedef struct {
     uint32_t directstorage_gpu_queue_capacity;
     int directstorage_require_completion_event;
     uint32_t prefill_group_wait_us;
-    int require_gpu_expert_batch_kernel_for_fast_mode;
+    int internal_require_gpu_expert_batch_kernel;
+    int internal_verified_backend_only;
     int enable_compute_io_overlap;
     int enable_multistage_pipeline;
     int enable_lookahead_prefetch;

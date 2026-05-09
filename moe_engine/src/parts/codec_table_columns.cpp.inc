@@ -1,4 +1,4 @@
-enum moe_codec_col : size_t {
+enum moe_codec_col {
     moe_CODEC_COL_PART = 0,
     moe_CODEC_COL_SHARD = 1,
     moe_CODEC_COL_SHARD_FILE = 2,

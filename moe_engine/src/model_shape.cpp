@@ -23,4 +23,3 @@ moe_model_shape_t moe_pc_Moe1_model_shape(void) {
     shape.projection_count = c->expert_projection_count;
     return shape;
 }
-

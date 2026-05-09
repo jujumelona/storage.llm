@@ -89,21 +89,19 @@ static uint64_t moe_expert_bundle_bytes_hint(const moe_pc_engine* engine, uint64
 }
 
 static uint64_t cache_for_experts(uint32_t expert_count) {
-    // BUGFIX 479: expert_count overflow 泥댄겕
     const uint64_t bundle_max = normal_bundle_max_or(32ull * 1024ull * 1024ull);
-    // BUGFIX 526: bundle_max媛 0????division by zero 諛⑹? ??
-    // Problem: normal_bundle_max_or can return 0 if storage constants are corrupted
-    // Causes division by zero in overflow check
-    // Solution: Check bundle_max > 0 before division
-    if (bundle_max == 0 || expert_count > UINT64_MAX / bundle_max) return UINT64_MAX;
+    if (bundle_max == 0 || expert_count > UINT64_MAX / bundle_max) {
+        return UINT64_MAX;
+    }
     return bundle_max * expert_count;
 }
 
 static uint64_t cache_with_common_for_experts(uint32_t expert_count) {
     const uint64_t common = working_common_cache_bytes();
     const uint64_t expert_cache = cache_for_experts(expert_count);
-    // BUGFIX 480: overflow 泥댄겕
-    if (common > UINT64_MAX - expert_cache) return UINT64_MAX;
+    if (common > UINT64_MAX - expert_cache) {
+        return UINT64_MAX;
+    }
     return common + expert_cache;
 }
 

@@ -64,7 +64,7 @@ struct moe_tensor_record {
     uint8_t residency_hint = moe_JUJU_RESIDENCY_AUTO;
     uint8_t graph_role = moe_JUJU_ROLE_UNKNOWN;
     uint8_t prefetch_class = moe_JUJU_PREFETCH_AUTO;
-    uint8_t juju_section_type = 0;
+    uint32_t juju_section_type = 0;
     uint8_t bundle_native = 0;
     uint8_t bundle_member_role = 0;
     uint32_t bundle_id = UINT32_MAX;

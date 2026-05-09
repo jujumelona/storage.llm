@@ -17,7 +17,7 @@ static int read_file_range_to_buffer(
         return 0;
     }
 
-    // BUGFIX Problem D: Adaptive storage bandwidth measurement ?…â˜…??    // Measure bandwidth from large reads (>10MB) to avoid init delay
+    // BUGFIX Problem D: Adaptive storage bandwidth measurement ???    // Measure bandwidth from large reads (>10MB) to avoid init delay
     const uint64_t measure_threshold = 10ull * 1024ull * 1024ull;
     const bool should_measure = engine && bytes >= measure_threshold;
 
@@ -34,7 +34,7 @@ static int read_file_range_to_buffer(
         const std::streamsize chunk = static_cast<std::streamsize>(
             std::min<uint64_t>(remaining, 64ull * 1024ull * 1024ull));
         input.read(reinterpret_cast<char*>(dst + copied), chunk);
-        // BUGFIX 258: Check for EOF and partial reads ?…â˜…
+        // BUGFIX 258: Check for EOF and partial reads ?
         // Problem: gcount() != chunk treated as error, but EOF with partial read is valid
         // Solution: Check EOF separately, allow partial read at end of file
         const std::streamsize actual = input.gcount();
@@ -62,7 +62,7 @@ static int read_file_range_to_buffer(
         copied += static_cast<uint64_t>(actual);
     }
 
-    // BUGFIX 951: Adaptive EMA (Exponential Moving Average) for storage bandwidth ?…â˜…??PERFORMANCE
+    // BUGFIX 951: Adaptive EMA (Exponential Moving Average) for storage bandwidth ???PERFORMANCE
     // Problem: Bandwidth was measured once and fixed, ignoring SSD thermal throttling,
     //   cache exhaustion, or OS page cache hits over time.
     // Solution: Use EMA (alpha=0.2) to update measured bandwidth continuously
@@ -76,18 +76,17 @@ static int read_file_range_to_buffer(
         const uint64_t elapsed_us = moe_profile_now_us() - start_us;
         if (elapsed_us > 0) {
             const uint64_t current_bw = (bytes * 1000000ull) / elapsed_us;
-            uint64_t old_bw = __atomic_load_n(&engine->backend_caps.measured_storage_bw_bytes_per_sec, __ATOMIC_ACQUIRE);
-            while (true) {
-                uint64_t new_bw = (old_bw == 0) ? current_bw : (old_bw * 8ull + current_bw * 2ull) / 10ull;
-                if (__atomic_compare_exchange_n(&engine->backend_caps.measured_storage_bw_bytes_per_sec, &old_bw, new_bw, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
-                    if (old_bw == 0) {
-                        const double gb_per_sec = (double)current_bw / 1e9;
-                        fprintf(stderr,
-                            "[storageLLM INFO] Initial storage bandwidth measured: %.2f GB/s from %llu MB read\n",
-                            gb_per_sec, (unsigned long long)(bytes / (1024*1024)));
-                    }
-                    break;
-                }
+            static std::mutex s_storage_bw_update_mutex;
+            std::lock_guard<std::mutex> bw_lock(s_storage_bw_update_mutex);
+            const uint64_t old_bw = engine->backend_caps.measured_storage_bw_bytes_per_sec;
+            const uint64_t new_bw =
+                (old_bw == 0) ? current_bw : (old_bw * 8ull + current_bw * 2ull) / 10ull;
+            engine->backend_caps.measured_storage_bw_bytes_per_sec = new_bw;
+            if (old_bw == 0) {
+                const double gb_per_sec = (double)current_bw / 1e9;
+                fprintf(stderr,
+                    "[storageLLM INFO] Initial storage bandwidth measured: %.2f GB/s from %llu MB read\n",
+                    gb_per_sec, (unsigned long long)(bytes / (1024*1024)));
             }
         }
     }
@@ -95,9 +94,9 @@ static int read_file_range_to_buffer(
     return 1;
 }
 
-// BUGFIX 51: Issue 22 - Cache ifstream per worker thread ?ï¿½â˜…
+// BUGFIX 51: Issue 22 - Cache ifstream per worker thread ?
 // Problem: prefetch_tensor_file_to_pinned opens/closes ifstream for every tensor.
-// 8 experts Ã— 3 projections = 24 file opens per MoE layer. Same shard file reopened repeatedly.
+// 8 experts  3 projections = 24 file opens per MoE layer. Same shard file reopened repeatedly.
 // Each open requires seekg(), and non-mmap path uses different OS cache than mmap path.
 // Solution: Use thread_local ifstream cache keyed by path. Reuse open streams when path matches.
 // Fall back to mmap path when available (more efficient, shares OS page cache).
@@ -112,11 +111,11 @@ static int prefetch_tensor_file_to_pinned(
     }
     uint32_t slot_index = io_slot_index ? *io_slot_index : UINT32_MAX;
 
-    // BUGFIX Issue 5: Generalized unified memory fast path ?…â˜…??    // Problem: Metal, AMD APU, Intel integrated GPU all have unified memory
+    // BUGFIX Issue 5: Generalized unified memory fast path ???    // Problem: Metal, AMD APU, Intel integrated GPU all have unified memory
     // Old: Metal-only fast path hardcoded to moe_BACKEND_METAL
     // Solution: Check supports_unified_memory flag instead of backend type
     // This enables zero-copy for AMD APU (780M), Intel Iris Xe, and Metal
-    // BUGFIX Issue 3: Add explicit zero-copy signal to caller ?…â˜…??    // Problem: Caller doesn't know if unified memory fast path was taken
+    // BUGFIX Issue 3: Add explicit zero-copy signal to caller ???    // Problem: Caller doesn't know if unified memory fast path was taken
     // Solution: Set io_slot_index to UINT32_MAX to signal "no slot used"
     if (engine && engine->backend_caps.supports_unified_memory &&
         engine->backend_caps.unified_mmap_gpu_accessible) {
@@ -145,7 +144,7 @@ static int prefetch_tensor_file_to_pinned(
         return 1;
     }
 
-    // BUGFIX Issue 3: Use staging_slot_valid() helper for correct check order ?…â˜…??    // Problem: Manual checks can get order wrong (size before staging_slot_size)
+    // BUGFIX Issue 3: Use staging_slot_valid() helper for correct check order ???    // Problem: Manual checks can get order wrong (size before staging_slot_size)
     // Solution: Use centralized helper that enforces correct order
     if (!engine || !staging_slot_valid(engine, slot_index)) {
         if (engine && engine->staging_slot_size == 0 && slot_index < engine->staging_slots.size()) {
@@ -160,7 +159,7 @@ static int prefetch_tensor_file_to_pinned(
         return 0;
     }
     if (total_bytes > engine->staging_slots[slot_index].size) {
-        // BUGFIX ë¬¸ì œ3: Dynamic slot reallocation for oversized tensors ?…â˜…??        // Problem: Oversized tensors silently fail forever, causing blocking sync loads
+        // BUGFIX 3: Dynamic slot reallocation for oversized tensors ???        // Problem: Oversized tensors silently fail forever, causing blocking sync loads
         // Solution: Attempt dynamic reallocation if tensor exceeds slot size
         engine->io_atomic.oversized_tensor_fallbacks.fetch_add(1, std::memory_order_relaxed);
 
@@ -169,14 +168,14 @@ static int prefetch_tensor_file_to_pinned(
         const uint64_t last_warn = s_last_warn_time_ms.load(std::memory_order_relaxed);
 
         // Check if we should attempt reallocation
-        // BUGFIX Bug #7: Fix sys_free calculation to use actual available RAM ?…â˜…??CRITICAL
+        // BUGFIX Bug #7: Fix sys_free calculation to use actual available RAM ???CRITICAL
         // Problem: tier_budget() returns total RAM budget, not remaining free RAM.
         // Old code: sys_free = ram_budget (total budget, e.g., 16GB)
         // When RAM is 90% full (14.4GB used), sys_free still shows 16GB ??OOM on realloc
         // Solution: Subtract tier_used() from tier_budget() to get actual free RAM
         // sys_free = ram_budget - ram_used (e.g., 16GB - 14.4GB = 1.6GB)
         // This prevents reallocation attempts when RAM is actually full
-        // New buffer allocated BEFORE old one freed ??temporarily uses 2Ã— staging memory
+        // New buffer allocated BEFORE old one freed ??temporarily uses 2 staging memory
         const uint64_t ram_budget = tier_budget(engine, moe_TIER_RAM);
         const uint64_t ram_used = tier_used(engine, moe_TIER_RAM);
         const uint64_t sys_free = (ram_budget > ram_used) ? (ram_budget - ram_used) :
@@ -187,7 +186,7 @@ static int prefetch_tensor_file_to_pinned(
         const bool should_try_realloc = enough_headroom && total_bytes <= engine->staging_size / 2;
 
         if (should_try_realloc) {
-            // BUGFIX Issue 2-3: Fix race condition in dynamic slot reallocation ?…â˜…??            // Problem: Old sequence "release ??configure ??acquire" allows other workers
+            // BUGFIX Issue 2-3: Fix race condition in dynamic slot reallocation ???            // Problem: Old sequence "release ??configure ??acquire" allows other workers
             // to access memory being freed during configure_staging_slots, causing use-after-free.
             // Solution: New sequence "acquire new ??if success, release old" prevents race.
             // Trade-off: Temporarily uses one extra slot worth of memory during reallocation.
@@ -231,7 +230,7 @@ static int prefetch_tensor_file_to_pinned(
                 return 0;
             }
 
-            // BUGFIX 979: Fix use-after-free in staging slot reallocation ?…â˜…??CRITICAL
+            // BUGFIX 979: Fix use-after-free in staging slot reallocation ???CRITICAL
             // Problem: slot.buf freed outside staging_slot_mutex. Another io_worker
             // can pass staging_slot_valid() and read the freed pointer concurrently.
             // Solution: Snapshot old values and swap to new buffer inside the lock.
@@ -304,7 +303,7 @@ static int prefetch_tensor_file_to_pinned(
 
     uint64_t staging_offset = 0;
 
-    // BUGFIX Problem 3: Validate io_generation to prevent path transition buffer corruption ?…â˜…??CRITICAL
+    // BUGFIX Problem 3: Validate io_generation to prevent path transition buffer corruption ???CRITICAL
     // Problem: IO worker captures task with OVERLAPPED enabled, engine transitions to mmap,
     // worker allocates slot under old generation and submits OVERLAPPED read using stale assumption.
     // Solution: Validate slot's io_generation matches engine's current generation before submitting I/O.
@@ -342,7 +341,7 @@ static int prefetch_tensor_file_to_pinned(
         if (submits > 0) {
             engine->ring_adapter.submit();
             int completions = 0;
-            // BUGFIX 121: Issue 26 - io_uring completion wait is spin-yield loop ?…â˜…
+            // BUGFIX 121: Issue 26 - io_uring completion wait is spin-yield loop ?
             // Problem: yield() busy-wait consumes CPU while io_worker waits for I/O.
             // Solution: Add wait_completion() to io_ring_adapter that uses io_uring_wait_cqe (Linux)
             // or blocking wait (Windows). io_worker has no other work during this wait, so blocking is fine.
@@ -626,14 +625,14 @@ static int prefetch_tensor_ram_to_pinned(
         if (target_tier != moe_TIER_VRAM) {
             madvise(const_cast<uint8_t*>(src), static_cast<size_t>(length), MADV_COLD);
         } else {
-            // BUGFIX 703: Conditional MADV_COLD for VRAM targets under RAM pressure ?…â˜…
+            // BUGFIX 703: Conditional MADV_COLD for VRAM targets under RAM pressure ?
             // Problem: VRAM-bound mmap data stays warm in page cache indefinitely.
             //   With 32GB RAM and 300GB model, page cache fills up ??OOM risk.
             // Solution: When available RAM < 15% of total, demote VRAM pages too.
             //   MADV_WILLNEED in residency_eviction handles the reverse on VRAM eviction.
             const uint64_t avail = storagellm::available_ram_bytes();
             const uint64_t total = storagellm::total_ram_bytes();
-            // BUGFIX 712: Increased MADV_COLD threshold to 30% ?…â˜…??            // Problem: 15% threshold caused massive I/O spikes when RAM was almost exhausted.
+            // BUGFIX 712: Increased MADV_COLD threshold to 30% ???            // Problem: 15% threshold caused massive I/O spikes when RAM was almost exhausted.
             // Solution: Evict earlier at 30% to smooth out page cache eviction.
             const uint32_t threshold_pct = engine->io_config.madv_cold_threshold_pct;
             if (total > 0 && avail < total * (uint64_t)threshold_pct / 100ull) {

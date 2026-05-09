@@ -1,7 +1,16 @@
 #ifndef STORAGELLM_PPL_DIAG_HOOKS_CPP_INC
 #define STORAGELLM_PPL_DIAG_HOOKS_CPP_INC
 
-#define STORAGELLM_PPL_DIAG_ENABLED 1
+// Bug B5: Diagnostics separation
+// PPL diagnostics are controlled by STORAGELLM_PPL_DIAG compile flag
+// Default: OFF (0) for release builds
+// Enable with: -DSTORAGELLM_PPL_DIAG=1
+
+#ifndef STORAGELLM_PPL_DIAG
+#define STORAGELLM_PPL_DIAG 0
+#endif
+
+#if STORAGELLM_PPL_DIAG
 
 static int storagellm_ppl_diag_verbose_enabled() {
     static int cached = -1;
@@ -568,4 +577,48 @@ static void storagellm_ppl_diag_attention_heads_failed(
         (double)attn_logit_softcap);
 }
 
-#endif
+#else  // STORAGELLM_PPL_DIAG == 0
+
+// Stub functions when diagnostics are disabled (Bug B5)
+// These have zero overhead and will be optimized away by the compiler
+
+static inline void storagellm_ppl_diag_forward_vec(
+    const char*, uint32_t, uint32_t, const char*, const float*, uint32_t) {}
+
+static inline void storagellm_ppl_diag_lm_head_begin(
+    uint32_t, uint32_t, uint32_t, uint8_t, uint8_t, uint32_t,
+    uint64_t, uint64_t, float, const float*) {}
+
+static inline void storagellm_ppl_diag_lm_head_end(
+    uint32_t, float, uint32_t, float, uint64_t, float,
+    float, float, float, float) {}
+
+static inline void storagellm_ppl_diag_attention_config(
+    const char*, int32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, int, float, float) {}
+
+static inline void storagellm_ppl_diag_qkv_block(
+    const char*, int32_t, uint32_t, const float*, const float*,
+    const float*, uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t) {}
+
+static inline void storagellm_ppl_diag_qkv_append_probe(
+    uint32_t, uint32_t, uint32_t, uint32_t, const float*,
+    const float*, const qkv_state_t*, const char*) {}
+
+static inline void storagellm_ppl_diag_qkv_decode_enter(
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    const float*, const qkv_state_t*, const qkv_config_t*) {}
+
+static inline void storagellm_ppl_diag_qkv_decode_failed(
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    const float*, const qkv_state_t*, const qkv_config_t*) {}
+
+static inline void storagellm_ppl_diag_attention_heads_failed(
+    int32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, int, float, float) {}
+
+#endif  // STORAGELLM_PPL_DIAG
+
+#endif  // STORAGELLM_PPL_DIAG_HOOKS_CPP_INC

@@ -101,7 +101,8 @@ moe_io_config_t moe_pc_default_io_config(void) {
     cfg.directstorage_gpu_queue_capacity = 1024;
     cfg.directstorage_require_completion_event = 1;
     cfg.prefill_group_wait_us = 200;
-    cfg.require_gpu_expert_batch_kernel_for_fast_mode = 1;
+    cfg.internal_require_gpu_expert_batch_kernel = 1;
+    cfg.internal_verified_backend_only = 1;
     cfg.enable_compute_io_overlap = 1;
     cfg.enable_multistage_pipeline = 1;
     cfg.enable_lookahead_prefetch = 1;
@@ -125,5 +126,6 @@ moe_io_config_t moe_pc_default_io_config(void) {
     cfg.level_zero_memory_headroom_pct = 20;
     cfg.enable_bw_benchmark = 1;
     cfg.ram_eviction_target_fill_pct = 75;  // Default 75% RAM fill target
+    moe_apply_autotune_io_env(&cfg);
     return cfg;
 }
