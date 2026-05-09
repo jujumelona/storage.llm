@@ -2,6 +2,7 @@
 #include <math.h>
 #include <limits>
 #include <algorithm>
+#include <vector>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -52,17 +53,18 @@ static void lloyd_max_codebook(
         centroids[i] = (float)((-3.5 + 7.0 * (double)i / (double)(n_levels - 1)) * sigma);
     }
 
+    std::vector<float> bounds((size_t)n_levels + 1u);
     for (int iter = 0; iter < max_iters; iter++) {
-        thresholds[0] = -std::numeric_limits<float>::infinity();
+        bounds[0] = -std::numeric_limits<float>::infinity();
         for (int i = 1; i < n_levels; i++) {
-            thresholds[i] = (centroids[i - 1] + centroids[i]) / 2.0f;
+            bounds[i] = (centroids[i - 1] + centroids[i]) / 2.0f;
         }
-        thresholds[n_levels] = std::numeric_limits<float>::infinity();
+        bounds[n_levels] = std::numeric_limits<float>::infinity();
 
         bool converged = true;
         for (int i = 0; i < n_levels; i++) {
-            const double lo = (i == 0) ? -1.0 : (double)thresholds[i];
-            const double hi = (i + 1 == n_levels) ? 1.0 : (double)thresholds[i + 1];
+            const double lo = (i == 0) ? -1.0 : std::max(-1.0, (double)bounds[i]);
+            const double hi = (i + 1 == n_levels) ? 1.0 : std::min(1.0, (double)bounds[i + 1]);
             if (!(hi > lo)) {
                 continue;
             }
@@ -89,6 +91,10 @@ static void lloyd_max_codebook(
 
         if (converged) break;
     }
+
+    for (int i = 0; i + 1 < n_levels; ++i) {
+        thresholds[i] = (centroids[i] + centroids[i + 1]) / 2.0f;
+    }
 }
 
 void qkv_compute_lloyd_max_codebook_ex(
@@ -110,11 +116,9 @@ void qkv_compute_lloyd_max_codebook_ex(
         centroids[2] = (float)(0.453 * scale);
         centroids[3] = (float)(1.51 * scale);
 
-        thresholds[0] = -std::numeric_limits<float>::infinity();
-        thresholds[1] = (float)((-1.51 - 0.453) / 2.0 * scale);
-        thresholds[2] = 0.0f;
-        thresholds[3] = (float)((0.453 + 1.51) / 2.0 * scale);
-        thresholds[4] = std::numeric_limits<float>::infinity();
+        thresholds[0] = (float)((-1.51 - 0.453) / 2.0 * scale);
+        thresholds[1] = 0.0f;
+        thresholds[2] = (float)((0.453 + 1.51) / 2.0 * scale);
         return;
     }
 
@@ -144,14 +148,18 @@ int qkv_find_nearest_centroid(
     if (!centroids || !thresholds || n_levels <= 0) {
         return 0;
     }
-    int lo = 0, hi = n_levels;
+    if (n_levels == 1) {
+        return 0;
+    }
+    int lo = 0;
+    int hi = n_levels - 1;
     while (lo < hi) {
         int mid = (lo + hi) / 2;
-        if (val < thresholds[mid + 1]) {
+        if (val < thresholds[mid]) {
             hi = mid;
         } else {
             lo = mid + 1;
         }
     }
-    return lo < n_levels ? lo : n_levels - 1;
+    return lo;
 }
