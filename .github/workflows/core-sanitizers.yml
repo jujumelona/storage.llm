@@ -1,0 +1,117 @@
+name: Core Sanitizers
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ main, develop ]
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-core-asan-ubsan:
+    name: Ubuntu core ASAN/UBSAN verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ libgtest-dev liburing-dev
+
+      - name: Configure core sanitizer build
+        run: >
+          cmake -S . -B build-core-sanitize -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DSTORAGELLM_BUILD_TESTS=ON
+          -DSTORAGELLM_ENABLE_SANITIZERS=ON
+          -DSTORAGELLM_SANITIZER_SET=address,undefined
+          -DSTORAGELLM_PPL_DIAG=ON
+          -DSTORAGELLM_ENABLE_NATIVE_OPTIMIZE=OFF
+          -DSTORAGELLM_ENABLE_TVM_CODEGEN=OFF
+          -DSTORAGELLM_ENABLE_CUDA=OFF
+          -DSTORAGELLM_ENABLE_CUBLASLT=OFF
+          -DSTORAGELLM_ENABLE_CUTLASS=OFF
+          -DSTORAGELLM_ENABLE_ROCM=OFF
+          -DSTORAGELLM_ENABLE_HIPBLASLT=OFF
+          -DSTORAGELLM_ENABLE_CK=OFF
+          -DSTORAGELLM_ENABLE_METAL=OFF
+          -DSTORAGELLM_ENABLE_ONEDNN=OFF
+          -DSTORAGELLM_ENABLE_VULKAN=OFF
+          -DSTORAGELLM_ENABLE_OPENCL=OFF
+          -DSTORAGELLM_ENABLE_CLBLAST=OFF
+
+      - name: Detect CMake core sanitizer test targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ninja -C build-core-sanitize -t targets all | sed 's/:.*//' | sort -u > build-core-sanitize/targets.txt
+          candidates=(
+            test_json_parser
+            test_loader_manifest_examples
+            test_weight_contract_examples
+            test_qkv_contract_examples
+            test_qkv_parity
+            test_bug_fixes
+          )
+          selected=()
+          for target in "${candidates[@]}"; do
+            if grep -Fxq "${target}" build-core-sanitize/targets.txt; then
+              selected+=("${target}")
+            else
+              echo "Missing required sanitizer target: ${target}"
+              cat build-core-sanitize/targets.txt
+              exit 1
+            fi
+          done
+          printf '%s\n' "${selected[@]}" > build-core-sanitize/selected-targets.txt
+          printf 'Selected sanitizer targets: %s\n' "${selected[*]}"
+
+      - name: Build CMake core sanitizer tests
+        shell: bash
+        run: |
+          mapfile -t selected < build-core-sanitize/selected-targets.txt
+          cmake --build build-core-sanitize --parallel 2 --target "${selected[@]}"
+
+      - name: Run CMake core sanitizer tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: >
+          ctest --test-dir build-core-sanitize --output-on-failure --timeout 180
+          -R '^(JSONParser|test_loader_manifest_examples|test_weight_contract_examples|test_qkv_contract_examples|QKVParity|BugFixes)$'
+
+      - name: Build standalone PPL sanitizer tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-core-sanitize/ppl-standalone
+          g++ -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -I. moe_engine/tests/test_ppl_math_contract_examples.cpp \
+            -lgtest -lgtest_main -pthread \
+            -o build-core-sanitize/ppl-standalone/test_ppl_math_contract_examples
+          g++ -std=c++17 -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -I. moe_engine/tests/test_ppl_diag_contract_examples.cpp \
+            -lgtest -lgtest_main -pthread \
+            -o build-core-sanitize/ppl-standalone/test_ppl_diag_contract_examples
+
+      - name: Run standalone PPL sanitizer tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          build-core-sanitize/ppl-standalone/test_ppl_math_contract_examples
+          build-core-sanitize/ppl-standalone/test_ppl_diag_contract_examples
+
+      - name: Upload sanitizer CTest logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-sanitizer-ctest-logs
+          path: build-core-sanitize/Testing/Temporary/
