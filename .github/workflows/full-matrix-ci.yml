@@ -60,33 +60,41 @@ jobs:
           EOF
           cat > build/json-smoke/json_smoke.cpp <<'EOF'
           #include "json_request.h"
-          #include <cassert>
+          #include <iostream>
           #include <string>
           #include <vector>
 
+          namespace {
+          int failures = 0;
+          void check(bool condition, const char* message) {
+              if (!condition) {
+                  std::cerr << "json_smoke failure: " << message << '\n';
+                  ++failures;
+              }
+          }
+          }  // namespace
+
           int main() {
               using namespace storagellm;
-
               int layer = -1;
-              assert(json_read_int("{\"current_layer\":2,\"selected_experts\":[1,2]}", "current_layer", &layer));
-              assert(layer == 2);
+              check(json_read_int("{\"current_layer\":2,\"selected_experts\":[1,2]}", "current_layer", &layer), "valid integer is parsed");
+              check(layer == 2, "parsed integer value equals 2");
+              check(!json_read_int("{\"current_layer\":2abc}", "current_layer", &layer), "trailing junk after int is rejected");
+              check(!json_read_int("{\"current_layer\":2147483648}", "current_layer", &layer), "integer overflow is rejected");
+              check(!json_read_int("{\"current_layer\":\"2\"}", "current_layer", &layer), "quoted integer is rejected");
 
-              assert(!json_read_int("{\"current_layer\":2abc}", "current_layer", &layer));
-              assert(!json_read_int("{\"current_layer\":2147483648}", "current_layer", &layer));
-              assert(!json_read_int("{\"current_layer\":\"2\"}", "current_layer", &layer));
+              std::vector<int> experts = json_read_int_array("{\"selected_experts\":[1,2,3]}", "selected_experts");
+              check(experts.size() == 3, "valid int array has three values");
+              if (experts.size() == 3) {
+                  check(experts[0] == 1 && experts[1] == 2 && experts[2] == 3, "valid int array values match");
+              }
 
-              std::vector<int> experts = json_read_int_array(
-                  "{\"selected_experts\":[1,2,3]}", "selected_experts");
-              assert(experts.size() == 3);
-              assert(experts[0] == 1 && experts[1] == 2 && experts[2] == 3);
-
-              assert(json_read_int_array("{\"selected_experts\":[1,]}", "selected_experts").empty());
-              assert(json_read_int_array("{\"selected_experts\":[1,,2]}", "selected_experts").empty());
-              assert(json_read_int_array("{\"selected_experts\":[\"1\",2]}", "selected_experts").empty());
-              assert(json_read_int_array("{\"selected_experts\":[2147483648]}", "selected_experts").empty());
-              assert(json_read_int_array("{\"selected_experts\":[1,[2]]}", "selected_experts").empty());
-
-              return 0;
+              check(json_read_int_array("{\"selected_experts\":[1,]}", "selected_experts").empty(), "trailing comma is rejected");
+              check(json_read_int_array("{\"selected_experts\":[1,,2]}", "selected_experts").empty(), "double comma is rejected");
+              check(json_read_int_array("{\"selected_experts\":[\"1\",2]}", "selected_experts").empty(), "quoted array value is rejected");
+              check(json_read_int_array("{\"selected_experts\":[2147483648]}", "selected_experts").empty(), "array integer overflow is rejected");
+              check(json_read_int_array("{\"selected_experts\":[1,[2]]}", "selected_experts").empty(), "nested array is rejected");
+              return failures == 0 ? 0 : 1;
           }
           EOF
 
