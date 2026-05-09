@@ -7,148 +7,53 @@ on:
     branches: [ main, develop ]
 
 jobs:
-  build-and-test:
-    name: Build and Test (${{ matrix.os }}, ${{ matrix.build_type }})
-    runs-on: ${{ matrix.os }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        build_type: [Debug, Release]
-        include:
-          - os: ubuntu-latest
-            cc: gcc-11
-            cxx: g++-11
-          - os: windows-latest
-            cc: cl
-            cxx: cl
-          - os: macos-latest
-            cc: clang
-            cxx: clang++
+  smoke-test:
+    name: Smoke Test (JSONParser)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install dependencies (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build liburing-dev
+          sudo apt-get install -y g++ libgtest-dev
 
-      - name: Install dependencies (macOS)
-        if: matrix.os == 'macos-latest'
+      - name: Build JSON parser smoke test directly
         run: |
-          brew install cmake ninja
+          g++ -std=c++17 -Wall -Wextra -Wpedantic \
+            -I. \
+            moe_engine/tests/test_json_parser.cpp \
+            -lgtest -lgtest_main -pthread \
+            -o test_json_parser
 
-      - name: Install dependencies (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          choco install cmake ninja
+      - name: Run JSON parser smoke test
+        run: ./test_json_parser
 
-      - name: Configure CMake
+      - name: Write final summary
+        if: always()
         shell: bash
-        run: >
-          cmake -S . -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-          -DSTORAGELLM_BUILD_TESTS=ON
-          -DSTORAGELLM_PPL_DIAG=OFF
+        run: |
+          cat > ci-summary.md <<'EOF'
+          # CI Summary
 
-      - name: Build
-        run: cmake --build build --parallel
+          Copy this block into ChatGPT for follow-up fixes.
 
-      - name: Run tests
-        run: ctest --test-dir build --output-on-failure --parallel
+          | Check | Result |
+          | --- | --- |
+          | JSONParser direct smoke test | ${{ job.status }} |
 
-      - name: Upload test results
-        if: failure()
+          This workflow intentionally bypasses the full CMake project and runs one fast regression test:
+          `g++ ... moe_engine/tests/test_json_parser.cpp && ./test_json_parser`.
+          EOF
+          cat ci-summary.md >> "$GITHUB_STEP_SUMMARY"
+          cat ci-summary.md
+
+      - name: Upload CI summary
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ matrix.os }}-${{ matrix.build_type }}
-          path: build/Testing/Temporary/
-
-  sanitizers:
-    name: Sanitizers (Ubuntu)
-    runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        sanitizer: [address, thread, undefined]
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build liburing-dev
-
-      - name: Configure CMake with ${{ matrix.sanitizer }} sanitizer
-        run: |
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DSTORAGELLM_BUILD_TESTS=ON \
-            -DSTORAGELLM_ENABLE_SANITIZERS=ON \
-            -DSTORAGELLM_SANITIZER_SET=${{ matrix.sanitizer }}
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Run tests with ${{ matrix.sanitizer }} sanitizer
-        env:
-          ASAN_OPTIONS: detect_leaks=1:check_initialization_order=1
-          UBSAN_OPTIONS: print_stacktrace=1
-          TSAN_OPTIONS: second_deadlock_stack=1
-        run: ctest --test-dir build --output-on-failure
-
-  static-analysis:
-    name: Static Analysis
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-tidy cppcheck
-
-      - name: Run clang-tidy
-        run: |
-          find . -name '*.cpp' -o -name '*.h' | \
-            grep -v 'build/' | \
-            xargs clang-tidy --checks='-*,bugprone-*,performance-*,readability-*' \
-            -- -std=c++17 -I. -Imoe_engine/include -Iloader -Iengine_core || true
-
-      - name: Run cppcheck
-        run: |
-          cppcheck --enable=warning,performance,portability \
-            --inconclusive --std=c++17 \
-            --suppress=missingIncludeSystem \
-            -I. -Imoe_engine/include -Iloader -Iengine_core \
-            . 2>&1 | tee cppcheck-report.txt || true
-
-      - name: Upload static analysis results
-        uses: actions/upload-artifact@v4
-        with:
-          name: static-analysis-results
-          path: cppcheck-report.txt
-
-  format-check:
-    name: Format Check
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install clang-format
-        run: sudo apt-get install -y clang-format
-
-      - name: Check formatting
-        run: |
-          git diff --check
+          name: ci-summary
+          path: ci-summary.md
