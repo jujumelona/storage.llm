@@ -804,10 +804,6 @@ static void configure_staging_slots(moe_pc_engine* engine) {
     }
     engine->staging_slot_size = slot_size;
     engine->staging_slots.reserve(slot_count);
-#if defined(__APPLE__) && defined(__MACH__)
-extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t bytes);
-#endif
-
     for (uint32_t i = 0; i < slot_count; ++i) {
         moe_staging_slot slot;
         if (slot_size > 0 && i > UINT64_MAX / slot_size) {
@@ -830,7 +826,7 @@ extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t by
         slot.numa_allocated = engine->staging_numa_allocated;
         slot.device_host_allocated = engine->staging_device_host_allocated;
 #if defined(__APPLE__) && defined(__MACH__)
-        if (engine->backend_caps.backend == moe_BACKEND_METAL) {
+        if (engine->backend_caps.backend == moe_BACKEND_METAL && metal_zero_copy_map) {
             slot.metal_buffer = metal_zero_copy_map(nullptr, slot.buf, slot.size);
         } else {
             slot.metal_buffer = nullptr;

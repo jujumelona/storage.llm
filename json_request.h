@@ -150,7 +150,10 @@ inline std::vector<int> json_read_int_array(const std::string& body, const char*
         if (p >= array_end) break;
 
         // Check for nested array
-        if (*p == '[') return values;  // Reject nested arrays
+        if (*p == '[') {
+            values.clear();
+            return values;  // Reject nested arrays
+        }
 
         if (*p == ',' || *p == ']') {
             ++p;
@@ -165,6 +168,7 @@ inline std::vector<int> json_read_int_array(const std::string& body, const char*
             p = next;
         } else {
             // Invalid value in array
+            values.clear();
             return values;
         }
     }

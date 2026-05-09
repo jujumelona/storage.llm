@@ -74,6 +74,12 @@ static inline __m256 moe_madd_ps(__m256 a, __m256 b, __m256 c) {
 }
 #endif
 
+#if defined(__APPLE__) && defined(__MACH__)
+extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t bytes) __attribute__((weak_import));
+extern "C" void metal_zero_copy_unmap(void* buffer) __attribute__((weak_import));
+extern "C" void* metal_buffer_alloc(void* device_handle, uint64_t bytes) __attribute__((weak_import));
+#endif
+
 #include "storage_llm_tools.h"
 #include "parts/io_ring_adapter.cpp.inc"
 #include "parts/io_atomic_stats_state.cpp.inc"

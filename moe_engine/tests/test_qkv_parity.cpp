@@ -354,7 +354,7 @@ TEST(QKVParity, FailClosedPolicy) {
 TEST(QKVParity, ToleranceThresholds) {
     // Verify tolerance constants match specification
     EXPECT_EQ(PER_LAYER_TOL, 1e-5f);
-    EXPECT_EQ(MEAN_NLL_TOL, 5e-5);
+    EXPECT_EQ(MEAN_NLL_TOL, 5e-5f);
     EXPECT_EQ(PPL_REL_TOL, 1e-4f);
 }
 

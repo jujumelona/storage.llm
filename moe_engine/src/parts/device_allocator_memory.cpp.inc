@@ -537,8 +537,7 @@ static void device_free_deferred_ptrs(moe_pc_engine* e, std::vector<std::pair<CU
         }
         if (pair.first) {
 #if defined(__APPLE__) && defined(__MACH__)
-            if (e->backend_caps.backend == moe_BACKEND_METAL) {
-                extern "C" void metal_zero_copy_unmap(void* buffer);
+            if (e->backend_caps.backend == moe_BACKEND_METAL && metal_zero_copy_unmap) {
                 metal_zero_copy_unmap((void*)pair.first);
             } else
 #endif
@@ -627,8 +626,7 @@ static void device_release_allocation_locked(
             device_set_current(e);
             if (1) {
 #if defined(__APPLE__) && defined(__MACH__)
-                if (e->backend_caps.backend == moe_BACKEND_METAL) {
-                    extern "C" void metal_zero_copy_unmap(void* buffer);
+                if (e->backend_caps.backend == moe_BACKEND_METAL && metal_zero_copy_unmap) {
                     metal_zero_copy_unmap((void*)a.ptr);
                 } else
 #endif

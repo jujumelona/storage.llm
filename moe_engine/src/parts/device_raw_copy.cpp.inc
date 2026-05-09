@@ -11,11 +11,6 @@ static uint64_t device_key_raw_span(const moe_storage_raw_span_spec_t& s, uint8_
          | ((s.offset >> 12) & 0x00ffffffull);
 }
 
-#if defined(__APPLE__) && defined(__MACH__)
-extern "C" void* metal_zero_copy_map(void* device_handle, void* src, uint64_t bytes) __attribute__((weak_import));
-extern "C" void metal_zero_copy_unmap(void* buffer) __attribute__((weak_import));
-#endif
-
 static thread_local uint32_t s_raw_span_acquire_turn = 0;
 
 static int device_copy_raw_span(

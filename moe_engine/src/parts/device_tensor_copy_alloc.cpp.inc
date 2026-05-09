@@ -116,8 +116,7 @@ static int device_prepare_tensor_allocation(
             auto try_device_alloc = [&]() -> int {
                 next.ptr = 0;
 #if defined(__APPLE__) && defined(__MACH__)
-                if (e->backend_caps.backend == moe_BACKEND_METAL) {
-                    extern "C" void* metal_buffer_alloc(void* device_handle, uint64_t bytes);
+                if (e->backend_caps.backend == moe_BACKEND_METAL && metal_buffer_alloc) {
                     next.ptr = (CUdeviceptr)metal_buffer_alloc(nullptr, bytes);
                     return (next.ptr != 0) ? 1 : 0;
                 } else
