@@ -191,6 +191,38 @@ TEST(JSONParser, DuplicateKeys) {
     EXPECT_EQ(layer, 2);  // Should use first occurrence
 }
 
+// ============================================================================
+// Test 15: Reject trailing junk after integers
+// ============================================================================
+TEST(JSONParser, RejectsTrailingJunkAfterInt) {
+    std::string payload = R"({"current_layer":2abc,"selected_experts":[1,2]})";
+
+    int layer = -1;
+    EXPECT_FALSE(json_read_int(payload, "current_layer", &layer));
+}
+
+// ============================================================================
+// Test 16: Reject invalid array tokens and trailing commas
+// ============================================================================
+TEST(JSONParser, RejectsInvalidArrayTokens) {
+    EXPECT_TRUE(json_read_int_array(R"({"selected_experts":[1,2abc]})", "selected_experts").empty());
+    EXPECT_TRUE(json_read_int_array(R"({"selected_experts":[1,]})", "selected_experts").empty());
+    EXPECT_TRUE(json_read_int_array(R"({"selected_experts":[,1]})", "selected_experts").empty());
+    EXPECT_TRUE(json_read_int_array(R"({"selected_experts":[1,,2]})", "selected_experts").empty());
+    EXPECT_TRUE(json_read_int_array(R"({"selected_experts":["1",2]})", "selected_experts").empty());
+}
+
+// ============================================================================
+// Test 17: Reject integer overflow
+// ============================================================================
+TEST(JSONParser, RejectsIntegerOverflow) {
+    std::string payload = R"({"current_layer":2147483648,"selected_experts":[1]})";
+
+    int layer = -1;
+    EXPECT_FALSE(json_read_int(payload, "current_layer", &layer));
+    EXPECT_TRUE(json_read_int_array(R"({"selected_experts":[2147483648]})", "selected_experts").empty());
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
