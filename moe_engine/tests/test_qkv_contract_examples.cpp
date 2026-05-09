@@ -3,11 +3,16 @@
 // fields, packed indices, quantized KV rows, and attention decode fail closed
 // instead of crashing or silently accepting invalid contracts.
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <vector>
 
@@ -48,7 +53,7 @@ void expect_all_finite(const std::vector<float>& values) {
 
 double mse(const std::vector<float>& a, const std::vector<float>& b) {
     if (a.size() != b.size() || a.empty()) {
-        return INFINITY;
+        return std::numeric_limits<double>::infinity();
     }
     double acc = 0.0;
     for (size_t i = 0; i < a.size(); ++i) {
@@ -60,11 +65,11 @@ double mse(const std::vector<float>& a, const std::vector<float>& b) {
 
 double max_abs_error(const std::vector<float>& a, const std::vector<float>& b) {
     if (a.size() != b.size() || a.empty()) {
-        return INFINITY;
+        return std::numeric_limits<double>::infinity();
     }
     double out = 0.0;
     for (size_t i = 0; i < a.size(); ++i) {
-        out = std::max(out, std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
+        out = (std::max)(out, std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
     }
     return out;
 }
@@ -83,7 +88,6 @@ void expect_roundtrip_within(
 }  // namespace
 
 TEST(QKVContractExamples, OffloadKvExampleNumbersMapIntoConfig) {
-    // Representative values from the offload.* GGUF KV namespace.
     qkv_config_t cfg = qkv_config_default(128);
     cfg.k_bits = 3;
     cfg.v_bits = 2;
@@ -110,7 +114,6 @@ TEST(QKVContractExamples, OffloadKvExampleNumbersMapIntoConfig) {
     EXPECT_EQ(cfg.qjl_seed, 43u);
     EXPECT_FALSE(cfg.plain_kv_persistent_storage);
 
-    // 32 channels @ 3 bits + 96 channels @ 2 bits over dim=128 = 2.25.
     EXPECT_FLOAT_EQ(qkv_effective_bits_for_values(128, 32, 3, 2), 2.25f);
     EXPECT_FLOAT_EQ(qkv_effective_bits(&cfg), 2.25f);
 }
@@ -180,13 +183,8 @@ TEST(QKVContractExamples, CodebooksAreOrderedAndNearestIndexIsInRange) {
     for (int bits : {1, 2, 3, 4}) {
         const int levels = 1 << bits;
         std::vector<float> centroids(levels);
-        std::vector<float> thresholds(std::max(1, levels - 1));
-        qkv_compute_lloyd_max_codebook(
-            centroids.data(),
-            thresholds.data(),
-            bits,
-            128
-        );
+        std::vector<float> thresholds((std::max)(1, levels - 1));
+        qkv_compute_lloyd_max_codebook(centroids.data(), thresholds.data(), bits, 128);
 
         for (int i = 1; i < levels; ++i) {
             EXPECT_LE(centroids[i - 1], centroids[i]);
@@ -196,12 +194,7 @@ TEST(QKVContractExamples, CodebooksAreOrderedAndNearestIndexIsInRange) {
         }
 
         for (float sample : {-2.0f, -0.25f, 0.0f, 0.25f, 2.0f}) {
-            const int idx = qkv_find_nearest_centroid(
-                sample,
-                centroids.data(),
-                thresholds.data(),
-                levels
-            );
+            const int idx = qkv_find_nearest_centroid(sample, centroids.data(), thresholds.data(), levels);
             EXPECT_GE(idx, 0);
             EXPECT_LT(idx, levels);
         }
