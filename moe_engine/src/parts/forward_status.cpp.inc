@@ -40,22 +40,33 @@ static int moe_forward_expert_triplet_records_ready(const moe_pc_engine* engine)
     if (!engine || engine->tensors.empty()) {
         return 0;
     }
-    uint64_t gate = 0;
-    uint64_t up = 0;
-    uint64_t down = 0;
-    for (const moe_tensor_record& rec : engine->tensors) {
-        if (rec.info.weight_byte_length == 0) {
+    const moe_storage_constants_t storage = moe_engine_storage_constants_or_static(engine);
+    const uint32_t hidden_size = storage.hidden_size;
+    const uint32_t intermediate_size = storage.expert_intermediate_size;
+    if (hidden_size == 0 || intermediate_size == 0) {
+        return 0;
+    }
+
+    for (const moe_tensor_record& gate : engine->tensors) {
+        if (gate.info.proj != moe_PROJ_GATE || gate.info.weight_byte_length == 0 ||
+            gate.info.rows != intermediate_size || gate.info.cols != hidden_size) {
             continue;
         }
-        if (rec.info.proj == moe_PROJ_GATE) {
-            ++gate;
-        } else if (rec.info.proj == moe_PROJ_UP) {
-            ++up;
-        } else if (rec.info.proj == moe_PROJ_DOWN) {
-            ++down;
+        const moe_tensor_record* up = find_tensor_record(
+            const_cast<moe_pc_engine*>(engine), gate.info.layer, gate.info.expert, moe_PROJ_UP);
+        const moe_tensor_record* down = find_tensor_record(
+            const_cast<moe_pc_engine*>(engine), gate.info.layer, gate.info.expert, moe_PROJ_DOWN);
+        if (up && down &&
+            up->info.weight_byte_length > 0 &&
+            down->info.weight_byte_length > 0 &&
+            up->info.rows == intermediate_size &&
+            up->info.cols == hidden_size &&
+            down->info.rows == hidden_size &&
+            down->info.cols == intermediate_size) {
+            return 1;
         }
     }
-    return gate > 0 && up > 0 && down > 0 ? 1 : 0;
+    return 0;
 }
 
 int moe_pc_engine_get_forward_status(
@@ -114,7 +125,6 @@ int moe_pc_engine_get_forward_status(
     }
     out_status->tensor_table_loaded = out_status->tensor_count > 0;
     out_status->expert_triplet_available =
-        out_status->storage_state_valid &&
         out_status->tensor_table_loaded &&
         moe_forward_expert_triplet_records_ready(engine);
     {
