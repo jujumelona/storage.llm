@@ -1,0 +1,67 @@
+name: Core TSAN
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ main, develop ]
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-core-tsan:
+    name: Ubuntu core TSAN verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ libgtest-dev liburing-dev
+
+      - name: Configure TSAN build
+        run: >
+          cmake -S . -B build-tsan -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DSTORAGELLM_BUILD_TESTS=ON
+          -DSTORAGELLM_ENABLE_SANITIZERS=ON
+          -DSTORAGELLM_SANITIZER_SET=thread
+          -DSTORAGELLM_PPL_DIAG=ON
+          -DSTORAGELLM_ENABLE_NATIVE_OPTIMIZE=OFF
+          -DSTORAGELLM_ENABLE_TVM_CODEGEN=OFF
+          -DSTORAGELLM_ENABLE_CUDA=OFF
+          -DSTORAGELLM_ENABLE_CUBLASLT=OFF
+          -DSTORAGELLM_ENABLE_CUTLASS=OFF
+          -DSTORAGELLM_ENABLE_ROCM=OFF
+          -DSTORAGELLM_ENABLE_HIPBLASLT=OFF
+          -DSTORAGELLM_ENABLE_CK=OFF
+          -DSTORAGELLM_ENABLE_METAL=OFF
+          -DSTORAGELLM_ENABLE_ONEDNN=OFF
+          -DSTORAGELLM_ENABLE_VULKAN=OFF
+          -DSTORAGELLM_ENABLE_OPENCL=OFF
+          -DSTORAGELLM_ENABLE_CLBLAST=OFF
+
+      - name: Build TSAN tests
+        run: >
+          cmake --build build-tsan --parallel 2 --target
+          test_qkv_parity test_bug_fixes
+
+      - name: Run TSAN tests
+        env:
+          TSAN_OPTIONS: halt_on_error=1:report_signal_unsafe=0
+        run: >
+          ctest --test-dir build-tsan --output-on-failure --timeout 180
+          -R '^(QKVParity|BugFixes)$'
+
+      - name: Upload TSAN CTest logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-tsan-ctest-logs
+          path: build-tsan/Testing/Temporary/
