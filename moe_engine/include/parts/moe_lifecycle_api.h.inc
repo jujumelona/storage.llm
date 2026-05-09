@@ -1,6 +1,7 @@
 
 moe_pc_engine_config_t moe_pc_default_config(void);
 moe_io_config_t moe_pc_default_io_config(void);
+moe_model_shape_t moe_model_shape_from_storage_constants(const moe_storage_constants_t* constants);
 moe_model_shape_t moe_pc_Moe1_model_shape(void);
 
 moe_pc_engine_t* moe_pc_engine_create(const moe_pc_engine_config_t* config);
