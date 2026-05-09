@@ -1,6 +1,8 @@
 #import <Metal/Metal.h>
 #include "metal_adapter.h"
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 extern "C" {
 
@@ -34,19 +36,17 @@ void* metal_zero_copy_map_aligned(void* device_handle, void* src, uint64_t bytes
         return nullptr;
     }
 
-    // Create an MTLBuffer that wraps the existing mmap pointer without copying
     id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:(void*)aligned_src
                                                      length:(NSUInteger)aligned_bytes
                                                     options:MTLResourceStorageModeShared
                                                 deallocator:nil];
-    // Return the buffer as a void pointer (bridged to void* to pass through C-boundary)
-    return (void*)CFBridgingRetain(buffer);
+    return buffer ? (void*)CFBridgingRetain(buffer) : nullptr;
 }
 
 void metal_zero_copy_unmap(void* buffer) {
     if (buffer) {
         id<MTLBuffer> mtlBuffer = (id<MTLBuffer>)CFBridgingRelease(buffer);
-        mtlBuffer = nil; // ARC will deallocate
+        mtlBuffer = nil;
     }
 }
 
@@ -77,13 +77,6 @@ int metal_copy_h2d_async(void* dst_buffer, const void* src, uint64_t bytes, void
     id<MTLDevice> device = [dst device] ?: MTLCreateSystemDefaultDevice();
     if (!device) return 0;
 
-    // BUGFIX 903: Use zero-copy path for Metal unified memory ★★★ PERFORMANCE
-    // Problem: newBufferWithBytes allocates new MTLBuffer + memcpy every call
-    // → Wastes CPU cycles and memory bandwidth on unified memory architecture
-    // Solution: Try newBufferWithBytesNoCopy first (zero-copy), fallback to memcpy if alignment fails
-    // Impact: Eliminates memcpy + staging allocation on Apple Silicon, ~2x H2D throughput
-
-    // Try zero-copy path (requires page alignment)
     NSUInteger pageSize = [NSProcessInfo processInfo].pageSize;
     uintptr_t src_addr = (uintptr_t)src;
     uintptr_t aligned_src = src_addr & ~((uintptr_t)pageSize - 1u);
@@ -93,7 +86,6 @@ int metal_copy_h2d_async(void* dst_buffer, const void* src, uint64_t bytes, void
     NSUInteger srcOffset = 0;
 
     if (prefix == 0 && (bytes % pageSize == 0 || bytes + pageSize <= (uint64_t)NSUIntegerMax)) {
-        // Page-aligned source → zero-copy possible
         uint64_t aligned_bytes = bytes;
         const uint64_t rem = aligned_bytes % (uint64_t)pageSize;
         if (rem) {
@@ -107,7 +99,6 @@ int metal_copy_h2d_async(void* dst_buffer, const void* src, uint64_t bytes, void
     }
 
     if (!srcBuffer) {
-        // Fallback: alignment failed or not page-aligned → use memcpy path
         srcBuffer = [device newBufferWithBytes:src
                                         length:(NSUInteger)bytes
                                        options:MTLResourceStorageModeShared];
@@ -140,12 +131,11 @@ int metal_copy_h2d_sync(void* dst_buffer, const void* src, uint64_t bytes) {
     return metal_copy_h2d_sync_impl(dst_buffer, src, bytes);
 }
 
-// Metal Async Callbacks
 void* metal_stream_create(void* device_handle) {
     id<MTLDevice> device = device_handle ? (__bridge id<MTLDevice>)device_handle : MTLCreateSystemDefaultDevice();
     if (!device) return nullptr;
     id<MTLCommandQueue> queue = [device newCommandQueue];
-    return (void*)CFBridgingRetain(queue);
+    return queue ? (void*)CFBridgingRetain(queue) : nullptr;
 }
 
 void metal_stream_destroy(void* stream) {
@@ -176,18 +166,15 @@ int metal_event_record(void* event, void* stream) {
     if (!event || !stream) return 0;
     MetalEvent* ev = (MetalEvent*)event;
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)stream;
-
-    // Create a dummy command buffer just to track completion
     id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
     if (!commandBuffer) return 0;
 
     ev->completed = false;
-
     [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        (void)cb;
         ev->completed = true;
         dispatch_semaphore_signal(ev->sem);
     }];
-
     [commandBuffer commit];
     return 1;
 }
@@ -203,33 +190,17 @@ int metal_event_sync(void* event) {
     MetalEvent* ev = (MetalEvent*)event;
     if (ev->completed) return 1;
     dispatch_semaphore_wait(ev->sem, DISPATCH_TIME_FOREVER);
-    // put token back since wait decrements it, allowing multiple syncs
     dispatch_semaphore_signal(ev->sem);
     return 1;
 }
 
-}
-
-
-// BUGFIX Problem 8: Metal bandwidth measurement ★★ PERFORMANCE
-// Problem: All Metal devices use hardcoded 120 GB/s
-// M3 Max (400 GB/s) and M4 Pro (273 GB/s) underutilize by 3x
-// Solution: Measure actual H2D bandwidth at runtime
-// Impact: Correct staging slot count and prefetch depth calculation
-// BUGFIX Problem E: Apply correction factor for GPU pipeline overhead ★★ FIXED
-// Problem: MTLResourceStorageModeShared measures CPU→unified memory write speed
-// Doesn't include GPU consumption latency → overestimates by 20-30%
-// Solution: Apply 0.75 correction factor to account for GPU pipeline overhead
-// Impact: More realistic staging slot count and prefetch depth
 uint64_t metal_measure_h2d_bandwidth(void* device_handle) {
     id<MTLDevice> device = device_handle ? (__bridge id<MTLDevice>)device_handle : MTLCreateSystemDefaultDevice();
     if (!device) return 0;
 
-    const size_t test_size = 100 * 1024 * 1024;  // 100MB
+    const size_t test_size = 100 * 1024 * 1024;
     void* host_buf = malloc(test_size);
     if (!host_buf) return 0;
-
-    // Fill with data to prevent lazy allocation
     memset(host_buf, 0xAB, test_size);
 
     id<MTLBuffer> device_buf = [device newBufferWithLength:test_size
@@ -239,7 +210,6 @@ uint64_t metal_measure_h2d_bandwidth(void* device_handle) {
         return 0;
     }
 
-    // Warmup: 3 iterations
     for (int i = 0; i < 3; ++i) {
         memcpy([device_buf contents], host_buf, test_size);
 #if TARGET_OS_OSX
@@ -247,17 +217,14 @@ uint64_t metal_measure_h2d_bandwidth(void* device_handle) {
 #endif
     }
 
-    // Measure: 10 iterations
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
-
     for (int i = 0; i < 10; ++i) {
         memcpy([device_buf contents], host_buf, test_size);
 #if TARGET_OS_OSX
         [device_buf didModifyRange:NSMakeRange(0, test_size)];
 #endif
     }
-
     clock_gettime(CLOCK_MONOTONIC, &end);
 
     double elapsed_sec = (end.tv_sec - start.tv_sec) +
@@ -265,13 +232,11 @@ uint64_t metal_measure_h2d_bandwidth(void* device_handle) {
 
     uint64_t bytes_per_sec = 0;
     if (elapsed_sec > 0.0) {
-        // Apply 0.75 correction factor for GPU pipeline overhead
         bytes_per_sec = (uint64_t)((test_size * 10.0 * 0.75) / elapsed_sec);
     }
 
     device_buf = nil;
     free(host_buf);
-
     return bytes_per_sec;
 }
 
