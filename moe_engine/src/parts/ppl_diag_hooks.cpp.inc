@@ -10,6 +10,14 @@
 #define STORAGELLM_PPL_DIAG 0
 #endif
 
+// Production call sites historically guard expensive diagnostics with
+// STORAGELLM_PPL_DIAG_ENABLED. Keep that gate synchronized with the public
+// CMake/user-facing STORAGELLM_PPL_DIAG switch so enabling diagnostics actually
+// compiles the hook calls.
+#if STORAGELLM_PPL_DIAG && !defined(STORAGELLM_PPL_DIAG_ENABLED)
+#define STORAGELLM_PPL_DIAG_ENABLED 1
+#endif
+
 #if STORAGELLM_PPL_DIAG
 
 static int storagellm_ppl_diag_verbose_enabled() {
@@ -580,18 +588,20 @@ static void storagellm_ppl_diag_attention_heads_failed(
 #else  // STORAGELLM_PPL_DIAG == 0
 
 // Stub functions when diagnostics are disabled (Bug B5)
-// These have zero overhead and will be optimized away by the compiler
+// These have zero overhead and will be optimized away by the compiler.
+// Keep signatures identical to enabled hooks so disabled builds compile even if
+// a call site is intentionally unguarded.
 
 static inline void storagellm_ppl_diag_forward_vec(
-    const char*, uint32_t, uint32_t, const char*, const float*, uint32_t) {}
+    const char*, uint32_t, uint32_t, const float*, uint32_t) {}
 
 static inline void storagellm_ppl_diag_lm_head_begin(
-    uint32_t, uint32_t, uint32_t, uint8_t, uint8_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, uint8_t, uint8_t, uint8_t,
     uint64_t, uint64_t, float, const float*) {}
 
 static inline void storagellm_ppl_diag_lm_head_end(
-    uint32_t, float, uint32_t, float, uint64_t, float,
-    float, float, float, float) {}
+    uint32_t, float, uint32_t, float, uint64_t, double,
+    float, double, double, float) {}
 
 static inline void storagellm_ppl_diag_attention_config(
     const char*, int32_t, uint32_t, uint32_t, uint32_t, uint32_t,
@@ -599,8 +609,8 @@ static inline void storagellm_ppl_diag_attention_config(
     uint32_t, uint32_t, uint32_t, int, float, float) {}
 
 static inline void storagellm_ppl_diag_qkv_block(
-    const char*, int32_t, uint32_t, const float*, const float*,
-    const float*, uint32_t, uint32_t, uint32_t, uint32_t,
+    const char*, int32_t, uint32_t, const float*, uint32_t,
+    const float*, uint32_t, const float*, uint32_t, uint32_t,
     uint32_t, uint32_t, uint32_t) {}
 
 static inline void storagellm_ppl_diag_qkv_append_probe(
@@ -609,11 +619,11 @@ static inline void storagellm_ppl_diag_qkv_append_probe(
 
 static inline void storagellm_ppl_diag_qkv_decode_enter(
     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
-    const float*, const qkv_state_t*, const qkv_config_t*) {}
+    float, float, const float*, const qkv_state_t*, const qkv_config_t*) {}
 
 static inline void storagellm_ppl_diag_qkv_decode_failed(
-    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
-    const float*, const qkv_state_t*, const qkv_config_t*) {}
+    uint32_t, uint32_t, uint32_t, const float*, const qkv_state_t*,
+    const qkv_config_t*, uint32_t, uint32_t, uint32_t, float, float) {}
 
 static inline void storagellm_ppl_diag_attention_heads_failed(
     int32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
