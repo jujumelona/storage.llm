@@ -46,6 +46,40 @@ void expect_all_finite(const std::vector<float>& values) {
     }
 }
 
+double mse(const std::vector<float>& a, const std::vector<float>& b) {
+    if (a.size() != b.size() || a.empty()) {
+        return INFINITY;
+    }
+    double acc = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const double d = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+        acc += d * d;
+    }
+    return acc / static_cast<double>(a.size());
+}
+
+double max_abs_error(const std::vector<float>& a, const std::vector<float>& b) {
+    if (a.size() != b.size() || a.empty()) {
+        return INFINITY;
+    }
+    double out = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        out = std::max(out, std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
+    }
+    return out;
+}
+
+void expect_roundtrip_within(
+    const std::vector<float>& original,
+    const std::vector<float>& restored,
+    double max_mse,
+    double max_error
+) {
+    expect_all_finite(restored);
+    EXPECT_LE(mse(original, restored), max_mse);
+    EXPECT_LE(max_abs_error(original, restored), max_error);
+}
+
 }  // namespace
 
 TEST(QKVContractExamples, OffloadKvExampleNumbersMapIntoConfig) {
@@ -191,6 +225,86 @@ TEST(QKVContractExamples, HadamardRotationRoundTripIsStableForPowerOfTwoDim) {
 
     for (int i = 0; i < kHeadDim; ++i) {
         EXPECT_NEAR(restored[i], input[i], 1e-5f);
+    }
+}
+
+TEST(QKVContractExamples, RawFp32KvRoundTripIsLosslessWithoutCompression) {
+    qkv_config_t cfg = qkv_config_default(kHeadDim);
+    cfg.k_bits = 32;
+    cfg.v_bits = 32;
+    cfg.enable_qjl = false;
+    cfg.enable_rotation = false;
+    cfg.sink_tokens = 0;
+    cfg.plain_kv_persistent_storage = true;
+
+    qkv_state_t state{};
+    ASSERT_TRUE(qkv_init(&state, &cfg, kTokens));
+
+    const std::vector<float> keys = make_example_keys();
+    const std::vector<float> values = make_example_values();
+    ASSERT_TRUE(qkv_quantize(&state, &cfg, keys.data(), values.data(), kTokens));
+
+    std::vector<float> key_out(keys.size(), 0.0f);
+    std::vector<float> value_out(values.size(), 0.0f);
+    ASSERT_TRUE(qkv_dequantize(&state, &cfg, key_out.data(), value_out.data(), kTokens));
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_FLOAT_EQ(key_out[i], keys[i]);
+        EXPECT_FLOAT_EQ(value_out[i], values[i]);
+    }
+    qkv_free(&state);
+}
+
+TEST(QKVContractExamples, RawFp16KvRoundTripIsCloseWithoutCodebookCompression) {
+    qkv_config_t cfg = qkv_config_default(kHeadDim);
+    cfg.k_bits = 16;
+    cfg.v_bits = 16;
+    cfg.enable_qjl = false;
+    cfg.enable_rotation = false;
+    cfg.sink_tokens = 0;
+    cfg.plain_kv_persistent_storage = true;
+
+    qkv_state_t state{};
+    ASSERT_TRUE(qkv_init(&state, &cfg, kTokens));
+
+    const std::vector<float> keys = make_example_keys();
+    const std::vector<float> values = make_example_values();
+    ASSERT_TRUE(qkv_quantize(&state, &cfg, keys.data(), values.data(), kTokens));
+
+    std::vector<float> key_out(keys.size(), 0.0f);
+    std::vector<float> value_out(values.size(), 0.0f);
+    ASSERT_TRUE(qkv_dequantize(&state, &cfg, key_out.data(), value_out.data(), kTokens));
+    expect_roundtrip_within(keys, key_out, 1e-6, 0.001);
+    expect_roundtrip_within(values, value_out, 1e-6, 0.001);
+    qkv_free(&state);
+}
+
+TEST(QKVContractExamples, QuantizedKvRoundTripHasBoundedReconstructionError) {
+    for (int bits : {2, 3, 4, 8}) {
+        qkv_config_t cfg = qkv_config_default(kHeadDim);
+        cfg.k_bits = bits;
+        cfg.v_bits = bits;
+        cfg.enable_qjl = false;
+        cfg.enable_rotation = false;
+        cfg.sink_tokens = 0;
+        cfg.plain_kv_persistent_storage = false;
+
+        qkv_state_t state{};
+        ASSERT_TRUE(qkv_init(&state, &cfg, kTokens));
+
+        const std::vector<float> keys = make_example_keys();
+        const std::vector<float> values = make_example_values();
+        ASSERT_TRUE(qkv_quantize(&state, &cfg, keys.data(), values.data(), kTokens));
+
+        std::vector<float> key_out(keys.size(), 0.0f);
+        std::vector<float> value_out(values.size(), 0.0f);
+        ASSERT_TRUE(qkv_dequantize(&state, &cfg, key_out.data(), value_out.data(), kTokens));
+
+        const double max_mse = bits <= 2 ? 0.08 : bits == 3 ? 0.04 : bits == 4 ? 0.02 : 0.01;
+        const double max_err = bits <= 2 ? 0.90 : bits == 3 ? 0.70 : bits == 4 ? 0.45 : 0.25;
+        expect_roundtrip_within(keys, key_out, max_mse, max_err);
+        expect_roundtrip_within(values, value_out, max_mse, max_err);
+        qkv_free(&state);
     }
 }
 
