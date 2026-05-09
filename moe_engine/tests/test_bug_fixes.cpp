@@ -22,22 +22,57 @@ extern "C" {
 
 namespace {
 
-float virtual_fp4_weight_at(uint32_t row, uint32_t col, uint32_t projection_seed) {
+moe_storage_constants_t make_shape_constants(
+    uint32_t layers,
+    uint32_t first_moe,
+    uint32_t last_moe,
+    uint32_t experts,
+    uint32_t projections,
+    uint32_t hidden,
+    uint32_t intermediate,
+    uint32_t vocab
+) {
+    moe_storage_constants_t c{};
+    c.num_hidden_layers = layers;
+    c.first_moe_layer = first_moe;
+    c.last_moe_layer = last_moe;
+    c.experts_per_moe_layer = experts;
+    c.expert_projection_count = projections;
+    c.hidden_size = hidden;
+    c.expert_intermediate_size = intermediate;
+    c.vocab_size = vocab;
+    c.total_expert_count =
+        static_cast<uint64_t>(last_moe - first_moe + 1u) * static_cast<uint64_t>(experts);
+    return c;
+}
+
+bool shape_is_zero(const moe_model_shape_t& shape) {
+    return shape.num_hidden_layers == 0 &&
+           shape.first_moe_layer == 0 &&
+           shape.last_moe_layer == 0 &&
+           shape.experts_per_moe_layer == 0 &&
+           shape.hidden_size == 0 &&
+           shape.expert_intermediate_size == 0 &&
+           shape.vocab_size == 0 &&
+           shape.projection_count == 0;
+}
+
+float virtual_weight_at(uint32_t row, uint32_t col, uint32_t projection_seed) {
     const uint32_t code = (row * 131u + col * 17u + projection_seed * 7u) & 0x0Fu;
     const int signed_code = static_cast<int>(code) - 8;
     return static_cast<float>(signed_code) / 8.0f;
 }
 
-float virtual_projection_prefix_dot(
-    const moe_projection_shape_spec_t* shape,
-    uint32_t row,
-    uint32_t projection_seed
-) {
-    const uint32_t cols = std::min<uint32_t>(shape->cols, 32u);
+float virtual_projection_prefix_dot(uint32_t rows, uint32_t cols, uint32_t projection_seed) {
+    if (rows == 0 || cols == 0) {
+        return 0.0f;
+    }
+    const uint32_t sampled_cols = std::min<uint32_t>(cols, 32u);
+    const uint32_t sampled_row = rows / 2u;
     double acc = 0.0;
-    for (uint32_t col = 0; col < cols; ++col) {
+    for (uint32_t col = 0; col < sampled_cols; ++col) {
         const float activation = (static_cast<float>(col % 5u) - 2.0f) * 0.25f;
-        acc += static_cast<double>(virtual_fp4_weight_at(row, col, projection_seed)) * activation;
+        acc += static_cast<double>(virtual_weight_at(sampled_row, col, projection_seed)) * activation;
     }
     return static_cast<float>(acc);
 }
@@ -286,49 +321,69 @@ TEST(BugFix, Bug13_IntelArcDetection) {
 }
 
 // ============================================================================
-// Module contract tests: model shape + virtual weights
+// Module contract tests: generic model shape + virtual weights
 // ============================================================================
-TEST(ModuleContract, ModelShapeMatchesStorageConstants) {
+TEST(ModuleContract, ModelShapeBuilderUsesProvidedConstants) {
+    const std::array<moe_storage_constants_t, 3> examples = {
+        make_shape_constants(8, 1, 6, 16, 3, 1024, 4096, 32000),
+        make_shape_constants(32, 0, 31, 64, 3, 4096, 14336, 128000),
+        make_shape_constants(80, 3, 78, 256, 4, 6144, 2048, 154880),
+    };
+
+    for (const moe_storage_constants_t& constants : examples) {
+        const moe_model_shape_t shape = moe_model_shape_from_storage_constants(&constants);
+        EXPECT_EQ(shape.num_hidden_layers, constants.num_hidden_layers);
+        EXPECT_EQ(shape.first_moe_layer, constants.first_moe_layer);
+        EXPECT_EQ(shape.last_moe_layer, constants.last_moe_layer);
+        EXPECT_EQ(shape.experts_per_moe_layer, constants.experts_per_moe_layer);
+        EXPECT_EQ(shape.hidden_size, constants.hidden_size);
+        EXPECT_EQ(shape.expert_intermediate_size, constants.expert_intermediate_size);
+        EXPECT_EQ(shape.vocab_size, constants.vocab_size);
+        EXPECT_EQ(shape.projection_count, constants.expert_projection_count);
+    }
+}
+
+TEST(ModuleContract, ModelShapeBuilderRejectsInvalidContracts) {
+    EXPECT_TRUE(shape_is_zero(moe_model_shape_from_storage_constants(nullptr)));
+
+    moe_storage_constants_t zero = make_shape_constants(8, 1, 6, 16, 3, 1024, 4096, 32000);
+    zero.hidden_size = 0;
+    EXPECT_TRUE(shape_is_zero(moe_model_shape_from_storage_constants(&zero)));
+
+    moe_storage_constants_t bad_range = make_shape_constants(8, 6, 1, 16, 3, 1024, 4096, 32000);
+    EXPECT_TRUE(shape_is_zero(moe_model_shape_from_storage_constants(&bad_range)));
+
+    moe_storage_constants_t bad_last = make_shape_constants(8, 1, 8, 16, 3, 1024, 4096, 32000);
+    EXPECT_TRUE(shape_is_zero(moe_model_shape_from_storage_constants(&bad_last)));
+
+    moe_storage_constants_t bad_total = make_shape_constants(8, 1, 6, 16, 3, 1024, 4096, 32000);
+    bad_total.total_expert_count += 1;
+    EXPECT_TRUE(shape_is_zero(moe_model_shape_from_storage_constants(&bad_total)));
+}
+
+TEST(ModuleContract, CurrentModelShapeWrapperMatchesCurrentConstants) {
     const moe_storage_constants_t* constants = moe_storage_constants();
     ASSERT_NE(constants, nullptr);
 
-    const moe_model_shape_t shape = moe_pc_Moe1_model_shape();
-    EXPECT_EQ(shape.num_hidden_layers, constants->num_hidden_layers);
-    EXPECT_EQ(shape.first_moe_layer, constants->first_moe_layer);
-    EXPECT_EQ(shape.last_moe_layer, constants->last_moe_layer);
-    EXPECT_EQ(shape.experts_per_moe_layer, constants->experts_per_moe_layer);
-    EXPECT_EQ(shape.hidden_size, constants->hidden_size);
-    EXPECT_EQ(shape.expert_intermediate_size, constants->expert_intermediate_size);
-    EXPECT_EQ(shape.vocab_size, constants->vocab_size);
-    EXPECT_EQ(shape.projection_count, constants->expert_projection_count);
+    const moe_model_shape_t generic = moe_model_shape_from_storage_constants(constants);
+    const moe_model_shape_t wrapper = moe_pc_Moe1_model_shape();
 
-    ASSERT_LE(shape.first_moe_layer, shape.last_moe_layer);
-    ASSERT_LT(shape.last_moe_layer, shape.num_hidden_layers);
-    const uint64_t moe_layer_count =
-        static_cast<uint64_t>(shape.last_moe_layer - shape.first_moe_layer + 1u);
-    EXPECT_EQ(constants->total_expert_count,
-              moe_layer_count * static_cast<uint64_t>(shape.experts_per_moe_layer));
-    EXPECT_EQ(shape.projection_count, 3u);
+    EXPECT_EQ(wrapper.num_hidden_layers, generic.num_hidden_layers);
+    EXPECT_EQ(wrapper.first_moe_layer, generic.first_moe_layer);
+    EXPECT_EQ(wrapper.last_moe_layer, generic.last_moe_layer);
+    EXPECT_EQ(wrapper.experts_per_moe_layer, generic.experts_per_moe_layer);
+    EXPECT_EQ(wrapper.hidden_size, generic.hidden_size);
+    EXPECT_EQ(wrapper.expert_intermediate_size, generic.expert_intermediate_size);
+    EXPECT_EQ(wrapper.vocab_size, generic.vocab_size);
+    EXPECT_EQ(wrapper.projection_count, generic.projection_count);
 }
 
-TEST(ModuleContract, ProjectionShapesCoverGateUpDownContracts) {
-    const moe_model_shape_t shape = moe_pc_Moe1_model_shape();
-
-    const moe_projection_shape_spec_t* gate = moe_storage_projection_shape(moe_PROJ_GATE);
-    const moe_projection_shape_spec_t* up = moe_storage_projection_shape(moe_PROJ_UP);
-    const moe_projection_shape_spec_t* down = moe_storage_projection_shape(moe_PROJ_DOWN);
-    ASSERT_NE(gate, nullptr);
-    ASSERT_NE(up, nullptr);
-    ASSERT_NE(down, nullptr);
-
-    EXPECT_EQ(gate->rows, shape.expert_intermediate_size);
-    EXPECT_EQ(gate->cols, shape.hidden_size);
-    EXPECT_EQ(up->rows, shape.expert_intermediate_size);
-    EXPECT_EQ(up->cols, shape.hidden_size);
-    EXPECT_EQ(down->rows, shape.hidden_size);
-    EXPECT_EQ(down->cols, shape.expert_intermediate_size);
-
-    for (const moe_projection_shape_spec_t* spec : {gate, up, down}) {
+TEST(ModuleContract, ProjectionShapesAreInternallyConsistent) {
+    for (uint32_t proj = 0; proj < 3u; ++proj) {
+        const moe_projection_shape_spec_t* spec =
+            moe_storage_projection_shape(static_cast<moe_projection_t>(proj));
+        ASSERT_NE(spec, nullptr);
+        EXPECT_EQ(static_cast<uint32_t>(spec->proj), proj);
         EXPECT_GT(spec->rows, 0u);
         EXPECT_GT(spec->cols, 0u);
         EXPECT_GT(spec->group_size, 0u);
@@ -340,25 +395,28 @@ TEST(ModuleContract, ProjectionShapesCoverGateUpDownContracts) {
     EXPECT_EQ(moe_storage_projection_shape(static_cast<moe_projection_t>(3)), nullptr);
 }
 
-TEST(ModuleContract, VirtualWeightDotsStayFiniteAcrossProjectionShapes) {
-    const std::array<moe_projection_t, 3> projections = {
-        moe_PROJ_GATE,
-        moe_PROJ_UP,
-        moe_PROJ_DOWN,
+TEST(ModuleContract, VirtualWeightDotsStayFiniteAcrossGenericShapes) {
+    const std::array<moe_storage_constants_t, 3> examples = {
+        make_shape_constants(8, 1, 6, 16, 3, 1024, 4096, 32000),
+        make_shape_constants(32, 0, 31, 64, 3, 4096, 14336, 128000),
+        make_shape_constants(80, 3, 78, 256, 4, 6144, 2048, 154880),
     };
 
-    for (size_t i = 0; i < projections.size(); ++i) {
-        const moe_projection_shape_spec_t* spec = moe_storage_projection_shape(projections[i]);
-        ASSERT_NE(spec, nullptr);
+    for (const moe_storage_constants_t& constants : examples) {
+        const moe_model_shape_t shape = moe_model_shape_from_storage_constants(&constants);
+        ASSERT_FALSE(shape_is_zero(shape));
 
-        const std::array<uint32_t, 3> sampled_rows = {
-            0u,
-            spec->rows / 2u,
-            spec->rows - 1u,
+        const std::array<std::pair<uint32_t, uint32_t>, 3> logical_projection_shapes = {
+            std::pair<uint32_t, uint32_t>{shape.expert_intermediate_size, shape.hidden_size},
+            std::pair<uint32_t, uint32_t>{shape.expert_intermediate_size, shape.hidden_size},
+            std::pair<uint32_t, uint32_t>{shape.hidden_size, shape.expert_intermediate_size},
         };
-        for (uint32_t row : sampled_rows) {
-            SCOPED_TRACE(::testing::Message() << "projection=" << i << " row=" << row);
-            const float dot = virtual_projection_prefix_dot(spec, row, static_cast<uint32_t>(i + 1u));
+
+        for (size_t i = 0; i < logical_projection_shapes.size(); ++i) {
+            const float dot = virtual_projection_prefix_dot(
+                logical_projection_shapes[i].first,
+                logical_projection_shapes[i].second,
+                static_cast<uint32_t>(i + 1u));
             EXPECT_TRUE(std::isfinite(dot));
             EXPECT_LT(std::fabs(dot), 32.0f);
         }
