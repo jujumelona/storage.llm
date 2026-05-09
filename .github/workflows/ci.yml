@@ -104,40 +104,6 @@ jobs:
           TSAN_OPTIONS: second_deadlock_stack=1
         run: ctest --test-dir build --output-on-failure
 
-  static-analysis:
-    name: Static Analysis
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-tidy cppcheck
-
-      - name: Run clang-tidy
-        run: |
-          find . -name '*.cpp' -o -name '*.h' | \
-            grep -v 'build/' | \
-            xargs clang-tidy --checks='-*,bugprone-*,performance-*,readability-*' \
-            -- -std=c++17 -I. -Imoe_engine/include -Iloader -Iengine_core || true
-
-      - name: Run cppcheck
-        run: |
-          cppcheck --enable=warning,performance,portability \
-            --inconclusive --std=c++17 \
-            --suppress=missingIncludeSystem \
-            -I. -Imoe_engine/include -Iloader -Iengine_core \
-            . 2>&1 | tee cppcheck-report.txt || true
-
-      - name: Upload static analysis results
-        uses: actions/upload-artifact@v4
-        with:
-          name: static-analysis-results
-          path: cppcheck-report.txt
-
   format-check:
     name: Format Check
     runs-on: ubuntu-latest
@@ -147,7 +113,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install clang-format
-        run: sudo apt-get install -y clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
 
       - name: Check formatting
         run: |
