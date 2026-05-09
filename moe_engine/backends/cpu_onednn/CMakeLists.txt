@@ -23,7 +23,12 @@ endif()
 if(STORAGELLM_ENABLE_NATIVE_OPTIMIZE)
   if(MSVC)
     target_compile_options(storagellm_cpu_onednn PRIVATE /O2 /Oi /Ot)
-  elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+  elseif(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+    # AppleClang, especially on Apple Silicon CI runners, does not consistently
+    # accept the same host-tuning flags as upstream Clang/GCC. Keep the safe
+    # optimization level and avoid target-specific flags in portable builds.
+    target_compile_options(storagellm_cpu_onednn PRIVATE -O3)
+  elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(storagellm_cpu_onednn PRIVATE -O3 -march=native -mtune=native)
   endif()
 endif()
