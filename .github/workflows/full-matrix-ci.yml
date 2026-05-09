@@ -31,18 +31,12 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build
+          sudo apt-get install -y cmake g++ make
 
       - name: Install dependencies on macOS
         if: matrix.os == 'macos-latest'
         run: |
-          brew install cmake ninja
-
-      - name: Install dependencies on Windows
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          choco install cmake ninja -y
+          brew install cmake
 
       - name: Generate portable JSON smoke project
         shell: bash
@@ -61,6 +55,8 @@ jobs:
           else()
             target_compile_definitions(json_smoke PRIVATE STORAGELLM_PPL_DIAG=0)
           endif()
+          enable_testing()
+          add_test(NAME json_smoke COMMAND json_smoke)
           EOF
           cat > build/json-smoke/json_smoke.cpp <<'EOF'
           #include "json_request.h"
@@ -97,16 +93,15 @@ jobs:
       - name: Configure JSON smoke project
         shell: bash
         run: >
-          cmake -S build/json-smoke -B build/json-smoke-out -G Ninja
+          cmake -S build/json-smoke -B build/json-smoke-out
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           -DSMOKE_PPL_DIAG=${{ matrix.ppl_diag }}
 
       - name: Build JSON smoke project
-        run: cmake --build build/json-smoke-out --parallel
+        run: cmake --build build/json-smoke-out --config ${{ matrix.build_type }} --parallel
 
       - name: Run JSON smoke project
-        shell: bash
-        run: ./build/json-smoke-out/json_smoke
+        run: ctest --test-dir build/json-smoke-out --build-config ${{ matrix.build_type }} --output-on-failure
 
   ubuntu-focused-cmake:
     name: Ubuntu focused CMake module verification
