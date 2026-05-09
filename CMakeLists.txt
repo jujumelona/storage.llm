@@ -337,6 +337,17 @@ if(STORAGELLM_BUILD_TESTS)
         moe_engine/tests/test_weight_contract_examples.cpp
     )
 
+    storagellm_add_gtest(test_ppl_math_contract_examples
+        moe_engine/tests/test_ppl_math_contract_examples.cpp
+    )
+
+    storagellm_add_gtest(test_ppl_diag_contract_examples
+        moe_engine/tests/test_ppl_diag_contract_examples.cpp
+    )
+    target_link_libraries(test_ppl_diag_contract_examples
+        PRIVATE storagellm_kv
+    )
+
     # Batch dot microbenchmark (Bug B4)
     add_executable(bench_batch_dot
         moe_engine/tests/bench_batch_dot.cpp
