@@ -24,16 +24,36 @@ std::string write_temp_manifest(const std::string& name, const std::string& body
     return path;
 }
 
-std::string projection_json(uint64_t base) {
+std::string projection_json(uint64_t base, uint32_t rows = 6144, uint32_t cols = 2048) {
     return std::string("{") +
         "\"weight_block\":" + std::to_string(base + 0) + "," +
         "\"raw_scale_block\":" + std::to_string(base + 1) + "," +
         "\"raw_scale2_block\":" + std::to_string(base + 2) + "," +
         "\"aux0_block\":" + std::to_string(base + 3) + "," +
         "\"aux1_block\":" + std::to_string(base + 4) + "," +
-        "\"rows\":6144," +
-        "\"cols\":2048," +
+        "\"rows\":" + std::to_string(rows) + "," +
+        "\"cols\":" + std::to_string(cols) + "," +
         "\"groups\":96," +
+        "\"group_size\":64," +
+        "\"scale_mode\":\"grouped\"" +
+        "}";
+}
+
+std::string tensor_projection_json(
+    uint64_t base,
+    uint32_t rows,
+    uint32_t cols,
+    const std::string& file
+) {
+    return std::string("{") +
+        "\"part\":4," +
+        "\"part_path\":\"" + file + "\"," +
+        "\"bundle_offset\":" + std::to_string(base * 4096) + "," +
+        "\"bundle_length\":4096," +
+        "\"weight_block\":" + std::to_string(base) + "," +
+        "\"rows\":" + std::to_string(rows) + "," +
+        "\"cols\":" + std::to_string(cols) + "," +
+        "\"groups\":8," +
         "\"group_size\":64," +
         "\"scale_mode\":\"grouped\"" +
         "}";
@@ -111,6 +131,65 @@ TEST(LoaderManifestExamples, FullManifestFindsRepresentativeExpertTriplet) {
     EXPECT_EQ(entry.up.weight_block, 20u);
     EXPECT_EQ(entry.down.weight_block, 30u);
     EXPECT_FALSE(lookup.find_expert(21, 8, &entry));
+}
+
+TEST(LoaderManifestExamples, GenericGgufTensorAliasesAssembleExpertTriplet) {
+    const std::string manifest = std::string("{") +
+        "\"tensors\":{" +
+        "\"blk.2.ffn_gate_exps.weight\":{\"ignored\":true}," +
+        "\"layers.12.mlp.experts.5.gate_proj.weight\":" + tensor_projection_json(101, 4096, 1024, "model-00001.gguf") + "," +
+        "\"layers.12.mlp.experts.5.up_proj.weight\":" + tensor_projection_json(102, 4096, 1024, "model-00001.gguf") + "," +
+        "\"layers.12.mlp.experts.5.down_proj.weight\":" + tensor_projection_json(103, 1024, 4096, "model-00001.gguf") +
+        "}" +
+    "}";
+
+    const std::string path = write_temp_manifest("manifest_tensor_aliases.json", manifest);
+    storagellm::ManifestLookup lookup;
+    ASSERT_TRUE(lookup.load(path.c_str()));
+
+    storagellm::ExpertManifestEntry entry{};
+    ASSERT_TRUE(lookup.find_expert(12, 5, &entry));
+    EXPECT_EQ(entry.layer, 12u);
+    EXPECT_EQ(entry.expert, 5u);
+    EXPECT_EQ(entry.part, 4u);
+    EXPECT_EQ(entry.part_path, "model-00001.gguf");
+    EXPECT_EQ(entry.gate.weight_block, 101u);
+    EXPECT_EQ(entry.up.weight_block, 102u);
+    EXPECT_EQ(entry.down.weight_block, 103u);
+    EXPECT_EQ(entry.gate.rows, 4096u);
+    EXPECT_EQ(entry.down.cols, 4096u);
+}
+
+TEST(LoaderManifestExamples, W1W2W3TensorAliasesMapToGateDownUp) {
+    const std::string manifest = std::string("{") +
+        "\"model.layers.3.block_sparse_moe.experts.11.w1.weight\":" + tensor_projection_json(201, 2048, 512, "moe.gguf") + "," +
+        "\"model.layers.3.block_sparse_moe.experts.11.w3.weight\":" + tensor_projection_json(202, 2048, 512, "moe.gguf") + "," +
+        "\"model.layers.3.block_sparse_moe.experts.11.w2.weight\":" + tensor_projection_json(203, 512, 2048, "moe.gguf") +
+    "}";
+
+    const std::string path = write_temp_manifest("manifest_w_aliases.json", manifest);
+    storagellm::ManifestLookup lookup;
+    ASSERT_TRUE(lookup.load(path.c_str()));
+
+    storagellm::ExpertManifestEntry entry{};
+    ASSERT_TRUE(lookup.find_expert(3, 11, &entry));
+    EXPECT_EQ(entry.gate.weight_block, 201u);
+    EXPECT_EQ(entry.up.weight_block, 202u);
+    EXPECT_EQ(entry.down.weight_block, 203u);
+}
+
+TEST(LoaderManifestExamples, IncompleteTensorAliasTripletFailsClosed) {
+    const std::string manifest = std::string("{") +
+        "\"layers.9.mlp.experts.2.gate_proj.weight\":" + tensor_projection_json(301, 1024, 256, "partial.gguf") + "," +
+        "\"layers.9.mlp.experts.2.up_proj.weight\":" + tensor_projection_json(302, 1024, 256, "partial.gguf") +
+    "}";
+
+    const std::string path = write_temp_manifest("manifest_partial_aliases.json", manifest);
+    storagellm::ManifestLookup lookup;
+    ASSERT_TRUE(lookup.load(path.c_str()));
+
+    storagellm::ExpertManifestEntry entry{};
+    EXPECT_FALSE(lookup.find_expert(9, 2, &entry));
 }
 
 TEST(LoaderManifestExamples, MalformedExpertIsSkippedButLaterValidEntryStillLoads) {
