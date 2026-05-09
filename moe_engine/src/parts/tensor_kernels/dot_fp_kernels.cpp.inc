@@ -1,3 +1,7 @@
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 static float moe_dot_raw_fp16_row(const uint8_t* packed, const float* x, uint32_t cols) {
     // BUGFIX 699: FP16 input validation - NaN/Inf handling ★★
     // Problem: No validation of packed FP16 data or x input
@@ -85,7 +89,6 @@ static float moe_dot_raw_fp16_row(const uint8_t* packed, const float* x, uint32_
     // Problem: Only AVX-512/AVX2 paths existed, ARM fell back to scalar loop
     // Impact: 8x slower on Apple Silicon M2/M3 despite Metal zero-copy
     // Solution: Add NEON intrinsics for FP16 dot product
-    #include <arm_neon.h>
     const uint16_t* fp16 = reinterpret_cast<const uint16_t*>(packed);
     float32x4_t acc0 = vdupq_n_f32(0.f);
     float32x4_t acc1 = vdupq_n_f32(0.f);
@@ -219,7 +222,6 @@ static float moe_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32_
     // Problem: Only AVX-512/AVX2 paths existed, ARM fell back to scalar loop
     // Impact: 8x slower on Apple Silicon for FP32 operations
     // Solution: Add NEON intrinsics for FP32 dot product
-    #include <arm_neon.h>
     const float* fp32 = reinterpret_cast<const float*>(packed);
     float32x4_t acc0 = vdupq_n_f32(0.f);
     float32x4_t acc1 = vdupq_n_f32(0.f);
