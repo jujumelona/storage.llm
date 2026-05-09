@@ -1,0 +1,37 @@
+name: JSONParser Smoke All PRs
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ main, develop ]
+
+permissions:
+  contents: read
+
+jobs:
+  jsonparser-smoke:
+    name: Build and run JSONParser smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ libgtest-dev
+
+      - name: Build JSON parser smoke test
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Wpedantic \
+            -I. \
+            moe_engine/tests/test_json_parser.cpp \
+            -lgtest -lgtest_main -pthread \
+            -o test_json_parser
+
+      - name: Run JSON parser smoke test
+        run: ./test_json_parser
