@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 #include "../include/moe_pc_engine.h"
 
