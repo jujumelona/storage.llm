@@ -3,8 +3,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 extern "C" {
+
+static NSUInteger metal_page_size() {
+    const int ps = getpagesize();
+    return ps > 0 ? (NSUInteger)ps : (NSUInteger)4096;
+}
 
 void* metal_zero_copy_map(void* device_handle, void* src, uint64_t bytes) {
     uint64_t prefix = 0;
@@ -23,7 +29,7 @@ void* metal_zero_copy_map_aligned(void* device_handle, void* src, uint64_t bytes
     id<MTLDevice> device = device_handle ? (__bridge id<MTLDevice>)device_handle : MTLCreateSystemDefaultDevice();
     if (!device || !src || bytes == 0) return nullptr;
 
-    NSUInteger pageSize = [NSProcessInfo processInfo].pageSize;
+    NSUInteger pageSize = metal_page_size();
     uintptr_t aligned_src = (uintptr_t)src & ~((uintptr_t)pageSize - 1u);
     uint64_t prefix = (uint64_t)((uintptr_t)src - aligned_src);
     uint64_t aligned_bytes = bytes + prefix;
@@ -74,10 +80,13 @@ int metal_copy_h2d_async(void* dst_buffer, const void* src, uint64_t bytes, void
     id<MTLBuffer> dst = (__bridge id<MTLBuffer>)dst_buffer;
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)stream;
     if (!dst || !queue || bytes > (uint64_t)[dst length]) return 0;
-    id<MTLDevice> device = [dst device] ?: MTLCreateSystemDefaultDevice();
+    id<MTLDevice> device = [dst device];
+    if (!device) {
+        device = MTLCreateSystemDefaultDevice();
+    }
     if (!device) return 0;
 
-    NSUInteger pageSize = [NSProcessInfo processInfo].pageSize;
+    NSUInteger pageSize = metal_page_size();
     uintptr_t src_addr = (uintptr_t)src;
     uintptr_t aligned_src = src_addr & ~((uintptr_t)pageSize - 1u);
     uint64_t prefix = (uint64_t)(src_addr - aligned_src);
