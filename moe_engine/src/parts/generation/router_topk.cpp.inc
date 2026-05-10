@@ -483,6 +483,108 @@ static int moe_router_select_topk_logits_norm_softmax_f32(
     return 1;
 }
 
+
+// Sigmoid routers are monotonic in the raw router logits.  Selecting top-k after
+// materializing sigmoid(logit) is numerically wrong for large positive logits:
+// sigmoid() saturates to exactly 1.0f, causing ties and deterministic low expert
+// ids even when the raw logits are distinct.  Keep selection in raw-logit space,
+// then apply sigmoid only to the selected experts for the final routing weights.
+static int moe_router_select_topk_logits_sigmoid_f32(
+    const std::vector<float>& logits,
+    uint32_t experts,
+    uint32_t top_k,
+    std::vector<int>* out_experts,
+    std::vector<float>* out_weights,
+    float* out_denom
+) {
+    if (!out_experts || !out_weights || !out_denom || top_k == 0 || experts == 0 || logits.size() < experts) {
+        return 0;
+    }
+    if (top_k > 64u) {
+        return 0;
+    }
+    uint32_t ids[64];
+    float vals[64];
+    uint32_t count = 0;
+    for (uint32_t e = 0; e < experts; ++e) {
+        const float v = logits[e];
+        if (!std::isfinite(v)) {
+            return 0;
+        }
+        uint32_t pos = count;
+        while (pos > 0) {
+            const float pv = vals[pos - 1u];
+            const uint32_t pid = ids[pos - 1u];
+            if (pv > v || (pv == v && pid < e)) {
+                break;
+            }
+            --pos;
+        }
+        if (pos >= top_k) {
+            continue;
+        }
+        if (count < top_k) {
+            ++count;
+        }
+        for (uint32_t j = count - 1u; j > pos; --j) {
+            vals[j] = vals[j - 1u];
+            ids[j] = ids[j - 1u];
+        }
+        vals[pos] = v;
+        ids[pos] = e;
+    }
+    if (count != top_k) {
+        return 0;
+    }
+    out_experts->resize(top_k);
+    out_weights->resize(top_k);
+    float denom = 0.0f;
+    for (uint32_t i = 0; i < top_k; ++i) {
+        const float w = moe_router_sigmoid(vals[i]);
+        if (!std::isfinite(w)) {
+            return 0;
+        }
+        (*out_experts)[i] = (int)ids[i];
+        (*out_weights)[i] = w;
+        denom += w;
+    }
+    *out_denom = denom;
+    return std::isfinite(denom) && denom > 0.0f ? 1 : 0;
+}
+
+static float moe_router_normalized_entropy_from_raw_sigmoid_logits(
+    const std::vector<float>& logits,
+    uint32_t experts
+) {
+    if (experts <= 1u || logits.size() < experts) {
+        return 0.0f;
+    }
+    double sum = 0.0;
+    for (uint32_t i = 0; i < experts; ++i) {
+        const float p = moe_router_sigmoid(logits[i]);
+        if (p > 0.0f && std::isfinite(p)) {
+            sum += (double)p;
+        }
+    }
+    if (!(sum > 0.0) || !std::isfinite(sum)) {
+        return 0.0f;
+    }
+    double entropy = 0.0;
+    for (uint32_t i = 0; i < experts; ++i) {
+        const float p = moe_router_sigmoid(logits[i]);
+        if (p <= 0.0f || !std::isfinite(p)) {
+            continue;
+        }
+        const double q = (double)p / sum;
+        entropy -= q * (double)fast_log2f((float)q);
+    }
+    const double denom = (double)fast_log2f((float)experts);
+    if (!(denom > 0.0) || !std::isfinite(denom)) {
+        return 0.0f;
+    }
+    return (float)std::max(0.0, std::min(1.0, entropy / denom));
+}
+
 static int moe_router_topk_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -537,24 +639,25 @@ static int moe_router_topk_f32(
             out_weights->empty() ? 0.0 : (double)(*out_weights)[0]);
         return 1;
     }
-    if (use_sigmoid) {
-        for (float& v : *scratch_logits) {
-            v = moe_router_sigmoid(v);
+    float raw_min_logit = std::numeric_limits<float>::infinity();
+    float raw_max_logit = -std::numeric_limits<float>::infinity();
+    for (float v : *scratch_logits) {
+        if (!std::isfinite(v)) {
+            return 0;
         }
+        if (v < raw_min_logit) raw_min_logit = v;
+        if (v > raw_max_logit) raw_max_logit = v;
+    }
+    if (use_sigmoid) {
+        // Mask group-limited experts in raw-logit space.  Sigmoid is monotonic,
+        // so the selected experts are unchanged versus ideal real-valued sigmoid
+        // scores, but we avoid float32 saturation to exactly 1.0f before top-k.
         moe_router_apply_group_limit(engine, scratch_logits, experts);
     } else {
         // BUGFIX 665: Check for NaN/Inf before softmax computation ★★★
         // BUGFIX 667: Prevent NaN propagation in router logits ★★
-        float max_logit = -std::numeric_limits<float>::infinity();
-        bool has_invalid = false;
-        for (float v : *scratch_logits) {
-            if (!std::isfinite(v)) {
-                has_invalid = true;
-                break;
-            }
-            if (v > max_logit) max_logit = v;
-        }
-        if (has_invalid || !std::isfinite(max_logit)) {
+        const float max_logit = raw_max_logit;
+        if (!std::isfinite(max_logit)) {
             return 0;
         } else {
             double exp_denom = 0.0;
@@ -578,7 +681,7 @@ static int moe_router_topk_f32(
 
     float router_entropy = 0.5f;
     if (use_sigmoid) {
-        router_entropy = moe_router_normalized_entropy(*scratch_logits);
+        router_entropy = moe_router_normalized_entropy_from_raw_sigmoid_logits(*scratch_logits, experts);
         const uint32_t entropy_milli = (uint32_t)(router_entropy * 1000.0f);
         // BUGFIX Problem F stage 2: Per-session entropy and prefetch depth ★★★
         // Primary: write to session-level fields for proper isolation
@@ -613,7 +716,11 @@ static int moe_router_topk_f32(
     const int cpu_storage_router_fast =
         engine->cpu_storage_engine_ready.load(std::memory_order_relaxed) ||
         engine->cpu_only_runtime.load(std::memory_order_relaxed);
-    if (cpu_storage_router_fast && top_k <= 64u &&
+    if (use_sigmoid && cpu_storage_router_fast && top_k <= 64u &&
+        moe_router_select_topk_logits_sigmoid_f32(*scratch_logits, experts, top_k, out_experts, out_weights, &denom)) {
+        // Top-k was selected by raw logits to avoid sigmoid saturation ties; the
+        // returned weights are sigmoid(selected_logit) values.
+    } else if (!use_sigmoid && cpu_storage_router_fast && top_k <= 64u &&
         moe_router_select_topk_small_f32(*scratch_logits, experts, top_k, out_experts, out_weights, &denom)) {
         // Small top-k selection succeeded without scratch_order allocation.
     } else {
@@ -639,7 +746,13 @@ static int moe_router_topk_f32(
         out_experts->reserve(top_k);
         out_weights->reserve(top_k);
         for (uint32_t i = 0; i < top_k; ++i) {
-            const float w = (*scratch_logits)[order[i]];
+            float w = (*scratch_logits)[order[i]];
+            if (use_sigmoid) {
+                w = moe_router_sigmoid(w);
+            }
+            if (!std::isfinite(w)) {
+                return 0;
+            }
             out_experts->push_back((int)order[i]);
             out_weights->push_back(w);
             denom += w;
@@ -666,8 +779,9 @@ static int moe_router_topk_f32(
     }
     moe_profile_log(
         "router_topk",
-        "layer=%d experts=%u top_k=%u use_sigmoid=%d norm_topk=%d entropy=%.3f scale=%.6g first_expert=%d first_weight=%.6g",
+        "layer=%d experts=%u top_k=%u use_sigmoid=%d norm_topk=%d entropy=%.3f scale=%.6g raw_min=%.6g raw_max=%.6g raw_span=%.6g sigmoid_topk_raw=1 first_expert=%d first_weight=%.6g",
         layer, experts, top_k, use_sigmoid, norm_topk, (double)router_entropy, (double)scale,
+        (double)raw_min_logit, (double)raw_max_logit, (double)(raw_max_logit - raw_min_logit),
         out_experts->empty() ? -1 : (*out_experts)[0],
         out_weights->empty() ? 0.0 : (double)(*out_weights)[0]);
     return 1;

@@ -440,9 +440,15 @@ def test_router_contract_reads_graph_ir_sigmoid_scale_and_norm_topk():
     assert uses_pos < scale_pos < norm_pos
 
 
-def test_router_scale_tensor_uses_rmsnorm_unit_offset_semantics():
-    router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
-    assert "const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, scale_raw);" in router_text
-    assert "const float effective_scale = unit_offset ? (1.0f + scale) : scale;" in router_text
-    assert "router_scale_apply" in router_text
-    assert "Using raw deltas here made sigmoid" in router_text
+def test_sigmoid_router_selects_topk_from_raw_logits_before_sigmoid_saturation():
+    router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_topk.cpp.inc").read_text()
+    assert "moe_router_select_topk_logits_sigmoid_f32" in router_text
+    assert "Selecting top-k after" in router_text
+    assert "sigmoid() saturates to exactly 1.0f" in router_text
+    use_pos = router_text.index("if (use_sigmoid) {")
+    mask_pos = router_text.index("moe_router_apply_group_limit(engine, scratch_logits, experts);", use_pos)
+    select_pos = router_text.index("moe_router_select_topk_logits_sigmoid_f32", mask_pos)
+    norm_pos = router_text.index("if (norm_topk)", select_pos)
+    assert use_pos < mask_pos < select_pos < norm_pos
+    assert "sigmoid_topk_raw=1" in router_text
+    assert "raw_min=%.6g raw_max=%.6g raw_span=%.6g" in router_text
