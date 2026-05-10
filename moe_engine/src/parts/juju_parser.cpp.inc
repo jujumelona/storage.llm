@@ -575,7 +575,7 @@ static int moe_read_juju_tensor_index_json(
         // bootstrap metadata after an empty/unreadable/malformed sidecar silently
         // revives stale index contracts and makes sidecar repair workflows
         // ineffective.
-        if (!sidecar_present || sidecar_bytes == 0 || sidecar_bytes > 256ull * 1024ull * 1024ull ||
+        if (!sidecar_present || sidecar_bytes == 0 || sidecar_bytes > 2ull * 1024ull * 1024ull * 1024ull ||
             !moe_read_text_file_local(sidecar_path, &sidecar)) {
             std::fprintf(stderr,
                 "[storagellm] JUJU sidecar idx rejected: unreadable authoritative sidecar idx=%s bytes=%llu\n",
@@ -1252,6 +1252,30 @@ static void moe_ingest_juju_runtime_metadata_sections(
     }
 }
 
+
+static int moe_juju_tensor_payload_range_valid(
+    const moe_juju_tensor_json_entry_t& entry,
+    uint64_t file_bytes,
+    const char** reason
+) {
+    if (reason) {
+        *reason = nullptr;
+    }
+    if (entry.juju_bytes == 0) {
+        if (reason) *reason = "zero juju_bytes";
+        return 0;
+    }
+    if (entry.juju_offset > file_bytes) {
+        if (reason) *reason = "juju_offset beyond file";
+        return 0;
+    }
+    if (entry.juju_bytes > file_bytes - entry.juju_offset) {
+        if (reason) *reason = "juju range exceeds file";
+        return 0;
+    }
+    return 1;
+}
+
 static int moe_parse_juju_tensor_index_json(
     const std::string& json,
     std::vector<moe_juju_tensor_json_entry_t>* out_entries,
@@ -1281,27 +1305,45 @@ static int moe_parse_juju_tensor_index_json(
     uint64_t tensor_count = 0;
     uint64_t executable_count = 0;
     uint64_t max_executable = 0;
+    uint64_t tensor_object_count = 0;
+    uint64_t malformed_count = 0;
+    std::string first_malformed_name;
+    const char* first_malformed_reason = nullptr;
+    uint64_t declared_tensor_count = 0;
+    const int has_declared_tensor_count =
+        moe_json_get_u64_local(json, "tensor_count", &declared_tensor_count);
+    uint64_t schema_version = 0;
+    const int strict_tensor_index =
+        (moe_json_get_u64_local(json, "schema_version", &schema_version) && schema_version >= 6u) ||
+        json.find("\"runtime_tensor_index_contract\"") != std::string::npos ||
+        json.find("\"fail_closed_kernel_contract\"") != std::string::npos;
+    auto mark_malformed = [&](const char* reason, const std::string& name) {
+        ++malformed_count;
+        if (!first_malformed_reason) {
+            first_malformed_reason = reason ? reason : "unknown";
+            first_malformed_name = name;
+        }
+    };
     size_t cursor = arr_begin + 1;
     size_t obj_begin = 0;
     size_t obj_end = 0;
     while (moe_json_next_object_in_array(json, &cursor, arr_end, &obj_begin, &obj_end)) {
+        ++tensor_object_count;
         moe_juju_tensor_json_entry_t rec{};
         uint64_t value = 0;
         uint64_t shape[4]{};
         uint32_t shape_count = 0;
         int bool_value = 0;
-        if (!moe_json_get_string_slice(json, obj_begin, obj_end, "name", &rec.name) ||
-            !moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_offset", &rec.juju_offset) ||
-            !moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_bytes", &rec.juju_bytes)) {
-            continue;
-        }
-        if (rec.juju_bytes == 0) {
-            continue;
-        }
-        // BUGFIX 331: Check juju_bytes > 0 to prevent zero-size tensors ★
-        // Problem: juju_bytes can be 0, causing issues in tensor loading
-        // Solution: Skip tensors with juju_bytes == 0
-        if (rec.juju_bytes == 0) {
+        int rec_malformed = 0;
+        const int has_name = moe_json_get_string_slice(json, obj_begin, obj_end, "name", &rec.name);
+        const int has_offset = moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_offset", &rec.juju_offset);
+        const int has_bytes = moe_json_get_u64_slice(json, obj_begin, obj_end, "juju_bytes", &rec.juju_bytes);
+        if (!has_name || rec.name.empty() || !has_offset || !has_bytes || rec.juju_bytes == 0) {
+            rec_malformed = 1;
+            mark_malformed("missing/invalid required name, juju_offset, or juju_bytes", rec.name);
+            if (!strict_tensor_index) {
+                continue;
+            }
             continue;
         }
         if (moe_json_get_u64_slice(json, obj_begin, obj_end, "gguf_type", &value)) {
@@ -1496,10 +1538,14 @@ static int moe_parse_juju_tensor_index_json(
         if (moe_json_get_double_slice(json, obj_begin, obj_end, "partial_accuracy", &accuracy)) {
             rec.partial_accuracy_milli = moe_juju_accuracy_to_milli(accuracy);
         }
-        if (moe_json_get_u64_slice(json, obj_begin, obj_end, "dims", &value)) {
+        const int has_dims = moe_json_get_u64_slice(json, obj_begin, obj_end, "dims", &value);
+        uint64_t raw_dims = 0;
+        if (has_dims) {
+            raw_dims = value;
             rec.dims = moe_u64_to_u32_clamped(value, 0);
         }
-        if (moe_json_get_u64_array_slice(json, obj_begin, obj_end, "shape", shape, 4, &shape_count)) {
+        const int has_shape = moe_json_get_u64_array_slice(json, obj_begin, obj_end, "shape", shape, 4, &shape_count);
+        if (has_shape) {
             rec.dims = rec.dims ? std::min<uint32_t>(rec.dims, 4u) : shape_count;
             for (uint32_t i = 0; i < std::min<uint32_t>(shape_count, 4u); ++i) {
                 rec.shape[i] = shape[i];
@@ -1520,6 +1566,29 @@ static int moe_parse_juju_tensor_index_json(
                 }
             }
         }
+        if (strict_tensor_index) {
+            if (!rec.has_gguf_type || rec.codec_id.empty() || rec.codec_registry_version.empty()) {
+                rec_malformed = 1;
+                mark_malformed("missing codec registry/type contract", rec.name);
+                continue;
+            }
+            if (!has_dims || !has_shape || raw_dims == 0 || raw_dims > 4u ||
+                shape_count == 0 || shape_count < raw_dims) {
+                rec_malformed = 1;
+                mark_malformed("missing/invalid dims or shape", rec.name);
+                continue;
+            }
+            for (uint32_t dim_i = 0; dim_i < rec.dims; ++dim_i) {
+                if (rec.shape[dim_i] == 0) {
+                    rec_malformed = 1;
+                    mark_malformed("zero tensor shape dimension", rec.name);
+                    break;
+                }
+            }
+            if (rec_malformed) {
+                continue;
+            }
+        }
         ++tensor_count;
         if (moe_gguf_tensor_name_executable(rec.name)) {
             ++executable_count;
@@ -1529,6 +1598,30 @@ static int moe_parse_juju_tensor_index_json(
         }
         if (out_entries) {
             out_entries->push_back(std::move(rec));
+        }
+    }
+    if (strict_tensor_index) {
+        if (malformed_count != 0) {
+            std::fprintf(stderr,
+                "[storagellm] malformed JUJU tensor index rejected: malformed=%llu first_name=%s reason=%s\n",
+                (unsigned long long)malformed_count,
+                first_malformed_name.empty() ? "<unknown>" : first_malformed_name.c_str(),
+                first_malformed_reason ? first_malformed_reason : "unknown");
+            return 0;
+        }
+        if (has_declared_tensor_count && declared_tensor_count != tensor_object_count) {
+            std::fprintf(stderr,
+                "[storagellm] JUJU tensor_count mismatch: declared=%llu objects=%llu\n",
+                (unsigned long long)declared_tensor_count,
+                (unsigned long long)tensor_object_count);
+            return 0;
+        }
+        if (tensor_count != tensor_object_count) {
+            std::fprintf(stderr,
+                "[storagellm] JUJU tensor index rejected: parsed=%llu objects=%llu\n",
+                (unsigned long long)tensor_count,
+                (unsigned long long)tensor_object_count);
+            return 0;
         }
     }
     if (out_tensor_count) {

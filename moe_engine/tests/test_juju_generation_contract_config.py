@@ -286,3 +286,23 @@ def test_cpp_juju_sidecar_presence_is_fail_closed_even_when_unreadable():
     unreadable_pos = parser_text.index("unreadable authoritative sidecar")
     embedded_pos = parser_text.index("moe_read_juju_json_section(path, entries")
     assert sidecar_present_pos < unreadable_pos < embedded_pos
+
+def test_cpp_juju_tensor_index_is_fail_closed_on_malformed_records():
+    parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
+    assert "malformed JUJU tensor index rejected" in parser_text
+    assert "JUJU tensor_count mismatch" in parser_text
+    assert "missing/invalid required name, juju_offset, or juju_bytes" in parser_text
+    assert "missing codec registry/type contract" in parser_text
+    assert "missing/invalid dims or shape" in parser_text
+    assert "tensor_count != tensor_object_count" in parser_text
+
+
+def test_juju_runtime_loader_rejects_bad_payload_ranges_not_skip():
+    parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
+    main_parse_text = (ROOT / "moe_engine" / "src" / "parts" / "codec" / "juju_main_parsing.cpp.inc").read_text()
+    assert "moe_juju_tensor_payload_range_valid" in parser_text
+    assert "JUJU tensor index payload range rejected" in main_parse_text
+    assert "JUJU tensor index payload range rejected during probe" in main_parse_text
+    rejected_pos = main_parse_text.index("JUJU tensor index payload range rejected")
+    return_pos = main_parse_text.index("return 0;", rejected_pos)
+    assert rejected_pos < return_pos

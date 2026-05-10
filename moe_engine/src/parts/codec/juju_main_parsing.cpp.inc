@@ -251,6 +251,18 @@ static int load_juju_tensor_index_as_tensor_index(
             continue;
         }
         for (const moe_juju_tensor_json_entry_t& entry : tensors) {
+            const char* range_reason = nullptr;
+            if (!moe_juju_tensor_payload_range_valid(entry, file_bytes, &range_reason)) {
+                std::fprintf(stderr,
+                    "[storagellm] JUJU tensor index payload range rejected during probe: file=%s name=%s reason=%s offset=%llu bytes=%llu file_bytes=%llu\n",
+                    path.c_str(),
+                    entry.name.c_str(),
+                    range_reason ? range_reason : "unknown",
+                    (unsigned long long)entry.juju_offset,
+                    (unsigned long long)entry.juju_bytes,
+                    (unsigned long long)file_bytes);
+                return 0;
+            }
             moe_juju_probe_note_tensor(&probe, entry);
         }
     }
@@ -290,6 +302,18 @@ static int load_juju_tensor_index_as_tensor_index(
             continue;
         }
         for (const moe_juju_tensor_json_entry_t& entry : tensors) {
+            const char* range_reason = nullptr;
+            if (!moe_juju_tensor_payload_range_valid(entry, file_bytes, &range_reason)) {
+                std::fprintf(stderr,
+                    "[storagellm] JUJU tensor index payload range rejected during probe: file=%s name=%s reason=%s offset=%llu bytes=%llu file_bytes=%llu\n",
+                    path.c_str(),
+                    entry.name.c_str(),
+                    range_reason ? range_reason : "unknown",
+                    (unsigned long long)entry.juju_offset,
+                    (unsigned long long)entry.juju_bytes,
+                    (unsigned long long)file_bytes);
+                return 0;
+            }
             moe_juju_probe_note_tensor(&probe, entry);
         }
         uint16_t path_idx = 0xFFFFu;
@@ -307,10 +331,17 @@ static int load_juju_tensor_index_as_tensor_index(
         const uint32_t part_id = (uint32_t)path_idx + 1u;
         const uint32_t shard_id = part_id;
         for (const moe_juju_tensor_json_entry_t& entry : tensors) {
-            if (entry.juju_bytes == 0 ||
-                entry.juju_offset > file_bytes ||
-                entry.juju_bytes > file_bytes - entry.juju_offset) {
-                continue;
+            const char* range_reason = nullptr;
+            if (!moe_juju_tensor_payload_range_valid(entry, file_bytes, &range_reason)) {
+                std::fprintf(stderr,
+                    "[storagellm] JUJU tensor index payload range rejected: file=%s name=%s reason=%s offset=%llu bytes=%llu file_bytes=%llu\n",
+                    path.c_str(),
+                    entry.name.c_str(),
+                    range_reason ? range_reason : "unknown",
+                    (unsigned long long)entry.juju_offset,
+                    (unsigned long long)entry.juju_bytes,
+                    (unsigned long long)file_bytes);
+                return 0;
             }
             if (!moe_juju_tensor_codec_contract_valid(entry, contract)) {
                 std::fprintf(stderr,
