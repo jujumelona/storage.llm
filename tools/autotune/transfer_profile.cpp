@@ -246,11 +246,11 @@ TransferProfile measure_transfer_profile() {
     // latency, pinned workers saturate host memory copy, GPU workers feed DMA
     // streams.  Caps are intentionally tied to the measured slowest stage so an
     // upstream queue does not explode while a downstream stage idles.
-    const uint32_t worker_cap = std::min<uint32_t>(p.hw_threads, max_storage_autotune ? 96u : 48u);
-    const uint32_t io_cap = std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, max_storage_autotune ? 64u : 32u));
-    const uint32_t disk_cap = std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, max_storage_autotune ? 64u : 32u));
-    const uint32_t pinned_cap = std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, max_storage_autotune ? 32u : 16u));
-    const uint32_t gpu_cap = std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, max_storage_autotune ? 16u : 8u));
+    const uint32_t worker_cap = std::min<uint32_t>(p.hw_threads, max_storage_autotune ? 128u : 48u);
+    const uint32_t io_cap = std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, max_storage_autotune ? 96u : 32u));
+    const uint32_t disk_cap = std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, max_storage_autotune ? 128u : 32u));
+    const uint32_t pinned_cap = std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, max_storage_autotune ? 48u : 16u));
+    const uint32_t gpu_cap = std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, max_storage_autotune ? 24u : 8u));
 
     p.io_workers = clamp_u32(
         very_fast_storage ? 16u : fast_storage ? 12u : mid_storage ? 8u : slow_storage ? 6u : 4u,
@@ -278,6 +278,16 @@ TransferProfile measure_transfer_profile() {
     else p.prefetch_window_layers = 2;
     if (ram_much_faster && !very_fast_storage) {
         p.prefetch_window_layers = std::min<uint32_t>(8u, p.prefetch_window_layers + 1u);
+    }
+    if (max_storage_autotune) {
+        // Max mode is explicitly storage-required: give the runtime a deeper
+        // layer runway when movement is storage-bound, but avoid overfeeding
+        // when RAM copy is the measured bottleneck.
+        const uint32_t max_window = slow_storage ? 24u : mid_storage ? 16u : fast_storage ? 12u : 8u;
+        if (ram_much_faster || slow_storage || mid_storage) {
+            p.prefetch_window_layers = std::min<uint32_t>(max_window,
+                std::max<uint32_t>(p.prefetch_window_layers, slow_storage ? 8u : mid_storage ? 6u : 4u));
+        }
     }
 
     const uint32_t base_slots = std::max(6u, p.pinned_workers * std::max(2u, p.gpu_workers) * 3u);
@@ -332,6 +342,8 @@ std::string transfer_env_text(const TransferProfile& p) {
     ss << "STORAGELLM_PINNED_STAGE_DEPTH_CAP=" << p.pinned_stage_depth_cap << "\n";
     ss << "STORAGELLM_GPU_STAGE_DEPTH_CAP=" << p.gpu_stage_depth_cap << "\n";
     ss << "STORAGELLM_DIRECT_UPLOAD_MIN_MB=" << p.direct_upload_min_mb << "\n";
+    ss << "STORAGELLM_STORAGE_PREFETCH_WORKERS=" << p.disk_workers << "\n";
+    ss << "STORAGELLM_STORAGE_PREFETCH_QUEUE_DEPTH=" << p.max_prefetch_queue << "\n";
     ss << "STORAGELLM_PIPELINE_DEPTH_SCALE=" << p.pipeline_depth_scale << "\n";
     ss << "STORAGELLM_STORAGE_AUTOTUNE=1\n";
     ss << "STORAGELLM_STORAGE_BOTTLENECK=" << p.movement_bottleneck << "\n";
@@ -372,6 +384,8 @@ std::string transfer_report_json(const TransferProfile& p) {
     ss << "    \"pinned_stage_depth_cap\": " << p.pinned_stage_depth_cap << ",\n";
     ss << "    \"gpu_stage_depth_cap\": " << p.gpu_stage_depth_cap << ",\n";
     ss << "    \"direct_upload_min_mb\": " << p.direct_upload_min_mb << ",\n";
+    ss << "    \"storage_prefetch_workers\": " << p.disk_workers << ",\n";
+    ss << "    \"storage_prefetch_queue_depth\": " << p.max_prefetch_queue << ",\n";
     ss << "    \"pipeline_depth_scale\": " << p.pipeline_depth_scale << "\n";
     ss << "  },\n";
     ss << "  \"truth\": \"This minimizes movement bottlenecks by measuring RAM/storage throughput, sizing queues, workers, staging and lookahead together, and letting runtime backpressure prevent oversupply. It does not prove physical bottleneck=0 for every model/device.\"\n";

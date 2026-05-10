@@ -299,9 +299,18 @@ static int moe_map_router_scale_tensor(
         return 0;
     }
     static const char* const suffixes[] = {
-        "ffn_gate_inp.scale",
-        "router.scale",
+        // Do not match ffn_gate_inp.scale here.  In GGUF/MXFP4 artifacts that
+        // name is the quantization sidecar for ffn_gate_inp.weight, not a
+        // model activation/RMSNorm scale.  Treating it as a router input norm
+        // multiplies the router input by ~32 and saturates sigmoid routing.
+        "router_norm.weight",
+        "router.input_layernorm.weight",
+        "router.input_norm.weight",
+        "moe_router_norm.weight",
+        "moe.gate_norm.weight",
+        "mlp.router_norm.weight",
         "mlp.router.scale",
+        "router.scale",
         "moe.gate.scale"
     };
 
@@ -388,7 +397,7 @@ static int moe_prepare_scaled_router_input_f32(
     const uint32_t sample_step = hidden_size > sample_limit ?
         (hidden_size + sample_limit - 1u) / sample_limit : 1u;
     uint32_t samples = 0;
-    for (uint32_t i = 0; i < hidden_size; ++i) {
+    for (uint32_t i = 0; i < hidden_size; i += sample_step) {
         float scale = 1.0f;
         if (scale_count == 1u) {
             if (!moe_router_raw_scalar_at_f32(scale_raw, 0, &scale)) return 0;
@@ -402,14 +411,57 @@ static int moe_prepare_scaled_router_input_f32(
         if (!std::isfinite(effective_scale)) {
             return 0;
         }
-        if ((i % sample_step) == 0u) {
-            const float raw_abs = std::fabs(scale);
-            const float eff_abs = std::fabs(effective_scale);
-            raw_abs_sum += (double)raw_abs;
-            eff_abs_sum += (double)eff_abs;
-            if (raw_abs > raw_max_abs) raw_max_abs = raw_abs;
-            if (eff_abs > eff_max_abs) eff_max_abs = eff_abs;
-            ++samples;
+        const float raw_abs = std::fabs(scale);
+        const float eff_abs = std::fabs(effective_scale);
+        raw_abs_sum += (double)raw_abs;
+        eff_abs_sum += (double)eff_abs;
+        if (raw_abs > raw_max_abs) raw_max_abs = raw_abs;
+        if (eff_abs > eff_max_abs) eff_max_abs = eff_abs;
+        ++samples;
+    }
+    const double inv_samples = samples ? 1.0 / (double)samples : 0.0;
+    const double raw_mean_abs = raw_abs_sum * inv_samples;
+    const double eff_mean_abs = eff_abs_sum * inv_samples;
+
+    // A router activation/RMSNorm scale vector should be O(1).  The real PPL
+    // logs showed count=hidden and raw_mean_abs≈32/max≈33.75, which matches an
+    // MXFP4/GGUF quantization scale sidecar, not a model norm weight.  Using it
+    // as an activation scale inflated router logits to |logit|~100-200, made
+    // sigmoid top-k saturate to 1.0, and collapsed MoE weights to 1/top_k.
+    // Return 0 so callers fall back to the unscaled hidden router input.
+    if (scale_count != 1u && (raw_mean_abs > 8.0 || eff_mean_abs > 8.0 ||
+            raw_max_abs > 16.0f || eff_max_abs > 16.0f)) {
+        if (moe_profile_level() >= 2) {
+            moe_profile_log(
+                "router_scale_ignore",
+                "layer=%d hidden=%u count=%llu reason=implausible_activation_scale unit_offset=%d input_norm=%.6g raw_mean_abs=%.6g raw_max_abs=%.6g eff_mean_abs=%.6g eff_max_abs=%.6g samples=%u",
+                layer,
+                hidden_size,
+                (unsigned long long)scale_count,
+                unit_offset,
+                (double)norm,
+                raw_mean_abs,
+                (double)raw_max_abs,
+                eff_mean_abs,
+                (double)eff_max_abs,
+                samples);
+        }
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < hidden_size; ++i) {
+        float scale = 1.0f;
+        if (scale_count == 1u) {
+            if (!moe_router_raw_scalar_at_f32(scale_raw, 0, &scale)) return 0;
+        } else {
+            if (!moe_router_raw_scalar_at_f32(scale_raw, i, &scale)) return 0;
+        }
+        if (!std::isfinite(scale)) {
+            return 0;
+        }
+        const float effective_scale = unit_offset ? (1.0f + scale) : scale;
+        if (!std::isfinite(effective_scale)) {
+            return 0;
         }
         // Graph contract: router scale is the RMSNorm/scale weight for the
         // router input.  RMSNorm already divides by sqrt(mean(x^2)); applying
@@ -426,7 +478,6 @@ static int moe_prepare_scaled_router_input_f32(
         (*out)[i] = result;
     }
     if (moe_profile_level() >= 2) {
-        const double inv_samples = samples ? 1.0 / (double)samples : 0.0;
         moe_profile_log(
             "router_scale_apply",
             "layer=%d hidden=%u count=%llu unit_offset=%d input_norm=%.6g raw_mean_abs=%.6g raw_max_abs=%.6g eff_mean_abs=%.6g eff_max_abs=%.6g samples=%u",
@@ -435,9 +486,9 @@ static int moe_prepare_scaled_router_input_f32(
             (unsigned long long)scale_count,
             unit_offset,
             (double)norm,
-            raw_abs_sum * inv_samples,
+            raw_mean_abs,
             (double)raw_max_abs,
-            eff_abs_sum * inv_samples,
+            eff_mean_abs,
             (double)eff_max_abs,
             samples);
     }

@@ -542,6 +542,11 @@ static void clear_stage(moe_pc_engine* engine, moe_stage_queue& stage) {
     const uint32_t removed = static_cast<uint32_t>(stage.queue.size() + stage.urgent_queue.size());
     stage.queue.clear();
     stage.urgent_queue.clear();
+    // Reset byte pressure with the queues.  Otherwise a reconfigure/clear can
+    // leave stale queued/inflight byte accounting behind and make the stage look
+    // saturated even when it is empty, which throttles the storage pipeline.
+    stage.queued_bytes.store(0, std::memory_order_relaxed);
+    stage.inflight_bytes.store(0, std::memory_order_relaxed);
     // BUGFIX 205: Add memory_order_relaxed for depth/inflight counters ★
     stage.depth.store(0, std::memory_order_relaxed);
     stage.inflight.store(0, std::memory_order_relaxed);

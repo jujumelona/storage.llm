@@ -109,7 +109,8 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                     break;
                 }
                 const auto& next_task = engine->gpu_stage.urgent_queue.front();
-                uint64_t next_bytes = moe_prefetch_task_estimated_bytes(engine, next_task);
+                uint64_t next_bytes = next_task.stage_accounted_bytes ?
+                    next_task.stage_accounted_bytes : moe_prefetch_task_estimated_bytes(engine, next_task);
                 if (byte_limit > 0 && batch_bytes + next_bytes > byte_limit && batch_count > 0) {
                     break;
                 }
@@ -131,7 +132,8 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
                     break;
                 }
                 const auto& next_task = engine->gpu_stage.queue.front();
-                uint64_t next_bytes = moe_prefetch_task_estimated_bytes(engine, next_task);
+                uint64_t next_bytes = next_task.stage_accounted_bytes ?
+                    next_task.stage_accounted_bytes : moe_prefetch_task_estimated_bytes(engine, next_task);
                 if (byte_limit > 0 && batch_bytes + next_bytes > byte_limit && batch_count > 0) {
                     break;
                 }
@@ -151,7 +153,7 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
             // BUGFIX 97: Cache size calculation in gpu_worker
             const uint32_t new_depth = static_cast<uint32_t>(
                 engine->gpu_stage.queue.size() + engine->gpu_stage.urgent_queue.size());
-            engine->gpu_stage.depth.store(new_depth);
+            engine->gpu_stage.depth.store(new_depth, std::memory_order_relaxed);
             queue_total_depth_sub(engine, extra_popped);
         }
 

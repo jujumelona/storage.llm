@@ -8,32 +8,47 @@
 // plan, prefetch and health state are CPU-storage specific.
 
 static int moe_cpu_storage_env_truthy(const char* name) {
-    const char* v = std::getenv(name);
-    if (!v || !*v) return 0;
-    if (v[0] == '0') return 0;
-    if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return 0;
-    if ((v[0] == 'n' || v[0] == 'N') && (v[1] == 'o' || v[1] == 'O')) return 0;
+    // Read process env first and selected_backend.env second.  CPU-storage has
+    // its own hot prefetch planner, so it must consume the same host-local
+    // autotune file as the main IO pipeline instead of silently falling back to
+    // conservative defaults when the operator did not export the env vars.
+    const std::string value = moe_autotune_value(name);
+    if (value.empty()) return 0;
+    const char c0 = value[0];
+    if (c0 == '0') return 0;
+    if ((c0 == 'f' || c0 == 'F') && value.size() > 1 && (value[1] == 'a' || value[1] == 'A')) return 0;
+    if ((c0 == 'n' || c0 == 'N') && value.size() > 1 && (value[1] == 'o' || value[1] == 'O')) return 0;
+    if ((c0 == 'o' || c0 == 'O') && value.size() > 1 && (value[1] == 'f' || value[1] == 'F')) return 0;
     return 1;
 }
 
 static thread_local int g_moe_storage_prefetch_worker_tls = 0;
 
 static int moe_cpu_storage_env_false(const char* name) {
-    const char* v = std::getenv(name);
-    if (!v || !*v) return 0;
-    return v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N';
+    const std::string value = moe_autotune_value(name);
+    if (value.empty()) return 0;
+    const char c0 = value[0];
+    return c0 == '0' || c0 == 'f' || c0 == 'F' || c0 == 'n' || c0 == 'N';
 }
 
 static int moe_cpu_storage_env_enabled_default_on(const char* name) {
-    const char* v = std::getenv(name);
-    if (!v || !*v) return 1;
-    return !(v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N');
+    const std::string value = moe_autotune_value(name);
+    if (value.empty()) return 1;
+    const char c0 = value[0];
+    return !(c0 == '0' || c0 == 'f' || c0 == 'F' || c0 == 'n' || c0 == 'N');
+}
+
+static int moe_storage_max_parallel_env_enabled() {
+    return moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_MAX") ||
+           moe_cpu_storage_env_truthy("STORAGELLM_MAX_PARALLELISM") ||
+           moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_AUTOTUNE_MAX");
 }
 
 static int moe_storage_always_env_enabled() {
     return moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_ALWAYS") ||
            moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_REQUIRED") ||
-           moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_IO_PLANNER");
+           moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_IO_PLANNER") ||
+           moe_storage_max_parallel_env_enabled();
 }
 
 static void moe_cpu_storage_hint_mapped_range(const uint8_t* ptr, uint64_t bytes) {
@@ -136,11 +151,11 @@ static uint8_t moe_cpu_storage_format_simple_dot(int weight_format) {
 
 
 static uint64_t moe_cpu_storage_env_u64_default(const char* name, uint64_t defv) {
-    const char* v = std::getenv(name);
-    if (!v || !*v) return defv;
+    const std::string value = moe_autotune_value(name);
+    if (value.empty()) return defv;
     char* end = nullptr;
-    const unsigned long long parsed = std::strtoull(v, &end, 10);
-    if (end == v) return defv;
+    const unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
+    if (end == value.c_str()) return defv;
     return (uint64_t)parsed;
 }
 
@@ -159,8 +174,9 @@ static int moe_cpu_storage_page_touch_enabled() {
 
 
 static uint32_t moe_storage_io_parse_profile() {
-    const char* v = std::getenv("STORAGELLM_STORAGE_PROFILE");
-    if (!v || !*v || std::strcmp(v, "auto") == 0) return moe_STORAGE_PROFILE_AUTO;
+    const std::string value = moe_autotune_value("STORAGELLM_STORAGE_PROFILE");
+    if (value.empty() || value == "auto") return moe_STORAGE_PROFILE_AUTO;
+    const char* v = value.c_str();
     if (std::strcmp(v, "nvme") == 0 || std::strcmp(v, "nvme_ssd") == 0) return moe_STORAGE_PROFILE_NVME;
     if (std::strcmp(v, "ssd") == 0 || std::strcmp(v, "sata_ssd") == 0 || std::strcmp(v, "sata") == 0) return moe_STORAGE_PROFILE_SATA_SSD;
     if (std::strcmp(v, "hdd") == 0) return moe_STORAGE_PROFILE_HDD;
@@ -171,74 +187,83 @@ static uint32_t moe_storage_io_parse_profile() {
 
 static uint32_t moe_storage_io_worker_cap(uint32_t profile) {
     const uint32_t hw = std::max<uint32_t>(1u, moe_cpu_thread_count_hint());
+    const int max_mode = moe_storage_max_parallel_env_enabled();
     switch (profile) {
         case moe_STORAGE_PROFILE_NVME:
-            return std::min<uint32_t>(64u, std::max<uint32_t>(16u, hw));
+            return std::min<uint32_t>(max_mode ? 128u : 64u, std::max<uint32_t>(max_mode ? 32u : 16u, hw));
         case moe_STORAGE_PROFILE_SATA_SSD:
-            return std::min<uint32_t>(32u, std::max<uint32_t>(8u, hw / 2u));
+            return std::min<uint32_t>(max_mode ? 64u : 32u, std::max<uint32_t>(max_mode ? 16u : 8u, hw / 2u));
         case moe_STORAGE_PROFILE_HDD:
-            return 2u;
+            return max_mode ? 4u : 2u;
         case moe_STORAGE_PROFILE_NETWORK:
-            return std::min<uint32_t>(8u, std::max<uint32_t>(2u, hw / 4u));
+            return std::min<uint32_t>(max_mode ? 16u : 8u, std::max<uint32_t>(2u, hw / 4u));
         case moe_STORAGE_PROFILE_RAMDISK:
             return 0u;
         default:
-            return std::min<uint32_t>(32u, std::max<uint32_t>(8u, hw / 2u));
+            return std::min<uint32_t>(max_mode ? 64u : 32u, std::max<uint32_t>(max_mode ? 16u : 8u, hw / 2u));
     }
 }
 
 static uint32_t moe_storage_io_default_queue_depth(uint32_t profile) {
-    if (const char* env = std::getenv("STORAGELLM_STORAGE_PREFETCH_QUEUE_DEPTH")) {
-        char* end = nullptr;
-        const unsigned long v = std::strtoul(env, &end, 10);
-        if (end != env && v > 0) return (uint32_t)v;
-    }
+    const uint32_t cap_hi = moe_storage_max_parallel_env_enabled() ? 65536u : 32768u;
+    const uint32_t explicit_q = moe_autotune_u32("STORAGELLM_STORAGE_PREFETCH_QUEUE_DEPTH", 0u, 1u, cap_hi);
+    if (explicit_q) return explicit_q;
+    const uint32_t autotuned_disk_cap = moe_autotune_u32("STORAGELLM_DISK_STAGE_DEPTH_CAP", 0u, 1u, cap_hi);
+    const uint32_t autotuned_maxq = moe_autotune_u32("STORAGELLM_MAX_PREFETCH_QUEUE", 0u, 1u, cap_hi);
     const uint32_t workers = std::max<uint32_t>(1u, moe_storage_io_worker_cap(profile));
+    uint32_t q = 0;
     switch (profile) {
         case moe_STORAGE_PROFILE_NVME:
-            return std::max<uint32_t>(1024u, workers * 128u);
+            q = std::max<uint32_t>(moe_storage_max_parallel_env_enabled() ? 4096u : 1024u, workers * (moe_storage_max_parallel_env_enabled() ? 256u : 128u));
+            break;
         case moe_STORAGE_PROFILE_SATA_SSD:
-            return std::max<uint32_t>(256u, workers * 64u);
+            q = std::max<uint32_t>(moe_storage_max_parallel_env_enabled() ? 1024u : 256u, workers * (moe_storage_max_parallel_env_enabled() ? 128u : 64u));
+            break;
         case moe_STORAGE_PROFILE_HDD:
-            return 16u;
+            q = moe_storage_max_parallel_env_enabled() ? 32u : 16u;
+            break;
         case moe_STORAGE_PROFILE_NETWORK:
-            return std::max<uint32_t>(32u, workers * 16u);
+            q = std::max<uint32_t>(32u, workers * 16u);
+            break;
         case moe_STORAGE_PROFILE_RAMDISK:
             return 0u;
         default:
-            return std::max<uint32_t>(512u, workers * 96u);
+            q = std::max<uint32_t>(moe_storage_max_parallel_env_enabled() ? 2048u : 512u, workers * (moe_storage_max_parallel_env_enabled() ? 192u : 96u));
+            break;
     }
+    if (autotuned_disk_cap) q = std::max<uint32_t>(q, autotuned_disk_cap);
+    if (autotuned_maxq) q = std::max<uint32_t>(q, std::min<uint32_t>(autotuned_maxq, cap_hi));
+    return std::min<uint32_t>(q, cap_hi);
 }
 
 static uint32_t moe_storage_io_default_workers(uint32_t profile) {
-    if (const char* env = std::getenv("STORAGELLM_STORAGE_PREFETCH_WORKERS")) {
-        char* end = nullptr;
-        const unsigned long v = std::strtoul(env, &end, 10);
-        if (end != env) return (uint32_t)std::min<unsigned long>(v, 128ul);
-    }
+    const uint32_t cap = moe_storage_io_worker_cap(profile);
+    if (cap == 0) return 0u;
+    const uint32_t explicit_workers = moe_autotune_u32("STORAGELLM_STORAGE_PREFETCH_WORKERS", 0u, 1u, 128u);
+    if (explicit_workers) return std::min<uint32_t>(explicit_workers, cap);
+    const uint32_t measured_best = moe_autotune_u32("STORAGELLM_STORAGE_THREAD_PROBE_BEST", 0u, 1u, 128u);
+    if (measured_best) return std::min<uint32_t>(std::max<uint32_t>(1u, measured_best), cap);
     const uint32_t hw = std::max<uint32_t>(1u, moe_cpu_thread_count_hint());
+    const int max_mode = moe_storage_max_parallel_env_enabled();
     switch (profile) {
         case moe_STORAGE_PROFILE_NVME:
-            return std::min<uint32_t>(moe_storage_io_worker_cap(profile), std::max<uint32_t>(8u, hw / 2u));
+            return std::min<uint32_t>(cap, std::max<uint32_t>(max_mode ? 16u : 8u, max_mode ? hw : hw / 2u));
         case moe_STORAGE_PROFILE_SATA_SSD:
-            return std::min<uint32_t>(moe_storage_io_worker_cap(profile), std::max<uint32_t>(4u, hw / 4u));
+            return std::min<uint32_t>(cap, std::max<uint32_t>(max_mode ? 8u : 4u, max_mode ? hw / 2u : hw / 4u));
         case moe_STORAGE_PROFILE_HDD:
-            return 1u;
+            return max_mode ? std::min<uint32_t>(cap, 2u) : 1u;
         case moe_STORAGE_PROFILE_NETWORK:
-            return std::min<uint32_t>(moe_storage_io_worker_cap(profile), std::max<uint32_t>(2u, hw / 8u));
+            return std::min<uint32_t>(cap, std::max<uint32_t>(2u, hw / 8u));
         case moe_STORAGE_PROFILE_RAMDISK:
             return 0u;
         default:
-            return std::min<uint32_t>(moe_storage_io_worker_cap(profile), std::max<uint32_t>(6u, hw / 3u));
+            return std::min<uint32_t>(cap, std::max<uint32_t>(max_mode ? 8u : 6u, max_mode ? hw / 2u : hw / 3u));
     }
 }
 
 static uint64_t moe_storage_io_merge_gap_bytes(uint32_t profile) {
-    if (const char* env = std::getenv("STORAGELLM_STORAGE_PREFETCH_MERGE_GAP_BYTES")) {
-        char* end = nullptr;
-        const unsigned long long v = std::strtoull(env, &end, 10);
-        if (end != env) return (uint64_t)v;
-    }
+    const uint64_t explicit_gap = moe_autotune_u64("STORAGELLM_STORAGE_PREFETCH_MERGE_GAP_BYTES", 0, 1, UINT64_MAX);
+    if (explicit_gap) return explicit_gap;
     switch (profile) {
         case moe_STORAGE_PROFILE_NVME: return 256ull * 1024ull;
         case moe_STORAGE_PROFILE_SATA_SSD: return 128ull * 1024ull;
@@ -293,6 +318,24 @@ static int moe_storage_prefetch_inline_on_overflow_enabled() {
     return enabled;
 }
 
+
+static size_t moe_storage_prefetch_batch_cap(uint32_t profile, uint32_t workers) {
+    const int max_mode = moe_storage_max_parallel_env_enabled();
+    const size_t worker_scaled = std::max<size_t>(2u, std::min<uint32_t>(workers, max_mode ? 16u : 8u));
+    switch (profile) {
+        case moe_STORAGE_PROFILE_NVME:
+            return max_mode ? std::max<size_t>(16u, worker_scaled * 2u) : 8u;
+        case moe_STORAGE_PROFILE_SATA_SSD:
+            return max_mode ? std::max<size_t>(8u, worker_scaled) : 4u;
+        case moe_STORAGE_PROFILE_HDD:
+            return 2u;
+        case moe_STORAGE_PROFILE_NETWORK:
+            return max_mode ? 4u : 2u;
+        default:
+            return max_mode ? std::max<size_t>(8u, worker_scaled) : 2u;
+    }
+}
+
 static int moe_storage_async_prefetch_default_enabled(moe_pc_engine* engine) {
     if (!engine) return 0;
     if (!moe_cpu_storage_env_enabled_default_on("STORAGELLM_STORAGE_ASYNC_PREFETCH")) return 0;
@@ -307,9 +350,10 @@ static void moe_storage_prefetch_worker_loop(moe_pc_engine* engine) {
     if (!engine) return;
     g_moe_storage_prefetch_worker_tls = 1;
     std::vector<moe_storage_prefetch_request_t> batch;
-    batch.reserve(8u);
+    batch.reserve(32u);
     for (;;) {
         batch.clear();
+        bool wake_more_workers = false;
         {
             std::unique_lock<std::mutex> lock(engine->storage_prefetch_queue_mutex);
             engine->storage_prefetch_queue_cv.wait(lock, [engine]() {
@@ -321,12 +365,17 @@ static void moe_storage_prefetch_worker_loop(moe_pc_engine* engine) {
                 break;
             }
             const uint32_t profile = engine->storage_profile.load(std::memory_order_relaxed);
-            const size_t batch_cap = profile == moe_STORAGE_PROFILE_NVME ? 8u :
-                                     profile == moe_STORAGE_PROFILE_SATA_SSD ? 4u : 2u;
+            const uint32_t workers = std::max<uint32_t>(1u, engine->storage_prefetch_workers.load(std::memory_order_relaxed));
+            const size_t batch_cap = moe_storage_prefetch_batch_cap(profile, workers);
+            if (batch.capacity() < batch_cap) batch.reserve(batch_cap);
             while (!engine->storage_prefetch_queue.empty() && batch.size() < batch_cap) {
                 batch.push_back(engine->storage_prefetch_queue.front());
                 engine->storage_prefetch_queue.pop_front();
             }
+            wake_more_workers = !engine->storage_prefetch_queue.empty();
+        }
+        if (wake_more_workers) {
+            engine->storage_prefetch_queue_cv.notify_all();
         }
         if (!batch.empty()) {
             engine->storage_async_prefetch_pending.fetch_sub(
@@ -412,6 +461,7 @@ static int moe_storage_async_prefetch_enqueue(
     req.bytes = bytes;
     req.profile = engine->storage_profile.load(std::memory_order_relaxed);
     req.gpu_consumer = (uint8_t)moe_storage_io_gpu_consumer_active(engine);
+    bool wake_all = false;
     {
         std::lock_guard<std::mutex> lock(engine->storage_prefetch_queue_mutex);
         if (engine->storage_prefetch_stop.load(std::memory_order_acquire)) return 0;
@@ -424,9 +474,13 @@ static int moe_storage_async_prefetch_enqueue(
         }
         engine->storage_prefetch_queue.push_back(req);
         engine->storage_async_prefetch_enqueued.fetch_add(1, std::memory_order_relaxed);
-        engine->storage_async_prefetch_pending.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t pending_after = engine->storage_async_prefetch_pending.fetch_add(1, std::memory_order_relaxed) + 1u;
+        const size_t batch_cap = moe_storage_prefetch_batch_cap(req.profile,
+            std::max<uint32_t>(1u, engine->storage_prefetch_workers.load(std::memory_order_relaxed)));
+        wake_all = pending_after > batch_cap;
     }
-    engine->storage_prefetch_queue_cv.notify_one();
+    if (wake_all) engine->storage_prefetch_queue_cv.notify_all();
+    else engine->storage_prefetch_queue_cv.notify_one();
     return 1;
 }
 
@@ -446,8 +500,10 @@ static void moe_storage_io_apply_profile(moe_pc_engine* engine) {
     engine->storage_iouring_available.store(engine->ring_adapter.initialized ? 1 : 0, std::memory_order_relaxed);
     engine->storage_iouring_enabled.store((engine->ring_adapter.initialized && moe_storage_io_iouring_default_enabled(engine)) ? 1 : 0, std::memory_order_relaxed);
     engine->storage_gpu_staging_plan_ready.store(moe_storage_io_gpu_consumer_active(engine) ? 1 : 0, std::memory_order_relaxed);
-    engine->storage_prefetch_workers.store(moe_storage_io_default_workers(profile), std::memory_order_relaxed);
-    engine->storage_prefetch_queue_depth.store(moe_storage_io_default_queue_depth(profile), std::memory_order_relaxed);
+    const uint32_t planned_workers = moe_storage_io_default_workers(profile);
+    const uint32_t planned_depth = moe_storage_io_default_queue_depth(profile);
+    engine->storage_prefetch_workers.store(planned_workers, std::memory_order_relaxed);
+    engine->storage_prefetch_queue_depth.store(planned_depth, std::memory_order_relaxed);
 
     // Storage I/O planning is common to CPU and GPU/offload.  CPU-only uses it to
     // keep page faults out of the matvec path.  GPU/offload uses the same merged
@@ -1135,6 +1191,20 @@ static int moe_cpu_storage_forward_allowed(moe_pc_engine* engine, moe_generation
     return 0;
 }
 
+
+static uint32_t moe_cpu_storage_layer_lookahead_depth(const moe_pc_engine* engine, uint32_t layers) {
+    if (!engine || layers == 0) return 1u;
+    const uint32_t configured = engine->io_config.prefetch_window_layers ? engine->io_config.prefetch_window_layers : 6u;
+    uint32_t cap = 8u;
+    if (moe_storage_max_parallel_env_enabled() || moe_autotune_truthy("STORAGELLM_STORAGE_AUTOTUNE")) {
+        cap = moe_storage_max_parallel_env_enabled() ? 32u : 16u;
+        const std::string bottleneck = moe_autotune_value("STORAGELLM_STORAGE_BOTTLENECK");
+        if (bottleneck == "storage") cap = std::min<uint32_t>(cap + 8u, moe_storage_max_parallel_env_enabled() ? 48u : 24u);
+        if (bottleneck == "ram-copy") cap = std::min<uint32_t>(cap, 12u);
+    }
+    return std::max<uint32_t>(1u, std::min<uint32_t>(configured, std::min<uint32_t>(cap, layers)));
+}
+
 static void moe_cpu_storage_begin_token(moe_pc_engine* engine, uint32_t position, uint32_t token_id) {
     if (!engine || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
     (void)position;
@@ -1151,7 +1221,7 @@ static void moe_cpu_storage_begin_token(moe_pc_engine* engine, uint32_t position
     // without scanning all tensors.
     const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
     const uint32_t layers = runtime_c.num_hidden_layers;
-    const uint32_t depth = std::max<uint32_t>(1u, std::min<uint32_t>(engine->io_config.prefetch_window_layers ? engine->io_config.prefetch_window_layers : 6u, 8u));
+    const uint32_t depth = moe_cpu_storage_layer_lookahead_depth(engine, layers);
     for (uint32_t l = 0; l < layers && l < depth; ++l) {
         moe_cpu_storage_schedule_layer_hot_prefetch(engine, l);
         moe_enqueue_attention_prefetch(engine, (int32_t)l);
@@ -1163,7 +1233,7 @@ static void moe_cpu_storage_begin_token(moe_pc_engine* engine, uint32_t position
 static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, const moe_storage_constants_t* c) {
     if (!engine || !c || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
     engine->cpu_layer_begin_count.fetch_add(1, std::memory_order_relaxed);
-    const uint32_t depth = std::max<uint32_t>(1u, std::min<uint32_t>(engine->io_config.prefetch_window_layers ? engine->io_config.prefetch_window_layers : 6u, 8u));
+    const uint32_t depth = moe_cpu_storage_layer_lookahead_depth(engine, c->num_hidden_layers);
     for (uint32_t d = 1; d <= depth; ++d) {
         const uint32_t next = layer + d;
         if (next >= c->num_hidden_layers) break;
