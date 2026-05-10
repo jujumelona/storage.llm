@@ -566,22 +566,11 @@ static int moe_read_juju_tensor_index_json(
                 moe_juju_path_basename_local(path).c_str());
             return 0;
         }
-        std::string embedded;
-        if (moe_read_juju_json_section(
-                path, entries, moe_JUJU_SECTION_LAYER_ORDER_INDEX, file_bytes, &embedded)) {
-            std::string sidecar_uid;
-            std::string embedded_uid;
-            if (!moe_json_get_string_local(sidecar, "artifact_uid", &sidecar_uid) ||
-                !moe_json_get_string_local(embedded, "artifact_uid", &embedded_uid) ||
-                sidecar_uid.empty() || embedded_uid.empty() ||
-                sidecar_uid != embedded_uid) {
-                std::fprintf(stderr,
-                    "[storagellm] JUJU sidecar idx rejected: artifact_uid mismatch idx=%s weight=%s\n",
-                    (path + ".idx").c_str(),
-                    moe_juju_path_basename_local(path).c_str());
-                return 0;
-            }
-        }
+        // The sidecar .juju.idx is authoritative when it names this weight file.
+        // Large JUJU payloads are immutable and expensive to rewrite; contract-only
+        // repairs must be possible by replacing the sidecar index.  Do not reject a
+        // valid sidecar merely because the embedded bootstrap index has an older or
+        // different artifact_uid.
         if (out) {
             *out = std::move(sidecar);
         }
@@ -593,23 +582,84 @@ static int moe_read_juju_tensor_index_json(
     return 0;
 }
 
+static const char* const moe_juju_required_feature_contract[] = {
+    "juju_idx_schema_v6",
+    "juju_binary_wire_v2",
+    "gguf_codec_registry_v1",
+    "expert_bundle_table_v2",
+    "bundle_native",
+    "explicit_expert_layout",
+    "graph_ir",
+    "qkv_policy",
+    "codec_registry_v1",
+    "fail_closed_kernel_contract",
+    "fail_closed_required_features",
+    "exact_ppl_mode",
+    "metadata_first_expert_resolution",
+    "source_quant_rows_preserved",
+    "deterministic_router_topk",
+    "moe_router_topk_contract",
+    "moe_router_topk_contract_aliases",
+    "metadata_sidecar_config_extraction",
+    "attention_scale_contract",
+    "attention_head_dim_fallback_scale",
+    "attention_query_pre_attn_scalar_contract",
+    "storage_plan_contract",
+    "runtime_tensor_index_contract",
+    nullptr,
+};
+
 static int moe_juju_required_feature_supported(const std::string& feature) {
     const std::string f = moe_lower_ascii_copy(feature);
-    if (f.empty()) return 1;
-    return f == "bundle_native" ||
-           f == "explicit_expert_layout" ||
-           f == "graph_ir" ||
-           f == "qkv_policy" ||
-           f == "codec_registry_v1" ||
-           f == "fail_closed_kernel_contract" ||
-           f == "exact_ppl_mode" ||
-           f == "metadata_first_expert_resolution" ||
-           f == "source_quant_rows_preserved" ||
-           f == "deterministic_router_topk" ||
-           f == "moe_router_topk_contract_aliases" ||
-           f == "metadata_sidecar_config_extraction" ||
-           f == "attention_head_dim_fallback_scale" ||
-           f == "attention_query_pre_attn_scalar_contract";
+    if (f.empty()) return 0;
+    for (const char* const* expected = moe_juju_required_feature_contract; *expected; ++expected) {
+        if (f == *expected) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_juju_required_feature_vector_has(
+    const std::vector<std::string>& features,
+    const char* feature
+) {
+    if (!feature || !*feature) {
+        return 0;
+    }
+    const std::string expected = moe_lower_ascii_copy(feature);
+    for (const std::string& value : features) {
+        if (moe_lower_ascii_copy(value) == expected) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_juju_required_feature_set_complete(const std::string& json) {
+    std::vector<std::string> features;
+    if (!moe_json_get_string_array_slice(json, 0, json.size(), "required_features", &features) ||
+        features.empty()) {
+        std::fprintf(stderr, "[storagellm] missing JUJU required_features\n");
+        return 0;
+    }
+    for (const std::string& feature : features) {
+        if (!moe_juju_required_feature_supported(feature)) {
+            std::fprintf(stderr,
+                "[storagellm] unsupported JUJU required feature: %s\n",
+                feature.c_str());
+            return 0;
+        }
+    }
+    for (const char* const* expected = moe_juju_required_feature_contract; *expected; ++expected) {
+        if (!moe_juju_required_feature_vector_has(features, *expected)) {
+            std::fprintf(stderr,
+                "[storagellm] missing JUJU required feature: %s\n",
+                *expected);
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static int moe_juju_required_feature_present(
@@ -631,7 +681,6 @@ static int moe_juju_required_feature_present(
     }
     return 0;
 }
-
 
 static int moe_juju_extract_attention_contract(
     const std::string& json,
@@ -725,20 +774,7 @@ static void moe_ingest_juju_attention_contract(moe_pc_engine* engine, const std:
         moe_juju_required_feature_present(json, "exact_ppl_mode") ? 1 : 0,
         std::memory_order_release);
     engine->juju_required_features_contract_ready.store(
-        moe_juju_required_feature_present(json, "bundle_native") &&
-        moe_juju_required_feature_present(json, "explicit_expert_layout") &&
-        moe_juju_required_feature_present(json, "graph_ir") &&
-        moe_juju_required_feature_present(json, "qkv_policy") &&
-        moe_juju_required_feature_present(json, "codec_registry_v1") &&
-        moe_juju_required_feature_present(json, "fail_closed_kernel_contract") &&
-        moe_juju_required_feature_present(json, "exact_ppl_mode") &&
-        moe_juju_required_feature_present(json, "metadata_first_expert_resolution") &&
-        moe_juju_required_feature_present(json, "source_quant_rows_preserved") &&
-        moe_juju_required_feature_present(json, "deterministic_router_topk") &&
-        moe_juju_required_feature_present(json, "moe_router_topk_contract_aliases") &&
-        moe_juju_required_feature_present(json, "metadata_sidecar_config_extraction") &&
-        moe_juju_required_feature_present(json, "attention_head_dim_fallback_scale") &&
-        moe_juju_required_feature_present(json, "attention_query_pre_attn_scalar_contract") ? 1 : 0,
+        moe_juju_required_feature_set_complete(json) ? 1 : 0,
         std::memory_order_release);
     const std::string compact = moe_juju_attention_contract_compact_json(json);
     if (!compact.empty() && engine->offload_gguf_metadata_json.find("JUJU_RUNTIME_ATTENTION_CONTRACT_V1") == std::string::npos) {
@@ -778,6 +814,17 @@ static int moe_juju_index_schema_supported(const std::string& json) {
         std::fprintf(stderr, "[storagellm] missing/wrong JUJU expert_bundle_table_format\n");
         return 0;
     }
+    if (!moe_json_get_string_local(json, "format_contract_source", &text) ||
+        text != "juju_required_idx_contract_fields") {
+        std::fprintf(stderr, "[storagellm] missing/wrong JUJU format_contract_source\n");
+        return 0;
+    }
+    int mutable_runtime_index = 0;
+    if (!moe_json_get_bool_local(json, "mutable_runtime_index", &mutable_runtime_index) ||
+        !mutable_runtime_index) {
+        std::fprintf(stderr, "[storagellm] missing/wrong JUJU mutable_runtime_index\n");
+        return 0;
+    }
     uint64_t format_contract_version = 0;
     if (!moe_json_get_u64_local(json, "format_contract_version", &format_contract_version) ||
         format_contract_version != 4u) {
@@ -786,43 +833,8 @@ static int moe_juju_index_schema_supported(const std::string& json) {
             (unsigned long long)format_contract_version);
         return 0;
     }
-    std::vector<std::string> features;
-    if (!moe_json_get_string_array_slice(json, 0, json.size(), "required_features", &features) ||
-        features.empty()) {
-        std::fprintf(stderr, "[storagellm] missing JUJU required_features\n");
+    if (!moe_juju_required_feature_set_complete(json)) {
         return 0;
-    }
-    for (const std::string& feature : features) {
-        if (!moe_juju_required_feature_supported(feature)) {
-            std::fprintf(stderr,
-                "[storagellm] unsupported JUJU required feature: %s\n",
-                feature.c_str());
-            return 0;
-        }
-    }
-    const char* expected_features[] = {
-        "bundle_native",
-        "explicit_expert_layout",
-        "graph_ir",
-        "qkv_policy",
-        "codec_registry_v1",
-        "fail_closed_kernel_contract",
-        "exact_ppl_mode",
-        "metadata_first_expert_resolution",
-        "source_quant_rows_preserved",
-        "deterministic_router_topk",
-        "moe_router_topk_contract_aliases",
-        "metadata_sidecar_config_extraction",
-        "attention_head_dim_fallback_scale",
-        "attention_query_pre_attn_scalar_contract",
-    };
-    for (const char* expected : expected_features) {
-        if (std::find(features.begin(), features.end(), std::string(expected)) == features.end()) {
-            std::fprintf(stderr,
-                "[storagellm] missing JUJU required feature: %s\n",
-                expected);
-            return 0;
-        }
     }
     double query_pre_attn_scalar = 0.0;
     double attention_scale = 0.0;

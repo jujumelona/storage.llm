@@ -141,6 +141,9 @@ def test_cpp_reader_requires_current_schema_and_contract_fields():
     assert 'missing/wrong JUJU codec_registry_version' in parser_text
     assert 'missing/wrong JUJU expert_bundle_table_format' in parser_text
     assert 'missing/wrong JUJU format_contract_version' in parser_text
+    assert 'missing/wrong JUJU format_contract_source' in parser_text
+    assert 'missing/wrong JUJU mutable_runtime_index' in parser_text
+    assert 'moe_juju_required_feature_set_complete' in parser_text
     assert 'JUJU idx missing/invalid query_pre_attn_scalar' in parser_text
     assert 'JUJU idx attention scale mismatch' in parser_text
 
@@ -163,8 +166,10 @@ def test_cpp_reader_requires_every_declared_feature_not_just_unknown_filter():
     fmt = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fmt)
     parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
+    assert 'moe_juju_required_feature_contract' in parser_text
+    assert 'missing JUJU required feature group: %s' not in parser_text
+    assert 'missing JUJU required feature: %s' in parser_text
     for feature in fmt.JUJU_REQUIRED_FEATURES:
-        assert f'missing JUJU required feature: %s' in parser_text
         assert f'"{feature}"' in parser_text
 
 
