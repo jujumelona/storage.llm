@@ -9,21 +9,45 @@ static float moe_embedding_scale_value(const moe_pc_engine* engine, uint32_t hid
     }
 
     double value = 0.0;
+    int bool_value = 0;
     float scale = 1.0f;
+    const char* source = "default";
     if (!engine->offload_gguf_metadata_json.empty() &&
         (moe_json_get_double_local(engine->offload_gguf_metadata_json, "embedding_scale", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "embed_scale", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "scale_emb", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "scale_embedding", &value)) &&
-        value > 0.0) {
+        value > 0.0 && std::isfinite(value)) {
         scale = (float)value;
-    }
-    else if (moe_engine_graph_ir_mentions(engine, "sqrt_hidden_size") ||
-        moe_engine_graph_ir_mentions(engine, "scale_embedding") ||
-        moe_engine_metadata_mentions(engine, "sqrt_hidden_size") ||
-        moe_engine_metadata_mentions(engine, "scale_embedding")) {
+        source = "metadata_double";
+    } else if (!engine->offload_graph_ir_json.empty() &&
+        (moe_json_get_double_local(engine->offload_graph_ir_json, "embedding_scale", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "embed_scale", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "scale_emb", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "scale_embedding", &value)) &&
+        value > 0.0 && std::isfinite(value)) {
+        scale = (float)value;
+        source = "graph_ir_double";
+    } else if ((!engine->offload_graph_ir_json.empty() &&
+                (moe_json_get_bool_local(engine->offload_graph_ir_json, "scale_embedding", &bool_value) ||
+                 moe_json_get_bool_local(engine->offload_graph_ir_json, "sqrt_hidden_size", &bool_value)) &&
+                bool_value) ||
+               (!engine->offload_gguf_metadata_json.empty() &&
+                (moe_json_get_bool_local(engine->offload_gguf_metadata_json, "scale_embedding", &bool_value) ||
+                 moe_json_get_bool_local(engine->offload_gguf_metadata_json, "sqrt_hidden_size", &bool_value)) &&
+                bool_value)) {
         scale = std::sqrt((float)hidden_size);
+        source = "explicit_bool_sqrt_hidden";
+    } else if (moe_engine_metadata_mentions(engine, "sqrt_hidden_size")) {
+        scale = std::sqrt((float)hidden_size);
+        source = "metadata_text_sqrt_hidden";
     }
+    moe_profile_log(
+        "embedding_scale_contract",
+        "source=%s scale=%.9g hidden=%u",
+        source,
+        (double)scale,
+        hidden_size);
     engine->cached_embedding_scale_hidden.store(hidden_size, std::memory_order_release);
     engine->cached_embedding_scale_bits.store(moe_f32_bits(scale), std::memory_order_release);
     return scale;
@@ -149,7 +173,15 @@ static float moe_final_logit_softcap_value(const moe_pc_engine* engine) {
         (moe_json_get_double_local(engine->offload_gguf_metadata_json, "final_logit_softcapping", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "final_logit_softcap", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "logit_softcap", &value)) &&
-        value > 0.0) {
+        value > 0.0 && std::isfinite(value)) {
+        return (float)value;
+    }
+    if (engine &&
+        !engine->offload_graph_ir_json.empty() &&
+        (moe_json_get_double_local(engine->offload_graph_ir_json, "final_logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "final_logit_softcap", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "logit_softcap", &value)) &&
+        value > 0.0 && std::isfinite(value)) {
         return (float)value;
     }
     return 0.0f;

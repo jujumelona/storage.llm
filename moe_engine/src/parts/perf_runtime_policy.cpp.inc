@@ -39,6 +39,8 @@ static int moe_perf_strict_fast_path_enabled() {
 
 static int moe_perf_storage_required_enabled() {
     return moe_perf_env_truthy("STORAGELLM_STORAGE_REQUIRED") ||
+           moe_perf_env_truthy("STORAGELLM_STORAGE_ALWAYS") ||
+           moe_perf_env_truthy("STORAGELLM_STORAGE_IO_PLANNER") ||
            moe_perf_env_truthy("STORAGELLM_STORAGE_PROFILE") ||
            moe_perf_env_truthy("STORAGELLM_STORAGE_MAX");
 }

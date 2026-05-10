@@ -153,10 +153,12 @@ moe_io_config_t moe_pc_default_io_config(void) {
         cfg.enable_lookahead_prefetch = 1;
         cfg.enable_topology_prefetch = 1;
         cfg.enable_mmap_prefetch = 1;
-        cfg.prefetch_window_layers = hw >= 16u ? 6u : (hw >= 8u ? 4u : 2u);
-        cfg.max_prefetch_queue = hw >= 16u ? 32768u : (hw >= 8u ? 16384u : 8192u);
-        cfg.disk_worker_threads = std::max<uint32_t>(cfg.disk_worker_threads, hw >= 32u ? 12u : (hw >= 16u ? 8u : (hw >= 8u ? 4u : 1u)));
-        cfg.io_worker_threads = std::max<uint32_t>(cfg.io_worker_threads, hw >= 32u ? 10u : (hw >= 16u ? 6u : (hw >= 8u ? 4u : 1u)));
+        cfg.prefetch_window_layers = hw >= 32u ? 8u : (hw >= 16u ? 6u : (hw >= 8u ? 4u : 2u));
+        cfg.max_prefetch_queue = hw >= 32u ? 65536u : (hw >= 16u ? 32768u : (hw >= 8u ? 16384u : 8192u));
+        cfg.disk_worker_threads = std::max<uint32_t>(cfg.disk_worker_threads, hw >= 32u ? 16u : (hw >= 16u ? 12u : (hw >= 8u ? 6u : 2u)));
+        cfg.io_worker_threads = std::max<uint32_t>(cfg.io_worker_threads, hw >= 32u ? 16u : (hw >= 16u ? 10u : (hw >= 8u ? 6u : 2u)));
+        cfg.pinned_worker_threads = std::max<uint32_t>(cfg.pinned_worker_threads, hw >= 32u ? 10u : (hw >= 16u ? 8u : (hw >= 8u ? 4u : 1u)));
+        cfg.gpu_worker_threads = std::max<uint32_t>(cfg.gpu_worker_threads, hw >= 32u ? 10u : (hw >= 16u ? 8u : (hw >= 8u ? 4u : 1u)));
         cfg.ram_eviction_target_fill_pct = 94;
         cfg.ram_eviction_threshold_pct = 98;
     }
@@ -166,16 +168,16 @@ moe_io_config_t moe_pc_default_io_config(void) {
         // workers.  Reserve 1-2 cores for IO on larger machines and keep GPU
         // staging completely disabled.
         const uint32_t cpu_io_workers =
-            hw_cpu >= 32u ? 10u :
-            hw_cpu >= 16u ? 6u :
-            hw_cpu >= 8u  ? 4u : 1u;
+            hw_cpu >= 32u ? 16u :
+            hw_cpu >= 16u ? 10u :
+            hw_cpu >= 8u  ? 6u : 2u;
         cfg.io_worker_threads = cpu_io_workers;
         cfg.disk_worker_threads = cpu_io_workers;
         cfg.pinned_worker_threads = 0;
         cfg.gpu_worker_threads = 0;
         cfg.gpu_expert_scratch_slots = 0;
-        cfg.prefetch_window_layers = hw_cpu >= 16u ? 6u : 4u;
-        cfg.max_prefetch_queue = hw_cpu >= 16u ? 32768u : 16384u;
+        cfg.prefetch_window_layers = hw_cpu >= 32u ? 8u : (hw_cpu >= 16u ? 6u : 4u);
+        cfg.max_prefetch_queue = hw_cpu >= 32u ? 65536u : (hw_cpu >= 16u ? 32768u : 16384u);
         cfg.pinned_staging_bytes = 0;
         cfg.directstorage_staging_queue_capacity = 0;
         cfg.directstorage_gpu_queue_capacity = 0;

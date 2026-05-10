@@ -397,3 +397,25 @@ def test_mxfp4_dot_and_cache_decode_use_physical_row_stride_from_index():
     assert "moe_dot_gguf_mxfp4_two_rows_strided(pa, pb, x, a->cols, a->row_bytes, b->row_bytes" in tensor_dot_text
     assert "moe_dot_gguf_mxfp4_row_strided(row_ptr, hidden, hidden_count, row_bytes)" in raw_ops_text
     assert "moe_mxfp4_row_layout_for_bytes(out_count, row_bytes)" in cache_text
+
+
+def test_rmsnorm_false_metadata_does_not_poison_all_tensor_local_detection():
+    raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_ops.cpp.inc").read_text()
+    materializer_text = MAT_PATH.read_text()
+    assert 'False,\n        ),\n        "rmsnorm_unit_offset"' not in materializer_text
+    assert 'None,\n        ),\n        "rmsnorm_unit_offset"' in materializer_text
+    assert 'Only a positive unit-offset contract is safe to cache model-wide' in raw_ops_text
+    assert 'metadata_cache == 1' in raw_ops_text
+    assert 'engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0' not in raw_ops_text
+    assert 'weight_stats_override_metadata_false' in raw_ops_text
+    assert 'weight_stats_confirm_metadata_false' in raw_ops_text
+    assert 'metadata=%d metadata_source=%s' in raw_ops_text
+
+
+def test_embedding_and_final_softcap_read_explicit_graph_ir_values_not_text_mentions():
+    forward_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_ops.cpp.inc").read_text()
+    assert 'moe_json_get_double_local(engine->offload_graph_ir_json, "embedding_scale", &value)' in forward_ops_text
+    assert 'moe_json_get_bool_local(engine->offload_graph_ir_json, "scale_embedding", &bool_value)' in forward_ops_text
+    assert 'moe_engine_graph_ir_mentions(engine, "scale_embedding")' not in forward_ops_text
+    assert 'embedding_scale_contract' in forward_ops_text
+    assert 'moe_json_get_double_local(engine->offload_graph_ir_json, "final_logit_softcapping", &value)' in forward_ops_text
