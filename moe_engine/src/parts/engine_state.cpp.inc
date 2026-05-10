@@ -496,6 +496,7 @@ struct moe_pc_engine {
     // graph_ir readiness so CPU backends cannot silently fall back to the slow
     // graph interpreter when storage execution is available.
     std::atomic<int> cpu_only_runtime{0};
+    std::atomic<uint32_t> storage_runtime_path{0};
     std::atomic<int> cpu_storage_engine_ready{0};
     std::atomic<int> cpu_storage_execution_plan_ready{0};
     std::atomic<int> cpu_quant_registry_ready{0};

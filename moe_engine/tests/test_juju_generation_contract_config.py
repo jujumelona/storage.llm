@@ -290,11 +290,12 @@ def test_cpp_juju_sidecar_presence_is_fail_closed_even_when_unreadable():
 def test_cpp_juju_tensor_index_is_fail_closed_on_malformed_records():
     parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
     assert "malformed JUJU tensor index rejected" in parser_text
-    assert "JUJU tensor_count mismatch" in parser_text
+    assert "JUJU runtime tensor count mismatch" in parser_text
+    assert "source tensor_count differs from runtime objects" in parser_text
     assert "missing/invalid required name, juju_offset, or juju_bytes" in parser_text
     assert "missing codec registry/type contract" in parser_text
     assert "missing/invalid dims or shape" in parser_text
-    assert "tensor_count != tensor_object_count" in parser_text
+    assert "declared_runtime_tensor_count != tensor_object_count" in parser_text
 
 
 def test_juju_runtime_loader_rejects_bad_payload_ranges_not_skip():
@@ -368,3 +369,20 @@ def test_qkv_decode_requires_appended_tokens_not_just_capacity():
     filled_pos = qkv_text.index("engine->qkv_head_state_filled_tokens[slot_index] < context_tokens", decode_pos)
     qkv_call_pos = qkv_text.index("qkv_attention_decode(query, slot", decode_pos)
     assert filled_pos < qkv_call_pos
+
+
+def test_mxfp4_dot_and_cache_decode_use_physical_row_stride_from_index():
+    kernel_text = (ROOT / "moe_engine" / "src" / "parts" / "tensor_kernels" / "dot_q8q4q5_kernels.cpp.inc").read_text()
+    tensor_dot_text = (ROOT / "moe_engine" / "src" / "parts" / "tensor_dot.cpp.inc").read_text()
+    raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_ops.cpp.inc").read_text()
+    cache_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_cache.cpp.inc").read_text()
+    assert "moe_mxfp4_row_layout_for_bytes" in kernel_text
+    assert "moe_mxfp4_row_bytes_for_block_cols(cols, 16u)" in kernel_text
+    assert "layout.bytewise_codes ? (qs[index] & 0x0fu)" in kernel_text
+    assert "moe_dot_gguf_mxfp4_row_strided" in kernel_text
+    assert "moe_dot_gguf_mxfp4_two_rows_strided" in kernel_text
+    assert "moe_dot_gguf_mxfp4_row_strided(packed, x, rec->info.cols, rec->weight_row_bytes)" in tensor_dot_text
+    assert "moe_dot_gguf_mxfp4_row_strided(packed, x, view->cols, view->row_bytes)" in tensor_dot_text
+    assert "moe_dot_gguf_mxfp4_two_rows_strided(pa, pb, x, a->cols, a->row_bytes, b->row_bytes" in tensor_dot_text
+    assert "moe_dot_gguf_mxfp4_row_strided(row_ptr, hidden, hidden_count, row_bytes)" in raw_ops_text
+    assert "moe_mxfp4_row_layout_for_bytes(out_count, row_bytes)" in cache_text

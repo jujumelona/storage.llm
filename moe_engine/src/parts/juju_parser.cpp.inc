@@ -1357,6 +1357,12 @@ static int moe_parse_juju_tensor_index_json(
     uint64_t declared_tensor_count = 0;
     const int has_declared_tensor_count =
         moe_json_get_u64_local(json, "tensor_count", &declared_tensor_count);
+    uint64_t declared_runtime_tensor_count = 0;
+    int has_declared_runtime_tensor_count =
+        moe_json_get_u64_local(json, "runtime_tensor_count", &declared_runtime_tensor_count) ||
+        moe_json_get_u64_local(json, "tensor_record_count", &declared_runtime_tensor_count) ||
+        moe_json_get_u64_local(json, "emitted_tensor_count", &declared_runtime_tensor_count) ||
+        moe_json_get_u64_local(json, "index_tensor_count", &declared_runtime_tensor_count);
     uint64_t schema_version = 0;
     const int strict_tensor_index =
         (moe_json_get_u64_local(json, "schema_version", &schema_version) && schema_version >= 6u) ||
@@ -1654,12 +1660,18 @@ static int moe_parse_juju_tensor_index_json(
                 first_malformed_reason ? first_malformed_reason : "unknown");
             return 0;
         }
-        if (has_declared_tensor_count && declared_tensor_count != tensor_object_count) {
+        if (has_declared_runtime_tensor_count && declared_runtime_tensor_count != tensor_object_count) {
             std::fprintf(stderr,
-                "[storagellm] JUJU tensor_count mismatch: declared=%llu objects=%llu\n",
-                (unsigned long long)declared_tensor_count,
+                "[storagellm] JUJU runtime tensor count mismatch: declared=%llu objects=%llu\n",
+                (unsigned long long)declared_runtime_tensor_count,
                 (unsigned long long)tensor_object_count);
             return 0;
+        }
+        if (!has_declared_runtime_tensor_count && has_declared_tensor_count && declared_tensor_count != tensor_object_count) {
+            std::fprintf(stderr,
+                "[storagellm] JUJU source tensor_count differs from runtime objects; tensors[] authoritative: declared=%llu objects=%llu\n",
+                (unsigned long long)declared_tensor_count,
+                (unsigned long long)tensor_object_count);
         }
         if (tensor_count != tensor_object_count) {
             std::fprintf(stderr,

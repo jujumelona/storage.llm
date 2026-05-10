@@ -401,7 +401,7 @@ static float moe_raw_tensor_dot_row(
         return moe_dot_gguf_q5_1_row(row_ptr, hidden, hidden_count);
     }
     if (effective_weight_format == moe_WEIGHT_ENCODING_MXFP4) {
-        return moe_dot_gguf_mxfp4_row(row_ptr, hidden, hidden_count);
+        return moe_dot_gguf_mxfp4_row_strided(row_ptr, hidden, hidden_count, row_bytes);
     }
     if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q2_K) {
         return moe_dot_gguf_q2_k_row(row_ptr, hidden, hidden_count);

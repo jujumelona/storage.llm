@@ -1,33 +1,13 @@
 // JUJU dynamic shape inference
 
-static int moe_dynamic_shape_env_truthy_local(const char* name) {
-    const char* v = std::getenv(name);
-    if (!v || !*v || v[0] == '0') return 0;
-    if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return 0;
-    if ((v[0] == 'n' || v[0] == 'N') && (v[1] == 'o' || v[1] == 'O')) return 0;
-    return 1;
-}
-
-static int moe_dynamic_shape_cpu_only_runtime_local(const moe_pc_engine* engine) {
-    if (moe_dynamic_shape_env_truthy_local("STORAGELLM_CPU_ONLY") ||
-        moe_dynamic_shape_env_truthy_local("STORAGELLM_CPU_STORAGE_ENGINE") ||
-        moe_dynamic_shape_env_truthy_local("STORAGELLM_CPU_STORAGE_MAX") ||
-        moe_dynamic_shape_env_truthy_local("STORAGELLM_CPU_PIPELINE")) return 1;
-    const char* backend = std::getenv("STORAGELLM_BACKEND");
-    if (backend && std::strcmp(backend, "cpu") == 0) return 1;
-    const char* platform = std::getenv("STORAGELLM_PLATFORM");
-    if (platform && std::strcmp(platform, "cpu") == 0) return 1;
-    if (engine && (engine->config.preferred_backend == moe_BACKEND_CPU ||
-                   engine->config.platform == moe_PLATFORM_CPU_ONLY ||
-                   engine->config.vram_budget_bytes == 0)) return 1;
-    return 0;
-}
+// Runtime path selection is centralized in storage_path_policy.cpp.inc.
 
 static void moe_dynamic_shape_finalize_adapter(moe_pc_engine* engine) {
     if (!engine || !engine->dynamic_shape_valid.load(std::memory_order_relaxed)) {
         return;
     }
-    if (moe_dynamic_shape_cpu_only_runtime_local(engine)) {
+    const uint32_t runtime_path = moe_storage_runtime_path_refresh(engine);
+    if (runtime_path == moe_STORAGE_RUNTIME_PATH_CPU_RAM) {
         engine->cpu_only_runtime.store(1, std::memory_order_relaxed);
         engine->gpu_path_disabled_for_cpu_only.store(1, std::memory_order_relaxed);
         engine->graph_ir_used_for_forward.store(0, std::memory_order_relaxed);
@@ -43,7 +23,10 @@ static void moe_dynamic_shape_finalize_adapter(moe_pc_engine* engine) {
     }
     uint32_t adapter = moe_FORWARD_ADAPTER_GGUF_GENERIC;
     int executable = 0;
-    if (engine->config.vram_budget_bytes > 0 && engine->config.preferred_backend != moe_BACKEND_CPU) {
+    if (runtime_path == moe_STORAGE_RUNTIME_PATH_GPU_RAM) {
+        engine->cpu_only_runtime.store(0, std::memory_order_relaxed);
+        engine->gpu_path_disabled_for_cpu_only.store(0, std::memory_order_relaxed);
+        engine->graph_ir_used_for_forward.store(0, std::memory_order_relaxed);
         adapter = moe_FORWARD_ADAPTER_GPU_OFFLOAD;
         executable = 1;
     } else if (engine->offload_graph_ir_ready.load(std::memory_order_relaxed)) {

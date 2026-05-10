@@ -69,24 +69,7 @@ static int moe_cpu_storage_tensor_is_hot_for_hint(const moe_tensor_record& rec) 
 }
 
 static int moe_cpu_storage_runtime_detected(const moe_pc_engine* engine) {
-    if (moe_cpu_storage_env_truthy("STORAGELLM_CPU_ONLY") ||
-        moe_cpu_storage_env_truthy("STORAGELLM_CPU_STORAGE_ENGINE") ||
-        moe_cpu_storage_env_truthy("STORAGELLM_CPU_STORAGE_MAX") ||
-        moe_cpu_storage_env_truthy("STORAGELLM_CPU_PIPELINE")) {
-        return 1;
-    }
-    const char* backend = std::getenv("STORAGELLM_BACKEND");
-    if (backend && std::strcmp(backend, "cpu") == 0) return 1;
-    const char* platform = std::getenv("STORAGELLM_PLATFORM");
-    if (platform && std::strcmp(platform, "cpu") == 0) return 1;
-    if (engine) {
-        if (engine->config.preferred_backend == moe_BACKEND_CPU ||
-            engine->config.platform == moe_PLATFORM_CPU_ONLY ||
-            engine->config.vram_budget_bytes == 0) {
-            return 1;
-        }
-    }
-    return 0;
+    return moe_storage_runtime_cpu_ram_path(engine);
 }
 
 static int moe_cpu_storage_explicit_slow_fallback_allowed() {
@@ -136,6 +119,8 @@ static void moe_cpu_storage_disable_gpu_paths(moe_pc_engine* engine) {
     engine->io_config.enable_lookahead_prefetch = 1;
     engine->io_config.enable_topology_prefetch = 1;
     engine->io_config.enable_mmap_prefetch = 1;
+    engine->storage_runtime_path.store(moe_STORAGE_RUNTIME_PATH_CPU_RAM, std::memory_order_relaxed);
+    engine->cpu_only_runtime.store(1, std::memory_order_relaxed);
     engine->gpu_path_disabled_for_cpu_only.store(1, std::memory_order_relaxed);
 }
 
@@ -441,8 +426,8 @@ static int moe_storage_io_iouring_default_enabled(const moe_pc_engine* engine) {
 static int moe_storage_io_gpu_consumer_active(const moe_pc_engine* engine) {
     if (!engine) return 0;
     if (engine->gpu_path_disabled_for_cpu_only.load(std::memory_order_relaxed)) return 0;
+    if (!moe_storage_runtime_gpu_ram_path_has_device_memory(engine)) return 0;
     if (engine->backend_caps.supports_unified_memory && engine->backend_caps.unified_mmap_gpu_accessible) return 0;
-    if (tier_budget(const_cast<moe_pc_engine*>(engine), moe_TIER_VRAM) == 0) return 0;
     return engine->backend_caps.supports_pinned_host || engine->backend_caps.supports_fixed_read_staging ||
            engine->io_config.enable_directstorage || engine->io_config.enable_gpudirect_storage;
 }
@@ -1040,20 +1025,18 @@ static void moe_cpu_storage_build_execution_plan(moe_pc_engine* engine) {
 
 static void moe_cpu_storage_select_forward_adapter(moe_pc_engine* engine) {
     if (!engine) return;
-    const int cpu_only = moe_cpu_storage_runtime_detected(engine);
-    engine->cpu_only_runtime.store(cpu_only, std::memory_order_relaxed);
+    const uint32_t runtime_path = moe_storage_runtime_path_cached(engine);
+    const int cpu_only = runtime_path == moe_STORAGE_RUNTIME_PATH_CPU_RAM;
+    engine->cpu_only_runtime.store(cpu_only ? 1 : 0, std::memory_order_relaxed);
+    engine->gpu_path_disabled_for_cpu_only.store(cpu_only ? 1 : 0, std::memory_order_relaxed);
     if (cpu_only) {
         moe_cpu_storage_disable_gpu_paths(engine);
         moe_cpu_storage_build_execution_plan(engine);
         if (engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) {
-            const int graph_contract_ready =
-                engine->offload_graph_ir_required.load(std::memory_order_relaxed) &&
-                engine->offload_graph_ir_ready.load(std::memory_order_relaxed) &&
-                engine->juju_runtime_execution_manifest_ready.load(std::memory_order_relaxed) &&
-                engine->juju_runtime_access_plan_ready.load(std::memory_order_relaxed);
-            engine->forward_adapter.store(
-                graph_contract_ready ? moe_FORWARD_ADAPTER_GRAPH_IR : moe_FORWARD_ADAPTER_CPU_STORAGE,
-                std::memory_order_relaxed);
+            // CPU-storage is a real fast path, not graph_ir.  Do not advertise or
+            // enter graph_ir here unless the operator explicitly requested a slow
+            // fallback elsewhere.
+            engine->forward_adapter.store(moe_FORWARD_ADAPTER_CPU_STORAGE, std::memory_order_relaxed);
             engine->forward_adapter_executable.store(1, std::memory_order_relaxed);
             engine->graph_ir_used_for_forward.store(0, std::memory_order_relaxed);
         } else if (!moe_cpu_storage_explicit_slow_fallback_allowed()) {
@@ -1064,11 +1047,10 @@ static void moe_cpu_storage_select_forward_adapter(moe_pc_engine* engine) {
         return;
     }
 
-    const int gpu_ready =
-        engine->config.preferred_backend != moe_BACKEND_CPU &&
-        engine->config.platform != moe_PLATFORM_CPU_ONLY &&
-        engine->config.vram_budget_bytes > 0;
+    const int gpu_ready = runtime_path == moe_STORAGE_RUNTIME_PATH_GPU_RAM;
     if (gpu_ready) {
+        engine->cpu_only_runtime.store(0, std::memory_order_relaxed);
+        engine->gpu_path_disabled_for_cpu_only.store(0, std::memory_order_relaxed);
         // Storage span planning is backend-common: GPU/offload still reads
         // weights from SSD into host/device staging and benefits from the same
         // merged layer-span hints.

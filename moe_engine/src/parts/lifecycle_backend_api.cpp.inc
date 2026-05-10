@@ -35,6 +35,7 @@ moe_pc_engine_t* moe_pc_engine_create(const moe_pc_engine_config_t* config) {
         caps_gpu_backend_available(engine->backend_caps)) {
         engine->config.vram_budget_bytes = engine->backend_caps.recommended_vram_cache_bytes;
     }
+    moe_storage_runtime_path_refresh(engine);
     device_allocator_init(engine);
     apply_common_vram_reservation(engine);
     moe_pc_engine_configure_io(engine, nullptr);

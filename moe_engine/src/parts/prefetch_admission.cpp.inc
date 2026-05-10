@@ -18,6 +18,9 @@ static int prefetch_under_queue_pressure(
     }
     if (engine->disk_stage_depth_cap > 0 &&
         prefetch_stage_load(engine->disk_stage) * 4u >= engine->disk_stage_depth_cap * 3u) { return 1; }
+    if (moe_storage_runtime_cpu_ram_path(engine)) {
+        return 0;
+    }
     if (item.target_tier == moe_TIER_VRAM &&
         ((engine->pinned_stage_depth_cap > 0 &&
           prefetch_stage_load(engine->pinned_stage) * 4u >= engine->pinned_stage_depth_cap * 3u) ||
@@ -72,7 +75,9 @@ static moe_tier_t prefetch_admitted_tier(
     }
 
     moe_tier_t target = item.target_tier;
-    if (!prefetch_is_router_selected(item) && prefetch_under_queue_pressure(engine, item)) {
+    if (moe_storage_runtime_cpu_ram_path(engine) && target == moe_TIER_VRAM) {
+        target = moe_TIER_RAM;
+    } else if (!prefetch_is_router_selected(item) && prefetch_under_queue_pressure(engine, item)) {
         target = moe_TIER_RAM;
     }
     if (target == moe_TIER_VRAM) {

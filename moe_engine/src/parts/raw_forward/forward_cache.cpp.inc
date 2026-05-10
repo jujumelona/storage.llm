@@ -201,19 +201,18 @@ static int moe_raw_tensor_copy_row_f32(
         return 1;
     }
     if (effective_weight_format == moe_WEIGHT_ENCODING_MXFP4) {
-        const uint32_t block_cols = 32u;
-        const uint32_t block_bytes = 17u;
+        const moe_mxfp4_row_layout_t layout = moe_mxfp4_row_layout_for_bytes(out_count, row_bytes);
         uint32_t dst = 0;
         const uint8_t* block = row_ptr;
         while (dst < out_count) {
             const float scale = moe_e8m0_to_f32_half(block[0]);
             const uint8_t* qs = block + 1u;
-            const uint32_t limit = std::min<uint32_t>(block_cols, out_count - dst);
+            const uint32_t limit = std::min<uint32_t>(layout.block_cols, out_count - dst);
             for (uint32_t i = 0; i < limit; ++i) {
-                out[dst + i] = moe_mxfp4_value_from_code(moe_mxfp4_code_at(qs, i)) * scale;
+                out[dst + i] = moe_mxfp4_value_from_code(moe_mxfp4_code_at_layout(qs, i, layout)) * scale;
             }
             dst += limit;
-            block += block_bytes;
+            block += layout.block_bytes;
         }
         return 1;
     }

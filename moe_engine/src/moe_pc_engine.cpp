@@ -96,6 +96,7 @@ extern "C" void* metal_buffer_alloc(void* device_handle, uint64_t bytes) __attri
 #include "parts/generation_batch_scheduler.cpp.inc"
 #include "parts/generation_paged_kv.cpp.inc"
 #include "parts/engine_state.cpp.inc"
+#include "parts/storage_path_policy.cpp.inc"
 #include "parts/csv_numbers.cpp.inc"
 #include "parts/projection_parse.cpp.inc"
 #include "parts/tensor_slots.cpp.inc"

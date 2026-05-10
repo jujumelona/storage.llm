@@ -343,13 +343,66 @@ static uint8_t moe_mxfp4_code_at(const uint8_t* qs, uint32_t index) {
     return (index < 16u) ? (byte & 0x0fu) : (byte >> 4);
 }
 
+struct moe_mxfp4_row_layout_t {
+    uint32_t block_cols;
+    uint32_t block_bytes;
+    uint8_t bytewise_codes;
+};
 
+static inline uint64_t moe_mxfp4_row_bytes_for_block_cols(uint32_t cols, uint32_t block_cols) {
+    return ((uint64_t)cols + (uint64_t)block_cols - 1ull) / (uint64_t)block_cols * 17ull;
+}
 
-static void moe_dot_gguf_mxfp4_two_rows(
+static moe_mxfp4_row_layout_t moe_mxfp4_row_layout_for_bytes(uint32_t cols, uint64_t physical_row_bytes) {
+    // The real MXFP4_MOE logs show rows such as 2816 -> 2992 bytes and
+    // 2112 -> 2244 bytes: exactly 17 bytes per 16 values.  Older JUJU/GGUF
+    // paths used 17 bytes per 32 values with nibble-packed codes.  The row
+    // stride recorded in the tensor index is therefore part of the codec
+    // contract and must drive decoding; otherwise the dot kernel reads every
+    // second scale block as payload and corrupts lm_head/MLP from token 0.
+    moe_mxfp4_row_layout_t layout{32u, 17u, 0u};
+    if (cols == 0 || physical_row_bytes == 0) {
+        return layout;
+    }
+    const uint64_t bytes_16 = moe_mxfp4_row_bytes_for_block_cols(cols, 16u);
+    const uint64_t bytes_32 = moe_mxfp4_row_bytes_for_block_cols(cols, 32u);
+    if (physical_row_bytes == bytes_16) {
+        layout.block_cols = 16u;
+        layout.bytewise_codes = 1u;
+        return layout;
+    }
+    if (physical_row_bytes == bytes_32) {
+        layout.block_cols = 32u;
+        layout.bytewise_codes = 0u;
+        return layout;
+    }
+    // If the source row has extra stride padding, keep the legacy packed
+    // contract rather than guessing a different quantization family.
+    return layout;
+}
+
+static inline uint8_t moe_mxfp4_code_at_layout(
+    const uint8_t* qs,
+    uint32_t index,
+    const moe_mxfp4_row_layout_t& layout
+) {
+    return layout.bytewise_codes ? (qs[index] & 0x0fu) : moe_mxfp4_code_at(qs, index);
+}
+
+static float moe_dot_gguf_mxfp4_row_strided(
+    const uint8_t* packed,
+    const float* x,
+    uint32_t cols,
+    uint64_t physical_row_bytes
+);
+
+static void moe_dot_gguf_mxfp4_two_rows_strided(
     const uint8_t* packed0,
     const uint8_t* packed1,
     const float* x,
     uint32_t cols,
+    uint64_t row_bytes0,
+    uint64_t row_bytes1,
     float* out0,
     float* out1
 ) {
@@ -361,48 +414,80 @@ static void moe_dot_gguf_mxfp4_two_rows(
         *out1 = 0.0f;
         return;
     }
-    const uint32_t block_cols = 32u;
-    const uint32_t block_bytes = 17u;
+    const moe_mxfp4_row_layout_t layout0 = moe_mxfp4_row_layout_for_bytes(cols, row_bytes0);
+    const moe_mxfp4_row_layout_t layout1 = moe_mxfp4_row_layout_for_bytes(cols, row_bytes1);
+    if (layout0.block_cols != layout1.block_cols ||
+        layout0.bytewise_codes != layout1.bytewise_codes) {
+        *out0 = moe_dot_gguf_mxfp4_row_strided(packed0, x, cols, row_bytes0);
+        *out1 = moe_dot_gguf_mxfp4_row_strided(packed1, x, cols, row_bytes1);
+        return;
+    }
     const float* table = moe_mxfp4_value_table();
     float acc0 = 0.0f;
     float acc1 = 0.0f;
     uint32_t start = 0;
-    const uint32_t full_cols = cols & ~(block_cols - 1u);
-    for (; start < full_cols; start += block_cols) {
+    while (start < cols) {
+        const uint32_t limit0 = std::min<uint32_t>(layout0.block_cols, cols - start);
+        const uint32_t limit1 = std::min<uint32_t>(layout1.block_cols, cols - start);
+        const uint32_t limit = std::min<uint32_t>(limit0, limit1);
         const float scale0 = moe_e8m0_to_f32_half(packed0[0]);
         const float scale1 = moe_e8m0_to_f32_half(packed1[0]);
         const uint8_t* qs0 = packed0 + 1u;
         const uint8_t* qs1 = packed1 + 1u;
-        const float* xb = x + start;
         float block0 = 0.0f;
         float block1 = 0.0f;
-        for (uint32_t j = 0; j < 32u; ++j) {
-            block0 += table[moe_mxfp4_code_at(qs0, j)] * xb[j];
-            block1 += table[moe_mxfp4_code_at(qs1, j)] * xb[j];
+        for (uint32_t j = 0; j < limit; ++j) {
+            const float xv = x[start + j];
+            block0 += table[moe_mxfp4_code_at_layout(qs0, j, layout0)] * xv;
+            block1 += table[moe_mxfp4_code_at_layout(qs1, j, layout1)] * xv;
         }
         acc0 += block0 * scale0;
         acc1 += block1 * scale1;
-        packed0 += block_bytes;
-        packed1 += block_bytes;
-    }
-    if (start < cols) {
-        const float scale0 = moe_e8m0_to_f32_half(packed0[0]);
-        const float scale1 = moe_e8m0_to_f32_half(packed1[0]);
-        const uint8_t* qs0 = packed0 + 1u;
-        const uint8_t* qs1 = packed1 + 1u;
-        const uint32_t limit = cols - start;
-        float tail0 = 0.0f;
-        float tail1 = 0.0f;
-        for (uint32_t i = 0; i < limit; ++i) {
-            const float xv = x[start + i];
-            tail0 += table[moe_mxfp4_code_at(qs0, i)] * xv;
-            tail1 += table[moe_mxfp4_code_at(qs1, i)] * xv;
-        }
-        acc0 += tail0 * scale0;
-        acc1 += tail1 * scale1;
+        start += limit;
+        packed0 += layout0.block_bytes;
+        packed1 += layout1.block_bytes;
     }
     *out0 = acc0;
     *out1 = acc1;
+}
+
+static void moe_dot_gguf_mxfp4_two_rows(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const float* x,
+    uint32_t cols,
+    float* out0,
+    float* out1
+) {
+    moe_dot_gguf_mxfp4_two_rows_strided(packed0, packed1, x, cols, 0ull, 0ull, out0, out1);
+}
+
+static float moe_dot_gguf_mxfp4_row_strided(
+    const uint8_t* packed,
+    const float* x,
+    uint32_t cols,
+    uint64_t physical_row_bytes
+) {
+    if (!packed || !x) {
+        return 0.0f;
+    }
+    const moe_mxfp4_row_layout_t layout = moe_mxfp4_row_layout_for_bytes(cols, physical_row_bytes);
+    const float* table = moe_mxfp4_value_table();
+    float acc = 0.0f;
+    uint32_t start = 0;
+    while (start < cols) {
+        const float scale = moe_e8m0_to_f32_half(packed[0]);
+        const uint8_t* qs = packed + 1u;
+        const uint32_t limit = std::min<uint32_t>(layout.block_cols, cols - start);
+        float block_acc = 0.0f;
+        for (uint32_t j = 0; j < limit; ++j) {
+            block_acc += table[moe_mxfp4_code_at_layout(qs, j, layout)] * x[start + j];
+        }
+        acc += block_acc * scale;
+        start += limit;
+        packed += layout.block_bytes;
+    }
+    return acc;
 }
 
 static float moe_dot_gguf_mxfp4_row(
@@ -410,36 +495,5 @@ static float moe_dot_gguf_mxfp4_row(
     const float* x,
     uint32_t cols
 ) {
-    if (!packed || !x) {
-        return 0.0f;
-    }
-    float acc = 0.0f;
-    const uint32_t block_cols = 32u;
-    const uint32_t block_bytes = 17u;
-    const float* table = moe_mxfp4_value_table();
-    uint32_t start = 0;
-    const uint32_t full_cols = cols & ~(block_cols - 1u);
-    for (; start < full_cols; start += block_cols) {
-        const float scale = moe_e8m0_to_f32_half(packed[0]);
-        const uint8_t* qs = packed + 1u;
-        const float* xb = x + start;
-        float block_acc = 0.0f;
-        for (uint32_t j = 0; j < 32u; ++j) {
-            block_acc += table[moe_mxfp4_code_at(qs, j)] * xb[j];
-        }
-        acc += block_acc * scale;
-        packed += block_bytes;
-    }
-    if (start < cols) {
-        const float scale = moe_e8m0_to_f32_half(packed[0]);
-        const uint8_t* qs = packed + 1u;
-        const uint32_t limit = cols - start;
-        float block_acc = 0.0f;
-        for (uint32_t i = 0; i < limit; ++i) {
-            block_acc += table[moe_mxfp4_code_at(qs, i)] * x[start + i];
-        }
-        acc += block_acc * scale;
-        packed += block_bytes;
-    }
-    return acc;
+    return moe_dot_gguf_mxfp4_row_strided(packed, x, cols, 0ull);
 }

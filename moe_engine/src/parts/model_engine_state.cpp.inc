@@ -256,6 +256,7 @@ static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {
     engine->forward_adapter.store(moe_FORWARD_ADAPTER_NONE, std::memory_order_relaxed);
     engine->forward_adapter_executable.store(0, std::memory_order_relaxed);
     engine->cpu_only_runtime.store(0, std::memory_order_relaxed);
+    engine->storage_runtime_path.store(0, std::memory_order_relaxed);
     engine->cpu_storage_engine_ready.store(0, std::memory_order_relaxed);
     engine->cpu_storage_execution_plan_ready.store(0, std::memory_order_relaxed);
     engine->cpu_quant_registry_ready.store(0, std::memory_order_relaxed);

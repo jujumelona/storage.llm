@@ -208,7 +208,7 @@ static int moe_dot_tensor_record_row(
         return 1;
     }
     if (weight_format == moe_WEIGHT_ENCODING_MXFP4) {
-        *out_value = moe_dot_gguf_mxfp4_row(packed, x, rec->info.cols);
+        *out_value = moe_dot_gguf_mxfp4_row_strided(packed, x, rec->info.cols, rec->weight_row_bytes);
         return 1;
     }
     if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0) {
@@ -481,7 +481,7 @@ static int moe_dot_tensor_fast_view_row(
             *out_value = moe_dot_fp4_row(*view->rec, view->shard, packed, x, engine, row);
             break;
         case moe_WEIGHT_ENCODING_MXFP4:
-            *out_value = moe_dot_gguf_mxfp4_row(packed, x, view->cols);
+            *out_value = moe_dot_gguf_mxfp4_row_strided(packed, x, view->cols, view->row_bytes);
             break;
         case moe_WEIGHT_ENCODING_GGUF_Q4_0:
             *out_value = moe_dot_gguf_q4_0_row(packed, x, view->cols);
@@ -579,7 +579,7 @@ static int moe_dot_tensor_fast_view_two_rows(
     }
     if (a->weight_format == moe_WEIGHT_ENCODING_MXFP4 &&
         b->weight_format == moe_WEIGHT_ENCODING_MXFP4) {
-        moe_dot_gguf_mxfp4_two_rows(pa, pb, x, a->cols, out_a, out_b);
+        moe_dot_gguf_mxfp4_two_rows_strided(pa, pb, x, a->cols, a->row_bytes, b->row_bytes, out_a, out_b);
         return std::isfinite(*out_a) && std::isfinite(*out_b) ? 1 : 0;
     }
     return moe_dot_tensor_fast_view_row(engine, a, row, x, x_count, out_a) &&
@@ -653,7 +653,7 @@ static int moe_dot_tensor_record_row_batch(
             out_values[b] = moe_dot_fp4_row(*rec, shard, packed, batch_x[b], engine, row);
         }
         else if (weight_format == moe_WEIGHT_ENCODING_MXFP4) {
-            out_values[b] = moe_dot_gguf_mxfp4_row(packed, batch_x[b], rec->info.cols);
+            out_values[b] = moe_dot_gguf_mxfp4_row_strided(packed, batch_x[b], rec->info.cols, rec->weight_row_bytes);
         }
         else if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0) {
             out_values[b] = moe_dot_gguf_q4_0_row(packed, batch_x[b], rec->info.cols);

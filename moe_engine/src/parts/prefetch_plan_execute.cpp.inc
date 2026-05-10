@@ -36,9 +36,10 @@ int moe_pc_engine_execute_prefetch_plan(
     // Fix 37: Snapshot stage loads once before admission loop
     // Eliminates 6 atomic reads per item (hundreds of items ??thousands of reads)
     // Stale snapshots are acceptable: queue pressure changes on 10s of ms timescale
+    const bool cpu_storage_path = moe_storage_runtime_cpu_ram_path(engine);
     const uint32_t snap_disk_load = prefetch_stage_load(engine->disk_stage);
-    const uint32_t snap_pinned_load = prefetch_stage_load(engine->pinned_stage);
-    const uint32_t snap_gpu_load = prefetch_stage_load(engine->gpu_stage);
+    const uint32_t snap_pinned_load = cpu_storage_path ? 0u : prefetch_stage_load(engine->pinned_stage);
+    const uint32_t snap_gpu_load = cpu_storage_path ? 0u : prefetch_stage_load(engine->gpu_stage);
 
     for (uint32_t i = 0; i < item_count; ++i) {
         if (stream_inflight[i]) {
@@ -49,13 +50,13 @@ int moe_pc_engine_execute_prefetch_plan(
         if (engine->disk_stage_depth_cap > 0 &&
             snap_disk_load * 4u >= engine->disk_stage_depth_cap * 3u) {
             under_pressure = true;
-        } else if (items[i].target_tier == moe_TIER_VRAM &&
+        } else if (!cpu_storage_path && items[i].target_tier == moe_TIER_VRAM &&
             ((engine->pinned_stage_depth_cap > 0 &&
               snap_pinned_load * 4u >= engine->pinned_stage_depth_cap * 3u) ||
              (engine->gpu_stage_depth_cap > 0 &&
               snap_gpu_load * 4u >= engine->gpu_stage_depth_cap * 3u))) {
             under_pressure = true;
-        } else if (items[i].target_tier == moe_TIER_RAM) {
+        } else if (!cpu_storage_path && items[i].target_tier == moe_TIER_RAM) {
             const uint32_t pinned_workers = runtime_pinned_workers(engine);
             const uint32_t dyn_batch_max = moe_gpu_stage_batch_max(engine);
             const uint32_t pinned_threshold = std::min(
@@ -66,7 +67,9 @@ int moe_pc_engine_execute_prefetch_plan(
             }
         }
         moe_expert_prefetch_item_t adjusted_item = items[i];
-        if (under_pressure && !prefetch_is_router_selected(items[i])) {
+        if (cpu_storage_path && adjusted_item.target_tier == moe_TIER_VRAM) {
+            adjusted_item.target_tier = moe_TIER_RAM;
+        } else if (under_pressure && !prefetch_is_router_selected(items[i])) {
             adjusted_item.target_tier = moe_TIER_RAM;
         }
         admitted_tiers[i] = prefetch_admitted_tier(engine, adjusted_item, all_to_free[i], &vram_tokens[i]);
@@ -105,7 +108,8 @@ int moe_pc_engine_execute_prefetch_plan(
     // Re-check RAM-admitted speculative items after freeing victims. Reserve
     // with the tier counter itself; a stale remaining-bytes snapshot can race
     // with other workers and over-admit VRAM work.
-    for (uint32_t i = 0; i < item_count; ++i) {
+    if (!cpu_storage_path) {
+        for (uint32_t i = 0; i < item_count; ++i) {
         if (admitted_tiers[i] == moe_TIER_RAM
             && items[i].target_tier == moe_TIER_VRAM
             && !prefetch_is_router_selected(items[i])) {
@@ -120,6 +124,7 @@ int moe_pc_engine_execute_prefetch_plan(
                 vram_pending_reserved[i] = 1u;
                 prefetch_release_pending_ram_reservation(engine, items[i].bytes);
             }
+        }
         }
     }
 

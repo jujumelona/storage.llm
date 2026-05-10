@@ -134,6 +134,31 @@ static void queue_total_depth_sub(moe_pc_engine* engine, uint32_t count) {
     }
 }
 
+static uint32_t moe_stage_depth_cap_for(const moe_pc_engine* engine, const moe_stage_queue& stage) {
+    if (!engine) return 0;
+    if (&stage == &engine->disk_stage) return engine->disk_stage_depth_cap;
+    if (&stage == &engine->pinned_stage) return engine->pinned_stage_depth_cap;
+    if (&stage == &engine->gpu_stage) return engine->gpu_stage_depth_cap;
+    return engine->io_config.max_prefetch_queue;
+}
+
+
+static int moe_stage_accepts_current_storage_path(
+    moe_pc_engine* engine,
+    moe_stage_queue& stage
+) {
+    if (!engine) {
+        return 0;
+    }
+    if ((&stage == &engine->pinned_stage || &stage == &engine->gpu_stage) &&
+        (engine->gpu_path_disabled_for_cpu_only.load(std::memory_order_relaxed) ||
+         moe_storage_runtime_cpu_ram_path(engine))) {
+        engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    return 1;
+}
+
 static int enqueue_stage(
     moe_pc_engine* engine,
     moe_stage_queue& stage,
@@ -142,32 +167,26 @@ static int enqueue_stage(
     if (!engine) {
         return 0;
     }
+    if (!moe_stage_accepts_current_storage_path(engine, stage)) {
+        return 0;
+    }
     if (engine->io_reconfiguring.load(std::memory_order_acquire)) {
         engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
     moe_prefetch_task queued = task;
     queued.stage_accounted_bytes = 0;
+    const uint32_t stage_cap = moe_stage_depth_cap_for(engine, stage);
+    const uint64_t task_bytes = moe_prefetch_task_estimated_bytes(engine, queued);
     {
         std::lock_guard<std::mutex> lock(stage.mtx);
-        // BUGFIX 97: Issue 18 - Cache queue size calculations ★
-        // Problem: size() called twice per enqueue (total check + depth store)
-        // Solution: Cache size calculation to avoid repeated calls
+        // Cache queue sizes once and keep the mutex hold short.  Task byte
+        // estimation can touch tensor metadata, so it is intentionally done
+        // before taking stage.mtx.
         const size_t queue_sz = stage.queue.size();
         const size_t urgent_sz = stage.urgent_queue.size();
         const size_t total = queue_sz + urgent_sz;
 
-        // BUGFIX 645: 단계별 큐 깊이 cap 적용 ★★★
-        uint32_t stage_cap = engine->io_config.max_prefetch_queue;
-        if (&stage == &engine->disk_stage) {
-            stage_cap = engine->disk_stage_depth_cap;
-        } else if (&stage == &engine->pinned_stage) {
-            stage_cap = engine->pinned_stage_depth_cap;
-        } else if (&stage == &engine->gpu_stage) {
-            stage_cap = engine->gpu_stage_depth_cap;
-        }
-
-        const uint64_t task_bytes = moe_prefetch_task_estimated_bytes(engine, queued);
         if (total >= stage_cap || !moe_stage_byte_room(engine, stage, queued, task_bytes)) {
             // BUGFIX 154: Add memory_order_relaxed for statistics counter
             engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
@@ -195,37 +214,26 @@ static int enqueue_stage_or_retry(
     if (!engine) {
         return 0;
     }
+    if (!moe_stage_accepts_current_storage_path(engine, stage)) {
+        return 0;
+    }
     if (engine->io_reconfiguring.load(std::memory_order_acquire)) {
         engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
     moe_prefetch_task queued = task;
     queued.stage_accounted_bytes = 0;
-    size_t final_depth_after = 0;  // Fix 30: declared outside lock scope
+    const size_t normal_cap = moe_stage_depth_cap_for(engine, stage);
+    const size_t retry_room = std::max<size_t>(32u, normal_cap / 4u);
+    const size_t retry_cap = normal_cap + retry_room;
+    const uint64_t task_bytes = moe_prefetch_task_estimated_bytes(engine, queued);
     {
         std::lock_guard<std::mutex> lock(stage.mtx);
-        // BUGFIX 97: Cache queue size calculations
+        // Cache queue sizes once and keep metadata reads outside the lock.
         const size_t queue_sz = stage.queue.size();
         const size_t urgent_sz = stage.urgent_queue.size();
         const size_t total = queue_sz + urgent_sz;
 
-        // BUGFIX 645: 단계별 큐 깊이 cap 적용 ★★★
-        size_t normal_cap = engine->io_config.max_prefetch_queue;
-        if (&stage == &engine->disk_stage) {
-            normal_cap = engine->disk_stage_depth_cap;
-        } else if (&stage == &engine->pinned_stage) {
-            normal_cap = engine->pinned_stage_depth_cap;
-        } else if (&stage == &engine->gpu_stage) {
-            normal_cap = engine->gpu_stage_depth_cap;
-        }
-
-        // PIPELINE FIX 18: Reduce retry_cap from 1.5x to 1.25x ??�쁾
-        // Old: retry_room = normal_cap/2 ??queue can grow to 150%
-        // New: retry_room = normal_cap/4 ??queue can grow to 125%
-        // Reduces queue inflation and makes dropped_requests metric more meaningful
-        const size_t retry_room = std::max<size_t>(32u, normal_cap / 4u);
-        const size_t retry_cap = normal_cap + retry_room;
-        const uint64_t task_bytes = moe_prefetch_task_estimated_bytes(engine, queued);
         if (total >= retry_cap || !moe_stage_byte_room(engine, stage, queued, task_bytes)) {
             // BUGFIX 154: Add memory_order_relaxed for statistics counter
             engine->io_atomic.dropped_requests.fetch_add(1, std::memory_order_relaxed);
@@ -269,7 +277,7 @@ static int enqueue_stage_or_retry(
         // Problem: Thread A computes final=5, releases lock, Thread B stores 6, Thread A stores 5
         // Result: depth shows 5 but actual queue has 6 items → admission underestimates pressure
         // Solution: Store depth inside lock, same pattern as enqueue_stage
-        final_depth_after = stage.queue.size() + stage.urgent_queue.size();
+        const size_t final_depth_after = stage.queue.size() + stage.urgent_queue.size();
         stage.depth.store(static_cast<uint32_t>(final_depth_after), std::memory_order_relaxed);
         if (task_bytes > 0) stage.queued_bytes.fetch_add(task_bytes, std::memory_order_relaxed);
     }
