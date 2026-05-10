@@ -212,7 +212,11 @@ static void moe_router_apply_group_limit(
         const uint32_t begin = g * experts_per_group;
         const uint32_t end = begin + experts_per_group;
         for (uint32_t e = begin; e < end; ++e) {
-            (*scores)[e] = 0.0f;
+            // Group-limited routers use this tensor as an execution mask, not as
+            // a probability floor.  0.0 is a valid sigmoid score and can re-enter
+            // top-k on ties or very small kept scores, so push masked experts
+            // below any real router probability.
+            (*scores)[e] = -std::numeric_limits<float>::max();
         }
     }
 }

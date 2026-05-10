@@ -144,7 +144,11 @@ static int moe_scan_offload_juju_root(
     for (const std::string& path : paths) {
         moe_offload_gguf_file_t file{};
         if (!moe_read_offload_juju_file(path, &file)) {
-            continue;
+            std::fprintf(stderr,
+                "[storagellm] invalid JUJU artifact rejected during model scan: %s\n",
+                path.c_str());
+            std::fflush(stderr);
+            return 0;
         }
         out->juju_format = true;
         out->present_total_bytes += file.bytes;

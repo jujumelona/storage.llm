@@ -158,7 +158,10 @@ static int moe_layer_apply_expert_down_scale_f32(
         }
         return 1;
     }
-    return 1;
+    std::fprintf(stderr,
+        "[storagellm mlp] expert down scale tensor has invalid shape layer=%d expert=%d count=%llu experts=%u hidden=%u\n",
+        layer, expert_id, (unsigned long long)count, experts, hidden_size);
+    return 0;
 }
 
 static int moe_add_mlp_residual_f32(

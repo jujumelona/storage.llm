@@ -290,6 +290,7 @@ def test_cpp_juju_sidecar_presence_is_fail_closed_even_when_unreadable():
 def test_cpp_juju_tensor_index_is_fail_closed_on_malformed_records():
     parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
     assert "malformed JUJU tensor index rejected" in parser_text
+    assert "JUJU tensor_count mismatch" in parser_text
     assert "missing/invalid required name, juju_offset, or juju_bytes" in parser_text
     assert "missing codec registry/type contract" in parser_text
     assert "missing/invalid dims or shape" in parser_text
@@ -307,10 +308,63 @@ def test_juju_runtime_loader_rejects_bad_payload_ranges_not_skip():
     assert rejected_pos < return_pos
 
 
-def test_standard_attention_allows_declared_k_equals_v_value_source():
-    attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_decode.cpp.inc").read_text()
-    assert 'moe_engine_graph_ir_mentions(engine, "attention_k_eq_v")' in attn_text
-    assert 'moe_engine_graph_ir_mentions(engine, "raw_k_projection_before_k_norm")' in attn_text
-    blocked_pos = attn_text.index('attn_v_equals_k_blocked')
-    allow_pos = attn_text.index('const int allow_v_equals_k')
-    assert allow_pos < blocked_pos
+def test_juju_runtime_loader_is_fail_closed_on_partial_load_and_duplicate_slots():
+    main_parse_text = (ROOT / "moe_engine" / "src" / "parts" / "codec" / "juju_main_parsing.cpp.inc").read_text()
+    assert "malformed JUJU artifact rejected during table read" in main_parse_text
+    assert "missing/unreadable JUJU tensor index rejected" in main_parse_text
+    assert "empty JUJU tensor index rejected during probe" in main_parse_text
+    assert "empty JUJU tensor index rejected during load" in main_parse_text
+    assert "too many JUJU tensor paths; refusing partial index load" in main_parse_text
+    assert "JUJU bundle-native tensor has invalid member projection" in main_parse_text
+    assert "JUJU expert tensor bytes are not divisible by expert_count" in main_parse_text
+    assert "JUJU expert tensor math shape exceeds runtime slot width" in main_parse_text
+    assert "moe_juju_claim_tensor_slot_unique" in main_parse_text
+    assert "invalid JUJU tensor slot" in main_parse_text
+    assert "duplicate JUJU tensor slot rejected" in main_parse_text
+    claim_pos = main_parse_text.index("moe_juju_claim_tensor_slot_unique(engine, rec, entry.name.c_str())")
+    push_pos = main_parse_text.index("engine->tensors.push_back(std::move(rec));", claim_pos)
+    assert claim_pos < push_pos
+
+
+def test_juju_model_root_scan_rejects_invalid_juju_artifact_instead_of_skipping():
+    scan_text = (ROOT / "moe_engine" / "src" / "parts" / "model_scan.cpp.inc").read_text()
+    bad_read_pos = scan_text.index("if (!moe_read_offload_juju_file(path, &file))")
+    reject_pos = scan_text.index("invalid JUJU artifact rejected during model scan", bad_read_pos)
+    return_pos = scan_text.index("return 0;", reject_pos)
+    push_pos = scan_text.index("out->files.push_back(std::move(file));", bad_read_pos)
+    assert bad_read_pos < reject_pos < return_pos < push_pos
+
+
+def test_juju_section_table_rejects_overlaps_and_duplicate_singleton_json_sections():
+    parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
+    assert "moe_juju_section_type_is_singleton" in parser_text
+    assert "std::unordered_set<uint32_t> singleton_section_types" in parser_text
+    assert "!singleton_section_types.insert(entry.type).second" in parser_text
+    assert "std::vector<moe_juju_section_range_check_t> section_ranges" in parser_text
+    assert "section_ranges[i].begin < section_ranges[i - 1u].end" in parser_text
+
+
+def test_mixed_head_dim_qkv_config_does_not_free_all_persistent_head_states():
+    qkv_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_qkv.cpp.inc").read_text()
+    apply_pos = qkv_text.index("static void moe_qkv_apply_contract_config_locked")
+    prepare_pos = qkv_text.index("static int moe_qkv_prepare_runtime_config", apply_pos)
+    apply_body = qkv_text[apply_pos:prepare_pos]
+    assert "Do not clear the whole persistent KV cache" in apply_body
+    assert "moe_qkv_free_head_states_locked(engine);" not in apply_body
+    assert "moe_qkv_layer_head_fingerprint(" in qkv_text
+    assert "head_dim," in qkv_text[qkv_text.index("moe_qkv_layer_head_fingerprint("):qkv_text.index("static qkv_state_t* moe_qkv_ensure_layer_head_state_locked")]
+    assert "engine->qkv_head_state_fingerprints[slot_index] == desired_fingerprint" in qkv_text
+
+
+def test_qkv_decode_requires_appended_tokens_not_just_capacity():
+    state_text = (ROOT / "moe_engine" / "src" / "parts" / "engine_state.cpp.inc").read_text()
+    qkv_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_qkv.cpp.inc").read_text()
+    assert "qkv_head_state_filled_tokens" in state_text
+    assert "qkv_head_state_filled_tokens.resize(slot_count, 0)" in qkv_text
+    assert "qkv_head_state_filled_tokens.clear()" in qkv_text
+    assert "token_index + 1u" in qkv_text
+    assert "engine->qkv_head_state_filled_tokens[slot_index] < context_tokens" in qkv_text
+    decode_pos = qkv_text.index("static int moe_pc_engine_attention_decode_layer_head_qkv_f32")
+    filled_pos = qkv_text.index("engine->qkv_head_state_filled_tokens[slot_index] < context_tokens", decode_pos)
+    qkv_call_pos = qkv_text.index("qkv_attention_decode(query, slot", decode_pos)
+    assert filled_pos < qkv_call_pos

@@ -378,6 +378,27 @@ static int moe_read_binary_range_to_string(
     return 1;
 }
 
+static int moe_juju_section_type_is_singleton(uint32_t type) {
+    switch (type) {
+    case moe_JUJU_SECTION_MODEL_META:
+    case moe_JUJU_SECTION_PREDICTOR:
+    case moe_JUJU_SECTION_BUDDY_MAP:
+    case moe_JUJU_SECTION_TIER_HINT:
+    case moe_JUJU_SECTION_LAYER_ORDER_INDEX:
+    case moe_JUJU_SECTION_QKV_POLICY:
+    case moe_JUJU_SECTION_RUNTIME_CONTRACT:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+struct moe_juju_section_range_check_t {
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    uint32_t type = 0;
+};
+
 static int moe_juju_read_table_local(
     const std::string& path,
     moe_juju_header_t* header,
@@ -416,6 +437,9 @@ static int moe_juju_read_table_local(
         entries->clear();
         return 0;
     }
+    std::vector<moe_juju_section_range_check_t> section_ranges;
+    section_ranges.reserve(entries->size());
+    std::unordered_set<uint32_t> singleton_section_types;
     for (const moe_juju_section_entry_t& entry : *entries) {
         if (entry.size == 0) {
             continue;
@@ -428,6 +452,27 @@ static int moe_juju_read_table_local(
             entry.offset < table_end ||
             entry.offset > declared_bytes ||
             entry.size > declared_bytes - entry.offset) {
+            entries->clear();
+            return 0;
+        }
+        if (moe_juju_section_type_is_singleton(entry.type) &&
+            !singleton_section_types.insert(entry.type).second) {
+            entries->clear();
+            return 0;
+        }
+        section_ranges.push_back(moe_juju_section_range_check_t{
+            entry.offset,
+            entry.offset + entry.size,
+            entry.type});
+    }
+    std::sort(
+        section_ranges.begin(),
+        section_ranges.end(),
+        [](const moe_juju_section_range_check_t& a, const moe_juju_section_range_check_t& b) {
+            return a.begin < b.begin || (a.begin == b.begin && a.end < b.end);
+        });
+    for (size_t i = 1; i < section_ranges.size(); ++i) {
+        if (section_ranges[i].begin < section_ranges[i - 1u].end) {
             entries->clear();
             return 0;
         }
@@ -575,7 +620,7 @@ static int moe_read_juju_tensor_index_json(
         // bootstrap metadata after an empty/unreadable/malformed sidecar silently
         // revives stale index contracts and makes sidecar repair workflows
         // ineffective.
-        if (!sidecar_present || sidecar_bytes == 0 || sidecar_bytes > 2ull * 1024ull * 1024ull * 1024ull ||
+        if (!sidecar_present || sidecar_bytes == 0 || sidecar_bytes > 256ull * 1024ull * 1024ull ||
             !moe_read_text_file_local(sidecar_path, &sidecar)) {
             std::fprintf(stderr,
                 "[storagellm] JUJU sidecar idx rejected: unreadable authoritative sidecar idx=%s bytes=%llu\n",
@@ -1309,6 +1354,9 @@ static int moe_parse_juju_tensor_index_json(
     uint64_t malformed_count = 0;
     std::string first_malformed_name;
     const char* first_malformed_reason = nullptr;
+    uint64_t declared_tensor_count = 0;
+    const int has_declared_tensor_count =
+        moe_json_get_u64_local(json, "tensor_count", &declared_tensor_count);
     uint64_t schema_version = 0;
     const int strict_tensor_index =
         (moe_json_get_u64_local(json, "schema_version", &schema_version) && schema_version >= 6u) ||
@@ -1604,6 +1652,13 @@ static int moe_parse_juju_tensor_index_json(
                 (unsigned long long)malformed_count,
                 first_malformed_name.empty() ? "<unknown>" : first_malformed_name.c_str(),
                 first_malformed_reason ? first_malformed_reason : "unknown");
+            return 0;
+        }
+        if (has_declared_tensor_count && declared_tensor_count != tensor_object_count) {
+            std::fprintf(stderr,
+                "[storagellm] JUJU tensor_count mismatch: declared=%llu objects=%llu\n",
+                (unsigned long long)declared_tensor_count,
+                (unsigned long long)tensor_object_count);
             return 0;
         }
         if (tensor_count != tensor_object_count) {

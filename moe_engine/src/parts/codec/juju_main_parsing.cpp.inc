@@ -171,6 +171,48 @@ static void moe_ingest_juju_graph_ir(moe_pc_engine* engine, const std::string& i
     engine->offload_graph_ir_version.store((uint32_t)std::min<uint64_t>(schema_version, UINT32_MAX), std::memory_order_relaxed);
 }
 
+static int moe_juju_claim_tensor_slot_unique(
+    moe_pc_engine* engine,
+    const moe_tensor_record& rec,
+    const char* name
+) {
+    if (!engine) {
+        return 0;
+    }
+    const size_t slot = tensor_dense_slot(
+        engine,
+        (int)rec.info.layer,
+        (int)rec.info.expert,
+        rec.info.proj);
+    if (slot == tensor_slot_invalid() || slot >= engine->tensor_slots.size()) {
+        std::fprintf(stderr,
+            "[storagellm] invalid JUJU tensor slot: name=%s layer=%u expert=%u proj=%u slots=%zu\n",
+            name ? name : "",
+            (unsigned)rec.info.layer,
+            (unsigned)rec.info.expert,
+            (unsigned)rec.info.proj,
+            engine->tensor_slots.size());
+        return 0;
+    }
+    if (engine->tensor_slots[slot] != tensor_slot_invalid()) {
+        std::fprintf(stderr,
+            "[storagellm] duplicate JUJU tensor slot rejected: name=%s layer=%u expert=%u proj=%u existing_index=%zu\n",
+            name ? name : "",
+            (unsigned)rec.info.layer,
+            (unsigned)rec.info.expert,
+            (unsigned)rec.info.proj,
+            engine->tensor_slots[slot]);
+        return 0;
+    }
+    tensor_slots_set(
+        engine,
+        (int)rec.info.layer,
+        (int)rec.info.expert,
+        rec.info.proj,
+        engine->tensors.size());
+    return 1;
+}
+
 static int moe_juju_validate_required_bundle_native_experts(moe_pc_engine* engine) {
     if (!engine || !engine->io_config.require_bundle_native_experts) {
         return 1;
@@ -230,13 +272,19 @@ static int load_juju_tensor_index_as_tensor_index(
         std::vector<moe_juju_section_entry_t> sections;
         uint64_t file_bytes = 0;
         if (!moe_juju_read_table_local(path, &header, &sections, &file_bytes)) {
-            continue;
+            std::fprintf(stderr,
+                "[storagellm] malformed JUJU artifact rejected during table read: %s\n",
+                path.c_str());
+            return 0;
         }
         moe_ingest_juju_runtime_metadata_sections(engine, path, sections, file_bytes);
         moe_juju_probe_note_header(&probe, header);
         std::string index_json;
         if (!moe_read_juju_tensor_index_json(path, sections, file_bytes, &index_json)) {
-            continue;
+            std::fprintf(stderr,
+                "[storagellm] missing/unreadable JUJU tensor index rejected: %s\n",
+                path.c_str());
+            return 0;
         }
         if (!moe_juju_index_schema_supported(index_json)) {
             std::fprintf(stderr,
@@ -248,7 +296,16 @@ static int load_juju_tensor_index_as_tensor_index(
         moe_juju_probe_note_index_json(&probe, index_json);
         std::vector<moe_juju_tensor_json_entry_t> tensors;
         if (!moe_parse_juju_tensor_index_json(index_json, &tensors, nullptr, nullptr, nullptr)) {
-            continue;
+            std::fprintf(stderr,
+                "[storagellm] malformed JUJU tensor index rejected during probe: %s\n",
+                path.c_str());
+            return 0;
+        }
+        if (tensors.empty()) {
+            std::fprintf(stderr,
+                "[storagellm] empty JUJU tensor index rejected during probe: %s\n",
+                path.c_str());
+            return 0;
         }
         for (const moe_juju_tensor_json_entry_t& entry : tensors) {
             const char* range_reason = nullptr;
@@ -279,13 +336,19 @@ static int load_juju_tensor_index_as_tensor_index(
         std::vector<moe_juju_section_entry_t> sections;
         uint64_t file_bytes = 0;
         if (!moe_juju_read_table_local(path, &header, &sections, &file_bytes)) {
-            continue;
+            std::fprintf(stderr,
+                "[storagellm] malformed JUJU artifact rejected during load: %s\n",
+                path.c_str());
+            return 0;
         }
         moe_ingest_juju_runtime_metadata_sections(engine, path, sections, file_bytes);
         moe_juju_probe_note_header(&probe, header);
         std::string index_json;
         if (!moe_read_juju_tensor_index_json(path, sections, file_bytes, &index_json)) {
-            continue;
+            std::fprintf(stderr,
+                "[storagellm] missing/unreadable JUJU tensor index rejected during load: %s\n",
+                path.c_str());
+            return 0;
         }
         if (!moe_juju_index_schema_supported(index_json)) {
             std::fprintf(stderr,
@@ -297,9 +360,17 @@ static int load_juju_tensor_index_as_tensor_index(
         moe_juju_probe_note_index_json(&probe, index_json);
         moe_ingest_juju_graph_ir(engine, index_json);
         std::vector<moe_juju_tensor_json_entry_t> tensors;
-        if (!moe_parse_juju_tensor_index_json(index_json, &tensors, nullptr, nullptr, nullptr) ||
-            tensors.empty()) {
-            continue;
+        if (!moe_parse_juju_tensor_index_json(index_json, &tensors, nullptr, nullptr, nullptr)) {
+            std::fprintf(stderr,
+                "[storagellm] malformed JUJU tensor index rejected during load: %s\n",
+                path.c_str());
+            return 0;
+        }
+        if (tensors.empty()) {
+            std::fprintf(stderr,
+                "[storagellm] empty JUJU tensor index rejected during load: %s\n",
+                path.c_str());
+            return 0;
         }
         for (const moe_juju_tensor_json_entry_t& entry : tensors) {
             const char* range_reason = nullptr;
@@ -322,7 +393,10 @@ static int load_juju_tensor_index_as_tensor_index(
             path_idx = pit->second;
         } else {
             if (engine->tensor_paths.size() >= 0xFFFFu) {
-                continue;
+                std::fprintf(stderr,
+                    "[storagellm] too many JUJU tensor paths; refusing partial index load: %zu\n",
+                    engine->tensor_paths.size());
+                return 0;
             }
             path_idx = (uint16_t)engine->tensor_paths.size();
             engine->tensor_paths.push_back(path);
@@ -371,7 +445,12 @@ static int load_juju_tensor_index_as_tensor_index(
             moe_projection_t bundle_projection_probe = moe_PROJ_GATE;
             if (entry.bundle_native &&
                 !moe_juju_bundle_member_projection(entry, &bundle_projection_probe)) {
-                continue;
+                std::fprintf(stderr,
+                    "[storagellm] JUJU bundle-native tensor has invalid member projection: name=%s role=%s projection=%s\n",
+                    entry.name.c_str(),
+                    entry.bundle_member_role.c_str(),
+                    entry.expert_projection.c_str());
+                return 0;
             }
             if (moe_gguf_tensor_name_executable(entry.name)) {
                 moe_gguf_tensor_dir_entry_t common{};
@@ -420,18 +499,50 @@ static int load_juju_tensor_index_as_tensor_index(
             const int explicit_projection = moe_juju_entry_projection(entry, &proj);
             if (!moe_juju_entry_layer(entry, &layer) ||
                 (!combined_gate_up && !explicit_projection)) {
+                if (entry.has_expert_layout || entry.bundle_native ||
+                    entry.graph_role == moe_JUJU_ROLE_EXPERT ||
+                    !entry.expert_projection.empty() ||
+                    !entry.bundle_member_role.empty()) {
+                    std::fprintf(stderr,
+                        "[storagellm] JUJU expert tensor missing executable layer/projection contract: name=%s layer=%d projection=%s role=%s\n",
+                        entry.name.c_str(),
+                        (int)entry.execution_layer,
+                        entry.expert_projection.c_str(),
+                        entry.bundle_member_role.c_str());
+                    return 0;
+                }
                 continue;
             }
             const uint64_t expert_count64 = moe_juju_entry_expert_count(entry);
             if (expert_count64 == 0) {
-                continue;
+                std::fprintf(stderr,
+                    "[storagellm] JUJU expert tensor missing expert-count contract: name=%s layer=%u projection=%s\n",
+                    entry.name.c_str(),
+                    (unsigned)layer,
+                    entry.expert_projection.c_str());
+                return 0;
             }
             const uint64_t effective_entry_bytes = moe_effective_juju_tensor_bytes(entry, contract);
             const uint64_t per_expert = entry.per_expert_bytes ? entry.per_expert_bytes :
                 (expert_count64 ? effective_entry_bytes / expert_count64 : 0);
+            if (!entry.per_expert_bytes && expert_count64 &&
+                (effective_entry_bytes % expert_count64) != 0) {
+                std::fprintf(stderr,
+                    "[storagellm] JUJU expert tensor bytes are not divisible by expert_count: name=%s bytes=%llu experts=%llu\n",
+                    entry.name.c_str(),
+                    (unsigned long long)effective_entry_bytes,
+                    (unsigned long long)expert_count64);
+                return 0;
+            }
             const uint64_t expert_base_offset = entry.expert_base_offset ? entry.expert_base_offset : entry.juju_offset;
             if (per_expert == 0 || expert_count64 > 4096ull) {
-                continue;
+                std::fprintf(stderr,
+                    "[storagellm] JUJU expert tensor has invalid expert byte partition: name=%s experts=%llu effective_bytes=%llu per_expert=%llu\n",
+                    entry.name.c_str(),
+                    (unsigned long long)expert_count64,
+                    (unsigned long long)effective_entry_bytes,
+                    (unsigned long long)per_expert);
+                return 0;
             }
             const uint64_t entry_end = entry.juju_offset + entry.juju_bytes;
             if (expert_base_offset < entry.juju_offset ||
@@ -495,8 +606,16 @@ static int load_juju_tensor_index_as_tensor_index(
                     (unsigned long long)per_expert);
                 return 0;
             }
-            const uint32_t rows_total = (uint32_t)std::min<uint64_t>(math_rows_total64, UINT32_MAX);
-            const uint32_t cols = (uint32_t)std::min<uint64_t>(math_cols64, UINT32_MAX);
+            if (math_rows_total64 > UINT32_MAX || math_cols64 > UINT32_MAX) {
+                std::fprintf(stderr,
+                    "[storagellm] JUJU expert tensor math shape exceeds runtime slot width: name=%s rows=%llu cols=%llu\n",
+                    entry.name.c_str(),
+                    (unsigned long long)math_rows_total64,
+                    (unsigned long long)math_cols64);
+                return 0;
+            }
+            const uint32_t rows_total = (uint32_t)math_rows_total64;
+            const uint32_t cols = (uint32_t)math_cols64;
             for (uint64_t expert = 0; expert < expert_count64; ++expert) {
                 const uint32_t split_count = combined_gate_up ? 2u : 1u;
                 for (uint32_t split = 0; split < split_count; ++split) {
@@ -586,7 +705,9 @@ static int load_juju_tensor_index_as_tensor_index(
                     if (stream_bytes > engine->max_tensor_stream_bytes.load(std::memory_order_relaxed)) {
                         engine->max_tensor_stream_bytes.store(stream_bytes, std::memory_order_relaxed);
                     }
-                    tensor_slots_set(engine, (int)rec.info.layer, (int)rec.info.expert, rec.info.proj, engine->tensors.size());
+                    if (!moe_juju_claim_tensor_slot_unique(engine, rec, entry.name.c_str())) {
+                        return 0;
+                    }
                     expert_bytes_add(engine, (int)rec.info.layer, (int)rec.info.expert, stream_bytes);
                     expert_runtime_hints_update(
                         engine,

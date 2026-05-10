@@ -30,6 +30,9 @@ static void moe_qkv_ensure_head_storage_locked(moe_pc_engine* engine, size_t slo
     if (engine->qkv_head_state_epochs.size() < slot_count) {
         engine->qkv_head_state_epochs.resize(slot_count, 0);
     }
+    if (engine->qkv_head_state_filled_tokens.size() < slot_count) {
+        engine->qkv_head_state_filled_tokens.resize(slot_count, 0);
+    }
     for (size_t i = 0; i < slot_count; ++i) {
         if (!engine->qkv_head_state_locks[i]) {
             engine->qkv_head_state_locks[i] = std::make_unique<std::mutex>();
@@ -53,6 +56,7 @@ static void moe_qkv_free_head_states_locked(moe_pc_engine* engine) {
     engine->qkv_head_state_heads.clear();
     engine->qkv_head_state_fingerprints.clear();
     engine->qkv_head_state_epochs.clear();
+    engine->qkv_head_state_filled_tokens.clear();
     engine->qkv_last_ctx = 0;
 }
 
@@ -299,7 +303,14 @@ static void moe_qkv_apply_contract_config_locked(
     const qkv_config_t desired = moe_qkv_contract_config_for_head_dim(engine, head_dim);
     if (!engine->qkv_cfg_initialized.load(std::memory_order_acquire) ||
         !moe_qkv_config_matches_contract(engine->qkv_cfg, desired)) {
-        moe_qkv_free_head_states_locked(engine);
+        // Mixed-attention models such as Gemma variants can alternate head_dim
+        // across layers (for example sliding/local vs global attention).  The
+        // QKV slot fingerprint already includes head_dim and policy_hash, so a
+        // per-slot mismatch is enough to rebuild only the affected layer/head.
+        // Do not clear the whole persistent KV cache merely because the next
+        // layer uses a different head_dim: that drops previous-token KV for
+        // other layers and makes PPL explode while the request still reports
+        // forward_ok=1.
         engine->qkv_cfg = desired;
         engine->qkv_cfg_initialized.store(true, std::memory_order_release);
         moe_profile_log(
@@ -485,6 +496,9 @@ static qkv_state_t* moe_qkv_ensure_layer_head_state_locked(
         qkv_free(slot);
         *slot = qkv_state_t{};
         engine->qkv_head_state_valid[slot_index] = 0;
+        if (slot_index < engine->qkv_head_state_filled_tokens.size()) {
+            engine->qkv_head_state_filled_tokens[slot_index] = 0;
+        }
     }
     qkv_state_t st{};
     if (capacity_tokens > (uint32_t)std::numeric_limits<int>::max() ||
@@ -497,6 +511,9 @@ static qkv_state_t* moe_qkv_ensure_layer_head_state_locked(
     engine->qkv_head_state_heads[slot_index] = head;
     engine->qkv_head_state_fingerprints[slot_index] = desired_fingerprint;
     engine->qkv_head_state_epochs[slot_index] = epoch;
+    if (slot_index < engine->qkv_head_state_filled_tokens.size()) {
+        engine->qkv_head_state_filled_tokens[slot_index] = 0;
+    }
     return slot;
 }
 
@@ -558,6 +575,11 @@ static int moe_qkv_append_layer_head_token(
             slot, &engine->qkv_cfg, key, value, token_index, head_dim)) {
         return 0;
     }
+    if (slot_index < engine->qkv_head_state_filled_tokens.size()) {
+        engine->qkv_head_state_filled_tokens[slot_index] = std::max(
+            engine->qkv_head_state_filled_tokens[slot_index],
+            token_index + 1u);
+    }
 #ifdef STORAGELLM_PPL_DIAG_ENABLED
     storagellm_ppl_diag_qkv_append_probe(
         layer, head, token_index, head_dim, key, value, slot, "after_quantize");
@@ -595,6 +617,8 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
     slot = &engine->qkv_head_state_slots[slot_index];
     if (slot_index >= engine->qkv_head_state_valid.size() ||
         !engine->qkv_head_state_valid[slot_index] ||
+        slot_index >= engine->qkv_head_state_filled_tokens.size() ||
+        engine->qkv_head_state_filled_tokens[slot_index] < context_tokens ||
         slot->n_tokens < (int)context_tokens) {
         return 0;
     }

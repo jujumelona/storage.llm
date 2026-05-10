@@ -373,11 +373,17 @@ static int moe_prepare_scaled_router_input_f32(
     // Safe: hidden_size > 0 guaranteed by check above
     const float norm = 1.0f / std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f);
     const uint64_t scale_count = moe_router_raw_scalar_count(scale_raw);
+    if (scale_count != 1u && scale_count < (uint64_t)hidden_size) {
+        std::fprintf(stderr,
+            "[storagellm router] router scale tensor has invalid shape layer=%d count=%llu hidden=%u\n",
+            layer, (unsigned long long)scale_count, hidden_size);
+        return 0;
+    }
     for (uint32_t i = 0; i < hidden_size; ++i) {
         float scale = 1.0f;
         if (scale_count == 1u) {
             if (!moe_router_raw_scalar_at_f32(scale_raw, 0, &scale)) return 0;
-        } else if (scale_count >= hidden_size) {
+        } else {
             if (!moe_router_raw_scalar_at_f32(scale_raw, i, &scale)) return 0;
         }
         if (!std::isfinite(scale)) {

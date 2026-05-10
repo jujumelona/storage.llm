@@ -1700,7 +1700,10 @@ static int moe_layer_expert_down_scalar_scale_f32(
     };
     moe_raw_tensor_cache_entry raw{};
     if (!moe_map_layer_common_tensor(engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]), &raw)) {
-        *out_scalar_supported = 0;
+        // No scale tensor is an identity scalar scale, so indexed/grouped GPU
+        // expert paths may still be used with weight multiplier 1.0.
+        *out_scale = 1.0f;
+        *out_scalar_supported = 1;
         return 1;
     }
     const uint64_t count = moe_raw_tensor_scalar_count(raw);
@@ -1726,8 +1729,11 @@ static int moe_layer_expert_down_scalar_scale_f32(
         *out_scalar_supported = 0;
         return 1;
     }
+    std::fprintf(stderr,
+        "[storagellm mlp] expert scalar down scale tensor has invalid shape layer=%d expert=%d count=%llu experts=%u hidden=%u\n",
+        layer, expert_id, (unsigned long long)count, experts, hidden_size);
     *out_scalar_supported = 0;
-    return 1;
+    return 0;
 }
 
 static int moe_layer_moe_mlp_prefill_batch_f32(
