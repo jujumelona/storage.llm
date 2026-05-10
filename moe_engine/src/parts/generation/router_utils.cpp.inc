@@ -122,7 +122,7 @@ static uint32_t moe_router_adaptive_top_k(
     }
     top_k = std::min(top_k, experts);
     const uint32_t entropy_milli = (uint32_t)(entropy * 1000.0f);
-    // BUGFIX Problem F stage 2: Per-session entropy ★★★
+    // BUGFIX Problem F stage 2: Per-session entropy
     if (session) {
         session->session_router_entropy_milli = entropy_milli;
     }

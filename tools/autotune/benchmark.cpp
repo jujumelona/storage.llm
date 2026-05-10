@@ -18,6 +18,24 @@
 #include <cuda_runtime_api.h>
 #endif
 
+#if defined(STORAGELLM_AUTOTUNE_HAS_HIP_RUNTIME)
+#if defined(__has_include)
+#if __has_include(<hip/hip_runtime.h>)
+#include <hip/hip_runtime.h>
+#define STORAGELLM_AUTOTUNE_HIP_USABLE 1
+#endif
+#endif
+#endif
+
+#if defined(STORAGELLM_AUTOTUNE_HAS_OPENCL_RUNTIME)
+#if defined(__has_include)
+#if __has_include(<CL/cl.h>)
+#include <CL/cl.h>
+#define STORAGELLM_AUTOTUNE_OPENCL_USABLE 1
+#endif
+#endif
+#endif
+
 namespace storagellm::autotune {
 
 struct Task {
@@ -49,10 +67,10 @@ static int env_int_local(const char* name, int fallback) {
 
 template <typename Fn>
 static int measure_adaptive_ms(Fn&& fn, double& latency_ms) {
-    const int warmups = (std::max)(0, env_int_local("STORAGELLM_AUTOTUNE_WARMUPS", 3));
-    const int min_iters = (std::max)(1, env_int_local("STORAGELLM_AUTOTUNE_MIN_ITERS", 8));
-    const int max_iters = (std::max)(min_iters, env_int_local("STORAGELLM_AUTOTUNE_MAX_ITERS", 256));
-    const double min_ms = (std::max)(1, env_int_local("STORAGELLM_AUTOTUNE_MIN_MS", 120));
+    const int warmups = std::max(0, env_int_local("STORAGELLM_AUTOTUNE_WARMUPS", 3));
+    const int min_iters = std::max(1, env_int_local("STORAGELLM_AUTOTUNE_MIN_ITERS", 8));
+    const int max_iters = std::max(min_iters, env_int_local("STORAGELLM_AUTOTUNE_MAX_ITERS", 256));
+    const double min_ms = std::max(1, env_int_local("STORAGELLM_AUTOTUNE_MIN_MS", 120));
 
     for (int i = 0; i < warmups; ++i) {
         if (!fn()) return 0;
@@ -94,6 +112,30 @@ extern "C" int storagellm_cublaslt_grouped_moe_indexed_device_f32(
 
 #if defined(STORAGELLM_AUTOTUNE_HAS_CUTLASS_NATIVE)
 extern "C" int storagellm_cutlass_grouped_moe_indexed_device_f32(
+    int32_t backend,
+    const Task* tasks,
+    uint32_t task_count,
+    void* stream_or_queue);
+#endif
+
+#if defined(STORAGELLM_AUTOTUNE_HAS_HIPBLASLT_NATIVE)
+extern "C" int storagellm_hipblaslt_grouped_moe_indexed_device_f32(
+    int32_t backend,
+    const Task* tasks,
+    uint32_t task_count,
+    void* stream_or_queue);
+#endif
+
+#if defined(STORAGELLM_AUTOTUNE_HAS_CK_NATIVE)
+extern "C" int storagellm_ck_grouped_moe_indexed_device_f32(
+    int32_t backend,
+    const Task* tasks,
+    uint32_t task_count,
+    void* stream_or_queue);
+#endif
+
+#if defined(STORAGELLM_AUTOTUNE_HAS_CLBLAST_NATIVE)
+extern "C" int storagellm_clblast_grouped_moe_indexed_device_f32(
     int32_t backend,
     const Task* tasks,
     uint32_t task_count,
@@ -386,14 +428,347 @@ static void benchmark_cuda_cutlass_native(Candidate& c) {
 #endif
 }
 
-[[maybe_unused]] static void mark_linked_but_unmeasured(Candidate& c, const char* label) {
-    c.compiled = true;
-    c.loadable = true;
-    c.measured = false;
-    c.validation = "linked-but-no-portable-fixture";
-    c.reason = std::string(label ? label : c.name.c_str()) +
-        " is linked as a true device kernel, but storagellm_host_autotune does not yet own a portable device-context fixture for this SDK; fail-closed so it will not be selected without measurement";
+
+#if defined(STORAGELLM_AUTOTUNE_HIP_USABLE)
+template <typename T>
+static int hip_alloc_copy(T*& device_ptr, const std::vector<T>& host) {
+    device_ptr = nullptr;
+    if (host.empty()) return 0;
+    const size_t bytes = host.size() * sizeof(T);
+    if (hipMalloc(reinterpret_cast<void**>(&device_ptr), bytes) != hipSuccess) return 0;
+    if (hipMemcpy(device_ptr, host.data(), bytes, hipMemcpyHostToDevice) != hipSuccess) {
+        hipFree(device_ptr);
+        device_ptr = nullptr;
+        return 0;
+    }
+    return 1;
 }
+
+static void benchmark_hip_indexed_native(Candidate& c, Entry fn, const char* label) {
+    if (!fn) {
+        c.reason = std::string(label ? label : "HIP backend") + " entry symbol was not linked";
+        return;
+    }
+    int device_count = 0;
+    const hipError_t dev_rc = hipGetDeviceCount(&device_count);
+    if (dev_rc != hipSuccess || device_count <= 0) {
+        c.reason = std::string(label ? label : "HIP backend") + " runtime device check failed: no HIP/ROCm device";
+        c.validation = "runtime-device-missing";
+        return;
+    }
+    if (hipSetDevice(0) != hipSuccess) {
+        c.reason = std::string(label ? label : "HIP backend") + " could not select device 0";
+        c.validation = "runtime-device-unusable";
+        return;
+    }
+
+    const uint32_t H = 128;
+    const uint32_t I = 256;
+    const uint32_t A = 4;
+    const uint32_t E = 2;
+    std::vector<float> x(H * A), gate(E * I * H), up(E * I * H), down(E * H * I),
+        accum(H * A, 0.0f), weights(E * A, 1.0f);
+    std::vector<uint32_t> idx(E * A);
+    for (uint32_t i = 0; i < A; ++i) { idx[i] = i; idx[A + i] = i; }
+    for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(double(i) * 0.01);
+    for (size_t i = 0; i < gate.size(); ++i) {
+        gate[i] = std::cos(double(i) * 0.003) * 0.01f;
+        up[i] = std::sin(double(i) * 0.005) * 0.01f;
+    }
+    for (size_t i = 0; i < down.size(); ++i) down[i] = std::cos(double(i) * 0.007) * 0.01f;
+
+    float *d_x = nullptr, *d_gate = nullptr, *d_up = nullptr, *d_down = nullptr, *d_accum = nullptr, *d_weights = nullptr;
+    uint32_t* d_idx = nullptr;
+    hipStream_t stream = nullptr;
+    int ok = 0;
+    if (!hip_alloc_copy(d_x, x) || !hip_alloc_copy(d_gate, gate) ||
+        !hip_alloc_copy(d_up, up) || !hip_alloc_copy(d_down, down) ||
+        !hip_alloc_copy(d_weights, weights) || !hip_alloc_copy(d_idx, idx) ||
+        hipMalloc(reinterpret_cast<void**>(&d_accum), accum.size() * sizeof(float)) != hipSuccess ||
+        hipStreamCreate(&stream) != hipSuccess) {
+        c.reason = std::string(label ? label : "HIP backend") + " allocation/copy/stream setup failed";
+        goto cleanup;
+    }
+
+    {
+        TensorView gate_v[E];
+        TensorView up_v[E];
+        TensorView down_v[E];
+        Task tasks[E]{};
+        for (uint32_t e = 0; e < E; ++e) {
+            gate_v[e] = make_view(d_gate + size_t(e) * I * H, I, H);
+            up_v[e] = make_view(d_up + size_t(e) * I * H, I, H);
+            down_v[e] = make_view(d_down + size_t(e) * H * I, H, I);
+            tasks[e].layer = 0;
+            tasks[e].expert = static_cast<int32_t>(e);
+            tasks[e].gate_weight = &gate_v[e];
+            tasks[e].up_weight = &up_v[e];
+            tasks[e].down_weight = &down_v[e];
+            tasks[e].d_input = d_x;
+            tasks[e].input_stride = H;
+            tasks[e].d_token_indices = d_idx;
+            tasks[e].d_token_weights = d_weights;
+            tasks[e].assignment_offset = e * A;
+            tasks[e].assignment_count = A;
+            tasks[e].d_accum = d_accum;
+            tasks[e].accum_stride = H;
+            tasks[e].hidden_size = H;
+            tasks[e].intermediate_size = I;
+            tasks[e].activation_mode = 0;
+        }
+        const int backend_hip = 7;
+        if (hipMemsetAsync(d_accum, 0, accum.size() * sizeof(float), stream) != hipSuccess ||
+            !fn(backend_hip, tasks, E, stream) || hipStreamSynchronize(stream) != hipSuccess) {
+            c.reason = std::string(label ? label : "HIP backend") + " returned failure during warmup/sync";
+            c.validation = "warmup-failed";
+            goto cleanup;
+        }
+        double latency = 0.0;
+        const int measured_ok = measure_adaptive_ms([&]() {
+            if (hipMemsetAsync(d_accum, 0, accum.size() * sizeof(float), stream) != hipSuccess) return false;
+            if (!fn(backend_hip, tasks, E, stream)) return false;
+            return hipStreamSynchronize(stream) == hipSuccess;
+        }, latency);
+        if (!measured_ok) {
+            c.reason = std::string(label ? label : "HIP backend") + " returned failure during adaptive measurement";
+            c.validation = "measurement-failed";
+            goto cleanup;
+        }
+        c.compiled = true;
+        c.loadable = true;
+        c.measured = true;
+        c.true_kernel = true;
+        c.fused_moe = true;
+        c.latency_ms = latency;
+        c.validation = "linked+runtime-device+warmup+adaptive-measurement";
+        c.reason = std::string("measured ") + (label ? label : "HIP backend") + " on this ROCm device with warmup/adaptive iterations";
+        ok = 1;
+    }
+
+cleanup:
+    if (!ok && c.reason.empty()) c.reason = std::string(label ? label : "HIP backend") + " probe failed";
+    if (stream) hipStreamDestroy(stream);
+    if (d_accum) hipFree(d_accum);
+    if (d_idx) hipFree(d_idx);
+    if (d_weights) hipFree(d_weights);
+    if (d_down) hipFree(d_down);
+    if (d_up) hipFree(d_up);
+    if (d_gate) hipFree(d_gate);
+    if (d_x) hipFree(d_x);
+}
+#endif
+
+static void benchmark_rocm_hipblaslt_native(Candidate& c) {
+#if defined(STORAGELLM_AUTOTUNE_HIP_USABLE) && defined(STORAGELLM_AUTOTUNE_HAS_HIPBLASLT_NATIVE)
+    benchmark_hip_indexed_native(c, storagellm_hipblaslt_grouped_moe_indexed_device_f32, "native ROCm hipBLASLt/HIP fused grouped-MoE adapter");
+#else
+    c.reason = "native ROCm hipBLASLt adapter was not linked with a usable HIP runtime into storagellm_host_autotune";
+    c.validation = "not-linked-or-runtime-header-missing";
+#endif
+}
+
+static void benchmark_rocm_ck_native(Candidate& c) {
+#if defined(STORAGELLM_AUTOTUNE_HIP_USABLE) && defined(STORAGELLM_AUTOTUNE_HAS_CK_NATIVE)
+    benchmark_hip_indexed_native(c, storagellm_ck_grouped_moe_indexed_device_f32, "native ROCm CK/HIP fused grouped-MoE adapter");
+#else
+    c.reason = "native ROCm CK adapter was not linked with a usable HIP runtime into storagellm_host_autotune";
+    c.validation = "not-linked-or-runtime-header-missing";
+#endif
+}
+
+#if defined(STORAGELLM_AUTOTUNE_OPENCL_USABLE)
+static int cl_choose_device(cl_platform_id* out_platform, cl_device_id* out_device) {
+    if (!out_platform || !out_device) return 0;
+    *out_platform = nullptr;
+    *out_device = nullptr;
+    cl_uint platform_count = 0;
+    if (clGetPlatformIDs(0, nullptr, &platform_count) != CL_SUCCESS || platform_count == 0) return 0;
+    std::vector<cl_platform_id> platforms(platform_count);
+    if (clGetPlatformIDs(platform_count, platforms.data(), nullptr) != CL_SUCCESS) return 0;
+    for (cl_platform_id p : platforms) {
+        for (cl_device_type ty : {CL_DEVICE_TYPE_GPU, CL_DEVICE_TYPE_ACCELERATOR, CL_DEVICE_TYPE_CPU}) {
+            cl_uint n = 0;
+            if (clGetDeviceIDs(p, ty, 0, nullptr, &n) != CL_SUCCESS || n == 0) continue;
+            std::vector<cl_device_id> devs(n);
+            if (clGetDeviceIDs(p, ty, n, devs.data(), nullptr) == CL_SUCCESS && !devs.empty()) {
+                *out_platform = p;
+                *out_device = devs[0];
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+template <typename T>
+static cl_mem cl_make_buffer(cl_context ctx, cl_command_queue q, cl_mem_flags flags, const std::vector<T>& host, int* ok) {
+    if (!ok || !*ok || host.empty()) { if (ok) *ok = 0; return nullptr; }
+    cl_int err = CL_SUCCESS;
+    cl_mem m = clCreateBuffer(ctx, flags, host.size() * sizeof(T), nullptr, &err);
+    if (err != CL_SUCCESS || !m) { *ok = 0; return nullptr; }
+    err = clEnqueueWriteBuffer(q, m, CL_TRUE, 0, host.size() * sizeof(T), host.data(), 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) { clReleaseMemObject(m); *ok = 0; return nullptr; }
+    return m;
+}
+
+static void benchmark_opencl_clblast_native(Candidate& c) {
+#if defined(STORAGELLM_AUTOTUNE_HAS_CLBLAST_NATIVE)
+    cl_platform_id platform = nullptr;
+    cl_device_id device = nullptr;
+    if (!cl_choose_device(&platform, &device)) {
+        c.reason = "OpenCL runtime device check failed: no OpenCL device";
+        c.validation = "runtime-device-missing";
+        return;
+    }
+    cl_int err = CL_SUCCESS;
+    cl_context ctx = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
+    if (err != CL_SUCCESS || !ctx) {
+        c.reason = "OpenCL context creation failed";
+        c.validation = "runtime-device-unusable";
+        return;
+    }
+#if defined(CL_VERSION_2_0)
+    cl_command_queue q = clCreateCommandQueueWithProperties(ctx, device, nullptr, &err);
+#else
+    cl_command_queue q = clCreateCommandQueue(ctx, device, 0, &err);
+#endif
+    if (err != CL_SUCCESS || !q) {
+        clReleaseContext(ctx);
+        c.reason = "OpenCL command queue creation failed";
+        c.validation = "runtime-device-unusable";
+        return;
+    }
+
+    const uint32_t H = 128;
+    const uint32_t I = 256;
+    const uint32_t A = 4;
+    const uint32_t E = 2;
+    std::vector<float> x(H * A), gate(E * I * H), up(E * I * H), down(E * H * I),
+        accum(H * A, 0.0f), weights(E * A, 1.0f);
+    std::vector<uint32_t> idx(E * A);
+    for (uint32_t i = 0; i < A; ++i) { idx[i] = i; idx[A + i] = i; }
+    for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(double(i) * 0.01);
+    for (size_t i = 0; i < gate.size(); ++i) { gate[i] = std::cos(double(i) * 0.003) * 0.01f; up[i] = std::sin(double(i) * 0.005) * 0.01f; }
+    for (size_t i = 0; i < down.size(); ++i) down[i] = std::cos(double(i) * 0.007) * 0.01f;
+
+    int ok = 1;
+    cl_mem d_x = cl_make_buffer(ctx, q, CL_MEM_READ_ONLY, x, &ok);
+    cl_mem d_gate = cl_make_buffer(ctx, q, CL_MEM_READ_ONLY, gate, &ok);
+    cl_mem d_up = cl_make_buffer(ctx, q, CL_MEM_READ_ONLY, up, &ok);
+    cl_mem d_down = cl_make_buffer(ctx, q, CL_MEM_READ_ONLY, down, &ok);
+    cl_mem d_weights = cl_make_buffer(ctx, q, CL_MEM_READ_ONLY, weights, &ok);
+    cl_mem d_idx = cl_make_buffer(ctx, q, CL_MEM_READ_ONLY, idx, &ok);
+    cl_mem d_accum = nullptr;
+    if (ok) {
+        d_accum = clCreateBuffer(ctx, CL_MEM_READ_WRITE, accum.size() * sizeof(float), nullptr, &err);
+        if (err != CL_SUCCESS || !d_accum) ok = 0;
+    }
+    if (!ok || clFinish(q) != CL_SUCCESS) {
+        c.reason = "OpenCL allocation/copy setup failed";
+        c.validation = "fixture-setup-failed";
+        goto cleanup;
+    }
+
+    {
+        TensorView gate_v[E];
+        TensorView up_v[E];
+        TensorView down_v[E];
+        Task tasks[E]{};
+        for (uint32_t e = 0; e < E; ++e) {
+            gate_v[e] = make_view(reinterpret_cast<float*>(d_gate), I, H);
+            up_v[e] = make_view(reinterpret_cast<float*>(d_up), I, H);
+            down_v[e] = make_view(reinterpret_cast<float*>(d_down), H, I);
+            // OpenCL keeps all experts in one cl_mem per matrix.  Force the
+            // adapter's expert-layout path so each task uses its byte offset;
+            // raw-FP32 path would point every expert at offset 0.
+            gate_v[e].weight_format = 0u;
+            up_v[e].weight_format = 0u;
+            down_v[e].weight_format = 0u;
+            gate_v[e].bytes = uint64_t(E) * I * H * sizeof(float);
+            up_v[e].bytes = uint64_t(E) * I * H * sizeof(float);
+            down_v[e].bytes = uint64_t(E) * H * I * sizeof(float);
+            gate_v[e].weight_bytes = gate_v[e].bytes;
+            up_v[e].weight_bytes = up_v[e].bytes;
+            down_v[e].weight_bytes = down_v[e].bytes;
+            gate_v[e].expert_gpu_layout_kind = 3u;
+            up_v[e].expert_gpu_layout_kind = 3u;
+            down_v[e].expert_gpu_layout_kind = 3u;
+            gate_v[e].expert_gpu_layout_offset = uint64_t(e) * I * H * sizeof(float);
+            up_v[e].expert_gpu_layout_offset = uint64_t(e) * I * H * sizeof(float);
+            down_v[e].expert_gpu_layout_offset = uint64_t(e) * H * I * sizeof(float);
+            gate_v[e].expert_gpu_layout_size = uint64_t(I) * H * sizeof(float);
+            up_v[e].expert_gpu_layout_size = uint64_t(I) * H * sizeof(float);
+            down_v[e].expert_gpu_layout_size = uint64_t(H) * I * sizeof(float);
+            gate_v[e].expert_gpu_layout_row_bytes = uint64_t(H) * sizeof(float);
+            up_v[e].expert_gpu_layout_row_bytes = uint64_t(H) * sizeof(float);
+            down_v[e].expert_gpu_layout_row_bytes = uint64_t(I) * sizeof(float);
+            tasks[e].layer = 0;
+            tasks[e].expert = static_cast<int32_t>(e);
+            tasks[e].gate_weight = &gate_v[e];
+            tasks[e].up_weight = &up_v[e];
+            tasks[e].down_weight = &down_v[e];
+            tasks[e].d_input = reinterpret_cast<const void*>(d_x);
+            tasks[e].input_stride = H;
+            tasks[e].d_token_indices = reinterpret_cast<const uint32_t*>(d_idx);
+            tasks[e].d_token_weights = reinterpret_cast<const float*>(d_weights);
+            tasks[e].assignment_offset = e * A;
+            tasks[e].assignment_count = A;
+            tasks[e].d_accum = reinterpret_cast<void*>(d_accum);
+            tasks[e].accum_stride = H;
+            tasks[e].hidden_size = H;
+            tasks[e].intermediate_size = I;
+            tasks[e].activation_mode = 0;
+        }
+        const int backend_opencl = 6;
+        if (clEnqueueFillBuffer(q, d_accum, &accum[0], sizeof(float), 0, accum.size() * sizeof(float), 0, nullptr, nullptr) != CL_SUCCESS ||
+            !storagellm_clblast_grouped_moe_indexed_device_f32(backend_opencl, tasks, E, q) || clFinish(q) != CL_SUCCESS) {
+            c.reason = "OpenCL/CLBlast adapter returned failure during warmup/sync";
+            c.validation = "warmup-failed";
+            goto cleanup;
+        }
+        double latency = 0.0;
+        const int measured_ok = measure_adaptive_ms([&]() {
+            const float zero = 0.0f;
+            if (clEnqueueFillBuffer(q, d_accum, &zero, sizeof(zero), 0, accum.size() * sizeof(float), 0, nullptr, nullptr) != CL_SUCCESS) return false;
+            if (!storagellm_clblast_grouped_moe_indexed_device_f32(backend_opencl, tasks, E, q)) return false;
+            return clFinish(q) == CL_SUCCESS;
+        }, latency);
+        if (!measured_ok) {
+            c.reason = "OpenCL/CLBlast adapter returned failure during adaptive measurement";
+            c.validation = "measurement-failed";
+            goto cleanup;
+        }
+        c.compiled = true;
+        c.loadable = true;
+        c.measured = true;
+        c.true_kernel = true;
+        c.fused_moe = true;
+        c.latency_ms = latency;
+        c.validation = "linked+runtime-device+warmup+adaptive-measurement";
+        c.reason = "measured native OpenCL/CLBlast fused grouped-MoE adapter with real OpenCL buffers/queue";
+    }
+
+cleanup:
+    if (d_accum) clReleaseMemObject(d_accum);
+    if (d_idx) clReleaseMemObject(d_idx);
+    if (d_weights) clReleaseMemObject(d_weights);
+    if (d_down) clReleaseMemObject(d_down);
+    if (d_up) clReleaseMemObject(d_up);
+    if (d_gate) clReleaseMemObject(d_gate);
+    if (d_x) clReleaseMemObject(d_x);
+    if (q) clReleaseCommandQueue(q);
+    if (ctx) clReleaseContext(ctx);
+#else
+    c.reason = "native OpenCL/CLBlast adapter was not linked into storagellm_host_autotune";
+    c.validation = "not-linked";
+#endif
+}
+#else
+static void benchmark_opencl_clblast_native(Candidate& c) {
+    c.reason = "native OpenCL/CLBlast adapter was not linked with a usable OpenCL runtime into storagellm_host_autotune";
+    c.validation = "not-linked-or-runtime-header-missing";
+}
+#endif
 
 static void benchmark_tvm_cpu(Candidate& c) {
     if (!file_exists(c.library)) {
@@ -481,50 +856,14 @@ void benchmark_candidates(std::vector<Candidate>& candidates) {
         } else if (c.kind == "tvm" && c.name == "tvm_cpu") {
             benchmark_tvm_cpu(c);
         } else if (c.name == "rocm_hipblaslt") {
-#if defined(STORAGELLM_AUTOTUNE_HAS_HIPBLASLT_NATIVE)
-            mark_linked_but_unmeasured(c, "native ROCm hipBLASLt grouped-MoE adapter");
-#else
-            c.validation = "not-linked";
-            c.reason = "native ROCm hipBLASLt adapter was not linked into storagellm_host_autotune";
-#endif
+            benchmark_rocm_hipblaslt_native(c);
         } else if (c.name == "rocm_ck") {
-#if defined(STORAGELLM_AUTOTUNE_HAS_CK_NATIVE)
-            mark_linked_but_unmeasured(c, "native ROCm CK grouped-MoE adapter");
-#else
-            c.validation = "not-linked";
-            c.reason = "native ROCm CK adapter was not linked into storagellm_host_autotune";
-#endif
-        } else if (c.name == "metal_mps") {
-#if defined(STORAGELLM_AUTOTUNE_HAS_METAL_NATIVE)
-            mark_linked_but_unmeasured(c, "native Metal/MPS grouped-MoE adapter");
-#else
-            c.validation = "not-linked";
-            c.reason = "native Metal/MPS adapter was not linked into storagellm_host_autotune";
-#endif
-        } else if (c.name == "vulkan_coopmat") {
-#if defined(STORAGELLM_AUTOTUNE_HAS_VULKAN_NATIVE)
-            mark_linked_but_unmeasured(c, "native Vulkan cooperative-matrix grouped-MoE adapter");
-#else
-            c.validation = "not-linked";
-            c.reason = "native Vulkan cooperative-matrix adapter was not linked into storagellm_host_autotune";
-#endif
+            benchmark_rocm_ck_native(c);
         } else if (c.name == "opencl_clblast") {
-#if defined(STORAGELLM_AUTOTUNE_HAS_CLBLAST_NATIVE)
-            mark_linked_but_unmeasured(c, "native OpenCL/CLBlast grouped-MoE adapter");
-#else
-            c.validation = "not-linked";
-            c.reason = "native OpenCL/CLBlast adapter was not linked into storagellm_host_autotune";
-#endif
-        } else if (c.name == "intel_onednn_sycl") {
-#if defined(STORAGELLM_AUTOTUNE_HAS_ONEDNN_SYCL_NATIVE)
-            mark_linked_but_unmeasured(c, "native Intel oneDNN/SYCL grouped-MoE adapter");
-#else
-            c.validation = "not-linked";
-            c.reason = "native Intel oneDNN/SYCL adapter was not linked into storagellm_host_autotune";
-#endif
+            benchmark_opencl_clblast_native(c);
         } else if (c.kind == "tvm") {
-            c.validation = "device-tvm-not-measured";
-            c.reason = "TVM device candidate is generated/reported, but this C++ autotune fixture currently only measures TVM CPU fail-closed";
+            c.validation = "not-measured";
+            c.reason = "only TVM CPU is emitted as an automatic candidate; device TVM libraries require a real device runtime fixture and are not advertised as fast candidates";
         } else if (c.compiled) {
             c.reason = c.reason.empty() ? "compiled but not benchmarked by generic C++ probe" : c.reason;
         }

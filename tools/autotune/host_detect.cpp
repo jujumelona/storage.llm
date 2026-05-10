@@ -112,31 +112,28 @@ static Candidate make_candidate(
 
 std::vector<Candidate> make_backend_plan(const HostInfo& host) {
     std::vector<Candidate> v;
-    if (host.has_cuda) {
-        v.push_back(make_candidate("cuda_cublaslt", "native", "cuda", "", "", 10, host.cuda_device, true, false));
-        v.push_back(make_candidate("cuda_cutlass", "native", "cuda", "", "", 20, host.cuda_device, true, true));
-        v.push_back(make_candidate("tvm_cuda", "tvm", "cuda", "build/tvm_codegen/grouped_moe_cuda" + shared_library_suffix(), "STORAGELLM_TVM_CUDA_MOE_LIB", 30, host.cuda_device, true, true));
+
+    // Only emit candidates that storagellm_host_autotune can actually execute
+    // and time with a real fixture in this executable.  Platform/device support
+    // that is merely detected is still reported in HostInfo, but it is not
+    // advertised as an automatic fast-backend candidate until a real benchmark
+    // path exists here.  This avoids "looks enabled" skeleton paths.
+    if (host.cuda_device) {
+        v.push_back(make_candidate("cuda_cublaslt", "native", "cuda", "", "", 10, true, true, false));
+        v.push_back(make_candidate("cuda_cutlass", "native", "cuda", "", "", 20, true, true, true));
     }
-    if (host.has_rocm) {
-        v.push_back(make_candidate("rocm_hipblaslt", "native", "rocm", "", "", 35, host.rocm_device, true, true));
-        v.push_back(make_candidate("rocm_ck", "native", "rocm", "", "", 36, host.rocm_device, true, true));
-        v.push_back(make_candidate("tvm_rocm", "tvm", "rocm", "build/tvm_codegen/grouped_moe_rocm" + shared_library_suffix(), "STORAGELLM_TVM_ROCM_MOE_LIB", 40, host.rocm_device, true, true));
+    if (host.rocm_device) {
+        v.push_back(make_candidate("rocm_hipblaslt", "native", "rocm", "", "", 35, true, true, true));
+        v.push_back(make_candidate("rocm_ck", "native", "rocm", "", "", 36, true, true, true));
     }
-    if (host.has_metal) {
-        v.push_back(make_candidate("metal_mps", "native", "metal", "", "", 45, true, true, true));
-        v.push_back(make_candidate("tvm_metal", "tvm", "metal", "build/tvm_codegen/grouped_moe_metal" + shared_library_suffix(), "STORAGELLM_TVM_METAL_MOE_LIB", 50, true, true, true));
+    if (host.opencl_device) {
+        v.push_back(make_candidate("opencl_clblast", "native", "opencl", "", "", 65, true, true, true));
     }
-    if (host.has_vulkan) {
-        v.push_back(make_candidate("vulkan_coopmat", "native", "vulkan", "", "", 55, host.vulkan_device, true, true));
-        v.push_back(make_candidate("tvm_vulkan", "tvm", "vulkan", "build/tvm_codegen/grouped_moe_vulkan" + shared_library_suffix(), "STORAGELLM_TVM_VULKAN_MOE_LIB", 60, host.vulkan_device, true, true));
-    }
-    if (host.has_opencl) {
-        v.push_back(make_candidate("opencl_clblast", "native", "opencl", "", "", 65, host.opencl_device, true, true));
-        v.push_back(make_candidate("tvm_opencl", "tvm", "opencl", "build/tvm_codegen/grouped_moe_opencl" + shared_library_suffix(), "STORAGELLM_TVM_OPENCL_MOE_LIB", 70, host.opencl_device, true, true));
-    }
-    if (host.has_sycl) {
-        v.push_back(make_candidate("intel_onednn_sycl", "native", "sycl", "", "", 75, host.sycl_device, true, true));
-    }
+
+    // TVM CPU is measured in-process through a host pointer fixture.  Device TVM
+    // is not listed here because a CUDA/HIP/Metal/Vulkan/OpenCL TVM module needs
+    // a matching runtime context and device allocations; reporting it without
+    // that measurement would be a fake fast path.
     v.push_back(make_candidate("cpu_native_f32", "native", "cpu", "", "", 900, true, true, true));
     v.push_back(make_candidate("tvm_cpu", "tvm", "llvm", "build/tvm_codegen/grouped_moe_cpu" + shared_library_suffix(), "STORAGELLM_TVM_CPU_MOE_LIB", 1000, true, true, true));
     return v;

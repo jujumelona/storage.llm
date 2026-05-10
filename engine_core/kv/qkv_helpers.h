@@ -19,11 +19,23 @@ bool qkv_bits_raw(int bits);
 int qkv_outlier_bits_for_target(const qkv_config_t* cfg, int target);
 int qkv_normal_bits_for_target(const qkv_config_t* cfg, int target);
 
-// Get codebook for given bit-width
+// Get codebook for given bit-width using the state's primary head_dim.
 const float* qkv_codebook_for_bits(const qkv_state_t* state, int bits);
 
-// Get thresholds for given bit-width
+// Get thresholds for given bit-width using the state's primary head_dim.
 const float* qkv_thresholds_for_bits(const qkv_state_t* state, int bits);
+
+// Get paper Lloyd-Max codebook/thresholds for an explicit TurboQuant
+// instance dimension. Split outlier/non-outlier instances must use their own
+// dimensions, not the parent head_dim codebook.
+const float* qkv_codebook_for_bits_dim(int bits, int dim, unsigned distribution);
+const float* qkv_thresholds_for_bits_dim(int bits, int dim, unsigned distribution);
+
+// Per-token QJL stride. In split mode this is byte-aligned outlier signs plus
+// byte-aligned normal signs; in unsplit mode it is ceil(head_dim/8).
+size_t qkv_qjl_token_bytes(const qkv_state_t* state);
+size_t qkv_split_qjl_outlier_bytes(const qkv_config_t* cfg);
+size_t qkv_split_qjl_normal_bytes(const qkv_config_t* cfg);
 
 // Determine target (KEY/VALUE) from buffer pointers
 int qkv_target_from_buffers(const qkv_state_t* state, const uint8_t* idx, const float* norms);

@@ -1,6 +1,16 @@
+static void moe_infinigen_speculative_prefetch(
+    moe_pc_engine* engine,
+    int32_t target_layer,
+    uint32_t experts,
+    std::vector<int>& predicted_experts,
+    float* out_confidence,
+    moe_decode_scratch* session = nullptr
+) {
 // Adaptive router strategies
     // This blocks moe_save_gate_input_snapshot writes and causes 200μs+ latency spikes.
     // Solution: Only copy the truncated portion we actually need (hidden_size/5).
+
+    const int32_t source_layer = target_layer - 1;
     // This reduces copy size by 80% and lock hold time from ~50μs to ~10μs.
     // Trade-off: Need to know full_hidden before lock, so check size first.
     // Fix 19: Double buffering lock-free read

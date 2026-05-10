@@ -14,6 +14,7 @@
 #include "qkv_packing.h"
 #include "qkv_matrix.h"
 #include <atomic>
+#include <cmath>
 #include <math.h>
 #include <string.h>
 #include <algorithm>
@@ -64,6 +65,110 @@ static void fwht_inplace(float* data, int dim) {
             }
         }
     }
+}
+
+
+static const float* qkv_split_rotation_matrix_for_group(const qkv_state_t* s, bool outlier) {
+    if (!s) return nullptr;
+    return outlier ? s->rotation_matrix_outlier : s->rotation_matrix_normal;
+}
+
+static const float* qkv_split_rotation_signs_for_group(const qkv_state_t* s, bool outlier) {
+    if (!s) return nullptr;
+    return outlier ? s->rotation_signs_outlier : s->rotation_signs_normal;
+}
+
+static const float* qkv_split_qjl_matrix_for_group(const qkv_state_t* s, bool outlier) {
+    if (!s) return nullptr;
+    return outlier ? s->qjl_matrix_outlier : s->qjl_matrix_normal;
+}
+
+static float* qkv_split_norms_for_target(qkv_state_t* s, int target, bool outlier) {
+    if (!s) return nullptr;
+    if (target == QKV_TARGET_KEY) return outlier ? s->k_norms_outlier : s->k_norms_normal;
+    if (target == QKV_TARGET_VALUE) return outlier ? s->v_norms_outlier : s->v_norms_normal;
+    return nullptr;
+}
+
+static const float* qkv_split_norms_for_target_const(const qkv_state_t* s, int target, bool outlier) {
+    if (!s) return nullptr;
+    if (target == QKV_TARGET_KEY) return outlier ? s->k_norms_outlier : s->k_norms_normal;
+    if (target == QKV_TARGET_VALUE) return outlier ? s->v_norms_outlier : s->v_norms_normal;
+    return nullptr;
+}
+
+static float* qkv_split_residual_norms_for_target(qkv_state_t* s, int target, bool outlier) {
+    if (!s) return nullptr;
+    if (target == QKV_TARGET_KEY) return outlier ? s->k_residual_norms_outlier : s->k_residual_norms_normal;
+    if (target == QKV_TARGET_VALUE) return outlier ? s->v_residual_norms_outlier : s->v_residual_norms_normal;
+    return nullptr;
+}
+
+static const float* qkv_split_residual_norms_for_target_const(const qkv_state_t* s, int target, bool outlier) {
+    if (!s) return nullptr;
+    if (target == QKV_TARGET_KEY) return outlier ? s->k_residual_norms_outlier : s->k_residual_norms_normal;
+    if (target == QKV_TARGET_VALUE) return outlier ? s->v_residual_norms_outlier : s->v_residual_norms_normal;
+    return nullptr;
+}
+
+static int qkv_apply_split_rotation_forward(
+    const qkv_config_t* cfg,
+    const float* matrix,
+    const float* signs,
+    const float* input,
+    float* output,
+    int dim
+) {
+    if (!input || !output || dim <= 0 || dim > 16384) return 0;
+    if (cfg && cfg->enable_rotation && matrix) {
+        if (signs && qkv_apply_hadamard_rotation_forward(input, signs, output, dim)) return 1;
+        for (int i = 0; i < dim; ++i) {
+            float sum = 0.0f;
+            const float* row = matrix + (size_t)i * (size_t)dim;
+            for (int j = 0; j < dim; ++j) sum += row[j] * input[j];
+            if (!std::isfinite(sum)) return 0;
+            output[i] = sum;
+        }
+        return 1;
+    }
+    memcpy(output, input, (size_t)dim * sizeof(float));
+    return 1;
+}
+
+static int qkv_apply_split_rotation_inverse(
+    const qkv_config_t* cfg,
+    const float* matrix,
+    const float* signs,
+    const float* input,
+    float* output,
+    int dim
+) {
+    if (!input || !output || dim <= 0 || dim > 16384) return 0;
+    if (cfg && cfg->enable_rotation && matrix) {
+        if (signs && qkv_apply_hadamard_rotation_inverse(input, signs, output, dim)) return 1;
+        for (int i = 0; i < dim; ++i) output[i] = 0.0f;
+        for (int j = 0; j < dim; ++j) {
+            const float y = input[j];
+            const float* row = matrix + (size_t)j * (size_t)dim;
+            for (int i = 0; i < dim; ++i) output[i] += row[i] * y;
+        }
+        for (int i = 0; i < dim; ++i) if (!std::isfinite(output[i])) return 0;
+        return 1;
+    }
+    memcpy(output, input, (size_t)dim * sizeof(float));
+    return 1;
+}
+
+static int qkv_project_qjl(const float* matrix, const float* vec, float* out, int dim) {
+    if (!matrix || !vec || !out || dim <= 0 || dim > 16384) return 0;
+    for (int i = 0; i < dim; ++i) {
+        float sum = 0.0f;
+        const float* row = matrix + (size_t)i * (size_t)dim;
+        for (int j = 0; j < dim; ++j) sum += row[j] * vec[j];
+        if (!std::isfinite(sum)) return 0;
+        out[i] = sum;
+    }
+    return 1;
 }
 
 static void qkv_store_raw_scalar(uint8_t* dst, int index, float value, int bits) {
@@ -120,17 +225,10 @@ static int qkv_quantize_split_vector_with_state(
     const int dim = config->head_dim;
     const int n_out = config->outlier_channels;
     const int n_norm = dim - n_out;
-    const int outlier_bits = qkv_outlier_bits_for_target(config, target);
-    const int normal_bits = qkv_normal_bits_for_target(config, target);
-    const bool use_qjl = config->enable_qjl && qjl_base && residual_norms && state->qjl_matrix &&
-        qkv_bits_codebook(outlier_bits) && qkv_bits_codebook(normal_bits) &&
-        outlier_bits > 1 && normal_bits > 1;
-    const int out_mse_bits = qkv_mse_bits_for_total_bits(outlier_bits, use_qjl);
-    const int norm_mse_bits = qkv_mse_bits_for_total_bits(normal_bits, use_qjl);
-    if (dim <= 0 || dim > 16384 || n_out <= 0 || n_out >= dim || n_norm <= 0 ||
-        !out_mse_bits || !norm_mse_bits) {
+    if (dim <= 0 || dim > 16384 || n_out <= 0 || n_out >= dim || n_norm <= 0) {
         return 0;
     }
+
     uint8_t* split_outlier = qkv_idx_outlier_for_target(state, target);
     uint8_t* split_normal = qkv_idx_normal_for_target(state, target);
     const int* outlier_channels = qkv_outlier_indices_for_target_const(state, target);
@@ -140,264 +238,135 @@ static int qkv_quantize_split_vector_with_state(
         !state->scratch_indices || !state->scratch_y_tilde || !state->scratch_x_tilde) {
         return 0;
     }
-    if (n_out > INT_MAX / out_mse_bits || n_norm > INT_MAX / norm_mse_bits) {
+
+    const int outlier_bits = qkv_outlier_bits_for_target(config, target);
+    const int normal_bits = qkv_normal_bits_for_target(config, target);
+    const bool use_qjl = config->enable_qjl && qjl_base && residual_norms &&
+        state->qjl_matrix_outlier && state->qjl_matrix_normal &&
+        qkv_bits_codebook(outlier_bits) && qkv_bits_codebook(normal_bits) &&
+        outlier_bits > 1 && normal_bits > 1;
+    const int out_mse_bits = qkv_mse_bits_for_total_bits(outlier_bits, use_qjl);
+    const int norm_mse_bits = qkv_mse_bits_for_total_bits(normal_bits, use_qjl);
+    if (!qkv_bits_valid(out_mse_bits) || !qkv_bits_valid(norm_mse_bits) ||
+        n_out > INT_MAX / out_mse_bits || n_norm > INT_MAX / norm_mse_bits) {
         return 0;
     }
+
     const int out_stride = (n_out * out_mse_bits + 7) / 8;
     const int norm_stride = (n_norm * norm_mse_bits + 7) / 8;
-    const int qjl_stride = (dim + 7) / 8;
-    if (out_stride <= 0 || norm_stride <= 0 || token_idx > INT_MAX / std::max(out_stride, norm_stride)) {
+    const size_t qjl_out_stride = qkv_split_qjl_outlier_bytes(config);
+    const size_t qjl_norm_stride = qkv_split_qjl_normal_bytes(config);
+    const size_t qjl_stride = qkv_qjl_token_bytes(state);
+    if (out_stride <= 0 || norm_stride <= 0 ||
+        (use_qjl && (qjl_out_stride == 0 || qjl_norm_stride == 0 ||
+                     qjl_stride < qjl_out_stride + qjl_norm_stride))) {
         return 0;
     }
+
     uint8_t* out_dst = split_outlier + (size_t)token_idx * (size_t)out_stride;
     uint8_t* norm_dst = split_normal + (size_t)token_idx * (size_t)norm_stride;
+    uint8_t* qjl_token = use_qjl ? (qjl_base + (size_t)token_idx * qjl_stride) : nullptr;
+    float* out_norms = qkv_split_norms_for_target(state, target, true);
+    float* norm_norms = qkv_split_norms_for_target(state, target, false);
+    float* out_rnorms = qkv_split_residual_norms_for_target(state, target, true);
+    float* norm_rnorms = qkv_split_residual_norms_for_target(state, target, false);
+    if (!out_norms || !norm_norms || (use_qjl && (!out_rnorms || !norm_rnorms))) return 0;
 
-    float l2_norm = 0.0f;
+    float global_norm_sq = 0.0f;
     for (int i = 0; i < dim; ++i) {
-        l2_norm += input[i] * input[i];
+        if (!std::isfinite(input[i])) return 0;
+        global_norm_sq += input[i] * input[i];
     }
-    l2_norm = sqrtf(l2_norm);
-    *norm_out = l2_norm;
-    if (residual_norms) {
-        residual_norms[token_idx] = 0.0f;
-    }
-    if (l2_norm < 1e-12f) {
-        memset(out_dst, 0, (size_t)out_stride);
-        memset(norm_dst, 0, (size_t)norm_stride);
+    *norm_out = sqrtf(std::max(0.0f, global_norm_sq));
+    if (residual_norms) residual_norms[token_idx] = 0.0f;
+
+    auto quant_group = [&](bool outlier_group) -> int {
+        const int gd = outlier_group ? n_out : n_norm;
+        const int bits_total = outlier_group ? outlier_bits : normal_bits;
+        const int mse_bits = outlier_group ? out_mse_bits : norm_mse_bits;
+        uint8_t* dst = outlier_group ? out_dst : norm_dst;
+        float* group_norms = outlier_group ? out_norms : norm_norms;
+        float* group_rnorms = outlier_group ? out_rnorms : norm_rnorms;
+        const float* rot = qkv_split_rotation_matrix_for_group(state, outlier_group);
+        const float* signs = qkv_split_rotation_signs_for_group(state, outlier_group);
+        const float* qjl_mat = qkv_split_qjl_matrix_for_group(state, outlier_group);
+        uint8_t* qjl_dst = nullptr;
         if (use_qjl) {
-            memset(qjl_base + (size_t)token_idx * (size_t)qjl_stride, 0, (size_t)qjl_stride);
+            qjl_dst = outlier_group ? qjl_token : (qjl_token + qjl_out_stride);
+        }
+        float* unit = state->scratch_residual;
+        float* rotated = state->scratch_s_times_r;
+        float* y_tilde = state->scratch_y_tilde;
+        float* x_mse = state->scratch_x_tilde;
+        int* codes = state->scratch_indices;
+        float norm_sq = 0.0f;
+        if (outlier_group) {
+            for (int i = 0; i < gd; ++i) {
+                const int ch = outlier_channels[i];
+                if (ch < 0 || ch >= dim) return 0;
+                unit[i] = input[ch];
+                norm_sq += unit[i] * unit[i];
+            }
+        } else {
+            int pos = 0;
+            for (int ch = 0; ch < dim; ++ch) {
+                if (is_outlier[ch]) continue;
+                if (pos >= gd) return 0;
+                unit[pos] = input[ch];
+                norm_sq += unit[pos] * unit[pos];
+                ++pos;
+            }
+            if (pos != gd) return 0;
+        }
+        const float group_norm = sqrtf(std::max(0.0f, norm_sq));
+        group_norms[token_idx] = group_norm;
+        if (group_rnorms) group_rnorms[token_idx] = 0.0f;
+        if (group_norm < 1e-12f) {
+            memset(dst, 0, (size_t)((gd * mse_bits + 7) / 8));
+            if (qjl_dst) memset(qjl_dst, 0, outlier_group ? qjl_out_stride : qjl_norm_stride);
+            return 1;
+        }
+        const float inv = 1.0f / group_norm;
+        for (int i = 0; i < gd; ++i) unit[i] *= inv;
+
+        if (!qkv_apply_split_rotation_forward(config, rot, signs, unit, rotated, gd)) return 0;
+        const bool raw = qkv_bits_raw(mse_bits);
+        const float* centroids = raw ? nullptr : qkv_codebook_for_bits_dim(mse_bits, gd, config->codebook_distribution);
+        const float* thresholds = raw ? nullptr : qkv_thresholds_for_bits_dim(mse_bits, gd, config->codebook_distribution);
+        if (!raw && (!centroids || !thresholds)) return 0;
+        const int levels = raw ? 0 : (1 << mse_bits);
+        for (int i = 0; i < gd; ++i) {
+            if (raw) {
+                qkv_store_raw_scalar(dst, i, rotated[i], mse_bits);
+                y_tilde[i] = rotated[i];
+            } else {
+                const int code = qkv_find_nearest_centroid(rotated[i], centroids, thresholds, levels);
+                if (code < 0 || code >= levels) return 0;
+                codes[i] = code;
+                y_tilde[i] = centroids[code];
+            }
+        }
+        if (!raw) qkv_pack_indices(codes, dst, gd, mse_bits);
+
+        if (use_qjl) {
+            if (!qkv_apply_split_rotation_inverse(config, rot, signs, y_tilde, x_mse, gd)) return 0;
+            float r_norm_sq = 0.0f;
+            for (int i = 0; i < gd; ++i) {
+                unit[i] = unit[i] - x_mse[i];
+                r_norm_sq += unit[i] * unit[i];
+            }
+            group_rnorms[token_idx] = sqrtf(std::max(0.0f, r_norm_sq));
+            if (!qkv_project_qjl(qjl_mat, unit, rotated, gd)) return 0;
+            qkv_pack_signs(rotated, qjl_dst, gd);
         }
         return 1;
-    }
+    };
 
-    float* normalized = state->scratch_residual;
-    float* rotated = state->scratch_s_times_r;
-    float* y_tilde = state->scratch_y_tilde;
-    float* x_mse = state->scratch_x_tilde;
-    int* indices = state->scratch_indices;
-    const float inv_norm = 1.0f / l2_norm;
-    for (int i = 0; i < dim; ++i) {
-        normalized[i] = input[i] * inv_norm;
-    }
-
-    const float* src = normalized;
-    if (config->enable_rotation && state->rotation_matrix) {
-        // BUGFIX Issue 9: Use Fast Hadamard Transform for power-of-2 dimensions
-        // O(dim²) → O(dim·log₂dim) speedup (18x for dim=128)
-        // CRITICAL: The original code order was CORRECT
-        // Hadamard H = (1/sqrt(d)) * D * W where D is diagonal, W is Walsh
-        // Forward: y = H*x = (1/sqrt(d)) * D * W * x
-        // The sign vector extraction in qkv_state.cpp extracts D from first row
-        // So the correct order is: copy → apply signs → FWHT → scale
-
-        const bool is_power_of_2 = (dim & (dim - 1)) == 0;
-        if (is_power_of_2 && state->rotation_signs) {
-            // Fast path: Hadamard structure with sign vector
-            memcpy(rotated, normalized, (size_t)dim * sizeof(float));
-            // Apply sign vector (precomputed from rotation matrix)
-            for (int j = 0; j < dim; ++j) {
-                rotated[j] *= state->rotation_signs[j];
-            }
-            // Fast Walsh-Hadamard Transform
-            fwht_inplace(rotated, dim);
-            // Apply scale factor
-            const float scale = 1.0f / sqrtf((float)dim);
-            for (int i = 0; i < dim; ++i) {
-                rotated[i] *= scale;
-            }
-            src = rotated;
-        } else {
-            // Slow path: Full matrix multiplication for non-power-of-2
-            // BUGFIX 942: Add SIMD for non-power-of-2 forward rotation ★★ PERFORMANCE
-#if defined(__AVX2__)
-            for (int i = 0; i < dim; ++i) {
-                __m256 sum_vec = _mm256_setzero_ps();
-                const float* row = &state->rotation_matrix[(size_t)i * (size_t)dim];
-                int j = 0;
-                for (; j + 7 < dim; j += 8) {
-                    __m256 r_vec = _mm256_loadu_ps(&row[j]);
-                    __m256 n_vec = _mm256_loadu_ps(&normalized[j]);
-                    sum_vec = _mm256_add_ps(sum_vec, _mm256_mul_ps(r_vec, n_vec));
-                }
-                __m128 hi = _mm256_extractf128_ps(sum_vec, 1);
-                __m128 lo = _mm256_castps256_ps128(sum_vec);
-                __m128 sum4 = _mm_add_ps(lo, hi);
-                sum4 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
-                sum4 = _mm_add_ss(sum4, _mm_shuffle_ps(sum4, sum4, 1));
-                float sum = _mm_cvtss_f32(sum4);
-                for (; j < dim; ++j) {
-                    sum += row[j] * normalized[j];
-                }
-                rotated[i] = sum;
-            }
-#elif defined(__ARM_NEON)
-            for (int i = 0; i < dim; ++i) {
-                float32x4_t sum_vec = vdupq_n_f32(0.0f);
-                const float* row = &state->rotation_matrix[(size_t)i * (size_t)dim];
-                int j = 0;
-                for (; j + 3 < dim; j += 4) {
-                    float32x4_t r_vec = vld1q_f32(&row[j]);
-                    float32x4_t n_vec = vld1q_f32(&normalized[j]);
-                    sum_vec = vmlaq_f32(sum_vec, r_vec, n_vec);
-                }
-                float sum = vaddvq_f32(sum_vec);
-                for (; j < dim; ++j) {
-                    sum += row[j] * normalized[j];
-                }
-                rotated[i] = sum;
-            }
-#else
-            for (int i = 0; i < dim; ++i) {
-                float sum = 0.0f;
-                for (int j = 0; j < dim; ++j) {
-                    sum += state->rotation_matrix[(size_t)i * (size_t)dim + (size_t)j] * normalized[j];
-                }
-                rotated[i] = sum;
-            }
-#endif
-            src = rotated;
-        }
-    }
-
-    const bool out_raw = qkv_bits_raw(out_mse_bits);
-    const bool norm_raw = qkv_bits_raw(norm_mse_bits);
-    const float* out_centroids = out_raw ? nullptr : qkv_codebook_for_bits(state, out_mse_bits);
-    const float* out_thresholds = out_raw ? nullptr : qkv_thresholds_for_bits(state, out_mse_bits);
-    const float* norm_centroids = norm_raw ? nullptr : qkv_codebook_for_bits(state, norm_mse_bits);
-    const float* norm_thresholds = norm_raw ? nullptr : qkv_thresholds_for_bits(state, norm_mse_bits);
-    if ((!out_raw && (!out_centroids || !out_thresholds)) ||
-        (!norm_raw && (!norm_centroids || !norm_thresholds))) {
-        return 0;
-    }
-    const int out_levels = out_raw ? 0 : (1 << out_mse_bits);
-    const int norm_levels = norm_raw ? 0 : (1 << norm_mse_bits);
-    for (int i = 0; i < n_out; ++i) {
-        const int ch = outlier_channels[i];
-        if (ch < 0 || ch >= dim) return 0;
-        if (out_raw) {
-            qkv_store_raw_scalar(out_dst, i, src[ch], out_mse_bits);
-            y_tilde[ch] = src[ch];
-            continue;
-        }
-        const int code = qkv_find_nearest_centroid(src[ch], out_centroids, out_thresholds, out_levels);
-        // BUGFIX 655: Validate centroid index before array access ★★★
-        // Problem: qkv_find_nearest_centroid may return invalid index due to numerical issues
-        // Solution: Explicit range check before accessing out_centroids array
-        // Impact: Prevents out-of-bounds access → memory corruption → PPL errors
-        if (code < 0 || code >= out_levels) return 0;
-        indices[i] = code;
-        y_tilde[ch] = out_centroids[code];
-    }
-    if (!out_raw) {
-        qkv_pack_indices(indices, out_dst, n_out, out_mse_bits);
-    }
-
-    int normal_pos = 0;
-    for (int ch = 0; ch < dim; ++ch) {
-        if (is_outlier[ch]) continue;
-        if (normal_pos >= n_norm) {
-            return 0;
-        }
-        if (norm_raw) {
-            qkv_store_raw_scalar(norm_dst, normal_pos, src[ch], norm_mse_bits);
-            y_tilde[ch] = src[ch];
-            ++normal_pos;
-            continue;
-        }
-        const int code = qkv_find_nearest_centroid(src[ch], norm_centroids, norm_thresholds, norm_levels);
-        // BUGFIX 655: Validate centroid index before array access ★★★
-        if (code < 0 || code >= norm_levels) return 0;
-        indices[normal_pos++] = code;
-        y_tilde[ch] = norm_centroids[code];
-    }
-    if (normal_pos != n_norm) {
-        return 0;
-    }
-    if (!norm_raw) {
-        qkv_pack_indices(indices, norm_dst, n_norm, norm_mse_bits);
-    }
-
-    if (config->enable_rotation && state->rotation_matrix) {
-        if (state->rotation_signs &&
-            qkv_apply_hadamard_rotation_inverse(y_tilde, state->rotation_signs, x_mse, dim)) {
-            // Fast inverse rotation path for Hadamard-backed QKV states.
-        } else {
-        // BUGFIX 911: Optimize rotation matrix access pattern (location 1/3) ★★ PERFORMANCE
-        // Problem: rotation_matrix[j * dim + i] with i outer, j inner → cache miss
-        // Solution: Loop interchange for better spatial locality
-        for (int i = 0; i < dim; ++i) {
-            x_mse[i] = 0.0f;
-        }
-        for (int j = 0; j < dim; ++j) {
-            const float y_val = y_tilde[j];
-            const float* row = &state->rotation_matrix[(size_t)j * (size_t)dim];
-            for (int i = 0; i < dim; ++i) {
-                x_mse[i] += row[i] * y_val;
-            }
-        }
-        }
-    } else {
-        memcpy(x_mse, y_tilde, (size_t)dim * sizeof(float));
-    }
-
-    if (use_qjl) {
-        float r_norm_sq = 0.0f;
-        for (int i = 0; i < dim; ++i) {
-            normalized[i] = normalized[i] - x_mse[i];
-            r_norm_sq += normalized[i] * normalized[i];
-        }
-        residual_norms[token_idx] = sqrtf(r_norm_sq);
-        // BUGFIX 942: SIMD for QJL projection in split vector path ★★ PERFORMANCE
-#if defined(__AVX2__)
-        for (int i = 0; i < dim; ++i) {
-            __m256 sum_vec = _mm256_setzero_ps();
-            const float* qjl_row = &state->qjl_matrix[(size_t)i * (size_t)dim];
-            int j = 0;
-            for (; j + 7 < dim; j += 8) {
-                __m256 q_vec = _mm256_loadu_ps(&qjl_row[j]);
-                __m256 n_vec = _mm256_loadu_ps(&normalized[j]);
-                sum_vec = _mm256_add_ps(sum_vec, _mm256_mul_ps(q_vec, n_vec));
-            }
-            __m128 hi = _mm256_extractf128_ps(sum_vec, 1);
-            __m128 lo = _mm256_castps256_ps128(sum_vec);
-            __m128 sum4 = _mm_add_ps(lo, hi);
-            sum4 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
-            sum4 = _mm_add_ss(sum4, _mm_shuffle_ps(sum4, sum4, 1));
-            float sum = _mm_cvtss_f32(sum4);
-            for (; j < dim; ++j) {
-                sum += qjl_row[j] * normalized[j];
-            }
-            rotated[i] = sum;
-        }
-#elif defined(__ARM_NEON)
-        for (int i = 0; i < dim; ++i) {
-            float32x4_t sum_vec = vdupq_n_f32(0.0f);
-            const float* qjl_row = &state->qjl_matrix[(size_t)i * (size_t)dim];
-            int j = 0;
-            for (; j + 3 < dim; j += 4) {
-                float32x4_t q_vec = vld1q_f32(&qjl_row[j]);
-                float32x4_t n_vec = vld1q_f32(&normalized[j]);
-                sum_vec = vmlaq_f32(sum_vec, q_vec, n_vec);
-            }
-            float sum = vaddvq_f32(sum_vec);
-            for (; j < dim; ++j) {
-                sum += qjl_row[j] * normalized[j];
-            }
-            rotated[i] = sum;
-        }
-#else
-        for (int i = 0; i < dim; ++i) {
-            float sum = 0.0f;
-            for (int j = 0; j < dim; ++j) {
-                sum += state->qjl_matrix[(size_t)i * (size_t)dim + (size_t)j] * normalized[j];
-            }
-            rotated[i] = sum;
-        }
-#endif
-        qkv_pack_signs(rotated, qjl_base + (size_t)token_idx * (size_t)qjl_stride, dim);
-    }
+    if (!quant_group(true)) return 0;
+    if (!quant_group(false)) return 0;
     return 1;
 }
+
 
 static int qkv_store_qjl_residual_for_token(
     qkv_state_t* state,

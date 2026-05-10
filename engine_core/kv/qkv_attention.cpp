@@ -132,7 +132,10 @@ int qkv_attention_decode_impl(
         qkv_bits_codebook(key_normal_total_bits) &&
         key_outlier_total_bits > 1 &&
         key_normal_total_bits > 1;
-    const bool use_qjl_key_residual = qjl && (!k_split || key_split_qjl) && s->k_qjl && s->qjl_matrix;
+    // Split mode has two independent TurboQuant instances, so its QJL
+    // residuals are applied inside qkv_dot_mse_split_rotated_token() with
+    // group-local S matrices and group-local residual norms.
+    const bool use_qjl_key_residual = qjl && !k_split && s->k_qjl && s->qjl_matrix;
 
     float* s_q_precomputed = s->scratch_s_times_r;
     float* qjl_z = s->scratch_qjl_signs;
@@ -153,7 +156,7 @@ int qkv_attention_decode_impl(
     }
 
     // Parallel K scoring for large context (n >= 1024)
-    if (n >= 1024) {
+    if (n >= 1024 && !k_split) {
         const int out_bits = key_split_qjl ? key_outlier_total_bits - 1 : key_outlier_total_bits;
         const int norm_bits = key_split_qjl ? key_normal_total_bits - 1 : key_normal_total_bits;
         const int n_outliers = cfg->outlier_channels;
@@ -282,7 +285,8 @@ int qkv_attention_decode_impl(
                         }
                     }
                 }
-                att[t] = qkv_attention_apply_logit_softcap(attn_logit_softcap, dot * norm_k * sc);
+                att[t] = qkv_attention_apply_logit_softcap(
+                attn_logit_softcap, (k_split ? dot : dot * norm_k) * sc);
             }
         };
 
@@ -318,7 +322,7 @@ int qkv_attention_decode_impl(
             }
 
             if (k_split) {
-                if (!qkv_dot_mse_split_rotated_token(s, cfg, QKV_TARGET_KEY, t, q_eff, &dot)) return 0;
+                if (!qkv_dot_mse_split_rotated_token(s, cfg, QKV_TARGET_KEY, t, query, &dot)) return 0;
             } else if (k_raw) {
                 const uint8_t* tidx = s->k_idx + t * k_stride;
                 for (int i = 0; i < d; i++) {
@@ -353,7 +357,8 @@ int qkv_attention_decode_impl(
                     }
                 }
             }
-            att[t] = qkv_attention_apply_logit_softcap(attn_logit_softcap, dot * norm_k * sc);
+            att[t] = qkv_attention_apply_logit_softcap(
+                attn_logit_softcap, (k_split ? dot : dot * norm_k) * sc);
         }
     }
 

@@ -1,5 +1,73 @@
 #include "qkv_helpers.h"
+#include "qkv_codebook.h"
 #include <stddef.h>
+#include <stdint.h>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+
+static uint64_t qkv_codebook_cache_key_local(int dim, int bits, bool thresholds, unsigned distribution) {
+    uint64_t x = (uint64_t)(uint32_t)dim * 0x9e3779b97f4a7c15ull;
+    x ^= (uint64_t)(uint32_t)bits * 0xbf58476d1ce4e5b9ull;
+    x ^= ((uint64_t)distribution << 48);
+    if (thresholds) x ^= 0x8000000000000000ull;
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebull;
+    x ^= x >> 31;
+    return x;
+}
+
+static const float* qkv_codebook_or_thresholds_for_dim_local(
+    int bits, int dim, unsigned distribution, bool thresholds) {
+    if (!qkv_bits_codebook(bits) || dim <= 0 || dim > 16384) return NULL;
+    static std::mutex mutex;
+    static std::unordered_map<uint64_t, std::shared_ptr<std::vector<float>>> cache;
+    const uint64_t key = qkv_codebook_cache_key_local(dim, bits, thresholds, distribution);
+    std::lock_guard<std::mutex> lock(mutex);
+    auto found = cache.find(key);
+    if (found != cache.end()) return found->second->data();
+
+    const int levels = 1 << bits;
+    auto cb = std::make_shared<std::vector<float>>((size_t)levels);
+    auto th = std::make_shared<std::vector<float>>((size_t)levels + 1u);
+    qkv_compute_lloyd_max_codebook_ex(cb->data(), th->data(), bits, dim, distribution);
+    const uint64_t cb_key = qkv_codebook_cache_key_local(dim, bits, false, distribution);
+    const uint64_t th_key = qkv_codebook_cache_key_local(dim, bits, true, distribution);
+    cache[cb_key] = cb;
+    cache[th_key] = th;
+    return thresholds ? th->data() : cb->data();
+}
+
+const float* qkv_codebook_for_bits_dim(int bits, int dim, unsigned distribution) {
+    return qkv_codebook_or_thresholds_for_dim_local(bits, dim, distribution, false);
+}
+
+const float* qkv_thresholds_for_bits_dim(int bits, int dim, unsigned distribution) {
+    return qkv_codebook_or_thresholds_for_dim_local(bits, dim, distribution, true);
+}
+
+size_t qkv_split_qjl_outlier_bytes(const qkv_config_t* cfg) {
+    if (!cfg || cfg->outlier_channels <= 0) return 0;
+    return ((size_t)cfg->outlier_channels + 7u) / 8u;
+}
+
+size_t qkv_split_qjl_normal_bytes(const qkv_config_t* cfg) {
+    if (!cfg || cfg->head_dim <= 0 || cfg->outlier_channels <= 0 ||
+        cfg->outlier_channels >= cfg->head_dim) {
+        return 0;
+    }
+    return ((size_t)(cfg->head_dim - cfg->outlier_channels) + 7u) / 8u;
+}
+
+size_t qkv_qjl_token_bytes(const qkv_state_t* state) {
+    if (!state || state->head_dim <= 0) return 0;
+    if (state->qjl_token_bytes > 0) return (size_t)state->qjl_token_bytes;
+    return ((size_t)state->head_dim + 7u) / 8u;
+}
 
 bool qkv_bits_valid(int bits) {
     return (bits >= 1 && bits <= 8) || bits == 16 || bits == 32;

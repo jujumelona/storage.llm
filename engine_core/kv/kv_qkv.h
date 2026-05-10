@@ -169,9 +169,13 @@ typedef struct {
     float* v_sink;
     uint32_t sink_tokens;
 
-    // QJL residual streams.
+    // QJL residual streams. For split TurboQuant, k_qjl/v_qjl store
+    // two independent sign streams per token: outlier signs followed by
+    // normal signs, each byte-aligned. qjl_token_bytes is the per-token
+    // stride for either layout.
     uint8_t* k_qjl;
     uint8_t* v_qjl;
+    uint32_t qjl_token_bytes;
     float* k_residual_norms;
     float* v_residual_norms;
 
@@ -179,6 +183,16 @@ typedef struct {
     float* rotation_matrix;   // [head_dim, head_dim] random orthogonal
     float* rotation_signs;    // [head_dim] sign vector for Hadamard structure (Issue 9)
     float* qjl_matrix;        // [head_dim, head_dim] Gaussian S, S_ij ~ N(0,1) (paper Lemma 4)
+    // Paper Section 4.3: outlier and non-outlier channel groups are two
+    // independent TurboQuant instances, not slices through one head_dim
+    // transform. These matrices are generated with independent seeds and
+    // dimensions n_outlier and n_normal.
+    float* rotation_matrix_outlier;
+    float* rotation_matrix_normal;
+    float* rotation_signs_outlier;
+    float* rotation_signs_normal;
+    float* qjl_matrix_outlier;
+    float* qjl_matrix_normal;
     int8_t* qjl_signs_matrix; // Reserved (NULL — Rademacher disabled per paper)
     float* codebook_1bit;     // Bug ②: 2 levels for prod-mode v_bits=2
     float* thresholds_1bit;
@@ -215,6 +229,10 @@ typedef struct {
     float* k_norms_normal;
     float* v_norms_outlier;
     float* v_norms_normal;
+    float* k_residual_norms_outlier;
+    float* k_residual_norms_normal;
+    float* v_residual_norms_outlier;
+    float* v_residual_norms_normal;
 
     // Fix 56: Pre-allocated scratch buffers (eliminate per-token malloc)
     float* scratch_qjl_signs;  // [head_dim]

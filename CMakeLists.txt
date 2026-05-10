@@ -245,11 +245,23 @@ if(TARGET storagellm_cuda_cublaslt OR TARGET storagellm_cuda_cutlass)
 endif()
 if(TARGET storagellm_rocm_hipblaslt)
     target_link_libraries(storagellm_host_autotune PRIVATE storagellm_rocm_hipblaslt)
-    target_compile_definitions(storagellm_host_autotune PRIVATE STORAGELLM_AUTOTUNE_HAS_HIPBLASLT_NATIVE=1)
+    target_compile_definitions(storagellm_host_autotune PRIVATE
+        STORAGELLM_AUTOTUNE_HAS_HIPBLASLT_NATIVE=1
+        STORAGELLM_AUTOTUNE_HAS_HIP_RUNTIME=1)
+    find_package(hip QUIET)
+    if(TARGET hip::host)
+        target_link_libraries(storagellm_host_autotune PRIVATE hip::host)
+    endif()
 endif()
 if(TARGET storagellm_rocm_ck)
     target_link_libraries(storagellm_host_autotune PRIVATE storagellm_rocm_ck)
-    target_compile_definitions(storagellm_host_autotune PRIVATE STORAGELLM_AUTOTUNE_HAS_CK_NATIVE=1)
+    target_compile_definitions(storagellm_host_autotune PRIVATE
+        STORAGELLM_AUTOTUNE_HAS_CK_NATIVE=1
+        STORAGELLM_AUTOTUNE_HAS_HIP_RUNTIME=1)
+    find_package(hip QUIET)
+    if(TARGET hip::host)
+        target_link_libraries(storagellm_host_autotune PRIVATE hip::host)
+    endif()
 endif()
 if(TARGET storagellm_metal_mps)
     target_link_libraries(storagellm_host_autotune PRIVATE storagellm_metal_mps)
@@ -265,7 +277,9 @@ if(TARGET storagellm_vulkan_coopmat)
 endif()
 if(TARGET storagellm_opencl_clblast)
     target_link_libraries(storagellm_host_autotune PRIVATE storagellm_opencl_clblast)
-    target_compile_definitions(storagellm_host_autotune PRIVATE STORAGELLM_AUTOTUNE_HAS_CLBLAST_NATIVE=1)
+    target_compile_definitions(storagellm_host_autotune PRIVATE
+        STORAGELLM_AUTOTUNE_HAS_CLBLAST_NATIVE=1
+        STORAGELLM_AUTOTUNE_HAS_OPENCL_RUNTIME=1)
 endif()
 
 # Example server executable

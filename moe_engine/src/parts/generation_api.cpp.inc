@@ -5,6 +5,20 @@ static uint64_t tier_budget(const moe_pc_engine* engine, moe_tier_t tier);
 static uint64_t expert_triplet_bytes(const moe_pc_engine* engine, int layer, int expert);
 static int tensor_weight_format(const moe_tensor_record& rec);
 static void touch_expert_heat(moe_pc_engine* engine, moe_block_state* state, double boost);
+static const moe_storage_raw_span_spec_t* find_raw_role_span_bytes(
+    int32_t layer,
+    uint32_t role,
+    uint64_t bytes,
+    uint32_t occurrence
+);
+static int moe_apply_rmsnorm_common_weight_f32(
+    const moe_pc_engine* engine,
+    const moe_raw_tensor_cache_entry& raw,
+    const float* input,
+    uint32_t hidden_size,
+    float* output,
+    float eps
+);
 
 // Error handling (no dependencies)
 #include "generation_error.cpp.inc"

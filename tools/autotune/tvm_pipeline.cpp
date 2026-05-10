@@ -35,6 +35,10 @@ void run_tvm_pipeline(const HostInfo& host, std::vector<Candidate>& candidates, 
 
     for (auto& c : candidates) {
         if (c.kind != "tvm") continue;
+        if (c.name != "tvm_cpu") {
+            c.reason = "device TVM candidate skipped: no in-process real device fixture is available for safe measurement";
+            continue;
+        }
         const std::string profile = "build/tvm_codegen/profile_" + c.name + ".json";
         write_profile_json(profile, c);
         const std::string workdir = "build/tvm_tuning/" + c.name;

@@ -423,3 +423,18 @@ def test_rmsnorm_metadata_false_is_not_cached_as_model_wide_authority():
     assert "metadata_false_stats_inconclusive" in raw_ops_text
     assert "mean_abs_raw < 0.75" in raw_ops_text
     assert "raw_rms < 0.75" in raw_ops_text
+
+
+def test_router_contract_reads_graph_ir_sigmoid_scale_and_norm_topk():
+    router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_topk.cpp.inc").read_text()
+    assert "&engine->offload_graph_ir_json" in router_text
+    assert "router_scoring_func" in router_text
+    assert "router_score_function" in router_text
+    assert "router_score_contract" in router_text
+    assert "moe_router_json_get_double_any" in router_text
+    assert "router_routed_scaling_factor" in router_text
+    assert "moe_router_json_get_bool_any(engine->offload_graph_ir_json" in router_text
+    uses_pos = router_text.index("static int moe_router_uses_sigmoid_scores")
+    scale_pos = router_text.index("static float moe_router_routed_scaling_factor")
+    norm_pos = router_text.index("static int moe_router_norm_topk_prob")
+    assert uses_pos < scale_pos < norm_pos

@@ -1,4 +1,193 @@
 // MLP forward pass operations
+// Keep moe_layer_moe_mlp_f32 in this file as one complete function.
+// Do not split this function across .inc boundaries: depth/s/c/hidden_size/num_selected
+// are intentionally shared through the full function scope.
+
+static int moe_layer_moe_mlp_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    moe_decode_scratch* s,
+    float* hidden,
+    const moe_storage_constants_t* c
+) {
+    const uint64_t total_start_us = moe_profile_now_us();
+    const uint32_t hidden_size = c->hidden_size;
+    const uint32_t configured_expert_intermediate = c->expert_intermediate_size;
+    const moe_attn_config_t attn_cfg = moe_generation_attn_config(engine);
+    moe_profile_log(
+        "mlp_moe_begin",
+        "layer=%d hidden=%u configured_intermediate=%u experts=%u first_moe=%u last_moe=%u",
+        layer, hidden_size, configured_expert_intermediate,
+        c->experts_per_moe_layer, c->first_moe_layer, c->last_moe_layer);
+    moe_profile_log(
+        "mlp_moe_scratch",
+        "layer=%d hidden=%u mlp=%zu shared=%zu expert=%zu norm=%zu residual=%zu",
+        layer,
+        hidden_size,
+        s ? s->mlp.size() : 0u,
+        s ? s->shared.size() : 0u,
+        s ? s->expert.size() : 0u,
+        s ? s->norm.size() : 0u,
+        s ? s->residual.size() : 0u);
+    if (!s || s->mlp.size() < hidden_size || s->shared.size() < hidden_size ||
+        s->expert.size() < hidden_size || s->norm.size() < hidden_size ||
+        s->residual.size() < hidden_size) {
+        std::fprintf(stderr,
+            "[storagellm mlp] scratch too small layer=%d hidden=%u mlp=%zu shared=%zu expert=%zu norm=%zu residual=%zu\n",
+            layer,
+            hidden_size,
+            s ? s->mlp.size() : 0u,
+            s ? s->shared.size() : 0u,
+            s ? s->expert.size() : 0u,
+            s ? s->norm.size() : 0u,
+            s ? s->residual.size() : 0u);
+        return 0;
+    }
+    std::fill(s->mlp.begin(), s->mlp.begin() + hidden_size, 0.0f);
+    moe_profile_log("mlp_moe_zero", "layer=%d hidden=%u", layer, hidden_size);
+
+    const uint64_t norm_start_us = moe_profile_now_us();
+    const float* shared_input = s->norm.data();
+    const float* expert_input = s->norm.data();
+    moe_profile_log(
+        "mlp_moe_norm_begin",
+        "layer=%d hidden=%u hidden_ptr=%p expert_ptr=%p",
+        layer, hidden_size, (void*)hidden, (void*)s->expert.data());
+    const int moe_norm_ok = moe_layer_moe_norm_f32(
+        engine, layer, hidden, hidden_size, s->expert.data(), attn_cfg.rms_norm_eps);
+    if (moe_norm_ok) {
+        expert_input = s->expert.data();
+    } else if (moe_layer_has_moe_norm_weight(engine, layer)) {
+        std::fprintf(stderr,
+            "[storagellm mlp] expert ffn norm tensor is required but could not be mapped layer=%d\n",
+            layer);
+        return 0;
+    }
+    moe_profile_log("mlp_moe_norm", "layer=%d ok=%d ms=%.3f", layer, moe_norm_ok, moe_profile_elapsed_ms(norm_start_us));
+
+    const uint64_t shared_bytes =
+        2ull * (uint64_t)configured_expert_intermediate * (uint64_t)hidden_size * 2ull +
+        (uint64_t)hidden_size * (uint64_t)configured_expert_intermediate * 2ull;
+    const moe_storage_raw_span_spec_t* shared = find_raw_role_span_bytes(layer, moe_RAW_ROLE_SHARED, shared_bytes, 0);
+    int shared_ok = 0;
+    const uint64_t shared_start_us = moe_profile_now_us();
+    if (moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
+        shared_ok = 1;
+    } else if (shared &&
+        moe_raw_mlp_span_f32(
+            engine, shared, shared_input, hidden_size, configured_expert_intermediate,
+            s->gate.data(), s->up.data(), s->shared.data())) {
+        shared_ok = 1;
+    }
+    if (shared_ok) {
+        float shared_gate = 1.0f;
+        if (!moe_layer_shared_expert_gate_f32(engine, layer, shared_input, hidden_size, &shared_gate)) {
+            return 0;
+        }
+        const float* shared_out = s->shared.data();
+        if (moe_layer_post_ffw_norm1_f32(
+                engine, layer, s->shared.data(), hidden_size, s->residual.data(), attn_cfg.rms_norm_eps)) {
+            shared_out = s->residual.data();
+        } else if (moe_layer_has_post_ffw_norm1_weight(engine, layer)) {
+            std::fprintf(stderr,
+                "[storagellm mlp] post-ffw norm1 tensor is required but could not be mapped layer=%d\n",
+                layer);
+            return 0;
+        }
+        for (uint32_t i = 0; i < hidden_size; ++i) {
+            s->mlp[i] += shared_out[i] * shared_gate;
+        }
+    }
+    moe_profile_log(
+        "mlp_moe_shared",
+        "layer=%d ok=%d has_raw_span=%d ms=%.3f",
+        layer, shared_ok, shared ? 1 : 0, moe_profile_elapsed_ms(shared_start_us));
+
+    const int router_has_internal_norm_scale =
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "router.scale") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale");
+    const float* router_input = router_has_internal_norm_scale ? hidden : expert_input;
+    moe_save_gate_input_snapshot(engine, layer, router_input, hidden_size);
+    const uint64_t router_start_us = moe_profile_now_us();
+    if (!moe_router_topk_f32(
+            engine,
+            layer,
+            router_input,
+            hidden_size,
+            c->experts_per_moe_layer,
+            moe_router_top_k_from_metadata(engine, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer),
+            &s->selected_experts,
+            &s->selected_weights,
+            &s->router_logits,
+            &s->router_order,
+            s)) {
+        std::fprintf(stderr,
+            "[storagellm mlp] router top-k failed layer=%d hidden=%u experts=%u topk=%u\n",
+            layer,
+            hidden_size,
+            c->experts_per_moe_layer,
+            moe_router_top_k_from_metadata(engine, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer));
+        return 0;
+    }
+    moe_juju_update_co_activation(engine, layer, s->selected_experts);
+
+    // BUGFIX 문제10: Update heat for actually used experts ?�★
+    // Problem: touch_expert_heat only called during tier transitions, not during actual use
+    // Solution: Touch heat for each selected expert after router selection
+    // This ensures frequently-used experts maintain high heat scores
+    // Fix 23: Removed map_mutex from hot path. expert_states vector is stable after init,
+    // so reading tier/active without lock is safe. touch_expert_heat only writes hot_score
+    // which is tolerant of stale reads (proactive eviction re-sorts every 25ms).
+    for (int expert_id : s->selected_experts) {
+        const size_t slot = expert_dense_slot(engine, layer, expert_id);
+        if (slot == tensor_slot_invalid() || slot >= engine->expert_states.size()) {
+            continue;
+        }
+        moe_block_state& state = engine->expert_states[slot];
+        if (!state.active) continue;
+        const moe_tier_t tier = state.tier;
+        const double boost = tier == moe_TIER_VRAM ? 4.0 :
+                            tier == moe_TIER_RAM ? 1.0 : 0.25;
+        touch_expert_heat(engine, &state, boost);
+    }
+
+    moe_profile_log(
+        "mlp_moe_router",
+        "layer=%d selected=%zu weights=%zu logits=%zu internal_norm_scale=%d ms=%.3f",
+        layer, s->selected_experts.size(), s->selected_weights.size(),
+        s->router_logits.size(), router_has_internal_norm_scale,
+        moe_profile_elapsed_ms(router_start_us));
+    const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
+    const uint64_t prefetch_start_us = moe_profile_now_us();
+    if (phase != moe_GEN_PHASE_PREFILL) {
+        // BUGFIX Problem F stage 2: Read depth from per-session state ★★★
+        const uint32_t depth = s->session_adaptive_prefetch_depth;
+
+        // InfiniGen speculative prefetch: use truncated hidden dot-product
+        // with next layer's gate weights for ~85% accurate expert prediction.
+        // This fires 200μs before the actual router runs, giving I/O a head start.
+        // Fix 24: Stack-allocated arrays instead of heap vectors
+        int infinigen_predicted_buf[256];
+        int infinigen_predicted_count = 0;
+        float spec_confidence = 0.0f;
+        if (depth > 0u && layer + 1 < (int32_t)c->num_hidden_layers) {
+            std::vector<int> infinigen_predicted_vec;
+            moe_infinigen_speculative_prefetch(
+                engine,
+                layer + 1,
+                c->experts_per_moe_layer,
+                infinigen_predicted_vec,
+                &spec_confidence,
+                s
+            );
+            infinigen_predicted_count = (int)std::min(infinigen_predicted_vec.size(), (size_t)256);
+            for (int ii = 0; ii < infinigen_predicted_count; ++ii)
+                infinigen_predicted_buf[ii] = infinigen_predicted_vec[ii];
+        }
+
+        // Fallback: co-activation statistics if InfiniGen yields nothing
         // Fix 24: Use stack buffer for predicted_experts (Increased to 2048 for universal MoE support)
         int predicted_experts_buf[2048];
         const int predicted_experts_cap =

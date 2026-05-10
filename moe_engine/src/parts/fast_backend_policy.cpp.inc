@@ -4,8 +4,9 @@ static int moe_fast_backend_selected_name_is(const char* expected) {
     if (!expected || !expected[0]) {
         return 0;
     }
-    const char* selected = std::getenv("STORAGELLM_SELECTED_FAST_BACKEND");
-    if (!selected || !selected[0] ||
+    const std::string selected_value = moe_autotune_value("STORAGELLM_SELECTED_FAST_BACKEND");
+    const char* selected = selected_value.c_str();
+    if (selected_value.empty() ||
         std::strcmp(selected, "auto") == 0 ||
         std::strcmp(selected, "AUTO") == 0 ||
         std::strcmp(selected, "max") == 0 ||
@@ -18,6 +19,9 @@ static int moe_fast_backend_selected_name_is(const char* expected) {
     // Short aliases for user/runtime autotune output.
     if ((std::strcmp(expected, "cuda_cublaslt") == 0 && std::strcmp(selected, "cublaslt") == 0) ||
         (std::strcmp(expected, "cuda_cutlass") == 0 && std::strcmp(selected, "cutlass") == 0) ||
+        (std::strcmp(expected, "rocm_hipblaslt") == 0 && std::strcmp(selected, "hipblaslt") == 0) ||
+        (std::strcmp(expected, "rocm_ck") == 0 && std::strcmp(selected, "ck") == 0) ||
+        (std::strcmp(expected, "opencl_clblast") == 0 && std::strcmp(selected, "clblast") == 0) ||
         (std::strcmp(expected, "cpu_native_f32") == 0 &&
             (std::strcmp(selected, "onednn") == 0 || std::strcmp(selected, "cpu_onednn") == 0 || std::strcmp(selected, "cpu") == 0)) ||
         (std::strncmp(expected, "tvm_", 4) == 0 && std::strcmp(selected, "tvm") == 0)) {
@@ -27,8 +31,8 @@ static int moe_fast_backend_selected_name_is(const char* expected) {
 }
 
 static int moe_fast_backend_policy_is(const char* expected) {
-    const char* policy = std::getenv("STORAGELLM_FAST_BACKEND_POLICY");
-    return policy && expected && std::strcmp(policy, expected) == 0;
+    const std::string policy = moe_autotune_value("STORAGELLM_FAST_BACKEND_POLICY");
+    return !policy.empty() && expected && std::strcmp(policy.c_str(), expected) == 0;
 }
 
 static moe_fast_backend_kind_t moe_fast_backend_kind_from_selected_env(
@@ -228,6 +232,15 @@ static moe_fast_backend_kind_t choose_fast_backend(const moe_pc_engine* e) {
         moe_fast_backend_kind_from_selected_env(e->backend_caps.backend, mask);
     if (selected != moe_FAST_BACKEND_NONE) {
         return moe_fast_backend_kind_allowed_runtime(selected) ? selected : moe_FAST_BACKEND_NONE;
+    }
+
+    // In verified-only mode, do not silently choose an unmeasured fast backend.
+    // storagellm_host_autotune writes STORAGELLM_SELECTED_FAST_BACKEND to
+    // selected_backend.env after a real warmup+measurement pass; without that
+    // artifact, falling back to a compiled adapter would be "looks fast" rather
+    // than verified-fast.
+    if (moe_verified_backend_required(e)) {
+        return moe_FAST_BACKEND_NONE;
     }
 
     // Hardware/backend-aware default order.  This is deliberately centralized:

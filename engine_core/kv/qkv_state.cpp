@@ -145,6 +145,14 @@ int qkv_state_init(
     const bool qjl_streams = config->enable_qjl &&
         qkv_bits_codebook(k_bits) && qkv_bits_codebook(v_bits) &&
         k_bits > 1 && v_bits > 1;
+    const bool split_requested = config->outlier_channels > 0 && config->outlier_channels < dim;
+    const size_t qjl_token_bytes = split_requested
+        ? (qkv_split_qjl_outlier_bytes(config) + qkv_split_qjl_normal_bytes(config))
+        : (((size_t)dim + 7u) / 8u);
+    if (qjl_streams && qjl_token_bytes == 0) {
+        return 0;
+    }
+    state->qjl_token_bytes = (uint32_t)qjl_token_bytes;
     const int k_storage_bits = qjl_streams ? k_bits - 1 : k_bits;
     const int v_storage_bits = qjl_streams ? v_bits - 1 : v_bits;
     if (!qkv_bits_valid(k_storage_bits) || !qkv_bits_valid(v_storage_bits)) {
@@ -175,14 +183,16 @@ int qkv_state_init(
 
     // Allocate QJL residual storage
     if (qjl_streams) {
-        // BUGFIX 408: QJL 할당 크기 overflow 방지
-        if ((size_t)n_tokens > SIZE_MAX / (size_t)dim) {
+        // Paper Algorithm 2 stores one sign per dimension. In split mode the
+        // outlier and non-outlier TurboQuant instances have separate sign
+        // streams, byte-aligned in the same per-token buffer.
+        if ((size_t)n_tokens > SIZE_MAX / qjl_token_bytes) {
             qkv_state_free(state);
             return 0;
         }
-        state->k_qjl = (uint8_t*)calloc(((size_t)n_tokens * (size_t)dim + 7) / 8, 1);
+        state->k_qjl = (uint8_t*)calloc((size_t)n_tokens * qjl_token_bytes, 1);
         state->k_residual_norms = (float*)calloc((size_t)n_tokens, sizeof(float));
-        state->v_qjl = (uint8_t*)calloc(((size_t)n_tokens * (size_t)dim + 7) / 8, 1);
+        state->v_qjl = (uint8_t*)calloc((size_t)n_tokens * qjl_token_bytes, 1);
         state->v_residual_norms = (float*)calloc((size_t)n_tokens, sizeof(float));
 
         if (!state->k_qjl || !state->k_residual_norms ||
@@ -322,6 +332,46 @@ int qkv_state_init(
             return 0;
         }
 
+        if (config->enable_rotation) {
+            auto r_out = qkv_cached_rotation(n_out, config->rotation_seed ^ 0x6f75746c69657231ull, config->rotation_backend);
+            auto r_norm = qkv_cached_rotation(n_norm, config->rotation_seed ^ 0x6e6f726d616c3031ull, config->rotation_backend);
+            if (!r_out || !r_norm || r_out->size() != (size_t)n_out * (size_t)n_out ||
+                r_norm->size() != (size_t)n_norm * (size_t)n_norm) {
+                qkv_state_free(state);
+                return 0;
+            }
+            state->rotation_matrix_outlier = r_out->data();
+            state->rotation_matrix_normal = r_norm->data();
+            const bool out_hadamard = config->rotation_backend == QKV_ROTATION_BACKEND_HADAMARD_SIGN_FAST &&
+                ((n_out & (n_out - 1)) == 0);
+            const bool norm_hadamard = config->rotation_backend == QKV_ROTATION_BACKEND_HADAMARD_SIGN_FAST &&
+                ((n_norm & (n_norm - 1)) == 0);
+            if (out_hadamard) {
+                state->rotation_signs_outlier = (float*)std::malloc((size_t)n_out * sizeof(float));
+                if (!state->rotation_signs_outlier) { qkv_state_free(state); return 0; }
+                for (int i = 0; i < n_out; ++i) state->rotation_signs_outlier[i] =
+                    state->rotation_matrix_outlier[i] > 0.0f ? 1.0f : -1.0f;
+            }
+            if (norm_hadamard) {
+                state->rotation_signs_normal = (float*)std::malloc((size_t)n_norm * sizeof(float));
+                if (!state->rotation_signs_normal) { qkv_state_free(state); return 0; }
+                for (int i = 0; i < n_norm; ++i) state->rotation_signs_normal[i] =
+                    state->rotation_matrix_normal[i] > 0.0f ? 1.0f : -1.0f;
+            }
+        }
+
+        if (qjl_streams) {
+            auto q_out = qkv_cached_qjl(n_out, config->qjl_seed ^ 0x716a6c6f757431ull);
+            auto q_norm = qkv_cached_qjl(n_norm, config->qjl_seed ^ 0x716a6c6e6f7231ull);
+            if (!q_out || !q_norm || q_out->size() != (size_t)n_out * (size_t)n_out ||
+                q_norm->size() != (size_t)n_norm * (size_t)n_norm) {
+                qkv_state_free(state);
+                return 0;
+            }
+            state->qjl_matrix_outlier = q_out->data();
+            state->qjl_matrix_normal = q_norm->data();
+        }
+
         state->outlier_indices = (int*)malloc((size_t)n_out * sizeof(int));
         state->k_outlier_indices = (int*)malloc((size_t)n_out * sizeof(int));
         state->v_outlier_indices = (int*)malloc((size_t)n_out * sizeof(int));
@@ -350,13 +400,21 @@ int qkv_state_init(
         state->k_norms_normal = (float*)calloc((size_t)n_tokens, sizeof(float));
         state->v_norms_outlier = (float*)calloc((size_t)n_tokens, sizeof(float));
         state->v_norms_normal = (float*)calloc((size_t)n_tokens, sizeof(float));
+        if (qjl_streams) {
+            state->k_residual_norms_outlier = (float*)calloc((size_t)n_tokens, sizeof(float));
+            state->k_residual_norms_normal = (float*)calloc((size_t)n_tokens, sizeof(float));
+            state->v_residual_norms_outlier = (float*)calloc((size_t)n_tokens, sizeof(float));
+            state->v_residual_norms_normal = (float*)calloc((size_t)n_tokens, sizeof(float));
+        }
 
         if (!state->outlier_indices || !state->k_outlier_indices || !state->v_outlier_indices ||
             !state->k_is_outlier || !state->v_is_outlier ||
             !state->k_idx_outlier || !state->k_idx_normal ||
             !state->v_idx_outlier || !state->v_idx_normal ||
             !state->k_norms_outlier || !state->k_norms_normal ||
-            !state->v_norms_outlier || !state->v_norms_normal) {
+            !state->v_norms_outlier || !state->v_norms_normal ||
+            (qjl_streams && (!state->k_residual_norms_outlier || !state->k_residual_norms_normal ||
+                !state->v_residual_norms_outlier || !state->v_residual_norms_normal))) {
             qkv_state_free(state);
             return 0;
         }
@@ -444,7 +502,7 @@ int qkv_state_init(
         (size_t)n_tokens * sizeof(float) * 2; // k_norms + v_norms
     total_qkv_bytes += (uint64_t)state->sink_tokens * (uint64_t)dim * (uint64_t)sizeof(float) * 2ull;
     if (qjl_streams) {
-        total_qkv_bytes += ((size_t)n_tokens * (size_t)dim + 7) / 8 * 2; // k_qjl + v_qjl
+        total_qkv_bytes += (size_t)n_tokens * qjl_token_bytes * 2; // k_qjl + v_qjl
         total_qkv_bytes += (size_t)n_tokens * sizeof(float) * 2; // residual_norms
     }
     if (config->outlier_channels > 0 && config->outlier_channels < dim) {
@@ -465,6 +523,9 @@ int qkv_state_init(
         total_qkv_bytes += ((size_t)n_tokens * (size_t)n_out * (size_t)v_out_storage_bits + 7) / 8;
         total_qkv_bytes += ((size_t)n_tokens * (size_t)n_norm * (size_t)v_norm_storage_bits + 7) / 8;
         total_qkv_bytes += (size_t)n_tokens * sizeof(float) * 4; // outlier/normal norms
+        if (qjl_streams) {
+            total_qkv_bytes += (size_t)n_tokens * sizeof(float) * 4; // split residual norms
+        }
     }
     prepare_windows_staging_working_set(total_qkv_bytes);
 
@@ -486,6 +547,8 @@ void qkv_state_free(qkv_state_t* state) {
     free(state->v_residual_norms);
     if (state->owns_rotation_matrix) free(state->rotation_matrix);
     free(state->rotation_signs);  // BUGFIX Issue 9: Free rotation_signs
+    free(state->rotation_signs_outlier);
+    free(state->rotation_signs_normal);
     if (state->owns_qjl_matrix) free(state->qjl_matrix);
     free(state->qjl_signs_matrix);
     if (state->owns_codebooks) {
@@ -530,6 +593,10 @@ void qkv_state_free(qkv_state_t* state) {
     free(state->k_norms_normal);
     free(state->v_norms_outlier);
     free(state->v_norms_normal);
+    free(state->k_residual_norms_outlier);
+    free(state->k_residual_norms_normal);
+    free(state->v_residual_norms_outlier);
+    free(state->v_residual_norms_normal);
 
     if (state->thread_pool) {
         delete static_cast<QkvThreadPool*>(state->thread_pool);

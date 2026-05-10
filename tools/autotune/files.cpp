@@ -80,6 +80,7 @@ void write_report_json(const std::string& path, const HostInfo& host, const std:
     ss << "{\n";
     ss << "  \"version\": 6,\n";
     ss << "  \"pipeline_owner\": \"C++ storagellm_host_autotune executable\",\n";
+    ss << "  \"candidate_policy\": \"no skeleton candidates: only backends with an in-process real-device benchmark fixture are emitted as automatic candidates; detected-but-unmeasured platform support remains host diagnostics, not selectable success\",\n";
     ss << "  \"python_policy\": \"not engine runtime; only invoked for pip/TVM Python API codegen when TVM candidates are built\",\n";
     ss << "  \"cmake_policy\": \"build system only; user does not manually choose backend options in the default path\",\n";
     ss << "  \"host\": {\n";
@@ -127,7 +128,7 @@ void write_report_json(const std::string& path, const HostInfo& host, const std:
         ss << "null";
     }
     ss << ",\n";
-    ss << "  \"truth\": \"C++ auto pipeline is wired fail-closed: a backend is only selected when it is linked/loadable, has a runtime device when needed, and is actually measured. Unmeasured platform kernels are reported but never silently counted as maximum-speed success.\"\n";
+    ss << "  \"truth\": \"C++ auto pipeline is wired fail-closed: a backend is only selected when it is linked/loadable, has a runtime device when needed, and is actually measured. Backends without a complete benchmark fixture are not emitted as auto candidates, so they cannot be mistaken for maximum-speed success.\"\n";
     ss << "}\n";
     write_text(path, ss.str());
 }

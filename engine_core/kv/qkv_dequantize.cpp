@@ -13,6 +13,56 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+
+static int qkv_apply_split_rotation_inverse_deq(
+    const qkv_config_t* cfg,
+    const float* matrix,
+    const float* signs,
+    const float* input,
+    float* output,
+    int dim
+) {
+    if (!input || !output || dim <= 0 || dim > 16384) return 0;
+    if (cfg && cfg->enable_rotation && matrix) {
+        if (signs && qkv_apply_hadamard_rotation_inverse(input, signs, output, dim)) return 1;
+        for (int i = 0; i < dim; ++i) output[i] = 0.0f;
+        for (int j = 0; j < dim; ++j) {
+            const float y = input[j];
+            const float* row = matrix + (size_t)j * (size_t)dim;
+            for (int i = 0; i < dim; ++i) output[i] += row[i] * y;
+        }
+        for (int i = 0; i < dim; ++i) if (!std::isfinite(output[i])) return 0;
+        return 1;
+    }
+    memcpy(output, input, (size_t)dim * sizeof(float));
+    return 1;
+}
+
+static int qkv_project_qjl_t_deq(const float* matrix, const float* signs, float* out, int dim) {
+    if (!matrix || !signs || !out || dim <= 0 || dim > 16384) return 0;
+    for (int i = 0; i < dim; ++i) {
+        float sum = 0.0f;
+        for (int j = 0; j < dim; ++j) sum += matrix[(size_t)j * (size_t)dim + (size_t)i] * signs[j];
+        if (!std::isfinite(sum)) return 0;
+        out[i] = sum;
+    }
+    return 1;
+}
+
+static const float* qkv_deq_split_norms(const qkv_state_t* s, int target, bool outlier) {
+    if (!s) return nullptr;
+    if (target == QKV_TARGET_KEY) return outlier ? s->k_norms_outlier : s->k_norms_normal;
+    if (target == QKV_TARGET_VALUE) return outlier ? s->v_norms_outlier : s->v_norms_normal;
+    return nullptr;
+}
+
+static const float* qkv_deq_split_residual_norms(const qkv_state_t* s, int target, bool outlier) {
+    if (!s) return nullptr;
+    if (target == QKV_TARGET_KEY) return outlier ? s->k_residual_norms_outlier : s->k_residual_norms_normal;
+    if (target == QKV_TARGET_VALUE) return outlier ? s->v_residual_norms_outlier : s->v_residual_norms_normal;
+    return nullptr;
+}
+
 static int qkv_mse_bits_for_total_bits_dequant(int bits, bool use_qjl) {
     if (qkv_bits_raw(bits)) return bits;
     const int mse_bits = use_qjl ? bits - 1 : bits;
@@ -56,165 +106,108 @@ static int qkv_dequant_one_split(
     bool use_qjl,
     float* output
 ) {
-    if (!s || !cfg || !norms || !output || token_idx < 0) {
-        return 0;
-    }
+    (void)residual_norms;
+    (void)norms;
+    if (!s || !cfg || !output || token_idx < 0) return 0;
     const int d = s->head_dim;
     const int n_out = cfg->outlier_channels;
     const int n_norm = d - n_out;
-    const int outlier_bits = qkv_outlier_bits_for_target(cfg, target);
-    const int normal_bits = qkv_normal_bits_for_target(cfg, target);
-    const bool base_use_qjl = use_qjl && outlier_bits > 1 && normal_bits > 1;
-    const int out_mse_bits = qkv_mse_bits_for_total_bits_dequant(outlier_bits, base_use_qjl);
-    const int norm_mse_bits = qkv_mse_bits_for_total_bits_dequant(normal_bits, base_use_qjl);
-    if (d <= 0 || d > 16384 || n_out <= 0 || n_out >= d || n_norm <= 0 ||
-        !out_mse_bits || !norm_mse_bits) {
-        return 0;
-    }
+    if (d <= 0 || d > 16384 || n_out <= 0 || n_out >= d || n_norm <= 0) return 0;
     const int* outlier_channels = qkv_outlier_indices_for_target_const(s, target);
     const uint8_t* split_outlier = qkv_idx_outlier_for_target_const(s, target);
     const uint8_t* split_normal = qkv_idx_normal_for_target_const(s, target);
     const uint8_t* is_outlier = qkv_is_outlier_for_target_const(s, target);
     if (!outlier_channels || !split_outlier || !split_normal || !is_outlier ||
-        !s->scratch_indices || !s->scratch_y_tilde || !s->scratch_x_tilde) {
-        return 0;
-    }
-    if (n_out > INT_MAX / out_mse_bits || n_norm > INT_MAX / norm_mse_bits) {
-        return 0;
-    }
-    const int out_stride = (n_out * out_mse_bits + 7) / 8;
-    const int norm_stride = (n_norm * norm_mse_bits + 7) / 8;
-    const int qstride = (d + 7) / 8;
-    if (out_stride <= 0 || norm_stride <= 0 ||
-        token_idx > INT_MAX / std::max(out_stride, norm_stride)) {
-        return 0;
-    }
-    const bool out_raw = qkv_bits_raw(out_mse_bits);
-    const bool norm_raw = qkv_bits_raw(norm_mse_bits);
-    const float* out_centroids = out_raw ? nullptr : qkv_codebook_for_bits(s, out_mse_bits);
-    const float* norm_centroids = norm_raw ? nullptr : qkv_codebook_for_bits(s, norm_mse_bits);
-    if ((!out_raw && !out_centroids) || (!norm_raw && !norm_centroids)) {
-        return 0;
-    }
+        !s->scratch_indices || !s->scratch_y_tilde || !s->scratch_x_tilde ||
+        !s->scratch_qjl_signs || !s->scratch_s_t_qjl) return 0;
 
-    int* indices = s->scratch_indices;
-    float* y_tilde = s->scratch_y_tilde;
-    float* x_tilde = s->scratch_x_tilde;
-    const int out_levels = out_raw ? 0 : (1 << out_mse_bits);
-    const int norm_levels = norm_raw ? 0 : (1 << norm_mse_bits);
+    const int outlier_bits = qkv_outlier_bits_for_target(cfg, target);
+    const int normal_bits = qkv_normal_bits_for_target(cfg, target);
+    const bool split_use_qjl = use_qjl && qjl && s->qjl_matrix_outlier && s->qjl_matrix_normal &&
+        qkv_bits_codebook(outlier_bits) && qkv_bits_codebook(normal_bits) &&
+        outlier_bits > 1 && normal_bits > 1;
+    const int out_bits = qkv_mse_bits_for_total_bits_dequant(outlier_bits, split_use_qjl);
+    const int norm_bits = qkv_mse_bits_for_total_bits_dequant(normal_bits, split_use_qjl);
+    if (!qkv_bits_valid(out_bits) || !qkv_bits_valid(norm_bits) ||
+        n_out > INT_MAX / out_bits || n_norm > INT_MAX / norm_bits) return 0;
+    const int out_stride = (n_out * out_bits + 7) / 8;
+    const int norm_stride = (n_norm * norm_bits + 7) / 8;
+    const size_t qjl_out_stride = qkv_split_qjl_outlier_bytes(cfg);
+    const size_t qjl_norm_stride = qkv_split_qjl_normal_bytes(cfg);
+    const size_t qjl_stride = qkv_qjl_token_bytes(s);
+    if (split_use_qjl && (qjl_stride < qjl_out_stride + qjl_norm_stride)) return 0;
+    const uint8_t* qjl_token = split_use_qjl ? qjl + (size_t)token_idx * qjl_stride : nullptr;
 
-    const uint8_t* out_src = split_outlier + (size_t)token_idx * (size_t)out_stride;
-    if (!out_raw) {
-        qkv_unpack_indices(out_src, indices, n_out, out_mse_bits);
-    }
-    for (int i = 0; i < n_out; ++i) {
-        const int channel = outlier_channels[i];
-        if (channel < 0 || channel >= d) {
-            return 0;
+    memset(output, 0, (size_t)d * sizeof(float));
+
+    auto deq_group = [&](bool outlier_group) -> int {
+        const int gd = outlier_group ? n_out : n_norm;
+        const int bits = outlier_group ? out_bits : norm_bits;
+        const uint8_t* src = (outlier_group ? split_outlier : split_normal) +
+            (size_t)token_idx * (size_t)((gd * bits + 7) / 8);
+        const float* group_norms = qkv_deq_split_norms(s, target, outlier_group);
+        const float* group_rnorms = qkv_deq_split_residual_norms(s, target, outlier_group);
+        const float* rot = outlier_group ? s->rotation_matrix_outlier : s->rotation_matrix_normal;
+        const float* rot_signs = outlier_group ? s->rotation_signs_outlier : s->rotation_signs_normal;
+        const float* qjl_mat = outlier_group ? s->qjl_matrix_outlier : s->qjl_matrix_normal;
+        const uint8_t* qjl_src = nullptr;
+        if (split_use_qjl) qjl_src = outlier_group ? qjl_token : (qjl_token + qjl_out_stride);
+        if (!group_norms || (split_use_qjl && (!group_rnorms || !qjl_mat || !qjl_src))) return 0;
+        int* indices = s->scratch_indices;
+        float* y = s->scratch_y_tilde;
+        float* x = s->scratch_x_tilde;
+        const bool raw = qkv_bits_raw(bits);
+        const float* centroids = raw ? nullptr : qkv_codebook_for_bits_dim(bits, gd, cfg->codebook_distribution);
+        if (!raw && !centroids) return 0;
+        const int levels = raw ? 0 : (1 << bits);
+        if (!raw) qkv_unpack_indices(src, indices, gd, bits);
+        for (int i = 0; i < gd; ++i) {
+            if (raw) y[i] = qkv_load_raw_scalar(src, i, bits);
+            else {
+                if (indices[i] < 0 || indices[i] >= levels) return 0;
+                y[i] = centroids[indices[i]];
+            }
         }
-        if (out_raw) {
-            y_tilde[channel] = qkv_load_raw_scalar(out_src, i, out_mse_bits);
+        if (!qkv_apply_split_rotation_inverse_deq(cfg, rot, rot_signs, y, x, gd)) return 0;
+        if (split_use_qjl) {
+            const float r_norm = group_rnorms[token_idx];
+            if (r_norm > 1e-10f) {
+                float* signs = s->scratch_qjl_signs;
+                float* stz = s->scratch_s_t_qjl;
+                qkv_unpack_signs(qjl_src, signs, gd);
+                if (!qkv_project_qjl_t_deq(qjl_mat, signs, stz, gd)) return 0;
+                const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)gd;
+                if (!std::isfinite(qjl_scale)) return 0;
+                for (int i = 0; i < gd; ++i) x[i] += qjl_scale * r_norm * stz[i];
+            }
+        }
+        const float norm = group_norms[token_idx];
+        if (!std::isfinite(norm) || norm < 1e-12f) {
+            return 1;
+        }
+        if (outlier_group) {
+            for (int i = 0; i < gd; ++i) {
+                const int ch = outlier_channels[i];
+                if (ch < 0 || ch >= d) return 0;
+                output[ch] = x[i] * norm;
+            }
         } else {
-            if (indices[i] < 0 || indices[i] >= out_levels) return 0;
-            y_tilde[channel] = out_centroids[indices[i]];
-        }
-    }
-
-    const uint8_t* norm_src = split_normal + (size_t)token_idx * (size_t)norm_stride;
-    if (!norm_raw) {
-        qkv_unpack_indices(norm_src, indices, n_norm, norm_mse_bits);
-    }
-    int normal_pos = 0;
-    for (int i = 0; i < d; ++i) {
-        if (is_outlier[i]) {
-            continue;
-        }
-        if (normal_pos >= n_norm) {
-            return 0;
-        }
-        if (norm_raw) {
-            y_tilde[i] = qkv_load_raw_scalar(norm_src, normal_pos++, norm_mse_bits);
-        } else {
-            if (indices[normal_pos] < 0 || indices[normal_pos] >= norm_levels) return 0;
-            y_tilde[i] = norm_centroids[indices[normal_pos++]];
-        }
-    }
-    if (normal_pos != n_norm) {
-        return 0;
-    }
-
-    if (cfg->enable_rotation && s->rotation_matrix) {
-        if (s->rotation_signs &&
-            qkv_apply_hadamard_rotation_inverse(y_tilde, s->rotation_signs, x_tilde, d)) {
-            // Fast inverse rotation path for Hadamard-backed QKV states.
-        } else {
-        for (int i = 0; i < d; ++i) {
-            float sum = 0.0f;
-            for (int j = 0; j < d; ++j) {
-                sum += s->rotation_matrix[(size_t)j * (size_t)d + (size_t)i] * y_tilde[j];
+            int pos = 0;
+            for (int ch = 0; ch < d; ++ch) {
+                if (is_outlier[ch]) continue;
+                if (pos >= gd) return 0;
+                output[ch] = x[pos++] * norm;
             }
-            // BUGFIX 725: Check inverse rotation result for NaN/Inf ★★
-            if (!std::isfinite(sum)) {
-                sum = 0.0f;
-            }
-            x_tilde[i] = sum;
+            if (pos != gd) return 0;
         }
-        }
-    } else {
-        memcpy(x_tilde, y_tilde, (size_t)d * sizeof(float));
-    }
-
-    if (base_use_qjl && qjl && residual_norms && s->qjl_matrix) {
-        const float r_norm = residual_norms[token_idx];
-        if (r_norm > 1e-10f) {
-            const uint8_t* tqjl = qjl + (size_t)token_idx * (size_t)qstride;
-            float* qjl_signs = s->scratch_qjl_signs;
-            float* s_t_qjl = s->scratch_s_t_qjl;
-            if (!qjl_signs || !s_t_qjl) return 0;
-            qkv_unpack_signs(tqjl, qjl_signs, d);
-            for (int i = 0; i < d; ++i) {
-                float sum = 0.0f;
-                for (int j = 0; j < d; ++j) {
-                    sum += s->qjl_matrix[(size_t)j * (size_t)d + (size_t)i] * qjl_signs[j];
-                }
-                // BUGFIX 731: Check QJL matrix multiplication result for NaN/Inf (split path) ★★
-                if (!std::isfinite(sum)) {
-                    sum = 0.0f;
-                }
-                s_t_qjl[i] = sum;
-            }
-            // BUGFIX 657: Prevent division by zero in QJL scale (split path) ★
-            if (d <= 0) return 0;
-            const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)d;
-            // BUGFIX 732: Check QJL scale for NaN/Inf (split path) ★★
-            if (!std::isfinite(qjl_scale)) return 0;
-            for (int i = 0; i < d; ++i) {
-                float residual_term = qjl_scale * r_norm * s_t_qjl[i];
-                // BUGFIX 733: Check residual term for NaN/Inf before adding (split path) ★★
-                if (std::isfinite(residual_term)) {
-                    x_tilde[i] += residual_term;
-                }
-            }
-        }
-    }
-
-    const float norm = norms[token_idx];
-    // BUGFIX 656: Handle zero norm consistently (split path) ★★
-    // BUGFIX 734: Check norm for NaN/Inf (split path) ★★★
-    if (!std::isfinite(norm) || norm < 1e-12f) {
-        memset(output, 0, (size_t)d * sizeof(float));
         return 1;
-    }
-    for (int i = 0; i < d; ++i) {
-        float result = x_tilde[i] * norm;
-        // BUGFIX 735: Check final denormalized result for NaN/Inf (split path) ★★★
-        if (!std::isfinite(result)) {
-            result = 0.0f;
-        }
-        output[i] = result;
-    }
+    };
+
+    if (!deq_group(true)) return 0;
+    if (!deq_group(false)) return 0;
     return 1;
 }
+
 
 // Paper Algorithm 2: TurboQuant_prod dequantization
 // x_hat = Pi^T * y_hat_mse + sqrt(pi/2) / d * ||r|| * S^T * sign(S*r)
@@ -388,14 +381,14 @@ int qkv_dequant_one(
     //          but dequantization multiplies by 0 → inconsistent behavior
     // Solution: Return zero vector explicitly when norm is too small
     // Impact: Consistent quantization/dequantization behavior → accurate PPL
-    // BUGFIX 729: Check norm for NaN/Inf ★★★
+    // BUGFIX 729: Check norm for NaN/Inf
     if (!std::isfinite(norm) || norm < 1e-12f) {
         memset(output, 0, (size_t)d * sizeof(float));
         return 1;
     }
     for (int i = 0; i < d; i++) {
         float result = x_tilde[i] * norm;
-        // BUGFIX 730: Check final denormalized result for NaN/Inf ★★★
+        // BUGFIX 730: Check final denormalized result for NaN/Inf
         if (!std::isfinite(result)) {
             result = 0.0f;
         }
@@ -411,104 +404,119 @@ int qkv_dot_mse_split_rotated_token(
     const qkv_config_t* cfg,
     int target,
     int token_idx,
-    const float* q_rotated,
+    const float* query,
     float* out_dot
 ) {
-    if (!s || !cfg || !q_rotated || !out_dot) return 0;
-
-    // BUGFIX 377: head_dim 유효성 체크
+    if (!s || !cfg || !query || !out_dot || token_idx < 0) return 0;
     const int d = s->head_dim;
-    if (d <= 0 || d > 16384) return 0;
-
     const int n_out = cfg->outlier_channels;
-    // BUGFIX 378: outlier_channels 범위 체크
-    if (n_out < 0 || n_out > d) return 0;
     const int n_norm = d - n_out;
-    const int outlier_bits = qkv_outlier_bits_for_target(cfg, target);
-    const int normal_bits = qkv_normal_bits_for_target(cfg, target);
-    const bool use_qjl = cfg->enable_qjl && s->k_qjl && s->v_qjl &&
-        qkv_bits_codebook(outlier_bits) && qkv_bits_codebook(normal_bits) &&
-        s->k_bits > 1 && s->v_bits > 1 &&
-        outlier_bits > 1 && normal_bits > 1;
-    const int out_bits = qkv_mse_bits_for_total_bits_dequant(outlier_bits, use_qjl);
-    const int norm_bits = qkv_mse_bits_for_total_bits_dequant(normal_bits, use_qjl);
-    if (!out_bits || !norm_bits) return 0;
-
+    if (d <= 0 || d > 16384 || n_out <= 0 || n_out >= d || n_norm <= 0) return 0;
     const int* outlier_channels = qkv_outlier_indices_for_target_const(s, target);
+    const uint8_t* is_outlier = qkv_is_outlier_for_target_const(s, target);
     const uint8_t* split_outlier = qkv_idx_outlier_for_target_const(s, target);
     const uint8_t* split_normal = qkv_idx_normal_for_target_const(s, target);
-    const uint8_t* is_outlier = qkv_is_outlier_for_target_const(s, target);
+    if (!outlier_channels || !is_outlier || !split_outlier || !split_normal ||
+        !s->scratch_residual || !s->scratch_rotated_q || !s->scratch_indices ||
+        !s->scratch_qjl_signs || !s->scratch_s_times_r) return 0;
 
-    if (!outlier_channels || !split_outlier || !split_normal || !is_outlier) {
-        return 0;
-    }
+    const int outlier_bits = qkv_outlier_bits_for_target(cfg, target);
+    const int normal_bits = qkv_normal_bits_for_target(cfg, target);
+    const uint8_t* qjl_base = (target == QKV_TARGET_KEY) ? s->k_qjl : s->v_qjl;
+    const bool split_qjl = cfg->enable_qjl && qjl_base && s->qjl_matrix_outlier && s->qjl_matrix_normal &&
+        qkv_bits_codebook(outlier_bits) && qkv_bits_codebook(normal_bits) &&
+        outlier_bits > 1 && normal_bits > 1;
+    const int out_bits = qkv_mse_bits_for_total_bits_dequant(outlier_bits, split_qjl);
+    const int norm_bits = qkv_mse_bits_for_total_bits_dequant(normal_bits, split_qjl);
+    if (!qkv_bits_valid(out_bits) || !qkv_bits_valid(norm_bits)) return 0;
+    const size_t qjl_out_stride = qkv_split_qjl_outlier_bytes(cfg);
+    const size_t qjl_stride = qkv_qjl_token_bytes(s);
 
-    const bool out_raw = qkv_bits_raw(out_bits);
-    const bool norm_raw = qkv_bits_raw(norm_bits);
-    const float* out_centroids = out_raw ? nullptr : qkv_codebook_for_bits(s, out_bits);
-    const float* norm_centroids = norm_raw ? nullptr : qkv_codebook_for_bits(s, norm_bits);
-    if ((!out_raw && !out_centroids) || (!norm_raw && !norm_centroids)) return 0;
-
-    // BUGFIX 379: packed_size overflow 방지
-    if (n_out > INT_MAX / out_bits || n_norm > INT_MAX / norm_bits) {
-        return 0;
-    }
-    const int out_packed_size = (n_out * out_bits + 7) / 8;
-    const int norm_packed_size = (n_norm * norm_bits + 7) / 8;
-
-    int* indices = s->scratch_indices;
-    if (!indices) return 0;
-
-    float dot = 0.0f;
-
-    // Outlier channels
-    // BUGFIX 380: token_idx overflow 방지
-    if (token_idx < 0 || (out_packed_size > 0 && token_idx > INT_MAX / out_packed_size)) {
-        return 0;
-    }
-    const uint8_t* out_src = split_outlier + (size_t)token_idx * (size_t)out_packed_size;
-    if (!out_raw) {
-        qkv_unpack_indices(out_src, indices, n_out, out_bits);
-    }
-    for (int i = 0; i < n_out; i++) {
-        const int channel = outlier_channels[i];
-        if (channel < 0 || channel >= d) return 0;
-        const float kv = out_raw ? qkv_load_raw_scalar(out_src, i, out_bits) : out_centroids[indices[i]];
-        float term = q_rotated[channel] * kv;
-        // BUGFIX 737: Check dot product term for NaN/Inf (outlier) ★★
-        if (std::isfinite(term)) {
-            dot += term;
+    auto group_dot = [&](bool outlier_group, float* acc) -> int {
+        const int gd = outlier_group ? n_out : n_norm;
+        const int bits = outlier_group ? out_bits : norm_bits;
+        const uint8_t* src = (outlier_group ? split_outlier : split_normal) +
+            (size_t)token_idx * (size_t)((gd * bits + 7) / 8);
+        const float* group_norms = qkv_deq_split_norms(s, target, outlier_group);
+        const float* group_rnorms = qkv_deq_split_residual_norms(s, target, outlier_group);
+        const float* rot = outlier_group ? s->rotation_matrix_outlier : s->rotation_matrix_normal;
+        const float* signs = outlier_group ? s->rotation_signs_outlier : s->rotation_signs_normal;
+        const float* qjl_mat = outlier_group ? s->qjl_matrix_outlier : s->qjl_matrix_normal;
+        if (!group_norms) return 0;
+        float* q_subset = s->scratch_residual;
+        float* q_rot = s->scratch_rotated_q;
+        int* codes = s->scratch_indices;
+        if (outlier_group) {
+            for (int i = 0; i < gd; ++i) {
+                const int ch = outlier_channels[i];
+                if (ch < 0 || ch >= d) return 0;
+                q_subset[i] = query[ch];
+            }
+        } else {
+            int pos = 0;
+            for (int ch = 0; ch < d; ++ch) {
+                if (is_outlier[ch]) continue;
+                if (pos >= gd) return 0;
+                q_subset[pos++] = query[ch];
+            }
+            if (pos != gd) return 0;
         }
-    }
-
-    // Normal channels
-    // BUGFIX 381: token_idx overflow 방지
-    if (norm_packed_size > 0 && token_idx > INT_MAX / norm_packed_size) {
-        return 0;
-    }
-    const uint8_t* norm_src = split_normal + (size_t)token_idx * (size_t)norm_packed_size;
-    if (!norm_raw) {
-        qkv_unpack_indices(norm_src, indices, n_norm, norm_bits);
-    }
-    int normal_pos = 0;
-    for (int i = 0; i < d; i++) {
-        if (is_outlier[i]) continue;
-        // BUGFIX 382: normal_pos 범위 체크
-        if (normal_pos >= n_norm) return 0;
-        const float kv = norm_raw ? qkv_load_raw_scalar(norm_src, normal_pos, norm_bits) :
-            norm_centroids[indices[normal_pos]];
-        ++normal_pos;
-        float term = q_rotated[i] * kv;
-        // BUGFIX 738: Check dot product term for NaN/Inf (normal) ★★
-        if (std::isfinite(term)) {
-            dot += term;
+        if (!qkv_apply_split_rotation_inverse_deq(cfg, rot, signs, q_subset, q_rot, gd)) return 0;
+        // The helper above applies Pi^T; for an orthogonal matrix this is not
+        // the forward query rotation. Use direct forward multiply when rotation
+        // is present. The inverse helper handles no-rotation identity.
+        if (cfg->enable_rotation && rot) {
+            if (signs && qkv_apply_hadamard_rotation_forward(q_subset, signs, q_rot, gd)) {
+                // ok
+            } else {
+                for (int i = 0; i < gd; ++i) {
+                    float sum = 0.0f;
+                    const float* row = rot + (size_t)i * (size_t)gd;
+                    for (int j = 0; j < gd; ++j) sum += row[j] * q_subset[j];
+                    if (!std::isfinite(sum)) return 0;
+                    q_rot[i] = sum;
+                }
+            }
         }
-    }
 
-    // BUGFIX 739: Check final dot product for NaN/Inf ★★★
-    if (!std::isfinite(dot)) {
-        dot = 0.0f;
-    }
-    *out_dot = dot;
+        const bool raw = qkv_bits_raw(bits);
+        const float* centroids = raw ? nullptr : qkv_codebook_for_bits_dim(bits, gd, cfg->codebook_distribution);
+        if (!raw && !centroids) return 0;
+        const int levels = raw ? 0 : (1 << bits);
+        float dot = 0.0f;
+        if (!raw) qkv_unpack_indices(src, codes, gd, bits);
+        for (int i = 0; i < gd; ++i) {
+            float kv = 0.0f;
+            if (raw) kv = qkv_load_raw_scalar(src, i, bits);
+            else {
+                if (codes[i] < 0 || codes[i] >= levels) return 0;
+                kv = centroids[codes[i]];
+            }
+            dot += q_rot[i] * kv;
+        }
+        if (split_qjl && qjl_base && group_rnorms && qjl_mat) {
+            const float r_norm = group_rnorms[token_idx];
+            if (r_norm > 1e-10f) {
+                const uint8_t* qjl_token = qjl_base + (size_t)token_idx * qjl_stride;
+                const uint8_t* qjl_src = outlier_group ? qjl_token : (qjl_token + qjl_out_stride);
+                float* signs_buf = s->scratch_qjl_signs;
+                float* sq = s->scratch_s_times_r;
+                qkv_unpack_signs(qjl_src, signs_buf, gd);
+                if (!qkv_project_qjl_t_deq(qjl_mat, signs_buf, sq, gd)) return 0;
+                const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)gd;
+                for (int i = 0; i < gd; ++i) dot += qjl_scale * r_norm * sq[i] * q_subset[i];
+            }
+        }
+        const float norm = group_norms[token_idx];
+        if (!std::isfinite(norm)) return 0;
+        *acc += dot * norm;
+        return 1;
+    };
+
+    float acc = 0.0f;
+    if (!group_dot(true, &acc)) return 0;
+    if (!group_dot(false, &acc)) return 0;
+    if (!std::isfinite(acc)) return 0;
+    *out_dot = acc;
     return 1;
 }
