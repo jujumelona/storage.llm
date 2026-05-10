@@ -612,6 +612,27 @@ static int moe_juju_required_feature_supported(const std::string& feature) {
            f == "attention_query_pre_attn_scalar_contract";
 }
 
+static int moe_juju_required_feature_present(
+    const std::string& json,
+    const char* feature
+) {
+    if (json.empty() || !feature || !*feature) {
+        return 0;
+    }
+    std::vector<std::string> features;
+    if (!moe_json_get_string_array_slice(json, 0, json.size(), "required_features", &features)) {
+        return 0;
+    }
+    const std::string expected = moe_lower_ascii_copy(feature);
+    for (const std::string& value : features) {
+        if (moe_lower_ascii_copy(value) == expected) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+
 static int moe_juju_extract_attention_contract(
     const std::string& json,
     double* out_query_pre_attn_scalar,
@@ -698,6 +719,27 @@ static void moe_ingest_juju_attention_contract(moe_pc_engine* engine, const std:
         return;
     }
     engine->model_config_query_pre_attn_scalar = (float)query_pre_attn_scalar;
+    engine->model_config_attention_scale = (float)attention_scale;
+    engine->juju_attention_contract_ready.store(1, std::memory_order_release);
+    engine->juju_exact_ppl_contract_ready.store(
+        moe_juju_required_feature_present(json, "exact_ppl_mode") ? 1 : 0,
+        std::memory_order_release);
+    engine->juju_required_features_contract_ready.store(
+        moe_juju_required_feature_present(json, "bundle_native") &&
+        moe_juju_required_feature_present(json, "explicit_expert_layout") &&
+        moe_juju_required_feature_present(json, "graph_ir") &&
+        moe_juju_required_feature_present(json, "qkv_policy") &&
+        moe_juju_required_feature_present(json, "codec_registry_v1") &&
+        moe_juju_required_feature_present(json, "fail_closed_kernel_contract") &&
+        moe_juju_required_feature_present(json, "exact_ppl_mode") &&
+        moe_juju_required_feature_present(json, "metadata_first_expert_resolution") &&
+        moe_juju_required_feature_present(json, "source_quant_rows_preserved") &&
+        moe_juju_required_feature_present(json, "deterministic_router_topk") &&
+        moe_juju_required_feature_present(json, "moe_router_topk_contract_aliases") &&
+        moe_juju_required_feature_present(json, "metadata_sidecar_config_extraction") &&
+        moe_juju_required_feature_present(json, "attention_head_dim_fallback_scale") &&
+        moe_juju_required_feature_present(json, "attention_query_pre_attn_scalar_contract") ? 1 : 0,
+        std::memory_order_release);
     const std::string compact = moe_juju_attention_contract_compact_json(json);
     if (!compact.empty() && engine->offload_gguf_metadata_json.find("JUJU_RUNTIME_ATTENTION_CONTRACT_V1") == std::string::npos) {
         if (!engine->offload_gguf_metadata_json.empty()) {

@@ -1,3 +1,43 @@
+
+static int moe_eval_exact_ppl_contract_ready(
+    moe_pc_engine_t* engine,
+    moe_eval_stats_t* out_stats
+) {
+    if (!engine) {
+        moe_eval_set_error(out_stats, "engine is null");
+        return 0;
+    }
+    if (engine->juju_required_features_contract_ready.load(std::memory_order_acquire) != 1 ||
+        engine->juju_exact_ppl_contract_ready.load(std::memory_order_acquire) != 1) {
+        moe_eval_set_error(out_stats, "JUJU exact_ppl_mode required_features contract is not loaded");
+        return 0;
+    }
+    if (engine->juju_attention_contract_ready.load(std::memory_order_acquire) != 1 ||
+        !(engine->model_config_query_pre_attn_scalar > 0.0f) ||
+        !(engine->model_config_attention_scale > 0.0f) ||
+        !std::isfinite(engine->model_config_query_pre_attn_scalar) ||
+        !std::isfinite(engine->model_config_attention_scale)) {
+        moe_eval_set_error(out_stats, "JUJU attention scale contract is not loaded");
+        return 0;
+    }
+    const double expected = 1.0 / std::sqrt((double)engine->model_config_query_pre_attn_scalar);
+    const double actual = (double)engine->model_config_attention_scale;
+    const double tol = std::max(1.0e-8, std::fabs(expected) * 1.0e-5);
+    if (!std::isfinite(expected) || std::fabs(actual - expected) > tol) {
+        moe_eval_set_error(out_stats, "JUJU attention scale does not match query_pre_attn_scalar");
+        return 0;
+    }
+    if (engine->storage_format_plan_available.load(std::memory_order_acquire) != 1) {
+        moe_eval_set_error(out_stats, "JUJU storage format plan is not available for exact PPL");
+        return 0;
+    }
+    if (engine->storage_expert_index_ready.load(std::memory_order_acquire) != 1) {
+        moe_eval_set_error(out_stats, "JUJU expert index is not ready for exact PPL");
+        return 0;
+    }
+    return 1;
+}
+
 int moe_pc_engine_eval_token_ids_from(
     moe_pc_engine_t* engine,
     const int32_t* input_token_ids,
@@ -8,11 +48,22 @@ int moe_pc_engine_eval_token_ids_from(
     if (out_stats) {
         std::memset(out_stats, 0, sizeof(*out_stats));
     }
+    if (!engine) {
+        moe_eval_set_error(out_stats, "engine is null");
+        return 0;
+    }
+    if (!input_token_ids || input_token_count < 2) {
+        moe_eval_set_error(out_stats, "eval requires at least two input tokens");
+        return 0;
+    }
+    if (!moe_eval_exact_ppl_contract_ready(engine, out_stats)) {
+        return 0;
+    }
     const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
     const moe_storage_constants_t* c = &runtime_c;
     const moe_attn_config_t attn_cfg = moe_generation_attn_config(engine);
-    if (!engine || !c || !input_token_ids || input_token_count < 2) {
-        moe_eval_set_error(out_stats, "eval requires at least two input tokens");
+    if (!c) {
+        moe_eval_set_error(out_stats, "engine storage constants unavailable");
         return 0;
     }
     struct eval_scope_t {
@@ -144,8 +195,11 @@ int moe_pc_engine_eval_token_ids_from(
         !forward.expert_triplet_available ||
         !forward.embedding_ready ||
         !forward.lm_head_ready ||
-        !forward.attention_ready) {
-        moe_eval_set_error(out_stats, "full eval path is not ready");
+        !forward.attention_ready ||
+        !forward.storage_format_plan_available ||
+        !forward.storage_expert_index_ready ||
+        !forward.cpu_quant_registry_ready) {
+        moe_eval_set_error(out_stats, "full exact eval path is not ready");
         return 0;
     }
     if (input_token_count > attn_cfg.max_seq_len) {
@@ -247,6 +301,8 @@ int moe_pc_engine_eval_token_ids_from(
 
     double nll = 0.0;
     uint32_t evaluated = 0;
+    const uint64_t linear_fallbacks_before =
+        engine->storage_selected_expert_linear_fallbacks.load(std::memory_order_acquire);
     moe_generation_stats_t gen_stats{};
     for (uint32_t i = 0; i + 1u < input_token_count; ++i) {
         engine->generation_token.store(i, std::memory_order_relaxed);
@@ -265,6 +321,18 @@ int moe_pc_engine_eval_token_ids_from(
                 pre_allocate_kv)) {
             moe_eval_set_error(out_stats, gen_stats.error[0] ? gen_stats.error : "eval forward failed");
             return 0;
+        }
+        const uint64_t linear_fallbacks_now =
+            engine->storage_selected_expert_linear_fallbacks.load(std::memory_order_acquire);
+        if (linear_fallbacks_now != linear_fallbacks_before) {
+            moe_eval_set_error(out_stats, "exact PPL aborted: selected-expert linear fallback was used");
+            return 0;
+        }
+        for (uint32_t h = 0; h < c->hidden_size; ++h) {
+            if (!std::isfinite(scratch.hidden[h])) {
+                moe_eval_set_error(out_stats, "exact PPL aborted: non-finite hidden state");
+                return 0;
+            }
         }
         const uint32_t target_index = i + 1u;
         const int score_target = target_index >= first_target_index;
@@ -300,6 +368,12 @@ int moe_pc_engine_eval_token_ids_from(
             moe_eval_set_error(out_stats, "failed to score target token");
             return 0;
         }
+        if (!std::isfinite(target_logit) ||
+            !std::isfinite(logsumexp) ||
+            !std::isfinite(logprob)) {
+            moe_eval_set_error(out_stats, "exact PPL aborted: non-finite lm_head logprob");
+            return 0;
+        }
         // BUGFIX 248: Add overflow check for NLL accumulation ★
         // Problem: nll += -(double)logprob without overflow check
         // Very long sequences can cause nll to overflow to infinity
@@ -332,7 +406,15 @@ int moe_pc_engine_eval_token_ids_from(
         moe_eval_set_error(out_stats, "no tokens evaluated");
         return 0;
     }
+    if (!std::isfinite(nll)) {
+        moe_eval_set_error(out_stats, "exact PPL aborted: non-finite NLL");
+        return 0;
+    }
     const double mean_nll = nll / (double)evaluated;
+    if (!std::isfinite(mean_nll)) {
+        moe_eval_set_error(out_stats, "exact PPL aborted: non-finite mean NLL");
+        return 0;
+    }
     double ppl = 0.0;
     if (mean_nll > std::log(std::numeric_limits<double>::max())) {
         ppl = std::numeric_limits<double>::max();

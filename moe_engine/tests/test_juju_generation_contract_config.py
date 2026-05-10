@@ -155,3 +155,35 @@ def test_engine_ingests_idx_attention_contract_into_runtime_metadata():
     assert main_parse_text.count("moe_ingest_juju_attention_contract(engine, index_json);") >= 2
     assert "moe_juju_attention_contract_compact_json(index_json)" in readers_text
     assert "!moe_juju_index_schema_supported(index_json)" in readers_text
+
+
+def test_cpp_reader_requires_every_declared_feature_not_just_unknown_filter():
+    contract_path = ROOT / "colab" / "juju_modules" / "format_contract.py"
+    spec = importlib.util.spec_from_file_location("format_contract", contract_path)
+    fmt = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fmt)
+    parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
+    for feature in fmt.JUJU_REQUIRED_FEATURES:
+        assert f'missing JUJU required feature: %s' in parser_text
+        assert f'"{feature}"' in parser_text
+
+
+def test_exact_ppl_eval_is_fail_closed_on_runtime_contract_and_fallbacks():
+    eval_text = (ROOT / "moe_engine" / "src" / "parts" / "generation_eval.cpp.inc").read_text()
+    state_text = (ROOT / "moe_engine" / "src" / "parts" / "engine_state.cpp.inc").read_text()
+    parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
+    assert "juju_exact_ppl_contract_ready" in state_text
+    assert "juju_required_features_contract_ready" in state_text
+    assert "juju_attention_contract_ready" in state_text
+    assert "model_config_attention_scale" in state_text
+    assert "moe_eval_exact_ppl_contract_ready" in eval_text
+    assert "JUJU exact_ppl_mode required_features contract is not loaded" in eval_text
+    assert "JUJU attention scale contract is not loaded" in eval_text
+    assert "JUJU attention scale does not match query_pre_attn_scalar" in eval_text
+    assert "JUJU storage format plan is not available for exact PPL" in eval_text
+    assert "JUJU expert index is not ready for exact PPL" in eval_text
+    assert "selected-expert linear fallback was used" in eval_text
+    assert "non-finite hidden state" in eval_text
+    assert "non-finite lm_head logprob" in eval_text
+    assert "moe_juju_required_feature_present(json, \"exact_ppl_mode\")" in parser_text
+    assert "engine->model_config_attention_scale = (float)attention_scale" in parser_text
