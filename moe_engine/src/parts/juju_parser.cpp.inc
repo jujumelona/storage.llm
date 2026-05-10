@@ -321,7 +321,18 @@ static int moe_juju_index_matches_weight_file(const std::string& index_json, con
             return 0;
         }
     }
-    return weight_file == moe_juju_path_basename_local(juju_path);
+    const std::string expected_weight = moe_juju_path_basename_local(juju_path);
+    if (moe_juju_path_basename_local(weight_file) == expected_weight) {
+        return 1;
+    }
+    // Some repair sidecars carry both weight_file and index_file.  Accept the
+    // index basename as a secondary guard so path-prefixed metadata generated on
+    // Colab/Linux still works on Windows/local engine paths.
+    std::string index_file;
+    if (moe_json_get_string_local(index_json, "index_file", &index_file) && !index_file.empty()) {
+        return moe_juju_path_basename_local(index_file) == expected_weight + ".idx";
+    }
+    return 0;
 }
 
 static int moe_read_binary_range_to_string(
@@ -556,13 +567,33 @@ static int moe_read_juju_tensor_index_json(
     std::string* out
 ) {
     std::string sidecar;
-    if (moe_read_text_file_local(path + ".idx", &sidecar) &&
-        sidecar.find("\"JUJU_IDX_JSON_V2\"") != std::string::npos &&
-        sidecar.find("\"tensors\"") != std::string::npos) {
+    const std::string sidecar_path = path + ".idx";
+    uint64_t sidecar_bytes = 0;
+    const int sidecar_present = file_size_bytes(sidecar_path, &sidecar_bytes);
+    if (sidecar_present || moe_path_is_directory_local(sidecar_path)) {
+        // If a sidecar exists it is authoritative.  Falling back to embedded
+        // bootstrap metadata after an empty/unreadable/malformed sidecar silently
+        // revives stale index contracts and makes sidecar repair workflows
+        // ineffective.
+        if (!sidecar_present || sidecar_bytes == 0 || sidecar_bytes > 256ull * 1024ull * 1024ull ||
+            !moe_read_text_file_local(sidecar_path, &sidecar)) {
+            std::fprintf(stderr,
+                "[storagellm] JUJU sidecar idx rejected: unreadable authoritative sidecar idx=%s bytes=%llu\n",
+                sidecar_path.c_str(),
+                (unsigned long long)sidecar_bytes);
+            return 0;
+        }
+        if (sidecar.find("\"JUJU_IDX_JSON_V2\"") == std::string::npos ||
+            sidecar.find("\"tensors\"") == std::string::npos) {
+            std::fprintf(stderr,
+                "[storagellm] JUJU sidecar idx rejected: malformed authoritative sidecar idx=%s\n",
+                sidecar_path.c_str());
+            return 0;
+        }
         if (!moe_juju_index_matches_weight_file(sidecar, path)) {
             std::fprintf(stderr,
                 "[storagellm] JUJU sidecar idx rejected: weight_file does not match artifact path idx=%s weight=%s\n",
-                (path + ".idx").c_str(),
+                sidecar_path.c_str(),
                 moe_juju_path_basename_local(path).c_str());
             return 0;
         }

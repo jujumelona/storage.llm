@@ -192,3 +192,97 @@ def test_exact_ppl_eval_is_fail_closed_on_runtime_contract_and_fallbacks():
     assert "non-finite lm_head logprob" in eval_text
     assert "moe_juju_required_feature_present(json, \"exact_ppl_mode\")" in parser_text
     assert "engine->model_config_attention_scale = (float)attention_scale" in parser_text
+
+
+def test_gguf_byte_diagnostics_treats_alignment_padding_as_ok():
+    diag = mat.gguf_tensor_byte_diagnostics([
+        {
+            "name": "blk.1.layer_output_scale.weight",
+            "type": 0,
+            "shape": [1],
+            "exact_bytes": 4,
+            "source_storage_bytes": 32,
+            "bytes": 4,
+            "source_padding_bytes": 28,
+        }
+    ])
+    assert diag["mismatch_count"] == 0
+    assert diag["alignment_padding_ok"] == 1
+    assert diag["type_stats"][0]["alignment_padding_ok"] == 1
+
+
+def test_file_size_prefers_range_total_over_head_content_length():
+    class _Resp:
+        def __init__(self, ok=True, headers=None):
+            self.ok = ok
+            self.headers = headers or {}
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class _Session:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, headers=None, stream=True, timeout=None):
+            self.calls.append(("GET", dict(headers or {})))
+            return _Resp(headers={"Content-Range": "bytes 0-0/123456789"})
+
+        def head(self, url, allow_redirects=True, headers=None, timeout=None):
+            self.calls.append(("HEAD", dict(headers or {})))
+            return _Resp(headers={"Content-Length": "42"})
+
+    session = _Session()
+    assert mat.file_size(session, "https://example.invalid/model.gguf", token="tok") == 123456789
+    assert session.calls[0][0] == "GET"
+    assert session.calls[0][1]["Range"] == "bytes=0-0"
+    assert session.calls[0][1]["Authorization"] == "Bearer tok"
+
+
+def test_cpp_juju_sidecar_is_authoritative_and_basename_tolerant():
+    parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
+    assert 'const std::string expected_weight = moe_juju_path_basename_local(juju_path);' in parser_text
+    assert 'moe_juju_path_basename_local(weight_file) == expected_weight' in parser_text
+    assert 'moe_juju_path_basename_local(index_file) == expected_weight + ".idx"' in parser_text
+    assert 'const std::string sidecar_path = path + ".idx";' in parser_text
+    assert 'malformed authoritative sidecar' in parser_text
+    sidecar_pos = parser_text.index('const int sidecar_present = file_size_bytes(sidecar_path, &sidecar_bytes);')
+    reject_pos = parser_text.index('malformed authoritative sidecar')
+    embedded_pos = parser_text.index('moe_read_juju_json_section(path, entries')
+    assert sidecar_pos < reject_pos < embedded_pos
+
+
+def test_exact_ppl_builds_runtime_plan_before_readiness_check():
+    eval_text = (ROOT / "moe_engine" / "src" / "parts" / "generation_eval.cpp.inc").read_text()
+    entry_pos = eval_text.index('int moe_pc_engine_eval_token_ids_from')
+    runtime_pos = eval_text.index('moe_cpu_storage_ensure_runtime(engine);', entry_pos)
+    ready_pos = eval_text.index('moe_eval_exact_ppl_contract_ready(engine, out_stats)', entry_pos)
+    assert runtime_pos < ready_pos
+
+
+def test_gguf_byte_diagnostics_allows_large_declared_source_alignment_padding():
+    diag = mat.gguf_tensor_byte_diagnostics([
+        {
+            "name": "blk.1.layer_output_scale.weight",
+            "type": 0,
+            "shape": [1],
+            "exact_bytes": 4,
+            "source_storage_bytes": 512,
+            "bytes": 4,
+            "source_padding_bytes": 508,
+            "source_alignment_bytes": 512,
+        }
+    ])
+    assert diag["mismatch_count"] == 0
+    assert diag["alignment_padding_ok"] == 1
+
+
+def test_cpp_juju_sidecar_presence_is_fail_closed_even_when_unreadable():
+    parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
+    assert "const int sidecar_present = file_size_bytes(sidecar_path, &sidecar_bytes);" in parser_text
+    assert "unreadable authoritative sidecar" in parser_text
+    sidecar_present_pos = parser_text.index("const int sidecar_present = file_size_bytes(sidecar_path, &sidecar_bytes);")
+    unreadable_pos = parser_text.index("unreadable authoritative sidecar")
+    embedded_pos = parser_text.index("moe_read_juju_json_section(path, entries")
+    assert sidecar_present_pos < unreadable_pos < embedded_pos

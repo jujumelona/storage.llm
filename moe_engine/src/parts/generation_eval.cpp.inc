@@ -56,6 +56,12 @@ int moe_pc_engine_eval_token_ids_from(
         moe_eval_set_error(out_stats, "eval requires at least two input tokens");
         return 0;
     }
+    // Build/select the CPU-storage runtime plan before checking plan readiness.
+    // The readiness bits are produced by moe_cpu_storage_build_execution_plan(),
+    // which is reached through moe_cpu_storage_ensure_runtime().  Checking them
+    // first makes exact PPL fail closed before the engine has a chance to create
+    // the required runtime tensor/expert index plan.
+    moe_cpu_storage_ensure_runtime(engine);
     if (!moe_eval_exact_ppl_contract_ready(engine, out_stats)) {
         return 0;
     }
