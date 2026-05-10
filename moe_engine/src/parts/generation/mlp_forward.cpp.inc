@@ -896,6 +896,9 @@ using moe_model_lib_grouped_expert_triplets_indexed_device_f32_fn = int (*)(
     uint32_t task_count,
     void* stream_or_queue);
 
+using moe_model_lib_grouped_expert_triplets_indexed_device_f32_v2_fn = int (*)(
+    const moe_fast_backend_dispatch_request_t* request);
+
 using moe_model_lib_prefill_activation_acquire_f32_fn = int (*)(
     uint32_t abi_version,
     int32_t backend,
@@ -1050,6 +1053,199 @@ moe_gpu_grouped_expert_indexed_device_kernel_fn(moe_pc_engine* engine) {
     }
     return reinterpret_cast<moe_model_lib_grouped_expert_triplets_indexed_device_f32_fn>(
         engine->model_lib_grouped_expert_triplets_indexed_device_f32);
+}
+
+static moe_model_lib_grouped_expert_triplets_indexed_device_f32_v2_fn
+moe_gpu_grouped_expert_indexed_device_kernel_v2_fn(moe_pc_engine* engine) {
+    if (!engine || !engine->model_lib_handle ||
+        !engine->model_lib_grouped_expert_triplets_indexed_device_f32_v2) {
+        return nullptr;
+    }
+    return reinterpret_cast<moe_model_lib_grouped_expert_triplets_indexed_device_f32_v2_fn>(
+        engine->model_lib_grouped_expert_triplets_indexed_device_f32_v2);
+}
+
+static moe_fast_backend_context_t moe_make_fast_backend_context(
+    const moe_pc_engine* engine,
+    void* legacy_stream_or_queue
+) {
+    moe_fast_backend_context_t ctx{};
+    ctx.abi_version = STORAGELLM_FAST_BACKEND_DISPATCH_ABI_V2;
+    if (!engine) {
+        ctx.context_kind = moe_FAST_BACKEND_CONTEXT_NONE;
+        return ctx;
+    }
+    switch (engine->backend_caps.backend) {
+        case moe_BACKEND_CUDA:
+            ctx.context_kind = moe_FAST_BACKEND_CONTEXT_CUDA;
+            ctx.u.cuda.cuda_stream = legacy_stream_or_queue;
+            break;
+        case moe_BACKEND_HIP:
+            ctx.context_kind = moe_FAST_BACKEND_CONTEXT_HIP;
+            ctx.u.hip.hip_stream = legacy_stream_or_queue;
+            break;
+        case moe_BACKEND_METAL:
+            ctx.context_kind = moe_FAST_BACKEND_CONTEXT_METAL;
+            // The engine Metal stream is an MTLCommandQueue.  Do not also cast it
+            // to MTLCommandBuffer; the adapter will allocate a command buffer from
+            // the queue unless an actual command buffer is supplied by a future path.
+            ctx.u.metal.command_queue = legacy_stream_or_queue;
+            ctx.u.metal.command_buffer = nullptr;
+#if defined(__APPLE__) && defined(__MACH__)
+            ctx.u.metal.device = metal_get_default_device();
+#endif
+            break;
+        case moe_BACKEND_VULKAN:
+            ctx.context_kind = moe_FAST_BACKEND_CONTEXT_VULKAN;
+            ctx.u.vulkan.instance = engine->vk.instance;
+            ctx.u.vulkan.physical_device = engine->vk.physicalDevice;
+            ctx.u.vulkan.device = engine->vk.device;
+            ctx.u.vulkan.queue = engine->vk.queue;
+            ctx.u.vulkan.command_buffer = legacy_stream_or_queue;
+            ctx.u.vulkan.command_pool = engine->vk.commandPool;
+            ctx.u.vulkan.descriptor_pool = nullptr;
+            ctx.u.vulkan.queue_family_index = engine->vk.queueFamilyIndex;
+            break;
+        case moe_BACKEND_OPENCL:
+            ctx.context_kind = moe_FAST_BACKEND_CONTEXT_OPENCL;
+            ctx.u.opencl.command_queue = legacy_stream_or_queue;
+            break;
+        case moe_BACKEND_LEVEL_ZERO:
+        case moe_BACKEND_SYCL:
+            ctx.context_kind = moe_FAST_BACKEND_CONTEXT_SYCL;
+            ctx.u.sycl.queue = legacy_stream_or_queue ? legacy_stream_or_queue : engine->ze.command_queue;
+            break;
+        case moe_BACKEND_CPU:
+            ctx.context_kind = moe_FAST_BACKEND_CONTEXT_CPU;
+            break;
+        default:
+            ctx.context_kind = moe_FAST_BACKEND_CONTEXT_NONE;
+            break;
+    }
+    return ctx;
+}
+
+static int moe_engine_direct_fast_backend_dispatch_v2(
+    const moe_fast_backend_dispatch_request_t* request
+) {
+    if (!request || request->abi_version != STORAGELLM_FAST_BACKEND_DISPATCH_ABI_V2 ||
+        !request->tasks || request->task_count == 0) {
+        return 0;
+    }
+    switch (static_cast<moe_fast_backend_kind_t>(request->fast_backend)) {
+        case moe_FAST_BACKEND_CUDA_CUTLASS:
+#if defined(STORAGELLM_HAS_CUTLASS_MOE_ADAPTER)
+            return request->backend == moe_BACKEND_CUDA ?
+                storagellm_cutlass_grouped_moe_indexed_device_f32_v2(request) : 0;
+#else
+            return 0;
+#endif
+        case moe_FAST_BACKEND_CUDA_CUBLASLT:
+#if defined(STORAGELLM_HAS_CUBLASLT_MOE_ADAPTER)
+            return request->backend == moe_BACKEND_CUDA ?
+                storagellm_cublaslt_grouped_moe_indexed_device_f32_v2(request) : 0;
+#else
+            return 0;
+#endif
+        case moe_FAST_BACKEND_ROCM_HIPBLASLT:
+#if defined(STORAGELLM_HAS_HIPBLASLT_MOE_ADAPTER)
+            return request->backend == moe_BACKEND_HIP ?
+                storagellm_hipblaslt_grouped_moe_indexed_device_f32_v2(request) : 0;
+#else
+            return 0;
+#endif
+        case moe_FAST_BACKEND_ROCM_CK:
+#if defined(STORAGELLM_HAS_CK_MOE_ADAPTER)
+            return request->backend == moe_BACKEND_HIP ?
+                storagellm_ck_grouped_moe_indexed_device_f32_v2(request) : 0;
+#else
+            return 0;
+#endif
+        case moe_FAST_BACKEND_METAL_MPS:
+#if defined(STORAGELLM_HAS_METAL_MPS_MOE_ADAPTER)
+            return request->backend == moe_BACKEND_METAL ?
+                storagellm_metal_mps_grouped_moe_indexed_device_f32_v2(request) : 0;
+#else
+            return 0;
+#endif
+        case moe_FAST_BACKEND_INTEL_ONEDNN_SYCL:
+#if defined(STORAGELLM_HAS_ONEDNN_SYCL_MOE_ADAPTER)
+            return (request->backend == moe_BACKEND_SYCL || request->backend == moe_BACKEND_LEVEL_ZERO) ?
+                storagellm_onednn_sycl_grouped_moe_indexed_device_f32_v2(request) : 0;
+#else
+            return 0;
+#endif
+        case moe_FAST_BACKEND_VULKAN_COOPMAT:
+#if defined(STORAGELLM_HAS_VULKAN_COOPMAT_MOE_ADAPTER)
+            return request->backend == moe_BACKEND_VULKAN ?
+                storagellm_vulkan_coopmat_grouped_moe_indexed_device_f32_v2(request) : 0;
+#else
+            return 0;
+#endif
+        case moe_FAST_BACKEND_OPENCL_CLBLAST:
+#if defined(STORAGELLM_HAS_CLBLAST_MOE_ADAPTER)
+            return request->backend == moe_BACKEND_OPENCL ?
+                storagellm_clblast_grouped_moe_indexed_device_f32_v2(request) : 0;
+#else
+            return 0;
+#endif
+        case moe_FAST_BACKEND_CPU_ONEDNN:
+#if defined(STORAGELLM_HAS_ONEDNN_CPU_MOE_ADAPTER)
+            return request->backend == moe_BACKEND_CPU ?
+                storagellm_onednn_cpu_grouped_moe_indexed_device_f32_v2(request) : 0;
+#else
+            return 0;
+#endif
+        case moe_FAST_BACKEND_TVM_CUDA:
+        case moe_FAST_BACKEND_TVM_METAL:
+        case moe_FAST_BACKEND_TVM_VULKAN:
+        case moe_FAST_BACKEND_TVM_OPENCL:
+        case moe_FAST_BACKEND_TVM_CPU:
+#if defined(STORAGELLM_HAS_TVM_CODEGEN_ADAPTER)
+            return storagellm_tvm_codegen_grouped_moe_indexed_device_f32_v2(request);
+#else
+            return 0;
+#endif
+        default:
+            return 0;
+    }
+}
+
+static int moe_run_grouped_expert_indexed_device_fast(
+    moe_pc_engine* engine,
+    const moe_grouped_expert_device_task_t* tasks,
+    uint32_t task_count,
+    void* legacy_stream_or_queue
+) {
+    if (!engine || !tasks || task_count == 0) {
+        return 0;
+    }
+    moe_fast_backend_context_t ctx = moe_make_fast_backend_context(engine, legacy_stream_or_queue);
+    moe_fast_backend_dispatch_request_t request{};
+    request.abi_version = STORAGELLM_FAST_BACKEND_DISPATCH_ABI_V2;
+    request.backend = static_cast<int32_t>(engine->backend_caps.backend);
+    request.fast_backend = static_cast<int32_t>(choose_fast_backend(engine));
+    request.tasks = tasks;
+    request.task_count = task_count;
+    request.context = &ctx;
+    request.legacy_stream_or_queue = legacy_stream_or_queue;
+
+    // Correct fast path: backend adapters are linked to the engine and dispatched
+    // here.  Generated model libraries contain model-specific contracts only;
+    // they no longer need to resolve CUDA/ROCm/Metal/Vulkan/OpenCL/SYCL symbols.
+    if (request.fast_backend != moe_FAST_BACKEND_NONE) {
+        const int fast_ok = moe_engine_direct_fast_backend_dispatch_v2(&request);
+        if (fast_ok) return 1;
+        if (moe_perf_strict_fast_path_enabled()) return 0;
+    }
+
+    auto legacy = moe_gpu_grouped_expert_indexed_device_kernel_fn(engine);
+    return legacy ? legacy(
+        engine->model_lib_abi_version,
+        static_cast<int32_t>(engine->backend_caps.backend),
+        tasks,
+        task_count,
+        legacy_stream_or_queue) : 0;
 }
 
 static moe_model_lib_prefill_activation_acquire_f32_fn
@@ -1504,6 +1700,7 @@ static int moe_layer_expert_down_scalar_scale_f32(
     };
     moe_raw_tensor_cache_entry raw{};
     if (!moe_map_layer_common_tensor(engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]), &raw)) {
+        *out_scalar_supported = 0;
         return 1;
     }
     const uint64_t count = moe_raw_tensor_scalar_count(raw);
@@ -1529,6 +1726,7 @@ static int moe_layer_expert_down_scalar_scale_f32(
         *out_scalar_supported = 0;
         return 1;
     }
+    *out_scalar_supported = 0;
     return 1;
 }
 
@@ -1894,9 +2092,8 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                         }
                         engine->io_atomic.gpu_grouped_indexed_device_submitted.fetch_add(
                             fast_token_indices.size(), std::memory_order_relaxed);
-                        const int run_ok = indexed_device_fn(
-                            engine->model_lib_abi_version,
-                            static_cast<int32_t>(engine->backend_caps.backend),
+                        const int run_ok = moe_run_grouped_expert_indexed_device_fast(
+                            engine,
                             fast_tasks.data(),
                             static_cast<uint32_t>(fast_tasks.size()),
                             nullptr);
@@ -2069,9 +2266,8 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                             }
                             engine->io_atomic.gpu_grouped_indexed_device_submitted.fetch_add(
                                 indexed_token_indices.size(), std::memory_order_relaxed);
-                            if (indexed_device_fn(
-                                    engine->model_lib_abi_version,
-                                    static_cast<int32_t>(engine->backend_caps.backend),
+                            if (moe_run_grouped_expert_indexed_device_fast(
+                                    engine,
                                     fast_tasks.data(),
                                     (uint32_t)fast_tasks.size(),
                                     nullptr)) {

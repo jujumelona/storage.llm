@@ -566,9 +566,35 @@ static int device_copy_tensor_from_host(
         return 0;
     }
     CUstream stream = device_tensor_stream_current(e);
-    bool is_host_pinned = true; if (staging_slot != UINT32_MAX && staging_slot_valid(e, staging_slot)) { is_host_pinned = e->staging_slots[staging_slot].pinned; } if (!is_host_pinned) { e->io_atomic.nonpinned_fallback_count.fetch_add(1, std::memory_order_relaxed); } const int async_copy = is_host_pinned && device_backend_async_h2d_available(e, stream, 1);
+    bool is_host_pinned = true;
+    if (staging_slot != UINT32_MAX && staging_slot_valid(e, staging_slot)) {
+        is_host_pinned = e->staging_slots[staging_slot].pinned;
+    }
+    if (!is_host_pinned) {
+        e->io_atomic.nonpinned_fallback_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    const int async_copy = is_host_pinned && device_backend_async_h2d_available(e, stream, 1);
     if (!async_copy && e->backend_caps.supports_backend_async_api) {
         e->io_atomic.backend_async_fallback.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    if (!async_copy && moe_perf_gpu_profile_requires_pinned_host(e->backend_caps.backend)) {
+        e->io_atomic.bytes_sync_h2d_fallback.fetch_add(bytes, std::memory_order_relaxed);
+        e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
+        std::fprintf(stderr,
+            "[storageLLM STRICT ERROR] tensor H2D requires async pinned/device-direct copy; "
+            "refusing sync fallback layer=%u expert=%u proj=%u bytes=%llu pinned=%d\n",
+            r.info.layer,
+            r.info.expert,
+            (unsigned)r.info.proj,
+            (unsigned long long)bytes,
+            is_host_pinned ? 1 : 0);
+        if (staging_slot != UINT32_MAX && release_slot_on_submit) {
+            release_staging_slot(e, staging_slot);
+        }
+        if (reservation.valid) {
+            device_vram_release_reservation_token(e, reservation);
+        }
+        return 0;
     }
     if (!async_copy && !allow_sync_fallback) {
         if (staging_slot != UINT32_MAX && release_slot_on_submit) {

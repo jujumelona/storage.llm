@@ -82,6 +82,7 @@ extern "C" void* metal_buffer_alloc(void* device_handle, uint64_t bytes) __attri
 #endif
 
 #include "storage_llm_tools.h"
+#include "parts/perf_runtime_policy.cpp.inc"
 #include "parts/io_ring_adapter.cpp.inc"
 #include "parts/io_atomic_stats_state.cpp.inc"
 #include "parts/device_types.cpp.inc"
@@ -168,6 +169,9 @@ static int moe_gguf_expert_projection(const std::string& name, moe_projection_t*
 #include "parts/lifecycle_backend_api.cpp.inc"
 #include "parts/optimization_plan.cpp.inc"
 #include "parts/kv_residency_api.cpp.inc"
+// Forward-declared here because residency_stats is included before the batch
+// executor implementation in this single-translation-unit engine build.
+static uint64_t moe_batch_runtime_state_count();
 #include "parts/residency_stats.cpp.inc"
 #include "parts/io_config_api.cpp.inc"
 #include "parts/common_raw_prefetch.cpp.inc"

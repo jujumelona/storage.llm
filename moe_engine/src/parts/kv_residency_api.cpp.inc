@@ -6,6 +6,8 @@ int moe_pc_engine_set_kv_mode(moe_pc_engine_t* engine, moe_kv_mode_t mode) {
         return 0;
     }
     if (engine->qkv_forced_by_format.load(std::memory_order_relaxed) && mode != moe_KV_MODE_QKV) {
+        engine->qkv_plain_kv_forbidden_touches.fetch_add(1, std::memory_order_relaxed);
+        qkv_set_mode(true);
         return 0;
     }
     engine->config.kv_mode = mode;

@@ -256,3 +256,15 @@ extern "C" int storagellm_tvm_codegen_grouped_moe_indexed_device_f32(
     }
     return fn(backend, tasks, task_count, stream_or_queue);
 }
+
+
+extern "C" int storagellm_tvm_codegen_grouped_moe_indexed_device_f32_v2(
+    const moe_fast_backend_dispatch_request_t* request
+) {
+    if (!request || request->abi_version != STORAGELLM_FAST_BACKEND_DISPATCH_ABI_V2) {
+        return 0;
+    }
+    return storagellm_tvm_codegen_grouped_moe_indexed_device_f32(
+        request->backend, request->tasks, request->task_count, request->legacy_stream_or_queue);
+}
+

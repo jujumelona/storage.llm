@@ -705,6 +705,10 @@ static int moe_standard_kv_cache_ensure(
     if (!engine || !s || kv_entry_dim == 0) {
         return 0;
     }
+    if (moe_engine_qkv_only_required(engine)) {
+        moe_qkv_only_plain_touch(engine, "capacity");
+        return 0;
+    }
     // BUGFIX 778: Check position for overflow ★★★
     if (position > UINT32_MAX / 2) {
         return 0;

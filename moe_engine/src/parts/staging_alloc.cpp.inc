@@ -295,6 +295,31 @@ static void free_staging_for_engine(
     free_staging(ptr, bytes, pinned, numa_allocated);
 }
 
+static bool moe_staging_strict_requires_pinned(const moe_pc_engine* e) {
+    if (!e) return false;
+    return moe_perf_gpu_profile_requires_pinned_host(e->backend_caps.backend) != 0;
+}
+
+static uint8_t* moe_staging_fail_strict_pinned(
+    moe_pc_engine* e,
+    const char* reason,
+    uint64_t requested_bytes,
+    uint64_t detail
+) {
+    if (e) {
+        e->io_atomic.nonpinned_fallback_count.fetch_add(1, std::memory_order_relaxed);
+        e->io_atomic.device_alloc_failures.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::fprintf(stderr,
+        "[storageLLM STRICT ERROR] pinned host staging is required for gpu-vram-ram-storage, "
+        "but allocation would fall back to non-pinned memory: reason=%s requested=%llu detail=%llu. "
+        "Raise memlock/VirtualLock quota, reduce STORAGELLM_PINNED_STAGING_BYTES, or disable strict fast path.\n",
+        reason ? reason : "unknown",
+        (unsigned long long)requested_bytes,
+        (unsigned long long)detail);
+    return nullptr;
+}
+
 static uint8_t* allocate_best_staging(
     moe_pc_engine* e,
     uint64_t requested_bytes,
@@ -333,6 +358,9 @@ static uint8_t* allocate_best_staging(
         memlock_limit.rlim_cur != RLIM_INFINITY) {
         const uint64_t limit = static_cast<uint64_t>(memlock_limit.rlim_cur);
         if (limit < min_pinned) {
+            if (moe_staging_strict_requires_pinned(e)) {
+                return moe_staging_fail_strict_pinned(e, "RLIMIT_MEMLOCK_BELOW_MIN_PINNED", requested_bytes, limit);
+            }
             fprintf(stderr,
                 "[storagellm] pinned staging skipped: RLIMIT_MEMLOCK=%llu bytes < %llu bytes. "
                 "Falling back to non-pinned staging (sync DMA only).\n",
@@ -361,6 +389,9 @@ static uint8_t* allocate_best_staging(
             return nullptr;
         }
         if (bytes > limit) {
+            if (moe_staging_strict_requires_pinned(e)) {
+                return moe_staging_fail_strict_pinned(e, "RLIMIT_MEMLOCK_BELOW_REQUEST", requested_bytes, limit);
+            }
             fprintf(stderr,
                 "[storagellm] pinned staging exceeds RLIMIT_MEMLOCK: requested=%llu limit=%llu. "
                 "Using full-size non-pinned staging with synchronous DMA fallback.\n",
@@ -436,10 +467,13 @@ static uint8_t* allocate_best_staging(
         ++retry_count;
     }
 
-    // CRITICAL FIX: When pinned allocation fails completely, return non-pinned fallback
-    // instead of NULL to prevent pipeline shutdown. Non-pinned staging allows sync DMA,
-    // which is slower but functional. Returning NULL disables multistage pipeline entirely,
-    // preventing model from loading at all.
+    // In strict GPU fast-path mode, non-pinned staging is not an acceptable fallback:
+    // it turns async DMA into a blocking host copy and hides the real bottleneck.
+    if (moe_staging_strict_requires_pinned(e)) {
+        return moe_staging_fail_strict_pinned(e, "PINNED_ALLOCATION_FAILED", requested_bytes, bytes);
+    }
+
+    // Non-strict mode may still use a functional slow path so the engine can load.
     if (e) {
         e->io_atomic.nonpinned_fallback_count.fetch_add(1, std::memory_order_relaxed);
     }

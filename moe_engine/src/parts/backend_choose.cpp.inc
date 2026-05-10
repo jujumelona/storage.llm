@@ -17,6 +17,12 @@ static moe_backend_t choose_backend(moe_backend_t preferred, moe_platform_t plat
     if (preferred != moe_BACKEND_AUTO) {
         return preferred;
     }
+    // CPU-only profile must win before compiled GPU backends are considered.
+    // Otherwise a CUDA/Metal-capable build silently picks GPU even when the
+    // operator requested the CPU/storage execution structure.
+    if (moe_perf_force_cpu_only_enabled()) {
+        return moe_BACKEND_CPU;
+    }
     if (platform < moe_PLATFORM_AUTO || platform > moe_PLATFORM_CPU_ONLY) {
         platform = moe_PLATFORM_AUTO;
     }

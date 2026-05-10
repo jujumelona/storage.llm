@@ -49,6 +49,7 @@ static int moe_engine_load_offload_gguf_contract(
         primary.contract.qkv_value_outlier_bits != 0;
     if (qkv_required) {
         engine->qkv_forced_by_format.store(1, std::memory_order_relaxed);
+        engine->offload_qkv_cfg.plain_kv_persistent_storage = false;
         engine->config.kv_mode = moe_KV_MODE_QKV;
         qkv_set_mode(true);
     } else {

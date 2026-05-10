@@ -54,6 +54,14 @@ static int moe_map_lm_head_tensor(
             "name=%s rows=%u cols=%u vocab=%u hidden=%u",
             graph_name.c_str(), desc.rows, desc.cols, c->vocab_size, c->hidden_size);
     }
+    int lm_head_tied_to_embedding = 0;
+    (void)moe_json_get_bool_local(engine->offload_graph_ir_json, "lm_head_tied_to_token_embedding", &lm_head_tied_to_embedding);
+    auto is_embedding_candidate = [](const char* name) -> bool {
+        return name && (
+            std::strcmp(name, "token_embd.weight") == 0 ||
+            std::strcmp(name, "model.embed_tokens.weight") == 0 ||
+            std::strcmp(name, "embed_tokens.weight") == 0);
+    };
     static const char* const lm_head_names[] = {
         "output.weight",
         "lm_head.weight",
@@ -81,6 +89,18 @@ static int moe_map_lm_head_tensor(
                 "lm_head_candidate_shape_rejected",
                 "name=%s rows=%u cols=%u vocab=%u hidden=%u",
                 lm_head_names[i],
+                desc.rows,
+                desc.cols,
+                c->vocab_size,
+                c->hidden_size);
+            continue;
+        }
+        if (is_embedding_candidate(lm_head_names[i]) && !lm_head_tied_to_embedding) {
+            moe_profile_log(
+                "lm_head_embedding_fallback_blocked",
+                "name=%s tied=%d rows=%u cols=%u vocab=%u hidden=%u",
+                lm_head_names[i],
+                lm_head_tied_to_embedding,
                 desc.rows,
                 desc.cols,
                 c->vocab_size,
@@ -218,6 +238,9 @@ int moe_pc_engine_lm_head_top1_f32(
                 for (uint32_t i = 0; i < batch; ++i) {
                     scores[i] = moe_apply_final_logit_softcap_cached(
                         logit_softcap, moe_raw_tensor_dot_row(raw, t + i, hidden, hidden_count));
+                    if (!std::isfinite(scores[i])) {
+                        return 0;
+                    }
                 }
 #if defined(__AVX512F__)
                 __m512 v_max = _mm512_set1_ps(local_max);
@@ -273,6 +296,9 @@ int moe_pc_engine_lm_head_top1_f32(
             for (; t < end; ++t) {
                 const float s = moe_apply_final_logit_softcap_cached(
                     logit_softcap, moe_raw_tensor_dot_row(raw, t, hidden, hidden_count));
+                if (!std::isfinite(s)) {
+                    return 0;
+                }
                 if (s > local_max) {
                     local_max = s;
                     local_best = t;
@@ -459,6 +485,9 @@ int moe_pc_engine_lm_head_token_logprob_f32(
                 for (uint32_t i = 0; i < batch; ++i) {
                     scores[i] = moe_apply_final_logit_softcap_cached(
                         logit_softcap, moe_raw_tensor_dot_row(raw, t + i, hidden, hidden_count));
+                    if (!std::isfinite(scores[i])) {
+                        return 0;
+                    }
                 }
                 for (uint32_t i = 0; i < batch; ++i) {
                     const float score = scores[i];
@@ -487,6 +516,9 @@ int moe_pc_engine_lm_head_token_logprob_f32(
             for (; t < end; ++t) {
                 const float score = moe_apply_final_logit_softcap_cached(
                     logit_softcap, moe_raw_tensor_dot_row(raw, t, hidden, hidden_count));
+                if (!std::isfinite(score)) {
+                    return 0;
+                }
                 if (score > local_best_score) {
                     local_best_score = score;
                     local_best_token = t;

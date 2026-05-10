@@ -3,6 +3,7 @@
 #include <sys/sysctl.h>
 #endif
 
+#include <type_traits>
 
 static int moe_parallel_env_truthy(const char* name) {
     const char* v = std::getenv(name);
@@ -15,10 +16,19 @@ static int moe_parallel_env_truthy(const char* name) {
 static uint32_t moe_cpu_storage_row_threads(uint32_t hw) {
     if (hw <= 1u) return 1u;
     if (!(moe_parallel_env_truthy("STORAGELLM_CPU_STORAGE_MAX") ||
-          moe_parallel_env_truthy("STORAGELLM_CPU_PIPELINE"))) {
+          moe_parallel_env_truthy("STORAGELLM_CPU_PIPELINE") ||
+          moe_parallel_env_truthy("STORAGELLM_CPU_ONLY") ||
+          moe_parallel_env_truthy("STORAGELLM_CPU_STORAGE_ENGINE"))) {
         return hw;
     }
-    const uint32_t reserve = hw >= 12u ? 2u : 1u;
+    // Aggressive CPU mode: use every logical CPU for row kernels by default.
+    // The old default reserved 1-2 threads, which made Task Manager look capped
+    // around 50-85% on many CPUs even when the token loop was CPU-bound.
+    // Users who need a quieter desktop can still reserve threads explicitly.
+    const char* reserve_env = std::getenv("STORAGELLM_CPU_RESERVE_THREADS");
+    const uint32_t reserve = reserve_env && *reserve_env
+        ? std::min<uint32_t>(moe_parse_env_u32("STORAGELLM_CPU_RESERVE_THREADS"), hw - 1u)
+        : 0u;
     return hw > reserve ? hw - reserve : 1u;
 }
 
@@ -79,8 +89,10 @@ static uint32_t moe_cpu_row_min_block() {
     // workers. CPU storage-max uses smaller blocks because mmap page latency can
     // vary per shard; dynamic work stealing hides those stalls better.
     if (moe_parallel_env_truthy("STORAGELLM_CPU_STORAGE_MAX") ||
-        moe_parallel_env_truthy("STORAGELLM_CPU_PIPELINE")) {
-        return 8u;
+        moe_parallel_env_truthy("STORAGELLM_CPU_PIPELINE") ||
+        moe_parallel_env_truthy("STORAGELLM_CPU_ONLY") ||
+        moe_parallel_env_truthy("STORAGELLM_CPU_STORAGE_ENGINE")) {
+        return 4u;
     }
     return 16u;
 }
@@ -236,6 +248,18 @@ static moe_cpu_row_pool_t& moe_get_cpu_row_pool() {
     return pool;
 }
 
+
+
+template <typename RowFn>
+static inline int moe_parallel_rows_call(RowFn& fn, uint32_t row) {
+    if constexpr (std::is_same<decltype(fn(row)), void>::value) {
+        fn(row);
+        return 1;
+    } else {
+        return fn(row) ? 1 : 0;
+    }
+}
+
 template <typename RowFn>
 static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t block_rows, RowFn fn) {
     if (row_count == 0) {
@@ -255,7 +279,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     if (!engine || workers <= 1) {
         int ok = 1;
         for (uint32_t row = 0; row < row_count; ++row) {
-            if (!fn(row)) {
+            if (!moe_parallel_rows_call(fn, row)) {
                 ok = 0;
                 break;
             }
@@ -291,7 +315,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
         // Another thread owns the pool - run single-threaded for this expert
         int ok = 1;
         for (uint32_t row = 0; row < row_count; ++row) {
-            if (!fn(row)) {
+            if (!moe_parallel_rows_call(fn, row)) {
                 ok = 0;
                 break;
             }
@@ -326,7 +350,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
                 end = row_count;
             }
             for (uint32_t row = start; row < end && ok.load(std::memory_order_acquire); ++row) {
-                if (!fn(row)) {
+                if (!moe_parallel_rows_call(fn, row)) {
                     ok.store(0, std::memory_order_release);
                     break;
                 }
@@ -360,7 +384,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
         if (pool_workers > 0 && pool.initialized && !dispatch_guard.owns_lock()) {
             // Pool busy with another engine - run single-threaded
             for (uint32_t row = 0; row < row_count; ++row) {
-                if (!fn(row)) {
+                if (!moe_parallel_rows_call(fn, row)) {
                     ok.store(0, std::memory_order_release);
                     break;
                 }

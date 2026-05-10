@@ -66,6 +66,7 @@ struct moe_pc_engine {
     void* model_lib_grouped_expert_triplets_device_f32 = nullptr;
     void* model_lib_grouped_expert_triplets_indexed_f32 = nullptr;
     void* model_lib_grouped_expert_triplets_indexed_device_f32 = nullptr;
+    void* model_lib_grouped_expert_triplets_indexed_device_f32_v2 = nullptr;
     void* model_lib_prefill_activation_acquire_f32 = nullptr;
     void* model_lib_prefill_activation_release_f32 = nullptr;
     void* model_lib_gpu_expert_scratch_wait_ns = nullptr;
@@ -208,7 +209,16 @@ struct moe_pc_engine {
     uint64_t last_merge_build_token_count{0};
     moe_paged_kv_manager_t paged_kv_manager;
     moe_continuous_batch_scheduler_t batch_scheduler; // History of selected experts per layer
-    std::mutex generation_api_mutex; // BUGFIX: Mutex to separate generation paths and protect KV manager
+    // Serializes legacy single-request generation/eval only. Real continuous-batch
+    // server path does not take this lock; it uses batch_scheduler state plus the
+    // narrower shared_forward_io_mutex below.
+    std::mutex generation_api_mutex;
+    // Protects engine-global IO/forward resources still shared by batch requests:
+    // staging slots, residency maps, prefetch queues, and backend stream/event pools.
+    // This is intentionally narrower than generation_api_mutex and can later be
+    // split into residency/prefetch/staging/backend locks without changing the
+    // public generation API.
+    std::mutex shared_forward_io_mutex;
     moe_expert_merge_map expert_merge_map; // BUGFIX: Move merge map from global static to per-engine instance
     std::mutex gate_snapshot_mutex;
     std::vector<std::vector<float>> gate_input_snapshots;
@@ -398,6 +408,16 @@ struct moe_pc_engine {
     std::atomic<uint64_t> offload_gguf_tensor_count{0};
     std::atomic<uint64_t> offload_gguf_executable_tensor_count{0};
     std::atomic<int> qkv_forced_by_format{0};
+    // QKV-only invariant diagnostics. These counters must remain zero on a
+    // clean QKV-only PPL/generation path except allocation_skips/evals.
+    std::atomic<uint64_t> qkv_plain_kv_forbidden_touches{0};
+    std::atomic<uint64_t> qkv_plain_kv_allocation_skips{0};
+    std::atomic<uint64_t> qkv_plain_kv_readiness_touches{0};
+    std::atomic<uint64_t> qkv_plain_kv_capacity_touches{0};
+    std::atomic<uint64_t> qkv_plain_kv_store_touches{0};
+    std::atomic<uint64_t> qkv_plain_kv_decode_cache_touches{0};
+    std::atomic<uint64_t> qkv_ppl_qkv_only_evals{0};
+    std::atomic<uint64_t> qkv_env_override_blocked{0};
     std::atomic<bool> offload_qkv_cfg_available{false};
     qkv_config_t offload_qkv_cfg{};
     std::atomic<uint32_t> offload_weight_quant_bits{0};

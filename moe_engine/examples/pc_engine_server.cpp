@@ -51,6 +51,142 @@ static const socket_handle_t invalid_socket_handle = -1;
 
 static volatile std::sig_atomic_t g_server_shutdown_requested = 0;
 
+static std::string resource_log_suffix();
+
+static bool server_env_truthy(const char* name) {
+    const char* v = name ? std::getenv(name) : nullptr;
+    if (!v || !*v) return false;
+    return !(std::strcmp(v, "0") == 0 ||
+             std::strcmp(v, "false") == 0 ||
+             std::strcmp(v, "FALSE") == 0 ||
+             std::strcmp(v, "off") == 0 ||
+             std::strcmp(v, "OFF") == 0 ||
+             std::strcmp(v, "no") == 0 ||
+             std::strcmp(v, "NO") == 0);
+}
+
+static uint32_t server_env_u32(const char* name, uint32_t fallback, uint32_t lo, uint32_t hi) {
+    const char* v = name ? std::getenv(name) : nullptr;
+    if (!v || !*v) return fallback;
+    char* end = nullptr;
+    unsigned long parsed = std::strtoul(v, &end, 10);
+    if (end == v) return fallback;
+    if (parsed < lo) parsed = lo;
+    if (parsed > hi) parsed = hi;
+    return static_cast<uint32_t>(parsed);
+}
+
+static bool server_real_batch_generation_enabled() {
+    return server_env_truthy("STORAGELLM_ENABLE_REAL_CONTINUOUS_BATCH_EXEC") ||
+           server_env_truthy("STORAGELLM_REAL_CONTINUOUS_BATCHING") ||
+           (server_env_truthy("STORAGELLM_CONTINUOUS_BATCHING") &&
+            !server_env_truthy("STORAGELLM_DISABLE_REAL_CONTINUOUS_BATCH_EXEC"));
+}
+
+
+struct server_engine_mutex_metrics_t {
+    std::atomic<uint64_t> acquisitions{0};
+    std::atomic<uint64_t> contentions{0};
+    std::atomic<uint64_t> wait_ns_total{0};
+    std::atomic<uint64_t> wait_ns_max{0};
+    std::atomic<uint64_t> slow_waits{0};
+    std::atomic<uint32_t> active{0};
+};
+
+static server_engine_mutex_metrics_t g_engine_mutex_metrics;
+static std::atomic<uint64_t> g_server_batch_request_seq{1};
+
+struct server_batch_driver_metrics_t {
+    std::atomic<uint64_t> acquisitions{0};
+    std::atomic<uint64_t> skipped_busy{0};
+    std::atomic<uint64_t> step_calls{0};
+    std::atomic<uint64_t> progressed_steps{0};
+    std::atomic<uint64_t> wait_result_calls{0};
+    std::atomic<uint32_t> active{0};
+};
+
+static server_batch_driver_metrics_t g_batch_driver_metrics;
+static std::atomic<uint32_t> g_batch_driver_active{0};
+
+static void server_atomic_max_u64(std::atomic<uint64_t>& target, uint64_t value) {
+    uint64_t cur = target.load(std::memory_order_relaxed);
+    while (cur < value && !target.compare_exchange_weak(
+            cur, value, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+}
+
+
+static int server_drive_real_batch_steps(moe_pc_engine_t* engine) {
+    if (!engine) return 0;
+    uint32_t expected = 0;
+    if (!g_batch_driver_active.compare_exchange_strong(
+            expected, 1u, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        g_batch_driver_metrics.skipped_busy.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    g_batch_driver_metrics.active.fetch_add(1, std::memory_order_relaxed);
+    g_batch_driver_metrics.acquisitions.fetch_add(1, std::memory_order_relaxed);
+    int progressed_any = 0;
+    const uint32_t max_steps = server_env_u32(
+        "STORAGELLM_BATCH_DRIVER_MAX_STEPS", 8u, 1u, 1024u);
+    for (uint32_t i = 0; i < max_steps && !g_server_shutdown_requested; ++i) {
+        g_batch_driver_metrics.step_calls.fetch_add(1, std::memory_order_relaxed);
+        const int progressed = moe_pc_engine_step_batch(engine);
+        if (!progressed) break;
+        progressed_any = 1;
+        g_batch_driver_metrics.progressed_steps.fetch_add(1, std::memory_order_relaxed);
+    }
+    uint32_t active = g_batch_driver_metrics.active.load(std::memory_order_acquire);
+    while (active > 0 && !g_batch_driver_metrics.active.compare_exchange_weak(
+            active, active - 1u, std::memory_order_release, std::memory_order_acquire)) {}
+    g_batch_driver_active.store(0u, std::memory_order_release);
+    return progressed_any;
+}
+
+class server_engine_mutex_guard {
+public:
+    server_engine_mutex_guard(std::mutex* mutex, const char* op)
+        : mutex_(mutex), op_(op ? op : "engine") {
+        if (!mutex_) return;
+        auto start = std::chrono::steady_clock::now();
+        lock_ = std::unique_lock<std::mutex>(*mutex_, std::defer_lock);
+        if (!lock_.try_lock()) {
+            g_engine_mutex_metrics.contentions.fetch_add(1, std::memory_order_relaxed);
+            lock_.lock();
+        }
+        const uint64_t wait_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        g_engine_mutex_metrics.acquisitions.fetch_add(1, std::memory_order_relaxed);
+        g_engine_mutex_metrics.wait_ns_total.fetch_add(wait_ns, std::memory_order_relaxed);
+        server_atomic_max_u64(g_engine_mutex_metrics.wait_ns_max, wait_ns);
+        g_engine_mutex_metrics.active.fetch_add(1, std::memory_order_relaxed);
+        if (wait_ns > 1000000ull) {
+            g_engine_mutex_metrics.slow_waits.fetch_add(1, std::memory_order_relaxed);
+            std::cerr << "[storagellm request] engine_mutex_wait op=" << op_
+                      << " wait_ms=" << ((double)wait_ns / 1000000.0)
+                      << resource_log_suffix() << "\n" << std::flush;
+        }
+    }
+
+    ~server_engine_mutex_guard() {
+        if (!mutex_) return;
+        uint32_t cur = g_engine_mutex_metrics.active.load(std::memory_order_acquire);
+        while (cur > 0) {
+            if (g_engine_mutex_metrics.active.compare_exchange_weak(
+                    cur, cur - 1, std::memory_order_release, std::memory_order_acquire)) {
+                break;
+            }
+        }
+    }
+
+    server_engine_mutex_guard(const server_engine_mutex_guard&) = delete;
+    server_engine_mutex_guard& operator=(const server_engine_mutex_guard&) = delete;
+
+private:
+    std::mutex* mutex_ = nullptr;
+    const char* op_ = "engine";
+    std::unique_lock<std::mutex> lock_;
+};
+
 static void handle_server_shutdown_signal(int) {
     g_server_shutdown_requested = 1;
 }
@@ -304,7 +440,12 @@ static void log_engine_snapshot(const char* tag, moe_pc_engine_t* engine) {
                   << " gpu_q=" << io.gpu_queue_depth
                   << " active_workers=" << io.active_workers
                   << " bytes_prefetched=" << io.bytes_prefetched
-                  << " h2d_fallback=" << io.bytes_sync_h2d_fallback;
+                  << " h2d_fallback=" << io.bytes_sync_h2d_fallback
+                  << " touch_fallback=" << io.bytes_touch_fallback
+                  << " backend_async_fallback=" << io.backend_async_fallback
+                  << " gpu_grouped_host_fallback=" << io.gpu_grouped_host_fallback_count
+                  << " device_alloc_fail=" << io.device_alloc_failures
+                  << " device_copy_fail=" << io.device_copy_failures;
     }
     std::cerr << resource_log_suffix() << "\n" << std::flush;
 }
@@ -2268,12 +2409,82 @@ static server_generation_result run_server_generation(
     std::cerr << "[storagellm request] generation begin input_tokens=" << input_ids.size()
               << " max_tokens=" << max_tokens
               << " body_bytes=" << body.size()
+              << " batch=" << (server_real_batch_generation_enabled() ? 1 : 0)
               << resource_log_suffix()
               << "\n" << std::flush;
     log_engine_snapshot("generation_engine_begin", engine);
     const auto generation_start = std::chrono::steady_clock::now();
-    if (engine_mutex) {
-        std::lock_guard<std::mutex> lock(*engine_mutex);
+    if (server_real_batch_generation_enabled()) {
+        const uint64_t request_id =
+            ((uint64_t)std::chrono::steady_clock::now().time_since_epoch().count() << 16) ^
+            g_server_batch_request_seq.fetch_add(1, std::memory_order_relaxed);
+        std::vector<int32_t> batch_out((size_t)max_tokens);
+        uint32_t batch_count = 0;
+        uint32_t batch_prompt = 0;
+        int batch_failed = 0;
+        const auto prefetch_start = std::chrono::steady_clock::now();
+        server_orchestrate_request_prefetch(engine, opts, body);
+        std::cerr << "[storagellm request] prefetch_orchestrate ms="
+                  << elapsed_ms_since(prefetch_start)
+                  << resource_log_suffix() << "\n" << std::flush;
+        const int submitted = moe_pc_engine_submit_request_ex(
+            engine,
+            request_id,
+            input_ids.data(),
+            static_cast<uint32_t>(input_ids.size()),
+            static_cast<uint32_t>(max_tokens),
+            cfg.eos_token_id,
+            cfg.stop_on_eos);
+        if (!submitted) {
+            std::snprintf(stats.error, sizeof(stats.error), "continuous batch submit failed");
+        } else {
+            const uint32_t timeout_ms = server_env_u32(
+                "STORAGELLM_BATCH_WAIT_TIMEOUT_MS", 600000u, 1000u, 86400000u);
+            uint32_t idle_spins = 0;
+            while (!g_server_shutdown_requested) {
+                if (moe_pc_engine_fetch_request_result(
+                        engine, request_id, batch_out.data(), (uint32_t)batch_out.size(),
+                        &batch_count, &batch_prompt, &batch_failed, 1)) {
+                    generated = batch_failed ? 0 : 1;
+                    stats.prompt_tokens = batch_prompt;
+                    stats.completion_tokens = std::min<uint32_t>(batch_count, (uint32_t)out_ids.size());
+                    stats.finish_reason = (stats.completion_tokens >= (uint32_t)max_tokens) ? 1u : 0u;
+                    for (uint32_t i = 0; i < stats.completion_tokens; ++i) {
+                        out_ids[i] = batch_out[i] < 0 ? 0u : (uint32_t)batch_out[i];
+                    }
+                    if (batch_failed) {
+                        std::snprintf(stats.error, sizeof(stats.error), "continuous batch request failed");
+                    }
+                    break;
+                }
+                const int progressed = server_drive_real_batch_steps(engine);
+                if (progressed) {
+                    idle_spins = 0;
+                } else {
+                    ++idle_spins;
+                    g_batch_driver_metrics.wait_result_calls.fetch_add(1, std::memory_order_relaxed);
+                    // Do not let every HTTP worker spin on generation_api_mutex.
+                    // One elected driver advances the shared batch; the rest sleep on
+                    // the scheduler/result condition variable for a short interval.
+                    (void)moe_pc_engine_wait_request_result(engine, request_id, 1u);
+                }
+                if (elapsed_ms_since(generation_start) > (double)timeout_ms) {
+                    moe_pc_engine_cancel_request(engine, request_id);
+                    std::snprintf(stats.error, sizeof(stats.error), "continuous batch request timed out");
+                    generated = 0;
+                    break;
+                }
+                if (idle_spins > 10000u) {
+                    // Keep trying, but expose a log line instead of silently spinning forever.
+                    idle_spins = 0;
+                    std::cerr << "[storagellm request] batch_wait request=" << request_id
+                              << " elapsed_ms=" << elapsed_ms_since(generation_start)
+                              << resource_log_suffix() << "\n" << std::flush;
+                }
+            }
+        }
+    } else if (engine_mutex) {
+        server_engine_mutex_guard lock(engine_mutex, "generation");
         const auto prefetch_start = std::chrono::steady_clock::now();
         server_orchestrate_request_prefetch(engine, opts, body);
         std::cerr << "[storagellm request] prefetch_orchestrate ms="
@@ -2490,7 +2701,7 @@ static server_eval_result run_server_eval(
         );
     };
     if (engine_mutex) {
-        std::lock_guard<std::mutex> lock(*engine_mutex);
+        server_engine_mutex_guard lock(engine_mutex, "eval");
         const auto prefetch_start = std::chrono::steady_clock::now();
         server_orchestrate_request_prefetch(engine, opts, body);
         std::cerr << "[storagellm request] eval_prefetch_orchestrate ms="
@@ -2585,6 +2796,142 @@ static const char* forward_adapter_name(uint32_t adapter) {
     }
 }
 
+static uint64_t server_perf_fallback_event_count(
+    const moe_forward_status_t& forward,
+    const moe_io_stats_t& io_stats
+) {
+    return forward.storage_selected_expert_linear_fallbacks +
+           forward.storage_iouring_fallback_count +
+           io_stats.backend_async_fallback +
+           io_stats.gpu_grouped_host_fallback_count +
+           io_stats.oversized_tensor_fallbacks +
+           io_stats.device_alloc_failures +
+           io_stats.device_copy_failures +
+           io_stats.failed_requests +
+           io_stats.dropped_requests +
+           io_stats.urgent_dropped_requests;
+}
+
+static bool server_perf_fallback_detected(
+    const moe_forward_status_t& forward,
+    const moe_io_stats_t& io_stats
+) {
+    return server_perf_fallback_event_count(forward, io_stats) != 0 ||
+           io_stats.bytes_sync_h2d_fallback != 0 ||
+           io_stats.bytes_touch_fallback != 0;
+}
+
+static void server_append_json_string_item(std::ostringstream& out, bool& first, const char* text) {
+    if (!text || !*text) return;
+    if (!first) out << ",";
+    first = false;
+    out << "\"" << json_escape(text) << "\"";
+}
+
+static std::string server_perf_bottleneck_hints_json(
+    const moe_backend_caps_t& caps,
+    const moe_forward_status_t& forward,
+    const moe_pc_engine_stats_t& stats,
+    const moe_io_stats_t& io_stats
+) {
+    std::ostringstream hints;
+    bool first = true;
+    hints << "[";
+    if (g_engine_mutex_metrics.contentions.load(std::memory_order_relaxed) != 0) {
+        server_append_json_string_item(hints, first, "server_engine_mutex_contention");
+    }
+    if (stats.generation_active > 1u &&
+        !(stats.real_continuous_batch_exec_requested && stats.real_continuous_batch_executor_available)) {
+        server_append_json_string_item(hints, first, "generation_api_mutex_or_kv_serialization");
+    }
+    if (stats.real_continuous_batch_exec_requested && !stats.real_continuous_batch_executor_available) {
+        server_append_json_string_item(hints, first, "real_continuous_batch_executor_missing");
+    }
+    if (!stats.per_request_context_available) {
+        server_append_json_string_item(hints, first, "per_request_context_not_split");
+    }
+    if (!stats.engine_mutex_removable) {
+        server_append_json_string_item(hints, first, "engine_mutex_required_for_correctness");
+    }
+    if (!stats.fast_backend_true_kernel) {
+        server_append_json_string_item(hints, first, "true_fast_backend_missing");
+    }
+    if (!stats.fast_backend_fused_moe) {
+        server_append_json_string_item(hints, first, "fused_grouped_moe_kernel_missing");
+    }
+    if (io_stats.disk_queue_depth > 0 && io_stats.active_workers == 0) {
+        server_append_json_string_item(hints, first, "disk_queue_waiting_without_active_workers");
+    } else if (io_stats.disk_queue_depth > io_stats.active_workers + 4u) {
+        server_append_json_string_item(hints, first, "disk_queue_backlog");
+    }
+    if (io_stats.pinned_queue_depth > io_stats.gpu_queue_depth + 8u) {
+        server_append_json_string_item(hints, first, "pinned_to_gpu_copy_backlog");
+    }
+    if (io_stats.gpu_queue_depth > io_stats.active_workers + 4u) {
+        server_append_json_string_item(hints, first, "gpu_upload_queue_backlog");
+    }
+    if (stats.expert_cache_request_count > 0 && stats.expert_hit_rate_milli < 850u) {
+        server_append_json_string_item(hints, first, "expert_cache_hit_rate_low");
+    }
+    if (forward.storage_selected_expert_linear_fallbacks != 0) {
+        server_append_json_string_item(hints, first, "selected_expert_index_linear_fallback");
+    }
+    if (forward.storage_iouring_fallback_count != 0) {
+        server_append_json_string_item(hints, first, "io_uring_unavailable_or_fallback");
+    }
+    if (io_stats.backend_async_fallback != 0) {
+        server_append_json_string_item(hints, first, "backend_async_copy_fallback");
+    }
+    if (io_stats.bytes_sync_h2d_fallback != 0) {
+        server_append_json_string_item(hints, first, "sync_h2d_copy_fallback");
+    }
+    if (io_stats.gpu_grouped_host_fallback_count != 0) {
+        server_append_json_string_item(hints, first, "gpu_grouped_moe_host_fallback");
+    }
+    if (!forward.cpu_only_runtime && !stats.model_lib_loaded) {
+        server_append_json_string_item(hints, first, "model_lib_not_loaded_gpu_fast_backend_missing");
+    }
+    if (!forward.cpu_only_runtime && !stats.model_lib_compile_succeeded && stats.model_lib_compile_attempted) {
+        server_append_json_string_item(hints, first, "model_lib_compile_failed");
+    }
+    if (!forward.cpu_only_runtime && caps.supports_directstorage && !io_stats.directstorage_active) {
+        server_append_json_string_item(hints, first, "directstorage_supported_but_inactive");
+    }
+    if (!forward.cpu_only_runtime && caps.supports_gpudirect_storage && !io_stats.gpudirect_storage_active) {
+        server_append_json_string_item(hints, first, "gpudirect_storage_supported_but_inactive");
+    }
+    if (stats.gpu_copy_idle_milli > 800u && (io_stats.disk_queue_depth || io_stats.pinned_queue_depth)) {
+        server_append_json_string_item(hints, first, "gpu_copy_idle_while_storage_queue_backlogged");
+    }
+    if (io_stats.device_alloc_failures || io_stats.device_copy_failures) {
+        server_append_json_string_item(hints, first, "device_allocation_or_copy_failures");
+    }
+    if (io_stats.dropped_requests || io_stats.urgent_dropped_requests) {
+        server_append_json_string_item(hints, first, "io_prefetch_requests_dropped");
+    }
+    hints << "]";
+    return hints.str();
+}
+
+static std::string server_perf_bottleneck_summary(
+    const moe_forward_status_t& forward,
+    const moe_pc_engine_stats_t& stats,
+    const moe_io_stats_t& io_stats
+) {
+    if (stats.real_continuous_batch_exec_requested && !stats.real_continuous_batch_executor_available) return "real_continuous_batch_executor_missing";
+    if (!stats.per_request_context_available) return "per_request_context_not_split";
+    if (!stats.fast_backend_true_kernel) return "true_fast_backend_missing";
+    if (!stats.fast_backend_fused_moe) return "fused_grouped_moe_kernel_missing";
+    if (g_engine_mutex_metrics.contentions.load(std::memory_order_relaxed) != 0) return "request_serialization_mutex";
+    if (server_perf_fallback_detected(forward, io_stats)) return "fallback_path_detected";
+    if (io_stats.disk_queue_depth > io_stats.active_workers + 4u) return "storage_queue_backlog";
+    if (stats.expert_cache_request_count > 0 && stats.expert_hit_rate_milli < 850u) return "expert_cache_miss_pressure";
+    if (!forward.cpu_only_runtime && !stats.model_lib_loaded) return "gpu_fast_backend_missing";
+    if (stats.generation_phase == moe_GEN_PHASE_ATTENTION) return "attention_phase_active";
+    if (stats.generation_phase == moe_GEN_PHASE_MLP) return "moe_mlp_phase_active";
+    return "none_observed";
+}
+
 static std::string make_health_json(
     const server_options& opts,
     const moe_backend_caps_t& caps,
@@ -2605,6 +2952,36 @@ static std::string make_health_json(
         << "\"modelReady\":" << (loaded ? "true" : "false") << ","
         << "\"modelLoaded\":" << (loaded ? "true" : "false") << ","
         << "\"generationReady\":" << (generation_ready ? "true" : "false") << ","
+        << "\"strictFastPathRequested\":" << (server_strict_fast_path_enabled() ? "true" : "false") << ","
+        << "\"maxParallelismRequested\":" << (server_env_truthy("STORAGELLM_MAX_PARALLELISM") || server_env_truthy("STORAGELLM_MAX_SPEED") || server_env_truthy("STORAGELLM_SQUEEZE_ALL") ? "true" : "false") << ","
+        << "\"runtimeProfile\":\"" << json_escape(stats.runtime_profile) << "\","
+        << "\"runtimeProfileKind\":" << stats.runtime_profile_kind << ","
+        << "\"runtimePipeline\":\"" << json_escape(stats.runtime_pipeline) << "\","
+        << "\"runtimeUsesVram\":" << (stats.runtime_uses_vram ? "true" : "false") << ","
+        << "\"realContinuousBatchExecRequested\":" << (stats.real_continuous_batch_exec_requested ? "true" : "false") << ","
+        << "\"realContinuousBatchExecLinked\":" << (stats.real_continuous_batch_exec_linked ? "true" : "false") << ","
+        << "\"realContinuousBatchExecutorAvailable\":" << (stats.real_continuous_batch_executor_available ? "true" : "false") << ","
+        << "\"perRequestContextAvailable\":" << (stats.per_request_context_available ? "true" : "false") << ","
+        << "\"engineMutexRemovable\":" << (stats.engine_mutex_removable ? "true" : "false") << ","
+        << "\"fastBackendKind\":" << stats.fast_backend_kind << ","
+        << "\"fastBackendName\":\"" << json_escape(stats.fast_backend_name) << "\","
+        << "\"fastBackendTrueKernel\":" << (stats.fast_backend_true_kernel ? "true" : "false") << ","
+        << "\"fastBackendFusedMoe\":" << (stats.fast_backend_fused_moe ? "true" : "false") << ","
+        << "\"strictCompletionReady\":" << (stats.strict_completion_ready ? "true" : "false") << ","
+        << "\"performanceCompletionLevel\":\"" << json_escape(stats.performance_completion_level) << "\","
+        << "\"continuousBatchingQueueOnly\":" << ((stats.batch_submitted_requests > 0 && !stats.real_continuous_batch_exec_linked) ? "true" : "false") << ","
+        << "\"requestSerializationActive\":" << ((stats.real_continuous_batch_exec_requested && stats.real_continuous_batch_executor_available) ? "false" : "true") << ","
+        << "\"requestMutexActive\":" << g_engine_mutex_metrics.active.load(std::memory_order_relaxed) << ","
+        << "\"requestMutexAcquisitions\":" << g_engine_mutex_metrics.acquisitions.load(std::memory_order_relaxed) << ","
+        << "\"requestMutexContentions\":" << g_engine_mutex_metrics.contentions.load(std::memory_order_relaxed) << ","
+        << "\"requestMutexSlowWaits\":" << g_engine_mutex_metrics.slow_waits.load(std::memory_order_relaxed) << ","
+        << "\"requestMutexWaitNsTotal\":" << g_engine_mutex_metrics.wait_ns_total.load(std::memory_order_relaxed) << ","
+        << "\"requestMutexWaitNsMax\":" << g_engine_mutex_metrics.wait_ns_max.load(std::memory_order_relaxed) << ","
+        << "\"perfFallbackDetected\":" << (server_perf_fallback_detected(forward, io_stats) ? "true" : "false") << ","
+        << "\"perfFallbackEvents\":" << server_perf_fallback_event_count(forward, io_stats) << ","
+        << "\"perfBottleneckDetected\":" << (server_perf_bottleneck_summary(forward, stats, io_stats) == "none_observed" ? "false" : "true") << ","
+        << "\"perfBottleneckSummary\":\"" << json_escape(server_perf_bottleneck_summary(forward, stats, io_stats)) << "\","
+        << "\"perfBottleneckHints\":" << server_perf_bottleneck_hints_json(caps, forward, stats, io_stats) << ","
         << "\"modelFailed\":" << (failed ? "true" : "false") << ","
         << "\"mode\":\"openclaw\","
         << "\"model\":\"" << json_escape(opts.model_id) << "\","
@@ -2764,6 +3141,26 @@ static std::string make_health_json(
         << "\"generationToken\":" << stats.generation_token << ","
         << "\"generationLayer\":" << stats.generation_layer << ","
         << "\"generationPhase\":\"" << generation_phase_name(stats.generation_phase) << "\","
+        << "\"batchSubmittedRequests\":" << stats.batch_submitted_requests << ","
+        << "\"batchAdmittedRequests\":" << stats.batch_admitted_requests << ","
+        << "\"batchCompletedRequests\":" << stats.batch_completed_requests << ","
+        << "\"batchCancelledRequests\":" << stats.batch_cancelled_requests << ","
+        << "\"batchCompletedResultSlots\":" << stats.batch_completed_result_slots << ","
+        << "\"batchRuntimeStates\":" << stats.batch_runtime_states << ","
+        << "\"batchScheduleIterations\":" << stats.batch_schedule_iterations << ","
+        << "\"batchPrefillScheduled\":" << stats.batch_prefill_scheduled << ","
+        << "\"batchDecodeScheduled\":" << stats.batch_decode_scheduled << ","
+        << "\"batchWaitingRequests\":" << stats.batch_waiting_requests << ","
+        << "\"batchRunningRequests\":" << stats.batch_running_requests << ","
+        << "\"batchMaxWaitingObserved\":" << stats.batch_max_waiting_observed << ","
+        << "\"batchMaxRunningObserved\":" << stats.batch_max_running_observed << ","
+        << "\"batchMaxCompletedObserved\":" << stats.batch_max_completed_observed << ","
+        << "\"batchRoundRobinCursor\":" << stats.batch_round_robin_cursor << ","
+        << "\"batchMaxRunningRequests\":" << stats.batch_max_running_requests << ","
+        << "\"batchMaxTokensPerIteration\":" << stats.batch_max_tokens_per_iteration << ","
+        << "\"continuousBatchingConfigured\":" << ((stats.real_continuous_batch_exec_linked && stats.batch_max_running_requests > 1u) ? "true" : "false") << ","
+        << "\"continuousBatchingSchedulerOnly\":" << ((!stats.real_continuous_batch_exec_linked && stats.batch_max_running_requests > 1u) ? "true" : "false") << ","
+        << "\"continuousBatchingRealExecution\":" << (stats.real_continuous_batch_exec_linked ? "true" : "false") << ","
         << "\"kvMode\":\"" << moe_kv_mode_name(stats.kv_mode) << "\","
         << "\"offloadGgufValid\":" << (stats.offload_gguf_valid ? "true" : "false") << ","
         << "\"offloadGgufFileCount\":" << stats.offload_gguf_file_count << ","
@@ -2787,6 +3184,14 @@ static std::string make_health_json(
         << "\"qkvKeyOutlierBits\":" << stats.qkv_key_outlier_bits << ","
         << "\"qkvValueOutlierBits\":" << stats.qkv_value_outlier_bits << ","
         << "\"qkvPlainPersistentStorage\":" << (stats.qkv_plain_kv_persistent_storage ? "true" : "false") << ","
+        << "\"qkvPlainKvForbiddenTouches\":" << stats.qkv_plain_kv_forbidden_touches << ","
+        << "\"qkvPlainKvAllocationSkips\":" << stats.qkv_plain_kv_allocation_skips << ","
+        << "\"qkvPlainKvReadinessTouches\":" << stats.qkv_plain_kv_readiness_touches << ","
+        << "\"qkvPlainKvCapacityTouches\":" << stats.qkv_plain_kv_capacity_touches << ","
+        << "\"qkvPlainKvStoreTouches\":" << stats.qkv_plain_kv_store_touches << ","
+        << "\"qkvPlainKvDecodeCacheTouches\":" << stats.qkv_plain_kv_decode_cache_touches << ","
+        << "\"qkvPplQkvOnlyEvals\":" << stats.qkv_ppl_qkv_only_evals << ","
+        << "\"qkvEnvOverrideBlocked\":" << stats.qkv_env_override_blocked << ","
         << "\"weightQuantBits\":" << stats.weight_quant_bits << ","
         << "\"weightQuantEncoding\":" << stats.weight_quant_encoding << ","
         << "\"weightQuantBlockSize\":" << stats.weight_quant_block_size << ","

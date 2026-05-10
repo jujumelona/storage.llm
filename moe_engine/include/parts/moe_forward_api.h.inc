@@ -223,8 +223,7 @@ int moe_pc_engine_eval_token_ids_from(
     moe_eval_stats_t* out_stats
 );
 
-// Continuous Batching API
-#if defined(MOE_ENABLE_PAGED_KV) && MOE_ENABLE_PAGED_KV
+// Continuous Batching API (always built; paged-KV is optional allocator, not a compile gate)
 int moe_pc_engine_submit_request(
     moe_pc_engine_t* engine,
     uint64_t request_id,
@@ -232,8 +231,39 @@ int moe_pc_engine_submit_request(
     uint32_t token_count
 );
 
+int moe_pc_engine_submit_request_ex(
+    moe_pc_engine_t* engine,
+    uint64_t request_id,
+    const int32_t* prompt_tokens,
+    uint32_t token_count,
+    uint32_t max_new_tokens,
+    uint32_t eos_token_id,
+    uint32_t stop_on_eos
+);
+
 int moe_pc_engine_step_batch(moe_pc_engine_t* engine);
-#endif
+
+int moe_pc_engine_fetch_request_result(
+    moe_pc_engine_t* engine,
+    uint64_t request_id,
+    int32_t* out_token_ids,
+    uint32_t out_token_capacity,
+    uint32_t* out_token_count,
+    uint32_t* out_prompt_token_count,
+    int* out_failed,
+    int remove_after_fetch
+);
+
+int moe_pc_engine_cancel_request(
+    moe_pc_engine_t* engine,
+    uint64_t request_id
+);
+
+int moe_pc_engine_wait_request_result(
+    moe_pc_engine_t* engine,
+    uint64_t request_id,
+    uint32_t timeout_ms
+);
 
 int moe_pc_engine_find_raw_tensor(
     moe_pc_engine_t* engine,

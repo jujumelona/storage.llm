@@ -250,8 +250,12 @@ int moe_pc_engine_eval_token_ids_from(
         input_token_count > eval_ids_limit ? " truncated=1" : "");
     const uint64_t eval_start_us = moe_profile_now_us();
     moe_decode_scratch scratch;
-    moe_kv_cache_ram_scope kv_scope{engine, &scratch.kv_cache};
-    moe_kv_decode_cache_ram_scope decode_cache_scope{engine, &scratch};
+    const int eval_qkv_only = moe_engine_qkv_only_required(engine);
+    if (eval_qkv_only) {
+        engine->qkv_ppl_qkv_only_evals.fetch_add(1, std::memory_order_relaxed);
+    }
+    moe_kv_cache_ram_scope kv_scope{engine, eval_qkv_only ? nullptr : &scratch.kv_cache};
+    moe_kv_decode_cache_ram_scope decode_cache_scope{engine, eval_qkv_only ? nullptr : &scratch};
     // BUGFIX 562: Check num_hidden_layers > 0 before allocation ★
     // Problem: num_hidden_layers can be 0, causing invalid memory allocation
     // Solution: Check before calling moe_generation_should_preallocate_kv_cache
@@ -284,8 +288,11 @@ int moe_pc_engine_eval_token_ids_from(
     }
     moe_profile_log(
         "eval_prepare_end",
-        "kv_max_seq=%u rope_q=%zu rope_k=%zu hidden=%zu",
-        scratch.kv_cache.max_seq_len,
+        "kv_max_seq=%u qkv_cap=%u qkv_limit=%u plain_kv_bytes=%llu rope_q=%zu rope_k=%zu hidden=%zu",
+        eval_qkv_only ? 0u : scratch.kv_cache.max_seq_len,
+        scratch.qkv_capacity_tokens,
+        scratch.qkv_seq_limit,
+        (unsigned long long)(eval_qkv_only ? 0ull : moe_kv_cache_allocated_bytes(scratch.kv_cache)),
         scratch.rope_q_cos.size(),
         scratch.rope_k_cos.size(),
         scratch.hidden.size());
@@ -296,7 +303,9 @@ int moe_pc_engine_eval_token_ids_from(
         moe_eval_set_error(out_stats, "failed to allocate decode scratch");
         return 0;
     }
-    moe_kv_cache_track_ram(engine, &scratch.kv_cache);
+    if (!eval_qkv_only) {
+        moe_kv_cache_track_ram(engine, &scratch.kv_cache);
+    }
     scratch.position = 0;
 
     double nll = 0.0;
@@ -312,7 +321,7 @@ int moe_pc_engine_eval_token_ids_from(
             i,
             (uint32_t)input_token_ids[i],
             (uint32_t)input_token_ids[i + 1u]);
-        if (!moe_forward_one_token_f32(
+        if (!moe_forward_one_token_dispatch_f32(
                 engine,
                 (uint32_t)input_token_ids[i],
                 &scratch,

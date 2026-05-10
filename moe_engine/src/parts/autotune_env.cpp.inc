@@ -128,7 +128,7 @@ static void moe_apply_autotune_transfer_queue_caps(moe_pc_engine* engine) {
     pinned_base = static_cast<uint32_t>(std::min<double>(65536.0, std::ceil(pinned_base * depth_scale)));
     gpu_base = static_cast<uint32_t>(std::min<double>(65536.0, std::ceil(gpu_base * depth_scale / std::max(0.5, std::min(2.0, bottleneck_ratio)))));
 
-    const uint32_t base_cap = std::max<uint32_t>(512u, engine->io_config.max_prefetch_queue);
+    const uint32_t base_cap = std::max<uint32_t>(1024u, engine->io_config.max_prefetch_queue);
     engine->disk_stage_depth_cap = std::max<uint32_t>(512u, std::min<uint32_t>(base_cap, moe_autotune_round_up_pow2ish(disk_base)));
     engine->pinned_stage_depth_cap = std::max<uint32_t>(512u, std::min<uint32_t>(base_cap, moe_autotune_round_up_pow2ish(pinned_base)));
     engine->gpu_stage_depth_cap = std::max<uint32_t>(512u, std::min<uint32_t>(std::max<uint32_t>(base_cap, 1024u), moe_autotune_round_up_pow2ish(gpu_base)));

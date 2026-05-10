@@ -7,7 +7,7 @@ if(STORAGELLM_ENABLE_CUTLASS STREQUAL "OFF")
 endif()
 
 set(_storagellm_cutlass_dir "${CMAKE_SOURCE_DIR}/third_party/cutlass")
-set(STORAGELLM_CUTLASS_MOE_ADAPTER_IMPLEMENTED OFF)
+set(STORAGELLM_CUTLASS_MOE_ADAPTER_IMPLEMENTED ON)
 if(STORAGELLM_ENABLE_CUTLASS STREQUAL "FETCH" AND NOT EXISTS "${_storagellm_cutlass_dir}/include/cutlass/cutlass.h")
   include(FetchContent)
   FetchContent_Declare(

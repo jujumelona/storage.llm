@@ -813,8 +813,9 @@ static int moe_layer_uses_split_post_norm_block(const moe_pc_engine* engine, int
         moe_engine_has_common_tensor_suffix(engine, layer, "layer_output_scale.weight")) {
         result = 1;
     } else {
-        result = (moe_engine_graph_ir_mentions(engine, "post_ffw_norm") ||
-            moe_engine_graph_ir_mentions(engine, "layer_output_scale")) ? 1 : 0;
+        // Do not let a global GraphIR substring enable split-post-norm for every layer.
+        // Per-layer behavior must come from a layer-local tensor/op binding.
+        result = 0;
     }
     if (cached) {
         *cached = result ? 1 : 0;
@@ -845,49 +846,11 @@ static size_t moe_graph_ir_first_pos_any(
 }
 
 static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* engine, int32_t layer) {
-    if (!engine || !engine->offload_graph_ir_ready.load(std::memory_order_relaxed)) {
-        return 0;
-    }
-    if (moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_layernorm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "post_attention_layer_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "post_attn_norm.weight")) {
-        return 0;
-    }
-    static const char* const post_attention_norm_ops[] = {
-        "\"name\":\"post_attention_norm\"",
-        "\"name\": \"post_attention_norm\"",
-        "\"name\":\"post_attention_layernorm\"",
-        "\"name\": \"post_attention_layernorm\"",
-        "\"name\":\"post_attention_layer_norm\"",
-        "\"name\": \"post_attention_layer_norm\""
-    };
-    static const char* const attention_residual_ops[] = {
-        "\"name\":\"attention_residual\"",
-        "\"name\": \"attention_residual\"",
-        "attention_residual"
-    };
-    static const char* const ffn_norm_ops[] = {
-        "\"name\":\"ffn_norm\"",
-        "\"name\": \"ffn_norm\"",
-        "ffn_norm"
-    };
-    const size_t residual_pos = moe_graph_ir_first_pos_any(
-        engine, attention_residual_ops, sizeof(attention_residual_ops) / sizeof(attention_residual_ops[0]));
-    if (residual_pos == std::string::npos) {
-        return 0;
-    }
-    const size_t ffn_norm_pos = moe_graph_ir_first_pos_any(
-        engine, ffn_norm_ops, sizeof(ffn_norm_ops) / sizeof(ffn_norm_ops[0]), residual_pos);
-    if (ffn_norm_pos == std::string::npos) {
-        return 0;
-    }
-    const size_t explicit_post_norm_pos = moe_graph_ir_first_pos_any(
-        engine, post_attention_norm_ops, sizeof(post_attention_norm_ops) / sizeof(post_attention_norm_ops[0]));
-    if (explicit_post_norm_pos != std::string::npos && explicit_post_norm_pos < residual_pos) {
-        return 0;
-    }
-    return 1;
+    (void)engine;
+    (void)layer;
+    // Disabled: the previous implementation used whole-GraphIR substring ordering,
+    // which is not a per-layer edge and can reorder every layer incorrectly.
+    return 0;
 }
 
 static int moe_layer_post_ffw_norm_suffixes_f32(
@@ -1017,9 +980,8 @@ static int moe_layer_output_scale_f32(
         if (!moe_raw_tensor_scalar_at_f32(raw, 0, &scale)) {
             return 0;
         }
-        // BUGFIX 711: Check scale validity
         if (!std::isfinite(scale)) {
-            scale = 1.0f;
+            return 0;
         }
         moe_scale_f32(hidden, scale, hidden_size);
         return 1;
@@ -1032,9 +994,8 @@ static int moe_layer_output_scale_f32(
         if (!moe_raw_tensor_scalar_at_f32(raw, i, &scale)) {
             return 0;
         }
-        // BUGFIX 711: Check scale validity
         if (!std::isfinite(scale)) {
-            scale = 1.0f;
+            return 0;
         }
         hidden[i] *= scale;
     }

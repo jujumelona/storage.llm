@@ -116,6 +116,14 @@ target_link_libraries(storagellm_engine
     PRIVATE storagellm_mmap
 )
 
+if(STORAGELLM_ENABLE_NATIVE_OPTIMIZE)
+    if(MSVC)
+        target_compile_options(storagellm_engine PRIVATE /O2 /Oi /Ot)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(storagellm_engine PRIVATE -O3 -march=native -mtune=native)
+    endif()
+endif()
+
 # Optional fast backends are created by moe_engine/backends.  Link only targets
 # that really configured successfully; do not require vendored TVM/CUTLASS trees.
 if(TARGET storagellm_tvm_codegen)
@@ -233,6 +241,13 @@ add_executable(storagellm_server
 target_link_libraries(storagellm_server
     PRIVATE storagellm_engine
 )
+if(STORAGELLM_ENABLE_NATIVE_OPTIMIZE)
+    if(MSVC)
+        target_compile_options(storagellm_server PRIVATE /O2 /Oi /Ot)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(storagellm_server PRIVATE -O3 -march=native -mtune=native)
+    endif()
+endif()
 
 # Probe executable
 add_executable(storagellm_probe

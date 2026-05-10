@@ -57,7 +57,14 @@ struct moe_decode_scratch {
     std::vector<uint32_t> cpu_active_expert_indices;
     std::vector<float> ple_inputs;
     std::vector<float> ple_projected;
+    // Legacy/plain KV cache. QKV-only models must not allocate or use this; it
+    // remains only for legacy/debug plain-KV models and is guarded by the
+    // qkv_only_runtime fields below.
     moe_kv_cache kv_cache;
+    uint8_t qkv_only_runtime = 0;
+    uint32_t qkv_seq_len = 0;
+    uint32_t qkv_capacity_tokens = 0;
+    uint32_t qkv_seq_limit = 0;
     uint32_t position = 0;
     // Per-session router EMA state (BUGFIX Problem F, stage 2: wiring) ★★★ PERFORMANCE
     // Problem: Engine-level smoothed_router_entropy_milli shared across all sessions
@@ -429,6 +436,51 @@ static int moe_decode_scratch_resize(
         moe_engine_signal_memory_pressure_recovery(engine, "decode_scratch_bad_alloc");
         return 0;
     }
+    const int qkv_only_required = engine &&
+        (engine->qkv_forced_by_format.load(std::memory_order_acquire) ||
+         engine->config.kv_mode == moe_KV_MODE_QKV);
+    if (qkv_only_required) {
+        s->qkv_only_runtime = 1;
+        s->qkv_seq_limit = cfg.max_seq_len ? cfg.max_seq_len : moe_MLA_MAX_SEQ_LEN;
+        if (s->qkv_seq_limit == 0) {
+            s->qkv_seq_limit = 1;
+        }
+        uint32_t cap = pre_allocate_kv ? s->qkv_seq_limit :
+            std::min<uint32_t>(moe_MLA_KV_INITIAL_CHUNK, s->qkv_seq_limit);
+        if (cap == 0) {
+            cap = 1;
+        }
+        if (s->qkv_capacity_tokens == 0 ||
+            s->qkv_capacity_tokens > s->qkv_seq_limit ||
+            (pre_allocate_kv && s->qkv_capacity_tokens < s->qkv_seq_limit)) {
+            s->qkv_capacity_tokens = cap;
+        }
+        if (s->kv_cache.data || s->kv_cache.scales || s->kv_cache.zeros ||
+            s->kv_cache.tracked_ram_bytes != 0) {
+            if (engine && s->kv_cache.tracked_ram_bytes > 0) {
+                subtract_tier_usage(engine, moe_TIER_RAM, s->kv_cache.tracked_ram_bytes);
+                s->kv_cache.tracked_ram_bytes = 0;
+            }
+            std::free(s->kv_cache.data);
+            std::free(s->kv_cache.scales);
+            std::free(s->kv_cache.zeros);
+            s->kv_cache.data = nullptr;
+            s->kv_cache.scales = nullptr;
+            s->kv_cache.zeros = nullptr;
+        }
+        s->kv_cache.num_layers = 0;
+        s->kv_cache.max_seq_len = 0;
+        s->kv_cache.seq_len = 0;
+        s->kv_cache.entry_dim = kv_entry_dim;
+        s->kv_cache.seq_limit = s->qkv_seq_limit;
+        s->kv_decoded_up_to.clear();
+        if (engine) {
+            engine->qkv_plain_kv_allocation_skips.fetch_add(1, std::memory_order_relaxed);
+        }
+        return s->hidden.size() >= hidden && s->norm.size() >= hidden &&
+            s->qkv_only_runtime && s->qkv_capacity_tokens > 0;
+    }
+    s->qkv_only_runtime = 0;
     if (s->kv_cache.num_layers != c->num_hidden_layers ||
         s->kv_cache.entry_dim != kv_entry_dim ||
         s->kv_cache.seq_limit != cfg.max_seq_len ||

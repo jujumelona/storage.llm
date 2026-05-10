@@ -261,10 +261,10 @@ def main() -> None:
     if backend != "cpu":
         metadata["compiled"] = False
         metadata["reason"] = (
-            f"{backend} target-specific TVM device wrapper is not implemented in this patch; "
-            "no fake GPU fast path emitted."
+            f"{backend} TVM device wrapper generation is disabled in this source-complete build; "
+            "engine-owned native backend adapters handle GPU fast paths."
         )
-        print("[storageLLM] non-CPU backend requested; wrote source/metadata only, no fake fast DLL.")
+        print("[storageLLM] non-CPU TVM requested; wrote metadata only. Use engine-owned native GPU adapters for fast paths.")
     elif args.no_compile:
         metadata["compiled"] = False
         metadata["reason"] = "--no-compile"

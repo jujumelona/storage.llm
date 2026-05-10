@@ -310,6 +310,7 @@ static void moe_rt_apply_juju_io_flags(
     io->enable_lookahead_prefetch = 1;
     io->enable_topology_prefetch = 1;
     io->enable_mmap_prefetch = 1;
+    io->enable_common_raw_vram_pin = (engine && engine->config.prefer_gpu) ? 1 : 0;
     uint32_t hinted_prefetch_distance = 0;
     const uint32_t section_hints_ready = engine && engine->juju_io_section_hints_ready.load(std::memory_order_acquire);
     const uint32_t contract_io_ready = engine && engine->juju_runtime_contract_io_policy_ready.load(std::memory_order_acquire);
@@ -358,8 +359,8 @@ static void moe_rt_apply_juju_io_flags(
     if (stream_block >= 65536u && stream_block < io->direct_upload_min_bytes) {
         io->direct_upload_min_bytes = stream_block;
     }
-    if (io->max_prefetch_queue < 12288u) {
-        io->max_prefetch_queue = 12288u;
+    if (io->max_prefetch_queue < 32768u) {
+        io->max_prefetch_queue = 32768u;
     }
     if (io->topology_max_candidates < 4u) {
         io->topology_max_candidates = 4u;
@@ -414,9 +415,10 @@ static void moe_rt_apply_juju_io_flags(
                 io->io_worker_threads = 1;
                 io->disk_worker_threads = 1;
             } else if (!engine->config.prefer_gpu || engine->backend_caps.supports_unified_memory) {
-                // CPU_WITH_CACHE or unified GPU. Limit IO to preserve compute cores.
-                // 2 threads are enough to saturate NVMe page faults without thrashing AVX2.
-                io->io_worker_threads = io->io_worker_threads > 2u ? 2u : io->io_worker_threads;
+                // Max-speed mode keeps the prefetch pipeline active even for
+                // CPU_WITH_CACHE/unified-memory paths; users can still cap it with
+                // STORAGELLM_IO_WORKERS/STORAGELLM_DISK_WORKERS if their desktop is noisy.
+                io->io_worker_threads = std::max<uint32_t>(io->io_worker_threads, 4u);
                 io->disk_worker_threads = io->io_worker_threads;
             }
         } else {

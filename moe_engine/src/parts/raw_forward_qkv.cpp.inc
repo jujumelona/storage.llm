@@ -1,4 +1,4 @@
-﻿// Raw forward - QKV attention integration
+// Raw forward - QKV attention integration
 
 // GAP 1A: Quantize plain float K/V into persistent per-head qkv_state_t
 // Called once per head when context changes; state persists across decode calls
@@ -176,32 +176,59 @@ static qkv_config_t moe_qkv_contract_config_for_head_dim(
         }
     }
     int bits_overridden = 0;
-    cfg.k_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_K_BITS", cfg.k_bits, &bits_overridden);
-    cfg.v_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_V_BITS", cfg.v_bits, &bits_overridden);
-    cfg.normal_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_NORMAL_BITS", cfg.normal_bits, &bits_overridden);
-    cfg.outlier_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_OUTLIER_BITS", cfg.outlier_bits, &bits_overridden);
-    cfg.key_normal_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_KEY_NORMAL_BITS", cfg.key_normal_bits, &bits_overridden);
-    cfg.value_normal_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_VALUE_NORMAL_BITS", cfg.value_normal_bits, &bits_overridden);
-    cfg.key_outlier_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_KEY_OUTLIER_BITS", cfg.key_outlier_bits, &bits_overridden);
-    cfg.value_outlier_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_VALUE_OUTLIER_BITS", cfg.value_outlier_bits, &bits_overridden);
-    const uint32_t outlier_channels_override = moe_parse_env_u32("STORAGELLM_QKV_OUTLIER_CHANNELS");
-    if (outlier_channels_override > 0 || std::getenv("STORAGELLM_QKV_OUTLIER_CHANNELS")) {
-        cfg.outlier_channels = (int)std::min<uint32_t>(outlier_channels_override, head_dim);
-    } else if (bits_overridden && (qkv_bits_raw(cfg.k_bits) || qkv_bits_raw(cfg.v_bits))) {
-        cfg.outlier_channels = 0;
-        cfg.normal_bits = cfg.v_bits;
-        cfg.outlier_bits = cfg.k_bits;
-        cfg.key_normal_bits = cfg.normal_bits;
-        cfg.value_normal_bits = cfg.normal_bits;
-        cfg.key_outlier_bits = cfg.outlier_bits;
-        cfg.value_outlier_bits = cfg.outlier_bits;
+    const int qkv_forced = engine && engine->qkv_forced_by_format.load(std::memory_order_acquire);
+    const char* allow_override_env = std::getenv("STORAGELLM_ALLOW_QKV_ENV_OVERRIDE");
+    const int allow_env_override = allow_override_env && allow_override_env[0] &&
+        std::strcmp(allow_override_env, "0") != 0 &&
+        std::strcmp(allow_override_env, "false") != 0 &&
+        std::strcmp(allow_override_env, "FALSE") != 0;
+    const int apply_env_overrides = !qkv_forced || allow_env_override;
+    if (apply_env_overrides) {
+        cfg.k_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_K_BITS", cfg.k_bits, &bits_overridden);
+        cfg.v_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_V_BITS", cfg.v_bits, &bits_overridden);
+        cfg.normal_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_NORMAL_BITS", cfg.normal_bits, &bits_overridden);
+        cfg.outlier_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_OUTLIER_BITS", cfg.outlier_bits, &bits_overridden);
+        cfg.key_normal_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_KEY_NORMAL_BITS", cfg.key_normal_bits, &bits_overridden);
+        cfg.value_normal_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_VALUE_NORMAL_BITS", cfg.value_normal_bits, &bits_overridden);
+        cfg.key_outlier_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_KEY_OUTLIER_BITS", cfg.key_outlier_bits, &bits_overridden);
+        cfg.value_outlier_bits = moe_qkv_env_bits_or_current("STORAGELLM_QKV_VALUE_OUTLIER_BITS", cfg.value_outlier_bits, &bits_overridden);
+        const uint32_t outlier_channels_override = moe_parse_env_u32("STORAGELLM_QKV_OUTLIER_CHANNELS");
+        if (outlier_channels_override > 0 || std::getenv("STORAGELLM_QKV_OUTLIER_CHANNELS")) {
+            cfg.outlier_channels = (int)std::min<uint32_t>(outlier_channels_override, head_dim);
+        } else if (bits_overridden && (qkv_bits_raw(cfg.k_bits) || qkv_bits_raw(cfg.v_bits))) {
+            cfg.outlier_channels = 0;
+            cfg.normal_bits = cfg.v_bits;
+            cfg.outlier_bits = cfg.k_bits;
+            cfg.key_normal_bits = cfg.normal_bits;
+            cfg.value_normal_bits = cfg.normal_bits;
+            cfg.key_outlier_bits = cfg.outlier_bits;
+            cfg.value_outlier_bits = cfg.outlier_bits;
+        }
+        cfg.enable_rotation = moe_qkv_env_bool_or_current("STORAGELLM_QKV_ROTATION", cfg.enable_rotation ? 1 : 0) != 0;
+        cfg.enable_qjl = moe_qkv_env_bool_or_current("STORAGELLM_QKV_QJL", cfg.enable_qjl ? 1 : 0) != 0;
+        cfg.rotation_backend = moe_qkv_rotation_backend_from_env_or_current(
+            "STORAGELLM_QKV_ROTATION_BACKEND", cfg.rotation_backend);
+        cfg.codebook_distribution = moe_qkv_codebook_distribution_from_env_or_current(
+            "STORAGELLM_QKV_CODEBOOK_DISTRIBUTION", cfg.codebook_distribution);
+    } else if (std::getenv("STORAGELLM_QKV_K_BITS") ||
+               std::getenv("STORAGELLM_QKV_V_BITS") ||
+               std::getenv("STORAGELLM_QKV_NORMAL_BITS") ||
+               std::getenv("STORAGELLM_QKV_OUTLIER_BITS") ||
+               std::getenv("STORAGELLM_QKV_KEY_NORMAL_BITS") ||
+               std::getenv("STORAGELLM_QKV_VALUE_NORMAL_BITS") ||
+               std::getenv("STORAGELLM_QKV_KEY_OUTLIER_BITS") ||
+               std::getenv("STORAGELLM_QKV_VALUE_OUTLIER_BITS") ||
+               std::getenv("STORAGELLM_QKV_OUTLIER_CHANNELS") ||
+               std::getenv("STORAGELLM_QKV_ROTATION") ||
+               std::getenv("STORAGELLM_QKV_QJL") ||
+               std::getenv("STORAGELLM_QKV_ROTATION_BACKEND") ||
+               std::getenv("STORAGELLM_QKV_CODEBOOK_DISTRIBUTION")) {
+        if (engine) {
+            const_cast<moe_pc_engine*>(engine)->qkv_env_override_blocked.fetch_add(1, std::memory_order_relaxed);
+        }
+        moe_profile_log("qkv_env_override_blocked", "head_dim=%u policy_hash=%llu",
+            head_dim, (unsigned long long)cfg.policy_hash);
     }
-    cfg.enable_rotation = moe_qkv_env_bool_or_current("STORAGELLM_QKV_ROTATION", cfg.enable_rotation ? 1 : 0) != 0;
-    cfg.enable_qjl = moe_qkv_env_bool_or_current("STORAGELLM_QKV_QJL", cfg.enable_qjl ? 1 : 0) != 0;
-    cfg.rotation_backend = moe_qkv_rotation_backend_from_env_or_current(
-        "STORAGELLM_QKV_ROTATION_BACKEND", cfg.rotation_backend);
-    cfg.codebook_distribution = moe_qkv_codebook_distribution_from_env_or_current(
-        "STORAGELLM_QKV_CODEBOOK_DISTRIBUTION", cfg.codebook_distribution);
     if (qkv_bits_raw(cfg.k_bits) || qkv_bits_raw(cfg.v_bits) ||
         qkv_bits_raw(cfg.normal_bits) || qkv_bits_raw(cfg.outlier_bits) ||
         qkv_bits_raw(cfg.key_normal_bits) || qkv_bits_raw(cfg.value_normal_bits) ||
@@ -221,6 +248,9 @@ static qkv_config_t moe_qkv_contract_config_for_head_dim(
     if (cfg.codebook_distribution != QKV_CODEBOOK_DISTRIBUTION_EXACT_BETA &&
         cfg.codebook_distribution != QKV_CODEBOOK_DISTRIBUTION_GAUSSIAN_APPROX) {
         cfg.codebook_distribution = QKV_CODEBOOK_DISTRIBUTION_EXACT_BETA;
+    }
+    if (qkv_forced) {
+        cfg.plain_kv_persistent_storage = false;
     }
     if (cfg.policy_hash == 0) {
         cfg.policy_hash = moe_qkv_config_policy_hash(cfg);

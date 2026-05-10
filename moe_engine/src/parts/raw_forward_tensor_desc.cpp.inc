@@ -8,6 +8,7 @@ struct moe_raw_tensor_desc {
     uint64_t bytes;
     uint32_t rows;
     uint32_t cols;
+    uint8_t math_transposed;
 };
 
 static uint8_t moe_raw_scalar_encoding_from_common_tensor(
@@ -169,6 +170,7 @@ static int moe_common_tensor_record_to_raw_desc(
     moe_raw_tensor_desc desc{};
     desc.rel_offset = 0;
     desc.bytes = rec.bytes;
+    desc.math_transposed = rec.math_transposed;
     if (rec.dims == 1) {
         desc.rows = (uint32_t)std::min<uint64_t>(rec.shape[0], UINT32_MAX);
         desc.cols = 0;
@@ -264,10 +266,8 @@ static void moe_raw_tensor_kind_common_names(
                 "ln_1.weight"
             };
             moe_push_layer_tensor_candidates(out, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
-            out->push_back("output_norm.weight");
-            out->push_back("model.norm.weight");
-            out->push_back("norm.weight");
-            out->push_back("transformer.ln_f.weight");
+            // Do not fall back to final_norm/global norm for a layer-local input norm.
+            // That silently applies the final layer scale to every attention block.
             break;
         }
         case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM: {
@@ -599,7 +599,11 @@ static const moe_gguf_common_tensor_record* find_common_tensor_by_op_role(
         if (!moe_common_tensor_op_role_matches(rec, role)) {
             continue;
         }
-        if (layer != INT32_MIN && rec.execution_layer != INT32_MIN &&
+        if (layer >= 0) {
+            if (!moe_common_tensor_layer_matches(rec, layer)) {
+                continue;
+            }
+        } else if (layer != INT32_MIN && rec.execution_layer != INT32_MIN &&
             rec.execution_layer != layer) {
             continue;
         }
@@ -657,6 +661,18 @@ static int map_common_tensor_record(
     entry.cols = desc.cols;
     entry.scalar_encoding = moe_raw_scalar_encoding_from_common_tensor(rec, desc.rows, desc.cols);
     entry.weight_format = moe_common_tensor_effective_weight_format(rec, desc);
+    entry.math_transposed = rec.math_transposed;
+    entry.physical_rows = entry.rows;
+    entry.physical_cols = entry.cols;
+    if (rec.math_transposed) {
+        if (rec.source_dims >= 2 && rec.source_shape[0] && rec.source_shape[1]) {
+            entry.physical_cols = (uint32_t)std::min<uint64_t>(rec.source_shape[0], UINT32_MAX);
+            entry.physical_rows = (uint32_t)std::min<uint64_t>(rec.source_shape[1], UINT32_MAX);
+        } else {
+            entry.physical_rows = desc.cols;
+            entry.physical_cols = desc.rows;
+        }
+    }
     if (entry.weight_format == moe_WEIGHT_ENCODING_UNKNOWN) {
         moe_trace_common_tensor_unknown_weight_format(rec, desc);
         return 0;

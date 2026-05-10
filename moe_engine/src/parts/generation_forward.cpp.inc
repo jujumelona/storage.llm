@@ -130,9 +130,10 @@ static void moe_forward_trace_runtime_resources(
     const uint64_t vram_used = engine->vram_used_bytes.load(std::memory_order_relaxed);
     const uint64_t db_used = engine->db_used_bytes.load(std::memory_order_relaxed);
     const uint64_t available_ram = storagellm::available_ram_bytes();
-    const uint64_t kv_bytes = s ? moe_kv_cache_allocated_bytes(s->kv_cache) : 0;
-    const uint32_t kv_seq = s ? s->kv_cache.max_seq_len : 0;
-    const uint32_t kv_entry_dim = s ? s->kv_cache.entry_dim : 0;
+    const int qkv_only = engine && moe_engine_qkv_only_required(engine);
+    const uint64_t kv_bytes = (s && !qkv_only) ? moe_kv_cache_allocated_bytes(s->kv_cache) : 0;
+    const uint32_t kv_seq = s ? (qkv_only ? s->qkv_capacity_tokens : s->kv_cache.max_seq_len) : 0;
+    const uint32_t kv_entry_dim = s ? (qkv_only ? s->qkv_seq_limit : s->kv_cache.entry_dim) : 0;
     moe_profile_log(
         "cpu_ram",
         "position=%u layer=%u stage=%s ram_tier=%llu vram_tier=%llu db_tier=%llu ram_used=%llu vram_used=%llu db_used=%llu available_ram=%llu cpu_workers=%u",
@@ -148,16 +149,17 @@ static void moe_forward_trace_runtime_resources(
         (unsigned long long)available_ram,
         engine->cpu_active_workers.load(std::memory_order_relaxed));
     moe_profile_log(
-        "kv_cache",
-        "position=%u layer=%u stage=%s bytes=%llu tracked_ram=%llu seq_len=%u max_seq_len=%u entry_dim=%u layout=position_major_layer_contiguous",
+        qkv_only ? "qkv_cache" : "kv_cache",
+        "position=%u layer=%u stage=%s bytes=%llu tracked_ram=%llu seq_len=%u max_seq_len=%u entry_dim=%u layout=%s",
         position,
         layer,
         stage ? stage : "",
         (unsigned long long)kv_bytes,
-        (unsigned long long)(s ? s->kv_cache.tracked_ram_bytes : 0),
-        s ? s->kv_cache.seq_len : 0,
+        (unsigned long long)((s && !qkv_only) ? s->kv_cache.tracked_ram_bytes : 0),
+        s ? (qkv_only ? s->qkv_seq_len : s->kv_cache.seq_len) : 0,
         kv_seq,
-        kv_entry_dim);
+        kv_entry_dim,
+        qkv_only ? "qkv_layer_head_state" : "position_major_layer_contiguous");
     moe_profile_log(
         "io_pipeline",
         "position=%u layer=%u stage=%s disk_depth=%u pinned_depth=%u gpu_depth=%u total_depth=%u disk_inflight=%u pinned_inflight=%u gpu_inflight=%u queued=%llu prefetch=%llu disk_to_ram=%llu ram_to_pinned=%llu pinned_to_gpu=%llu direct_to_gpu=%llu",
@@ -215,7 +217,9 @@ static int moe_forward_one_token_f32(
         moe_generation_set_error(stats, "decode scratch allocation failed");
         return 0;
     }
-    moe_kv_cache_track_ram(engine, &s->kv_cache);  // ensure_capacity delta tracking
+    if (!moe_engine_qkv_only_required(engine)) {
+        moe_kv_cache_track_ram(engine, &s->kv_cache);  // ensure_capacity delta tracking
+    }
     moe_forward_trace_runtime_resources(engine, s, position, 0xffffffffu, "after_scratch");
     moe_cpu_storage_begin_token(engine, position, token_id);
     float* hidden = s->hidden.data();

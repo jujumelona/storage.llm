@@ -171,11 +171,17 @@ static int moe_map_router_tensor(
             return 1;
         }
     }
-    std::vector<std::string> names;
-    moe_push_layer_tensor_candidates(&names, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_desc desc{};
     const moe_gguf_common_tensor_record* rec =
-        moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
+        find_common_tensor_by_op_role(engine, "moe_router", layer, &desc);
+    if (!rec) {
+        rec = find_common_tensor_by_op_role(engine, "router", layer, &desc);
+    }
+    if (!rec) {
+        std::vector<std::string> names;
+        moe_push_layer_tensor_candidates(&names, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+        rec = moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
+    }
     if (!rec || desc.cols != hidden_size || desc.rows != experts) {
         return 0;
     }

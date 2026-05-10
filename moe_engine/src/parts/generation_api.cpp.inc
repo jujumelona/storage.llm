@@ -26,6 +26,9 @@ static void touch_expert_heat(moe_pc_engine* engine, moe_block_state* state, dou
 // Scratch (depends on: kv_cache, mla_constants)
 #include "generation_scratch.cpp.inc"
 
+// QKV-only invariant guards (depends on scratch and qkv runtime state)
+#include "generation/qkv_only_runtime.cpp.inc"
+
 // Router (depends on: raw_ops, scratch session telemetry)
 #include "generation_router.cpp.inc"
 
@@ -47,6 +50,9 @@ static void touch_expert_heat(moe_pc_engine* engine, moe_block_state* state, dou
 
 // Forward (depends on: attention, mlp, scratch, cpu_storage_engine)
 #include "generation_forward.cpp.inc"
+
+// Forward dispatch adapter (depends on generation_forward)
+#include "generation/graph_contract_forward.cpp.inc"
 
 // Main API (depends on: forward, kv_cache, scratch, error)
 #include "generation_api_main.cpp.inc"

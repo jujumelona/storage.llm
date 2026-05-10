@@ -60,6 +60,10 @@
     const int has_v_raw = has_v ? get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_KV_B_PROJ, &v_raw) : 0;
     const int qkv_parallel_path = has_q_raw && has_k_raw && q_raw.cols == hidden_size && k_raw.cols == hidden_size &&
         (!has_v || (has_v_raw && v_raw.cols == hidden_size));
+    const int allow_v_equals_k = !engine || !engine->offload_graph_ir_required.load(std::memory_order_relaxed) ||
+        moe_engine_graph_ir_mentions(engine, "v_equals_k") ||
+        moe_engine_graph_ir_mentions(engine, "k_equals_v") ||
+        moe_engine_graph_ir_mentions(engine, "shared_kv_projection");
 
     if (qkv_parallel_path) {
         // BUGFIX 216: Add scratch buffer size validation before parallel Q/K/V
@@ -84,14 +88,17 @@
                 if (row < q_dim) {
                     // Q projection
                     s->q_b[row] = moe_raw_tensor_dot_row(q_raw, row, attn_input, hidden_size);
+                    if (!std::isfinite(s->q_b[row])) return 0;
                 } else if (row < q_dim + k_dim) {
                     // K projection
                     const uint32_t k_row = row - q_dim;
                     s->attn_kv_a[k_row] = moe_raw_tensor_dot_row(k_raw, k_row, attn_input, hidden_size);
+                    if (!std::isfinite(s->attn_kv_a[k_row])) return 0;
                 } else if (has_v) {
                     // V projection
                     const uint32_t v_row = row - q_dim - k_dim;
                     s->attn_value[v_row] = moe_raw_tensor_dot_row(v_raw, v_row, attn_input, hidden_size);
+                    if (!std::isfinite(s->attn_value[v_row])) return 0;
                 }
                 return 1;
             })) {
@@ -100,6 +107,10 @@
             }
         }
         if (!has_v) {
+            if (!allow_v_equals_k) {
+                moe_profile_log("attn_v_equals_k_blocked", "layer=%d pos=%u k_dim=%u v_dim=%u", layer, position, k_dim, kv_v_dim);
+                return 0;
+            }
             std::memcpy(s->attn_value.data(), s->attn_kv_a.data(), (size_t)kv_v_dim * sizeof(float));
         }
     } else {
@@ -125,6 +136,10 @@
                 return 0;
             }
         } else {
+            if (!allow_v_equals_k) {
+                moe_profile_log("attn_v_equals_k_blocked", "layer=%d pos=%u k_dim=%u v_dim=%u", layer, position, k_dim, kv_v_dim);
+                return 0;
+            }
             std::memcpy(s->attn_value.data(), s->attn_kv_a.data(), (size_t)kv_v_dim * sizeof(float));
         }
     }
@@ -270,9 +285,7 @@
         head_dim,
         v_head_dim);
 #endif
-    const int qkv_configured =
-        engine &&
-        engine->config.kv_mode == moe_KV_MODE_QKV;
+    const int qkv_configured = engine && moe_engine_qkv_only_required(engine);
     const int qkv_decode = qkv_configured && qkv_is_enabled();
     if (qkv_configured && !qkv_decode) {
         std::fprintf(stderr,
@@ -288,37 +301,22 @@
     float* layer_decode = nullptr;
     uint32_t decode_start = 0;
     if (qkv_decode) {
-        const uint32_t seq_limit = s->kv_cache.seq_limit ? s->kv_cache.seq_limit :
-            (cfg.max_seq_len ? cfg.max_seq_len : position + 1u);
-        if (position >= seq_limit) {
-            std::fprintf(stderr,
-                "[storagellm attn] qkv context exceeds seq_limit layer=%d pos=%u limit=%u\n",
-                layer, position, seq_limit);
-            return 0;
-        }
-        seq_len = position + 1u;
-        qkv_capacity_tokens = s->kv_cache.max_seq_len ? s->kv_cache.max_seq_len :
-            (cfg.max_seq_len ? std::min<uint32_t>(cfg.max_seq_len, moe_MLA_KV_INITIAL_CHUNK) : seq_len);
+        qkv_capacity_tokens = moe_qkv_only_ensure_capacity(engine, s, cfg, position, 0);
         if (qkv_capacity_tokens == 0) {
-            qkv_capacity_tokens = seq_len;
-        }
-        while (qkv_capacity_tokens < seq_len && qkv_capacity_tokens < seq_limit) {
-            const uint32_t next_cap = qkv_capacity_tokens > UINT32_MAX / 2u
-                ? seq_limit
-                : std::min<uint32_t>(seq_limit, qkv_capacity_tokens * 2u);
-            if (next_cap <= qkv_capacity_tokens) {
-                break;
-            }
-            qkv_capacity_tokens = next_cap;
-        }
-        if (qkv_capacity_tokens < seq_len) {
             std::fprintf(stderr,
-                "[storagellm attn] qkv capacity underflow layer=%d pos=%u seq=%u cap=%u limit=%u\n",
-                layer, position, seq_len, qkv_capacity_tokens, seq_limit);
+                "[storagellm attn] qkv-only capacity failed layer=%d pos=%u limit=%u\n",
+                layer, position, s ? s->qkv_seq_limit : 0u);
             return 0;
         }
-        s->kv_cache.seq_len = seq_len;
+        seq_len = s->qkv_seq_len;
     } else {
+        if (moe_engine_qkv_only_required(engine)) {
+            moe_qkv_only_plain_touch(engine, "store");
+            std::fprintf(stderr,
+                "[storagellm attn] plain KV branch reached in QKV-only model layer=%d pos=%u\n",
+                layer, position);
+            return 0;
+        }
         if (!moe_standard_kv_cache_ensure(engine, s, position, kv_entry_dim)) {
             std::fprintf(stderr, "[storagellm attn] kv ensure failed layer=%d pos=%u entry=%u\n", layer, position, kv_entry_dim);
             return 0;
@@ -353,7 +351,7 @@
         layer, position, seq_len, decode_start, kv_entry_dim,
         qkv_decode ? "qkv_only" : "plain_kv_cache",
         qkv_capacity_tokens,
-        s->kv_cache.max_seq_len,
+        qkv_decode ? 0u : s->kv_cache.max_seq_len,
         moe_profile_elapsed_ms(kv_start_us));
 
     const char* scale_source = nullptr;

@@ -2,6 +2,8 @@
 
 #include <climits>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <vector>
 
@@ -88,6 +90,27 @@ private:
 
 static thread_local storagellm_cublaslt_workspace g_storagellm_cublaslt_workspace;
 
+
+
+static int storagellm_cuda_env_truthy(const char* name, int fallback) {
+    const char* v = name ? std::getenv(name) : nullptr;
+    if (!v || !*v) return fallback;
+    return !(std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+             std::strcmp(v, "FALSE") == 0 || std::strcmp(v, "off") == 0 ||
+             std::strcmp(v, "OFF") == 0 || std::strcmp(v, "no") == 0 ||
+             std::strcmp(v, "NO") == 0);
+}
+
+static uint32_t storagellm_cuda_env_u32(const char* name, uint32_t fallback, uint32_t lo, uint32_t hi) {
+    const char* v = name ? std::getenv(name) : nullptr;
+    if (!v || !*v) return fallback;
+    char* end = nullptr;
+    unsigned long parsed = std::strtoul(v, &end, 10);
+    if (end == v) return fallback;
+    if (parsed < lo) parsed = lo;
+    if (parsed > hi) parsed = hi;
+    return static_cast<uint32_t>(parsed);
+}
 
 static int storagellm_ensure_cublas_grouped() {
     std::call_once(g_storagellm_cublas_once, [] {
@@ -237,6 +260,96 @@ __global__ void storagellm_weighted_accum_rows_kernel(
     atomicAdd(accum + static_cast<uint64_t>(token) * accum_stride + col, v);
 }
 
+
+__global__ void storagellm_one_shot_fused_moe_kernel(
+    const float* gate,
+    const float* up,
+    const float* down,
+    const float* input,
+    uint32_t input_stride,
+    const uint32_t* token_indices,
+    const float* token_weights,
+    uint32_t assignment_offset,
+    uint32_t assignment_count,
+    uint32_t hidden,
+    uint32_t intermediate,
+    uint32_t activation_mode,
+    float* accum,
+    uint32_t accum_stride
+) {
+    const uint32_t local_row = blockIdx.x;
+    if (local_row >= assignment_count) return;
+    const uint32_t global_row = assignment_offset + local_row;
+    const uint32_t token = token_indices[global_row];
+    const float route_weight = token_weights ? token_weights[global_row] : 1.0f;
+    if (!isfinite(route_weight)) return;
+    const float* x = input + static_cast<uint64_t>(token) * input_stride;
+    extern __shared__ float mid[];
+
+    for (uint32_t r = threadIdx.x; r < intermediate; r += blockDim.x) {
+        const float* gw = gate + static_cast<uint64_t>(r) * hidden;
+        const float* uw = up + static_cast<uint64_t>(r) * hidden;
+        float g = 0.0f;
+        float u = 0.0f;
+        for (uint32_t h = 0; h < hidden; ++h) {
+            const float xv = x[h];
+            g = fmaf(gw[h], xv, g);
+            u = fmaf(uw[h], xv, u);
+        }
+        mid[r] = storagellm_gated_activation(activation_mode, g, u);
+    }
+    __syncthreads();
+
+    for (uint32_t h = threadIdx.x; h < hidden; h += blockDim.x) {
+        const float* dw = down + static_cast<uint64_t>(h) * intermediate;
+        float y = 0.0f;
+        for (uint32_t r = 0; r < intermediate; ++r) {
+            y = fmaf(dw[r], mid[r], y);
+        }
+        atomicAdd(accum + static_cast<uint64_t>(token) * accum_stride + h, y * route_weight);
+    }
+}
+
+static int storagellm_run_cuda_one_shot_fused(
+    const moe_grouped_expert_device_task_t* tasks,
+    uint32_t task_count,
+    cudaStream_t stream
+) {
+    if (!tasks || task_count == 0) return 0;
+    const uint32_t max_intermediate = storagellm_cuda_env_u32(
+        "STORAGELLM_CUDA_FUSED_MAX_INTERMEDIATE", 12288u, 1u, 65536u);
+    const uint32_t block = storagellm_cuda_env_u32(
+        "STORAGELLM_CUDA_FUSED_BLOCK_THREADS", 256u, 64u, 1024u);
+    for (uint32_t i = 0; i < task_count; ++i) {
+        const auto& t = tasks[i];
+        if (!storagellm_validate_cublas_task(t)) return 0;
+        if (t.intermediate_size > max_intermediate) return 0;
+        const size_t shared_bytes = static_cast<size_t>(t.intermediate_size) * sizeof(float);
+        const float* gate = storagellm_weight_ptr_fp32(t.gate_weight, t.intermediate_size, t.hidden_size);
+        const float* up = storagellm_weight_ptr_fp32(t.up_weight, t.intermediate_size, t.hidden_size);
+        const float* down = storagellm_weight_ptr_fp32(t.down_weight, t.hidden_size, t.intermediate_size);
+        if (!gate || !up || !down) return 0;
+        if (t.assignment_count == 0) continue;
+        storagellm_one_shot_fused_moe_kernel<<<t.assignment_count, block, shared_bytes, stream>>>(
+            gate,
+            up,
+            down,
+            static_cast<const float*>(t.d_input),
+            t.input_stride,
+            t.d_token_indices,
+            t.d_token_weights,
+            t.assignment_offset,
+            t.assignment_count,
+            t.hidden_size,
+            t.intermediate_size,
+            t.activation_mode,
+            static_cast<float*>(t.d_accum),
+            t.accum_stride);
+        if (cudaGetLastError() != cudaSuccess) return 0;
+    }
+    return 1;
+}
+
 static int storagellm_run_grouped_sgemm(
     const std::vector<cublasOperation_t>& trans_a,
     const std::vector<cublasOperation_t>& trans_b,
@@ -352,6 +465,15 @@ extern "C" int storagellm_cublaslt_grouped_moe_indexed_device_f32(
     if (rows == 0 || hidden > static_cast<uint32_t>(INT_MAX) ||
         intermediate > static_cast<uint32_t>(INT_MAX)) {
         return 0;
+    }
+
+    // Optional single-launch-per-assignment fused kernel.  This is a real CUDA
+    // kernel path, but it is not always faster than cuBLAS grouped GEMM for large
+    // shapes; enable it explicitly when low launch count/small assignment batches
+    // win on the target GPU.
+    if (storagellm_cuda_env_truthy("STORAGELLM_CUDA_ONE_SHOT_FUSED", 0) &&
+        storagellm_run_cuda_one_shot_fused(tasks, task_count, stream)) {
+        return 1;
     }
 
     const size_t x_bytes = static_cast<size_t>(rows) * hidden * sizeof(float);
@@ -484,3 +606,19 @@ cleanup:
     return ok;
 #endif
 }
+
+
+extern "C" int storagellm_cublaslt_grouped_moe_indexed_device_f32_v2(
+    const moe_fast_backend_dispatch_request_t* request
+) {
+    if (!request || request->abi_version != STORAGELLM_FAST_BACKEND_DISPATCH_ABI_V2) {
+        return 0;
+    }
+    void* stream = request->legacy_stream_or_queue;
+    if (request->context && request->context->context_kind == moe_FAST_BACKEND_CONTEXT_CUDA) {
+        stream = request->context->u.cuda.cuda_stream;
+    }
+    return storagellm_cublaslt_grouped_moe_indexed_device_f32(
+        request->backend, request->tasks, request->task_count, stream);
+}
+

@@ -94,6 +94,12 @@ static int moe_cpu_storage_explicit_slow_fallback_allowed() {
            moe_cpu_storage_env_truthy("STORAGELLM_EXPLICIT_SLOW_MODE");
 }
 
+static int moe_cpu_storage_strict_fast_path_enabled() {
+    return moe_cpu_storage_env_truthy("STORAGELLM_STRICT_FAST_PATH") ||
+           moe_cpu_storage_env_truthy("STORAGELLM_FAIL_ON_FALLBACK") ||
+           moe_cpu_storage_env_truthy("STORAGELLM_NO_SLOW_FALLBACK");
+}
+
 static void moe_cpu_storage_disable_gpu_paths(moe_pc_engine* engine) {
     if (!engine) return;
     engine->config.prefer_gpu = 0;
@@ -115,13 +121,15 @@ static void moe_cpu_storage_disable_gpu_paths(moe_pc_engine* engine) {
     engine->io_config.enable_common_raw_vram_pin = 0;
     engine->io_config.internal_require_gpu_expert_batch_kernel = 0;
     engine->io_config.internal_verified_backend_only = 0;
-    engine->io_config.enable_cold_expert_cpu_fallback = 1;
-    engine->io_config.allow_required_sync_fallback = 1;
-    if (engine->io_config.prefetch_window_layers == 0 || engine->io_config.prefetch_window_layers > 4) {
-        engine->io_config.prefetch_window_layers = 3;
+    engine->io_config.enable_cold_expert_cpu_fallback =
+        moe_cpu_storage_strict_fast_path_enabled() ? 0 : 1;
+    engine->io_config.allow_required_sync_fallback =
+        moe_cpu_storage_strict_fast_path_enabled() ? 0 : 1;
+    if (engine->io_config.prefetch_window_layers == 0 || engine->io_config.prefetch_window_layers < 4) {
+        engine->io_config.prefetch_window_layers = 4;
     }
-    if (engine->io_config.max_prefetch_queue == 0 || engine->io_config.max_prefetch_queue > 8192) {
-        engine->io_config.max_prefetch_queue = 8192;
+    if (engine->io_config.max_prefetch_queue == 0 || engine->io_config.max_prefetch_queue < 16384) {
+        engine->io_config.max_prefetch_queue = 16384;
     }
     engine->io_config.enable_compute_io_overlap = 1;
     engine->io_config.enable_multistage_pipeline = 1;
@@ -154,9 +162,10 @@ static uint64_t moe_cpu_storage_env_u64_default(const char* name, uint64_t defv)
 static uint64_t moe_cpu_storage_layer_prefetch_budget_bytes() {
     // Large enough to queue the next layer's hot/common tensors, small enough
     // to avoid evicting the current token's working set from RAM on CPU-only.
+    // CPU max mode benefits from a deeper page-cache runway, especially on NVMe.
     return moe_cpu_storage_env_u64_default(
         "STORAGELLM_CPU_LAYER_PREFETCH_BUDGET_BYTES",
-        768ull * 1024ull * 1024ull);
+        2048ull * 1024ull * 1024ull);
 }
 
 static int moe_cpu_storage_page_touch_enabled() {
@@ -182,12 +191,12 @@ static uint32_t moe_storage_io_default_queue_depth(uint32_t profile) {
         if (end != env && v > 0) return (uint32_t)v;
     }
     switch (profile) {
-        case moe_STORAGE_PROFILE_NVME: return 128u;
-        case moe_STORAGE_PROFILE_SATA_SSD: return 32u;
+        case moe_STORAGE_PROFILE_NVME: return 256u;
+        case moe_STORAGE_PROFILE_SATA_SSD: return 64u;
         case moe_STORAGE_PROFILE_HDD: return 8u;
         case moe_STORAGE_PROFILE_NETWORK: return 4u;
         case moe_STORAGE_PROFILE_RAMDISK: return 0u;
-        default: return 64u;
+        default: return 128u;
     }
 }
 
@@ -198,12 +207,12 @@ static uint32_t moe_storage_io_default_workers(uint32_t profile) {
         if (end != env) return (uint32_t)v;
     }
     switch (profile) {
-        case moe_STORAGE_PROFILE_NVME: return 4u;
-        case moe_STORAGE_PROFILE_SATA_SSD: return 2u;
+        case moe_STORAGE_PROFILE_NVME: return 8u;
+        case moe_STORAGE_PROFILE_SATA_SSD: return 4u;
         case moe_STORAGE_PROFILE_HDD: return 1u;
         case moe_STORAGE_PROFILE_NETWORK: return 1u;
         case moe_STORAGE_PROFILE_RAMDISK: return 0u;
-        default: return 2u;
+        default: return 6u;
     }
 }
 
@@ -312,7 +321,7 @@ static void moe_storage_async_prefetch_ensure_started(moe_pc_engine* engine) {
     engine->storage_prefetch_stop.store(0, std::memory_order_release);
     uint32_t workers = engine->storage_prefetch_workers.load(std::memory_order_relaxed);
     if (workers == 0) workers = moe_storage_io_default_workers(engine->storage_profile.load(std::memory_order_relaxed));
-    workers = std::min<uint32_t>(workers, 8u);
+    workers = std::min<uint32_t>(workers, 16u);
     for (uint32_t i = 0; i < workers; ++i) {
         try {
             engine->storage_prefetch_worker_threads.emplace_back([engine]() { moe_storage_prefetch_worker_loop(engine); });
@@ -1017,9 +1026,11 @@ static void moe_cpu_storage_build_execution_plan(moe_pc_engine* engine) {
     engine->cpu_execution_plan_expert_tensors.store(expert_tensors, std::memory_order_relaxed);
     engine->cpu_execution_plan_bytes.store(bytes, std::memory_order_relaxed);
     engine->cpu_quant_registry_ready.store(supported == tensors ? 1 : 0, std::memory_order_relaxed);
-    engine->storage_format_plan_available.store(
-        engine->offload_gguf_metadata_json.find("\"storage_execution_plan\"") != std::string::npos ? 1 : 0,
-        std::memory_order_relaxed);
+    const int storage_plan_ready =
+        engine->juju_runtime_access_plan_ready.load(std::memory_order_relaxed) ||
+        engine->offload_gguf_metadata_json.find("\"storage_execution_plan\"") != std::string::npos ||
+        engine->offload_gguf_metadata_json.find("\"runtime_access_plan\"") != std::string::npos;
+    engine->storage_format_plan_available.store(storage_plan_ready ? 1 : 0, std::memory_order_relaxed);
     moe_cpu_storage_build_hot_tensor_views(engine);
     moe_storage_io_build_span_plan(engine);
     moe_storage_io_build_expert_index(engine);
@@ -1035,7 +1046,14 @@ static void moe_cpu_storage_select_forward_adapter(moe_pc_engine* engine) {
         moe_cpu_storage_disable_gpu_paths(engine);
         moe_cpu_storage_build_execution_plan(engine);
         if (engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) {
-            engine->forward_adapter.store(moe_FORWARD_ADAPTER_CPU_STORAGE, std::memory_order_relaxed);
+            const int graph_contract_ready =
+                engine->offload_graph_ir_required.load(std::memory_order_relaxed) &&
+                engine->offload_graph_ir_ready.load(std::memory_order_relaxed) &&
+                engine->juju_runtime_execution_manifest_ready.load(std::memory_order_relaxed) &&
+                engine->juju_runtime_access_plan_ready.load(std::memory_order_relaxed);
+            engine->forward_adapter.store(
+                graph_contract_ready ? moe_FORWARD_ADAPTER_GRAPH_IR : moe_FORWARD_ADAPTER_CPU_STORAGE,
+                std::memory_order_relaxed);
             engine->forward_adapter_executable.store(1, std::memory_order_relaxed);
             engine->graph_ir_used_for_forward.store(0, std::memory_order_relaxed);
         } else if (!moe_cpu_storage_explicit_slow_fallback_allowed()) {
@@ -1080,7 +1098,11 @@ static void moe_cpu_storage_begin_token(moe_pc_engine* engine, uint32_t position
     if (!engine || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
     (void)position;
     (void)token_id;
-    engine->graph_ir_used_for_forward.store(0, std::memory_order_relaxed);
+    const int graph_contract_active =
+        engine->forward_adapter.load(std::memory_order_relaxed) == moe_FORWARD_ADAPTER_GRAPH_IR &&
+        engine->offload_graph_ir_required.load(std::memory_order_relaxed) &&
+        engine->offload_graph_ir_ready.load(std::memory_order_relaxed);
+    engine->graph_ir_used_for_forward.store(graph_contract_active ? 1 : 0, std::memory_order_relaxed);
     engine->generation_phase.store(moe_GEN_PHASE_INIT, std::memory_order_relaxed);
     engine->cpu_prefetch_epoch.fetch_add(1u, std::memory_order_relaxed);
     // Warm the first layers before the loop reaches them.  Existing IO queues
@@ -1088,7 +1110,7 @@ static void moe_cpu_storage_begin_token(moe_pc_engine* engine, uint32_t position
     // without scanning all tensors.
     const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
     const uint32_t layers = runtime_c.num_hidden_layers;
-    const uint32_t depth = std::max<uint32_t>(1u, std::min<uint32_t>(engine->io_config.prefetch_window_layers ? engine->io_config.prefetch_window_layers : 3u, 4u));
+    const uint32_t depth = std::max<uint32_t>(1u, std::min<uint32_t>(engine->io_config.prefetch_window_layers ? engine->io_config.prefetch_window_layers : 6u, 8u));
     for (uint32_t l = 0; l < layers && l < depth; ++l) {
         moe_cpu_storage_schedule_layer_hot_prefetch(engine, l);
         moe_enqueue_attention_prefetch(engine, (int32_t)l);
@@ -1100,7 +1122,7 @@ static void moe_cpu_storage_begin_token(moe_pc_engine* engine, uint32_t position
 static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, const moe_storage_constants_t* c) {
     if (!engine || !c || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
     engine->cpu_layer_begin_count.fetch_add(1, std::memory_order_relaxed);
-    const uint32_t depth = std::max<uint32_t>(1u, std::min<uint32_t>(engine->io_config.prefetch_window_layers ? engine->io_config.prefetch_window_layers : 2u, 3u));
+    const uint32_t depth = std::max<uint32_t>(1u, std::min<uint32_t>(engine->io_config.prefetch_window_layers ? engine->io_config.prefetch_window_layers : 6u, 8u));
     for (uint32_t d = 1; d <= depth; ++d) {
         const uint32_t next = layer + d;
         if (next >= c->num_hidden_layers) break;

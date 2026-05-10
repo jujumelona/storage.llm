@@ -3,6 +3,54 @@ int moe_pc_engine_get_stats(const moe_pc_engine_t* engine, moe_pc_engine_stats_t
         return 0;
     }
     std::memset(out_stats, 0, sizeof(*out_stats));
+    const moe_perf_runtime_profile_t runtime_profile =
+        moe_perf_profile_for_backend(engine->backend_caps.backend);
+    out_stats->runtime_profile_kind = static_cast<uint32_t>(runtime_profile);
+    out_stats->real_continuous_batch_exec_requested =
+        moe_perf_real_continuous_batch_exec_requested() ? 1u : 0u;
+    out_stats->real_continuous_batch_exec_linked =
+        moe_perf_real_continuous_batch_exec_linked() ? 1u : 0u;
+    out_stats->runtime_uses_vram =
+        moe_perf_profile_uses_vram(runtime_profile) ? 1u : 0u;
+    out_stats->real_continuous_batch_executor_available =
+        moe_perf_real_continuous_batch_executor_available() ? 1u : 0u;
+    out_stats->per_request_context_available =
+        moe_perf_per_request_context_available() ? 1u : 0u;
+    out_stats->engine_mutex_removable =
+        moe_perf_engine_mutex_removable() ? 1u : 0u;
+    const moe_fast_backend_kind_t selected_fast_backend = choose_fast_backend(engine);
+    out_stats->fast_backend_kind = static_cast<uint32_t>(selected_fast_backend);
+    out_stats->fast_backend_true_kernel =
+        moe_perf_backend_kind_is_true_kernel(selected_fast_backend) ? 1u : 0u;
+    out_stats->fast_backend_fused_moe =
+        moe_perf_backend_kind_is_fused_moe(selected_fast_backend) ? 1u : 0u;
+    out_stats->strict_completion_ready =
+        (out_stats->real_continuous_batch_executor_available &&
+         out_stats->per_request_context_available &&
+         out_stats->engine_mutex_removable &&
+         out_stats->fast_backend_true_kernel &&
+         out_stats->fast_backend_fused_moe) ? 1u : 0u;
+    std::strncpy(
+        out_stats->runtime_profile,
+        moe_perf_profile_name(runtime_profile),
+        sizeof(out_stats->runtime_profile) - 1);
+    std::strncpy(
+        out_stats->runtime_pipeline,
+        moe_perf_pipeline_name(runtime_profile),
+        sizeof(out_stats->runtime_pipeline) - 1);
+    std::strncpy(
+        out_stats->fast_backend_name,
+        moe_perf_backend_kind_name(selected_fast_backend),
+        sizeof(out_stats->fast_backend_name) - 1);
+    std::strncpy(
+        out_stats->performance_completion_level,
+        moe_perf_completion_level(
+            out_stats->real_continuous_batch_executor_available,
+            out_stats->per_request_context_available,
+            out_stats->engine_mutex_removable,
+            out_stats->fast_backend_true_kernel,
+            out_stats->fast_backend_fused_moe),
+        sizeof(out_stats->performance_completion_level) - 1);
     out_stats->vram_used_bytes = tier_used(engine, moe_TIER_VRAM);
     out_stats->ram_used_bytes = tier_used(engine, moe_TIER_RAM);
     out_stats->db_used_bytes = tier_used(engine, moe_TIER_DB);
@@ -68,6 +116,14 @@ int moe_pc_engine_get_stats(const moe_pc_engine_t* engine, moe_pc_engine_stats_t
         out_stats->qkv_plain_kv_persistent_storage =
             engine->offload_qkv_cfg.plain_kv_persistent_storage ? 1u : 0u;
     }
+    out_stats->qkv_plain_kv_forbidden_touches = engine->qkv_plain_kv_forbidden_touches.load(std::memory_order_relaxed);
+    out_stats->qkv_plain_kv_allocation_skips = engine->qkv_plain_kv_allocation_skips.load(std::memory_order_relaxed);
+    out_stats->qkv_plain_kv_readiness_touches = engine->qkv_plain_kv_readiness_touches.load(std::memory_order_relaxed);
+    out_stats->qkv_plain_kv_capacity_touches = engine->qkv_plain_kv_capacity_touches.load(std::memory_order_relaxed);
+    out_stats->qkv_plain_kv_store_touches = engine->qkv_plain_kv_store_touches.load(std::memory_order_relaxed);
+    out_stats->qkv_plain_kv_decode_cache_touches = engine->qkv_plain_kv_decode_cache_touches.load(std::memory_order_relaxed);
+    out_stats->qkv_ppl_qkv_only_evals = engine->qkv_ppl_qkv_only_evals.load(std::memory_order_relaxed);
+    out_stats->qkv_env_override_blocked = engine->qkv_env_override_blocked.load(std::memory_order_relaxed);
     out_stats->weight_quant_bits = engine->offload_weight_quant_bits.load(std::memory_order_relaxed);
     out_stats->weight_quant_encoding = engine->offload_weight_encoding.load(std::memory_order_relaxed);
     out_stats->weight_quant_block_size = engine->offload_weight_block_size.load(std::memory_order_relaxed);
@@ -171,5 +227,25 @@ int moe_pc_engine_get_stats(const moe_pc_engine_t* engine, moe_pc_engine_stats_t
             sizeof(out_stats->weight_kernel_family) - 1
         );
     }
+    {
+        std::lock_guard<std::mutex> batch_lock(const_cast<std::mutex&>(engine->batch_scheduler.mtx));
+        out_stats->batch_waiting_requests = (uint64_t)engine->batch_scheduler.waiting_queue.size();
+        out_stats->batch_running_requests = (uint64_t)engine->batch_scheduler.running_queue.size();
+        out_stats->batch_completed_result_slots = (uint64_t)engine->batch_scheduler.completed_results.size();
+        out_stats->batch_round_robin_cursor = (uint64_t)engine->batch_scheduler.round_robin_cursor;
+        out_stats->batch_max_running_requests = engine->batch_scheduler.max_running_requests;
+        out_stats->batch_max_tokens_per_iteration = engine->batch_scheduler.max_tokens_per_iteration;
+    }
+    out_stats->batch_submitted_requests = engine->batch_scheduler.submitted_requests.load(std::memory_order_relaxed);
+    out_stats->batch_admitted_requests = engine->batch_scheduler.admitted_requests.load(std::memory_order_relaxed);
+    out_stats->batch_completed_requests = engine->batch_scheduler.completed_requests.load(std::memory_order_relaxed);
+    out_stats->batch_cancelled_requests = engine->batch_scheduler.cancelled_requests.load(std::memory_order_relaxed);
+    out_stats->batch_schedule_iterations = engine->batch_scheduler.schedule_iterations.load(std::memory_order_relaxed);
+    out_stats->batch_prefill_scheduled = engine->batch_scheduler.prefill_scheduled.load(std::memory_order_relaxed);
+    out_stats->batch_decode_scheduled = engine->batch_scheduler.decode_scheduled.load(std::memory_order_relaxed);
+    out_stats->batch_max_waiting_observed = engine->batch_scheduler.max_waiting_observed.load(std::memory_order_relaxed);
+    out_stats->batch_max_running_observed = engine->batch_scheduler.max_running_observed.load(std::memory_order_relaxed);
+    out_stats->batch_max_completed_observed = engine->batch_scheduler.max_completed_observed.load(std::memory_order_relaxed);
+    out_stats->batch_runtime_states = moe_batch_runtime_state_count();
     return 1;
 }

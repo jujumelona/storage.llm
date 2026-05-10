@@ -115,6 +115,16 @@ static int device_copy_raw_span(
         if (!async_copy && e->backend_caps.supports_backend_async_api) {
             e->io_atomic.backend_async_fallback.fetch_add(s.bytes, std::memory_order_relaxed);
         }
+        if (!async_copy && moe_perf_gpu_profile_requires_pinned_host(e->backend_caps.backend)) {
+            e->io_atomic.bytes_sync_h2d_fallback.fetch_add(s.bytes, std::memory_order_relaxed);
+            e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr,
+                "[storageLLM STRICT ERROR] raw span H2D requires async pinned/device-direct copy; "
+                "refusing sync fallback bytes=%llu part=%u layer=%d\n",
+                (unsigned long long)s.bytes, (unsigned)s.part, (int)s.layer);
+            release_staging_slot(e, slot_idx);
+            return 0;
+        }
         if (!async_copy && !allow_sync_fallback) {
             release_staging_slot(e, slot_idx);
             return moe_DEVICE_COPY_BACKPRESSURE;
@@ -159,7 +169,15 @@ static int device_copy_raw_span(
         return 1;
     }
 
-    if (!allow_sync_fallback) {
+    if (!allow_sync_fallback || moe_perf_gpu_profile_requires_pinned_host(e->backend_caps.backend)) {
+        if (moe_perf_gpu_profile_requires_pinned_host(e->backend_caps.backend)) {
+            e->io_atomic.bytes_sync_h2d_fallback.fetch_add(s.bytes, std::memory_order_relaxed);
+            e->io_atomic.device_copy_failures.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr,
+                "[storageLLM STRICT ERROR] raw span H2D has no staging slot and sync fallback is forbidden bytes=%llu part=%u layer=%d\n",
+                (unsigned long long)s.bytes, (unsigned)s.part, (int)s.layer);
+            return 0;
+        }
         return moe_DEVICE_COPY_BACKPRESSURE;
     }
     e->io_atomic.bytes_sync_h2d_fallback.fetch_add(s.bytes);

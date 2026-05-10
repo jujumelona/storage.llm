@@ -320,7 +320,25 @@ static float moe_mxfp4_value_from_code(uint8_t code) {
     return moe_mxfp4_value_table()[code & 0x0fu];
 }
 
+static int moe_mxfp4_pairwise_nibble_order_enabled() {
+    // JUJU/Colab MXFP4 contract declares pairwise packing:
+    // even logical value -> low nibble, odd logical value -> high nibble.
+    // Legacy GGUF split16 can be explicitly restored for old artifacts.
+    static int mode = -1;
+    if (mode < 0) {
+        const char* env = std::getenv("STORAGELLM_MXFP4_NIBBLE_ORDER");
+        mode = (!env || !*env ||
+                std::strcmp(env, "pairwise") == 0 ||
+                std::strcmp(env, "juju_pairwise") == 0) ? 1 : 0;
+    }
+    return mode != 0;
+}
+
 static uint8_t moe_mxfp4_code_at(const uint8_t* qs, uint32_t index) {
+    if (moe_mxfp4_pairwise_nibble_order_enabled()) {
+        const uint8_t byte = qs[index >> 1u];
+        return (index & 1u) ? (byte >> 4) : (byte & 0x0fu);
+    }
     const uint8_t byte = qs[index & 15u];
     return (index < 16u) ? (byte & 0x0fu) : (byte >> 4);
 }
@@ -356,50 +374,14 @@ static void moe_dot_gguf_mxfp4_two_rows(
         const uint8_t* qs0 = packed0 + 1u;
         const uint8_t* qs1 = packed1 + 1u;
         const float* xb = x + start;
-        float low0 = 0.0f, high0 = 0.0f;
-        float low1 = 0.0f, high1 = 0.0f;
-#if defined(__AVX2__) && defined(__FMA__)
-        const __m256i lo_mask = _mm256_set1_epi32(0x0F);
-        __m256 acc0_low_v = _mm256_setzero_ps();
-        __m256 acc0_high_v = _mm256_setzero_ps();
-        __m256 acc1_low_v = _mm256_setzero_ps();
-        __m256 acc1_high_v = _mm256_setzero_ps();
-        for (uint32_t j = 0; j < 16u; j += 8u) {
-            const __m256 x_low = _mm256_loadu_ps(xb + j);
-            const __m256 x_high = _mm256_loadu_ps(xb + 16u + j);
-
-            __m128i raw0_8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs0 + j));
-            __m256i bytes0_8 = _mm256_cvtepu8_epi32(raw0_8);
-            __m256i lo0_idx = _mm256_and_si256(bytes0_8, lo_mask);
-            __m256i hi0_idx = _mm256_srli_epi32(bytes0_8, 4);
-            acc0_low_v = _mm256_fmadd_ps(_mm256_i32gather_ps(table, lo0_idx, 4), x_low, acc0_low_v);
-            acc0_high_v = _mm256_fmadd_ps(_mm256_i32gather_ps(table, hi0_idx, 4), x_high, acc0_high_v);
-
-            __m128i raw1_8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs1 + j));
-            __m256i bytes1_8 = _mm256_cvtepu8_epi32(raw1_8);
-            __m256i lo1_idx = _mm256_and_si256(bytes1_8, lo_mask);
-            __m256i hi1_idx = _mm256_srli_epi32(bytes1_8, 4);
-            acc1_low_v = _mm256_fmadd_ps(_mm256_i32gather_ps(table, lo1_idx, 4), x_low, acc1_low_v);
-            acc1_high_v = _mm256_fmadd_ps(_mm256_i32gather_ps(table, hi1_idx, 4), x_high, acc1_high_v);
+        float block0 = 0.0f;
+        float block1 = 0.0f;
+        for (uint32_t j = 0; j < 32u; ++j) {
+            block0 += table[moe_mxfp4_code_at(qs0, j)] * xb[j];
+            block1 += table[moe_mxfp4_code_at(qs1, j)] * xb[j];
         }
-        low0 = moe_dot_hsum256_ps(acc0_low_v);
-        high0 = moe_dot_hsum256_ps(acc0_high_v);
-        low1 = moe_dot_hsum256_ps(acc1_low_v);
-        high1 = moe_dot_hsum256_ps(acc1_high_v);
-#else
-        for (uint32_t j = 0; j < 16u; ++j) {
-            const uint8_t b0 = qs0[j];
-            const uint8_t b1 = qs1[j];
-            const float xl = xb[j];
-            const float xh = xb[16u + j];
-            low0 += table[b0 & 0x0fu] * xl;
-            high0 += table[b0 >> 4] * xh;
-            low1 += table[b1 & 0x0fu] * xl;
-            high1 += table[b1 >> 4] * xh;
-        }
-#endif
-        acc0 += (low0 + high0) * scale0;
-        acc1 += (low1 + high1) * scale1;
+        acc0 += block0 * scale0;
+        acc1 += block1 * scale1;
         packed0 += block_bytes;
         packed1 += block_bytes;
     }
@@ -441,36 +423,11 @@ static float moe_dot_gguf_mxfp4_row(
         const float scale = moe_e8m0_to_f32_half(packed[0]);
         const uint8_t* qs = packed + 1u;
         const float* xb = x + start;
-        float low = 0.0f;
-        float high = 0.0f;
-#if defined(__AVX2__) && defined(__FMA__)
-        // GGUF block_mxfp4 stores the first 16 values in low nibbles and the
-        // next 16 values in high nibbles of the same 16 payload bytes.
-        const __m256i lo_mask = _mm256_set1_epi32(0x0F);
-        __m256 vacc_low = _mm256_setzero_ps();
-        __m256 vacc_high = _mm256_setzero_ps();
-        for (uint32_t j = 0; j < 16u; j += 8u) {
-            __m128i raw8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + j));
-            __m256i bytes8 = _mm256_cvtepu8_epi32(raw8);
-            __m256i lo_idx = _mm256_and_si256(bytes8, lo_mask);
-            __m256 lo_vals = _mm256_i32gather_ps(table, lo_idx, 4);
-            __m256i hi_idx = _mm256_srli_epi32(bytes8, 4);
-            __m256 hi_vals = _mm256_i32gather_ps(table, hi_idx, 4);
-            const __m256 low_x = _mm256_loadu_ps(xb + j);
-            const __m256 high_x = _mm256_loadu_ps(xb + 16u + j);
-            vacc_low = _mm256_fmadd_ps(lo_vals, low_x, vacc_low);
-            vacc_high = _mm256_fmadd_ps(hi_vals, high_x, vacc_high);
+        float block_acc = 0.0f;
+        for (uint32_t j = 0; j < 32u; ++j) {
+            block_acc += table[moe_mxfp4_code_at(qs, j)] * xb[j];
         }
-        low = moe_dot_hsum256_ps(vacc_low);
-        high = moe_dot_hsum256_ps(vacc_high);
-#else
-        for (uint32_t j = 0; j < 16u; ++j) {
-            const uint8_t byte = qs[j];
-            low += table[byte & 0x0fu] * xb[j];
-            high += table[byte >> 4] * xb[16u + j];
-        }
-#endif
-        acc += (low + high) * scale;
+        acc += block_acc * scale;
         packed += block_bytes;
     }
     if (start < cols) {

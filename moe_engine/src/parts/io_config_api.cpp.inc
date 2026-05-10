@@ -436,9 +436,9 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
         // moe_rt_compute_tflops_hint is in juju_runtime_strategy.cpp.inc (included earlier).
         // Impact: Window automatically adapts to actual I/O throughput.
         uint32_t vram_cap =
-            !engine->config.prefer_gpu || engine->backend_caps.backend == moe_BACKEND_CPU ? 4u :
-            vram > 24ull * gib ? 8u :
-            vram >= 12ull * gib ? 4u : 2u;
+            !engine->config.prefer_gpu || engine->backend_caps.backend == moe_BACKEND_CPU ? 6u :
+            vram > 24ull * gib ? 12u :
+            vram >= 12ull * gib ? 8u : 4u;
 
         uint32_t computed_window = vram_cap; // default to VRAM-tier if no measurement
         const uint64_t storage_bw = engine->backend_caps.measured_storage_bw_bytes_per_sec;
@@ -524,9 +524,11 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
         engine->io_config.io_worker_threads = disk_worker_cap();
     }
     if (engine->io_config.max_prefetch_queue == 0) {
-        engine->io_config.max_prefetch_queue = 4096;
-    } else if (engine->io_config.max_prefetch_queue < 4096) {
-        engine->io_config.max_prefetch_queue = 4096;
+        engine->io_config.max_prefetch_queue = using_default_io_config ? 32768u : 8192u;
+    } else if (using_default_io_config && engine->io_config.max_prefetch_queue < 32768u) {
+        engine->io_config.max_prefetch_queue = 32768u;
+    } else if (engine->io_config.max_prefetch_queue < 8192u) {
+        engine->io_config.max_prefetch_queue = 8192u;
     }
     if (engine->io_config.metal_memory_budget_pct != 0 &&
         (engine->io_config.metal_memory_budget_pct < 50 ||
@@ -559,15 +561,9 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
     // - pinned_stage: 기본값 (병목 단계)
     // - gpu_stage: 1.5배 (DMA 병렬성 활용)
     const uint32_t base_queue = engine->io_config.max_prefetch_queue;
-    engine->disk_stage_depth_cap = base_queue / 2;
-    if (engine->disk_stage_depth_cap < 2048) {
-        engine->disk_stage_depth_cap = 2048;  // 최소값 보장
-    }
-    engine->pinned_stage_depth_cap = base_queue;
-    engine->gpu_stage_depth_cap = (base_queue * 3) / 2;
-    if (engine->gpu_stage_depth_cap > 16384) {
-        engine->gpu_stage_depth_cap = 16384;  // 메모리 과다 사용 방지
-    }
+    engine->disk_stage_depth_cap = std::max<uint32_t>(4096u, base_queue);
+    engine->pinned_stage_depth_cap = std::max<uint32_t>(4096u, base_queue);
+    engine->gpu_stage_depth_cap = std::max<uint32_t>(8192u, std::min<uint32_t>(65536u, base_queue * 2u));
     if (engine->io_config.topology_max_candidates == 0) {
         engine->io_config.topology_max_candidates = 1;
     }
@@ -607,13 +603,13 @@ int moe_pc_engine_configure_io(moe_pc_engine_t* engine, const moe_io_config_t* c
         clamp_to_cap(engine->io_config.gpu_worker_threads, gpu_worker_cap(engine));
     if (engine->io_config.gpu_expert_scratch_slots == 0) {
         engine->io_config.gpu_expert_scratch_slots =
-            std::max<uint32_t>(16u, engine->io_config.gpu_worker_threads * 2u);
+            std::max<uint32_t>(32u, engine->io_config.gpu_worker_threads * 4u);
     } else {
         const uint32_t scratch_cap =
-            std::max<uint32_t>(16u, std::max<uint32_t>(engine->io_config.gpu_worker_threads * 4u, 64u));
+            std::max<uint32_t>(32u, std::max<uint32_t>(engine->io_config.gpu_worker_threads * 6u, 128u));
         engine->io_config.gpu_expert_scratch_slots =
             std::max<uint32_t>(
-                16u,
+                32u,
                 std::min<uint32_t>(engine->io_config.gpu_expert_scratch_slots, scratch_cap));
     }
     if (using_default_io_config) {

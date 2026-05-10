@@ -276,19 +276,106 @@ static uint64_t moe_raw_tensor_row_bytes(
     return (uint64_t)cols * (uint64_t)elem;
 }
 
+static float moe_raw_tensor_invalid_dot_value(const char* reason, const moe_raw_tensor_cache_entry& raw, uint32_t row, uint32_t hidden_count) {
+    static std::atomic<uint32_t> logs{0};
+    const uint32_t n = logs.fetch_add(1, std::memory_order_relaxed);
+    if (n < 64u) {
+        moe_profile_log(
+            "raw_dot_invalid",
+            "reason=%s row=%u rows=%u cols=%u physical_rows=%u physical_cols=%u hidden=%u fmt=%u scalar=%u transposed=%u bytes=%llu row_bytes=%llu",
+            reason ? reason : "unknown",
+            row,
+            raw.rows,
+            raw.cols,
+            raw.physical_rows,
+            raw.physical_cols,
+            hidden_count,
+            (unsigned)raw.weight_format,
+            (unsigned)raw.scalar_encoding,
+            (unsigned)raw.math_transposed,
+            (unsigned long long)raw.bytes,
+            (unsigned long long)raw.weight_row_bytes);
+    }
+    return std::numeric_limits<float>::quiet_NaN();
+}
+
+static float moe_raw_tensor_dot_row_transposed(
+    const moe_raw_tensor_cache_entry& raw,
+    uint32_t row,
+    const float* hidden,
+    uint32_t hidden_count
+) {
+    if (!raw.base || !hidden || row >= raw.rows || hidden_count == 0) {
+        return moe_raw_tensor_invalid_dot_value("transposed_bounds", raw, row, hidden_count);
+    }
+    if (raw.weight_format != moe_WEIGHT_ENCODING_UNKNOWN &&
+        raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP16 &&
+        raw.weight_format != moe_WEIGHT_ENCODING_RAW_BF16 &&
+        raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP32) {
+        return moe_raw_tensor_invalid_dot_value("transposed_quant_unsupported", raw, row, hidden_count);
+    }
+    const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
+    if (!elem) {
+        return moe_raw_tensor_invalid_dot_value("transposed_scalar_unknown", raw, row, hidden_count);
+    }
+    const uint32_t physical_cols = raw.physical_cols ? raw.physical_cols : raw.rows;
+    const uint32_t physical_rows = raw.physical_rows ? raw.physical_rows : raw.cols;
+    if (row >= physical_cols || hidden_count > physical_rows) {
+        return moe_raw_tensor_invalid_dot_value("transposed_shape_mismatch", raw, row, hidden_count);
+    }
+    const uint64_t physical_row_bytes = raw.weight_row_bytes ? raw.weight_row_bytes : (uint64_t)physical_cols * (uint64_t)elem;
+    if (physical_row_bytes == 0 || physical_row_bytes > raw.bytes) {
+        return moe_raw_tensor_invalid_dot_value("transposed_row_bytes", raw, row, hidden_count);
+    }
+    double acc = 0.0;
+    for (uint32_t i = 0; i < hidden_count; ++i) {
+        if ((uint64_t)i > UINT64_MAX / physical_row_bytes) {
+            return moe_raw_tensor_invalid_dot_value("transposed_offset_overflow", raw, row, hidden_count);
+        }
+        const uint64_t off = (uint64_t)i * physical_row_bytes + (uint64_t)row * (uint64_t)elem;
+        if (off > raw.bytes || (uint64_t)elem > raw.bytes - off) {
+            return moe_raw_tensor_invalid_dot_value("transposed_element_bounds", raw, row, hidden_count);
+        }
+        const float w = moe_raw_scalar_to_f32(raw.base + off, raw.scalar_encoding);
+        if (!std::isfinite(w) || !std::isfinite(hidden[i])) {
+            return moe_raw_tensor_invalid_dot_value("transposed_nonfinite", raw, row, hidden_count);
+        }
+        acc += (double)w * (double)hidden[i];
+    }
+    return (float)acc;
+}
+
 static float moe_raw_tensor_dot_row(
     const moe_raw_tensor_cache_entry& raw,
     uint32_t row,
     const float* hidden,
     uint32_t hidden_count
 ) {
+    if (raw.math_transposed) {
+        return moe_raw_tensor_dot_row_transposed(raw, row, hidden, hidden_count);
+    }
     const uint32_t stride_cols = raw.cols ? raw.cols : hidden_count;
     const uint64_t row_bytes = moe_raw_tensor_row_bytes(raw, stride_cols);
     if (!raw.base || !hidden || row >= raw.rows || row_bytes == 0 ||
         row > UINT64_MAX / row_bytes ||
         (uint64_t)row * row_bytes > raw.bytes ||
         row_bytes > raw.bytes - (uint64_t)row * row_bytes) {
-        return 0.0f;
+        static std::atomic<uint32_t> raw_dot_bounds_logs{0};
+        const uint32_t n = raw_dot_bounds_logs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 32u) {
+            moe_profile_log(
+                "raw_dot_bounds_failed",
+                "row=%u rows=%u cols=%u hidden=%u row_bytes=%llu bytes=%llu base=%p hidden=%p",
+                row,
+                raw.rows,
+                raw.cols,
+                hidden_count,
+                (unsigned long long)row_bytes,
+                (unsigned long long)raw.bytes,
+                (const void*)raw.base,
+                (const void*)hidden);
+        }
+        return moe_raw_tensor_invalid_dot_value("row_bounds", raw, row, hidden_count);
     }
     const uint8_t* row_ptr = raw.base + (uint64_t)row * row_bytes;
     const uint8_t effective_weight_format = moe_effective_weight_format_for_row_bytes(raw, stride_cols);
@@ -363,7 +450,8 @@ static float moe_raw_tensor_dot_row(
         effective_weight_format != moe_WEIGHT_ENCODING_RAW_BF16 &&
         effective_weight_format != moe_WEIGHT_ENCODING_RAW_FP32) {
         moe_trace_raw_dot_unsupported(raw);
-        return 0.0f;
+        return moe_raw_tensor_invalid_dot_value("unsupported_weight_format", raw, row, hidden_count);
     }
-    return moe_dot_raw_row(row_ptr, raw.scalar_encoding, hidden, hidden_count);
+    const float raw_dot = moe_dot_raw_row(row_ptr, raw.scalar_encoding, hidden, hidden_count);
+    return std::isfinite(raw_dot) ? raw_dot : moe_raw_tensor_invalid_dot_value("raw_scalar_nonfinite", raw, row, hidden_count);
 }

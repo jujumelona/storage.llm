@@ -281,8 +281,14 @@ static int moe_engine_has_common_tensor_suffix(
     if (!engine || !suffix || layer < 0) {
         return 0;
     }
-    const std::string layer_prefix = "blk." + std::to_string(layer) + ".";
     const std::string suffix_lower = moe_lower_ascii_copy(std::string(suffix));
+    char p0[64], p1[64], p2[64], p3[64], p4[64];
+    std::snprintf(p0, sizeof(p0), "blk.%d.", (int)layer);
+    std::snprintf(p1, sizeof(p1), "model.layers.%d.", (int)layer);
+    std::snprintf(p2, sizeof(p2), "layers.%d.", (int)layer);
+    std::snprintf(p3, sizeof(p3), "transformer.h.%d.", (int)layer);
+    std::snprintf(p4, sizeof(p4), "h.%d.", (int)layer);
+    const char* prefixes[] = {p0, p1, p2, p3, p4};
     std::string cache_key = std::to_string(layer);
     cache_key.push_back('\n');
     cache_key.append(suffix_lower);
@@ -296,12 +302,16 @@ static int moe_engine_has_common_tensor_suffix(
     int result = 0;
     for (const auto& it : engine->gguf_common_tensor_slots) {
         const std::string& key = it.first;
-        if (key.size() >= layer_prefix.size() + suffix_lower.size() &&
-            key.compare(0, layer_prefix.size(), layer_prefix) == 0 &&
-            key.compare(key.size() - suffix_lower.size(), suffix_lower.size(), suffix_lower) == 0) {
-            result = 1;
-            break;
+        for (const char* prefix : prefixes) {
+            const size_t prefix_len = std::strlen(prefix);
+            if (key.size() >= prefix_len + suffix_lower.size() &&
+                key.compare(0, prefix_len, prefix) == 0 &&
+                key.compare(key.size() - suffix_lower.size(), suffix_lower.size(), suffix_lower) == 0) {
+                result = 1;
+                break;
+            }
         }
+        if (result) break;
     }
     {
         std::unique_lock<std::shared_mutex> lock(engine->common_tensor_suffix_cache_mutex);

@@ -170,6 +170,15 @@ static int moe_raw_lm_head_ready(const moe_pc_engine* engine) {
         return rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size ?
             common_tensor_backing_file_ready(engine, rec) : 0;
     }
+    int lm_head_tied_to_embedding = 0;
+    if (engine) {
+        (void)moe_json_get_bool_local(engine->offload_graph_ir_json, "lm_head_tied_to_token_embedding", &lm_head_tied_to_embedding);
+    }
+    auto is_embedding_candidate = [](const char* name) -> bool {
+        return name && (std::strcmp(name, "token_embd.weight") == 0 ||
+            std::strcmp(name, "model.embed_tokens.weight") == 0 ||
+            std::strcmp(name, "embed_tokens.weight") == 0);
+    };
     static const char* const lm_head_names[] = {
         "output.weight",
         "lm_head.weight",
@@ -190,6 +199,9 @@ static int moe_raw_lm_head_ready(const moe_pc_engine* engine) {
         const moe_gguf_common_tensor_record* rec =
             find_common_tensor_by_names(engine, &lm_head_names[i], 1, &desc);
         if (rec && c && desc.cols == c->hidden_size && desc.rows >= c->vocab_size) {
+            if (is_embedding_candidate(lm_head_names[i]) && !lm_head_tied_to_embedding) {
+                continue;
+            }
             return common_tensor_backing_file_ready(engine, rec);
         }
     }

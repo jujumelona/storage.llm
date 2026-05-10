@@ -1,28 +1,23 @@
 
 
+
 static int moe_env_truthy_local(const char* name) {
-    const char* v = std::getenv(name);
-    if (!v || !*v) return 0;
-    if (v[0] == '0') return 0;
-    if ((v[0] == 'f' || v[0] == 'F') && (v[1] == 'a' || v[1] == 'A')) return 0;
-    if ((v[0] == 'n' || v[0] == 'N') && (v[1] == 'o' || v[1] == 'O')) return 0;
-    return 1;
+    return moe_perf_env_truthy(name);
+}
+
+static int moe_strict_fast_path_enabled() {
+    return moe_perf_strict_fast_path_enabled();
 }
 
 static int moe_cpu_storage_max_enabled() {
-    return moe_env_truthy_local("STORAGELLM_CPU_ONLY") ||
-           moe_env_truthy_local("STORAGELLM_CPU_STORAGE_ENGINE") ||
-           moe_env_truthy_local("STORAGELLM_CPU_STORAGE_MAX") ||
-           moe_env_truthy_local("STORAGELLM_CPU_PIPELINE");
+    return moe_perf_cpu_storage_mode_enabled();
 }
 
 static int moe_storage_always_enabled() {
     // StorageLLM format/runtime target: weights remain storage-resident and RAM
     // is a hotset/page-cache/scratch tier.  This is backend-common; unlike
     // CPU_STORAGE_MAX it must not force GPU environments onto CPU.
-    return moe_env_truthy_local("STORAGELLM_STORAGE_ALWAYS") ||
-           moe_env_truthy_local("STORAGELLM_STORAGE_REQUIRED") ||
-           moe_env_truthy_local("STORAGELLM_STORAGE_IO_PLANNER");
+    return moe_perf_storage_required_enabled();
 }
 
 static uint32_t moe_default_io_worker_threads(uint32_t hw) {
@@ -53,12 +48,10 @@ static uint64_t moe_default_pinned_staging_bytes(
 ) {
     const uint32_t gpu = std::max(1u, gpu_workers);
     uint64_t slot_count = (uint64_t)std::max(1u, io_workers) * (uint64_t)gpu * 2ull;
-    // BUGFIX 993: Cap default staging slots to prevent excessive pinned memory ★★ IMPORTANT
-    // Problem: 32-core machine → io=8, gpu=4 → slot_count=64 → 64 × 32MB = 2GB pinned
-    // This wastes RAM, especially with GDS (staging bypassed) or CPU-only (RAM > throughput).
-    // Solution: Cap at 16 slots (512MB). moe_ensure_staging_capacity grows if genuinely needed.
-    // 16 slots provides sufficient pipeline depth for 4 GPU workers × 4 batch.
-    slot_count = std::max<uint64_t>(4ull, std::min<uint64_t>(slot_count, 16ull));
+    // Max-speed default: keep enough pinned slots to overlap SSD read, host copy,
+    // and device upload without immediately starving the queue on large MoE bundles.
+    // Still bounded so machines without GDS/DirectStorage do not pin unbounded RAM.
+    slot_count = std::max<uint64_t>(8ull, std::min<uint64_t>(slot_count, 32ull));
     uint64_t desired = normal_max > 0 && slot_count <= UINT64_MAX / normal_max
         ? normal_max * slot_count : UINT64_MAX;
     const uint64_t ram_cap = storagellm::default_ram_budget_bytes(25);
@@ -102,20 +95,16 @@ moe_io_config_t moe_pc_default_io_config(void) {
     const uint64_t normal_max = storage ? storage->normal_bundle_max_bytes : normal_min;
     const uint32_t hw = moe_cpu_thread_count_hint();
     cfg.io_worker_threads = moe_default_io_worker_threads(hw);
-    // BUGFIX 965: Set default to 0 (auto-calculate) instead of 6 ★★
-    // Problem: Value 6 was immediately overwritten by io_config_api.cpp.inc VRAM-based
-    // logic. But if user calls moe_pc_default_io_config() without configure_io(),
-    // the stale 6 leaks through. 0 = "auto" is consistent with the documented
-    // (using_default_io_config || == 0) auto-calculation condition.
-    // Safety: common_raw_prefetch.cpp.inc::runtime_prefetch_window() already
-    // falls back to 1 when both runtime and config values are 0.
-    cfg.prefetch_window_layers = 0;
-    cfg.max_prefetch_queue = 12288;
-    cfg.topology_max_candidates = 2;
-    cfg.topology_max_edges_per_source = 32;
-    cfg.pinned_worker_threads = hw >= 32 ? 4u : hw >= 16 ? 3u : 1u;
-    cfg.gpu_worker_threads = hw >= 32 ? 4u : hw >= 16 ? 3u : 1u;
-    cfg.gpu_expert_scratch_slots = std::max<uint32_t>(16u, cfg.gpu_worker_threads * 2u);
+    // Max-speed storage/GPU defaults. configure_io() may still adapt these to
+    // measured bandwidth and backend caps, but the baseline should keep the
+    // disk->pinned->GPU pipeline full instead of starting conservative.
+    cfg.prefetch_window_layers = hw >= 16u ? 6u : (hw >= 8u ? 4u : 2u);
+    cfg.max_prefetch_queue = hw >= 16u ? 32768u : (hw >= 8u ? 16384u : 8192u);
+    cfg.topology_max_candidates = 4;
+    cfg.topology_max_edges_per_source = 64;
+    cfg.pinned_worker_threads = hw >= 32 ? 8u : hw >= 16 ? 6u : hw >= 8 ? 4u : 1u;
+    cfg.gpu_worker_threads = hw >= 32 ? 8u : hw >= 16 ? 6u : hw >= 8 ? 4u : 1u;
+    cfg.gpu_expert_scratch_slots = std::max<uint32_t>(32u, cfg.gpu_worker_threads * 4u);
     cfg.disk_worker_threads = moe_balanced_disk_worker_threads(hw, cfg.io_worker_threads, cfg.gpu_worker_threads);
     cfg.pinned_staging_bytes = moe_default_pinned_staging_bytes(
         normal_min,
@@ -123,11 +112,11 @@ moe_io_config_t moe_pc_default_io_config(void) {
         cfg.io_worker_threads,
         cfg.gpu_worker_threads);
     cfg.direct_upload_min_bytes = normal_min;
-    cfg.vram_safety_margin_bytes = 256ull * 1024ull * 1024ull;
-    cfg.directstorage_staging_queue_capacity = 1024;
-    cfg.directstorage_gpu_queue_capacity = 1024;
+    cfg.vram_safety_margin_bytes = 128ull * 1024ull * 1024ull;
+    cfg.directstorage_staging_queue_capacity = 4096;
+    cfg.directstorage_gpu_queue_capacity = 8192;
     cfg.directstorage_require_completion_event = 1;
-    cfg.prefill_group_wait_us = 200;
+    cfg.prefill_group_wait_us = 100;
     cfg.internal_require_gpu_expert_batch_kernel = 1;
     cfg.internal_verified_backend_only = 1;
     cfg.enable_compute_io_overlap = 1;
@@ -152,7 +141,9 @@ moe_io_config_t moe_pc_default_io_config(void) {
     // BUGFIX 902: Level Zero iGPU needs higher headroom (20% default)
     cfg.level_zero_memory_headroom_pct = 20;
     cfg.enable_bw_benchmark = 1;
-    cfg.ram_eviction_target_fill_pct = 75;  // Default 75% RAM fill target
+    cfg.vram_eviction_threshold_pct = 88;
+    cfg.attention_prefetch_threshold_pct = 92;
+    cfg.ram_eviction_target_fill_pct = 85;  // Max-speed default keeps a larger RAM hotset
     if (moe_storage_always_enabled()) {
         // Backend-common SSD/RAM optimization.  CPU consumes this through
         // mmap/page-cache; GPU/offload consumes the same merged span plan through
@@ -162,11 +153,11 @@ moe_io_config_t moe_pc_default_io_config(void) {
         cfg.enable_lookahead_prefetch = 1;
         cfg.enable_topology_prefetch = 1;
         cfg.enable_mmap_prefetch = 1;
-        cfg.prefetch_window_layers = hw >= 16u ? 3u : 2u;
-        cfg.max_prefetch_queue = hw >= 16u ? 16384u : (hw >= 8u ? 8192u : 4096u);
-        cfg.disk_worker_threads = std::max<uint32_t>(cfg.disk_worker_threads, hw >= 16u ? 4u : (hw >= 8u ? 2u : 1u));
-        cfg.io_worker_threads = std::max<uint32_t>(cfg.io_worker_threads, hw >= 16u ? 4u : (hw >= 8u ? 2u : 1u));
-        cfg.ram_eviction_target_fill_pct = 92;
+        cfg.prefetch_window_layers = hw >= 16u ? 6u : (hw >= 8u ? 4u : 2u);
+        cfg.max_prefetch_queue = hw >= 16u ? 32768u : (hw >= 8u ? 16384u : 8192u);
+        cfg.disk_worker_threads = std::max<uint32_t>(cfg.disk_worker_threads, hw >= 32u ? 12u : (hw >= 16u ? 8u : (hw >= 8u ? 4u : 1u)));
+        cfg.io_worker_threads = std::max<uint32_t>(cfg.io_worker_threads, hw >= 32u ? 10u : (hw >= 16u ? 6u : (hw >= 8u ? 4u : 1u)));
+        cfg.ram_eviction_target_fill_pct = 94;
         cfg.ram_eviction_threshold_pct = 98;
     }
     if (moe_cpu_storage_max_enabled()) {
@@ -174,13 +165,17 @@ moe_io_config_t moe_pc_default_io_config(void) {
         // CPU-only needs overlap, but compute must not starve page-cache/NVMe
         // workers.  Reserve 1-2 cores for IO on larger machines and keep GPU
         // staging completely disabled.
-        cfg.io_worker_threads = hw_cpu >= 16u ? 3u : (hw_cpu >= 8u ? 2u : 1u);
-        cfg.disk_worker_threads = hw_cpu >= 16u ? 3u : (hw_cpu >= 8u ? 2u : 1u);
+        const uint32_t cpu_io_workers =
+            hw_cpu >= 32u ? 10u :
+            hw_cpu >= 16u ? 6u :
+            hw_cpu >= 8u  ? 4u : 1u;
+        cfg.io_worker_threads = cpu_io_workers;
+        cfg.disk_worker_threads = cpu_io_workers;
         cfg.pinned_worker_threads = 0;
         cfg.gpu_worker_threads = 0;
         cfg.gpu_expert_scratch_slots = 0;
-        cfg.prefetch_window_layers = hw_cpu >= 8u ? 3u : 2u;
-        cfg.max_prefetch_queue = hw_cpu >= 8u ? 8192u : 4096u;
+        cfg.prefetch_window_layers = hw_cpu >= 16u ? 6u : 4u;
+        cfg.max_prefetch_queue = hw_cpu >= 16u ? 32768u : 16384u;
         cfg.pinned_staging_bytes = 0;
         cfg.directstorage_staging_queue_capacity = 0;
         cfg.directstorage_gpu_queue_capacity = 0;
@@ -204,5 +199,21 @@ moe_io_config_t moe_pc_default_io_config(void) {
         cfg.ram_eviction_threshold_pct = 98;
     }
     moe_apply_autotune_io_env(&cfg);
+    if (moe_strict_fast_path_enabled()) {
+        // Verification mode is profile-aware.  CPU-only strict mode must not
+        // demand a GPU batch kernel; GPU/offload strict mode should fail fast
+        // when the model library/backend kernel is missing.
+        cfg.allow_required_sync_fallback = 0;
+        cfg.require_bundle_native_experts = 1;
+        if (moe_cpu_storage_max_enabled()) {
+            cfg.enable_cold_expert_cpu_fallback = 1;   // CPU is the target path, not a fallback here.
+            cfg.internal_verified_backend_only = 0;
+            cfg.internal_require_gpu_expert_batch_kernel = 0;
+        } else {
+            cfg.enable_cold_expert_cpu_fallback = 0;
+            cfg.internal_verified_backend_only = 1;
+            cfg.internal_require_gpu_expert_batch_kernel = 1;
+        }
+    }
     return cfg;
 }

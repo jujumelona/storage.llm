@@ -1,3 +1,21 @@
+static bool moe_generation_api_main_env_truthy(const char* name) {
+    const char* v = name ? std::getenv(name) : nullptr;
+    if (!v || !*v) return false;
+    return !(std::strcmp(v, "0") == 0 ||
+             std::strcmp(v, "false") == 0 ||
+             std::strcmp(v, "FALSE") == 0 ||
+             std::strcmp(v, "off") == 0 ||
+             std::strcmp(v, "OFF") == 0 ||
+             std::strcmp(v, "no") == 0 ||
+             std::strcmp(v, "NO") == 0);
+}
+
+static bool moe_generation_parallel_prefill_embed_enabled() {
+    const char* v = std::getenv("STORAGELLM_PARALLEL_PREFILL_EMBED");
+    if (!v) return true;
+    return moe_generation_api_main_env_truthy("STORAGELLM_PARALLEL_PREFILL_EMBED");
+}
+
 int moe_pc_engine_generate_token_ids(
     moe_pc_engine_t* engine,
     const int32_t* input_token_ids,
@@ -154,8 +172,9 @@ int moe_pc_engine_generate_token_ids(
     }
 
     moe_decode_scratch scratch;
-    moe_kv_cache_ram_scope kv_scope{engine, &scratch.kv_cache};
-    moe_kv_decode_cache_ram_scope decode_cache_scope{engine, &scratch};
+    const int generation_qkv_only = moe_engine_qkv_only_required(engine);
+    moe_kv_cache_ram_scope kv_scope{engine, generation_qkv_only ? nullptr : &scratch.kv_cache};
+    moe_kv_decode_cache_ram_scope decode_cache_scope{engine, generation_qkv_only ? nullptr : &scratch};
     uint32_t produced = 0;
     int failed = 0;
     float last_logit = 0.0f;
@@ -168,7 +187,9 @@ int moe_pc_engine_generate_token_ids(
         moe_generation_set_error(out_stats, "decode scratch allocation failed");
         return 0;
     }
-    moe_kv_cache_track_ram(engine, &scratch.kv_cache);
+    if (!generation_qkv_only) {
+        moe_kv_cache_track_ram(engine, &scratch.kv_cache);
+    }
     scratch.position = 0;
 
     // Layer-first prefill: invert token-by-layer into layer-by-token.
@@ -203,7 +224,7 @@ int moe_pc_engine_generate_token_ids(
         if (!moe_generation_should_use_layer_first_prefill(engine, prefill_count, c->hidden_size)) {
             for (uint32_t i = 0; i < prefill_count; ++i) {
                 const uint64_t prefill_token_start_us = moe_profile_now_us();
-                if (!moe_forward_one_token_f32(
+                if (!moe_forward_one_token_dispatch_f32(
                         engine, (uint32_t)safe_input[i], &scratch, out_stats,
                         scratch.position, pre_allocate_kv)) {
                     return 0;
@@ -225,22 +246,42 @@ int moe_pc_engine_generate_token_ids(
             std::vector<float> batch_hidden(prefill_count * hs);
             std::vector<float> batch_norm(prefill_count * hs);
 
-            // Phase 1: Embed all tokens in parallel
+            // Phase 1: Embed all tokens. Embedding is read-only on weights and writes
+            // one independent hidden row per prompt token, so it can safely use the
+            // same row worker pool as tensor kernels. This removes one of the last
+            // avoidable serial chunks in long-prompt prefill.
             const uint64_t batch_embed_start_us = moe_profile_now_us();
-            for (uint32_t i = 0; i < prefill_count; ++i) {
-                if (!moe_pc_engine_embed_token_f32(
-                        engine, (uint32_t)safe_input[i],
-                        batch_hidden.data() + i * hs, (uint32_t)hs)) {
-                    moe_generation_set_error(out_stats, "prefill embedding failed");
-                    return 0;
+            std::atomic<int> embed_ok{1};
+            if (prefill_count >= 2u && moe_generation_parallel_prefill_embed_enabled()) {
+                const int rows_ok = moe_parallel_rows(engine, prefill_count, 0, [&](uint32_t i) {
+                    if (!moe_pc_engine_embed_token_f32(
+                            engine, (uint32_t)safe_input[i],
+                            batch_hidden.data() + (size_t)i * hs, (uint32_t)hs)) {
+                        embed_ok.store(0, std::memory_order_relaxed);
+                    }
+                });
+                if (!rows_ok) embed_ok.store(0, std::memory_order_relaxed);
+            } else {
+                for (uint32_t i = 0; i < prefill_count; ++i) {
+                    if (!moe_pc_engine_embed_token_f32(
+                            engine, (uint32_t)safe_input[i],
+                            batch_hidden.data() + (size_t)i * hs, (uint32_t)hs)) {
+                        embed_ok.store(0, std::memory_order_relaxed);
+                        break;
+                    }
                 }
+            }
+            if (!embed_ok.load(std::memory_order_relaxed)) {
+                moe_generation_set_error(out_stats, "prefill embedding failed");
+                return 0;
             }
             moe_profile_log(
                 "prefill_batch_embed",
-                "id=%llu tokens=%u hidden=%u ms=%.3f",
+                "id=%llu tokens=%u hidden=%u parallel=%d ms=%.3f",
                 (unsigned long long)generation_scope.id,
                 prefill_count,
                 c->hidden_size,
+                (prefill_count >= 2u && moe_generation_parallel_prefill_embed_enabled()) ? 1 : 0,
                 moe_profile_elapsed_ms(batch_embed_start_us));
 
             // Ensure scratch is sized
@@ -248,17 +289,25 @@ int moe_pc_engine_generate_token_ids(
                 moe_generation_set_error(out_stats, "prefill scratch allocation failed");
                 return 0;
             }
-            moe_kv_cache_track_ram(engine, &scratch.kv_cache);
-
-            // Bug 8: Pre-allocate KV cache capacity to avoid reallocation inside tight loop
-            // Without pre-allocation, ensure_capacity() inside moe_layer_attention_f32 triggers
-            // ~176MB reallocation at t=1024, ~353MB at t=2048, blocking GPU prefetch pipeline
-            if (!pre_allocate_kv && prefill_count > scratch.kv_cache.max_seq_len) {
-                if (!scratch.kv_cache.ensure_capacity(prefill_count - 1)) {
-                    moe_generation_set_error(out_stats, "prefill KV cache allocation failed");
-                    return 0;
-                }
+            if (!generation_qkv_only) {
                 moe_kv_cache_track_ram(engine, &scratch.kv_cache);
+            }
+
+            // QKV-only models own sequence capacity in qkv_state, never in moe_kv_cache.
+            if (!pre_allocate_kv) {
+                if (generation_qkv_only) {
+                    if (prefill_count > 0 &&
+                        !moe_qkv_only_ensure_capacity(engine, &scratch, attn_cfg, prefill_count - 1u, 0)) {
+                        moe_generation_set_error(out_stats, "prefill QKV capacity allocation failed");
+                        return 0;
+                    }
+                } else if (prefill_count > scratch.kv_cache.max_seq_len) {
+                    if (!scratch.kv_cache.ensure_capacity(prefill_count - 1)) {
+                        moe_generation_set_error(out_stats, "prefill KV cache allocation failed");
+                        return 0;
+                    }
+                    moe_kv_cache_track_ram(engine, &scratch.kv_cache);
+                }
             }
 
             // Phase 2: layer-first, process all prompt tokens per layer.
@@ -387,7 +436,7 @@ int moe_pc_engine_generate_token_ids(
     for (; produced < max_new_tokens; ++produced) {
         const uint64_t decode_start_us = moe_profile_now_us();
         engine->generation_token.store(prefill_count + produced, std::memory_order_relaxed);
-        if (!moe_forward_one_token_f32(
+        if (!moe_forward_one_token_dispatch_f32(
                 engine, (uint32_t)current, &scratch, out_stats, scratch.position, pre_allocate_kv)) {
             failed = 1;
             break;

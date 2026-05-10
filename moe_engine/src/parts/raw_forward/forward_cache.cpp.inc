@@ -10,6 +10,34 @@ static int moe_raw_tensor_copy_row_f32(
     if (!out || out_count > 100000) {
         return 0;
     }
+    if (raw.math_transposed) {
+        if (raw.weight_format != moe_WEIGHT_ENCODING_UNKNOWN &&
+            raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP16 &&
+            raw.weight_format != moe_WEIGHT_ENCODING_RAW_BF16 &&
+            raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP32) {
+            moe_profile_log("raw_copy_transposed_quant_unsupported", "row=%u rows=%u cols=%u fmt=%u", row, raw.rows, raw.cols, (unsigned)raw.weight_format);
+            return 0;
+        }
+        const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
+        const uint32_t physical_cols = raw.physical_cols ? raw.physical_cols : raw.rows;
+        const uint32_t physical_rows = raw.physical_rows ? raw.physical_rows : raw.cols;
+        const uint64_t physical_row_bytes = raw.weight_row_bytes ? raw.weight_row_bytes : (uint64_t)physical_cols * (uint64_t)elem;
+        if (!elem || row >= physical_cols || out_count > physical_rows || physical_row_bytes == 0) {
+            return 0;
+        }
+        for (uint32_t i = 0; i < out_count; ++i) {
+            const uint64_t off = (uint64_t)i * physical_row_bytes + (uint64_t)row * (uint64_t)elem;
+            if (off > raw.bytes || (uint64_t)elem > raw.bytes - off) {
+                return 0;
+            }
+            const float v = moe_raw_scalar_to_f32(raw.base + off, raw.scalar_encoding);
+            if (!std::isfinite(v)) {
+                return 0;
+            }
+            out[i] = v;
+        }
+        return 1;
+    }
     const uint32_t stride_cols = raw.cols ? raw.cols : out_count;
     const uint64_t row_bytes = moe_raw_tensor_row_bytes(raw, stride_cols);
     if (!raw.base || !out || row >= raw.rows || row_bytes == 0 ||

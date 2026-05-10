@@ -7,6 +7,13 @@ static int server_env_truthy_local(const char* name) {
     return 1;
 }
 
+
+static int server_strict_fast_path_enabled() {
+    return server_env_truthy_local("STORAGELLM_STRICT_FAST_PATH") ||
+           server_env_truthy_local("STORAGELLM_FAIL_ON_FALLBACK") ||
+           server_env_truthy_local("STORAGELLM_NO_SLOW_FALLBACK");
+}
+
 static int server_cpu_storage_max_enabled(const moe_backend_caps_t& caps) {
     return caps.backend == moe_BACKEND_CPU ||
            server_env_truthy_local("STORAGELLM_CPU_ONLY") ||
@@ -71,7 +78,11 @@ static moe_io_config_t make_server_io_config(const server_options& opts, const m
     const uint64_t expert_max_bytes = storage && storage->normal_bundle_max_bytes ?
         storage->normal_bundle_max_bytes : expert_min_bytes;
     io.enable_compute_io_overlap = 1;
-    io.enable_multistage_pipeline = server_cpu_storage_max_enabled(caps) ? 0 : 1;
+    // CPU storage mode is exactly where the multistage pipeline matters most:
+    // the compute thread should keep running while disk/page-cache prefetch warms
+    // the next layer.  The previous server override disabled it for CPU and
+    // caused the token loop to alternate between compute and I/O waits.
+    io.enable_multistage_pipeline = 1;
     io.enable_lookahead_prefetch = 1;
     io.enable_topology_prefetch = 1;
     io.enable_mmap_prefetch = 1;
@@ -79,20 +90,30 @@ static moe_io_config_t make_server_io_config(const server_options& opts, const m
     io.enable_directstorage = server_cpu_storage_max_enabled(caps) ? 0 : caps.supports_directstorage;
     io.enable_gpudirect_storage = server_cpu_storage_max_enabled(caps) ? 0 : caps.supports_gpudirect_storage;
     io.enable_bam_nvme = server_cpu_storage_max_enabled(caps) ? 0 : caps.supports_gpu_direct_file_io;
-    // Keep common raw pinning opt-in. Server auto startup must stay portable
-    // across CPU and GPU backends instead of assuming one device allocator path.
-    io.enable_common_raw_vram_pin = 0;
-    io.prefetch_window_layers = std::max<uint32_t>(2u, io.prefetch_window_layers);
+    // Max-speed GPU/offload server path: keep common tensors resident in VRAM
+    // when a discrete GPU/cache budget exists so attention/common projections do
+    // not bounce through host memory every token.
+    io.enable_common_raw_vram_pin = server_cpu_storage_max_enabled(caps) ? 0 : 1;
+    io.prefetch_window_layers = std::max<uint32_t>(server_cpu_storage_max_enabled(caps) ? 4u : 6u, io.prefetch_window_layers);
+    io.max_prefetch_queue = std::max<uint32_t>(io.max_prefetch_queue, server_cpu_storage_max_enabled(caps) ? 16384u : 32768u);
+    io.topology_max_candidates = std::max<uint32_t>(io.topology_max_candidates, 4u);
+    io.topology_max_edges_per_source = std::max<uint32_t>(io.topology_max_edges_per_source, 64u);
+    io.directstorage_staging_queue_capacity = std::max<uint32_t>(io.directstorage_staging_queue_capacity, 4096u);
+    io.directstorage_gpu_queue_capacity = std::max<uint32_t>(io.directstorage_gpu_queue_capacity, 8192u);
     io.ram_eviction_target_fill_pct = std::max<uint8_t>(io.ram_eviction_target_fill_pct, 85u);
     io.ram_eviction_threshold_pct = std::max<uint8_t>(io.ram_eviction_threshold_pct, 90u);
     if (server_cpu_storage_max_enabled(caps)) {
         const uint32_t hw_cpu = std::max<uint32_t>(1u, std::thread::hardware_concurrency());
-        io.io_worker_threads = hw_cpu >= 8u ? 2u : 1u;
-        io.disk_worker_threads = hw_cpu >= 8u ? 2u : 1u;
+        const uint32_t cpu_io_workers =
+            hw_cpu >= 32u ? 10u :
+            hw_cpu >= 16u ? 6u :
+            hw_cpu >= 8u  ? 4u : 1u;
+        io.io_worker_threads = cpu_io_workers;
+        io.disk_worker_threads = cpu_io_workers;
         io.pinned_worker_threads = 0;
         io.gpu_worker_threads = 0;
-        io.prefetch_window_layers = 2;
-        io.max_prefetch_queue = 4096;
+        io.prefetch_window_layers = hw_cpu >= 16u ? 6u : 4u;
+        io.max_prefetch_queue = hw_cpu >= 16u ? 32768u : 16384u;
         io.pinned_staging_bytes = 0;
         io.directstorage_staging_queue_capacity = 0;
         io.directstorage_gpu_queue_capacity = 0;
@@ -103,20 +124,39 @@ static moe_io_config_t make_server_io_config(const server_options& opts, const m
         io.internal_require_gpu_expert_batch_kernel = 0;
         io.internal_verified_backend_only = 0;
     } else {
-        io.disk_worker_threads = 4;
-        io.pinned_worker_threads = caps.copy_streams > 1 ? 4u : 2u;
-        io.gpu_worker_threads = caps.copy_streams ? caps.copy_streams : 1u;
+        const uint32_t hw_gpu = std::max<uint32_t>(1u, std::thread::hardware_concurrency());
+        const uint32_t stream_workers = std::max<uint32_t>(2u, caps.copy_streams ? caps.copy_streams * 2u : 2u);
+        io.disk_worker_threads = hw_gpu >= 32u ? 12u : (hw_gpu >= 16u ? 8u : 4u);
+        io.pinned_worker_threads = std::min<uint32_t>(16u, std::max<uint32_t>(4u, stream_workers));
+        io.gpu_worker_threads = std::min<uint32_t>(16u, std::max<uint32_t>(4u, stream_workers));
+        io.gpu_expert_scratch_slots = std::max<uint32_t>(32u, io.gpu_worker_threads * 4u);
     }
     io.direct_upload_min_bytes = expert_min_bytes;
     const uint32_t active_workers =
         io.disk_worker_threads + io.pinned_worker_threads + io.gpu_worker_threads;
     const uint64_t slot_bytes = expert_max_bytes + 4ull * 1024ull * 1024ull;
-    const uint64_t worker_slots = std::max<uint32_t>(8u, active_workers * 2u);
+    const uint64_t worker_slots = std::max<uint32_t>(16u, active_workers * 3u);
     const uint64_t worker_staging = slot_bytes * worker_slots;
     if (!server_cpu_storage_max_enabled(caps)) {
         io.pinned_staging_bytes = std::max<uint64_t>(
             std::max<uint64_t>(caps.recommended_pinned_bytes, worker_staging),
             512ull * 1024ull * 1024ull);
+    }
+    if (server_strict_fast_path_enabled()) {
+        // Strict mode is profile-aware.  CPU-only strict mode refuses hidden
+        // storage sync fallback, but it must not require GPU kernels.  GPU/offload
+        // strict mode requires the verified fast backend and grouped expert kernel.
+        io.allow_required_sync_fallback = 0;
+        io.require_bundle_native_experts = 1;
+        if (server_cpu_storage_max_enabled(caps)) {
+            io.enable_cold_expert_cpu_fallback = 1;
+            io.internal_verified_backend_only = 0;
+            io.internal_require_gpu_expert_batch_kernel = 0;
+        } else {
+            io.enable_cold_expert_cpu_fallback = 0;
+            io.internal_verified_backend_only = 1;
+            io.internal_require_gpu_expert_batch_kernel = 1;
+        }
     }
     return io;
 }

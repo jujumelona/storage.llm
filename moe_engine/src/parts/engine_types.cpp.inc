@@ -217,6 +217,9 @@ struct moe_raw_tensor_cache_entry {
     uint8_t scalar_encoding = moe_RAW_SCALAR_BF16;
     uint8_t weight_format = moe_WEIGHT_ENCODING_RAW_FP16;
     uint64_t weight_row_bytes = 0;
+    uint8_t math_transposed = 0;
+    uint32_t physical_rows = 0;
+    uint32_t physical_cols = 0;
 };
 
 struct moe_prefetch_task {
