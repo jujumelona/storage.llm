@@ -34,10 +34,20 @@ static void gpu_worker_loop(moe_pc_engine* engine, uint32_t worker_index) {
         }
     } cleanup_guard{engine};
 
+    uint32_t idle_drain_tick = 0;
     for (;;) {
         moe_prefetch_task task{};
-        device_refresh_mem_info(engine, 0);
-        device_drain_directstorage_device_copies(engine);
+        const uint32_t ds_pending = engine->directstorage_pending_count.load(std::memory_order_acquire);
+        const size_t deferred_pending = device_deferred_staging_copy_count(engine);
+        if (ds_pending > 0 || deferred_pending > 0 || ((++idle_drain_tick & 63u) == 0u)) {
+            if (deferred_pending > 0) {
+                device_drain_deferred_staging_copies(engine, false);
+            }
+            if (ds_pending > 0) {
+                device_drain_directstorage_device_copies(engine);
+            }
+            device_refresh_mem_info(engine, 0);
+        }
         if (!pop_stage_task(engine, engine->gpu_stage, &task, &engine->gpu_worker_target, worker_index)) {
             stream_guard.e = nullptr;  // BUG 4 FIX: Prevent double-destroy
             device_stream_destroy_current(engine);

@@ -399,18 +399,17 @@ def test_mxfp4_dot_and_cache_decode_use_physical_row_stride_from_index():
     assert "moe_mxfp4_row_layout_for_bytes(out_count, row_bytes)" in cache_text
 
 
-def test_qkv_single_token_attention_uses_exact_current_value_not_compressed_roundtrip():
+def test_qkv_single_token_attention_uses_paper_quantized_decode_path():
     attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_decode.cpp.inc").read_text()
-    assert "qkv_current_value_exact" in attn_text
-    assert "seq_len == 1u" in attn_text
+    assert "TurboQuant/QJL KV mode must use the same quantize/dequantize contract" in attn_text
     assert "current_exact=%d" in attn_text
-    preserve_pos = attn_text.index("qkv_current_value_exact = s->kv_entry.data();")
-    append_pos = attn_text.index("moe_qkv_append_layer_head_token", preserve_pos)
+    assert "qkv_current_value_exact" not in attn_text
+    assert "if (qkv_current_value_exact && seq_len == 1u)" not in attn_text
+    assert "const float* v = qkv_current_value_exact" not in attn_text
+    append_pos = attn_text.index("moe_qkv_append_layer_head_token")
     fill_pos = attn_text.index("std::fill(s->attn_value.begin()", append_pos)
-    bypass_pos = attn_text.index("if (qkv_current_value_exact && seq_len == 1u)", fill_pos)
-    qkv_decode_pos = attn_text.index("moe_pc_engine_attention_decode_layer_head_qkv_f32", bypass_pos)
-    assert preserve_pos < append_pos < fill_pos < bypass_pos < qkv_decode_pos
-    assert "const float* v = qkv_current_value_exact + (uint64_t)kv_h * v_head_dim" in attn_text
+    qkv_decode_pos = attn_text.index("moe_pc_engine_attention_decode_layer_head_qkv_f32", fill_pos)
+    assert append_pos < fill_pos < qkv_decode_pos
 
 
 def test_rmsnorm_metadata_false_is_not_cached_as_model_wide_authority():

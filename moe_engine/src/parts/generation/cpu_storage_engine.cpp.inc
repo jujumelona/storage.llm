@@ -568,20 +568,46 @@ static int moe_storage_io_try_iouring_warm_range(
     // Use the already registered staging slots as a warm buffer.  This is shared
     // by CPU and GPU: for CPU it pulls pages into the kernel cache before the
     // matvec thread touches them; for GPU it feeds the same pinned/staging pool
-    // used by the H2D path.  We only use it from prefetch hooks, not from the dot
-    // hot loop.
+    // used by the H2D path.  Submit several chunks per ring transaction instead
+    // of submit+wait per chunk; this keeps the SSD queue deeper without letting
+    // multiple workers interleave on the single shared ring.
     const uint64_t max_chunk = std::min<uint64_t>(engine->staging_slot_size, 8ull * 1024ull * 1024ull);
     if (max_chunk == 0) return 0;
-    uint64_t done = 0;
+
+    struct WarmChunk {
+        uint32_t slot;
+        uint64_t offset;
+        uint64_t bytes;
+    };
+
+    const uint32_t profile = engine->storage_profile.load(std::memory_order_relaxed);
+    const uint32_t workers = std::max<uint32_t>(1u, engine->storage_prefetch_workers.load(std::memory_order_relaxed));
+    const uint32_t max_inflight = static_cast<uint32_t>(std::max<size_t>(1u, std::min<size_t>(
+        moe_storage_prefetch_batch_cap(profile, workers),
+        std::min<size_t>(engine->staging_slots.size(), 32u))));
+
+    std::vector<WarmChunk> chunks;
+    chunks.reserve(max_inflight);
+    uint64_t submitted_bytes_total = 0;
+    uint64_t completed_bytes_total = 0;
     uint32_t turn = (uint32_t)(engine->storage_iouring_submit_count.load(std::memory_order_relaxed) + 1u);
-    while (done < bytes) {
-        const uint64_t chunk = std::min<uint64_t>(max_chunk, bytes - done);
-        const uint32_t slot = acquire_staging_slot(engine, 0u, turn++, chunk, true);
-        if (slot == UINT32_MAX || !staging_slot_valid(engine, slot)) {
-            engine->storage_iouring_fallback_count.fetch_add(1, std::memory_order_relaxed);
-            if (slot != UINT32_MAX) release_staging_slot(engine, slot);
-            return done > 0 ? 1 : 0;
+
+    while (submitted_bytes_total < bytes) {
+        chunks.clear();
+        uint64_t batch_bytes = 0;
+        while (submitted_bytes_total + batch_bytes < bytes && chunks.size() < max_inflight) {
+            const uint64_t chunk = std::min<uint64_t>(max_chunk, bytes - submitted_bytes_total - batch_bytes);
+            const uint32_t slot = acquire_staging_slot(engine, 0u, turn++, chunk, true);
+            if (slot == UINT32_MAX || !staging_slot_valid(engine, slot)) {
+                engine->storage_iouring_fallback_count.fetch_add(1, std::memory_order_relaxed);
+                if (slot != UINT32_MAX) release_staging_slot(engine, slot);
+                return completed_bytes_total > 0 ? 1 : 0;
+            }
+            chunks.push_back(WarmChunk{slot, offset + submitted_bytes_total + batch_bytes, chunk});
+            batch_bytes += chunk;
         }
+        if (chunks.empty()) break;
+
         const uint32_t io_gen = engine->prefer_overlapped_io_generation.load(std::memory_order_relaxed);
         void* user_data = reinterpret_cast<void*>((uintptr_t)std::max<uint32_t>(1u, io_gen));
 #ifdef _WIN32
@@ -589,36 +615,56 @@ static int moe_storage_io_try_iouring_warm_range(
 #else
         void* file_handle = nullptr;
 #endif
-        int submitted = engine->ring_adapter.prep_read_fixed(
-            shard->fd,
-            file_handle,
-            engine->staging_slots[slot].buf,
-            (size_t)chunk,
-            offset + done,
-            slot,
-            user_data,
-            0);
-        if (submitted) {
-            engine->ring_adapter.submit();
-            void* got = engine->ring_adapter.wait_completion();
-            if (got) {
-                engine->storage_iouring_submit_count.fetch_add(1, std::memory_order_relaxed);
-                engine->storage_iouring_bytes.fetch_add(chunk, std::memory_order_relaxed);
-                if (bytes_io) *bytes_io += chunk;
-                done += chunk;
-            } else {
-                engine->storage_iouring_fallback_count.fetch_add(1, std::memory_order_relaxed);
-                release_staging_slot(engine, slot);
-                return done > 0 ? 1 : 0;
+        uint32_t submits = 0;
+        uint64_t submitted_batch_bytes = 0;
+        bool prep_failed = false;
+        {
+            std::lock_guard<std::mutex> ring_lock(engine->ring_adapter.submit_mutex);
+            for (const WarmChunk& c : chunks) {
+                int submitted = engine->ring_adapter.prep_read_fixed(
+                    shard->fd,
+                    file_handle,
+                    engine->staging_slots[c.slot].buf,
+                    (size_t)c.bytes,
+                    c.offset,
+                    c.slot,
+                    user_data,
+                    0);
+                if (!submitted) {
+                    prep_failed = true;
+                    break;
+                }
+                ++submits;
+                submitted_batch_bytes += c.bytes;
             }
-        } else {
-            engine->storage_iouring_fallback_count.fetch_add(1, std::memory_order_relaxed);
-            release_staging_slot(engine, slot);
-            return done > 0 ? 1 : 0;
+            if (!prep_failed && submits > 0) {
+                engine->ring_adapter.submit();
+                uint32_t completions = 0;
+                while (completions < submits) {
+                    void* got = engine->ring_adapter.wait_completion();
+                    if (!got) break;
+                    ++completions;
+                }
+                if (completions == submits) {
+                    completed_bytes_total += submitted_batch_bytes;
+                    engine->storage_iouring_submit_count.fetch_add(submits, std::memory_order_relaxed);
+                    engine->storage_iouring_bytes.fetch_add(submitted_batch_bytes, std::memory_order_relaxed);
+                    if (bytes_io) *bytes_io += submitted_batch_bytes;
+                } else {
+                    prep_failed = true;
+                    engine->storage_iouring_fallback_count.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
         }
-        release_staging_slot(engine, slot);
+        for (const WarmChunk& c : chunks) {
+            release_staging_slot(engine, c.slot);
+        }
+        if (prep_failed || submits == 0) {
+            return completed_bytes_total > 0 ? 1 : 0;
+        }
+        submitted_bytes_total += submitted_batch_bytes;
     }
-    return done > 0 ? 1 : 0;
+    return completed_bytes_total > 0 ? 1 : 0;
 }
 
 static void moe_storage_io_prefetch_range_execute(

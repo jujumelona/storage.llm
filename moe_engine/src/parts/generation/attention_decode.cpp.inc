@@ -399,7 +399,6 @@
         scale,
         attn_logit_softcap);
 #endif
-    const float* qkv_current_value_exact = nullptr;
     if (qkv_decode) {
         const uint64_t qkv_append_start_us = moe_profile_now_us();
         if (v_head_dim != head_dim) {
@@ -408,20 +407,12 @@
                 layer, head_dim, v_head_dim);
             return 0;
         }
-        // For the current decode step, seq_len==1 has a single attention
-        // source: the just-projected current token. Plain KV uses that value
-        // directly via s->kv_entry. The QKV-only path previously appended it
-        // to the compressed cache and immediately decoded it back, so first
-        // token self-attention went through lossy 2/3-bit KV even though the
-        // exact value was still in scratch. Preserve the exact per-KV-head V
-        // before s->attn_value is reused as the per-query-head output buffer.
-        if (seq_len == 1u) {
-            if (s->kv_entry.size() < kv_v_dim) {
-                s->kv_entry.resize(kv_v_dim);
-            }
-            std::memcpy(s->kv_entry.data(), s->attn_value.data(), (size_t)kv_v_dim * sizeof(float));
-            qkv_current_value_exact = s->kv_entry.data();
-        }
+        // TurboQuant/QJL KV mode must use the same quantize/dequantize contract
+        // for every generated token, including the seq_len==1 self-attention
+        // case. Bypassing the just-appended current value with the scratch FP32
+        // V made PPL evaluate a hybrid path that is not the paper algorithm and
+        // hid cache/dequant errors for the first token. Append first, then read
+        // it back through the QKV decode path below.
         for (uint32_t kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
             const float* key = s->attn_kv_a.data() + (uint64_t)kv_h * head_dim;
             const float* value = s->attn_value.data() + (uint64_t)kv_h * v_head_dim;
@@ -457,7 +448,7 @@
             engine->qkv_cfg.key_normal_bits,
             engine->qkv_cfg.value_outlier_bits,
             engine->qkv_cfg.value_normal_bits,
-            qkv_current_value_exact ? 1 : 0,
+            0,
             (double)scale,
             scale_source ? scale_source : "unknown",
             (double)attn_logit_softcap,
@@ -474,11 +465,6 @@
         const float* q = s->q_b.data() + (uint64_t)h * head_dim;
         float* out_h = s->attn_value.data() + (uint64_t)h * v_head_dim;
         if (qkv_decode) {
-            if (qkv_current_value_exact && seq_len == 1u) {
-                const float* v = qkv_current_value_exact + (uint64_t)kv_h * v_head_dim;
-                std::memcpy(out_h, v, (size_t)v_head_dim * sizeof(float));
-                return 1;
-            }
             return moe_pc_engine_attention_decode_layer_head_qkv_f32(
                 engine,
                 (uint32_t)layer,

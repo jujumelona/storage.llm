@@ -35,6 +35,14 @@ static int moe_fast_backend_policy_is(const char* expected) {
     return !policy.empty() && expected && std::strcmp(policy.c_str(), expected) == 0;
 }
 
+static double moe_fast_backend_selected_latency_ms() {
+    const std::string value = moe_autotune_value("STORAGELLM_SELECTED_FAST_BACKEND_LATENCY_MS");
+    if (value.empty()) return 0.0;
+    char* end = nullptr;
+    const double parsed = std::strtod(value.c_str(), &end);
+    return (end != value.c_str() && std::isfinite(parsed) && parsed > 0.0) ? parsed : 0.0;
+}
+
 static int moe_selected_fast_backend_verified() {
     if (!moe_autotune_truthy("STORAGELLM_SELECTED_FAST_BACKEND_VERIFIED")) {
         return 0;
@@ -46,7 +54,10 @@ static int moe_selected_fast_backend_verified() {
     if (validation.find("adaptive-measurement") == std::string::npos) {
         return 0;
     }
-    return 1;
+    // Verified-only means a real measured backend, not just a validation string.
+    // Requiring a positive measured latency prevents hand-written/stale env files
+    // from forcing a fake fast path into the runtime.
+    return moe_fast_backend_selected_latency_ms() > 0.0 ? 1 : 0;
 }
 
 static moe_fast_backend_kind_t moe_fast_backend_kind_from_selected_env(

@@ -10,22 +10,41 @@ static std::string moe_autotune_trim(std::string s) {
     return i ? s.substr(i) : s;
 }
 
-static std::string moe_autotune_file_value(const char* key) {
-    if (!key || !key[0]) return {};
+static std::unordered_map<std::string, std::string> moe_autotune_load_file_values_once() {
+    std::unordered_map<std::string, std::string> values;
     const char* paths[] = {"build/selected_backend.env", "selected_backend.env"};
     for (const char* path : paths) {
         std::ifstream in(path, std::ios::binary);
         if (!in) continue;
         std::string line;
-        const std::string prefix = std::string(key) + "=";
         while (std::getline(in, line)) {
             line = moe_autotune_trim(line);
-            if (line.rfind(prefix, 0) == 0) {
-                return moe_autotune_trim(line.substr(prefix.size()));
+            if (line.empty() || line[0] == '#') continue;
+            const size_t eq = line.find('=');
+            if (eq == std::string::npos || eq == 0) continue;
+            const std::string key = moe_autotune_trim(line.substr(0, eq));
+            const std::string value = moe_autotune_trim(line.substr(eq + 1));
+            if (!key.empty()) {
+                values[key] = value;
             }
         }
+        if (!values.empty()) {
+            // build/selected_backend.env is the freshest autotune artifact in normal
+            // builds.  Only consult the repository-root fallback when the build file
+            // does not exist or is empty.  This avoids repeatedly merging stale files
+            // and keeps runtime hot paths from opening files per env lookup.
+            break;
+        }
     }
-    return {};
+    return values;
+}
+
+static std::string moe_autotune_file_value(const char* key) {
+    if (!key || !key[0]) return {};
+    static const std::unordered_map<std::string, std::string> values =
+        moe_autotune_load_file_values_once();
+    const auto it = values.find(key);
+    return it == values.end() ? std::string() : it->second;
 }
 
 static std::string moe_autotune_value(const char* key) {
@@ -205,7 +224,10 @@ static void moe_apply_autotune_io_env(moe_pc_engine* engine) {
             pinned ? pinned : runtime_pinned_workers(engine),
             gpu ? gpu : runtime_gpu_workers(engine));
     }
-    const uint32_t window = moe_autotune_u32("STORAGELLM_PREFETCH_WINDOW_LAYERS", 0, 1u, 64u);
+    const int max_mode = moe_autotune_truthy("STORAGELLM_STORAGE_MAX") ||
+        moe_autotune_truthy("STORAGELLM_MAX_PARALLELISM") ||
+        moe_autotune_truthy("STORAGELLM_STORAGE_AUTOTUNE_MAX");
+    const uint32_t window = moe_autotune_u32("STORAGELLM_PREFETCH_WINDOW_LAYERS", 0, 1u, max_mode ? 128u : 64u);
     if (window) {
         engine->runtime_prefetch_window_layers.store(window, std::memory_order_relaxed);
         engine->adaptive_prefetch_window_last.store(window, std::memory_order_relaxed);

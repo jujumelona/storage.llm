@@ -20,6 +20,7 @@
 #endif
 
 #include <vector>
+#include <mutex>
 
 #if defined(_WIN32)
 struct moe_win_ioring_api_t {
@@ -89,6 +90,12 @@ static const moe_win_ioring_api_t* moe_win_ioring_api() {
 #endif
 
 struct moe_io_ring_adapter {
+    // A single io_uring/IORing instance is shared by disk, pinned, and CPU-storage
+    // prefetch workers.  SQE prepare/submit/completion must be a single critical
+    // section; otherwise workers can interleave SQEs and consume each other's CQEs.
+    // The hot path still parallelizes at the worker/stage level, while this guard
+    // keeps the shared ring transaction correct.
+    mutable std::mutex submit_mutex;
 #if defined(__linux__) && MOE_HAVE_LIBURING
     struct io_uring ring;
     bool initialized = false;

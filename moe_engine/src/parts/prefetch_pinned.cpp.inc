@@ -313,9 +313,12 @@ static int prefetch_tensor_file_to_pinned(
     }
     void* io_gen_ptr = (void*)(uintptr_t)current_io_gen;
 
-    // Check if we can use IORing/io_uring registered buffer I/O
+    // Check if we can use IORing/io_uring registered buffer I/O.  The engine owns
+    // one registered-buffer ring, so the whole SQE prepare/submit/wait sequence
+    // is serialized to prevent one worker from consuming another worker's CQEs.
     if (staging_offset != total_bytes && engine->ring_adapter.initialized) {
         int submits = 0;
+        std::lock_guard<std::mutex> ring_lock(engine->ring_adapter.submit_mutex);
         for (const auto& range : ranges) {
             const uint64_t offset = range[0];
             const uint64_t length = range[1];
