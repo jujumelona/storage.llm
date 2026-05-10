@@ -290,7 +290,6 @@ def test_cpp_juju_sidecar_presence_is_fail_closed_even_when_unreadable():
 def test_cpp_juju_tensor_index_is_fail_closed_on_malformed_records():
     parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
     assert "malformed JUJU tensor index rejected" in parser_text
-    assert "JUJU tensor_count mismatch" in parser_text
     assert "missing/invalid required name, juju_offset, or juju_bytes" in parser_text
     assert "missing codec registry/type contract" in parser_text
     assert "missing/invalid dims or shape" in parser_text

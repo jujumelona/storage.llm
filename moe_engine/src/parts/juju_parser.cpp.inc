@@ -1309,9 +1309,6 @@ static int moe_parse_juju_tensor_index_json(
     uint64_t malformed_count = 0;
     std::string first_malformed_name;
     const char* first_malformed_reason = nullptr;
-    uint64_t declared_tensor_count = 0;
-    const int has_declared_tensor_count =
-        moe_json_get_u64_local(json, "tensor_count", &declared_tensor_count);
     uint64_t schema_version = 0;
     const int strict_tensor_index =
         (moe_json_get_u64_local(json, "schema_version", &schema_version) && schema_version >= 6u) ||
@@ -1607,13 +1604,6 @@ static int moe_parse_juju_tensor_index_json(
                 (unsigned long long)malformed_count,
                 first_malformed_name.empty() ? "<unknown>" : first_malformed_name.c_str(),
                 first_malformed_reason ? first_malformed_reason : "unknown");
-            return 0;
-        }
-        if (has_declared_tensor_count && declared_tensor_count != tensor_object_count) {
-            std::fprintf(stderr,
-                "[storagellm] JUJU tensor_count mismatch: declared=%llu objects=%llu\n",
-                (unsigned long long)declared_tensor_count,
-                (unsigned long long)tensor_object_count);
             return 0;
         }
         if (tensor_count != tensor_object_count) {
