@@ -175,9 +175,12 @@ static int enqueue_stage(
         return 0;
     }
     moe_prefetch_task queued = task;
-    queued.stage_accounted_bytes = 0;
     const uint32_t stage_cap = moe_stage_depth_cap_for(engine, stage);
     const uint64_t task_bytes = moe_prefetch_task_estimated_bytes(engine, queued);
+    // Carry the admission byte estimate with the task.  The pop path runs under
+    // stage.mtx, so avoiding a second tensor metadata lookup there reduces lock
+    // hold time for all workers.
+    queued.stage_accounted_bytes = task_bytes;
     {
         std::lock_guard<std::mutex> lock(stage.mtx);
         // Cache queue sizes once and keep the mutex hold short.  Task byte
@@ -222,11 +225,11 @@ static int enqueue_stage_or_retry(
         return 0;
     }
     moe_prefetch_task queued = task;
-    queued.stage_accounted_bytes = 0;
     const size_t normal_cap = moe_stage_depth_cap_for(engine, stage);
     const size_t retry_room = std::max<size_t>(32u, normal_cap / 4u);
     const size_t retry_cap = normal_cap + retry_room;
     const uint64_t task_bytes = moe_prefetch_task_estimated_bytes(engine, queued);
+    queued.stage_accounted_bytes = task_bytes;
     {
         std::lock_guard<std::mutex> lock(stage.mtx);
         // Cache queue sizes once and keep metadata reads outside the lock.
@@ -312,28 +315,35 @@ static size_t drain_directstorage_staging_copies(moe_pc_engine* engine) {
         return 0;
     }
     size_t drained = 0;
+    std::vector<moe_directstorage_staging_pending> pending_local;
+    std::vector<moe_directstorage_staging_pending> not_ready;
     std::vector<moe_directstorage_staging_pending> ready;
     std::vector<moe_directstorage_staging_pending> failed;
     {
         std::lock_guard<std::mutex> lock(engine->directstorage_staging_pending_mutex);
-        auto& pending = engine->directstorage_pending_staging_copies;
-        for (size_t i = 0; i < pending.size();) {
-            moe_directstorage_staging_pending& item = pending[i];
-            const int state = directstorage_poll_pending_copy(engine, &item.io);
-            if (state == 0) {
-                ++i;
-                continue;
-            }
-            if (state > 0) {
-                ready.push_back(item);
-            } else {
-                failed.push_back(item);
-            }
-            pending[i] = pending.back();
-            pending.pop_back();
-            engine->directstorage_pending_count.fetch_sub(1, std::memory_order_acq_rel);
-            ++drained;
+        pending_local.swap(engine->directstorage_pending_staging_copies);
+    }
+    not_ready.reserve(pending_local.size());
+    ready.reserve(pending_local.size());
+    failed.reserve(pending_local.size());
+    for (moe_directstorage_staging_pending& item : pending_local) {
+        const int state = directstorage_poll_pending_copy(engine, &item.io);
+        if (state == 0) {
+            not_ready.push_back(item);
+            continue;
         }
+        if (state > 0) {
+            ready.push_back(item);
+        } else {
+            failed.push_back(item);
+        }
+        engine->directstorage_pending_count.fetch_sub(1, std::memory_order_acq_rel);
+        ++drained;
+    }
+    if (!not_ready.empty()) {
+        std::lock_guard<std::mutex> lock(engine->directstorage_staging_pending_mutex);
+        auto& dst = engine->directstorage_pending_staging_copies;
+        dst.insert(dst.end(), not_ready.begin(), not_ready.end());
     }
     for (moe_directstorage_staging_pending& item : ready) {
         moe_prefetch_task next = item.next_task;
@@ -386,13 +396,18 @@ static bool pop_stage_task(
             if (engine->io_stop.load() || retiring || !stage.queue.empty() || !stage.urgent_queue.empty()) {
                 break;
             }
-            const uint32_t wait_us =
-                engine->directstorage_pending_count.load(std::memory_order_acquire) > 0 ? 100u : 2000u;
+            const uint32_t ds_pending = engine->directstorage_pending_count.load(std::memory_order_acquire);
+            const size_t deferred = device_deferred_staging_copy_count(engine);
+            const uint32_t wait_us = (ds_pending > 0 || deferred > 0) ? 100u : 2000u;
             stage.cv.wait_for(lock, std::chrono::microseconds(wait_us));
             lock.unlock();
-            device_drain_deferred_staging_copies(engine, false);
-            device_drain_directstorage_device_copies(engine);
-            device_refresh_mem_info(engine, 0);
+            if (deferred > 0) {
+                device_drain_deferred_staging_copies(engine, false);
+            }
+            if (ds_pending > 0) {
+                device_drain_directstorage_device_copies(engine);
+                device_refresh_mem_info(engine, 0);
+            }
             lock.lock();
         }
     } else if (&stage == &engine->disk_stage) {
@@ -401,12 +416,17 @@ static bool pop_stage_task(
             if (engine->io_stop.load() || retiring || !stage.queue.empty() || !stage.urgent_queue.empty()) {
                 break;
             }
-            const uint32_t wait_us =
-                engine->directstorage_pending_count.load(std::memory_order_acquire) > 0 ? 100u : 2000u;
+            const uint32_t ds_pending = engine->directstorage_pending_count.load(std::memory_order_acquire);
+            const size_t deferred = device_deferred_staging_copy_count(engine);
+            const uint32_t wait_us = (ds_pending > 0 || deferred > 0) ? 100u : 2000u;
             stage.cv.wait_for(lock, std::chrono::microseconds(wait_us));
             lock.unlock();
-            device_drain_deferred_staging_copies(engine, false);
-            drain_directstorage_staging_copies(engine);
+            if (deferred > 0) {
+                device_drain_deferred_staging_copies(engine, false);
+            }
+            if (ds_pending > 0) {
+                drain_directstorage_staging_copies(engine);
+            }
             lock.lock();
         }
     } else {
@@ -432,8 +452,11 @@ static bool pop_stage_task(
         *out_task = stage.urgent_queue.front();
         stage.urgent_queue.pop_front();
     }
-    const uint64_t popped_bytes = moe_prefetch_task_estimated_bytes(engine, *out_task);
-    out_task->stage_accounted_bytes = popped_bytes;
+    uint64_t popped_bytes = out_task->stage_accounted_bytes;
+    if (popped_bytes == 0) {
+        popped_bytes = moe_prefetch_task_estimated_bytes(engine, *out_task);
+        out_task->stage_accounted_bytes = popped_bytes;
+    }
     moe_stage_queued_bytes_sub(stage, popped_bytes);
     if (popped_bytes > 0) {
         stage.inflight_bytes.fetch_add(popped_bytes, std::memory_order_relaxed);

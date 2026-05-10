@@ -35,13 +35,33 @@ static void* moe_find_cuda_symbol(void* lib, const char* a, const char* b = null
 }
 
 static int runtime_cuda_driver_available() {
-    void* lib = moe_open_cuda_driver_library();
-    if (!lib) {
-        return 0;
+    // Runtime availability must mean a real CUDA device can be initialized, not
+    // merely that libcuda is present.  Picking CUDA on a driver stub/no-device
+    // host creates a slow fail/fallback path and can route storage into the GPU
+    // staging pipeline unnecessarily.  Cache the probe because backend selection
+    // and capability fill may both ask for it.
+    static std::atomic<int> cached{-1};
+    int current = cached.load(std::memory_order_acquire);
+    if (current >= 0) {
+        return current;
     }
-    const int ok = moe_find_shared_symbol(lib, "cuInit") ? 1 : 0;
-    moe_close_shared_library(lib);
-    return ok;
+
+    int result = 0;
+    void* lib = moe_open_cuda_driver_library();
+    if (lib) {
+        auto cu_init = (moe_cu_init_fn)moe_find_shared_symbol(lib, "cuInit");
+        auto cu_device_get = (moe_cu_device_get_fn)moe_find_shared_symbol(lib, "cuDeviceGet");
+        int dev = 0;
+        result = (cu_init && cu_device_get && cu_init(0) == 0 && cu_device_get(&dev, 0) == 0) ? 1 : 0;
+        moe_close_shared_library(lib);
+    }
+
+    int expected = -1;
+    if (cached.compare_exchange_strong(expected, result,
+            std::memory_order_release, std::memory_order_acquire)) {
+        return result;
+    }
+    return cached.load(std::memory_order_acquire);
 }
 
 static int cuda_driver_load(moe_cuda_driver_api* api) {

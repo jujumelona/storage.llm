@@ -22,13 +22,30 @@ static void* moe_find_hip_symbol(void* lib, const char* a, const char* b = nullp
 }
 
 static int runtime_hip_driver_available() {
-    void* lib = moe_open_hip_driver_library();
-    if (!lib) {
-        return 0;
+    // Treat HIP as available only when the runtime initializes and exposes a
+    // device.  A library-only hit is not enough for max-speed auto selection.
+    static std::atomic<int> cached{-1};
+    int current = cached.load(std::memory_order_acquire);
+    if (current >= 0) {
+        return current;
     }
-    const int ok = moe_find_shared_symbol(lib, "hipInit") ? 1 : 0;
-    moe_close_shared_library(lib);
-    return ok;
+
+    int result = 0;
+    void* lib = moe_open_hip_driver_library();
+    if (lib) {
+        auto hip_init = (moe_cu_init_fn)moe_find_shared_symbol(lib, "hipInit");
+        auto hip_device_get = (moe_cu_device_get_fn)moe_find_shared_symbol(lib, "hipDeviceGet");
+        int dev = 0;
+        result = (hip_init && hip_device_get && hip_init(0) == 0 && hip_device_get(&dev, 0) == 0) ? 1 : 0;
+        moe_close_shared_library(lib);
+    }
+
+    int expected = -1;
+    if (cached.compare_exchange_strong(expected, result,
+            std::memory_order_release, std::memory_order_acquire)) {
+        return result;
+    }
+    return cached.load(std::memory_order_acquire);
 }
 
 static int hip_driver_load(moe_hip_driver_api* api) {

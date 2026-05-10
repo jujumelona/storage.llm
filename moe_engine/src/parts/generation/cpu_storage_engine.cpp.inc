@@ -253,6 +253,14 @@ static void moe_storage_io_prefetch_range_execute(
     uint64_t bytes,
     uint64_t* bytes_io);
 
+
+static int moe_storage_prefetch_inline_on_overflow_enabled() {
+    // Queue-overflow behavior is a runtime policy, not per-request data.  Cache
+    // it so the token hot path does not call getenv while saturated.
+    static const int enabled = moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_PREFETCH_INLINE_ON_OVERFLOW");
+    return enabled;
+}
+
 static int moe_storage_async_prefetch_default_enabled(moe_pc_engine* engine) {
     if (!engine) return 0;
     if (!moe_cpu_storage_env_enabled_default_on("STORAGELLM_STORAGE_ASYNC_PREFETCH")) return 0;
@@ -343,9 +351,15 @@ static int moe_storage_async_prefetch_enqueue(
 ) {
     if (!engine || !shard || !mapped_base || bytes == 0) return 0;
     if (g_moe_storage_prefetch_worker_tls) return 0;
-    moe_storage_async_prefetch_ensure_started(engine);
-    if (!engine->storage_async_prefetch_enabled.load(std::memory_order_relaxed)) return 0;
+    if (!engine->storage_async_prefetch_enabled.load(std::memory_order_relaxed)) {
+        moe_storage_async_prefetch_ensure_started(engine);
+        if (!engine->storage_async_prefetch_enabled.load(std::memory_order_relaxed)) return 0;
+    }
     const uint32_t depth = std::max<uint32_t>(1u, engine->storage_prefetch_queue_depth.load(std::memory_order_relaxed));
+    if (engine->storage_async_prefetch_pending.load(std::memory_order_relaxed) >= depth) {
+        engine->storage_async_prefetch_dropped.fetch_add(1, std::memory_order_relaxed);
+        return moe_storage_prefetch_inline_on_overflow_enabled() ? 0 : 1;
+    }
     moe_storage_prefetch_request_t req{};
     req.shard = shard;
     req.mapped_base = mapped_base;
@@ -358,7 +372,7 @@ static int moe_storage_async_prefetch_enqueue(
         if (engine->storage_prefetch_stop.load(std::memory_order_acquire)) return 0;
         if (engine->storage_prefetch_queue.size() >= (size_t)depth) {
             engine->storage_async_prefetch_dropped.fetch_add(1, std::memory_order_relaxed);
-            if (!moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_PREFETCH_INLINE_ON_OVERFLOW")) {
+            if (!moe_storage_prefetch_inline_on_overflow_enabled()) {
                 return 1;  // Drop prefetch instead of stalling token compute.
             }
             return 0;

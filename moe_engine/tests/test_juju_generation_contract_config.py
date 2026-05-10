@@ -327,6 +327,17 @@ def test_juju_runtime_loader_is_fail_closed_on_partial_load_and_duplicate_slots(
     assert claim_pos < push_pos
 
 
+def test_juju_aux_scale_helpers_skip_executable_projection_rejection():
+    main_parse_text = (ROOT / "moe_engine" / "src" / "parts" / "codec" / "juju_main_parsing.cpp.inc").read_text()
+    assert "moe_juju_tensor_name_is_aux_scale" in main_parse_text
+    assert '".scale"' in main_parse_text
+    assert '".scale2"' in main_parse_text
+    assert '".scale4"' in main_parse_text
+    helper_pos = main_parse_text.index("moe_juju_tensor_name_is_aux_scale(entry.name)")
+    reject_pos = main_parse_text.index("JUJU expert tensor missing executable layer/projection contract")
+    assert helper_pos < reject_pos
+
+
 def test_juju_model_root_scan_rejects_invalid_juju_artifact_instead_of_skipping():
     scan_text = (ROOT / "moe_engine" / "src" / "parts" / "model_scan.cpp.inc").read_text()
     bad_read_pos = scan_text.index("if (!moe_read_offload_juju_file(path, &file))")

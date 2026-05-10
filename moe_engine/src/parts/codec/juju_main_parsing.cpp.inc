@@ -213,6 +213,20 @@ static int moe_juju_claim_tensor_slot_unique(
     return 1;
 }
 
+static int moe_juju_tensor_name_is_aux_scale(const std::string& name) {
+    const std::string lower = moe_lower_ascii_copy(name);
+    if (lower.size() >= 6u && lower.compare(lower.size() - 6u, 6u, ".scale") == 0) {
+        return 1;
+    }
+    if (lower.size() >= 7u && lower.compare(lower.size() - 7u, 7u, ".scale2") == 0) {
+        return 1;
+    }
+    if (lower.size() >= 7u && lower.compare(lower.size() - 7u, 7u, ".scale4") == 0) {
+        return 1;
+    }
+    return 0;
+}
+
 static int moe_juju_validate_required_bundle_native_experts(moe_pc_engine* engine) {
     if (!engine || !engine->io_config.require_bundle_native_experts) {
         return 1;
@@ -499,6 +513,9 @@ static int load_juju_tensor_index_as_tensor_index(
             const int explicit_projection = moe_juju_entry_projection(entry, &proj);
             if (!moe_juju_entry_layer(entry, &layer) ||
                 (!combined_gate_up && !explicit_projection)) {
+                if (moe_juju_tensor_name_is_aux_scale(entry.name)) {
+                    continue;
+                }
                 if (entry.has_expert_layout || entry.bundle_native ||
                     entry.graph_role == moe_JUJU_ROLE_EXPERT ||
                     !entry.expert_projection.empty() ||

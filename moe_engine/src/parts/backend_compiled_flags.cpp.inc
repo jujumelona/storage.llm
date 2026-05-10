@@ -62,19 +62,11 @@ static int compiled_bam_nvme_available() {
 }
 
 static int compiled_cuda_available() {
-#ifdef moe_ENABLE_CUDA_BACKEND
-    return 1;
-#else
     return runtime_cuda_driver_available();
-#endif
 }
 
 static int compiled_hip_available() {
-#ifdef moe_ENABLE_HIP_BACKEND
-    return 1;
-#else
-    return 0;
-#endif
+    return runtime_hip_driver_available();
 }
 
 static int compiled_level_zero_available() {
