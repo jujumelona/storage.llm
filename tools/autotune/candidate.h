@@ -40,7 +40,10 @@ struct Candidate {
     bool runtime_device = false;
     bool true_kernel = false;
     bool fused_moe = false;
+    bool verified = false;
     double latency_ms = 0.0;
+    double correctness_max_abs = 0.0;
+    double correctness_max_rel = 0.0;
     std::string validation;
     std::string reason;
 };

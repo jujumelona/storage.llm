@@ -35,6 +35,20 @@ static int moe_fast_backend_policy_is(const char* expected) {
     return !policy.empty() && expected && std::strcmp(policy.c_str(), expected) == 0;
 }
 
+static int moe_selected_fast_backend_verified() {
+    if (!moe_autotune_truthy("STORAGELLM_SELECTED_FAST_BACKEND_VERIFIED")) {
+        return 0;
+    }
+    const std::string validation = moe_autotune_value("STORAGELLM_SELECTED_FAST_BACKEND_VALIDATION");
+    if (validation.find("correctness") == std::string::npos) {
+        return 0;
+    }
+    if (validation.find("adaptive-measurement") == std::string::npos) {
+        return 0;
+    }
+    return 1;
+}
+
 static moe_fast_backend_kind_t moe_fast_backend_kind_from_selected_env(
     moe_backend_t backend,
     uint32_t mask
@@ -231,6 +245,9 @@ static moe_fast_backend_kind_t choose_fast_backend(const moe_pc_engine* e) {
     const moe_fast_backend_kind_t selected =
         moe_fast_backend_kind_from_selected_env(e->backend_caps.backend, mask);
     if (selected != moe_FAST_BACKEND_NONE) {
+        if (moe_verified_backend_required(e) && !moe_selected_fast_backend_verified()) {
+            return moe_FAST_BACKEND_NONE;
+        }
         return moe_fast_backend_kind_allowed_runtime(selected) ? selected : moe_FAST_BACKEND_NONE;
     }
 

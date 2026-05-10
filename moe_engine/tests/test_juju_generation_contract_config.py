@@ -438,3 +438,11 @@ def test_router_contract_reads_graph_ir_sigmoid_scale_and_norm_topk():
     scale_pos = router_text.index("static float moe_router_routed_scaling_factor")
     norm_pos = router_text.index("static int moe_router_norm_topk_prob")
     assert uses_pos < scale_pos < norm_pos
+
+
+def test_router_scale_tensor_uses_rmsnorm_unit_offset_semantics():
+    router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
+    assert "const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, scale_raw);" in router_text
+    assert "const float effective_scale = unit_offset ? (1.0f + scale) : scale;" in router_text
+    assert "router_scale_apply" in router_text
+    assert "Using raw deltas here made sigmoid" in router_text

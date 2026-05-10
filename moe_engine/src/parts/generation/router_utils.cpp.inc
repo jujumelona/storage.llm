@@ -379,6 +379,15 @@ static int moe_prepare_scaled_router_input_f32(
             layer, (unsigned long long)scale_count, hidden_size);
         return 0;
     }
+    const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, scale_raw);
+    double raw_abs_sum = 0.0;
+    double eff_abs_sum = 0.0;
+    float raw_max_abs = 0.0f;
+    float eff_max_abs = 0.0f;
+    const uint32_t sample_limit = 512u;
+    const uint32_t sample_step = hidden_size > sample_limit ?
+        (hidden_size + sample_limit - 1u) / sample_limit : 1u;
+    uint32_t samples = 0;
     for (uint32_t i = 0; i < hidden_size; ++i) {
         float scale = 1.0f;
         if (scale_count == 1u) {
@@ -389,15 +398,48 @@ static int moe_prepare_scaled_router_input_f32(
         if (!std::isfinite(scale)) {
             return 0;
         }
+        const float effective_scale = unit_offset ? (1.0f + scale) : scale;
+        if (!std::isfinite(effective_scale)) {
+            return 0;
+        }
+        if ((i % sample_step) == 0u) {
+            const float raw_abs = std::fabs(scale);
+            const float eff_abs = std::fabs(effective_scale);
+            raw_abs_sum += (double)raw_abs;
+            eff_abs_sum += (double)eff_abs;
+            if (raw_abs > raw_max_abs) raw_max_abs = raw_abs;
+            if (eff_abs > eff_max_abs) eff_max_abs = eff_abs;
+            ++samples;
+        }
         // Graph contract: router scale is the RMSNorm/scale weight for the
         // router input.  RMSNorm already divides by sqrt(mean(x^2)); applying
         // an additional 1/sqrt(hidden_size) shrinks all router logits by ~53x
-        // for hidden=2816 and turns expert routing nearly uniform.
-        const float result = hidden[i] * norm * scale;
+        // for hidden=2816 and turns expert routing nearly uniform.  The scale
+        // tensor itself follows the same Gemma shifted-RMSNorm convention as
+        // other norm weights: if stats identify it as a delta tensor, use
+        // (1 + scale), not the raw delta.  Using raw deltas here made sigmoid
+        // routers effectively uniform in the PPL log.
+        const float result = hidden[i] * norm * effective_scale;
         if (!std::isfinite(result)) {
             return 0;
         }
         (*out)[i] = result;
+    }
+    if (moe_profile_level() >= 2) {
+        const double inv_samples = samples ? 1.0 / (double)samples : 0.0;
+        moe_profile_log(
+            "router_scale_apply",
+            "layer=%d hidden=%u count=%llu unit_offset=%d input_norm=%.6g raw_mean_abs=%.6g raw_max_abs=%.6g eff_mean_abs=%.6g eff_max_abs=%.6g samples=%u",
+            layer,
+            hidden_size,
+            (unsigned long long)scale_count,
+            unit_offset,
+            (double)norm,
+            raw_abs_sum * inv_samples,
+            (double)raw_max_abs,
+            eff_abs_sum * inv_samples,
+            (double)eff_max_abs,
+            samples);
     }
     return 1;
 }

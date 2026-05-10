@@ -69,6 +69,11 @@ void write_selected_env(const std::string& path, const Candidate* selected) {
             ss << selected->env_key << "=" << selected->library << "\n";
         }
         ss << "STORAGELLM_SELECTED_FAST_BACKEND=" << selected->name << "\n";
+        ss << "STORAGELLM_SELECTED_FAST_BACKEND_VERIFIED=" << (selected->verified ? 1 : 0) << "\n";
+        ss << "STORAGELLM_SELECTED_FAST_BACKEND_LATENCY_MS=" << selected->latency_ms << "\n";
+        ss << "STORAGELLM_SELECTED_FAST_BACKEND_VALIDATION=" << selected->validation << "\n";
+        ss << "STORAGELLM_SELECTED_FAST_BACKEND_CORRECTNESS_MAX_ABS=" << selected->correctness_max_abs << "\n";
+        ss << "STORAGELLM_SELECTED_FAST_BACKEND_CORRECTNESS_MAX_REL=" << selected->correctness_max_rel << "\n";
     }
     write_text(path, ss.str());
 }
@@ -115,7 +120,10 @@ void write_report_json(const std::string& path, const HostInfo& host, const std:
         ss << ", \"runtime_device\": "; write_bool(ss, c.runtime_device);
         ss << ", \"true_kernel\": "; write_bool(ss, c.true_kernel);
         ss << ", \"fused_moe\": "; write_bool(ss, c.fused_moe);
+        ss << ", \"verified\": "; write_bool(ss, c.verified);
         ss << ", \"measured\": "; write_bool(ss, c.measured); ss << ", \"latency_ms\": " << c.latency_ms
+           << ", \"correctness_max_abs\": " << c.correctness_max_abs
+           << ", \"correctness_max_rel\": " << c.correctness_max_rel
            << ", \"validation\": \"" << json_escape(c.validation) << "\""
            << ", \"reason\": \"" << json_escape(c.reason) << "\"}" << (i + 1 == candidates.size() ? "" : ",") << "\n";
     }
@@ -123,12 +131,16 @@ void write_report_json(const std::string& path, const HostInfo& host, const std:
     ss << "  \"selected_backend\": ";
     if (selected) {
         ss << "{\"name\": \"" << json_escape(selected->name) << "\", \"latency_ms\": " << selected->latency_ms
+           << ", \"verified\": "; write_bool(ss, selected->verified);
+        ss << ", \"correctness_max_abs\": " << selected->correctness_max_abs
+           << ", \"correctness_max_rel\": " << selected->correctness_max_rel
+           << ", \"validation\": \"" << json_escape(selected->validation) << "\""
            << ", \"library\": \"" << json_escape(selected->library) << "\"}";
     } else {
         ss << "null";
     }
     ss << ",\n";
-    ss << "  \"truth\": \"C++ auto pipeline is wired fail-closed: a backend is only selected when it is linked/loadable, has a runtime device when needed, and is actually measured. Backends without a complete benchmark fixture are not emitted as auto candidates, so they cannot be mistaken for maximum-speed success.\"\n";
+    ss << "  \"truth\": \"C++ auto pipeline is wired fail-closed: a backend is only selected when it is linked/loadable, has a runtime device when needed, produces output matching the C++ reference, and is actually measured. Backends without a complete benchmark+correctness fixture are not emitted as auto candidates, so they cannot be mistaken for maximum-speed success.\"\n";
     ss << "}\n";
     write_text(path, ss.str());
 }

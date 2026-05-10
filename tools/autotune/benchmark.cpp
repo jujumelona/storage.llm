@@ -239,6 +239,113 @@ static TensorView make_view(float* p, uint32_t rows, uint32_t cols) {
     return v;
 }
 
+static float reference_activation(uint32_t mode, float gate, float up) {
+    if (!std::isfinite(gate) || !std::isfinite(up)) return 0.0f;
+    float activated = 0.0f;
+    if (mode == 2u) {
+        const float k = 0.7978845608028654f;
+        const float inner = k * (gate + 0.044715f * gate * gate * gate);
+        activated = 0.5f * gate * (1.0f + std::tanh(inner));
+    } else if (mode == 1u) {
+        activated = 0.5f * gate * (1.0f + std::erf(gate * 0.7071067811865476f));
+    } else {
+        activated = gate > 40.0f ? gate : (gate < -40.0f ? 0.0f : gate / (1.0f + std::exp(-gate)));
+    }
+    const float y = activated * up;
+    return std::isfinite(y) ? y : 0.0f;
+}
+
+static void reference_grouped_moe_task(
+    std::vector<float>& accum_ref,
+    const std::vector<float>& x,
+    const std::vector<float>& gate,
+    const std::vector<float>& up,
+    const std::vector<float>& down,
+    const std::vector<float>& weights,
+    const std::vector<uint32_t>& idx,
+    uint32_t assignment_offset,
+    uint32_t assignment_count,
+    uint32_t H,
+    uint32_t I,
+    uint32_t activation_mode,
+    size_t gate_offset,
+    size_t up_offset,
+    size_t down_offset
+) {
+    std::vector<float> mid(I, 0.0f);
+    for (uint32_t local = 0; local < assignment_count; ++local) {
+        const uint32_t global = assignment_offset + local;
+        if (global >= idx.size()) continue;
+        const uint32_t token = idx[global];
+        if (static_cast<uint64_t>(token + 1u) * H > x.size() ||
+            static_cast<uint64_t>(token + 1u) * H > accum_ref.size()) {
+            continue;
+        }
+        const float route = global < weights.size() ? weights[global] : 1.0f;
+        if (!std::isfinite(route)) continue;
+        const float* input = x.data() + static_cast<size_t>(token) * H;
+        for (uint32_t r = 0; r < I; ++r) {
+            float g = 0.0f;
+            float u = 0.0f;
+            const float* gw = gate.data() + gate_offset + static_cast<size_t>(r) * H;
+            const float* uw = up.data() + up_offset + static_cast<size_t>(r) * H;
+            for (uint32_t h = 0; h < H; ++h) {
+                const float xv = input[h];
+                g += gw[h] * xv;
+                u += uw[h] * xv;
+            }
+            mid[r] = reference_activation(activation_mode, g, u);
+        }
+        float* dst = accum_ref.data() + static_cast<size_t>(token) * H;
+        for (uint32_t h = 0; h < H; ++h) {
+            const float* dw = down.data() + down_offset + static_cast<size_t>(h) * I;
+            float y = 0.0f;
+            for (uint32_t r = 0; r < I; ++r) y += dw[r] * mid[r];
+            dst[h] += y * route;
+        }
+    }
+}
+
+static bool validate_accum_against_reference(
+    Candidate& c,
+    const std::vector<float>& got,
+    const std::vector<float>& ref,
+    const char* label,
+    double abs_tol = 2.5e-3,
+    double rel_tol = 2.5e-3
+) {
+    if (got.size() != ref.size() || got.empty()) {
+        c.reason = std::string(label ? label : "backend") + " correctness validation failed: output size mismatch";
+        c.validation = "correctness-failed";
+        return false;
+    }
+    double max_abs = 0.0;
+    double max_rel = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        const double a = static_cast<double>(got[i]);
+        const double b = static_cast<double>(ref[i]);
+        if (!std::isfinite(a) || !std::isfinite(b)) {
+            c.reason = std::string(label ? label : "backend") + " correctness validation failed: non-finite output";
+            c.validation = "correctness-failed";
+            return false;
+        }
+        const double abs_err = std::fabs(a - b);
+        const double rel_err = abs_err / std::max(1.0, std::fabs(b));
+        max_abs = std::max(max_abs, abs_err);
+        max_rel = std::max(max_rel, rel_err);
+    }
+    c.correctness_max_abs = max_abs;
+    c.correctness_max_rel = max_rel;
+    if (max_abs > abs_tol && max_rel > rel_tol) {
+        c.reason = std::string(label ? label : "backend") + " correctness validation failed: max_abs=" +
+            std::to_string(max_abs) + " max_rel=" + std::to_string(max_rel);
+        c.validation = "correctness-failed";
+        return false;
+    }
+    c.verified = true;
+    return true;
+}
+
 static void benchmark_cpu_native(Candidate& c) {
 #if defined(STORAGELLM_AUTOTUNE_HAS_CPU_NATIVE)
     std::vector<float> x, gate, up, down, accum, weights;
@@ -252,8 +359,15 @@ static void benchmark_cpu_native(Candidate& c) {
     task.up_weight = &up_view;
     task.down_weight = &down_view;
     const int backend_cpu = 1;
+    std::fill(accum.begin(), accum.end(), 0.0f);
     if (!storagellm_onednn_cpu_grouped_moe_indexed_device_f32(backend_cpu, &task, 1, nullptr)) {
         c.reason = "CPU native adapter returned failure during warmup";
+        return;
+    }
+    std::vector<float> ref(accum.size(), 0.0f);
+    reference_grouped_moe_task(ref, x, gate, up, down, weights, idx, 0u, task.assignment_count,
+        task.hidden_size, task.intermediate_size, task.activation_mode, 0u, 0u, 0u);
+    if (!validate_accum_against_reference(c, accum, ref, "CPU native adapter")) {
         return;
     }
     double latency = 0.0;
@@ -272,8 +386,8 @@ static void benchmark_cpu_native(Candidate& c) {
     c.true_kernel = true;
     c.fused_moe = true;
     c.latency_ms = latency;
-    c.validation = "linked+warmup+adaptive-measurement";
-    c.reason = "measured C++ CPU native F32 grouped-MoE adapter with warmup/adaptive iterations on this machine";
+    c.validation = "linked+warmup+correctness+adaptive-measurement";
+    c.reason = "measured and correctness-verified C++ CPU native F32 grouped-MoE adapter with warmup/adaptive iterations on this machine";
 #else
     c.reason = "CPU native adapter was not linked into storagellm_host_autotune";
     c.validation = "not-linked";
@@ -375,6 +489,23 @@ static void benchmark_cuda_indexed_native(Candidate& c, Entry fn, const char* la
             c.validation = "warmup-failed";
             goto cleanup;
         }
+        if (cudaMemcpy(accum.data(), d_accum, accum.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            c.reason = std::string(label ? label : "CUDA backend") + " failed to copy correctness output to host";
+            c.validation = "correctness-copy-failed";
+            goto cleanup;
+        }
+        {
+            std::vector<float> ref(accum.size(), 0.0f);
+            for (uint32_t e = 0; e < E; ++e) {
+                reference_grouped_moe_task(ref, x, gate, up, down, weights, idx, e * A, A, H, I, 0u,
+                    static_cast<size_t>(e) * I * H,
+                    static_cast<size_t>(e) * I * H,
+                    static_cast<size_t>(e) * H * I);
+            }
+            if (!validate_accum_against_reference(c, accum, ref, label ? label : "CUDA backend", 6.0e-3, 6.0e-3)) {
+                goto cleanup;
+            }
+        }
         double latency = 0.0;
         const int measured_ok = measure_adaptive_ms([&]() {
             if (cudaMemsetAsync(d_accum, 0, accum.size() * sizeof(float), stream) != cudaSuccess) return false;
@@ -392,8 +523,8 @@ static void benchmark_cuda_indexed_native(Candidate& c, Entry fn, const char* la
         c.true_kernel = true;
         c.fused_moe = fused;
         c.latency_ms = latency;
-        c.validation = "linked+runtime-device+warmup+adaptive-measurement";
-        c.reason = std::string("measured ") + (label ? label : "CUDA backend") + " on this CUDA device with warmup/adaptive iterations";
+        c.validation = "linked+runtime-device+warmup+correctness+adaptive-measurement";
+        c.reason = std::string("measured and correctness-verified ") + (label ? label : "CUDA backend") + " on this CUDA device with warmup/adaptive iterations";
         ok = 1;
     }
 
@@ -523,6 +654,23 @@ static void benchmark_hip_indexed_native(Candidate& c, Entry fn, const char* lab
             c.validation = "warmup-failed";
             goto cleanup;
         }
+        if (hipMemcpy(accum.data(), d_accum, accum.size() * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess) {
+            c.reason = std::string(label ? label : "HIP backend") + " failed to copy correctness output to host";
+            c.validation = "correctness-copy-failed";
+            goto cleanup;
+        }
+        {
+            std::vector<float> ref(accum.size(), 0.0f);
+            for (uint32_t e = 0; e < E; ++e) {
+                reference_grouped_moe_task(ref, x, gate, up, down, weights, idx, e * A, A, H, I, 0u,
+                    static_cast<size_t>(e) * I * H,
+                    static_cast<size_t>(e) * I * H,
+                    static_cast<size_t>(e) * H * I);
+            }
+            if (!validate_accum_against_reference(c, accum, ref, label ? label : "HIP backend", 6.0e-3, 6.0e-3)) {
+                goto cleanup;
+            }
+        }
         double latency = 0.0;
         const int measured_ok = measure_adaptive_ms([&]() {
             if (hipMemsetAsync(d_accum, 0, accum.size() * sizeof(float), stream) != hipSuccess) return false;
@@ -540,8 +688,8 @@ static void benchmark_hip_indexed_native(Candidate& c, Entry fn, const char* lab
         c.true_kernel = true;
         c.fused_moe = true;
         c.latency_ms = latency;
-        c.validation = "linked+runtime-device+warmup+adaptive-measurement";
-        c.reason = std::string("measured ") + (label ? label : "HIP backend") + " on this ROCm device with warmup/adaptive iterations";
+        c.validation = "linked+runtime-device+warmup+correctness+adaptive-measurement";
+        c.reason = std::string("measured and correctness-verified ") + (label ? label : "HIP backend") + " on this ROCm device with warmup/adaptive iterations";
         ok = 1;
     }
 
@@ -720,11 +868,31 @@ static void benchmark_opencl_clblast_native(Candidate& c) {
             tasks[e].activation_mode = 0;
         }
         const int backend_opencl = 6;
-        if (clEnqueueFillBuffer(q, d_accum, &accum[0], sizeof(float), 0, accum.size() * sizeof(float), 0, nullptr, nullptr) != CL_SUCCESS ||
-            !storagellm_clblast_grouped_moe_indexed_device_f32(backend_opencl, tasks, E, q) || clFinish(q) != CL_SUCCESS) {
-            c.reason = "OpenCL/CLBlast adapter returned failure during warmup/sync";
-            c.validation = "warmup-failed";
+        {
+            const float zero = 0.0f;
+            if (clEnqueueFillBuffer(q, d_accum, &zero, sizeof(zero), 0, accum.size() * sizeof(float), 0, nullptr, nullptr) != CL_SUCCESS ||
+                !storagellm_clblast_grouped_moe_indexed_device_f32(backend_opencl, tasks, E, q) || clFinish(q) != CL_SUCCESS) {
+                c.reason = "OpenCL/CLBlast adapter returned failure during warmup/sync";
+                c.validation = "warmup-failed";
+                goto cleanup;
+            }
+        }
+        if (clEnqueueReadBuffer(q, d_accum, CL_TRUE, 0, accum.size() * sizeof(float), accum.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+            c.reason = "OpenCL/CLBlast adapter failed to copy correctness output to host";
+            c.validation = "correctness-copy-failed";
             goto cleanup;
+        }
+        {
+            std::vector<float> ref(accum.size(), 0.0f);
+            for (uint32_t e = 0; e < E; ++e) {
+                reference_grouped_moe_task(ref, x, gate, up, down, weights, idx, e * A, A, H, I, 0u,
+                    static_cast<size_t>(e) * I * H,
+                    static_cast<size_t>(e) * I * H,
+                    static_cast<size_t>(e) * H * I);
+            }
+            if (!validate_accum_against_reference(c, accum, ref, "OpenCL/CLBlast adapter", 8.0e-3, 8.0e-3)) {
+                goto cleanup;
+            }
         }
         double latency = 0.0;
         const int measured_ok = measure_adaptive_ms([&]() {
@@ -744,8 +912,8 @@ static void benchmark_opencl_clblast_native(Candidate& c) {
         c.true_kernel = true;
         c.fused_moe = true;
         c.latency_ms = latency;
-        c.validation = "linked+runtime-device+warmup+adaptive-measurement";
-        c.reason = "measured native OpenCL/CLBlast fused grouped-MoE adapter with real OpenCL buffers/queue";
+        c.validation = "linked+runtime-device+warmup+correctness+adaptive-measurement";
+        c.reason = "measured and correctness-verified native OpenCL/CLBlast fused grouped-MoE adapter with real OpenCL buffers/queue";
     }
 
 cleanup:
@@ -811,8 +979,16 @@ static void benchmark_tvm_cpu(Candidate& c) {
     task.hidden_size = H;
     task.intermediate_size = I;
 
+    std::fill(accum.begin(), accum.end(), 0.0f);
     if (!fn(1, &task, 1, nullptr)) {
         c.reason = "entry returned failure during warmup";
+        close_handle(handle);
+        return;
+    }
+    std::vector<float> ref(accum.size(), 0.0f);
+    reference_grouped_moe_task(ref, x, gate, up, down, weights, idx, 0u, task.assignment_count,
+        task.hidden_size, task.intermediate_size, task.activation_mode, 0u, 0u, 0u);
+    if (!validate_accum_against_reference(c, accum, ref, "TVM CPU adapter")) {
         close_handle(handle);
         return;
     }
@@ -831,8 +1007,8 @@ static void benchmark_tvm_cpu(Candidate& c) {
     c.true_kernel = true;
     c.fused_moe = true;
     c.latency_ms = latency;
-    c.validation = "library-load+symbol+warmup+adaptive-measurement";
-    c.reason = "measured by C++ host_autotune with warmup/adaptive iterations on this machine";
+    c.validation = "library-load+symbol+warmup+correctness+adaptive-measurement";
+    c.reason = "measured and correctness-verified by C++ host_autotune with warmup/adaptive iterations on this machine";
     close_handle(handle);
 }
 
