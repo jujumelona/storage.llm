@@ -63,6 +63,18 @@ static double moe_autotune_f64(const char* key, double fallback, double min_valu
     return std::max(min_value, std::min(parsed, max_value));
 }
 
+static int moe_autotune_truthy(const char* key) {
+    const std::string value = moe_autotune_value(key);
+    if (value.empty()) return 0;
+    return value != "0" && value != "false" && value != "FALSE" &&
+           value != "off" && value != "OFF" && value != "no" && value != "NO";
+}
+
+static int moe_autotune_equals(const char* key, const char* expected) {
+    if (!expected) return 0;
+    return moe_autotune_value(key) == expected;
+}
+
 static uint32_t moe_autotune_round_up_pow2ish(uint32_t v) {
     if (v <= 64u) return 64u;
     uint32_t out = 64u;
@@ -73,12 +85,31 @@ static uint32_t moe_autotune_round_up_pow2ish(uint32_t v) {
 static void moe_apply_autotune_io_env(moe_io_config_t* cfg) {
     if (!cfg) return;
     const uint32_t hw = moe_cpu_thread_count_hint();
-    const uint32_t max_workers = std::max<uint32_t>(1u, std::min<uint32_t>(hw, 64u));
-    cfg->io_worker_threads = moe_autotune_u32("STORAGELLM_IO_WORKERS", cfg->io_worker_threads, 1u, max_workers);
-    cfg->disk_worker_threads = moe_autotune_u32("STORAGELLM_DISK_WORKERS", cfg->disk_worker_threads, 1u, max_workers);
-    cfg->pinned_worker_threads = moe_autotune_u32("STORAGELLM_PINNED_WORKERS", cfg->pinned_worker_threads, 1u, max_workers);
-    cfg->gpu_worker_threads = moe_autotune_u32("STORAGELLM_GPU_WORKERS", cfg->gpu_worker_threads, 1u, max_workers);
-    cfg->prefetch_window_layers = moe_autotune_u32("STORAGELLM_PREFETCH_WINDOW_LAYERS", cfg->prefetch_window_layers, 1u, 64u);
+    const int max_mode = moe_autotune_truthy("STORAGELLM_STORAGE_MAX") ||
+        moe_autotune_truthy("STORAGELLM_MAX_PARALLELISM") ||
+        moe_autotune_truthy("STORAGELLM_STORAGE_AUTOTUNE_MAX");
+    const uint32_t max_workers = std::max<uint32_t>(1u, std::min<uint32_t>(hw, max_mode ? 128u : 64u));
+
+    const uint32_t storage_best = moe_autotune_u32("STORAGELLM_STORAGE_THREAD_PROBE_BEST", 0u, 1u, max_workers);
+    const uint32_t ram_best = moe_autotune_u32("STORAGELLM_RAM_THREAD_PROBE_BEST", 0u, 1u, max_workers);
+    uint32_t io_default = cfg->io_worker_threads;
+    uint32_t disk_default = cfg->disk_worker_threads;
+    uint32_t pinned_default = cfg->pinned_worker_threads;
+    uint32_t gpu_default = cfg->gpu_worker_threads;
+    if (storage_best) {
+        disk_default = std::max<uint32_t>(disk_default, std::min<uint32_t>(storage_best, max_workers));
+        io_default = std::max<uint32_t>(io_default, std::min<uint32_t>(std::max<uint32_t>(2u, storage_best / 2u), max_workers));
+    }
+    if (ram_best) {
+        pinned_default = std::max<uint32_t>(pinned_default, std::min<uint32_t>(std::max<uint32_t>(1u, ram_best / 2u), max_workers));
+        gpu_default = std::max<uint32_t>(gpu_default, std::min<uint32_t>(std::max<uint32_t>(1u, ram_best / 4u), max_workers));
+    }
+
+    cfg->io_worker_threads = moe_autotune_u32("STORAGELLM_IO_WORKERS", io_default, 1u, max_workers);
+    cfg->disk_worker_threads = moe_autotune_u32("STORAGELLM_DISK_WORKERS", disk_default, 1u, max_workers);
+    cfg->pinned_worker_threads = moe_autotune_u32("STORAGELLM_PINNED_WORKERS", pinned_default, 1u, max_workers);
+    cfg->gpu_worker_threads = moe_autotune_u32("STORAGELLM_GPU_WORKERS", gpu_default, 1u, max_workers);
+    cfg->prefetch_window_layers = moe_autotune_u32("STORAGELLM_PREFETCH_WINDOW_LAYERS", cfg->prefetch_window_layers, 1u, max_mode ? 128u : 64u);
 
     // Movement bottleneck profile from storagellm_host_autotune.  These are not
     // user-facing "modes"; they are measured host-local defaults that keep the
@@ -115,16 +146,30 @@ static void moe_apply_autotune_transfer_queue_caps(moe_pc_engine* engine) {
     const double bottleneck_ratio = (storage_gbps > 0.0 && ram_gbps > 0.0)
         ? std::max(0.125, std::min(8.0, ram_gbps / storage_gbps))
         : 1.0;
-    const double depth_scale = moe_autotune_f64("STORAGELLM_PIPELINE_DEPTH_SCALE", 1.0, 0.25, 8.0);
+    double depth_scale = moe_autotune_f64("STORAGELLM_PIPELINE_DEPTH_SCALE", 1.0, 0.25, 8.0);
+    const double parallel_eff = moe_autotune_f64("STORAGELLM_STORAGE_PARALLEL_EFFICIENCY", 1.0, 0.05, 4.0);
+    const int storage_bottleneck = moe_autotune_equals("STORAGELLM_STORAGE_BOTTLENECK", "storage");
+    const int ram_bottleneck = moe_autotune_equals("STORAGELLM_STORAGE_BOTTLENECK", "ram-copy");
 
-    // Slow storage needs more lookahead to hide latency; very fast storage should
-    // avoid oversupplying GPU queues beyond DMA stream capacity.
+    // Slow or storage-bound hosts need more disk lookahead to keep kernels fed.
+    // RAM-copy-bound hosts should avoid building a huge disk backlog that only
+    // increases cache pressure. Low parallel efficiency means the probe found
+    // diminishing returns, so favor depth over blindly adding more workers.
+    if (storage_bottleneck) depth_scale = std::min(8.0, depth_scale * 1.25);
+    if (ram_bottleneck) depth_scale = std::max(0.5, depth_scale * 0.85);
+
     uint32_t disk_base = disk_workers * window * 64u;
     if (storage_gbps > 0.0 && storage_gbps < 1.0) disk_base *= 2u;
+    if (storage_bottleneck) disk_base *= 2u;
+    if (parallel_eff < 0.35) disk_base = static_cast<uint32_t>(std::ceil(double(disk_base) * 1.5));
     uint32_t pinned_base = pinned_workers * std::max<uint32_t>(4u, gpu_workers) * 64u;
     uint32_t gpu_base = gpu_workers * std::max<uint32_t>(4u, engine->backend_caps.copy_streams ? engine->backend_caps.copy_streams : 1u) * 64u;
+    if (ram_bottleneck) {
+        pinned_base = static_cast<uint32_t>(std::ceil(double(pinned_base) * 1.5));
+        gpu_base = static_cast<uint32_t>(std::ceil(double(gpu_base) * 1.25));
+    }
 
-    disk_base = static_cast<uint32_t>(std::min<double>(65536.0, std::ceil(disk_base * depth_scale * std::min(2.0, bottleneck_ratio))));
+    disk_base = static_cast<uint32_t>(std::min<double>(65536.0, std::ceil(disk_base * depth_scale * std::min(2.5, bottleneck_ratio))));
     pinned_base = static_cast<uint32_t>(std::min<double>(65536.0, std::ceil(pinned_base * depth_scale)));
     gpu_base = static_cast<uint32_t>(std::min<double>(65536.0, std::ceil(gpu_base * depth_scale / std::max(0.5, std::min(2.0, bottleneck_ratio)))));
 
@@ -147,9 +192,12 @@ static void moe_apply_autotune_io_env(moe_pc_engine* engine) {
             static_cast<uint64_t>(measured_storage_gbps_for_caps * 1024.0 * 1024.0 * 1024.0);
     }
     moe_apply_autotune_io_env(&engine->io_config);
-    const uint32_t disk = moe_autotune_u32("STORAGELLM_DISK_WORKERS", 0, 1u, 64u);
-    const uint32_t pinned = moe_autotune_u32("STORAGELLM_PINNED_WORKERS", 0, 1u, 64u);
-    const uint32_t gpu = moe_autotune_u32("STORAGELLM_GPU_WORKERS", 0, 1u, 64u);
+    const uint32_t worker_cap = std::max<uint32_t>(1u, std::min<uint32_t>(moe_cpu_thread_count_hint(),
+        (moe_autotune_truthy("STORAGELLM_STORAGE_MAX") || moe_autotune_truthy("STORAGELLM_MAX_PARALLELISM") ||
+         moe_autotune_truthy("STORAGELLM_STORAGE_AUTOTUNE_MAX")) ? 128u : 64u));
+    const uint32_t disk = moe_autotune_u32("STORAGELLM_DISK_WORKERS", 0, 1u, worker_cap);
+    const uint32_t pinned = moe_autotune_u32("STORAGELLM_PINNED_WORKERS", 0, 1u, worker_cap);
+    const uint32_t gpu = moe_autotune_u32("STORAGELLM_GPU_WORKERS", 0, 1u, worker_cap);
     if (disk || pinned || gpu) {
         runtime_store_io_workers(
             engine,

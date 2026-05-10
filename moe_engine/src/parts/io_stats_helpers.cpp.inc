@@ -127,6 +127,19 @@ static void snapshot_io_stats(const moe_pc_engine* engine, moe_io_stats_t* out) 
     out->disk_inflight_bytes = engine->disk_stage.inflight_bytes.load(std::memory_order_relaxed);
     out->pinned_inflight_bytes = engine->pinned_stage.inflight_bytes.load(std::memory_order_relaxed);
     out->gpu_inflight_bytes = engine->gpu_stage.inflight_bytes.load(std::memory_order_relaxed);
+    out->disk_worker_threads = runtime_disk_workers(engine);
+    out->pinned_worker_threads = runtime_pinned_workers(engine);
+    out->gpu_worker_threads = runtime_gpu_workers(engine);
+    out->runtime_prefetch_window_layers = engine->runtime_prefetch_window_layers.load(std::memory_order_relaxed);
+    out->disk_stage_depth_cap = engine->disk_stage_depth_cap;
+    out->pinned_stage_depth_cap = engine->pinned_stage_depth_cap;
+    out->gpu_stage_depth_cap = engine->gpu_stage_depth_cap;
+    out->storage_runtime_path = engine->storage_runtime_path.load(std::memory_order_relaxed);
+    out->storage_async_prefetch_pending = engine->storage_async_prefetch_pending.load(std::memory_order_relaxed);
+    out->storage_async_prefetch_enqueued = engine->storage_async_prefetch_enqueued.load(std::memory_order_relaxed);
+    out->storage_async_prefetch_completed = engine->storage_async_prefetch_completed.load(std::memory_order_relaxed);
+    out->storage_async_prefetch_dropped = engine->storage_async_prefetch_dropped.load(std::memory_order_relaxed);
+    out->storage_async_prefetch_inline = engine->storage_async_prefetch_inline.load(std::memory_order_relaxed);
     out->active_workers = engine->disk_stage.inflight.load(std::memory_order_relaxed) +
         engine->pinned_stage.inflight.load(std::memory_order_relaxed) + engine->gpu_stage.inflight.load(std::memory_order_relaxed);
     out->active_path = static_cast<moe_io_path_t>(engine->io_atomic.active_path.load(std::memory_order_relaxed));

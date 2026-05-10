@@ -10,8 +10,21 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#if defined(_WIN32)
+extern "C" uintptr_t __cdecl _beginthreadex(
+    void* security,
+    unsigned stack_size,
+    unsigned (__stdcall* start_address)(void*),
+    void* arglist,
+    unsigned initflag,
+    unsigned* thrdaddr);
+#endif
 #include <thread>
 #include <vector>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -25,6 +38,39 @@ static uint32_t env_u32(const char* name, uint32_t fallback, uint32_t lo, uint32
     unsigned long parsed = std::strtoul(v, &end, 10);
     if (end == v || parsed == 0) return fallback;
     return std::max(lo, std::min<uint32_t>((uint32_t)parsed, hi));
+}
+
+
+static bool env_truthy(const char* name) {
+    const char* v = std::getenv(name);
+    if (!v || !v[0]) return false;
+    return std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0 &&
+           std::strcmp(v, "FALSE") != 0 && std::strcmp(v, "off") != 0 &&
+           std::strcmp(v, "OFF") != 0;
+}
+
+static std::vector<uint32_t> probe_thread_counts(uint32_t cap) {
+    static const uint32_t values[] = {1u, 2u, 3u, 4u, 6u, 8u, 12u, 16u, 24u, 32u, 48u, 64u, 96u, 128u};
+    std::vector<uint32_t> out;
+    for (uint32_t v : values) {
+        if (v <= cap) out.push_back(v);
+    }
+    if (out.empty() || out.back() != cap) out.push_back(cap);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+static void drop_probe_file_cache(const fs::path& path) {
+#if defined(__linux__)
+    int fd = ::open(path.string().c_str(), O_RDONLY);
+    if (fd >= 0) {
+        (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        ::close(fd);
+    }
+#else
+    (void)path;
+#endif
 }
 
 static uint32_t hw_threads() {
@@ -139,11 +185,6 @@ static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi) {
     return std::max(lo, std::min(v, hi));
 }
 
-static uint32_t next_power_probe(uint32_t prev, uint32_t maxv) {
-    if (prev >= maxv) return maxv + 1;
-    return std::min(maxv, prev * 2u);
-}
-
 } // namespace
 
 TransferProfile measure_transfer_profile() {
@@ -152,8 +193,14 @@ TransferProfile measure_transfer_profile() {
     p.probe_mb = env_u32("STORAGELLM_TRANSFER_PROBE_MB", 64, 8, 512);
     const size_t probe_bytes = size_t(p.probe_mb) * 1024ull * 1024ull;
 
-    const uint32_t ram_thread_cap = clamp_u32(std::min(p.hw_threads, 16u), 1, 16);
-    for (uint32_t t = 1; t <= ram_thread_cap; t = next_power_probe(t, ram_thread_cap)) {
+    const bool max_storage_autotune = env_truthy("STORAGELLM_STORAGE_MAX") ||
+        env_truthy("STORAGELLM_MAX_PARALLELISM") || env_truthy("STORAGELLM_STORAGE_AUTOTUNE_MAX");
+    p.ram_thread_probe_cap = env_u32(
+        "STORAGELLM_RAM_THREAD_PROBE_CAP",
+        clamp_u32(std::min<uint32_t>(p.hw_threads, max_storage_autotune ? 64u : 16u), 1u, max_storage_autotune ? 128u : 32u),
+        1u,
+        128u);
+    for (uint32_t t : probe_thread_counts(p.ram_thread_probe_cap)) {
         const double gbps = memcpy_gbps_once(probe_bytes, t);
         if (gbps > p.ram_memcpy_gbps) {
             p.ram_memcpy_gbps = gbps;
@@ -164,13 +211,25 @@ TransferProfile measure_transfer_profile() {
     fs::create_directories("build");
     fs::path probe_path = fs::path("build") / "storagellm_transfer_probe.bin";
     p.storage_write_gbps = write_probe_file(probe_path, probe_bytes);
-    const uint32_t disk_thread_cap = clamp_u32(std::min(p.hw_threads, 8u), 1, 8);
-    for (uint32_t t = 1; t <= disk_thread_cap; t = next_power_probe(t, disk_thread_cap)) {
+    p.storage_thread_probe_cap = env_u32(
+        "STORAGELLM_STORAGE_THREAD_PROBE_CAP",
+        clamp_u32(std::min<uint32_t>(p.hw_threads, max_storage_autotune ? 64u : 16u), 1u, max_storage_autotune ? 128u : 32u),
+        1u,
+        128u);
+    const bool cold_storage_probe = !env_truthy("STORAGELLM_AUTOTUNE_WARM_STORAGE_CACHE");
+    double storage_single_thread_gbps = 0.0;
+    for (uint32_t t : probe_thread_counts(p.storage_thread_probe_cap)) {
+        if (cold_storage_probe) drop_probe_file_cache(probe_path);
         const double gbps = read_probe_file_gbps(probe_path, probe_bytes, t);
+        if (t == 1u) storage_single_thread_gbps = gbps;
         if (gbps > p.storage_read_gbps) {
             p.storage_read_gbps = gbps;
             p.storage_best_threads = t;
         }
+    }
+    if (storage_single_thread_gbps > 0.0 && p.storage_best_threads > 0) {
+        p.storage_parallel_efficiency = std::max(0.05, std::min(4.0,
+            p.storage_read_gbps / (storage_single_thread_gbps * double(p.storage_best_threads))));
     }
     std::error_code ec;
     fs::remove(probe_path, ec);
@@ -187,25 +246,30 @@ TransferProfile measure_transfer_profile() {
     // latency, pinned workers saturate host memory copy, GPU workers feed DMA
     // streams.  Caps are intentionally tied to the measured slowest stage so an
     // upstream queue does not explode while a downstream stage idles.
-    const uint32_t worker_cap = std::min<uint32_t>(p.hw_threads, 32u);
+    const uint32_t worker_cap = std::min<uint32_t>(p.hw_threads, max_storage_autotune ? 96u : 48u);
+    const uint32_t io_cap = std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, max_storage_autotune ? 64u : 32u));
+    const uint32_t disk_cap = std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, max_storage_autotune ? 64u : 32u));
+    const uint32_t pinned_cap = std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, max_storage_autotune ? 32u : 16u));
+    const uint32_t gpu_cap = std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, max_storage_autotune ? 16u : 8u));
+
     p.io_workers = clamp_u32(
-        very_fast_storage ? 12u : fast_storage ? 8u : mid_storage ? 6u : slow_storage ? 4u : 4u,
-        1, std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, 16u)));
+        very_fast_storage ? 16u : fast_storage ? 12u : mid_storage ? 8u : slow_storage ? 6u : 4u,
+        1, io_cap);
 
     p.disk_workers = clamp_u32(
-        std::max<uint32_t>(p.storage_best_threads, very_fast_storage ? 8u : fast_storage ? 6u : mid_storage ? 4u : 2u),
-        1, std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, 16u)));
+        std::max<uint32_t>(p.storage_best_threads, very_fast_storage ? 16u : fast_storage ? 12u : mid_storage ? 6u : 3u),
+        1, disk_cap);
 
     p.pinned_workers = clamp_u32(
-        p.ram_best_threads >= 8u ? 6u : p.ram_best_threads >= 4u ? 4u : p.ram_best_threads >= 2u ? 2u : 1u,
-        1, std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, 8u)));
+        p.ram_best_threads >= 16u ? 8u : p.ram_best_threads >= 8u ? 6u : p.ram_best_threads >= 4u ? 4u : p.ram_best_threads >= 2u ? 2u : 1u,
+        1, pinned_cap);
 
-    // GPU copy workers are limited because too many H2D submitters can serialize
-    // on driver locks.  Autotune still emits enough workers for double/triple
-    // buffering on devices with multiple copy engines.
+    // GPU copy workers are intentionally below disk workers because many drivers
+    // serialize H2D submissions internally.  The emitted value is still large enough
+    // for double/triple buffering and can be overridden by env or live runtime tuning.
     p.gpu_workers = clamp_u32(
-        p.pinned_workers >= 6u ? 4u : p.pinned_workers >= 4u ? 3u : p.pinned_workers >= 2u ? 2u : 1u,
-        1, std::max<uint32_t>(1u, std::min<uint32_t>(worker_cap, 8u)));
+        p.pinned_workers >= 8u ? 6u : p.pinned_workers >= 6u ? 4u : p.pinned_workers >= 4u ? 3u : p.pinned_workers >= 2u ? 2u : 1u,
+        1, gpu_cap);
 
     if (storage_unknown) p.prefetch_window_layers = 2;
     else if (p.storage_read_gbps < 0.75) p.prefetch_window_layers = 4;
@@ -225,7 +289,17 @@ TransferProfile measure_transfer_profile() {
     const double ratio = (p.storage_read_gbps > 0.0 && p.ram_memcpy_gbps > 0.0)
         ? std::max(0.25, std::min(8.0, p.ram_memcpy_gbps / p.storage_read_gbps))
         : 1.0;
+    if (p.storage_read_gbps > 0.0 && p.ram_memcpy_gbps > 0.0) {
+        if (p.storage_read_gbps * 1.25 < p.ram_memcpy_gbps) p.movement_bottleneck = "storage";
+        else if (p.ram_memcpy_gbps * 1.25 < p.storage_read_gbps) p.movement_bottleneck = "ram-copy";
+        else p.movement_bottleneck = "balanced";
+    } else {
+        p.movement_bottleneck = "unknown";
+    }
     p.pipeline_depth_scale = slow_storage ? 2.0 : mid_storage ? 1.5 : very_fast_storage ? 0.85 : 1.0;
+    if (max_storage_autotune && p.movement_bottleneck == "storage") {
+        p.pipeline_depth_scale = std::min(3.0, p.pipeline_depth_scale * 1.25);
+    }
     const uint32_t disk_units = p.disk_workers * p.prefetch_window_layers * (slow_storage ? 256u : 128u);
     const uint32_t pinned_units = p.pinned_workers * std::max<uint32_t>(2u, p.gpu_workers) * 128u;
     const uint32_t gpu_units = p.gpu_workers * (very_fast_storage ? 192u : 128u);
@@ -259,6 +333,13 @@ std::string transfer_env_text(const TransferProfile& p) {
     ss << "STORAGELLM_GPU_STAGE_DEPTH_CAP=" << p.gpu_stage_depth_cap << "\n";
     ss << "STORAGELLM_DIRECT_UPLOAD_MIN_MB=" << p.direct_upload_min_mb << "\n";
     ss << "STORAGELLM_PIPELINE_DEPTH_SCALE=" << p.pipeline_depth_scale << "\n";
+    ss << "STORAGELLM_STORAGE_AUTOTUNE=1\n";
+    ss << "STORAGELLM_STORAGE_BOTTLENECK=" << p.movement_bottleneck << "\n";
+    ss << "STORAGELLM_STORAGE_THREAD_PROBE_CAP=" << p.storage_thread_probe_cap << "\n";
+    ss << "STORAGELLM_STORAGE_THREAD_PROBE_BEST=" << p.storage_best_threads << "\n";
+    ss << "STORAGELLM_RAM_THREAD_PROBE_CAP=" << p.ram_thread_probe_cap << "\n";
+    ss << "STORAGELLM_RAM_THREAD_PROBE_BEST=" << p.ram_best_threads << "\n";
+    ss << "STORAGELLM_STORAGE_PARALLEL_EFFICIENCY=" << p.storage_parallel_efficiency << "\n";
     ss << "STORAGELLM_MEASURED_RAM_GBPS=" << p.ram_memcpy_gbps << "\n";
     ss << "STORAGELLM_MEASURED_STORAGE_GBPS=" << p.storage_read_gbps << "\n";
     return ss.str();
@@ -267,14 +348,18 @@ std::string transfer_env_text(const TransferProfile& p) {
 std::string transfer_report_json(const TransferProfile& p) {
     std::ostringstream ss;
     ss << "{\n";
-    ss << "  \"version\": 1,\n";
+    ss << "  \"version\": 2,\n";
     ss << "  \"hw_threads\": " << p.hw_threads << ",\n";
     ss << "  \"probe_mb\": " << p.probe_mb << ",\n";
+    ss << "  \"ram_thread_probe_cap\": " << p.ram_thread_probe_cap << ",\n";
+    ss << "  \"storage_thread_probe_cap\": " << p.storage_thread_probe_cap << ",\n";
     ss << "  \"ram_memcpy_gbps\": " << p.ram_memcpy_gbps << ",\n";
     ss << "  \"ram_best_threads\": " << p.ram_best_threads << ",\n";
     ss << "  \"storage_read_gbps\": " << p.storage_read_gbps << ",\n";
     ss << "  \"storage_write_gbps\": " << p.storage_write_gbps << ",\n";
     ss << "  \"storage_best_threads\": " << p.storage_best_threads << ",\n";
+    ss << "  \"storage_parallel_efficiency\": " << p.storage_parallel_efficiency << ",\n";
+    ss << "  \"movement_bottleneck\": \"" << p.movement_bottleneck << "\",\n";
     ss << "  \"selected_knobs\": {\n";
     ss << "    \"io_workers\": " << p.io_workers << ",\n";
     ss << "    \"disk_workers\": " << p.disk_workers << ",\n";

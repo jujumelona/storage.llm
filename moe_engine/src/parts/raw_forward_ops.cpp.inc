@@ -88,11 +88,20 @@ static int moe_rmsnorm_unit_offset_from_weight_stats(
     if (out_mean_abs_raw) *out_mean_abs_raw = mean_abs_raw;
     if (out_mean_abs_plus_one) *out_mean_abs_plus_one = mean_abs_plus_one;
 
-    if (mean_abs_raw < 0.35 && mean_abs_plus_one > 0.65 && mean_abs_plus_one < 1.35) {
+    // Gemma-style shifted RMSNorm weights are often stored as a small
+    // additive delta around zero and must be used as (1 + weight). Plain
+    // RMSNorm weights are usually already centered near one or larger. The
+    // old 0.35/0.50 split left many post-attention norms around 0.4-0.5 as
+    // "ambiguous", so a non-authoritative graph_ir=false default could leak
+    // through and corrupt late-layer residual math. Keep the decision tensor-
+    // local and deliberately separate small delta tensors from already-unit
+    // tensors.
+    if (mean_abs_raw < 0.75 && raw_rms < 0.75 &&
+        mean_abs_plus_one > 0.65 && mean_abs_plus_one < 1.85) {
         *out = 1;
         return 1;
     }
-    if (mean_abs_raw > 0.50 || raw_rms > 0.50) {
+    if (mean_abs_raw > 0.85 || raw_rms > 0.85) {
         *out = 0;
         return 1;
     }
@@ -126,82 +135,84 @@ static int moe_engine_rmsnorm_unit_offset(
             return found->second ? 1 : 0;
         }
     }
-
     int value = 0;
-    int metadata_value = -1;
-    const char* metadata_source = nullptr;
     const char* source = "default";
     uint32_t samples = 0;
     double raw_mean = 0.0;
     double raw_rms = 0.0;
     double mean_abs_raw = 0.0;
     double mean_abs_plus_one = 0.0;
-
-    // Only a positive unit-offset contract is safe to cache model-wide.  A
-    // negative value in graph_ir is frequently a generator default rather than
-    // an actual architecture invariant; caching that false once makes every
-    // subsequent norm tensor skip tensor-local detection and can corrupt PPL
-    // without tripping readiness checks.
+    int metadata_done = 0;
+    int metadata_value = -1;
+    const char* metadata_source = "none";
     const int metadata_cache = engine->cached_rmsnorm_unit_offset.load(std::memory_order_acquire);
+
+    // Treat only an explicit model-wide true as authoritative. A model-wide
+    // false in graph_ir/metadata is frequently an emitter default rather than
+    // a tensor contract; using it globally was visible in PPL logs as
+    // source=graph_ir value=0 even when tensor-local weights looked like
+    // shifted Gemma RMSNorm deltas.
     if (metadata_cache == 1) {
+        value = 1;
+        source = "metadata_cache_true";
+        metadata_done = 1;
         metadata_value = 1;
-        metadata_source = "metadata_cache_true";
-    } else if (metadata_cache != 2) {
+        metadata_source = "cache";
+    } else {
         int parsed_value = 0;
-        if (moe_rmsnorm_unit_offset_from_json(engine->offload_gguf_metadata_json, &parsed_value)) {
-            metadata_value = parsed_value ? 1 : 0;
-            metadata_source = "metadata";
-            if (metadata_value == 1) {
-                engine->cached_rmsnorm_unit_offset.store(1, std::memory_order_release);
+        if (metadata_cache != 2) {
+            if (moe_rmsnorm_unit_offset_from_json(engine->offload_gguf_metadata_json, &parsed_value)) {
+                metadata_value = parsed_value ? 1 : 0;
+                metadata_source = "metadata";
+            } else if (moe_rmsnorm_unit_offset_from_json(engine->offload_graph_ir_json, &parsed_value)) {
+                metadata_value = parsed_value ? 1 : 0;
+                metadata_source = "graph_ir";
+            } else {
+                engine->cached_rmsnorm_unit_offset.store(2, std::memory_order_release);
             }
-        } else if (moe_rmsnorm_unit_offset_from_json(engine->offload_graph_ir_json, &parsed_value)) {
-            metadata_value = parsed_value ? 1 : 0;
-            metadata_source = "graph_ir";
             if (metadata_value == 1) {
+                value = 1;
+                source = metadata_source;
+                metadata_done = 1;
                 engine->cached_rmsnorm_unit_offset.store(1, std::memory_order_release);
+            } else if (metadata_value == 0) {
+                // Do not cache false globally. Fall through to tensor-local
+                // stats; they can confirm false or override to unit-offset.
+                engine->cached_rmsnorm_unit_offset.store(2, std::memory_order_release);
             }
-        } else {
-            engine->cached_rmsnorm_unit_offset.store(2, std::memory_order_release);
+        }
+        if (!metadata_done &&
+            moe_rmsnorm_unit_offset_from_weight_stats(
+                raw,
+                &value,
+                &samples,
+                &raw_mean,
+                &raw_rms,
+                &mean_abs_raw,
+                &mean_abs_plus_one)) {
+            if (metadata_value == 0) {
+                source = value ? "weight_stats_override_metadata_false" : "weight_stats_confirm_metadata_false";
+            } else {
+                source = "weight_stats";
+            }
+            metadata_done = 1;
         }
     }
-
-    int stats_value = -1;
-    const int stats_done = moe_rmsnorm_unit_offset_from_weight_stats(
-        raw,
-        &stats_value,
-        &samples,
-        &raw_mean,
-        &raw_rms,
-        &mean_abs_raw,
-        &mean_abs_plus_one);
-
-    if (metadata_value == 1) {
-        value = 1;
-        source = metadata_source ? metadata_source : "metadata_true";
-    } else if (stats_done) {
-        value = stats_value ? 1 : 0;
-        source = metadata_value == 0 ?
-            (stats_value ? "weight_stats_override_metadata_false" : "weight_stats_confirm_metadata_false") :
-            "weight_stats";
-    } else if (metadata_value == 0) {
-        value = 0;
-        source = metadata_source ? metadata_source : "metadata_false";
-    } else {
+    if (!metadata_done) {
         // Unit-offset RMSNorm changes math. If the package does not carry an
-        // explicit positive contract and tensor-local stats are inconclusive,
+        // explicit true contract and tensor-local stats are inconclusive,
         // preserve the stored weights as-is instead of applying a model-wide
-        // guess.
+        // guess or a non-authoritative false default.
         value = 0;
-        source = "contract_default";
+        source = metadata_value == 0 ? "metadata_false_stats_inconclusive" : "contract_default";
     }
-
     moe_profile_log(
         "rmsnorm_unit_offset",
         "source=%s value=%d metadata=%d metadata_source=%s samples=%u raw_mean=%.6g raw_rms=%.6g mean_abs_raw=%.6g mean_abs_plus_one=%.6g cache_key=%llu",
         source,
         value ? 1 : 0,
         metadata_value,
-        metadata_source ? metadata_source : "-",
+        metadata_source,
         samples,
         raw_mean,
         raw_rms,

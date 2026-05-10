@@ -399,23 +399,27 @@ def test_mxfp4_dot_and_cache_decode_use_physical_row_stride_from_index():
     assert "moe_mxfp4_row_layout_for_bytes(out_count, row_bytes)" in cache_text
 
 
-def test_rmsnorm_false_metadata_does_not_poison_all_tensor_local_detection():
+def test_qkv_single_token_attention_uses_exact_current_value_not_compressed_roundtrip():
+    attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_decode.cpp.inc").read_text()
+    assert "qkv_current_value_exact" in attn_text
+    assert "seq_len == 1u" in attn_text
+    assert "current_exact=%d" in attn_text
+    preserve_pos = attn_text.index("qkv_current_value_exact = s->kv_entry.data();")
+    append_pos = attn_text.index("moe_qkv_append_layer_head_token", preserve_pos)
+    fill_pos = attn_text.index("std::fill(s->attn_value.begin()", append_pos)
+    bypass_pos = attn_text.index("if (qkv_current_value_exact && seq_len == 1u)", fill_pos)
+    qkv_decode_pos = attn_text.index("moe_pc_engine_attention_decode_layer_head_qkv_f32", bypass_pos)
+    assert preserve_pos < append_pos < fill_pos < bypass_pos < qkv_decode_pos
+    assert "const float* v = qkv_current_value_exact + (uint64_t)kv_h * v_head_dim" in attn_text
+
+
+def test_rmsnorm_metadata_false_is_not_cached_as_model_wide_authority():
     raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_ops.cpp.inc").read_text()
-    materializer_text = MAT_PATH.read_text()
-    assert 'False,\n        ),\n        "rmsnorm_unit_offset"' not in materializer_text
-    assert 'None,\n        ),\n        "rmsnorm_unit_offset"' in materializer_text
-    assert 'Only a positive unit-offset contract is safe to cache model-wide' in raw_ops_text
-    assert 'metadata_cache == 1' in raw_ops_text
-    assert 'engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0' not in raw_ops_text
-    assert 'weight_stats_override_metadata_false' in raw_ops_text
-    assert 'weight_stats_confirm_metadata_false' in raw_ops_text
-    assert 'metadata=%d metadata_source=%s' in raw_ops_text
-
-
-def test_embedding_and_final_softcap_read_explicit_graph_ir_values_not_text_mentions():
-    forward_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_ops.cpp.inc").read_text()
-    assert 'moe_json_get_double_local(engine->offload_graph_ir_json, "embedding_scale", &value)' in forward_ops_text
-    assert 'moe_json_get_bool_local(engine->offload_graph_ir_json, "scale_embedding", &bool_value)' in forward_ops_text
-    assert 'moe_engine_graph_ir_mentions(engine, "scale_embedding")' not in forward_ops_text
-    assert 'embedding_scale_contract' in forward_ops_text
-    assert 'moe_json_get_double_local(engine->offload_graph_ir_json, "final_logit_softcapping", &value)' in forward_ops_text
+    assert "Treat only an explicit model-wide true as authoritative" in raw_ops_text
+    assert "Do not cache false globally" in raw_ops_text
+    assert "engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0" not in raw_ops_text
+    assert "engine->cached_rmsnorm_unit_offset.store(1" in raw_ops_text
+    assert "weight_stats_override_metadata_false" in raw_ops_text
+    assert "metadata_false_stats_inconclusive" in raw_ops_text
+    assert "mean_abs_raw < 0.75" in raw_ops_text
+    assert "raw_rms < 0.75" in raw_ops_text

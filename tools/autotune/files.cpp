@@ -78,7 +78,7 @@ static void write_bool(std::ostream& os, bool v) { os << (v ? "true" : "false");
 void write_report_json(const std::string& path, const HostInfo& host, const std::vector<Candidate>& candidates, const Candidate* selected) {
     std::ostringstream ss;
     ss << "{\n";
-    ss << "  \"version\": 5,\n";
+    ss << "  \"version\": 6,\n";
     ss << "  \"pipeline_owner\": \"C++ storagellm_host_autotune executable\",\n";
     ss << "  \"python_policy\": \"not engine runtime; only invoked for pip/TVM Python API codegen when TVM candidates are built\",\n";
     ss << "  \"cmake_policy\": \"build system only; user does not manually choose backend options in the default path\",\n";
@@ -87,11 +87,23 @@ void write_report_json(const std::string& path, const HostInfo& host, const std:
     ss << "    \"python\": \"" << json_escape(host.python) << "\",\n";
     ss << "    \"cmake\": \"" << json_escape(host.cmake) << "\",\n";
     ss << "    \"cuda\": "; write_bool(ss, host.has_cuda); ss << ",\n";
+    ss << "    \"cuda_toolkit\": "; write_bool(ss, host.cuda_toolkit); ss << ",\n";
+    ss << "    \"cuda_device\": "; write_bool(ss, host.cuda_device); ss << ",\n";
+    ss << "    \"cuda_probe\": \"" << json_escape(host.cuda_probe) << "\",\n";
     ss << "    \"rocm\": "; write_bool(ss, host.has_rocm); ss << ",\n";
+    ss << "    \"rocm_toolkit\": "; write_bool(ss, host.rocm_toolkit); ss << ",\n";
+    ss << "    \"rocm_device\": "; write_bool(ss, host.rocm_device); ss << ",\n";
+    ss << "    \"rocm_probe\": \"" << json_escape(host.rocm_probe) << "\",\n";
     ss << "    \"metal\": "; write_bool(ss, host.has_metal); ss << ",\n";
     ss << "    \"vulkan\": "; write_bool(ss, host.has_vulkan); ss << ",\n";
+    ss << "    \"vulkan_device\": "; write_bool(ss, host.vulkan_device); ss << ",\n";
+    ss << "    \"vulkan_probe\": \"" << json_escape(host.vulkan_probe) << "\",\n";
     ss << "    \"opencl\": "; write_bool(ss, host.has_opencl); ss << ",\n";
-    ss << "    \"sycl\": "; write_bool(ss, host.has_sycl); ss << "\n";
+    ss << "    \"opencl_device\": "; write_bool(ss, host.opencl_device); ss << ",\n";
+    ss << "    \"opencl_probe\": \"" << json_escape(host.opencl_probe) << "\",\n";
+    ss << "    \"sycl\": "; write_bool(ss, host.has_sycl); ss << ",\n";
+    ss << "    \"sycl_device\": "; write_bool(ss, host.sycl_device); ss << ",\n";
+    ss << "    \"sycl_probe\": \"" << json_escape(host.sycl_probe) << "\"\n";
     ss << "  },\n";
     ss << "  \"candidates\": [\n";
     for (size_t i = 0; i < candidates.size(); ++i) {
@@ -99,7 +111,11 @@ void write_report_json(const std::string& path, const HostInfo& host, const std:
         ss << "    {\"name\": \"" << json_escape(c.name) << "\", \"kind\": \"" << json_escape(c.kind)
            << "\", \"target\": \"" << json_escape(c.tvm_target) << "\", \"library\": \"" << json_escape(c.library)
            << "\", \"compiled\": "; write_bool(ss, c.compiled); ss << ", \"loadable\": "; write_bool(ss, c.loadable);
+        ss << ", \"runtime_device\": "; write_bool(ss, c.runtime_device);
+        ss << ", \"true_kernel\": "; write_bool(ss, c.true_kernel);
+        ss << ", \"fused_moe\": "; write_bool(ss, c.fused_moe);
         ss << ", \"measured\": "; write_bool(ss, c.measured); ss << ", \"latency_ms\": " << c.latency_ms
+           << ", \"validation\": \"" << json_escape(c.validation) << "\""
            << ", \"reason\": \"" << json_escape(c.reason) << "\"}" << (i + 1 == candidates.size() ? "" : ",") << "\n";
     }
     ss << "  ],\n";
@@ -111,7 +127,7 @@ void write_report_json(const std::string& path, const HostInfo& host, const std:
         ss << "null";
     }
     ss << ",\n";
-    ss << "  \"truth\": \"C++ auto pipeline is wired. CPU native, TVM CPU, and linked CUDA cuBLASLt native candidates can be measured automatically. Other SDK-specific GPU native adapters remain fail-closed unless their real device kernels are present and measured.\"\n";
+    ss << "  \"truth\": \"C++ auto pipeline is wired fail-closed: a backend is only selected when it is linked/loadable, has a runtime device when needed, and is actually measured. Unmeasured platform kernels are reported but never silently counted as maximum-speed success.\"\n";
     ss << "}\n";
     write_text(path, ss.str());
 }

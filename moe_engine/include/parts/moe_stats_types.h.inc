@@ -216,4 +216,17 @@ typedef struct {
     uint64_t disk_inflight_bytes;
     uint64_t pinned_inflight_bytes;
     uint64_t gpu_inflight_bytes;
+    uint32_t disk_worker_threads;
+    uint32_t pinned_worker_threads;
+    uint32_t gpu_worker_threads;
+    uint32_t runtime_prefetch_window_layers;
+    uint32_t disk_stage_depth_cap;
+    uint32_t pinned_stage_depth_cap;
+    uint32_t gpu_stage_depth_cap;
+    uint32_t storage_runtime_path;
+    uint64_t storage_async_prefetch_pending;
+    uint64_t storage_async_prefetch_enqueued;
+    uint64_t storage_async_prefetch_completed;
+    uint64_t storage_async_prefetch_dropped;
+    uint64_t storage_async_prefetch_inline;
 } moe_io_stats_t;
