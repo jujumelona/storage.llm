@@ -1,0 +1,3979 @@
+#include "moe_pc_engine.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <cmath>
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+using socket_handle_t = SOCKET;
+static const socket_handle_t invalid_socket_handle = INVALID_SOCKET;
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+using socket_handle_t = int;
+static const socket_handle_t invalid_socket_handle = -1;
+#endif
+
+#include "../../byte_size.h"
+#include "../../json_request.h"
+#include "../../system_memory.h"
+#include "../../loader/wide_path.h"
+
+static volatile std::sig_atomic_t g_server_shutdown_requested = 0;
+
+static void handle_server_shutdown_signal(int) {
+    g_server_shutdown_requested = 1;
+}
+
+struct server_options {
+    bool allow_remote = false;
+    std::string host = "127.0.0.1";
+    uint16_t port = 8000;
+    std::string model_id = "storagellm-offload";
+    bool model_id_explicit = false;
+    std::string topology_path;
+    std::string table_path;
+    std::string model_root;
+    std::string scale4_path;
+    std::string openclaw_config_path;
+    bool openclaw_config_only = false;
+    bool ram_budget_override = false;
+    bool vram_budget_override = false;
+    moe_execution_policy_t policy = moe_EXECUTION_PERFORMANCE;
+    moe_pc_engine_config_t engine_config = moe_pc_default_config();
+};
+
+struct http_request {
+    std::string method;
+    std::string target;
+    std::string path;
+    std::string body;
+};
+
+struct server_runtime_state {
+    std::atomic<moe_pc_engine_t*> engine{nullptr};
+    std::atomic<int> model_ready{0};
+    std::atomic<int> model_failed{0};
+    std::atomic<int> shutdown_requested{0};
+    moe_backend_caps_t initial_caps{};
+    mutable std::mutex error_mutex;
+    std::string error_message;
+    mutable std::mutex stage_mutex;
+    std::string load_stage{"not_started"};
+    std::chrono::steady_clock::time_point load_started_at{};
+    std::chrono::steady_clock::time_point last_stage_at{};
+    bool load_clock_started = false;
+    mutable std::mutex root_check_mutex;
+    std::string root_check_model_root;
+    moe_model_root_check_t root_check{};
+    int root_check_ready = 0;
+};
+
+#include "pc_server_runtime_config.inc"
+#include "pc_server_prefetch.inc"
+
+static void close_socket_handle(socket_handle_t s) {
+    if (s == invalid_socket_handle) {
+        return;
+    }
+#ifdef _WIN32
+    closesocket(s);
+#else
+    close(s);
+#endif
+}
+
+static bool network_startup() {
+#ifdef _WIN32
+    WSADATA data{};
+    return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+#else
+    return true;
+#endif
+}
+
+static void network_cleanup() {
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
+
+static bool is_loopback_host(const std::string& host) {
+    return host == "127.0.0.1" || host == "localhost" || host == "::1";
+}
+
+static std::string json_escape(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 16);
+    for (char ch : value) {
+        switch (ch) {
+            case '\\':
+                out += "\\\\";
+                break;
+            case '"':
+                out += "\\\"";
+                break;
+            case '\b':
+                out += "\\b";
+                break;
+            case '\f':
+                out += "\\f";
+                break;
+            case '\n':
+                out += "\\n";
+                break;
+            case '\r':
+                out += "\\r";
+                break;
+            case '\t':
+                out += "\\t";
+                break;
+            default:
+                if (static_cast<unsigned char>(ch) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(ch));
+                    out += buf;
+                } else {
+                    out += ch;
+                }
+                break;
+        }
+    }
+    return out;
+}
+
+static int64_t unix_time_seconds() {
+    using namespace std::chrono;
+    return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
+}
+
+static double elapsed_ms_since(std::chrono::steady_clock::time_point start) {
+    if (start == std::chrono::steady_clock::time_point{}) {
+        return 0.0;
+    }
+    return (double)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count() / 1000.0;
+}
+
+static std::string resource_log_suffix() {
+    using clock = std::chrono::steady_clock;
+    const uint64_t wall_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        clock::now().time_since_epoch()).count();
+    const uint64_t cpu_us = storagellm::current_process_cpu_time_us();
+    static std::atomic<uint64_t> last_wall_us{0};
+    static std::atomic<uint64_t> last_cpu_us{0};
+    const uint64_t prev_wall = last_wall_us.exchange(wall_us, std::memory_order_relaxed);
+    const uint64_t prev_cpu = last_cpu_us.exchange(cpu_us, std::memory_order_relaxed);
+    double core_pct = 0.0;
+    double host_pct = 0.0;
+    if (prev_wall && prev_cpu && wall_us > prev_wall && cpu_us >= prev_cpu) {
+        core_pct = 100.0 * (double)(cpu_us - prev_cpu) / (double)(wall_us - prev_wall);
+        const uint32_t hw = std::max<uint32_t>(1u, std::thread::hardware_concurrency());
+        host_pct = core_pct / (double)hw;
+    }
+    std::ostringstream out;
+    out << " proc_cpu_core_pct=" << core_pct
+        << " proc_cpu_host_pct=" << host_pct
+        << " rss_bytes=" << storagellm::current_process_rss_bytes()
+        << " avail_ram_bytes=" << storagellm::available_ram_bytes();
+    return out.str();
+}
+
+static const char* forward_adapter_name(uint32_t adapter);
+
+static const char* server_generation_phase_name(uint32_t phase) {
+    switch (phase) {
+        case moe_GEN_PHASE_INIT: return "init";
+        case moe_GEN_PHASE_PREFILL: return "prefill";
+        case moe_GEN_PHASE_ATTENTION: return "attention";
+        case moe_GEN_PHASE_MLP: return "mlp";
+        case moe_GEN_PHASE_LM_HEAD: return "lm_head";
+        case moe_GEN_PHASE_DONE: return "done";
+        case moe_GEN_PHASE_IDLE:
+        default: return "idle";
+    }
+}
+
+static void log_engine_snapshot(const char* tag, moe_pc_engine_t* engine) {
+    if (!engine) {
+        std::cerr << "[storagellm request] " << (tag ? tag : "engine_snapshot")
+                  << " engine=null" << resource_log_suffix() << "\n" << std::flush;
+        return;
+    }
+    moe_forward_status_t forward{};
+    moe_pc_engine_stats_t stats{};
+    moe_io_stats_t io{};
+    const int forward_ok = moe_pc_engine_get_forward_status(engine, &forward);
+    const int stats_ok = moe_pc_engine_get_stats(engine, &stats);
+    const int io_ok = moe_pc_engine_get_io_stats(engine, &io);
+    std::cerr << "[storagellm request] " << (tag ? tag : "engine_snapshot")
+              << " forward_ok=" << forward_ok
+              << " stats_ok=" << stats_ok
+              << " io_ok=" << io_ok;
+    if (forward_ok) {
+        std::cerr << " adapter=" << forward_adapter_name(forward.forward_adapter)
+                  << " executable=" << forward.forward_adapter_executable
+                  << " graph_ir=" << forward.graph_ir_ready
+                  << " graph_required=" << forward.graph_ir_required
+                  << " graph_layers=" << forward.graph_ir_layer_count
+                  << " graph_ops=" << forward.graph_ir_op_count
+                  << " runtime_manifest=" << forward.runtime_execution_manifest_ready
+                  << " access_plan=" << forward.runtime_access_plan_ready
+                  << " hotset=" << forward.runtime_access_hotset_count
+                  << " file_groups=" << forward.runtime_access_file_group_count
+                  << " kv_layout=" << forward.kv_layout_contract_ready
+                  << " layers=" << forward.dynamic_num_hidden_layers
+                  << " hidden=" << forward.dynamic_hidden_size
+                  << " vocab=" << forward.dynamic_vocab_size
+                  << " embed=" << forward.embedding_ready
+                  << " lm_head=" << forward.lm_head_ready
+                  << " attention=" << forward.attention_ready
+                  << " decode_loop=" << forward.decode_loop_ready;
+    }
+    if (stats_ok) {
+        std::cerr << " phase=" << server_generation_phase_name(stats.generation_phase)
+                  << " gen_started=" << stats.generation_started
+                  << " gen_done=" << stats.generation_completed
+                  << " gen_failed=" << stats.generation_failed
+                  << " gen_active=" << stats.generation_active
+                  << " gen_token=" << stats.generation_token
+                  << " gen_layer=" << stats.generation_layer
+                  << " kv=" << moe_kv_mode_name(stats.kv_mode)
+                  << " qkv_forced=" << stats.qkv_forced_by_format
+                  << " qkv_bits=" << stats.qkv_k_bits << "/" << stats.qkv_v_bits
+                  << " qkv_normal=" << stats.qkv_normal_bits
+                  << " qkv_key_normal=" << stats.qkv_key_normal_bits
+                  << " qkv_value_normal=" << stats.qkv_value_normal_bits
+                  << " qkv_outlier=" << stats.qkv_outlier_channels << "/" << stats.qkv_outlier_bits
+                  << " qkv_key_outlier=" << stats.qkv_key_outlier_bits
+                  << " qkv_value_outlier=" << stats.qkv_value_outlier_bits
+                  << " qkv_group=" << stats.qkv_group_size
+                  << " ram_used=" << stats.ram_used_bytes
+                  << " vram_used=" << stats.vram_used_bytes
+                  << " common_raw=" << stats.common_raw_prefetched_bytes
+                  << " ram_experts=" << stats.ram_expert_count
+                  << " storage_experts=" << stats.db_expert_count
+                  << " weight_bits=" << stats.weight_quant_bits
+                  << " weight_encoding=" << stats.weight_quant_encoding
+                  << " weight_kernel=" << stats.weight_kernel_family
+                  << " juju_io_hints=" << stats.juju_io_section_hints_ready
+                  << " juju_runtime_mmap=" << stats.juju_runtime_mmap_allowed
+                  << " juju_cold_mmap=" << stats.juju_cold_mmap_friendly
+                  << " juju_warm_mmap=" << stats.juju_warm_mmap_friendly
+                  << " juju_cold_seq=" << stats.juju_cold_sequential_block_size
+                  << " juju_warm_seq=" << stats.juju_warm_sequential_block_size
+                  << " juju_prefetch_distance=" << stats.juju_max_prefetch_distance;
+    }
+    if (io_ok) {
+        std::cerr << " io_queued=" << io.queued_requests
+                  << " io_done=" << io.completed_requests
+                  << " io_failed=" << io.failed_requests
+                  << " io_dropped=" << io.dropped_requests
+                  << " disk_q=" << io.disk_queue_depth
+                  << " pinned_q=" << io.pinned_queue_depth
+                  << " gpu_q=" << io.gpu_queue_depth
+                  << " active_workers=" << io.active_workers
+                  << " bytes_prefetched=" << io.bytes_prefetched
+                  << " h2d_fallback=" << io.bytes_sync_h2d_fallback;
+    }
+    std::cerr << resource_log_suffix() << "\n" << std::flush;
+}
+
+static std::string lower_ascii(std::string value) {
+    for (char& ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value;
+}
+
+static bool request_wants_stream(const std::string& body) {
+    std::string compact;
+    compact.reserve(body.size());
+    for (char ch : body) {
+        if (!std::isspace(static_cast<unsigned char>(ch))) {
+            compact.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+    }
+    return compact.find("\"stream\":true") != std::string::npos;
+}
+
+static void append_utf8(std::string* out, uint32_t cp) {
+    if (!out) return;
+    if (cp <= 0x7Fu) {
+        out->push_back(static_cast<char>(cp));
+    } else if (cp <= 0x7FFu) {
+        out->push_back(static_cast<char>(0xC0u | (cp >> 6)));
+        out->push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0xFFFFu) {
+        out->push_back(static_cast<char>(0xE0u | (cp >> 12)));
+        out->push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+        out->push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else {
+        out->push_back(static_cast<char>(0xF0u | (cp >> 18)));
+        out->push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+        out->push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+        out->push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    }
+}
+
+static int hex_value(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return 10 + ch - 'a';
+    if (ch >= 'A' && ch <= 'F') return 10 + ch - 'A';
+    return -1;
+}
+
+static bool parse_json_string_at(const std::string& text, size_t quote, std::string* out, size_t* next_pos) {
+    if (quote >= text.size() || text[quote] != '"' || !out) {
+        return false;
+    }
+    out->clear();
+    for (size_t i = quote + 1; i < text.size(); ++i) {
+        const char ch = text[i];
+        if (ch == '"') {
+            if (next_pos) *next_pos = i + 1;
+            return true;
+        }
+        if (ch != '\\') {
+            out->push_back(ch);
+            continue;
+        }
+        if (++i >= text.size()) {
+            return false;
+        }
+        const char esc = text[i];
+        switch (esc) {
+            case '"': out->push_back('"'); break;
+            case '\\': out->push_back('\\'); break;
+            case '/': out->push_back('/'); break;
+            case 'b': out->push_back('\b'); break;
+            case 'f': out->push_back('\f'); break;
+            case 'n': out->push_back('\n'); break;
+            case 'r': out->push_back('\r'); break;
+            case 't': out->push_back('\t'); break;
+            case 'u': {
+                if (i + 4 >= text.size()) return false;
+                uint32_t cp = 0;
+                for (int k = 0; k < 4; ++k) {
+                    const int hv = hex_value(text[i + 1 + k]);
+                    if (hv < 0) return false;
+                    cp = (cp << 4) | (uint32_t)hv;
+                }
+                i += 4;
+                append_utf8(out, cp);
+                break;
+            }
+            default:
+                out->push_back(esc);
+                break;
+        }
+    }
+    return false;
+}
+
+static bool json_read_string_value(const std::string& body, const char* key, std::string* out) {
+    if (!key || !out) return false;
+    const std::string needle = std::string("\"") + key + "\"";
+    const size_t pos = body.find(needle);
+    const size_t colon = pos == std::string::npos ? pos : body.find(':', pos + needle.size());
+    const size_t quote = colon == std::string::npos ? colon : body.find('"', colon + 1);
+    return quote != std::string::npos && parse_json_string_at(body, quote, out, nullptr);
+}
+
+static std::vector<std::string> json_collect_string_values(const std::string& body, const char* key) {
+    std::vector<std::string> values;
+    if (!key) return values;
+    const std::string needle = std::string("\"") + key + "\"";
+    size_t pos = 0;
+    while ((pos = body.find(needle, pos)) != std::string::npos) {
+        const size_t colon = body.find(':', pos + needle.size());
+        const size_t quote = colon == std::string::npos ? colon : body.find('"', colon + 1);
+        std::string value;
+        size_t next = quote;
+        if (quote != std::string::npos && parse_json_string_at(body, quote, &value, &next)) {
+            values.push_back(std::move(value));
+            pos = next;
+        } else {
+            pos += needle.size();
+        }
+    }
+    return values;
+}
+
+static std::string join_model_file(const std::string& root, const char* name) {
+    if (root.empty() || !name || !name[0]) return "";
+    const char sep =
+#ifdef _WIN32
+        '\\';
+#else
+        '/';
+#endif
+    if (root.back() == '\\' || root.back() == '/') {
+        return root + name;
+    }
+    return root + sep + name;
+}
+
+static bool read_text_file(const std::string& path, std::string* out) {
+    if (!out || path.empty()) return false;
+    std::ifstream input(path, std::ios::binary);
+#ifdef _WIN32
+    if (!input) {
+        const std::wstring wide = storagellm::wide_path_from_utf8(path);
+        if (!wide.empty()) {
+            input.open(wide.c_str(), std::ios::binary);
+        }
+    }
+#endif
+    if (!input) return false;
+    std::ostringstream ss;
+    ss << input.rdbuf();
+    *out = ss.str();
+    return true;
+}
+
+static uint64_t fnv1a64_bytes(const std::string& text) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char ch : text) {
+        h ^= (uint64_t)ch;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static std::string hex_u64(uint64_t value) {
+    char buf[17]{};
+    std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)value);
+    return std::string(buf);
+}
+
+static bool file_exists_utf8(const std::string& path) {
+    if (path.empty()) return false;
+    std::ifstream input(path, std::ios::binary);
+#ifdef _WIN32
+    if (!input) {
+        const std::wstring wide = storagellm::wide_path_from_utf8(path);
+        if (!wide.empty()) {
+            input.open(wide.c_str(), std::ios::binary);
+        }
+    }
+#endif
+    return static_cast<bool>(input);
+}
+
+static bool write_text_file_utf8(const std::string& path, const std::string& text) {
+    if (path.empty()) return false;
+    std::ofstream output;
+#ifdef _WIN32
+    const std::wstring wide = storagellm::wide_path_from_utf8(path);
+    if (!wide.empty()) {
+        output.open(wide.c_str(), std::ios::binary);
+    }
+#else
+    output.open(path, std::ios::binary);
+#endif
+    if (!output) return false;
+    output.write(text.data(), static_cast<std::streamsize>(text.size()));
+    return static_cast<bool>(output);
+}
+
+struct server_tokenizer {
+    bool attempted = false;
+    bool loaded = false;
+    bool byte_level = false;
+    bool has_merges = false;
+    std::string model_root;
+    std::unordered_map<uint32_t, std::string> id_to_text;
+    std::unordered_map<uint32_t, std::string> id_to_piece;
+    std::unordered_map<std::string, uint32_t> text_to_id;
+    std::unordered_map<std::string, uint32_t> piece_to_id;
+    std::unordered_map<std::string, uint32_t> bpe_rank;
+    std::unordered_map<std::string, double> unigram_score_by_piece;
+    std::vector<std::pair<std::string, std::string>> normalizer_replacements;
+    std::vector<std::pair<std::string, uint32_t>> special_token_pieces;
+    std::unordered_set<uint32_t> special_ids;
+    size_t max_piece_bytes = 0;
+    size_t max_special_piece_bytes = 0;
+    std::string model_type;
+    uint32_t bos_token_id = 0;
+    uint32_t eos_token_id = 0;
+    uint32_t unk_token_id = 0;
+    bool has_bos = false;
+    bool has_eos = false;
+    bool has_unk = false;
+    bool add_bos_token = false;
+    bool add_bos_token_explicit = false;
+    bool add_eos_token = false;
+    bool add_space_prefix = false;
+    bool byte_fallback = false;
+    bool has_unigram = false;
+    std::string tokenizer_hash;
+    std::string tokenizer_config_hash;
+    std::string error;
+};
+
+static void append_utf8_codepoint(std::string* out, uint32_t cp) {
+    append_utf8(out, cp);
+}
+
+static uint32_t utf8_next_codepoint(const std::string& text, size_t* pos) {
+    if (!pos || *pos >= text.size()) return 0;
+    const unsigned char c0 = static_cast<unsigned char>(text[*pos]);
+    if (c0 < 0x80u) {
+        ++(*pos);
+        return c0;
+    }
+    if ((c0 & 0xE0u) == 0xC0u && *pos + 1 < text.size()) {
+        const uint32_t cp =
+            ((uint32_t)(c0 & 0x1Fu) << 6) |
+            (uint32_t)(static_cast<unsigned char>(text[*pos + 1]) & 0x3Fu);
+        *pos += 2;
+        return cp;
+    }
+    if ((c0 & 0xF0u) == 0xE0u && *pos + 2 < text.size()) {
+        const uint32_t cp =
+            ((uint32_t)(c0 & 0x0Fu) << 12) |
+            ((uint32_t)(static_cast<unsigned char>(text[*pos + 1]) & 0x3Fu) << 6) |
+            (uint32_t)(static_cast<unsigned char>(text[*pos + 2]) & 0x3Fu);
+        *pos += 3;
+        return cp;
+    }
+    if ((c0 & 0xF8u) == 0xF0u && *pos + 3 < text.size()) {
+        const uint32_t cp =
+            ((uint32_t)(c0 & 0x07u) << 18) |
+            ((uint32_t)(static_cast<unsigned char>(text[*pos + 1]) & 0x3Fu) << 12) |
+            ((uint32_t)(static_cast<unsigned char>(text[*pos + 2]) & 0x3Fu) << 6) |
+            (uint32_t)(static_cast<unsigned char>(text[*pos + 3]) & 0x3Fu);
+        *pos += 4;
+        return cp;
+    }
+    ++(*pos);
+    return c0;
+}
+
+static uint32_t byte_level_codepoint_for_byte(uint8_t b) {
+    if ((b >= 33u && b <= 126u) || (b >= 161u && b <= 172u) || (b >= 174u && b <= 255u)) {
+        return b;
+    }
+    uint32_t n = 0;
+    for (uint32_t x = 0; x < b; ++x) {
+        if (!((x >= 33u && x <= 126u) || (x >= 161u && x <= 172u) || (x >= 174u && x <= 255u))) {
+            ++n;
+        }
+    }
+    return 256u + n;
+}
+
+static int byte_level_byte_for_codepoint(uint32_t cp, uint8_t* out) {
+    if (!out) return 0;
+    if ((cp >= 33u && cp <= 126u) || (cp >= 161u && cp <= 172u) || (cp >= 174u && cp <= 255u)) {
+        *out = static_cast<uint8_t>(cp);
+        return 1;
+    }
+    uint32_t n = 0;
+    for (uint32_t b = 0; b <= 255u; ++b) {
+        if ((b >= 33u && b <= 126u) || (b >= 161u && b <= 172u) || (b >= 174u && b <= 255u)) {
+            continue;
+        }
+        if (256u + n == cp) {
+            *out = static_cast<uint8_t>(b);
+            return 1;
+        }
+        ++n;
+    }
+    return 0;
+}
+
+static std::string byte_level_encode_text(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() * 2u);
+    for (unsigned char ch : text) {
+        append_utf8_codepoint(&out, byte_level_codepoint_for_byte(ch));
+    }
+    return out;
+}
+
+static std::string byte_level_decode_text(const std::string& encoded) {
+    std::string bytes;
+    bytes.reserve(encoded.size());
+    size_t pos = 0;
+    while (pos < encoded.size()) {
+        const size_t before = pos;
+        const uint32_t cp = utf8_next_codepoint(encoded, &pos);
+        uint8_t b = 0;
+        if (byte_level_byte_for_codepoint(cp, &b)) {
+            bytes.push_back(static_cast<char>(b));
+        } else {
+            bytes.append(encoded, before, pos - before);
+        }
+    }
+    return bytes;
+}
+
+static bool utf8_next_symbol(const std::string& text, size_t* pos, std::string* out) {
+    if (!pos || !out || *pos >= text.size()) return false;
+    const size_t start = *pos;
+    (void)utf8_next_codepoint(text, pos);
+    out->assign(text.data() + start, *pos - start);
+    return true;
+}
+
+static bool utf8_symbol_is_ascii_space(const std::string& symbol) {
+    return symbol.size() == 1u && std::isspace(static_cast<unsigned char>(symbol[0]));
+}
+
+static bool utf8_symbol_is_word_char(const std::string& symbol) {
+    if (symbol.size() != 1u) {
+        return true;
+    }
+    const unsigned char ch = static_cast<unsigned char>(symbol[0]);
+    return std::isalnum(ch) != 0;
+}
+
+static std::vector<std::string> bytelevel_pretokenize_text(const std::string& text) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t token_start = pos;
+        std::string symbol;
+        if (!utf8_next_symbol(text, &pos, &symbol)) {
+            break;
+        }
+        const bool leading_space = utf8_symbol_is_ascii_space(symbol);
+        if (leading_space) {
+            if (pos >= text.size()) {
+                out.push_back(symbol);
+                break;
+            }
+            size_t next_pos = pos;
+            std::string next_symbol;
+            if (!utf8_next_symbol(text, &next_pos, &next_symbol)) {
+                out.push_back(symbol);
+                break;
+            }
+            if (utf8_symbol_is_ascii_space(next_symbol)) {
+                while (next_pos < text.size()) {
+                    size_t peek_pos = next_pos;
+                    std::string peek;
+                    if (!utf8_next_symbol(text, &peek_pos, &peek) || !utf8_symbol_is_ascii_space(peek)) {
+                        break;
+                    }
+                    next_pos = peek_pos;
+                }
+                out.emplace_back(text.data() + token_start, next_pos - token_start);
+                pos = next_pos;
+                continue;
+            }
+            pos = next_pos;
+            symbol = next_symbol;
+        }
+
+        const bool word_run = utf8_symbol_is_word_char(symbol);
+        while (pos < text.size()) {
+            size_t peek_pos = pos;
+            std::string peek;
+            if (!utf8_next_symbol(text, &peek_pos, &peek)) {
+                break;
+            }
+            if (utf8_symbol_is_ascii_space(peek) || utf8_symbol_is_word_char(peek) != word_run) {
+                break;
+            }
+            pos = peek_pos;
+        }
+        out.emplace_back(text.data() + token_start, pos - token_start);
+    }
+    return out;
+}
+
+static std::string tokenizer_piece_to_text(const std::string& raw, bool byte_level) {
+    if (raw.empty()) return "";
+    if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') {
+        return "";
+    }
+    if (byte_level) {
+        return byte_level_decode_text(raw);
+    }
+    std::string out;
+    for (size_t i = 0; i < raw.size();) {
+        if (i + 2 <= raw.size() &&
+            static_cast<unsigned char>(raw[i]) == 0xC4u &&
+            static_cast<unsigned char>(raw[i + 1]) == 0xA0u) {
+            out.push_back(' ');
+            i += 2;
+            continue;
+        }
+        if (i + 2 <= raw.size() &&
+            static_cast<unsigned char>(raw[i]) == 0xC4u &&
+            static_cast<unsigned char>(raw[i + 1]) == 0x8Au) {
+            out.push_back('\n');
+            i += 2;
+            continue;
+        }
+        if (i + 3 <= raw.size() &&
+            static_cast<unsigned char>(raw[i]) == 0xE2u &&
+            static_cast<unsigned char>(raw[i + 1]) == 0x96u &&
+            static_cast<unsigned char>(raw[i + 2]) == 0x81u) {
+            out.push_back(' ');
+            i += 3;
+            continue;
+        }
+        if (raw.compare(i, 4, "</w>") == 0) {
+            i += 4;
+            continue;
+        }
+        out.push_back(raw[i++]);
+    }
+    return out;
+}
+
+static size_t json_find_matching(const std::string& text, size_t open_pos, char open_ch, char close_ch) {
+    if (open_pos >= text.size() || text[open_pos] != open_ch) return std::string::npos;
+    int depth = 0;
+    bool in_string = false;
+    bool escape = false;
+    for (size_t i = open_pos; i < text.size(); ++i) {
+        const char ch = text[i];
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (ch == '\\') {
+                escape = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (ch == '"') {
+            in_string = true;
+        } else if (ch == open_ch) {
+            ++depth;
+        } else if (ch == close_ch) {
+            --depth;
+            if (depth == 0) return i;
+        }
+    }
+    return std::string::npos;
+}
+
+static bool json_find_key_object_range(
+    const std::string& text,
+    const char* key,
+    size_t start,
+    size_t* out_begin,
+    size_t* out_end
+) {
+    if (!key || !out_begin || !out_end) return false;
+    const std::string needle = std::string("\"") + key + "\"";
+    const size_t pos = text.find(needle, start);
+    const size_t colon = pos == std::string::npos ? pos : text.find(':', pos + needle.size());
+    const size_t begin = colon == std::string::npos ? colon : text.find('{', colon + 1);
+    if (begin == std::string::npos) return false;
+    const size_t end = json_find_matching(text, begin, '{', '}');
+    if (end == std::string::npos) return false;
+    *out_begin = begin;
+    *out_end = end;
+    return true;
+}
+
+static bool json_find_key_array_range(
+    const std::string& text,
+    const char* key,
+    size_t start,
+    size_t* out_begin,
+    size_t* out_end
+) {
+    if (!key || !out_begin || !out_end) return false;
+    const std::string needle = std::string("\"") + key + "\"";
+    const size_t pos = text.find(needle, start);
+    const size_t colon = pos == std::string::npos ? pos : text.find(':', pos + needle.size());
+    const size_t begin = colon == std::string::npos ? colon : text.find('[', colon + 1);
+    if (begin == std::string::npos) return false;
+    const size_t end = json_find_matching(text, begin, '[', ']');
+    if (end == std::string::npos) return false;
+    *out_begin = begin;
+    *out_end = end;
+    return true;
+}
+
+static bool json_read_u32_in_range(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    uint32_t* out
+) {
+    if (!key || !out || begin >= end || end > text.size()) return false;
+    const std::string needle = std::string("\"") + key + "\"";
+    const size_t pos = text.find(needle, begin);
+    if (pos == std::string::npos || pos >= end) return false;
+    const size_t colon = text.find(':', pos + needle.size());
+    if (colon == std::string::npos || colon >= end) return false;
+    char* parse_end = nullptr;
+    const unsigned long value = std::strtoul(text.c_str() + colon + 1, &parse_end, 10);
+    if (!parse_end || parse_end == text.c_str() + colon + 1) return false;
+    // BUGFIX 458: strtoul 결과 범위 체크
+    if (value > UINT32_MAX) return false;
+    *out = static_cast<uint32_t>(value);
+    return true;
+}
+
+static bool json_read_double_at(
+    const std::string& text,
+    size_t pos,
+    size_t end,
+    double* out,
+    size_t* next
+) {
+    if (!out || pos >= end || end > text.size()) return false;
+    while (pos < end && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+    char* parse_end = nullptr;
+    const double value = std::strtod(text.c_str() + pos, &parse_end);
+    if (!parse_end || parse_end == text.c_str() + pos) return false;
+    if (parse_end < text.c_str() || static_cast<size_t>(parse_end - text.c_str()) > end) return false;
+    *out = value;
+    if (next) *next = static_cast<size_t>(parse_end - text.c_str());
+    return std::isfinite(value);
+}
+
+static bool json_read_string_in_range(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    std::string* out
+) {
+    if (!key || !out || begin >= end || end > text.size()) return false;
+    const std::string needle = std::string("\"") + key + "\"";
+    const size_t pos = text.find(needle, begin);
+    if (pos == std::string::npos || pos >= end) return false;
+    const size_t colon = text.find(':', pos + needle.size());
+    const size_t quote = colon == std::string::npos ? colon : text.find('"', colon + 1);
+    if (quote == std::string::npos || quote >= end) return false;
+    return parse_json_string_at(text, quote, out, nullptr);
+}
+
+static bool json_read_bool_in_range(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    bool* out
+) {
+    if (!key || !out || begin >= end || end > text.size()) return false;
+    const std::string needle = std::string("\"") + key + "\"";
+    const size_t pos = text.find(needle, begin);
+    if (pos == std::string::npos || pos >= end) return false;
+    size_t p = text.find(':', pos + needle.size());
+    if (p == std::string::npos || p >= end) return false;
+    ++p;
+    while (p < end && std::isspace(static_cast<unsigned char>(text[p]))) ++p;
+    if (p + 4 <= end && text.compare(p, 4, "true") == 0) {
+        *out = true;
+        return true;
+    }
+    if (p + 5 <= end && text.compare(p, 5, "false") == 0) {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+static std::string bpe_pair_key(const std::string& a, const std::string& b) {
+    std::string key;
+    key.reserve(a.size() + b.size() + 1u);
+    key += a;
+    key.push_back('\x1f');
+    key += b;
+    return key;
+}
+
+static bool tokenizer_load_replace_normalizer_object(
+    server_tokenizer* tok,
+    const std::string& json,
+    size_t obj_begin,
+    size_t obj_end
+) {
+    if (!tok || obj_begin >= obj_end || obj_end > json.size()) return false;
+    std::string type;
+    if (!json_read_string_in_range(json, obj_begin, obj_end, "type", &type) || type != "Replace") {
+        return false;
+    }
+
+    size_t pattern_begin = 0;
+    size_t pattern_end = 0;
+    std::string pattern;
+    std::string content;
+    if (!json_find_key_object_range(json, "pattern", obj_begin, &pattern_begin, &pattern_end) ||
+        pattern_begin >= obj_end || pattern_end > obj_end ||
+        !json_read_string_in_range(json, pattern_begin, pattern_end, "String", &pattern) ||
+        !json_read_string_in_range(json, obj_begin, obj_end, "content", &content) ||
+        pattern.empty()) {
+        return false;
+    }
+    tok->normalizer_replacements.emplace_back(pattern, content);
+    return true;
+}
+
+static void tokenizer_load_normalizer_config(server_tokenizer* tok, const std::string& json) {
+    if (!tok) return;
+    size_t norm_begin = 0;
+    size_t norm_end = 0;
+    if (!json_find_key_object_range(json, "normalizer", 0, &norm_begin, &norm_end)) {
+        return;
+    }
+
+    tokenizer_load_replace_normalizer_object(tok, json, norm_begin, norm_end);
+
+    size_t seq_begin = 0;
+    size_t seq_end = 0;
+    if (!json_find_key_array_range(json, "normalizers", norm_begin, &seq_begin, &seq_end) ||
+        seq_begin >= norm_end || seq_end > norm_end) {
+        return;
+    }
+    size_t p = seq_begin + 1;
+    while (p < seq_end) {
+        const size_t obj_begin = json.find('{', p);
+        if (obj_begin == std::string::npos || obj_begin >= seq_end) break;
+        const size_t obj_end = json_find_matching(json, obj_begin, '{', '}');
+        if (obj_end == std::string::npos || obj_end > seq_end) break;
+        tokenizer_load_replace_normalizer_object(tok, json, obj_begin, obj_end);
+        p = obj_end + 1;
+    }
+}
+
+static std::string replace_all_non_overlapping(
+    const std::string& text,
+    const std::string& from,
+    const std::string& to
+) {
+    if (from.empty()) return text;
+    std::string out;
+    out.reserve(text.size());
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t found = text.find(from, pos);
+        if (found == std::string::npos) {
+            out.append(text, pos, text.size() - pos);
+            break;
+        }
+        out.append(text, pos, found - pos);
+        out += to;
+        pos = found + from.size();
+    }
+    return out;
+}
+
+static std::string tokenizer_normalize_text(const server_tokenizer& tok, const std::string& text) {
+    std::string normalized = text;
+    for (const auto& replacement : tok.normalizer_replacements) {
+        normalized = replace_all_non_overlapping(normalized, replacement.first, replacement.second);
+    }
+    return normalized;
+}
+
+static bool tokenizer_emit_byte_fallback_piece(
+    const server_tokenizer& tok,
+    const std::string& piece,
+    std::vector<int32_t>* out_ids
+) {
+    if (!tok.byte_fallback || !out_ids) return false;
+    char token[8];
+    std::vector<int32_t> fallback_ids;
+    fallback_ids.reserve(piece.size());
+    for (unsigned char ch : piece) {
+        std::snprintf(token, sizeof(token), "<0x%02X>", static_cast<unsigned int>(ch));
+        auto it = tok.piece_to_id.find(token);
+        if (it == tok.piece_to_id.end()) {
+            return false;
+        }
+        fallback_ids.push_back(static_cast<int32_t>(it->second));
+    }
+    out_ids->insert(out_ids->end(), fallback_ids.begin(), fallback_ids.end());
+    return true;
+}
+
+static bool tokenizer_encode_bpe_piece(
+    const server_tokenizer& tok,
+    const std::string& encoded,
+    std::vector<int32_t>* out_ids
+) {
+    if (!out_ids || encoded.empty()) return false;
+    std::vector<std::string> word;
+    size_t p = 0;
+    std::string sym;
+    while (utf8_next_symbol(encoded, &p, &sym)) {
+        word.push_back(sym);
+    }
+    if (word.empty()) return false;
+
+    while (word.size() > 1u) {
+        uint32_t best_rank = UINT32_MAX;
+        size_t best_index = SIZE_MAX;
+        for (size_t i = 0; i + 1u < word.size(); ++i) {
+            auto it = tok.bpe_rank.find(bpe_pair_key(word[i], word[i + 1u]));
+            if (it != tok.bpe_rank.end() && it->second < best_rank) {
+                best_rank = it->second;
+                best_index = i;
+            }
+        }
+        if (best_index == SIZE_MAX) break;
+        std::vector<std::string> merged;
+        merged.reserve(word.size() - 1u);
+        for (size_t i = 0; i < word.size();) {
+            if (i == best_index && i + 1u < word.size()) {
+                merged.push_back(word[i] + word[i + 1u]);
+                i += 2u;
+            } else {
+                merged.push_back(word[i]);
+                ++i;
+            }
+        }
+        word.swap(merged);
+    }
+
+    for (const std::string& piece : word) {
+        auto it = tok.piece_to_id.find(piece);
+        if (it != tok.piece_to_id.end()) {
+            out_ids->push_back(static_cast<int32_t>(it->second));
+        } else if (!tokenizer_emit_byte_fallback_piece(tok, piece, out_ids)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool tokenizer_encode_unigram_candidate(
+    const server_tokenizer& tok,
+    const std::string& normalized_text,
+    std::vector<int32_t>* out_ids,
+    double* out_score
+) {
+    if (!out_ids || normalized_text.empty() || !tok.has_unigram) return false;
+    const size_t n = normalized_text.size();
+    const double neg_inf = -std::numeric_limits<double>::infinity();
+    std::vector<double> best(n + 1u, neg_inf);
+    std::vector<size_t> prev(n + 1u, SIZE_MAX);
+    std::vector<uint32_t> prev_id(n + 1u, 0);
+    best[0] = 0.0;
+    for (size_t pos = 0; pos < n; ++pos) {
+        if (!std::isfinite(best[pos])) continue;
+        const size_t max_len = std::min(tok.max_piece_bytes ? tok.max_piece_bytes : n, n - pos);
+        for (size_t len = 1; len <= max_len; ++len) {
+            const std::string piece = normalized_text.substr(pos, len);
+            uint32_t id = 0;
+            auto text_it = tok.text_to_id.find(piece);
+            if (text_it != tok.text_to_id.end()) {
+                id = text_it->second;
+            } else {
+                auto piece_it = tok.piece_to_id.find(piece);
+                if (piece_it == tok.piece_to_id.end()) {
+                    continue;
+                }
+                id = piece_it->second;
+            }
+            if (id > INT32_MAX) {
+                continue;
+            }
+            auto score_it = tok.unigram_score_by_piece.find(piece);
+            const double score = score_it == tok.unigram_score_by_piece.end() ? -10.0 : score_it->second;
+            const double candidate = best[pos] + score;
+            if (candidate > best[pos + len]) {
+                best[pos + len] = candidate;
+                prev[pos + len] = pos;
+                prev_id[pos + len] = id;
+            }
+        }
+    }
+    if (!std::isfinite(best[n])) {
+        return false;
+    }
+    std::vector<int32_t> reversed;
+    for (size_t pos = n; pos > 0;) {
+        if (prev[pos] == SIZE_MAX) return false;
+        reversed.push_back(static_cast<int32_t>(prev_id[pos]));
+        pos = prev[pos];
+    }
+    out_ids->insert(out_ids->end(), reversed.rbegin(), reversed.rend());
+    if (out_score) *out_score = best[n];
+    return !reversed.empty();
+}
+
+static bool tokenizer_encode_unigram_text(
+    const server_tokenizer& tok,
+    const std::string& text,
+    std::vector<int32_t>* out_ids
+) {
+    if (!out_ids || !tok.has_unigram) return false;
+    const std::string normalized_text = tokenizer_normalize_text(tok, text);
+    std::vector<int32_t> best_ids;
+    double best_score = -std::numeric_limits<double>::infinity();
+    std::vector<int32_t> candidate;
+    double score = -std::numeric_limits<double>::infinity();
+    if (tokenizer_encode_unigram_candidate(tok, normalized_text, &candidate, &score)) {
+        best_ids = candidate;
+        best_score = score;
+    }
+    if (!normalized_text.empty() && normalized_text[0] != ' ') {
+        candidate.clear();
+        score = -std::numeric_limits<double>::infinity();
+        if (tokenizer_encode_unigram_candidate(tok, std::string(" ") + normalized_text, &candidate, &score) &&
+            (!std::isfinite(best_score) || tok.add_space_prefix || score > best_score)) {
+            best_ids = candidate;
+            best_score = score;
+        }
+    }
+    if (best_ids.empty()) {
+        return false;
+    }
+    out_ids->insert(out_ids->end(), best_ids.begin(), best_ids.end());
+    return true;
+}
+
+static bool tokenizer_is_control_token_text(const std::string& piece) {
+    if (piece == "<bos>" || piece == "<eos>" || piece == "<pad>" || piece == "<unk>") {
+        return true;
+    }
+    if (piece.size() >= 3u && piece.rfind("<|", 0) == 0) {
+        return true;
+    }
+    if (piece.size() >= 3u && piece.find("|>") != std::string::npos) {
+        return true;
+    }
+    return false;
+}
+
+static void tokenizer_add_special_piece(server_tokenizer* tok, const std::string& piece, uint32_t id) {
+    if (!tok || piece.empty()) {
+        return;
+    }
+    for (auto& existing : tok->special_token_pieces) {
+        if (existing.first == piece) {
+            existing.second = id;
+            tok->special_ids.insert(id);
+            return;
+        }
+    }
+    tok->special_token_pieces.emplace_back(piece, id);
+    tok->special_ids.insert(id);
+    tok->max_special_piece_bytes = std::max(tok->max_special_piece_bytes, piece.size());
+}
+
+static void tokenizer_add_piece(server_tokenizer* tok, const std::string& raw_piece, uint32_t id) {
+    if (!tok) return;
+    tok->id_to_piece[id] = raw_piece;
+    tok->piece_to_id[raw_piece] = id;
+    tok->max_piece_bytes = std::max(tok->max_piece_bytes, raw_piece.size());
+    const std::string text_piece = tokenizer_piece_to_text(raw_piece, tok->byte_level);
+    tok->id_to_text[id] = text_piece;
+    if (!text_piece.empty()) {
+        tok->text_to_id.emplace(text_piece, id);
+        tok->max_piece_bytes = std::max(tok->max_piece_bytes, text_piece.size());
+    }
+    if (tokenizer_is_control_token_text(raw_piece)) {
+        tokenizer_add_special_piece(tok, raw_piece, id);
+    }
+    if (text_piece != raw_piece && tokenizer_is_control_token_text(text_piece)) {
+        tokenizer_add_special_piece(tok, text_piece, id);
+    }
+    const std::string lowered = lower_ascii(raw_piece);
+    if (!tok->has_bos && lowered.find("bos") != std::string::npos) {
+        tok->bos_token_id = id;
+        tok->has_bos = true;
+    }
+    if (!tok->has_unk && lowered.find("unk") != std::string::npos) {
+        tok->unk_token_id = id;
+        tok->has_unk = true;
+    }
+    if (!tok->has_eos && (lowered.find("eos") != std::string::npos ||
+                          lowered.find("end") != std::string::npos ||
+                          lowered.find("eot") != std::string::npos)) {
+        tok->eos_token_id = id;
+        tok->has_eos = true;
+    }
+}
+
+static void tokenizer_add_unigram_piece(server_tokenizer* tok, const std::string& raw_piece, uint32_t id, double score) {
+    if (!tok) return;
+    tokenizer_add_piece(tok, raw_piece, id);
+    tok->has_unigram = true;
+    tok->unigram_score_by_piece[raw_piece] = score;
+    const std::string text_piece = tokenizer_piece_to_text(raw_piece, tok->byte_level);
+    if (!text_piece.empty()) {
+        tok->unigram_score_by_piece[text_piece] = score;
+    }
+}
+
+static bool tokenizer_load_unigram_vocab_array(
+    server_tokenizer* tok,
+    const std::string& json,
+    size_t vocab_begin,
+    size_t vocab_end
+) {
+    if (!tok || vocab_begin >= vocab_end || vocab_end > json.size()) return false;
+    size_t pos = vocab_begin + 1u;
+    uint32_t id = 0;
+    uint32_t loaded = 0;
+    while (pos < vocab_end) {
+        while (pos < vocab_end && (std::isspace(static_cast<unsigned char>(json[pos])) || json[pos] == ',')) ++pos;
+        if (pos >= vocab_end) break;
+        const size_t entry_begin = json.find('[', pos);
+        if (entry_begin == std::string::npos || entry_begin >= vocab_end) break;
+        const size_t entry_end = json_find_matching(json, entry_begin, '[', ']');
+        if (entry_end == std::string::npos || entry_end > vocab_end) break;
+        std::string raw_piece;
+        size_t next = entry_begin + 1u;
+        while (next < entry_end && std::isspace(static_cast<unsigned char>(json[next]))) ++next;
+        if (next < entry_end && json[next] == '"' && parse_json_string_at(json, next, &raw_piece, &next)) {
+            const size_t comma = json.find(',', next);
+            double score = 0.0;
+            if (comma != std::string::npos && comma < entry_end) {
+                (void)json_read_double_at(json, comma + 1u, entry_end, &score, nullptr);
+            }
+            tokenizer_add_unigram_piece(tok, raw_piece, id, score);
+            ++loaded;
+        }
+        ++id;
+        pos = entry_end + 1u;
+    }
+    return loaded > 0;
+}
+
+static bool load_tokenizer_vocab(server_tokenizer* tok, const std::string& json) {
+    if (!tok) return false;
+    tok->byte_level = json.find("\"ByteLevel\"") != std::string::npos;
+    tokenizer_load_normalizer_config(tok, json);
+
+    size_t model_begin = 0;
+    size_t model_end = json.size();
+    size_t tmp_begin = 0;
+    size_t tmp_end = 0;
+    if (json_find_key_object_range(json, "model", 0, &tmp_begin, &tmp_end)) {
+        model_begin = tmp_begin;
+        model_end = tmp_end;
+        (void)json_read_string_in_range(json, model_begin, model_end, "type", &tok->model_type);
+        (void)json_read_bool_in_range(json, model_begin, model_end, "byte_fallback", &tok->byte_fallback);
+    }
+
+    size_t lbrace = 0;
+    size_t rbrace = 0;
+    const bool vocab_is_object =
+        json_find_key_object_range(json, "vocab", model_begin, &lbrace, &rbrace) &&
+        lbrace < model_end && rbrace <= model_end;
+    if (vocab_is_object) {
+        size_t p = lbrace + 1;
+        while (p < rbrace) {
+            while (p < rbrace && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
+            if (p >= rbrace) break;
+            if (json[p] != '"') {
+                ++p;
+                continue;
+            }
+            std::string raw_piece;
+            size_t next = p;
+            if (!parse_json_string_at(json, p, &raw_piece, &next)) {
+                ++p;
+                continue;
+            }
+            p = next;
+            while (p < rbrace && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
+            if (p >= rbrace || json[p] != ':') {
+                continue;
+            }
+            ++p;
+            while (p < rbrace && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
+            char* end = nullptr;
+            const char* value_begin = json.c_str() + p;
+            const long id_long = std::strtol(value_begin, &end, 10);
+        // BUGFIX 459: strtol 결과 범위 체크
+            if (!end || end == value_begin || id_long < 0 || id_long > UINT32_MAX) {
+                if (end && end > value_begin && static_cast<size_t>(end - json.c_str()) <= rbrace) {
+                    p = static_cast<size_t>(end - json.c_str());
+                } else {
+                    ++p;
+                }
+                continue;
+            }
+        // BUGFIX 460: end - json.c_str() overflow 체크
+            if (end < json.c_str() || static_cast<size_t>(end - json.c_str()) > rbrace) {
+                ++p;
+                continue;
+            }
+            p = (size_t)(end - json.c_str());
+            tokenizer_add_piece(tok, raw_piece, (uint32_t)id_long);
+        }
+    } else if (json_find_key_array_range(json, "vocab", model_begin, &lbrace, &rbrace) &&
+               lbrace < model_end && rbrace <= model_end) {
+        if (!tokenizer_load_unigram_vocab_array(tok, json, lbrace, rbrace)) {
+            tok->error = "tokenizer.json model.vocab array parse produced no usable pieces";
+            return false;
+        }
+    } else {
+        tok->error = "tokenizer.json does not expose model.vocab";
+        return false;
+    }
+
+    size_t added_begin = 0;
+    size_t added_end = 0;
+    if (json_find_key_array_range(json, "added_tokens", 0, &added_begin, &added_end)) {
+        size_t ap = added_begin + 1;
+        while (ap < added_end) {
+            const size_t obj_begin = json.find('{', ap);
+            if (obj_begin == std::string::npos || obj_begin >= added_end) break;
+            const size_t obj_end = json_find_matching(json, obj_begin, '{', '}');
+            if (obj_end == std::string::npos || obj_end > added_end) break;
+            uint32_t id = 0;
+            std::string content;
+            bool special = false;
+            if (json_read_u32_in_range(json, obj_begin, obj_end, "id", &id) &&
+                json_read_string_in_range(json, obj_begin, obj_end, "content", &content)) {
+                (void)json_read_bool_in_range(json, obj_begin, obj_end, "special", &special);
+                tokenizer_add_piece(tok, content, id);
+                if (special || tokenizer_is_control_token_text(content)) {
+                    tokenizer_add_special_piece(tok, content, id);
+                }
+            }
+            ap = obj_end + 1;
+        }
+    }
+
+    size_t merges_begin = 0;
+    size_t merges_end = 0;
+    if (json_find_key_array_range(json, "merges", model_begin, &merges_begin, &merges_end) && merges_begin < model_end) {
+        uint32_t rank = 0;
+        size_t mp = merges_begin + 1;
+        while (mp < merges_end) {
+            while (mp < merges_end && (std::isspace(static_cast<unsigned char>(json[mp])) || json[mp] == ',')) ++mp;
+            if (mp >= merges_end) break;
+            std::string left;
+            std::string right;
+            if (json[mp] == '"') {
+                std::string merge;
+                size_t next = mp;
+                if (!parse_json_string_at(json, mp, &merge, &next)) break;
+                const size_t split = merge.find(' ');
+                if (split != std::string::npos) {
+                    left = merge.substr(0, split);
+                    right = merge.substr(split + 1);
+                }
+                mp = next;
+            } else if (json[mp] == '[') {
+                const size_t arr_end = json_find_matching(json, mp, '[', ']');
+                if (arr_end == std::string::npos || arr_end > merges_end) break;
+                size_t sp = mp + 1;
+                while (sp < arr_end && json[sp] != '"') ++sp;
+                size_t next = sp;
+                if (sp < arr_end) parse_json_string_at(json, sp, &left, &next);
+                sp = next;
+                while (sp < arr_end && json[sp] != '"') ++sp;
+                next = sp;
+                if (sp < arr_end) parse_json_string_at(json, sp, &right, &next);
+                mp = arr_end + 1;
+            } else {
+                ++mp;
+                continue;
+            }
+            if (!left.empty() || !right.empty()) {
+                tok->bpe_rank.emplace(bpe_pair_key(left, right), rank++);
+            }
+        }
+        tok->has_merges = !tok->bpe_rank.empty();
+    }
+
+    std::sort(tok->special_token_pieces.begin(), tok->special_token_pieces.end(),
+        [](const std::pair<std::string, uint32_t>& a, const std::pair<std::string, uint32_t>& b) {
+            if (a.first.size() != b.first.size()) {
+                return a.first.size() > b.first.size();
+            }
+            return a.first < b.first;
+        });
+    tok->loaded = !tok->id_to_piece.empty() && !tok->piece_to_id.empty();
+    if (!tok->loaded) {
+        tok->error = "tokenizer vocab parse produced no usable pieces";
+    }
+    return tok->loaded;
+}
+
+static void tokenizer_apply_runtime_config(server_tokenizer* tok, const std::string& json) {
+    if (!tok || json.empty()) {
+        return;
+    }
+    bool add_bos = false;
+    bool add_eos = false;
+    bool add_space = false;
+    if (json_read_bool_in_range(json, 0, json.size(), "add_bos_token", &add_bos) ||
+        json_read_bool_in_range(json, 0, json.size(), "tokenizer_add_bos_token", &add_bos) ||
+        json_read_bool_in_range(json, 0, json.size(), "tokenizer.ggml.add_bos_token", &add_bos)) {
+        tok->add_bos_token = add_bos;
+        tok->add_bos_token_explicit = true;
+    }
+    if (json_read_bool_in_range(json, 0, json.size(), "add_eos_token", &add_eos) ||
+        json_read_bool_in_range(json, 0, json.size(), "tokenizer_add_eos_token", &add_eos) ||
+        json_read_bool_in_range(json, 0, json.size(), "tokenizer.ggml.add_eos_token", &add_eos)) {
+        tok->add_eos_token = add_eos;
+    }
+    if (json_read_bool_in_range(json, 0, json.size(), "add_space_prefix", &add_space) ||
+        json_read_bool_in_range(json, 0, json.size(), "tokenizer_add_space_prefix", &add_space) ||
+        json_read_bool_in_range(json, 0, json.size(), "add_prefix_space", &add_space) ||
+        json_read_bool_in_range(json, 0, json.size(), "tokenizer.ggml.add_space_prefix", &add_space)) {
+        tok->add_space_prefix = add_space;
+    }
+    uint32_t bos_id = 0;
+    if (json_read_u32_in_range(json, 0, json.size(), "bos_token_id", &bos_id) ||
+        json_read_u32_in_range(json, 0, json.size(), "tokenizer.ggml.bos_token_id", &bos_id)) {
+        tok->bos_token_id = bos_id;
+        tok->has_bos = true;
+    }
+    uint32_t eos_id = 0;
+    if (json_read_u32_in_range(json, 0, json.size(), "eos_token_id", &eos_id) ||
+        json_read_u32_in_range(json, 0, json.size(), "tokenizer.ggml.eos_token_id", &eos_id)) {
+        tok->eos_token_id = eos_id;
+        tok->has_eos = true;
+    }
+    uint32_t unk_id = 0;
+    if (json_read_u32_in_range(json, 0, json.size(), "unk_token_id", &unk_id) ||
+        json_read_u32_in_range(json, 0, json.size(), "unknown_token_id", &unk_id) ||
+        json_read_u32_in_range(json, 0, json.size(), "tokenizer.ggml.unknown_token_id", &unk_id)) {
+        tok->unk_token_id = unk_id;
+        tok->has_unk = true;
+    }
+    std::string bos_piece;
+    if (json_read_string_value(json, "bos_token", &bos_piece) && !bos_piece.empty()) {
+        auto pit = tok->piece_to_id.find(bos_piece);
+        if (pit != tok->piece_to_id.end()) {
+            tok->bos_token_id = pit->second;
+            tok->has_bos = true;
+        } else {
+            auto tit = tok->text_to_id.find(bos_piece);
+            if (tit != tok->text_to_id.end()) {
+                tok->bos_token_id = tit->second;
+                tok->has_bos = true;
+            }
+        }
+    }
+    if (!tok->has_bos) {
+        auto it = tok->piece_to_id.find("<bos>");
+        if (it != tok->piece_to_id.end()) {
+            tok->bos_token_id = it->second;
+            tok->has_bos = true;
+        }
+    }
+    std::string tokenizer_class;
+    std::string model_type;
+    std::string tokenizer_model;
+    std::string tokenizer_pre;
+    (void)json_read_string_in_range(json, 0, json.size(), "tokenizer_class", &tokenizer_class);
+    (void)json_read_string_in_range(json, 0, json.size(), "model_type", &model_type);
+    (void)json_read_string_in_range(json, 0, json.size(), "tokenizer_model", &tokenizer_model);
+    (void)json_read_string_in_range(json, 0, json.size(), "tokenizer.ggml.model", &tokenizer_model);
+    (void)json_read_string_in_range(json, 0, json.size(), "tokenizer_pre", &tokenizer_pre);
+    (void)json_read_string_in_range(json, 0, json.size(), "tokenizer.ggml.pre", &tokenizer_pre);
+    auto lower_contains = [](const std::string& s, const char* needle) {
+        if (!needle || !*needle) {
+            return false;
+        }
+        std::string lower = s;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+            return (char)std::tolower(c);
+        });
+        return lower.find(needle) != std::string::npos;
+    };
+    if (!tok->add_bos_token_explicit && tok->has_bos) {
+        const bool bpe_like =
+            lower_contains(tokenizer_model, "gpt") ||
+            lower_contains(tokenizer_model, "bpe") ||
+            lower_contains(tokenizer_model, "tiktoken") ||
+            lower_contains(tokenizer_model, "qwen") ||
+            lower_contains(tokenizer_pre, "gpt") ||
+            lower_contains(tokenizer_pre, "bpe") ||
+            lower_contains(tokenizer_pre, "tiktoken") ||
+            lower_contains(tokenizer_pre, "qwen");
+        const bool sentencepiece_like =
+            tok->has_unigram ||
+            lower_contains(tokenizer_model, "llama") ||
+            lower_contains(tokenizer_model, "sentencepiece") ||
+            lower_contains(tokenizer_model, "spm") ||
+            lower_contains(tokenizer_model, "unigram") ||
+            lower_contains(tokenizer_class, "gemma") ||
+            lower_contains(model_type, "gemma");
+        if (sentencepiece_like && !bpe_like) {
+            tok->add_bos_token = true;
+        }
+    }
+}
+
+static void tokenizer_prepend_bos_if_needed(const server_tokenizer& tok, std::vector<int32_t>* ids) {
+    if (!ids || !tok.add_bos_token || !tok.has_bos) {
+        return;
+    }
+    if (!ids->empty() && ids->front() == static_cast<int32_t>(tok.bos_token_id)) {
+        return;
+    }
+    ids->insert(ids->begin(), static_cast<int32_t>(tok.bos_token_id));
+}
+
+static void tokenizer_append_eos_if_needed(const server_tokenizer& tok, std::vector<int32_t>* ids) {
+    if (!ids || !tok.add_eos_token || !tok.has_eos) {
+        return;
+    }
+    if (!ids->empty() && ids->back() == static_cast<int32_t>(tok.eos_token_id)) {
+        return;
+    }
+    ids->push_back(static_cast<int32_t>(tok.eos_token_id));
+}
+
+static server_tokenizer& get_server_tokenizer(const server_options& opts) {
+    static std::mutex mtx;
+    static server_tokenizer tok;
+    std::lock_guard<std::mutex> lock(mtx);
+    if (tok.attempted && tok.model_root == opts.model_root) {
+        return tok;
+    }
+    tok = server_tokenizer{};
+    tok.attempted = true;
+    tok.model_root = opts.model_root;
+    if (opts.model_root.empty()) {
+        tok.error = "model_root is required for tokenizer.json";
+        return tok;
+    }
+    std::string json;
+    const char* candidates[] = {
+        "tokenizer.json",
+        "tokenizer/tokenizer.json"
+    };
+    for (const char* rel : candidates) {
+        const std::string path = join_model_file(opts.model_root, rel);
+        if (read_text_file(path, &json) && !json.empty()) {
+            break;
+        }
+        json.clear();
+    }
+    if (json.empty()) {
+        tok.error = "tokenizer.json was not found under model_root or tokenizer/";
+        return tok;
+    }
+    load_tokenizer_vocab(&tok, json);
+    tok.tokenizer_hash = hex_u64(fnv1a64_bytes(json));
+    tokenizer_apply_runtime_config(&tok, json);
+    std::string tokenizer_config_fingerprint;
+    const char* config_candidates[] = {
+        "tokenizer_config.json",
+        "tokenizer/tokenizer_config.json",
+        "config.json",
+        "storagellm_runtime_contract.json",
+        "runtime_assets_manifest.json"
+    };
+    for (const char* rel : config_candidates) {
+        std::string config_json;
+        const std::string path = join_model_file(opts.model_root, rel);
+        if (read_text_file(path, &config_json) && !config_json.empty()) {
+            tokenizer_config_fingerprint.append(rel);
+            tokenizer_config_fingerprint.push_back('\0');
+            tokenizer_config_fingerprint.append(config_json);
+            tokenizer_config_fingerprint.push_back('\0');
+            tokenizer_apply_runtime_config(&tok, config_json);
+        }
+    }
+    if (!tokenizer_config_fingerprint.empty()) {
+        tok.tokenizer_config_hash = hex_u64(fnv1a64_bytes(tokenizer_config_fingerprint));
+    }
+    std::cerr << "[storagellm tokenizer] load"
+              << " loaded=" << (tok.loaded ? 1 : 0)
+              << " model_type=" << (tok.model_type.empty() ? "unknown" : tok.model_type)
+              << " byte_level=" << (tok.byte_level ? 1 : 0)
+              << " has_merges=" << (tok.has_merges ? 1 : 0)
+              << " has_unigram=" << (tok.has_unigram ? 1 : 0)
+              << " byte_fallback=" << (tok.byte_fallback ? 1 : 0)
+              << " pieces=" << tok.id_to_piece.size()
+              << " specials=" << tok.special_ids.size()
+              << " add_bos=" << (tok.add_bos_token ? 1 : 0)
+              << " add_eos=" << (tok.add_eos_token ? 1 : 0)
+              << " add_space_prefix=" << (tok.add_space_prefix ? 1 : 0)
+              << " has_bos=" << (tok.has_bos ? 1 : 0)
+              << " bos=" << tok.bos_token_id
+              << " has_eos=" << (tok.has_eos ? 1 : 0)
+              << " eos=" << tok.eos_token_id
+              << " has_unk=" << (tok.has_unk ? 1 : 0)
+              << " unk=" << tok.unk_token_id
+              << " error=" << (tok.error.empty() ? "-" : tok.error)
+              << "\n" << std::flush;
+    return tok;
+}
+
+static void log_token_ids_preview(
+    const char* tag,
+    const server_tokenizer& tok,
+    const std::vector<int32_t>& ids,
+    uint32_t first_target_index = UINT32_MAX
+) {
+    std::cerr << "[storagellm tokenizer] " << (tag ? tag : "tokens")
+              << " tokens=" << ids.size();
+    if (first_target_index != UINT32_MAX) {
+        std::cerr << " first_target_index=" << first_target_index;
+    }
+    std::cerr << " model_type=" << (tok.model_type.empty() ? "unknown" : tok.model_type)
+              << " byte_level=" << (tok.byte_level ? 1 : 0)
+              << " has_merges=" << (tok.has_merges ? 1 : 0)
+              << " ids=[";
+    const size_t limit = std::min<size_t>(ids.size(), 32u);
+    for (size_t i = 0; i < limit; ++i) {
+        if (i) {
+            std::cerr << ",";
+        }
+        std::cerr << ids[i];
+    }
+    std::cerr << "]";
+    if (ids.size() > limit) {
+        std::cerr << " truncated=1";
+    }
+    std::cerr << "\n" << std::flush;
+}
+
+static bool tokenizer_match_special_at(
+    const server_tokenizer& tok,
+    const std::string& text,
+    size_t pos,
+    uint32_t* out_id,
+    size_t* out_len
+) {
+    if (pos >= text.size()) {
+        return false;
+    }
+    const size_t remaining = text.size() - pos;
+    if (tok.max_special_piece_bytes == 0 || remaining == 0) {
+        return false;
+    }
+    for (const auto& item : tok.special_token_pieces) {
+        const std::string& piece = item.first;
+        if (piece.empty() || piece.size() > remaining) {
+            continue;
+        }
+        if (text.compare(pos, piece.size(), piece) == 0) {
+            if (out_id) {
+                *out_id = item.second;
+            }
+            if (out_len) {
+                *out_len = piece.size();
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool tokenizer_encode_regular_text(
+    const server_tokenizer& tok,
+    const std::string& text,
+    std::vector<int32_t>* out_ids
+) {
+    if (!out_ids || text.empty()) return true;
+    std::vector<int32_t> segment_ids;
+    if (tok.has_unigram) {
+        if (tokenizer_encode_unigram_text(tok, text, &segment_ids) && !segment_ids.empty()) {
+            out_ids->insert(out_ids->end(), segment_ids.begin(), segment_ids.end());
+            return true;
+        }
+        segment_ids.clear();
+    }
+
+    if (tok.byte_level && tok.has_merges) {
+        bool ok = true;
+        const std::string normalized_text = tokenizer_normalize_text(tok, text);
+        const std::vector<std::string> pretokens = bytelevel_pretokenize_text(normalized_text);
+        for (const std::string& pretoken : pretokens) {
+            const std::string encoded = byte_level_encode_text(pretoken);
+            if (!tokenizer_encode_bpe_piece(tok, encoded, &segment_ids)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok && !segment_ids.empty()) {
+            out_ids->insert(out_ids->end(), segment_ids.begin(), segment_ids.end());
+            return true;
+        }
+        segment_ids.clear();
+    }
+
+    if (!tok.byte_level && tok.has_merges) {
+        const std::string normalized_text = tokenizer_normalize_text(tok, text);
+        if (tokenizer_encode_bpe_piece(tok, normalized_text, &segment_ids) && !segment_ids.empty()) {
+            out_ids->insert(out_ids->end(), segment_ids.begin(), segment_ids.end());
+            return true;
+        }
+        segment_ids.clear();
+    }
+
+    const std::string normalized_text = tokenizer_normalize_text(tok, text);
+    const std::string encoded_text = tok.byte_level ? byte_level_encode_text(normalized_text) : normalized_text;
+    size_t pos = 0;
+    while (pos < encoded_text.size()) {
+        const size_t max_len = std::min(tok.max_piece_bytes ? tok.max_piece_bytes : encoded_text.size(), encoded_text.size() - pos);
+        bool matched = false;
+        for (size_t len = max_len; len > 0; --len) {
+            auto it = tok.piece_to_id.find(encoded_text.substr(pos, len));
+            if (it != tok.piece_to_id.end()) {
+                segment_ids.push_back((int32_t)it->second);
+                pos += len;
+                matched = true;
+                break;
+            }
+            auto text_it = tok.text_to_id.find(encoded_text.substr(pos, len));
+            if (text_it != tok.text_to_id.end()) {
+                segment_ids.push_back((int32_t)text_it->second);
+                pos += len;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            if (tok.has_unk) {
+                segment_ids.push_back((int32_t)tok.unk_token_id);
+                size_t next = pos;
+                std::string ignored;
+                if (utf8_next_symbol(encoded_text, &next, &ignored) && next > pos) {
+                    pos = next;
+                } else {
+                    ++pos;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+    if (segment_ids.empty()) {
+        return false;
+    }
+    out_ids->insert(out_ids->end(), segment_ids.begin(), segment_ids.end());
+    return true;
+}
+
+static bool tokenizer_encode_greedy(const server_tokenizer& tok, const std::string& text, std::vector<int32_t>* out_ids) {
+    if (!tok.loaded || !out_ids) return false;
+    out_ids->clear();
+
+    size_t pos = 0;
+    while (pos < text.size()) {
+        uint32_t special_id = 0;
+        size_t special_len = 0;
+        if (tokenizer_match_special_at(tok, text, pos, &special_id, &special_len)) {
+            out_ids->push_back(static_cast<int32_t>(special_id));
+            pos += special_len;
+            continue;
+        }
+        size_t next = pos;
+        while (next < text.size()) {
+            uint32_t ignored_id = 0;
+            size_t ignored_len = 0;
+            if (tokenizer_match_special_at(tok, text, next, &ignored_id, &ignored_len)) {
+                break;
+            }
+            size_t advance = next;
+            std::string ignored;
+            if (utf8_next_symbol(text, &advance, &ignored) && advance > next) {
+                next = advance;
+            } else {
+                ++next;
+            }
+        }
+        if (next == pos) {
+            ++pos;
+            continue;
+        }
+        if (!tokenizer_encode_regular_text(tok, text.substr(pos, next - pos), out_ids)) {
+            return false;
+        }
+        pos = next;
+    }
+    tokenizer_prepend_bos_if_needed(tok, out_ids);
+    tokenizer_append_eos_if_needed(tok, out_ids);
+    return !out_ids->empty();
+}
+
+static std::string tokenizer_decode_ids(const server_tokenizer& tok, const std::vector<uint32_t>& ids) {
+    std::string pieces;
+    for (uint32_t id : ids) {
+        if (tok.special_ids.count(id)) {
+            continue;
+        }
+        auto raw_it = tok.id_to_piece.find(id);
+        if (raw_it != tok.id_to_piece.end()) {
+            pieces += raw_it->second;
+            continue;
+        }
+        auto text_it = tok.id_to_text.find(id);
+        if (text_it != tok.id_to_text.end()) {
+            pieces += text_it->second;
+        } else {
+            pieces += "<token:";
+            pieces += std::to_string(id);
+            pieces += ">";
+        }
+    }
+    if (tok.byte_level) {
+        return byte_level_decode_text(pieces);
+    }
+    return tokenizer_piece_to_text(pieces, false);
+}
+
+struct server_chat_message {
+    std::string role;
+    std::string content;
+};
+
+static std::string trim_ascii_copy(const std::string& value) {
+    size_t begin = 0;
+    while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin]))) {
+        ++begin;
+    }
+    size_t end = value.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1u]))) {
+        --end;
+    }
+    return value.substr(begin, end - begin);
+}
+
+static bool parse_chat_messages(const std::string& body, std::vector<server_chat_message>* out) {
+    if (out) {
+        out->clear();
+    }
+    if (!out) {
+        return false;
+    }
+    size_t begin = 0;
+    size_t end = 0;
+    if (!json_find_key_array_range(body, "messages", 0, &begin, &end)) {
+        return false;
+    }
+    size_t pos = begin + 1u;
+    while (pos < end) {
+        const size_t obj_begin = body.find('{', pos);
+        if (obj_begin == std::string::npos || obj_begin >= end) {
+            break;
+        }
+        const size_t obj_end = json_find_matching(body, obj_begin, '{', '}');
+        if (obj_end == std::string::npos || obj_end > end) {
+            break;
+        }
+        server_chat_message message;
+        (void)json_read_string_in_range(body, obj_begin, obj_end, "role", &message.role);
+        if (!json_read_string_in_range(body, obj_begin, obj_end, "content", &message.content)) {
+            std::vector<std::string> text_items = json_collect_string_values(body.substr(obj_begin, obj_end - obj_begin + 1u), "text");
+            for (const std::string& item : text_items) {
+                if (!message.content.empty()) {
+                    message.content.push_back('\n');
+                }
+                message.content += item;
+            }
+        }
+        message.role = lower_ascii(trim_ascii_copy(message.role));
+        message.content = trim_ascii_copy(message.content);
+        if (!message.role.empty() || !message.content.empty()) {
+            out->push_back(std::move(message));
+        }
+        pos = obj_end + 1u;
+    }
+    return !out->empty();
+}
+
+static bool load_chat_template_text(const server_options& opts, std::string* out) {
+    if (out) {
+        out->clear();
+    }
+    if (!out || opts.model_root.empty()) {
+        return false;
+    }
+    const char* candidates[] = {
+        "chat_template.jinja",
+        "tokenizer/chat_template.jinja"
+    };
+    for (const char* rel : candidates) {
+        const std::string path = join_model_file(opts.model_root, rel);
+        if (read_text_file(path, out) && !out->empty() && out->size() <= (1u << 20)) {
+            return true;
+        }
+        out->clear();
+    }
+    const char* config_candidates[] = {
+        "tokenizer_config.json",
+        "tokenizer/tokenizer_config.json"
+    };
+    for (const char* rel : config_candidates) {
+        std::string json;
+        const std::string path = join_model_file(opts.model_root, rel);
+        if (read_text_file(path, &json) && !json.empty() && json.size() <= (4u << 20) &&
+            json_read_string_value(json, "chat_template", out) && !out->empty() &&
+            out->size() <= (1u << 20)) {
+            return true;
+        }
+        out->clear();
+    }
+    return false;
+}
+
+static size_t token_common_prefix_len(
+    const std::vector<int32_t>& a,
+    const std::vector<int32_t>& b
+) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) {
+        ++i;
+    }
+    return i;
+}
+
+static bool tokens_have_prefix(
+    const std::vector<int32_t>& value,
+    const std::vector<int32_t>& prefix
+) {
+    return prefix.size() <= value.size() &&
+        token_common_prefix_len(value, prefix) == prefix.size();
+}
+
+static std::string apply_sidecar_chat_template(
+    const server_options& opts,
+    const std::vector<server_chat_message>& messages,
+    bool add_generation_prompt,
+    bool enable_thinking
+) {
+    if (messages.empty()) {
+        return "";
+    }
+    std::string templ;
+    if (!load_chat_template_text(opts, &templ) ||
+        templ.find("<|turn>") == std::string::npos ||
+        templ.find("<turn|>") == std::string::npos) {
+        return "";
+    }
+
+    std::string prompt = "<bos>";
+    size_t first_loop_message = 0;
+    const std::string first_role = messages.empty() ? "" : messages[0].role;
+    const bool first_is_system = first_role == "system" || first_role == "developer";
+    if (enable_thinking || first_is_system) {
+        prompt += "<|turn>system\n";
+        if (enable_thinking) {
+            prompt += "<|think|>";
+        }
+        if (first_is_system) {
+            prompt += messages[0].content;
+            first_loop_message = 1;
+        }
+        prompt += "<turn|>\n";
+    }
+
+    for (size_t i = first_loop_message; i < messages.size(); ++i) {
+        const server_chat_message& message = messages[i];
+        std::string role = message.role;
+        if (role == "assistant") {
+            role = "model";
+        } else if (role == "developer") {
+            role = "system";
+        }
+        if (role.empty()) {
+            role = "user";
+        }
+        prompt += "<|turn>";
+        prompt += role;
+        prompt.push_back('\n');
+        prompt += message.content;
+        prompt += "<turn|>\n";
+    }
+    if (add_generation_prompt) {
+        prompt += "<|turn>model\n";
+        if (!enable_thinking &&
+            templ.find("<|channel>thought") != std::string::npos &&
+            templ.find("<channel|>") != std::string::npos) {
+            prompt += "<|channel>thought\n<channel|>";
+        }
+    }
+    return prompt;
+}
+
+static std::string extract_generation_text(
+    const server_options& opts,
+    const std::string& body,
+    bool default_add_generation_prompt
+) {
+    std::vector<server_chat_message> messages;
+    if (parse_chat_messages(body, &messages)) {
+        bool add_generation_prompt = default_add_generation_prompt;
+        bool enable_thinking = false;
+        (void)json_read_bool_in_range(body, 0, body.size(), "add_generation_prompt", &add_generation_prompt);
+        (void)json_read_bool_in_range(body, 0, body.size(), "enable_thinking", &enable_thinking);
+        const std::string templated = apply_sidecar_chat_template(
+            opts,
+            messages,
+            add_generation_prompt,
+            enable_thinking
+        );
+        if (!templated.empty()) {
+            std::cerr << "[storagellm request] chat_template applied messages=" << messages.size()
+                      << " input_chars=" << templated.size()
+                      << " add_generation_prompt=" << (add_generation_prompt ? 1 : 0)
+                      << " enable_thinking=" << (enable_thinking ? 1 : 0)
+                      << "\n" << std::flush;
+            return templated;
+        }
+        std::string prompt;
+        for (const server_chat_message& message : messages) {
+            if (!prompt.empty()) prompt += "\n";
+            prompt += message.content;
+        }
+        return prompt;
+    }
+    std::vector<std::string> contents = json_collect_string_values(body, "content");
+    if (!contents.empty()) {
+        std::string prompt;
+        for (const std::string& item : contents) {
+            if (!prompt.empty()) prompt += "\n";
+            prompt += item;
+        }
+        return prompt;
+    }
+    std::vector<std::string> text_items = json_collect_string_values(body, "text");
+    if (!text_items.empty()) {
+        std::string prompt;
+        for (const std::string& item : text_items) {
+            if (!prompt.empty()) prompt += "\n";
+            prompt += item;
+        }
+        return prompt;
+    }
+    std::string value;
+    if (json_read_string_value(body, "prompt", &value)) return value;
+    if (json_read_string_value(body, "input", &value)) return value;
+    return "";
+}
+
+static bool role_is_assistant_like(const std::string& role) {
+    return role == "assistant" || role == "model";
+}
+
+static bool body_requests_response_only_chat_eval(const std::string& body) {
+    std::vector<server_chat_message> messages;
+    if (!parse_chat_messages(body, &messages) || messages.size() < 2u) {
+        return false;
+    }
+    bool score_response_only = true;
+    (void)json_read_bool_in_range(body, 0, body.size(), "score_response_only", &score_response_only);
+    if (!score_response_only) {
+        return false;
+    }
+    const server_chat_message& last = messages.back();
+    return role_is_assistant_like(last.role) && !last.content.empty();
+}
+
+static bool encode_chat_response_only_eval(
+    const server_options& opts,
+    const server_tokenizer& tok,
+    const std::string& body,
+    std::vector<int32_t>* out_ids,
+    uint32_t* out_first_target_index
+) {
+    if (!out_ids || !out_first_target_index) {
+        return false;
+    }
+    std::vector<server_chat_message> messages;
+    if (!parse_chat_messages(body, &messages) || messages.size() < 2u) {
+        return false;
+    }
+    bool score_response_only = true;
+    (void)json_read_bool_in_range(body, 0, body.size(), "score_response_only", &score_response_only);
+    if (!score_response_only) {
+        return false;
+    }
+    const server_chat_message& last = messages.back();
+    if (!role_is_assistant_like(last.role) || last.content.empty()) {
+        return false;
+    }
+    bool enable_thinking = false;
+    (void)json_read_bool_in_range(body, 0, body.size(), "enable_thinking", &enable_thinking);
+    std::vector<server_chat_message> prompt_messages(messages.begin(), messages.end() - 1);
+    const std::string prompt = apply_sidecar_chat_template(opts, prompt_messages, true, enable_thinking);
+    if (prompt.empty()) {
+        return false;
+    }
+    std::vector<int32_t> prompt_ids;
+    std::vector<int32_t> full_ids;
+    if (!tokenizer_encode_greedy(tok, prompt, &prompt_ids) || prompt_ids.empty()) {
+        return false;
+    }
+
+    if (!tokenizer_encode_greedy(tok, prompt + last.content, &full_ids) ||
+        full_ids.size() <= prompt_ids.size() ||
+        !tokens_have_prefix(full_ids, prompt_ids)) {
+        const size_t common = token_common_prefix_len(full_ids, prompt_ids);
+        std::cerr << "[storagellm request] eval response_only_chat generation_prompt_rejected"
+                  << " reason=prompt_prefix_mismatch"
+                  << " prompt_tokens=" << prompt_ids.size()
+                  << " full_tokens=" << full_ids.size()
+                  << " common_prefix=" << common
+                  << "\n" << std::flush;
+        full_ids.clear();
+    } else {
+        *out_ids = std::move(full_ids);
+        *out_first_target_index = static_cast<uint32_t>(prompt_ids.size());
+        std::cerr << "[storagellm request] eval response_only_chat prompt_tokens="
+                  << prompt_ids.size()
+                  << " target_tokens=" << (out_ids->size() - prompt_ids.size())
+                  << " input_tokens=" << out_ids->size()
+                  << " template_mode=generation_prompt"
+                  << "\n" << std::flush;
+        return true;
+    }
+
+    const std::string full_templated = apply_sidecar_chat_template(opts, messages, false, enable_thinking);
+    if (!full_templated.empty()) {
+        const size_t content_pos = full_templated.rfind(last.content);
+        if (content_pos != std::string::npos) {
+            const std::string full_prefix = full_templated.substr(0, content_pos);
+            std::vector<int32_t> full_prefix_ids;
+            if (tokenizer_encode_greedy(tok, full_templated, &full_ids) &&
+                tokenizer_encode_greedy(tok, full_prefix, &full_prefix_ids) &&
+                !full_prefix_ids.empty() &&
+                full_ids.size() > full_prefix_ids.size() &&
+                tokens_have_prefix(full_ids, full_prefix_ids)) {
+                *out_ids = std::move(full_ids);
+                *out_first_target_index = static_cast<uint32_t>(full_prefix_ids.size());
+                std::cerr << "[storagellm request] eval response_only_chat prompt_tokens="
+                          << full_prefix_ids.size()
+                          << " target_tokens=" << (out_ids->size() - full_prefix_ids.size())
+                          << " input_tokens=" << out_ids->size()
+                          << " template_mode=full_messages_fallback"
+                          << " generation_prompt_tokens=" << prompt_ids.size()
+                          << "\n" << std::flush;
+                return true;
+            }
+        }
+    }
+
+    std::cerr << "[storagellm request] eval response_only_chat rejected"
+              << " reason=no_template_token_prefix"
+              << " prompt_tokens=" << prompt_ids.size()
+              << "\n" << std::flush;
+    return false;
+}
+
+struct server_generation_result {
+    int ok = 0;
+    int http_status = 200;
+    std::string text;
+    std::string error_code;
+    std::string error_message;
+    uint32_t prompt_tokens = 0;
+    uint32_t completion_tokens = 0;
+    std::string finish_reason = "stop";
+};
+
+static server_generation_result run_server_generation(
+    moe_pc_engine_t* engine,
+    std::mutex* engine_mutex,
+    const server_options& opts,
+    const std::string& body
+) {
+    const auto request_start = std::chrono::steady_clock::now();
+    server_generation_result result;
+    std::vector<int> request_ids = storagellm::json_read_int_array(body, "input_ids");
+    std::vector<int32_t> input_ids;
+    server_tokenizer& tok = get_server_tokenizer(opts);
+    if (!request_ids.empty()) {
+        input_ids.reserve(request_ids.size());
+        for (int id : request_ids) {
+            input_ids.push_back((int32_t)id);
+        }
+    } else {
+        const std::string text = extract_generation_text(opts, body, true);
+        if (text.empty()) {
+            result.http_status = 400;
+            result.error_code = "invalid_request_error";
+            result.error_message = "OpenAI request must include messages/content, prompt, input, or input_ids";
+            std::cerr << "[storagellm request] reject reason=missing_input ms="
+                      << elapsed_ms_since(request_start) << "\n" << std::flush;
+            return result;
+        }
+        if (!tok.loaded) {
+            result.http_status = 503;
+            result.error_code = "tokenizer_unavailable";
+            result.error_message = tok.error.empty() ? "tokenizer.json is not loaded" : tok.error;
+            std::cerr << "[storagellm request] reject reason=tokenizer_unavailable ms="
+                      << elapsed_ms_since(request_start) << " error=" << result.error_message
+                      << "\n" << std::flush;
+            return result;
+        }
+        const auto tokenize_start = std::chrono::steady_clock::now();
+        if (!tokenizer_encode_greedy(tok, text, &input_ids)) {
+            result.http_status = 422;
+            result.error_code = "tokenization_failed";
+            result.error_message = "tokenizer vocab could not encode the request text";
+            std::cerr << "[storagellm request] reject reason=tokenization_failed input_chars="
+                      << text.size() << " ms=" << elapsed_ms_since(request_start)
+                      << "\n" << std::flush;
+            return result;
+        }
+        std::cerr << "[storagellm request] tokenize input_chars=" << text.size()
+                  << " tokens=" << input_ids.size()
+                  << " ms=" << elapsed_ms_since(tokenize_start)
+                  << "\n" << std::flush;
+    }
+    log_token_ids_preview("generation_input_ids", tok, input_ids);
+
+    int max_tokens = 128;
+    int parsed = 0;
+    if (storagellm::json_read_int(body, "max_output_tokens", &parsed) && parsed > 0) {
+        max_tokens = parsed;
+    } else if (storagellm::json_read_int(body, "max_completion_tokens", &parsed) && parsed > 0) {
+        max_tokens = parsed;
+    } else if (storagellm::json_read_int(body, "max_tokens", &parsed) && parsed > 0) {
+        max_tokens = parsed;
+    }
+    if (max_tokens > 4096) max_tokens = 4096;
+
+    std::vector<uint32_t> out_ids((size_t)max_tokens);
+    moe_generation_config_t cfg{};
+    cfg.max_new_tokens = (uint32_t)max_tokens;
+    cfg.stop_on_eos = tok.has_eos ? 1 : 0;
+    cfg.eos_token_id = tok.eos_token_id;
+    moe_generation_stats_t stats{};
+    int generated = 0;
+    std::cerr << "[storagellm request] generation begin input_tokens=" << input_ids.size()
+              << " max_tokens=" << max_tokens
+              << " body_bytes=" << body.size()
+              << resource_log_suffix()
+              << "\n" << std::flush;
+    log_engine_snapshot("generation_engine_begin", engine);
+    const auto generation_start = std::chrono::steady_clock::now();
+    if (engine_mutex) {
+        std::lock_guard<std::mutex> lock(*engine_mutex);
+        const auto prefetch_start = std::chrono::steady_clock::now();
+        server_orchestrate_request_prefetch(engine, opts, body);
+        std::cerr << "[storagellm request] prefetch_orchestrate ms="
+                  << elapsed_ms_since(prefetch_start)
+                  << resource_log_suffix() << "\n" << std::flush;
+        generated = moe_pc_engine_generate_token_ids(
+            engine,
+            input_ids.data(),
+            static_cast<uint32_t>(input_ids.size()),
+            &cfg,
+            out_ids.data(),
+            static_cast<uint32_t>(out_ids.size()),
+            &stats
+        );
+    } else {
+        generated = moe_pc_engine_generate_token_ids(
+            engine,
+            input_ids.data(),
+            static_cast<uint32_t>(input_ids.size()),
+            &cfg,
+            out_ids.data(),
+            static_cast<uint32_t>(out_ids.size()),
+            &stats
+        );
+    }
+    const double generation_ms = elapsed_ms_since(generation_start);
+    if (!generated) {
+        result.http_status = 503;
+        result.error_code = "generation_not_ready";
+        result.error_message = stats.error[0] ? stats.error : "generation failed";
+        std::cerr << "[storagellm request] generation failed input_tokens=" << input_ids.size()
+                  << " max_tokens=" << max_tokens
+                  << " generation_ms=" << generation_ms
+                  << " total_ms=" << elapsed_ms_since(request_start)
+                  << " error=" << result.error_message
+                  << resource_log_suffix()
+                  << "\n" << std::flush;
+        log_engine_snapshot("generation_engine_failed", engine);
+        return result;
+    }
+    out_ids.resize(stats.completion_tokens);
+    result.ok = 1;
+    result.prompt_tokens = stats.prompt_tokens;
+    result.completion_tokens = stats.completion_tokens;
+    result.finish_reason = stats.finish_reason == 1u ? "length" : "stop";
+    const auto decode_text_start = std::chrono::steady_clock::now();
+    result.text = tok.loaded ? tokenizer_decode_ids(tok, out_ids) : tokenizer_decode_ids(server_tokenizer{}, out_ids);
+    std::cerr << "[storagellm request] generation ok prompt_tokens=" << result.prompt_tokens
+              << " completion_tokens=" << result.completion_tokens
+              << " finish_reason=" << result.finish_reason
+              << " last_logit=" << stats.last_logit
+              << " generation_ms=" << generation_ms
+              << " decode_text_ms=" << elapsed_ms_since(decode_text_start)
+              << " total_ms=" << elapsed_ms_since(request_start)
+              << resource_log_suffix()
+              << "\n" << std::flush;
+    log_engine_snapshot("generation_engine_end", engine);
+    return result;
+}
+
+struct server_eval_result {
+    int ok = 0;
+    int http_status = 200;
+    std::string error_code;
+    std::string error_message;
+    uint32_t input_tokens = 0;
+    uint32_t evaluated_tokens = 0;
+    double nll = 0.0;
+    double mean_nll = 0.0;
+    double perplexity = 0.0;
+    uint32_t first_target_index = 1;
+    std::vector<int32_t> input_ids_preview;
+    std::string kv_backend;
+    uint32_t qkv_forced_by_format = 0;
+    std::string tokenizer_hash;
+    std::string tokenizer_config_hash;
+    std::string chat_template_hash;
+    bool tokenizer_add_bos = false;
+    bool tokenizer_add_eos = false;
+    bool tokenizer_add_space_prefix = false;
+    bool tokenizer_has_bos = false;
+    bool tokenizer_has_eos = false;
+    uint32_t tokenizer_bos_id = 0;
+    uint32_t tokenizer_eos_id = 0;
+};
+
+static server_eval_result run_server_eval(
+    moe_pc_engine_t* engine,
+    std::mutex* engine_mutex,
+    const server_options& opts,
+    const std::string& body
+) {
+    server_eval_result result;
+    std::vector<int> request_ids = storagellm::json_read_int_array(body, "input_ids");
+    std::vector<int32_t> input_ids;
+    uint32_t first_target_index = 1u;
+    server_tokenizer& tok = get_server_tokenizer(opts);
+    result.tokenizer_hash = tok.tokenizer_hash;
+    result.tokenizer_config_hash = tok.tokenizer_config_hash;
+    result.tokenizer_add_bos = tok.add_bos_token;
+    result.tokenizer_add_eos = tok.add_eos_token;
+    result.tokenizer_add_space_prefix = tok.add_space_prefix;
+    result.tokenizer_has_bos = tok.has_bos;
+    result.tokenizer_has_eos = tok.has_eos;
+    result.tokenizer_bos_id = tok.bos_token_id;
+    result.tokenizer_eos_id = tok.eos_token_id;
+    std::string chat_template;
+    if (load_chat_template_text(opts, &chat_template) && !chat_template.empty()) {
+        result.chat_template_hash = hex_u64(fnv1a64_bytes(chat_template));
+    }
+    moe_pc_engine_stats_t engine_stats{};
+    if (moe_pc_engine_get_stats(engine, &engine_stats)) {
+        result.kv_backend = engine_stats.kv_mode == moe_KV_MODE_QKV ? "qkv_contract" : "plain_kv_cache";
+        result.qkv_forced_by_format = engine_stats.qkv_forced_by_format;
+    } else {
+        result.kv_backend = moe_pc_engine_get_kv_mode(engine) == moe_KV_MODE_QKV ? "qkv_contract" : "plain_kv_cache";
+    }
+    if (!request_ids.empty()) {
+        input_ids.reserve(request_ids.size());
+        for (int id : request_ids) {
+            input_ids.push_back((int32_t)id);
+        }
+        int parsed_first_target = 0;
+        if (storagellm::json_read_int(body, "first_target_index", &parsed_first_target) && parsed_first_target > 0) {
+            first_target_index = static_cast<uint32_t>(parsed_first_target);
+        }
+    } else if (body_requests_response_only_chat_eval(body)) {
+        if (!tok.loaded) {
+            result.http_status = 503;
+            result.error_code = "tokenizer_unavailable";
+            result.error_message = tok.error.empty() ? "tokenizer.json is not loaded" : tok.error;
+            return result;
+        }
+        if (!encode_chat_response_only_eval(opts, tok, body, &input_ids, &first_target_index)) {
+            result.http_status = 422;
+            result.error_code = "chat_eval_tokenization_failed";
+            result.error_message = "could not tokenize response-only chat eval; send input_ids instead";
+            return result;
+        }
+    } else {
+        const std::string text = extract_generation_text(opts, body, false);
+        if (text.empty()) {
+            result.http_status = 400;
+            result.error_code = "input_ids_required";
+            result.error_message = "perplexity requires input_ids, messages with final assistant response, or input/prompt text";
+            return result;
+        }
+        if (!tok.loaded) {
+            result.http_status = 503;
+            result.error_code = "tokenizer_unavailable";
+            result.error_message = tok.error.empty() ? "tokenizer.json is not loaded" : tok.error;
+            return result;
+        }
+        if (!tokenizer_encode_greedy(tok, text, &input_ids)) {
+            result.http_status = 422;
+            result.error_code = "tokenization_failed";
+            result.error_message = "tokenizer vocab could not encode PPL request text";
+            return result;
+        }
+    }
+    int parsed_first_target = 0;
+    if (storagellm::json_read_int(body, "first_target_index", &parsed_first_target) &&
+        parsed_first_target > 0 &&
+        static_cast<size_t>(parsed_first_target) < input_ids.size()) {
+        first_target_index = static_cast<uint32_t>(parsed_first_target);
+    }
+    int max_input_tokens = 0;
+    if (storagellm::json_read_int(body, "max_input_tokens", &max_input_tokens) && max_input_tokens > 1 &&
+        static_cast<size_t>(max_input_tokens) < input_ids.size()) {
+        input_ids.resize(static_cast<size_t>(max_input_tokens));
+    }
+    int max_eval_tokens = 0;
+    if (storagellm::json_read_int(body, "max_eval_tokens", &max_eval_tokens) && max_eval_tokens > 0) {
+        const size_t wanted = static_cast<size_t>(first_target_index) + static_cast<size_t>(max_eval_tokens);
+        if (wanted > 1u && wanted < input_ids.size()) {
+            input_ids.resize(wanted);
+        }
+    }
+    log_token_ids_preview("eval_input_ids", tok, input_ids, first_target_index);
+    result.first_target_index = first_target_index;
+    const size_t preview_count = std::min<size_t>(input_ids.size(), 32u);
+    result.input_ids_preview.assign(input_ids.begin(), input_ids.begin() + preview_count);
+    if (input_ids.size() < 2) {
+        result.http_status = 400;
+        result.error_code = "invalid_request_error";
+        result.error_message = "eval requires at least two tokens";
+        return result;
+    }
+
+    const auto eval_start = std::chrono::steady_clock::now();
+    std::cerr << "[storagellm request] eval begin input_tokens=" << input_ids.size()
+              << " first_target_index=" << first_target_index
+              << " body_bytes=" << body.size()
+              << resource_log_suffix()
+              << "\n" << std::flush;
+    log_engine_snapshot("eval_engine_begin", engine);
+    moe_eval_stats_t stats{};
+    int evaluated = 0;
+    const auto eval_tokens = [&]() -> int {
+        if (first_target_index != 1u) {
+            return moe_pc_engine_eval_token_ids_from(
+                engine,
+                input_ids.data(),
+                static_cast<uint32_t>(input_ids.size()),
+                first_target_index,
+                &stats
+            );
+        }
+        return moe_pc_engine_eval_token_ids(
+            engine,
+            input_ids.data(),
+            static_cast<uint32_t>(input_ids.size()),
+            &stats
+        );
+    };
+    if (engine_mutex) {
+        std::lock_guard<std::mutex> lock(*engine_mutex);
+        const auto prefetch_start = std::chrono::steady_clock::now();
+        server_orchestrate_request_prefetch(engine, opts, body);
+        std::cerr << "[storagellm request] eval_prefetch_orchestrate ms="
+                  << elapsed_ms_since(prefetch_start)
+                  << resource_log_suffix() << "\n" << std::flush;
+        evaluated = eval_tokens();
+    } else {
+        evaluated = eval_tokens();
+    }
+    if (!evaluated) {
+        result.http_status = 503;
+        result.error_code = "eval_not_ready";
+        result.error_message = stats.error[0] ? stats.error : "eval failed";
+        std::cerr << "[storagellm request] eval failed input_tokens=" << input_ids.size()
+                  << " total_ms=" << elapsed_ms_since(eval_start)
+                  << " error=" << result.error_message
+                  << resource_log_suffix()
+                  << "\n" << std::flush;
+        log_engine_snapshot("eval_engine_failed", engine);
+        return result;
+    }
+
+    result.ok = 1;
+    result.input_tokens = stats.input_tokens;
+    result.evaluated_tokens = stats.evaluated_tokens;
+    result.nll = stats.nll;
+    result.mean_nll = stats.mean_nll;
+    result.perplexity = stats.perplexity;
+    std::cerr << "[storagellm request] eval ok input_tokens=" << result.input_tokens
+              << " evaluated_tokens=" << result.evaluated_tokens
+              << " nll=" << result.nll
+              << " mean_nll=" << result.mean_nll
+              << " ppl=" << result.perplexity
+              << " total_ms=" << elapsed_ms_since(eval_start)
+              << resource_log_suffix()
+              << "\n" << std::flush;
+    log_engine_snapshot("eval_engine_end", engine);
+    return result;
+}
+
+static std::string make_openai_error_json(const server_generation_result& result) {
+    std::ostringstream out;
+    out << "{"
+        << "\"error\":{"
+        << "\"message\":\"" << json_escape(result.error_message) << "\","
+        << "\"type\":\"" << json_escape(result.error_code.empty() ? "server_error" : result.error_code) << "\","
+        << "\"code\":\"" << json_escape(result.error_code.empty() ? "server_error" : result.error_code) << "\""
+        << "}"
+        << "}";
+    return out.str();
+}
+
+static std::string make_eval_error_json(const server_eval_result& result) {
+    std::ostringstream out;
+    out << "{"
+        << "\"error\":{"
+        << "\"message\":\"" << json_escape(result.error_message) << "\","
+        << "\"type\":\"" << json_escape(result.error_code.empty() ? "server_error" : result.error_code) << "\","
+        << "\"code\":\"" << json_escape(result.error_code.empty() ? "server_error" : result.error_code) << "\""
+        << "}"
+        << "}";
+    return out.str();
+}
+
+static const char* generation_phase_name(uint32_t phase) {
+    switch (phase) {
+        case moe_GEN_PHASE_INIT: return "init";
+        case moe_GEN_PHASE_PREFILL: return "prefill";
+        case moe_GEN_PHASE_ATTENTION: return "attention";
+        case moe_GEN_PHASE_MLP: return "mlp";
+        case moe_GEN_PHASE_LM_HEAD: return "lm_head";
+        case moe_GEN_PHASE_DONE: return "done";
+        default: return "idle";
+    }
+}
+
+static bool get_cached_model_root_check(
+    const server_runtime_state* runtime,
+    const std::string& model_root,
+    moe_model_root_check_t* out_check
+);
+
+static const char* forward_adapter_name(uint32_t adapter) {
+    switch (adapter) {
+        case 1: return "raw_static";
+        case 2: return "gguf_generic";
+        case 3: return "gguf_moe";
+        case 4: return "graph_ir";
+        case 10: return "cpu_storage";
+        case 20: return "gpu_offload";
+        default: return "none";
+    }
+}
+
+static std::string make_health_json(
+    const server_options& opts,
+    const moe_backend_caps_t& caps,
+    const moe_forward_status_t& forward,
+    const moe_pc_engine_stats_t& stats,
+    const moe_io_stats_t& io_stats,
+    const server_runtime_state* runtime = nullptr
+) {
+    std::ostringstream out;
+    const bool loading = runtime && runtime->model_ready.load(std::memory_order_acquire) == 0 &&
+        runtime->model_failed.load(std::memory_order_acquire) == 0;
+    const bool failed = runtime && runtime->model_failed.load(std::memory_order_acquire) != 0;
+    const bool loaded = !loading && !failed;
+    const bool generation_ready = loaded && forward.decode_loop_ready != 0;
+    out << "{"
+        << "\"status\":\"ok\","
+        << "\"modelLoading\":" << (loading ? "true" : "false") << ","
+        << "\"modelReady\":" << (loaded ? "true" : "false") << ","
+        << "\"modelLoaded\":" << (loaded ? "true" : "false") << ","
+        << "\"generationReady\":" << (generation_ready ? "true" : "false") << ","
+        << "\"modelFailed\":" << (failed ? "true" : "false") << ","
+        << "\"mode\":\"openclaw\","
+        << "\"model\":\"" << json_escape(opts.model_id) << "\","
+        << "\"base_url\":\"http://" << json_escape(opts.host) << ":" << opts.port << "/v1\","
+        << "\"backend\":\"" << moe_backend_name(caps.backend) << "\","
+        << "\"platform\":\"" << moe_platform_name(caps.platform) << "\","
+        << "\"forwardPath\":\"" << forward_adapter_name(forward.forward_adapter) << "\","
+        << "\"forwardAdapter\":\"" << forward_adapter_name(forward.forward_adapter) << "\","
+        << "\"forwardAdapterId\":" << forward.forward_adapter << ","
+        << "\"forwardAdapterExecutable\":" << (forward.forward_adapter_executable ? "true" : "false") << ","
+        << "\"dynamicShapeReady\":" << (forward.dynamic_shape_ready ? "true" : "false") << ","
+        << "\"dynamicNumHiddenLayers\":" << forward.dynamic_num_hidden_layers << ","
+        << "\"dynamicHiddenSize\":" << forward.dynamic_hidden_size << ","
+        << "\"dynamicVocabSize\":" << forward.dynamic_vocab_size << ","
+        << "\"graphIrReady\":" << (forward.graph_ir_ready ? "true" : "false") << ","
+        << "\"graphIrRequired\":" << (forward.graph_ir_required ? "true" : "false") << ","
+        << "\"graphIrVersion\":" << forward.graph_ir_version << ","
+        << "\"graphIrLayerCount\":" << forward.graph_ir_layer_count << ","
+        << "\"graphIrOpCount\":" << forward.graph_ir_op_count << ","
+        << "\"runtimeExecutionManifestReady\":" << (forward.runtime_execution_manifest_ready ? "true" : "false") << ","
+        << "\"runtimeAccessPlanReady\":" << (forward.runtime_access_plan_ready ? "true" : "false") << ","
+        << "\"runtimeAccessHotsetCount\":" << forward.runtime_access_hotset_count << ","
+        << "\"runtimeAccessFileGroupCount\":" << forward.runtime_access_file_group_count << ","
+        << "\"runtimeAccessExecutorTensorCount\":" << forward.runtime_access_executor_tensor_count << ","
+        << "\"runtimeAccessLayerPrefetchPlanCount\":" << forward.runtime_access_layer_prefetch_plan_count << ","
+        << "\"kvLayoutContractReady\":" << (forward.kv_layout_contract_ready ? "true" : "false") << ","
+        << "\"kvLayoutMaxEntryDim\":" << forward.kv_layout_max_entry_dim << ","
+        << "\"kvLayoutPageSizeTokens\":" << forward.kv_layout_page_size_tokens << ","
+        << "\"cpuOnlyRuntime\":" << (forward.cpu_only_runtime ? "true" : "false") << ","
+        << "\"cpuStorageEngineReady\":" << (forward.cpu_storage_engine_ready ? "true" : "false") << ","
+        << "\"cpuStorageExecutionPlanReady\":" << (forward.cpu_storage_execution_plan_ready ? "true" : "false") << ","
+        << "\"cpuQuantRegistryReady\":" << (forward.cpu_quant_registry_ready ? "true" : "false") << ","
+        << "\"graphIrUsedForForward\":" << (forward.graph_ir_used_for_forward ? "true" : "false") << ","
+        << "\"gpuPathDisabledForCpuOnly\":" << (forward.gpu_path_disabled_for_cpu_only ? "true" : "false") << ","
+        << "\"cpuExecutionPlanLayers\":" << forward.cpu_execution_plan_layers << ","
+        << "\"cpuExecutionPlanTensors\":" << forward.cpu_execution_plan_tensors << ","
+        << "\"cpuExecutionPlanExpertTensors\":" << forward.cpu_execution_plan_expert_tensors << ","
+        << "\"cpuExecutionPlanBytes\":" << forward.cpu_execution_plan_bytes << ","
+        << "\"cpuPrefetchScheduled\":" << forward.cpu_prefetch_scheduled << ","
+        << "\"cpuSelectedExpertPrefetchScheduled\":" << forward.cpu_selected_expert_prefetch_scheduled << ","
+        << "\"cpuLayerBeginCount\":" << forward.cpu_layer_begin_count << ","
+<< "\"cpuHotTensorViewsReady\":" << (forward.cpu_hot_tensor_views_ready ? "true" : "false") << ","
+<< "\"cpuHotTensorViewCount\":" << forward.cpu_hot_tensor_view_count << ","
+<< "\"cpuHotTensorSimpleDotCount\":" << forward.cpu_hot_tensor_simple_dot_count << ","
+<< "\"cpuHotTensorBytes\":" << forward.cpu_hot_tensor_bytes << ","
+<< "\"cpuHotTensorReused\":" << forward.cpu_hot_tensor_reused << ","
+<< "\"cpuLayerHotPlanReady\":" << (forward.cpu_layer_hot_plan_ready ? "true" : "false") << ","
+<< "\"cpuLayerHotTensorCount\":" << forward.cpu_layer_hot_tensor_count << ","
+<< "\"cpuLayerHotPrefetchCount\":" << forward.cpu_layer_hot_prefetch_count << ","
+<< "\"cpuLayerHotPrefetchBytes\":" << forward.cpu_layer_hot_prefetch_bytes << ","
+<< "\"cpuLayerPrefetchDuplicateSkips\":" << forward.cpu_layer_prefetch_duplicate_skips << ","
+<< "\"storageIoPlanReady\":" << (forward.storage_io_plan_ready ? "true" : "false") << ","
+<< "\"storageProfile\":" << forward.storage_profile << ","
+<< "\"storagePrefetchWorkers\":" << forward.storage_prefetch_workers << ","
+<< "\"storagePrefetchQueueDepth\":" << forward.storage_prefetch_queue_depth << ","
+<< "\"storageIoSpanCount\":" << forward.storage_io_span_count << ","
+<< "\"storageIoMergedSpanCount\":" << forward.storage_io_merged_span_count << ","
+<< "\"storageIoPrefetchCount\":" << forward.storage_io_prefetch_count << ","
+<< "\"storageIoPrefetchBytes\":" << forward.storage_io_prefetch_bytes << ","
+<< "\"storageIoFadviseCount\":" << forward.storage_io_fadvise_count << ","
+<< "\"storageIoReadaheadCount\":" << forward.storage_io_readahead_count << ","
+<< "\"storageIoMadviseCount\":" << forward.storage_io_madvise_count << ","
+<< "\"storageIoPageTouchCount\":" << forward.storage_io_page_touch_count << ","
+<< "\"storageIoDuplicateSkips\":" << forward.storage_io_duplicate_skips << ","
+<< "\"storageIouringAvailable\":" << (forward.storage_iouring_available ? "true" : "false") << ","
+<< "\"storageIouringEnabled\":" << (forward.storage_iouring_enabled ? "true" : "false") << ","
+<< "\"storageIouringSubmitCount\":" << forward.storage_iouring_submit_count << ","
+<< "\"storageIouringBytes\":" << forward.storage_iouring_bytes << ","
+<< "\"storageIouringFallbackCount\":" << forward.storage_iouring_fallback_count << ","
+<< "\"storageAsyncPrefetchEnabled\":" << (forward.storage_async_prefetch_enabled ? "true" : "false") << ","
+<< "\"storageAsyncPrefetchEnqueued\":" << forward.storage_async_prefetch_enqueued << ","
+<< "\"storageAsyncPrefetchCompleted\":" << forward.storage_async_prefetch_completed << ","
+<< "\"storageAsyncPrefetchDropped\":" << forward.storage_async_prefetch_dropped << ","
+<< "\"storageAsyncPrefetchInline\":" << forward.storage_async_prefetch_inline << ","
+<< "\"storageAsyncPrefetchPending\":" << forward.storage_async_prefetch_pending << ","
+<< "\"storageGpuStagingPlanReady\":" << (forward.storage_gpu_staging_plan_ready ? "true" : "false") << ","
+<< "\"storageGpuStagingHookCount\":" << forward.storage_gpu_staging_hook_count << ","
+<< "\"storageGpuStagingBytes\":" << forward.storage_gpu_staging_bytes << ","
+<< "\"storageCpuPagecacheHookCount\":" << forward.storage_cpu_pagecache_hook_count << ","
+<< "\"storageCpuPagecacheBytes\":" << forward.storage_cpu_pagecache_bytes << ","
+<< "\"storageExpertIndexReady\":" << (forward.storage_expert_index_ready ? "true" : "false") << ","
+<< "\"storageExpertIndexEntryCount\":" << forward.storage_expert_index_entry_count << ","
+<< "\"storageExpertIndexViewCount\":" << forward.storage_expert_index_view_count << ","
+<< "\"storageSelectedExpertIndexHits\":" << forward.storage_selected_expert_index_hits << ","
+<< "\"storageSelectedExpertLinearFallbacks\":" << forward.storage_selected_expert_linear_fallbacks << ","
+<< "\"storageSelectedExpertPrefetchBytes\":" << forward.storage_selected_expert_prefetch_bytes << ","
+<< "\"storageSelectedExpertDuplicateSkips\":" << forward.storage_selected_expert_duplicate_skips << ","
+<< "\"storageFormatPlanAvailable\":" << (forward.storage_format_plan_available ? "true" : "false") << ","
+        << "\"storageStateValid\":" << (forward.storage_state_valid ? "true" : "false") << ","
+        << "\"tensorTableLoaded\":" << (forward.tensor_table_loaded ? "true" : "false") << ","
+        << "\"expertTripletAvailable\":" << (forward.expert_triplet_available ? "true" : "false") << ","
+        << "\"tokenizerReady\":" << (forward.tokenizer_ready ? "true" : "false") << ","
+        << "\"embeddingReady\":" << (forward.embedding_ready ? "true" : "false") << ","
+        << "\"lmHeadReady\":" << (forward.lm_head_ready ? "true" : "false") << ","
+        << "\"attentionProjectorReady\":" << (forward.attention_projector_ready ? "true" : "false") << ","
+        << "\"attentionDecodeReady\":" << (forward.attention_decode_ready ? "true" : "false") << ","
+        << "\"kvCacheReady\":" << (forward.kv_cache_ready ? "true" : "false") << ","
+        << "\"attentionReady\":" << (forward.attention_ready ? "true" : "false") << ","
+        << "\"samplerReady\":" << (forward.sampler_ready ? "true" : "false") << ","
+        << "\"decodeLoopReady\":" << (forward.decode_loop_ready ? "true" : "false") << ","
+        << "\"chatGraphReady\":" << (forward.chat_graph_ready ? "true" : "false") << ","
+        << "\"tensorCount\":" << forward.tensor_count << ","
+        << "\"vramBudgetBytes\":" << opts.engine_config.vram_budget_bytes << ","
+        << "\"ramBudgetBytes\":" << opts.engine_config.ram_budget_bytes << ","
+        << "\"vramUsedBytes\":" << stats.vram_used_bytes << ","
+        << "\"commonVramReservedBytes\":" << stats.common_vram_reserved_bytes << ","
+        << "\"vramExpertUsedBytes\":" << stats.vram_expert_used_bytes << ","
+        << "\"commonRawPrefetchedBytes\":" << stats.common_raw_prefetched_bytes << ","
+        << "\"commonRawPrefetchedSpans\":" << stats.common_raw_prefetched_spans << ","
+        << "\"commonRawTensorCount\":" << stats.common_raw_tensor_count << ","
+        << "\"processRssBytes\":" << storagellm::current_process_rss_bytes() << ","
+        << "\"availableRamBytes\":" << storagellm::available_ram_bytes() << ","
+        << "\"deviceAllocatedBytes\":" << stats.device_allocated_bytes << ","
+        << "\"deviceAllocationCount\":" << stats.device_allocation_count << ","
+        << "\"deviceFixedBytes\":" << stats.device_fixed_bytes << ","
+        << "\"deviceActivationBytes\":" << stats.device_activation_bytes << ","
+        << "\"deviceExpertBytes\":" << stats.device_expert_bytes << ","
+        << "\"deviceStreamBytes\":" << stats.device_stream_bytes << ","
+        << "\"jujuIdxSchemaVersion\":" << stats.juju_idx_schema_version << ","
+        << "\"jujuSplitGroupCount\":" << stats.juju_split_group_count << ","
+        << "\"jujuSplitMissingCount\":" << stats.juju_split_missing_count << ","
+        << "\"jujuRuntimeHintTensorCount\":" << stats.juju_runtime_hint_tensor_count << ","
+        << "\"jujuPriorityTensorCount\":" << stats.juju_priority_tensor_count << ","
+        << "\"jujuFastMemTensorCount\":" << stats.juju_fastmem_tensor_count << ","
+        << "\"jujuSlowMemTensorCount\":" << stats.juju_slowmem_tensor_count << ","
+        << "\"expertCacheRequests\":" << stats.expert_cache_request_count << ","
+        << "\"expertCacheHits\":" << stats.expert_cache_hit_count << ","
+        << "\"expertCacheVramHits\":" << stats.expert_cache_vram_hit_count << ","
+        << "\"expertCacheRamHits\":" << stats.expert_cache_ram_hit_count << ","
+        << "\"expertCacheMisses\":" << stats.expert_cache_miss_count << ","
+        << "\"expertCacheMissBytes\":" << stats.expert_cache_miss_bytes << ","
+        << "\"expertMissLatencyUsTotal\":" << stats.expert_miss_latency_us_total << ","
+        << "\"expertHitRateMilli\":" << stats.expert_hit_rate_milli << ","
+        << "\"speculativePrefetchPlannedCount\":" << stats.speculative_prefetch_planned_count << ","
+        << "\"speculativePrefetchPlannedBytes\":" << stats.speculative_prefetch_planned_bytes << ","
+        << "\"prefetchWasteRatioMilli\":" << stats.prefetch_waste_ratio_milli << ","
+        << "\"gpuCopyIdleMilli\":" << stats.gpu_copy_idle_milli << ","
+        << "\"adaptivePrefetchWindowLast\":" << stats.adaptive_prefetch_window_last << ","
+        << "\"diskReadBytes\":" << stats.disk_read_bytes << ","
+        << "\"pcieCopyBytes\":" << stats.pcie_copy_bytes << ","
+        << "\"deviceTotalBytes\":" << stats.device_total_bytes << ","
+        << "\"deviceFreeBytes\":" << stats.device_free_bytes << ","
+        << "\"modelLibLoaded\":" << (stats.model_lib_loaded ? "true" : "false") << ","
+        << "\"modelLibGenerated\":" << (stats.model_lib_generated ? "true" : "false") << ","
+        << "\"modelLibCompileAttempted\":" << (stats.model_lib_compile_attempted ? "true" : "false") << ","
+        << "\"modelLibCompileSucceeded\":" << (stats.model_lib_compile_succeeded ? "true" : "false") << ","
+        << "\"modelLibPath\":\"" << json_escape(stats.model_lib_path) << "\","
+        << "\"ramUsedBytes\":" << stats.ram_used_bytes << ","
+        << "\"storageTierBytes\":" << stats.db_used_bytes << ","
+        << "\"vramExpertCount\":" << stats.vram_expert_count << ","
+        << "\"ramExpertCount\":" << stats.ram_expert_count << ","
+        << "\"storageExpertCount\":" << stats.db_expert_count << ","
+        << "\"generationStarted\":" << stats.generation_started << ","
+        << "\"generationCompleted\":" << stats.generation_completed << ","
+        << "\"generationFailed\":" << stats.generation_failed << ","
+        << "\"generationActive\":" << stats.generation_active << ","
+        << "\"generationToken\":" << stats.generation_token << ","
+        << "\"generationLayer\":" << stats.generation_layer << ","
+        << "\"generationPhase\":\"" << generation_phase_name(stats.generation_phase) << "\","
+        << "\"kvMode\":\"" << moe_kv_mode_name(stats.kv_mode) << "\","
+        << "\"offloadGgufValid\":" << (stats.offload_gguf_valid ? "true" : "false") << ","
+        << "\"offloadGgufFileCount\":" << stats.offload_gguf_file_count << ","
+        << "\"offloadGgufTensorHeaders\":" << stats.offload_gguf_tensor_count << ","
+        << "\"offloadGgufExecutableTensors\":" << stats.offload_gguf_executable_tensor_count << ","
+        << "\"qkvForcedByFormat\":" << (stats.qkv_forced_by_format ? "true" : "false") << ","
+        << "\"qkvKBits\":" << stats.qkv_k_bits << ","
+        << "\"qkvVBits\":" << stats.qkv_v_bits << ","
+        << "\"qkvNormalBits\":" << stats.qkv_normal_bits << ","
+        << "\"qkvKeyNormalBits\":" << stats.qkv_key_normal_bits << ","
+        << "\"qkvValueNormalBits\":" << stats.qkv_value_normal_bits << ","
+        << "\"qkvGroupSize\":" << stats.qkv_group_size << ","
+        << "\"qkvPageSizeTokens\":" << stats.qkv_page_size_tokens << ","
+        << "\"qkvSinkTokens\":" << stats.qkv_sink_tokens << ","
+        << "\"qkvRotationEnabled\":" << (stats.qkv_enable_rotation ? "true" : "false") << ","
+        << "\"qkvRotationSeed\":" << stats.qkv_rotation_seed << ","
+        << "\"qkvQjlEnabled\":" << (stats.qkv_enable_qjl ? "true" : "false") << ","
+        << "\"qkvQjlSeed\":" << stats.qkv_qjl_seed << ","
+        << "\"qkvOutlierChannels\":" << stats.qkv_outlier_channels << ","
+        << "\"qkvOutlierBits\":" << stats.qkv_outlier_bits << ","
+        << "\"qkvKeyOutlierBits\":" << stats.qkv_key_outlier_bits << ","
+        << "\"qkvValueOutlierBits\":" << stats.qkv_value_outlier_bits << ","
+        << "\"qkvPlainPersistentStorage\":" << (stats.qkv_plain_kv_persistent_storage ? "true" : "false") << ","
+        << "\"weightQuantBits\":" << stats.weight_quant_bits << ","
+        << "\"weightQuantEncoding\":" << stats.weight_quant_encoding << ","
+        << "\"weightQuantBlockSize\":" << stats.weight_quant_block_size << ","
+        << "\"weightQuantFamily\":\"" << json_escape(stats.weight_quant_family) << "\","
+        << "\"weightKernelFamily\":\"" << json_escape(stats.weight_kernel_family) << "\","
+        << "\"offloadGgufFirstFile\":\"" << json_escape(stats.offload_gguf_first_file) << "\","
+        << "\"recommendedVramCacheBytes\":" << caps.recommended_vram_cache_bytes << ","
+        << "\"recommendedVramCommonBytes\":" << caps.recommended_vram_common_bytes << ","
+        << "\"recommendedPinnedBytes\":" << caps.recommended_pinned_bytes << ","
+        << "\"queuedRequests\":" << io_stats.queued_requests << ","
+        << "\"completedRequests\":" << io_stats.completed_requests << ","
+        << "\"failedRequests\":" << io_stats.failed_requests << ","
+        << "\"droppedRequests\":" << io_stats.dropped_requests << ","
+        << "\"deviceAllocFailures\":" << io_stats.device_alloc_failures << ","
+        << "\"deviceCopyFailures\":" << io_stats.device_copy_failures << ","
+        << "\"diskQueueDepth\":" << io_stats.disk_queue_depth << ","
+        << "\"pinnedQueueDepth\":" << io_stats.pinned_queue_depth << ","
+        << "\"gpuQueueDepth\":" << io_stats.gpu_queue_depth << ","
+        << "\"activeWorkers\":" << io_stats.active_workers << ","
+        << "\"stagingSlotDeficit\":" << io_stats.staging_slot_deficit << ","
+        << "\"directStorageSubmittedBytes\":" << io_stats.bytes_directstorage_submitted << ","
+        << "\"directStorageCompletedBytes\":" << io_stats.bytes_directstorage_completed << ","
+        << "\"directStorageFailedBytes\":" << io_stats.bytes_directstorage_failed << ","
+        << "\"backendAsyncSubmittedBytes\":" << io_stats.backend_async_submitted << ","
+        << "\"backendAsyncCompletedBytes\":" << io_stats.backend_async_completed << ","
+        << "\"backendAsyncFallbackBytes\":" << io_stats.backend_async_fallback << ","
+        << "\"backendFenceWaits\":" << io_stats.backend_fence_waits << ","
+        << "\"vulkanFenceWaits\":" << io_stats.vulkan_fence_waits << ","
+        << "\"levelZeroFenceWaits\":" << io_stats.level_zero_fence_waits << ","
+        << "\"recommendedStagingBytes\":" << io_stats.recommended_staging_bytes;
+    if (!opts.model_root.empty()) {
+        moe_model_root_check_t root_check{};
+        if (get_cached_model_root_check(runtime, opts.model_root, &root_check) ||
+            moe_storage_validate_model_root(opts.model_root.c_str(), &root_check)) {
+            out << ",\"modelRoot\":\"" << json_escape(opts.model_root) << "\""
+                << ",\"modelRootValid\":" << (root_check.valid ? "true" : "false")
+                << ",\"modelRootExpectedParts\":" << root_check.expected_part_count
+                << ",\"modelRootPresentParts\":" << root_check.present_part_count
+                << ",\"modelRootMissingParts\":" << root_check.missing_part_count
+                << ",\"modelRootSizeMismatches\":" << root_check.size_mismatch_count
+                << ",\"modelRootExpectedBytes\":" << root_check.expected_total_bytes
+                << ",\"modelRootPresentBytes\":" << root_check.present_total_bytes;
+            if (root_check.first_missing_part) {
+                out << ",\"modelRootFirstMissingPart\":" << root_check.first_missing_part
+                    << ",\"modelRootFirstMissingPath\":\"" << json_escape(root_check.first_missing_path) << "\"";
+            }
+            if (root_check.first_size_mismatch_part) {
+                out << ",\"modelRootFirstSizeMismatchPart\":" << root_check.first_size_mismatch_part
+                    << ",\"modelRootFirstSizeMismatchPath\":\"" << json_escape(root_check.first_size_mismatch_path) << "\""
+                    << ",\"modelRootFirstExpectedBytes\":" << root_check.first_expected_bytes
+                    << ",\"modelRootFirstActualBytes\":" << root_check.first_actual_bytes;
+            }
+        }
+    }
+    out << ","
+        << "\"loopback_only\":" << (is_loopback_host(opts.host) ? "true" : "false")
+        ;
+    if (failed && runtime) {
+        std::lock_guard<std::mutex> lock(runtime->error_mutex);
+        out << ",\"modelLoadError\":\"" << json_escape(runtime->error_message) << "\"";
+    }
+    if (runtime) {
+        std::lock_guard<std::mutex> lock(runtime->stage_mutex);
+        out << ",\"modelLoadStage\":\"" << json_escape(runtime->load_stage) << "\"";
+    }
+    out << "}";
+    return out.str();
+}
+
+static std::string make_models_json(const server_options& opts) {
+    std::ostringstream out;
+    out << "{"
+        << "\"object\":\"list\","
+        << "\"data\":[{"
+        << "\"id\":\"" << json_escape(opts.model_id) << "\","
+        << "\"object\":\"model\","
+        << "\"created\":" << unix_time_seconds() << ","
+        << "\"owned_by\":\"storagellm\""
+        << "}]"
+        << "}";
+    return out.str();
+}
+
+static std::string make_openclaw_config_json(const server_options& opts, const moe_forward_status_t& forward) {
+    const std::string base_url = "http://" + opts.host + ":" + std::to_string(opts.port) + "/v1";
+    const std::string model_ref = "storagellm/" + opts.model_id;
+    uint32_t ctx_window = forward.dynamic_max_seq_len > 0 ? forward.dynamic_max_seq_len : 131072;
+    std::ostringstream out;
+    out << "{\n"
+        << "  \"agents\": {\n"
+        << "    \"defaults\": {\n"
+        << "      \"model\": { \"primary\": \"" << json_escape(model_ref) << "\" },\n"
+        << "      \"models\": {\n"
+        << "        \"" << json_escape(model_ref) << "\": { \"alias\": \"StorageLLM\" }\n"
+        << "      }\n"
+        << "    }\n"
+        << "  },\n"
+        << "  \"models\": {\n"
+        << "    \"mode\": \"merge\",\n"
+        << "    \"providers\": {\n"
+        << "      \"storagellm\": {\n"
+        << "        \"baseUrl\": \"" << json_escape(base_url) << "\",\n"
+        << "        \"apiKey\": \"sk-local\",\n"
+        << "        \"api\": \"openai-responses\",\n"
+        << "        \"models\": [\n"
+        << "          {\n"
+        << "            \"id\": \"" << json_escape(opts.model_id) << "\",\n"
+        << "            \"name\": \"" << json_escape(opts.model_id) << "\",\n"
+        << "            \"reasoning\": false,\n"
+        << "            \"input\": [\"text\"],\n"
+        << "            \"contextWindow\": " << ctx_window << ",\n"
+        << "            \"maxTokens\": 4096,\n"
+        << "            \"cost\": { \"input\": 0, \"output\": 0, \"cacheRead\": 0, \"cacheWrite\": 0 },\n"
+        << "            \"compat\": { \"requiresStringContent\": true, \"supportsTools\": false }\n"
+        << "          }\n"
+        << "        ]\n"
+        << "      }\n"
+        << "    }\n"
+        << "  }\n"
+        << "}\n";
+    return out.str();
+}
+
+static bool write_openclaw_config_file(const server_options& opts, const moe_forward_status_t& forward) {
+    if (opts.openclaw_config_path.empty()) {
+        return true;
+    }
+    return write_text_file_utf8(opts.openclaw_config_path, make_openclaw_config_json(opts, forward));
+}
+
+static std::string generation_status_text(
+    const server_options& opts,
+    const moe_backend_caps_t& caps,
+    const moe_forward_status_t& forward
+) {
+    std::ostringstream out;
+    out << "StorageLLM local OpenClaw server is running at http://"
+        << opts.host << ":" << opts.port << "/v1. "
+        << "Backend auto-detected as " << moe_backend_name(caps.backend)
+        << " on " << moe_platform_name(caps.platform)
+        << ". Storage state valid=" << (forward.storage_state_valid ? "true" : "false")
+        << ", tensor table loaded=" << (forward.tensor_table_loaded ? "true" : "false")
+        << ", expert triplet runtime=" << (forward.expert_triplet_available ? "ready" : "waiting")
+        << ", tokenizer=" << (forward.tokenizer_ready ? "ready" : "waiting")
+        << ", embedding=" << (forward.embedding_ready ? "ready" : "waiting")
+        << ", lm_head=" << (forward.lm_head_ready ? "ready" : "waiting")
+        << ", attention_projector=" << (forward.attention_projector_ready ? "ready" : "waiting")
+        << ", attention_decode=" << (forward.attention_decode_ready ? "ready" : "waiting")
+        << ", kv_cache=" << (forward.kv_cache_ready ? "ready" : "waiting")
+        << ", attention=" << (forward.attention_ready ? "ready" : "waiting")
+        << ", sampler=" << (forward.sampler_ready ? "ready" : "waiting")
+        << ", decode_loop=" << (forward.decode_loop_ready ? "ready" : "waiting")
+        << ", chat graph ready=" << (forward.chat_graph_ready ? "true" : "false") << ".";
+    return out.str();
+}
+
+static std::string make_chat_json(
+    const server_options& opts,
+    const server_generation_result& generated
+) {
+    std::ostringstream out;
+    out << "{"
+        << "\"id\":\"chatcmpl-storagellm-local\","
+        << "\"object\":\"chat.completion\","
+        << "\"created\":" << unix_time_seconds() << ","
+        << "\"model\":\"" << json_escape(opts.model_id) << "\","
+        << "\"choices\":[{"
+        << "\"index\":0,"
+        << "\"message\":{\"role\":\"assistant\",\"content\":\"" << json_escape(generated.text) << "\"},"
+        << "\"finish_reason\":\"" << generated.finish_reason << "\""
+        << "}],"
+        << "\"usage\":{\"prompt_tokens\":" << generated.prompt_tokens
+        << ",\"completion_tokens\":" << generated.completion_tokens
+        << ",\"total_tokens\":" << (generated.prompt_tokens + generated.completion_tokens) << "}"
+        << "}";
+    return out.str();
+}
+
+static std::string make_chat_sse(
+    const server_options& opts,
+    const server_generation_result& generated
+) {
+    std::ostringstream out;
+    out << "data: {"
+        << "\"id\":\"chatcmpl-storagellm-local\","
+        << "\"object\":\"chat.completion.chunk\","
+        << "\"created\":" << unix_time_seconds() << ","
+        << "\"model\":\"" << json_escape(opts.model_id) << "\","
+        << "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\""
+        << json_escape(generated.text)
+        << "\"},\"finish_reason\":null}]"
+        << "}\n\n";
+    out << "data: {"
+        << "\"id\":\"chatcmpl-storagellm-local\","
+        << "\"object\":\"chat.completion.chunk\","
+        << "\"created\":" << unix_time_seconds() << ","
+        << "\"model\":\"" << json_escape(opts.model_id) << "\","
+        << "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"" << generated.finish_reason << "\"}]"
+        << "}\n\n";
+    out << "data: [DONE]\n\n";
+    return out.str();
+}
+
+static std::string make_completion_json(
+    const server_options& opts,
+    const server_generation_result& generated
+) {
+    std::ostringstream out;
+    out << "{"
+        << "\"id\":\"cmpl-storagellm-local\","
+        << "\"object\":\"text_completion\","
+        << "\"created\":" << unix_time_seconds() << ","
+        << "\"model\":\"" << json_escape(opts.model_id) << "\","
+        << "\"choices\":[{\"index\":0,\"text\":\"" << json_escape(generated.text)
+        << "\",\"finish_reason\":\"" << generated.finish_reason << "\"}],"
+        << "\"usage\":{\"prompt_tokens\":" << generated.prompt_tokens
+        << ",\"completion_tokens\":" << generated.completion_tokens
+        << ",\"total_tokens\":" << (generated.prompt_tokens + generated.completion_tokens) << "}"
+        << "}";
+    return out.str();
+}
+
+static std::string make_completion_sse(
+    const server_options& opts,
+    const server_generation_result& generated
+) {
+    std::ostringstream out;
+    out << "data: {"
+        << "\"id\":\"cmpl-storagellm-local\","
+        << "\"object\":\"text_completion\","
+        << "\"created\":" << unix_time_seconds() << ","
+        << "\"model\":\"" << json_escape(opts.model_id) << "\","
+        << "\"choices\":[{\"index\":0,\"text\":\"" << json_escape(generated.text)
+        << "\",\"finish_reason\":null}]"
+        << "}\n\n";
+    out << "data: {"
+        << "\"id\":\"cmpl-storagellm-local\","
+        << "\"object\":\"text_completion\","
+        << "\"created\":" << unix_time_seconds() << ","
+        << "\"model\":\"" << json_escape(opts.model_id) << "\","
+        << "\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"" << generated.finish_reason << "\"}]"
+        << "}\n\n";
+    out << "data: [DONE]\n\n";
+    return out.str();
+}
+
+static std::string make_response_json(
+    const server_options& opts,
+    const server_generation_result& generated
+) {
+    std::ostringstream out;
+    out << "{"
+        << "\"id\":\"resp-storagellm-local\","
+        << "\"object\":\"response\","
+        << "\"created_at\":" << unix_time_seconds() << ","
+        << "\"status\":\"completed\","
+        << "\"model\":\"" << json_escape(opts.model_id) << "\","
+        << "\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\""
+        << json_escape(generated.text) << "\"}]}],"
+        << "\"usage\":{\"input_tokens\":" << generated.prompt_tokens
+        << ",\"output_tokens\":" << generated.completion_tokens
+        << ",\"total_tokens\":" << (generated.prompt_tokens + generated.completion_tokens) << "}"
+        << "}";
+    return out.str();
+}
+
+static std::string json_double(double value) {
+    if (!std::isfinite(value)) {
+        return "null";
+    }
+    std::ostringstream out;
+    out.precision(17);
+    out << value;
+    return out.str();
+}
+
+static void append_int32_array_json(std::ostringstream& out, const std::vector<int32_t>& values) {
+    out << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i) {
+            out << ",";
+        }
+        out << values[i];
+    }
+    out << "]";
+}
+
+static std::string make_eval_json(
+    const server_options& opts,
+    const server_eval_result& evaluated
+) {
+    std::ostringstream out;
+    out << "{"
+        << "\"object\":\"storagellm.eval\","
+        << "\"model\":\"" << json_escape(opts.model_id) << "\","
+        << "\"input_tokens\":" << evaluated.input_tokens << ","
+        << "\"evaluated_tokens\":" << evaluated.evaluated_tokens << ","
+        << "\"first_target_index\":" << evaluated.first_target_index << ","
+        << "\"kv_backend\":\"" << json_escape(evaluated.kv_backend) << "\","
+        << "\"qkv_forced_by_format\":" << (evaluated.qkv_forced_by_format ? "true" : "false") << ","
+        << "\"tokenizer_hash\":\"" << json_escape(evaluated.tokenizer_hash) << "\","
+        << "\"tokenizer_config_hash\":\"" << json_escape(evaluated.tokenizer_config_hash) << "\","
+        << "\"chat_template_hash\":\"" << json_escape(evaluated.chat_template_hash) << "\","
+        << "\"tokenizer_add_bos\":" << (evaluated.tokenizer_add_bos ? "true" : "false") << ","
+        << "\"tokenizer_add_eos\":" << (evaluated.tokenizer_add_eos ? "true" : "false") << ","
+        << "\"tokenizer_add_space_prefix\":" << (evaluated.tokenizer_add_space_prefix ? "true" : "false") << ","
+        << "\"tokenizer_has_bos\":" << (evaluated.tokenizer_has_bos ? "true" : "false") << ","
+        << "\"tokenizer_has_eos\":" << (evaluated.tokenizer_has_eos ? "true" : "false") << ","
+        << "\"tokenizer_bos_id\":" << evaluated.tokenizer_bos_id << ","
+        << "\"tokenizer_eos_id\":" << evaluated.tokenizer_eos_id << ","
+        << "\"input_ids_preview\":";
+    append_int32_array_json(out, evaluated.input_ids_preview);
+    out << ","
+        << "\"nll\":" << json_double(evaluated.nll) << ","
+        << "\"mean_nll\":" << json_double(evaluated.mean_nll) << ","
+        << "\"ppl\":" << json_double(evaluated.perplexity) << ","
+        << "\"perplexity\":" << json_double(evaluated.perplexity)
+        << "}";
+    return out.str();
+}
+
+static std::string make_chat_not_ready_json(const moe_forward_status_t& forward) {
+    std::ostringstream out;
+    out << "{"
+        << "\"error\":{"
+        << "\"message\":\"GGUF offload server status surface is not ready; storage="
+        << (forward.storage_state_valid ? "valid" : "invalid")
+        << ", tensorTable=" << (forward.tensor_table_loaded ? "loaded" : "missing")
+        << ", expertTriplet=" << (forward.expert_triplet_available ? "ready" : "missing")
+        << ", tokenizer=" << (forward.tokenizer_ready ? "ready" : "missing")
+        << ", embedding=" << (forward.embedding_ready ? "ready" : "missing")
+        << ", lmHead=" << (forward.lm_head_ready ? "ready" : "missing")
+        << ", attentionProjector=" << (forward.attention_projector_ready ? "ready" : "missing")
+        << ", attentionDecode=" << (forward.attention_decode_ready ? "ready" : "missing")
+        << ", kvCache=" << (forward.kv_cache_ready ? "ready" : "missing")
+        << ", attention=" << (forward.attention_ready ? "ready" : "missing")
+        << ", sampler=" << (forward.sampler_ready ? "ready" : "missing")
+        << ", decodeLoop=" << (forward.decode_loop_ready ? "ready" : "missing")
+        << ", graphIr=" << (forward.graph_ir_ready ? "ready" : "missing")
+        << ", graphIrRequired=" << (forward.graph_ir_required ? "yes" : "no")
+        << ", runtimeExecutionManifest=" << (forward.runtime_execution_manifest_ready ? "ready" : "missing")
+        << ", runtimeAccessPlan=" << (forward.runtime_access_plan_ready ? "ready" : "missing")
+        << ", runtimeHotset=" << forward.runtime_access_hotset_count
+        << ", runtimeFileGroups=" << forward.runtime_access_file_group_count
+        << ", runtimeTensorRefs=" << forward.runtime_access_executor_tensor_count
+        << ", layerPrefetchPlans=" << forward.runtime_access_layer_prefetch_plan_count
+        << ", kvLayoutContract=" << (forward.kv_layout_contract_ready ? "ready" : "missing")
+        << ", kvEntryDim=" << forward.kv_layout_max_entry_dim
+        << ", kvPageTokens=" << forward.kv_layout_page_size_tokens
+        << "\","
+        << "\"type\":\"service_unavailable\","
+        << "\"code\":\"runtime_status_not_ready\""
+        << "}"
+        << "}";
+    return out.str();
+}
+
+static bool server_chat_status_surface_ready(const moe_forward_status_t& forward) {
+    return forward.storage_state_valid &&
+        forward.tensor_table_loaded &&
+        forward.expert_triplet_available;
+}
+
+static std::string http_reason(int status) {
+    switch (status) {
+        case 200:
+            return "OK";
+        case 204:
+            return "No Content";
+        case 400:
+            return "Bad Request";
+        case 404:
+            return "Not Found";
+        case 422:
+            return "Unprocessable Entity";
+        case 405:
+            return "Method Not Allowed";
+        case 500:
+            return "Internal Server Error";
+        case 503:
+            return "Service Unavailable";
+        default:
+            return "OK";
+    }
+}
+
+static std::string make_response(
+    int status,
+    const std::string& content_type,
+    const std::string& body
+) {
+    std::string typed_content = content_type;
+    if (typed_content == "application/json" ||
+        typed_content == "text/event-stream" ||
+        typed_content == "text/plain") {
+        typed_content += "; charset=utf-8";
+    }
+    std::ostringstream out;
+    out << "HTTP/1.1 " << status << " " << http_reason(status) << "\r\n"
+        << "Content-Type: " << typed_content << "\r\n"
+        << "Content-Length: " << body.size() << "\r\n"
+        << "Access-Control-Allow-Origin: *\r\n"
+        << "Access-Control-Allow-Headers: authorization, content-type\r\n"
+        << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        << "Connection: close\r\n"
+        << "\r\n"
+        << body;
+    return out.str();
+}
+
+static bool send_all(socket_handle_t client, const std::string& data) {
+    size_t sent = 0;
+    while (sent < data.size()) {
+#ifdef _WIN32
+        const int n = send(client, data.data() + sent, static_cast<int>(data.size() - sent), 0);
+#else
+        const ssize_t n = send(client, data.data() + sent, data.size() - sent, 0);
+#endif
+        if (n <= 0) {
+            return false;
+        }
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static bool parse_http_request(socket_handle_t client, http_request* out_req) {
+    if (!out_req) {
+        return false;
+    }
+    std::string raw;
+    char buf[4096];
+    size_t header_end = std::string::npos;
+    while (header_end == std::string::npos && raw.size() < 1024 * 1024) {
+#ifdef _WIN32
+        const int n = recv(client, buf, static_cast<int>(sizeof(buf)), 0);
+#else
+        const ssize_t n = recv(client, buf, sizeof(buf), 0);
+#endif
+        if (n <= 0) {
+            return false;
+        }
+        raw.append(buf, buf + n);
+        header_end = raw.find("\r\n\r\n");
+    }
+    if (header_end == std::string::npos) {
+        return false;
+    }
+
+    const std::string header = raw.substr(0, header_end + 4);
+    std::istringstream input(header);
+    std::string request_line;
+    if (!std::getline(input, request_line)) {
+        return false;
+    }
+    if (!request_line.empty() && request_line.back() == '\r') {
+        request_line.pop_back();
+    }
+    std::istringstream first(request_line);
+    std::string version;
+    first >> out_req->method >> out_req->target >> version;
+    if (out_req->method.empty() || out_req->target.empty()) {
+        return false;
+    }
+    const size_t qmark = out_req->target.find('?');
+    out_req->path = qmark == std::string::npos ? out_req->target : out_req->target.substr(0, qmark);
+
+    size_t content_length = 0;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        const size_t sep = line.find(':');
+        if (sep == std::string::npos) {
+            continue;
+        }
+        const std::string name = lower_ascii(line.substr(0, sep));
+        std::string value = line.substr(sep + 1);
+        while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+            value.erase(value.begin());
+        }
+        if (name == "content-length") {
+            // BUGFIX 461: strtoull errno 체크 및 범위 검증
+            errno = 0;
+            char* endptr = nullptr;
+            unsigned long long ull_value = std::strtoull(value.c_str(), &endptr, 10);
+            if (errno == ERANGE || !endptr || endptr == value.c_str() || ull_value > SIZE_MAX) {
+                content_length = 0;
+            } else {
+                content_length = static_cast<size_t>(ull_value);
+            }
+        }
+    }
+
+    const size_t body_start = header_end + 4;
+    if (raw.size() > body_start) {
+        out_req->body = raw.substr(body_start);
+    }
+    while (out_req->body.size() < content_length && raw.size() < 64ull * 1024ull * 1024ull) {
+#ifdef _WIN32
+        const int n = recv(client, buf, static_cast<int>(sizeof(buf)), 0);
+#else
+        const ssize_t n = recv(client, buf, sizeof(buf), 0);
+#endif
+        if (n <= 0) {
+            return false;
+        }
+        out_req->body.append(buf, buf + n);
+    }
+    if (out_req->body.size() > content_length) {
+        out_req->body.resize(content_length);
+    }
+    return true;
+}
+
+static std::string route_request(
+    const http_request& req,
+    const server_options& opts,
+    moe_pc_engine_t* engine,
+    std::mutex* engine_mutex,
+    const server_runtime_state* runtime = nullptr
+) {
+    if (!engine && runtime) {
+        engine = runtime->engine.load(std::memory_order_acquire);
+    }
+    if (req.method == "OPTIONS") {
+        return make_response(204, "text/plain", "");
+    }
+    if (req.method == "GET" && (req.path == "/v1/models" || req.path == "/models")) {
+        return make_response(200, "application/json", make_models_json(opts));
+    }
+    if (req.method == "GET" && req.path == "/openclaw/config") {
+        moe_forward_status_t forward{};
+        if (engine && (!runtime || runtime->model_ready.load(std::memory_order_acquire) != 0)) {
+            moe_pc_engine_get_forward_status(engine, &forward);
+        }
+        return make_response(200, "application/json", make_openclaw_config_json(opts, forward));
+    }
+    auto load_backend_caps = [&]() {
+        moe_backend_caps_t caps{};
+        const bool ready = !runtime || runtime->model_ready.load(std::memory_order_acquire) != 0;
+        if (engine && ready && !moe_pc_engine_get_backend_caps(engine, &caps)) {
+            moe_pc_detect_backend_caps(opts.engine_config.preferred_backend, opts.engine_config.platform, &caps);
+        } else if (!engine && runtime) {
+            caps = runtime->initial_caps;
+        } else if (!ready && runtime) {
+            caps = runtime->initial_caps;
+        }
+        return caps;
+    };
+
+    if (req.method == "GET" && req.path == "/health") {
+        const moe_backend_caps_t caps = load_backend_caps();
+        const bool ready = !runtime || runtime->model_ready.load(std::memory_order_acquire) != 0;
+        moe_forward_status_t forward{};
+        if (engine && ready) {
+            moe_pc_engine_get_forward_status(engine, &forward);
+        }
+        moe_pc_engine_stats_t stats{};
+        if (engine && ready) {
+            moe_pc_engine_get_stats(engine, &stats);
+        }
+        moe_io_stats_t io_stats{};
+        if (engine && ready) {
+            moe_pc_engine_get_io_stats(engine, &io_stats);
+        }
+        return make_response(200, "application/json", make_health_json(opts, caps, forward, stats, io_stats, runtime));
+    }
+    if (runtime && runtime->model_ready.load(std::memory_order_acquire) == 0) {
+        const std::string body = runtime->model_failed.load(std::memory_order_acquire) != 0
+            ? "{\"error\":{\"message\":\"model load failed; check /health\",\"type\":\"model_load_failed\"}}"
+            : "{\"error\":{\"message\":\"model is still loading; check /health\",\"type\":\"model_loading\"}}";
+        return make_response(503, "application/json", body);
+    }
+    if (!engine) {
+        return make_response(
+            503,
+            "application/json",
+            "{\"error\":{\"message\":\"model is not ready; check /health\",\"type\":\"model_not_ready\"}}"
+        );
+    }
+    if (req.method == "POST" && req.path == "/v1/chat/completions") {
+        const server_generation_result generated = run_server_generation(engine, engine_mutex, opts, req.body);
+        if (!generated.ok) {
+            return make_response(generated.http_status, "application/json", make_openai_error_json(generated));
+        }
+        if (request_wants_stream(req.body)) {
+            return make_response(200, "text/event-stream", make_chat_sse(opts, generated));
+        }
+        return make_response(200, "application/json", make_chat_json(opts, generated));
+    }
+    if (req.method == "POST" && req.path == "/v1/completions") {
+        const server_generation_result generated = run_server_generation(engine, engine_mutex, opts, req.body);
+        if (!generated.ok) {
+            return make_response(generated.http_status, "application/json", make_openai_error_json(generated));
+        }
+        if (request_wants_stream(req.body)) {
+            return make_response(200, "text/event-stream", make_completion_sse(opts, generated));
+        }
+        return make_response(200, "application/json", make_completion_json(opts, generated));
+    }
+    if (req.method == "POST" && req.path == "/v1/responses") {
+        const server_generation_result generated = run_server_generation(engine, engine_mutex, opts, req.body);
+        if (!generated.ok) {
+            return make_response(generated.http_status, "application/json", make_openai_error_json(generated));
+        }
+        return make_response(200, "application/json", make_response_json(opts, generated));
+    }
+    if (req.method == "POST" &&
+        (req.path == "/v1/storagellm/eval" ||
+         req.path == "/v1/storagellm/perplexity" ||
+         req.path == "/v1/perplexity")) {
+        const server_eval_result evaluated = run_server_eval(engine, engine_mutex, opts, req.body);
+        if (!evaluated.ok) {
+            return make_response(evaluated.http_status, "application/json", make_eval_error_json(evaluated));
+        }
+        return make_response(200, "application/json", make_eval_json(opts, evaluated));
+    }
+
+    const std::string body = "{\"error\":{\"message\":\"unknown endpoint\",\"type\":\"not_found\"}}";
+    return make_response(404, "application/json", body);
+}
+
+static void handle_client(
+    socket_handle_t client,
+    const server_options* opts,
+    moe_pc_engine_t* engine,
+    std::mutex* engine_mutex,
+    const server_runtime_state* runtime = nullptr
+) {
+    std::unique_ptr<socket_handle_t, void(*)(socket_handle_t*)> guard(
+        new socket_handle_t(client),
+        [](socket_handle_t* s) {
+            if (s) {
+                close_socket_handle(*s);
+                delete s;
+            }
+        });
+    http_request req;
+    std::string response;
+    if (parse_http_request(client, &req)) {
+        response = route_request(req, *opts, engine, engine_mutex, runtime);
+    } else {
+        response = make_response(
+            400,
+            "application/json",
+            "{\"error\":{\"message\":\"bad request\",\"type\":\"bad_request\"}}"
+        );
+    }
+    send_all(client, response);
+}
+
+static uint32_t max_http_workers(const moe_backend_caps_t& caps) {
+    const uint32_t streams = caps.compute_streams + caps.copy_streams;
+    return std::max<uint32_t>(2u, streams ? streams : 2u);
+}
+
+static socket_handle_t create_server_socket(const server_options& opts) {
+    if (!opts.allow_remote && !is_loopback_host(opts.host)) {
+        std::cerr << "Refusing non-loopback host without --allow-remote: " << opts.host << "\n";
+        return invalid_socket_handle;
+    }
+
+    socket_handle_t server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (server == invalid_socket_handle) {
+        return invalid_socket_handle;
+    }
+
+    int yes = 1;
+#ifdef _WIN32
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
+#else
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#endif
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(opts.port);
+    const std::string bind_host = opts.host == "localhost" ? "127.0.0.1" : opts.host;
+    if (inet_pton(AF_INET, bind_host.c_str(), &addr.sin_addr) != 1) {
+        close_socket_handle(server);
+        return invalid_socket_handle;
+    }
+
+    if (bind(server, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        close_socket_handle(server);
+        return invalid_socket_handle;
+    }
+    if (listen(server, 16) != 0) {
+        close_socket_handle(server);
+        return invalid_socket_handle;
+    }
+    return server;
+}
+
+static bool prepare_model_paths(server_options* opts) {
+    if (!opts || opts->model_root.empty()) {
+        return true;
+    }
+    if (opts->table_path.empty()) {
+        const char* index_names[] = {"tensor_index.bin", "tensors.sltidx"};
+        for (const char* name : index_names) {
+            const std::string index = join_model_file(opts->model_root, name);
+            if (file_exists_utf8(index)) {
+                opts->table_path = index;
+                break;
+            }
+        }
+        if (opts->table_path.empty()) {
+            const std::string table = join_model_file(opts->model_root, "tensors.csv");
+            if (file_exists_utf8(table)) {
+                opts->table_path = table;
+            }
+        }
+    }
+    if (opts->scale4_path.empty()) {
+        const std::string scale4 = join_model_file(opts->model_root, "moe_scale4.gsc4");
+        if (file_exists_utf8(scale4)) {
+            opts->scale4_path = scale4;
+        }
+    }
+    return true;
+}
+
+static void mark_model_load_failed(server_runtime_state* runtime, const std::string& message) {
+    if (!runtime) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(runtime->error_mutex);
+        runtime->error_message = message;
+    }
+    runtime->model_failed.store(1, std::memory_order_release);
+}
+
+static void set_model_load_stage(server_runtime_state* runtime, const char* stage) {
+    if (!runtime || !stage) {
+        return;
+    }
+    double total_ms = 0.0;
+    double previous_stage_ms = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(runtime->stage_mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (!runtime->load_clock_started) {
+            runtime->load_started_at = now;
+            runtime->last_stage_at = now;
+            runtime->load_clock_started = true;
+        }
+        total_ms = (double)std::chrono::duration_cast<std::chrono::microseconds>(
+            now - runtime->load_started_at).count() / 1000.0;
+        previous_stage_ms = (double)std::chrono::duration_cast<std::chrono::microseconds>(
+            now - runtime->last_stage_at).count() / 1000.0;
+        runtime->last_stage_at = now;
+        runtime->load_stage = stage;
+    }
+    std::cerr << "[storagellm] load stage: " << stage
+              << " total_ms=" << total_ms
+              << " previous_stage_ms=" << previous_stage_ms
+              << "\n" << std::flush;
+}
+
+static void cache_model_root_check(
+    server_runtime_state* runtime,
+    const std::string& model_root,
+    const moe_model_root_check_t& root_check
+) {
+    if (!runtime) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(runtime->root_check_mutex);
+    runtime->root_check_model_root = model_root;
+    runtime->root_check = root_check;
+    runtime->root_check_ready = 1;
+}
+
+static bool get_cached_model_root_check(
+    const server_runtime_state* runtime,
+    const std::string& model_root,
+    moe_model_root_check_t* out_check
+) {
+    if (!runtime || !out_check) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(runtime->root_check_mutex);
+    if (!runtime->root_check_ready || runtime->root_check_model_root != model_root) {
+        return false;
+    }
+    *out_check = runtime->root_check;
+    return true;
+}
+
+static bool cleanup_background_engine_if_shutdown(server_runtime_state* runtime) {
+    if (!runtime || runtime->shutdown_requested.load(std::memory_order_acquire) == 0) {
+        return false;
+    }
+    set_model_load_stage(runtime, "shutdown");
+    if (moe_pc_engine_t* engine = runtime->engine.exchange(nullptr, std::memory_order_acq_rel)) {
+        moe_pc_engine_destroy(engine);
+    }
+    return true;
+}
+
+static void fail_model_load_and_destroy(server_runtime_state* runtime, const std::string& message) {
+    mark_model_load_failed(runtime, message);
+    set_model_load_stage(runtime, "failed");
+    if (runtime) {
+        if (moe_pc_engine_t* engine = runtime->engine.exchange(nullptr, std::memory_order_acq_rel)) {
+            moe_pc_engine_destroy(engine);
+        }
+    }
+}
+
+static void load_server_model_background(
+    server_options opts,
+    moe_io_config_t io_config,
+    server_runtime_state* runtime
+) {
+    if (!runtime) {
+        return;
+    }
+    set_model_load_stage(runtime, "engine_create");
+    moe_pc_engine_t* engine = moe_pc_engine_create(&opts.engine_config);
+    if (!engine) {
+        mark_model_load_failed(runtime, "engine create failed");
+        std::cerr << "Engine create failed\n";
+        return;
+    }
+    runtime->engine.store(engine, std::memory_order_release);
+    if (cleanup_background_engine_if_shutdown(runtime)) {
+        return;
+    }
+    set_model_load_stage(runtime, "configure_io");
+    moe_pc_engine_configure_io(engine, &io_config);
+    if (cleanup_background_engine_if_shutdown(runtime)) {
+        return;
+    }
+    set_model_load_stage(runtime, "resolve_model_paths");
+    if (!opts.model_root.empty()) {
+        moe_pc_engine_set_model_root(engine, opts.model_root.c_str());
+    }
+    if (cleanup_background_engine_if_shutdown(runtime)) {
+        return;
+    }
+    prepare_model_paths(&opts);
+    {
+        const char* root = opts.model_root.empty() ? nullptr : opts.model_root.c_str();
+        const char* scale4 = opts.scale4_path.empty() ? nullptr : opts.scale4_path.c_str();
+        if (opts.table_path.empty()) {
+            set_model_load_stage(runtime, "load_offload_gguf_header");
+            std::cerr << "[storagellm] no tensor index found; trying offload GGUF header index\n" << std::flush;
+            if (!moe_pc_engine_load_codec_table(engine, nullptr, root, scale4)) {
+                fail_model_load_and_destroy(
+                    runtime,
+                    "missing tensor index or offload GGUF metadata under model root"
+                );
+                std::cerr << "Missing tensor index or offload GGUF metadata under model root\n";
+                return;
+            }
+            std::cerr << "[storagellm] offload GGUF header index loaded\n" << std::flush;
+        } else {
+            set_model_load_stage(runtime, "load_tensor_index");
+            std::cerr << "[storagellm] loading tensor index: " << opts.table_path << "\n" << std::flush;
+            if (!moe_pc_engine_load_codec_table(engine, opts.table_path.c_str(), root, scale4)) {
+                fail_model_load_and_destroy(runtime, "failed to load tensor index: " + opts.table_path);
+                std::cerr << "Failed to load tensor index: " << opts.table_path << "\n";
+                return;
+            }
+            std::cerr << "[storagellm] tensor index loaded\n" << std::flush;
+        }
+    }
+    if (cleanup_background_engine_if_shutdown(runtime)) {
+        return;
+    }
+    if (!opts.topology_path.empty()) {
+        set_model_load_stage(runtime, "load_topology");
+        moe_pc_engine_load_topology(engine, opts.topology_path.c_str());
+    }
+    if (cleanup_background_engine_if_shutdown(runtime)) {
+        return;
+    }
+    print_optimization_plan(engine);
+    set_model_load_stage(runtime, "warm_common_raw");
+    const int common_warm = moe_pc_engine_prefetch_common_raw(engine);
+    std::cerr << "[storagellm] common raw warm " << (common_warm ? "done" : "skipped") << "\n" << std::flush;
+    set_model_load_stage(runtime, "startup_warm");
+    std::cerr << "[storagellm] startup warm begin\n" << std::flush;
+    const int warm_started = moe_pc_engine_startup_warm_model(engine);
+    std::cerr << "[storagellm] startup warm " << (warm_started ? "queued" : "skipped") << "\n" << std::flush;
+    set_model_load_stage(runtime, "ready");
+    runtime->model_ready.store(1, std::memory_order_release);
+}
+
+static void print_usage() {
+    std::cout
+        << "Usage:\n"
+        << "  moe_pc_engine_server [model_root]\n"
+        << "  moe_pc_engine_server --model-root path\n"
+        << "\n"
+        << "Backend, platform, RAM, VRAM, and local API mode are detected automatically.\n"
+        << "Use --backend auto|cpu|cuda|hip|metal|vulkan|levelzero|sycl and --platform auto|linux|windows|mac|cpu to override.\n"
+        << "QKV is the default KV cache path; qkv/--qkv is accepted for compatibility.\n"
+        << "\n"
+        << "Endpoints:\n"
+        << "  GET  /health\n"
+        << "  GET  /v1/models\n"
+        << "  POST /v1/chat/completions\n"
+        << "  POST /v1/completions\n"
+        << "  POST /v1/responses\n"
+        << "  POST /v1/storagellm/eval\n"
+        << "  GET  /openclaw/config\n";
+}
+
+static moe_backend_t parse_backend_name(const char* name) {
+    if (!name || std::strcmp(name, "auto") == 0) return moe_BACKEND_AUTO;
+    if (std::strcmp(name, "cpu") == 0) return moe_BACKEND_CPU;
+    if (std::strcmp(name, "cuda") == 0 || std::strcmp(name, "nvidia") == 0) return moe_BACKEND_CUDA;
+    if (std::strcmp(name, "hip") == 0 || std::strcmp(name, "rocm") == 0 || std::strcmp(name, "amd") == 0) return moe_BACKEND_HIP;
+    if (std::strcmp(name, "metal") == 0) return moe_BACKEND_METAL;
+    if (std::strcmp(name, "vulkan") == 0) return moe_BACKEND_VULKAN;
+    if (std::strcmp(name, "directml") == 0) return moe_BACKEND_DIRECTML;
+    if (std::strcmp(name, "opencl") == 0) return moe_BACKEND_OPENCL;
+    if (std::strcmp(name, "levelzero") == 0 ||
+        std::strcmp(name, "level_zero") == 0 ||
+        std::strcmp(name, "level-zero") == 0 ||
+        std::strcmp(name, "intel") == 0) {
+        return moe_BACKEND_LEVEL_ZERO;
+    }
+    if (std::strcmp(name, "sycl") == 0 || std::strcmp(name, "oneapi") == 0) return moe_BACKEND_SYCL;
+    if (std::strcmp(name, "webgpu") == 0) return moe_BACKEND_WEBGPU;
+    return moe_BACKEND_AUTO;
+}
+
+static moe_platform_t parse_platform_name(const char* name) {
+    if (!name || std::strcmp(name, "auto") == 0) return moe_PLATFORM_AUTO;
+    if (std::strcmp(name, "windows") == 0 || std::strcmp(name, "win") == 0) return moe_PLATFORM_WINDOWS_PC;
+    if (std::strcmp(name, "linux") == 0) return moe_PLATFORM_LINUX_PC;
+    if (std::strcmp(name, "mac") == 0 || std::strcmp(name, "apple") == 0 || std::strcmp(name, "darwin") == 0) return moe_PLATFORM_MACOS_APPLE;
+    if (std::strcmp(name, "cpu") == 0 || std::strcmp(name, "cpu_only") == 0) return moe_PLATFORM_CPU_ONLY;
+    return moe_PLATFORM_AUTO;
+}
+
+static server_options parse_args(int argc, char** argv) {
+    server_options opts;
+    opts.engine_config.allow_db_streaming = 1;
+
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--openclaw") == 0 || std::strcmp(argv[i], "--serve-openai") == 0) {
+            continue;
+        } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
+            opts.host = argv[++i];
+        } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            const int port = std::atoi(argv[++i]);
+            if (port > 0 && port <= 65535) {
+                opts.port = static_cast<uint16_t>(port);
+            }
+        } else if (std::strcmp(argv[i], "--model-id") == 0 && i + 1 < argc) {
+            opts.model_id = argv[++i];
+            opts.model_id_explicit = true;
+        } else if (std::strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+            opts.engine_config.preferred_backend = parse_backend_name(argv[++i]);
+        } else if (std::strcmp(argv[i], "--platform") == 0 && i + 1 < argc) {
+            opts.engine_config.platform = parse_platform_name(argv[++i]);
+        } else if (std::strcmp(argv[i], "--allow-remote") == 0) {
+            opts.allow_remote = true;
+        } else if (std::strcmp(argv[i], "--qkv") == 0 || std::strcmp(argv[i], "qkv") == 0) {
+            opts.engine_config.kv_mode = moe_KV_MODE_QKV;
+        } else if (std::strcmp(argv[i], "--topology") == 0 && i + 1 < argc) {
+            opts.topology_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--table") == 0 && i + 1 < argc) {
+            opts.table_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--model-root") == 0 && i + 1 < argc) {
+            opts.model_root = argv[++i];
+        } else if (std::strcmp(argv[i], "--scale4") == 0 && i + 1 < argc) {
+            opts.scale4_path = argv[++i];
+        } else if ((std::strcmp(argv[i], "--openclaw-config") == 0 ||
+                    std::strcmp(argv[i], "--write-openclaw-config") == 0) && i + 1 < argc) {
+            opts.openclaw_config_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--openclaw-config-only") == 0) {
+            opts.openclaw_config_only = true;
+        } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
+            print_usage();
+            std::exit(0);
+        } else if (argv[i][0] != '-' && opts.model_root.empty()) {
+            opts.model_root = argv[i];
+        }
+    }
+    return opts;
+}
+
+static void apply_format_model_id(server_options* opts) {
+    if (!opts || opts->model_id_explicit || opts->model_root.empty()) {
+        return;
+    }
+    char inferred[160]{};
+    if (moe_storage_infer_model_id(opts->model_root.c_str(), inferred, sizeof(inferred)) && inferred[0]) {
+        opts->model_id = inferred;
+    }
+}
+
+// Declare the fast FP mode function so we can use it in main
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <xmmintrin.h>
+#include <pmmintrin.h>
+#endif
+static inline void moe_cpu_enable_fast_fp_mode_main() {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+#endif
+}
+
+static int server_main(int argc, char** argv) {
+    // Fix 21: Enable CPU Fast FP mode in the main thread to prevent denormal slow-downs
+    moe_cpu_enable_fast_fp_mode_main();
+    server_options opts = parse_args(argc, argv);
+    apply_format_model_id(&opts);
+
+    g_server_shutdown_requested = 0;
+    std::signal(SIGINT, handle_server_shutdown_signal);
+    std::signal(SIGTERM, handle_server_shutdown_signal);
+#ifdef SIGBREAK
+    std::signal(SIGBREAK, handle_server_shutdown_signal);
+#endif
+
+    if (!network_startup()) {
+        std::cerr << "Network startup failed\n";
+        return 1;
+    }
+
+    moe_backend_caps_t caps{};
+    if (!moe_pc_detect_backend_caps(
+            opts.engine_config.preferred_backend,
+            opts.engine_config.platform,
+            &caps)) {
+        network_cleanup();
+        std::cerr << "Backend capability detection failed\n";
+        return 1;
+    }
+    apply_detected_budgets(&opts, caps);
+    moe_forward_status_t empty_forward{};
+    if (!write_openclaw_config_file(opts, empty_forward)) {
+        network_cleanup();
+        std::cerr << "Failed to write OpenClaw config: " << opts.openclaw_config_path << "\n";
+        return 1;
+    }
+    if (!opts.openclaw_config_path.empty()) {
+        std::cout << "OpenClaw config written: " << opts.openclaw_config_path << "\n";
+        if (opts.openclaw_config_only) {
+            network_cleanup();
+            return 0;
+        }
+    }
+
+    moe_io_config_t io_config = make_server_io_config(opts, caps);
+
+    socket_handle_t server = create_server_socket(opts);
+    if (server == invalid_socket_handle) {
+        network_cleanup();
+        std::cerr << "Failed to bind " << opts.host << ":" << opts.port << "\n";
+        return 1;
+    }
+    server_runtime_state runtime;
+    runtime.initial_caps = caps;
+    set_model_load_stage(&runtime, "queued");
+    moe_model_root_check_t startup_root_check{};
+    const bool startup_root_check_ok =
+        !opts.model_root.empty() &&
+        moe_storage_validate_model_root(opts.model_root.c_str(), &startup_root_check);
+    if (startup_root_check_ok) {
+        cache_model_root_check(&runtime, opts.model_root, startup_root_check);
+    }
+    std::thread loader_thread(load_server_model_background, opts, io_config, &runtime);
+
+    std::cout << "StorageLLM server listening on http://" << opts.host << ":" << opts.port << "/v1\n";
+    std::cout << "Model: " << opts.model_id << "\n";
+    std::cout << "Backend: " << moe_backend_name(caps.backend) << " / " << moe_platform_name(caps.platform) << "\n";
+    std::cout << "Budgets: VRAM=" << opts.engine_config.vram_budget_bytes
+              << " RAM=" << opts.engine_config.ram_budget_bytes
+              << " KV=" << moe_kv_mode_name(opts.engine_config.kv_mode) << "\n";
+    std::cout << "IO: disk=" << io_config.disk_worker_threads
+              << " pinned=" << io_config.pinned_worker_threads
+              << " gpu=" << io_config.gpu_worker_threads
+              << " direct_min=" << io_config.direct_upload_min_bytes
+              << " staging=" << io_config.pinned_staging_bytes << "\n";
+    if (startup_root_check_ok) {
+        std::cout << "Model root: valid=" << startup_root_check.valid
+                  << " present=" << startup_root_check.present_part_count
+                  << "/" << startup_root_check.expected_part_count
+                  << " missing=" << startup_root_check.missing_part_count
+                  << " size_mismatch=" << startup_root_check.size_mismatch_count << "\n";
+    }
+    if (!opts.topology_path.empty()) {
+        std::cout << "Topology: " << opts.topology_path << "\n";
+    }
+    std::cout << "OpenClaw config: http://" << opts.host << ":" << opts.port << "/openclaw/config\n";
+
+    std::mutex engine_mutex;
+    const uint32_t worker_limit = max_http_workers(caps);
+    auto active_clients = std::make_shared<std::atomic<uint32_t>>(0);
+    while (!g_server_shutdown_requested) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(server, &readfds);
+        timeval timeout{};
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 250000;
+#ifdef _WIN32
+        const int ready = select(0, &readfds, nullptr, nullptr, &timeout);
+#else
+        const int ready = select(server + 1, &readfds, nullptr, nullptr, &timeout);
+#endif
+        if (ready <= 0) {
+            continue;
+        }
+        sockaddr_in client_addr{};
+#ifdef _WIN32
+        int client_len = sizeof(client_addr);
+#else
+        socklen_t client_len = sizeof(client_addr);
+#endif
+        socket_handle_t client = accept(server, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+        if (client == invalid_socket_handle) {
+            continue;
+        }
+
+        while (active_clients->load() >= worker_limit) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        active_clients->fetch_add(1);
+        std::thread([client, &opts, &engine_mutex, active_clients, &runtime]() {
+            handle_client(client, &opts, nullptr, &engine_mutex, &runtime);
+            active_clients->fetch_sub(1);
+        }).detach();
+    }
+
+    runtime.shutdown_requested.store(1, std::memory_order_release);
+    close_socket_handle(server);
+    while (active_clients->load(std::memory_order_acquire) > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (loader_thread.joinable()) {
+        loader_thread.join();
+    }
+    if (moe_pc_engine_t* engine = runtime.engine.exchange(nullptr, std::memory_order_acq_rel)) {
+        moe_pc_engine_destroy(engine);
+    }
+    network_cleanup();
+    return 0;
+}
+
+#ifdef _WIN32
+static std::string wide_to_utf8_arg(const wchar_t* value) {
+    if (!value) {
+        return std::string();
+    }
+    const int count = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
+    if (count <= 0) {
+        return std::string();
+    }
+    std::string out((size_t)count, '\0');
+    if (!WideCharToMultiByte(CP_UTF8, 0, value, -1, &out[0], count, nullptr, nullptr)) {
+        return std::string();
+    }
+    if (!out.empty() && out.back() == '\0') {
+        out.pop_back();
+    }
+    return out;
+}
+
+int wmain(int argc, wchar_t** wargv) {
+    std::vector<std::string> args;
+    std::vector<char*> argv8;
+    args.reserve((size_t)argc);
+    argv8.reserve((size_t)argc + 1);
+    for (int i = 0; i < argc; ++i) {
+        args.push_back(wide_to_utf8_arg(wargv[i]));
+    }
+    for (std::string& arg : args) {
+        argv8.push_back(arg.empty() ? const_cast<char*>("") : &arg[0]);
+    }
+    argv8.push_back(nullptr);
+    return server_main(argc, argv8.data());
+}
+#else
+int main(int argc, char** argv) {
+    return server_main(argc, argv);
+}
+#endif

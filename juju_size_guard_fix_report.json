@@ -1,0 +1,18 @@
+{
+  "status": "fixed_size_guard_and_offset_normalization",
+  "fixes": [
+    "normalize split GGUF tensor offsets when relative offsets are global/logical instead of physical-shard local",
+    "validate every source segment stays within the physical GGUF shard before upload",
+    "reject impossible JUJU artifact size before Hugging Face upload starts",
+    "reject per-file artifact size above upload limit after materialization planning",
+    "keep 01-05 notebook cell content structure; patch inline generator code plus shared materializer"
+  ],
+  "tests": [
+    "colab/juju_shard_materializer.py py_compile passed",
+    "all patched notebook code cells compile passed",
+    "synthetic GGUF split-global-offset fixture normalized correctly",
+    "moe_engine/tests/test_juju_generation_contract_config.py: 7 passed",
+    "moe_engine/tests: 7 passed, 14 skipped",
+    "CPU-only CMake/Ninja build completed"
+  ]
+}

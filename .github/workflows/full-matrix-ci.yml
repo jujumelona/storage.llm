@@ -1,0 +1,194 @@
+name: Full Matrix CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ main, develop ]
+
+permissions:
+  contents: read
+
+jobs:
+  cross-platform-json-smoke:
+    name: JSON smoke / ${{ matrix.os }} / ${{ matrix.build_type }} / ppl=${{ matrix.ppl_diag }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        build_type: [Debug, Release]
+        ppl_diag: [OFF, ON]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies on Ubuntu
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ make
+
+      - name: Install dependencies on macOS
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install cmake
+
+      - name: Generate portable JSON smoke project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/json-smoke
+          cat > build/json-smoke/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.24)
+          project(json_smoke LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          add_executable(json_smoke json_smoke.cpp)
+          target_include_directories(json_smoke PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../..")
+          if(SMOKE_PPL_DIAG)
+            target_compile_definitions(json_smoke PRIVATE STORAGELLM_PPL_DIAG=1)
+          else()
+            target_compile_definitions(json_smoke PRIVATE STORAGELLM_PPL_DIAG=0)
+          endif()
+          enable_testing()
+          add_test(NAME json_smoke COMMAND json_smoke)
+          EOF
+          cat > build/json-smoke/json_smoke.cpp <<'EOF'
+          #include "json_request.h"
+          #include <iostream>
+          #include <string>
+          #include <vector>
+
+          namespace {
+          int failures = 0;
+          void check(bool condition, const char* message) {
+              if (!condition) {
+                  std::cerr << "json_smoke failure: " << message << '\n';
+                  ++failures;
+              }
+          }
+          }  // namespace
+
+          int main() {
+              using namespace storagellm;
+              int layer = -1;
+              check(json_read_int("{\"current_layer\":2,\"selected_experts\":[1,2]}", "current_layer", &layer), "valid integer is parsed");
+              check(layer == 2, "parsed integer value equals 2");
+              check(!json_read_int("{\"current_layer\":2abc}", "current_layer", &layer), "trailing junk after int is rejected");
+              check(!json_read_int("{\"current_layer\":2147483648}", "current_layer", &layer), "integer overflow is rejected");
+              check(!json_read_int("{\"current_layer\":\"2\"}", "current_layer", &layer), "quoted integer is rejected");
+
+              std::vector<int> experts = json_read_int_array("{\"selected_experts\":[1,2,3]}", "selected_experts");
+              check(experts.size() == 3, "valid int array has three values");
+              if (experts.size() == 3) {
+                  check(experts[0] == 1 && experts[1] == 2 && experts[2] == 3, "valid int array values match");
+              }
+
+              check(json_read_int_array("{\"selected_experts\":[1,]}", "selected_experts").empty(), "trailing comma is rejected");
+              check(json_read_int_array("{\"selected_experts\":[1,,2]}", "selected_experts").empty(), "double comma is rejected");
+              check(json_read_int_array("{\"selected_experts\":[\"1\",2]}", "selected_experts").empty(), "quoted array value is rejected");
+              check(json_read_int_array("{\"selected_experts\":[2147483648]}", "selected_experts").empty(), "array integer overflow is rejected");
+              check(json_read_int_array("{\"selected_experts\":[1,[2]]}", "selected_experts").empty(), "nested array is rejected");
+              return failures == 0 ? 0 : 1;
+          }
+          EOF
+
+      - name: Configure JSON smoke project
+        shell: bash
+        run: >
+          cmake -S build/json-smoke -B build/json-smoke-out
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DSMOKE_PPL_DIAG=${{ matrix.ppl_diag }}
+
+      - name: Build JSON smoke project
+        run: cmake --build build/json-smoke-out --config ${{ matrix.build_type }} --parallel
+
+      - name: Run JSON smoke project
+        run: ctest --test-dir build/json-smoke-out --build-config ${{ matrix.build_type }} --output-on-failure
+
+  ubuntu-focused-cmake:
+    name: Ubuntu focused CMake module verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ libgtest-dev liburing-dev
+
+      - name: Configure focused CMake build
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DSTORAGELLM_BUILD_TESTS=ON
+          -DSTORAGELLM_PPL_DIAG=OFF
+          -DSTORAGELLM_ENABLE_NATIVE_OPTIMIZE=OFF
+          -DSTORAGELLM_ENABLE_TVM_CODEGEN=OFF
+          -DSTORAGELLM_ENABLE_CUDA=OFF
+          -DSTORAGELLM_ENABLE_CUBLASLT=OFF
+          -DSTORAGELLM_ENABLE_CUTLASS=OFF
+          -DSTORAGELLM_ENABLE_ROCM=OFF
+          -DSTORAGELLM_ENABLE_HIPBLASLT=OFF
+          -DSTORAGELLM_ENABLE_CK=OFF
+          -DSTORAGELLM_ENABLE_METAL=OFF
+          -DSTORAGELLM_ENABLE_ONEDNN=OFF
+          -DSTORAGELLM_ENABLE_VULKAN=OFF
+          -DSTORAGELLM_ENABLE_OPENCL=OFF
+          -DSTORAGELLM_ENABLE_CLBLAST=OFF
+
+      - name: Detect available focused test targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ninja -C build -t targets all | sed 's/:.*//' | sort -u > build/targets.txt
+          candidates=(
+            test_json_parser
+            test_loader_manifest_examples
+            test_weight_contract_examples
+            test_ppl_math_contract_examples
+            test_ppl_diag_contract_examples
+            test_qkv_contract_examples
+            test_qkv_parity
+          )
+          selected=()
+          for target in "${candidates[@]}"; do
+            if grep -Fxq "${target}" build/targets.txt; then
+              selected+=("${target}")
+            else
+              echo "Skipping unavailable target: ${target}"
+            fi
+          done
+          if [ "${#selected[@]}" -eq 0 ]; then
+            echo "No focused test targets were generated by CMake. Dumping all targets:"
+            cat build/targets.txt
+            exit 1
+          fi
+          printf '%s\n' "${selected[@]}" > build/selected-targets.txt
+          printf 'Selected test targets: %s\n' "${selected[*]}"
+
+      - name: Build available focused test targets
+        shell: bash
+        run: |
+          mapfile -t selected < build/selected-targets.txt
+          cmake --build build --parallel 2 --target "${selected[@]}"
+
+      - name: Run available focused tests
+        run: >
+          ctest --test-dir build --output-on-failure --timeout 120
+          -R '^(JSONParser|test_loader_manifest_examples|test_weight_contract_examples|test_ppl_math_contract_examples|test_ppl_diag_contract_examples|test_qkv_contract_examples|QKVParity)$'
+
+      - name: Upload CTest logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-focused-cmake-logs
+          path: build/Testing/Temporary/

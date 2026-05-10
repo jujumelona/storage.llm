@@ -1,0 +1,88 @@
+#include "json_scan.h"
+
+#include <cerrno>
+#include <cstdlib>
+
+namespace storagellm {
+
+static size_t find_value(const JsonSlice& slice, const char* key) {
+    if (!slice.text || !key) {
+        return std::string::npos;
+    }
+    const std::string needle = std::string("\"") + key + "\"";
+    size_t pos = slice.begin;
+    for (;;) {
+        const size_t key_pos = slice.text->find(needle, pos);
+        if (key_pos == std::string::npos || key_pos >= slice.end) {
+            return std::string::npos;
+        }
+        const size_t colon = slice.text->find_first_not_of(" \t\r\n", key_pos + needle.size());
+        if (colon != std::string::npos && colon < slice.end && (*slice.text)[colon] == ':') {
+            return colon + 1;
+        }
+        pos = key_pos + 1;
+    }
+}
+
+bool json_get_u64(const JsonSlice& slice, const char* key, uint64_t* out) {
+    const size_t value = find_value(slice, key);
+    if (value == std::string::npos || !out) {
+        return false;
+    }
+    if (value >= slice.end) {
+        return false;
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    const char* begin = slice.text->c_str() + value;
+    const char* limit = slice.text->c_str() + slice.end;
+    if (!begin || !limit || begin >= limit) {
+        return false;
+    }
+
+    *out = std::strtoull(begin, &end, 10);
+    if (!end || end == begin || end > limit || errno == ERANGE) {
+        return false;
+    }
+    return true;
+}
+
+bool json_get_string(const JsonSlice& slice, const char* key, std::string* out) {
+    const size_t value = find_value(slice, key);
+    if (value == std::string::npos || !out) {
+        return false;
+    }
+    const size_t begin = slice.text->find('"', value);
+    if (begin == std::string::npos || begin >= slice.end) {
+        return false;
+    }
+
+    size_t end = begin + 1;
+    if (end >= slice.end) {
+        return false;
+    }
+    while (end < slice.end) {
+        if ((*slice.text)[end] == '\\') {
+            if (end + 1 >= slice.end) {
+                break;
+            }
+            end += 2;
+            continue;
+        }
+        if ((*slice.text)[end] == '"') {
+            break;
+        }
+        ++end;
+    }
+    if (end >= slice.end) {
+        return false;
+    }
+    if (begin + 1 > end || end > slice.text->size()) {
+        return false;
+    }
+    *out = slice.text->substr(begin + 1, end - begin - 1);
+    return true;
+}
+
+}  // namespace storagellm

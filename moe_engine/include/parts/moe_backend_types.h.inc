@@ -1,0 +1,56 @@
+typedef struct {
+    moe_backend_t backend;
+    moe_platform_t platform;
+    uint32_t device_id;
+    uint32_t compute_streams;
+    uint32_t copy_streams;
+    uint32_t prefetch_streams;
+    uint64_t device_memory_bytes;
+    uint64_t system_memory_bytes;
+    uint64_t recommended_vram_cache_bytes;
+    uint64_t recommended_vram_common_bytes;
+    uint64_t recommended_pinned_bytes;
+    int supports_fp4;
+    int supports_scale4;
+    int supports_native_nvfp4_gemm;
+    int supports_native_mxfp4_gemm;
+    int supports_weight_q2;
+    int supports_weight_q3;
+    int supports_weight_q4;
+    int supports_weight_q8;
+    int supports_weight_iq2;
+    int supports_weight_mxfp4;
+    int supports_async_copy;
+    int supports_pinned_host;
+    int supports_unified_memory;
+    int supports_zero_copy_host;
+    int supports_zero_copy_mmap;
+    int supports_fixed_read_staging;
+    int supports_registered_io_buffers;
+    int supports_backend_async_api;
+    int supports_mmap;
+    int supports_directstorage;
+    int supports_gpudirect_storage;
+    // BUGFIX Platform Issue: AMD APU zero-copy validation ★★★
+    // Problem: supports_unified_memory doesn't guarantee mmap GPU accessibility
+    // AMD ROCm versions vary in zero-copy support
+    // Solution: Add explicit flag for validated GPU-accessible mmap
+    int unified_mmap_gpu_accessible;
+    int supports_metal;
+    int supports_vulkan;
+    int supports_cuda;
+    int supports_directml;
+    int supports_opencl;
+    int supports_hip;
+    int supports_level_zero;
+    int supports_sycl;
+    int supports_webgpu;
+    int supports_gpu_direct_file_io;
+    int is_integrated_gpu;
+    int preferred_numa_node;
+    double dma_bandwidth_gbps;
+    double tflops_hint;
+    uint64_t copy_stream_bytes_limit;
+    uint64_t measured_h2d_bw_bytes_per_sec;
+    uint64_t measured_storage_bw_bytes_per_sec;
+} moe_backend_caps_t;

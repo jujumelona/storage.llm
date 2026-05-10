@@ -1,0 +1,454 @@
+#include "qkv_attention.h"
+#include "qkv_helpers.h"
+#include "qkv_dequantize.h"
+#include "qkv_codebook.h"
+#include "qkv_packing.h"
+#include "qkv_thread_pool.h"
+#include "qkv_matrix.h"
+#include <math.h>
+#include <string.h>
+#include <vector>
+#include <algorithm>
+#include <climits>
+#include <cmath>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// Do not patch this path as a PPL root-cause guess. QKV changes must be
+// justified against QKV.pdf / TurboQuant semantics, not by fallbacking failed
+// attention math to zeros, uniform softmax, or exact-cache bypasses.
+
+static float qkv_attention_load_raw_scalar(const uint8_t* src, int index, int bits) {
+    if (!src || index < 0) return 0.0f;
+    if (bits == 16) {
+        const uint16_t h = (uint16_t)src[(size_t)index * 2u] |
+            ((uint16_t)src[(size_t)index * 2u + 1u] << 8);
+        return qkv_fp16_bits_to_float(h);
+    }
+    if (bits == 32) {
+        float out = 0.0f;
+        memcpy(&out, src + (size_t)index * sizeof(float), sizeof(float));
+        return out;
+    }
+    return 0.0f;
+}
+
+static float qkv_attention_apply_logit_softcap(float cap, float score) {
+    if (!(cap > 0.0f) || !std::isfinite(cap) || !std::isfinite(score)) {
+        return score;
+    }
+    return tanhf(score / cap) * cap;
+}
+
+// Paper: Attention decode directly on quantized KV cache
+// Avoids full dequantize → attention → discard cycle
+int qkv_attention_decode_impl(
+    const float* query,
+    const qkv_state_t* s,
+    const qkv_config_t* cfg,
+    uint32_t ctx,
+    uint32_t hdim,
+    float* output
+) {
+    // BUGFIX 349: 모든 포인터 null 체크 및 파라미터 유효성 체크
+    if (!query || !s || !cfg || !output || ctx == 0 || hdim == 0) return 0;
+    if (hdim > 16384) return 0;  // 비정상적으로 큰 차원 방지
+    const int d = (int)hdim, n = (int)ctx;
+    const bool qjl = cfg->enable_qjl && s->k_bits > 1 && s->v_bits > 1 &&
+        qkv_bits_codebook(s->k_bits) && qkv_bits_codebook(s->v_bits) &&
+        s->k_qjl && s->v_qjl;
+
+    // Use scratch buffers
+    float* row = s->scratch_residual;
+    if (!row || s->head_dim != d) return 0;
+
+    // BUGFIX 350: n_tokens 범위 체크
+    if (n > s->n_tokens || n < 0) return 0;
+    float* att = s->scratch_attention;
+    if (!att) return 0;
+
+    // Paper optimization: Pre-rotate query ONCE with Pi (O(d²) × 1)
+    // Then dequant uses codebook-only path (skip inverse rotation) — O(d) × N
+    // Exploits: <q, Pi^T * y_hat> = <Pi * q, y_hat>
+    const float* q_eff = query;
+    if (cfg->enable_rotation && s->rotation_matrix) {
+        float* rq = s->scratch_rotated_q;
+        if (!rq) return 0;
+        if (s->rotation_signs &&
+            qkv_apply_hadamard_rotation_forward(query, s->rotation_signs, rq, d)) {
+            q_eff = rq;
+        } else {
+        // BUGFIX 351: rotation_matrix 범위 체크
+        for (int i = 0; i < d; i++) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                size_t idx = (size_t)i * (size_t)d + (size_t)j;
+                sum += s->rotation_matrix[idx] * query[j];
+            }
+            rq[i] = sum;
+        }
+        q_eff = rq;
+        }
+    }
+
+    // BUGFIX 352: d가 0일 때 division by zero 방지
+    if (d <= 0) return 0;
+    float sc = 1.0f / sqrtf((float)d);
+    if (cfg->attention_score_scale > 0.0f && std::isfinite(cfg->attention_score_scale)) {
+        sc = cfg->attention_score_scale;
+    }
+    const float attn_logit_softcap =
+        (cfg->attention_logit_softcap > 0.0f && std::isfinite(cfg->attention_logit_softcap))
+            ? cfg->attention_logit_softcap
+            : 0.0f;
+
+    // Bug 2 Fix: Use pre-computed worker limit instead of OS call
+    const int max_workers = s->computed_workers > 0 ? s->computed_workers : 1;
+    // BUGFIX 353: workers 계산 시 division by zero 방지
+    const int workers = (n >= 512) ? std::max(1, std::min<int>(max_workers, n / 512)) : 1;
+
+    // Phase 1: K scores — dequant in rotated domain (no inverse rotation needed)
+    // Paper Algorithm 2: For unbiased inner product, include QJL residual
+    const int k_mse_bits = qjl ? s->k_bits - 1 : s->k_bits;
+    if (!qkv_bits_valid(k_mse_bits)) return 0;
+    const bool k_raw = qkv_bits_raw(k_mse_bits);
+    const float* k_centroids = k_raw ? nullptr : qkv_codebook_for_bits(s, k_mse_bits);
+    if (!k_raw && !k_centroids) return 0;
+    // BUGFIX 354: k_stride overflow 방지
+    if (d > INT_MAX / k_mse_bits) return 0;
+    const int k_stride = (d * k_mse_bits + 7) / 8;
+    const int k_qstride = (d + 7) / 8;
+    // BUGFIX 355: d가 0일 때 division by zero 방지 (이미 위에서 체크했지만 명시적으로)
+    // Paper Definition 1 / Algorithm 2: QJL inverse is sqrt(pi/2) / d * S^T z.
+    // The stored gamma is the normalized residual norm, so att[t] applies norm_k once.
+    const float qjl_scale = sqrtf((float)M_PI / 2.0f) / (float)d;
+    const bool k_split = qkv_outlier_split_ready(s, cfg, QKV_TARGET_KEY);
+    const int key_outlier_total_bits = qkv_outlier_bits_for_target(cfg, QKV_TARGET_KEY);
+    const int key_normal_total_bits = qkv_normal_bits_for_target(cfg, QKV_TARGET_KEY);
+    const bool key_split_qjl = qjl &&
+        qkv_bits_codebook(key_outlier_total_bits) &&
+        qkv_bits_codebook(key_normal_total_bits) &&
+        key_outlier_total_bits > 1 &&
+        key_normal_total_bits > 1;
+    const bool use_qjl_key_residual = qjl && (!k_split || key_split_qjl) && s->k_qjl && s->qjl_matrix;
+
+    float* s_q_precomputed = s->scratch_s_times_r;
+    float* qjl_z = s->scratch_qjl_signs;
+
+    // TurboQuant Algorithm 2 stores QJL on the residual in the original basis.
+    // q_eff is only for the rotated MSE codebook dot product.
+    if (use_qjl_key_residual) {
+        if (!s_q_precomputed || !qjl_z) return 0;
+        // BUGFIX 356: qjl_matrix 범위 체크
+        for (int i = 0; i < d; i++) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                size_t idx = (size_t)i * (size_t)d + (size_t)j;
+                sum += s->qjl_matrix[idx] * query[j];
+            }
+            s_q_precomputed[i] = sum;
+        }
+    }
+
+    // Parallel K scoring for large context (n >= 1024)
+    if (n >= 1024) {
+        const int out_bits = key_split_qjl ? key_outlier_total_bits - 1 : key_outlier_total_bits;
+        const int norm_bits = key_split_qjl ? key_normal_total_bits - 1 : key_normal_total_bits;
+        const int n_outliers = cfg->outlier_channels;
+        const int n_normal = d - n_outliers;
+        // BUGFIX 357: overflow 방지
+        if (n_outliers < 0 || n_outliers > d || n_normal < 0) return 0;
+        // BUGFIX 487: out_bits/norm_bits 범위 체크
+        if (!qkv_bits_valid(out_bits) || !qkv_bits_valid(norm_bits)) return 0;
+        // BUGFIX 488: packed_size overflow 방지
+        if (n_outliers > INT_MAX / out_bits || n_normal > INT_MAX / norm_bits) return 0;
+        const int out_packed_size = k_split ? (n_outliers * out_bits + 7) / 8 : 0;
+        const int norm_packed_size = k_split ? (n_normal * norm_bits + 7) / 8 : 0;
+        const int* outlier_channels = k_split ? qkv_outlier_indices_for_target_const(s, QKV_TARGET_KEY) : nullptr;
+        const uint8_t* split_outlier = k_split ? qkv_idx_outlier_for_target_const(s, QKV_TARGET_KEY) : nullptr;
+        const uint8_t* split_normal = k_split ? qkv_idx_normal_for_target_const(s, QKV_TARGET_KEY) : nullptr;
+        const bool out_raw = qkv_bits_raw(out_bits);
+        const bool norm_raw = qkv_bits_raw(norm_bits);
+        const float* out_centroids = (k_split && !out_raw) ? qkv_codebook_for_bits(s, out_bits) : nullptr;
+        const float* norm_centroids = (k_split && !norm_raw) ? qkv_codebook_for_bits(s, norm_bits) : nullptr;
+        const uint8_t* is_outlier = k_split ? qkv_is_outlier_for_target_const(s, QKV_TARGET_KEY) : nullptr;
+
+        const int local_stride = std::max(d, std::max(n_outliers, n_normal));
+        // BUGFIX 358: work buffer 유효성 체크 강화
+        if (!s->work_codes_buf || !s->work_qjl_buf ||
+            s->work_buf_workers < workers || s->work_buf_stride < local_stride ||
+            workers <= 0 || local_stride <= 0) {
+            return 0;
+        }
+
+        auto score_range = [&](int begin, int end, int w, int* ok_flag) {
+            // BUGFIX 359: work buffer 인덱스 overflow 방지
+            // BUGFIX 659: Validate begin/end range to prevent invalid loop ★
+            // Problem: No validation of begin/end bounds → out-of-bounds access in parallel workers
+            // Solution: Check begin/end are within valid range [0, n]
+            // Impact: Prevents memory corruption in parallel attention computation
+            if (w < 0 || w >= workers || begin < 0 || end > n || begin > end) {
+                *ok_flag = 0;
+                return;
+            }
+            int* local_codes = s->work_codes_buf + (size_t)w * (size_t)s->work_buf_stride;
+            float* local_qjl = s->work_qjl_buf + (size_t)w * (size_t)d;
+
+            for (int t = begin; t < end && *ok_flag; t++) {
+                // BUGFIX 360: t 범위 체크
+                if (t < 0 || t >= n) {
+                    *ok_flag = 0;
+                    return;
+                }
+                float norm_k = s->k_norms[t];
+                float dot = 0.0f;
+
+                if ((uint32_t)t < s->sink_tokens && s->k_sink) {
+                    const float* exact_k = s->k_sink + (size_t)t * (size_t)d;
+                    for (int i = 0; i < d; ++i) {
+                        dot += query[i] * exact_k[i];
+                    }
+                    att[t] = qkv_attention_apply_logit_softcap(attn_logit_softcap, dot * sc);
+                    continue;
+                }
+
+                if (k_split) {
+                    if (!outlier_channels || !split_outlier || !split_normal ||
+                        (!out_raw && !out_centroids) || (!norm_raw && !norm_centroids)) {
+                        *ok_flag = 0;
+                        return;
+                    }
+                    const uint8_t* out_src = split_outlier + (size_t)t * (size_t)out_packed_size;
+                    if (!out_raw) {
+                        qkv_unpack_indices(out_src, local_codes, n_outliers, out_bits);
+                    }
+                    for (int i = 0; i < n_outliers; i++) {
+                        const int channel = outlier_channels[i];
+                        if (channel < 0 || channel >= d) {
+                            *ok_flag = 0;
+                            return;
+                        }
+                        const float kv = out_raw ? qkv_attention_load_raw_scalar(out_src, i, out_bits) :
+                            out_centroids[local_codes[i]];
+                        dot += q_eff[channel] * kv;
+                    }
+                    const uint8_t* norm_src = split_normal + (size_t)t * (size_t)norm_packed_size;
+                    if (!norm_raw) {
+                        qkv_unpack_indices(norm_src, local_codes, n_normal, norm_bits);
+                    }
+                    int normal_pos = 0;
+                    for (int i = 0; i < d; i++) {
+                        if (is_outlier && is_outlier[i]) continue;
+                        if (normal_pos >= n_normal) {
+                            *ok_flag = 0;
+                            return;
+                        }
+                        const float kv = norm_raw ? qkv_attention_load_raw_scalar(norm_src, normal_pos, norm_bits) :
+                            norm_centroids[local_codes[normal_pos]];
+                        ++normal_pos;
+                        dot += q_eff[i] * kv;
+                    }
+                } else if (k_raw) {
+                    const uint8_t* tidx = s->k_idx + t * k_stride;
+                    for (int i = 0; i < d; i++) {
+                        dot += q_eff[i] * qkv_attention_load_raw_scalar(tidx, i, k_mse_bits);
+                    }
+                } else if (k_mse_bits == 2) {
+                    const uint8_t* tidx = s->k_idx + t * k_stride;
+                    for (int i = 0; i < d; i++) {
+                        int byte_pos = (i * 2) / 8;
+                        int bit_pos = (i * 2) % 8;
+                        int code = (tidx[byte_pos] >> bit_pos) & 0x3;
+                        dot += q_eff[i] * k_centroids[code];
+                    }
+                } else {
+                    const uint8_t* tidx = s->k_idx + t * k_stride;
+                    qkv_unpack_indices(tidx, local_codes, d, k_mse_bits);
+                    for (int i = 0; i < d; i++) {
+                        dot += q_eff[i] * k_centroids[local_codes[i]];
+                    }
+                }
+
+                // Paper Algorithm 2: Add QJL residual for unbiased inner product
+                if (use_qjl_key_residual) {
+                    const uint8_t* tqjl = s->k_qjl + t * k_qstride;
+                    float r_norm = s->k_residual_norms[t];
+                    if (r_norm > 1e-10f) {
+                        qkv_unpack_signs(tqjl, local_qjl, d);
+                        for (int i = 0; i < d; i++) {
+                            dot += qjl_scale * r_norm * s_q_precomputed[i] * local_qjl[i];
+                        }
+                    }
+                }
+                att[t] = qkv_attention_apply_logit_softcap(attn_logit_softcap, dot * norm_k * sc);
+            }
+        };
+
+        std::vector<int> ok_flags((size_t)workers, 1);
+        auto k_task = [&](int w) {
+            const int begin = (int)(((int64_t)n * w) / workers);
+            const int end = (int)(((int64_t)n * (w + 1)) / workers);
+            score_range(begin, end, w, &ok_flags[(size_t)w]);
+        };
+
+        if (s->thread_pool) {
+            static_cast<QkvThreadPool*>(s->thread_pool)->run(workers, k_task);
+        } else {
+            for (int w = 0; w < workers; ++w) k_task(w);
+        }
+
+        for (int v : ok_flags) {
+            if (!v) return 0;
+        }
+    } else {
+        // Serial K scoring for small context (n < 1024)
+        for (int t = 0; t < n; t++) {
+            float norm_k = s->k_norms[t];
+            float dot = 0.0f;
+
+            if ((uint32_t)t < s->sink_tokens && s->k_sink) {
+                const float* exact_k = s->k_sink + (size_t)t * (size_t)d;
+                for (int i = 0; i < d; ++i) {
+                    dot += query[i] * exact_k[i];
+                }
+                att[t] = qkv_attention_apply_logit_softcap(attn_logit_softcap, dot * sc);
+                continue;
+            }
+
+            if (k_split) {
+                if (!qkv_dot_mse_split_rotated_token(s, cfg, QKV_TARGET_KEY, t, q_eff, &dot)) return 0;
+            } else if (k_raw) {
+                const uint8_t* tidx = s->k_idx + t * k_stride;
+                for (int i = 0; i < d; i++) {
+                    dot += q_eff[i] * qkv_attention_load_raw_scalar(tidx, i, k_mse_bits);
+                }
+            } else if (k_mse_bits == 2) {
+                const uint8_t* tidx = s->k_idx + t * k_stride;
+                for (int i = 0; i < d; i++) {
+                    int byte_pos = (i * 2) / 8;
+                    int bit_pos = (i * 2) % 8;
+                    int code = (tidx[byte_pos] >> bit_pos) & 0x3;
+                    dot += q_eff[i] * k_centroids[code];
+                }
+            } else {
+                const uint8_t* tidx = s->k_idx + t * k_stride;
+                int* indices = s->scratch_indices;
+                if (!indices) return 0;
+                qkv_unpack_indices(tidx, indices, d, k_mse_bits);
+                for (int i = 0; i < d; i++) {
+                    dot += q_eff[i] * k_centroids[indices[i]];
+                }
+            }
+
+            // Add QJL residual
+            if (use_qjl_key_residual) {
+                const uint8_t* tqjl = s->k_qjl + t * k_qstride;
+                float r_norm = s->k_residual_norms[t];
+                if (r_norm > 1e-10f) {
+                    qkv_unpack_signs(tqjl, qjl_z, d);
+                    for (int i = 0; i < d; i++) {
+                        dot += qjl_scale * r_norm * s_q_precomputed[i] * qjl_z[i];
+                    }
+                }
+            }
+            att[t] = qkv_attention_apply_logit_softcap(attn_logit_softcap, dot * norm_k * sc);
+        }
+    }
+
+    // Softmax
+    // BUGFIX 361: n이 0일 때 방지 (이미 위에서 체크했지만 명시적으로)
+    if (n <= 0) return 0;
+    float mx = att[0];
+    if (!std::isfinite(mx)) return 0;
+    for (int t = 1; t < n; t++) if (att[t] > mx) mx = att[t];
+    if (!std::isfinite(mx)) return 0;
+    float se = 0;
+    for (int t = 0; t < n; t++) {
+        if (!std::isfinite(att[t])) return 0;
+        att[t] = expf(att[t] - mx);
+        if (!std::isfinite(att[t])) return 0;
+        se += att[t];
+    }
+    // BUGFIX 362: softmax sum이 0일 때 division by zero 방지
+    if (se > 1e-10f && std::isfinite(se)) {
+        float iv = 1.0f / se;
+        for (int t = 0; t < n; t++) att[t] *= iv;
+    } else {
+        return 0;
+    }
+
+    // Phase 2: V weighted sum — need full dequant (with inverse rotation)
+    if (n >= 1024) {
+        // BUGFIX 363: workers 유효성 체크
+        if (workers <= 0 || workers > 1024) return 0;
+        std::vector<float> partial((size_t)workers * (size_t)d, 0.0f);
+        std::vector<int> ok_flags((size_t)workers, 1);
+
+        std::vector<float> work_row((size_t)workers * (size_t)d);
+        std::vector<float> work_residual((size_t)workers * (size_t)d);
+        std::vector<float> work_s_times_r((size_t)workers * (size_t)d);
+        std::vector<float> work_qjl((size_t)workers * (size_t)d);
+        std::vector<float> work_s_t_qjl((size_t)workers * (size_t)d);
+        std::vector<float> work_y((size_t)workers * (size_t)d);
+        std::vector<float> work_x((size_t)workers * (size_t)d);
+        std::vector<int> work_indices((size_t)workers * (size_t)d);
+
+        auto v_task = [&](int w) {
+            // BUGFIX 364: w 범위 체크
+            if (w < 0 || w >= workers) return;
+            const int begin = (int)(((int64_t)n * w) / workers);
+            const int end = (int)(((int64_t)n * (w + 1)) / workers);
+            qkv_state_t local = *s;
+            local.scratch_residual = work_residual.data() + w * d;
+            local.scratch_s_times_r = work_s_times_r.data() + w * d;
+            local.scratch_qjl_signs = work_qjl.data() + w * d;
+            local.scratch_s_t_qjl = work_s_t_qjl.data() + w * d;
+            local.scratch_y_tilde = work_y.data() + w * d;
+            local.scratch_x_tilde = work_x.data() + w * d;
+            local.scratch_indices = work_indices.data() + w * d;
+            float* dst = partial.data() + (size_t)w * (size_t)d;
+            float* local_row = work_row.data() + (size_t)w * (size_t)d;
+
+            for (int t = begin; t < end; ++t) {
+                if (!qkv_dequant_one(&local, cfg, local.v_idx, local.v_qjl,
+                        local.v_residual_norms, local.v_norms, t, local.v_bits, qjl, local_row)) {
+                    ok_flags[(size_t)w] = 0;
+                    return;
+                }
+                const float weight = att[t];
+                for (int i = 0; i < d; ++i) {
+                    dst[i] += weight * local_row[i];
+                }
+            }
+        };
+
+        if (s->thread_pool) {
+            static_cast<QkvThreadPool*>(s->thread_pool)->run(workers, v_task);
+        } else {
+            for (int w = 0; w < workers; ++w) v_task(w);
+        }
+
+        memset(output, 0, d * sizeof(float));
+        for (int w = 0; w < workers; ++w) {
+            if (!ok_flags[(size_t)w]) return 0;
+            const float* src = partial.data() + (size_t)w * (size_t)d;
+            for (int i = 0; i < d; ++i) {
+                output[i] += src[i];
+            }
+        }
+        return 1;
+    }
+
+    // Serial V accumulation for small context
+    memset(output, 0, d * sizeof(float));
+    for (int t = 0; t < n; t++) {
+        if (!qkv_dequant_one(s, cfg, s->v_idx, s->v_qjl,
+                s->v_residual_norms, s->v_norms, t, s->v_bits, qjl, row))
+            return 0;
+        float w = att[t];
+        for (int i = 0; i < d; i++) output[i] += w * row[i];
+    }
+    return 1;
+}

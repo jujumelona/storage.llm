@@ -1,0 +1,263 @@
+
+// ============================================================================
+// Continuous Batching Scheduler (Disaggregated Inference Ready)
+// ============================================================================
+// Handles dynamic request queuing, iteration-level scheduling, and prefill/decode
+// phase separation. Uses Paged KV Cache to avoid memory fragmentation.
+
+#include <vector>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <algorithm>
+#include <utility>
+
+#if defined(MOE_ENABLE_PAGED_KV) && MOE_ENABLE_PAGED_KV
+
+enum moe_request_phase_t {
+    moe_REQ_WAITING,
+    moe_REQ_PREFILL,
+    moe_REQ_DECODE,
+    moe_REQ_FINISHED
+};
+
+struct moe_batch_request_t {
+    uint64_t request_id;
+    std::vector<int32_t> prompt_tokens;
+    std::vector<int32_t> generated_tokens;
+    std::vector<uint32_t> kv_block_table; // Maps logical blocks to physical blocks
+    uint32_t processed_tokens = 0;
+    moe_request_phase_t phase = moe_REQ_WAITING;
+    // BUGFIX 702: Skip counter for head-of-line blocking prevention ★★
+    // Tracks how many scheduling iterations this request was bypassed.
+    // When skip_count >= kMaxSkipCount, the request is force-admitted next.
+    uint32_t skip_count = 0;
+
+    // BUGFIX Problem F: Per-session router EMA state ★★★ PERFORMANCE
+    // Problem: Engine-level smoothed_router_entropy_milli shared across all batches
+    // → Different domains (code gen vs chat) mix EMA state
+    // → Hysteresis effectiveness reduced, cache hit rate drops
+    // Solution: Store EMA state per request/session
+    // → Each session maintains independent entropy smoothing
+    // → Better adaptive top_k decisions for each domain
+    // Impact: Improved cache hit rate in multi-domain workloads
+    uint32_t smoothed_router_entropy_milli = 0;
+    uint32_t smoothed_adaptive_prefetch_depth = 2;
+
+    // BUGFIX Problem F stage 3: Save/restore EMA between request and decode scratch ★★★
+    // Problem: smoothed_router_entropy_milli field exists but is never read/written
+    // → Per-session EMA state is dead code, engine-level EMA shared across all sessions
+    // Solution: save_ema_to_request() called after router dispatch, restore before
+    // Impact: Each session maintains truly independent entropy tracking
+    void save_ema_from_scratch(const moe_decode_scratch* s) {
+        if (!s) return;
+        smoothed_router_entropy_milli = s->session_router_entropy_milli;
+        smoothed_adaptive_prefetch_depth = s->session_adaptive_prefetch_depth;
+    }
+    void restore_ema_to_scratch(moe_decode_scratch* s) const {
+        if (!s) return;
+        s->session_router_entropy_milli = smoothed_router_entropy_milli;
+        s->session_adaptive_prefetch_depth = smoothed_adaptive_prefetch_depth;
+    }
+};
+
+struct moe_continuous_batch_scheduler_t {
+    // BUGFIX 702: Replace std::queue with std::deque ★★
+    // std::queue only allows front-pop, causing head-of-line blocking when
+    // a large request at the front can't be admitted but smaller ones behind it could.
+    // std::deque allows random-access iteration + erase for skip-based scheduling.
+    std::deque<moe_batch_request_t*> waiting_queue;
+    std::vector<moe_batch_request_t*> running_queue;
+    std::mutex mtx;
+    uint32_t max_running_requests = 16;
+    uint32_t max_tokens_per_iteration = 512;
+
+    // BUGFIX 702: Maximum skip count before force-admission ★★
+    // Prevents starvation of large-context requests that keep getting bypassed.
+    // At 16 skips, the request is treated as highest priority and blocks further
+    // admission until KV blocks become available for it.
+    static constexpr uint32_t kMaxSkipCount = 16;
+
+    // BUGFIX 229: Add destructor to clean up pending requests ★★
+    // Problem: Requests in waiting_queue and running_queue never freed on scheduler destruction
+    // Solution: Delete all pending requests in destructor
+    // Impact: Prevents memory leak on engine shutdown
+    ~moe_continuous_batch_scheduler_t() {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (auto* req : waiting_queue) {
+            delete req;
+        }
+        waiting_queue.clear();
+        for (auto* req : running_queue) {
+            delete req;
+        }
+        running_queue.clear();
+    }
+
+    void add_request(moe_batch_request_t* req) {
+        // BUGFIX 308: Reject null requests to prevent queue corruption ★
+        // Problem: Caller can pass nullptr, causing crash in schedule_next_iteration
+        // Solution: Check req before adding to queue
+        if (!req) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mtx);
+        waiting_queue.push_back(req);
+    }
+
+    // Steps the scheduler: moves waiting requests to running if capacity allows,
+    // and determines the batch of tokens to process this iteration.
+    void schedule_next_iteration(moe_paged_kv_manager_t* kv_manager,
+                                 std::vector<moe_batch_request_t*>& out_prefill,
+                                 std::vector<moe_batch_request_t*>& out_decode) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto allocate_request_blocks = [](moe_paged_kv_manager_t* manager,
+                                          uint32_t needed,
+                                          std::vector<uint32_t>* out_blocks) -> bool {
+            if (!manager || !out_blocks) {
+                return false;
+            }
+            out_blocks->clear();
+            out_blocks->reserve(needed);
+            for (uint32_t i = 0; i < needed; ++i) {
+                const int block_id = manager->allocate_block();
+                if (block_id < 0) {
+                    for (uint32_t allocated : *out_blocks) {
+                        manager->free_block(allocated);
+                    }
+                    out_blocks->clear();
+                    return false;
+                }
+                out_blocks->push_back((uint32_t)block_id);
+            }
+            return true;
+        };
+
+        // 1. Evict finished requests
+        // Fix 26: O(n) single-pass sweep instead of O(n²) repeated vector::erase
+        // First: free resources for finished/null requests
+        for (auto*& req : running_queue) {
+            if (!req) continue;
+            if (req->phase == moe_REQ_FINISHED) {
+                if (kv_manager) {
+                    for (uint32_t block_id : req->kv_block_table) {
+                        kv_manager->free_block(block_id);
+                    }
+                }
+                delete req;
+                req = nullptr;  // Mark for removal
+            }
+        }
+        // Second: compact with erase-remove idiom (single memmove)
+        running_queue.erase(
+            std::remove(running_queue.begin(), running_queue.end(), nullptr),
+            running_queue.end());
+
+        // 2. Admit new requests (Iteration-level scheduling)
+        // BUGFIX 702: Skip-based scheduling to eliminate head-of-line blocking ★★
+        // Old: FIFO-only with break on first failure → large request blocks all behind it.
+        // New: Iterate the entire waiting_queue. If a request can't fit, skip it and try
+        //      the next one. Increment skip_count on each bypass. When skip_count reaches
+        //      kMaxSkipCount, force-block: stop admitting others until this request can go.
+        //      This preserves approximate FIFO fairness while allowing small requests through.
+
+        // BUGFIX 286: Check kv_manager validity before accessing free blocks.
+        if (!kv_manager || kv_manager->block_size == 0) {
+            // Cannot admit requests without valid KV manager.
+        } else {
+            auto it = waiting_queue.begin();
+            while (it != waiting_queue.end() && running_queue.size() < max_running_requests) {
+                auto* req = *it;
+
+                // BUGFIX 306: Check req validity before accessing members.
+                if (!req) {
+                    it = waiting_queue.erase(it);
+                    continue;
+                }
+
+                uint32_t needed_blocks = (static_cast<uint32_t>(req->prompt_tokens.size()) + kv_manager->block_size - 1) / kv_manager->block_size;
+
+                // free_count is only a lock-free hint; the free-list is authoritative.
+                const bool force_admit = req->skip_count >= kMaxSkipCount;
+                const bool enough_blocks_hint = kv_manager->available_free_blocks() >= needed_blocks;
+                if (enough_blocks_hint || force_admit) {
+                    std::vector<uint32_t> allocated_blocks;
+                    if (!allocate_request_blocks(kv_manager, needed_blocks, &allocated_blocks)) {
+                        if (force_admit) {
+                            req->skip_count = kMaxSkipCount / 2;
+                            break;
+                        }
+                        ++req->skip_count;
+                        ++it;
+                        continue;
+                    }
+                    req->kv_block_table = std::move(allocated_blocks);
+                    // Enough KV blocks available — admit this request
+                    req->phase = moe_REQ_PREFILL;
+                    req->skip_count = 0;
+                    running_queue.push_back(req);
+                    it = waiting_queue.erase(it);
+                } else {
+                    // Not enough KV blocks for this request
+                    req->skip_count++;
+
+                    // BUGFIX 702: Starvation guard ★★
+                    // If this request has been skipped too many times, STOP admitting
+                    // any further requests. This forces the system to drain KV blocks
+                    // until this starved request can be served, preserving SLO fairness.
+                    //
+                    // BUGFIX 882: Force-admit failure recovery ★★★ CRITICAL
+                    // Problem: Force-admitted request (skip_count >= kMaxSkipCount) blocks
+                    // all other requests. If KV block allocation fails, request stays in
+                    // waiting_queue with skip_count >= kMaxSkipCount, blocking forever.
+                    // Running queue empty → no eviction → deadlock.
+                    // Solution: On force-admit KV allocation failure, reduce skip_count to
+                    // kMaxSkipCount/2 and break. Next iteration will retry with lower priority.
+                    // Impact: Prevents deadlock, allows other requests to proceed while waiting
+                    // for KV eviction to free blocks.
+                    if (req->skip_count >= kMaxSkipCount) {
+                        req->skip_count = kMaxSkipCount / 2;
+                        break;
+                    } else {
+                        ++it;  // Skip this request, try the next one
+                    }
+                }
+            }
+        }
+
+        // 3. Separate into prefill and decode batches
+        for (auto* req : running_queue) {
+            // BUGFIX 309: Check req validity before accessing phase ★
+            // Problem: running_queue can contain null if corruption occurs
+            // Solution: Skip null entries
+            if (!req) {
+                continue;
+            }
+            if (req->phase == moe_REQ_PREFILL) out_prefill.push_back(req);
+            else if (req->phase == moe_REQ_DECODE) out_decode.push_back(req);
+        }
+    }
+
+    // BUGFIX Problem F stage 3: Restore per-request EMA to scratch before dispatch ★★★
+    // Called by batch forward pass before router invocation for each request.
+    // Ensures decode scratch uses this request's entropy state, not the previous request's.
+    static void restore_request_ema(moe_batch_request_t* req, moe_decode_scratch* s) {
+        if (req && s) {
+            req->restore_ema_to_scratch(s);
+        }
+    }
+    // Called by batch forward pass after router invocation for each request.
+    // Persists the updated entropy state back to the request for next iteration.
+    static void save_request_ema(moe_batch_request_t* req, const moe_decode_scratch* s) {
+        if (req && s) {
+            req->save_ema_from_scratch(s);
+        }
+    }
+};
+
+#else
+
+struct moe_batch_request_t {};
+struct moe_continuous_batch_scheduler_t {};
+
+#endif

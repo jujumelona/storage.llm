@@ -1,0 +1,442 @@
+// JSON parsing utilities
+// Lightweight JSON parser for extracting values from metadata
+
+static int moe_json_find_scalar(const std::string& text, const char* key, size_t* value_pos) {
+    if (!key || !value_pos) {
+        return 0;
+    }
+    // BUGFIX 90: Issue 14 - Optimize JSON key search with string_view ★
+    // Problem: std::string("\"") + key + "\"" creates temporary string on every call
+    // Called frequently during model validation (hundreds of keys)
+    // Solution: Use string_view or pre-compute needle length
+    // Avoid temporary string allocation
+    const size_t key_len = std::strlen(key);
+    const size_t needle_len = key_len + 2;  // "key"
+
+    size_t pos = 0;
+    while ((pos = text.find('"', pos)) != std::string::npos) {
+        if (pos + 1 + key_len < text.size() &&
+            text.compare(pos + 1, key_len, key) == 0 &&
+            text[pos + 1 + key_len] == '"') {
+            const size_t colon = text.find_first_not_of(" \t\r\n", pos + needle_len);
+            if (colon != std::string::npos && colon < text.size() && text[colon] == ':') {
+                *value_pos = text.find_first_not_of(" \t\r\n", colon + 1);
+                return *value_pos != std::string::npos;
+            }
+        }
+        pos++;
+    }
+    return 0;
+}
+
+static int moe_json_get_u64_local(const std::string& text, const char* key, uint64_t* out) {
+    size_t value = 0;
+    if (!out || !moe_json_find_scalar(text, key, &value) || value >= text.size()) {
+        return 0;
+    }
+    char* end = nullptr;
+    const char* begin = text.c_str() + value;
+    const uint64_t parsed = std::strtoull(begin, &end, 10);
+    if (!end || end == begin) {
+        return 0;
+    }
+    *out = parsed;
+    return 1;
+}
+
+static int moe_json_get_double_local(const std::string& text, const char* key, double* out) {
+    size_t value = 0;
+    if (!out || !moe_json_find_scalar(text, key, &value) || value >= text.size()) {
+        return 0;
+    }
+    char* end = nullptr;
+    const char* begin = text.c_str() + value;
+    const double parsed = std::strtod(begin, &end);
+    if (!end || end == begin || !std::isfinite(parsed)) {
+        return 0;
+    }
+    *out = parsed;
+    return 1;
+}
+
+static int moe_json_get_bool_local(const std::string& text, const char* key, int* out) {
+    size_t value = 0;
+    if (!out || !moe_json_find_scalar(text, key, &value) || value >= text.size()) {
+        return 0;
+    }
+    if (text.compare(value, 4, "true") == 0) {
+        *out = 1;
+        return 1;
+    }
+    if (text.compare(value, 5, "false") == 0) {
+        *out = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int moe_json_get_string_local(const std::string& text, const char* key, std::string* out) {
+    size_t value = 0;
+    if (!out || !moe_json_find_scalar(text, key, &value) || value >= text.size() || text[value] != '"') {
+        return 0;
+    }
+    ++value;
+    std::string parsed;
+    while (value < text.size()) {
+        const char c = text[value++];
+        if (c == '"') {
+            *out = parsed;
+            return 1;
+        }
+        // BUGFIX 268: Simplified escape handling for JSON metadata ★★
+        // Problem: Only copies next char after backslash without interpreting escape sequences
+        // Current behavior: "\n" → "n", "\t" → "t" (literal characters, not control codes)
+        // Solution: This is intentional for metadata parsing (model IDs, paths don't need control codes)
+        // Add comment to clarify this is simplified parsing, not full JSON spec
+        // For full JSON spec compliance, would need: \n→newline, \t→tab, \uXXXX→unicode, etc.
+        if (c == '\\' && value < text.size()) {
+            // Simplified escape: just remove backslash, keep next char as-is
+            // Sufficient for model metadata (no control codes in model IDs/paths)
+            parsed.push_back(text[value++]);
+        } else {
+            parsed.push_back(c);
+        }
+    }
+    return 0;
+}
+
+static size_t moe_json_match_bracket_local(
+    const std::string& text,
+    size_t begin,
+    char open_ch,
+    char close_ch
+) {
+    if (begin >= text.size() || text[begin] != open_ch) {
+        return std::string::npos;
+    }
+    uint32_t depth = 0;
+    bool in_string = false;
+    bool escape = false;
+    for (size_t i = begin; i < text.size(); ++i) {
+        const char c = text[i];
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+        if (c == open_ch) {
+            ++depth;
+        } else if (c == close_ch) {
+            if (depth == 0) {
+                return std::string::npos;
+            }
+            --depth;
+            if (depth == 0) {
+                return i + 1;
+            }
+        }
+    }
+    return std::string::npos;
+}
+
+static int moe_json_find_array_local(
+    const std::string& text,
+    const char* key,
+    size_t* begin,
+    size_t* end
+) {
+    size_t value = 0;
+    if (!begin || !end || !moe_json_find_scalar(text, key, &value) ||
+        value >= text.size() || text[value] != '[') {
+        return 0;
+    }
+    const size_t close = moe_json_match_bracket_local(text, value, '[', ']');
+    if (close == std::string::npos) {
+        return 0;
+    }
+    *begin = value;
+    *end = close;
+    return 1;
+}
+
+static int moe_json_find_top_level_array_local(
+    const std::string& text,
+    const char* key,
+    size_t* begin,
+    size_t* end
+) {
+    if (!key || !begin || !end) {
+        return 0;
+    }
+    const size_t key_len = std::strlen(key);
+    int depth = 0;
+    for (size_t i = 0; i < text.size();) {
+        const char c = text[i];
+        if (c == '"') {
+            const size_t key_begin = i + 1;
+            size_t j = key_begin;
+            int escape = 0;
+            while (j < text.size()) {
+                const char sc = text[j];
+                if (escape) {
+                    escape = 0;
+                } else if (sc == '\\') {
+                    escape = 1;
+                } else if (sc == '"') {
+                    break;
+                }
+                ++j;
+            }
+            if (j >= text.size()) {
+                return 0;
+            }
+            if (depth == 1 &&
+                j - key_begin == key_len &&
+                text.compare(key_begin, key_len, key) == 0) {
+                const size_t colon = text.find_first_not_of(" \t\r\n", j + 1);
+                if (colon != std::string::npos && colon < text.size() && text[colon] == ':') {
+                    const size_t value = text.find_first_not_of(" \t\r\n", colon + 1);
+                    if (value != std::string::npos && value < text.size() && text[value] == '[') {
+                        const size_t close = moe_json_match_bracket_local(text, value, '[', ']');
+                        if (close != std::string::npos) {
+                            *begin = value;
+                            *end = close;
+                            return 1;
+                        }
+                    }
+                }
+            }
+            i = j + 1;
+            continue;
+        }
+        if (c == '{' || c == '[') {
+            ++depth;
+        } else if (c == '}' || c == ']') {
+            if (depth > 0) {
+                --depth;
+            }
+        }
+        ++i;
+    }
+    return 0;
+}
+
+static int moe_json_find_object_local(
+    const std::string& text,
+    const char* key,
+    size_t* begin,
+    size_t* end
+) {
+    size_t value = 0;
+    if (!begin || !end || !moe_json_find_scalar(text, key, &value) ||
+        value >= text.size() || text[value] != '{') {
+        return 0;
+    }
+    const size_t close = moe_json_match_bracket_local(text, value, '{', '}');
+    if (close == std::string::npos) {
+        return 0;
+    }
+    *begin = value;
+    *end = close;
+    return 1;
+}
+
+static int moe_json_next_object_in_array(
+    const std::string& text,
+    size_t* cursor,
+    size_t end,
+    size_t* obj_begin,
+    size_t* obj_end
+) {
+    if (!cursor || !obj_begin || !obj_end || *cursor >= end) {
+        return 0;
+    }
+    size_t pos = *cursor;
+    while (pos < end && text[pos] != '{') {
+        ++pos;
+    }
+    if (pos >= end) {
+        *cursor = end;
+        return 0;
+    }
+    const size_t close = moe_json_match_bracket_local(text, pos, '{', '}');
+    if (close == std::string::npos || close > end) {
+        *cursor = end;
+        return 0;
+    }
+    *obj_begin = pos;
+    *obj_end = close;
+    *cursor = close;
+    return 1;
+}
+
+static int moe_json_get_u64_slice(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    uint64_t* out
+) {
+    if (begin >= end || end > text.size()) {
+        return 0;
+    }
+    // BUGFIX 549: Check for substr overflow ★
+    // Problem: If begin >= text.size(), substr throws out_of_range exception
+    // Solution: Add bounds check before substr
+    if (begin >= text.size()) {
+        return 0;
+    }
+    return moe_json_get_u64_local(text.substr(begin, end - begin), key, out);
+}
+
+static int moe_json_get_string_slice(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    std::string* out
+) {
+    if (begin >= end || end > text.size()) {
+        return 0;
+    }
+    // BUGFIX 548: Check for substr overflow ★
+    // Problem: If begin >= text.size(), substr throws out_of_range exception
+    // Solution: Add bounds check before substr
+    if (begin >= text.size()) {
+        return 0;
+    }
+    return moe_json_get_string_local(text.substr(begin, end - begin), key, out);
+}
+
+static int moe_json_get_double_slice(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    double* out
+) {
+    if (begin >= end || end > text.size() || begin >= text.size()) {
+        return 0;
+    }
+    return moe_json_get_double_local(text.substr(begin, end - begin), key, out);
+}
+
+static int moe_json_get_bool_slice(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    int* out
+) {
+    if (begin >= end || end > text.size() || begin >= text.size()) {
+        return 0;
+    }
+    return moe_json_get_bool_local(text.substr(begin, end - begin), key, out);
+}
+
+static int moe_json_get_string_array_slice(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    std::vector<std::string>* out
+) {
+    if (out) {
+        out->clear();
+    }
+    if (!out || begin >= end || end > text.size() || begin >= text.size()) {
+        return 0;
+    }
+    const std::string slice = text.substr(begin, end - begin);
+    size_t arr_begin = 0;
+    size_t arr_end = 0;
+    if (!moe_json_find_array_local(slice, key, &arr_begin, &arr_end)) {
+        return 0;
+    }
+    size_t pos = arr_begin + 1;
+    while (pos < arr_end) {
+        pos = slice.find_first_not_of(" \t\r\n,", pos);
+        if (pos == std::string::npos || pos >= arr_end || slice[pos] == ']') {
+            break;
+        }
+        if (slice[pos] != '"') {
+            return 0;
+        }
+        ++pos;
+        std::string value;
+        while (pos < arr_end) {
+            const char c = slice[pos++];
+            if (c == '"') {
+                out->push_back(std::move(value));
+                break;
+            }
+            if (c == '\\' && pos < arr_end) {
+                value.push_back(slice[pos++]);
+            } else {
+                value.push_back(c);
+            }
+        }
+    }
+    return !out->empty();
+}
+
+static int moe_json_get_u64_array_slice(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* key,
+    uint64_t* values,
+    uint32_t max_values,
+    uint32_t* out_count
+) {
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (!values || max_values == 0 || begin >= end || end > text.size()) {
+        return 0;
+    }
+    // BUGFIX 546: Check for substr overflow ★
+    // Problem: If begin >= text.size(), substr throws out_of_range exception
+    // Solution: Add bounds check before substr
+    if (begin >= text.size()) {
+        return 0;
+    }
+    const std::string slice = text.substr(begin, end - begin);
+    size_t arr_begin = 0;
+    size_t arr_end = 0;
+    if (!moe_json_find_array_local(slice, key, &arr_begin, &arr_end)) {
+        return 0;
+    }
+    uint32_t count = 0;
+    size_t pos = arr_begin + 1;
+    while (pos < arr_end && count < max_values) {
+        pos = slice.find_first_not_of(" \t\r\n,", pos);
+        if (pos == std::string::npos || pos >= arr_end || slice[pos] == ']') {
+            break;
+        }
+        char* parsed_end = nullptr;
+        const char* start = slice.c_str() + pos;
+        const uint64_t value = std::strtoull(start, &parsed_end, 10);
+        // BUGFIX 547: Check parsed_end is not null before dereferencing ★
+        // Problem: strtoull can set parsed_end to null on failure
+        // Solution: Check parsed_end != nullptr before comparing
+        if (!parsed_end || parsed_end == start) {
+            break;
+        }
+        values[count++] = value;
+        pos = (size_t)(parsed_end - slice.c_str());
+    }
+    if (out_count) {
+        *out_count = count;
+    }
+    return count > 0 ? 1 : 0;
+}

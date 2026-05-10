@@ -1,0 +1,14 @@
+build*/
+out/
+.glm5_model_lib_cache/
+*.obj
+*.lib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.tlog
+*.lastbuildstate
+__pycache__/
+*.pyc
+.pytest_cache/
