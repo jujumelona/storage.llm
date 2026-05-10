@@ -305,3 +305,12 @@ def test_juju_runtime_loader_rejects_bad_payload_ranges_not_skip():
     rejected_pos = main_parse_text.index("JUJU tensor index payload range rejected")
     return_pos = main_parse_text.index("return 0;", rejected_pos)
     assert rejected_pos < return_pos
+
+
+def test_standard_attention_allows_declared_k_equals_v_value_source():
+    attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_decode.cpp.inc").read_text()
+    assert 'moe_engine_graph_ir_mentions(engine, "attention_k_eq_v")' in attn_text
+    assert 'moe_engine_graph_ir_mentions(engine, "raw_k_projection_before_k_norm")' in attn_text
+    blocked_pos = attn_text.index('attn_v_equals_k_blocked')
+    allow_pos = attn_text.index('const int allow_v_equals_k')
+    assert allow_pos < blocked_pos

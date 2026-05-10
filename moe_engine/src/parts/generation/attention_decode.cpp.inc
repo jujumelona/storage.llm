@@ -63,7 +63,9 @@
     const int allow_v_equals_k = !engine || !engine->offload_graph_ir_required.load(std::memory_order_relaxed) ||
         moe_engine_graph_ir_mentions(engine, "v_equals_k") ||
         moe_engine_graph_ir_mentions(engine, "k_equals_v") ||
-        moe_engine_graph_ir_mentions(engine, "shared_kv_projection");
+        moe_engine_graph_ir_mentions(engine, "shared_kv_projection") ||
+        moe_engine_graph_ir_mentions(engine, "attention_k_eq_v") ||
+        moe_engine_graph_ir_mentions(engine, "raw_k_projection_before_k_norm");
 
     if (qkv_parallel_path) {
         // BUGFIX 216: Add scratch buffer size validation before parallel Q/K/V
