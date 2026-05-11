@@ -3,43 +3,6 @@
 // Do not split this function across .inc boundaries: depth/s/c/hidden_size/num_selected
 // are intentionally shared through the full function scope.
 
-static int moe_graph_ir_declares_shared_expert_mlp(const moe_pc_engine* engine, int32_t layer) {
-    if (!moe_graph_ir_math_required(engine)) {
-        return 0;
-    }
-    static const char* const gate_roles[] = {
-        "shared_expert_gate", "shared_gate_projection", "shared_ffn_gate",
-        "shared_expert_w1", "shared_expert_gate_proj"
-    };
-    static const char* const gate_suffixes[] = {
-        "shared_expert_gate.weight", "shared_expert.gate.weight", "shared_ffn_gate.weight",
-        "mlp.shared_expert_gate.weight", "shared_experts.gate_proj.weight",
-        "shared_expert.gate_proj.weight", "shared_expert.w1.weight"
-    };
-    static const char* const up_roles[] = {
-        "shared_expert_up", "shared_up_projection", "shared_ffn_up",
-        "shared_expert_w3", "shared_expert_up_proj"
-    };
-    static const char* const up_suffixes[] = {
-        "shared_expert_up.weight", "shared_expert.up.weight", "shared_ffn_up.weight",
-        "mlp.shared_expert_up.weight", "shared_experts.up_proj.weight",
-        "shared_expert.up_proj.weight", "shared_expert.w3.weight"
-    };
-    static const char* const down_roles[] = {
-        "shared_expert_down", "shared_down_projection", "shared_ffn_down",
-        "shared_expert_w2", "shared_expert_down_proj"
-    };
-    static const char* const down_suffixes[] = {
-        "shared_expert_down.weight", "shared_expert.down.weight", "shared_ffn_down.weight",
-        "mlp.shared_expert_down.weight", "shared_experts.down_proj.weight",
-        "shared_expert.down_proj.weight", "shared_expert.w2.weight"
-    };
-    return
-        moe_graph_ir_declares_layer_tensor(engine, layer, gate_roles, sizeof(gate_roles) / sizeof(gate_roles[0]), gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0])) ||
-        moe_graph_ir_declares_layer_tensor(engine, layer, up_roles, sizeof(up_roles) / sizeof(up_roles[0]), up_suffixes, sizeof(up_suffixes) / sizeof(up_suffixes[0])) ||
-        moe_graph_ir_declares_layer_tensor(engine, layer, down_roles, sizeof(down_roles) / sizeof(down_roles[0]), down_suffixes, sizeof(down_suffixes) / sizeof(down_suffixes[0]));
-}
-
 static int moe_layer_moe_mlp_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -108,17 +71,9 @@ static int moe_layer_moe_mlp_f32(
     const moe_storage_raw_span_spec_t* shared = find_raw_role_span_bytes(layer, moe_RAW_ROLE_SHARED, shared_bytes, 0);
     int shared_ok = 0;
     const uint64_t shared_start_us = moe_profile_now_us();
-    const int graph_shared_declared = moe_graph_ir_declares_shared_expert_mlp(engine, layer);
     if (moe_layer_shared_expert_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
         shared_ok = 1;
-    } else if (moe_graph_ir_math_required(engine)) {
-        if (graph_shared_declared) {
-            std::fprintf(stderr,
-                "[storagellm mlp] GraphIR shared expert op is declared but could not be explicitly bound layer=%d\n",
-                layer);
-            return 0;
-        }
-    } else if (shared &&
+    } else if (!moe_graph_ir_math_required(engine) && shared &&
         moe_raw_mlp_span_f32(
             engine, shared, shared_input, hidden_size, configured_expert_intermediate,
             s->gate.data(), s->up.data(), s->shared.data())) {
@@ -2082,17 +2037,9 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         float* mlp_out = batch_mlp.data() + (size_t)t * hidden_size;
         float* shared_out_buf = local.shared.data();
         int shared_ok = 0;
-        const int graph_shared_declared = moe_graph_ir_declares_shared_expert_mlp(engine, layer);
         if (moe_layer_shared_expert_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, shared_out_buf)) {
             shared_ok = 1;
-        } else if (moe_graph_ir_math_required(engine)) {
-            if (graph_shared_declared) {
-                std::fprintf(stderr,
-                    "[storagellm mlp] batch GraphIR shared expert op is declared but could not be explicitly bound layer=%d token=%u\n",
-                    layer, t);
-                return 0;
-            }
-        } else if (shared &&
+        } else if (!moe_graph_ir_math_required(engine) && shared &&
             moe_raw_mlp_span_f32(
                 engine, shared, shared_input, hidden_size, intermediate_size,
                 local.gate.data(), local.up.data(), shared_out_buf)) {

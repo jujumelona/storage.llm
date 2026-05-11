@@ -245,20 +245,19 @@ static int moe_layer_dense_mlp_from_suffixes_f32(
     int up_declared = 0;
     int down_declared = 0;
     const int graph_required = moe_graph_ir_math_required(engine);
-    const int gate_mapped = moe_map_layer_graph_or_suffix_tensor(
+    const int gate_mapped = moe_map_layer_tensor_by_roles_or_suffixes(
         engine, layer, gate_roles, gate_role_count, gate_suffixes, gate_suffix_count,
         &gate, &gate_declared);
-    const int up_mapped = moe_map_layer_graph_or_suffix_tensor(
+    const int up_mapped = moe_map_layer_tensor_by_roles_or_suffixes(
         engine, layer, up_roles, up_role_count, up_suffixes, up_suffix_count,
         &up, &up_declared);
-    const int down_mapped = moe_map_layer_graph_or_suffix_tensor(
+    const int down_mapped = moe_map_layer_tensor_by_roles_or_suffixes(
         engine, layer, down_roles, down_role_count, down_suffixes, down_suffix_count,
         &down, &down_declared);
     if (!gate_mapped || !up_mapped || !down_mapped) {
         if (graph_required && (gate_declared || up_declared || down_declared)) {
-            moe_profile_log(
-                "mlp_dense_graph_bind_failed",
-                "layer=%d tag=%s gate=%d/%d up=%d/%d down=%d/%d",
+            std::fprintf(stderr,
+                "[storagellm mlp] graph-declared dense tensor bind failed layer=%d tag=%s gate=%d/%d up=%d/%d down=%d/%d\n",
                 layer, profile_tag ? profile_tag : "mlp_dense_begin",
                 gate_mapped, gate_declared, up_mapped, up_declared, down_mapped, down_declared);
         }
@@ -366,22 +365,13 @@ static int moe_layer_common_dense_mlp_f32(
         "w2.weight"
     };
     static const char* const gate_roles[] = {
-        "ffn_gate",
-        "mlp_gate",
-        "gate_projection",
-        "ffn_gate_projection"
+        "ffn_gate", "mlp_gate", "gate_projection", "ffn_gate_projection"
     };
     static const char* const up_roles[] = {
-        "ffn_up",
-        "mlp_up",
-        "up_projection",
-        "ffn_up_projection"
+        "ffn_up", "mlp_up", "up_projection", "ffn_up_projection"
     };
     static const char* const down_roles[] = {
-        "ffn_down",
-        "mlp_down",
-        "down_projection",
-        "ffn_down_projection"
+        "ffn_down", "mlp_down", "down_projection", "ffn_down_projection"
     };
     return moe_layer_dense_mlp_from_suffixes_f32(
         engine, layer, s, input, hidden_size, out_hidden,
@@ -447,12 +437,6 @@ static int moe_layer_shared_expert_dense_mlp_f32(
         "shared_expert_down_proj",
         "shared_ffn_down"
     };
-    if (moe_graph_ir_math_required(engine) &&
-        !moe_graph_ir_declares_layer_tensor(engine, layer, gate_roles, sizeof(gate_roles) / sizeof(gate_roles[0]), gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0])) &&
-        !moe_graph_ir_declares_layer_tensor(engine, layer, up_roles, sizeof(up_roles) / sizeof(up_roles[0]), up_suffixes, sizeof(up_suffixes) / sizeof(up_suffixes[0])) &&
-        !moe_graph_ir_declares_layer_tensor(engine, layer, down_roles, sizeof(down_roles) / sizeof(down_roles[0]), down_suffixes, sizeof(down_suffixes) / sizeof(down_suffixes[0]))) {
-        return 0;
-    }
     return moe_layer_dense_mlp_from_suffixes_f32(
         engine, layer, s, input, hidden_size, out_hidden,
         gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0]),

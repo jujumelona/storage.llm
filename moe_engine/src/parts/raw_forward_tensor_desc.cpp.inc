@@ -586,7 +586,17 @@ static const moe_gguf_common_tensor_record* find_common_tensor_by_names(
     return nullptr;
 }
 
-static const moe_gguf_common_tensor_record* find_common_tensor_by_op_role(
+struct moe_common_op_role_lookup_cache_entry {
+    const moe_pc_engine* engine = nullptr;
+    uint64_t generation = 0;
+    int32_t layer = INT32_MIN;
+    std::string role;
+    const moe_gguf_common_tensor_record* rec = nullptr;
+    moe_raw_tensor_desc desc{};
+    int found = 0;
+};
+
+static const moe_gguf_common_tensor_record* find_common_tensor_by_op_role_uncached(
     const moe_pc_engine* engine,
     const char* role,
     int32_t layer,
@@ -620,6 +630,46 @@ static const moe_gguf_common_tensor_record* find_common_tensor_by_op_role(
         return &rec;
     }
     return nullptr;
+}
+
+static const moe_gguf_common_tensor_record* find_common_tensor_by_op_role(
+    const moe_pc_engine* engine,
+    const char* role,
+    int32_t layer,
+    moe_raw_tensor_desc* out_desc
+) {
+    if (!engine || !role || !role[0]) {
+        return nullptr;
+    }
+    static thread_local std::vector<moe_common_op_role_lookup_cache_entry> tls_cache;
+    const uint64_t generation = engine->engine_generation;
+    for (const moe_common_op_role_lookup_cache_entry& e : tls_cache) {
+        if (e.engine == engine && e.generation == generation && e.layer == layer && e.role == role) {
+            if (e.found && out_desc) {
+                *out_desc = e.desc;
+            }
+            return e.found ? e.rec : nullptr;
+        }
+    }
+    moe_raw_tensor_desc desc{};
+    const moe_gguf_common_tensor_record* rec =
+        find_common_tensor_by_op_role_uncached(engine, role, layer, &desc);
+    if (tls_cache.size() > 256u) {
+        tls_cache.erase(tls_cache.begin(), tls_cache.begin() + 64);
+    }
+    moe_common_op_role_lookup_cache_entry entry{};
+    entry.engine = engine;
+    entry.generation = generation;
+    entry.layer = layer;
+    entry.role = role;
+    entry.rec = rec;
+    entry.desc = desc;
+    entry.found = rec ? 1 : 0;
+    tls_cache.push_back(entry);
+    if (rec && out_desc) {
+        *out_desc = desc;
+    }
+    return rec;
 }
 
 static int common_tensor_backing_file_ready(

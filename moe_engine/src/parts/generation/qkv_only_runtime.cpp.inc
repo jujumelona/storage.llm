@@ -4,7 +4,24 @@
 // only for legacy/debug non-QKV models while making every QKV-required touch
 // explicit and countable.
 
+static int moe_qkv_force_plain_ab_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* v = std::getenv("STORAGELLM_QKV_FORCE_PLAIN_AB");
+        cached = (v && v[0] &&
+            std::strcmp(v, "0") != 0 &&
+            std::strcmp(v, "false") != 0 &&
+            std::strcmp(v, "FALSE") != 0 &&
+            std::strcmp(v, "off") != 0 &&
+            std::strcmp(v, "OFF") != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
 static int moe_engine_qkv_only_required(const moe_pc_engine* engine) {
+    if (moe_qkv_force_plain_ab_enabled()) {
+        return 0;
+    }
     return engine &&
         (engine->qkv_forced_by_format.load(std::memory_order_acquire) ||
          engine->config.kv_mode == moe_KV_MODE_QKV);
