@@ -891,11 +891,6 @@ static int moe_graph_ir_math_required(const moe_pc_engine* engine) {
         engine->offload_graph_ir_ready.load(std::memory_order_relaxed);
 }
 
-static int moe_graph_ir_mentions_exact_name_ci(const moe_pc_engine* engine, const std::string& name) {
-    return engine && !name.empty() && !engine->offload_graph_ir_json.empty() &&
-        moe_ascii_find_ci(engine->offload_graph_ir_json, name.c_str(), 0) != std::string::npos;
-}
-
 static const moe_gguf_common_tensor_record* moe_find_layer_tensor_by_roles(
     const moe_pc_engine* engine,
     int32_t layer,
@@ -944,19 +939,16 @@ static int moe_graph_ir_declares_layer_tensor_by_names(
     size_t suffix_count,
     std::string* out_name = nullptr
 ) {
-    if (!engine || !suffixes || layer < 0 || !moe_graph_ir_math_required(engine)) {
-        return 0;
+    (void)engine;
+    (void)layer;
+    (void)suffixes;
+    (void)suffix_count;
+    if (out_name) {
+        out_name->clear();
     }
-    std::vector<std::string> names;
-    moe_push_layer_tensor_candidates(&names, layer, suffixes, suffix_count);
-    for (const std::string& name : names) {
-        if (moe_graph_ir_mentions_exact_name_ci(engine, name)) {
-            if (out_name) {
-                *out_name = name;
-            }
-            return 1;
-        }
-    }
+    // Do not perform whole-GraphIR substring searches from token/layer forward.
+    // Name fallback must be implemented as a precomputed index before it can be
+    // used in graphIrRequired execution.
     return 0;
 }
 
