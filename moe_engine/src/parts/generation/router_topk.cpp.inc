@@ -102,13 +102,11 @@ static int moe_router_uses_sigmoid_scores(const moe_pc_engine* engine) {
         "\"router_score_function\":\"sigmoid\"",
         "\"router_score_function\": \"sigmoid\""
     };
-    static const char* const route_scale_needles[] = {
-        "routed_scaling_factor",
-        "route_scale",
-        "moe_routed_scaling_factor",
-        "moe_route_scale"
-    };
     int use_sigmoid = 0;
+    // Do not infer sigmoid routing from route_scale/routed_scaling_factor.
+    // Gemma4 uses pre-softmax/top-k routing with normalized top-k weights and
+    // per-expert scaling; treating scale metadata as a sigmoid-score marker
+    // saturates logits and collapses top-k weights to ~1/top_k.
     const std::string* docs[] = {
         &engine->offload_gguf_metadata_json,
         &engine->offload_graph_ir_json,
@@ -119,8 +117,7 @@ static int moe_router_uses_sigmoid_scores(const moe_pc_engine* engine) {
             continue;
         }
         if (moe_router_json_string_equals_any(*doc, score_keys, sizeof(score_keys) / sizeof(score_keys[0]), "sigmoid") ||
-            moe_router_json_mentions_any(*doc, sigmoid_needles, sizeof(sigmoid_needles) / sizeof(sigmoid_needles[0])) ||
-            moe_router_json_mentions_any(*doc, route_scale_needles, sizeof(route_scale_needles) / sizeof(route_scale_needles[0]))) {
+            moe_router_json_mentions_any(*doc, sigmoid_needles, sizeof(sigmoid_needles) / sizeof(sigmoid_needles[0]))) {
             use_sigmoid = 1;
             source = (doc == &engine->offload_gguf_metadata_json) ? "metadata" : "graph_ir";
             break;
