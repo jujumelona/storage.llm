@@ -188,12 +188,7 @@ struct moe_cuda_graph_cache_t {
     bool is_captured = false;
 };
 
-// Architecture-neutral decoder layer plan.
-//
-// Do not encode Gemma/Qwen/GLM names here. The loader/GraphIR/runtime manifest
-// decides which roles exist for the layer; the forward path executes a generic
-// decoder block contract. This keeps residual stream state separate from branch
-// outputs and avoids deciding semantic math solely from tensor suffix presence.
+
 struct moe_decoder_layer_plan_t {
     int graph_required = 0;
     int split_post_norm_block = 0;
@@ -222,7 +217,13 @@ static moe_decoder_layer_plan_t moe_build_decoder_layer_plan(
         moe_layer_has_post_attention_norm_weight(engine, (int32_t)layer) ? 1 : 0;
     plan.ffn_norm_required =
         moe_layer_has_ffn_norm_weight(engine, (int32_t)layer) ? 1 : 0;
-    plan.apply_layer_output_scale = moe_graph_ir_skip_layer_output_scale(engine) ? 0 : 1;
+    if (plan.graph_required) {
+        static const char* const roles[] = { "layer_output_scale" };
+        plan.apply_layer_output_scale = moe_graph_ir_layer_has_op_role_any(
+            engine, (int32_t)layer, roles, sizeof(roles) / sizeof(roles[0]));
+    } else {
+        plan.apply_layer_output_scale = 1;
+    }
     return plan;
 }
 
@@ -376,7 +377,7 @@ static int moe_forward_one_token_f32(
             if (!moe_layer_ffn_norm_f32(
                     engine, (int32_t)layer, hidden, c->hidden_size,
                     s->norm.data(), layer_attn_cfg.rms_norm_eps)) {
-                if (moe_layer_has_ffn_norm_weight(engine, (int32_t)layer)) {
+                if (layer_plan.ffn_norm_required) {
                     moe_generation_set_error(stats, "ffn norm tensor is required but could not be mapped");
                     return 0;
                 }
@@ -459,6 +460,11 @@ static int moe_forward_one_token_f32(
             return 0;
         }
         moe_forward_trace_vec("after_ple", position, layer, hidden, c->hidden_size);
+        // BUGFIX: Missing output scale in standard path
+        // Problem: split_post_norm path applied moe_layer_output_scale_f32 but
+        // standard path did NOT. Models with layer_output_scale.weight (Gemma4)
+        // produced unscaled outputs on the standard attention path, causing
+        // PPL drift that accumulated across all 79 layers.
         if (layer_plan.apply_layer_output_scale) {
             if (!moe_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
                 moe_generation_set_error(stats, "layer output scale failed");

@@ -8,11 +8,19 @@ static void moe_dynamic_shape_finalize_adapter(moe_pc_engine* engine) {
     }
     const uint32_t runtime_path = moe_storage_runtime_path_refresh(engine);
     if (runtime_path == moe_STORAGE_RUNTIME_PATH_CPU_RAM) {
+        const int graph_required =
+            engine->offload_graph_ir_required.load(std::memory_order_relaxed) &&
+            engine->offload_graph_ir_ready.load(std::memory_order_relaxed);
         engine->cpu_only_runtime.store(1, std::memory_order_relaxed);
         engine->gpu_path_disabled_for_cpu_only.store(1, std::memory_order_relaxed);
         engine->graph_ir_used_for_forward.store(0, std::memory_order_relaxed);
-        engine->forward_adapter.store(moe_FORWARD_ADAPTER_CPU_STORAGE, std::memory_order_relaxed);
-        engine->forward_adapter_executable.store(!engine->tensors.empty() ? 1 : 0, std::memory_order_relaxed);
+        if (graph_required) {
+            engine->forward_adapter.store(moe_FORWARD_ADAPTER_GRAPH_IR, std::memory_order_relaxed);
+            engine->forward_adapter_executable.store(moe_graph_ir_executor_compiled(engine), std::memory_order_relaxed);
+        } else {
+            engine->forward_adapter.store(moe_FORWARD_ADAPTER_CPU_STORAGE, std::memory_order_relaxed);
+            engine->forward_adapter_executable.store(!engine->tensors.empty() ? 1 : 0, std::memory_order_relaxed);
+        }
         if (!engine->tensors.empty()) {
             engine->cpu_storage_engine_ready.store(1, std::memory_order_relaxed);
             engine->cpu_execution_plan_layers.store(engine->dynamic_shape.num_hidden_layers, std::memory_order_relaxed);

@@ -34,8 +34,7 @@ static int moe_forward_one_token_graph_contract_f32(
         return 0;
     }
     engine->forward_adapter.store(moe_FORWARD_ADAPTER_GRAPH_IR, std::memory_order_relaxed);
-    engine->forward_adapter_executable.store(1, std::memory_order_relaxed);
-    engine->graph_ir_used_for_forward.store(1, std::memory_order_relaxed);
+    engine->graph_ir_used_for_forward.store(0, std::memory_order_relaxed);
     moe_profile_log(
         "graph_contract_forward_token",
         "pos=%u token=%u graph_ver=%u ops=%llu manifest=%u access=%u qkv_only=%d",
@@ -48,9 +47,7 @@ static int moe_forward_one_token_graph_contract_f32(
         moe_engine_qkv_only_required(engine));
     const int ok = moe_forward_one_token_f32(engine, token_id, s, stats, position, pre_allocate_kv);
     if (ok && moe_graph_contract_forward_required(engine)) {
-        engine->graph_ir_used_for_forward.store(1, std::memory_order_relaxed);
         engine->forward_adapter.store(moe_FORWARD_ADAPTER_GRAPH_IR, std::memory_order_relaxed);
-        engine->forward_adapter_executable.store(1, std::memory_order_relaxed);
     }
     return ok;
 }
