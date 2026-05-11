@@ -188,6 +188,44 @@ struct moe_cuda_graph_cache_t {
     bool is_captured = false;
 };
 
+// Architecture-neutral decoder layer plan.
+//
+// Do not encode Gemma/Qwen/GLM names here. The loader/GraphIR/runtime manifest
+// decides which roles exist for the layer; the forward path executes a generic
+// decoder block contract. This keeps residual stream state separate from branch
+// outputs and avoids deciding semantic math solely from tensor suffix presence.
+struct moe_decoder_layer_plan_t {
+    int graph_required = 0;
+    int split_post_norm_block = 0;
+    int is_moe = 0;
+    int attention_residual_before_ffn_norm = 0;
+    int post_attention_norm_required = 0;
+    int ffn_norm_required = 0;
+    int apply_layer_output_scale = 0;
+};
+
+static moe_decoder_layer_plan_t moe_build_decoder_layer_plan(
+    moe_pc_engine* engine,
+    const moe_storage_constants_t* c,
+    const moe_attn_config_t* base_attn_cfg,
+    uint32_t layer
+) {
+    moe_decoder_layer_plan_t plan{};
+    plan.graph_required = moe_graph_ir_math_required(engine) ? 1 : 0;
+    plan.split_post_norm_block =
+        base_attn_cfg && base_attn_cfg->type != moe_ATTN_TYPE_MLA &&
+        moe_layer_uses_split_post_norm_block(engine, (int32_t)layer);
+    plan.is_moe = moe_layer_is_moe_runtime(engine, c, (int32_t)layer) ? 1 : 0;
+    plan.attention_residual_before_ffn_norm =
+        moe_graph_ir_attention_residual_before_ffn_norm(engine, (int32_t)layer) ? 1 : 0;
+    plan.post_attention_norm_required =
+        moe_layer_has_post_attention_norm_weight(engine, (int32_t)layer) ? 1 : 0;
+    plan.ffn_norm_required =
+        moe_layer_has_ffn_norm_weight(engine, (int32_t)layer) ? 1 : 0;
+    plan.apply_layer_output_scale = moe_graph_ir_skip_layer_output_scale(engine) ? 0 : 1;
+    return plan;
+}
+
 static int moe_forward_one_token_f32(
     moe_pc_engine* engine,
     uint32_t token_id,
@@ -270,9 +308,9 @@ static int moe_forward_one_token_f32(
         // layer+1 prefetch alone provides sufficient DMA overlap during MLP compute.
         engine->generation_layer.store(layer, std::memory_order_relaxed);
         engine->generation_phase.store(moe_GEN_PHASE_ATTENTION, std::memory_order_relaxed);
-        const int split_post_norm_block =
-            attn_cfg.type != moe_ATTN_TYPE_MLA &&
-            moe_layer_uses_split_post_norm_block(engine, (int32_t)layer);
+        const moe_decoder_layer_plan_t layer_plan =
+            moe_build_decoder_layer_plan(engine, c, &attn_cfg, layer);
+        const int split_post_norm_block = layer_plan.split_post_norm_block;
         const moe_attn_config_t layer_attn_cfg =
             moe_generation_layer_attn_config(engine, (int32_t)layer);
         if (split_post_norm_block) {
@@ -302,10 +340,8 @@ static int moe_forward_one_token_f32(
                 position, layer, moe_profile_elapsed_ms(split_standard_attn_start_us));
             const uint64_t split_post_norm_start_us = moe_profile_now_us();
             const float* attn_residual = s->attn.data();
-            const int graph_residual_first =
-                moe_graph_ir_attention_residual_before_ffn_norm(engine, (int32_t)layer);
-            const int post_attention_norm_required =
-                moe_layer_has_post_attention_norm_weight(engine, (int32_t)layer);
+            const int graph_residual_first = layer_plan.attention_residual_before_ffn_norm;
+            const int post_attention_norm_required = layer_plan.post_attention_norm_required;
             const int post_norm_used = graph_residual_first ? 0 :
                 moe_layer_post_attention_output_norm_f32(
                     engine, (int32_t)layer, s->attn.data(), c->hidden_size,
@@ -332,7 +368,7 @@ static int moe_forward_one_token_f32(
                 position, layer, moe_profile_elapsed_ms(split_residual_start_us));
             moe_forward_trace_vec("after_attention", position, layer, hidden, c->hidden_size);
             const double attention_ms = moe_profile_elapsed_ms(attn_start_us);
-            const int is_moe = moe_layer_is_moe_runtime(engine, c, (int32_t)layer);
+            const int is_moe = layer_plan.is_moe;
             if (layer + 1u < c->num_hidden_layers &&
                 moe_can_enqueue_attention_lookahead(engine, (int32_t)(layer + 1u))) {
                 moe_enqueue_attention_prefetch(engine, (int32_t)(layer + 1u));
@@ -365,9 +401,13 @@ static int moe_forward_one_token_f32(
                 return 0;
             }
             moe_forward_trace_vec("after_ple", position, layer, hidden, c->hidden_size);
-            // layer_output_scale/layer_scalar is applied inside moe_add_mlp_residual_f32
-            // to the FFN/MoE branch before residual addition, matching the decoder
-            // block semantics used by llama.cpp, vLLM, and Transformers.
+            if (layer_plan.apply_layer_output_scale) {
+                if (!moe_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
+                    moe_generation_set_error(stats, "layer output scale failed");
+                    return 0;
+                }
+                moe_forward_trace_vec("after_output_scale", position, layer, hidden, c->hidden_size);
+            }
             moe_profile_log(
                 "forward_layer",
                 "position=%u layer=%u split=1 is_moe=%d attention_ms=%.3f mlp_ms=%.3f total_ms=%.3f",
@@ -388,7 +428,7 @@ static int moe_forward_one_token_f32(
             return 0;
         }
         const double attention_ms = moe_profile_elapsed_ms(attn_start_us);
-        const int is_moe = moe_layer_is_moe_runtime(engine, c, (int32_t)layer);
+        const int is_moe = layer_plan.is_moe;
 
         // Next-layer attention VRAM prefetch: enqueue layer+1 attention spans
         // so DMA overlaps with current layer's MLP compute.
@@ -419,8 +459,13 @@ static int moe_forward_one_token_f32(
             return 0;
         }
         moe_forward_trace_vec("after_ple", position, layer, hidden, c->hidden_size);
-        // layer_output_scale/layer_scalar is applied inside moe_add_mlp_residual_f32
-        // to the FFN/MoE branch before residual addition, not to the full residual stream.
+        if (layer_plan.apply_layer_output_scale) {
+            if (!moe_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
+                moe_generation_set_error(stats, "layer output scale failed");
+                return 0;
+            }
+            moe_forward_trace_vec("after_output_scale", position, layer, hidden, c->hidden_size);
+        }
         moe_profile_log(
             "forward_layer",
             "position=%u layer=%u split=0 is_moe=%d attention_ms=%.3f mlp_ms=%.3f total_ms=%.3f",

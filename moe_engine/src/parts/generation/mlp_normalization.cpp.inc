@@ -197,12 +197,10 @@ static int moe_add_mlp_residual_f32(
     float* hidden,
     uint32_t hidden_size
 ) {
-    // Match llama.cpp/vLLM/Transformers residual semantics: the FFN/MoE
-    // branch is fully formed first, optional post-FFW normalization is applied
-    // to that branch, layer_output_scale/layer_scalar scales that branch, and
-    // only then is the branch added to the residual stream.  Do not multiply the
-    // already-residualized hidden stream after the layer; that collapses the
-    // residual itself and does not match decoder block implementations.
+    // Keep this helper branch-local: it forms the FFN/MoE branch, applies
+    // optional post-FFW normalization to that branch when present, then adds it
+    // to the residual stream. Layer-level output/cvec transforms are handled by
+    // the layer plan after residual addition.
     if (!engine || !s || !hidden) {
         return 0;
     }
@@ -219,18 +217,6 @@ static int moe_add_mlp_residual_f32(
             "[storagellm mlp] post-ffw norm tensor is required but could not be mapped layer=%d\n",
             layer);
         return 0;
-    }
-    if (!moe_graph_ir_skip_layer_output_scale(engine)) {
-        if (!moe_layer_output_scale_f32(engine, layer, branch, hidden_size)) {
-            std::fprintf(stderr,
-                "[storagellm mlp] layer output scale tensor is required but could not be applied to branch layer=%d\n",
-                layer);
-            return 0;
-        }
-        moe_profile_log(
-            "mlp_branch_output_scale",
-            "layer=%d hidden=%u source=%s placement=pre_residual",
-            layer, hidden_size, branch_source);
     }
     for (uint32_t i = 0; i < hidden_size; ++i) {
         if (!std::isfinite(branch[i])) {
