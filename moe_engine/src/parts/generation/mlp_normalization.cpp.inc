@@ -431,7 +431,7 @@ static int moe_layer_shared_expert_dense_mlp_f32(
     float* out_hidden
 ) {
     if (moe_graph_ir_math_required(engine) &&
-        moe_autotune_truthy("STORAGELLM_GRAPHIR_DISABLE_SHARED_EXPERT")) {
+        moe_env_flag_enabled_cached("STORAGELLM_GRAPHIR_DISABLE_SHARED_EXPERT")) {
         return 0;
     }
     static const char* const gate_suffixes[] = {

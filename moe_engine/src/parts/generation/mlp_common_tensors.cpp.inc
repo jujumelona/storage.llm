@@ -61,68 +61,6 @@ static int moe_map_layer_common_tensor(
     return 1;
 }
 
-static int moe_layer_common_tensor_exists(
-    moe_pc_engine* engine,
-    int32_t layer,
-    const char* const* suffixes,
-    size_t suffix_count
-) {
-    if (!engine || !suffixes || layer < 0 || suffix_count == 0) {
-        return 0;
-    }
-    moe_raw_tensor_desc desc{};
-    return moe_find_layer_common_tensor(engine, layer, suffixes, suffix_count, &desc) ? 1 : 0;
-}
-
-static int moe_graph_ir_math_required(const moe_pc_engine* engine) {
-    return engine &&
-        engine->offload_graph_ir_required.load(std::memory_order_relaxed) &&
-        engine->offload_graph_ir_ready.load(std::memory_order_relaxed);
-}
-
-static int moe_graph_ir_layer_has_op_role_any(
-    const moe_pc_engine* engine,
-    int32_t layer,
-    const char* const* roles,
-    size_t role_count
-);
-
-static int moe_graph_ir_map_layer_op_role_any(
-    moe_pc_engine* engine,
-    int32_t layer,
-    const char* const* roles,
-    size_t role_count,
-    moe_raw_tensor_cache_entry* out
-);
-
-static int moe_map_layer_tensor_by_roles_or_suffixes(
-    moe_pc_engine* engine,
-    int32_t layer,
-    const char* const* roles,
-    size_t role_count,
-    const char* const* suffixes,
-    size_t suffix_count,
-    moe_raw_tensor_cache_entry* out,
-    int* out_declared = nullptr
-) {
-    if (out_declared) {
-        *out_declared = 0;
-    }
-    if (!engine || !out || layer < 0) {
-        return 0;
-    }
-    if (moe_graph_ir_math_required(engine)) {
-        if (out_declared) {
-            *out_declared = moe_graph_ir_layer_has_op_role_any(engine, layer, roles, role_count);
-        }
-        return moe_graph_ir_map_layer_op_role_any(engine, layer, roles, role_count, out);
-    }
-    if (out_declared) {
-        *out_declared = moe_layer_common_tensor_exists(engine, layer, suffixes, suffix_count);
-    }
-    return moe_map_layer_common_tensor(engine, layer, suffixes, suffix_count, out);
-}
-
 static int moe_common_linear_f32(
     moe_pc_engine* engine,
     const moe_raw_tensor_cache_entry& raw,
@@ -238,22 +176,6 @@ static int moe_graph_ir_apply_rmsnorm_role_any_f32(
     uint32_t hidden_size,
     float* output,
     float eps
-);
-
-static int moe_graph_ir_math_required(const moe_pc_engine* engine);
-static int moe_graph_ir_layer_has_op_role_any(
-    const moe_pc_engine* engine,
-    int32_t layer,
-    const char* const* roles,
-    size_t role_count
-);
-
-static int moe_graph_ir_map_layer_op_role_any(
-    moe_pc_engine* engine,
-    int32_t layer,
-    const char* const* roles,
-    size_t role_count,
-    moe_raw_tensor_cache_entry* out
 );
 
 struct moe_ple_binding_t {
