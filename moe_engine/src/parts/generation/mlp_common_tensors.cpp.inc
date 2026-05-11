@@ -80,6 +80,21 @@ static int moe_graph_ir_math_required(const moe_pc_engine* engine) {
         engine->offload_graph_ir_ready.load(std::memory_order_relaxed);
 }
 
+static int moe_graph_ir_layer_has_op_role_any(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* roles,
+    size_t role_count
+);
+
+static int moe_graph_ir_map_layer_op_role_any(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* roles,
+    size_t role_count,
+    moe_raw_tensor_cache_entry* out
+);
+
 static int moe_map_layer_tensor_by_roles_or_suffixes(
     moe_pc_engine* engine,
     int32_t layer,
