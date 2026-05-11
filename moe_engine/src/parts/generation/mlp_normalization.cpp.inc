@@ -195,46 +195,51 @@ static int moe_add_mlp_residual_f32(
     int32_t layer,
     moe_decode_scratch* s,
     float* hidden,
-    uint32_t hidden_size,
-    int apply_final_post_ffw_norm = 1
+    uint32_t hidden_size
 ) {
-    // BUGFIX 716: MLP residual addition NaN handling ★★
-    // Problem: No validation of residual values before addition
-    // Impact: NaN in MLP output propagates to hidden state
-    // Solution: Check for NaN in residual values
+    // Match llama.cpp/vLLM/Transformers residual semantics: the FFN/MoE
+    // branch is fully formed first, optional post-FFW normalization is applied
+    // to that branch, layer_output_scale/layer_scalar scales that branch, and
+    // only then is the branch added to the residual stream.  Do not multiply the
+    // already-residualized hidden stream after the layer; that collapses the
+    // residual itself and does not match decoder block implementations.
     if (!engine || !s || !hidden) {
         return 0;
     }
     const moe_attn_config_t cfg = moe_generation_attn_config(engine);
-    const int post_ffw_norm_required = apply_final_post_ffw_norm ?
-        moe_layer_has_post_ffw_norm_weight(engine, layer) : 0;
-    if (apply_final_post_ffw_norm && moe_layer_post_ffw_norm_f32(
+    const int post_ffw_norm_required = moe_layer_has_post_ffw_norm_weight(engine, layer);
+    float* branch = s->mlp.data();
+    const char* branch_source = "mlp";
+    if (moe_layer_post_ffw_norm_f32(
             engine, layer, s->mlp.data(), hidden_size, s->shared.data(), cfg.rms_norm_eps)) {
-        for (uint32_t i = 0; i < hidden_size; ++i) {
-            if (!std::isfinite(s->shared[i])) {
-                std::fprintf(stderr,
-                    "[storagellm mlp] non-finite post-ffw norm output layer=%d index=%u\n",
-                    layer, i);
-                return 0;
-            }
-            hidden[i] += s->shared[i];
-        }
-        return 1;
-    }
-    if (post_ffw_norm_required) {
+        branch = s->shared.data();
+        branch_source = "post_ffw_norm";
+    } else if (post_ffw_norm_required) {
         std::fprintf(stderr,
             "[storagellm mlp] post-ffw norm tensor is required but could not be mapped layer=%d\n",
             layer);
         return 0;
     }
-    for (uint32_t i = 0; i < hidden_size; ++i) {
-        if (!std::isfinite(s->mlp[i])) {
+    if (!moe_graph_ir_skip_layer_output_scale(engine)) {
+        if (!moe_layer_output_scale_f32(engine, layer, branch, hidden_size)) {
             std::fprintf(stderr,
-                "[storagellm mlp] non-finite mlp output layer=%d index=%u\n",
-                layer, i);
+                "[storagellm mlp] layer output scale tensor is required but could not be applied to branch layer=%d\n",
+                layer);
             return 0;
         }
-        hidden[i] += s->mlp[i];
+        moe_profile_log(
+            "mlp_branch_output_scale",
+            "layer=%d hidden=%u source=%s placement=pre_residual",
+            layer, hidden_size, branch_source);
+    }
+    for (uint32_t i = 0; i < hidden_size; ++i) {
+        if (!std::isfinite(branch[i])) {
+            std::fprintf(stderr,
+                "[storagellm mlp] non-finite mlp branch layer=%d index=%u source=%s\n",
+                layer, i, branch_source);
+            return 0;
+        }
+        hidden[i] += branch[i];
     }
     return 1;
 }

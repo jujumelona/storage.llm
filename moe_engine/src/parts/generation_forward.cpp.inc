@@ -365,13 +365,9 @@ static int moe_forward_one_token_f32(
                 return 0;
             }
             moe_forward_trace_vec("after_ple", position, layer, hidden, c->hidden_size);
-            if (!moe_graph_ir_skip_layer_output_scale(engine)) {
-                if (!moe_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
-                    moe_generation_set_error(stats, "layer output scale failed");
-                    return 0;
-                }
-                moe_forward_trace_vec("after_output_scale", position, layer, hidden, c->hidden_size);
-            }
+            // layer_output_scale/layer_scalar is applied inside moe_add_mlp_residual_f32
+            // to the FFN/MoE branch before residual addition, matching the decoder
+            // block semantics used by llama.cpp, vLLM, and Transformers.
             moe_profile_log(
                 "forward_layer",
                 "position=%u layer=%u split=1 is_moe=%d attention_ms=%.3f mlp_ms=%.3f total_ms=%.3f",
@@ -423,18 +419,8 @@ static int moe_forward_one_token_f32(
             return 0;
         }
         moe_forward_trace_vec("after_ple", position, layer, hidden, c->hidden_size);
-        // BUGFIX: Missing output scale in standard path
-        // Problem: split_post_norm path applied moe_layer_output_scale_f32 but
-        // standard path did NOT. Models with layer_output_scale.weight (Gemma4)
-        // produced unscaled outputs on the standard attention path, causing
-        // PPL drift that accumulated across all 79 layers.
-        if (!moe_graph_ir_skip_layer_output_scale(engine)) {
-            if (!moe_layer_output_scale_f32(engine, (int32_t)layer, hidden, c->hidden_size)) {
-                moe_generation_set_error(stats, "layer output scale failed");
-                return 0;
-            }
-            moe_forward_trace_vec("after_output_scale", position, layer, hidden, c->hidden_size);
-        }
+        // layer_output_scale/layer_scalar is applied inside moe_add_mlp_residual_f32
+        // to the FFN/MoE branch before residual addition, not to the full residual stream.
         moe_profile_log(
             "forward_layer",
             "position=%u layer=%u split=0 is_moe=%d attention_ms=%.3f mlp_ms=%.3f total_ms=%.3f",
