@@ -552,19 +552,14 @@ static int moe_apply_rmsnorm_common_weight_f32(
     double ss = 0.0;
     uint32_t valid_count = 0;
     for (uint32_t i = 0; i < count; ++i) {
-        // BUGFIX 710: Skip NaN values in sum
-        if (std::isfinite(input[i])) {
-            ss += (double)input[i] * (double)input[i];
-            ++valid_count;
+        if (!std::isfinite(input[i])) {
+            return 0;
         }
+        ss += (double)input[i] * (double)input[i];
+        ++valid_count;
     }
-    // BUGFIX 710: Check if we have any valid values
     if (valid_count == 0) {
-        // All inputs are NaN/Inf - output zeros
-        for (uint32_t i = 0; i < count; ++i) {
-            output[i] = 0.0f;
-        }
-        return 1;
+        return 0;
     }
     // Safe: valid_count > 0 guaranteed by check above
     const float norm = 1.0f / std::sqrt((float)(ss / (double)valid_count) + (eps > 0.0f ? eps : 1.0e-6f));
@@ -574,16 +569,14 @@ static int moe_apply_rmsnorm_common_weight_f32(
         if (!moe_raw_tensor_scalar_at_f32(raw, i, &w)) {
             return 0;
         }
-        // BUGFIX 710: Check weight validity
-        if (!std::isfinite(w)) {
-            w = 0.0f;
+        if (!std::isfinite(w) || !std::isfinite(input[i])) {
+            return 0;
         }
-        // BUGFIX 710: Check input validity before normalization
-        if (!std::isfinite(input[i])) {
-            output[i] = 0.0f;
-        } else {
-            output[i] = input[i] * norm * (unit_offset ? (1.0f + w) : w);
+        const float result = input[i] * norm * (unit_offset ? (1.0f + w) : w);
+        if (!std::isfinite(result)) {
+            return 0;
         }
+        output[i] = result;
     }
     return 1;
 }

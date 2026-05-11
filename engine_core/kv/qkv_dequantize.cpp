@@ -182,7 +182,10 @@ static int qkv_dequant_one_split(
             }
         }
         const float norm = group_norms[token_idx];
-        if (!std::isfinite(norm) || norm < 1e-12f) {
+        if (!std::isfinite(norm)) {
+            return 0;
+        }
+        if (norm < 1e-12f) {
             return 1;
         }
         if (outlier_group) {
@@ -312,9 +315,11 @@ int qkv_dequant_one(
                 size_t idx = (size_t)j * (size_t)d + (size_t)i;
                 sum += s->rotation_matrix[idx] * y_tilde[j];
             }
-            // BUGFIX 736: Check inverse rotation result for NaN/Inf (main path) ★★
+            // Non-finite inverse rotation means the stored QKV record is invalid;
+            // fail closed instead of replacing the component with zero and
+            // reporting a successful attention decode.
             if (!std::isfinite(sum)) {
-                sum = 0.0f;
+                return 0;
             }
             x_tilde[i] = sum;
         }
@@ -351,9 +356,9 @@ int qkv_dequant_one(
                     size_t idx = (size_t)j * (size_t)d + (size_t)i;
                     sum += s->qjl_matrix[idx] * qjl_signs[j];
                 }
-                // BUGFIX 726: Check QJL matrix multiplication result for NaN/Inf ★★
+                // Non-finite QJL reconstruction invalidates this cache vector.
                 if (!std::isfinite(sum)) {
-                    sum = 0.0f;
+                    return 0;
                 }
                 s_t_qjl[i] = sum;
             }
@@ -366,10 +371,13 @@ int qkv_dequant_one(
             if (!std::isfinite(qjl_scale)) return 0;
             for (int i = 0; i < d; i++) {
                 float residual_term = qjl_scale * r_norm * s_t_qjl[i];
-                // BUGFIX 728: Check residual term for NaN/Inf before adding ★★
-                if (std::isfinite(residual_term)) {
-                    x_tilde[i] += residual_term;
+                // Do not silently drop a non-finite residual term: that changes
+                // TurboQuant_prod into a biased MSE-only reconstruction while still
+                // returning success.
+                if (!std::isfinite(residual_term)) {
+                    return 0;
                 }
+                x_tilde[i] += residual_term;
             }
         }
     }
@@ -382,15 +390,17 @@ int qkv_dequant_one(
     // Solution: Return zero vector explicitly when norm is too small
     // Impact: Consistent quantization/dequantization behavior → accurate PPL
     // BUGFIX 729: Check norm for NaN/Inf
-    if (!std::isfinite(norm) || norm < 1e-12f) {
+    if (!std::isfinite(norm)) {
+        return 0;
+    }
+    if (norm < 1e-12f) {
         memset(output, 0, (size_t)d * sizeof(float));
         return 1;
     }
     for (int i = 0; i < d; i++) {
         float result = x_tilde[i] * norm;
-        // BUGFIX 730: Check final denormalized result for NaN/Inf
         if (!std::isfinite(result)) {
-            result = 0.0f;
+            return 0;
         }
         output[i] = result;
     }

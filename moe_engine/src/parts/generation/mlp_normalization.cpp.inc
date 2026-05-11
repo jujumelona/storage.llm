@@ -220,49 +220,53 @@ static int moe_layer_common_dense_mlp_f32(
     float* out_hidden
 ) {
     static const char* const gate_suffixes[] = {
-        "ffn_gate.weight",
-        "mlp.gate_proj.weight",
-        "gate_proj.weight",
-        "feed_forward.w1.weight",
-        "ffn.w1.weight",
-        "w1.weight",
+        // Shared-expert names must win before generic FFN aliases.  In MoE
+        // layers this helper is used for the shared branch; matching a generic
+        // ffn_gate/w1 tensor first can add the wrong dense FFN branch on top of
+        // routed experts.
         "shared_expert.gate_proj.weight",
         "shared_experts.gate_proj.weight",
         "shared_expert.w1.weight",
         "shared_experts.w1.weight",
         "ffn_shared_expert_gate.weight",
         "ffn_shared_exps_gate.weight",
-        "ffn_shared_gate_proj.weight"
+        "ffn_shared_gate_proj.weight",
+        "ffn_gate.weight",
+        "mlp.gate_proj.weight",
+        "gate_proj.weight",
+        "feed_forward.w1.weight",
+        "ffn.w1.weight",
+        "w1.weight"
     };
     static const char* const up_suffixes[] = {
-        "ffn_up.weight",
-        "mlp.up_proj.weight",
-        "up_proj.weight",
-        "feed_forward.w3.weight",
-        "ffn.w3.weight",
-        "w3.weight",
         "shared_expert.up_proj.weight",
         "shared_experts.up_proj.weight",
         "shared_expert.w3.weight",
         "shared_experts.w3.weight",
         "ffn_shared_expert_up.weight",
         "ffn_shared_exps_up.weight",
-        "ffn_shared_up_proj.weight"
+        "ffn_shared_up_proj.weight",
+        "ffn_up.weight",
+        "mlp.up_proj.weight",
+        "up_proj.weight",
+        "feed_forward.w3.weight",
+        "ffn.w3.weight",
+        "w3.weight"
     };
     static const char* const down_suffixes[] = {
-        "ffn_down.weight",
-        "mlp.down_proj.weight",
-        "down_proj.weight",
-        "feed_forward.w2.weight",
-        "ffn.w2.weight",
-        "w2.weight",
         "shared_expert.down_proj.weight",
         "shared_experts.down_proj.weight",
         "shared_expert.w2.weight",
         "shared_experts.w2.weight",
         "ffn_shared_expert_down.weight",
         "ffn_shared_exps_down.weight",
-        "ffn_shared_down_proj.weight"
+        "ffn_shared_down_proj.weight",
+        "ffn_down.weight",
+        "mlp.down_proj.weight",
+        "down_proj.weight",
+        "feed_forward.w2.weight",
+        "ffn.w2.weight",
+        "w2.weight"
     };
     const uint64_t total_start_us = moe_profile_now_us();
     const uint64_t map_start_us = moe_profile_now_us();

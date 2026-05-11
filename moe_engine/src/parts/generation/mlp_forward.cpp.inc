@@ -103,8 +103,19 @@ static int moe_layer_moe_mlp_f32(
         "layer=%d ok=%d has_raw_span=%d ms=%.3f",
         layer, shared_ok, shared ? 1 : 0, moe_profile_elapsed_ms(shared_start_us));
 
+    // Router input must be selected from the same activation-scale contract that
+    // router_topk will actually consume.  `ffn_gate_inp.scale` is a quantization
+    // sidecar for the router weight in MXFP4/GGUF artifacts, not an activation
+    // RMSNorm/scale op.  The previous existence check switched the router from
+    // expert_input to raw hidden even after the scale sidecar itself was ignored,
+    // so MoE routing kept using the wrong vector and remained near-uniform.
     const int router_has_internal_norm_scale =
-        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "router_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "router.input_layernorm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "router.input_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "moe_router_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale");
@@ -1992,7 +2003,12 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
     const moe_storage_raw_span_spec_t* shared =
         find_raw_role_span_bytes(layer, moe_RAW_ROLE_SHARED, shared_bytes, 0);
     const int router_has_internal_norm_scale =
-        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "router_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "router.input_layernorm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "router.input_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "moe_router_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale");

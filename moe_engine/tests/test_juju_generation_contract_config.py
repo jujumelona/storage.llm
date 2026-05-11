@@ -460,3 +460,42 @@ def test_router_scale_does_not_treat_mxfp_sidecar_as_activation_norm():
     return_pos = router_text.index("return 0;", ignore_pos)
     apply_pos = router_text.index("router_scale_apply", return_pos)
     assert ignore_pos < return_pos < apply_pos
+
+
+def test_router_input_mode_does_not_use_mxfp_sidecar_presence():
+    mlp_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
+    first_block = mlp_text[mlp_text.index("const int router_has_internal_norm_scale ="):mlp_text.index("const float* router_input = router_has_internal_norm_scale ? hidden : expert_input;")]
+    assert '"ffn_gate_inp.scale"' not in first_block
+    assert '"router_norm.weight"' in first_block
+    assert "wrong vector and remained near-uniform" in mlp_text
+
+
+def test_post_attention_norm_no_longer_falls_back_to_ffn_norm_aliases():
+    desc_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_tensor_desc.cpp.inc").read_text()
+    suffix_block = desc_text[desc_text.index("case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM: {"):desc_text.index("case moe_RAW_TENSOR_Q_A_LAYER_NORM:")]
+    assert '"ffn_norm.weight"' not in suffix_block
+    assert '"mlp_norm.weight"' not in suffix_block
+    assert '"pre_ffw_norm.weight"' not in suffix_block
+    assert "cross-role suffix" in suffix_block
+    role_block = desc_text[desc_text.index("case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM:"):desc_text.index("case moe_RAW_TENSOR_Q_A_LAYER_NORM:", desc_text.index("case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM:"))]
+    assert 'out->push_back("ffn_norm")' not in role_block
+
+
+def test_qkv_quantization_and_dequantization_fail_closed_on_nonfinite_values():
+    q_text = (ROOT / "engine_core" / "kv" / "qkv_quantize.cpp").read_text()
+    d_text = (ROOT / "engine_core" / "kv" / "qkv_dequantize.cpp").read_text()
+    assert "return 0;" in q_text[q_text.index("if (!std::isfinite(input[i]))"):q_text.index("l2_norm += input[i]")]
+    assert "silently store a zero vector" in q_text
+    assert "fail closed instead of replacing the component with zero" in d_text
+    assert "return 0;" in d_text[d_text.index("if (!std::isfinite(norm))"):d_text.index("if (norm < 1e-12f)")]
+    assert "biased MSE-only reconstruction" in d_text
+
+
+def test_shared_expert_suffixes_are_preferred_before_generic_dense_ffn_aliases():
+    mlp_norm_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
+    gate_block = mlp_norm_text[mlp_norm_text.index("static const char* const gate_suffixes[]"):mlp_norm_text.index("static const char* const up_suffixes[]")]
+    assert gate_block.index('"shared_expert.gate_proj.weight"') < gate_block.index('"ffn_gate.weight"')
+    up_block = mlp_norm_text[mlp_norm_text.index("static const char* const up_suffixes[]"):mlp_norm_text.index("static const char* const down_suffixes[]")]
+    assert up_block.index('"shared_expert.up_proj.weight"') < up_block.index('"ffn_up.weight"')
+    down_block = mlp_norm_text[mlp_norm_text.index("static const char* const down_suffixes[]"):mlp_norm_text.index("const uint64_t total_start_us")]
+    assert down_block.index('"shared_expert.down_proj.weight"') < down_block.index('"ffn_down.weight"')
