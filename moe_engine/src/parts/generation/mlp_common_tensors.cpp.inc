@@ -43,20 +43,33 @@ static int moe_env_flag_enabled_cached(const char* name) {
             std::strcmp(v, "OFF") != 0) ? 1 : 0;
 }
 
-static int moe_graph_ir_allow_skeleton_optional_math() {
+static int moe_graph_ir_strict_optional_math_disabled() {
     static int cached = -1;
     if (cached < 0) {
-        cached = moe_env_flag_enabled_cached("STORAGELLM_GRAPHIR_ALLOW_SKELETON_OPTIONAL_MATH") ? 1 : 0;
+        // Multi-engine rule: do not make GraphIR-required mode silently change
+        // decoder math.  llama.cpp/vLLM/Transformers all keep residual, norm,
+        // shared-expert, and layer-scale placement architecture-specific.
+        // Therefore the generic skeleton must preserve the recorded tensor math
+        // by default and expose A/B kill-switches instead of hard-skipping all
+        // optional edges.
+        cached = (
+            moe_env_flag_enabled_cached("STORAGELLM_GRAPHIR_STRICT_OPTIONAL_MATH") ||
+            moe_env_flag_enabled_cached("STORAGELLM_GRAPHIR_DISABLE_SKELETON_OPTIONAL_MATH")
+        ) ? 1 : 0;
     }
     return cached;
 }
 
 static int moe_graph_ir_skip_skeleton_optional_math(const moe_pc_engine* engine) {
-    return moe_graph_ir_math_required(engine) && !moe_graph_ir_allow_skeleton_optional_math();
+    return moe_graph_ir_math_required(engine) && moe_graph_ir_strict_optional_math_disabled();
 }
 
 static int moe_graph_ir_skip_layer_output_scale(const moe_pc_engine* engine) {
-    return moe_graph_ir_skip_skeleton_optional_math(engine);
+    // Separate A/B switch.  The previous bulk patch tied layer_output_scale to
+    // optional-math skipping and removed a real architecture edge, making PPL
+    // worse.  Keep scale enabled by default; only disable it explicitly.
+    return moe_graph_ir_math_required(engine) &&
+        moe_env_flag_enabled_cached("STORAGELLM_GRAPHIR_DISABLE_LAYER_OUTPUT_SCALE");
 }
 
 static int moe_map_layer_common_tensor(

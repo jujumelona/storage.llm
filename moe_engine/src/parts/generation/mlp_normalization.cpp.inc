@@ -392,6 +392,10 @@ static int moe_layer_shared_expert_dense_mlp_f32(
     uint32_t hidden_size,
     float* out_hidden
 ) {
+    if (moe_graph_ir_math_required(engine) &&
+        moe_env_flag_enabled_cached("STORAGELLM_GRAPHIR_DISABLE_SHARED_EXPERT")) {
+        return 0;
+    }
     static const char* const gate_suffixes[] = {
         "shared_expert.gate_proj.weight",
         "shared_experts.gate_proj.weight",
