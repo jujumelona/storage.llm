@@ -59,6 +59,9 @@ static int moe_apply_rmsnorm_common_weight_f32(
 // Included before MLP because the MoE MLP calls selected-expert prefetch hooks.
 #include "generation/cpu_storage_engine.cpp.inc"
 
+// MLP contract helpers (must be visible before generation_mlp.cpp.inc)
+#include "generation/mlp_contract_helpers.cpp.inc"
+
 // MLP (depends on: router, raw_ops, silu, scratch, cpu_storage_engine hooks)
 #include "generation_mlp.cpp.inc"
 
