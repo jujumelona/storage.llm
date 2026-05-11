@@ -195,7 +195,8 @@ static int moe_add_mlp_residual_f32(
     int32_t layer,
     moe_decode_scratch* s,
     float* hidden,
-    uint32_t hidden_size
+    uint32_t hidden_size,
+    int apply_final_post_ffw_norm = 1
 ) {
     // BUGFIX 716: MLP residual addition NaN handling ★★
     // Problem: No validation of residual values before addition
@@ -205,8 +206,9 @@ static int moe_add_mlp_residual_f32(
         return 0;
     }
     const moe_attn_config_t cfg = moe_generation_attn_config(engine);
-    const int post_ffw_norm_required = moe_layer_has_post_ffw_norm_weight(engine, layer);
-    if (moe_layer_post_ffw_norm_f32(
+    const int post_ffw_norm_required = apply_final_post_ffw_norm ?
+        moe_layer_has_post_ffw_norm_weight(engine, layer) : 0;
+    if (apply_final_post_ffw_norm && moe_layer_post_ffw_norm_f32(
             engine, layer, s->mlp.data(), hidden_size, s->shared.data(), cfg.rms_norm_eps)) {
         for (uint32_t i = 0; i < hidden_size; ++i) {
             if (!std::isfinite(s->shared[i])) {

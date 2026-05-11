@@ -753,9 +753,11 @@ static int moe_layer_moe_mlp_f32(
             }
 
             const float* expert_branch = s->residual.data();
+            int expert_branch_post_normed = 0;
             if (moe_layer_post_ffw_norm2_f32(
                     engine, layer, s->residual.data(), hidden_size, s->expert.data(), attn_cfg.rms_norm_eps)) {
                 expert_branch = s->expert.data();
+                expert_branch_post_normed = 1;
             } else if (moe_layer_has_post_ffw_norm2_weight(engine, layer)) {
                 std::fprintf(stderr,
                     "[storagellm mlp] post-ffw norm2 tensor is required but could not be mapped layer=%d\n",
@@ -776,7 +778,8 @@ static int moe_layer_moe_mlp_f32(
                 s->mlp[i] += expert_branch[i];
             }
             const uint64_t residual_start_us = moe_profile_now_us();
-            const int residual_ok = moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
+            const int residual_ok = moe_add_mlp_residual_f32(
+                engine, layer, s, hidden, hidden_size, !expert_branch_post_normed);
             moe_profile_log(
                 "mlp_moe_fused_down_accum_end",
                 "layer=%d ok=%d selected=%zu mapped=%u hidden=%u intermediate=%u fused_ms=%.3f residual_ms=%.3f total_ms=%.3f",
@@ -896,9 +899,11 @@ static int moe_layer_moe_mlp_f32(
         moe_axpy_f32(s->residual.data(), work[e].out, work[e].weight, hidden_size);
     }
     const float* expert_branch = s->residual.data();
+    int expert_branch_post_normed = 0;
     if (moe_layer_post_ffw_norm2_f32(
             engine, layer, s->residual.data(), hidden_size, s->expert.data(), attn_cfg.rms_norm_eps)) {
         expert_branch = s->expert.data();
+        expert_branch_post_normed = 1;
     } else if (moe_layer_has_post_ffw_norm2_weight(engine, layer)) {
         std::fprintf(stderr,
             "[storagellm mlp] post-ffw norm2 tensor is required but could not be mapped layer=%d\n",
@@ -923,7 +928,8 @@ static int moe_layer_moe_mlp_f32(
     const double accumulate_ms = moe_profile_elapsed_ms(accumulate_start_us);
 
     const uint64_t residual_start_us = moe_profile_now_us();
-    const int residual_ok = moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
+    const int residual_ok = moe_add_mlp_residual_f32(
+        engine, layer, s, hidden, hidden_size, !expert_branch_post_normed);
     moe_profile_log(
         "mlp_moe_end",
         "layer=%d ok=%d selected=%zu mapped=%u hidden=%u intermediate=%u accumulate_ms=%.3f residual_ms=%.3f total_ms=%.3f",
@@ -2845,10 +2851,12 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         }
         float* expert_sum = batch_expert_sum.data() + (size_t)t * hidden_size;
         const float* expert_branch = expert_sum;
+        int expert_branch_post_normed = 0;
         if (moe_layer_post_ffw_norm2_f32(
                 engine, layer, expert_sum, hidden_size,
                 local.expert.data(), attn_cfg.rms_norm_eps)) {
             expert_branch = local.expert.data();
+            expert_branch_post_normed = 1;
         } else if (moe_layer_has_post_ffw_norm2_weight(engine, layer)) {
             std::fprintf(stderr,
                 "[storagellm mlp] batch post-ffw norm2 tensor is required but could not be mapped layer=%d token=%u\n",
@@ -2866,7 +2874,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
             mlp_out[i] += expert_branch[i];
         }
         float* hidden = batch_hidden + (size_t)t * hidden_size;
-        if (moe_layer_post_ffw_norm_f32(
+        if (!expert_branch_post_normed && moe_layer_post_ffw_norm_f32(
                 engine, layer, mlp_out, hidden_size,
                 local.shared.data(), attn_cfg.rms_norm_eps)) {
             // BUGFIX 715: MLP residual addition NaN handling ★★
@@ -2883,7 +2891,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                 hidden[i] += local.shared[i];
             }
         } else {
-            if (moe_layer_has_post_ffw_norm_weight(engine, layer)) {
+            if (!expert_branch_post_normed && moe_layer_has_post_ffw_norm_weight(engine, layer)) {
                 std::fprintf(stderr,
                     "[storagellm mlp] batch post-ffw norm tensor is required but could not be mapped layer=%d token=%u\n",
                     layer, t);
