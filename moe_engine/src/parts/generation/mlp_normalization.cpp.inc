@@ -16,25 +16,51 @@ static int moe_layer_shared_expert_gate_f32(
         return 0;
     }
     static const char* const suffixes[] = {
+        "ffn_gate_inp_shexp.weight",
         "shared_expert_gate.weight",
         "shared_expert.gate.weight",
+        "shared_expert.gate_inp.weight",
+        "shared_expert_gate_proj.weight",
         "ffn_shared_gate.weight",
+        "ffn_shared_expert_gate_inp.weight",
         "shared_gate.weight"
     };
     moe_raw_tensor_cache_entry raw{};
     if (!moe_map_layer_common_tensor(engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]), &raw)) {
         return 1;
     }
-    if (raw.cols != hidden_size || raw.rows == 0) {
+    float logit = 0.0f;
+    if (raw.cols == hidden_size && raw.rows > 0) {
+        logit = moe_raw_tensor_dot_row(raw, 0, input, hidden_size);
+    } else {
+        const uint64_t scalar_count = moe_raw_tensor_scalar_count(raw);
+        if (scalar_count != hidden_size) {
+            return 0;
+        }
+        double acc = 0.0;
+        for (uint32_t i = 0; i < hidden_size; ++i) {
+            float w = 0.0f;
+            if (!moe_raw_tensor_scalar_at_f32(raw, i, &w) || !std::isfinite(w)) {
+                return 0;
+            }
+            acc += (double)w * (double)input[i];
+        }
+        logit = (float)acc;
+    }
+    if (!std::isfinite(logit)) {
         return 0;
     }
-    const float logit = moe_raw_tensor_dot_row(raw, 0, input, hidden_size);
     // BUGFIX 209: Numerically stable sigmoid computation
     // Problem: logit < 0 branch uses exp(logit) / (1 + exp(logit)) which underflows for large negative logit
     // Solution: Use log-sum-exp trick: sigmoid(x) = 1 / (1 + exp(-x)) for all x
     // For x < 0: 1 / (1 + exp(-x)) = exp(x) / (exp(x) + 1) but direct formula is more stable
-    *out_gate = 1.0f / (1.0f + std::exp(-logit));
-    return 1;
+    if (logit >= 0.0f) {
+        *out_gate = 1.0f / (1.0f + std::exp(-logit));
+    } else {
+        const float e = std::exp(logit);
+        *out_gate = e / (1.0f + e);
+    }
+    return std::isfinite(*out_gate) ? 1 : 0;
 }
 
 
@@ -230,7 +256,8 @@ static int moe_layer_dense_mlp_from_suffixes_f32(
     const char* const* up_roles = nullptr,
     size_t up_role_count = 0,
     const char* const* down_roles = nullptr,
-    size_t down_role_count = 0
+    size_t down_role_count = 0,
+    int allow_graph_suffix_fallback = 0
 ) {
     const uint64_t total_start_us = moe_profile_now_us();
     const uint64_t map_start_us = moe_profile_now_us();
@@ -245,15 +272,33 @@ static int moe_layer_dense_mlp_from_suffixes_f32(
     int up_declared = 0;
     int down_declared = 0;
     const int graph_required = moe_graph_ir_math_required(engine);
-    const int gate_mapped = moe_map_layer_tensor_by_roles_or_suffixes(
+    int gate_mapped = moe_map_layer_tensor_by_roles_or_suffixes(
         engine, layer, gate_roles, gate_role_count, gate_suffixes, gate_suffix_count,
         &gate, &gate_declared);
-    const int up_mapped = moe_map_layer_tensor_by_roles_or_suffixes(
+    int up_mapped = moe_map_layer_tensor_by_roles_or_suffixes(
         engine, layer, up_roles, up_role_count, up_suffixes, up_suffix_count,
         &up, &up_declared);
-    const int down_mapped = moe_map_layer_tensor_by_roles_or_suffixes(
+    int down_mapped = moe_map_layer_tensor_by_roles_or_suffixes(
         engine, layer, down_roles, down_role_count, down_suffixes, down_suffix_count,
         &down, &down_declared);
+    if (graph_required && allow_graph_suffix_fallback) {
+        // Shared-expert tensors are safe to bind by explicit shared suffixes even
+        // when GraphIR op_role metadata is incomplete.  This keeps generic FFN
+        // fallback forbidden while matching llama.cpp/vLLM Qwen-MoE naming
+        // families such as ffn_*_shexp.
+        if (!gate_mapped) {
+            gate_mapped = moe_map_layer_common_tensor(
+                engine, layer, gate_suffixes, gate_suffix_count, &gate);
+        }
+        if (!up_mapped) {
+            up_mapped = moe_map_layer_common_tensor(
+                engine, layer, up_suffixes, up_suffix_count, &up);
+        }
+        if (!down_mapped) {
+            down_mapped = moe_map_layer_common_tensor(
+                engine, layer, down_suffixes, down_suffix_count, &down);
+        }
+    }
     if (!gate_mapped || !up_mapped || !down_mapped) {
         if (graph_required && (gate_declared || up_declared || down_declared)) {
             std::fprintf(stderr,
@@ -399,6 +444,8 @@ static int moe_layer_shared_expert_dense_mlp_f32(
     static const char* const gate_suffixes[] = {
         "shared_expert.gate_proj.weight",
         "shared_experts.gate_proj.weight",
+        "ffn_gate_shexp.weight",
+        "ffn_shared_shexp_gate.weight",
         "shared_expert.w1.weight",
         "shared_experts.w1.weight",
         "ffn_shared_expert_gate.weight",
@@ -408,6 +455,8 @@ static int moe_layer_shared_expert_dense_mlp_f32(
     static const char* const up_suffixes[] = {
         "shared_expert.up_proj.weight",
         "shared_experts.up_proj.weight",
+        "ffn_up_shexp.weight",
+        "ffn_shared_shexp_up.weight",
         "shared_expert.w3.weight",
         "shared_experts.w3.weight",
         "ffn_shared_expert_up.weight",
@@ -417,6 +466,8 @@ static int moe_layer_shared_expert_dense_mlp_f32(
     static const char* const down_suffixes[] = {
         "shared_expert.down_proj.weight",
         "shared_experts.down_proj.weight",
+        "ffn_down_shexp.weight",
+        "ffn_shared_shexp_down.weight",
         "shared_expert.w2.weight",
         "shared_experts.w2.weight",
         "ffn_shared_expert_down.weight",
@@ -449,7 +500,8 @@ static int moe_layer_shared_expert_dense_mlp_f32(
         "mlp_shared_dense_begin",
         gate_roles, sizeof(gate_roles) / sizeof(gate_roles[0]),
         up_roles, sizeof(up_roles) / sizeof(up_roles[0]),
-        down_roles, sizeof(down_roles) / sizeof(down_roles[0]));
+        down_roles, sizeof(down_roles) / sizeof(down_roles[0]),
+        1);
 }
 
 static int moe_layer_dense_mlp_f32(
