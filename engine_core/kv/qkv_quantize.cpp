@@ -1,4 +1,4 @@
-#include "qkv_quantize.h"
+﻿#include "qkv_quantize.h"
 #include "qkv_helpers.h"
 #include "qkv_codebook.h"
 #include "qkv_packing.h"
@@ -34,13 +34,13 @@ int qkv_quantize_vector_with_state(
         return 0;
     }
 
-    // BUGFIX 400: dim 범위 체크
+    // BUGFIX 400: dim 踰붿쐞 泥댄겕
     if (dim > 16384) {
         return 0;
     }
 
     // Step 1: Compute L2 norm
-    // BUGFIX 722: Check for NaN/Inf in input before accumulation ★★★
+    // BUGFIX 722: Check for NaN/Inf in input before accumulation ?끸쁾??
     float l2_norm = 0.0f;
     for (int i = 0; i < dim; ++i) {
         if (!std::isfinite(input[i])) {
@@ -48,14 +48,14 @@ int qkv_quantize_vector_with_state(
         }
         l2_norm += input[i] * input[i];
     }
-    // BUGFIX 723: Check for overflow in l2_norm accumulation ★★
+    // BUGFIX 723: Check for overflow in l2_norm accumulation ?끸쁾
     if (!std::isfinite(l2_norm)) {
         return 0;
     }
     l2_norm = sqrtf(l2_norm);
     *norm_out = l2_norm;
 
-    // BUGFIX 401: dim * bits overflow 방지
+    // BUGFIX 401: dim * bits overflow 諛⑹?
     if (dim > INT_MAX / bits) {
         return 0;
     }
@@ -72,7 +72,7 @@ int qkv_quantize_vector_with_state(
         return 0;
     }
 
-    // BUGFIX 402: l2_norm이 0일 때 division by zero 방지 (이미 위에서 체크했지만 명시적으로)
+    // BUGFIX 402: l2_norm??0????division by zero 諛⑹? (?대? ?꾩뿉??泥댄겕?덉?留?紐낆떆?곸쑝濡?
     if (l2_norm < 1e-12f) {
         return 0;
     }
@@ -88,7 +88,7 @@ int qkv_quantize_vector_with_state(
             qkv_apply_hadamard_rotation_forward(normalized, state->rotation_signs, rotated, dim)) {
             src = rotated;
         } else {
-        // BUGFIX 403: rotation_matrix 범위 체크
+        // BUGFIX 403: rotation_matrix 踰붿쐞 泥댄겕
         for (int i = 0; i < dim; i++) {
             float sum = 0.0f;
             for (int j = 0; j < dim; j++) {
@@ -117,10 +117,10 @@ int qkv_quantize_vector_with_state(
     if (!qkv_bits_codebook(bits)) return 0;
     const float* centroids_s = qkv_codebook_for_bits(state, bits);
     const float* thresholds_s = qkv_thresholds_for_bits(state, bits);
-    // BUGFIX 485: centroids/thresholds null 체크
+    // BUGFIX 485: centroids/thresholds null 泥댄겕
     if (!centroids_s || !thresholds_s) return 0;
     const int n_levels = 1 << bits;
-    // BUGFIX 486: n_levels 범위 체크
+    // BUGFIX 486: n_levels 踰붿쐞 泥댄겕
     if (n_levels <= 0 || n_levels > 256) return 0;
 
     for (int i = 0; i < dim; ++i) {
@@ -131,3 +131,4 @@ int qkv_quantize_vector_with_state(
     qkv_pack_indices(indices, output, dim, bits);
     return 1;
 }
+
