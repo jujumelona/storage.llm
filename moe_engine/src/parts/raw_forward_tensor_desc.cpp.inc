@@ -468,7 +468,6 @@ static void moe_raw_tensor_kind_op_roles(
             break;
         case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM:
             out->push_back("post_attention_norm");
-            out->push_back("ffn_norm");
             break;
         case moe_RAW_TENSOR_Q_A_LAYER_NORM:
             out->push_back("q_norm");

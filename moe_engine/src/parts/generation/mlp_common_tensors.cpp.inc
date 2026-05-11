@@ -22,6 +22,19 @@ static uint32_t moe_fnv1a_hash_string(const char* str) {
     return hash;
 }
 
+static int moe_layer_common_tensor_exists(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* suffixes,
+    size_t suffix_count
+) {
+    if (!engine || !suffixes || layer < 0 || suffix_count == 0) {
+        return 0;
+    }
+    moe_raw_tensor_desc desc{};
+    return moe_find_layer_common_tensor(engine, layer, suffixes, suffix_count, &desc) ? 1 : 0;
+}
+
 static int moe_map_layer_common_tensor(
     moe_pc_engine* engine,
     int32_t layer,
@@ -769,6 +782,16 @@ static int moe_final_norm_f32(
         input, hidden_size, output, eps);
 }
 
+static int moe_graph_ir_math_required(const moe_pc_engine* engine);
+static int moe_graph_ir_declares_layer_tensor(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* roles,
+    size_t role_count,
+    const char* const* suffixes,
+    size_t suffix_count
+);
+
 // Cache split/post-norm detection per layer; layer 0 must not decide every layer.
 static int moe_layer_uses_split_post_norm_block(const moe_pc_engine* engine, int32_t layer) {
     if (!engine || layer < 0) {
@@ -795,15 +818,36 @@ static int moe_layer_uses_split_post_norm_block(const moe_pc_engine* engine, int
         }
     }
     int result = 0;
-    if (moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm.weight") ||
+    if (moe_graph_ir_math_required(engine)) {
+        static const char* const post_attn_roles[] = { "post_attention_norm" };
+        static const char* const post_attn_suffixes[] = {
+            "post_attention_norm.weight",
+            "post_attention_layernorm.weight",
+            "post_attention_layer_norm.weight",
+            "post_attn_norm.weight"
+        };
+        static const char* const ffn_roles[] = { "ffn_norm", "ffn_pre_norm", "pre_ffw_norm", "mlp_norm" };
+        static const char* const ffn_suffixes[] = {
+            "ffn_norm.weight",
+            "ffn_pre_norm.weight",
+            "pre_ffw_norm.weight",
+            "mlp_norm.weight"
+        };
+        static const char* const moe_roles[] = { "pre_ffw_norm_2", "ffn_pre_norm_2", "moe_norm", "expert_norm" };
+        static const char* const moe_suffixes[] = {
+            "pre_ffw_norm_2.weight",
+            "ffn_pre_norm_2.weight",
+            "moe_norm.weight"
+        };
+        result =
+            moe_graph_ir_declares_layer_tensor(engine, layer, post_attn_roles, sizeof(post_attn_roles) / sizeof(post_attn_roles[0]), post_attn_suffixes, sizeof(post_attn_suffixes) / sizeof(post_attn_suffixes[0])) ||
+            moe_graph_ir_declares_layer_tensor(engine, layer, ffn_roles, sizeof(ffn_roles) / sizeof(ffn_roles[0]), ffn_suffixes, sizeof(ffn_suffixes) / sizeof(ffn_suffixes[0])) ||
+            moe_graph_ir_declares_layer_tensor(engine, layer, moe_roles, sizeof(moe_roles) / sizeof(moe_roles[0]), moe_suffixes, sizeof(moe_suffixes) / sizeof(moe_suffixes[0]));
+    } else if (moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_1.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_2.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "layer_output_scale.weight")) {
         result = 1;
-    } else {
-        // Do not let a global GraphIR substring enable split-post-norm for every layer.
-        // Per-layer behavior must come from a layer-local tensor/op binding.
-        result = 0;
     }
     if (cached) {
         *cached = result ? 1 : 0;
@@ -841,6 +885,192 @@ static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* 
     return 0;
 }
 
+static int moe_graph_ir_math_required(const moe_pc_engine* engine) {
+    return engine &&
+        engine->offload_graph_ir_required.load(std::memory_order_relaxed) &&
+        engine->offload_graph_ir_ready.load(std::memory_order_relaxed);
+}
+
+static int moe_graph_ir_mentions_exact_name_ci(const moe_pc_engine* engine, const std::string& name) {
+    return engine && !name.empty() && !engine->offload_graph_ir_json.empty() &&
+        moe_ascii_find_ci(engine->offload_graph_ir_json, name.c_str(), 0) != std::string::npos;
+}
+
+static const moe_gguf_common_tensor_record* moe_find_layer_tensor_by_roles(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* roles,
+    size_t role_count,
+    moe_raw_tensor_desc* out_desc
+) {
+    if (!engine || !roles || layer < 0) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < role_count; ++i) {
+        if (!roles[i] || !roles[i][0]) {
+            continue;
+        }
+        if (const moe_gguf_common_tensor_record* rec =
+                find_common_tensor_by_op_role(engine, roles[i], layer, out_desc)) {
+            return rec;
+        }
+    }
+    return nullptr;
+}
+
+static int moe_map_layer_tensor_by_roles(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* roles,
+    size_t role_count,
+    moe_raw_tensor_cache_entry* out
+) {
+    if (!engine || !out) {
+        return 0;
+    }
+    moe_raw_tensor_desc desc{};
+    const moe_gguf_common_tensor_record* rec =
+        moe_find_layer_tensor_by_roles(engine, layer, roles, role_count, &desc);
+    if (!rec) {
+        return 0;
+    }
+    return map_common_tensor_record(engine, *rec, desc, out);
+}
+
+static int moe_graph_ir_declares_layer_tensor_by_names(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* suffixes,
+    size_t suffix_count,
+    std::string* out_name = nullptr
+) {
+    if (!engine || !suffixes || layer < 0 || !moe_graph_ir_math_required(engine)) {
+        return 0;
+    }
+    std::vector<std::string> names;
+    moe_push_layer_tensor_candidates(&names, layer, suffixes, suffix_count);
+    for (const std::string& name : names) {
+        if (moe_graph_ir_mentions_exact_name_ci(engine, name)) {
+            if (out_name) {
+                *out_name = name;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_graph_ir_declares_layer_tensor(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* roles,
+    size_t role_count,
+    const char* const* suffixes,
+    size_t suffix_count
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    moe_raw_tensor_desc desc{};
+    if (moe_find_layer_tensor_by_roles(engine, layer, roles, role_count, &desc)) {
+        return 1;
+    }
+    return moe_graph_ir_declares_layer_tensor_by_names(engine, layer, suffixes, suffix_count, nullptr);
+}
+
+static int moe_map_layer_graph_tensor(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* roles,
+    size_t role_count,
+    const char* const* suffixes,
+    size_t suffix_count,
+    moe_raw_tensor_cache_entry* out,
+    int* out_declared = nullptr
+) {
+    if (out_declared) {
+        *out_declared = 0;
+    }
+    if (!engine || !out || layer < 0) {
+        return 0;
+    }
+    moe_raw_tensor_desc desc{};
+    if (const moe_gguf_common_tensor_record* rec =
+            moe_find_layer_tensor_by_roles(engine, layer, roles, role_count, &desc)) {
+        if (out_declared) {
+            *out_declared = 1;
+        }
+        return map_common_tensor_record(engine, *rec, desc, out);
+    }
+    std::string graph_name;
+    if (moe_graph_ir_declares_layer_tensor_by_names(
+            engine, layer, suffixes, suffix_count, &graph_name)) {
+        if (out_declared) {
+            *out_declared = 1;
+        }
+        const char* exact_name = graph_name.c_str();
+        const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_names(engine, &exact_name, 1, &desc);
+        if (!rec) {
+            return 0;
+        }
+        return map_common_tensor_record(engine, *rec, desc, out);
+    }
+    return 0;
+}
+
+static int moe_layer_graph_rmsnorm_or_suffixes_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* roles,
+    size_t role_count,
+    const char* const* suffixes,
+    size_t suffix_count,
+    const float* input,
+    uint32_t hidden_size,
+    float* output,
+    float eps
+) {
+    if (!moe_graph_ir_math_required(engine)) {
+        return moe_layer_rmsnorm_suffixes_f32(
+            engine, layer, suffixes, suffix_count, input, hidden_size, output, eps);
+    }
+    moe_raw_tensor_cache_entry raw{};
+    int declared = 0;
+    if (!moe_map_layer_graph_tensor(
+            engine, layer, roles, role_count, suffixes, suffix_count, &raw, &declared)) {
+        if (declared) {
+            moe_profile_log(
+                "graph_ir_tensor_bind_failed",
+                "layer=%d suffix0=%s",
+                layer,
+                (suffixes && suffix_count > 0 && suffixes[0]) ? suffixes[0] : "");
+        }
+        return 0;
+    }
+    return moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
+}
+
+static int moe_map_layer_graph_or_suffix_tensor(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* roles,
+    size_t role_count,
+    const char* const* suffixes,
+    size_t suffix_count,
+    moe_raw_tensor_cache_entry* out,
+    int* out_declared = nullptr
+) {
+    if (!moe_graph_ir_math_required(engine)) {
+        if (out_declared) {
+            *out_declared = moe_layer_common_tensor_exists(engine, layer, suffixes, suffix_count);
+        }
+        return moe_map_layer_common_tensor(engine, layer, suffixes, suffix_count, out);
+    }
+    return moe_map_layer_graph_tensor(
+        engine, layer, roles, role_count, suffixes, suffix_count, out, out_declared);
+}
+
 static int moe_layer_post_ffw_norm_suffixes_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -863,12 +1093,18 @@ static int moe_layer_post_ffw_norm_f32(
     float* output,
     float eps
 ) {
+    static const char* const roles[] = {
+        "post_ffw_norm",
+        "ffn_post_norm",
+        "mlp_post_norm"
+    };
     static const char* const suffixes[] = {
         "post_ffw_norm.weight",
         "ffn_post_norm.weight"
     };
-    return moe_layer_post_ffw_norm_suffixes_f32(
-        engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
+    return moe_layer_graph_rmsnorm_or_suffixes_f32(
+        engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
+        suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
         input, hidden_size, output, eps);
 }
 
@@ -876,6 +1112,20 @@ static int moe_layer_has_post_ffw_norm_weight(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
+    static const char* const roles[] = {
+        "post_ffw_norm",
+        "ffn_post_norm",
+        "mlp_post_norm"
+    };
+    static const char* const suffixes[] = {
+        "post_ffw_norm.weight",
+        "ffn_post_norm.weight"
+    };
+    if (moe_graph_ir_math_required(engine)) {
+        return moe_graph_ir_declares_layer_tensor(
+            engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
+            suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+    }
     return
         moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "ffn_post_norm.weight");
@@ -889,12 +1139,20 @@ static int moe_layer_post_ffw_norm1_f32(
     float* output,
     float eps
 ) {
+    static const char* const roles[] = {
+        "post_ffw_norm_1",
+        "post_ffw_norm1",
+        "ffn_post_norm_1",
+        "shared_expert_post_norm",
+        "shared_post_ffw_norm"
+    };
     static const char* const suffixes[] = {
         "post_ffw_norm_1.weight",
         "ffn_post_norm_1.weight"
     };
-    return moe_layer_post_ffw_norm_suffixes_f32(
-        engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
+    return moe_layer_graph_rmsnorm_or_suffixes_f32(
+        engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
+        suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
         input, hidden_size, output, eps);
 }
 
@@ -902,6 +1160,22 @@ static int moe_layer_has_post_ffw_norm1_weight(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
+    static const char* const roles[] = {
+        "post_ffw_norm_1",
+        "post_ffw_norm1",
+        "ffn_post_norm_1",
+        "shared_expert_post_norm",
+        "shared_post_ffw_norm"
+    };
+    static const char* const suffixes[] = {
+        "post_ffw_norm_1.weight",
+        "ffn_post_norm_1.weight"
+    };
+    if (moe_graph_ir_math_required(engine)) {
+        return moe_graph_ir_declares_layer_tensor(
+            engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
+            suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+    }
     return
         moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_1.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "ffn_post_norm_1.weight");
@@ -915,12 +1189,20 @@ static int moe_layer_post_ffw_norm2_f32(
     float* output,
     float eps
 ) {
+    static const char* const roles[] = {
+        "post_ffw_norm_2",
+        "post_ffw_norm2",
+        "ffn_post_norm_2",
+        "expert_post_ffw_norm",
+        "routed_post_ffw_norm"
+    };
     static const char* const suffixes[] = {
         "post_ffw_norm_2.weight",
         "ffn_post_norm_2.weight"
     };
-    return moe_layer_post_ffw_norm_suffixes_f32(
-        engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
+    return moe_layer_graph_rmsnorm_or_suffixes_f32(
+        engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
+        suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
         input, hidden_size, output, eps);
 }
 
@@ -928,6 +1210,22 @@ static int moe_layer_has_post_ffw_norm2_weight(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
+    static const char* const roles[] = {
+        "post_ffw_norm_2",
+        "post_ffw_norm2",
+        "ffn_post_norm_2",
+        "expert_post_ffw_norm",
+        "routed_post_ffw_norm"
+    };
+    static const char* const suffixes[] = {
+        "post_ffw_norm_2.weight",
+        "ffn_post_norm_2.weight"
+    };
+    if (moe_graph_ir_math_required(engine)) {
+        return moe_graph_ir_declares_layer_tensor(
+            engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
+            suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+    }
     return
         moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_2.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "ffn_post_norm_2.weight");
@@ -958,9 +1256,17 @@ static int moe_layer_output_scale_f32(
         "layer_scalar.weight",
         "layer_scalar"
     };
+    static const char* const roles[] = {
+        "layer_output_scale",
+        "output_scale",
+        "layer_scalar"
+    };
     moe_raw_tensor_cache_entry raw{};
-    if (!moe_map_layer_common_tensor(engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]), &raw)) {
-        return 1;
+    int declared = 0;
+    if (!moe_map_layer_graph_or_suffix_tensor(
+            engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
+            suffixes, sizeof(suffixes) / sizeof(suffixes[0]), &raw, &declared)) {
+        return moe_graph_ir_math_required(engine) && declared ? 0 : 1;
     }
     const uint64_t count = moe_raw_tensor_scalar_count(raw);
     if (count == 1u) {

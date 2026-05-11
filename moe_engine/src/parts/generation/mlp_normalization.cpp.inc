@@ -224,7 +224,13 @@ static int moe_layer_dense_mlp_from_suffixes_f32(
     size_t up_suffix_count,
     const char* const* down_suffixes,
     size_t down_suffix_count,
-    const char* profile_tag
+    const char* profile_tag,
+    const char* const* gate_roles = nullptr,
+    size_t gate_role_count = 0,
+    const char* const* up_roles = nullptr,
+    size_t up_role_count = 0,
+    const char* const* down_roles = nullptr,
+    size_t down_role_count = 0
 ) {
     const uint64_t total_start_us = moe_profile_now_us();
     const uint64_t map_start_us = moe_profile_now_us();
@@ -232,10 +238,30 @@ static int moe_layer_dense_mlp_from_suffixes_f32(
     moe_raw_tensor_cache_entry gate{};
     moe_raw_tensor_cache_entry up{};
     moe_raw_tensor_cache_entry down{};
-    if (!gate_suffixes || !up_suffixes || !down_suffixes ||
-        !moe_map_layer_common_tensor(engine, layer, gate_suffixes, gate_suffix_count, &gate) ||
-        !moe_map_layer_common_tensor(engine, layer, up_suffixes, up_suffix_count, &up) ||
-        !moe_map_layer_common_tensor(engine, layer, down_suffixes, down_suffix_count, &down)) {
+    if (!gate_suffixes || !up_suffixes || !down_suffixes) {
+        return 0;
+    }
+    int gate_declared = 0;
+    int up_declared = 0;
+    int down_declared = 0;
+    const int graph_required = moe_graph_ir_math_required(engine);
+    const int gate_mapped = moe_map_layer_graph_or_suffix_tensor(
+        engine, layer, gate_roles, gate_role_count, gate_suffixes, gate_suffix_count,
+        &gate, &gate_declared);
+    const int up_mapped = moe_map_layer_graph_or_suffix_tensor(
+        engine, layer, up_roles, up_role_count, up_suffixes, up_suffix_count,
+        &up, &up_declared);
+    const int down_mapped = moe_map_layer_graph_or_suffix_tensor(
+        engine, layer, down_roles, down_role_count, down_suffixes, down_suffix_count,
+        &down, &down_declared);
+    if (!gate_mapped || !up_mapped || !down_mapped) {
+        if (graph_required && (gate_declared || up_declared || down_declared)) {
+            moe_profile_log(
+                "mlp_dense_graph_bind_failed",
+                "layer=%d tag=%s gate=%d/%d up=%d/%d down=%d/%d",
+                layer, profile_tag ? profile_tag : "mlp_dense_begin",
+                gate_mapped, gate_declared, up_mapped, up_declared, down_mapped, down_declared);
+        }
         return 0;
     }
     const uint32_t intermediate = gate.rows;
@@ -339,12 +365,33 @@ static int moe_layer_common_dense_mlp_f32(
         "ffn.w2.weight",
         "w2.weight"
     };
+    static const char* const gate_roles[] = {
+        "ffn_gate",
+        "mlp_gate",
+        "gate_projection",
+        "ffn_gate_projection"
+    };
+    static const char* const up_roles[] = {
+        "ffn_up",
+        "mlp_up",
+        "up_projection",
+        "ffn_up_projection"
+    };
+    static const char* const down_roles[] = {
+        "ffn_down",
+        "mlp_down",
+        "down_projection",
+        "ffn_down_projection"
+    };
     return moe_layer_dense_mlp_from_suffixes_f32(
         engine, layer, s, input, hidden_size, out_hidden,
         gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0]),
         up_suffixes, sizeof(up_suffixes) / sizeof(up_suffixes[0]),
         down_suffixes, sizeof(down_suffixes) / sizeof(down_suffixes[0]),
-        "mlp_dense_begin");
+        "mlp_dense_begin",
+        gate_roles, sizeof(gate_roles) / sizeof(gate_roles[0]),
+        up_roles, sizeof(up_roles) / sizeof(up_roles[0]),
+        down_roles, sizeof(down_roles) / sizeof(down_roles[0]));
 }
 
 static int moe_layer_shared_expert_dense_mlp_f32(
@@ -382,12 +429,39 @@ static int moe_layer_shared_expert_dense_mlp_f32(
         "ffn_shared_exps_down.weight",
         "ffn_shared_down_proj.weight"
     };
+    static const char* const gate_roles[] = {
+        "shared_expert_gate",
+        "shared_expert_gate_projection",
+        "shared_expert_gate_proj",
+        "shared_ffn_gate"
+    };
+    static const char* const up_roles[] = {
+        "shared_expert_up",
+        "shared_expert_up_projection",
+        "shared_expert_up_proj",
+        "shared_ffn_up"
+    };
+    static const char* const down_roles[] = {
+        "shared_expert_down",
+        "shared_expert_down_projection",
+        "shared_expert_down_proj",
+        "shared_ffn_down"
+    };
+    if (moe_graph_ir_math_required(engine) &&
+        !moe_graph_ir_declares_layer_tensor(engine, layer, gate_roles, sizeof(gate_roles) / sizeof(gate_roles[0]), gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0])) &&
+        !moe_graph_ir_declares_layer_tensor(engine, layer, up_roles, sizeof(up_roles) / sizeof(up_roles[0]), up_suffixes, sizeof(up_suffixes) / sizeof(up_suffixes[0])) &&
+        !moe_graph_ir_declares_layer_tensor(engine, layer, down_roles, sizeof(down_roles) / sizeof(down_roles[0]), down_suffixes, sizeof(down_suffixes) / sizeof(down_suffixes[0]))) {
+        return 0;
+    }
     return moe_layer_dense_mlp_from_suffixes_f32(
         engine, layer, s, input, hidden_size, out_hidden,
         gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0]),
         up_suffixes, sizeof(up_suffixes) / sizeof(up_suffixes[0]),
         down_suffixes, sizeof(down_suffixes) / sizeof(down_suffixes[0]),
-        "mlp_shared_dense_begin");
+        "mlp_shared_dense_begin",
+        gate_roles, sizeof(gate_roles) / sizeof(gate_roles[0]),
+        up_roles, sizeof(up_roles) / sizeof(up_roles[0]),
+        down_roles, sizeof(down_roles) / sizeof(down_roles[0]));
 }
 
 static int moe_layer_dense_mlp_f32(
