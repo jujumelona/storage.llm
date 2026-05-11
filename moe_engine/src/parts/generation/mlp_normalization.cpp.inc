@@ -211,72 +211,31 @@ static int moe_add_mlp_residual_f32(
     return 1;
 }
 
-static int moe_layer_common_dense_mlp_f32(
+static int moe_layer_dense_mlp_from_suffixes_f32(
     moe_pc_engine* engine,
     int32_t layer,
     moe_decode_scratch* s,
     const float* input,
     uint32_t hidden_size,
-    float* out_hidden
+    float* out_hidden,
+    const char* const* gate_suffixes,
+    size_t gate_suffix_count,
+    const char* const* up_suffixes,
+    size_t up_suffix_count,
+    const char* const* down_suffixes,
+    size_t down_suffix_count,
+    const char* profile_tag
 ) {
-    static const char* const gate_suffixes[] = {
-        // Shared-expert names must win before generic FFN aliases.  In MoE
-        // layers this helper is used for the shared branch; matching a generic
-        // ffn_gate/w1 tensor first can add the wrong dense FFN branch on top of
-        // routed experts.
-        "shared_expert.gate_proj.weight",
-        "shared_experts.gate_proj.weight",
-        "shared_expert.w1.weight",
-        "shared_experts.w1.weight",
-        "ffn_shared_expert_gate.weight",
-        "ffn_shared_exps_gate.weight",
-        "ffn_shared_gate_proj.weight",
-        "ffn_gate.weight",
-        "mlp.gate_proj.weight",
-        "gate_proj.weight",
-        "feed_forward.w1.weight",
-        "ffn.w1.weight",
-        "w1.weight"
-    };
-    static const char* const up_suffixes[] = {
-        "shared_expert.up_proj.weight",
-        "shared_experts.up_proj.weight",
-        "shared_expert.w3.weight",
-        "shared_experts.w3.weight",
-        "ffn_shared_expert_up.weight",
-        "ffn_shared_exps_up.weight",
-        "ffn_shared_up_proj.weight",
-        "ffn_up.weight",
-        "mlp.up_proj.weight",
-        "up_proj.weight",
-        "feed_forward.w3.weight",
-        "ffn.w3.weight",
-        "w3.weight"
-    };
-    static const char* const down_suffixes[] = {
-        "shared_expert.down_proj.weight",
-        "shared_experts.down_proj.weight",
-        "shared_expert.w2.weight",
-        "shared_experts.w2.weight",
-        "ffn_shared_expert_down.weight",
-        "ffn_shared_exps_down.weight",
-        "ffn_shared_down_proj.weight",
-        "ffn_down.weight",
-        "mlp.down_proj.weight",
-        "down_proj.weight",
-        "feed_forward.w2.weight",
-        "ffn.w2.weight",
-        "w2.weight"
-    };
     const uint64_t total_start_us = moe_profile_now_us();
     const uint64_t map_start_us = moe_profile_now_us();
-    moe_profile_log("mlp_dense_begin", "layer=%d hidden=%u", layer, hidden_size);
+    moe_profile_log(profile_tag ? profile_tag : "mlp_dense_begin", "layer=%d hidden=%u", layer, hidden_size);
     moe_raw_tensor_cache_entry gate{};
     moe_raw_tensor_cache_entry up{};
     moe_raw_tensor_cache_entry down{};
-    if (!moe_map_layer_common_tensor(engine, layer, gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0]), &gate) ||
-        !moe_map_layer_common_tensor(engine, layer, up_suffixes, sizeof(up_suffixes) / sizeof(up_suffixes[0]), &up) ||
-        !moe_map_layer_common_tensor(engine, layer, down_suffixes, sizeof(down_suffixes) / sizeof(down_suffixes[0]), &down)) {
+    if (!gate_suffixes || !up_suffixes || !down_suffixes ||
+        !moe_map_layer_common_tensor(engine, layer, gate_suffixes, gate_suffix_count, &gate) ||
+        !moe_map_layer_common_tensor(engine, layer, up_suffixes, up_suffix_count, &up) ||
+        !moe_map_layer_common_tensor(engine, layer, down_suffixes, down_suffix_count, &down)) {
         return 0;
     }
     const uint32_t intermediate = gate.rows;
@@ -346,6 +305,89 @@ static int moe_layer_common_dense_mlp_f32(
         layer, intermediate, hidden_size, activation_mode, gate_up_ms,
         moe_profile_elapsed_ms(down_start_us), moe_profile_elapsed_ms(total_start_us));
     return 1;
+}
+
+static int moe_layer_common_dense_mlp_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    moe_decode_scratch* s,
+    const float* input,
+    uint32_t hidden_size,
+    float* out_hidden
+) {
+    static const char* const gate_suffixes[] = {
+        "ffn_gate.weight",
+        "mlp.gate_proj.weight",
+        "gate_proj.weight",
+        "feed_forward.w1.weight",
+        "ffn.w1.weight",
+        "w1.weight"
+    };
+    static const char* const up_suffixes[] = {
+        "ffn_up.weight",
+        "mlp.up_proj.weight",
+        "up_proj.weight",
+        "feed_forward.w3.weight",
+        "ffn.w3.weight",
+        "w3.weight"
+    };
+    static const char* const down_suffixes[] = {
+        "ffn_down.weight",
+        "mlp.down_proj.weight",
+        "down_proj.weight",
+        "feed_forward.w2.weight",
+        "ffn.w2.weight",
+        "w2.weight"
+    };
+    return moe_layer_dense_mlp_from_suffixes_f32(
+        engine, layer, s, input, hidden_size, out_hidden,
+        gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0]),
+        up_suffixes, sizeof(up_suffixes) / sizeof(up_suffixes[0]),
+        down_suffixes, sizeof(down_suffixes) / sizeof(down_suffixes[0]),
+        "mlp_dense_begin");
+}
+
+static int moe_layer_shared_expert_dense_mlp_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    moe_decode_scratch* s,
+    const float* input,
+    uint32_t hidden_size,
+    float* out_hidden
+) {
+    static const char* const gate_suffixes[] = {
+        "shared_expert.gate_proj.weight",
+        "shared_experts.gate_proj.weight",
+        "shared_expert.w1.weight",
+        "shared_experts.w1.weight",
+        "ffn_shared_expert_gate.weight",
+        "ffn_shared_exps_gate.weight",
+        "ffn_shared_gate_proj.weight"
+    };
+    static const char* const up_suffixes[] = {
+        "shared_expert.up_proj.weight",
+        "shared_experts.up_proj.weight",
+        "shared_expert.w3.weight",
+        "shared_experts.w3.weight",
+        "ffn_shared_expert_up.weight",
+        "ffn_shared_exps_up.weight",
+        "ffn_shared_up_proj.weight"
+    };
+    static const char* const down_suffixes[] = {
+        "shared_expert.down_proj.weight",
+        "shared_experts.down_proj.weight",
+        "shared_expert.w2.weight",
+        "shared_experts.w2.weight",
+        "ffn_shared_expert_down.weight",
+        "ffn_shared_exps_down.weight",
+        "ffn_shared_down_proj.weight"
+    };
+    return moe_layer_dense_mlp_from_suffixes_f32(
+        engine, layer, s, input, hidden_size, out_hidden,
+        gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0]),
+        up_suffixes, sizeof(up_suffixes) / sizeof(up_suffixes[0]),
+        down_suffixes, sizeof(down_suffixes) / sizeof(down_suffixes[0]),
+        "mlp_shared_dense_begin");
 }
 
 static int moe_layer_dense_mlp_f32(

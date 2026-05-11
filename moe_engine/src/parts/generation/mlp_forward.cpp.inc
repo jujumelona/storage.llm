@@ -71,7 +71,7 @@ static int moe_layer_moe_mlp_f32(
     const moe_storage_raw_span_spec_t* shared = find_raw_role_span_bytes(layer, moe_RAW_ROLE_SHARED, shared_bytes, 0);
     int shared_ok = 0;
     const uint64_t shared_start_us = moe_profile_now_us();
-    if (moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
+    if (moe_layer_shared_expert_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
         shared_ok = 1;
     } else if (shared &&
         moe_raw_mlp_span_f32(
@@ -103,12 +103,6 @@ static int moe_layer_moe_mlp_f32(
         "layer=%d ok=%d has_raw_span=%d ms=%.3f",
         layer, shared_ok, shared ? 1 : 0, moe_profile_elapsed_ms(shared_start_us));
 
-    // Router input must be selected from the same activation-scale contract that
-    // router_topk will actually consume.  `ffn_gate_inp.scale` is a quantization
-    // sidecar for the router weight in MXFP4/GGUF artifacts, not an activation
-    // RMSNorm/scale op.  The previous existence check switched the router from
-    // expert_input to raw hidden even after the scale sidecar itself was ignored,
-    // so MoE routing kept using the wrong vector and remained near-uniform.
     const int router_has_internal_norm_scale =
         moe_engine_has_common_tensor_suffix(engine, layer, "router_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router.input_layernorm.weight") ||
@@ -2043,7 +2037,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         float* mlp_out = batch_mlp.data() + (size_t)t * hidden_size;
         float* shared_out_buf = local.shared.data();
         int shared_ok = 0;
-        if (moe_layer_common_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, shared_out_buf)) {
+        if (moe_layer_shared_expert_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, shared_out_buf)) {
             shared_ok = 1;
         } else if (shared &&
             moe_raw_mlp_span_f32(

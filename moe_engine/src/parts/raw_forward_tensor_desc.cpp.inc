@@ -277,11 +277,12 @@ static void moe_raw_tensor_kind_common_names(
                 "post_attention_layer_norm.weight",
                 "post_attn_norm.weight"
             };
-            // Do not fall back to ffn_norm/mlp_norm/pre_ffw_norm here.  In
-            // GraphIR-required Gemma-MoE runs that broad fallback can bind the
-            // FFN input norm as a post-attention norm and corrupt the residual
-            // stream on the first token.  Legacy aliases must be represented by
-            // op_role or an exact post_attention_* name, not by cross-role suffix.
+            // GraphIR-required GLM/Gemma-MoE artifacts carry separate ffn_norm,
+            // pre_ffw_norm and post_ffw_norm tensors.  Treating those aliases as
+            // post-attention norms made the hand-coded forward bind an FFN norm
+            // into the attention residual branch.  Keep this raw role exact; old
+            // naming aliases such as ln_2 must be handled by graph/model-specific
+            // binding rather than a broad fallback.
             moe_push_layer_tensor_candidates(out, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
             break;
         }
@@ -467,6 +468,7 @@ static void moe_raw_tensor_kind_op_roles(
             break;
         case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM:
             out->push_back("post_attention_norm");
+            out->push_back("ffn_norm");
             break;
         case moe_RAW_TENSOR_Q_A_LAYER_NORM:
             out->push_back("q_norm");

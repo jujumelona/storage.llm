@@ -617,6 +617,9 @@ static int moe_router_topk_f32(
     if (!moe_router_logits_f32(engine, layer, router_input, hidden_size, experts, scratch_logits)) {
         return 0;
     }
+    if (!moe_router_apply_bias_f32(engine, layer, experts, scratch_logits)) {
+        return 0;
+    }
 
     top_k = std::min(top_k, experts);
 

@@ -290,6 +290,95 @@ static uint64_t moe_router_raw_scalar_count(const moe_raw_tensor_cache_entry& ra
     return elem ? raw.bytes / (uint64_t)elem : 0;
 }
 
+static int moe_map_router_bias_tensor(
+    moe_pc_engine* engine,
+    int32_t layer,
+    uint32_t experts,
+    moe_raw_tensor_cache_entry* out
+) {
+    if (!engine || !out || layer < 0 || experts == 0) {
+        return 0;
+    }
+    static const char* const suffixes[] = {
+        "e_score_correction_bias",
+        "expert_bias",
+        "router.expert_bias",
+        "router.bias",
+        "mlp.router.expert_bias",
+        "moe.gate.expert_bias",
+        "moe.gate.e_score_correction_bias",
+        "ffn_gate_inp.bias"
+    };
+    const uint32_t suffix_hash = moe_router_fnv1a_hash_string(suffixes[0]);
+    const uint64_t key = ((uint64_t)(uint32_t)layer << 32) | suffix_hash | 0x90000000ull;
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        auto found = engine->raw_tensor_cache.find(key);
+        if (found != engine->raw_tensor_cache.end() && found->second.base) {
+            *out = found->second;
+            return 1;
+        }
+    }
+    std::vector<std::string> names;
+    moe_push_layer_tensor_candidates(&names, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+    moe_raw_tensor_desc desc{};
+    const moe_gguf_common_tensor_record* rec =
+        moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
+    if (!rec) {
+        return 0;
+    }
+    moe_raw_tensor_cache_entry raw{};
+    if (!map_common_tensor_record(engine, *rec, desc, &raw)) {
+        return 0;
+    }
+    const uint64_t count = moe_router_raw_scalar_count(raw);
+    if (count != (uint64_t)experts) {
+        moe_profile_log(
+            "router_bias_reject",
+            "layer=%d experts=%u count=%llu rows=%u cols=%u",
+            layer, experts, (unsigned long long)count, raw.rows, raw.cols);
+        return 0;
+    }
+    *out = raw;
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        engine->raw_tensor_cache[key] = *out;
+    }
+    return 1;
+}
+
+static int moe_router_apply_bias_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    uint32_t experts,
+    std::vector<float>* logits
+) {
+    if (!engine || !logits || logits->size() < experts || experts == 0) {
+        return 0;
+    }
+    moe_raw_tensor_cache_entry bias{};
+    if (!moe_map_router_bias_tensor(engine, layer, experts, &bias)) {
+        return 1;
+    }
+    double abs_sum = 0.0;
+    float max_abs = 0.0f;
+    for (uint32_t i = 0; i < experts; ++i) {
+        float b = 0.0f;
+        if (!moe_router_raw_scalar_at_f32(bias, i, &b) || !std::isfinite(b)) {
+            return 0;
+        }
+        (*logits)[i] += b;
+        const float ab = std::fabs(b);
+        abs_sum += (double)ab;
+        if (ab > max_abs) max_abs = ab;
+    }
+    moe_profile_log(
+        "router_bias_apply",
+        "layer=%d experts=%u mean_abs=%.6g max_abs=%.6g",
+        layer, experts, abs_sum / (double)experts, (double)max_abs);
+    return 1;
+}
+
 static int moe_map_router_scale_tensor(
     moe_pc_engine* engine,
     int32_t layer,

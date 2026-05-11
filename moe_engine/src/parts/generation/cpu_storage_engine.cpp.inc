@@ -1194,12 +1194,18 @@ static void moe_cpu_storage_select_forward_adapter(moe_pc_engine* engine) {
         moe_cpu_storage_disable_gpu_paths(engine);
         moe_cpu_storage_build_execution_plan(engine);
         if (engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) {
-            // CPU-storage is a real fast path, not graph_ir.  Do not advertise or
-            // enter graph_ir here unless the operator explicitly requested a slow
-            // fallback elsewhere.
-            engine->forward_adapter.store(moe_FORWARD_ADAPTER_CPU_STORAGE, std::memory_order_relaxed);
+            const int graph_contract_required =
+                engine->offload_graph_ir_required.load(std::memory_order_relaxed) &&
+                engine->offload_graph_ir_ready.load(std::memory_order_relaxed);
+            // CPU-storage is the weight backend.  For graph-required artifacts the
+            // semantic forward adapter must remain GraphIR-bound; otherwise health
+            // and PPL diagnostics report cpu_storage even while graph contracts are
+            // supposed to govern norm/router/shared-expert ordering.
+            engine->forward_adapter.store(
+                graph_contract_required ? moe_FORWARD_ADAPTER_GRAPH_IR : moe_FORWARD_ADAPTER_CPU_STORAGE,
+                std::memory_order_relaxed);
             engine->forward_adapter_executable.store(1, std::memory_order_relaxed);
-            engine->graph_ir_used_for_forward.store(0, std::memory_order_relaxed);
+            engine->graph_ir_used_for_forward.store(graph_contract_required ? 1 : 0, std::memory_order_relaxed);
         } else if (!moe_cpu_storage_explicit_slow_fallback_allowed()) {
             engine->forward_adapter.store(moe_FORWARD_ADAPTER_CPU_STORAGE, std::memory_order_relaxed);
             engine->forward_adapter_executable.store(0, std::memory_order_relaxed);
@@ -1256,9 +1262,13 @@ static void moe_cpu_storage_begin_token(moe_pc_engine* engine, uint32_t position
     (void)position;
     (void)token_id;
     const int graph_contract_active =
-        engine->forward_adapter.load(std::memory_order_relaxed) == moe_FORWARD_ADAPTER_GRAPH_IR &&
         engine->offload_graph_ir_required.load(std::memory_order_relaxed) &&
         engine->offload_graph_ir_ready.load(std::memory_order_relaxed);
+    if (graph_contract_active &&
+        engine->forward_adapter.load(std::memory_order_relaxed) != moe_FORWARD_ADAPTER_GRAPH_IR) {
+        engine->forward_adapter.store(moe_FORWARD_ADAPTER_GRAPH_IR, std::memory_order_relaxed);
+        engine->forward_adapter_executable.store(1, std::memory_order_relaxed);
+    }
     engine->graph_ir_used_for_forward.store(graph_contract_active ? 1 : 0, std::memory_order_relaxed);
     engine->generation_phase.store(moe_GEN_PHASE_INIT, std::memory_order_relaxed);
     engine->cpu_prefetch_epoch.fetch_add(1u, std::memory_order_relaxed);
