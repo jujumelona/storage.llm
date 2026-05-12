@@ -27,6 +27,45 @@ static int moe_accumulate_branch_checked_f32(
     return 1;
 }
 
+
+static int moe_graphir_moe_layer_has_routed_expert_f32(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    static const char* const routed_roles[] = {
+        "moe_expert_mlp",
+        "routed_expert_mlp",
+        "expert_mlp",
+        "selected_expert_mlp",
+        "moe_router",
+        "router"
+    };
+    return moe_graph_ir_layer_has_op_role_any(
+        engine, layer, routed_roles, sizeof(routed_roles) / sizeof(routed_roles[0]));
+}
+
+static int moe_moe_dense_branch_enabled_f32(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!moe_graph_ir_math_required(engine)) {
+        return 1;
+    }
+    // GraphIR emits dense_mlp entries for generic FFN weights, but the layer
+    // contract marks them as a fallback: dense_branch is required only when the
+    // layer has no routed MoE/shared-expert weights.  The runtime tensor table
+    // stores op_role but not the per-op "required" bit, so a routed MoE layer
+    // must not execute the generic dense branch merely because ffn_gate/up/down
+    // tensors are present.  Doing so double-counts the FFN path and breaks PPL.
+    if (moe_env_flag_enabled_cached("STORAGELLM_GRAPHIR_ENABLE_DENSE_MOE_BRANCH")) {
+        return 1;
+    }
+    if (moe_graphir_moe_layer_has_routed_expert_f32(engine, layer)) {
+        return 0;
+    }
+    return 1;
+}
+
 static int moe_layer_moe_mlp_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -91,14 +130,18 @@ static int moe_layer_moe_mlp_f32(
 
     int dense_ok = 0;
     const uint64_t dense_start_us = moe_profile_now_us();
+    const int dense_enabled = moe_moe_dense_branch_enabled_f32(engine, layer);
     std::fill(s->shared.begin(), s->shared.begin() + hidden_size, 0.0f);
-    if (moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
+    if (dense_enabled &&
+        moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
         dense_ok = 1;
     }
     moe_profile_log(
         "mlp_moe_dense_branch",
-        "layer=%d ok=%d deferred=1 ms=%.3f",
-        layer, dense_ok, moe_profile_elapsed_ms(dense_start_us));
+        "layer=%d ok=%d enabled=%d graph_routed=%d deferred=1 ms=%.3f",
+        layer, dense_ok, dense_enabled,
+        moe_graph_ir_math_required(engine) ? moe_graphir_moe_layer_has_routed_expert_f32(engine, layer) : 0,
+        moe_profile_elapsed_ms(dense_start_us));
 
     const uint64_t shared_bytes =
         2ull * (uint64_t)configured_expert_intermediate * (uint64_t)hidden_size * 2ull +
@@ -2089,8 +2132,10 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         float* mlp_out = batch_mlp.data() + (size_t)t * hidden_size;
         int dense_ok = 0;
         float* dense_out = batch_dense.data() + (size_t)t * hidden_size;
+        const int dense_enabled = moe_moe_dense_branch_enabled_f32(engine, layer);
         std::fill(dense_out, dense_out + hidden_size, 0.0f);
-        if (moe_layer_common_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, dense_out)) {
+        if (dense_enabled &&
+            moe_layer_common_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, dense_out)) {
             dense_ok = 1;
         }
         float* shared_out_buf = local.residual.data();
