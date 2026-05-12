@@ -40,74 +40,6 @@ static int moe_rmsnorm_unit_offset_from_json(
     return 0;
 }
 
-static int moe_rmsnorm_unit_offset_from_weight_stats(
-    const moe_raw_tensor_cache_entry& raw,
-    int* out,
-    uint32_t* out_samples,
-    double* out_raw_mean,
-    double* out_raw_rms,
-    double* out_mean_abs_raw,
-    double* out_mean_abs_plus_one
-) {
-    if (!out || !raw.base || raw.cols != 0 || raw.rows == 0) {
-        return 0;
-    }
-    const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
-    if (!elem || raw.bytes < (uint64_t)raw.rows * (uint64_t)elem) {
-        return 0;
-    }
-    const uint32_t max_samples = 512u;
-    const uint32_t step = raw.rows > max_samples ? (raw.rows + max_samples - 1u) / max_samples : 1u;
-    uint32_t samples = 0;
-    double raw_sum = 0.0;
-    double raw_ss = 0.0;
-    double mean_abs_raw = 0.0;
-    double mean_abs_plus_one = 0.0;
-    for (uint32_t i = 0; i < raw.rows; i += step) {
-        const float w = moe_raw_scalar_to_f32(raw.base + (uint64_t)i * (uint64_t)elem, raw.scalar_encoding);
-        if (!std::isfinite(w)) {
-            continue;
-        }
-        raw_sum += (double)w;
-        raw_ss += (double)w * (double)w;
-        mean_abs_raw += (double)std::fabs(w);
-        mean_abs_plus_one += (double)std::fabs(1.0f + w);
-        ++samples;
-    }
-    if (samples < 16u) {
-        return 0;
-    }
-    const double inv = 1.0 / (double)samples;
-    const double raw_mean = raw_sum * inv;
-    const double raw_rms = std::sqrt(raw_ss * inv);
-    mean_abs_raw *= inv;
-    mean_abs_plus_one *= inv;
-    if (out_samples) *out_samples = samples;
-    if (out_raw_mean) *out_raw_mean = raw_mean;
-    if (out_raw_rms) *out_raw_rms = raw_rms;
-    if (out_mean_abs_raw) *out_mean_abs_raw = mean_abs_raw;
-    if (out_mean_abs_plus_one) *out_mean_abs_plus_one = mean_abs_plus_one;
-
-    // Shifted RMSNorm weights are often stored as a small
-    // additive delta around zero and must be used as (1 + weight). Plain
-    // RMSNorm weights are usually already centered near one or larger. The
-    // old 0.35/0.50 split left many post-attention norms around 0.4-0.5 as
-    // "ambiguous", so a non-authoritative graph_ir=false default could leak
-    // through and corrupt late-layer residual math. Keep the decision tensor-
-    // local and deliberately separate small delta tensors from already-unit
-    // tensors.
-    if (mean_abs_raw < 0.75 && raw_rms < 0.75 &&
-        mean_abs_plus_one > 0.65 && mean_abs_plus_one < 1.85) {
-        *out = 1;
-        return 1;
-    }
-    if (mean_abs_raw > 0.85 || raw_rms > 0.85) {
-        *out = 0;
-        return 1;
-    }
-    return 0;
-}
-
 static uint64_t moe_rmsnorm_unit_offset_cache_key(
     const moe_raw_tensor_cache_entry& raw
 ) {
@@ -135,89 +67,37 @@ static int moe_engine_rmsnorm_unit_offset(
             return found->second ? 1 : 0;
         }
     }
+
     int value = 0;
-    const char* source = "default";
-    uint32_t samples = 0;
-    double raw_mean = 0.0;
-    double raw_rms = 0.0;
-    double mean_abs_raw = 0.0;
-    double mean_abs_plus_one = 0.0;
-    int metadata_done = 0;
     int metadata_value = -1;
     const char* metadata_source = "none";
-    const int metadata_cache = engine->cached_rmsnorm_unit_offset.load(std::memory_order_acquire);
+    const char* source = "contract_default";
+    int parsed_value = 0;
 
-    // Treat only an explicit model-wide true as authoritative. A model-wide
-    // false in graph_ir/metadata is frequently an emitter default rather than
-    // a tensor contract; using it globally was visible in PPL logs as
-    // source=graph_ir value=0 even when tensor-local weights looked like
-    // shifted RMSNorm deltas.
-    if (metadata_cache == 1) {
-        value = 1;
-        source = "metadata_cache_true";
-        metadata_done = 1;
-        metadata_value = 1;
-        metadata_source = "cache";
-    } else {
-        int parsed_value = 0;
-        if (metadata_cache != 2) {
-            if (moe_rmsnorm_unit_offset_from_json(engine->offload_gguf_metadata_json, &parsed_value)) {
-                metadata_value = parsed_value ? 1 : 0;
-                metadata_source = "metadata";
-            } else if (moe_rmsnorm_unit_offset_from_json(engine->offload_graph_ir_json, &parsed_value)) {
-                metadata_value = parsed_value ? 1 : 0;
-                metadata_source = "graph_ir";
-            } else {
-                engine->cached_rmsnorm_unit_offset.store(2, std::memory_order_release);
-            }
-            if (metadata_value == 1) {
-                value = 1;
-                source = metadata_source;
-                metadata_done = 1;
-                engine->cached_rmsnorm_unit_offset.store(1, std::memory_order_release);
-            } else if (metadata_value == 0) {
-                // Do not cache false globally. Fall through to tensor-local
-                // stats; they can confirm false or override to unit-offset.
-                engine->cached_rmsnorm_unit_offset.store(2, std::memory_order_release);
-            }
-        }
-        if (!metadata_done &&
-            moe_rmsnorm_unit_offset_from_weight_stats(
-                raw,
-                &value,
-                &samples,
-                &raw_mean,
-                &raw_rms,
-                &mean_abs_raw,
-                &mean_abs_plus_one)) {
-            if (metadata_value == 0) {
-                source = value ? "weight_stats_override_metadata_false" : "weight_stats_confirm_metadata_false";
-            } else {
-                source = "weight_stats";
-            }
-            metadata_done = 1;
-        }
+    // Contract rule: unit-offset RMSNorm is architecture/config math, not a
+    // tensor-statistics heuristic.  Previous code inferred (1+w) from weight
+    // magnitudes; that made layer-local decisions drift across norm tensors and
+    // caused the same model to run different math depending on quant sidecars.
+    // Use only explicit metadata/GraphIR.  If absent, use normal RMSNorm weight.
+    if (moe_rmsnorm_unit_offset_from_json(engine->offload_gguf_metadata_json, &parsed_value)) {
+        metadata_value = parsed_value ? 1 : 0;
+        metadata_source = "metadata";
+        value = metadata_value;
+        source = "metadata";
+    } else if (moe_rmsnorm_unit_offset_from_json(engine->offload_graph_ir_json, &parsed_value)) {
+        metadata_value = parsed_value ? 1 : 0;
+        metadata_source = "graph_ir";
+        value = metadata_value;
+        source = "graph_ir";
     }
-    if (!metadata_done) {
-        // Unit-offset RMSNorm changes math. If the package does not carry an
-        // explicit true contract and tensor-local stats are inconclusive,
-        // preserve the stored weights as-is instead of applying a model-wide
-        // guess or a non-authoritative false default.
-        value = 0;
-        source = metadata_value == 0 ? "metadata_false_stats_inconclusive" : "contract_default";
-    }
+
     moe_profile_log(
         "rmsnorm_unit_offset",
-        "source=%s value=%d metadata=%d metadata_source=%s samples=%u raw_mean=%.6g raw_rms=%.6g mean_abs_raw=%.6g mean_abs_plus_one=%.6g cache_key=%llu",
+        "source=%s value=%d metadata=%d metadata_source=%s cache_key=%llu",
         source,
         value ? 1 : 0,
         metadata_value,
         metadata_source,
-        samples,
-        raw_mean,
-        raw_rms,
-        mean_abs_raw,
-        mean_abs_plus_one,
         (unsigned long long)cache_key);
     if (cache_key) {
         std::unique_lock<std::shared_mutex> lock(engine->rmsnorm_unit_offset_cache_mutex);

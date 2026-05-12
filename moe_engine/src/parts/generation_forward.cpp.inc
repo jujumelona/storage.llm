@@ -13,28 +13,57 @@ static void moe_forward_trace_vec(
     }
     double ss = 0.0;
     double mean_abs = 0.0;
+    double sum = 0.0;
     float max_abs = 0.0f;
+    float min_v = std::numeric_limits<float>::infinity();
+    float max_v = -std::numeric_limits<float>::infinity();
+    uint64_t hash = 1469598103934665603ull;
+    uint32_t bad = 0;
     for (uint32_t i = 0; i < count; ++i) {
         const float v = values[i];
+        if (!std::isfinite(v)) {
+            ++bad;
+        }
         const float av = std::fabs(v);
         ss += (double)v * (double)v;
         mean_abs += (double)av;
+        sum += (double)v;
         if (av > max_abs) {
             max_abs = av;
         }
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+        uint32_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(v), "float hash assumes 32-bit float");
+        std::memcpy(&bits, &v, sizeof(bits));
+        hash ^= (uint64_t)bits;
+        hash *= 1099511628211ull;
     }
+    const double rms = std::sqrt(ss / (double)count);
+    const double mean = sum / (double)count;
     moe_profile_log(
         "forward_vec",
-        "position=%u layer=%u stage=%s count=%u rms=%.6g mean_abs=%.6g max_abs=%.6g first4=[%.6g,%.6g,%.6g,%.6g]",
+        "position=%u layer=%u stage=%s count=%u rms=%.6g mean=%.6g mean_abs=%.6g max_abs=%.6g min=%.6g max=%.6g bad=%u hash=%016llx first4=[%.6g,%.6g,%.6g,%.6g]",
         position, layer, stage ? stage : "",
         count,
-        std::sqrt(ss / (double)count),
+        rms,
+        mean,
         mean_abs / (double)count,
         (double)max_abs,
+        (double)min_v,
+        (double)max_v,
+        bad,
+        (unsigned long long)hash,
         count > 0 ? (double)values[0] : 0.0,
         count > 1 ? (double)values[1] : 0.0,
         count > 2 ? (double)values[2] : 0.0,
         count > 3 ? (double)values[3] : 0.0);
+    moe_profile_log(
+        "op_parity_vec",
+        "position=%u layer=%u op=%s count=%u rms=%.9g mean=%.9g mean_abs=%.9g max_abs=%.9g min=%.9g max=%.9g bad=%u hash=%016llx",
+        position, layer, stage ? stage : "", count, rms, mean,
+        mean_abs / (double)count, (double)max_abs, (double)min_v, (double)max_v, bad,
+        (unsigned long long)hash);
 }
 
 static void moe_forward_trace_generation_contract(

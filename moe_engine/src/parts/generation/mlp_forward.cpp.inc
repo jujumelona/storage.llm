@@ -4,6 +4,48 @@
 // are intentionally shared through the full function scope.
 
 
+
+static void moe_mlp_trace_vec_f32(
+    const char* stage,
+    int32_t layer,
+    const float* values,
+    uint32_t count
+) {
+    if (!moe_profile_enabled() || !values || count == 0) {
+        return;
+    }
+    double ss = 0.0;
+    double mean_abs = 0.0;
+    double sum = 0.0;
+    float max_abs = 0.0f;
+    float min_v = std::numeric_limits<float>::infinity();
+    float max_v = -std::numeric_limits<float>::infinity();
+    uint32_t bad = 0;
+    uint64_t hash = 1469598103934665603ull;
+    for (uint32_t i = 0; i < count; ++i) {
+        const float v = values[i];
+        if (!std::isfinite(v)) ++bad;
+        const float av = std::fabs(v);
+        ss += (double)v * (double)v;
+        mean_abs += (double)av;
+        sum += (double)v;
+        if (av > max_abs) max_abs = av;
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+        uint32_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        hash ^= (uint64_t)bits;
+        hash *= 1099511628211ull;
+    }
+    const double rms = std::sqrt(ss / (double)count);
+    moe_profile_log(
+        "op_parity_vec",
+        "position=%u layer=%u op=%s count=%u rms=%.9g mean=%.9g mean_abs=%.9g max_abs=%.9g min=%.9g max=%.9g bad=%u hash=%016llx",
+        0u, (uint32_t)std::max<int32_t>(0, layer), stage ? stage : "", count,
+        rms, sum / (double)count, mean_abs / (double)count, (double)max_abs,
+        (double)min_v, (double)max_v, bad, (unsigned long long)hash);
+}
+
 static int moe_accumulate_branch_checked_f32(
     float* acc,
     const float* branch,
@@ -128,6 +170,7 @@ static int moe_layer_moe_mlp_f32(
     // branch as zero.
     if (moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
         dense_ok = 1;
+        moe_mlp_trace_vec_f32("mlp_dense_branch", layer, s->shared.data(), hidden_size);
     }
     moe_profile_log(
         "mlp_moe_dense_branch",
@@ -156,10 +199,12 @@ static int moe_layer_moe_mlp_f32(
         for (uint32_t i = 0; i < hidden_size; ++i) {
             s->residual[i] *= shared_gate;
         }
+        moe_mlp_trace_vec_f32("mlp_shared_branch_raw", layer, s->residual.data(), hidden_size);
         const float* shared_branch = s->residual.data();
         if (moe_layer_post_ffw_norm1_f32(
                 engine, layer, s->residual.data(), hidden_size, s->mlp.data(), attn_cfg.rms_norm_eps)) {
             shared_branch = s->mlp.data();
+            moe_mlp_trace_vec_f32("mlp_shared_branch_post_norm1", layer, shared_branch, hidden_size);
         } else if (moe_layer_has_post_ffw_norm1_weight(engine, layer) &&
                    moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
             std::fprintf(stderr,
@@ -861,6 +906,7 @@ static int moe_layer_moe_mlp_f32(
                 std::fprintf(stderr, "[storagellm mlp] NULL expert_branch layer=%d\n", layer);
                 return 0;
             }
+            moe_mlp_trace_vec_f32("mlp_expert_branch", layer, expert_branch, hidden_size);
             if (!moe_accumulate_branch_checked_f32(s->mlp.data(), expert_branch, hidden_size, layer, "expert")) {
                 return 0;
             }
@@ -868,6 +914,7 @@ static int moe_layer_moe_mlp_f32(
                 !moe_accumulate_branch_checked_f32(s->mlp.data(), s->shared.data(), hidden_size, layer, "dense")) {
                 return 0;
             }
+            moe_mlp_trace_vec_f32("mlp_branch_sum_pre_residual", layer, s->mlp.data(), hidden_size);
             const uint64_t residual_start_us = moe_profile_now_us();
             const int residual_ok = moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
             moe_profile_log(
@@ -1004,6 +1051,7 @@ static int moe_layer_moe_mlp_f32(
         std::fprintf(stderr, "[storagellm mlp] NULL expert_branch layer=%d\n", layer);
         return 0;
     }
+    moe_mlp_trace_vec_f32("mlp_expert_branch", layer, expert_branch, hidden_size);
     if (!moe_accumulate_branch_checked_f32(s->mlp.data(), expert_branch, hidden_size, layer, "expert")) {
         return 0;
     }
@@ -1011,6 +1059,7 @@ static int moe_layer_moe_mlp_f32(
         !moe_accumulate_branch_checked_f32(s->mlp.data(), s->shared.data(), hidden_size, layer, "dense")) {
         return 0;
     }
+    moe_mlp_trace_vec_f32("mlp_branch_sum_pre_residual", layer, s->mlp.data(), hidden_size);
     const double accumulate_ms = moe_profile_elapsed_ms(accumulate_start_us);
 
     const uint64_t residual_start_us = moe_profile_now_us();
