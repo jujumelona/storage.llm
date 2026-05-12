@@ -310,6 +310,98 @@ int moe_pc_engine_raw_linear_f32(
     });
 }
 
+
+static int moe_rmsnorm_weight_implausible_sidecar_f32(
+    const moe_raw_tensor_cache_entry& raw,
+    uint32_t count,
+    int unit_offset,
+    double* out_mean_abs,
+    double* out_rms,
+    double* out_max_abs
+) {
+    if (out_mean_abs) *out_mean_abs = 0.0;
+    if (out_rms) *out_rms = 0.0;
+    if (out_max_abs) *out_max_abs = 0.0;
+    if (!raw.base || raw.cols != 0 || count == 0) {
+        return 0;
+    }
+    const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
+    if (!elem || raw.bytes < (uint64_t)count * (uint64_t)elem) {
+        return 0;
+    }
+    const uint32_t max_samples = 512u;
+    const uint32_t step = count > max_samples ? (count + max_samples - 1u) / max_samples : 1u;
+    uint32_t samples = 0;
+    double abs_sum = 0.0;
+    double ss = 0.0;
+    double max_abs = 0.0;
+    for (uint32_t i = 0; i < count; i += step) {
+        const float raw_w = moe_raw_scalar_to_f32(
+            raw.base + (uint64_t)i * (uint64_t)elem,
+            raw.scalar_encoding);
+        if (!std::isfinite(raw_w)) {
+            return 1;
+        }
+        const float w = unit_offset ? (1.0f + raw_w) : raw_w;
+        if (!std::isfinite(w)) {
+            return 1;
+        }
+        const double aw = (double)std::fabs(w);
+        abs_sum += aw;
+        ss += (double)w * (double)w;
+        if (aw > max_abs) max_abs = aw;
+        ++samples;
+    }
+    if (samples < 16u) {
+        return 0;
+    }
+    const double mean_abs = abs_sum / (double)samples;
+    const double rms = std::sqrt(ss / (double)samples);
+    if (out_mean_abs) *out_mean_abs = mean_abs;
+    if (out_rms) *out_rms = rms;
+    if (out_max_abs) *out_max_abs = max_abs;
+
+    // RMSNorm vectors are ordinary multiplicative weights.  In the JUJU/GGUF
+    // MXFP path, quantization sidecars can be 1-D F32 vectors with the same
+    // length as hidden_size and values around 16..64.  Treating those sidecars
+    // as norm weights blows up hidden states before lm_head.  Reject only values
+    // that are far outside plausible norm-weight statistics.
+    return (mean_abs > 8.0 || rms > 16.0 || max_abs > 96.0) ? 1 : 0;
+}
+
+static int moe_apply_unweighted_rmsnorm_f32(
+    const float* input,
+    uint32_t count,
+    float* output,
+    float eps
+) {
+    if (!input || !output || count == 0) {
+        return 0;
+    }
+    double ss = 0.0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!std::isfinite(input[i])) {
+            return 0;
+        }
+        ss += (double)input[i] * (double)input[i];
+    }
+    if (!std::isfinite(ss) || ss < 0.0) {
+        return 0;
+    }
+    const float norm = 1.0f / std::sqrt((float)(ss / (double)count) + (eps > 0.0f ? eps : 1.0e-6f));
+    if (!std::isfinite(norm)) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const float v = input[i] * norm;
+        if (!std::isfinite(v)) {
+            return 0;
+        }
+        output[i] = v;
+    }
+    return 1;
+}
+
 int moe_pc_engine_raw_rmsnorm_f32(
     moe_pc_engine_t* engine,
     int32_t layer,
@@ -383,6 +475,28 @@ int moe_pc_engine_raw_rmsnorm_f32(
         return 0;
     }
     const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, raw);
+    double norm_weight_mean_abs = 0.0;
+    double norm_weight_rms = 0.0;
+    double norm_weight_max_abs = 0.0;
+    if (moe_rmsnorm_weight_implausible_sidecar_f32(
+            raw, input_count, unit_offset,
+            &norm_weight_mean_abs, &norm_weight_rms, &norm_weight_max_abs)) {
+        if (moe_profile_level() >= 1) {
+            moe_profile_log(
+                "rmsnorm_raw_weight_rejected",
+                "layer=%d kind=%u hidden=%u scalar=%u bytes=%llu unit_offset=%d mean_abs=%.6g rms=%.6g max_abs=%.6g fallback=unweighted",
+                (int)layer,
+                (uint32_t)kind,
+                input_count,
+                (uint32_t)raw.scalar_encoding,
+                (unsigned long long)raw.bytes,
+                unit_offset,
+                norm_weight_mean_abs,
+                norm_weight_rms,
+                norm_weight_max_abs);
+        }
+        return moe_apply_unweighted_rmsnorm_f32(input, input_count, output, eps);
+    }
     if (moe_profile_level() >= 2) {
         double weight_ss = 0.0;
         double weight_abs = 0.0;
