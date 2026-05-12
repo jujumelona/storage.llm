@@ -590,26 +590,10 @@ static int moe_apply_rmsnorm_common_weight_f32(
     // Safe: valid_count > 0 guaranteed by check above
     const float norm = 1.0f / std::sqrt((float)(ss / (double)valid_count) + (eps > 0.0f ? eps : 1.0e-6f));
     const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, raw);
-    double norm_weight_mean_abs = 0.0;
-    double norm_weight_rms = 0.0;
-    double norm_weight_max_abs = 0.0;
-    if (moe_rmsnorm_weight_implausible_sidecar_f32(
-            raw, count, unit_offset,
-            &norm_weight_mean_abs, &norm_weight_rms, &norm_weight_max_abs)) {
-        if (moe_profile_level() >= 1) {
-            moe_profile_log(
-                "rmsnorm_common_weight_rejected",
-                "hidden=%u scalar=%u bytes=%llu unit_offset=%d mean_abs=%.6g rms=%.6g max_abs=%.6g fallback=unweighted",
-                count,
-                (uint32_t)raw.scalar_encoding,
-                (unsigned long long)raw.bytes,
-                unit_offset,
-                norm_weight_mean_abs,
-                norm_weight_rms,
-                norm_weight_max_abs);
-        }
-        return moe_apply_unweighted_rmsnorm_f32(input, count, output, eps);
-    }
+    // Match standard runtimes: a structurally bound RMSNorm weight is part of
+    // the model math.  Do not drop it because its statistics look large; scale
+    // vectors that are not norm weights must be filtered by role/name/shape
+    // before reaching this function.
     for (uint32_t i = 0; i < count; ++i) {
         float w = 0.0f;
         if (!moe_raw_tensor_scalar_at_f32(raw, i, &w)) {
