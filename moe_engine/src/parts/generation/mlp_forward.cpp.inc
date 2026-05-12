@@ -27,6 +27,70 @@ static int moe_accumulate_branch_checked_f32(
     return 1;
 }
 
+
+static int moe_layer_graph_has_any_role_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* roles,
+    size_t role_count
+) {
+    return moe_graph_ir_layer_has_op_role_any(engine, layer, roles, role_count);
+}
+
+static int moe_layer_graph_should_run_dense_fallback_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const moe_storage_constants_t* c
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    if (!moe_graph_ir_math_required(engine)) {
+        return 1;
+    }
+    static const char* const dense_roles[] = {
+        "dense_mlp", "ffn_gate", "ffn_up", "ffn_down",
+        "mlp_gate", "mlp_up", "mlp_down",
+        "gate_projection", "up_projection", "down_projection",
+        "ffn_gate_projection", "ffn_up_projection", "ffn_down_projection"
+    };
+    if (!moe_layer_graph_has_any_role_f32(
+            engine, layer, dense_roles, sizeof(dense_roles) / sizeof(dense_roles[0]))) {
+        return 0;
+    }
+    static const char* const routed_roles[] = {
+        "moe_router", "router", "expert_select", "moe_expert_mlp",
+        "routed_expert_mlp", "ffn_gate_inp"
+    };
+    if (moe_layer_graph_has_any_role_f32(
+            engine, layer, routed_roles, sizeof(routed_roles) / sizeof(routed_roles[0]))) {
+        return 0;
+    }
+    if (c && c->experts_per_moe_layer > 0 &&
+        (uint32_t)layer >= c->first_moe_layer &&
+        (uint32_t)layer <= c->last_moe_layer) {
+        return 0;
+    }
+    return 1;
+}
+
+static int moe_layer_graph_shared_expert_declared_f32(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0 || !moe_graph_ir_math_required(engine)) {
+        return 0;
+    }
+    static const char* const roles[] = {
+        "shared_expert_mlp",
+        "shared_expert_gate", "shared_expert_up", "shared_expert_down",
+        "shared_expert_mlp_gate", "shared_expert_mlp_up", "shared_expert_mlp_down",
+        "shared_ffn_gate", "shared_ffn_up", "shared_ffn_down"
+    };
+    return moe_layer_graph_has_any_role_f32(
+        engine, layer, roles, sizeof(roles) / sizeof(roles[0]));
+}
+
 static int moe_layer_moe_mlp_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -90,15 +154,18 @@ static int moe_layer_moe_mlp_f32(
     moe_profile_log("mlp_moe_norm", "layer=%d ok=%d ms=%.3f", layer, moe_norm_ok, moe_profile_elapsed_ms(norm_start_us));
 
     int dense_ok = 0;
+    const int dense_fallback_enabled =
+        moe_layer_graph_should_run_dense_fallback_f32(engine, layer, c);
     const uint64_t dense_start_us = moe_profile_now_us();
     std::fill(s->shared.begin(), s->shared.begin() + hidden_size, 0.0f);
-    if (moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
+    if (dense_fallback_enabled &&
+        moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
         dense_ok = 1;
     }
     moe_profile_log(
         "mlp_moe_dense_branch",
-        "layer=%d ok=%d deferred=1 ms=%.3f",
-        layer, dense_ok, moe_profile_elapsed_ms(dense_start_us));
+        "layer=%d enabled=%d ok=%d deferred=1 ms=%.3f",
+        layer, dense_fallback_enabled, dense_ok, moe_profile_elapsed_ms(dense_start_us));
 
     const uint64_t shared_bytes =
         2ull * (uint64_t)configured_expert_intermediate * (uint64_t)hidden_size * 2ull +
@@ -126,9 +193,10 @@ static int moe_layer_moe_mlp_f32(
         if (moe_layer_post_ffw_norm1_f32(
                 engine, layer, s->residual.data(), hidden_size, s->mlp.data(), attn_cfg.rms_norm_eps)) {
             shared_branch = s->mlp.data();
-        } else if (moe_layer_has_post_ffw_norm1_weight(engine, layer)) {
+        } else if (moe_layer_has_post_ffw_norm1_weight(engine, layer) &&
+                   moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
             std::fprintf(stderr,
-                "[storagellm mlp] post-ffw norm1 tensor is required but could not be mapped layer=%d\n",
+                "[storagellm mlp] shared post-ffw norm1 tensor is required but could not be mapped layer=%d\n",
                 layer);
             return 0;
         }
@@ -146,6 +214,11 @@ static int moe_layer_moe_mlp_f32(
                 }
             }
         }
+    } else if (moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
+        std::fprintf(stderr,
+            "[storagellm mlp] graph-declared shared expert branch could not be mapped layer=%d\n",
+            layer);
+        return 0;
     }
     moe_profile_log(
         "mlp_moe_shared",
@@ -2094,9 +2167,12 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
 
         float* mlp_out = batch_mlp.data() + (size_t)t * hidden_size;
         int dense_ok = 0;
+        const int dense_fallback_enabled =
+            moe_layer_graph_should_run_dense_fallback_f32(engine, layer, c);
         float* dense_out = batch_dense.data() + (size_t)t * hidden_size;
         std::fill(dense_out, dense_out + hidden_size, 0.0f);
-        if (moe_layer_common_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, dense_out)) {
+        if (dense_fallback_enabled &&
+            moe_layer_common_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, dense_out)) {
             dense_ok = 1;
         }
         float* shared_out_buf = local.residual.data();
@@ -2122,9 +2198,10 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                     engine, layer, shared_out_buf, hidden_size,
                     mlp_out, attn_cfg.rms_norm_eps)) {
                 branch1 = mlp_out;
-            } else if (moe_layer_has_post_ffw_norm1_weight(engine, layer)) {
+            } else if (moe_layer_has_post_ffw_norm1_weight(engine, layer) &&
+                       moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
                 std::fprintf(stderr,
-                    "[storagellm mlp] batch post-ffw norm1 tensor is required but could not be mapped layer=%d token=%u\n",
+                    "[storagellm mlp] batch shared post-ffw norm1 tensor is required but could not be mapped layer=%d token=%u\n",
                     layer, t);
                 return 0;
             }
@@ -2132,6 +2209,11 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                 !moe_accumulate_branch_checked_f32(mlp_out, branch1, hidden_size, layer, "shared")) {
                 return 0;
             }
+        } else if (moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
+            std::fprintf(stderr,
+                "[storagellm mlp] batch graph-declared shared expert branch could not be mapped layer=%d token=%u\n",
+                layer, t);
+            return 0;
         }
         // Defer dense_branch until after expert_branch, matching the GraphIR branch-sum order.
         dense_branch_ok[t] = dense_ok ? 1u : 0u;
