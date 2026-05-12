@@ -361,17 +361,12 @@ static int moe_rmsnorm_weight_implausible_sidecar_f32(
     if (out_rms) *out_rms = rms;
     if (out_max_abs) *out_max_abs = max_abs;
 
-    // RMSNorm vectors are learned multiplicative weights.  Other runtimes bind
-    // them structurally by role/name/shape; they do not let per-tensor quant
-    // sidecars enter the RMSNorm kernel.  JUJU/GGUF MXFP packages can carry
-    // 1-D F32 sidecars with hidden_size elements and norm-like roles.  If such a
-    // sidecar reaches this low-level kernel, applying it changes the model scale
-    // by one or two orders of magnitude (latest PPL logs: final_norm rms 18.5,
-    // softcap saturation).  Treat only physically implausible multiplicative
-    // norm vectors as sidecars and execute the contract's parameter-free RMSNorm
-    // behavior for that op.  This is format-generic: no model name, no layer id,
-    // no architecture-specific constant.
-    return (mean_abs > 3.0 || rms > 8.0 || max_abs > 64.0) ? 1 : 0;
+    // RMSNorm vectors are ordinary multiplicative weights.  In the JUJU/GGUF
+    // MXFP path, quantization sidecars can be 1-D F32 vectors with the same
+    // length as hidden_size and values around 16..64.  Treating those sidecars
+    // as norm weights blows up hidden states before lm_head.  Reject only values
+    // that are far outside plausible norm-weight statistics.
+    return (mean_abs > 8.0 || rms > 16.0 || max_abs > 96.0) ? 1 : 0;
 }
 
 static int moe_apply_unweighted_rmsnorm_f32(
