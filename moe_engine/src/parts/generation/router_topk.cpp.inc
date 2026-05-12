@@ -189,19 +189,18 @@ static float moe_router_routed_scaling_factor(const moe_pc_engine* engine) {
         return moe_f32_from_bits(cached_bits);
     }
     double value = 1.0;
-    // Contract: this value is the routed-expert output multiplier.  Do not
-    // accept generic names such as "router_scale", "expert_scale",
-    // "route_scale" or "routed_scale": old JUJU/GraphIR uses those names
-    // for tensor-role counts/bindings and per-weight sidecars.  Parsing them as
-    // a routed scaling factor inflated normalized top-k weights by values such
-    // as 30, corrupting MoE residuals before the LM head.
+    // Contract: this value is the routed-expert output multiplier for
+    // sigmoid-score MoE routers.  It is not an activation/tensor scale, and it
+    // must not be applied to softmax routers whose selected top-k weights are
+    // already probability-normalized.  Do not accept generic names such as
+    // "router_scale", "expert_scale", "route_scale" or "routed_scale": old
+    // JUJU/GraphIR uses those names for tensor-role counts/bindings and
+    // per-weight sidecars.
     static const char* const scale_keys[] = {
         "routed_scaling_factor",
         "moe_routed_scaling_factor",
-        "moe_router_scaling_factor",
         "router_routed_scaling_factor",
-        "expert_routed_scaling_factor",
-        "route_scaling_factor"
+        "expert_routed_scaling_factor"
     };
     const std::string* docs[] = {
         &engine->offload_gguf_metadata_json,
@@ -217,6 +216,18 @@ static float moe_router_routed_scaling_factor(const moe_pc_engine* engine) {
     }
     engine->cached_router_route_scale_bits.store(moe_f32_bits(1.0f), std::memory_order_release);
     return 1.0f;
+}
+
+static float moe_router_effective_routed_scaling_factor(const moe_pc_engine* engine, int use_sigmoid) {
+    if (!use_sigmoid) {
+        // Softmax routers produce a normalized probability simplex.  Multiplying
+        // the normalized top-k weights by routed_scaling_factor makes
+        // norm_topk=1 produce weights greater than 1.0 and diverges from the
+        // adaptive router path, which only applies routed scaling to sigmoid
+        // routers.
+        return 1.0f;
+    }
+    return moe_router_routed_scaling_factor(engine);
 }
 
 static int moe_router_norm_topk_prob(const moe_pc_engine* engine, int use_sigmoid) {
@@ -633,7 +644,7 @@ static int moe_router_topk_f32(
     const int norm_topk_pref = moe_router_norm_topk_prob(engine, use_sigmoid);
     if (!use_sigmoid && norm_topk_pref && cpu_storage_router_shortcut && top_k <= 64u &&
         moe_router_select_topk_logits_norm_softmax_f32(*scratch_logits, experts, top_k, out_experts, out_weights)) {
-        const float route_scale = moe_router_routed_scaling_factor(engine);
+        const float route_scale = moe_router_effective_routed_scaling_factor(engine, use_sigmoid);
         if (route_scale != 1.0f) {
             for (float& w : *out_weights) {
                 w *= route_scale;
@@ -783,7 +794,7 @@ static int moe_router_topk_f32(
             }
         }
     }
-    const float scale = moe_router_routed_scaling_factor(engine);
+    const float scale = moe_router_effective_routed_scaling_factor(engine, use_sigmoid);
     if (scale != 1.0f) {
         for (float& w : *out_weights) {
             w *= scale;

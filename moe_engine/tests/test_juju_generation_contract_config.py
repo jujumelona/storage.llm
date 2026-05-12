@@ -420,6 +420,7 @@ def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
     assert "metadata_false_stats_inconclusive" not in raw_ops_text
     assert "mean_abs_raw < 0.75" not in raw_ops_text
     assert "raw_rms < 0.75" not in raw_ops_text
+    assert "moe_rmsnorm_weight_implausible_sidecar_f32" not in raw_ops_text
     assert "moe_rmsnorm_unit_offset_from_json(engine->offload_gguf_metadata_json" in raw_ops_text
     assert "moe_rmsnorm_unit_offset_from_json(engine->offload_graph_ir_json" in raw_ops_text
 
@@ -432,11 +433,13 @@ def test_router_contract_reads_graph_ir_sigmoid_scale_and_norm_topk():
     assert "router_score_contract" in router_text
     assert "moe_router_json_get_double_any" in router_text
     assert "router_routed_scaling_factor" in router_text
+    assert "moe_router_effective_routed_scaling_factor" in router_text
     assert "moe_router_json_get_bool_any(engine->offload_graph_ir_json" in router_text
     uses_pos = router_text.index("static int moe_router_uses_sigmoid_scores")
     scale_pos = router_text.index("static float moe_router_routed_scaling_factor")
+    effective_pos = router_text.index("static float moe_router_effective_routed_scaling_factor")
     norm_pos = router_text.index("static int moe_router_norm_topk_prob")
-    assert uses_pos < scale_pos < norm_pos
+    assert uses_pos < scale_pos < effective_pos < norm_pos
 
 
 def test_router_routed_scaling_factor_does_not_parse_tensor_role_scale_names():
@@ -452,7 +455,11 @@ def test_router_routed_scaling_factor_does_not_parse_tensor_role_scale_names():
     assert '"route_scale"' not in keys_block
     assert '"router_route_scale"' not in keys_block
     assert '"routed_scale"' not in keys_block
-    assert "inflated normalized top-k weights" in scale_block
+    assert '"moe_router_scaling_factor"' not in keys_block
+    assert '"route_scaling_factor"' not in keys_block
+    assert "softmax routers whose selected top-k weights are" in scale_block
+    assert "moe_router_effective_routed_scaling_factor" in scale_block
+    assert "norm_topk=1 produce weights greater than 1.0" in scale_block
 
 
 def test_router_scale_tensor_uses_rmsnorm_unit_offset_semantics():
