@@ -37,42 +37,6 @@ static int moe_layer_graph_has_any_role_f32(
     return moe_graph_ir_layer_has_op_role_any(engine, layer, roles, role_count);
 }
 
-static int moe_layer_graph_should_run_dense_fallback_f32(
-    const moe_pc_engine* engine,
-    int32_t layer,
-    const moe_storage_constants_t* c
-) {
-    if (!engine || layer < 0) {
-        return 0;
-    }
-    if (!moe_graph_ir_math_required(engine)) {
-        return 1;
-    }
-    static const char* const dense_roles[] = {
-        "dense_mlp", "ffn_gate", "ffn_up", "ffn_down",
-        "mlp_gate", "mlp_up", "mlp_down",
-        "gate_projection", "up_projection", "down_projection",
-        "ffn_gate_projection", "ffn_up_projection", "ffn_down_projection"
-    };
-    if (!moe_layer_graph_has_any_role_f32(
-            engine, layer, dense_roles, sizeof(dense_roles) / sizeof(dense_roles[0]))) {
-        return 0;
-    }
-    static const char* const routed_roles[] = {
-        "moe_router", "router", "expert_select", "moe_expert_mlp",
-        "routed_expert_mlp", "ffn_gate_inp"
-    };
-    if (moe_layer_graph_has_any_role_f32(
-            engine, layer, routed_roles, sizeof(routed_roles) / sizeof(routed_roles[0]))) {
-        return 0;
-    }
-    if (c && c->experts_per_moe_layer > 0 &&
-        (uint32_t)layer >= c->first_moe_layer &&
-        (uint32_t)layer <= c->last_moe_layer) {
-        return 0;
-    }
-    return 1;
-}
 
 static int moe_layer_graph_shared_expert_declared_f32(
     const moe_pc_engine* engine,
@@ -154,18 +118,21 @@ static int moe_layer_moe_mlp_f32(
     moe_profile_log("mlp_moe_norm", "layer=%d ok=%d ms=%.3f", layer, moe_norm_ok, moe_profile_elapsed_ms(norm_start_us));
 
     int dense_ok = 0;
-    const int dense_fallback_enabled =
-        moe_layer_graph_should_run_dense_fallback_f32(engine, layer, c);
     const uint64_t dense_start_us = moe_profile_now_us();
     std::fill(s->shared.begin(), s->shared.begin() + hidden_size, 0.0f);
-    if (dense_fallback_enabled &&
-        moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
+    // Contract note: some JUJU/GraphIR packages mark dense_mlp.required=false
+    // when routed experts are present, but still carry dense_mlp weights and
+    // runtime_policy.adapter_contract.dense_mlp_uses_shared_path=true.  That
+    // means dense_mlp is an optional branch in ffn_branch_sum, not a disabled
+    // path.  Run it when the tensors actually bind; absence simply leaves the
+    // branch as zero.
+    if (moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
         dense_ok = 1;
     }
     moe_profile_log(
         "mlp_moe_dense_branch",
-        "layer=%d enabled=%d ok=%d deferred=1 ms=%.3f",
-        layer, dense_fallback_enabled, dense_ok, moe_profile_elapsed_ms(dense_start_us));
+        "layer=%d enabled=1 ok=%d deferred=1 ms=%.3f",
+        layer, dense_ok, moe_profile_elapsed_ms(dense_start_us));
 
     const uint64_t shared_bytes =
         2ull * (uint64_t)configured_expert_intermediate * (uint64_t)hidden_size * 2ull +
@@ -2167,12 +2134,9 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
 
         float* mlp_out = batch_mlp.data() + (size_t)t * hidden_size;
         int dense_ok = 0;
-        const int dense_fallback_enabled =
-            moe_layer_graph_should_run_dense_fallback_f32(engine, layer, c);
         float* dense_out = batch_dense.data() + (size_t)t * hidden_size;
         std::fill(dense_out, dense_out + hidden_size, 0.0f);
-        if (dense_fallback_enabled &&
-            moe_layer_common_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, dense_out)) {
+        if (moe_layer_common_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, dense_out)) {
             dense_ok = 1;
         }
         float* shared_out_buf = local.residual.data();
