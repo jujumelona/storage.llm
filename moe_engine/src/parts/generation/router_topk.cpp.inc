@@ -189,20 +189,19 @@ static float moe_router_routed_scaling_factor(const moe_pc_engine* engine) {
         return moe_f32_from_bits(cached_bits);
     }
     double value = 1.0;
+    // Contract: this value is the routed-expert output multiplier.  Do not
+    // accept generic names such as "router_scale", "expert_scale",
+    // "route_scale" or "routed_scale": old JUJU/GraphIR uses those names
+    // for tensor-role counts/bindings and per-weight sidecars.  Parsing them as
+    // a routed scaling factor inflated normalized top-k weights by values such
+    // as 30, corrupting MoE residuals before the LM head.
     static const char* const scale_keys[] = {
         "routed_scaling_factor",
-        "route_scale",
-        "router_scale",
-        "moe_router_scale",
         "moe_routed_scaling_factor",
-        "moe_route_scale",
         "moe_router_scaling_factor",
         "router_routed_scaling_factor",
-        "router_route_scale",
         "expert_routed_scaling_factor",
-        "expert_scale",
-        "route_scaling_factor",
-        "routed_scale"
+        "route_scaling_factor"
     };
     const std::string* docs[] = {
         &engine->offload_gguf_metadata_json,

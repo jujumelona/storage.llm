@@ -412,16 +412,16 @@ def test_qkv_single_token_attention_uses_paper_quantized_decode_path():
     assert append_pos < fill_pos < qkv_decode_pos
 
 
-def test_rmsnorm_metadata_false_is_not_cached_as_model_wide_authority():
+def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
     raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_ops.cpp.inc").read_text()
-    assert "Treat only an explicit model-wide true as authoritative" in raw_ops_text
-    assert "Do not cache false globally" in raw_ops_text
-    assert "engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0" not in raw_ops_text
-    assert "engine->cached_rmsnorm_unit_offset.store(1" in raw_ops_text
-    assert "weight_stats_override_metadata_false" in raw_ops_text
-    assert "metadata_false_stats_inconclusive" in raw_ops_text
-    assert "mean_abs_raw < 0.75" in raw_ops_text
-    assert "raw_rms < 0.75" in raw_ops_text
+    assert "unit-offset RMSNorm is architecture/config math" in raw_ops_text
+    assert "Use only explicit metadata/GraphIR" in raw_ops_text
+    assert "weight_stats_override_metadata_false" not in raw_ops_text
+    assert "metadata_false_stats_inconclusive" not in raw_ops_text
+    assert "mean_abs_raw < 0.75" not in raw_ops_text
+    assert "raw_rms < 0.75" not in raw_ops_text
+    assert "moe_rmsnorm_unit_offset_from_json(engine->offload_gguf_metadata_json" in raw_ops_text
+    assert "moe_rmsnorm_unit_offset_from_json(engine->offload_graph_ir_json" in raw_ops_text
 
 
 def test_router_contract_reads_graph_ir_sigmoid_scale_and_norm_topk():
@@ -439,35 +439,52 @@ def test_router_contract_reads_graph_ir_sigmoid_scale_and_norm_topk():
     assert uses_pos < scale_pos < norm_pos
 
 
+def test_router_routed_scaling_factor_does_not_parse_tensor_role_scale_names():
+    router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_topk.cpp.inc").read_text()
+    scale_block = router_text[router_text.index("static float moe_router_routed_scaling_factor"):router_text.index("static int moe_router_norm_topk_prob")]
+    keys_block = scale_block[scale_block.index("static const char* const scale_keys[]"):scale_block.index("};", scale_block.index("static const char* const scale_keys[]"))]
+    assert "routed_scaling_factor" in keys_block
+    assert "router_routed_scaling_factor" in keys_block
+    assert "expert_routed_scaling_factor" in keys_block
+    assert '"router_scale"' not in keys_block
+    assert '"moe_router_scale"' not in keys_block
+    assert '"expert_scale"' not in keys_block
+    assert '"route_scale"' not in keys_block
+    assert '"router_route_scale"' not in keys_block
+    assert '"routed_scale"' not in keys_block
+    assert "inflated normalized top-k weights" in scale_block
+
+
 def test_router_scale_tensor_uses_rmsnorm_unit_offset_semantics():
     router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
     assert "const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, scale_raw);" in router_text
     assert "const float effective_scale = unit_offset ? (1.0f + scale) : scale;" in router_text
     assert "router_scale_apply" in router_text
-    assert "Using raw deltas here made sigmoid" in router_text
+    assert "this tensor is a router input RMSNorm/scale weight" in router_text
 
 
 def test_router_scale_does_not_treat_mxfp_sidecar_as_activation_norm():
     router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
     suffix_block = router_text[router_text.index("static int moe_map_router_scale_tensor"):router_text.index("static int moe_prepare_scaled_router_input_f32")]
     assert '"ffn_gate_inp.scale"' not in suffix_block
-    assert "quantization sidecar for ffn_gate_inp.weight" in suffix_block
-    assert "router_scale_ignore" in router_text
-    assert "reason=implausible_activation_scale" in router_text
-    assert "raw_mean_abs > 8.0" in router_text
-    assert "raw_max_abs > 16.0f" in router_text
-    ignore_pos = router_text.index("router_scale_ignore")
-    return_pos = router_text.index("return 0;", ignore_pos)
+    assert "Weight-quantization sidecars are rejected by name before mapping" in suffix_block
+    assert "router_scale_contract_reject" in router_text
+    assert "reason=quant_sidecar_suffix" in router_text
+    reject_pos = router_text.index("router_scale_contract_reject")
+    return_pos = router_text.index("continue;", reject_pos)
     apply_pos = router_text.index("router_scale_apply", return_pos)
-    assert ignore_pos < return_pos < apply_pos
+    assert reject_pos < return_pos < apply_pos
 
 
 def test_router_input_mode_does_not_use_mxfp_sidecar_presence():
     mlp_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
-    first_block = mlp_text[mlp_text.index("const int router_has_internal_norm_scale ="):mlp_text.index("const float* router_input = router_has_internal_norm_scale ? hidden : expert_input;")]
+    first_start = mlp_text.index("const int router_has_internal_norm_scale =")
+    first_end = mlp_text.index("moe_save_gate_input_snapshot", first_start)
+    first_block = mlp_text[first_start:first_end]
     assert '"ffn_gate_inp.scale"' not in first_block
     assert '"router_norm.weight"' in first_block
-    assert "const float* router_input = router_has_internal_norm_scale ? hidden : expert_input;" in mlp_text
+    assert "router_uses_raw_residual_contract && router_has_plausible_input_scale" in first_block
+    assert "(router_has_internal_norm_scale || router_uses_raw_residual) ?" in first_block
 
 
 def test_post_attention_norm_no_longer_falls_back_to_ffn_norm_aliases():
