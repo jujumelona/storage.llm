@@ -449,6 +449,279 @@ static int moe_layer_common_dense_mlp_f32(
         1);
 }
 
+
+struct moe_shared_expert_graph_candidate_f32 {
+    moe_raw_tensor_cache_entry raw{};
+    std::string name;
+    std::string role;
+    uint64_t file_offset = 0;
+    uint16_t execution_order = 0;
+};
+
+static int moe_shared_expert_text_is_shared_f32(
+    const std::string& text
+) {
+    const std::string lower = moe_lower_ascii_copy(text);
+    return lower.find("shared_expert") != std::string::npos ||
+        lower.find("shared_experts") != std::string::npos ||
+        lower.find("shared_exp") != std::string::npos ||
+        lower.find("shared_exps") != std::string::npos ||
+        lower.find("expert_shared") != std::string::npos ||
+        lower.find("experts_shared") != std::string::npos ||
+        lower.find("exps_shared") != std::string::npos ||
+        lower.find("shexp") != std::string::npos ||
+        lower.find("sh_expert") != std::string::npos ||
+        lower.find("ffn_shared") != std::string::npos;
+}
+
+static int moe_shared_expert_role_is_shared_f32(
+    const std::string& role
+) {
+    return role == "shared_expert_mlp" ||
+        role == "shared_experts" ||
+        role == "shared_expert" ||
+        role == "shared_ffn" ||
+        role == "shared_core";
+}
+
+static int moe_shared_expert_name_has_part_f32(
+    const std::string& name,
+    const char* part
+) {
+    if (!part || !part[0]) {
+        return 0;
+    }
+    const std::string lower = moe_lower_ascii_copy(name);
+    if (!moe_shared_expert_text_is_shared_f32(lower)) {
+        return 0;
+    }
+    if (std::strcmp(part, "gate") == 0) {
+        return lower.find("gate_proj") != std::string::npos ||
+            lower.find("gate_inp") != std::string::npos ||
+            lower.find("gate.weight") != std::string::npos ||
+            lower.find("_gate_") != std::string::npos ||
+            lower.find(".gate_") != std::string::npos ||
+            lower.find("_gate.") != std::string::npos ||
+            lower.find(".gate.") != std::string::npos ||
+            lower.find("w1.weight") != std::string::npos ||
+            lower.find("_w1_") != std::string::npos ||
+            lower.find(".w1.") != std::string::npos;
+    }
+    if (std::strcmp(part, "up") == 0) {
+        return lower.find("up_proj") != std::string::npos ||
+            lower.find("up_inp") != std::string::npos ||
+            lower.find("up.weight") != std::string::npos ||
+            lower.find("_up_") != std::string::npos ||
+            lower.find(".up_") != std::string::npos ||
+            lower.find("_up.") != std::string::npos ||
+            lower.find(".up.") != std::string::npos ||
+            lower.find("w3.weight") != std::string::npos ||
+            lower.find("_w3_") != std::string::npos ||
+            lower.find(".w3.") != std::string::npos;
+    }
+    if (std::strcmp(part, "down") == 0) {
+        return lower.find("down_proj") != std::string::npos ||
+            lower.find("down_inp") != std::string::npos ||
+            lower.find("down.weight") != std::string::npos ||
+            lower.find("_down_") != std::string::npos ||
+            lower.find(".down_") != std::string::npos ||
+            lower.find("_down.") != std::string::npos ||
+            lower.find(".down.") != std::string::npos ||
+            lower.find("w2.weight") != std::string::npos ||
+            lower.find("_w2_") != std::string::npos ||
+            lower.find(".w2.") != std::string::npos;
+    }
+    return 0;
+}
+
+static void moe_shared_expert_sort_candidates_f32(
+    std::vector<moe_shared_expert_graph_candidate_f32>* values
+) {
+    if (!values) {
+        return;
+    }
+    std::stable_sort(values->begin(), values->end(), [](
+        const moe_shared_expert_graph_candidate_f32& a,
+        const moe_shared_expert_graph_candidate_f32& b) {
+        if (a.execution_order != b.execution_order) {
+            return a.execution_order < b.execution_order;
+        }
+        if (a.file_offset != b.file_offset) {
+            return a.file_offset < b.file_offset;
+        }
+        return a.name < b.name;
+    });
+}
+
+static int moe_shared_expert_append_candidate_f32(
+    moe_pc_engine* engine,
+    const moe_gguf_common_tensor_record& rec,
+    const moe_raw_tensor_desc& desc,
+    std::vector<moe_shared_expert_graph_candidate_f32>* out
+) {
+    if (!engine || !out) {
+        return 0;
+    }
+    moe_raw_tensor_cache_entry raw{};
+    if (!map_common_tensor_record(engine, rec, desc, &raw)) {
+        return 0;
+    }
+    moe_shared_expert_graph_candidate_f32 cand{};
+    cand.raw = raw;
+    cand.name = rec.name;
+    cand.role = rec.op_role;
+    cand.file_offset = rec.file_offset;
+    cand.execution_order = rec.execution_order;
+    out->push_back(cand);
+    return 1;
+}
+
+static int moe_map_shared_expert_graph_role_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    uint32_t hidden_size,
+    moe_raw_tensor_cache_entry* gate_out,
+    moe_raw_tensor_cache_entry* up_out,
+    moe_raw_tensor_cache_entry* down_out
+) {
+    if (!engine || layer < 0 || hidden_size == 0 || !gate_out || !up_out || !down_out) {
+        return 0;
+    }
+    std::vector<moe_shared_expert_graph_candidate_f32> gate_named;
+    std::vector<moe_shared_expert_graph_candidate_f32> up_named;
+    std::vector<moe_shared_expert_graph_candidate_f32> down_named;
+    std::vector<moe_shared_expert_graph_candidate_f32> gate_up_shape;
+    std::vector<moe_shared_expert_graph_candidate_f32> down_shape;
+    uint32_t scanned = 0;
+    uint32_t role_shared = 0;
+    uint32_t name_shared = 0;
+    for (const moe_gguf_common_tensor_record& rec : engine->gguf_common_tensors) {
+        if (!moe_common_tensor_layer_matches(rec, layer)) {
+            continue;
+        }
+        const int shared_by_role = moe_shared_expert_role_is_shared_f32(rec.op_role);
+        const int shared_by_name = moe_shared_expert_text_is_shared_f32(rec.name);
+        if (!shared_by_role && !shared_by_name) {
+            continue;
+        }
+        scanned++;
+        role_shared += shared_by_role ? 1u : 0u;
+        name_shared += shared_by_name ? 1u : 0u;
+        moe_raw_tensor_desc desc{};
+        if (!moe_common_tensor_record_to_raw_desc(rec, &desc) ||
+            !moe_common_tensor_record_raw_compatible(rec, desc)) {
+            continue;
+        }
+        const uint8_t fmt = moe_common_tensor_effective_weight_format(rec, desc);
+        if (!moe_common_tensor_raw_weight_format_supported(fmt) || desc.rows == 0) {
+            continue;
+        }
+        const int gateup_shape = desc.cols == hidden_size && desc.rows != hidden_size;
+        const int down_shape_ok = desc.rows == hidden_size && desc.cols != 0 && desc.cols != hidden_size;
+        if (!gateup_shape && !down_shape_ok) {
+            continue;
+        }
+        const int is_gate = gateup_shape && moe_shared_expert_name_has_part_f32(rec.name, "gate");
+        const int is_up = gateup_shape && moe_shared_expert_name_has_part_f32(rec.name, "up");
+        const int is_down = down_shape_ok && moe_shared_expert_name_has_part_f32(rec.name, "down");
+        if (is_gate) {
+            moe_shared_expert_append_candidate_f32(engine, rec, desc, &gate_named);
+        } else if (is_up) {
+            moe_shared_expert_append_candidate_f32(engine, rec, desc, &up_named);
+        } else if (is_down) {
+            moe_shared_expert_append_candidate_f32(engine, rec, desc, &down_named);
+        } else if (gateup_shape) {
+            moe_shared_expert_append_candidate_f32(engine, rec, desc, &gate_up_shape);
+        } else if (down_shape_ok) {
+            moe_shared_expert_append_candidate_f32(engine, rec, desc, &down_shape);
+        }
+    }
+    moe_shared_expert_sort_candidates_f32(&gate_named);
+    moe_shared_expert_sort_candidates_f32(&up_named);
+    moe_shared_expert_sort_candidates_f32(&down_named);
+    moe_shared_expert_sort_candidates_f32(&gate_up_shape);
+    moe_shared_expert_sort_candidates_f32(&down_shape);
+
+    int have_gate = !gate_named.empty();
+    int have_up = !up_named.empty();
+    int have_down = !down_named.empty();
+    moe_raw_tensor_cache_entry gate = have_gate ? gate_named[0].raw : moe_raw_tensor_cache_entry{};
+    moe_raw_tensor_cache_entry up = have_up ? up_named[0].raw : moe_raw_tensor_cache_entry{};
+    moe_raw_tensor_cache_entry down = have_down ? down_named[0].raw : moe_raw_tensor_cache_entry{};
+    std::string gate_name = have_gate ? gate_named[0].name : std::string();
+    std::string up_name = have_up ? up_named[0].name : std::string();
+    std::string down_name = have_down ? down_named[0].name : std::string();
+
+    if (!have_gate || !have_up) {
+        std::vector<moe_shared_expert_graph_candidate_f32> remaining;
+        remaining.reserve(gate_up_shape.size() + gate_named.size() + up_named.size());
+        for (const auto& cand : gate_up_shape) {
+            if ((!have_gate || cand.raw.rows == gate.rows || gate.rows == 0) &&
+                (!have_up || cand.raw.rows == up.rows || up.rows == 0)) {
+                remaining.push_back(cand);
+            }
+        }
+        if (!have_gate && !have_up && remaining.size() >= 2) {
+            gate = remaining[0].raw;
+            up = remaining[1].raw;
+            gate_name = remaining[0].name;
+            up_name = remaining[1].name;
+            have_gate = 1;
+            have_up = 1;
+        } else if (!have_gate && have_up) {
+            for (const auto& cand : remaining) {
+                if (cand.raw.rows == up.rows && cand.name != up_name) {
+                    gate = cand.raw;
+                    gate_name = cand.name;
+                    have_gate = 1;
+                    break;
+                }
+            }
+        } else if (have_gate && !have_up) {
+            for (const auto& cand : remaining) {
+                if (cand.raw.rows == gate.rows && cand.name != gate_name) {
+                    up = cand.raw;
+                    up_name = cand.name;
+                    have_up = 1;
+                    break;
+                }
+            }
+        }
+    }
+    if (!have_down && !down_shape.empty()) {
+        down = down_shape[0].raw;
+        down_name = down_shape[0].name;
+        have_down = 1;
+    }
+    if (!have_gate || !have_up || !have_down) {
+        moe_profile_log(
+            "mlp_shared_graph_role_candidates",
+            "layer=%d ok=0 scanned=%u role_shared=%u name_shared=%u gate_named=%zu up_named=%zu down_named=%zu gateup_shape=%zu down_shape=%zu",
+            layer, scanned, role_shared, name_shared,
+            gate_named.size(), up_named.size(), down_named.size(), gate_up_shape.size(), down_shape.size());
+        return 0;
+    }
+    const uint32_t intermediate = gate.rows;
+    if (intermediate == 0 || intermediate > 100000 ||
+        up.rows != intermediate || gate.cols != hidden_size || up.cols != hidden_size ||
+        down.rows != hidden_size || down.cols != intermediate) {
+        moe_profile_log(
+            "mlp_shared_graph_role_shape_mismatch",
+            "layer=%d gate=%ux%u up=%ux%u down=%ux%u hidden=%u gate_name=%s up_name=%s down_name=%s",
+            layer, gate.rows, gate.cols, up.rows, up.cols, down.rows, down.cols, hidden_size,
+            gate_name.c_str(), up_name.c_str(), down_name.c_str());
+        return 0;
+    }
+    *gate_out = gate;
+    *up_out = up;
+    *down_out = down;
+    moe_profile_log(
+        "mlp_shared_graph_role_bind",
+        "layer=%d gate=%s up=%s down=%s intermediate=%u hidden=%u",
+        layer, gate_name.c_str(), up_name.c_str(), down_name.c_str(), intermediate, hidden_size);
+    return 1;
+}
+
 static int moe_layer_shared_expert_dense_mlp_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -466,83 +739,143 @@ static int moe_layer_shared_expert_dense_mlp_f32(
         "shared_experts.gate_proj.weight",
         "shared_expert.gate.weight",
         "shared_experts.gate.weight",
+        "shared_expert_gate.weight",
+        "shared_expert_gate_proj.weight",
+        "shared_expert.gate_inp.weight",
         "ffn_gate_shexp.weight",
         "ffn_gate_inp_shexp.weight",
+        "ffn_shared_gate.weight",
+        "ffn_shared_gate_proj.weight",
         "ffn_shared_gate_inp.weight",
+        "ffn_shared_expert_gate.weight",
         "ffn_shared_expert_gate_inp.weight",
         "ffn_shared_shexp_gate.weight",
+        "shared_gate.weight",
+        "shared_gate_proj.weight",
         "shared_expert.w1.weight",
         "shared_experts.w1.weight",
-        "ffn_shared_expert_gate.weight",
-        "ffn_shared_exps_gate.weight",
-        "ffn_shared_gate_proj.weight"
+        "ffn_shared_exps_gate.weight"
     };
     static const char* const up_suffixes[] = {
         "shared_expert.up_proj.weight",
         "shared_experts.up_proj.weight",
         "shared_expert.up.weight",
         "shared_experts.up.weight",
+        "shared_expert_up.weight",
+        "shared_expert_up_proj.weight",
+        "shared_expert.up_inp.weight",
         "ffn_up_shexp.weight",
         "ffn_up_inp_shexp.weight",
+        "ffn_shared_up.weight",
+        "ffn_shared_up_proj.weight",
         "ffn_shared_up_inp.weight",
+        "ffn_shared_expert_up.weight",
         "ffn_shared_expert_up_inp.weight",
         "ffn_shared_shexp_up.weight",
+        "shared_up.weight",
+        "shared_up_proj.weight",
         "shared_expert.w3.weight",
         "shared_experts.w3.weight",
-        "ffn_shared_expert_up.weight",
-        "ffn_shared_exps_up.weight",
-        "ffn_shared_up_proj.weight"
+        "ffn_shared_exps_up.weight"
     };
     static const char* const down_suffixes[] = {
         "shared_expert.down_proj.weight",
         "shared_experts.down_proj.weight",
         "shared_expert.down.weight",
         "shared_experts.down.weight",
+        "shared_expert_down.weight",
+        "shared_expert_down_proj.weight",
+        "shared_expert.down_inp.weight",
         "ffn_down_shexp.weight",
         "ffn_down_inp_shexp.weight",
+        "ffn_shared_down.weight",
+        "ffn_shared_down_proj.weight",
         "ffn_shared_down_inp.weight",
+        "ffn_shared_expert_down.weight",
         "ffn_shared_expert_down_inp.weight",
         "ffn_shared_shexp_down.weight",
+        "shared_down.weight",
+        "shared_down_proj.weight",
         "shared_expert.w2.weight",
         "shared_experts.w2.weight",
-        "ffn_shared_expert_down.weight",
-        "ffn_shared_exps_down.weight",
-        "ffn_shared_down_proj.weight"
+        "ffn_shared_exps_down.weight"
     };
     static const char* const gate_roles[] = {
         "shared_expert_gate",
         "shared_expert_gate_projection",
         "shared_expert_gate_proj",
+        "shared_expert_gate_inp",
         "shared_expert_mlp_gate",
         "shared_experts_gate",
-        "shared_ffn_gate"
+        "shared_ffn_gate",
+        "ffn_shared_gate"
     };
     static const char* const up_roles[] = {
         "shared_expert_up",
         "shared_expert_up_projection",
         "shared_expert_up_proj",
+        "shared_expert_up_inp",
         "shared_expert_mlp_up",
         "shared_experts_up",
-        "shared_ffn_up"
+        "shared_ffn_up",
+        "ffn_shared_up"
     };
     static const char* const down_roles[] = {
         "shared_expert_down",
         "shared_expert_down_projection",
         "shared_expert_down_proj",
+        "shared_expert_down_inp",
         "shared_expert_mlp_down",
         "shared_experts_down",
-        "shared_ffn_down"
+        "shared_ffn_down",
+        "ffn_shared_down"
     };
-    return moe_layer_dense_mlp_from_suffixes_f32(
-        engine, layer, s, input, hidden_size, out_hidden,
-        gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0]),
-        up_suffixes, sizeof(up_suffixes) / sizeof(up_suffixes[0]),
-        down_suffixes, sizeof(down_suffixes) / sizeof(down_suffixes[0]),
-        "mlp_shared_dense_begin",
-        gate_roles, sizeof(gate_roles) / sizeof(gate_roles[0]),
-        up_roles, sizeof(up_roles) / sizeof(up_roles[0]),
-        down_roles, sizeof(down_roles) / sizeof(down_roles[0]),
-        1);
+    if (moe_layer_dense_mlp_from_suffixes_f32(
+            engine, layer, s, input, hidden_size, out_hidden,
+            gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0]),
+            up_suffixes, sizeof(up_suffixes) / sizeof(up_suffixes[0]),
+            down_suffixes, sizeof(down_suffixes) / sizeof(down_suffixes[0]),
+            "mlp_shared_dense_begin",
+            gate_roles, sizeof(gate_roles) / sizeof(gate_roles[0]),
+            up_roles, sizeof(up_roles) / sizeof(up_roles[0]),
+            down_roles, sizeof(down_roles) / sizeof(down_roles[0]),
+            1)) {
+        return 1;
+    }
+    if (!moe_graph_ir_math_required(engine)) {
+        return 0;
+    }
+    moe_raw_tensor_cache_entry gate{};
+    moe_raw_tensor_cache_entry up{};
+    moe_raw_tensor_cache_entry down{};
+    if (!moe_map_shared_expert_graph_role_f32(engine, layer, hidden_size, &gate, &up, &down)) {
+        return 0;
+    }
+    const uint32_t intermediate = gate.rows;
+    if (!s || s->gate.size() < intermediate || s->up.size() < intermediate || s->shared.size() < hidden_size) {
+        return 0;
+    }
+    const uint64_t total_start_us = moe_profile_now_us();
+    const int activation_mode = moe_engine_gelu_activation_mode(engine);
+    {
+        moe_profile_parallel_label_scope rows_label("shared_dense_mlp_gate_up");
+        if (!moe_parallel_rows(engine, intermediate, 0, [&](uint32_t row) {
+            const float g = moe_raw_tensor_dot_row(gate, row, input, hidden_size);
+            const float u = moe_raw_tensor_dot_row(up, row, input, hidden_size);
+            s->gate[row] = moe_generation_gated_activation_cached(activation_mode, g, u);
+            return 1;
+        })) {
+            return 0;
+        }
+    }
+    if (!moe_common_linear_f32(engine, down, s->gate.data(), intermediate, out_hidden, hidden_size)) {
+        return 0;
+    }
+    moe_profile_log(
+        "mlp_shared_dense_graph_role_end",
+        "layer=%d intermediate=%u hidden=%u activation_mode=%d total_ms=%.3f",
+        layer, intermediate, hidden_size, activation_mode, moe_profile_elapsed_ms(total_start_us));
+    return 1;
 }
 
 static int moe_layer_dense_mlp_f32(
