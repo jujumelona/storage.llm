@@ -97,6 +97,37 @@ static int moe_layer_graph_shared_expert_declared_f32(
         engine, layer, roles, sizeof(roles) / sizeof(roles[0]));
 }
 
+
+static int moe_layer_dense_mlp_should_run_f32(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    static const char* const dense_roles[] = { "dense_mlp" };
+    if (!moe_graph_ir_math_required(engine)) {
+        return 1;
+    }
+    if (!moe_graph_ir_layer_has_op_role_any(
+            engine, layer, dense_roles, sizeof(dense_roles) / sizeof(dense_roles[0]))) {
+        return 0;
+    }
+    static const char* const routed_roles[] = {
+        "moe_expert_mlp", "moe_experts", "expert_mlp",
+        "shared_expert_mlp", "shared_expert_gate", "shared_expert_up", "shared_expert_down"
+    };
+    if (moe_graph_ir_layer_has_op_role_any(
+            engine, layer, routed_roles, sizeof(routed_roles) / sizeof(routed_roles[0]))) {
+        // GraphIR contract names this dense_ffn_fallback and marks it non-required
+        // when routed experts are present.  The branch-sum contract supplies zero
+        // for missing optional branches; executing fallback dense alongside routed
+        // experts double-counts FFN capacity and dominates layer 0 activations.
+        return 0;
+    }
+    return 1;
+}
+
 static int moe_layer_moe_mlp_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -162,20 +193,20 @@ static int moe_layer_moe_mlp_f32(
     int dense_ok = 0;
     const uint64_t dense_start_us = moe_profile_now_us();
     std::fill(s->shared.begin(), s->shared.begin() + hidden_size, 0.0f);
-    // Contract note: some JUJU/GraphIR packages mark dense_mlp.required=false
-    // when routed experts are present, but still carry dense_mlp weights and
-    // runtime_policy.adapter_contract.dense_mlp_uses_shared_path=true.  That
-    // means dense_mlp is an optional branch in ffn_branch_sum, not a disabled
-    // path.  Run it when the tensors actually bind; absence simply leaves the
-    // branch as zero.
-    if (moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
+    // Contract note: dense_mlp is a fallback branch in GraphIR.  In routed MoE
+    // layers, branch-sum treats missing optional dense input as zero.  Do not
+    // execute dense weights merely because tensor names bind; that double-counts
+    // FFN output beside routed experts and creates the layer-0 branch explosion
+    // seen in PPL traces.
+    const int dense_enabled = moe_layer_dense_mlp_should_run_f32(engine, layer);
+    if (dense_enabled && moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
         dense_ok = 1;
         moe_mlp_trace_vec_f32("mlp_dense_branch", layer, s->shared.data(), hidden_size);
     }
     moe_profile_log(
         "mlp_moe_dense_branch",
-        "layer=%d enabled=1 ok=%d deferred=1 ms=%.3f",
-        layer, dense_ok, moe_profile_elapsed_ms(dense_start_us));
+        "layer=%d enabled=%d ok=%d deferred=1 ms=%.3f",
+        layer, dense_enabled, dense_ok, moe_profile_elapsed_ms(dense_start_us));
 
     const uint64_t shared_bytes =
         2ull * (uint64_t)configured_expert_intermediate * (uint64_t)hidden_size * 2ull +
@@ -2185,7 +2216,8 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         int dense_ok = 0;
         float* dense_out = batch_dense.data() + (size_t)t * hidden_size;
         std::fill(dense_out, dense_out + hidden_size, 0.0f);
-        if (moe_layer_common_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, dense_out)) {
+        const int dense_enabled = moe_layer_dense_mlp_should_run_f32(engine, layer);
+        if (dense_enabled && moe_layer_common_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, dense_out)) {
             dense_ok = 1;
         }
         float* shared_out_buf = local.residual.data();

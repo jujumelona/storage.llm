@@ -355,28 +355,6 @@ int moe_pc_engine_raw_rmsnorm_f32(
         return 0;
     }
     const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, raw);
-    double norm_weight_mean_abs = 0.0;
-    double norm_weight_rms = 0.0;
-    double norm_weight_max_abs = 0.0;
-    if (moe_rmsnorm_weight_implausible_sidecar_f32(
-            raw, input_count, unit_offset,
-            &norm_weight_mean_abs, &norm_weight_rms, &norm_weight_max_abs)) {
-        if (moe_profile_level() >= 1) {
-            moe_profile_log(
-                "rmsnorm_raw_weight_rejected",
-                "layer=%d kind=%u hidden=%u scalar=%u bytes=%llu unit_offset=%d mean_abs=%.6g rms=%.6g max_abs=%.6g fallback=unweighted",
-                (int)layer,
-                (uint32_t)kind,
-                input_count,
-                (uint32_t)raw.scalar_encoding,
-                (unsigned long long)raw.bytes,
-                unit_offset,
-                norm_weight_mean_abs,
-                norm_weight_rms,
-                norm_weight_max_abs);
-        }
-        return moe_apply_unweighted_rmsnorm_f32(input, input_count, output, eps);
-    }
     if (moe_profile_level() >= 2) {
         double weight_ss = 0.0;
         double weight_abs = 0.0;

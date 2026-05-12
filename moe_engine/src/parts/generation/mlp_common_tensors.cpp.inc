@@ -590,26 +590,6 @@ static int moe_apply_rmsnorm_common_weight_f32(
     // Safe: valid_count > 0 guaranteed by check above
     const float norm = 1.0f / std::sqrt((float)(ss / (double)valid_count) + (eps > 0.0f ? eps : 1.0e-6f));
     const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, raw);
-    double norm_weight_mean_abs = 0.0;
-    double norm_weight_rms = 0.0;
-    double norm_weight_max_abs = 0.0;
-    if (moe_rmsnorm_weight_implausible_sidecar_f32(
-            raw, count, unit_offset,
-            &norm_weight_mean_abs, &norm_weight_rms, &norm_weight_max_abs)) {
-        if (moe_profile_level() >= 1) {
-            moe_profile_log(
-                "rmsnorm_common_weight_rejected",
-                "hidden=%u scalar=%u bytes=%llu unit_offset=%d mean_abs=%.6g rms=%.6g max_abs=%.6g fallback=unweighted",
-                count,
-                (uint32_t)raw.scalar_encoding,
-                (unsigned long long)raw.bytes,
-                unit_offset,
-                norm_weight_mean_abs,
-                norm_weight_rms,
-                norm_weight_max_abs);
-        }
-        return moe_apply_unweighted_rmsnorm_f32(input, count, output, eps);
-    }
     for (uint32_t i = 0; i < count; ++i) {
         float w = 0.0f;
         if (!moe_raw_tensor_scalar_at_f32(raw, i, &w)) {
@@ -643,9 +623,7 @@ static int moe_layer_rmsnorm_suffixes_f32(
 
     std::vector<std::string> names;
     moe_push_layer_tensor_candidates(&names, layer, suffixes, suffix_count);
-    moe_raw_tensor_cache_entry first_mapped{};
-    int have_first_mapped = 0;
-    uint32_t rejected = 0;
+    uint32_t tried = 0;
 
     for (const std::string& name : names) {
         const char* exact = name.c_str();
@@ -659,29 +637,13 @@ static int moe_layer_rmsnorm_suffixes_f32(
         if (!map_common_tensor_record(engine, *rec, desc, &raw)) {
             continue;
         }
-        if (!have_first_mapped) {
-            first_mapped = raw;
-            have_first_mapped = 1;
-        }
-        double mean_abs = 0.0, rms = 0.0, max_abs = 0.0;
-        const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, raw);
-        if (moe_rmsnorm_weight_implausible_sidecar_f32(
-                raw, hidden_size, unit_offset, &mean_abs, &rms, &max_abs)) {
-            ++rejected;
-            moe_profile_log(
-                "rmsnorm_common_candidate_rejected",
-                "layer=%d name=%s suffix0=%s hidden=%u rows=%u cols=%u scalar=%u unit_offset=%d mean_abs=%.6g rms=%.6g max_abs=%.6g reason=sidecar_stats",
-                layer, name.c_str(), suffixes[0] ? suffixes[0] : "", hidden_size,
-                raw.rows, raw.cols, (unsigned)raw.scalar_encoding, unit_offset,
-                mean_abs, rms, max_abs);
-            continue;
-        }
+        ++tried;
         moe_profile_log(
             "rmsnorm_common_map",
-            "layer=%d suffix0=%s mapped=1 name=%s rows=%u cols=%u bytes=%llu hidden=%u input=%p output=%p rejected_before=%u",
+            "layer=%d suffix0=%s mapped=1 name=%s rows=%u cols=%u bytes=%llu hidden=%u input=%p output=%p tried_before=%u",
             layer, suffixes[0] ? suffixes[0] : "", name.c_str(),
             raw.rows, raw.cols, (unsigned long long)raw.bytes, hidden_size,
-            (const void*)input, (void*)output, rejected);
+            (const void*)input, (void*)output, tried - 1u);
         const int ok = moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
         moe_profile_log(
             "rmsnorm_common_apply",
@@ -693,14 +655,9 @@ static int moe_layer_rmsnorm_suffixes_f32(
 
     moe_profile_log(
         "rmsnorm_common_map",
-        "layer=%d suffix0=%s mapped=%d rejected=%u hidden=%u input=%p output=%p",
-        layer, suffixes[0] ? suffixes[0] : "", have_first_mapped, rejected,
+        "layer=%d suffix0=%s mapped=0 tried=%u hidden=%u input=%p output=%p",
+        layer, suffixes[0] ? suffixes[0] : "", tried,
         hidden_size, (const void*)input, (void*)output);
-    if (have_first_mapped) {
-        // All contract candidates looked like scale/quant sidecars.  Keep eval
-        // finite and explicit instead of silently multiplying by a sidecar.
-        return moe_apply_unweighted_rmsnorm_f32(input, hidden_size, output, eps);
-    }
     return 0;
 }
 
@@ -792,48 +749,6 @@ static int moe_layer_has_post_attention_norm_weight(
         moe_engine_has_common_tensor_suffix(engine, layer, "post_attn_norm.weight");
 }
 
-static int moe_final_norm_try_raw_candidate_f32(
-    moe_pc_engine* engine,
-    const char* name,
-    const moe_gguf_common_tensor_record* rec,
-    const moe_raw_tensor_desc& desc,
-    const float* input,
-    uint32_t hidden_size,
-    float* output,
-    float eps,
-    uint32_t* rejected_count
-) {
-    if (!engine || !rec || !input || !output || hidden_size == 0) {
-        return 0;
-    }
-    if (desc.cols != 0 || desc.rows < hidden_size) {
-        return 0;
-    }
-    moe_raw_tensor_cache_entry raw{};
-    if (!map_common_tensor_record(engine, *rec, desc, &raw)) {
-        return 0;
-    }
-    double mean_abs = 0.0, rms = 0.0, max_abs = 0.0;
-    const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, raw);
-    if (moe_rmsnorm_weight_implausible_sidecar_f32(
-            raw, hidden_size, unit_offset, &mean_abs, &rms, &max_abs)) {
-        if (rejected_count) {
-            ++(*rejected_count);
-        }
-        moe_profile_log(
-            "final_norm_candidate_rejected",
-            "name=%s rows=%u cols=%u hidden=%u unit_offset=%d mean_abs=%.6g rms=%.6g max_abs=%.6g reason=sidecar_stats",
-            name ? name : rec->name.c_str(), desc.rows, desc.cols, hidden_size,
-            unit_offset, mean_abs, rms, max_abs);
-        return 0;
-    }
-    moe_profile_log(
-        "final_norm_candidate_apply",
-        "name=%s rows=%u cols=%u hidden=%u unit_offset=%d",
-        name ? name : rec->name.c_str(), desc.rows, desc.cols, hidden_size, unit_offset);
-    return moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
-}
-
 static int moe_final_norm_f32(
     moe_pc_engine* engine,
     const moe_storage_constants_t* c,
@@ -845,64 +760,54 @@ static int moe_final_norm_f32(
     if (!engine || !c || !input || !output || hidden_size == 0) {
         return 0;
     }
-    uint32_t rejected = 0;
-
-    // Contract order: exact GraphIR binding, semantic op_role, then global
-    // final-norm names.  A rejected sidecar candidate must not stop the search;
-    // it only proves that candidate is not the executable norm weight.
     std::string graph_name;
     if (moe_graph_ir_tensor_binding_name(engine, "final_norm", &graph_name)) {
         moe_raw_tensor_desc desc{};
         const char* exact_name = graph_name.c_str();
         const moe_gguf_common_tensor_record* rec =
             find_common_tensor_by_names(engine, &exact_name, 1, &desc);
-        if (moe_final_norm_try_raw_candidate_f32(
-                engine, graph_name.c_str(), rec, desc, input, hidden_size, output, eps, &rejected)) {
-            return 1;
+        if (rec && desc.rows >= hidden_size && desc.cols == 0) {
+            moe_raw_tensor_cache_entry raw{};
+            if (!map_common_tensor_record(engine, *rec, desc, &raw)) {
+                return 0;
+            }
+            moe_profile_log(
+                "final_norm_contract_binding",
+                "name=%s rows=%u cols=%u hidden=%u source=tensor_binding",
+                graph_name.c_str(), desc.rows, desc.cols, hidden_size);
+            return moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
         }
+        moe_profile_log(
+            "final_norm_contract_binding_missing",
+            "name=%s rows=%u cols=%u hidden=%u",
+            graph_name.c_str(), desc.rows, desc.cols, hidden_size);
     }
-
     {
         moe_raw_tensor_desc desc{};
         const moe_gguf_common_tensor_record* rec =
             find_common_tensor_by_op_role(engine, "final_norm", -1, &desc);
-        if (moe_final_norm_try_raw_candidate_f32(
-                engine, rec ? rec->name.c_str() : "final_norm", rec, desc,
-                input, hidden_size, output, eps, &rejected)) {
-            return 1;
+        if (rec && desc.rows >= hidden_size && desc.cols == 0) {
+            moe_raw_tensor_cache_entry raw{};
+            if (!map_common_tensor_record(engine, *rec, desc, &raw)) {
+                return 0;
+            }
+            moe_profile_log(
+                "final_norm_contract_binding",
+                "name=%s rows=%u cols=%u hidden=%u source=op_role",
+                rec->name.c_str(), desc.rows, desc.cols, hidden_size);
+            return moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
         }
     }
-
-    static const char* const names[] = {
+    static const char* const suffixes[] = {
         "output_norm.weight",
-        "final_norm.weight",
         "model.norm.weight",
         "norm.weight",
         "transformer.ln_f.weight"
     };
-    for (const char* exact_name : names) {
-        moe_raw_tensor_desc desc{};
-        const moe_gguf_common_tensor_record* rec =
-            find_common_tensor_by_names(engine, &exact_name, 1, &desc);
-        if (moe_final_norm_try_raw_candidate_f32(
-                engine, exact_name, rec, desc, input, hidden_size, output, eps, &rejected)) {
-            return 1;
-        }
-    }
-
-    if (rejected > 0) {
-        moe_profile_log(
-            "final_norm_unweighted_after_sidecar_candidates",
-            "hidden=%u rejected=%u reason=no_non_sidecar_final_norm_candidate",
-            hidden_size, rejected);
-        return moe_apply_unweighted_rmsnorm_f32(input, hidden_size, output, eps);
-    }
-
-    moe_profile_log(
-        "final_norm_missing_contract",
-        "hidden=%u rejected=%u reason=no_final_norm_candidate",
-        hidden_size, rejected);
-    return 0;
+    return moe_layer_rmsnorm_suffixes_f32(
+        engine, (int32_t)c->num_hidden_layers, suffixes,
+        sizeof(suffixes) / sizeof(suffixes[0]),
+        input, hidden_size, output, eps);
 }
 
 // Cache split/post-norm detection per layer; layer 0 must not decide every layer.
@@ -1050,62 +955,6 @@ static int moe_graph_ir_apply_rmsnorm_role_any_f32(
     return moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
 }
 
-static int moe_graph_ir_apply_rmsnorm_role_any_then_suffixes_f32(
-    moe_pc_engine* engine,
-    int32_t layer,
-    const char* const* roles,
-    size_t role_count,
-    const char* const* suffixes,
-    size_t suffix_count,
-    const float* input,
-    uint32_t hidden_size,
-    float* output,
-    float eps
-) {
-    if (!engine || layer < 0 || !input || !output || hidden_size == 0) {
-        return 0;
-    }
-
-    // GraphIR role metadata is authoritative, but some generated artifacts carry
-    // 1-D quant/scale sidecars under norm-like op roles.  Do not treat that as a
-    // hard success; try the exact layer-name candidates before falling back to
-    // unweighted RMSNorm.  This mirrors mature runtimes: bind by semantic name,
-    // reject scale sidecars, then execute the norm contract.
-    for (size_t i = 0; roles && i < role_count; ++i) {
-        if (!roles[i] || !roles[i][0]) {
-            continue;
-        }
-        moe_raw_tensor_desc desc{};
-        const moe_gguf_common_tensor_record* rec =
-            find_common_tensor_by_op_role(engine, roles[i], layer, &desc);
-        if (!rec) {
-            continue;
-        }
-        moe_raw_tensor_cache_entry raw{};
-        if (!map_common_tensor_record(engine, *rec, desc, &raw)) {
-            return 0;
-        }
-        double mean_abs = 0.0, rms = 0.0, max_abs = 0.0;
-        const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, raw);
-        if (!moe_rmsnorm_weight_implausible_sidecar_f32(
-                raw, hidden_size, unit_offset, &mean_abs, &rms, &max_abs)) {
-            return moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
-        }
-        moe_profile_log(
-            "rmsnorm_graph_role_candidate_rejected",
-            "layer=%d role=%s name=%s hidden=%u rows=%u cols=%u unit_offset=%d mean_abs=%.6g rms=%.6g max_abs=%.6g reason=sidecar_stats",
-            layer, roles[i], rec->name.c_str(), hidden_size, raw.rows, raw.cols,
-            unit_offset, mean_abs, rms, max_abs);
-        break;
-    }
-
-    if (suffixes && suffix_count) {
-        return moe_layer_rmsnorm_suffixes_f32(
-            engine, layer, suffixes, suffix_count, input, hidden_size, output, eps);
-    }
-    return moe_apply_unweighted_rmsnorm_f32(input, hidden_size, output, eps);
-}
-
 static int moe_layer_post_ffw_norm_suffixes_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -1129,16 +978,15 @@ static int moe_layer_post_ffw_norm_f32(
     float eps
 ) {
     static const char* const roles[] = { "post_ffw_norm" };
+    if (moe_graph_ir_math_required(engine)) {
+        return moe_graph_ir_apply_rmsnorm_role_any_f32(
+            engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
+            input, hidden_size, output, eps);
+    }
     static const char* const suffixes[] = {
         "post_ffw_norm.weight",
         "ffn_post_norm.weight"
     };
-    if (moe_graph_ir_math_required(engine)) {
-        return moe_graph_ir_apply_rmsnorm_role_any_then_suffixes_f32(
-            engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
-            suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
-            input, hidden_size, output, eps);
-    }
     return moe_layer_post_ffw_norm_suffixes_f32(
         engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
         input, hidden_size, output, eps);
@@ -1167,16 +1015,15 @@ static int moe_layer_post_ffw_norm1_f32(
     float eps
 ) {
     static const char* const roles[] = { "post_ffw_norm_1" };
+    if (moe_graph_ir_math_required(engine)) {
+        return moe_graph_ir_apply_rmsnorm_role_any_f32(
+            engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
+            input, hidden_size, output, eps);
+    }
     static const char* const suffixes[] = {
         "post_ffw_norm_1.weight",
         "ffn_post_norm_1.weight"
     };
-    if (moe_graph_ir_math_required(engine)) {
-        return moe_graph_ir_apply_rmsnorm_role_any_then_suffixes_f32(
-            engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
-            suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
-            input, hidden_size, output, eps);
-    }
     return moe_layer_post_ffw_norm_suffixes_f32(
         engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
         input, hidden_size, output, eps);
@@ -1205,16 +1052,15 @@ static int moe_layer_post_ffw_norm2_f32(
     float eps
 ) {
     static const char* const roles[] = { "post_ffw_norm_2" };
+    if (moe_graph_ir_math_required(engine)) {
+        return moe_graph_ir_apply_rmsnorm_role_any_f32(
+            engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
+            input, hidden_size, output, eps);
+    }
     static const char* const suffixes[] = {
         "post_ffw_norm_2.weight",
         "ffn_post_norm_2.weight"
     };
-    if (moe_graph_ir_math_required(engine)) {
-        return moe_graph_ir_apply_rmsnorm_role_any_then_suffixes_f32(
-            engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
-            suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
-            input, hidden_size, output, eps);
-    }
     return moe_layer_post_ffw_norm_suffixes_f32(
         engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]),
         input, hidden_size, output, eps);
