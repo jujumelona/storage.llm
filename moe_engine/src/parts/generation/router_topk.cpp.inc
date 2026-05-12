@@ -192,10 +192,17 @@ static float moe_router_routed_scaling_factor(const moe_pc_engine* engine) {
     static const char* const scale_keys[] = {
         "routed_scaling_factor",
         "route_scale",
+        "router_scale",
+        "moe_router_scale",
         "moe_routed_scaling_factor",
         "moe_route_scale",
+        "moe_router_scaling_factor",
         "router_routed_scaling_factor",
-        "router_route_scale"
+        "router_route_scale",
+        "expert_routed_scaling_factor",
+        "expert_scale",
+        "route_scaling_factor",
+        "routed_scale"
     };
     const std::string* docs[] = {
         &engine->offload_gguf_metadata_json,
@@ -627,14 +634,20 @@ static int moe_router_topk_f32(
     const int norm_topk_pref = moe_router_norm_topk_prob(engine, use_sigmoid);
     if (!use_sigmoid && norm_topk_pref && cpu_storage_router_shortcut && top_k <= 64u &&
         moe_router_select_topk_logits_norm_softmax_f32(*scratch_logits, experts, top_k, out_experts, out_weights)) {
+        const float route_scale = moe_router_routed_scaling_factor(engine);
+        if (route_scale != 1.0f) {
+            for (float& w : *out_weights) {
+                w *= route_scale;
+            }
+        }
         if (session) {
             session->session_router_entropy_milli = 500u;
         }
         engine->last_router_entropy_milli.store(500u, std::memory_order_relaxed);
         moe_profile_log(
             "router_topk",
-            "layer=%d experts=%u top_k=%u use_sigmoid=0 norm_topk=1 entropy=0.500 scale=1 first_expert=%d first_weight=%.6g fast_logits_topk=1",
-            layer, experts, top_k,
+            "layer=%d experts=%u top_k=%u use_sigmoid=0 norm_topk=1 entropy=0.500 scale=%.6g first_expert=%d first_weight=%.6g fast_logits_topk=1",
+            layer, experts, top_k, (double)route_scale,
             out_experts->empty() ? -1 : (*out_experts)[0],
             out_weights->empty() ? 0.0 : (double)(*out_weights)[0]);
         return 1;
@@ -771,7 +784,7 @@ static int moe_router_topk_f32(
             }
         }
     }
-    const float scale = use_sigmoid ? moe_router_routed_scaling_factor(engine) : 1.0f;
+    const float scale = moe_router_routed_scaling_factor(engine);
     if (scale != 1.0f) {
         for (float& w : *out_weights) {
             w *= scale;

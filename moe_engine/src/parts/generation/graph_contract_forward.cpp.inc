@@ -48,6 +48,7 @@ static int moe_forward_one_token_graph_contract_f32(
     const int ok = moe_forward_one_token_f32(engine, token_id, s, stats, position, pre_allocate_kv);
     if (ok && moe_graph_contract_forward_required(engine)) {
         engine->forward_adapter.store(moe_FORWARD_ADAPTER_GRAPH_IR, std::memory_order_relaxed);
+        engine->graph_ir_used_for_forward.store(1, std::memory_order_relaxed);
     }
     return ok;
 }
@@ -60,7 +61,15 @@ static int moe_forward_one_token_dispatch_f32(
     uint32_t position,
     int pre_allocate_kv
 ) {
-    if (moe_graph_contract_forward_available(engine)) {
+    if (moe_graph_contract_forward_required(engine)) {
+        if (!moe_graph_contract_forward_available(engine)) {
+            std::fprintf(stderr,
+                "[storagellm graph] GraphIR-required forward is not executable: manifest=%u access=%u adapter=%u\n",
+                engine ? engine->juju_runtime_execution_manifest_ready.load(std::memory_order_relaxed) : 0u,
+                engine ? engine->juju_runtime_access_plan_ready.load(std::memory_order_relaxed) : 0u,
+                engine ? engine->forward_adapter_executable.load(std::memory_order_relaxed) : 0u);
+            return 0;
+        }
         return moe_forward_one_token_graph_contract_f32(engine, token_id, s, stats, position, pre_allocate_kv);
     }
     return moe_forward_one_token_f32(engine, token_id, s, stats, position, pre_allocate_kv);

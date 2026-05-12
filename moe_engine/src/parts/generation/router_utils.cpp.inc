@@ -387,6 +387,13 @@ static int moe_map_router_scale_tensor(
     if (!engine || !out || layer < 0) {
         return 0;
     }
+    static const char* const role_names[] = {
+        "moe_router_scale",
+        "router_scale",
+        "moe_router_norm",
+        "router_norm",
+        "router_input_norm"
+    };
     static const char* const suffixes[] = {
         // Do not match ffn_gate_inp.scale here.  In GGUF/MXFP4 artifacts that
         // name is the quantization sidecar for ffn_gate_inp.weight, not a
@@ -403,9 +410,12 @@ static int moe_map_router_scale_tensor(
         "moe.gate.scale"
     };
 
-    // Fix 18: Cache tensor mapping to avoid std::string vector allocation per token
-    const uint32_t suffix_hash = moe_router_fnv1a_hash_string(suffixes[0]);
-    const uint64_t key = ((uint64_t)(uint32_t)layer << 32) | suffix_hash | 0x80000000ull;
+    // Fix 18: Cache tensor mapping to avoid std::string vector allocation per token.
+    // Use a role-specific hash so GraphIR op-role bindings and suffix fallback do
+    // not alias the same cache entry.
+    const uint32_t cache_hash =
+        moe_router_fnv1a_hash_string("moe_router_scale|router_scale|router_norm");
+    const uint64_t key = ((uint64_t)(uint32_t)layer << 32) | cache_hash | 0x80000000ull;
     {
         std::shared_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
         auto found = engine->raw_tensor_cache.find(key);
@@ -414,11 +424,20 @@ static int moe_map_router_scale_tensor(
             return 1;
         }
     }
-    std::vector<std::string> names;
-    moe_push_layer_tensor_candidates(&names, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+
     moe_raw_tensor_desc desc{};
-    const moe_gguf_common_tensor_record* rec =
-        moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
+    const moe_gguf_common_tensor_record* rec = nullptr;
+    for (const char* role : role_names) {
+        rec = find_common_tensor_by_op_role(engine, role, layer, &desc);
+        if (rec) {
+            break;
+        }
+    }
+    if (!rec) {
+        std::vector<std::string> names;
+        moe_push_layer_tensor_candidates(&names, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+        rec = moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
+    }
     if (!rec) {
         return 0;
     }

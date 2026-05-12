@@ -464,7 +464,12 @@ static int moe_layer_shared_expert_dense_mlp_f32(
     static const char* const gate_suffixes[] = {
         "shared_expert.gate_proj.weight",
         "shared_experts.gate_proj.weight",
+        "shared_expert.gate.weight",
+        "shared_experts.gate.weight",
         "ffn_gate_shexp.weight",
+        "ffn_gate_inp_shexp.weight",
+        "ffn_shared_gate_inp.weight",
+        "ffn_shared_expert_gate_inp.weight",
         "ffn_shared_shexp_gate.weight",
         "shared_expert.w1.weight",
         "shared_experts.w1.weight",
@@ -475,7 +480,12 @@ static int moe_layer_shared_expert_dense_mlp_f32(
     static const char* const up_suffixes[] = {
         "shared_expert.up_proj.weight",
         "shared_experts.up_proj.weight",
+        "shared_expert.up.weight",
+        "shared_experts.up.weight",
         "ffn_up_shexp.weight",
+        "ffn_up_inp_shexp.weight",
+        "ffn_shared_up_inp.weight",
+        "ffn_shared_expert_up_inp.weight",
         "ffn_shared_shexp_up.weight",
         "shared_expert.w3.weight",
         "shared_experts.w3.weight",
@@ -486,7 +496,12 @@ static int moe_layer_shared_expert_dense_mlp_f32(
     static const char* const down_suffixes[] = {
         "shared_expert.down_proj.weight",
         "shared_experts.down_proj.weight",
+        "shared_expert.down.weight",
+        "shared_experts.down.weight",
         "ffn_down_shexp.weight",
+        "ffn_down_inp_shexp.weight",
+        "ffn_shared_down_inp.weight",
+        "ffn_shared_expert_down_inp.weight",
         "ffn_shared_shexp_down.weight",
         "shared_expert.w2.weight",
         "shared_experts.w2.weight",
@@ -498,18 +513,24 @@ static int moe_layer_shared_expert_dense_mlp_f32(
         "shared_expert_gate",
         "shared_expert_gate_projection",
         "shared_expert_gate_proj",
+        "shared_expert_mlp_gate",
+        "shared_experts_gate",
         "shared_ffn_gate"
     };
     static const char* const up_roles[] = {
         "shared_expert_up",
         "shared_expert_up_projection",
         "shared_expert_up_proj",
+        "shared_expert_mlp_up",
+        "shared_experts_up",
         "shared_ffn_up"
     };
     static const char* const down_roles[] = {
         "shared_expert_down",
         "shared_expert_down_projection",
         "shared_expert_down_proj",
+        "shared_expert_mlp_down",
+        "shared_experts_down",
         "shared_ffn_down"
     };
     return moe_layer_dense_mlp_from_suffixes_f32(
