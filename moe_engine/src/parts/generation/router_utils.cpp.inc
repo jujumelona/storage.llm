@@ -379,6 +379,67 @@ static int moe_router_apply_bias_f32(
     return 1;
 }
 
+
+static int moe_router_name_has_suffix_f32(const std::string& name, const char* suffix) {
+    if (!suffix || !suffix[0] || name.size() < std::strlen(suffix)) {
+        return 0;
+    }
+    return name.compare(name.size() - std::strlen(suffix), std::strlen(suffix), suffix) == 0 ? 1 : 0;
+}
+
+static int moe_router_scale_tensor_is_quant_sidecar_name_f32(const std::string& name) {
+    // These suffixes are weight-quantization sidecars.  They can have the same
+    // length as hidden_size but are not activation/RMSNorm parameters.
+    static const char* const sidecar_suffixes[] = {
+        "ffn_gate_inp.scale",
+        "ffn_gate_inp.scales",
+        "ffn_gate_inp.weight.scale",
+        "ffn_gate_inp.weight.scales"
+    };
+    for (const char* suffix : sidecar_suffixes) {
+        if (moe_router_name_has_suffix_f32(name, suffix)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role_f32(
+    const moe_pc_engine* engine,
+    const char* role,
+    int32_t layer,
+    moe_raw_tensor_desc* out_desc
+) {
+    if (!engine || !role || !role[0]) {
+        return nullptr;
+    }
+    for (const moe_gguf_common_tensor_record& rec : engine->gguf_common_tensors) {
+        if (!moe_common_tensor_op_role_matches(rec, role) ||
+            !moe_common_tensor_layer_matches(rec, layer)) {
+            continue;
+        }
+        if (moe_router_scale_tensor_is_quant_sidecar_name_f32(rec.name)) {
+            if (moe_profile_level() >= 2) {
+                moe_profile_log(
+                    "router_scale_contract_reject",
+                    "layer=%d name=%s op_role=%s reason=quant_sidecar_suffix",
+                    layer, rec.name.c_str(), rec.op_role.c_str());
+            }
+            continue;
+        }
+        moe_raw_tensor_desc desc{};
+        if (!moe_common_tensor_record_to_raw_desc(rec, &desc) ||
+            !moe_common_tensor_record_raw_compatible(rec, desc)) {
+            continue;
+        }
+        if (out_desc) {
+            *out_desc = desc;
+        }
+        return &rec;
+    }
+    return nullptr;
+}
+
 static int moe_map_router_scale_tensor(
     moe_pc_engine* engine,
     int32_t layer,
@@ -395,10 +456,8 @@ static int moe_map_router_scale_tensor(
         "router_input_norm"
     };
     static const char* const suffixes[] = {
-        // Do not match ffn_gate_inp.scale here.  In GGUF/MXFP4 artifacts that
-        // name is the quantization sidecar for ffn_gate_inp.weight, not a
-        // model activation/RMSNorm scale.  Treating it as a router input norm
-        // multiplies the router input by ~32 and saturates sigmoid routing.
+        // Only activation/RMSNorm router-scale names are allowed here.
+        // Weight-quantization sidecars are rejected by name before mapping.
         "router_norm.weight",
         "router.input_layernorm.weight",
         "router.input_norm.weight",
@@ -428,7 +487,7 @@ static int moe_map_router_scale_tensor(
     moe_raw_tensor_desc desc{};
     const moe_gguf_common_tensor_record* rec = nullptr;
     for (const char* role : role_names) {
-        rec = find_common_tensor_by_op_role(engine, role, layer, &desc);
+        rec = moe_find_router_scale_record_by_role_f32(engine, role, layer, &desc);
         if (rec) {
             break;
         }
@@ -439,6 +498,15 @@ static int moe_map_router_scale_tensor(
         rec = moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
     }
     if (!rec) {
+        return 0;
+    }
+    if (moe_router_scale_tensor_is_quant_sidecar_name_f32(rec->name)) {
+        if (moe_profile_level() >= 2) {
+            moe_profile_log(
+                "router_scale_contract_reject",
+                "layer=%d name=%s op_role=%s reason=quant_sidecar_suffix",
+                layer, rec->name.c_str(), rec->op_role.c_str());
+        }
         return 0;
     }
     if (!map_common_tensor_record(engine, *rec, desc, out)) {
@@ -452,15 +520,12 @@ static int moe_map_router_scale_tensor(
 }
 
 
-static int moe_router_has_plausible_input_scale_f32(
+static int moe_router_has_contract_input_scale_f32(
     moe_pc_engine* engine,
     int32_t layer,
     uint32_t hidden_size
 ) {
-    if (!engine || layer < 0 || hidden_size == 0) {
-        return 0;
-    }
-    if (hidden_size > 100000) {
+    if (!engine || layer < 0 || hidden_size == 0 || hidden_size > 100000) {
         return 0;
     }
     moe_raw_tensor_cache_entry scale_raw{};
@@ -469,70 +534,6 @@ static int moe_router_has_plausible_input_scale_f32(
     }
     const uint64_t scale_count = moe_router_raw_scalar_count(scale_raw);
     if (scale_count != 1u && scale_count < (uint64_t)hidden_size) {
-        return 0;
-    }
-    const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, scale_raw);
-    double raw_abs_sum = 0.0;
-    double eff_abs_sum = 0.0;
-    float raw_max_abs = 0.0f;
-    float eff_max_abs = 0.0f;
-    const uint32_t sample_limit = 512u;
-    const uint32_t sample_step = hidden_size > sample_limit ?
-        (hidden_size + sample_limit - 1u) / sample_limit : 1u;
-    uint32_t samples = 0;
-    for (uint32_t i = 0; i < hidden_size; i += sample_step) {
-        float scale = 1.0f;
-        if (scale_count == 1u) {
-            if (!moe_router_raw_scalar_at_f32(scale_raw, 0, &scale)) return 0;
-        } else {
-            if (!moe_router_raw_scalar_at_f32(scale_raw, i, &scale)) return 0;
-        }
-        if (!std::isfinite(scale)) {
-            return 0;
-        }
-        const float effective_scale = unit_offset ? (1.0f + scale) : scale;
-        if (!std::isfinite(effective_scale)) {
-            return 0;
-        }
-        const float raw_abs = std::fabs(scale);
-        const float eff_abs = std::fabs(effective_scale);
-        raw_abs_sum += (double)raw_abs;
-        eff_abs_sum += (double)eff_abs;
-        if (raw_abs > raw_max_abs) raw_max_abs = raw_abs;
-        if (eff_abs > eff_max_abs) eff_max_abs = eff_abs;
-        ++samples;
-    }
-    if (samples == 0) {
-        return 0;
-    }
-    const double raw_mean_abs = raw_abs_sum / (double)samples;
-    const double eff_mean_abs = eff_abs_sum / (double)samples;
-
-    // Vector router input norms are ordinary activation scales and should be
-    // O(1).  GGUF/MXFP sidecars such as ffn_gate_inp.scale are also shaped like
-    // hidden_size but have raw values around 32; those are quantization scales,
-    // not graph router-input RMSNorm weights.  If such a sidecar made the caller
-    // choose raw hidden as the router source, the expert_ffn_norm branch would be
-    // bypassed even though no usable router input norm was applied.
-    if (scale_count != 1u && (raw_mean_abs > 8.0 || eff_mean_abs > 8.0 ||
-            raw_max_abs > 16.0f || eff_max_abs > 16.0f)) {
-        if (moe_profile_level() >= 3) {
-            moe_profile_log(
-                "router_scale_plausible",
-                "layer=%d hidden=%u count=%llu ok=0 reason=implausible_activation_scale raw_mean_abs=%.6g raw_max_abs=%.6g eff_mean_abs=%.6g eff_max_abs=%.6g samples=%u",
-                layer,
-                hidden_size,
-                (unsigned long long)scale_count,
-                raw_mean_abs,
-                (double)raw_max_abs,
-                eff_mean_abs,
-                (double)eff_max_abs,
-                samples);
-        }
-        return 0;
-    }
-    if (scale_count == 1u && (raw_max_abs <= 0.0f || eff_max_abs <= 0.0f ||
-            raw_max_abs > 64.0f || eff_max_abs > 64.0f)) {
         return 0;
     }
     return 1;
@@ -584,65 +585,6 @@ static int moe_prepare_scaled_router_input_f32(
         return 0;
     }
     const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, scale_raw);
-    double raw_abs_sum = 0.0;
-    double eff_abs_sum = 0.0;
-    float raw_max_abs = 0.0f;
-    float eff_max_abs = 0.0f;
-    const uint32_t sample_limit = 512u;
-    const uint32_t sample_step = hidden_size > sample_limit ?
-        (hidden_size + sample_limit - 1u) / sample_limit : 1u;
-    uint32_t samples = 0;
-    for (uint32_t i = 0; i < hidden_size; i += sample_step) {
-        float scale = 1.0f;
-        if (scale_count == 1u) {
-            if (!moe_router_raw_scalar_at_f32(scale_raw, 0, &scale)) return 0;
-        } else {
-            if (!moe_router_raw_scalar_at_f32(scale_raw, i, &scale)) return 0;
-        }
-        if (!std::isfinite(scale)) {
-            return 0;
-        }
-        const float effective_scale = unit_offset ? (1.0f + scale) : scale;
-        if (!std::isfinite(effective_scale)) {
-            return 0;
-        }
-        const float raw_abs = std::fabs(scale);
-        const float eff_abs = std::fabs(effective_scale);
-        raw_abs_sum += (double)raw_abs;
-        eff_abs_sum += (double)eff_abs;
-        if (raw_abs > raw_max_abs) raw_max_abs = raw_abs;
-        if (eff_abs > eff_max_abs) eff_max_abs = eff_abs;
-        ++samples;
-    }
-    const double inv_samples = samples ? 1.0 / (double)samples : 0.0;
-    const double raw_mean_abs = raw_abs_sum * inv_samples;
-    const double eff_mean_abs = eff_abs_sum * inv_samples;
-
-    // A router activation/RMSNorm scale vector should be O(1).  The real PPL
-    // logs showed count=hidden and raw_mean_abs≈32/max≈33.75, which matches an
-    // MXFP4/GGUF quantization scale sidecar, not a model norm weight.  Using it
-    // as an activation scale inflated router logits to |logit|~100-200, made
-    // sigmoid top-k saturate to 1.0, and collapsed MoE weights to 1/top_k.
-    // Return 0 so callers fall back to the unscaled hidden router input.
-    if (scale_count != 1u && (raw_mean_abs > 8.0 || eff_mean_abs > 8.0 ||
-            raw_max_abs > 16.0f || eff_max_abs > 16.0f)) {
-        if (moe_profile_level() >= 2) {
-            moe_profile_log(
-                "router_scale_ignore",
-                "layer=%d hidden=%u count=%llu reason=implausible_activation_scale unit_offset=%d input_norm=%.6g raw_mean_abs=%.6g raw_max_abs=%.6g eff_mean_abs=%.6g eff_max_abs=%.6g samples=%u",
-                layer,
-                hidden_size,
-                (unsigned long long)scale_count,
-                unit_offset,
-                (double)norm,
-                raw_mean_abs,
-                (double)raw_max_abs,
-                eff_mean_abs,
-                (double)eff_max_abs,
-                samples);
-        }
-        return 0;
-    }
 
     for (uint32_t i = 0; i < hidden_size; ++i) {
         float scale = 1.0f;
@@ -658,14 +600,9 @@ static int moe_prepare_scaled_router_input_f32(
         if (!std::isfinite(effective_scale)) {
             return 0;
         }
-        // Graph contract: router scale is the RMSNorm/scale weight for the
-        // router input.  RMSNorm already divides by sqrt(mean(x^2)); applying
-        // an additional 1/sqrt(hidden_size) shrinks all router logits by ~53x
-        // for hidden=2816 and turns expert routing nearly uniform.  The scale
-        // tensor itself follows the same Gemma shifted-RMSNorm convention as
-        // other norm weights: if stats identify it as a delta tensor, use
-        // (1 + scale), not the raw delta.  Using raw deltas here made sigmoid
-        // routers effectively uniform in the PPL log.
+        // Graph contract: this tensor is a router input RMSNorm/scale weight.
+        // The RMSNorm denominator is mean-square based; do not add an extra
+        // hidden-size divisor here.
         const float result = hidden[i] * norm * effective_scale;
         if (!std::isfinite(result)) {
             return 0;
@@ -675,17 +612,12 @@ static int moe_prepare_scaled_router_input_f32(
     if (moe_profile_level() >= 2) {
         moe_profile_log(
             "router_scale_apply",
-            "layer=%d hidden=%u count=%llu unit_offset=%d input_norm=%.6g raw_mean_abs=%.6g raw_max_abs=%.6g eff_mean_abs=%.6g eff_max_abs=%.6g samples=%u",
+            "layer=%d hidden=%u count=%llu unit_offset=%d input_norm=%.6g source=contract",
             layer,
             hidden_size,
             (unsigned long long)scale_count,
             unit_offset,
-            (double)norm,
-            raw_mean_abs,
-            (double)raw_max_abs,
-            eff_mean_abs,
-            (double)eff_max_abs,
-            samples);
+            (double)norm);
     }
     return 1;
 }

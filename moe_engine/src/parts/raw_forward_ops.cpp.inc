@@ -88,7 +88,7 @@ static int moe_rmsnorm_unit_offset_from_weight_stats(
     if (out_mean_abs_raw) *out_mean_abs_raw = mean_abs_raw;
     if (out_mean_abs_plus_one) *out_mean_abs_plus_one = mean_abs_plus_one;
 
-    // Gemma-style shifted RMSNorm weights are often stored as a small
+    // Shifted RMSNorm weights are often stored as a small
     // additive delta around zero and must be used as (1 + weight). Plain
     // RMSNorm weights are usually already centered near one or larger. The
     // old 0.35/0.50 split left many post-attention norms around 0.4-0.5 as
@@ -151,7 +151,7 @@ static int moe_engine_rmsnorm_unit_offset(
     // false in graph_ir/metadata is frequently an emitter default rather than
     // a tensor contract; using it globally was visible in PPL logs as
     // source=graph_ir value=0 even when tensor-local weights looked like
-    // shifted Gemma RMSNorm deltas.
+    // shifted RMSNorm deltas.
     if (metadata_cache == 1) {
         value = 1;
         source = "metadata_cache_true";

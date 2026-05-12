@@ -153,7 +153,7 @@ static int moe_layer_moe_mlp_f32(
         layer, shared_ok, shared ? 1 : 0, moe_profile_elapsed_ms(shared_start_us));
 
     const int router_has_plausible_input_scale =
-        moe_router_has_plausible_input_scale_f32(engine, layer, hidden_size);
+        moe_router_has_contract_input_scale_f32(engine, layer, hidden_size);
     const int router_has_internal_norm_scale = router_has_plausible_input_scale && (
         moe_engine_has_common_tensor_suffix(engine, layer, "router_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router.input_layernorm.weight") ||
@@ -257,7 +257,7 @@ static int moe_layer_moe_mlp_f32(
             engine && engine->cpu_storage_engine_ready.load(std::memory_order_relaxed);
         // BUGFIX 950: Entropy-adaptive InfiniGen confidence threshold ★★★ PERFORMANCE
         // Problem: Hardcoded 0.50 threshold never reached by high-entropy models
-        //   (uniform router distributions e.g. GLM-4-9B) → speculative prefetch disabled
+        //   (uniform router distributions e.g. low-entropy router contracts) → speculative prefetch disabled
         // Solution: Scale threshold based on per-session router entropy
         //   Low entropy (sharp topk): threshold stays ~0.50 (high accuracy requirement)
         //   High entropy (uniform):   threshold drops to ~0.30 (allow lower-confidence predictions)
@@ -911,7 +911,7 @@ static int moe_layer_moe_mlp_f32(
     }
 
     // Phase 3: Accumulate weighted expert outputs, then apply the expert-branch
-    // post norm once. Gemma4 normalizes the summed expert branch, not each expert
+    // post norm once. split-post-norm contracts normalize the summed expert branch, not each expert
     // independently.
     const uint64_t accumulate_start_us = moe_profile_now_us();
 
@@ -2050,7 +2050,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
     const moe_storage_raw_span_spec_t* shared =
         find_raw_role_span_bytes(layer, moe_RAW_ROLE_SHARED, shared_bytes, 0);
     const int router_has_plausible_input_scale =
-        moe_router_has_plausible_input_scale_f32(engine, layer, hidden_size);
+        moe_router_has_contract_input_scale_f32(engine, layer, hidden_size);
     const int router_has_internal_norm_scale = router_has_plausible_input_scale && (
         moe_engine_has_common_tensor_suffix(engine, layer, "router_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router.input_layernorm.weight") ||
