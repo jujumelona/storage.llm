@@ -404,6 +404,47 @@ static int moe_router_scale_tensor_is_quant_sidecar_name_f32(const std::string& 
     return 0;
 }
 
+static int moe_router_scale_tensor_implausible_activation_norm_f32(
+    const moe_raw_tensor_cache_entry& raw,
+    double* out_mean_abs,
+    float* out_max_abs
+) {
+    if (out_mean_abs) *out_mean_abs = 0.0;
+    if (out_max_abs) *out_max_abs = 0.0f;
+    const uint64_t count = moe_router_raw_scalar_count(raw);
+    if (!raw.base || count == 0u) {
+        return 0;
+    }
+    const uint32_t max_samples = 512u;
+    const uint64_t step = count > (uint64_t)max_samples ?
+        (count + (uint64_t)max_samples - 1u) / (uint64_t)max_samples :
+        1u;
+    uint32_t samples = 0;
+    double abs_sum = 0.0;
+    float raw_max_abs = 0.0f;
+    for (uint64_t i = 0; i < count; i += step) {
+        float scale = 0.0f;
+        if (!moe_router_raw_scalar_at_f32(raw, i, &scale) || !std::isfinite(scale)) {
+            return 1;
+        }
+        const float abs_scale = std::fabs(scale);
+        abs_sum += (double)abs_scale;
+        if (abs_scale > raw_max_abs) raw_max_abs = abs_scale;
+        ++samples;
+    }
+    if (samples < 16u) {
+        return 0;
+    }
+    const double raw_mean_abs = abs_sum / (double)samples;
+    if (out_mean_abs) *out_mean_abs = raw_mean_abs;
+    if (out_max_abs) *out_max_abs = raw_max_abs;
+
+    // Router activation norm/scale tensors are ordinary norm weights. MXFP block
+    // scale sidecars commonly sit around 16..64 and can share hidden_size length.
+    // Reject those before they can route the model through sidecar math.
+    return (raw_mean_abs > 8.0 || raw_max_abs > 16.0f) ? 1 : 0;
+}
+
 static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role_f32(
     const moe_pc_engine* engine,
     const char* role,
@@ -457,7 +498,8 @@ static int moe_map_router_scale_tensor(
     };
     static const char* const suffixes[] = {
         // Only activation/RMSNorm router-scale names are allowed here.
-        // Weight-quantization sidecars are rejected by name before mapping.
+        // A quantization sidecar for ffn_gate_inp.weight is rejected by name
+        // before mapping and again by value statistics after mapping.
         "router_norm.weight",
         "router.input_layernorm.weight",
         "router.input_norm.weight",
@@ -509,9 +551,25 @@ static int moe_map_router_scale_tensor(
         }
         return 0;
     }
-    if (!map_common_tensor_record(engine, *rec, desc, out)) {
+    moe_raw_tensor_cache_entry mapped_scale{};
+    if (!map_common_tensor_record(engine, *rec, desc, &mapped_scale)) {
         return 0;
     }
+    double raw_mean_abs = 0.0;
+    float raw_max_abs = 0.0f;
+    if (moe_router_scale_tensor_implausible_activation_norm_f32(
+            mapped_scale, &raw_mean_abs, &raw_max_abs)) {
+        moe_profile_log(
+            "router_scale_ignore",
+            "layer=%d name=%s op_role=%s reason=implausible_activation_scale raw_mean_abs=%.6g raw_max_abs=%.6g",
+            layer,
+            rec->name.c_str(),
+            rec->op_role.c_str(),
+            raw_mean_abs,
+            (double)raw_max_abs);
+        return 0;
+    }
+    *out = mapped_scale;
     {
         std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
         engine->raw_tensor_cache[key] = *out;
@@ -596,6 +654,8 @@ static int moe_prepare_scaled_router_input_f32(
         if (!std::isfinite(scale)) {
             return 0;
         }
+        // Using raw deltas here made sigmoid router logits collapse when the
+        // router norm tensor follows the +1 RMSNorm storage convention.
         const float effective_scale = unit_offset ? (1.0f + scale) : scale;
         if (!std::isfinite(effective_scale)) {
             return 0;
