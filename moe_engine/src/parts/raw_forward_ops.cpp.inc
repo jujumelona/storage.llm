@@ -71,88 +71,35 @@ static int moe_engine_rmsnorm_unit_offset(
     int value = 0;
     int metadata_value = -1;
     const char* metadata_source = "none";
-    const char* source = "weight_stats_default";
+    const char* source = "contract_default";
     int parsed_value = 0;
 
+    // Contract rule: unit-offset RMSNorm is architecture/config math, not a
+    // tensor-statistics heuristic.  Previous code inferred (1+w) from weight
+    // magnitudes; that made layer-local decisions drift across norm tensors and
+    // caused the same model to run different math depending on quant sidecars.
+    // Use only explicit metadata/GraphIR.  If absent, use normal RMSNorm weight.
     if (moe_rmsnorm_unit_offset_from_json(engine->offload_gguf_metadata_json, &parsed_value)) {
         metadata_value = parsed_value ? 1 : 0;
         metadata_source = "metadata";
+        value = metadata_value;
+        source = "metadata";
     } else if (moe_rmsnorm_unit_offset_from_json(engine->offload_graph_ir_json, &parsed_value)) {
         metadata_value = parsed_value ? 1 : 0;
         metadata_source = "graph_ir";
-    }
-
-    // Treat only an explicit model-wide true as authoritative.  Some converted
-    // GraphIR/GGUF files carry rmsnorm_unit_offset=false even when the actual
-    // RMSNorm tensors are stored as learned deltas around zero.  Applying the
-    // false globally turns those deltas into near-zero multiplicative weights and
-    // destroys logits/PPL.  A true flag is safe to cache model-wide; a false flag
-    // still needs tensor-level confirmation.
-    if (metadata_value == 1) {
-        value = 1;
-        source = metadata_source;
-        engine->cached_rmsnorm_unit_offset.store(1, std::memory_order_relaxed);
-    }
-
-    double mean_abs_raw = 0.0;
-    double raw_rms = 0.0;
-    double raw_max_abs = 0.0;
-    uint32_t samples = 0;
-    if (metadata_value != 1 && raw.base && raw.cols == 0 && raw.rows > 0) {
-        const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
-        if (elem && raw.bytes >= (uint64_t)raw.rows * (uint64_t)elem) {
-            const uint32_t max_samples = 512u;
-            const uint32_t step = raw.rows > max_samples ? (raw.rows + max_samples - 1u) / max_samples : 1u;
-            double abs_sum = 0.0;
-            double ss = 0.0;
-            for (uint32_t i = 0; i < raw.rows; i += step) {
-                const float w = moe_raw_scalar_to_f32(
-                    raw.base + (uint64_t)i * (uint64_t)elem,
-                    raw.scalar_encoding);
-                if (!std::isfinite(w)) {
-                    samples = 0;
-                    break;
-                }
-                const double aw = (double)std::fabs(w);
-                abs_sum += aw;
-                ss += (double)w * (double)w;
-                if (aw > raw_max_abs) raw_max_abs = aw;
-                ++samples;
-            }
-            if (samples) {
-                mean_abs_raw = abs_sum / (double)samples;
-                raw_rms = std::sqrt(ss / (double)samples);
-            }
-        }
-    }
-
-    if (metadata_value != 1) {
-        if (samples >= 16u && mean_abs_raw < 0.75 && raw_rms < 0.75) {
-            value = 1;
-            source = "weight_stats_override_metadata_false";
-        } else {
-            value = 0;
-            source = metadata_value == 0 ?
-                "metadata_false_stats_inconclusive" :
-                "weight_stats_default";
-        }
+        value = metadata_value;
+        source = "graph_ir";
     }
 
     moe_profile_log(
         "rmsnorm_unit_offset",
-        "source=%s value=%d metadata=%d metadata_source=%s cache_key=%llu samples=%u mean_abs_raw=%.6g raw_rms=%.6g raw_max_abs=%.6g",
+        "source=%s value=%d metadata=%d metadata_source=%s cache_key=%llu",
         source,
         value ? 1 : 0,
         metadata_value,
         metadata_source,
-        (unsigned long long)cache_key,
-        (uint32_t)samples,
-        mean_abs_raw,
-        raw_rms,
-        raw_max_abs);
+        (unsigned long long)cache_key);
     if (cache_key) {
-        // Do not cache false globally: a model can mix metadata that is too coarse
-        // with tensors whose storage convention is only recoverable per tensor.
         std::unique_lock<std::shared_mutex> lock(engine->rmsnorm_unit_offset_cache_mutex);
         engine->rmsnorm_unit_offset_cache[cache_key] = value ? 1 : 0;
     }

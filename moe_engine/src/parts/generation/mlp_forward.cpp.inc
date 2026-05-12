@@ -268,7 +268,9 @@ static int moe_layer_moe_mlp_f32(
         "layer=%d ok=%d has_raw_span=%d ms=%.3f",
         layer, shared_ok, shared ? 1 : 0, moe_profile_elapsed_ms(shared_start_us));
 
-    const int router_has_internal_norm_scale = (
+    const int router_has_plausible_input_scale =
+        moe_router_has_contract_input_scale_f32(engine, layer, hidden_size);
+    const int router_has_internal_norm_scale = router_has_plausible_input_scale && (
         moe_engine_has_common_tensor_suffix(engine, layer, "router_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router.input_layernorm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router.input_norm.weight") ||
@@ -278,8 +280,11 @@ static int moe_layer_moe_mlp_f32(
         moe_engine_has_common_tensor_suffix(engine, layer, "router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale"));
-    const int router_uses_raw_residual = router_has_internal_norm_scale;
-    const float* router_input = router_has_internal_norm_scale ? hidden : expert_input;
+    const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
+    const int router_uses_raw_residual =
+        router_uses_raw_residual_contract && router_has_plausible_input_scale;
+    const float* router_input = (router_has_internal_norm_scale || router_uses_raw_residual) ?
+        hidden : expert_input;
     moe_save_gate_input_snapshot(engine, layer, router_input, hidden_size);
     const uint64_t router_start_us = moe_profile_now_us();
     if (!moe_router_topk_f32(
