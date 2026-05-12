@@ -48,19 +48,13 @@ static int moe_moe_dense_branch_enabled_f32(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
-    if (!moe_graph_ir_math_required(engine)) {
-        return 1;
-    }
-    // GraphIR emits dense_mlp entries for generic FFN weights, but the layer
-    // contract marks them as a fallback: dense_branch is required only when the
-    // layer has no routed MoE/shared-expert weights.  The runtime tensor table
-    // stores op_role but not the per-op "required" bit, so a routed MoE layer
-    // must not execute the generic dense branch merely because ffn_gate/up/down
-    // tensors are present.  Doing so double-counts the FFN path and breaks PPL.
-    if (moe_env_flag_enabled_cached("STORAGELLM_GRAPHIR_ENABLE_DENSE_MOE_BRANCH")) {
-        return 1;
-    }
-    if (moe_graphir_moe_layer_has_routed_expert_f32(engine, layer)) {
+    (void)engine;
+    (void)layer;
+    // Gemma-4/GraphIR MoE blocks carry both dense FFN tensors and routed expert
+    // tensors.  The dense FFN is not a fallback for those blocks: disabling it
+    // regressed the post-patch PPL logs immediately.  Keep it enabled by
+    // default; retain an explicit experiment switch for parity bisects only.
+    if (moe_env_flag_enabled_cached("STORAGELLM_GRAPHIR_DISABLE_DENSE_MOE_BRANCH")) {
         return 0;
     }
     return 1;
@@ -117,7 +111,7 @@ static int moe_layer_moe_mlp_f32(
         "layer=%d hidden=%u hidden_ptr=%p expert_ptr=%p",
         layer, hidden_size, (void*)hidden, (void*)s->expert.data());
     const int moe_norm_ok = moe_layer_moe_norm_f32(
-        engine, layer, hidden, hidden_size, s->expert.data(), attn_cfg.rms_norm_eps);
+        engine, layer, shared_input, hidden_size, s->expert.data(), attn_cfg.rms_norm_eps);
     if (moe_norm_ok) {
         expert_input = s->expert.data();
     } else if (moe_layer_has_moe_norm_weight(engine, layer)) {
@@ -2117,7 +2111,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         const float* shared_input = batch_norm + (size_t)t * hidden_size;
         const float* expert_input = shared_input;
         if (moe_layer_moe_norm_f32(
-                engine, layer, hidden, hidden_size,
+                engine, layer, shared_input, hidden_size,
                 batch_expert_norm.data() + (size_t)t * hidden_size,
                 attn_cfg.rms_norm_eps)) {
             expert_input = batch_expert_norm.data() + (size_t)t * hidden_size;
