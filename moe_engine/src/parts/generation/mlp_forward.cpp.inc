@@ -152,19 +152,15 @@ static int moe_layer_common_ffn_is_shared_branch_f32(
     if (!engine || layer < 0 || !moe_graph_ir_math_required(engine)) {
         return 0;
     }
-    static const char* const routed_roles[] = {
-        "moe_expert_mlp", "moe_experts", "expert_mlp"
-    };
-    if (!moe_graph_ir_layer_has_op_role_any(
-            engine, layer, routed_roles, sizeof(routed_roles) / sizeof(routed_roles[0]))) {
+    // Do not promote the plain ffn_gate/up/down triplet in a routed MoE layer
+    // to a shared/common branch by shape alone.  The retry logs showed that this
+    // heuristic changed the layer-0 branch sum and regressed NLL from the
+    // no-shared-branch baseline.  The dense triplet is a fallback/dense_mlp
+    // contract unless GraphIR/tensor roles explicitly declare a shared expert.
+    if (!moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
         return 0;
     }
-    // Some split-FFN MoE graphs store the always-on shared/common FFN as the
-    // normal ffn_gate/up/down tensors next to routed experts.  This is not a
-    // generic dense fallback: it is a required shared branch when split FFN
-    // norms and the common FFN triplet are present.
-    return moe_engine_contract_uses_split_ffn_norm(engine, layer) &&
-        moe_layer_has_post_ffw_norm1_weight(engine, layer) &&
+    return moe_layer_has_post_ffw_norm1_weight(engine, layer) &&
         moe_layer_has_common_dense_mlp_tensors_f32(engine, layer);
 }
 

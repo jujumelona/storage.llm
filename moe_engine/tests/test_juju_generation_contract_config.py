@@ -685,13 +685,14 @@ def test_dense_branch_uses_graph_role_not_common_alias_presence():
 
 
 
-def test_common_ffn_shared_branch_is_separate_from_dense_fallback():
+def test_common_ffn_shared_branch_requires_explicit_shared_contract():
     mlp_text = (ROOT / "moe_engine/src/parts/generation/mlp_forward.cpp.inc").read_text()
     assert "moe_layer_common_ffn_is_shared_branch_f32" in mlp_text
     helper_pos = mlp_text.index("static int moe_layer_common_ffn_is_shared_branch_f32")
-    helper_block = mlp_text[helper_pos:mlp_text.index("static int moe_layer_moe_mlp_f32", helper_pos)]
-    assert '"moe_expert_mlp"' in helper_block
-    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer)" in helper_block
+    helper_block = mlp_text[helper_pos:mlp_text.index("static int moe_layer_dense_mlp_should_run_f32", helper_pos)]
+    assert "moe_layer_graph_shared_expert_declared_f32(engine, layer)" in helper_block
+    assert "!moe_layer_graph_shared_expert_declared_f32(engine, layer)" in helper_block
+    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer)" not in helper_block
     assert "moe_layer_has_post_ffw_norm1_weight(engine, layer)" in helper_block
     assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" in helper_block
     assert "common_enabled=%d common_ok=%d" in mlp_text
