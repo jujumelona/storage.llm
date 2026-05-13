@@ -52,77 +52,6 @@ static uint64_t moe_rmsnorm_unit_offset_cache_key(
     return key ? key : 1u;
 }
 
-static int moe_rmsnorm_tensor_stats_unit_offset_hint(
-    const moe_raw_tensor_cache_entry& raw,
-    int* out,
-    float* out_mean_abs,
-    float* out_rms,
-    float* out_max_abs,
-    float* out_min,
-    float* out_max
-) {
-    if (!out || !raw.base || raw.rows < 64 || raw.cols != 0) {
-        return 0;
-    }
-    const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
-    if (!elem || raw.bytes < (uint64_t)raw.rows * (uint64_t)elem) {
-        return 0;
-    }
-    const uint32_t samples = raw.rows < 512u ? raw.rows : 512u;
-    if (samples < 64u) {
-        return 0;
-    }
-    double ss = 0.0;
-    double abs_sum = 0.0;
-    float max_abs = 0.0f;
-    float min_v = std::numeric_limits<float>::infinity();
-    float max_v = -std::numeric_limits<float>::infinity();
-    uint32_t seen = 0;
-    for (uint32_t i = 0; i < samples; ++i) {
-        const uint32_t idx = samples == raw.rows ?
-            i :
-            (uint32_t)(((uint64_t)i * (uint64_t)(raw.rows - 1u)) / (uint64_t)(samples - 1u));
-        const float w = moe_raw_scalar_to_f32(raw.base + (uint64_t)idx * (uint64_t)elem, raw.scalar_encoding);
-        if (!std::isfinite(w)) {
-            return 0;
-        }
-        const float aw = std::fabs(w);
-        ss += (double)w * (double)w;
-        abs_sum += (double)aw;
-        if (aw > max_abs) max_abs = aw;
-        if (w < min_v) min_v = w;
-        if (w > max_v) max_v = w;
-        ++seen;
-    }
-    if (seen < 64u) {
-        return 0;
-    }
-    const float mean_abs = (float)(abs_sum / (double)seen);
-    const float rms = (float)std::sqrt(ss / (double)seen);
-    if (!std::isfinite(mean_abs) || !std::isfinite(rms) || !std::isfinite(max_abs)) {
-        return 0;
-    }
-    if (out_mean_abs) *out_mean_abs = mean_abs;
-    if (out_rms) *out_rms = rms;
-    if (out_max_abs) *out_max_abs = max_abs;
-    if (out_min) *out_min = min_v;
-    if (out_max) *out_max = max_v;
-
-    // Contract fallback: when GraphIR/metadata do not provide a positive
-    // direct-weight contract, strongly delta-like RMSNorm weights must run as
-    // (1 + w).  This is deliberately tensor-shape/statistics based, not a
-    // model-name branch, and only triggers on conservative margins.
-    if (mean_abs < 0.35f && rms < 0.45f && max_abs < 0.90f) {
-        *out = 1;
-        return 1;
-    }
-    if (mean_abs > 0.65f || rms > 0.75f || (min_v > 0.25f && max_v > 0.75f)) {
-        *out = 0;
-        return 1;
-    }
-    return 0;
-}
-
 static int moe_engine_rmsnorm_unit_offset(
     const moe_pc_engine* engine,
     const moe_raw_tensor_cache_entry& raw
@@ -158,61 +87,32 @@ static int moe_engine_rmsnorm_unit_offset(
 
     const int direct_contract = moe_engine_contract_uses_direct_rmsnorm_weight(engine);
     const int unit_contract = moe_engine_contract_uses_rmsnorm_unit_offset(engine);
-    int stats_value = -1;
-    float stats_mean_abs = 0.0f;
-    float stats_rms = 0.0f;
-    float stats_max_abs = 0.0f;
-    float stats_min = 0.0f;
-    float stats_max = 0.0f;
-    const int stats_found = moe_rmsnorm_tensor_stats_unit_offset_hint(
-        raw,
-        &stats_value,
-        &stats_mean_abs,
-        &stats_rms,
-        &stats_max_abs,
-        &stats_min,
-        &stats_max);
 
-    // Priority order is explicit direct-weight contract first, then positive
-    // unit-offset contract/metadata.  GraphIR false can be a generator default,
-    // so a strong tensor-statistics hint is allowed to recover unit-offset
-    // semantics only when no direct-weight contract exists.
+    // Contract priority must be deterministic.  Explicit direct-weight contract
+    // wins first, explicit unit-offset contract wins second, then metadata/GraphIR
+    // boolean value is authoritative.  Tensor-value statistics are intentionally
+    // not used to override an explicit false value: learned RMSNorm weights can be
+    // small or scalar-like while still representing direct gamma.
     if (direct_contract) {
         value = 0;
         source = "direct_rmsnorm_contract";
     } else if (unit_contract) {
         value = 1;
         source = "unit_offset_contract";
-    } else if (metadata_found && metadata_value) {
-        value = 1;
-        source = metadata_source;
-    } else if (stats_found && stats_value > 0) {
-        value = 1;
-        source = metadata_found ? "metadata_false_tensor_stats_unit_offset" : "tensor_stats_unit_offset";
     } else if (metadata_found) {
-        value = 0;
+        value = metadata_value ? 1 : 0;
         source = metadata_source;
-    } else if (stats_found && stats_value == 0) {
-        value = 0;
-        source = "tensor_stats_direct_weight";
     }
 
     moe_profile_log(
         "rmsnorm_unit_offset",
-        "source=%s value=%d metadata=%d metadata_source=%s direct_contract=%d unit_contract=%d stats_found=%d stats_value=%d stats_mean_abs=%.6g stats_rms=%.6g stats_max_abs=%.6g stats_min=%.6g stats_max=%.6g cache_key=%llu",
+        "source=%s value=%d metadata=%d metadata_source=%s direct_contract=%d unit_contract=%d cache_key=%llu",
         source,
         value ? 1 : 0,
         metadata_value,
         metadata_source,
         direct_contract ? 1 : 0,
         unit_contract ? 1 : 0,
-        stats_found ? 1 : 0,
-        stats_value,
-        (double)stats_mean_abs,
-        (double)stats_rms,
-        (double)stats_max_abs,
-        (double)stats_min,
-        (double)stats_max,
         (unsigned long long)cache_key);
     if (cache_key) {
         std::unique_lock<std::shared_mutex> lock(engine->rmsnorm_unit_offset_cache_mutex);
