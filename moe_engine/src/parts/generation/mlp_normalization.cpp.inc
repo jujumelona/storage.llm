@@ -84,7 +84,6 @@ static int moe_layer_get_expert_down_uniform_scale_f32(
     // materializing a full [top_k, hidden] output buffer.  Per-channel scale tensors
     // still fall back to the fully general path for correctness.
     static const char* const suffixes[] = {
-        "ffn_down_exps.scale",
         "ffn_gate_inp.per_expert_scale",
         "router.per_expert_scale",
         "mlp.router.per_expert_scale",
@@ -101,6 +100,10 @@ static int moe_layer_get_expert_down_uniform_scale_f32(
         "moe.gate.per_expert_scale"
     };
     const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
+    // ffn_down_exps.scale is a quantization sidecar for expert down weights in
+    // MXFP/GGUF artifacts.  It must not be reinterpreted as a runtime
+    // per-expert output multiplier.  Only explicit per_expert_scale contract
+    // tensors are allowed to affect the expert branch after dequantization.
     const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
     const size_t scale_suffix_count = direct_scale_contract ?
         (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :
@@ -158,7 +161,6 @@ static int moe_layer_apply_expert_down_scale_f32(
     }
 
     static const char* const suffixes[] = {
-        "ffn_down_exps.scale",
         "ffn_gate_inp.per_expert_scale",
         "router.per_expert_scale",
         "mlp.router.per_expert_scale",
@@ -175,6 +177,10 @@ static int moe_layer_apply_expert_down_scale_f32(
         "moe.gate.per_expert_scale"
     };
     const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
+    // ffn_down_exps.scale is a quantization sidecar for expert down weights in
+    // MXFP/GGUF artifacts.  It must not be reinterpreted as a runtime
+    // per-expert output multiplier.  Only explicit per_expert_scale contract
+    // tensors are allowed to affect the expert branch after dequantization.
     const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
     const size_t scale_suffix_count = direct_scale_contract ?
         (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :

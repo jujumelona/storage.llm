@@ -2121,7 +2121,6 @@ static int moe_layer_expert_down_scalar_scale_f32(
     }
 
     static const char* const suffixes[] = {
-        "ffn_down_exps.scale",
         "ffn_gate_inp.per_expert_scale",
         "router.per_expert_scale",
         "mlp.router.per_expert_scale",
@@ -2138,6 +2137,8 @@ static int moe_layer_expert_down_scalar_scale_f32(
         "moe.gate.per_expert_scale"
     };
     const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
+    // Do not use ffn_down_exps.scale here: it is a weight quantization sidecar
+    // already consumed by the MXFP/GGUF dequant path, not a branch multiplier.
     const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
     const size_t scale_suffix_count = direct_scale_contract ?
         (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :

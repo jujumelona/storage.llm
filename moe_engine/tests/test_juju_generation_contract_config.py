@@ -630,18 +630,22 @@ def test_ple_vocab_masking_allows_smaller_per_layer_vocab():
     assert "token_desc.rows == 0" in mlp_common
 
 
-def test_direct_per_expert_scale_does_not_parse_down_weight_sidecar():
+def test_expert_down_weight_sidecar_is_never_runtime_per_expert_scale():
     norm_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
     fwd_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
-    assert '"ffn_down_exps.scale"' in norm_text
-    assert "direct_contract_suffixes" in norm_text
-    direct_block = norm_text[norm_text.index("static const char* const direct_contract_suffixes[]"):
-                             norm_text.index("const int direct_scale_contract")]
-    assert '"ffn_down_exps.scale"' not in direct_block
-    assert '"per_expert_scale"' in direct_block
-    assert '"experts.per_expert_scale"' in direct_block
-    assert "moe_engine_contract_uses_direct_per_expert_scale(engine, layer)" in norm_text
-    assert "moe_engine_contract_uses_direct_per_expert_scale(engine, layer)" in fwd_text
+    for text in (norm_text, fwd_text):
+        assert "direct_contract_suffixes" in text
+        direct_block = text[text.index("static const char* const direct_contract_suffixes[]"):
+                            text.index("const int direct_scale_contract", text.index("static const char* const direct_contract_suffixes[]"))]
+        assert '"ffn_down_exps.scale"' not in direct_block
+        assert '"per_expert_scale"' in direct_block
+        assert '"experts.per_expert_scale"' in direct_block
+        assert "moe_engine_contract_uses_direct_per_expert_scale(engine, layer)" in text
+        for suffix_block in text.split("static const char* const suffixes[] = {")[1:]:
+            block = suffix_block[:suffix_block.index("};")]
+            assert '"ffn_down_exps.scale"' not in block
+    assert "quantization sidecar" in norm_text
+    assert "weight quantization sidecar" in fwd_text
 
 
 def test_raw_residual_router_input_is_split_ffn_or_explicit_graph_contract():
