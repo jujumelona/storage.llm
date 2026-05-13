@@ -403,7 +403,8 @@ def test_mxfp4_dot_and_cache_decode_use_physical_row_stride_from_index():
 def test_qkv_single_token_attention_uses_paper_quantized_decode_path():
     attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_decode.cpp.inc").read_text()
     assert "TurboQuant/QJL KV mode must use the same quantize/dequantize contract" in attn_text
-    assert "current_exact=%d" in attn_text
+    assert "sink_exact=%d current_exact=%d" in attn_text
+    assert "qkv_sink_exact_current" in attn_text
     assert "qkv_current_value_exact" not in attn_text
     assert "if (qkv_current_value_exact && seq_len == 1u)" not in attn_text
     assert "const float* v = qkv_current_value_exact" not in attn_text
@@ -424,6 +425,8 @@ def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
     assert "moe_rmsnorm_weight_implausible_sidecar_f32" not in raw_ops_text
     assert "moe_rmsnorm_unit_offset_from_json(engine->offload_gguf_metadata_json" in raw_ops_text
     assert "moe_rmsnorm_unit_offset_from_json(engine->offload_graph_ir_json" in raw_ops_text
+    assert "moe_engine_contract_uses_rmsnorm_unit_offset(engine)" in raw_ops_text
+    assert "moe_engine_contract_uses_direct_rmsnorm_weight(engine)" in raw_ops_text
 
 
 def test_router_contract_reads_graph_ir_sigmoid_scale_and_norm_topk():
@@ -541,6 +544,25 @@ def test_attention_uses_unit_qk_norm_contract_scale_in_engine():
     qpre_pos = attn_text.index("query_pre_attn_scalar > 0.0f", contract_pos)
     assert contract_pos < qpre_pos
 
+
+
+
+def test_contract_helpers_cover_remaining_non_name_runtime_axes():
+    helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
+    raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_ops.cpp.inc").read_text()
+    gen_text = (ROOT / "moe_engine" / "src" / "parts" / "generation_forward.cpp.inc").read_text()
+    profile_text = (ROOT / "moe_engine" / "src" / "parts" / "profile_trace.cpp.inc").read_text()
+    assert "moe_engine_contract_uses_direct_rmsnorm_weight" in helper_text
+    assert "moe_engine_contract_uses_rmsnorm_unit_offset" in helper_text
+    assert "moe_engine_contract_uses_gelu_tanh_mlp" in helper_text
+    assert "moe_engine_is_gemma4_text_contract" not in helper_text
+    assert "gelu_tanh_mlp_contract" in raw_ops_text
+    assert "direct_rmsnorm=%d rmsnorm_unit_offset=%d gelu_tanh_mlp=%d" in gen_text
+    assert '"activation_mode"' in profile_text
+    assert '"rmsnorm_unit_offset"' in profile_text
+    assert '"router_scale_apply"' in profile_text
+    assert '"mlp_moe_router"' in profile_text
+    assert '"mlp_moe_gate_up"' in profile_text
 
 def test_dense_branch_forces_split_ffn_contract_when_weights_exist():
     mlp_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()

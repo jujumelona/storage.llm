@@ -561,6 +561,112 @@ static int moe_engine_contract_uses_unit_qk_norm_global(
                engine, block_scale_suffixes, sizeof(block_scale_suffixes) / sizeof(block_scale_suffixes[0]));
 }
 
+
+static int moe_engine_contract_uses_direct_rmsnorm_weight(
+    const moe_pc_engine* engine
+) {
+    if (!engine) {
+        return 0;
+    }
+    int direct = 0;
+    static const char* const direct_bool_keys[] = {
+        "direct_rmsnorm_weight",
+        "rmsnorm_direct_weight",
+        "rms_norm_direct_weight",
+        "rmsnorm_weight_direct",
+        "rms_norm_weight_direct"
+    };
+    for (const char* key : direct_bool_keys) {
+        if (moe_json_get_bool_local(engine->offload_gguf_metadata_json, key, &direct) ||
+            moe_json_get_bool_local(engine->offload_graph_ir_json, key, &direct)) {
+            return direct ? 1 : 0;
+        }
+    }
+    if (moe_engine_graph_ir_mentions(engine, "direct_rmsnorm_weight") ||
+        moe_engine_graph_ir_mentions(engine, "rmsnorm_direct_weight") ||
+        moe_engine_graph_ir_mentions(engine, "rms_norm_direct_weight") ||
+        moe_engine_graph_ir_mentions(engine, "rmsnorm_weight_semantics\":\"direct") ||
+        moe_engine_graph_ir_mentions(engine, "rms_norm_weight_semantics\":\"direct") ||
+        moe_engine_metadata_mentions(engine, "direct_rmsnorm_weight") ||
+        moe_engine_metadata_mentions(engine, "rmsnorm_direct_weight") ||
+        moe_engine_metadata_mentions(engine, "rms_norm_direct_weight") ||
+        moe_engine_metadata_mentions(engine, "rmsnorm_weight_semantics\":\"direct") ||
+        moe_engine_metadata_mentions(engine, "rms_norm_weight_semantics\":\"direct")) {
+        return 1;
+    }
+    return 0;
+}
+
+static int moe_engine_contract_uses_rmsnorm_unit_offset(
+    const moe_pc_engine* engine
+) {
+    if (!engine) {
+        return 0;
+    }
+    int unit_offset = 0;
+    static const char* const unit_bool_keys[] = {
+        "rms_norm_unit_offset",
+        "rmsnorm_unit_offset",
+        "rms_norm_weight_unit_offset",
+        "rmsnorm_weight_unit_offset",
+        "rms_norm_weight_plus_one",
+        "rmsnorm_weight_plus_one",
+        "rms_norm_add_unit",
+        "rmsnorm_add_unit"
+    };
+    for (const char* key : unit_bool_keys) {
+        if (moe_json_get_bool_local(engine->offload_gguf_metadata_json, key, &unit_offset) ||
+            moe_json_get_bool_local(engine->offload_graph_ir_json, key, &unit_offset)) {
+            return unit_offset ? 1 : 0;
+        }
+    }
+    if (moe_engine_graph_ir_mentions(engine, "rms_norm_unit_offset") ||
+        moe_engine_graph_ir_mentions(engine, "rmsnorm_unit_offset") ||
+        moe_engine_graph_ir_mentions(engine, "rms_norm_weight_unit_offset") ||
+        moe_engine_graph_ir_mentions(engine, "rmsnorm_weight_unit_offset") ||
+        moe_engine_graph_ir_mentions(engine, "rms_norm_weight_plus_one") ||
+        moe_engine_graph_ir_mentions(engine, "rmsnorm_weight_plus_one") ||
+        moe_engine_graph_ir_mentions(engine, "rmsnorm_weight_semantics\":\"unit_offset") ||
+        moe_engine_graph_ir_mentions(engine, "rms_norm_weight_semantics\":\"unit_offset") ||
+        moe_engine_graph_ir_mentions(engine, "rmsnorm_weight_semantics\":\"plus_one") ||
+        moe_engine_graph_ir_mentions(engine, "rms_norm_weight_semantics\":\"plus_one") ||
+        moe_engine_metadata_mentions(engine, "rms_norm_unit_offset") ||
+        moe_engine_metadata_mentions(engine, "rmsnorm_unit_offset") ||
+        moe_engine_metadata_mentions(engine, "rms_norm_weight_unit_offset") ||
+        moe_engine_metadata_mentions(engine, "rmsnorm_weight_unit_offset") ||
+        moe_engine_metadata_mentions(engine, "rms_norm_weight_plus_one") ||
+        moe_engine_metadata_mentions(engine, "rmsnorm_weight_plus_one") ||
+        moe_engine_metadata_mentions(engine, "rmsnorm_weight_semantics\":\"unit_offset") ||
+        moe_engine_metadata_mentions(engine, "rms_norm_weight_semantics\":\"unit_offset") ||
+        moe_engine_metadata_mentions(engine, "rmsnorm_weight_semantics\":\"plus_one") ||
+        moe_engine_metadata_mentions(engine, "rms_norm_weight_semantics\":\"plus_one")) {
+        return 1;
+    }
+    return 0;
+}
+
+static int moe_engine_contract_uses_gelu_tanh_mlp(
+    const moe_pc_engine* engine
+) {
+    if (!engine) {
+        return 0;
+    }
+    static const char* const gelu_tanh_terms[] = {
+        "gelu_pytorch_tanh",
+        "gelu_tanh",
+        "gelu_new",
+        "gelu_fast",
+        "approximate_gelu"
+    };
+    for (const char* term : gelu_tanh_terms) {
+        if (moe_engine_graph_ir_mentions(engine, term) ||
+            moe_engine_metadata_mentions(engine, term)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int moe_engine_contract_allows_missing_v_projection(
     const moe_pc_engine* engine,
     int32_t layer

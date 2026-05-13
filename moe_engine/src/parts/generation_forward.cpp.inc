@@ -90,6 +90,9 @@ static void moe_forward_trace_generation_contract(
     uint64_t no_v_proj = 0;
     uint64_t v_norm = 0;
     uint64_t router_scale = 0;
+    const int direct_rmsnorm = moe_engine_contract_uses_direct_rmsnorm_weight(engine);
+    const int rmsnorm_unit_offset = moe_engine_contract_uses_rmsnorm_unit_offset(engine);
+    const int gelu_tanh_mlp = moe_engine_contract_uses_gelu_tanh_mlp(engine);
     const uint32_t runtime_manifest_ready = engine->juju_runtime_execution_manifest_ready.load(std::memory_order_relaxed);
     const uint32_t access_plan_ready = engine->juju_runtime_access_plan_ready.load(std::memory_order_relaxed);
     const uint64_t hotset_count = engine->juju_runtime_access_hotset_count.load(std::memory_order_relaxed);
@@ -114,7 +117,7 @@ static void moe_forward_trace_generation_contract(
     (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_router_scale", &router_scale);
     moe_profile_log(
         "generation_contract",
-        "layers=%u hidden=%u vocab=%u token_embedding=%s lm_head=%s tied=%d final_norm=%s post_attn=%llu expert_norm=%llu post_ffw=%llu post_ffw1=%llu post_ffw2=%llu output_scale=%llu no_v_proj=%llu v_norm=%llu router_scale=%llu runtime_manifest=%u access_plan=%u hotset=%llu file_groups=%llu tensor_refs=%llu layer_prefetch=%llu kv_layout=%u kv_entry_dim=%llu kv_page_tokens=%llu",
+        "layers=%u hidden=%u vocab=%u token_embedding=%s lm_head=%s tied=%d final_norm=%s post_attn=%llu expert_norm=%llu post_ffw=%llu post_ffw1=%llu post_ffw2=%llu output_scale=%llu no_v_proj=%llu v_norm=%llu router_scale=%llu direct_rmsnorm=%d rmsnorm_unit_offset=%d gelu_tanh_mlp=%d runtime_manifest=%u access_plan=%u hotset=%llu file_groups=%llu tensor_refs=%llu layer_prefetch=%llu kv_layout=%u kv_entry_dim=%llu kv_page_tokens=%llu",
         c->num_hidden_layers,
         c->hidden_size,
         c->vocab_size,
@@ -131,6 +134,9 @@ static void moe_forward_trace_generation_contract(
         (unsigned long long)no_v_proj,
         (unsigned long long)v_norm,
         (unsigned long long)router_scale,
+        direct_rmsnorm,
+        rmsnorm_unit_offset,
+        gelu_tanh_mlp,
         runtime_manifest_ready,
         access_plan_ready,
         (unsigned long long)hotset_count,

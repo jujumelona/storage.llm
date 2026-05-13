@@ -89,6 +89,12 @@ static int moe_engine_rmsnorm_unit_offset(
         metadata_source = "graph_ir";
         value = metadata_value;
         source = "graph_ir";
+    } else if (moe_engine_contract_uses_rmsnorm_unit_offset(engine)) {
+        value = 1;
+        source = "unit_offset_contract";
+    } else if (moe_engine_contract_uses_direct_rmsnorm_weight(engine)) {
+        value = 0;
+        source = "direct_rmsnorm_contract";
     }
 
     moe_profile_log(

@@ -436,12 +436,14 @@
                 return 0;
             }
         }
+        const int qkv_sink_exact_current =
+            (seq_len > 0u && (seq_len - 1u) < engine->qkv_cfg.sink_tokens) ? 1 : 0;
         moe_profile_log(
             "attn_standard_qkv_append",
             "layer=%d pos=%u kv_heads=%u seq=%u cap=%u head_dim=%u "
             "k_bits=%d v_bits=%d outlier_channels=%d outlier_bits=%d normal_bits=%d "
             "key_outlier_bits=%d key_normal_bits=%d value_outlier_bits=%d value_normal_bits=%d "
-            "current_exact=%d scale=%.6g scale_source=%s attn_softcap=%.6g ms=%.3f",
+            "sink_exact=%d current_exact=%d scale=%.6g scale_source=%s attn_softcap=%.6g ms=%.3f",
             layer, position, num_kv_heads, seq_len, qkv_capacity_tokens, head_dim,
             engine->qkv_cfg.k_bits,
             engine->qkv_cfg.v_bits,
@@ -452,7 +454,8 @@
             engine->qkv_cfg.key_normal_bits,
             engine->qkv_cfg.value_outlier_bits,
             engine->qkv_cfg.value_normal_bits,
-            0,
+            qkv_sink_exact_current,
+            qkv_sink_exact_current,
             (double)scale,
             scale_source ? scale_source : "unknown",
             (double)attn_logit_softcap,

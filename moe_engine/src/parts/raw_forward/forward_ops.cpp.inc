@@ -135,13 +135,9 @@ static int moe_engine_gelu_activation_mode(const moe_pc_engine* engine) {
             }
         }
     }
-    if (!resolved &&
-        (moe_engine_graph_ir_mentions(engine, "gelu_pytorch_tanh") ||
-         moe_engine_graph_ir_mentions(engine, "gelu_tanh") ||
-         moe_engine_metadata_mentions(engine, "gelu_pytorch_tanh") ||
-         moe_engine_metadata_mentions(engine, "gelu_tanh"))) {
+    if (!resolved && moe_engine_contract_uses_gelu_tanh_mlp(engine)) {
         mode = 2;
-        source = "text_mention_tanh";
+        source = "gelu_tanh_mlp_contract";
         resolved = 1;
     } else if (!resolved &&
         (moe_engine_graph_ir_mentions(engine, "gelu") ||
