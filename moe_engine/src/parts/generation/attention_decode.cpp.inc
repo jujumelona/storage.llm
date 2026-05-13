@@ -69,7 +69,7 @@
         moe_engine_graph_ir_mentions(engine, "no_v_proj") ||
         moe_engine_graph_ir_mentions(engine, "layers_with_no_v_proj") ||
         moe_engine_graph_ir_mentions(engine, "no_value_projection") ||
-        (moe_engine_is_gemma4_text_contract(engine) && !has_v);
+        (!has_v && moe_engine_contract_allows_missing_v_projection(engine, layer));
 
     if (qkv_parallel_path) {
         // BUGFIX 216: Add scratch buffer size validation before parallel Q/K/V

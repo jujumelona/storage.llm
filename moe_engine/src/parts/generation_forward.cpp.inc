@@ -491,7 +491,7 @@ static int moe_forward_one_token_f32(
         moe_forward_trace_vec("after_ple", position, layer, hidden, c->hidden_size);
         // BUGFIX: Missing output scale in standard path
         // Problem: split_post_norm path applied moe_layer_output_scale_f32 but
-        // standard path did NOT. Models with layer_output_scale.weight (Gemma4)
+        // standard path did NOT. Contract graphs with layer_output_scale.weight
         // produced unscaled outputs on the standard attention path, causing
         // PPL drift that accumulated across all 79 layers.
         if (layer_plan.apply_layer_output_scale) {

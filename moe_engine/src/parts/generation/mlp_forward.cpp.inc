@@ -156,7 +156,7 @@ static int moe_layer_dense_mlp_should_run_f32(
     if (!moe_graph_ir_math_required(engine)) {
         return 1;
     }
-    if (moe_engine_is_gemma4_text_contract(engine) &&
+    if (moe_engine_contract_uses_split_ffn_norm(engine, layer) &&
         moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)) {
         return 1;
     }
@@ -252,12 +252,12 @@ static int moe_layer_moe_mlp_f32(
     const int dense_enabled = moe_layer_dense_mlp_should_run_f32(engine, layer);
     if (dense_enabled && moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
         dense_ok = 1;
-        if (moe_engine_is_gemma4_text_contract(engine) &&
+        if (moe_engine_contract_uses_split_ffn_norm(engine, layer) &&
             moe_layer_post_ffw_norm1_f32(
                 engine, layer, s->shared.data(), hidden_size,
                 s->residual.data(), attn_cfg.rms_norm_eps)) {
             std::memcpy(s->shared.data(), s->residual.data(), (size_t)hidden_size * sizeof(float));
-        } else if (moe_engine_is_gemma4_text_contract(engine) &&
+        } else if (moe_engine_contract_uses_split_ffn_norm(engine, layer) &&
                    moe_layer_has_post_ffw_norm1_weight(engine, layer)) {
             std::fprintf(stderr,
                 "[storagellm mlp] dense post-ffw norm1 tensor is required but could not be mapped layer=%d\n",
@@ -2132,7 +2132,7 @@ static int moe_layer_expert_down_scalar_scale_f32(
         "mlp.router.per_expert_scale",
         "moe.gate.per_expert_scale"
     };
-    static const char* const gemma4_suffixes[] = {
+    static const char* const direct_contract_suffixes[] = {
         "per_expert_scale",
         "moe.per_expert_scale",
         "mlp.moe.per_expert_scale",
@@ -2142,9 +2142,10 @@ static int moe_layer_expert_down_scalar_scale_f32(
         "mlp.router.per_expert_scale",
         "moe.gate.per_expert_scale"
     };
-    const char* const* scale_suffixes = moe_engine_is_gemma4_text_contract(engine) ? gemma4_suffixes : suffixes;
-    const size_t scale_suffix_count = moe_engine_is_gemma4_text_contract(engine) ?
-        (sizeof(gemma4_suffixes) / sizeof(gemma4_suffixes[0])) :
+    const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
+    const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
+    const size_t scale_suffix_count = direct_scale_contract ?
+        (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :
         (sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_cache_entry raw{};
     if (!moe_map_layer_common_tensor(engine, layer, scale_suffixes, scale_suffix_count, &raw)) {
@@ -2308,12 +2309,12 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         const int dense_enabled = moe_layer_dense_mlp_should_run_f32(engine, layer);
         if (dense_enabled && moe_layer_common_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, dense_out)) {
             dense_ok = 1;
-            if (moe_engine_is_gemma4_text_contract(engine) &&
+            if (moe_engine_contract_uses_split_ffn_norm(engine, layer) &&
                 moe_layer_post_ffw_norm1_f32(
                     engine, layer, dense_out, hidden_size,
                     local.residual.data(), attn_cfg.rms_norm_eps)) {
                 std::memcpy(dense_out, local.residual.data(), (size_t)hidden_size * sizeof(float));
-            } else if (moe_engine_is_gemma4_text_contract(engine) &&
+            } else if (moe_engine_contract_uses_split_ffn_norm(engine, layer) &&
                        moe_layer_has_post_ffw_norm1_weight(engine, layer)) {
                 std::fprintf(stderr,
                     "[storagellm mlp] batch dense post-ffw norm1 tensor is required but could not be mapped layer=%d token=%u\n",

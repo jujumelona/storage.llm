@@ -335,6 +335,21 @@ static int moe_layer_has_qk_norm_scaled_standard_layout(
     return has_q_norm && has_k_norm && has_scaled_block_norms;
 }
 
+static int moe_layer_uses_unit_qk_norm_contract(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || !moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
+        return 0;
+    }
+    if (moe_engine_graph_ir_mentions(engine, "unit_qk_norm") ||
+        moe_engine_graph_ir_mentions(engine, "qk_norm_unit_scale") ||
+        moe_engine_graph_ir_mentions(engine, "unit_attention_scale")) {
+        return 1;
+    }
+    return moe_engine_contract_uses_unit_qk_norm_global(engine);
+}
+
 static uint32_t moe_attention_float_to_bits(float value) {
     uint32_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
@@ -352,7 +367,7 @@ static const char* moe_attention_scale_source_name(int source) {
     case 1: return "graph_ir_scale";
     case 2: return "metadata_scale";
     case 3: return "query_pre_attn_scalar";
-    case 4: return "gemma4_unit_qk_norm";
+    case 4: return "unit_qk_norm";
     default: return "head_dim";
     }
 }
@@ -479,12 +494,11 @@ static float moe_standard_attention_score_scale(
         } else {
             int resolved_source = 0;
             float resolved_value = 0.0f;
-            if (moe_engine_is_gemma4_text_contract(engine) &&
-                moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
-                // Gemma4 text attention uses Q/K RMSNorm with unit attention
+            if (moe_layer_uses_unit_qk_norm_contract(engine, layer)) {
+                // Unit-QK-Norm attention uses Q/K RMSNorm with unit attention
                 // scaling.  query_pre_attn_scalar may still be present in
                 // JUJU metadata, but applying 1/sqrt(qpre) double-scales the
-                // normalized Q/K path and diverges from HF/vLLM.
+                // normalized Q/K path and diverges from the declared runtime contract.
                 resolved_source = 4;
                 resolved_value = 1.0f;
             }
@@ -567,9 +581,9 @@ static float moe_standard_attention_score_scale(
         return 1.0f;
     }
     if (moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
-        if (moe_engine_is_gemma4_text_contract(engine)) {
+        if (moe_layer_uses_unit_qk_norm_contract(engine, layer)) {
             if (source_out) {
-                *source_out = "gemma4_unit_qk_norm";
+                *source_out = "unit_qk_norm";
             }
             return 1.0f;
         }
@@ -588,7 +602,7 @@ static int moe_attention_score_scale_source_is_explicit(
         (std::strcmp(source, "graph_ir_scale") == 0 ||
          std::strcmp(source, "metadata_scale") == 0 ||
          std::strcmp(source, "query_pre_attn_scalar") == 0 ||
-         std::strcmp(source, "gemma4_unit_qk_norm") == 0);
+         std::strcmp(source, "unit_qk_norm") == 0);
 }
 
 static int moe_attention_score_scale_violates_qk_norm_contract(
@@ -674,23 +688,41 @@ static void moe_standard_attention_rope_params(
         return;
     }
     double partial_value = 0.0;
-    if (!engine || engine->offload_gguf_metadata_json.empty() ||
+    if (!engine) {
+        return;
+    }
+    if (engine->model_config_partial_rotary_factor > 0.0f &&
+        engine->model_config_partial_rotary_factor <= 1.0f) {
+        partial_value = (double)engine->model_config_partial_rotary_factor;
+    } else if (engine->offload_gguf_metadata_json.empty() ||
         !moe_json_get_double_local(engine->offload_gguf_metadata_json, "partial_rotary_factor", &partial_value) ||
         partial_value <= 0.0 || partial_value > 1.0) {
         return;
     }
     double full_theta = 0.0;
     double sliding_theta = 0.0;
-    const int has_full_theta =
-        moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_rope_theta", &full_theta) ||
-        moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_attention_rope_theta", &full_theta) ||
-        moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.rope.freq_base", &full_theta) ||
-        moe_json_get_double_local(engine->offload_gguf_metadata_json, "rope.freq_base", &full_theta);
-    const int has_sliding_theta =
-        moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_rope_theta", &sliding_theta) ||
-        moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_attention_rope_theta", &sliding_theta) ||
-        moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.rope.freq_base_swa", &sliding_theta) ||
-        moe_json_get_double_local(engine->offload_gguf_metadata_json, "rope.freq_base_swa", &sliding_theta);
+    int has_full_theta = 0;
+    int has_sliding_theta = 0;
+    if (engine->model_config_full_rope_theta > 0.0f) {
+        full_theta = (double)engine->model_config_full_rope_theta;
+        has_full_theta = 1;
+    } else if (!engine->offload_gguf_metadata_json.empty()) {
+        has_full_theta =
+            moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_rope_theta", &full_theta) ||
+            moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_attention_rope_theta", &full_theta) ||
+            moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.rope.freq_base", &full_theta) ||
+            moe_json_get_double_local(engine->offload_gguf_metadata_json, "rope.freq_base", &full_theta);
+    }
+    if (engine->model_config_sliding_rope_theta > 0.0f) {
+        sliding_theta = (double)engine->model_config_sliding_rope_theta;
+        has_sliding_theta = 1;
+    } else if (!engine->offload_gguf_metadata_json.empty()) {
+        has_sliding_theta =
+            moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_rope_theta", &sliding_theta) ||
+            moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_attention_rope_theta", &sliding_theta) ||
+            moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.rope.freq_base_swa", &sliding_theta) ||
+            moe_json_get_double_local(engine->offload_gguf_metadata_json, "rope.freq_base_swa", &sliding_theta);
+    }
     const int full_attention_layout =
         !has_v ||
         (head_dim > 256u) ||

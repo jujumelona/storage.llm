@@ -104,8 +104,8 @@ static int moe_router_uses_sigmoid_scores(const moe_pc_engine* engine) {
     };
     int use_sigmoid = 0;
     // Do not infer sigmoid routing from route_scale/routed_scaling_factor.
-    // Gemma4 uses pre-softmax/top-k routing with normalized top-k weights and
-    // per-expert scaling; treating scale metadata as a sigmoid-score marker
+    // Some softmax-MoE contracts use pre-softmax/top-k routing with normalized
+    // top-k weights and per-expert scaling; treating scale metadata as a sigmoid-score marker
     // saturates logits and collapses top-k weights to ~1/top_k.
     const std::string* docs[] = {
         &engine->offload_gguf_metadata_json,

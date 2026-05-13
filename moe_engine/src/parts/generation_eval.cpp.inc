@@ -20,10 +20,10 @@ static int moe_eval_exact_ppl_contract_ready(
         moe_eval_set_error(out_stats, "JUJU attention scale contract is not loaded");
         return 0;
     }
-    const double expected = moe_engine_is_gemma4_text_contract(engine)
+    const double expected = moe_engine_contract_uses_unit_qk_norm_global(engine)
         ? 1.0
         : 1.0 / std::sqrt((double)engine->model_config_query_pre_attn_scalar);
-    const double actual = moe_engine_is_gemma4_text_contract(engine)
+    const double actual = moe_engine_contract_uses_unit_qk_norm_global(engine)
         ? 1.0
         : (double)engine->model_config_attention_scale;
     const double tol = std::max(1.0e-8, std::fabs(expected) * 1.0e-5);

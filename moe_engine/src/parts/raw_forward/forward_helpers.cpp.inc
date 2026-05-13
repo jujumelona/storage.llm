@@ -360,47 +360,231 @@ static int moe_engine_metadata_mentions(const moe_pc_engine* engine, const char*
     return result;
 }
 
-static int moe_engine_is_gemma4_text_contract(const moe_pc_engine* engine) {
-    if (!engine) {
+static int moe_engine_contract_has_common_tensor_suffix_global(
+    const moe_pc_engine* engine,
+    const char* suffix
+) {
+    if (!engine || !suffix || !suffix[0]) {
         return 0;
     }
-    const std::string arch = moe_lower_ascii_copy(engine->dynamic_architecture);
-    if (arch.find("gemma4") != std::string::npos ||
-        arch.find("gemma_4") != std::string::npos ||
-        arch.find("gemma-4") != std::string::npos) {
-        return 1;
+    const std::string suffix_lower = moe_lower_ascii_copy(std::string(suffix));
+    std::string cache_key("global\n");
+    cache_key.append(suffix_lower);
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->common_tensor_suffix_cache_mutex);
+        auto found = engine->common_tensor_suffix_cache.find(cache_key);
+        if (found != engine->common_tensor_suffix_cache.end()) {
+            return found->second;
+        }
     }
-    if (moe_engine_metadata_mentions(engine, "gemma4") ||
-        moe_engine_metadata_mentions(engine, "gemma-4") ||
-        moe_engine_metadata_mentions(engine, "gemma_4") ||
-        moe_engine_graph_ir_mentions(engine, "gemma4") ||
-        moe_engine_graph_ir_mentions(engine, "gemma-4") ||
-        moe_engine_graph_ir_mentions(engine, "gemma_4")) {
-        return 1;
-    }
-    int saw_router_scale = 0;
-    int saw_split_ffn = 0;
-    int saw_moe_router = 0;
+    int result = 0;
     for (const auto& it : engine->gguf_common_tensor_slots) {
         const std::string& key = it.first;
-        if (key.find("ffn_gate_inp.scale") != std::string::npos ||
-            key.find("router.scale") != std::string::npos ||
-            key.find("mlp.router.scale") != std::string::npos) {
-            saw_router_scale = 1;
+        if (key.size() >= suffix_lower.size() &&
+            key.compare(key.size() - suffix_lower.size(), suffix_lower.size(), suffix_lower) == 0) {
+            result = 1;
+            break;
         }
-        if (key.find("post_ffw_norm_1.weight") != std::string::npos ||
-            key.find("post_ffw_norm_2.weight") != std::string::npos ||
-            key.find("pre_ffw_norm_2.weight") != std::string::npos) {
-            saw_split_ffn = 1;
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->common_tensor_suffix_cache_mutex);
+        engine->common_tensor_suffix_cache.emplace(std::move(cache_key), result);
+    }
+    return result;
+}
+
+static int moe_engine_contract_has_layer_tensor_suffix_any(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* suffixes,
+    size_t suffix_count
+) {
+    if (!engine || !suffixes || suffix_count == 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < suffix_count; ++i) {
+        const char* suffix = suffixes[i];
+        if (!suffix || !suffix[0]) {
+            continue;
         }
-        if (key.find("ffn_gate_inp.weight") != std::string::npos ||
-            key.find("moe.experts") != std::string::npos ||
-            key.find("ffn_gate_exps") != std::string::npos) {
-            saw_moe_router = 1;
-        }
-        if (saw_router_scale && saw_split_ffn && saw_moe_router) {
+        if (layer >= 0) {
+            if (moe_engine_has_common_tensor_suffix(engine, layer, suffix)) {
+                return 1;
+            }
+        } else if (moe_engine_contract_has_common_tensor_suffix_global(engine, suffix)) {
             return 1;
         }
     }
     return 0;
+}
+
+static int moe_engine_contract_has_global_tensor_suffix_any(
+    const moe_pc_engine* engine,
+    const char* const* suffixes,
+    size_t suffix_count
+) {
+    if (!engine || !suffixes || suffix_count == 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < suffix_count; ++i) {
+        if (moe_engine_contract_has_common_tensor_suffix_global(engine, suffixes[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_engine_contract_uses_split_ffn_norm(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine) {
+        return 0;
+    }
+    static const char* const split_norm_suffixes[] = {
+        "pre_ffw_norm_2.weight",
+        "post_ffw_norm_1.weight",
+        "post_ffw_norm_2.weight",
+        "post_ffw_norm.weight",
+        "ffn_norm_2.weight",
+        "mlp_norm_2.weight"
+    };
+    if (moe_engine_contract_has_layer_tensor_suffix_any(
+            engine, layer, split_norm_suffixes,
+            sizeof(split_norm_suffixes) / sizeof(split_norm_suffixes[0]))) {
+        return 1;
+    }
+    if (moe_engine_graph_ir_mentions(engine, "split_ffn_norm") ||
+        moe_engine_graph_ir_mentions(engine, "layers_with_post_ffw_norm_1") ||
+        moe_engine_graph_ir_mentions(engine, "layers_with_post_ffw_norm_2") ||
+        moe_engine_graph_ir_mentions(engine, "layers_with_expert_ffn_norm") ||
+        moe_engine_graph_ir_mentions(engine, "post_ffw_norm_1") ||
+        moe_engine_graph_ir_mentions(engine, "post_ffw_norm_2") ||
+        moe_engine_graph_ir_mentions(engine, "pre_ffw_norm_2")) {
+        return 1;
+    }
+    return 0;
+}
+
+static int moe_engine_contract_has_router_input_scale(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine) {
+        return 0;
+    }
+    static const char* const router_scale_suffixes[] = {
+        "ffn_gate_inp.scale",
+        "router.scale",
+        "mlp.router.scale",
+        "moe.router.scale"
+    };
+    if (moe_engine_contract_has_layer_tensor_suffix_any(
+            engine, layer, router_scale_suffixes,
+            sizeof(router_scale_suffixes) / sizeof(router_scale_suffixes[0]))) {
+        return 1;
+    }
+    return moe_engine_graph_ir_mentions(engine, "router_input_scale") ||
+        moe_engine_graph_ir_mentions(engine, "layers_with_router_scale") ||
+        moe_engine_graph_ir_mentions(engine, "ffn_gate_inp.scale") ||
+        moe_engine_graph_ir_mentions(engine, "router.scale");
+}
+
+static int moe_engine_contract_uses_direct_router_input_scale(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine) {
+        return 0;
+    }
+    if (layer >= 0 && moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale")) {
+        return 1;
+    }
+    if (moe_engine_contract_has_router_input_scale(engine, layer) &&
+        moe_engine_contract_uses_split_ffn_norm(engine, layer)) {
+        return 1;
+    }
+    return moe_engine_graph_ir_mentions(engine, "direct_router_input_scale") ||
+        moe_engine_graph_ir_mentions(engine, "router_scale_direct_weight") ||
+        moe_engine_graph_ir_mentions(engine, "router_input_rms_scale");
+}
+
+static int moe_engine_contract_uses_direct_per_expert_scale(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine) {
+        return 0;
+    }
+    static const char* const direct_suffixes[] = {
+        "per_expert_scale",
+        "moe.per_expert_scale",
+        "mlp.moe.per_expert_scale",
+        "experts.per_expert_scale",
+        "ffn_gate_inp.per_expert_scale",
+        "router.per_expert_scale",
+        "mlp.router.per_expert_scale",
+        "moe.gate.per_expert_scale"
+    };
+    if (moe_engine_contract_has_layer_tensor_suffix_any(
+            engine, layer, direct_suffixes,
+            sizeof(direct_suffixes) / sizeof(direct_suffixes[0]))) {
+        return 1;
+    }
+    return moe_engine_graph_ir_mentions(engine, "direct_per_expert_scale") ||
+        moe_engine_graph_ir_mentions(engine, "per_expert_scale");
+}
+
+static int moe_engine_contract_uses_unit_qk_norm_global(
+    const moe_pc_engine* engine
+) {
+    if (!engine) {
+        return 0;
+    }
+    if (moe_engine_graph_ir_mentions(engine, "unit_qk_norm") ||
+        moe_engine_graph_ir_mentions(engine, "qk_norm_unit_scale") ||
+        moe_engine_graph_ir_mentions(engine, "unit_attention_scale")) {
+        return 1;
+    }
+    static const char* const q_norm_suffixes[] = {"attn_q_norm.weight", "q_norm.weight"};
+    static const char* const k_norm_suffixes[] = {"attn_k_norm.weight", "k_norm.weight"};
+    static const char* const block_scale_suffixes[] = {
+        "post_attention_norm.weight",
+        "post_ffw_norm.weight",
+        "layer_output_scale.weight"
+    };
+    return moe_engine_contract_has_global_tensor_suffix_any(
+               engine, q_norm_suffixes, sizeof(q_norm_suffixes) / sizeof(q_norm_suffixes[0])) &&
+        moe_engine_contract_has_global_tensor_suffix_any(
+               engine, k_norm_suffixes, sizeof(k_norm_suffixes) / sizeof(k_norm_suffixes[0])) &&
+        moe_engine_contract_has_global_tensor_suffix_any(
+               engine, block_scale_suffixes, sizeof(block_scale_suffixes) / sizeof(block_scale_suffixes[0]));
+}
+
+static int moe_engine_contract_allows_missing_v_projection(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine) {
+        return 0;
+    }
+    if (moe_engine_graph_ir_mentions(engine, "v_equals_k") ||
+        moe_engine_graph_ir_mentions(engine, "k_equals_v") ||
+        moe_engine_graph_ir_mentions(engine, "shared_kv_projection") ||
+        moe_engine_graph_ir_mentions(engine, "attention_k_eq_v") ||
+        moe_engine_graph_ir_mentions(engine, "raw_k_projection_before_k_norm") ||
+        moe_engine_graph_ir_mentions(engine, "no_v_proj") ||
+        moe_engine_graph_ir_mentions(engine, "layers_with_no_v_proj") ||
+        moe_engine_graph_ir_mentions(engine, "no_value_projection")) {
+        return 1;
+    }
+    static const char* const q_suffixes[] = {"attn_q.weight", "q_proj.weight", "self_attn.q_proj.weight"};
+    static const char* const k_suffixes[] = {"attn_k.weight", "k_proj.weight", "self_attn.k_proj.weight"};
+    static const char* const v_suffixes[] = {"attn_v.weight", "v_proj.weight", "self_attn.v_proj.weight"};
+    static const char* const o_suffixes[] = {"attn_output.weight", "o_proj.weight", "self_attn.o_proj.weight"};
+    const int has_q = moe_engine_contract_has_layer_tensor_suffix_any(engine, layer, q_suffixes, sizeof(q_suffixes) / sizeof(q_suffixes[0]));
+    const int has_k = moe_engine_contract_has_layer_tensor_suffix_any(engine, layer, k_suffixes, sizeof(k_suffixes) / sizeof(k_suffixes[0]));
+    const int has_v = moe_engine_contract_has_layer_tensor_suffix_any(engine, layer, v_suffixes, sizeof(v_suffixes) / sizeof(v_suffixes[0]));
+    const int has_o = moe_engine_contract_has_layer_tensor_suffix_any(engine, layer, o_suffixes, sizeof(o_suffixes) / sizeof(o_suffixes[0]));
+    return has_q && has_k && has_o && !has_v;
 }

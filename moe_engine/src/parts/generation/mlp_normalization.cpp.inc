@@ -90,7 +90,7 @@ static int moe_layer_get_expert_down_uniform_scale_f32(
         "mlp.router.per_expert_scale",
         "moe.gate.per_expert_scale"
     };
-    static const char* const gemma4_suffixes[] = {
+    static const char* const direct_contract_suffixes[] = {
         "per_expert_scale",
         "moe.per_expert_scale",
         "mlp.moe.per_expert_scale",
@@ -100,9 +100,10 @@ static int moe_layer_get_expert_down_uniform_scale_f32(
         "mlp.router.per_expert_scale",
         "moe.gate.per_expert_scale"
     };
-    const char* const* scale_suffixes = moe_engine_is_gemma4_text_contract(engine) ? gemma4_suffixes : suffixes;
-    const size_t scale_suffix_count = moe_engine_is_gemma4_text_contract(engine) ?
-        (sizeof(gemma4_suffixes) / sizeof(gemma4_suffixes[0])) :
+    const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
+    const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
+    const size_t scale_suffix_count = direct_scale_contract ?
+        (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :
         (sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_cache_entry raw{};
     if (!moe_map_layer_common_tensor(engine, layer, scale_suffixes, scale_suffix_count, &raw)) {
@@ -163,7 +164,7 @@ static int moe_layer_apply_expert_down_scale_f32(
         "mlp.router.per_expert_scale",
         "moe.gate.per_expert_scale"
     };
-    static const char* const gemma4_suffixes[] = {
+    static const char* const direct_contract_suffixes[] = {
         "per_expert_scale",
         "moe.per_expert_scale",
         "mlp.moe.per_expert_scale",
@@ -173,9 +174,10 @@ static int moe_layer_apply_expert_down_scale_f32(
         "mlp.router.per_expert_scale",
         "moe.gate.per_expert_scale"
     };
-    const char* const* scale_suffixes = moe_engine_is_gemma4_text_contract(engine) ? gemma4_suffixes : suffixes;
-    const size_t scale_suffix_count = moe_engine_is_gemma4_text_contract(engine) ?
-        (sizeof(gemma4_suffixes) / sizeof(gemma4_suffixes[0])) :
+    const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
+    const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
+    const size_t scale_suffix_count = direct_scale_contract ?
+        (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :
         (sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_cache_entry raw{};
     if (!moe_map_layer_common_tensor(engine, layer, scale_suffixes, scale_suffix_count, &raw)) {
@@ -406,11 +408,12 @@ static int moe_layer_router_uses_raw_residual_input(
     if (!engine || layer < 0) {
         return 0;
     }
-    // Gemma4 MoE routes from the raw pre-MLP residual while experts consume
-    // pre_ffw_norm_2(hidden).  The router tensor is named ffn_gate_inp.weight
-    // in GGUF/JUJU artifacts.  Using the expert-normalized input for this
-    // tensor changes top-k selection and causes router drift after a few layers.
-    if (moe_engine_is_gemma4_text_contract(engine) &&
+    // Some split-FFN MoE graphs route from the raw pre-MLP residual while
+    // experts consume pre_ffw_norm_2(hidden).  The router tensor is commonly
+    // named ffn_gate_inp.weight in GGUF/JUJU artifacts.  Using the expert-
+    // normalized input for this tensor changes top-k selection and causes
+    // router drift after a few layers.
+    if (moe_engine_contract_uses_split_ffn_norm(engine, layer) &&
         moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.weight")) {
         return 1;
     }

@@ -574,10 +574,11 @@ static int moe_prepare_scaled_router_input_f32(
     if (!std::isfinite(ss)) {
         return 0;
     }
-    // Safe: hidden_size > 0 guaranteed by check above.  Gemma4 router input
-    // applies RMSNorm, then hidden_size^-0.5, then the learned router scale.
+    // Safe: hidden_size > 0 guaranteed by check above.  Contract-marked router
+    // input scale tensors apply RMSNorm, then hidden_size^-0.5, then the
+    // learned router scale.
     float norm = 1.0f / std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f);
-    if (moe_engine_is_gemma4_text_contract(engine)) {
+    if (moe_engine_contract_uses_direct_router_input_scale(engine, layer)) {
         const float root = 1.0f / std::sqrt((float)hidden_size);
         if (!std::isfinite(root) || !(root > 0.0f)) {
             return 0;
@@ -591,7 +592,7 @@ static int moe_prepare_scaled_router_input_f32(
             layer, (unsigned long long)scale_count, hidden_size);
         return 0;
     }
-    const int unit_offset = moe_engine_is_gemma4_text_contract(engine)
+    const int unit_offset = moe_engine_contract_uses_direct_router_input_scale(engine, layer)
         ? 0
         : moe_engine_rmsnorm_unit_offset(engine, scale_raw);
 
