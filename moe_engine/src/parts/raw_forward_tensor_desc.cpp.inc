@@ -277,11 +277,11 @@ static void moe_raw_tensor_kind_common_names(
                 "post_attention_layer_norm.weight",
                 "post_attn_norm.weight"
             };
-            // GraphIR-required GLM/Gemma-MoE artifacts carry separate ffn_norm,
+            // GraphIR-required artifacts can carry separate ffn_norm,
             // pre_ffw_norm and post_ffw_norm tensors.  Treating those aliases as
             // post-attention norms made the hand-coded forward bind an FFN norm
             // into the attention residual branch.  Keep this raw role exact; old
-            // naming aliases such as ln_2 must be handled by graph/model-specific
+            // naming aliases such as ln_2 must be handled by explicit graph-role
             // binding rather than a broad fallback.
             moe_push_layer_tensor_candidates(out, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
             break;

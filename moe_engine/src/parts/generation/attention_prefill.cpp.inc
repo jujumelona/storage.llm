@@ -1,4 +1,4 @@
-﻿static int moe_apply_rmsnorm_weight_entry_f32(
+static int moe_apply_rmsnorm_weight_entry_f32(
     const moe_pc_engine* engine,
     const moe_raw_tensor_cache_entry& raw,
     const float* input,
@@ -147,6 +147,36 @@ static size_t moe_json_find_next_array_for_key_local(
     return std::string::npos;
 }
 
+static int moe_json_slice_string_field_matches_any_ci(
+    const std::string& doc,
+    size_t obj_begin,
+    size_t obj_end,
+    const char* const* fields,
+    size_t field_count,
+    const char* const* values,
+    size_t value_count
+) {
+    if (doc.empty() || !fields || !values || obj_begin >= obj_end || obj_end > doc.size()) {
+        return 0;
+    }
+    for (size_t fi = 0; fi < field_count; ++fi) {
+        if (!fields[fi] || !fields[fi][0]) {
+            continue;
+        }
+        std::string field_value;
+        if (!moe_json_get_string_slice(doc, obj_begin, obj_end, fields[fi], &field_value) ||
+            field_value.empty()) {
+            continue;
+        }
+        for (size_t vi = 0; vi < value_count; ++vi) {
+            if (values[vi] && values[vi][0] && moe_ascii_contains_ci(field_value, values[vi])) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int moe_layer_contract_declares_unweighted_v_norm(
     const std::string& doc,
     const char* array_key,
@@ -155,6 +185,37 @@ static int moe_layer_contract_declares_unweighted_v_norm(
     if (doc.empty() || !array_key || layer < 0) {
         return 0;
     }
+    // This intentionally rejects summary/contract tables.  An unweighted V
+    // RMSNorm changes the actual value path, so it is allowed only from a
+    // layer-local executable op declaration.  Tensor-backed V norms are handled
+    // separately through moe_RAW_TENSOR_V_A_LAYER_NORM.
+    static const char* const executable_arrays[] = {
+        "ops",
+        "nodes",
+        "execution_ops",
+        "runtime_ops",
+        "layer_ops",
+        "graph_ops"
+    };
+    int executable_array = 0;
+    for (const char* key : executable_arrays) {
+        if (std::strcmp(array_key, key) == 0) {
+            executable_array = 1;
+            break;
+        }
+    }
+    if (!executable_array) {
+        return 0;
+    }
+    static const char* const role_fields[] = {
+        "op_role", "execution_op", "op_type", "type", "kind", "name"
+    };
+    static const char* const v_norm_roles[] = {
+        "v_norm",
+        "value_norm",
+        "attn_v_norm",
+        "attn_value_norm"
+    };
     size_t search_pos = 0;
     while (search_pos < doc.size()) {
         size_t arr_begin = 0;
@@ -177,11 +238,14 @@ static int moe_layer_contract_declares_unweighted_v_norm(
                 parsed_layer != (uint64_t)layer) {
                 continue;
             }
-            int declared = 0;
-            if (moe_json_get_bool_slice(
+            if (!moe_json_slice_string_field_matches_any_ci(
                     doc, obj_begin, obj_end,
-                    "unweighted_value_norm_is_contractual_when_declared", &declared) &&
-                declared) {
+                    role_fields, sizeof(role_fields) / sizeof(role_fields[0]),
+                    v_norm_roles, sizeof(v_norm_roles) / sizeof(v_norm_roles[0]))) {
+                continue;
+            }
+            int unweighted = 0;
+            if (moe_json_get_bool_slice(doc, obj_begin, obj_end, "unweighted", &unweighted) && unweighted) {
                 return 1;
             }
             std::string mode;
@@ -273,11 +337,12 @@ static int moe_layer_uses_unweighted_v_norm(
         "metadata",
     };
     const char* array_keys[] = {
-        "value_norm_contract_table",
-        "layer_execution_contract_table",
-        "attention_layer_contract_table",
-        "attention_layer_table",
-        "layers",
+        "ops",
+        "nodes",
+        "execution_ops",
+        "runtime_ops",
+        "layer_ops",
+        "graph_ops",
     };
     const char* matched_doc = "";
     const char* matched_array = "";
@@ -298,9 +363,9 @@ static int moe_layer_uses_unweighted_v_norm(
             break;
         }
     }
-    // Do not infer a layer-local V norm from graph-wide substring matches.
-    // Unweighted V norm is applied only when a per-layer contract declares it,
-    // regardless of whether the value source is v_projection or raw K.
+    // Do not infer a layer-local V norm from graph-wide substring matches or
+    // summary tables.  Unweighted V norm is applied only when a layer-local
+    // executable op declares it.
     if (result) {
         moe_profile_log(
             "attn_value_norm_contract",
@@ -368,6 +433,7 @@ static const char* moe_attention_scale_source_name(int source) {
     case 2: return "metadata_scale";
     case 3: return "query_pre_attn_scalar";
     case 4: return "unit_qk_norm";
+    case 5: return "attention_scale_contract";
     default: return "head_dim";
     }
 }
@@ -377,6 +443,7 @@ struct moe_attention_runtime_cache_t {
     size_t graph_size = 0;
     size_t metadata_size = 0;
     uint32_t query_pre_attn_scalar_bits = 0;
+    uint32_t attention_scale_bits = 0;
     int scale_source = -1;
     uint32_t scale_bits = 0;
     int softcap_state = -1;
@@ -392,15 +459,20 @@ static void moe_attention_runtime_cache_prepare_locked(const moe_pc_engine* engi
     const uint32_t query_bits = engine
         ? moe_attention_float_to_bits(engine->model_config_query_pre_attn_scalar)
         : 0;
+    const uint32_t attention_scale_bits = engine
+        ? moe_attention_float_to_bits(engine->model_config_attention_scale)
+        : 0;
     if (g_moe_attention_runtime_cache.engine != engine ||
         g_moe_attention_runtime_cache.graph_size != graph_size ||
         g_moe_attention_runtime_cache.metadata_size != metadata_size ||
-        g_moe_attention_runtime_cache.query_pre_attn_scalar_bits != query_bits) {
+        g_moe_attention_runtime_cache.query_pre_attn_scalar_bits != query_bits ||
+        g_moe_attention_runtime_cache.attention_scale_bits != attention_scale_bits) {
         g_moe_attention_runtime_cache = moe_attention_runtime_cache_t{};
         g_moe_attention_runtime_cache.engine = engine;
         g_moe_attention_runtime_cache.graph_size = graph_size;
         g_moe_attention_runtime_cache.metadata_size = metadata_size;
         g_moe_attention_runtime_cache.query_pre_attn_scalar_bits = query_bits;
+        g_moe_attention_runtime_cache.attention_scale_bits = attention_scale_bits;
     }
 }
 
@@ -494,21 +566,12 @@ static float moe_standard_attention_score_scale(
         } else {
             int resolved_source = 0;
             float resolved_value = 0.0f;
-            if (moe_layer_uses_unit_qk_norm_contract(engine, layer)) {
-                // Unit-QK-Norm attention uses Q/K RMSNorm with unit attention
-                // scaling.  query_pre_attn_scalar may still be present in
-                // JUJU metadata, but applying 1/sqrt(qpre) double-scales the
-                // normalized Q/K path and diverges from the declared runtime contract.
-                resolved_source = 4;
-                resolved_value = 1.0f;
-            }
-            float query_pre_attn_scalar = engine->model_config_query_pre_attn_scalar;
-            if (resolved_source == 0 && query_pre_attn_scalar > 0.0f && std::isfinite(query_pre_attn_scalar)) {
-                const float result = 1.0f / std::sqrt(query_pre_attn_scalar);
-                if (std::isfinite(result) && result > 0.0f) {
-                    resolved_source = 3;
-                    resolved_value = result;
-                }
+            const float config_attention_scale = engine->model_config_attention_scale;
+            if (config_attention_scale > 0.0f &&
+                config_attention_scale <= 1024.0f &&
+                std::isfinite(config_attention_scale)) {
+                resolved_source = 5;
+                resolved_value = config_attention_scale;
             }
             if (resolved_source == 0 && !engine->offload_graph_ir_json.empty()) {
                 double direct_scale = 0.0;
@@ -534,6 +597,7 @@ static float moe_standard_attention_score_scale(
                     resolved_value = (float)direct_scale;
                 }
             }
+            float query_pre_attn_scalar = engine->model_config_query_pre_attn_scalar;
             if (resolved_source == 0 && !(query_pre_attn_scalar > 0.0f) && !engine->offload_graph_ir_json.empty()) {
                 double value = 0.0;
                 if (moe_json_get_double_local(engine->offload_graph_ir_json, "query_pre_attn_scalar", &value) ||
@@ -556,10 +620,17 @@ static float moe_standard_attention_score_scale(
             }
             if (resolved_source == 0 && query_pre_attn_scalar > 0.0f && std::isfinite(query_pre_attn_scalar)) {
                 const float result = 1.0f / std::sqrt(query_pre_attn_scalar);
-                if (std::isfinite(result)) {
+                if (std::isfinite(result) && result > 0.0f) {
                     resolved_source = 3;
                     resolved_value = result;
                 }
+            }
+            if (resolved_source == 0 && moe_layer_uses_unit_qk_norm_contract(engine, layer)) {
+                // Unit-QK-Norm is a fallback only when no numeric attention
+                // contract is available.  Numeric query_pre_attn_scalar,
+                // attention_scale, and qk_scale contracts are authoritative.
+                resolved_source = 4;
+                resolved_value = 1.0f;
             }
             if (resolved_source > 0) {
                 moe_attention_store_global_scale(engine, resolved_source, resolved_value);
@@ -600,6 +671,7 @@ static int moe_attention_score_scale_source_is_explicit(
         (std::strcmp(source, "graph_ir_scale") == 0 ||
          std::strcmp(source, "metadata_scale") == 0 ||
          std::strcmp(source, "query_pre_attn_scalar") == 0 ||
+         std::strcmp(source, "attention_scale_contract") == 0 ||
          std::strcmp(source, "unit_qk_norm") == 0);
 }
 

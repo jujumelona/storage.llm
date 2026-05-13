@@ -191,7 +191,8 @@ def test_exact_ppl_eval_is_fail_closed_on_runtime_contract_and_fallbacks():
     assert "JUJU exact_ppl_mode required_features contract is not loaded" in eval_text
     assert "JUJU attention scale contract is not loaded" in eval_text
     assert "JUJU attention scale does not match runtime attention contract" in eval_text
-    assert "moe_engine_contract_uses_unit_qk_norm_global(engine)" in eval_text
+    assert "Numeric attention-scale contracts are authoritative" in eval_text
+    assert "moe_engine_contract_uses_unit_qk_norm_global(engine)" not in eval_text
     assert "JUJU storage format plan is not available for exact PPL" in eval_text
     assert "JUJU expert index is not ready for exact PPL" in eval_text
     assert "selected-expert linear fallback was used" in eval_text
@@ -534,7 +535,8 @@ def test_post_attention_norm_no_longer_falls_back_to_ffn_norm_aliases():
     assert '"ffn_norm.weight"' not in suffix_block
     assert '"mlp_norm.weight"' not in suffix_block
     assert '"pre_ffw_norm.weight"' not in suffix_block
-    assert "GraphIR-required GLM/Gemma-MoE artifacts" in suffix_block
+    assert "GraphIR-required artifacts" in suffix_block
+    assert "GLM/Gemma" not in suffix_block
     role_block = desc_text[desc_text.index("case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM:"):desc_text.index("case moe_RAW_TENSOR_Q_A_LAYER_NORM:", desc_text.index("case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM:"))]
     assert 'out->push_back("ffn_norm")' not in role_block
 
@@ -558,17 +560,46 @@ def test_shared_expert_suffixes_are_preferred_before_generic_dense_ffn_aliases()
     assert '"ffn_gate.weight"' in generic_block
 
 
-def test_attention_uses_unit_qk_norm_contract_scale_in_engine():
+def test_attention_uses_numeric_scale_before_unit_qk_norm_fallback():
     attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_prefill.cpp.inc").read_text()
     helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
     assert "moe_engine_contract_uses_unit_qk_norm_global" in helper_text
     assert "moe_engine_is_gemma4_text_contract" not in helper_text
-    assert "unit_qk_norm" in attn_text
-    assert "resolved_source = 4" in attn_text
-    assert "resolved_value = 1.0f" in attn_text
-    contract_pos = attn_text.index("moe_layer_uses_unit_qk_norm_contract(engine, layer)")
-    qpre_pos = attn_text.index("query_pre_attn_scalar > 0.0f", contract_pos)
-    assert contract_pos < qpre_pos
+    assert "attention_scale_contract" in attn_text
+    assert "const float config_attention_scale = engine->model_config_attention_scale" in attn_text
+    assert "Numeric query_pre_attn_scalar" in attn_text
+    scale_pos = attn_text.index("const float config_attention_scale = engine->model_config_attention_scale")
+    qpre_pos = attn_text.index("query_pre_attn_scalar > 0.0f", scale_pos)
+    unit_pos = attn_text.index("moe_layer_uses_unit_qk_norm_contract(engine, layer)", qpre_pos)
+    assert scale_pos < qpre_pos < unit_pos
+    unit_block = attn_text[unit_pos:attn_text.index("if (resolved_source > 0)", unit_pos)]
+    assert "resolved_source = 4" in unit_block
+    assert "resolved_value = 1.0f" in unit_block
+
+
+def test_unweighted_v_norm_requires_layer_local_executable_op():
+    attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_prefill.cpp.inc").read_text()
+    block = attn_text[
+        attn_text.index("static int moe_layer_uses_unweighted_v_norm"):
+        attn_text.index("static int moe_layer_has_qk_norm_scaled_standard_layout")
+    ]
+    assert "value_norm_contract_table" not in block
+    assert "layer_execution_contract_table" not in block
+    assert '"ops"' in block
+    assert '"execution_ops"' in block
+    assert '"runtime_ops"' in block
+    assert "summary tables" in block
+    assert "executable op declares it" in block
+
+
+def test_final_logit_softcap_requires_executable_graphir_op_in_graph_required_mode():
+    ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_ops.cpp.inc").read_text()
+    assert "moe_graph_ir_declares_final_logit_softcap_execution" in ops_text
+    assert "offload_graph_ir_required" in ops_text
+    assert "final_logit_softcap_ignored" in ops_text
+    assert "reason=no_executable_graphir_op" in ops_text
+    assert '"final_logit_softcap"' in ops_text
+    assert '"logit_softcap"' in ops_text
 
 
 
