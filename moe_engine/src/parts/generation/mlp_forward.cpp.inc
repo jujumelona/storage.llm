@@ -344,14 +344,7 @@ static int moe_layer_moe_mlp_f32(
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale"));
     const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
-    if (router_uses_raw_residual_contract && !router_has_plausible_input_scale) {
-        std::fprintf(stderr,
-            "[storagellm mlp] router scale tensor is required but could not be mapped layer=%d\n",
-            layer);
-        return 0;
-    }
-    const int router_uses_raw_residual =
-        router_uses_raw_residual_contract && router_has_plausible_input_scale;
+    const int router_uses_raw_residual = router_uses_raw_residual_contract;
     const float* router_input = (router_has_internal_norm_scale || router_uses_raw_residual) ?
         hidden : expert_input;
     moe_save_gate_input_snapshot(engine, layer, router_input, hidden_size);
@@ -400,10 +393,10 @@ static int moe_layer_moe_mlp_f32(
 
     moe_profile_log(
         "mlp_moe_router",
-        "layer=%d selected=%zu weights=%zu logits=%zu internal_norm_scale=%d raw_gate_input=%d ms=%.3f",
+        "layer=%d selected=%zu weights=%zu logits=%zu internal_norm_scale=%d raw_gate_input=%d router_scale_available=%d ms=%.3f",
         layer, s->selected_experts.size(), s->selected_weights.size(),
         s->router_logits.size(), router_has_internal_norm_scale, router_uses_raw_residual,
-        moe_profile_elapsed_ms(router_start_us));
+        router_has_plausible_input_scale, moe_profile_elapsed_ms(router_start_us));
     const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
     const uint64_t prefetch_start_us = moe_profile_now_us();
     if (phase != moe_GEN_PHASE_PREFILL) {
@@ -2266,14 +2259,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale"));
     const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
-    if (router_uses_raw_residual_contract && !router_has_plausible_input_scale) {
-        std::fprintf(stderr,
-            "[storagellm mlp] batch router scale tensor is required but could not be mapped layer=%d\n",
-            layer);
-        return 0;
-    }
-    const int router_uses_raw_residual =
-        router_uses_raw_residual_contract && router_has_plausible_input_scale;
+    const int router_uses_raw_residual = router_uses_raw_residual_contract;
     const uint32_t top_k = moe_router_top_k_from_metadata(
         engine, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer);
     // PPL/order correctness is not a user-facing mode. It is an engine invariant:

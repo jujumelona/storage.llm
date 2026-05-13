@@ -474,20 +474,33 @@ static int moe_engine_contract_has_router_input_scale(
         return 0;
     }
     static const char* const router_scale_suffixes[] = {
-        "ffn_gate_inp.scale",
         "router.scale",
         "mlp.router.scale",
-        "moe.router.scale"
+        "moe.gate.scale",
+        "router_norm.weight",
+        "router.input_layernorm.weight",
+        "router.input_norm.weight",
+        "moe_router_norm.weight",
+        "moe.gate_norm.weight",
+        "mlp.router_norm.weight"
     };
     if (moe_engine_contract_has_layer_tensor_suffix_any(
             engine, layer, router_scale_suffixes,
             sizeof(router_scale_suffixes) / sizeof(router_scale_suffixes[0]))) {
         return 1;
     }
+    // Do not use layers_with_router_scale or ffn_gate_inp.scale as activation-scale
+    // contracts: older/generated JUJU indexes can count MXFP router-weight sidecars
+    // under those names. Only explicit activation/RMSNorm-scale names may select
+    // router preprocessing.
     return moe_engine_graph_ir_mentions(engine, "router_input_scale") ||
-        moe_engine_graph_ir_mentions(engine, "layers_with_router_scale") ||
-        moe_engine_graph_ir_mentions(engine, "ffn_gate_inp.scale") ||
-        moe_engine_graph_ir_mentions(engine, "router.scale");
+        moe_engine_graph_ir_mentions(engine, "router_input_norm") ||
+        moe_engine_graph_ir_mentions(engine, "router.scale") ||
+        moe_engine_graph_ir_mentions(engine, "mlp.router.scale") ||
+        moe_engine_graph_ir_mentions(engine, "moe.gate.scale") ||
+        moe_engine_graph_ir_mentions(engine, "router_norm.weight") ||
+        moe_engine_graph_ir_mentions(engine, "router.input_layernorm.weight") ||
+        moe_engine_graph_ir_mentions(engine, "router.input_norm.weight");
 }
 
 static int moe_engine_contract_uses_direct_router_input_scale(
@@ -496,9 +509,6 @@ static int moe_engine_contract_uses_direct_router_input_scale(
 ) {
     if (!engine) {
         return 0;
-    }
-    if (layer >= 0 && moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale")) {
-        return 1;
     }
     if (moe_engine_contract_has_router_input_scale(engine, layer) &&
         moe_engine_contract_uses_split_ffn_norm(engine, layer)) {

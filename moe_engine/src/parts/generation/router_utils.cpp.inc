@@ -391,6 +391,8 @@ static int moe_router_scale_tensor_is_quant_sidecar_name_f32(const std::string& 
     // These suffixes are weight-quantization sidecars.  They can have the same
     // length as hidden_size but are not activation/RMSNorm parameters.
     static const char* const sidecar_suffixes[] = {
+        "ffn_gate_inp.scale",
+        "ffn_gate_inp.scales",
         "ffn_gate_inp.weight.scale",
         "ffn_gate_inp.weight.scales"
     };
@@ -462,7 +464,6 @@ static int moe_map_router_scale_tensor(
         "moe_router_norm.weight",
         "moe.gate_norm.weight",
         "mlp.router_norm.weight",
-        "ffn_gate_inp.scale",
         "mlp.router.scale",
         "router.scale",
         "moe.gate.scale"
