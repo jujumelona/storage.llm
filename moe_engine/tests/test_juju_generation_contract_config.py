@@ -420,15 +420,23 @@ def test_qkv_single_token_attention_uses_paper_quantized_decode_path():
     assert append_pos < fill_pos < qkv_decode_pos
 
 
-def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
+def test_rmsnorm_unit_offset_uses_contract_with_conservative_tensor_stats_fallback():
     raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_ops.cpp.inc").read_text()
-    assert "unit-offset RMSNorm is architecture/config math" in raw_ops_text
-    assert "Use only explicit metadata/GraphIR" in raw_ops_text
-    assert "weight_stats_override_metadata_false" not in raw_ops_text
-    assert "metadata_false_stats_inconclusive" not in raw_ops_text
-    assert "mean_abs_raw < 0.75" not in raw_ops_text
-    assert "raw_rms < 0.75" not in raw_ops_text
+    assert "moe_rmsnorm_tensor_stats_unit_offset_hint" in raw_ops_text
+    assert "model-name branch" in raw_ops_text
+    assert "direct_rmsnorm_contract" in raw_ops_text
+    assert "unit_offset_contract" in raw_ops_text
+    assert "metadata_false_tensor_stats_unit_offset" in raw_ops_text
+    assert "tensor_stats_direct_weight" in raw_ops_text
+    assert "stats_mean_abs" in raw_ops_text
     assert "moe_rmsnorm_weight_implausible_sidecar_f32" not in raw_ops_text
+    assert "moe_engine_is_gemma4_text_contract" not in raw_ops_text
+    assert "gemma4" not in raw_ops_text.lower()
+    direct_pos = raw_ops_text.index("if (direct_contract)")
+    unit_pos = raw_ops_text.index("else if (unit_contract)", direct_pos)
+    stats_pos = raw_ops_text.index("else if (stats_found && stats_value > 0)", unit_pos)
+    false_pos = raw_ops_text.index("else if (metadata_found)", stats_pos)
+    assert direct_pos < unit_pos < stats_pos < false_pos
     assert "moe_rmsnorm_unit_offset_from_json(engine->offload_gguf_metadata_json" in raw_ops_text
     assert "moe_rmsnorm_unit_offset_from_json(engine->offload_graph_ir_json" in raw_ops_text
     assert "moe_engine_contract_uses_rmsnorm_unit_offset(engine)" in raw_ops_text
