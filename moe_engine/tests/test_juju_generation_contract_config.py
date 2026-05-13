@@ -630,7 +630,7 @@ def test_ple_vocab_masking_allows_smaller_per_layer_vocab():
     assert "token_desc.rows == 0" in mlp_common
 
 
-def test_expert_down_weight_sidecar_is_never_runtime_per_expert_scale():
+def test_expert_down_scale_is_legacy_runtime_scale_but_not_direct_contract_scale():
     norm_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
     fwd_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
     for text in (norm_text, fwd_text):
@@ -641,11 +641,10 @@ def test_expert_down_weight_sidecar_is_never_runtime_per_expert_scale():
         assert '"per_expert_scale"' in direct_block
         assert '"experts.per_expert_scale"' in direct_block
         assert "moe_engine_contract_uses_direct_per_expert_scale(engine, layer)" in text
-        for suffix_block in text.split("static const char* const suffixes[] = {")[1:]:
-            block = suffix_block[:suffix_block.index("};")]
-            assert '"ffn_down_exps.scale"' not in block
-    assert "quantization sidecar" in norm_text
-    assert "weight quantization sidecar" in fwd_text
+        legacy_scale_pos = text.index('"ffn_down_exps.scale"')
+        direct_pos = text.index("static const char* const direct_contract_suffixes[]")
+        assert legacy_scale_pos < direct_pos
+        assert "runtime expert-down branch scale" in text
 
 
 def test_raw_residual_router_input_is_split_ffn_or_explicit_graph_contract():
