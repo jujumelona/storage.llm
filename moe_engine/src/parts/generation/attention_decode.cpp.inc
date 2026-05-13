@@ -65,7 +65,11 @@
         moe_engine_graph_ir_mentions(engine, "k_equals_v") ||
         moe_engine_graph_ir_mentions(engine, "shared_kv_projection") ||
         moe_engine_graph_ir_mentions(engine, "attention_k_eq_v") ||
-        moe_engine_graph_ir_mentions(engine, "raw_k_projection_before_k_norm");
+        moe_engine_graph_ir_mentions(engine, "raw_k_projection_before_k_norm") ||
+        moe_engine_graph_ir_mentions(engine, "no_v_proj") ||
+        moe_engine_graph_ir_mentions(engine, "layers_with_no_v_proj") ||
+        moe_engine_graph_ir_mentions(engine, "no_value_projection") ||
+        (moe_engine_is_gemma4_text_contract(engine) && !has_v);
 
     if (qkv_parallel_path) {
         // BUGFIX 216: Add scratch buffer size validation before parallel Q/K/V

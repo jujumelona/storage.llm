@@ -352,7 +352,7 @@ static const char* moe_attention_scale_source_name(int source) {
     case 1: return "graph_ir_scale";
     case 2: return "metadata_scale";
     case 3: return "query_pre_attn_scalar";
-    case 4: return "qk_norm_head_dim_fallback";
+    case 4: return "gemma4_unit_qk_norm";
     default: return "head_dim";
     }
 }
@@ -479,8 +479,17 @@ static float moe_standard_attention_score_scale(
         } else {
             int resolved_source = 0;
             float resolved_value = 0.0f;
+            if (moe_engine_is_gemma4_text_contract(engine) &&
+                moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
+                // Gemma4 text attention uses Q/K RMSNorm with unit attention
+                // scaling.  query_pre_attn_scalar may still be present in
+                // JUJU metadata, but applying 1/sqrt(qpre) double-scales the
+                // normalized Q/K path and diverges from HF/vLLM.
+                resolved_source = 4;
+                resolved_value = 1.0f;
+            }
             float query_pre_attn_scalar = engine->model_config_query_pre_attn_scalar;
-            if (query_pre_attn_scalar > 0.0f && std::isfinite(query_pre_attn_scalar)) {
+            if (resolved_source == 0 && query_pre_attn_scalar > 0.0f && std::isfinite(query_pre_attn_scalar)) {
                 const float result = 1.0f / std::sqrt(query_pre_attn_scalar);
                 if (std::isfinite(result) && result > 0.0f) {
                     resolved_source = 3;
@@ -558,9 +567,12 @@ static float moe_standard_attention_score_scale(
         return 1.0f;
     }
     if (moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
-        // Q/K RMSNorm does not remove dot-product attention scaling.
-        // Explicit metadata/query_pre_attn_scalar above wins; otherwise the
-        // only safe generic fallback is 1/sqrt(head_dim), never unit scale.
+        if (moe_engine_is_gemma4_text_contract(engine)) {
+            if (source_out) {
+                *source_out = "gemma4_unit_qk_norm";
+            }
+            return 1.0f;
+        }
         if (source_out) {
             *source_out = "qk_norm_head_dim_fallback";
         }
@@ -575,7 +587,8 @@ static int moe_attention_score_scale_source_is_explicit(
     return source &&
         (std::strcmp(source, "graph_ir_scale") == 0 ||
          std::strcmp(source, "metadata_scale") == 0 ||
-         std::strcmp(source, "query_pre_attn_scalar") == 0);
+         std::strcmp(source, "query_pre_attn_scalar") == 0 ||
+         std::strcmp(source, "gemma4_unit_qk_norm") == 0);
 }
 
 static int moe_attention_score_scale_violates_qk_norm_contract(

@@ -20,11 +20,15 @@ static int moe_eval_exact_ppl_contract_ready(
         moe_eval_set_error(out_stats, "JUJU attention scale contract is not loaded");
         return 0;
     }
-    const double expected = 1.0 / std::sqrt((double)engine->model_config_query_pre_attn_scalar);
-    const double actual = (double)engine->model_config_attention_scale;
+    const double expected = moe_engine_is_gemma4_text_contract(engine)
+        ? 1.0
+        : 1.0 / std::sqrt((double)engine->model_config_query_pre_attn_scalar);
+    const double actual = moe_engine_is_gemma4_text_contract(engine)
+        ? 1.0
+        : (double)engine->model_config_attention_scale;
     const double tol = std::max(1.0e-8, std::fabs(expected) * 1.0e-5);
     if (!std::isfinite(expected) || std::fabs(actual - expected) > tol) {
-        moe_eval_set_error(out_stats, "JUJU attention scale does not match query_pre_attn_scalar");
+        moe_eval_set_error(out_stats, "JUJU attention scale does not match runtime attention contract");
         return 0;
     }
     if (engine->storage_format_plan_available.load(std::memory_order_acquire) != 1) {

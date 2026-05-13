@@ -90,8 +90,22 @@ static int moe_layer_get_expert_down_uniform_scale_f32(
         "mlp.router.per_expert_scale",
         "moe.gate.per_expert_scale"
     };
+    static const char* const gemma4_suffixes[] = {
+        "per_expert_scale",
+        "moe.per_expert_scale",
+        "mlp.moe.per_expert_scale",
+        "experts.per_expert_scale",
+        "ffn_gate_inp.per_expert_scale",
+        "router.per_expert_scale",
+        "mlp.router.per_expert_scale",
+        "moe.gate.per_expert_scale"
+    };
+    const char* const* scale_suffixes = moe_engine_is_gemma4_text_contract(engine) ? gemma4_suffixes : suffixes;
+    const size_t scale_suffix_count = moe_engine_is_gemma4_text_contract(engine) ?
+        (sizeof(gemma4_suffixes) / sizeof(gemma4_suffixes[0])) :
+        (sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_cache_entry raw{};
-    if (!moe_map_layer_common_tensor(engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]), &raw)) {
+    if (!moe_map_layer_common_tensor(engine, layer, scale_suffixes, scale_suffix_count, &raw)) {
         *out_scale = 1.0f;
         return 1;
     }
@@ -149,8 +163,22 @@ static int moe_layer_apply_expert_down_scale_f32(
         "mlp.router.per_expert_scale",
         "moe.gate.per_expert_scale"
     };
+    static const char* const gemma4_suffixes[] = {
+        "per_expert_scale",
+        "moe.per_expert_scale",
+        "mlp.moe.per_expert_scale",
+        "experts.per_expert_scale",
+        "ffn_gate_inp.per_expert_scale",
+        "router.per_expert_scale",
+        "mlp.router.per_expert_scale",
+        "moe.gate.per_expert_scale"
+    };
+    const char* const* scale_suffixes = moe_engine_is_gemma4_text_contract(engine) ? gemma4_suffixes : suffixes;
+    const size_t scale_suffix_count = moe_engine_is_gemma4_text_contract(engine) ?
+        (sizeof(gemma4_suffixes) / sizeof(gemma4_suffixes[0])) :
+        (sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_cache_entry raw{};
-    if (!moe_map_layer_common_tensor(engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]), &raw)) {
+    if (!moe_map_layer_common_tensor(engine, layer, scale_suffixes, scale_suffix_count, &raw)) {
         return 1;
     }
     const uint64_t count = moe_raw_tensor_scalar_count(raw);
@@ -382,7 +410,8 @@ static int moe_layer_router_uses_raw_residual_input(
     // pre_ffw_norm_2(hidden).  The router tensor is named ffn_gate_inp.weight
     // in GGUF/JUJU artifacts.  Using the expert-normalized input for this
     // tensor changes top-k selection and causes router drift after a few layers.
-    if (moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.weight")) {
+    if (moe_engine_is_gemma4_text_contract(engine) &&
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.weight")) {
         return 1;
     }
     if (moe_graph_ir_math_required(engine)) {

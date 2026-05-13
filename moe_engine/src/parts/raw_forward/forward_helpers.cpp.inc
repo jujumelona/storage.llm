@@ -359,3 +359,48 @@ static int moe_engine_metadata_mentions(const moe_pc_engine* engine, const char*
     }
     return result;
 }
+
+static int moe_engine_is_gemma4_text_contract(const moe_pc_engine* engine) {
+    if (!engine) {
+        return 0;
+    }
+    const std::string arch = moe_lower_ascii_copy(engine->dynamic_architecture);
+    if (arch.find("gemma4") != std::string::npos ||
+        arch.find("gemma_4") != std::string::npos ||
+        arch.find("gemma-4") != std::string::npos) {
+        return 1;
+    }
+    if (moe_engine_metadata_mentions(engine, "gemma4") ||
+        moe_engine_metadata_mentions(engine, "gemma-4") ||
+        moe_engine_metadata_mentions(engine, "gemma_4") ||
+        moe_engine_graph_ir_mentions(engine, "gemma4") ||
+        moe_engine_graph_ir_mentions(engine, "gemma-4") ||
+        moe_engine_graph_ir_mentions(engine, "gemma_4")) {
+        return 1;
+    }
+    int saw_router_scale = 0;
+    int saw_split_ffn = 0;
+    int saw_moe_router = 0;
+    for (const auto& it : engine->gguf_common_tensor_slots) {
+        const std::string& key = it.first;
+        if (key.find("ffn_gate_inp.scale") != std::string::npos ||
+            key.find("router.scale") != std::string::npos ||
+            key.find("mlp.router.scale") != std::string::npos) {
+            saw_router_scale = 1;
+        }
+        if (key.find("post_ffw_norm_1.weight") != std::string::npos ||
+            key.find("post_ffw_norm_2.weight") != std::string::npos ||
+            key.find("pre_ffw_norm_2.weight") != std::string::npos) {
+            saw_split_ffn = 1;
+        }
+        if (key.find("ffn_gate_inp.weight") != std::string::npos ||
+            key.find("moe.experts") != std::string::npos ||
+            key.find("ffn_gate_exps") != std::string::npos) {
+            saw_moe_router = 1;
+        }
+        if (saw_router_scale && saw_split_ffn && saw_moe_router) {
+            return 1;
+        }
+    }
+    return 0;
+}

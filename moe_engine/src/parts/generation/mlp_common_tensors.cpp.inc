@@ -184,6 +184,7 @@ struct moe_ple_binding_t {
     moe_raw_tensor_cache_entry projection_norm{};
     uint32_t total_dim = 0;
     uint32_t layer_dim = 0;
+    uint32_t token_vocab_size = 0;
     int has_token_embedding = 0;
 };
 
@@ -319,7 +320,7 @@ static int moe_map_ple_binding(
         token_names, sizeof(token_names) / sizeof(token_names[0]),
         &token_embedding, &token_desc);
     if (has_token &&
-        (token_desc.cols != total_dim || token_desc.rows < c->vocab_size)) {
+        (token_desc.cols != total_dim || token_desc.rows == 0)) {
         moe_profile_log(
             "ple_token_embedding_rejected",
             "rows=%u cols=%u vocab=%u total_dim=%u",
@@ -332,6 +333,7 @@ static int moe_map_ple_binding(
     out->projection_norm = projection_norm;
     out->total_dim = total_dim;
     out->layer_dim = layer_dim;
+    out->token_vocab_size = has_token ? token_desc.rows : 0;
     out->has_token_embedding = has_token ? 1 : 0;
     return 1;
 }
@@ -363,9 +365,13 @@ static int moe_prepare_ple_inputs_f32(
     }
 
     if (ple.has_token_embedding) {
-        if (!moe_raw_tensor_copy_row_f32(
-                ple.token_embedding, token_id, s->ple_inputs.data(), ple.total_dim)) {
-            return 0;
+        if (token_id < ple.token_vocab_size) {
+            if (!moe_raw_tensor_copy_row_f32(
+                    ple.token_embedding, token_id, s->ple_inputs.data(), ple.total_dim)) {
+                return 0;
+            }
+        } else {
+            std::fill(s->ple_inputs.begin(), s->ple_inputs.end(), 0.0f);
         }
         const float token_scale = std::sqrt((float)ple.layer_dim);
         if (std::isfinite(token_scale) && token_scale != 1.0f) {
@@ -403,8 +409,8 @@ static int moe_prepare_ple_inputs_f32(
     if (logged.fetch_add(1, std::memory_order_relaxed) == 0) {
         moe_profile_log(
             "ple_prepare",
-            "total_dim=%u layer_dim=%u layers=%u token_embedding=%d projection_scale=%.9g",
-            ple.total_dim, ple.layer_dim, c->num_hidden_layers, ple.has_token_embedding,
+            "total_dim=%u layer_dim=%u layers=%u token_embedding=%d token_vocab=%u projection_scale=%.9g",
+            ple.total_dim, ple.layer_dim, c->num_hidden_layers, ple.has_token_embedding, ple.token_vocab_size,
             (double)projection_scale);
     }
     return 1;
@@ -417,10 +423,8 @@ static int moe_layer_has_ple_tensors(
     return
         (moe_engine_has_common_tensor_suffix(engine, layer, "inp_gate.weight") ||
          moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_input_gate.weight")) &&
-        (moe_engine_has_common_tensor_suffix(engine, layer, "proj.weight") ||
-         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_projection.weight")) &&
-        (moe_engine_has_common_tensor_suffix(engine, layer, "post_norm.weight") ||
-         moe_engine_has_common_tensor_suffix(engine, layer, "post_per_layer_input_norm.weight"));
+        moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_projection.weight") &&
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_per_layer_input_norm.weight");
 }
 
 static int moe_layer_apply_ple_f32(
@@ -448,11 +452,9 @@ static int moe_layer_apply_ple_f32(
         "per_layer_input_gate.weight"
     };
     static const char* const proj_suffixes[] = {
-        "proj.weight",
         "per_layer_projection.weight"
     };
     static const char* const norm_suffixes[] = {
-        "post_norm.weight",
         "post_per_layer_input_norm.weight"
     };
     moe_raw_tensor_cache_entry gate_raw{};

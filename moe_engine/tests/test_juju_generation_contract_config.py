@@ -184,7 +184,8 @@ def test_exact_ppl_eval_is_fail_closed_on_runtime_contract_and_fallbacks():
     assert "moe_eval_exact_ppl_contract_ready" in eval_text
     assert "JUJU exact_ppl_mode required_features contract is not loaded" in eval_text
     assert "JUJU attention scale contract is not loaded" in eval_text
-    assert "JUJU attention scale does not match query_pre_attn_scalar" in eval_text
+    assert "JUJU attention scale does not match runtime attention contract" in eval_text
+    assert "moe_engine_is_gemma4_text_contract(engine)" in eval_text
     assert "JUJU storage format plan is not available for exact PPL" in eval_text
     assert "JUJU expert index is not ready for exact PPL" in eval_text
     assert "selected-expert linear fallback was used" in eval_text
@@ -462,25 +463,29 @@ def test_router_routed_scaling_factor_does_not_parse_tensor_role_scale_names():
     assert "norm_topk=1 produce weights greater than 1.0" in scale_block
 
 
-def test_router_scale_tensor_uses_rmsnorm_unit_offset_semantics():
+def test_router_scale_tensor_uses_contract_specific_unit_offset_semantics():
     router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
-    assert "const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, scale_raw);" in router_text
+    assert "moe_engine_is_gemma4_text_contract(engine)" in router_text
+    assert "? 0" in router_text
+    assert ": moe_engine_rmsnorm_unit_offset(engine, scale_raw)" in router_text
     assert "const float effective_scale = unit_offset ? (1.0f + scale) : scale;" in router_text
     assert "router_scale_apply" in router_text
     assert "this tensor is a router input RMSNorm/scale weight" in router_text
 
 
-def test_router_scale_does_not_treat_mxfp_sidecar_as_activation_norm():
+def test_router_scale_accepts_gemma4_ffn_gate_inp_scale_but_rejects_weight_sidecars():
     router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
     suffix_block = router_text[router_text.index("static int moe_map_router_scale_tensor"):router_text.index("static int moe_prepare_scaled_router_input_f32")]
-    assert '"ffn_gate_inp.scale"' not in suffix_block
+    reject_block = router_text[router_text.index("static int moe_router_scale_tensor_is_quant_sidecar_name_f32"):router_text.index("static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role_f32")]
+    assert '"ffn_gate_inp.scale"' in suffix_block
+    assert '"ffn_gate_inp.weight.scale"' in reject_block
+    assert '"ffn_gate_inp.weight.scales"' in reject_block
     assert "Weight-quantization sidecars are rejected by name before mapping" in suffix_block
     assert "router_scale_contract_reject" in router_text
     assert "reason=quant_sidecar_suffix" in router_text
     reject_pos = router_text.index("router_scale_contract_reject")
-    return_pos = router_text.index("continue;", reject_pos)
-    apply_pos = router_text.index("router_scale_apply", return_pos)
-    assert reject_pos < return_pos < apply_pos
+    apply_pos = router_text.index("router_scale_apply", reject_pos)
+    assert reject_pos < apply_pos
 
 
 def test_router_input_mode_does_not_use_mxfp_sidecar_presence():
@@ -522,3 +527,87 @@ def test_shared_expert_suffixes_are_preferred_before_generic_dense_ffn_aliases()
     assert '"shared_expert.gate_proj.weight"' in shared_block
     assert '"shared_expert.gate_proj.weight"' not in generic_block
     assert '"ffn_gate.weight"' in generic_block
+
+
+def test_gemma4_attention_uses_unit_qk_norm_scale_in_engine():
+    attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_prefill.cpp.inc").read_text()
+    helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
+    assert "moe_engine_is_gemma4_text_contract" in helper_text
+    assert "gemma4_unit_qk_norm" in attn_text
+    assert "resolved_source = 4" in attn_text
+    assert "resolved_value = 1.0f" in attn_text
+    gemma4_pos = attn_text.index("moe_engine_is_gemma4_text_contract(engine)")
+    qpre_pos = attn_text.index("query_pre_attn_scalar > 0.0f", gemma4_pos)
+    assert gemma4_pos < qpre_pos
+
+
+def test_gemma4_dense_branch_forces_split_ffn_contract_when_weights_exist():
+    mlp_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
+    assert "moe_layer_dense_mlp_should_run_f32" in mlp_text
+    helper = mlp_text[mlp_text.index("static int moe_layer_has_common_dense_mlp_tensors_f32"):mlp_text.index("static int moe_layer_dense_mlp_should_run_f32")]
+    block = mlp_text[mlp_text.index("static int moe_layer_dense_mlp_should_run_f32"):mlp_text.index("static int moe_layer_moe_mlp_f32")]
+    assert "moe_engine_is_gemma4_text_contract(engine)" in block
+    assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" in block
+    assert '"ffn_gate.weight"' in helper
+    assert '"ffn_up.weight"' in helper
+    assert '"ffn_down.weight"' in helper
+    assert "return 1;" in block
+    assert "moe_layer_post_ffw_norm1_f32" in mlp_text
+    assert "router scale tensor is required but could not be mapped" in mlp_text
+
+
+def test_ple_vocab_masking_allows_smaller_per_layer_vocab():
+    mlp_common = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_common_tensors.cpp.inc").read_text()
+    assert "token_vocab_size" in mlp_common
+    assert "token_id < ple.token_vocab_size" in mlp_common
+    assert "std::fill(s->ple_inputs.begin(), s->ple_inputs.end(), 0.0f)" in mlp_common
+    assert "token_desc.rows == 0" in mlp_common
+
+
+def test_gemma4_per_expert_scale_does_not_parse_down_weight_sidecar():
+    norm_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
+    fwd_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
+    assert '"ffn_down_exps.scale"' in norm_text
+    assert "gemma4_suffixes" in norm_text
+    gemma_block = norm_text[norm_text.index("static const char* const gemma4_suffixes[]"):
+                            norm_text.index("const char* const* scale_suffixes")]
+    assert '"ffn_down_exps.scale"' not in gemma_block
+    assert '"per_expert_scale"' in gemma_block
+    assert '"experts.per_expert_scale"' in gemma_block
+    assert "moe_engine_is_gemma4_text_contract(engine) ? gemma4_suffixes : suffixes" in norm_text
+    assert "moe_engine_is_gemma4_text_contract(engine) ? gemma4_suffixes : suffixes" in fwd_text
+
+
+def test_raw_residual_router_input_is_gemma4_or_explicit_graph_contract():
+    norm_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
+    block = norm_text[norm_text.index("static int moe_layer_router_uses_raw_residual_input"):norm_text.index("static int moe_layer_common_dense_mlp_f32")]
+    assert "moe_engine_is_gemma4_text_contract(engine)" in block
+    assert '"ffn_gate_inp.weight"' in block
+    assert "moe_graph_ir_math_required(engine)" in block
+    assert '"moe_router"' in block
+
+def test_gemma4_no_v_proj_contract_allows_k_equals_v_without_qkv_weight_changes():
+    attn_text = (ROOT / "moe_engine/src/parts/generation/attention_decode.cpp.inc").read_text()
+    allow_pos = attn_text.index("const int allow_v_equals_k")
+    block = attn_text[allow_pos:attn_text.index("if (qkv_parallel_path)", allow_pos)]
+    assert '"no_v_proj"' in block
+    assert '"layers_with_no_v_proj"' in block
+    assert '"no_value_projection"' in block
+    assert "moe_engine_is_gemma4_text_contract(engine) && !has_v" in block
+    assert "QKV" not in block
+
+def test_gemma4_dense_branch_force_uses_same_suffix_families_as_dense_mlp_mapping():
+    mlp_text = (ROOT / "moe_engine/src/parts/generation/mlp_forward.cpp.inc").read_text()
+    helper_pos = mlp_text.index("static int moe_layer_has_common_dense_mlp_tensors_f32")
+    helper_block = mlp_text[helper_pos:mlp_text.index("static int moe_layer_dense_mlp_should_run_f32", helper_pos)]
+    for suffix in (
+        '"ffn_gate.weight"', '"mlp.gate_proj.weight"', '"gate_proj.weight"',
+        '"ffn_up.weight"', '"mlp.up_proj.weight"', '"up_proj.weight"',
+        '"ffn_down.weight"', '"mlp.down_proj.weight"', '"down_proj.weight"',
+    ):
+        assert suffix in helper_block
+    should_pos = mlp_text.index("static int moe_layer_dense_mlp_should_run_f32")
+    should_block = mlp_text[should_pos:mlp_text.index("static int moe_layer_moe_mlp_f32", should_pos)]
+    assert "moe_engine_is_gemma4_text_contract(engine)" in should_block
+    assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" in should_block
+

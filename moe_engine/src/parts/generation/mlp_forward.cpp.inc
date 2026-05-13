@@ -98,6 +98,53 @@ static int moe_layer_graph_shared_expert_declared_f32(
 }
 
 
+static int moe_layer_has_common_dense_mlp_tensors_f32(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    static const char* const gate_suffixes[] = {
+        "ffn_gate.weight",
+        "mlp.gate_proj.weight",
+        "gate_proj.weight",
+        "feed_forward.w1.weight",
+        "ffn.w1.weight",
+        "w1.weight"
+    };
+    static const char* const up_suffixes[] = {
+        "ffn_up.weight",
+        "mlp.up_proj.weight",
+        "up_proj.weight",
+        "feed_forward.w3.weight",
+        "ffn.w3.weight",
+        "w3.weight"
+    };
+    static const char* const down_suffixes[] = {
+        "ffn_down.weight",
+        "mlp.down_proj.weight",
+        "down_proj.weight",
+        "feed_forward.w2.weight",
+        "ffn.w2.weight",
+        "w2.weight"
+    };
+    int has_gate = 0;
+    int has_up = 0;
+    int has_down = 0;
+    for (const char* suffix : gate_suffixes) {
+        has_gate = has_gate || moe_engine_has_common_tensor_suffix(engine, layer, suffix);
+    }
+    for (const char* suffix : up_suffixes) {
+        has_up = has_up || moe_engine_has_common_tensor_suffix(engine, layer, suffix);
+    }
+    for (const char* suffix : down_suffixes) {
+        has_down = has_down || moe_engine_has_common_tensor_suffix(engine, layer, suffix);
+    }
+    return has_gate && has_up && has_down;
+}
+
+
 static int moe_layer_dense_mlp_should_run_f32(
     const moe_pc_engine* engine,
     int32_t layer
@@ -107,6 +154,10 @@ static int moe_layer_dense_mlp_should_run_f32(
     }
     static const char* const dense_roles[] = { "dense_mlp" };
     if (!moe_graph_ir_math_required(engine)) {
+        return 1;
+    }
+    if (moe_engine_is_gemma4_text_contract(engine) &&
+        moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)) {
         return 1;
     }
     if (!moe_graph_ir_layer_has_op_role_any(
@@ -201,6 +252,18 @@ static int moe_layer_moe_mlp_f32(
     const int dense_enabled = moe_layer_dense_mlp_should_run_f32(engine, layer);
     if (dense_enabled && moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
         dense_ok = 1;
+        if (moe_engine_is_gemma4_text_contract(engine) &&
+            moe_layer_post_ffw_norm1_f32(
+                engine, layer, s->shared.data(), hidden_size,
+                s->residual.data(), attn_cfg.rms_norm_eps)) {
+            std::memcpy(s->shared.data(), s->residual.data(), (size_t)hidden_size * sizeof(float));
+        } else if (moe_engine_is_gemma4_text_contract(engine) &&
+                   moe_layer_has_post_ffw_norm1_weight(engine, layer)) {
+            std::fprintf(stderr,
+                "[storagellm mlp] dense post-ffw norm1 tensor is required but could not be mapped layer=%d\n",
+                layer);
+            return 0;
+        }
         moe_mlp_trace_vec_f32("mlp_dense_branch", layer, s->shared.data(), hidden_size);
     }
     moe_profile_log(
@@ -281,6 +344,12 @@ static int moe_layer_moe_mlp_f32(
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale"));
     const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
+    if (router_uses_raw_residual_contract && !router_has_plausible_input_scale) {
+        std::fprintf(stderr,
+            "[storagellm mlp] router scale tensor is required but could not be mapped layer=%d\n",
+            layer);
+        return 0;
+    }
     const int router_uses_raw_residual =
         router_uses_raw_residual_contract && router_has_plausible_input_scale;
     const float* router_input = (router_has_internal_norm_scale || router_uses_raw_residual) ?
@@ -2063,8 +2132,22 @@ static int moe_layer_expert_down_scalar_scale_f32(
         "mlp.router.per_expert_scale",
         "moe.gate.per_expert_scale"
     };
+    static const char* const gemma4_suffixes[] = {
+        "per_expert_scale",
+        "moe.per_expert_scale",
+        "mlp.moe.per_expert_scale",
+        "experts.per_expert_scale",
+        "ffn_gate_inp.per_expert_scale",
+        "router.per_expert_scale",
+        "mlp.router.per_expert_scale",
+        "moe.gate.per_expert_scale"
+    };
+    const char* const* scale_suffixes = moe_engine_is_gemma4_text_contract(engine) ? gemma4_suffixes : suffixes;
+    const size_t scale_suffix_count = moe_engine_is_gemma4_text_contract(engine) ?
+        (sizeof(gemma4_suffixes) / sizeof(gemma4_suffixes[0])) :
+        (sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_cache_entry raw{};
-    if (!moe_map_layer_common_tensor(engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]), &raw)) {
+    if (!moe_map_layer_common_tensor(engine, layer, scale_suffixes, scale_suffix_count, &raw)) {
         // No scale tensor is an identity scalar scale, so indexed/grouped GPU
         // expert paths may still be used with weight multiplier 1.0.
         *out_scale = 1.0f;
@@ -2182,6 +2265,12 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale"));
     const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
+    if (router_uses_raw_residual_contract && !router_has_plausible_input_scale) {
+        std::fprintf(stderr,
+            "[storagellm mlp] batch router scale tensor is required but could not be mapped layer=%d\n",
+            layer);
+        return 0;
+    }
     const int router_uses_raw_residual =
         router_uses_raw_residual_contract && router_has_plausible_input_scale;
     const uint32_t top_k = moe_router_top_k_from_metadata(
@@ -2219,6 +2308,18 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         const int dense_enabled = moe_layer_dense_mlp_should_run_f32(engine, layer);
         if (dense_enabled && moe_layer_common_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, dense_out)) {
             dense_ok = 1;
+            if (moe_engine_is_gemma4_text_contract(engine) &&
+                moe_layer_post_ffw_norm1_f32(
+                    engine, layer, dense_out, hidden_size,
+                    local.residual.data(), attn_cfg.rms_norm_eps)) {
+                std::memcpy(dense_out, local.residual.data(), (size_t)hidden_size * sizeof(float));
+            } else if (moe_engine_is_gemma4_text_contract(engine) &&
+                       moe_layer_has_post_ffw_norm1_weight(engine, layer)) {
+                std::fprintf(stderr,
+                    "[storagellm mlp] batch dense post-ffw norm1 tensor is required but could not be mapped layer=%d token=%u\n",
+                    layer, t);
+                return 0;
+            }
         }
         float* shared_out_buf = local.residual.data();
         int shared_ok = 0;

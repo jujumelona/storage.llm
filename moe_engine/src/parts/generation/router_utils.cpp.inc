@@ -391,8 +391,6 @@ static int moe_router_scale_tensor_is_quant_sidecar_name_f32(const std::string& 
     // These suffixes are weight-quantization sidecars.  They can have the same
     // length as hidden_size but are not activation/RMSNorm parameters.
     static const char* const sidecar_suffixes[] = {
-        "ffn_gate_inp.scale",
-        "ffn_gate_inp.scales",
         "ffn_gate_inp.weight.scale",
         "ffn_gate_inp.weight.scales"
     };
@@ -464,6 +462,7 @@ static int moe_map_router_scale_tensor(
         "moe_router_norm.weight",
         "moe.gate_norm.weight",
         "mlp.router_norm.weight",
+        "ffn_gate_inp.scale",
         "mlp.router.scale",
         "router.scale",
         "moe.gate.scale"
@@ -575,8 +574,16 @@ static int moe_prepare_scaled_router_input_f32(
     if (!std::isfinite(ss)) {
         return 0;
     }
-    // Safe: hidden_size > 0 guaranteed by check above
-    const float norm = 1.0f / std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f);
+    // Safe: hidden_size > 0 guaranteed by check above.  Gemma4 router input
+    // applies RMSNorm, then hidden_size^-0.5, then the learned router scale.
+    float norm = 1.0f / std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f);
+    if (moe_engine_is_gemma4_text_contract(engine)) {
+        const float root = 1.0f / std::sqrt((float)hidden_size);
+        if (!std::isfinite(root) || !(root > 0.0f)) {
+            return 0;
+        }
+        norm *= root;
+    }
     const uint64_t scale_count = moe_router_raw_scalar_count(scale_raw);
     if (scale_count != 1u && scale_count < (uint64_t)hidden_size) {
         std::fprintf(stderr,
@@ -584,7 +591,9 @@ static int moe_prepare_scaled_router_input_f32(
             layer, (unsigned long long)scale_count, hidden_size);
         return 0;
     }
-    const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, scale_raw);
+    const int unit_offset = moe_engine_is_gemma4_text_contract(engine)
+        ? 0
+        : moe_engine_rmsnorm_unit_offset(engine, scale_raw);
 
     for (uint32_t i = 0; i < hidden_size; ++i) {
         float scale = 1.0f;
