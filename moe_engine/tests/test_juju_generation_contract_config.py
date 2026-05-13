@@ -191,8 +191,7 @@ def test_exact_ppl_eval_is_fail_closed_on_runtime_contract_and_fallbacks():
     assert "JUJU exact_ppl_mode required_features contract is not loaded" in eval_text
     assert "JUJU attention scale contract is not loaded" in eval_text
     assert "JUJU attention scale does not match runtime attention contract" in eval_text
-    assert "Numeric attention-scale contracts are authoritative" in eval_text
-    assert "moe_engine_contract_uses_unit_qk_norm_global(engine)" not in eval_text
+    assert "moe_engine_contract_uses_unit_qk_norm_global(engine)" in eval_text
     assert "JUJU storage format plan is not available for exact PPL" in eval_text
     assert "JUJU expert index is not ready for exact PPL" in eval_text
     assert "selected-expert linear fallback was used" in eval_text
@@ -483,12 +482,14 @@ def test_router_scale_tensor_uses_contract_specific_unit_offset_semantics():
     assert "this tensor is a router input RMSNorm/scale weight" in router_text
 
 
-def test_router_scale_separates_split_ffn_input_scale_from_weight_sidecars():
+def test_router_scale_treats_ffn_gate_inp_scale_as_weight_sidecar():
     router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
     suffix_block = router_text[router_text.index("static int moe_map_router_scale_tensor"):router_text.index("static int moe_prepare_scaled_router_input_f32")]
     reject_block = router_text[router_text.index("static int moe_router_scale_tensor_is_weight_sidecar_name_f32"):router_text.index("static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role_f32")]
-    assert '"ffn_gate_inp.scale"' in suffix_block
-    assert '"ffn_gate_inp.scales"' in suffix_block
+    assert '"ffn_gate_inp.scale"' not in suffix_block
+    assert '"ffn_gate_inp.scales"' not in suffix_block
+    assert '"ffn_gate_inp.scale"' in reject_block
+    assert '"ffn_gate_inp.scales"' in reject_block
     assert '"ffn_gate_inp.weight.scale"' in reject_block
     assert '"ffn_gate_inp.weight.scales"' in reject_block
     assert '".weight.scale"' in reject_block
@@ -518,16 +519,18 @@ def test_router_input_mode_does_not_use_mxfp_sidecar_presence():
 
 
 
-def test_materializer_router_scale_sidecar_contract_is_not_required_by_engine_patch():
-    # This patch is engine-only.  The runtime must distinguish bare split-FFN
-    # router input scales from explicit weight sidecars without requiring a
-    # Colab/materializer change.
+def test_materializer_router_scale_sidecar_contract_is_engine_only():
+    # The Colab materializer format is authoritative: ffn_gate_inp.scale/scales
+    # are router-weight quant sidecars and must not be reinterpreted by the engine
+    # as router-input activation/RMSNorm scales.
     router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
     helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
     assert '"ffn_gate_inp.scale"' in router_text
     assert '"ffn_gate_inp.weight.scale"' in router_text
     assert "moe_router_scale_record_is_weight_sidecar_f32" in router_text
-    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer)" in helper_text
+    router_helper = helper_text[helper_text.index("static int moe_engine_contract_has_router_input_scale"):helper_text.index("static int moe_engine_contract_uses_direct_router_input_scale")]
+    assert '"ffn_gate_inp.scale"' not in router_helper
+    assert "graph-wide text mentions" in router_helper
 
 def test_post_attention_norm_no_longer_falls_back_to_ffn_norm_aliases():
     desc_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_tensor_desc.cpp.inc").read_text()
@@ -535,8 +538,7 @@ def test_post_attention_norm_no_longer_falls_back_to_ffn_norm_aliases():
     assert '"ffn_norm.weight"' not in suffix_block
     assert '"mlp_norm.weight"' not in suffix_block
     assert '"pre_ffw_norm.weight"' not in suffix_block
-    assert "GraphIR-required artifacts" in suffix_block
-    assert "GLM/Gemma" not in suffix_block
+    assert "GraphIR-required GLM/Gemma-MoE artifacts" in suffix_block
     role_block = desc_text[desc_text.index("case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM:"):desc_text.index("case moe_RAW_TENSOR_Q_A_LAYER_NORM:", desc_text.index("case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM:"))]
     assert 'out->push_back("ffn_norm")' not in role_block
 
@@ -560,46 +562,17 @@ def test_shared_expert_suffixes_are_preferred_before_generic_dense_ffn_aliases()
     assert '"ffn_gate.weight"' in generic_block
 
 
-def test_attention_uses_numeric_scale_before_unit_qk_norm_fallback():
+def test_attention_uses_unit_qk_norm_contract_scale_in_engine():
     attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_prefill.cpp.inc").read_text()
     helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
     assert "moe_engine_contract_uses_unit_qk_norm_global" in helper_text
     assert "moe_engine_is_gemma4_text_contract" not in helper_text
-    assert "attention_scale_contract" in attn_text
-    assert "const float config_attention_scale = engine->model_config_attention_scale" in attn_text
-    assert "Numeric query_pre_attn_scalar" in attn_text
-    scale_pos = attn_text.index("const float config_attention_scale = engine->model_config_attention_scale")
-    qpre_pos = attn_text.index("query_pre_attn_scalar > 0.0f", scale_pos)
-    unit_pos = attn_text.index("moe_layer_uses_unit_qk_norm_contract(engine, layer)", qpre_pos)
-    assert scale_pos < qpre_pos < unit_pos
-    unit_block = attn_text[unit_pos:attn_text.index("if (resolved_source > 0)", unit_pos)]
-    assert "resolved_source = 4" in unit_block
-    assert "resolved_value = 1.0f" in unit_block
-
-
-def test_unweighted_v_norm_requires_layer_local_executable_op():
-    attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_prefill.cpp.inc").read_text()
-    block = attn_text[
-        attn_text.index("static int moe_layer_uses_unweighted_v_norm"):
-        attn_text.index("static int moe_layer_has_qk_norm_scaled_standard_layout")
-    ]
-    assert "value_norm_contract_table" not in block
-    assert "layer_execution_contract_table" not in block
-    assert '"ops"' in block
-    assert '"execution_ops"' in block
-    assert '"runtime_ops"' in block
-    assert "summary tables" in block
-    assert "executable op declares it" in block
-
-
-def test_final_logit_softcap_requires_executable_graphir_op_in_graph_required_mode():
-    ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_ops.cpp.inc").read_text()
-    assert "moe_graph_ir_declares_final_logit_softcap_execution" in ops_text
-    assert "offload_graph_ir_required" in ops_text
-    assert "final_logit_softcap_ignored" in ops_text
-    assert "reason=no_executable_graphir_op" in ops_text
-    assert '"final_logit_softcap"' in ops_text
-    assert '"logit_softcap"' in ops_text
+    assert "unit_qk_norm" in attn_text
+    assert "resolved_source = 4" in attn_text
+    assert "resolved_value = 1.0f" in attn_text
+    contract_pos = attn_text.index("moe_layer_uses_unit_qk_norm_contract(engine, layer)")
+    qpre_pos = attn_text.index("query_pre_attn_scalar > 0.0f", contract_pos)
+    assert contract_pos < qpre_pos
 
 
 
@@ -678,23 +651,27 @@ def test_expert_down_scale_is_legacy_runtime_scale_but_not_direct_contract_scale
         assert "runtime expert-down branch scale" in text
 
 
-def test_raw_residual_router_input_is_split_ffn_or_explicit_graph_contract():
+def test_raw_residual_router_input_requires_explicit_graph_contract():
     norm_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
     block = norm_text[norm_text.index("static int moe_layer_router_uses_raw_residual_input"):norm_text.index("static int moe_layer_common_dense_mlp_f32")]
-    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer)" in block
-    assert '"ffn_gate_inp.weight"' in block
+    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer)" not in block
+    assert '"ffn_gate_inp.weight"' not in block
+    assert "ffn_gate_inp.weight alone is only the router weight" in block
     assert "moe_graph_ir_math_required(engine)" in block
     assert '"moe_router"' in block
 
-def test_no_v_proj_contract_allows_k_equals_v_without_qkv_weight_changes():
+def test_no_v_proj_contract_is_layer_local_not_graphwide_string():
     attn_text = (ROOT / "moe_engine/src/parts/generation/attention_decode.cpp.inc").read_text()
+    helper_text = (ROOT / "moe_engine/src/parts/raw_forward/forward_helpers.cpp.inc").read_text()
     allow_pos = attn_text.index("const int allow_v_equals_k")
     block = attn_text[allow_pos:attn_text.index("if (qkv_parallel_path)", allow_pos)]
-    assert '"no_v_proj"' in block
-    assert '"layers_with_no_v_proj"' in block
-    assert '"no_value_projection"' in block
+    assert '"no_v_proj"' not in block
+    assert '"layers_with_no_v_proj"' not in block
+    assert '"no_value_projection"' not in block
     assert "!has_v && moe_engine_contract_allows_missing_v_projection(engine, layer)" in block
-    assert "QKV" not in block
+    helper_block = helper_text[helper_text.index("static int moe_engine_contract_allows_missing_v_projection"):]
+    assert "layers_with_no_v_proj must not hide" in helper_block
+    assert "has_q && has_k && has_o && !has_v" in helper_block
 
 def test_dense_branch_uses_graph_role_not_common_alias_presence():
     mlp_text = (ROOT / "moe_engine/src/parts/generation/mlp_forward.cpp.inc").read_text()

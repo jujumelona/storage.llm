@@ -449,21 +449,13 @@ static int moe_engine_contract_uses_split_ffn_norm(
         "ffn_norm_2.weight",
         "mlp_norm_2.weight"
     };
-    if (moe_engine_contract_has_layer_tensor_suffix_any(
-            engine, layer, split_norm_suffixes,
-            sizeof(split_norm_suffixes) / sizeof(split_norm_suffixes[0]))) {
-        return 1;
-    }
-    if (moe_engine_graph_ir_mentions(engine, "split_ffn_norm") ||
-        moe_engine_graph_ir_mentions(engine, "layers_with_post_ffw_norm_1") ||
-        moe_engine_graph_ir_mentions(engine, "layers_with_post_ffw_norm_2") ||
-        moe_engine_graph_ir_mentions(engine, "layers_with_expert_ffn_norm") ||
-        moe_engine_graph_ir_mentions(engine, "post_ffw_norm_1") ||
-        moe_engine_graph_ir_mentions(engine, "post_ffw_norm_2") ||
-        moe_engine_graph_ir_mentions(engine, "pre_ffw_norm_2")) {
-        return 1;
-    }
-    return 0;
+    // Do not use graph-wide counters/summary strings such as
+    // layers_with_post_ffw_norm_1 to force a layer into the split-FFN path.
+    // The runtime path is layer-local: actual tensors/roles must be present for
+    // this layer.
+    return moe_engine_contract_has_layer_tensor_suffix_any(
+        engine, layer, split_norm_suffixes,
+        sizeof(split_norm_suffixes) / sizeof(split_norm_suffixes[0]));
 }
 
 static int moe_engine_contract_has_router_input_scale(
@@ -484,31 +476,12 @@ static int moe_engine_contract_has_router_input_scale(
         "moe.gate_norm.weight",
         "mlp.router_norm.weight"
     };
-    if (moe_engine_contract_has_layer_tensor_suffix_any(
-            engine, layer, router_scale_suffixes,
-            sizeof(router_scale_suffixes) / sizeof(router_scale_suffixes[0]))) {
-        return 1;
-    }
-    // Split-FFN routers can carry the router-input RMS scale as a bare
-    // ffn_gate_inp.scale/scales tensor next to ffn_gate_inp.weight.  Treat that
-    // as activation scale only under the split-FFN contract; explicit
-    // *.weight.scale sidecars remain excluded in the router mapper.
-    if (moe_engine_contract_uses_split_ffn_norm(engine, layer) &&
-        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.weight") &&
-        (moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale") ||
-         moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scales"))) {
-        return 1;
-    }
-    return moe_engine_graph_ir_mentions(engine, "router_input_scale") ||
-        moe_engine_graph_ir_mentions(engine, "router_input_norm") ||
-        moe_engine_graph_ir_mentions(engine, "router.scale") ||
-        moe_engine_graph_ir_mentions(engine, "mlp.router.scale") ||
-        moe_engine_graph_ir_mentions(engine, "moe.gate.scale") ||
-        moe_engine_graph_ir_mentions(engine, "ffn_gate_inp.scale") ||
-        moe_engine_graph_ir_mentions(engine, "ffn_gate_inp.scales") ||
-        moe_engine_graph_ir_mentions(engine, "router_norm.weight") ||
-        moe_engine_graph_ir_mentions(engine, "router.input_layernorm.weight") ||
-        moe_engine_graph_ir_mentions(engine, "router.input_norm.weight");
+    // ffn_gate_inp.scale/scales are generated as router-weight quant sidecars,
+    // not as router-input activation/RMSNorm scales.  Do not infer router input
+    // scaling from those sidecars or from graph-wide text mentions.
+    return moe_engine_contract_has_layer_tensor_suffix_any(
+        engine, layer, router_scale_suffixes,
+        sizeof(router_scale_suffixes) / sizeof(router_scale_suffixes[0]));
 }
 
 static int moe_engine_contract_uses_direct_router_input_scale(
@@ -518,13 +491,10 @@ static int moe_engine_contract_uses_direct_router_input_scale(
     if (!engine) {
         return 0;
     }
-    if (moe_engine_contract_has_router_input_scale(engine, layer) &&
-        moe_engine_contract_uses_split_ffn_norm(engine, layer)) {
-        return 1;
-    }
-    return moe_engine_graph_ir_mentions(engine, "direct_router_input_scale") ||
-        moe_engine_graph_ir_mentions(engine, "router_scale_direct_weight") ||
-        moe_engine_graph_ir_mentions(engine, "router_input_rms_scale");
+    // Direct router-input scale is a layer-local tensor contract.  Graph-wide
+    // strings are not enough to switch RMSNorm weight semantics.
+    return moe_engine_contract_has_router_input_scale(engine, layer) &&
+        moe_engine_contract_uses_split_ffn_norm(engine, layer);
 }
 
 static int moe_engine_contract_uses_direct_per_expert_scale(
@@ -544,13 +514,11 @@ static int moe_engine_contract_uses_direct_per_expert_scale(
         "mlp.router.per_expert_scale",
         "moe.gate.per_expert_scale"
     };
-    if (moe_engine_contract_has_layer_tensor_suffix_any(
-            engine, layer, direct_suffixes,
-            sizeof(direct_suffixes) / sizeof(direct_suffixes[0]))) {
-        return 1;
-    }
-    return moe_engine_graph_ir_mentions(engine, "direct_per_expert_scale") ||
-        moe_engine_graph_ir_mentions(engine, "per_expert_scale");
+    // Do not enable direct per-expert scaling from graph-wide mentions.  It is
+    // valid only when a layer-local compatible tensor exists.
+    return moe_engine_contract_has_layer_tensor_suffix_any(
+        engine, layer, direct_suffixes,
+        sizeof(direct_suffixes) / sizeof(direct_suffixes[0]));
 }
 
 static int moe_engine_contract_uses_unit_qk_norm_global(
@@ -692,16 +660,9 @@ static int moe_engine_contract_allows_missing_v_projection(
     if (!engine) {
         return 0;
     }
-    if (moe_engine_graph_ir_mentions(engine, "v_equals_k") ||
-        moe_engine_graph_ir_mentions(engine, "k_equals_v") ||
-        moe_engine_graph_ir_mentions(engine, "shared_kv_projection") ||
-        moe_engine_graph_ir_mentions(engine, "attention_k_eq_v") ||
-        moe_engine_graph_ir_mentions(engine, "raw_k_projection_before_k_norm") ||
-        moe_engine_graph_ir_mentions(engine, "no_v_proj") ||
-        moe_engine_graph_ir_mentions(engine, "layers_with_no_v_proj") ||
-        moe_engine_graph_ir_mentions(engine, "no_value_projection")) {
-        return 1;
-    }
+    // Missing V is a layer-local K-as-V contract.  A global summary/string such
+    // as layers_with_no_v_proj must not hide a failed V-projection bind on other
+    // layers.
     static const char* const q_suffixes[] = {"attn_q.weight", "q_proj.weight", "self_attn.q_proj.weight"};
     static const char* const k_suffixes[] = {"attn_k.weight", "k_proj.weight", "self_attn.k_proj.weight"};
     static const char* const v_suffixes[] = {"attn_v.weight", "v_proj.weight", "self_attn.v_proj.weight"};

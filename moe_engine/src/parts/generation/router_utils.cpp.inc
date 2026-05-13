@@ -388,10 +388,11 @@ static int moe_router_name_has_suffix_f32(const std::string& name, const char* s
 }
 
 static int moe_router_scale_tensor_is_weight_sidecar_name_f32(const std::string& name) {
-    // Only weight-quantization sidecars are rejected by name.  Bare
-    // ffn_gate_inp.scale/scales can be the split-FFN router input scale; reject
-    // only the explicit weight sidecar form here.
+    // ffn_gate_inp.scale/scales are emitted by the Colab materializer as
+    // router-weight quant sidecars, not as router-input activation scales.
     static const char* const sidecar_suffixes[] = {
+        "ffn_gate_inp.scale",
+        "ffn_gate_inp.scales",
         "ffn_gate_inp.weight.scale",
         "ffn_gate_inp.weight.scales",
         ".weight.scale",
@@ -481,9 +482,7 @@ static int moe_map_router_scale_tensor(
         "mlp.router_norm.weight",
         "mlp.router.scale",
         "router.scale",
-        "moe.gate.scale",
-        "ffn_gate_inp.scale",
-        "ffn_gate_inp.scales"
+        "moe.gate.scale"
     };
 
     // Fix 18: Cache tensor mapping to avoid std::string vector allocation per token.

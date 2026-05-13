@@ -414,15 +414,10 @@ static int moe_layer_router_uses_raw_residual_input(
     if (!engine || layer < 0) {
         return 0;
     }
-    // Some split-FFN MoE graphs route from the raw pre-MLP residual while
-    // experts consume pre_ffw_norm_2(hidden).  The router tensor is commonly
-    // named ffn_gate_inp.weight in GGUF/JUJU artifacts.  Using the expert-
-    // normalized input for this tensor changes top-k selection and causes
-    // router drift after a few layers.
-    if (moe_engine_contract_uses_split_ffn_norm(engine, layer) &&
-        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.weight")) {
-        return 1;
-    }
+    // ffn_gate_inp.weight alone is only the router weight, not a proof that the
+    // router consumes the raw residual.  Raw-residual routing is allowed only
+    // when the GraphIR layer contract explicitly places the router before the
+    // expert FFN input normalization.
     if (moe_graph_ir_math_required(engine)) {
         static const char* const router_roles[] = { "moe_router", "router" };
         if (moe_layer_has_ffn_norm_weight(engine, layer) &&
