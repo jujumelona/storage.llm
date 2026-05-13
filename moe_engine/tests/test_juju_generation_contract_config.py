@@ -420,23 +420,15 @@ def test_qkv_single_token_attention_uses_paper_quantized_decode_path():
     assert append_pos < fill_pos < qkv_decode_pos
 
 
-def test_rmsnorm_unit_offset_uses_explicit_contract_without_tensor_stats_override():
+def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
     raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_ops.cpp.inc").read_text()
-    assert "moe_rmsnorm_tensor_stats_unit_offset_hint" not in raw_ops_text
-    assert "metadata_false_tensor_stats_unit_offset" not in raw_ops_text
-    assert "tensor_stats_unit_offset" not in raw_ops_text
-    assert "tensor_stats_direct_weight" not in raw_ops_text
-    assert "stats_mean_abs" not in raw_ops_text
+    assert "unit-offset RMSNorm is architecture/config math" in raw_ops_text
+    assert "Use only explicit metadata/GraphIR" in raw_ops_text
+    assert "weight_stats_override_metadata_false" not in raw_ops_text
+    assert "metadata_false_stats_inconclusive" not in raw_ops_text
+    assert "mean_abs_raw < 0.75" not in raw_ops_text
+    assert "raw_rms < 0.75" not in raw_ops_text
     assert "moe_rmsnorm_weight_implausible_sidecar_f32" not in raw_ops_text
-    assert "moe_engine_is_gemma4_text_contract" not in raw_ops_text
-    assert "gemma4" not in raw_ops_text.lower()
-    assert "direct_rmsnorm_contract" in raw_ops_text
-    assert "unit_offset_contract" in raw_ops_text
-    direct_pos = raw_ops_text.index("if (direct_contract)")
-    unit_pos = raw_ops_text.index("else if (unit_contract)", direct_pos)
-    metadata_pos = raw_ops_text.index("else if (metadata_found)", unit_pos)
-    assert direct_pos < unit_pos < metadata_pos
-    assert "Tensor-value statistics are intentionally" in raw_ops_text
     assert "moe_rmsnorm_unit_offset_from_json(engine->offload_gguf_metadata_json" in raw_ops_text
     assert "moe_rmsnorm_unit_offset_from_json(engine->offload_graph_ir_json" in raw_ops_text
     assert "moe_engine_contract_uses_rmsnorm_unit_offset(engine)" in raw_ops_text
@@ -611,30 +603,22 @@ def test_contract_helpers_cover_remaining_non_name_runtime_axes():
     assert '"mlp_moe_router"' in profile_text
     assert '"mlp_moe_gate_up"' in profile_text
 
-def test_routed_graph_suppresses_dense_fallback_but_keeps_common_ffn_shared_branch():
+def test_routed_graph_suppresses_dense_fallback_even_with_split_ffn_aliases():
     mlp_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
     assert "moe_layer_dense_mlp_should_run_f32" in mlp_text
     helper = mlp_text[mlp_text.index("static int moe_layer_has_common_dense_mlp_tensors_f32"):mlp_text.index("static int moe_layer_dense_mlp_should_run_f32")]
-    dense_block = mlp_text[mlp_text.index("static int moe_layer_dense_mlp_should_run_f32"):mlp_text.index("static int moe_layer_common_ffn_is_shared_branch_f32")]
-    shared_block = mlp_text[mlp_text.index("static int moe_layer_common_ffn_is_shared_branch_f32"):mlp_text.index("static int moe_layer_moe_mlp_f32")]
+    block = mlp_text[mlp_text.index("static int moe_layer_dense_mlp_should_run_f32"):mlp_text.index("static int moe_layer_moe_mlp_f32")]
     assert '"ffn_gate.weight"' in helper
     assert '"ffn_up.weight"' in helper
     assert '"ffn_down.weight"' in helper
-    assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" not in dense_block
-    assert '"moe_expert_mlp"' in dense_block
-    assert "GraphIR routed roles own the FFN branch" in dense_block
-    routed_pos = dense_block.index('"moe_expert_mlp"')
-    suppress_pos = dense_block.index("return 0;", routed_pos)
-    dense_pos = dense_block.index('"dense_mlp"')
+    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer) &&" not in block
+    assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" not in block
+    assert '"moe_expert_mlp"' in block
+    assert "GraphIR routed roles own the FFN branch" in block
+    routed_pos = block.index('"moe_expert_mlp"')
+    suppress_pos = block.index("return 0;", routed_pos)
+    dense_pos = block.index('"dense_mlp"')
     assert routed_pos < suppress_pos < dense_pos
-    assert "normal ffn_gate/up/down tensors" in shared_block
-    assert "required shared branch" in shared_block
-    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer)" in shared_block
-    assert "moe_layer_has_post_ffw_norm1_weight(engine, layer)" in shared_block
-    assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" in shared_block
-    assert "common FFN shared branch could not be mapped" in mlp_text
-    assert "common_enabled=%d common_ok=%d" in mlp_text
-    assert "mlp_common_shared_branch" in mlp_text
     assert "split-FFN router input scale is required" in mlp_text
 
 
@@ -692,14 +676,41 @@ def test_dense_branch_uses_graph_role_not_common_alias_presence():
     ):
         assert suffix in helper_block
     should_pos = mlp_text.index("static int moe_layer_dense_mlp_should_run_f32")
-    shared_pos = mlp_text.index("static int moe_layer_common_ffn_is_shared_branch_f32", should_pos)
-    should_block = mlp_text[should_pos:shared_pos]
-    shared_block = mlp_text[shared_pos:mlp_text.index("static int moe_layer_moe_mlp_f32", shared_pos)]
+    should_block = mlp_text[should_pos:mlp_text.index("static int moe_layer_moe_mlp_f32", should_pos)]
     assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" not in should_block
     assert '"dense_mlp"' in should_block
     assert '"dense_ffn"' in should_block
     assert '"moe_expert_mlp"' in should_block
     assert "return moe_graph_ir_layer_has_op_role_any" in should_block
-    assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" in shared_block
-    assert "normal ffn_gate/up/down tensors" in shared_block
 
+
+
+def test_common_ffn_shared_branch_is_separate_from_dense_fallback():
+    mlp_text = (ROOT / "moe_engine/src/parts/generation/mlp_forward.cpp.inc").read_text()
+    assert "moe_layer_common_ffn_is_shared_branch_f32" in mlp_text
+    helper_pos = mlp_text.index("static int moe_layer_common_ffn_is_shared_branch_f32")
+    helper_block = mlp_text[helper_pos:mlp_text.index("static int moe_layer_moe_mlp_f32", helper_pos)]
+    assert '"moe_expert_mlp"' in helper_block
+    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer)" in helper_block
+    assert "moe_layer_has_post_ffw_norm1_weight(engine, layer)" in helper_block
+    assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" in helper_block
+    assert "common_enabled=%d common_ok=%d" in mlp_text
+    assert "common FFN shared branch could not be mapped" in mlp_text
+
+
+def test_embedding_scale_is_cast_to_embedding_tensor_dtype_not_model_name():
+    ops_text = (ROOT / "moe_engine/src/parts/raw_forward/forward_ops.cpp.inc").read_text()
+    emb_text = (ROOT / "moe_engine/src/parts/raw_forward_embedding.cpp.inc").read_text()
+    assert "moe_round_f32_to_bf16_value" in ops_text
+    assert "moe_round_f32_to_fp16_value" in ops_text
+    assert "moe_cast_embedding_scale_to_tensor_dtype" in ops_text
+    assert "scalar_encoding == moe_RAW_SCALAR_BF16" in ops_text
+    assert "weight_format == moe_WEIGHT_ENCODING_RAW_BF16" in ops_text
+    assert "scalar_encoding == moe_RAW_SCALAR_F16" in ops_text
+    assert "weight_format == moe_WEIGHT_ENCODING_RAW_FP16" in ops_text
+    assert "cast=%s applied_scale=%.9g base_scale=%.9g scalar=%u format=%u hidden=%u" in ops_text
+    assert "moe_engine_is_gemma4_text_contract" not in ops_text
+    assert "gemma4" not in ops_text.lower()
+    assert "moe_apply_embedding_scale_f32(engine, c, out_hidden, common.scalar_encoding, common.weight_format)" in emb_text
+    assert "moe_apply_embedding_scale_f32(engine, c, dst, common.scalar_encoding, common.weight_format)" in emb_text
+    assert "moe_apply_embedding_scale_f32(engine, c, out_hidden, encoding, weight_format)" in emb_text

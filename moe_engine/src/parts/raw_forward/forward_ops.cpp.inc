@@ -1,3 +1,87 @@
+
+static float moe_round_f32_to_bf16_value(float value) {
+    if (!std::isfinite(value)) {
+        return value;
+    }
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t lsb = (bits >> 16u) & 1u;
+    bits += 0x7fffu + lsb;
+    bits &= 0xffff0000u;
+    float out = 0.0f;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static uint16_t moe_f32_to_fp16_bits_rne(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16u) & 0x8000u;
+    uint32_t mant = bits & 0x007fffffu;
+    int32_t exp = (int32_t)((bits >> 23u) & 0xffu) - 127 + 15;
+    if (exp <= 0) {
+        if (exp < -10) {
+            return (uint16_t)sign;
+        }
+        mant |= 0x00800000u;
+        const uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half_mant = mant >> shift;
+        const uint32_t round_bit = (mant >> (shift - 1u)) & 1u;
+        const uint32_t sticky = mant & ((1u << (shift - 1u)) - 1u);
+        if (round_bit && (sticky || (half_mant & 1u))) {
+            ++half_mant;
+        }
+        return (uint16_t)(sign | half_mant);
+    }
+    if (exp >= 31) {
+        if (((bits >> 23u) & 0xffu) == 0xffu && mant) {
+            return (uint16_t)(sign | 0x7e00u);
+        }
+        return (uint16_t)(sign | 0x7c00u);
+    }
+    uint32_t half_mant = mant >> 13u;
+    const uint32_t round = mant & 0x1fffu;
+    if (round > 0x1000u || (round == 0x1000u && (half_mant & 1u))) {
+        ++half_mant;
+        if (half_mant == 0x400u) {
+            half_mant = 0;
+            ++exp;
+            if (exp >= 31) {
+                return (uint16_t)(sign | 0x7c00u);
+            }
+        }
+    }
+    return (uint16_t)(sign | ((uint32_t)exp << 10u) | half_mant);
+}
+
+static float moe_round_f32_to_fp16_value(float value) {
+    if (!std::isfinite(value)) {
+        return value;
+    }
+    return moe_raw_fp16_to_f32(moe_f32_to_fp16_bits_rne(value));
+}
+
+static float moe_cast_embedding_scale_to_tensor_dtype(
+    float scale,
+    uint8_t scalar_encoding,
+    uint8_t weight_format,
+    const char** out_cast_source
+) {
+    const char* cast_source = "f32";
+    float cast_scale = scale;
+    if (scalar_encoding == moe_RAW_SCALAR_BF16 || weight_format == moe_WEIGHT_ENCODING_RAW_BF16) {
+        cast_scale = moe_round_f32_to_bf16_value(scale);
+        cast_source = "bf16";
+    } else if (scalar_encoding == moe_RAW_SCALAR_F16 || weight_format == moe_WEIGHT_ENCODING_RAW_FP16) {
+        cast_scale = moe_round_f32_to_fp16_value(scale);
+        cast_source = "fp16";
+    }
+    if (out_cast_source) {
+        *out_cast_source = cast_source;
+    }
+    return std::isfinite(cast_scale) && cast_scale > 0.0f ? cast_scale : scale;
+}
+
 static float moe_embedding_scale_value(const moe_pc_engine* engine, uint32_t hidden_size) {
     if (!engine || hidden_size == 0 || hidden_size > 100000u) {
         return 1.0f;
@@ -53,17 +137,45 @@ static float moe_embedding_scale_value(const moe_pc_engine* engine, uint32_t hid
     return scale;
 }
 
+static float moe_embedding_scale_value_for_tensor(
+    const moe_pc_engine* engine,
+    uint32_t hidden_size,
+    uint8_t scalar_encoding,
+    uint8_t weight_format,
+    const char** out_cast_source
+) {
+    const float scale = moe_embedding_scale_value(engine, hidden_size);
+    return moe_cast_embedding_scale_to_tensor_dtype(scale, scalar_encoding, weight_format, out_cast_source);
+}
+
 static void moe_apply_embedding_scale_f32(
     const moe_pc_engine* engine,
     const moe_storage_constants_t* c,
-    float* hidden
+    float* hidden,
+    uint8_t scalar_encoding = moe_RAW_SCALAR_UNKNOWN,
+    uint8_t weight_format = moe_WEIGHT_ENCODING_UNKNOWN
 ) {
     if (!engine || !c || !hidden || c->hidden_size == 0) {
         return;
     }
-    const float scale = moe_embedding_scale_value(engine, c->hidden_size);
+    const char* cast_source = "f32";
+    const float base_scale = moe_embedding_scale_value(engine, c->hidden_size);
+    const float scale = moe_cast_embedding_scale_to_tensor_dtype(
+        base_scale, scalar_encoding, weight_format, &cast_source);
     if (scale == 1.0f || !std::isfinite(scale)) {
         return;
+    }
+    static std::atomic<uint32_t> cast_logged{0};
+    if (cast_logged.fetch_add(1, std::memory_order_relaxed) < 4u) {
+        moe_profile_log(
+            "embedding_scale_contract",
+            "cast=%s applied_scale=%.9g base_scale=%.9g scalar=%u format=%u hidden=%u",
+            cast_source,
+            (double)scale,
+            (double)base_scale,
+            (unsigned)scalar_encoding,
+            (unsigned)weight_format,
+            c->hidden_size);
     }
     for (uint32_t i = 0; i < c->hidden_size; ++i) {
         hidden[i] *= scale;

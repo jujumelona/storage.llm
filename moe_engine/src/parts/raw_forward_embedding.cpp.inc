@@ -104,7 +104,7 @@ static int moe_copy_scaled_embedding_row_f32(
             weight_row_bytes, token_id, out_hidden)) {
         return 0;
     }
-    moe_apply_embedding_scale_f32(engine, c, out_hidden);
+    moe_apply_embedding_scale_f32(engine, c, out_hidden, encoding, weight_format);
     return 1;
 }
 
@@ -173,7 +173,7 @@ int moe_pc_engine_embed_token_f32(
         if (!moe_raw_tensor_copy_row_f32(common, token_id, out_hidden, c->hidden_size)) {
             return 0;
         }
-        moe_apply_embedding_scale_f32(engine, c, out_hidden);
+        moe_apply_embedding_scale_f32(engine, c, out_hidden, common.scalar_encoding, common.weight_format);
         return 1;
     }
     if (engine->offload_gguf_valid.load(std::memory_order_relaxed)) {
@@ -220,7 +220,7 @@ int moe_pc_engine_embed_tokens_f32(
             if (!moe_raw_tensor_copy_row_f32(common, (uint32_t)token, dst, c->hidden_size)) {
                 return 0;
             }
-            moe_apply_embedding_scale_f32(engine, c, dst);
+            moe_apply_embedding_scale_f32(engine, c, dst, common.scalar_encoding, common.weight_format);
             return 1;
         });
     }
