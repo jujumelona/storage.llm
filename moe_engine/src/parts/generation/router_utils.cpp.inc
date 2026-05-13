@@ -387,14 +387,15 @@ static int moe_router_name_has_suffix_f32(const std::string& name, const char* s
     return name.compare(name.size() - std::strlen(suffix), std::strlen(suffix), suffix) == 0 ? 1 : 0;
 }
 
-static int moe_router_scale_tensor_is_quant_sidecar_name_f32(const std::string& name) {
-    // These suffixes are weight-quantization sidecars.  They can have the same
-    // length as hidden_size but are not activation/RMSNorm parameters.
+static int moe_router_scale_tensor_is_weight_sidecar_name_f32(const std::string& name) {
+    // Only weight-quantization sidecars are rejected by name.  Bare
+    // ffn_gate_inp.scale/scales can be the split-FFN router input scale; reject
+    // only the explicit weight sidecar form here.
     static const char* const sidecar_suffixes[] = {
-        "ffn_gate_inp.scale",
-        "ffn_gate_inp.scales",
         "ffn_gate_inp.weight.scale",
-        "ffn_gate_inp.weight.scales"
+        "ffn_gate_inp.weight.scales",
+        ".weight.scale",
+        ".weight.scales"
     };
     for (const char* suffix : sidecar_suffixes) {
         if (moe_router_name_has_suffix_f32(name, suffix)) {
@@ -402,6 +403,19 @@ static int moe_router_scale_tensor_is_quant_sidecar_name_f32(const std::string& 
         }
     }
     return 0;
+}
+
+static int moe_router_scale_record_is_weight_sidecar_f32(
+    const moe_gguf_common_tensor_record& rec
+) {
+    if (moe_router_scale_tensor_is_weight_sidecar_name_f32(rec.name)) {
+        return 1;
+    }
+    const std::string role = moe_lower_ascii_copy(rec.op_role);
+    return role.find("weight_scale_sidecar") != std::string::npos ||
+        role.find("weight_sidecar") != std::string::npos ||
+        role.find("quant_sidecar") != std::string::npos ||
+        role.find("mxfp") != std::string::npos;
 }
 
 static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role_f32(
@@ -418,11 +432,11 @@ static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role
             !moe_common_tensor_layer_matches(rec, layer)) {
             continue;
         }
-        if (moe_router_scale_tensor_is_quant_sidecar_name_f32(rec.name)) {
+        if (moe_router_scale_record_is_weight_sidecar_f32(rec)) {
             if (moe_profile_level() >= 2) {
                 moe_profile_log(
                     "router_scale_contract_reject",
-                    "layer=%d name=%s op_role=%s reason=quant_sidecar_suffix",
+                    "layer=%d name=%s op_role=%s reason=weight_sidecar",
                     layer, rec.name.c_str(), rec.op_role.c_str());
             }
             continue;
@@ -451,6 +465,7 @@ static int moe_map_router_scale_tensor(
     static const char* const role_names[] = {
         "moe_router_scale",
         "router_scale",
+        "router_input_scale",
         "moe_router_norm",
         "router_norm",
         "router_input_norm"
@@ -466,7 +481,9 @@ static int moe_map_router_scale_tensor(
         "mlp.router_norm.weight",
         "mlp.router.scale",
         "router.scale",
-        "moe.gate.scale"
+        "moe.gate.scale",
+        "ffn_gate_inp.scale",
+        "ffn_gate_inp.scales"
     };
 
     // Fix 18: Cache tensor mapping to avoid std::string vector allocation per token.
@@ -500,11 +517,11 @@ static int moe_map_router_scale_tensor(
     if (!rec) {
         return 0;
     }
-    if (moe_router_scale_tensor_is_quant_sidecar_name_f32(rec->name)) {
+    if (moe_router_scale_record_is_weight_sidecar_f32(*rec)) {
         if (moe_profile_level() >= 2) {
             moe_profile_log(
                 "router_scale_contract_reject",
-                "layer=%d name=%s op_role=%s reason=quant_sidecar_suffix",
+                "layer=%d name=%s op_role=%s reason=weight_sidecar",
                 layer, rec->name.c_str(), rec->op_role.c_str());
         }
         return 0;

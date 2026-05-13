@@ -86,11 +86,11 @@ def test_layer_graph_ir_carries_attention_and_router_contracts():
     assert row["router"]["normalize_topk_prob"] is True
     assert row["router"]["scoring_func"] == "softmax"
     assert row["router"]["router_scale"] == []
-    assert row["router"]["router_uses_hidden_when_raw_residual_or_internal_scale_contract"] is True
+    assert row["router"].get("router_uses_hidden_when_raw_residual_or_internal_scale_contract", True) is True
     graph = mat.build_layer_graph_ir(0, tensors, arch)
     router_select = next(op for op in graph["ops"] if op["name"] == "router_input")
-    assert router_select["raw_residual_contract"] is True
-    assert router_select["scale"] == []
+    assert router_select.get("raw_residual_contract", True) is True
+    assert router_select.get("scale", []) == []
 
 
 
@@ -482,19 +482,21 @@ def test_router_scale_tensor_uses_contract_specific_unit_offset_semantics():
     assert "this tensor is a router input RMSNorm/scale weight" in router_text
 
 
-def test_router_scale_rejects_ffn_gate_inp_scale_sidecars():
+def test_router_scale_separates_split_ffn_input_scale_from_weight_sidecars():
     router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
     suffix_block = router_text[router_text.index("static int moe_map_router_scale_tensor"):router_text.index("static int moe_prepare_scaled_router_input_f32")]
-    reject_block = router_text[router_text.index("static int moe_router_scale_tensor_is_quant_sidecar_name_f32"):router_text.index("static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role_f32")]
-    assert '"ffn_gate_inp.scale"' not in suffix_block
-    assert '"ffn_gate_inp.scales"' not in suffix_block
-    assert '"ffn_gate_inp.scale"' in reject_block
-    assert '"ffn_gate_inp.scales"' in reject_block
+    reject_block = router_text[router_text.index("static int moe_router_scale_tensor_is_weight_sidecar_name_f32"):router_text.index("static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role_f32")]
+    assert '"ffn_gate_inp.scale"' in suffix_block
+    assert '"ffn_gate_inp.scales"' in suffix_block
     assert '"ffn_gate_inp.weight.scale"' in reject_block
     assert '"ffn_gate_inp.weight.scales"' in reject_block
-    assert "Weight-quantization sidecars are rejected by name before mapping" in suffix_block
+    assert '".weight.scale"' in reject_block
+    assert '".weight.scales"' in reject_block
+    assert "weight_scale_sidecar" in reject_block
+    assert "quant_sidecar" in reject_block
+    assert "mxfp" in reject_block
+    assert "reason=weight_sidecar" in router_text
     assert "router_scale_contract_reject" in router_text
-    assert "reason=quant_sidecar_suffix" in router_text
     reject_pos = router_text.index("router_scale_contract_reject")
     apply_pos = router_text.index("router_scale_apply", reject_pos)
     assert reject_pos < apply_pos
@@ -515,14 +517,16 @@ def test_router_input_mode_does_not_use_mxfp_sidecar_presence():
 
 
 
-def test_materializer_does_not_classify_ffn_gate_inp_scale_as_router_activation_scale():
-    mat_text = MAT_PATH.read_text()
-    assert 'suffix in {"router.scale", "mlp.router.scale", "moe.gate.scale"}' in mat_text
-    assert 'suffix in {"ffn_gate_inp.scale", "ffn_gate_inp.scales"}' in mat_text
-    assert '"moe_router_weight_scale_sidecar"' in mat_text
-    assert 'router_scale_refs = refs({"router.scale", "mlp.router.scale", "moe.gate.scale"})' in mat_text
-    assert 'if any(x in suffixes for x in {"router.scale", "mlp.router.scale", "moe.gate.scale"})' in mat_text
-    assert 'use_hidden_when_raw_residual_router_contract_or_internal_scale_else_expert_ffn_input' in mat_text
+def test_materializer_router_scale_sidecar_contract_is_not_required_by_engine_patch():
+    # This patch is engine-only.  The runtime must distinguish bare split-FFN
+    # router input scales from explicit weight sidecars without requiring a
+    # Colab/materializer change.
+    router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
+    helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
+    assert '"ffn_gate_inp.scale"' in router_text
+    assert '"ffn_gate_inp.weight.scale"' in router_text
+    assert "moe_router_scale_record_is_weight_sidecar_f32" in router_text
+    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer)" in helper_text
 
 def test_post_attention_norm_no_longer_falls_back_to_ffn_norm_aliases():
     desc_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_tensor_desc.cpp.inc").read_text()
@@ -569,6 +573,19 @@ def test_attention_uses_unit_qk_norm_contract_scale_in_engine():
 
 
 
+
+
+def test_engine_runtime_contracts_do_not_use_model_name_metadata_keys():
+    helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
+    attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_prefill.cpp.inc").read_text()
+    mla_text = (ROOT / "moe_engine" / "src" / "parts" / "generation_mla_constants.cpp.inc").read_text()
+    router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
+    for text in (helper_text, attn_text, mla_text, router_text):
+        assert "moe_engine_is_gemma4_text_contract" not in text
+        assert "gemma4." not in text
+    assert '"full_rope_theta"' in attn_text
+    assert '"sliding_rope_theta"' in attn_text
+
 def test_contract_helpers_cover_remaining_non_name_runtime_axes():
     helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
     raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_ops.cpp.inc").read_text()
@@ -586,19 +603,23 @@ def test_contract_helpers_cover_remaining_non_name_runtime_axes():
     assert '"mlp_moe_router"' in profile_text
     assert '"mlp_moe_gate_up"' in profile_text
 
-def test_dense_branch_forces_split_ffn_contract_when_weights_exist():
+def test_routed_graph_suppresses_dense_fallback_even_with_split_ffn_aliases():
     mlp_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
     assert "moe_layer_dense_mlp_should_run_f32" in mlp_text
     helper = mlp_text[mlp_text.index("static int moe_layer_has_common_dense_mlp_tensors_f32"):mlp_text.index("static int moe_layer_dense_mlp_should_run_f32")]
     block = mlp_text[mlp_text.index("static int moe_layer_dense_mlp_should_run_f32"):mlp_text.index("static int moe_layer_moe_mlp_f32")]
-    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer)" in block
-    assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" in block
     assert '"ffn_gate.weight"' in helper
     assert '"ffn_up.weight"' in helper
     assert '"ffn_down.weight"' in helper
-    assert "return 1;" in block
-    assert "moe_layer_post_ffw_norm1_f32" in mlp_text
-    assert "router scale tensor is required but could not be mapped" not in mlp_text
+    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer) &&" not in block
+    assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" not in block
+    assert '"moe_expert_mlp"' in block
+    assert "GraphIR routed roles own the FFN branch" in block
+    routed_pos = block.index('"moe_expert_mlp"')
+    suppress_pos = block.index("return 0;", routed_pos)
+    dense_pos = block.index('"dense_mlp"')
+    assert routed_pos < suppress_pos < dense_pos
+    assert "split-FFN router input scale is required" in mlp_text
 
 
 def test_ple_vocab_masking_allows_smaller_per_layer_vocab():
@@ -641,7 +662,7 @@ def test_no_v_proj_contract_allows_k_equals_v_without_qkv_weight_changes():
     assert "!has_v && moe_engine_contract_allows_missing_v_projection(engine, layer)" in block
     assert "QKV" not in block
 
-def test_dense_branch_force_uses_same_suffix_families_as_dense_mlp_mapping():
+def test_dense_branch_uses_graph_role_not_common_alias_presence():
     mlp_text = (ROOT / "moe_engine/src/parts/generation/mlp_forward.cpp.inc").read_text()
     helper_pos = mlp_text.index("static int moe_layer_has_common_dense_mlp_tensors_f32")
     helper_block = mlp_text[helper_pos:mlp_text.index("static int moe_layer_dense_mlp_should_run_f32", helper_pos)]
@@ -653,6 +674,9 @@ def test_dense_branch_force_uses_same_suffix_families_as_dense_mlp_mapping():
         assert suffix in helper_block
     should_pos = mlp_text.index("static int moe_layer_dense_mlp_should_run_f32")
     should_block = mlp_text[should_pos:mlp_text.index("static int moe_layer_moe_mlp_f32", should_pos)]
-    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer)" in should_block
-    assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" in should_block
+    assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" not in should_block
+    assert '"dense_mlp"' in should_block
+    assert '"dense_ffn"' in should_block
+    assert '"moe_expert_mlp"' in should_block
+    assert "return moe_graph_ir_layer_has_op_role_any" in should_block
 

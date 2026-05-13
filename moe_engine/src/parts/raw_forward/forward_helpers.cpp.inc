@@ -489,15 +489,23 @@ static int moe_engine_contract_has_router_input_scale(
             sizeof(router_scale_suffixes) / sizeof(router_scale_suffixes[0]))) {
         return 1;
     }
-    // Do not use layers_with_router_scale or ffn_gate_inp.scale as activation-scale
-    // contracts: older/generated JUJU indexes can count MXFP router-weight sidecars
-    // under those names. Only explicit activation/RMSNorm-scale names may select
-    // router preprocessing.
+    // Split-FFN routers can carry the router-input RMS scale as a bare
+    // ffn_gate_inp.scale/scales tensor next to ffn_gate_inp.weight.  Treat that
+    // as activation scale only under the split-FFN contract; explicit
+    // *.weight.scale sidecars remain excluded in the router mapper.
+    if (moe_engine_contract_uses_split_ffn_norm(engine, layer) &&
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.weight") &&
+        (moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale") ||
+         moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scales"))) {
+        return 1;
+    }
     return moe_engine_graph_ir_mentions(engine, "router_input_scale") ||
         moe_engine_graph_ir_mentions(engine, "router_input_norm") ||
         moe_engine_graph_ir_mentions(engine, "router.scale") ||
         moe_engine_graph_ir_mentions(engine, "mlp.router.scale") ||
         moe_engine_graph_ir_mentions(engine, "moe.gate.scale") ||
+        moe_engine_graph_ir_mentions(engine, "ffn_gate_inp.scale") ||
+        moe_engine_graph_ir_mentions(engine, "ffn_gate_inp.scales") ||
         moe_engine_graph_ir_mentions(engine, "router_norm.weight") ||
         moe_engine_graph_ir_mentions(engine, "router.input_layernorm.weight") ||
         moe_engine_graph_ir_mentions(engine, "router.input_norm.weight");

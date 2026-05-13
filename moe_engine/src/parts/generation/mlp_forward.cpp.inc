@@ -152,17 +152,8 @@ static int moe_layer_dense_mlp_should_run_f32(
     if (!engine || layer < 0) {
         return 0;
     }
-    static const char* const dense_roles[] = { "dense_mlp" };
     if (!moe_graph_ir_math_required(engine)) {
         return 1;
-    }
-    if (moe_engine_contract_uses_split_ffn_norm(engine, layer) &&
-        moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)) {
-        return 1;
-    }
-    if (!moe_graph_ir_layer_has_op_role_any(
-            engine, layer, dense_roles, sizeof(dense_roles) / sizeof(dense_roles[0]))) {
-        return 0;
     }
     static const char* const routed_roles[] = {
         "moe_expert_mlp", "moe_experts", "expert_mlp",
@@ -170,13 +161,16 @@ static int moe_layer_dense_mlp_should_run_f32(
     };
     if (moe_graph_ir_layer_has_op_role_any(
             engine, layer, routed_roles, sizeof(routed_roles) / sizeof(routed_roles[0]))) {
-        // GraphIR contract names this dense_ffn_fallback and marks it non-required
-        // when routed experts are present.  The branch-sum contract supplies zero
-        // for missing optional branches; executing fallback dense alongside routed
-        // experts double-counts FFN capacity and dominates layer 0 activations.
+        // Common dense FFN tensors can exist as aliases/fallback storage next to
+        // routed experts.  Do not execute them solely because split-FFN aliases
+        // are present; GraphIR routed roles own the FFN branch for this layer.
         return 0;
     }
-    return 1;
+    static const char* const dense_roles[] = {
+        "dense_mlp", "dense_ffn", "dense_ffn_mlp"
+    };
+    return moe_graph_ir_layer_has_op_role_any(
+        engine, layer, dense_roles, sizeof(dense_roles) / sizeof(dense_roles[0]));
 }
 
 static int moe_layer_moe_mlp_f32(
@@ -345,6 +339,14 @@ static int moe_layer_moe_mlp_f32(
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale"));
     const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
     const int router_uses_raw_residual = router_uses_raw_residual_contract;
+    if (router_uses_raw_residual_contract &&
+        moe_engine_contract_uses_direct_router_input_scale(engine, layer) &&
+        !router_has_plausible_input_scale) {
+        std::fprintf(stderr,
+            "[storagellm mlp] split-FFN router input scale is required but could not be mapped layer=%d\n",
+            layer);
+        return 0;
+    }
     const float* router_input = (router_has_internal_norm_scale || router_uses_raw_residual) ?
         hidden : expert_input;
     moe_save_gate_input_snapshot(engine, layer, router_input, hidden_size);
@@ -2260,6 +2262,14 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale"));
     const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
     const int router_uses_raw_residual = router_uses_raw_residual_contract;
+    if (router_uses_raw_residual_contract &&
+        moe_engine_contract_uses_direct_router_input_scale(engine, layer) &&
+        !router_has_plausible_input_scale) {
+        std::fprintf(stderr,
+            "[storagellm mlp] batch split-FFN router input scale is required but could not be mapped layer=%d\n",
+            layer);
+        return 0;
+    }
     const uint32_t top_k = moe_router_top_k_from_metadata(
         engine, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer);
     // PPL/order correctness is not a user-facing mode. It is an engine invariant:

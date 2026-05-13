@@ -516,7 +516,6 @@ static float moe_standard_attention_score_scale(
                      moe_json_get_double_local(engine->offload_graph_ir_json, "attn_scale", &direct_scale) ||
                      moe_json_get_double_local(engine->offload_graph_ir_json, "attention_score_scale", &direct_scale) ||
                      moe_json_get_double_local(engine->offload_graph_ir_json, "f_attn_scale", &direct_scale) ||
-                     moe_json_get_double_local(engine->offload_graph_ir_json, "gemma4.attention.scale", &direct_scale) ||
                      moe_json_get_double_local(engine->offload_graph_ir_json, "qk_scale", &direct_scale)) &&
                     direct_scale > 0.0 && direct_scale <= 1024.0 && std::isfinite(direct_scale)) {
                     resolved_source = 1;
@@ -529,7 +528,6 @@ static float moe_standard_attention_score_scale(
                      moe_json_get_double_local(engine->offload_gguf_metadata_json, "attn_scale", &direct_scale) ||
                      moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_score_scale", &direct_scale) ||
                      moe_json_get_double_local(engine->offload_gguf_metadata_json, "f_attn_scale", &direct_scale) ||
-                     moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.attention.scale", &direct_scale) ||
                      moe_json_get_double_local(engine->offload_gguf_metadata_json, "qk_scale", &direct_scale)) &&
                     direct_scale > 0.0 && direct_scale <= 1024.0 && std::isfinite(direct_scale)) {
                     resolved_source = 2;
@@ -710,7 +708,6 @@ static void moe_standard_attention_rope_params(
         has_full_theta =
             moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_rope_theta", &full_theta) ||
             moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_attention_rope_theta", &full_theta) ||
-            moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.rope.freq_base", &full_theta) ||
             moe_json_get_double_local(engine->offload_gguf_metadata_json, "rope.freq_base", &full_theta);
     }
     if (engine->model_config_sliding_rope_theta > 0.0f) {
@@ -720,7 +717,6 @@ static void moe_standard_attention_rope_params(
         has_sliding_theta =
             moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_rope_theta", &sliding_theta) ||
             moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_attention_rope_theta", &sliding_theta) ||
-            moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.rope.freq_base_swa", &sliding_theta) ||
             moe_json_get_double_local(engine->offload_gguf_metadata_json, "rope.freq_base_swa", &sliding_theta);
     }
     const int full_attention_layout =

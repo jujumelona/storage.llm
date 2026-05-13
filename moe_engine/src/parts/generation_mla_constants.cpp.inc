@@ -278,7 +278,6 @@ static moe_attn_config_t moe_generation_layer_attn_config(
             cfg.rope_theta = engine->model_config_full_rope_theta;
         } else if (moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_rope_theta", &dvalue) ||
                    moe_json_get_double_local(engine->offload_gguf_metadata_json, "full_attention_rope_theta", &dvalue) ||
-                   moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.rope.freq_base", &dvalue) ||
                    moe_json_get_double_local(engine->offload_gguf_metadata_json, "rope.freq_base", &dvalue)) {
             cfg.rope_theta = (float)dvalue;
         }
@@ -290,7 +289,6 @@ static moe_attn_config_t moe_generation_layer_attn_config(
             cfg.rope_theta = engine->model_config_sliding_rope_theta;
         } else if (moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_rope_theta", &dvalue) ||
                    moe_json_get_double_local(engine->offload_gguf_metadata_json, "sliding_attention_rope_theta", &dvalue) ||
-                   moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.rope.freq_base_swa", &dvalue) ||
                    moe_json_get_double_local(engine->offload_gguf_metadata_json, "rope.freq_base_swa", &dvalue)) {
             cfg.rope_theta = (float)dvalue;
         }

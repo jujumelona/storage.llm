@@ -625,8 +625,14 @@ static int moe_router_topk_f32(
     }
     std::vector<float> scaled_router_input;
     const float* router_input = hidden;
+    const int router_scale_declared = moe_engine_contract_has_router_input_scale(engine, layer);
     if (moe_prepare_scaled_router_input_f32(engine, layer, hidden, hidden_size, &scaled_router_input)) {
         router_input = scaled_router_input.data();
+    } else if (router_scale_declared) {
+        std::fprintf(stderr,
+            "[storagellm router] declared router input scale could not be applied layer=%d hidden=%u\n",
+            layer, hidden_size);
+        return 0;
     }
     if (!moe_router_logits_f32(engine, layer, router_input, hidden_size, experts, scratch_logits)) {
         return 0;
