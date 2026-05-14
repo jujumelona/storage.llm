@@ -406,6 +406,61 @@ static int moe_layer_dense_mlp_from_suffixes_f32(
 }
 
 
+
+static int moe_router_contract_scale_name_is_weight_sidecar_f32(const std::string& name) {
+    const std::string lower = moe_lower_ascii_copy(name);
+    static const char* const markers[] = {
+        "ffn_gate_inp.scale",
+        "ffn_gate_inp.scales",
+        "ffn_gate_inp.weight.scale",
+        "ffn_gate_inp.weight.scales",
+        ".weight.scale",
+        ".weight.scales",
+        "weight_sidecar",
+        "quant_sidecar",
+        "router_weight_scale_sidecar",
+        "mxfp"
+    };
+    for (const char* marker : markers) {
+        if (lower.find(marker) != std::string::npos) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_router_contract_name_list_has_activation_scale_f32(
+    const std::vector<std::string>& names
+) {
+    for (const std::string& name : names) {
+        if (!name.empty() && !moe_router_contract_scale_name_is_weight_sidecar_f32(name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_router_contract_object_has_activation_scale_f32(
+    const std::string& doc,
+    size_t obj_begin,
+    size_t obj_end
+) {
+    static const char* const scale_keys[] = {
+        "router_scale", "router_scales", "scale", "scales",
+        "input_scale", "input_scales", "router_input_scale", "router_input_scales",
+        "activation_scale", "activation_scales"
+    };
+    std::vector<std::string> names;
+    for (const char* key : scale_keys) {
+        names.clear();
+        if (moe_json_get_string_array_slice(doc, obj_begin, obj_end, key, &names) &&
+            moe_router_contract_name_list_has_activation_scale_f32(names)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int moe_layer_router_contract_has_hidden_input_f32(
     const std::string& doc,
     size_t obj_begin,
@@ -429,14 +484,10 @@ static int moe_layer_router_contract_has_hidden_input_f32(
         const std::string lowered_rule = moe_lower_ascii_copy(rule);
         if (lowered_rule.find("use_hidden_when_router_has_internal_scale") != std::string::npos ||
             lowered_rule.find("hidden_when_router_has_internal_scale") != std::string::npos) {
-            std::vector<std::string> scale_names;
-            if (moe_json_get_string_array_slice(doc, obj_begin, obj_end, "scale", &scale_names) &&
-                !scale_names.empty()) {
-                return 1;
-            }
-            std::vector<std::string> weight_names;
-            if (moe_json_get_string_array_slice(doc, obj_begin, obj_end, "weights", &weight_names) &&
-                !weight_names.empty()) {
+            // This rule is conditional: hidden/raw residual input is valid only
+            // when the router op has a real activation/input scale.  Weight
+            // sidecars such as ffn_gate_inp.scale must not trigger raw hidden.
+            if (moe_router_contract_object_has_activation_scale_f32(doc, obj_begin, obj_end)) {
                 return 1;
             }
         }
@@ -483,15 +534,13 @@ static int moe_layer_execution_contract_router_uses_hidden_f32(
                 doc, router_begin, router_end,
                 "router_uses_hidden_when_internal_scale_present", &uses_hidden) &&
             uses_hidden) {
-            std::vector<std::string> scale_names;
-            if (moe_json_get_string_array_slice(doc, router_begin, router_end, "router_scale", &scale_names) &&
-                !scale_names.empty()) {
-                return 1;
-            }
-            // Some GraphIR producers encode the boolean as the complete contract and keep
-            // scale tensors on the router_input/moe_router ops.  Honor the boolean instead
-            // of falling back to the normalized expert input.
-            return 1;
+            // The boolean means "use hidden when an internal router input
+            // scale/norm is present".  It is not itself proof that raw hidden is
+            // valid.  Filter out router-weight quant sidecars such as
+            // ffn_gate_inp.scale; without a real activation scale the router must
+            // consume the expert FFN norm output.
+            return moe_router_contract_object_has_activation_scale_f32(
+                doc, router_begin, router_end) ? 1 : 0;
         }
         return 0;
     }

@@ -215,6 +215,31 @@ static size_t moe_graph_ir_layer_contract_name_count_f32(
     return names.size();
 }
 
+
+static int moe_graph_ir_dense_mlp_uses_shared_path_f32(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    int flag = 0;
+    // Generator/runtime policy: dense_mlp refs are branch-1 only when the
+    // adapter contract explicitly routes dense MLP through the shared path.
+    // A bare dense_mlp ref in layer_execution_contract_table is not enough;
+    // otherwise ordinary dense weights are double-counted next to routed MoE.
+    if (moe_json_get_bool_local(engine->offload_graph_ir_json,
+            "dense_mlp_uses_shared_path", &flag) && flag) {
+        return 1;
+    }
+    if (moe_json_get_bool_local(engine->offload_gguf_metadata_json,
+            "dense_mlp_uses_shared_path", &flag) && flag) {
+        return 1;
+    }
+    (void)layer;
+    return 0;
+}
+
 static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
     const moe_pc_engine* engine,
     int32_t layer
@@ -285,8 +310,11 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
     // data-flow contract; do not require a model-name branch or a global suffix
     // heuristic.  This restores the common branch only when the IR declares the
     // branch norm and the actual layer has a complete dense FFN triplet.
+    const int dense_uses_shared_path =
+        moe_graph_ir_dense_mlp_uses_shared_path_f32(engine, layer);
     const int split_dense_branch_by_norm1 =
-        (plan.post_norm1.has_weights &&
+        (dense_uses_shared_path &&
+         plan.post_norm1.has_weights &&
          moe_layer_has_common_dense_mlp_tensors_f32(engine, layer) &&
          !plan.shared.has_weights) ? 1 : 0;
     if (split_dense_branch_by_norm1) {
@@ -302,12 +330,12 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
     plan.shared_required = plan.shared.required ? 1 : 0;
     moe_profile_log(
         "graphir_mlp_layer_plan",
-        "layer=%d routed_present=%d routed_weights=%zu shared_present=%d shared_required=%d shared_weights=%zu run_shared=%d dense_present=%d dense_required=%d dense_weights=%zu run_dense=%d split_dense_by_norm1=%d post_norm1_present=%d post_norm1_weights=%zu",
+        "layer=%d routed_present=%d routed_weights=%zu shared_present=%d shared_required=%d shared_weights=%zu run_shared=%d dense_present=%d dense_required=%d dense_weights=%zu run_dense=%d dense_uses_shared_path=%d split_dense_by_norm1=%d post_norm1_present=%d post_norm1_weights=%zu",
         layer,
         plan.routed.present, plan.routed.weight_count,
         plan.shared.present, plan.shared.required, plan.shared.weight_count, plan.run_shared,
         plan.dense.present, plan.dense.required, plan.dense.weight_count, plan.run_dense,
-        split_dense_branch_by_norm1, plan.post_norm1.present, plan.post_norm1.weight_count);
+        dense_uses_shared_path, split_dense_branch_by_norm1, plan.post_norm1.present, plan.post_norm1.weight_count);
     return plan;
 }
 
@@ -482,6 +510,11 @@ static int moe_layer_moe_mlp_f32(
     }
     moe_profile_log("mlp_moe_norm", "layer=%d ok=%d ms=%.3f", layer, moe_norm_ok, moe_profile_elapsed_ms(norm_start_us));
 
+    const moe_graph_ir_mlp_layer_plan_f32 mlp_plan =
+        moe_graph_ir_math_required(engine) ?
+            moe_build_graph_ir_mlp_layer_plan_f32(engine, layer) :
+            moe_graph_ir_mlp_layer_plan_f32{};
+
     int dense_ok = 0;
     const uint64_t dense_start_us = moe_profile_now_us();
     std::fill(s->shared.begin(), s->shared.begin() + hidden_size, 0.0f);
@@ -490,7 +523,8 @@ static int moe_layer_moe_mlp_f32(
     // execute dense weights merely because tensor names bind; that double-counts
     // FFN output beside routed experts and creates the layer-0 branch explosion
     // seen in PPL traces.
-    const int dense_enabled = moe_layer_dense_mlp_should_run_f32(engine, layer);
+    const int dense_enabled = moe_graph_ir_math_required(engine) ?
+        (mlp_plan.run_dense ? 1 : 0) : moe_layer_dense_mlp_should_run_f32(engine, layer);
     if (dense_enabled && moe_layer_common_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->shared.data())) {
         dense_ok = 1;
         if (moe_engine_contract_uses_split_ffn_norm(engine, layer) &&
@@ -516,7 +550,8 @@ static int moe_layer_moe_mlp_f32(
         2ull * (uint64_t)configured_expert_intermediate * (uint64_t)hidden_size * 2ull +
         (uint64_t)hidden_size * (uint64_t)configured_expert_intermediate * 2ull;
     const moe_storage_raw_span_spec_t* shared = find_raw_role_span_bytes(layer, moe_RAW_ROLE_SHARED, shared_bytes, 0);
-    const int common_shared_enabled = moe_layer_common_ffn_is_shared_branch_f32(engine, layer);
+    const int common_shared_enabled = moe_graph_ir_math_required(engine) ?
+        0 : moe_layer_common_ffn_is_shared_branch_f32(engine, layer);
     int shared_ok = 0;
     int common_shared_ok = 0;
     const uint64_t shared_start_us = moe_profile_now_us();
@@ -543,7 +578,7 @@ static int moe_layer_moe_mlp_f32(
             shared_branch = s->shared.data();
             moe_mlp_trace_vec_f32("mlp_shared_branch_post_norm1", layer, shared_branch, hidden_size);
         } else if (moe_layer_has_post_ffw_norm1_weight(engine, layer) &&
-                   moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
+                   (moe_graph_ir_math_required(engine) ? mlp_plan.shared.present : moe_layer_graph_shared_expert_declared_f32(engine, layer))) {
             std::fprintf(stderr,
                 "[storagellm mlp] shared post-ffw norm1 tensor is required but could not be mapped layer=%d\n",
                 layer);
@@ -574,7 +609,7 @@ static int moe_layer_moe_mlp_f32(
         }
         common_shared_ok = 1;
         moe_mlp_trace_vec_f32("mlp_common_shared_branch", layer, common_branch, hidden_size);
-    } else if (moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
+    } else if (moe_graph_ir_math_required(engine) ? mlp_plan.shared.present : moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
         // Shared branches are optional unless the tensor binding is explicit and
         // mappable.  Do not fail or substitute the plain dense FFN when GraphIR
         // only contains an abstract/shared op with no common tensor span; doing so
@@ -2519,7 +2554,12 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         (uint64_t)hidden_size * (uint64_t)intermediate_size * 2ull;
     const moe_storage_raw_span_spec_t* shared =
         find_raw_role_span_bytes(layer, moe_RAW_ROLE_SHARED, shared_bytes, 0);
-    const int common_shared_enabled = moe_layer_common_ffn_is_shared_branch_f32(engine, layer);
+    const moe_graph_ir_mlp_layer_plan_f32 mlp_plan =
+        moe_graph_ir_math_required(engine) ?
+            moe_build_graph_ir_mlp_layer_plan_f32(engine, layer) :
+            moe_graph_ir_mlp_layer_plan_f32{};
+    const int common_shared_enabled = moe_graph_ir_math_required(engine) ?
+        0 : moe_layer_common_ffn_is_shared_branch_f32(engine, layer);
     const int router_has_plausible_input_scale =
         moe_router_has_contract_input_scale_f32(engine, layer, hidden_size);
     const int router_has_internal_norm_scale = router_has_plausible_input_scale && (
@@ -2576,7 +2616,8 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         int dense_ok = 0;
         float* dense_out = batch_dense.data() + (size_t)t * hidden_size;
         std::fill(dense_out, dense_out + hidden_size, 0.0f);
-        const int dense_enabled = moe_layer_dense_mlp_should_run_f32(engine, layer);
+        const int dense_enabled = moe_graph_ir_math_required(engine) ?
+            (mlp_plan.run_dense ? 1 : 0) : moe_layer_dense_mlp_should_run_f32(engine, layer);
         if (dense_enabled && moe_layer_common_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, dense_out)) {
             dense_ok = 1;
             if (moe_engine_contract_uses_split_ffn_norm(engine, layer) &&
@@ -2617,7 +2658,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                     local.shared.data(), attn_cfg.rms_norm_eps)) {
                 branch1 = local.shared.data();
             } else if (moe_layer_has_post_ffw_norm1_weight(engine, layer) &&
-                       moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
+                       (moe_graph_ir_math_required(engine) ? mlp_plan.shared.present : moe_layer_graph_shared_expert_declared_f32(engine, layer))) {
                 std::fprintf(stderr,
                     "[storagellm mlp] batch shared post-ffw norm1 tensor is required but could not be mapped layer=%d token=%u\n",
                     layer, t);
@@ -2648,7 +2689,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                 return 0;
             }
             common_shared_ok = 1;
-        } else if (moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
+        } else if (moe_graph_ir_math_required(engine) ? mlp_plan.shared.present : moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
             moe_profile_log(
                 "prefill_shared_graph_role_unmapped",
                 "layer=%d token=%u action=skip_optional_shared_branch",
