@@ -91,30 +91,10 @@ static int moe_layer_graph_shared_expert_declared_f32(
         "shared_expert_mlp",
         "shared_expert_gate", "shared_expert_up", "shared_expert_down",
         "shared_expert_mlp_gate", "shared_expert_mlp_up", "shared_expert_mlp_down",
-        "shared_ffn_gate", "shared_ffn_up", "shared_ffn_down",
-        "ffn_shared_gate", "ffn_shared_up", "ffn_shared_down"
+        "shared_ffn_gate", "shared_ffn_up", "shared_ffn_down"
     };
-    if (moe_layer_graph_has_any_role_f32(
-            engine, layer, roles, sizeof(roles) / sizeof(roles[0]))) {
-        return 1;
-    }
-    // GraphIR producers may keep the semantic shared/common branch only in
-    // layers[].ops[] or the layer execution contract while tensor records carry
-    // generic ffn_gate/up/down names.  The runtime must follow that contract
-    // instead of treating the branch as absent.
-    for (const char* role : roles) {
-        std::vector<std::string> names;
-        if (moe_graph_ir_layer_ops_tensor_names_for_role(engine, layer, role, &names) &&
-            !names.empty()) {
-            return 1;
-        }
-        if (moe_graph_ir_layer_contract_declares_tensor_role(engine, layer, "branches", role) ||
-            moe_graph_ir_layer_contract_declares_tensor_role(engine, layer, "shared", role) ||
-            moe_graph_ir_layer_contract_declares_tensor_role(engine, layer, "ffn", role)) {
-            return 1;
-        }
-    }
-    return 0;
+    return moe_layer_graph_has_any_role_f32(
+        engine, layer, roles, sizeof(roles) / sizeof(roles[0]));
 }
 
 
@@ -169,23 +149,28 @@ static int moe_layer_common_ffn_is_shared_branch_f32(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
-    if (!engine || layer < 0 || !moe_graph_ir_math_required(engine)) {
+    if (!engine || layer < 0) {
         return 0;
     }
-    const int split_branch1_contract =
-        moe_layer_has_post_ffw_norm1_weight(engine, layer) &&
-        moe_layer_has_post_ffw_norm2_weight(engine, layer) &&
-        moe_layer_has_post_ffw_norm_weight(engine, layer);
-    // Do not promote a plain ffn_gate/up/down triplet by shape alone.  It is a
-    // branch-1/common FFN only when GraphIR explicitly declares a shared/common
-    // branch, or when the split-FFN contract declares the branch-1 norm together
-    // with the expert branch norm and final branch-sum norm.  That matches the
-    // existing generated contract without adding model-name special cases.
-    if (!moe_layer_graph_shared_expert_declared_f32(engine, layer) &&
-        !split_branch1_contract) {
+    if (moe_graph_ir_math_required(engine)) {
+        if (!moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
+            return 0;
+        }
+        // GraphIR-required execution must never promote the plain ffn_gate/up/down
+        // triplet to a shared/common MoE branch.  The 25335fe trace had
+        // mlp_shared_graph_role_candidates scanned=0 but still executed
+        // common_enabled=1/common_ok=1, which means the hand-written forward path
+        // double-counted the dense FFN without a GraphIR edge proving that branch.
+        // A real shared branch is handled by moe_layer_shared_expert_dense_mlp_f32()
+        // through explicit shared_* roles; otherwise the branch is optional zero.
+        moe_profile_log(
+            "mlp_common_shared_contract",
+            "layer=%d enabled=0 reason=graphir_requires_explicit_shared_binding",
+            layer);
         return 0;
     }
-    return moe_layer_has_common_dense_mlp_tensors_f32(engine, layer);
+    return moe_layer_has_post_ffw_norm1_weight(engine, layer) &&
+        moe_layer_has_common_dense_mlp_tensors_f32(engine, layer);
 }
 
 static int moe_layer_dense_mlp_should_run_f32(
@@ -371,10 +356,14 @@ static int moe_layer_moe_mlp_f32(
         common_shared_ok = 1;
         moe_mlp_trace_vec_f32("mlp_common_shared_branch", layer, common_branch, hidden_size);
     } else if (moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
-        std::fprintf(stderr,
-            "[storagellm mlp] graph-declared shared expert branch could not be mapped layer=%d\n",
+        // Shared branches are optional unless the tensor binding is explicit and
+        // mappable.  Do not fail or substitute the plain dense FFN when GraphIR
+        // only contains an abstract/shared op with no common tensor span; doing so
+        // changes logits instead of preserving the routed MoE path.
+        moe_profile_log(
+            "mlp_shared_graph_role_unmapped",
+            "layer=%d action=skip_optional_shared_branch",
             layer);
-        return 0;
     }
     moe_profile_log(
         "mlp_moe_shared",
@@ -2441,10 +2430,10 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
             }
             common_shared_ok = 1;
         } else if (moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
-            std::fprintf(stderr,
-                "[storagellm mlp] batch graph-declared shared expert branch could not be mapped layer=%d token=%u\n",
+            moe_profile_log(
+                "prefill_shared_graph_role_unmapped",
+                "layer=%d token=%u action=skip_optional_shared_branch",
                 layer, t);
-            return 0;
         }
         if (t == 0) {
             moe_profile_log(

@@ -85,12 +85,22 @@ static int moe_router_uses_sigmoid_scores(const moe_pc_engine* engine) {
         "router_scoring_func",
         "router_score_function",
         "router_scoring_function",
+        "router_score_activation",
+        "router_activation",
+        "routing_score_func",
+        "routing_score_function",
+        "routing_score_activation",
         "moe_router_score_func",
         "moe_router_scoring_func",
+        "moe_router_score_function",
+        "moe_router_score_activation",
         "moe_score_func",
         "moe_scoring_func",
         "expert_score_func",
-        "expert_scoring_func"
+        "expert_scoring_func",
+        "score_activation",
+        "score_type",
+        "score_fn"
     };
     static const char* const sigmoid_needles[] = {
         "\"scoring_func\":\"sigmoid\"",
@@ -100,7 +110,17 @@ static int moe_router_uses_sigmoid_scores(const moe_pc_engine* engine) {
         "\"router_scoring_func\":\"sigmoid\"",
         "\"router_scoring_func\": \"sigmoid\"",
         "\"router_score_function\":\"sigmoid\"",
-        "\"router_score_function\": \"sigmoid\""
+        "\"router_score_function\": \"sigmoid\"",
+        "\"router_score_activation\":\"sigmoid\"",
+        "\"router_score_activation\": \"sigmoid\"",
+        "\"routing_score_func\":\"sigmoid\"",
+        "\"routing_score_func\": \"sigmoid\"",
+        "\"routing_score_function\":\"sigmoid\"",
+        "\"routing_score_function\": \"sigmoid\"",
+        "\"score_activation\":\"sigmoid\"",
+        "\"score_activation\": \"sigmoid\"",
+        "\"score_fn\":\"sigmoid\"",
+        "\"score_fn\": \"sigmoid\""
     };
     int use_sigmoid = 0;
     // Do not infer sigmoid routing from route_scale/routed_scaling_factor.

@@ -913,11 +913,161 @@ static size_t moe_graph_ir_first_pos_any(
     return best;
 }
 
+static int moe_graph_ir_op_name_is_any_f32(
+    const std::string& lowered,
+    const char* const* needles,
+    size_t needle_count
+) {
+    if (lowered.empty() || !needles) {
+        return 0;
+    }
+    for (size_t i = 0; i < needle_count; ++i) {
+        if (needles[i] && needles[i][0] && lowered.find(needles[i]) != std::string::npos) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* engine, int32_t layer) {
-    (void)engine;
-    (void)layer;
-    // Disabled: the previous implementation used whole-GraphIR substring ordering,
-    // which is not a per-layer edge and can reorder every layer incorrectly.
+    if (!engine || layer < 0 || engine->offload_graph_ir_json.empty()) {
+        return 0;
+    }
+    const std::string& doc = engine->offload_graph_ir_json;
+    size_t arr_begin = 0;
+    size_t arr_end = 0;
+    if (moe_json_find_array_local(doc, "layer_execution_contract_table", &arr_begin, &arr_end)) {
+        size_t cursor = arr_begin + 1u;
+        while (cursor < arr_end) {
+            size_t obj_begin = 0;
+            size_t obj_end = 0;
+            if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+                break;
+            }
+            uint64_t parsed_layer = UINT64_MAX;
+            if (!moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed_layer) ||
+                parsed_layer != (uint64_t)layer) {
+                continue;
+            }
+            int flag = 0;
+            static const char* const bool_keys[] = {
+                "attention_residual_before_ffn_norm",
+                "post_attention_residual_before_norm",
+                "residual_before_post_attention_norm",
+                "post_attention_norm_after_residual",
+                "attention_norm_after_residual",
+                "graph_residual_first"
+            };
+            for (const char* key : bool_keys) {
+                if (moe_json_get_bool_slice(doc, obj_begin, obj_end, key, &flag)) {
+                    moe_profile_log(
+                        "graphir_attention_residual_order",
+                        "layer=%d residual_first=%d source=contract key=%s",
+                        layer, flag ? 1 : 0, key);
+                    return flag ? 1 : 0;
+                }
+            }
+            std::string order;
+            if ((moe_json_get_string_slice(doc, obj_begin, obj_end, "post_attention_norm_input", &order) ||
+                 moe_json_get_string_slice(doc, obj_begin, obj_end, "attention_norm_input", &order) ||
+                 moe_json_get_string_slice(doc, obj_begin, obj_end, "post_attention_order", &order))) {
+                const std::string lowered = moe_lower_ascii_copy(order);
+                if (lowered.find("residual") != std::string::npos ||
+                    lowered.find("attn_plus_hidden") != std::string::npos ||
+                    lowered.find("hidden_plus_attn") != std::string::npos) {
+                    moe_profile_log(
+                        "graphir_attention_residual_order",
+                        "layer=%d residual_first=1 source=contract_string value=%s",
+                        layer, order.c_str());
+                    return 1;
+                }
+                if (lowered.find("attention_output") != std::string::npos ||
+                    lowered.find("attn_output") != std::string::npos) {
+                    moe_profile_log(
+                        "graphir_attention_residual_order",
+                        "layer=%d residual_first=0 source=contract_string value=%s",
+                        layer, order.c_str());
+                    return 0;
+                }
+            }
+            break;
+        }
+    }
+
+    size_t layers_begin = 0;
+    size_t layers_end = 0;
+    if (!moe_json_find_array_local(doc, "layers", &layers_begin, &layers_end)) {
+        return 0;
+    }
+    size_t cursor = layers_begin + 1u;
+    while (cursor < layers_end) {
+        size_t layer_obj_begin = 0;
+        size_t layer_obj_end = 0;
+        if (!moe_json_next_object_in_array(doc, &cursor, layers_end, &layer_obj_begin, &layer_obj_end)) {
+            break;
+        }
+        uint64_t parsed_layer = UINT64_MAX;
+        if (!moe_json_get_u64_slice(doc, layer_obj_begin, layer_obj_end, "layer", &parsed_layer) ||
+            parsed_layer != (uint64_t)layer) {
+            continue;
+        }
+        const std::string layer_slice = doc.substr(layer_obj_begin, layer_obj_end - layer_obj_begin);
+        size_t ops_begin = 0;
+        size_t ops_end = 0;
+        if (!moe_json_find_array_local(layer_slice, "ops", &ops_begin, &ops_end)) {
+            return 0;
+        }
+        ops_begin += layer_obj_begin;
+        ops_end += layer_obj_begin;
+        size_t op_cursor = ops_begin + 1u;
+        int32_t residual_index = -1;
+        int32_t post_norm_index = -1;
+        int32_t index = 0;
+        static const char* const residual_needles[] = {
+            "residual_add", "attention_residual", "attn_residual",
+            "add_residual", "hidden_plus_attn", "attn_plus_hidden"
+        };
+        static const char* const post_norm_needles[] = {
+            "post_attention_norm", "post_attn_norm", "attention_output_norm",
+            "attn_output_norm"
+        };
+        while (op_cursor < ops_end) {
+            size_t op_begin = 0;
+            size_t op_end = 0;
+            if (!moe_json_next_object_in_array(doc, &op_cursor, ops_end, &op_begin, &op_end)) {
+                break;
+            }
+            std::string text;
+            std::string merged;
+            static const char* const fields[] = {
+                "name", "execution_op", "op_role", "role", "graph_role", "bundle_member_role", "type"
+            };
+            for (const char* field : fields) {
+                if (moe_json_get_string_slice(doc, op_begin, op_end, field, &text)) {
+                    merged += " ";
+                    merged += moe_lower_ascii_copy(text);
+                }
+            }
+            if (residual_index < 0 &&
+                moe_graph_ir_op_name_is_any_f32(merged, residual_needles, sizeof(residual_needles) / sizeof(residual_needles[0]))) {
+                residual_index = index;
+            }
+            if (post_norm_index < 0 &&
+                moe_graph_ir_op_name_is_any_f32(merged, post_norm_needles, sizeof(post_norm_needles) / sizeof(post_norm_needles[0]))) {
+                post_norm_index = index;
+            }
+            ++index;
+        }
+        if (residual_index >= 0 && post_norm_index >= 0) {
+            const int residual_first = residual_index < post_norm_index ? 1 : 0;
+            moe_profile_log(
+                "graphir_attention_residual_order",
+                "layer=%d residual_first=%d source=layers.ops residual_index=%d post_norm_index=%d",
+                layer, residual_first, residual_index, post_norm_index);
+            return residual_first;
+        }
+        return 0;
+    }
     return 0;
 }
 

@@ -381,19 +381,41 @@ static int moe_forward_one_token_f32(
                 "position=%u layer=%u ms=%.3f",
                 position, layer, moe_profile_elapsed_ms(split_standard_attn_start_us));
             const uint64_t split_post_norm_start_us = moe_profile_now_us();
-            const float* attn_residual = s->attn.data();
             const int graph_residual_first = layer_plan.attention_residual_before_ffn_norm;
             const int post_attention_norm_required = layer_plan.post_attention_norm_required;
-            const int post_norm_used = graph_residual_first ? 0 :
-                moe_layer_post_attention_output_norm_f32(
+            int post_norm_used = 0;
+            if (graph_residual_first) {
+                // GraphIR order: residual add feeds post_attention_norm.  The old
+                // branch only skipped the norm and then added raw attention, so a
+                // true residual-first contract was impossible to execute correctly.
+                for (uint32_t i = 0; i < c->hidden_size; ++i) {
+                    s->shared[i] = s->residual[i] + s->attn[i];
+                }
+                post_norm_used = moe_layer_post_attention_output_norm_f32(
+                    engine, (int32_t)layer, s->shared.data(), c->hidden_size,
+                    hidden, layer_attn_cfg.rms_norm_eps);
+                if (post_attention_norm_required && !post_norm_used) {
+                    moe_generation_set_error(stats, "post-attention norm tensor is required but could not be mapped");
+                    return 0;
+                }
+                if (!post_norm_used) {
+                    std::memcpy(hidden, s->shared.data(), (size_t)c->hidden_size * sizeof(float));
+                }
+            } else {
+                const float* attn_residual = s->attn.data();
+                post_norm_used = moe_layer_post_attention_output_norm_f32(
                     engine, (int32_t)layer, s->attn.data(), c->hidden_size,
                     s->norm.data(), layer_attn_cfg.rms_norm_eps);
-            if (!graph_residual_first && post_attention_norm_required && !post_norm_used) {
-                moe_generation_set_error(stats, "post-attention norm tensor is required but could not be mapped");
-                return 0;
-            }
-            if (post_norm_used) {
-                attn_residual = s->norm.data();
+                if (post_attention_norm_required && !post_norm_used) {
+                    moe_generation_set_error(stats, "post-attention norm tensor is required but could not be mapped");
+                    return 0;
+                }
+                if (post_norm_used) {
+                    attn_residual = s->norm.data();
+                }
+                for (uint32_t i = 0; i < c->hidden_size; ++i) {
+                    hidden[i] = s->residual[i] + attn_residual[i];
+                }
             }
             moe_profile_log(
                 "forward_split_post_attention_norm",
@@ -401,9 +423,6 @@ static int moe_forward_one_token_f32(
                 position, layer, post_norm_used, graph_residual_first,
                 moe_profile_elapsed_ms(split_post_norm_start_us));
             const uint64_t split_residual_start_us = moe_profile_now_us();
-            for (uint32_t i = 0; i < c->hidden_size; ++i) {
-                hidden[i] = s->residual[i] + attn_residual[i];
-            }
             moe_profile_log(
                 "forward_split_residual",
                 "position=%u layer=%u ms=%.3f",
