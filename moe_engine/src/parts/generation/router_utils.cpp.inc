@@ -419,6 +419,39 @@ static int moe_router_scale_record_is_weight_sidecar_f32(
         role.find("mxfp") != std::string::npos;
 }
 
+static int moe_router_has_internal_weight_scale_contract_f32(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    static const char* const roles[] = {
+        "moe_router_scale",
+        "router_scale"
+    };
+    moe_raw_tensor_desc desc{};
+    for (const char* role : roles) {
+        if (find_common_tensor_by_op_role(engine, role, layer, &desc)) {
+            return 1;
+        }
+    }
+    static const char* const suffixes[] = {
+        // Availability here means router-input activation scale, not MXFP/GGUF
+        // weight sidecar tensors. ffn_gate_inp.scale/scales are rejected by
+        // moe_map_router_scale_tensor and must not make router_scale_available=1.
+        "router.scale",
+        "mlp.router.scale",
+        "moe.gate.scale"
+    };
+    for (const char* suffix : suffixes) {
+        if (moe_engine_has_common_tensor_suffix(engine, layer, suffix)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role_f32(
     const moe_pc_engine* engine,
     const char* role,

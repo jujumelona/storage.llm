@@ -505,19 +505,26 @@ def test_router_scale_treats_ffn_gate_inp_scale_as_weight_sidecar():
     assert reject_pos < apply_pos
 
 
-def test_router_input_mode_does_not_use_mxfp_sidecar_presence():
+def test_router_input_mode_uses_router_internal_scale_without_activation_sidecar_norm():
     mlp_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
+    router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
     first_start = mlp_text.index("const int router_has_internal_norm_scale =")
     first_end = mlp_text.index("moe_save_gate_input_snapshot", first_start)
     first_block = mlp_text[first_start:first_end]
     assert '"ffn_gate_inp.scale"' not in first_block
     assert '"router_norm.weight"' in first_block
+    assert "moe_router_has_internal_weight_scale_contract_f32" in first_block
     assert "router_uses_raw_residual_contract && router_has_plausible_input_scale" not in first_block
+    assert "router_uses_raw_residual_contract || router_has_internal_weight_scale" not in first_block
     assert "const int router_uses_raw_residual = router_uses_raw_residual_contract;" in first_block
     assert "(router_has_internal_norm_scale || router_uses_raw_residual) ?" in first_block
     assert "router_scale_available=%d" in mlp_text
-
-
+    internal_start = router_text.index("moe_router_has_internal_weight_scale_contract_f32")
+    internal_block = router_text[internal_start:router_text.index("static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role_f32", internal_start)]
+    assert '"ffn_gate_inp.scale"' not in internal_block
+    assert '"ffn_gate_inp.weight.scale"' not in internal_block
+    assert '"router.scale"' in internal_block
+    assert "must not make router_scale_available=1" in internal_block
 
 
 def test_materializer_router_scale_sidecar_contract_is_engine_only():
@@ -735,6 +742,8 @@ def test_post_ffw_norms_use_layer_local_suffix_fallback_in_graphir_mode():
         block = text[text.index(f"static int {name}("):]
         block = block[:block.index("\nstatic int ", 1) if "\nstatic int " in block[1:] else len(block)]
         assert "moe_graph_ir_apply_rmsnorm_role_any_f32" in block
+        assert "moe_graph_ir_map_layer_contract_tensor_role_f32" in block
+        assert "layer_execution_contract_table" in text
         assert suffix in block
         assert "moe_layer_post_ffw_norm_suffixes_f32" in block
     for name, suffix in (
@@ -745,6 +754,7 @@ def test_post_ffw_norms_use_layer_local_suffix_fallback_in_graphir_mode():
         block = text[text.index(f"static int {name}("):]
         block = block[:block.index("\nstatic int ", 1) if "\nstatic int " in block[1:] else len(block)]
         assert "moe_graph_ir_layer_has_op_role_any" in block
+        assert "moe_graph_ir_layer_contract_declares_tensor_role" in block
         assert suffix in block
         assert "layers_with_" not in block
 
@@ -754,14 +764,35 @@ def test_layer_output_scale_plan_and_apply_use_role_or_layer_suffix_not_graphwid
     forward = (ROOT / "moe_engine/src/parts/generation_forward.cpp.inc").read_text()
     apply_block = common[common.index("static int moe_layer_output_scale_f32("):]
     assert "moe_graph_ir_map_layer_op_role_any" in apply_block
+    assert "moe_graph_ir_map_layer_contract_tensor_role_f32" in apply_block
     assert '"layer_output_scale.weight"' in apply_block
     assert '"layer_scalar.weight"' in apply_block
     assert "layers_with_layer_output_scale" not in apply_block
     plan_block = forward[forward.index("plan.apply_layer_output_scale ="):forward.index("return plan;", forward.index("plan.apply_layer_output_scale ="))]
     assert "moe_graph_ir_layer_has_op_role_any" in plan_block
+    assert "moe_graph_ir_layer_contract_declares_tensor_role" in plan_block
     assert '"layer_output_scale.weight"' in plan_block
     assert '"layer_scalar.weight"' in plan_block
     assert "layers_with_layer_output_scale" not in plan_block
+
+
+
+
+def test_layer_execution_contract_table_norms_and_tail_are_runtime_bindings():
+    text = (ROOT / "moe_engine/src/parts/generation/mlp_common_tensors.cpp.inc").read_text()
+    helper_start = text.rindex("static int moe_graph_ir_layer_contract_tensor_names_for_role")
+    helper_end = text.index("static int moe_graph_ir_apply_rmsnorm_role_any_f32", helper_start)
+    helper = text[helper_start:helper_end]
+    assert '"layer_execution_contract_table"' in helper
+    assert "moe_json_get_string_array_slice" in helper
+    assert "find_common_tensor_by_names" in helper or "moe_common_tensor_find(engine, name.c_str())" in helper
+    assert "graphir_contract_tensor_bind" in helper
+    assert '"norms"' in text
+    assert '"tail"' in text
+    assert '"post_ffw_norm_1"' in text
+    assert '"post_ffw_norm_2"' in text
+    assert '"post_ffw_norm"' in text
+    assert '"layer_output_scale"' in text
 
 
 def test_final_logit_softcap_uses_scalar_contract_not_executable_op_only():
@@ -791,3 +822,28 @@ def test_router_input_does_not_use_raw_residual_without_internal_scale():
     assert '"moe_router"' not in block
     assert "return 0;" in block
     assert "router_has_internal_norm_scale || router_uses_raw_residual" in fwd
+
+
+def test_common_tensor_role_lookup_preserves_execution_op_contract_fields():
+    type_text = (ROOT / "moe_engine" / "src" / "parts" / "engine_types.cpp.inc").read_text()
+    parse_text = (ROOT / "moe_engine" / "src" / "parts" / "codec" / "juju_main_parsing.cpp.inc").read_text()
+    desc_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_tensor_desc.cpp.inc").read_text()
+    assert "std::string execution_op;" in type_text
+    assert "std::string graph_role_text;" in type_text
+    assert "std::string bundle_member_role;" in type_text
+    assert "common_rec.execution_op = moe_lower_ascii_copy(entry.execution_op);" in parse_text
+    assert "common_rec.graph_role_text = moe_lower_ascii_copy(entry.graph_role_text);" in parse_text
+    assert "common_rec.bundle_member_role = moe_lower_ascii_copy(entry.bundle_member_role);" in parse_text
+    assert "moe_common_tensor_role_text_matches(rec.execution_op, role)" in desc_text
+    assert "moe_common_tensor_role_text_matches(rec.bundle_member_role, role)" in desc_text
+
+
+def test_shared_expert_role_scan_uses_execution_op_fields_without_model_names():
+    text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
+    assert "moe_shared_expert_role_is_shared_f32(rec.execution_op)" in text
+    assert "moe_shared_expert_role_is_shared_f32(rec.bundle_member_role)" in text
+    assert "moe_shared_expert_text_is_shared_f32(rec.graph_role_text)" in text
+    runtime_scope = text[text.index("static int moe_map_shared_expert_graph_role_f32"):text.index("static int moe_layer_shared_expert_dense_mlp_f32")]
+    assert "Gemma" not in runtime_scope
+    assert "GLM" not in runtime_scope
+    assert "Qwen" not in runtime_scope

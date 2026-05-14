@@ -257,6 +257,8 @@ static moe_decoder_layer_plan_t moe_build_decoder_layer_plan(
         plan.apply_layer_output_scale =
             moe_graph_ir_layer_has_op_role_any(
                 engine, (int32_t)layer, roles, sizeof(roles) / sizeof(roles[0])) ||
+            moe_graph_ir_layer_contract_declares_tensor_role(
+                engine, (int32_t)layer, "tail", "layer_output_scale") ||
             moe_engine_has_common_tensor_suffix(engine, (int32_t)layer, "layer_output_scale.weight") ||
             moe_engine_has_common_tensor_suffix(engine, (int32_t)layer, "layer_scalar.weight") ||
             moe_engine_has_common_tensor_suffix(engine, (int32_t)layer, "layer_scalar");

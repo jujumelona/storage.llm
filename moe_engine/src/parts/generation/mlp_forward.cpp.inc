@@ -370,6 +370,8 @@ static int moe_layer_moe_mlp_f32(
         moe_engine_has_common_tensor_suffix(engine, layer, "router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale"));
+    const int router_has_internal_weight_scale =
+        moe_router_has_internal_weight_scale_contract_f32(engine, layer);
     const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
     const int router_uses_raw_residual = router_uses_raw_residual_contract;
     if (router_uses_raw_residual_contract &&
@@ -431,7 +433,8 @@ static int moe_layer_moe_mlp_f32(
         "layer=%d selected=%zu weights=%zu logits=%zu internal_norm_scale=%d raw_gate_input=%d router_scale_available=%d ms=%.3f",
         layer, s->selected_experts.size(), s->selected_weights.size(),
         s->router_logits.size(), router_has_internal_norm_scale, router_uses_raw_residual,
-        router_has_plausible_input_scale, moe_profile_elapsed_ms(router_start_us));
+        (router_has_plausible_input_scale || router_has_internal_weight_scale) ? 1 : 0,
+        moe_profile_elapsed_ms(router_start_us));
     const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
     const uint64_t prefetch_start_us = moe_profile_now_us();
     if (phase != moe_GEN_PHASE_PREFILL) {
@@ -2297,6 +2300,8 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         moe_engine_has_common_tensor_suffix(engine, layer, "router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale"));
+    const int router_has_internal_weight_scale =
+        moe_router_has_internal_weight_scale_contract_f32(engine, layer);
     const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
     const int router_uses_raw_residual = router_uses_raw_residual_contract;
     if (router_uses_raw_residual_contract &&
