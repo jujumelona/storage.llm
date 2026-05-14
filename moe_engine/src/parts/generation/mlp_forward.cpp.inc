@@ -91,10 +91,30 @@ static int moe_layer_graph_shared_expert_declared_f32(
         "shared_expert_mlp",
         "shared_expert_gate", "shared_expert_up", "shared_expert_down",
         "shared_expert_mlp_gate", "shared_expert_mlp_up", "shared_expert_mlp_down",
-        "shared_ffn_gate", "shared_ffn_up", "shared_ffn_down"
+        "shared_ffn_gate", "shared_ffn_up", "shared_ffn_down",
+        "ffn_shared_gate", "ffn_shared_up", "ffn_shared_down"
     };
-    return moe_layer_graph_has_any_role_f32(
-        engine, layer, roles, sizeof(roles) / sizeof(roles[0]));
+    if (moe_layer_graph_has_any_role_f32(
+            engine, layer, roles, sizeof(roles) / sizeof(roles[0]))) {
+        return 1;
+    }
+    // GraphIR producers may keep the semantic shared/common branch only in
+    // layers[].ops[] or the layer execution contract while tensor records carry
+    // generic ffn_gate/up/down names.  The runtime must follow that contract
+    // instead of treating the branch as absent.
+    for (const char* role : roles) {
+        std::vector<std::string> names;
+        if (moe_graph_ir_layer_ops_tensor_names_for_role(engine, layer, role, &names) &&
+            !names.empty()) {
+            return 1;
+        }
+        if (moe_graph_ir_layer_contract_declares_tensor_role(engine, layer, "branches", role) ||
+            moe_graph_ir_layer_contract_declares_tensor_role(engine, layer, "shared", role) ||
+            moe_graph_ir_layer_contract_declares_tensor_role(engine, layer, "ffn", role)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 
@@ -152,16 +172,20 @@ static int moe_layer_common_ffn_is_shared_branch_f32(
     if (!engine || layer < 0 || !moe_graph_ir_math_required(engine)) {
         return 0;
     }
-    // Do not promote the plain ffn_gate/up/down triplet in a routed MoE layer
-    // to a shared/common branch by shape alone.  The retry logs showed that this
-    // heuristic changed the layer-0 branch sum and regressed NLL from the
-    // no-shared-branch baseline.  The dense triplet is a fallback/dense_mlp
-    // contract unless GraphIR/tensor roles explicitly declare a shared expert.
-    if (!moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
+    const int split_branch1_contract =
+        moe_layer_has_post_ffw_norm1_weight(engine, layer) &&
+        moe_layer_has_post_ffw_norm2_weight(engine, layer) &&
+        moe_layer_has_post_ffw_norm_weight(engine, layer);
+    // Do not promote a plain ffn_gate/up/down triplet by shape alone.  It is a
+    // branch-1/common FFN only when GraphIR explicitly declares a shared/common
+    // branch, or when the split-FFN contract declares the branch-1 norm together
+    // with the expert branch norm and final branch-sum norm.  That matches the
+    // existing generated contract without adding model-name special cases.
+    if (!moe_layer_graph_shared_expert_declared_f32(engine, layer) &&
+        !split_branch1_contract) {
         return 0;
     }
-    return moe_layer_has_post_ffw_norm1_weight(engine, layer) &&
-        moe_layer_has_common_dense_mlp_tensors_f32(engine, layer);
+    return moe_layer_has_common_dense_mlp_tensors_f32(engine, layer);
 }
 
 static int moe_layer_dense_mlp_should_run_f32(
