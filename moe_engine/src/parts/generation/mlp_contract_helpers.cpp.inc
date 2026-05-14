@@ -24,6 +24,68 @@ static int moe_graph_ir_math_required(const moe_pc_engine* engine) {
         engine->offload_graph_ir_ready.load(std::memory_order_relaxed);
 }
 
+static int moe_json_find_graph_layers_array_f32(
+    const std::string& doc,
+    size_t* out_begin,
+    size_t* out_end
+) {
+    if (!out_begin || !out_end) {
+        return 0;
+    }
+    static const char* const keys[] = {
+        "layers", "blocks", "decoder_layers", "transformer_layers", "layer_plans"
+    };
+    for (const char* key : keys) {
+        if (moe_json_find_array_local(doc, key, out_begin, out_end)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_json_slice_matches_layer_index_f32(
+    const std::string& doc,
+    size_t begin,
+    size_t end,
+    int32_t layer,
+    uint64_t implicit_index
+) {
+    if (layer < 0 || begin >= end || end > doc.size()) {
+        return 0;
+    }
+    uint64_t parsed = UINT64_MAX;
+    int saw_explicit_layer_key = 0;
+    static const char* const u64_keys[] = {
+        "layer", "layer_index", "layer_id", "block", "block_index", "idx", "index"
+    };
+    for (const char* key : u64_keys) {
+        if (moe_json_get_u64_slice(doc, begin, end, key, &parsed)) {
+            saw_explicit_layer_key = 1;
+            if (parsed == (uint64_t)layer) {
+                return 1;
+            }
+        }
+    }
+    std::string text;
+    const std::string want = std::to_string((long long)layer);
+    static const char* const string_keys[] = {
+        "layer", "layer_index", "layer_id", "block", "block_index"
+    };
+    for (const char* key : string_keys) {
+        if (moe_json_get_string_slice(doc, begin, end, key, &text)) {
+            saw_explicit_layer_key = 1;
+            if (text == want) {
+                return 1;
+            }
+        }
+    }
+    if (!saw_explicit_layer_key && implicit_index != UINT64_MAX &&
+        implicit_index == (uint64_t)layer) {
+        return 1;
+    }
+    return 0;
+}
+
 static int moe_map_layer_tensor_by_roles_or_suffixes(
     moe_pc_engine* engine,
     int32_t layer,

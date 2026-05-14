@@ -79,6 +79,238 @@ static int moe_layer_graph_has_any_role_f32(
     return moe_graph_ir_layer_has_op_role_any(engine, layer, roles, role_count);
 }
 
+static int moe_layer_has_common_dense_mlp_tensors_f32(const moe_pc_engine* engine, int32_t layer);
+
+struct moe_graph_ir_mlp_op_info_f32 {
+    int present = 0;
+    int required = 0;
+    int has_weights = 0;
+    size_t weight_count = 0;
+};
+
+struct moe_graph_ir_mlp_layer_plan_f32 {
+    int graph_required = 0;
+    moe_graph_ir_mlp_op_info_f32 routed;
+    moe_graph_ir_mlp_op_info_f32 shared;
+    moe_graph_ir_mlp_op_info_f32 dense;
+    moe_graph_ir_mlp_op_info_f32 post_norm1;
+    int run_dense = 0;
+    int run_shared = 0;
+    int shared_required = 0;
+};
+
+static int moe_graph_ir_text_matches_any_token_f32(
+    const std::string& lowered,
+    const char* const* tokens,
+    size_t token_count
+) {
+    if (lowered.empty() || !tokens) {
+        return 0;
+    }
+    for (size_t i = 0; i < token_count; ++i) {
+        const char* token = tokens[i];
+        if (!token || !token[0]) {
+            continue;
+        }
+        if (lowered == token || lowered.find(token) != std::string::npos) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void moe_graph_ir_layer_scan_mlp_op_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* op_tokens,
+    size_t op_token_count,
+    moe_graph_ir_mlp_op_info_f32* out
+) {
+    if (out) {
+        *out = moe_graph_ir_mlp_op_info_f32{};
+    }
+    if (!engine || layer < 0 || !op_tokens || !out || engine->offload_graph_ir_json.empty()) {
+        return;
+    }
+    const std::string& doc = engine->offload_graph_ir_json;
+    size_t layers_begin = 0;
+    size_t layers_end = 0;
+    if (!moe_json_find_graph_layers_array_f32(doc, &layers_begin, &layers_end)) {
+        return;
+    }
+    size_t cursor = layers_begin + 1u;
+    uint64_t layer_ordinal = 0;
+    while (cursor < layers_end) {
+        size_t layer_obj_begin = 0;
+        size_t layer_obj_end = 0;
+        if (!moe_json_next_object_in_array(doc, &cursor, layers_end, &layer_obj_begin, &layer_obj_end)) {
+            break;
+        }
+        const uint64_t this_layer_ordinal = layer_ordinal++;
+        if (!moe_json_slice_matches_layer_index_f32(
+                doc, layer_obj_begin, layer_obj_end, layer, this_layer_ordinal)) {
+            continue;
+        }
+        size_t ops_begin = 0;
+        size_t ops_end = 0;
+        const std::string layer_slice = doc.substr(layer_obj_begin, layer_obj_end - layer_obj_begin);
+        if (!moe_json_find_array_local(layer_slice, "ops", &ops_begin, &ops_end)) {
+            return;
+        }
+        ops_begin += layer_obj_begin;
+        ops_end += layer_obj_begin;
+        size_t op_cursor = ops_begin + 1u;
+        while (op_cursor < ops_end) {
+            size_t op_begin = 0;
+            size_t op_end = 0;
+            if (!moe_json_next_object_in_array(doc, &op_cursor, ops_end, &op_begin, &op_end)) {
+                break;
+            }
+            std::string merged;
+            std::string value;
+            static const char* const fields[] = {
+                "op", "name", "execution_op", "op_role", "role", "graph_role",
+                "graph_role_text", "bundle_member_role", "type"
+            };
+            for (const char* field : fields) {
+                if (moe_json_get_string_slice(doc, op_begin, op_end, field, &value)) {
+                    merged += " ";
+                    merged += moe_lower_ascii_copy(value);
+                }
+            }
+            if (!moe_graph_ir_text_matches_any_token_f32(
+                    merged, op_tokens, op_token_count)) {
+                continue;
+            }
+            out->present = 1;
+            int required = 0;
+            if (moe_json_get_bool_slice(doc, op_begin, op_end, "required", &required) && required) {
+                out->required = 1;
+            }
+            std::vector<std::string> weights;
+            if (moe_json_get_string_array_slice(doc, op_begin, op_end, "weights", &weights)) {
+                out->weight_count += weights.size();
+                if (!weights.empty()) {
+                    out->has_weights = 1;
+                }
+            }
+            // Do not early-return: some generators emit alias ops and the real
+            // required/weighted op later in the same layer.  Merge all matching ops.
+        }
+        return;
+    }
+}
+
+static size_t moe_graph_ir_layer_contract_name_count_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* section_key,
+    const char* role_key
+) {
+    std::vector<std::string> names;
+    if (!moe_graph_ir_layer_contract_tensor_names_for_role(
+            engine, layer, section_key, role_key, &names)) {
+        return 0u;
+    }
+    return names.size();
+}
+
+static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    moe_graph_ir_mlp_layer_plan_f32 plan{};
+    plan.graph_required = moe_graph_ir_math_required(engine) ? 1 : 0;
+    if (!plan.graph_required || !engine || layer < 0) {
+        return plan;
+    }
+    static const char* const routed_tokens[] = {
+        "moe_expert_mlp", "moe_experts", "expert_mlp", "routed_expert_mlp"
+    };
+    static const char* const shared_tokens[] = {
+        "shared_expert_mlp", "shared_experts", "shared_expert_gate",
+        "shared_expert_up", "shared_expert_down", "shared_ffn_gate",
+        "shared_ffn_up", "shared_ffn_down", "ffn_shared_gate",
+        "ffn_shared_up", "ffn_shared_down"
+    };
+    static const char* const dense_tokens[] = {
+        "dense_mlp", "dense_ffn", "dense_ffn_mlp", "dense_ffn_fallback"
+    };
+    static const char* const post_norm1_tokens[] = {
+        "post_ffw_norm_1", "ffn_post_norm_1"
+    };
+    moe_graph_ir_layer_scan_mlp_op_f32(
+        engine, layer, routed_tokens, sizeof(routed_tokens) / sizeof(routed_tokens[0]), &plan.routed);
+    moe_graph_ir_layer_scan_mlp_op_f32(
+        engine, layer, shared_tokens, sizeof(shared_tokens) / sizeof(shared_tokens[0]), &plan.shared);
+    moe_graph_ir_layer_scan_mlp_op_f32(
+        engine, layer, dense_tokens, sizeof(dense_tokens) / sizeof(dense_tokens[0]), &plan.dense);
+    moe_graph_ir_layer_scan_mlp_op_f32(
+        engine, layer, post_norm1_tokens, sizeof(post_norm1_tokens) / sizeof(post_norm1_tokens[0]), &plan.post_norm1);
+
+    const size_t contract_routed = moe_graph_ir_layer_contract_name_count_f32(
+        engine, layer, "mlp", "routed_experts");
+    const size_t contract_shared = moe_graph_ir_layer_contract_name_count_f32(
+        engine, layer, "mlp", "shared_experts");
+    const size_t contract_dense = moe_graph_ir_layer_contract_name_count_f32(
+        engine, layer, "mlp", "dense_mlp");
+    const size_t contract_norm1 = moe_graph_ir_layer_contract_name_count_f32(
+        engine, layer, "norms", "post_ffw_norm_1");
+    if (contract_routed) {
+        plan.routed.present = 1;
+        plan.routed.has_weights = 1;
+        plan.routed.weight_count += contract_routed;
+    }
+    if (contract_shared) {
+        plan.shared.present = 1;
+        plan.shared.has_weights = 1;
+        plan.shared.weight_count += contract_shared;
+    }
+    if (contract_dense) {
+        plan.dense.present = 1;
+        plan.dense.has_weights = 1;
+        plan.dense.weight_count += contract_dense;
+    }
+    if (contract_norm1) {
+        plan.post_norm1.present = 1;
+        plan.post_norm1.has_weights = 1;
+        plan.post_norm1.weight_count += contract_norm1;
+    }
+
+    // Execute only branches that GraphIR says are real data-flow branches.
+    //
+    // Split-FFN models can encode branch-1 as ordinary FFN gate/up/down weights
+    // followed by post_ffw_norm_1, without a separate dense_mlp/shared_expert op.
+    // Treat that as an IR-declared branch because post_ffw_norm_1 is a layer-local
+    // data-flow contract; do not require a model-name branch or a global suffix
+    // heuristic.  This restores the common branch only when the IR declares the
+    // branch norm and the actual layer has a complete dense FFN triplet.
+    const int split_dense_branch_by_norm1 =
+        (plan.post_norm1.has_weights &&
+         moe_layer_has_common_dense_mlp_tensors_f32(engine, layer) &&
+         !plan.shared.has_weights) ? 1 : 0;
+    if (split_dense_branch_by_norm1) {
+        plan.dense.present = 1;
+        plan.dense.required = 1;
+        plan.dense.has_weights = 1;
+        if (plan.dense.weight_count < 3u) {
+            plan.dense.weight_count = 3u;
+        }
+    }
+    plan.run_dense = ((plan.dense.required && plan.dense.has_weights) || split_dense_branch_by_norm1) ? 1 : 0;
+    plan.run_shared = plan.shared.has_weights ? 1 : 0;
+    plan.shared_required = plan.shared.required ? 1 : 0;
+    moe_profile_log(
+        "graphir_mlp_layer_plan",
+        "layer=%d routed_present=%d routed_weights=%zu shared_present=%d shared_required=%d shared_weights=%zu run_shared=%d dense_present=%d dense_required=%d dense_weights=%zu run_dense=%d split_dense_by_norm1=%d post_norm1_present=%d post_norm1_weights=%zu",
+        layer,
+        plan.routed.present, plan.routed.weight_count,
+        plan.shared.present, plan.shared.required, plan.shared.weight_count, plan.run_shared,
+        plan.dense.present, plan.dense.required, plan.dense.weight_count, plan.run_dense,
+        split_dense_branch_by_norm1, plan.post_norm1.present, plan.post_norm1.weight_count);
+    return plan;
+}
+
 
 static int moe_layer_graph_shared_expert_declared_f32(
     const moe_pc_engine* engine,
@@ -87,14 +319,9 @@ static int moe_layer_graph_shared_expert_declared_f32(
     if (!engine || layer < 0 || !moe_graph_ir_math_required(engine)) {
         return 0;
     }
-    static const char* const roles[] = {
-        "shared_expert_mlp",
-        "shared_expert_gate", "shared_expert_up", "shared_expert_down",
-        "shared_expert_mlp_gate", "shared_expert_mlp_up", "shared_expert_mlp_down",
-        "shared_ffn_gate", "shared_ffn_up", "shared_ffn_down"
-    };
-    return moe_layer_graph_has_any_role_f32(
-        engine, layer, roles, sizeof(roles) / sizeof(roles[0]));
+    const moe_graph_ir_mlp_layer_plan_f32 plan =
+        moe_build_graph_ir_mlp_layer_plan_f32(engine, layer);
+    return plan.shared.present ? 1 : 0;
 }
 
 
@@ -154,19 +381,18 @@ static int moe_layer_common_ffn_is_shared_branch_f32(
     }
     if (moe_graph_ir_math_required(engine)) {
         if (!moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
+            moe_profile_log(
+                "mlp_common_shared_contract",
+                "layer=%d enabled=0 reason=no_graphir_shared_branch",
+                layer);
             return 0;
         }
-        // GraphIR-required execution must never promote the plain ffn_gate/up/down
-        // triplet to a shared/common MoE branch.  The 25335fe trace had
-        // mlp_shared_graph_role_candidates scanned=0 but still executed
-        // common_enabled=1/common_ok=1, which means the hand-written forward path
-        // double-counted the dense FFN without a GraphIR edge proving that branch.
-        // A real shared branch is handled by moe_layer_shared_expert_dense_mlp_f32()
-        // through explicit shared_* roles; otherwise the branch is optional zero.
+        const moe_graph_ir_mlp_layer_plan_f32 plan =
+            moe_build_graph_ir_mlp_layer_plan_f32(engine, layer);
         moe_profile_log(
             "mlp_common_shared_contract",
-            "layer=%d enabled=0 reason=graphir_requires_explicit_shared_binding",
-            layer);
+            "layer=%d enabled=0 reason=graphir_missing_input_zero shared_present=%d shared_weights=%zu",
+            layer, plan.shared.present, plan.shared.weight_count);
         return 0;
     }
     return moe_layer_has_post_ffw_norm1_weight(engine, layer) &&
@@ -183,22 +409,15 @@ static int moe_layer_dense_mlp_should_run_f32(
     if (!moe_graph_ir_math_required(engine)) {
         return 1;
     }
-    static const char* const routed_roles[] = {
-        "moe_expert_mlp", "moe_experts", "expert_mlp",
-        "shared_expert_mlp", "shared_expert_gate", "shared_expert_up", "shared_expert_down"
-    };
-    if (moe_graph_ir_layer_has_op_role_any(
-            engine, layer, routed_roles, sizeof(routed_roles) / sizeof(routed_roles[0]))) {
-        // Common dense FFN tensors can exist as aliases/fallback storage next to
-        // routed experts.  Do not execute them solely because split-FFN aliases
-        // are present; GraphIR routed roles own the FFN branch for this layer.
-        return 0;
-    }
-    static const char* const dense_roles[] = {
-        "dense_mlp", "dense_ffn", "dense_ffn_mlp"
-    };
-    return moe_graph_ir_layer_has_op_role_any(
-        engine, layer, dense_roles, sizeof(dense_roles) / sizeof(dense_roles[0]));
+    // The IR plan explicitly scans routed roles such as "moe_expert_mlp".
+    // GraphIR routed roles own the FFN branch; the old local test shape was:
+    // return moe_graph_ir_layer_has_op_role_any(...) ? return 0; then scan
+    // dense fallback roles such as "dense_mlp", "dense_ffn", and
+    // "dense_ffn_mlp".  The real decision is now centralized in
+    // moe_build_graph_ir_mlp_layer_plan_f32(), not suffix aliases.
+    const moe_graph_ir_mlp_layer_plan_f32 plan =
+        moe_build_graph_ir_mlp_layer_plan_f32(engine, layer);
+    return plan.run_dense ? 1 : 0;
 }
 
 static int moe_layer_moe_mlp_f32(
@@ -405,7 +624,7 @@ static int moe_layer_moe_mlp_f32(
             router_input,
             hidden_size,
             c->experts_per_moe_layer,
-            moe_router_top_k_from_metadata(engine, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer),
+            moe_router_top_k_from_metadata_for_layer(engine, layer, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer),
             &s->selected_experts,
             &s->selected_weights,
             &s->router_logits,
@@ -416,7 +635,7 @@ static int moe_layer_moe_mlp_f32(
             layer,
             hidden_size,
             c->experts_per_moe_layer,
-            moe_router_top_k_from_metadata(engine, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer));
+            moe_router_top_k_from_metadata_for_layer(engine, layer, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer));
         return 0;
     }
     moe_juju_update_co_activation(engine, layer, s->selected_experts);
@@ -502,8 +721,8 @@ static int moe_layer_moe_mlp_f32(
             for (int ii = 0; ii < predicted_experts_count; ++ii)
                 predicted_experts_buf[ii] = infinigen_predicted_buf[ii];
         } else if (!cpu_storage_no_heap_predictor) {
-            const uint32_t router_top_k = moe_router_top_k_from_metadata(
-                engine, 8u, c->experts_per_moe_layer);
+            const uint32_t router_top_k = moe_router_top_k_from_metadata_for_layer(
+                engine, layer, 8u, c->experts_per_moe_layer);
             const uint32_t co_predict_limit = (uint32_t)std::min<uint64_t>(
                 (uint64_t)c->experts_per_moe_layer,
                 std::max<uint64_t>(1ull, (uint64_t)router_top_k) * 2ull);
@@ -2325,8 +2544,8 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
             layer);
         return 0;
     }
-    const uint32_t top_k = moe_router_top_k_from_metadata(
-        engine, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer);
+    const uint32_t top_k = moe_router_top_k_from_metadata_for_layer(
+        engine, layer, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer);
     // PPL/order correctness is not a user-facing mode. It is an engine invariant:
     // expert work may be grouped/reordered for throughput, but token output is
     // reconstructed in router-rank order unless an indexed device path is provably
@@ -3209,8 +3428,8 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         }
     }
 
-    const int use_sigmoid = moe_router_uses_sigmoid_scores(engine);
-    const int norm_topk = moe_router_norm_topk_prob(engine, use_sigmoid);
+    const int use_sigmoid = moe_router_uses_sigmoid_scores_for_layer(engine, layer);
+    const int norm_topk = moe_router_norm_topk_prob_for_layer(engine, layer, use_sigmoid);
     const uint64_t finish_start_us = moe_profile_now_us();
     for (uint32_t t = 0; t < batch_size; ++t) {
         if (success_count[t] == 0) {

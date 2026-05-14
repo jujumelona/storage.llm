@@ -938,15 +938,16 @@ static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* 
     size_t arr_end = 0;
     if (moe_json_find_array_local(doc, "layer_execution_contract_table", &arr_begin, &arr_end)) {
         size_t cursor = arr_begin + 1u;
+        uint64_t row_ordinal = 0;
         while (cursor < arr_end) {
             size_t obj_begin = 0;
             size_t obj_end = 0;
             if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
                 break;
             }
-            uint64_t parsed_layer = UINT64_MAX;
-            if (!moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed_layer) ||
-                parsed_layer != (uint64_t)layer) {
+            const uint64_t this_row_ordinal = row_ordinal++;
+            if (!moe_json_slice_matches_layer_index_f32(
+                    doc, obj_begin, obj_end, layer, this_row_ordinal)) {
                 continue;
             }
             int flag = 0;
@@ -996,19 +997,20 @@ static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* 
 
     size_t layers_begin = 0;
     size_t layers_end = 0;
-    if (!moe_json_find_array_local(doc, "layers", &layers_begin, &layers_end)) {
+    if (!moe_json_find_graph_layers_array_f32(doc, &layers_begin, &layers_end)) {
         return 0;
     }
     size_t cursor = layers_begin + 1u;
+    uint64_t layer_ordinal = 0;
     while (cursor < layers_end) {
         size_t layer_obj_begin = 0;
         size_t layer_obj_end = 0;
         if (!moe_json_next_object_in_array(doc, &cursor, layers_end, &layer_obj_begin, &layer_obj_end)) {
             break;
         }
-        uint64_t parsed_layer = UINT64_MAX;
-        if (!moe_json_get_u64_slice(doc, layer_obj_begin, layer_obj_end, "layer", &parsed_layer) ||
-            parsed_layer != (uint64_t)layer) {
+        const uint64_t this_layer_ordinal = layer_ordinal++;
+        if (!moe_json_slice_matches_layer_index_f32(
+                doc, layer_obj_begin, layer_obj_end, layer, this_layer_ordinal)) {
             continue;
         }
         const std::string layer_slice = doc.substr(layer_obj_begin, layer_obj_end - layer_obj_begin);
@@ -1178,20 +1180,21 @@ static int moe_graph_ir_layer_ops_tensor_names_for_role(
     const std::string& doc = engine->offload_graph_ir_json;
     size_t layers_begin = 0;
     size_t layers_end = 0;
-    if (!moe_json_find_array_local(doc, "layers", &layers_begin, &layers_end)) {
+    if (!moe_json_find_graph_layers_array_f32(doc, &layers_begin, &layers_end)) {
         return 0;
     }
     const size_t start_count = out_names->size();
     size_t cursor = layers_begin + 1u;
+    uint64_t layer_ordinal = 0;
     while (cursor < layers_end) {
         size_t layer_obj_begin = 0;
         size_t layer_obj_end = 0;
         if (!moe_json_next_object_in_array(doc, &cursor, layers_end, &layer_obj_begin, &layer_obj_end)) {
             break;
         }
-        uint64_t parsed_layer = UINT64_MAX;
-        if (!moe_json_get_u64_slice(doc, layer_obj_begin, layer_obj_end, "layer", &parsed_layer) ||
-            parsed_layer != (uint64_t)layer) {
+        const uint64_t this_layer_ordinal = layer_ordinal++;
+        if (!moe_json_slice_matches_layer_index_f32(
+                doc, layer_obj_begin, layer_obj_end, layer, this_layer_ordinal)) {
             continue;
         }
         size_t ops_begin = 0;
@@ -1244,15 +1247,16 @@ static int moe_graph_ir_layer_contract_tensor_names_for_role(
     size_t arr_end = 0;
     if (moe_json_find_array_local(doc, "layer_execution_contract_table", &arr_begin, &arr_end)) {
         size_t cursor = arr_begin + 1u;
+        uint64_t row_ordinal = 0;
         while (cursor < arr_end) {
             size_t obj_begin = 0;
             size_t obj_end = 0;
             if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
                 break;
             }
-            uint64_t parsed_layer = UINT64_MAX;
-            if (!moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed_layer) ||
-                parsed_layer != (uint64_t)layer) {
+            const uint64_t this_row_ordinal = row_ordinal++;
+            if (!moe_json_slice_matches_layer_index_f32(
+                    doc, obj_begin, obj_end, layer, this_row_ordinal)) {
                 continue;
             }
             size_t scope_begin = obj_begin;

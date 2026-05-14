@@ -70,13 +70,312 @@ static int moe_router_json_get_bool_any(
     return 0;
 }
 
-static int moe_router_uses_sigmoid_scores(const moe_pc_engine* engine) {
-    if (!engine) {
+static int moe_router_json_find_graph_layers_array_f32(
+    const std::string& doc,
+    size_t* out_begin,
+    size_t* out_end
+) {
+    if (!out_begin || !out_end) {
         return 0;
     }
-    const int cached = engine->cached_router_use_sigmoid.load(std::memory_order_acquire);
-    if (cached >= 0) {
-        return cached;
+    static const char* const keys[] = {
+        "layers", "blocks", "decoder_layers", "transformer_layers", "layer_plans"
+    };
+    for (const char* key : keys) {
+        if (moe_json_find_array_local(doc, key, out_begin, out_end)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_router_json_slice_matches_layer_index_f32(
+    const std::string& doc,
+    size_t begin,
+    size_t end,
+    int32_t layer,
+    uint64_t implicit_index
+) {
+    if (layer < 0 || begin >= end || end > doc.size()) {
+        return 0;
+    }
+    uint64_t parsed = UINT64_MAX;
+    int saw_explicit_layer_key = 0;
+    static const char* const u64_keys[] = {
+        "layer", "layer_index", "layer_id", "block", "block_index", "idx", "index"
+    };
+    for (const char* key : u64_keys) {
+        if (moe_json_get_u64_slice(doc, begin, end, key, &parsed)) {
+            saw_explicit_layer_key = 1;
+            if (parsed == (uint64_t)layer) {
+                return 1;
+            }
+        }
+    }
+    std::string text;
+    const std::string want = std::to_string((long long)layer);
+    static const char* const string_keys[] = {
+        "layer", "layer_index", "layer_id", "block", "block_index"
+    };
+    for (const char* key : string_keys) {
+        if (moe_json_get_string_slice(doc, begin, end, key, &text)) {
+            saw_explicit_layer_key = 1;
+            if (text == want) {
+                return 1;
+            }
+        }
+    }
+    if (!saw_explicit_layer_key && implicit_index != UINT64_MAX &&
+        implicit_index == (uint64_t)layer) {
+        return 1;
+    }
+    return 0;
+}
+
+static int moe_router_score_value_is_sigmoid_f32(const std::string& value) {
+    const std::string v = moe_lower_ascii_copy(value);
+    return (v == "sigmoid" || v == "sigmoid_score" || v == "sigmoid_scores" ||
+            v == "router_sigmoid" || v == "sigmoid_topk" ||
+            v.find("sigmoid") != std::string::npos) ? 1 : 0;
+}
+
+static int moe_router_score_value_is_softmax_f32(const std::string& value) {
+    const std::string v = moe_lower_ascii_copy(value);
+    return (v == "softmax" || v == "softmax_score" || v == "softmax_scores" ||
+            v == "router_softmax" || v == "softmax_topk" ||
+            v.find("softmax") != std::string::npos) ? 1 : 0;
+}
+
+static int moe_router_json_string_score_any_slice_f32(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* const* keys,
+    size_t key_count,
+    int* out_use_sigmoid
+) {
+    if (out_use_sigmoid) {
+        *out_use_sigmoid = 0;
+    }
+    if (text.empty() || begin >= end || end > text.size() || !keys || !out_use_sigmoid) {
+        return 0;
+    }
+    std::string value;
+    for (size_t i = 0; i < key_count; ++i) {
+        if (!keys[i]) {
+            continue;
+        }
+        if (!moe_json_get_string_slice(text, begin, end, keys[i], &value)) {
+            continue;
+        }
+        if (moe_router_score_value_is_sigmoid_f32(value)) {
+            *out_use_sigmoid = 1;
+            return 1;
+        }
+        if (moe_router_score_value_is_softmax_f32(value)) {
+            *out_use_sigmoid = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_router_json_bool_any_slice_f32(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* const* keys,
+    size_t key_count,
+    int* out
+) {
+    if (!out) {
+        return 0;
+    }
+    *out = 0;
+    if (text.empty() || begin >= end || end > text.size() || !keys) {
+        return 0;
+    }
+    for (size_t i = 0; i < key_count; ++i) {
+        if (keys[i] && moe_json_get_bool_slice(text, begin, end, keys[i], out)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_router_json_double_any_slice_f32(
+    const std::string& text,
+    size_t begin,
+    size_t end,
+    const char* const* keys,
+    size_t key_count,
+    double* out
+) {
+    if (!out) {
+        return 0;
+    }
+    if (text.empty() || begin >= end || end > text.size() || !keys) {
+        return 0;
+    }
+    for (size_t i = 0; i < key_count; ++i) {
+        if (keys[i] && moe_json_get_double_slice(text, begin, end, keys[i], out)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_router_layer_contract_object_slice_f32(
+    const std::string& doc,
+    int32_t layer,
+    size_t* out_begin,
+    size_t* out_end
+) {
+    if (out_begin) *out_begin = 0;
+    if (out_end) *out_end = 0;
+    if (doc.empty() || layer < 0 || !out_begin || !out_end) {
+        return 0;
+    }
+    size_t arr_begin = 0;
+    size_t arr_end = 0;
+    if (!moe_json_find_array_local(doc, "layer_execution_contract_table", &arr_begin, &arr_end)) {
+        return 0;
+    }
+    size_t cursor = arr_begin + 1u;
+    uint64_t row_ordinal = 0;
+    while (cursor < arr_end) {
+        size_t obj_begin = 0;
+        size_t obj_end = 0;
+        if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+            break;
+        }
+        const uint64_t this_row_ordinal = row_ordinal++;
+        if (moe_router_json_slice_matches_layer_index_f32(
+                doc, obj_begin, obj_end, layer, this_row_ordinal)) {
+            *out_begin = obj_begin;
+            *out_end = obj_end;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_router_layer_ops_object_slice_f32(
+    const std::string& doc,
+    int32_t layer,
+    size_t* out_begin,
+    size_t* out_end
+) {
+    if (out_begin) *out_begin = 0;
+    if (out_end) *out_end = 0;
+    if (doc.empty() || layer < 0 || !out_begin || !out_end) {
+        return 0;
+    }
+    size_t layers_begin = 0;
+    size_t layers_end = 0;
+    if (!moe_router_json_find_graph_layers_array_f32(doc, &layers_begin, &layers_end)) {
+        return 0;
+    }
+    size_t cursor = layers_begin + 1u;
+    uint64_t layer_ordinal = 0;
+    while (cursor < layers_end) {
+        size_t layer_obj_begin = 0;
+        size_t layer_obj_end = 0;
+        if (!moe_json_next_object_in_array(doc, &cursor, layers_end, &layer_obj_begin, &layer_obj_end)) {
+            break;
+        }
+        const uint64_t this_layer_ordinal = layer_ordinal++;
+        if (!moe_router_json_slice_matches_layer_index_f32(
+                doc, layer_obj_begin, layer_obj_end, layer, this_layer_ordinal)) {
+            continue;
+        }
+        size_t ops_begin_local = 0;
+        size_t ops_end_local = 0;
+        const std::string layer_slice = doc.substr(layer_obj_begin, layer_obj_end - layer_obj_begin);
+        if (!moe_json_find_array_local(layer_slice, "ops", &ops_begin_local, &ops_end_local)) {
+            return 0;
+        }
+        *out_begin = layer_obj_begin + ops_begin_local;
+        *out_end = layer_obj_begin + ops_end_local;
+        return 1;
+    }
+    return 0;
+}
+
+static int moe_router_op_slice_is_router_f32(
+    const std::string& doc,
+    size_t begin,
+    size_t end
+) {
+    static const char* const router_tokens[] = {
+        "moe_router", "expert_select", "router_topk", "router", "router_input"
+    };
+    static const char* const fields[] = {
+        "op", "name", "execution_op", "op_role", "role", "graph_role",
+        "graph_role_text", "bundle_member_role", "type"
+    };
+    std::string value;
+    std::string merged;
+    for (const char* field : fields) {
+        if (moe_json_get_string_slice(doc, begin, end, field, &value)) {
+            merged += " ";
+            merged += moe_lower_ascii_copy(value);
+        }
+    }
+    for (const char* token : router_tokens) {
+        if (token && merged.find(token) != std::string::npos) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_router_layer_op_score_contract_f32(
+    const std::string& doc,
+    int32_t layer,
+    const char* const* score_keys,
+    size_t score_key_count,
+    int* out_use_sigmoid,
+    const char** out_source
+) {
+    if (out_use_sigmoid) *out_use_sigmoid = 0;
+    if (out_source) *out_source = "none";
+    size_t ops_begin = 0;
+    size_t ops_end = 0;
+    if (!moe_router_layer_ops_object_slice_f32(doc, layer, &ops_begin, &ops_end)) {
+        return 0;
+    }
+    size_t cursor = ops_begin + 1u;
+    while (cursor < ops_end) {
+        size_t op_begin = 0;
+        size_t op_end = 0;
+        if (!moe_json_next_object_in_array(doc, &cursor, ops_end, &op_begin, &op_end)) {
+            break;
+        }
+        if (!moe_router_op_slice_is_router_f32(doc, op_begin, op_end)) {
+            continue;
+        }
+        int use_sigmoid = 0;
+        if (moe_router_json_string_score_any_slice_f32(
+                doc, op_begin, op_end, score_keys, score_key_count, &use_sigmoid)) {
+            if (out_use_sigmoid) *out_use_sigmoid = use_sigmoid;
+            if (out_source) *out_source = "graph_ir_layer_op";
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_router_layer_score_contract_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    int* out_use_sigmoid,
+    const char** out_source
+) {
+    if (out_use_sigmoid) *out_use_sigmoid = 0;
+    if (out_source) *out_source = "default";
+    if (!engine) {
+        return 0;
     }
     static const char* const score_keys[] = {
         "scoring_func",
@@ -100,8 +399,67 @@ static int moe_router_uses_sigmoid_scores(const moe_pc_engine* engine) {
         "expert_scoring_func",
         "score_activation",
         "score_type",
-        "score_fn"
+        "score_fn",
+        "router_score",
+        "router_score_type",
+        "router_logits_activation",
+        "router_logits_score_func",
+        "router_probs_activation",
+        "expert_score_type"
     };
+    if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
+        size_t obj_begin = 0;
+        size_t obj_end = 0;
+        if (moe_router_layer_contract_object_slice_f32(engine->offload_graph_ir_json, layer, &obj_begin, &obj_end)) {
+            int use_sigmoid = 0;
+            if (moe_router_json_string_score_any_slice_f32(
+                    engine->offload_graph_ir_json, obj_begin, obj_end,
+                    score_keys, sizeof(score_keys) / sizeof(score_keys[0]), &use_sigmoid)) {
+                if (out_use_sigmoid) *out_use_sigmoid = use_sigmoid;
+                if (out_source) *out_source = "layer_execution_contract_table";
+                return 1;
+            }
+        }
+        int use_sigmoid = 0;
+        const char* source = "none";
+        if (moe_router_layer_op_score_contract_f32(
+                engine->offload_graph_ir_json, layer,
+                score_keys, sizeof(score_keys) / sizeof(score_keys[0]),
+                &use_sigmoid, &source)) {
+            if (out_use_sigmoid) *out_use_sigmoid = use_sigmoid;
+            if (out_source) *out_source = source;
+            return 1;
+        }
+    }
+    if (moe_router_json_string_equals_any(
+            engine->offload_gguf_metadata_json, score_keys,
+            sizeof(score_keys) / sizeof(score_keys[0]), "sigmoid")) {
+        if (out_use_sigmoid) *out_use_sigmoid = 1;
+        if (out_source) *out_source = "metadata";
+        return 1;
+    }
+    if (moe_router_json_string_equals_any(
+            engine->offload_gguf_metadata_json, score_keys,
+            sizeof(score_keys) / sizeof(score_keys[0]), "softmax")) {
+        if (out_use_sigmoid) *out_use_sigmoid = 0;
+        if (out_source) *out_source = "metadata";
+        return 1;
+    }
+    const std::string* graph_ir_doc_for_score = &engine->offload_graph_ir_json;
+    if (moe_router_json_string_equals_any(
+            *graph_ir_doc_for_score, score_keys,
+            sizeof(score_keys) / sizeof(score_keys[0]), "sigmoid")) {
+        if (out_use_sigmoid) *out_use_sigmoid = 1;
+        if (out_source) *out_source = "graph_ir";
+        return 1;
+    }
+    if (moe_router_json_string_equals_any(
+            *graph_ir_doc_for_score, score_keys,
+            sizeof(score_keys) / sizeof(score_keys[0]), "softmax")) {
+        if (out_use_sigmoid) *out_use_sigmoid = 0;
+        if (out_source) *out_source = "graph_ir";
+        return 1;
+    }
     static const char* const sigmoid_needles[] = {
         "\"scoring_func\":\"sigmoid\"",
         "\"scoring_func\": \"sigmoid\"",
@@ -122,55 +480,149 @@ static int moe_router_uses_sigmoid_scores(const moe_pc_engine* engine) {
         "\"score_fn\":\"sigmoid\"",
         "\"score_fn\": \"sigmoid\""
     };
-    int use_sigmoid = 0;
-    // Do not infer sigmoid routing from route_scale/routed_scaling_factor.
-    // Some softmax-MoE contracts use pre-softmax/top-k routing with normalized
-    // top-k weights and per-expert scaling; treating scale metadata as a sigmoid-score marker
-    // saturates logits and collapses top-k weights to ~1/top_k.
-    const std::string* docs[] = {
-        &engine->offload_gguf_metadata_json,
-        &engine->offload_graph_ir_json,
-    };
-    const char* source = "default";
-    for (const std::string* doc : docs) {
-        if (!doc || doc->empty()) {
-            continue;
-        }
-        if (moe_router_json_string_equals_any(*doc, score_keys, sizeof(score_keys) / sizeof(score_keys[0]), "sigmoid") ||
-            moe_router_json_mentions_any(*doc, sigmoid_needles, sizeof(sigmoid_needles) / sizeof(sigmoid_needles[0]))) {
-            use_sigmoid = 1;
-            source = (doc == &engine->offload_gguf_metadata_json) ? "metadata" : "graph_ir";
-            break;
-        }
+    if (moe_router_json_mentions_any(
+            engine->offload_gguf_metadata_json, sigmoid_needles,
+            sizeof(sigmoid_needles) / sizeof(sigmoid_needles[0]))) {
+        if (out_use_sigmoid) *out_use_sigmoid = 1;
+        if (out_source) *out_source = "metadata";
+        return 1;
     }
-    moe_profile_log("router_score_contract", "use_sigmoid=%d source=%s", use_sigmoid, source);
-    engine->cached_router_use_sigmoid.store(use_sigmoid, std::memory_order_release);
-    return use_sigmoid;
+    if (moe_router_json_mentions_any(
+            *graph_ir_doc_for_score, sigmoid_needles,
+            sizeof(sigmoid_needles) / sizeof(sigmoid_needles[0]))) {
+        if (out_use_sigmoid) *out_use_sigmoid = 1;
+        if (out_source) *out_source = "graph_ir";
+        return 1;
+    }
+    return 0;
 }
 
-static uint32_t moe_router_top_k_from_metadata(
+static int moe_router_uses_sigmoid_scores_for_layer(const moe_pc_engine* engine, int32_t layer) {
+    if (!engine) {
+        return 0;
+    }
+    int use_sigmoid = 0;
+    const char* source = "default";
+    if (moe_router_layer_score_contract_f32(engine, layer, &use_sigmoid, &source)) {
+        moe_profile_log(
+            "router_score_contract",
+            "layer=%d use_sigmoid=%d source=%s",
+            layer, use_sigmoid, source ? source : "unknown");
+        return use_sigmoid ? 1 : 0;
+    }
+    if (layer < 0) {
+        const int cached = engine->cached_router_use_sigmoid.load(std::memory_order_acquire);
+        if (cached >= 0) {
+            return cached;
+        }
+        engine->cached_router_use_sigmoid.store(0, std::memory_order_release);
+    }
+    moe_profile_log("router_score_contract", "layer=%d use_sigmoid=0 source=default", layer);
+    return 0;
+}
+
+static int moe_router_uses_sigmoid_scores(const moe_pc_engine* engine) {
+    return moe_router_uses_sigmoid_scores_for_layer(engine, -1);
+}
+
+static int moe_router_layer_u32_contract_f32(
     const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* keys,
+    size_t key_count,
+    uint32_t* out,
+    const char** out_source
+) {
+    if (out_source) *out_source = "none";
+    if (!engine || !keys || !out) {
+        return 0;
+    }
+    uint64_t value = 0;
+    if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
+        size_t obj_begin = 0;
+        size_t obj_end = 0;
+        if (moe_router_layer_contract_object_slice_f32(engine->offload_graph_ir_json, layer, &obj_begin, &obj_end)) {
+            for (size_t i = 0; i < key_count; ++i) {
+                if (keys[i] && moe_json_get_u64_slice(engine->offload_graph_ir_json, obj_begin, obj_end, keys[i], &value) && value > 0) {
+                    *out = (uint32_t)std::min<uint64_t>(value, UINT32_MAX);
+                    if (out_source) *out_source = "layer_execution_contract_table";
+                    return 1;
+                }
+            }
+        }
+        size_t ops_begin = 0;
+        size_t ops_end = 0;
+        if (moe_router_layer_ops_object_slice_f32(engine->offload_graph_ir_json, layer, &ops_begin, &ops_end)) {
+            size_t cursor = ops_begin + 1u;
+            while (cursor < ops_end) {
+                size_t op_begin = 0;
+                size_t op_end = 0;
+                if (!moe_json_next_object_in_array(engine->offload_graph_ir_json, &cursor, ops_end, &op_begin, &op_end)) {
+                    break;
+                }
+                if (!moe_router_op_slice_is_router_f32(engine->offload_graph_ir_json, op_begin, op_end)) {
+                    continue;
+                }
+                for (size_t i = 0; i < key_count; ++i) {
+                    if (keys[i] && moe_json_get_u64_slice(engine->offload_graph_ir_json, op_begin, op_end, keys[i], &value) && value > 0) {
+                        *out = (uint32_t)std::min<uint64_t>(value, UINT32_MAX);
+                        if (out_source) *out_source = "graph_ir_layer_op";
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+    for (size_t i = 0; i < key_count; ++i) {
+        if (keys[i] && moe_json_get_u64_local(engine->offload_gguf_metadata_json, keys[i], &value) && value > 0) {
+            *out = (uint32_t)std::min<uint64_t>(value, UINT32_MAX);
+            if (out_source) *out_source = "metadata";
+            return 1;
+        }
+    }
+    for (size_t i = 0; i < key_count; ++i) {
+        if (keys[i] && moe_json_get_u64_local(engine->offload_graph_ir_json, keys[i], &value) && value > 0) {
+            *out = (uint32_t)std::min<uint64_t>(value, UINT32_MAX);
+            if (out_source) *out_source = "graph_ir";
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uint32_t moe_router_top_k_from_metadata_for_layer(
+    const moe_pc_engine* engine,
+    int32_t layer,
     uint32_t fallback,
     uint32_t experts
 ) {
+    static const char* const topk_keys[] = {
+        "num_experts_per_tok",
+        "n_experts_per_tok",
+        "routed_experts_per_token",
+        "expert_used_count",
+        "num_experts_per_token",
+        "moe_top_k",
+        "top_k_experts",
+        "num_selected_experts",
+        "topk",
+        "top_k"
+    };
+    uint32_t parsed = 0;
+    const char* source = "default";
+    if (moe_router_layer_u32_contract_f32(
+            engine, layer, topk_keys, sizeof(topk_keys) / sizeof(topk_keys[0]),
+            &parsed, &source) && parsed > 0) {
+        const uint32_t limited = std::min<uint32_t>(parsed, experts ? experts : parsed);
+        moe_profile_log(
+            "router_topk_contract",
+            "layer=%d top_k=%u source=%s experts=%u",
+            layer, limited, source ? source : "unknown", experts);
+        return limited;
+    }
     int cached = engine ? engine->cached_router_top_k_hint.load(std::memory_order_acquire) : -1;
     if (cached < 0) {
-        uint64_t value = 0;
         cached = 0;
-        if (engine && !engine->offload_gguf_metadata_json.empty() &&
-            (moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_experts_per_tok", &value) ||
-             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "n_experts_per_tok", &value) ||
-             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "routed_experts_per_token", &value) ||
-             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "expert_used_count", &value) ||
-             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_experts_per_token", &value) ||
-             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "moe_top_k", &value) ||
-             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "top_k_experts", &value) ||
-             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "num_selected_experts", &value) ||
-             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "topk", &value) ||
-             moe_json_get_u64_local(engine->offload_gguf_metadata_json, "top_k", &value)) &&
-            value > 0) {
-            cached = (int)std::min<uint64_t>(value, (uint64_t)INT32_MAX);
-        }
         if (engine) {
             engine->cached_router_top_k_hint.store(cached, std::memory_order_release);
         }
@@ -179,6 +631,14 @@ static uint32_t moe_router_top_k_from_metadata(
         return (uint32_t)std::min<uint32_t>((uint32_t)cached, experts ? experts : (uint32_t)cached);
     }
     return std::min(fallback, experts ? experts : fallback);
+}
+
+static uint32_t moe_router_top_k_from_metadata(
+    const moe_pc_engine* engine,
+    uint32_t fallback,
+    uint32_t experts
+) {
+    return moe_router_top_k_from_metadata_for_layer(engine, -1, fallback, experts);
 }
 
 static int moe_router_metadata_u32(
@@ -200,13 +660,115 @@ static int moe_router_metadata_u32(
     return 0;
 }
 
-static float moe_router_routed_scaling_factor(const moe_pc_engine* engine) {
+static int moe_router_layer_double_contract_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* keys,
+    size_t key_count,
+    double* out,
+    const char** out_source
+) {
+    if (out_source) *out_source = "none";
+    if (!engine || !keys || !out) {
+        return 0;
+    }
+    if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
+        size_t obj_begin = 0;
+        size_t obj_end = 0;
+        if (moe_router_layer_contract_object_slice_f32(engine->offload_graph_ir_json, layer, &obj_begin, &obj_end) &&
+            moe_router_json_double_any_slice_f32(
+                engine->offload_graph_ir_json, obj_begin, obj_end, keys, key_count, out)) {
+            if (out_source) *out_source = "layer_execution_contract_table";
+            return 1;
+        }
+        size_t ops_begin = 0;
+        size_t ops_end = 0;
+        if (moe_router_layer_ops_object_slice_f32(engine->offload_graph_ir_json, layer, &ops_begin, &ops_end)) {
+            size_t cursor = ops_begin + 1u;
+            while (cursor < ops_end) {
+                size_t op_begin = 0;
+                size_t op_end = 0;
+                if (!moe_json_next_object_in_array(engine->offload_graph_ir_json, &cursor, ops_end, &op_begin, &op_end)) {
+                    break;
+                }
+                if (!moe_router_op_slice_is_router_f32(engine->offload_graph_ir_json, op_begin, op_end)) {
+                    continue;
+                }
+                if (moe_router_json_double_any_slice_f32(
+                        engine->offload_graph_ir_json, op_begin, op_end, keys, key_count, out)) {
+                    if (out_source) *out_source = "graph_ir_layer_op";
+                    return 1;
+                }
+            }
+        }
+    }
+    if (moe_router_json_get_double_any(engine->offload_gguf_metadata_json, keys, key_count, out)) {
+        if (out_source) *out_source = "metadata";
+        return 1;
+    }
+    if (moe_router_json_get_double_any(engine->offload_graph_ir_json, keys, key_count, out)) {
+        if (out_source) *out_source = "graph_ir";
+        return 1;
+    }
+    return 0;
+}
+
+static int moe_router_layer_bool_contract_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* keys,
+    size_t key_count,
+    int* out,
+    const char** out_source
+) {
+    if (out_source) *out_source = "none";
+    if (!engine || !keys || !out) {
+        return 0;
+    }
+    if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
+        size_t obj_begin = 0;
+        size_t obj_end = 0;
+        if (moe_router_layer_contract_object_slice_f32(engine->offload_graph_ir_json, layer, &obj_begin, &obj_end) &&
+            moe_router_json_bool_any_slice_f32(
+                engine->offload_graph_ir_json, obj_begin, obj_end, keys, key_count, out)) {
+            if (out_source) *out_source = "layer_execution_contract_table";
+            return 1;
+        }
+        size_t ops_begin = 0;
+        size_t ops_end = 0;
+        if (moe_router_layer_ops_object_slice_f32(engine->offload_graph_ir_json, layer, &ops_begin, &ops_end)) {
+            size_t cursor = ops_begin + 1u;
+            while (cursor < ops_end) {
+                size_t op_begin = 0;
+                size_t op_end = 0;
+                if (!moe_json_next_object_in_array(engine->offload_graph_ir_json, &cursor, ops_end, &op_begin, &op_end)) {
+                    break;
+                }
+                if (!moe_router_op_slice_is_router_f32(engine->offload_graph_ir_json, op_begin, op_end)) {
+                    continue;
+                }
+                if (moe_router_json_bool_any_slice_f32(
+                        engine->offload_graph_ir_json, op_begin, op_end, keys, key_count, out)) {
+                    if (out_source) *out_source = "graph_ir_layer_op";
+                    return 1;
+                }
+            }
+        }
+    }
+    if (moe_router_json_get_bool_any(engine->offload_gguf_metadata_json, keys, key_count, out)) {
+        if (out_source) *out_source = "metadata";
+        return 1;
+    }
+    if (moe_router_json_get_bool_any(engine->offload_graph_ir_json, keys, key_count, out)) {
+        if (out_source) *out_source = "graph_ir";
+        return 1;
+    }
+    return 0;
+}
+
+static float moe_router_routed_scaling_factor_for_layer(const moe_pc_engine* engine, int32_t layer) {
     if (!engine) {
         return 1.0f;
-    }
-    const uint32_t cached_bits = engine->cached_router_route_scale_bits.load(std::memory_order_acquire);
-    if (cached_bits != 0u) {
-        return moe_f32_from_bits(cached_bits);
     }
     double value = 1.0;
     // Contract: this value is the routed-expert output multiplier for
@@ -222,23 +784,36 @@ static float moe_router_routed_scaling_factor(const moe_pc_engine* engine) {
         "router_routed_scaling_factor",
         "expert_routed_scaling_factor"
     };
-    const std::string* docs[] = {
-        &engine->offload_gguf_metadata_json,
-        &engine->offload_graph_ir_json,
-    };
-    for (const std::string* doc : docs) {
-        if (doc && moe_router_json_get_double_any(*doc, scale_keys, sizeof(scale_keys) / sizeof(scale_keys[0]), &value) &&
-            value > 0.0 && std::isfinite(value)) {
-            const float scale = (float)value;
-            engine->cached_router_route_scale_bits.store(moe_f32_bits(scale), std::memory_order_release);
-            return scale;
-        }
+    const char* source = "default";
+    if (moe_router_layer_double_contract_f32(
+            engine, layer, scale_keys, sizeof(scale_keys) / sizeof(scale_keys[0]),
+            &value, &source) &&
+        value > 0.0 && std::isfinite(value)) {
+        moe_profile_log(
+            "router_routed_scale_contract",
+            "layer=%d scale=%.9g source=%s",
+            layer, value, source ? source : "unknown");
+        return (float)value;
     }
-    engine->cached_router_route_scale_bits.store(moe_f32_bits(1.0f), std::memory_order_release);
+    if (layer < 0) {
+        const uint32_t cached_bits = engine->cached_router_route_scale_bits.load(std::memory_order_acquire);
+        if (cached_bits != 0u) {
+            return moe_f32_from_bits(cached_bits);
+        }
+        engine->cached_router_route_scale_bits.store(moe_f32_bits(1.0f), std::memory_order_release);
+    }
     return 1.0f;
 }
 
-static float moe_router_effective_routed_scaling_factor(const moe_pc_engine* engine, int use_sigmoid) {
+static float moe_router_routed_scaling_factor(const moe_pc_engine* engine) {
+    return moe_router_routed_scaling_factor_for_layer(engine, -1);
+}
+
+static float moe_router_effective_routed_scaling_factor_for_layer(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    int use_sigmoid
+) {
     if (!use_sigmoid) {
         // Softmax routers produce a normalized probability simplex.  Multiplying
         // the normalized top-k weights by routed_scaling_factor makes
@@ -247,16 +822,20 @@ static float moe_router_effective_routed_scaling_factor(const moe_pc_engine* eng
         // routers.
         return 1.0f;
     }
-    return moe_router_routed_scaling_factor(engine);
+    return moe_router_routed_scaling_factor_for_layer(engine, layer);
 }
 
-static int moe_router_norm_topk_prob(const moe_pc_engine* engine, int use_sigmoid) {
+static float moe_router_effective_routed_scaling_factor(const moe_pc_engine* engine, int use_sigmoid) {
+    return moe_router_effective_routed_scaling_factor_for_layer(engine, -1, use_sigmoid);
+}
+
+static int moe_router_norm_topk_prob_for_layer(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    int use_sigmoid
+) {
     if (!engine) {
         return use_sigmoid ? 1 : 0;
-    }
-    const int cached = engine->cached_router_norm_topk_prob.load(std::memory_order_acquire);
-    if (cached >= 0) {
-        return cached;
     }
     int value = 0;
     int result = use_sigmoid ? 1 : 0;
@@ -270,14 +849,33 @@ static int moe_router_norm_topk_prob(const moe_pc_engine* engine, int use_sigmoi
         "routed_norm_topk_prob",
         "routed_normalize_topk_prob"
     };
-    if (moe_router_json_get_bool_any(engine->offload_gguf_metadata_json, norm_keys, sizeof(norm_keys) / sizeof(norm_keys[0]), &value) ||
-        moe_router_json_get_bool_any(engine->offload_graph_ir_json, norm_keys, sizeof(norm_keys) / sizeof(norm_keys[0]), &value)) {
+    const char* source = "default";
+    if (moe_router_layer_bool_contract_f32(
+            engine, layer, norm_keys, sizeof(norm_keys) / sizeof(norm_keys[0]),
+            &value, &source)) {
         result = value ? 1 : 0;
-    } else if (!use_sigmoid && moe_engine_uses_hybrid_local_global_attention(engine)) {
+        moe_profile_log(
+            "router_norm_topk_contract",
+            "layer=%d norm_topk=%d source=%s",
+            layer, result, source ? source : "unknown");
+        return result;
+    }
+    if (!use_sigmoid && moe_engine_uses_hybrid_local_global_attention(engine)) {
         result = 1;
     }
-    engine->cached_router_norm_topk_prob.store(result, std::memory_order_release);
+    if (layer < 0) {
+        const int cached = engine->cached_router_norm_topk_prob.load(std::memory_order_acquire);
+        if (cached >= 0) {
+            return cached;
+        }
+        engine->cached_router_norm_topk_prob.store(result, std::memory_order_release);
+    }
+    moe_profile_log("router_norm_topk_contract", "layer=%d norm_topk=%d source=default", layer, result);
     return result;
+}
+
+static int moe_router_norm_topk_prob(const moe_pc_engine* engine, int use_sigmoid) {
+    return moe_router_norm_topk_prob_for_layer(engine, -1, use_sigmoid);
 }
 
 static void moe_router_apply_group_limit(
@@ -663,14 +1261,14 @@ static int moe_router_topk_f32(
 
     top_k = std::min(top_k, experts);
 
-    const int use_sigmoid = moe_router_uses_sigmoid_scores(engine);
+    const int use_sigmoid = moe_router_uses_sigmoid_scores_for_layer(engine, layer);
     const int cpu_storage_router_shortcut =
         engine->cpu_storage_engine_ready.load(std::memory_order_relaxed) ||
         engine->cpu_only_runtime.load(std::memory_order_relaxed);
-    const int norm_topk_pref = moe_router_norm_topk_prob(engine, use_sigmoid);
+    const int norm_topk_pref = moe_router_norm_topk_prob_for_layer(engine, layer, use_sigmoid);
     if (!use_sigmoid && norm_topk_pref && cpu_storage_router_shortcut && top_k <= 64u &&
         moe_router_select_topk_logits_norm_softmax_f32(*scratch_logits, experts, top_k, out_experts, out_weights)) {
-        const float route_scale = moe_router_effective_routed_scaling_factor(engine, use_sigmoid);
+        const float route_scale = moe_router_effective_routed_scaling_factor_for_layer(engine, layer, use_sigmoid);
         if (route_scale != 1.0f) {
             for (float& w : *out_weights) {
                 w *= route_scale;
@@ -807,7 +1405,7 @@ static int moe_router_topk_f32(
             denom += w;
         }
     }
-    const int norm_topk = moe_router_norm_topk_prob(engine, use_sigmoid);
+    const int norm_topk = moe_router_norm_topk_prob_for_layer(engine, layer, use_sigmoid);
     if (norm_topk) {
         // BUGFIX 666: Prevent weight explosion from near-zero denom ★★★
         // Problem: denom <= 0 → set to 1e-8f → weights explode by 1e8x → PPL corruption
@@ -820,7 +1418,7 @@ static int moe_router_topk_f32(
             }
         }
     }
-    const float scale = moe_router_effective_routed_scaling_factor(engine, use_sigmoid);
+    const float scale = moe_router_effective_routed_scaling_factor_for_layer(engine, layer, use_sigmoid);
     if (scale != 1.0f) {
         for (float& w : *out_weights) {
             w *= scale;
