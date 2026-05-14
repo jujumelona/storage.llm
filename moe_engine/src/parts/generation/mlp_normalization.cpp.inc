@@ -592,7 +592,7 @@ static int moe_shared_expert_append_candidate_f32(
     moe_shared_expert_graph_candidate_f32 cand{};
     cand.raw = raw;
     cand.name = rec.name;
-    cand.role = !rec.op_role.empty() ? rec.op_role : rec.execution_op;
+    cand.role = rec.op_role;
     cand.file_offset = rec.file_offset;
     cand.execution_order = rec.execution_order;
     out->push_back(cand);
@@ -624,11 +624,8 @@ static int moe_map_shared_expert_graph_role_f32(
         }
         const int shared_by_role =
             moe_shared_expert_role_is_shared_f32(rec.op_role) ||
-            moe_shared_expert_role_is_shared_f32(rec.execution_op) ||
-            moe_shared_expert_role_is_shared_f32(rec.bundle_member_role);
-        const int shared_by_name =
-            moe_shared_expert_text_is_shared_f32(rec.name) ||
-            moe_shared_expert_text_is_shared_f32(rec.graph_role_text);
+            rec.graph_role == moe_JUJU_ROLE_SHARED_CORE;
+        const int shared_by_name = moe_shared_expert_text_is_shared_f32(rec.name);
         if (!shared_by_role && !shared_by_name) {
             continue;
         }
