@@ -89,17 +89,16 @@ static int moe_engine_rmsnorm_unit_offset(
     const int unit_contract = moe_engine_contract_uses_rmsnorm_unit_offset(engine);
 
     // Contract priority must be deterministic.  unit-offset RMSNorm is architecture/config math.
-    // Use only explicit metadata/GraphIR or contract helpers to choose semantics.
-    // Explicit direct-weight contract wins first, explicit unit-offset contract wins second,
-    // then metadata/GraphIR boolean value is authoritative.  Tensor-value statistics are intentionally
-    // not used to override an explicit false value: learned RMSNorm weights can be
-    // small or scalar-like while still representing direct gamma.
-    if (direct_contract) {
-        value = 0;
-        source = "direct_rmsnorm_contract";
-    } else if (unit_contract) {
+    // Use explicit metadata/GraphIR plus structural tensor-contract helpers to choose
+    // semantics.  A generated false/default flag is not allowed to suppress a
+    // layer/tensor contract that requires x * (1 + weight). Tensor-value statistics
+    // are intentionally not used to infer or override the math.
+    if (unit_contract) {
         value = 1;
         source = "unit_offset_contract";
+    } else if (direct_contract) {
+        value = 0;
+        source = "direct_rmsnorm_contract";
     } else if (metadata_found) {
         value = metadata_value ? 1 : 0;
         source = metadata_source;

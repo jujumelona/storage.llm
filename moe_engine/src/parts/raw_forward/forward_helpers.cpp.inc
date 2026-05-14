@@ -469,6 +469,8 @@ static int moe_engine_contract_has_router_input_scale(
         "router.scale",
         "mlp.router.scale",
         "moe.gate.scale",
+        "ffn_gate_inp.scale",
+        "ffn_gate_inp.scales",
         "router_norm.weight",
         "router.input_layernorm.weight",
         "router.input_norm.weight",
@@ -476,9 +478,9 @@ static int moe_engine_contract_has_router_input_scale(
         "moe.gate_norm.weight",
         "mlp.router_norm.weight"
     };
-    // ffn_gate_inp.scale/scales are generated as router-weight quant sidecars,
-    // not as router-input activation/RMSNorm scales.  Do not infer router input
-    // scaling from those sidecars or from graph-wide text mentions.
+    // Bare ffn_gate_inp.scale/scales are router-input learned scales.
+    // Do not infer router input scaling from graph-wide text mentions or from
+    // concrete weight sidecars such as ffn_gate_inp.weight.scale.
     return moe_engine_contract_has_layer_tensor_suffix_any(
         engine, layer, router_scale_suffixes,
         sizeof(router_scale_suffixes) / sizeof(router_scale_suffixes[0]));
@@ -548,6 +550,53 @@ static int moe_engine_contract_uses_unit_qk_norm_global(
 }
 
 
+static int moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract(
+    const moe_pc_engine* engine
+) {
+    if (!engine) {
+        return 0;
+    }
+
+    static const char* const ple_global_suffixes[] = {
+        "per_layer_model_proj.weight",
+        "per_layer_model_projection.weight",
+        "per_layer_token_embd.weight",
+        "per_layer_token_embedding.weight",
+        "per_layer_embed.weight",
+        "embed_tokens_per_layer.weight"
+    };
+    if (moe_engine_contract_has_global_tensor_suffix_any(
+            engine, ple_global_suffixes,
+            sizeof(ple_global_suffixes) / sizeof(ple_global_suffixes[0]))) {
+        return 1;
+    }
+
+    static const char* const ple_layer_suffixes[] = {
+        "per_layer_inp_gate.weight",
+        "per_layer_input_gate.weight",
+        "per_layer_proj.weight",
+        "per_layer_projection.weight",
+        "per_layer_post_norm.weight",
+        "post_per_layer_input_norm.weight"
+    };
+    if (moe_engine_contract_has_layer_tensor_suffix_any(
+            engine, 0, ple_layer_suffixes,
+            sizeof(ple_layer_suffixes) / sizeof(ple_layer_suffixes[0]))) {
+        return 1;
+    }
+
+    const int has_q_norm =
+        moe_engine_has_common_tensor_suffix(engine, 0, "attn_q_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, 0, "q_norm.weight");
+    const int has_k_norm =
+        moe_engine_has_common_tensor_suffix(engine, 0, "attn_k_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, 0, "k_norm.weight");
+    const int has_block_output_contract =
+        moe_engine_has_common_tensor_suffix(engine, 0, "post_ffw_norm.weight") &&
+        moe_engine_has_common_tensor_suffix(engine, 0, "layer_output_scale.weight");
+    return (has_q_norm && has_k_norm && has_block_output_contract) ? 1 : 0;
+}
+
 static int moe_engine_contract_uses_direct_rmsnorm_weight(
     const moe_pc_engine* engine
 ) {
@@ -601,9 +650,10 @@ static int moe_engine_contract_uses_rmsnorm_unit_offset(
         "rmsnorm_add_unit"
     };
     for (const char* key : unit_bool_keys) {
-        if (moe_json_get_bool_local(engine->offload_gguf_metadata_json, key, &unit_offset) ||
-            moe_json_get_bool_local(engine->offload_graph_ir_json, key, &unit_offset)) {
-            return unit_offset ? 1 : 0;
+        if ((moe_json_get_bool_local(engine->offload_gguf_metadata_json, key, &unit_offset) ||
+             moe_json_get_bool_local(engine->offload_graph_ir_json, key, &unit_offset)) &&
+            unit_offset) {
+            return 1;
         }
     }
     if (moe_engine_graph_ir_mentions(engine, "rms_norm_unit_offset") ||
@@ -628,7 +678,7 @@ static int moe_engine_contract_uses_rmsnorm_unit_offset(
         moe_engine_metadata_mentions(engine, "rms_norm_weight_semantics\":\"plus_one")) {
         return 1;
     }
-    return 0;
+    return moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract(engine);
 }
 
 static int moe_engine_contract_uses_gelu_tanh_mlp(

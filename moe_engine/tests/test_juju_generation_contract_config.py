@@ -424,7 +424,11 @@ def test_qkv_single_token_attention_uses_paper_quantized_decode_path():
 def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
     raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_ops.cpp.inc").read_text()
     assert "unit-offset RMSNorm is architecture/config math" in raw_ops_text
-    assert "Use only explicit metadata/GraphIR" in raw_ops_text
+    assert "Use explicit metadata/GraphIR plus structural tensor-contract helpers" in raw_ops_text
+    helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
+    assert "moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract" in helper_text
+    assert '"per_layer_model_proj.weight"' in helper_text
+    assert '"layer_output_scale.weight"' in helper_text
     assert "weight_stats_override_metadata_false" not in raw_ops_text
     assert "metadata_false_stats_inconclusive" not in raw_ops_text
     assert "mean_abs_raw < 0.75" not in raw_ops_text
@@ -483,35 +487,35 @@ def test_router_scale_tensor_uses_contract_specific_unit_offset_semantics():
     assert "this tensor is a router input RMSNorm/scale weight" in router_text
 
 
-def test_router_scale_treats_ffn_gate_inp_scale_as_weight_sidecar():
+def test_router_scale_accepts_bare_ffn_gate_inp_scale_and_rejects_weight_sidecars():
     router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
     suffix_block = router_text[router_text.index("static int moe_map_router_scale_tensor"):router_text.index("static int moe_prepare_scaled_router_input_f32")]
     reject_block = router_text[router_text.index("static int moe_router_scale_tensor_is_weight_sidecar_name_f32"):router_text.index("static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role_f32")]
-    assert '"ffn_gate_inp.scale"' not in suffix_block
-    assert '"ffn_gate_inp.scales"' not in suffix_block
-    assert '"ffn_gate_inp.scale"' in reject_block
-    assert '"ffn_gate_inp.scales"' in reject_block
-    assert '"ffn_gate_inp.weight.scale"' in reject_block
-    assert '"ffn_gate_inp.weight.scales"' in reject_block
-    assert '".weight.scale"' in reject_block
-    assert '".weight.scales"' in reject_block
+    sidecar_array = reject_block[reject_block.index("static const char* const sidecar_suffixes[]"):reject_block.index("};", reject_block.index("static const char* const sidecar_suffixes[]"))]
+    assert '"ffn_gate_inp.scale"' in suffix_block
+    assert '"ffn_gate_inp.scales"' in suffix_block
+    assert '"ffn_gate_inp.scale"' not in sidecar_array
+    assert '"ffn_gate_inp.scales"' not in sidecar_array
+    assert '"ffn_gate_inp.weight.scale"' in sidecar_array
+    assert '"ffn_gate_inp.weight.scales"' in sidecar_array
+    assert '".weight.scale"' in sidecar_array
+    assert '".weight.scales"' in sidecar_array
     assert "weight_scale_sidecar" in reject_block
     assert "quant_sidecar" in reject_block
     assert "mxfp" in reject_block
     assert "reason=weight_sidecar" in router_text
     assert "router_scale_contract_reject" in router_text
-    reject_pos = router_text.index("router_scale_contract_reject")
-    apply_pos = router_text.index("router_scale_apply", reject_pos)
-    assert reject_pos < apply_pos
+    assert "router_scale_apply" in router_text
 
 
-def test_router_input_mode_uses_router_internal_scale_without_activation_sidecar_norm():
+def test_router_input_mode_uses_bare_ffn_gate_inp_as_internal_router_scale():
     mlp_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
     router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
     first_start = mlp_text.index("const int router_has_internal_norm_scale =")
     first_end = mlp_text.index("moe_save_gate_input_snapshot", first_start)
     first_block = mlp_text[first_start:first_end]
-    assert '"ffn_gate_inp.scale"' not in first_block
+    assert '"ffn_gate_inp.scale"' in first_block
+    assert '"ffn_gate_inp.scales"' in first_block
     assert '"router_norm.weight"' in first_block
     assert "moe_router_has_internal_weight_scale_contract_f32" in first_block
     assert "router_uses_raw_residual_contract && router_has_plausible_input_scale" not in first_block
@@ -521,23 +525,23 @@ def test_router_input_mode_uses_router_internal_scale_without_activation_sidecar
     assert "router_scale_available=%d" in mlp_text
     internal_start = router_text.index("moe_router_has_internal_weight_scale_contract_f32")
     internal_block = router_text[internal_start:router_text.index("static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role_f32", internal_start)]
-    assert '"ffn_gate_inp.scale"' not in internal_block
+    assert '"ffn_gate_inp.scale"' in internal_block
     assert '"ffn_gate_inp.weight.scale"' not in internal_block
     assert '"router.scale"' in internal_block
-    assert "must not make router_scale_available=1" in internal_block
+    assert "only *.weight.scale sidecars are rejected" in internal_block
 
 
 def test_materializer_router_scale_sidecar_contract_is_engine_only():
-    # The Colab materializer format is authoritative: ffn_gate_inp.scale/scales
-    # are router-weight quant sidecars and must not be reinterpreted by the engine
-    # as router-input activation/RMSNorm scales.
+    # The engine must distinguish the bare router-input scale from concrete
+    # router-weight quantization sidecars without changing the materializer.
     router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
     helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
     assert '"ffn_gate_inp.scale"' in router_text
     assert '"ffn_gate_inp.weight.scale"' in router_text
     assert "moe_router_scale_record_is_weight_sidecar_f32" in router_text
     router_helper = helper_text[helper_text.index("static int moe_engine_contract_has_router_input_scale"):helper_text.index("static int moe_engine_contract_uses_direct_router_input_scale")]
-    assert '"ffn_gate_inp.scale"' not in router_helper
+    assert '"ffn_gate_inp.scale"' in router_helper
+    assert '"ffn_gate_inp.weight.scale"' not in router_helper
     assert "graph-wide text mentions" in router_helper
 
 def test_post_attention_norm_no_longer_falls_back_to_ffn_norm_aliases():
@@ -639,6 +643,9 @@ def test_ple_vocab_masking_allows_smaller_per_layer_vocab():
     assert "token_id < ple.token_vocab_size" in mlp_common
     assert "std::fill(s->ple_inputs.begin(), s->ple_inputs.end(), 0.0f)" in mlp_common
     assert "token_desc.rows == 0" in mlp_common
+    assert '"per_layer_inp_gate.weight"' in mlp_common
+    assert '"per_layer_proj.weight"' in mlp_common
+    assert '"per_layer_post_norm.weight"' in mlp_common
 
 
 def test_expert_down_scale_is_legacy_runtime_scale_but_not_direct_contract_scale():

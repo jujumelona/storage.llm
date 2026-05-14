@@ -333,6 +333,8 @@ static int moe_map_ple_binding(
     };
     static const char* const token_names[] = {
         "per_layer_token_embd.weight",
+        "per_layer_token_embedding.weight",
+        "per_layer_embed.weight",
         "embed_tokens_per_layer.weight",
         "model.embed_tokens_per_layer.weight",
         "model.per_layer_token_embd.weight"
@@ -446,9 +448,12 @@ static int moe_layer_has_ple_tensors(
 ) {
     return
         (moe_engine_has_common_tensor_suffix(engine, layer, "inp_gate.weight") ||
+         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_inp_gate.weight") ||
          moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_input_gate.weight")) &&
-        moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_projection.weight") &&
-        moe_engine_has_common_tensor_suffix(engine, layer, "post_per_layer_input_norm.weight");
+        (moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_proj.weight") ||
+         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_projection.weight")) &&
+        (moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_post_norm.weight") ||
+         moe_engine_has_common_tensor_suffix(engine, layer, "post_per_layer_input_norm.weight"));
 }
 
 static int moe_layer_apply_ple_f32(
@@ -473,12 +478,17 @@ static int moe_layer_apply_ple_f32(
         (uint32_t)(s->ple_inputs.size() / (size_t)num_layers);
     static const char* const gate_suffixes[] = {
         "inp_gate.weight",
+        "per_layer_inp_gate.weight",
         "per_layer_input_gate.weight"
     };
     static const char* const proj_suffixes[] = {
+        "proj.weight",
+        "per_layer_proj.weight",
         "per_layer_projection.weight"
     };
     static const char* const norm_suffixes[] = {
+        "post_norm.weight",
+        "per_layer_post_norm.weight",
         "post_per_layer_input_norm.weight"
     };
     moe_raw_tensor_cache_entry gate_raw{};

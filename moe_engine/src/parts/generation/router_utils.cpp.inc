@@ -388,11 +388,10 @@ static int moe_router_name_has_suffix_f32(const std::string& name, const char* s
 }
 
 static int moe_router_scale_tensor_is_weight_sidecar_name_f32(const std::string& name) {
-    // ffn_gate_inp.scale/scales are emitted by the Colab materializer as
-    // router-weight quant sidecars, not as router-input activation scales.
+    // Only tensor names that scale a concrete weight tensor are sidecars.
+    // A bare ffn_gate_inp.scale/scales tensor is the router-input learned
+    // scale contract; do not reject it by name.
     static const char* const sidecar_suffixes[] = {
-        "ffn_gate_inp.scale",
-        "ffn_gate_inp.scales",
         "ffn_gate_inp.weight.scale",
         "ffn_gate_inp.weight.scales",
         ".weight.scale",
@@ -450,8 +449,10 @@ static int moe_router_has_internal_weight_scale_contract_f32(
     }
     static const char* const suffixes[] = {
         // Availability here means router-input activation scale, not MXFP/GGUF
-        // weight sidecar tensors. ffn_gate_inp.scale/scales are rejected by
-        // moe_map_router_scale_tensor and must not make router_scale_available=1.
+        // weight sidecar tensors. Bare ffn_gate_inp.scale/scales are learned
+        // router-input scales; only *.weight.scale sidecars are rejected.
+        "ffn_gate_inp.scale",
+        "ffn_gate_inp.scales",
         "router.scale",
         "mlp.router.scale",
         "moe.gate.scale"
@@ -525,6 +526,8 @@ static int moe_map_router_scale_tensor(
         "moe_router_norm.weight",
         "moe.gate_norm.weight",
         "mlp.router_norm.weight",
+        "ffn_gate_inp.scale",
+        "ffn_gate_inp.scales",
         "mlp.router.scale",
         "router.scale",
         "moe.gate.scale"

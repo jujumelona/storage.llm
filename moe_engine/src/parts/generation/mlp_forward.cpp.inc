@@ -634,6 +634,8 @@ static int moe_layer_moe_mlp_f32(
         moe_engine_has_common_tensor_suffix(engine, layer, "moe_router_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scales") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale"));
@@ -2569,6 +2571,8 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         moe_engine_has_common_tensor_suffix(engine, layer, "moe_router_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scales") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale"));
