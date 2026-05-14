@@ -254,8 +254,12 @@ static moe_decoder_layer_plan_t moe_build_decoder_layer_plan(
         moe_layer_has_ffn_norm_weight(engine, (int32_t)layer) ? 1 : 0;
     if (plan.graph_required) {
         static const char* const roles[] = { "layer_output_scale" };
-        plan.apply_layer_output_scale = moe_graph_ir_layer_has_op_role_any(
-            engine, (int32_t)layer, roles, sizeof(roles) / sizeof(roles[0]));
+        plan.apply_layer_output_scale =
+            moe_graph_ir_layer_has_op_role_any(
+                engine, (int32_t)layer, roles, sizeof(roles) / sizeof(roles[0])) ||
+            moe_engine_has_common_tensor_suffix(engine, (int32_t)layer, "layer_output_scale.weight") ||
+            moe_engine_has_common_tensor_suffix(engine, (int32_t)layer, "layer_scalar.weight") ||
+            moe_engine_has_common_tensor_suffix(engine, (int32_t)layer, "layer_scalar");
     } else {
         plan.apply_layer_output_scale = 1;
     }

@@ -185,28 +185,10 @@ static int moe_layer_contract_declares_unweighted_v_norm(
     if (doc.empty() || !array_key || layer < 0) {
         return 0;
     }
-    // This intentionally rejects summary/contract tables.  An unweighted V
-    // RMSNorm changes the actual value path, so it is allowed only from a
-    // layer-local executable op declaration.  Tensor-backed V norms are handled
-    // separately through moe_RAW_TENSOR_V_A_LAYER_NORM.
-    static const char* const executable_arrays[] = {
-        "ops",
-        "nodes",
-        "execution_ops",
-        "runtime_ops",
-        "layer_ops",
-        "graph_ops"
-    };
-    int executable_array = 0;
-    for (const char* key : executable_arrays) {
-        if (std::strcmp(array_key, key) == 0) {
-            executable_array = 1;
-            break;
-        }
-    }
-    if (!executable_array) {
-        return 0;
-    }
+    // The Colab generator emits value_norm_contract_table as the layer-local
+    // value-path contract.  It is not a model-name heuristic and it must not be
+    // ignored just because it is not an executable op list.  Tensor-backed V
+    // norms are still handled separately through moe_RAW_TENSOR_V_A_LAYER_NORM.
     static const char* const role_fields[] = {
         "op_role", "execution_op", "op_type", "type", "kind", "name"
     };
@@ -238,15 +220,22 @@ static int moe_layer_contract_declares_unweighted_v_norm(
                 parsed_layer != (uint64_t)layer) {
                 continue;
             }
-            if (!moe_json_slice_string_field_matches_any_ci(
-                    doc, obj_begin, obj_end,
-                    role_fields, sizeof(role_fields) / sizeof(role_fields[0]),
-                    v_norm_roles, sizeof(v_norm_roles) / sizeof(v_norm_roles[0]))) {
-                continue;
-            }
+            const int role_matches = moe_json_slice_string_field_matches_any_ci(
+                doc, obj_begin, obj_end,
+                role_fields, sizeof(role_fields) / sizeof(role_fields[0]),
+                v_norm_roles, sizeof(v_norm_roles) / sizeof(v_norm_roles[0]));
             int unweighted = 0;
             if (moe_json_get_bool_slice(doc, obj_begin, obj_end, "unweighted", &unweighted) && unweighted) {
                 return 1;
+            }
+            int declared = 0;
+            if (moe_json_get_bool_slice(
+                    doc, obj_begin, obj_end,
+                    "unweighted_value_norm_is_contractual_when_declared", &declared) && declared) {
+                return 1;
+            }
+            if (!role_matches) {
+                continue;
             }
             std::string mode;
             if (moe_json_get_string_slice(doc, obj_begin, obj_end, "value_norm_mode", &mode) &&
@@ -337,6 +326,11 @@ static int moe_layer_uses_unweighted_v_norm(
         "metadata",
     };
     const char* array_keys[] = {
+        "value_norm_contract_table",
+        "layer_execution_contract_table",
+        "attention_layer_contract_table",
+        "attention_layer_table",
+        "layers",
         "ops",
         "nodes",
         "execution_ops",
@@ -363,9 +357,9 @@ static int moe_layer_uses_unweighted_v_norm(
             break;
         }
     }
-    // Do not infer a layer-local V norm from graph-wide substring matches or
-    // summary tables.  Unweighted V norm is applied only when a layer-local
-    // executable op declares it.
+    // Do not infer a layer-local V norm from graph-wide substring matches.
+    // Unweighted V norm is applied only from the generator's layer-local
+    // value_norm_contract_table/layer contract or an explicit layer op.
     if (result) {
         moe_profile_log(
             "attn_value_norm_contract",

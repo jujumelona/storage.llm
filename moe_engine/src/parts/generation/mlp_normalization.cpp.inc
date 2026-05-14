@@ -1,5 +1,4 @@
 // MLP normalization operations
-}
 
 static int moe_layer_shared_expert_gate_f32(
     moe_pc_engine* engine,
@@ -313,7 +312,7 @@ static int moe_layer_dense_mlp_from_suffixes_f32(
     if (graph_required && allow_graph_suffix_fallback) {
         // Shared-expert tensors are safe to bind by explicit shared suffixes even
         // when GraphIR op_role metadata is incomplete.  This keeps generic FFN
-        // fallback forbidden while matching llama.cpp/vLLM Qwen-MoE naming
+        // fallback forbidden while matching explicit shared-expert suffix
         // families such as ffn_*_shexp.
         if (!gate_mapped) {
             gate_mapped = moe_map_layer_common_tensor(
@@ -411,21 +410,12 @@ static int moe_layer_router_uses_raw_residual_input(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
-    if (!engine || layer < 0) {
-        return 0;
-    }
-    // ffn_gate_inp.weight alone is only the router weight, not a proof that the
-    // router consumes the raw residual.  Raw-residual routing is allowed only
-    // when the GraphIR layer contract explicitly places the router before the
-    // expert FFN input normalization.
-    if (moe_graph_ir_math_required(engine)) {
-        static const char* const router_roles[] = { "moe_router", "router" };
-        if (moe_layer_has_ffn_norm_weight(engine, layer) &&
-            moe_layer_has_moe_norm_weight(engine, layer) &&
-            moe_graph_ir_layer_has_op_role_any(engine, layer, router_roles, sizeof(router_roles) / sizeof(router_roles[0]))) {
-            return 1;
-        }
-    }
+    (void)engine;
+    (void)layer;
+    // The generator contract is explicit: router_input is hidden only when a
+    // layer-local router internal scale/norm exists.  Router weight tensors and
+    // generic router ops are not proof that routing consumes the raw residual
+    // stream.
     return 0;
 }
 

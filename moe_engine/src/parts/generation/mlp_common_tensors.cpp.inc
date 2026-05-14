@@ -980,10 +980,11 @@ static int moe_layer_post_ffw_norm_f32(
     float eps
 ) {
     static const char* const roles[] = { "post_ffw_norm" };
-    if (moe_graph_ir_math_required(engine)) {
-        return moe_graph_ir_apply_rmsnorm_role_any_f32(
+    if (moe_graph_ir_math_required(engine) &&
+        moe_graph_ir_apply_rmsnorm_role_any_f32(
             engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
-            input, hidden_size, output, eps);
+            input, hidden_size, output, eps)) {
+        return 1;
     }
     static const char* const suffixes[] = {
         "post_ffw_norm.weight",
@@ -999,9 +1000,10 @@ static int moe_layer_has_post_ffw_norm_weight(
     int32_t layer
 ) {
     static const char* const roles[] = { "post_ffw_norm" };
-    if (moe_graph_ir_math_required(engine)) {
-        return moe_graph_ir_layer_has_op_role_any(
-            engine, layer, roles, sizeof(roles) / sizeof(roles[0]));
+    if (moe_graph_ir_math_required(engine) &&
+        moe_graph_ir_layer_has_op_role_any(
+            engine, layer, roles, sizeof(roles) / sizeof(roles[0]))) {
+        return 1;
     }
     return
         moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm.weight") ||
@@ -1017,10 +1019,11 @@ static int moe_layer_post_ffw_norm1_f32(
     float eps
 ) {
     static const char* const roles[] = { "post_ffw_norm_1" };
-    if (moe_graph_ir_math_required(engine)) {
-        return moe_graph_ir_apply_rmsnorm_role_any_f32(
+    if (moe_graph_ir_math_required(engine) &&
+        moe_graph_ir_apply_rmsnorm_role_any_f32(
             engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
-            input, hidden_size, output, eps);
+            input, hidden_size, output, eps)) {
+        return 1;
     }
     static const char* const suffixes[] = {
         "post_ffw_norm_1.weight",
@@ -1036,9 +1039,10 @@ static int moe_layer_has_post_ffw_norm1_weight(
     int32_t layer
 ) {
     static const char* const roles[] = { "post_ffw_norm_1" };
-    if (moe_graph_ir_math_required(engine)) {
-        return moe_graph_ir_layer_has_op_role_any(
-            engine, layer, roles, sizeof(roles) / sizeof(roles[0]));
+    if (moe_graph_ir_math_required(engine) &&
+        moe_graph_ir_layer_has_op_role_any(
+            engine, layer, roles, sizeof(roles) / sizeof(roles[0]))) {
+        return 1;
     }
     return
         moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_1.weight") ||
@@ -1054,10 +1058,11 @@ static int moe_layer_post_ffw_norm2_f32(
     float eps
 ) {
     static const char* const roles[] = { "post_ffw_norm_2" };
-    if (moe_graph_ir_math_required(engine)) {
-        return moe_graph_ir_apply_rmsnorm_role_any_f32(
+    if (moe_graph_ir_math_required(engine) &&
+        moe_graph_ir_apply_rmsnorm_role_any_f32(
             engine, layer, roles, sizeof(roles) / sizeof(roles[0]),
-            input, hidden_size, output, eps);
+            input, hidden_size, output, eps)) {
+        return 1;
     }
     static const char* const suffixes[] = {
         "post_ffw_norm_2.weight",
@@ -1073,9 +1078,10 @@ static int moe_layer_has_post_ffw_norm2_weight(
     int32_t layer
 ) {
     static const char* const roles[] = { "post_ffw_norm_2" };
-    if (moe_graph_ir_math_required(engine)) {
-        return moe_graph_ir_layer_has_op_role_any(
-            engine, layer, roles, sizeof(roles) / sizeof(roles[0]));
+    if (moe_graph_ir_math_required(engine) &&
+        moe_graph_ir_layer_has_op_role_any(
+            engine, layer, roles, sizeof(roles) / sizeof(roles[0]))) {
+        return 1;
     }
     return
         moe_engine_has_common_tensor_suffix(engine, layer, "post_ffw_norm_2.weight") ||
@@ -1088,32 +1094,17 @@ static int moe_layer_output_scale_f32(
     float* hidden,
     uint32_t hidden_size
 ) {
-    // BUGFIX 711: Layer output scale NaN handling ★★
-    // Problem: No validation of scale values before multiplication
-    // Impact: NaN in scale propagates to all hidden states
-    // Solution: Check for NaN in scale values
-    if (!engine || !hidden || hidden_size == 0) {
-        return 0;
-    }
-    // BUGFIX 507: Check hidden_size upper bound to prevent overflow ??
-    // Problem: hidden_size can be arbitrarily large from config
-    // Loop for (i = 0; i < hidden_size; ++i) can run billions of iterations
-    // Solution: Add reasonable upper bound check (e.g., 100000)
-    if (hidden_size > 100000) {
+    if (!engine || !hidden || hidden_size == 0 || hidden_size > 100000) {
         return 0;
     }
     moe_raw_tensor_cache_entry raw{};
+    int mapped = 0;
     if (moe_graph_ir_math_required(engine)) {
         static const char* const roles[] = { "layer_output_scale" };
-        if (!moe_graph_ir_layer_has_op_role_any(
-                engine, layer, roles, sizeof(roles) / sizeof(roles[0]))) {
-            return 1;
-        }
-        if (!moe_graph_ir_map_layer_op_role_any(
-                engine, layer, roles, sizeof(roles) / sizeof(roles[0]), &raw)) {
-            return 0;
-        }
-    } else {
+        mapped = moe_graph_ir_map_layer_op_role_any(
+            engine, layer, roles, sizeof(roles) / sizeof(roles[0]), &raw);
+    }
+    if (!mapped) {
         static const char* const suffixes[] = {
             "layer_output_scale.weight",
             "layer_scalar.weight",
@@ -1126,10 +1117,7 @@ static int moe_layer_output_scale_f32(
     const uint64_t count = moe_raw_tensor_scalar_count(raw);
     if (count == 1u) {
         float scale = 1.0f;
-        if (!moe_raw_tensor_scalar_at_f32(raw, 0, &scale)) {
-            return 0;
-        }
-        if (!std::isfinite(scale)) {
+        if (!moe_raw_tensor_scalar_at_f32(raw, 0, &scale) || !std::isfinite(scale)) {
             return 0;
         }
         moe_scale_f32(hidden, scale, hidden_size);
@@ -1140,12 +1128,10 @@ static int moe_layer_output_scale_f32(
     }
     for (uint32_t i = 0; i < hidden_size; ++i) {
         float scale = 1.0f;
-        if (!moe_raw_tensor_scalar_at_f32(raw, i, &scale)) {
-            return 0;
-        }
-        if (!std::isfinite(scale)) {
+        if (!moe_raw_tensor_scalar_at_f32(raw, i, &scale) || !std::isfinite(scale)) {
             return 0;
         }
         hidden[i] *= scale;
     }
     return 1;
+}

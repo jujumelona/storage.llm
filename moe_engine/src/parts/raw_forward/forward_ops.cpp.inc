@@ -274,221 +274,26 @@ static int moe_engine_prefers_gelu_activation(const moe_pc_engine* engine) {
     return moe_engine_gelu_activation_mode(engine) != 0 ? 1 : 0;
 }
 
-static int moe_json_slice_string_field_contains_any_ci(
-    const std::string& doc,
-    size_t obj_begin,
-    size_t obj_end,
-    const char* const* fields,
-    size_t field_count,
-    const char* const* values,
-    size_t value_count
-) {
-    std::string field_value;
-    for (size_t fi = 0; fi < field_count; ++fi) {
-        field_value.clear();
-        if (!moe_json_get_string_slice(doc, obj_begin, obj_end, fields[fi], &field_value) ||
-            field_value.empty()) {
-            continue;
-        }
-        for (size_t vi = 0; vi < value_count; ++vi) {
-            if (values[vi] && values[vi][0] && moe_ascii_contains_ci(field_value, values[vi])) {
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
-
-static int moe_json_get_double_slice_any(
-    const std::string& doc,
-    size_t obj_begin,
-    size_t obj_end,
-    const char* const* keys,
-    size_t key_count,
-    double* out
-) {
-    if (!out) {
-        return 0;
-    }
-    for (size_t i = 0; i < key_count; ++i) {
-        double value = 0.0;
-        if (moe_json_get_double_slice(doc, obj_begin, obj_end, keys[i], &value) &&
-            value > 0.0 && std::isfinite(value)) {
-            *out = value;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static int moe_graph_ir_declares_final_logit_softcap_execution(
-    const moe_pc_engine* engine,
-    double* out_value
-) {
-    if (out_value) {
-        *out_value = 0.0;
-    }
-    if (!engine || engine->offload_graph_ir_json.empty()) {
-        return 0;
-    }
-    const std::string& doc = engine->offload_graph_ir_json;
-    const char* const array_keys[] = {
-        "ops",
-        "nodes",
-        "execution_ops",
-        "runtime_ops",
-        "graph_ops",
-    };
-    const char* const role_fields[] = {
-        "op_role",
-        "execution_op",
-        "op_type",
-        "type",
-        "kind",
-        "name",
-    };
-    const char* const softcap_roles[] = {
-        "final_logit_softcap",
-        "final_logits_softcap",
-        "logit_softcap",
-        "logits_softcap",
-        "softcap_logits",
-        "softcap_logit",
-    };
-    const char* const value_keys[] = {
-        "softcap",
-        "cap",
-        "value",
-        "final_logit_softcapping",
-        "final_logit_softcap",
-        "logit_softcap",
-    };
-    for (size_t key_i = 0; key_i < sizeof(array_keys) / sizeof(array_keys[0]); ++key_i) {
-        size_t arr_begin = 0;
-        size_t arr_end = 0;
-        if (!moe_json_find_array_local(doc, array_keys[key_i], &arr_begin, &arr_end)) {
-            continue;
-        }
-        size_t cursor = arr_begin;
-        while (cursor < arr_end) {
-            size_t obj_begin = 0;
-            size_t obj_end = 0;
-            if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
-                break;
-            }
-            if (!moe_json_slice_string_field_contains_any_ci(
-                    doc,
-                    obj_begin,
-                    obj_end,
-                    role_fields,
-                    sizeof(role_fields) / sizeof(role_fields[0]),
-                    softcap_roles,
-                    sizeof(softcap_roles) / sizeof(softcap_roles[0]))) {
-                continue;
-            }
-            if (out_value) {
-                double op_value = 0.0;
-                if (moe_json_get_double_slice_any(
-                        doc,
-                        obj_begin,
-                        obj_end,
-                        value_keys,
-                        sizeof(value_keys) / sizeof(value_keys[0]),
-                        &op_value)) {
-                    *out_value = op_value;
-                }
-            }
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static int moe_json_has_positive_final_logit_softcap_key(const std::string& doc, double* out_value) {
-    if (out_value) {
-        *out_value = 0.0;
-    }
-    if (doc.empty()) {
-        return 0;
-    }
-    double value = 0.0;
-    if ((moe_json_get_double_local(doc, "final_logit_softcapping", &value) ||
-         moe_json_get_double_local(doc, "final_logit_softcap", &value) ||
-         moe_json_get_double_local(doc, "logit_softcap", &value)) &&
-        value > 0.0 && std::isfinite(value)) {
-        if (out_value) {
-            *out_value = value;
-        }
-        return 1;
-    }
-    return 0;
-}
-
-static float moe_final_logit_softcap_value_uncached(const moe_pc_engine* engine) {
+static float moe_final_logit_softcap_value(const moe_pc_engine* engine) {
     if (!engine) {
         return 0.0f;
     }
-    const int graph_required = engine->offload_graph_ir_required.load(std::memory_order_acquire) != 0;
     double value = 0.0;
-    if (graph_required) {
-        double op_value = 0.0;
-        if (!moe_graph_ir_declares_final_logit_softcap_execution(engine, &op_value)) {
-            double ignored_value = 0.0;
-            if (moe_json_has_positive_final_logit_softcap_key(engine->offload_graph_ir_json, &ignored_value) ||
-                moe_json_has_positive_final_logit_softcap_key(engine->offload_gguf_metadata_json, &ignored_value)) {
-                static std::atomic<uint32_t> ignored_log_count{0};
-                if (ignored_log_count.fetch_add(1, std::memory_order_relaxed) < 4u) {
-                    moe_profile_log(
-                        "final_logit_softcap_ignored",
-                        "value=%.9g reason=no_executable_graphir_op",
-                        ignored_value);
-                }
-            }
-            return 0.0f;
-        }
-        if (op_value > 0.0 && std::isfinite(op_value)) {
-            return (float)op_value;
-        }
-        if (moe_json_has_positive_final_logit_softcap_key(engine->offload_graph_ir_json, &value) ||
-            moe_json_has_positive_final_logit_softcap_key(engine->offload_gguf_metadata_json, &value)) {
-            return (float)value;
-        }
-        return 0.0f;
+    if (!engine->offload_gguf_metadata_json.empty() &&
+        (moe_json_get_double_local(engine->offload_gguf_metadata_json, "final_logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "final_logit_softcap", &value) ||
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "logit_softcap", &value)) &&
+        value > 0.0 && std::isfinite(value)) {
+        return (float)value;
     }
-    if (moe_json_has_positive_final_logit_softcap_key(engine->offload_gguf_metadata_json, &value) ||
-        moe_json_has_positive_final_logit_softcap_key(engine->offload_graph_ir_json, &value)) {
+    if (!engine->offload_graph_ir_json.empty() &&
+        (moe_json_get_double_local(engine->offload_graph_ir_json, "final_logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "final_logit_softcap", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "logit_softcap", &value)) &&
+        value > 0.0 && std::isfinite(value)) {
         return (float)value;
     }
     return 0.0f;
-}
-
-static float moe_final_logit_softcap_value(const moe_pc_engine* engine) {
-    static thread_local const moe_pc_engine* cached_engine = nullptr;
-    static thread_local uint64_t cached_generation = 0;
-    static thread_local size_t cached_graph_size = 0;
-    static thread_local size_t cached_metadata_size = 0;
-    static thread_local int cached_graph_required = -1;
-    static thread_local uint32_t cached_value_bits = 0;
-    if (!engine) {
-        return 0.0f;
-    }
-    const uint64_t generation = engine->engine_generation;
-    const size_t graph_size = engine->offload_graph_ir_json.size();
-    const size_t metadata_size = engine->offload_gguf_metadata_json.size();
-    const int graph_required = engine->offload_graph_ir_required.load(std::memory_order_acquire) != 0 ? 1 : 0;
-    if (cached_engine != engine ||
-        cached_generation != generation ||
-        cached_graph_size != graph_size ||
-        cached_metadata_size != metadata_size ||
-        cached_graph_required != graph_required) {
-        cached_engine = engine;
-        cached_generation = generation;
-        cached_graph_size = graph_size;
-        cached_metadata_size = metadata_size;
-        cached_graph_required = graph_required;
-        cached_value_bits = moe_f32_bits(moe_final_logit_softcap_value_uncached(engine));
-    }
-    return moe_f32_from_bits(cached_value_bits);
 }
 
 static float moe_apply_final_logit_softcap(const moe_pc_engine* engine, float score) {

@@ -191,7 +191,8 @@ def test_exact_ppl_eval_is_fail_closed_on_runtime_contract_and_fallbacks():
     assert "JUJU exact_ppl_mode required_features contract is not loaded" in eval_text
     assert "JUJU attention scale contract is not loaded" in eval_text
     assert "JUJU attention scale does not match runtime attention contract" in eval_text
-    assert "moe_engine_contract_uses_unit_qk_norm_global(engine)" in eval_text
+    assert "Numeric attention-scale contracts are authoritative" in eval_text
+    assert "moe_engine_contract_uses_unit_qk_norm_global(engine)" not in eval_text
     assert "JUJU storage format plan is not available for exact PPL" in eval_text
     assert "JUJU expert index is not ready for exact PPL" in eval_text
     assert "selected-expert linear fallback was used" in eval_text
@@ -538,7 +539,8 @@ def test_post_attention_norm_no_longer_falls_back_to_ffn_norm_aliases():
     assert '"ffn_norm.weight"' not in suffix_block
     assert '"mlp_norm.weight"' not in suffix_block
     assert '"pre_ffw_norm.weight"' not in suffix_block
-    assert "GraphIR-required GLM/Gemma-MoE artifacts" in suffix_block
+    assert "GraphIR-required artifacts" in suffix_block
+    assert "GLM/Gemma" not in suffix_block
     role_block = desc_text[desc_text.index("case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM:"):desc_text.index("case moe_RAW_TENSOR_Q_A_LAYER_NORM:", desc_text.index("case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM:"))]
     assert 'out->push_back("ffn_norm")' not in role_block
 
@@ -562,17 +564,15 @@ def test_shared_expert_suffixes_are_preferred_before_generic_dense_ffn_aliases()
     assert '"ffn_gate.weight"' in generic_block
 
 
-def test_attention_uses_unit_qk_norm_contract_scale_in_engine():
+def test_attention_scale_uses_contract_without_model_name_branch():
     attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_prefill.cpp.inc").read_text()
     helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
     assert "moe_engine_contract_uses_unit_qk_norm_global" in helper_text
     assert "moe_engine_is_gemma4_text_contract" not in helper_text
     assert "unit_qk_norm" in attn_text
-    assert "resolved_source = 4" in attn_text
-    assert "resolved_value = 1.0f" in attn_text
-    contract_pos = attn_text.index("moe_layer_uses_unit_qk_norm_contract(engine, layer)")
-    qpre_pos = attn_text.index("query_pre_attn_scalar > 0.0f", contract_pos)
-    assert contract_pos < qpre_pos
+    assert "attention_scale_contract" in attn_text
+    assert "query_pre_attn_scalar" in attn_text
+    assert "gemma" not in attn_text.lower()
 
 
 
@@ -656,9 +656,9 @@ def test_raw_residual_router_input_requires_explicit_graph_contract():
     block = norm_text[norm_text.index("static int moe_layer_router_uses_raw_residual_input"):norm_text.index("static int moe_layer_common_dense_mlp_f32")]
     assert "moe_engine_contract_uses_split_ffn_norm(engine, layer)" not in block
     assert '"ffn_gate_inp.weight"' not in block
-    assert "ffn_gate_inp.weight alone is only the router weight" in block
-    assert "moe_graph_ir_math_required(engine)" in block
-    assert '"moe_router"' in block
+    assert "ffn_gate_inp.weight" not in block
+    assert "use_hidden_when_router_has_internal_scale_else_expert_ffn_input" not in block
+    assert "return 0;" in block
 
 def test_no_v_proj_contract_is_layer_local_not_graphwide_string():
     attn_text = (ROOT / "moe_engine/src/parts/generation/attention_decode.cpp.inc").read_text()
@@ -723,3 +723,71 @@ def test_embedding_scale_is_cast_to_embedding_tensor_dtype_not_model_name():
     assert "moe_apply_embedding_scale_f32(engine, c, out_hidden, common.scalar_encoding, common.weight_format)" in emb_text
     assert "moe_apply_embedding_scale_f32(engine, c, dst, common.scalar_encoding, common.weight_format)" in emb_text
     assert "moe_apply_embedding_scale_f32(engine, c, out_hidden, encoding, weight_format)" in emb_text
+
+
+def test_post_ffw_norms_use_layer_local_suffix_fallback_in_graphir_mode():
+    text = (ROOT / "moe_engine/src/parts/generation/mlp_common_tensors.cpp.inc").read_text()
+    for name, suffix in (
+        ("moe_layer_post_ffw_norm_f32", '"post_ffw_norm.weight"'),
+        ("moe_layer_post_ffw_norm1_f32", '"post_ffw_norm_1.weight"'),
+        ("moe_layer_post_ffw_norm2_f32", '"post_ffw_norm_2.weight"'),
+    ):
+        block = text[text.index(f"static int {name}("):]
+        block = block[:block.index("\nstatic int ", 1) if "\nstatic int " in block[1:] else len(block)]
+        assert "moe_graph_ir_apply_rmsnorm_role_any_f32" in block
+        assert suffix in block
+        assert "moe_layer_post_ffw_norm_suffixes_f32" in block
+    for name, suffix in (
+        ("moe_layer_has_post_ffw_norm_weight", '"post_ffw_norm.weight"'),
+        ("moe_layer_has_post_ffw_norm1_weight", '"post_ffw_norm_1.weight"'),
+        ("moe_layer_has_post_ffw_norm2_weight", '"post_ffw_norm_2.weight"'),
+    ):
+        block = text[text.index(f"static int {name}("):]
+        block = block[:block.index("\nstatic int ", 1) if "\nstatic int " in block[1:] else len(block)]
+        assert "moe_graph_ir_layer_has_op_role_any" in block
+        assert suffix in block
+        assert "layers_with_" not in block
+
+
+def test_layer_output_scale_plan_and_apply_use_role_or_layer_suffix_not_graphwide_count():
+    common = (ROOT / "moe_engine/src/parts/generation/mlp_common_tensors.cpp.inc").read_text()
+    forward = (ROOT / "moe_engine/src/parts/generation_forward.cpp.inc").read_text()
+    apply_block = common[common.index("static int moe_layer_output_scale_f32("):]
+    assert "moe_graph_ir_map_layer_op_role_any" in apply_block
+    assert '"layer_output_scale.weight"' in apply_block
+    assert '"layer_scalar.weight"' in apply_block
+    assert "layers_with_layer_output_scale" not in apply_block
+    plan_block = forward[forward.index("plan.apply_layer_output_scale ="):forward.index("return plan;", forward.index("plan.apply_layer_output_scale ="))]
+    assert "moe_graph_ir_layer_has_op_role_any" in plan_block
+    assert '"layer_output_scale.weight"' in plan_block
+    assert '"layer_scalar.weight"' in plan_block
+    assert "layers_with_layer_output_scale" not in plan_block
+
+
+def test_final_logit_softcap_uses_scalar_contract_not_executable_op_only():
+    ops = (ROOT / "moe_engine/src/parts/raw_forward/forward_ops.cpp.inc").read_text()
+    block = ops[ops.index("static float moe_final_logit_softcap_value"):ops.index("static float moe_apply_final_logit_softcap")]
+    assert '"final_logit_softcapping"' in block
+    assert '"final_logit_softcap"' in block
+    assert '"logit_softcap"' in block
+    assert "moe_graph_ir_declares_final_logit_softcap_execution" not in ops
+    assert "final_logit_softcap_ignored" not in ops
+
+
+def test_value_norm_contract_table_is_layer_local_runtime_contract():
+    attn = (ROOT / "moe_engine/src/parts/generation/attention_prefill.cpp.inc").read_text()
+    block = attn[attn.index("static int moe_layer_uses_unweighted_v_norm"):attn.index("static int moe_layer_has_qk_norm_scaled_standard_layout")]
+    assert '"value_norm_contract_table"' in block
+    assert '"unweighted_value_norm_is_contractual_when_declared"' in attn
+    assert "graph-wide substring" in block
+    assert "executable op declares it" not in block
+
+
+def test_router_input_does_not_use_raw_residual_without_internal_scale():
+    norm = (ROOT / "moe_engine/src/parts/generation/mlp_normalization.cpp.inc").read_text()
+    fwd = (ROOT / "moe_engine/src/parts/generation/mlp_forward.cpp.inc").read_text()
+    block = norm[norm.index("static int moe_layer_router_uses_raw_residual_input"):norm.index("static int moe_layer_common_dense_mlp_f32")]
+    assert '"ffn_gate_inp.weight"' not in block
+    assert '"moe_router"' not in block
+    assert "return 0;" in block
+    assert "router_has_internal_norm_scale || router_uses_raw_residual" in fwd
