@@ -444,14 +444,30 @@ static int moe_common_tensor_layer_matches(
         (int32_t)parsed_layer == layer ? 1 : 0;
 }
 
+static int moe_common_tensor_role_text_matches(
+    const std::string& text,
+    const char* role
+) {
+    if (!role || !role[0] || text.empty()) {
+        return 0;
+    }
+    const std::string lhs = moe_lower_ascii_copy(text);
+    const std::string rhs = moe_lower_ascii_copy(role);
+    return lhs == rhs ? 1 : 0;
+}
+
 static int moe_common_tensor_op_role_matches(
     const moe_gguf_common_tensor_record& rec,
     const char* role
 ) {
-    if (!role || !role[0] || rec.op_role.empty()) {
+    if (!role || !role[0]) {
         return 0;
     }
-    return rec.op_role == role ? 1 : 0;
+    return
+        moe_common_tensor_role_text_matches(rec.op_role, role) ||
+        moe_common_tensor_role_text_matches(rec.execution_op, role) ||
+        moe_common_tensor_role_text_matches(rec.bundle_member_role, role) ||
+        moe_common_tensor_role_text_matches(rec.graph_role_text, role);
 }
 
 static void moe_raw_tensor_kind_op_roles(

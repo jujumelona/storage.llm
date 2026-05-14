@@ -485,6 +485,9 @@ static int load_juju_tensor_index_as_tensor_index(
                     common_it->second < engine->gguf_common_tensors.size()) {
                     moe_gguf_common_tensor_record& common_rec = engine->gguf_common_tensors[common_it->second];
                     common_rec.op_role = moe_lower_ascii_copy(!entry.op_role.empty() ? entry.op_role : entry.execution_op);
+                    common_rec.execution_op = moe_lower_ascii_copy(entry.execution_op);
+                    common_rec.graph_role_text = moe_lower_ascii_copy(entry.graph_role_text);
+                    common_rec.bundle_member_role = moe_lower_ascii_copy(entry.bundle_member_role);
                     common_rec.codec_id = entry.codec_id;
                     common_rec.codec_registry_version = entry.codec_registry_version;
                     common_rec.storage_layout = entry.storage_layout;

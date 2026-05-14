@@ -966,11 +966,114 @@ static int moe_graph_ir_map_layer_op_role_any(
         if (!map_common_tensor_record(engine, *rec, desc, out)) {
             return 0;
         }
+        moe_profile_log(
+            "graphir_contract_tensor_bind",
+            "layer=%d role=%s name=%s source=op_role rows=%u cols=%u bytes=%llu",
+            layer, roles[i], rec->name.c_str(), desc.rows, desc.cols,
+            (unsigned long long)rec->bytes);
+        moe_profile_log(
+            "rmsnorm_common_map",
+            "layer=%d suffix0=%s mapped=1 name=%s rows=%u cols=%u bytes=%llu source=op_role",
+            layer, roles[i], rec->name.c_str(), desc.rows, desc.cols,
+            (unsigned long long)rec->bytes);
         return 1;
     }
     return 0;
 }
 
+static int moe_graph_ir_string_field_matches_role_f32(
+    const std::string& doc,
+    size_t obj_begin,
+    size_t obj_end,
+    const char* field,
+    const char* role_key
+) {
+    if (!field || !role_key || !role_key[0]) {
+        return 0;
+    }
+    std::string value;
+    if (!moe_json_get_string_slice(doc, obj_begin, obj_end, field, &value)) {
+        return 0;
+    }
+    return moe_lower_ascii_copy(value) == moe_lower_ascii_copy(role_key) ? 1 : 0;
+}
+
+static int moe_graph_ir_layer_op_matches_tensor_role_f32(
+    const std::string& doc,
+    size_t obj_begin,
+    size_t obj_end,
+    const char* role_key
+) {
+    static const char* const fields[] = {
+        "name", "execution_op", "op_role", "role", "graph_role", "bundle_member_role"
+    };
+    for (const char* field : fields) {
+        if (moe_graph_ir_string_field_matches_role_f32(doc, obj_begin, obj_end, field, role_key)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_graph_ir_layer_ops_tensor_names_for_role(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* role_key,
+    std::vector<std::string>* out_names
+) {
+    if (!engine || layer < 0 || !role_key || !role_key[0] || !out_names ||
+        engine->offload_graph_ir_json.empty()) {
+        return 0;
+    }
+    const std::string& doc = engine->offload_graph_ir_json;
+    size_t layers_begin = 0;
+    size_t layers_end = 0;
+    if (!moe_json_find_array_local(doc, "layers", &layers_begin, &layers_end)) {
+        return 0;
+    }
+    const size_t start_count = out_names->size();
+    size_t cursor = layers_begin + 1u;
+    while (cursor < layers_end) {
+        size_t layer_obj_begin = 0;
+        size_t layer_obj_end = 0;
+        if (!moe_json_next_object_in_array(doc, &cursor, layers_end, &layer_obj_begin, &layer_obj_end)) {
+            break;
+        }
+        uint64_t parsed_layer = UINT64_MAX;
+        if (!moe_json_get_u64_slice(doc, layer_obj_begin, layer_obj_end, "layer", &parsed_layer) ||
+            parsed_layer != (uint64_t)layer) {
+            continue;
+        }
+        size_t ops_begin = 0;
+        size_t ops_end = 0;
+        const std::string layer_slice = doc.substr(layer_obj_begin, layer_obj_end - layer_obj_begin);
+        if (!moe_json_find_array_local(layer_slice, "ops", &ops_begin, &ops_end)) {
+            continue;
+        }
+        ops_begin += layer_obj_begin;
+        ops_end += layer_obj_begin;
+        size_t op_cursor = ops_begin + 1u;
+        while (op_cursor < ops_end) {
+            size_t op_begin = 0;
+            size_t op_end = 0;
+            if (!moe_json_next_object_in_array(doc, &op_cursor, ops_end, &op_begin, &op_end)) {
+                break;
+            }
+            if (!moe_graph_ir_layer_op_matches_tensor_role_f32(doc, op_begin, op_end, role_key)) {
+                continue;
+            }
+            std::vector<std::string> names;
+            if (moe_json_get_string_array_slice(doc, op_begin, op_end, "weights", &names) && !names.empty()) {
+                out_names->insert(out_names->end(), names.begin(), names.end());
+                moe_profile_log(
+                    "graphir_contract_tensor_names",
+                    "layer=%d role=%s count=%zu source=layers.ops.weights",
+                    layer, role_key, names.size());
+            }
+        }
+    }
+    return out_names->size() > start_count ? 1 : 0;
+}
 
 static int moe_graph_ir_layer_contract_tensor_names_for_role(
     const moe_pc_engine* engine,
@@ -989,34 +1092,37 @@ static int moe_graph_ir_layer_contract_tensor_names_for_role(
     const std::string& doc = engine->offload_graph_ir_json;
     size_t arr_begin = 0;
     size_t arr_end = 0;
-    if (!moe_json_find_array_local(doc, "layer_execution_contract_table", &arr_begin, &arr_end)) {
-        return 0;
-    }
-    size_t cursor = arr_begin + 1u;
-    while (cursor < arr_end) {
-        size_t obj_begin = 0;
-        size_t obj_end = 0;
-        if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+    if (moe_json_find_array_local(doc, "layer_execution_contract_table", &arr_begin, &arr_end)) {
+        size_t cursor = arr_begin + 1u;
+        while (cursor < arr_end) {
+            size_t obj_begin = 0;
+            size_t obj_end = 0;
+            if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+                break;
+            }
+            uint64_t parsed_layer = UINT64_MAX;
+            if (!moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed_layer) ||
+                parsed_layer != (uint64_t)layer) {
+                continue;
+            }
+            size_t scope_begin = obj_begin;
+            size_t scope_end = obj_end;
+            if (section_key && section_key[0]) {
+                if (!moe_json_find_object_local(doc.substr(obj_begin, obj_end - obj_begin), section_key,
+                        &scope_begin, &scope_end)) {
+                    break;
+                }
+                scope_begin += obj_begin;
+                scope_end += obj_begin;
+            }
+            if (moe_json_get_string_array_slice(doc, scope_begin, scope_end, role_key, out_names) &&
+                !out_names->empty()) {
+                return 1;
+            }
             break;
         }
-        uint64_t parsed_layer = UINT64_MAX;
-        if (!moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed_layer) ||
-            parsed_layer != (uint64_t)layer) {
-            continue;
-        }
-        size_t scope_begin = obj_begin;
-        size_t scope_end = obj_end;
-        if (section_key && section_key[0]) {
-            if (!moe_json_find_object_local(doc.substr(obj_begin, obj_end - obj_begin), section_key,
-                    &scope_begin, &scope_end)) {
-                return 0;
-            }
-            scope_begin += obj_begin;
-            scope_end += obj_begin;
-        }
-        return moe_json_get_string_array_slice(doc, scope_begin, scope_end, role_key, out_names) ? 1 : 0;
     }
-    return 0;
+    return moe_graph_ir_layer_ops_tensor_names_for_role(engine, layer, role_key, out_names);
 }
 
 static int moe_graph_ir_layer_contract_declares_tensor_role(
@@ -1065,6 +1171,11 @@ static int moe_graph_ir_map_layer_contract_tensor_role_f32(
             role_key,
             name.c_str(),
             section_key && section_key[0] ? section_key : "row");
+        moe_profile_log(
+            "rmsnorm_common_map",
+            "layer=%d suffix0=%s mapped=1 name=%s rows=%u cols=%u bytes=%llu source=contract",
+            layer, role_key, name.c_str(), desc.rows, desc.cols,
+            (unsigned long long)rec->bytes);
         return 1;
     }
     return 0;
@@ -1084,7 +1195,12 @@ static int moe_graph_ir_apply_rmsnorm_role_any_f32(
     if (!moe_graph_ir_map_layer_op_role_any(engine, layer, roles, role_count, &raw)) {
         return 0;
     }
-    return moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
+    const int ok = moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
+    moe_profile_log(
+        "rmsnorm_common_apply",
+        "layer=%d suffix0=%s ok=%d hidden=%u source=op_role",
+        layer, (role_count && roles && roles[0]) ? roles[0] : "", ok, hidden_size);
+    return ok;
 }
 
 static int moe_layer_post_ffw_norm_suffixes_f32(
@@ -1120,7 +1236,12 @@ static int moe_layer_post_ffw_norm_f32(
         moe_raw_tensor_cache_entry raw{};
         if (moe_graph_ir_map_layer_contract_tensor_role_f32(
                 engine, layer, "norms", "post_ffw_norm", &raw)) {
-            return moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
+            const int ok = moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
+            moe_profile_log(
+                "rmsnorm_common_apply",
+                "layer=%d suffix0=post_ffw_norm ok=%d hidden=%u source=contract",
+                layer, ok, hidden_size);
+            return ok;
         }
     }
     static const char* const suffixes[] = {
@@ -1170,7 +1291,12 @@ static int moe_layer_post_ffw_norm1_f32(
         moe_raw_tensor_cache_entry raw{};
         if (moe_graph_ir_map_layer_contract_tensor_role_f32(
                 engine, layer, "norms", "post_ffw_norm_1", &raw)) {
-            return moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
+            const int ok = moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
+            moe_profile_log(
+                "rmsnorm_common_apply",
+                "layer=%d suffix0=post_ffw_norm_1 ok=%d hidden=%u source=contract",
+                layer, ok, hidden_size);
+            return ok;
         }
     }
     static const char* const suffixes[] = {
@@ -1220,7 +1346,12 @@ static int moe_layer_post_ffw_norm2_f32(
         moe_raw_tensor_cache_entry raw{};
         if (moe_graph_ir_map_layer_contract_tensor_role_f32(
                 engine, layer, "norms", "post_ffw_norm_2", &raw)) {
-            return moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
+            const int ok = moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
+            moe_profile_log(
+                "rmsnorm_common_apply",
+                "layer=%d suffix0=post_ffw_norm_2 ok=%d hidden=%u source=contract",
+                layer, ok, hidden_size);
+            return ok;
         }
     }
     static const char* const suffixes[] = {

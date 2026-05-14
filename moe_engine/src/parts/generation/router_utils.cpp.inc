@@ -406,17 +406,27 @@ static int moe_router_scale_tensor_is_weight_sidecar_name_f32(const std::string&
     return 0;
 }
 
+static int moe_router_scale_role_text_is_weight_sidecar_f32(
+    const std::string& text
+) {
+    const std::string role = moe_lower_ascii_copy(text);
+    return role.find("weight_scale_sidecar") != std::string::npos ||
+        role.find("weight_sidecar") != std::string::npos ||
+        role.find("quant_sidecar") != std::string::npos ||
+        role.find("router_weight_scale_sidecar") != std::string::npos ||
+        role.find("mxfp") != std::string::npos;
+}
+
 static int moe_router_scale_record_is_weight_sidecar_f32(
     const moe_gguf_common_tensor_record& rec
 ) {
     if (moe_router_scale_tensor_is_weight_sidecar_name_f32(rec.name)) {
         return 1;
     }
-    const std::string role = moe_lower_ascii_copy(rec.op_role);
-    return role.find("weight_scale_sidecar") != std::string::npos ||
-        role.find("weight_sidecar") != std::string::npos ||
-        role.find("quant_sidecar") != std::string::npos ||
-        role.find("mxfp") != std::string::npos;
+    return moe_router_scale_role_text_is_weight_sidecar_f32(rec.op_role) ||
+        moe_router_scale_role_text_is_weight_sidecar_f32(rec.execution_op) ||
+        moe_router_scale_role_text_is_weight_sidecar_f32(rec.bundle_member_role) ||
+        moe_router_scale_role_text_is_weight_sidecar_f32(rec.graph_role_text);
 }
 
 static int moe_router_has_internal_weight_scale_contract_f32(
@@ -432,7 +442,9 @@ static int moe_router_has_internal_weight_scale_contract_f32(
     };
     moe_raw_tensor_desc desc{};
     for (const char* role : roles) {
-        if (find_common_tensor_by_op_role(engine, role, layer, &desc)) {
+        const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_op_role(engine, role, layer, &desc);
+        if (rec && !moe_router_scale_record_is_weight_sidecar_f32(*rec)) {
             return 1;
         }
     }

@@ -154,6 +154,9 @@ enum moe_storage_profile_kind : uint32_t {
 struct moe_gguf_common_tensor_record {
     std::string name;
     std::string op_role;
+    std::string execution_op;
+    std::string graph_role_text;
+    std::string bundle_member_role;
     std::string codec_id;
     std::string codec_registry_version;
     std::string storage_layout;
