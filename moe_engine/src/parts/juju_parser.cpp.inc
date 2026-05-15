@@ -342,12 +342,15 @@ static int moe_read_binary_range_to_string(
     uint64_t file_bytes,
     std::string* out
 ) {
-    // BUGFIX 326: Check offset + bytes doesn't overflow before comparison ★
-    // Problem: offset + bytes can overflow uint64_t if values are malformed
-    // Causes offset > file_bytes check to pass incorrectly
-    // Solution: Check bytes <= file_bytes - offset instead
-    if (!out || path.empty() || bytes == 0 || bytes > 256ull * 1024ull * 1024ull ||
-        offset > file_bytes || bytes > file_bytes - offset) {
+    // Validate only against the actual file/section bounds and host integer
+    // limits. Do not impose a fixed 256MiB cap here: large generated MoE
+    // artifacts can have .juju.idx sidecars larger than that, and rejecting a
+    // valid authoritative sidecar prevents model loading before PPL can run.
+    if (!out || path.empty() || bytes == 0 || offset > file_bytes || bytes > file_bytes - offset) {
+        return 0;
+    }
+    if (bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        bytes > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
         return 0;
     }
     std::ifstream input;
@@ -355,10 +358,6 @@ static int moe_read_binary_range_to_string(
     if (!input) {
         return 0;
     }
-    // BUGFIX 327: Check offset fits in streamoff before seekg ★
-    // Problem: offset can exceed std::streamoff max value
-    // seekg with out-of-range offset causes undefined behavior
-    // Solution: Check offset <= streamoff max before seekg
     if (offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max())) {
         return 0;
     }
@@ -366,11 +365,13 @@ static int moe_read_binary_range_to_string(
     if (!input) {
         return 0;
     }
-    std::string data((size_t)bytes, '\0');
-    input.read(&data[0], (std::streamsize)data.size());
-    // BUGFIX 328: Check gcount() matches requested bytes ★
-    // Problem: Partial read not detected, returns incomplete data
-    // Solution: Check gcount() == bytes before returning success
+    std::string data;
+    try {
+        data.resize(static_cast<size_t>(bytes));
+    } catch (...) {
+        return 0;
+    }
+    input.read(&data[0], static_cast<std::streamsize>(data.size()));
     if ((uint64_t)input.gcount() != bytes) {
         return 0;
     }
