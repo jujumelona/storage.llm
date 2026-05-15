@@ -19,7 +19,11 @@ __pycache__/
 !/tools/autotune/
 !/tools/autotune/**
 /glm51_runtime_colab/
-/colab/
+/colab/*
+!/colab/
+!/colab/juju_modules/
+!/colab/juju_modules/format_contract.py
+!/colab/juju_shard_materializer_PPL_FastRegen.py
 *.ipynb
 
 # Public generic Colab notebook template. Local conversion notebooks remain ignored.

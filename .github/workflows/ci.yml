@@ -61,6 +61,7 @@ jobs:
             test_ppl_math_contract_examples
             test_ppl_diag_contract_examples
             test_engine_fixture_loading
+            PythonJujuGenerationContractConfig
           )
           for t in "${required_tests[@]}"; do
             grep -Eq "Test +#[0-9]+: ${t}$" build/ctest-list.txt || { echo "Missing required CTest: ${t}"; exit 1; }

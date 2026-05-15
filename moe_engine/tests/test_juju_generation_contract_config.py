@@ -1,9 +1,32 @@
 import importlib.util
 import math
+import sys
+import types
 from pathlib import Path
 
+try:
+    import requests  # noqa: F401
+except ModuleNotFoundError:
+    sys.modules["requests"] = types.ModuleType("requests")
+
 ROOT = Path(__file__).resolve().parents[2]
-MAT_PATH = ROOT / "colab" / "juju_shard_materializer.py"
+
+
+def _resolve_materializer_path():
+    candidates = [
+        ROOT / "colab" / "juju_shard_materializer.py",
+        ROOT / "colab" / "juju_shard_materializer_PPL_FastRegen.py",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        "missing JUJU materializer source; expected one of: "
+        + ", ".join(str(x) for x in candidates)
+    )
+
+
+MAT_PATH = _resolve_materializer_path()
 spec = importlib.util.spec_from_file_location("juju_shard_materializer", MAT_PATH)
 mat = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mat)
@@ -635,13 +658,15 @@ def test_materializer_router_scale_sidecar_contract_matches_engine():
 
 
 def test_materializer_classifies_ffn_gate_inp_scale_as_router_weight_sidecar():
-    mat = (ROOT / "colab" / "juju_shard_materializer.py").read_text()
+    mat = MAT_PATH.read_text()
     sidecar_block = mat[mat.index('elif suffix in {"ffn_gate_inp.scale", "ffn_gate_inp.scales"}'):mat.index('elif suffix in {"router.scale", "mlp.router.scale", "moe.gate.scale"}')]
     assert '"router_weight_scale_sidecar"' in sidecar_block
-    feature_start = mat.rindex('if any(x in suffixes for x in {', 0, mat.index('feature_counts["layers_with_router_scale"]'))
-    feature_block = mat[feature_start:mat.index('if any("exps." in x or "_exps." in x for x in suffixes)', feature_start)]
-    assert '"ffn_gate_inp.scale"' not in feature_block
-    assert '"router.scale"' in feature_block
+    router_scale_marker = 'feature_counts["layers_with_router_scale"] += 1'
+    router_scale_start = mat.rindex('if any(x in suffixes for x in {', 0, mat.index(router_scale_marker))
+    router_scale_end = mat.index(router_scale_marker, router_scale_start)
+    router_scale_block = mat[router_scale_start:router_scale_end]
+    assert '"ffn_gate_inp.scale"' not in router_scale_block
+    assert '"router.scale"' in router_scale_block
 
 
 def test_graphir_dense_fallback_does_not_run_next_to_routed_moe_from_adapter_hint():

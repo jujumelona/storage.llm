@@ -311,6 +311,12 @@ target_link_libraries(storagellm_probe
 if(STORAGELLM_BUILD_TESTS)
     enable_testing()
 
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(
+        NAME PythonJujuGenerationContractConfig
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/moe_engine/tests/run_juju_generation_contract_config.py
+    )
+
     # Find Google Test
     find_package(GTest QUIET)
 
@@ -323,17 +329,11 @@ if(STORAGELLM_BUILD_TESTS)
             message(STATUS "Using bundled googletest from third_party/googletest")
             add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/googletest" "${CMAKE_BINARY_DIR}/_deps/googletest-build" EXCLUDE_FROM_ALL)
         else()
-            message(STATUS "Google Test not found locally, downloading...")
-            include(FetchContent)
-            FetchContent_Declare(
-                googletest
-                GIT_REPOSITORY https://github.com/google/googletest.git
-                GIT_TAG v1.14.0
-            )
-            FetchContent_MakeAvailable(googletest)
+            message(WARNING "Google Test not found locally; skipping C++ gtest targets. Install libgtest-dev or set STORAGELLM_BUNDLED_GTEST_SRC to enable them. Python contract tests remain registered.")
         endif()
     endif()
 
+    if(TARGET GTest::gtest AND TARGET GTest::gtest_main)
     function(storagellm_add_gtest test_name)
         add_executable(${test_name} ${ARGN})
         target_link_libraries(${test_name}
@@ -434,6 +434,10 @@ if(STORAGELLM_BUILD_TESTS)
 
     message(STATUS "Tests enabled. Run with: ctest --output-on-failure")
     message(STATUS "Benchmarks: ./build/bench_batch_dot")
+    else()
+        message(STATUS "C++ gtest targets disabled because Google Test was not found.")
+        message(STATUS "Python contract tests enabled. Run with: ctest --output-on-failure -R PythonJujuGenerationContractConfig")
+    endif()
 endif()
 
 # Installation
