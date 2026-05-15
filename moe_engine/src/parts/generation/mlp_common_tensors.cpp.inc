@@ -842,6 +842,22 @@ static int moe_final_norm_f32(
         "norm.weight",
         "transformer.ln_f.weight"
     };
+    if (const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_names(engine, suffixes, sizeof(suffixes) / sizeof(suffixes[0]), nullptr)) {
+        moe_raw_tensor_desc desc{};
+        if (moe_common_tensor_record_to_raw_desc(*rec, &desc) &&
+            desc.rows >= hidden_size && desc.cols == 0) {
+            moe_raw_tensor_cache_entry raw{};
+            if (!map_common_tensor_record(engine, *rec, desc, &raw)) {
+                return 0;
+            }
+            moe_profile_log(
+                "final_norm_contract_binding",
+                "name=%s rows=%u cols=%u hidden=%u source=global_name",
+                rec->name.c_str(), desc.rows, desc.cols, hidden_size);
+            return moe_apply_rmsnorm_common_weight_f32(engine, raw, input, hidden_size, output, eps);
+        }
+    }
     return moe_layer_rmsnorm_suffixes_f32(
         engine, (int32_t)c->num_hidden_layers, suffixes,
         sizeof(suffixes) / sizeof(suffixes[0]),
