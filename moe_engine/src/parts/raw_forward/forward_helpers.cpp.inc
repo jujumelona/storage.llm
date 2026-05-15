@@ -74,38 +74,6 @@ static int moe_graph_ir_tensor_binding_name(
     return moe_json_get_string_local(engine->offload_graph_ir_json, key, out) && !out->empty();
 }
 
-static int moe_graph_ir_lm_head_tied_to_token_embedding(const moe_pc_engine* engine) {
-    if (!engine || engine->offload_graph_ir_json.empty()) {
-        return 0;
-    }
-    int tied = 0;
-    size_t begin = 0;
-    size_t end = 0;
-    if (moe_json_find_object_local(engine->offload_graph_ir_json, "tensor_bindings", &begin, &end) &&
-        moe_json_get_bool_slice(engine->offload_graph_ir_json, begin, end, "lm_head_tied_to_token_embedding", &tied) &&
-        tied) {
-        return 1;
-    }
-    if (moe_json_get_bool_local(engine->offload_graph_ir_json, "lm_head_tied_to_token_embedding", &tied) && tied) {
-        return 1;
-    }
-    std::string lm_head;
-    std::string token_embedding;
-    if (moe_graph_ir_tensor_binding_name(engine, "lm_head", &lm_head)) {
-        if (moe_graph_ir_tensor_binding_name(engine, "token_embedding", &token_embedding) &&
-            !token_embedding.empty() &&
-            lm_head == token_embedding) {
-            return 1;
-        }
-        if (lm_head == "token_embd.weight" ||
-            lm_head == "model.embed_tokens.weight" ||
-            lm_head == "embed_tokens.weight") {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 static uint32_t moe_raw_scalar_size(uint8_t encoding) {
     if (encoding == moe_RAW_SCALAR_F32) {
         return 4u;
