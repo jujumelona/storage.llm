@@ -388,10 +388,11 @@ static int moe_router_name_has_suffix_f32(const std::string& name, const char* s
 }
 
 static int moe_router_scale_tensor_is_weight_sidecar_name_f32(const std::string& name) {
-    // Only tensor names that scale a concrete weight tensor are sidecars.
-    // A bare ffn_gate_inp.scale/scales tensor is the router-input learned
-    // scale contract; do not reject it by name.
+    // ffn_gate_inp.scale/scales in GGUF/MXFP artifacts are router-weight
+    // quantization sidecars, not router-input activation/RMSNorm scales.
     static const char* const sidecar_suffixes[] = {
+        "ffn_gate_inp.scale",
+        "ffn_gate_inp.scales",
         "ffn_gate_inp.weight.scale",
         "ffn_gate_inp.weight.scales",
         ".weight.scale",
@@ -449,12 +450,10 @@ static int moe_router_has_internal_weight_scale_contract_f32(
     }
     static const char* const suffixes[] = {
         // Availability here means router-input activation scale, not MXFP/GGUF
-        // weight sidecar tensors. Bare ffn_gate_inp.scale/scales are learned
-        // router-input scales; only explicit input-scale names are accepted by
+        // weight sidecar tensors. Bare ffn_gate_inp.scale/scales are router
+        // weight sidecars; only explicit input-scale names are accepted by
         // suffix. Generic router.scale/mlp.router.scale/moe.gate.scale are
         // ambiguous and require an explicit op-role record instead.
-        "ffn_gate_inp.scale",
-        "ffn_gate_inp.scales",
         "router_input_scale",
         "router.input_scale",
         "mlp.router_input_scale",
@@ -512,8 +511,6 @@ static int moe_router_has_direct_input_scale_contract_f32(
         return 0;
     }
     static const char* const direct_suffixes[] = {
-        "ffn_gate_inp.scale",
-        "ffn_gate_inp.scales",
         "router_input_scale",
         "router.input_scale",
         "mlp.router_input_scale",
@@ -558,12 +555,8 @@ static int moe_map_router_scale_tensor(
     };
     static const char* const suffixes[] = {
         // Prefer direct router-input activation scales over router RMSNorm gamma
-        // fallbacks.  Some formats may carry both a generic router norm and a
-        // bare ffn_gate_inp.scale; when the direct-scale contract is present,
-        // mapping the norm gamma here would incorrectly apply hidden_size^-0.5
-        // and unit_offset=0 semantics to the wrong tensor.
-        "ffn_gate_inp.scale",
-        "ffn_gate_inp.scales",
+        // fallbacks.  Bare ffn_gate_inp.scale/scales are router-weight sidecars
+        // and must not be mapped as activation scales.
         "router_input_scale",
         "router.input_scale",
         "mlp.router_input_scale",

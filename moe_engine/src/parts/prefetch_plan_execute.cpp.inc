@@ -209,6 +209,8 @@ int moe_pc_engine_execute_prefetch_plan(
             0,
             1,
             vram_tokens[i],
+            prefetch_is_router_selected(items[i]) ? 1 : 0,
+            items[i].reason,
             prefetch_is_router_selected(items[i]) ? 1 : 0
         );
         if (queued) {

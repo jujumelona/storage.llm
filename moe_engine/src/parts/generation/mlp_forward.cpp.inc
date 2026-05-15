@@ -302,18 +302,19 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
         plan.post_norm1.weight_count += contract_norm1;
     }
 
-    // Execute only branches that GraphIR says are real data-flow branches.
-    //
-    // Split-FFN models can encode branch-1 as ordinary FFN gate/up/down weights
-    // followed by post_ffw_norm_1, without a separate dense_mlp/shared_expert op.
-    // Treat that as an IR-declared branch because post_ffw_norm_1 is a layer-local
-    // data-flow contract; do not require a model-name branch or a global suffix
-    // heuristic.  This restores the common branch only when the IR declares the
-    // branch norm and the actual layer has a complete dense FFN triplet.
+    // Execute only branches that the layer GraphIR marks as real data-flow
+    // branches.  The global dense_mlp_uses_shared_path adapter hint must not
+    // override a layer-local dense_ffn_fallback op with required=false; otherwise
+    // ordinary dense FFN tensors are double-counted next to routed MoE and PPL
+    // collapses.  post_ffw_norm_1 alone is not proof that dense_branch exists:
+    // it is optional and receives missing_input=zero when no shared/dense branch
+    // is declared.
     const int dense_uses_shared_path =
         moe_graph_ir_dense_mlp_uses_shared_path_f32(engine, layer);
     const int split_dense_branch_by_norm1 =
         (dense_uses_shared_path &&
+         !plan.routed.present &&
+         !plan.routed.has_weights &&
          plan.post_norm1.has_weights &&
          moe_layer_has_common_dense_mlp_tensors_f32(engine, layer) &&
          !plan.shared.has_weights) ? 1 : 0;

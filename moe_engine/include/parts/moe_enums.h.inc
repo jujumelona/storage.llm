@@ -67,7 +67,8 @@ typedef enum {
     moe_PREFETCH_REASON_ROUTER_SELECTED = 0,
     moe_PREFETCH_REASON_LOOKAHEAD = 1,
     moe_PREFETCH_REASON_TOPOLOGY = 2,
-    moe_PREFETCH_REASON_BATCH_SELECTED = 3
+    moe_PREFETCH_REASON_BATCH_SELECTED = 3,
+    moe_PREFETCH_REASON_STARTUP_WARM = 4
 } moe_prefetch_reason_t;
 
 typedef enum {

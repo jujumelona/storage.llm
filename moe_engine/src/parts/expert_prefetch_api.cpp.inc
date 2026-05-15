@@ -377,10 +377,8 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
             moe_tier_t target = moe_TIER_DB;
             if (vram_limit > 0 && planned_vram + bytes <= vram_limit) {
                 target = moe_TIER_VRAM;
-                planned_vram += bytes;
             } else if (ram_limit > 0 && planned_ram + bytes <= ram_limit) {
                 target = moe_TIER_RAM;
-                planned_ram += bytes;
             } else {
                 // Stop once the active compute tiers are full. CPU-only roots have
                 // no VRAM budget, so RAM warm is the primary way to avoid first-token
@@ -415,7 +413,14 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
                     0,
                     1,
                     vram_reservation_token{},
+                    0,
+                    moe_PREFETCH_REASON_STARTUP_WARM,
                     0)) {
+                if (target == moe_TIER_VRAM) {
+                    planned_vram += bytes;
+                } else if (target == moe_TIER_RAM) {
+                    planned_ram += bytes;
+                }
                 ++queued;
                 if ((queued & 31u) == 0u) {
                     engine->disk_stage.cv.notify_all();

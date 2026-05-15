@@ -146,11 +146,13 @@ static int enqueue_tensor_prefetch(
         if (task.vram_token.valid) {
             device_vram_release_reservation_token(engine, task.vram_token);
         }
-        // BUGFIX 237: Track prefetch admission failures
-        // Problem: enqueue failure returns 0 without updating statistics
-        // Impact: /health monitoring shows incorrect hit rate (failures not counted)
-        // Solution: Increment failed_requests counter on enqueue failure
-        engine->io_atomic.failed_requests.fetch_add(1, std::memory_order_relaxed);
+        // Queue backpressure for speculative/lookahead/startup warm is already
+        // tracked as dropped_requests by the queue helpers.  Count hard failures
+        // only for router-selected/required work so health does not report
+        // speculative drops as I/O corruption and throttle the wrong path.
+        if (task.required_now || task.urgent_required) {
+            engine->io_atomic.failed_requests.fetch_add(1, std::memory_order_relaxed);
+        }
         return 0;
     }
     // Fix: Only count queued_requests after successful enqueue

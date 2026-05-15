@@ -469,9 +469,8 @@ static int moe_engine_contract_has_router_input_scale(
         // Direct router-input activation scales. Keep this list narrow: generic
         // router.scale/moe.gate.scale names are ambiguous and may describe a
         // projection scale or a quantization sidecar, not the residual router
-        // input transform.
-        "ffn_gate_inp.scale",
-        "ffn_gate_inp.scales",
+        // input transform.  ffn_gate_inp.scale/scales are router-weight
+        // quantization sidecars in GGUF/MXFP artifacts.
         "router_input_scale",
         "router.input_scale",
         "mlp.router_input_scale",
@@ -485,10 +484,9 @@ static int moe_engine_contract_has_router_input_scale(
         "moe.gate_norm.weight",
         "mlp.router_norm.weight"
     };
-    // Bare ffn_gate_inp.scale/scales are router-input learned scales.
     // Do not infer router input scaling from graph-wide text mentions, generic
     // router.scale/moe.gate.scale names, or concrete weight sidecars such as
-    // ffn_gate_inp.weight.scale.
+    // ffn_gate_inp.scale/scales.
     return moe_engine_contract_has_layer_tensor_suffix_any(
         engine, layer, router_scale_suffixes,
         sizeof(router_scale_suffixes) / sizeof(router_scale_suffixes[0]));
@@ -502,8 +500,6 @@ static int moe_engine_contract_uses_direct_router_input_scale(
         return 0;
     }
     static const char* const direct_scale_suffixes[] = {
-        "ffn_gate_inp.scale",
-        "ffn_gate_inp.scales",
         "router_input_scale",
         "router.input_scale",
         "mlp.router_input_scale",
