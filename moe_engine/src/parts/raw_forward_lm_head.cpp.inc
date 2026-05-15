@@ -40,8 +40,7 @@ static int moe_map_lm_head_tensor(
         if (rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size) {
             static std::atomic<uint32_t> logged{0};
             if (logged.fetch_add(1, std::memory_order_relaxed) == 0) {
-                int tied = 0;
-                (void)moe_json_get_bool_local(engine->offload_graph_ir_json, "lm_head_tied_to_token_embedding", &tied);
+                const int tied = moe_lm_head_tied_to_token_embedding(engine);
                 moe_profile_log(
                     "lm_head_contract_binding",
                     "name=%s tied=%d rows=%u cols=%u vocab=%u hidden=%u",
@@ -54,8 +53,7 @@ static int moe_map_lm_head_tensor(
             "name=%s rows=%u cols=%u vocab=%u hidden=%u",
             graph_name.c_str(), desc.rows, desc.cols, c->vocab_size, c->hidden_size);
     }
-    int lm_head_tied_to_embedding = 0;
-    (void)moe_json_get_bool_local(engine->offload_graph_ir_json, "lm_head_tied_to_token_embedding", &lm_head_tied_to_embedding);
+    const int lm_head_tied_to_embedding = moe_lm_head_tied_to_token_embedding(engine);
     auto is_embedding_candidate = [](const char* name) -> bool {
         return name && (
             std::strcmp(name, "token_embd.weight") == 0 ||

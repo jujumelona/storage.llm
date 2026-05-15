@@ -156,6 +156,28 @@ static int moe_raw_embedding_ready(const moe_pc_engine* engine) {
         raw_span_backing_file_ready(engine, span) ? 1 : 0;
 }
 
+static int moe_lm_head_tied_to_token_embedding(const moe_pc_engine* engine) {
+    if (!engine) {
+        return 0;
+    }
+    int tied = 0;
+    if (moe_json_get_bool_local(engine->offload_graph_ir_json, "lm_head_tied_to_token_embedding", &tied)) {
+        return tied ? 1 : 0;
+    }
+    if (moe_json_get_bool_local(engine->offload_graph_ir_json, "tie_word_embeddings", &tied) ||
+        moe_json_get_bool_local(engine->offload_graph_ir_json, "tie_embeddings", &tied) ||
+        moe_json_get_bool_local(engine->offload_graph_ir_json, "tied_word_embeddings", &tied)) {
+        return tied ? 1 : 0;
+    }
+    if (moe_json_get_bool_local(engine->offload_gguf_metadata_json, "lm_head_tied_to_token_embedding", &tied) ||
+        moe_json_get_bool_local(engine->offload_gguf_metadata_json, "tie_word_embeddings", &tied) ||
+        moe_json_get_bool_local(engine->offload_gguf_metadata_json, "tie_embeddings", &tied) ||
+        moe_json_get_bool_local(engine->offload_gguf_metadata_json, "tied_word_embeddings", &tied)) {
+        return tied ? 1 : 0;
+    }
+    return 0;
+}
+
 static int moe_raw_lm_head_ready(const moe_pc_engine* engine) {
     const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
     const moe_storage_constants_t* c = &runtime_c;
@@ -170,10 +192,7 @@ static int moe_raw_lm_head_ready(const moe_pc_engine* engine) {
         return rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size ?
             common_tensor_backing_file_ready(engine, rec) : 0;
     }
-    int lm_head_tied_to_embedding = 0;
-    if (engine) {
-        (void)moe_json_get_bool_local(engine->offload_graph_ir_json, "lm_head_tied_to_token_embedding", &lm_head_tied_to_embedding);
-    }
+    const int lm_head_tied_to_embedding = moe_lm_head_tied_to_token_embedding(engine);
     auto is_embedding_candidate = [](const char* name) -> bool {
         return name && (std::strcmp(name, "token_embd.weight") == 0 ||
             std::strcmp(name, "model.embed_tokens.weight") == 0 ||
