@@ -450,12 +450,15 @@ static int moe_router_has_internal_weight_scale_contract_f32(
     static const char* const suffixes[] = {
         // Availability here means router-input activation scale, not MXFP/GGUF
         // weight sidecar tensors. Bare ffn_gate_inp.scale/scales are learned
-        // router-input scales; only *.weight.scale sidecars are rejected.
+        // router-input scales; only explicit input-scale names are accepted by
+        // suffix. Generic router.scale/mlp.router.scale/moe.gate.scale are
+        // ambiguous and require an explicit op-role record instead.
         "ffn_gate_inp.scale",
         "ffn_gate_inp.scales",
-        "router.scale",
-        "mlp.router.scale",
-        "moe.gate.scale"
+        "router_input_scale",
+        "router.input_scale",
+        "mlp.router_input_scale",
+        "moe.gate_input_scale"
     };
     for (const char* suffix : suffixes) {
         if (moe_engine_has_common_tensor_suffix(engine, layer, suffix)) {
@@ -501,6 +504,42 @@ static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role
     return nullptr;
 }
 
+static int moe_router_has_direct_input_scale_contract_f32(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    static const char* const direct_suffixes[] = {
+        "ffn_gate_inp.scale",
+        "ffn_gate_inp.scales",
+        "router_input_scale",
+        "router.input_scale",
+        "mlp.router_input_scale",
+        "moe.gate_input_scale"
+    };
+    for (const char* suffix : direct_suffixes) {
+        if (moe_engine_has_common_tensor_suffix(engine, layer, suffix)) {
+            return 1;
+        }
+    }
+    static const char* const direct_roles[] = {
+        "moe_router_scale",
+        "router_scale",
+        "router_input_scale"
+    };
+    moe_raw_tensor_desc desc{};
+    for (const char* role : direct_roles) {
+        const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_op_role(engine, role, layer, &desc);
+        if (rec && !moe_router_scale_record_is_weight_sidecar_f32(*rec)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int moe_map_router_scale_tensor(
     moe_pc_engine* engine,
     int32_t layer,
@@ -518,19 +557,25 @@ static int moe_map_router_scale_tensor(
         "router_input_norm"
     };
     static const char* const suffixes[] = {
-        // Only activation/RMSNorm router-scale names are allowed here.
-        // Weight-quantization sidecars are rejected by name before mapping.
+        // Prefer direct router-input activation scales over router RMSNorm gamma
+        // fallbacks.  Some formats may carry both a generic router norm and a
+        // bare ffn_gate_inp.scale; when the direct-scale contract is present,
+        // mapping the norm gamma here would incorrectly apply hidden_size^-0.5
+        // and unit_offset=0 semantics to the wrong tensor.
+        "ffn_gate_inp.scale",
+        "ffn_gate_inp.scales",
+        "router_input_scale",
+        "router.input_scale",
+        "mlp.router_input_scale",
+        "moe.gate_input_scale",
+        // Router input RMSNorm gamma fallback.  These imply a router-input
+        // transform but are not bare direct activation scales.
         "router_norm.weight",
         "router.input_layernorm.weight",
         "router.input_norm.weight",
         "moe_router_norm.weight",
         "moe.gate_norm.weight",
-        "mlp.router_norm.weight",
-        "ffn_gate_inp.scale",
-        "ffn_gate_inp.scales",
-        "mlp.router.scale",
-        "router.scale",
-        "moe.gate.scale"
+        "mlp.router_norm.weight"
     };
 
     // Fix 18: Cache tensor mapping to avoid std::string vector allocation per token.
@@ -643,7 +688,8 @@ static int moe_prepare_scaled_router_input_f32(
     // input scale tensors apply RMSNorm, then hidden_size^-0.5, then the
     // learned router scale.
     float norm = 1.0f / std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f);
-    if (moe_engine_contract_uses_direct_router_input_scale(engine, layer)) {
+    const int direct_input_scale = moe_router_has_direct_input_scale_contract_f32(engine, layer);
+    if (direct_input_scale) {
         const float root = 1.0f / std::sqrt((float)hidden_size);
         if (!std::isfinite(root) || !(root > 0.0f)) {
             return 0;
@@ -657,7 +703,7 @@ static int moe_prepare_scaled_router_input_f32(
             layer, (unsigned long long)scale_count, hidden_size);
         return 0;
     }
-    const int unit_offset = moe_engine_contract_uses_direct_router_input_scale(engine, layer)
+    const int unit_offset = direct_input_scale
         ? 0
         : moe_engine_rmsnorm_unit_offset(engine, scale_raw);
 

@@ -427,11 +427,67 @@ static int moe_router_contract_scale_name_is_weight_sidecar_f32(const std::strin
     return 0;
 }
 
+static int moe_router_contract_name_is_activation_scale_f32(const std::string& name) {
+    if (name.empty() || moe_router_contract_scale_name_is_weight_sidecar_f32(name)) {
+        return 0;
+    }
+    const std::string lower = moe_lower_ascii_copy(name);
+    static const char* const accepted_exact[] = {
+        "ffn_gate_inp.scale",
+        "ffn_gate_inp.scales",
+        "router_input_scale",
+        "router_input_scales",
+        "router.input_scale",
+        "router.input_scales",
+        "mlp.router_input_scale",
+        "mlp.router_input_scales",
+        "moe.gate_input_scale",
+        "moe.gate_input_scales",
+        "router_norm.weight",
+        "router.input_layernorm.weight",
+        "router.input_norm.weight",
+        "moe_router_norm.weight",
+        "moe.gate_norm.weight",
+        "mlp.router_norm.weight"
+    };
+    for (const char* accepted : accepted_exact) {
+        if (lower == accepted) {
+            return 1;
+        }
+    }
+    static const char* const accepted_suffixes[] = {
+        ".ffn_gate_inp.scale",
+        ".ffn_gate_inp.scales",
+        ".router.input_scale",
+        ".router.input_scales",
+        ".mlp.router_input_scale",
+        ".mlp.router_input_scales",
+        ".moe.gate_input_scale",
+        ".moe.gate_input_scales",
+        ".router_norm.weight",
+        ".router.input_layernorm.weight",
+        ".router.input_norm.weight",
+        ".moe_router_norm.weight",
+        ".moe.gate_norm.weight",
+        ".mlp.router_norm.weight"
+    };
+    for (const char* suffix : accepted_suffixes) {
+        if (lower.size() >= std::strlen(suffix) &&
+            lower.compare(lower.size() - std::strlen(suffix), std::strlen(suffix), suffix) == 0) {
+            return 1;
+        }
+    }
+    // Generic router.scale/mlp.router.scale/moe.gate.scale remain ambiguous:
+    // they may describe router projection scale or quantization metadata, so
+    // they do not satisfy the raw-hidden/internal-scale rule by name.
+    return 0;
+}
+
 static int moe_router_contract_name_list_has_activation_scale_f32(
     const std::vector<std::string>& names
 ) {
     for (const std::string& name : names) {
-        if (!name.empty() && !moe_router_contract_scale_name_is_weight_sidecar_f32(name)) {
+        if (moe_router_contract_name_is_activation_scale_f32(name)) {
             return 1;
         }
     }

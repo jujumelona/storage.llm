@@ -480,8 +480,13 @@ static std::vector<int> moe_juju_predict_co_activation(moe_pc_engine* engine, in
 static void moe_juju_update_co_activation(moe_pc_engine* engine, int current_layer, const std::vector<int>& selected) {
     if (!engine) return;
 
-    // BUGFIX 문제9: Exclusive lock for write operations ★★★ CRITICAL
-    std::unique_lock<std::shared_mutex> lock(engine->co_activation_mutex);
+    // Co-activation stats are speculative prefetch hints, not part of the
+    // mathematical forward pass. Do not block the decode/PPL hot path behind an
+    // exclusive writer lock; skip this hint update if another thread owns it.
+    std::unique_lock<std::shared_mutex> lock(engine->co_activation_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return;
+    }
 
     // BUGFIX 505: current_layer 범위 체크
     // BUGFIX 635: current_layer 음수 체크 추가 ★

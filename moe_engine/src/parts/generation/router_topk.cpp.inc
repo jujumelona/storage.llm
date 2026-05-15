@@ -260,6 +260,48 @@ static int moe_router_layer_contract_object_slice_f32(
     return 0;
 }
 
+static int moe_router_layer_contract_object_slice_cached_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    size_t* out_begin,
+    size_t* out_end
+) {
+    if (out_begin) *out_begin = 0;
+    if (out_end) *out_end = 0;
+    if (!engine || layer < 0 || engine->offload_graph_ir_json.empty() || !out_begin || !out_end) {
+        return 0;
+    }
+    const size_t miss = std::numeric_limits<size_t>::max();
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->router_layer_contract_slice_cache_mutex);
+        auto it = engine->router_layer_contract_slice_cache.find(layer);
+        if (it != engine->router_layer_contract_slice_cache.end()) {
+            if (it->second.first == miss && it->second.second == miss) {
+                return 0;
+            }
+            *out_begin = it->second.first;
+            *out_end = it->second.second;
+            return *out_begin < *out_end && *out_end <= engine->offload_graph_ir_json.size() ? 1 : 0;
+        }
+    }
+    size_t begin = 0;
+    size_t end = 0;
+    const int ok = moe_router_layer_contract_object_slice_f32(
+        engine->offload_graph_ir_json, layer, &begin, &end);
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->router_layer_contract_slice_cache_mutex);
+        engine->router_layer_contract_slice_cache[layer] = ok ?
+            std::make_pair(begin, end) : std::make_pair(miss, miss);
+    }
+    if (!ok) {
+        return 0;
+    }
+    *out_begin = begin;
+    *out_end = end;
+    return 1;
+}
+
+
 static int moe_router_layer_ops_object_slice_f32(
     const std::string& doc,
     int32_t layer,
@@ -411,7 +453,7 @@ static int moe_router_layer_score_contract_f32(
     if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
         size_t obj_begin = 0;
         size_t obj_end = 0;
-        if (moe_router_layer_contract_object_slice_f32(engine->offload_graph_ir_json, layer, &obj_begin, &obj_end)) {
+        if (moe_router_layer_contract_object_slice_cached_f32(engine, layer, &obj_begin, &obj_end)) {
             has_layer_contract_row = 1;
             int use_sigmoid = 0;
             if (moe_router_json_string_score_any_slice_f32(
@@ -549,7 +591,7 @@ static int moe_router_layer_u32_contract_f32(
     if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
         size_t obj_begin = 0;
         size_t obj_end = 0;
-        if (moe_router_layer_contract_object_slice_f32(engine->offload_graph_ir_json, layer, &obj_begin, &obj_end)) {
+        if (moe_router_layer_contract_object_slice_cached_f32(engine, layer, &obj_begin, &obj_end)) {
             has_layer_contract_row = 1;
             for (size_t i = 0; i < key_count; ++i) {
                 if (keys[i] && moe_json_get_u64_slice(engine->offload_graph_ir_json, obj_begin, obj_end, keys[i], &value) && value > 0) {
@@ -688,7 +730,7 @@ static int moe_router_layer_double_contract_f32(
     if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
         size_t obj_begin = 0;
         size_t obj_end = 0;
-        if (moe_router_layer_contract_object_slice_f32(engine->offload_graph_ir_json, layer, &obj_begin, &obj_end)) {
+        if (moe_router_layer_contract_object_slice_cached_f32(engine, layer, &obj_begin, &obj_end)) {
             has_layer_contract_row = 1;
             if (moe_router_json_double_any_slice_f32(
                     engine->offload_graph_ir_json, obj_begin, obj_end, keys, key_count, out)) {
@@ -744,7 +786,7 @@ static int moe_router_layer_bool_contract_f32(
     if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
         size_t obj_begin = 0;
         size_t obj_end = 0;
-        if (moe_router_layer_contract_object_slice_f32(engine->offload_graph_ir_json, layer, &obj_begin, &obj_end)) {
+        if (moe_router_layer_contract_object_slice_cached_f32(engine, layer, &obj_begin, &obj_end)) {
             has_layer_contract_row = 1;
             if (moe_router_json_bool_any_slice_f32(
                     engine->offload_graph_ir_json, obj_begin, obj_end, keys, key_count, out)) {
@@ -1059,7 +1101,7 @@ static int moe_router_select_topk_small_f32(
 }
 
 // CPU-storage softmax router shortcut.  For routers that normalize the selected
-// top-k probabilities (Gemma/Qwen/GLM-style norm_topk), full softmax over all
+// top-k probabilities (norm_topk contract), full softmax over all
 // experts is mathematically unnecessary: top-k is monotonic in logits and the
 // final normalized weights are exp(selected_logits) / sum(exp(selected_logits)).
 // This removes per-layer exp() over every expert and avoids scratch_order.

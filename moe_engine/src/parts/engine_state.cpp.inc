@@ -610,6 +610,8 @@ std::atomic<int> storage_format_plan_available{0};
     mutable std::unordered_map<uint64_t, int> rmsnorm_unit_offset_cache;
     mutable std::shared_mutex common_tensor_suffix_cache_mutex;
     mutable std::unordered_map<std::string, int> common_tensor_suffix_cache;
+    mutable std::shared_mutex router_layer_contract_slice_cache_mutex;
+    mutable std::unordered_map<int32_t, std::pair<size_t, size_t>> router_layer_contract_slice_cache;
     mutable std::shared_mutex text_mention_cache_mutex;
     mutable std::unordered_map<std::string, int> graph_ir_mention_cache;
     mutable std::unordered_map<std::string, int> metadata_mention_cache;

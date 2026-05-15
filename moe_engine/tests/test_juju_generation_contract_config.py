@@ -482,8 +482,8 @@ def test_router_routed_scaling_factor_does_not_parse_tensor_role_scale_names():
 
 def test_router_scale_tensor_uses_contract_specific_unit_offset_semantics():
     router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
-    assert "moe_engine_contract_uses_direct_router_input_scale(engine, layer)" in router_text
-    assert "? 0" in router_text
+    assert "moe_router_has_direct_input_scale_contract_f32(engine, layer)" in router_text
+    assert "const int unit_offset = direct_input_scale" in router_text
     assert ": moe_engine_rmsnorm_unit_offset(engine, scale_raw)" in router_text
     assert "const float effective_scale = unit_offset ? (1.0f + scale) : scale;" in router_text
     assert "router_scale_apply" in router_text
@@ -511,9 +511,27 @@ def test_router_scale_accepts_bare_ffn_gate_inp_scale_and_rejects_weight_sidecar
     assert "router_scale_apply" in router_text
 
 
+def test_router_hidden_input_rule_does_not_accept_generic_router_scale_names():
+    mlp_norm_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
+    start = mlp_norm_text.index("static int moe_router_contract_name_is_activation_scale_f32")
+    end = mlp_norm_text.index("static int moe_router_contract_object_has_activation_scale_f32", start)
+    block = mlp_norm_text[start:end]
+    exact_block = block[block.index("static const char* const accepted_exact[]"):block.index("};", block.index("static const char* const accepted_exact[]"))]
+    suffix_block = block[block.index("static const char* const accepted_suffixes[]"):block.index("};", block.index("static const char* const accepted_suffixes[]"))]
+    assert '"ffn_gate_inp.scale"' in exact_block
+    assert '"router.input_scale"' in exact_block
+    assert '"router_norm.weight"' in exact_block
+    assert '"router.scale"' not in exact_block
+    assert '"mlp.router.scale"' not in exact_block
+    assert '"moe.gate.scale"' not in exact_block
+    assert '".router.input_scale"' in suffix_block
+    assert '".router.scale"' not in suffix_block
+    assert "remain ambiguous" in block
+
+
 def test_mlp_router_input_scale_filter_accepts_bare_ffn_gate_inp_scale():
     mlp_norm_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
-    sidecar_block = mlp_norm_text[mlp_norm_text.index("static int moe_router_contract_scale_name_is_weight_sidecar_f32"):mlp_norm_text.index("static int moe_router_contract_name_list_has_activation_scale_f32")]
+    sidecar_block = mlp_norm_text[mlp_norm_text.index("static int moe_router_contract_scale_name_is_weight_sidecar_f32"):mlp_norm_text.index("static int moe_router_contract_name_is_activation_scale_f32")]
     assert '"ffn_gate_inp.scale"' not in sidecar_block
     assert '"ffn_gate_inp.scales"' not in sidecar_block
     assert '"ffn_gate_inp.weight.scale"' in sidecar_block
@@ -527,8 +545,7 @@ def test_router_input_mode_uses_bare_ffn_gate_inp_as_internal_router_scale():
     first_start = mlp_text.index("const int router_has_internal_norm_scale =")
     first_end = mlp_text.index("moe_save_gate_input_snapshot", first_start)
     first_block = mlp_text[first_start:first_end]
-    assert '"ffn_gate_inp.scale"' in first_block
-    assert '"ffn_gate_inp.scales"' in first_block
+    assert "moe_router_has_direct_input_scale_contract_f32(engine, layer)" in first_block
     assert '"router_norm.weight"' in first_block
     assert "moe_router_has_internal_weight_scale_contract_f32" in first_block
     assert "router_uses_raw_residual_contract && router_has_plausible_input_scale" not in first_block
@@ -540,8 +557,60 @@ def test_router_input_mode_uses_bare_ffn_gate_inp_as_internal_router_scale():
     internal_block = router_text[internal_start:router_text.index("static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role_f32", internal_start)]
     assert '"ffn_gate_inp.scale"' in internal_block
     assert '"ffn_gate_inp.weight.scale"' not in internal_block
-    assert '"router.scale"' in internal_block
-    assert "only *.weight.scale sidecars are rejected" in internal_block
+    assert '"router_input_scale"' in internal_block
+    assert '"router.input_scale"' in internal_block
+    assert '"router.scale"' not in internal_block
+    assert '"mlp.router.scale"' not in internal_block
+    assert '"moe.gate.scale"' not in internal_block
+    assert "ambiguous and require an explicit op-role record" in internal_block
+
+
+def test_direct_router_input_scale_is_narrower_than_router_norm_gamma():
+    helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
+    start = helper_text.index("static int moe_engine_contract_uses_direct_router_input_scale")
+    end = helper_text.index("static int moe_engine_contract_uses_direct_per_expert_scale", start)
+    block = helper_text[start:end]
+    suffix_block = block[block.index("static const char* const direct_scale_suffixes[]"):block.index("};", block.index("static const char* const direct_scale_suffixes[]"))]
+    assert '"ffn_gate_inp.scale"' in suffix_block
+    assert '"ffn_gate_inp.scales"' in suffix_block
+    assert '"router_input_scale"' in suffix_block
+    assert '"router.input_scale"' in suffix_block
+    assert '"router_norm.weight"' not in suffix_block
+    assert '"router.scale"' not in suffix_block
+    assert '"mlp.router.scale"' not in suffix_block
+    assert '"moe.gate.scale"' not in suffix_block
+    assert "RMSNorm gamma weights" in block
+
+
+def test_router_direct_input_scale_helper_accepts_explicit_roles_not_norm_roles():
+    router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
+    start = router_text.index("static int moe_router_has_direct_input_scale_contract_f32")
+    end = router_text.index("static int moe_map_router_scale_tensor", start)
+    block = router_text[start:end]
+    assert '"ffn_gate_inp.scale"' in block
+    assert '"router_input_scale"' in block
+    assert '"moe_router_scale"' in block
+    assert '"router_scale"' in block
+    assert '"router_norm"' not in block
+    assert '"router_norm.weight"' not in block
+    assert "moe_router_scale_record_is_weight_sidecar_f32" in block
+
+
+
+def test_router_scale_mapper_prefers_direct_activation_scale_before_norm_gamma():
+    router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
+    start = router_text.index("static int moe_map_router_scale_tensor")
+    end = router_text.index("static int moe_router_has_contract_input_scale_f32", start)
+    block = router_text[start:end]
+    suffix_start = block.index("static const char* const suffixes[]")
+    suffix_end = block.index("};", suffix_start)
+    suffix_block = block[suffix_start:suffix_end]
+    assert suffix_block.index('"ffn_gate_inp.scale"') < suffix_block.index('"router_norm.weight"')
+    assert suffix_block.index('"router_input_scale"') < suffix_block.index('"router_norm.weight"')
+    assert "Prefer direct router-input activation scales" in suffix_block
+    assert "not bare direct activation scales" in suffix_block
+    assert "const int direct_input_scale = moe_router_has_direct_input_scale_contract_f32(engine, layer);" in router_text
+    assert "const int unit_offset = direct_input_scale" in router_text
 
 
 def test_materializer_router_scale_sidecar_contract_is_engine_only():
@@ -555,6 +624,9 @@ def test_materializer_router_scale_sidecar_contract_is_engine_only():
     router_helper = helper_text[helper_text.index("static int moe_engine_contract_has_router_input_scale"):helper_text.index("static int moe_engine_contract_uses_direct_router_input_scale")]
     assert '"ffn_gate_inp.scale"' in router_helper
     assert '"ffn_gate_inp.weight.scale"' not in router_helper
+    assert '"router.scale"' not in router_helper[router_helper.index("static const char* const router_scale_suffixes[]"):router_helper.index("};", router_helper.index("static const char* const router_scale_suffixes[]"))]
+    assert '"mlp.router.scale"' not in router_helper[router_helper.index("static const char* const router_scale_suffixes[]"):router_helper.index("};", router_helper.index("static const char* const router_scale_suffixes[]"))]
+    assert '"moe.gate.scale"' not in router_helper[router_helper.index("static const char* const router_scale_suffixes[]"):router_helper.index("};", router_helper.index("static const char* const router_scale_suffixes[]"))]
     assert "graph-wide text mentions" in router_helper
 
 def test_post_attention_norm_no_longer_falls_back_to_ffn_norm_aliases():
@@ -869,3 +941,40 @@ def test_shared_expert_role_scan_uses_execution_op_fields_without_model_names():
     assert "Gemma" not in runtime_scope
     assert "GLM" not in runtime_scope
     assert "Qwen" not in runtime_scope
+
+
+def test_standard_attention_skips_noop_rope_at_position_zero():
+    attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_decode.cpp.inc").read_text()
+    assert "position 0 is mathematically identity" in attn_text
+    assert "if (rope_dim >= 2u && position != 0u)" in attn_text
+    assert "attn_standard_rope" in attn_text
+
+
+def test_router_contract_layer_slice_is_cached_and_cleared_on_reload_paths():
+    state = (ROOT / "moe_engine" / "src" / "parts" / "engine_state.cpp.inc").read_text()
+    router = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_topk.cpp.inc").read_text()
+    reset = (ROOT / "moe_engine" / "src" / "parts" / "model_engine_state.cpp.inc").read_text()
+    juju = (ROOT / "moe_engine" / "src" / "parts" / "codec" / "juju_main_parsing.cpp.inc").read_text()
+    model_io = (ROOT / "moe_engine" / "src" / "parts" / "codec" / "model_file_io.cpp.inc").read_text()
+    lifecycle = (ROOT / "moe_engine" / "src" / "parts" / "lifecycle_backend_api.cpp.inc").read_text()
+    assert "router_layer_contract_slice_cache_mutex" in state
+    assert "router_layer_contract_slice_cache" in state
+    assert "moe_router_layer_contract_object_slice_cached_f32" in router
+    assert "moe_router_layer_contract_object_slice_f32(engine->offload_graph_ir_json" not in router
+    assert router.count("moe_router_layer_contract_object_slice_cached_f32(engine, layer") >= 4
+    for text in (reset, juju, model_io, lifecycle):
+        assert "router_layer_contract_slice_cache.clear();" in text
+
+
+def test_router_direct_input_scale_roles_are_distinct_from_norm_gamma_suffixes():
+    router = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
+    helper = router[router.index("static int moe_router_has_direct_input_scale_contract_f32"):router.index("static int moe_map_router_scale_tensor", router.index("static int moe_router_has_direct_input_scale_contract_f32"))]
+    assert '"ffn_gate_inp.scale"' in helper
+    assert '"router_input_scale"' in helper
+    assert '"moe_router_scale"' in helper
+    assert '"router_scale"' in helper
+    assert '"router_norm.weight"' not in helper
+    assert '"mlp.router.scale"' not in helper
+    prep = router[router.index("static int moe_prepare_scaled_router_input_f32"):]
+    assert "const int direct_input_scale = moe_router_has_direct_input_scale_contract_f32(engine, layer);" in prep
+    assert "const int unit_offset = direct_input_scale" in prep

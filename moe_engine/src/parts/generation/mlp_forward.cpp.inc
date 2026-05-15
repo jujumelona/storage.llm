@@ -628,17 +628,13 @@ static int moe_layer_moe_mlp_f32(
     const int router_has_plausible_input_scale =
         moe_router_has_contract_input_scale_f32(engine, layer, hidden_size);
     const int router_has_internal_norm_scale = router_has_plausible_input_scale && (
+        moe_router_has_direct_input_scale_contract_f32(engine, layer) ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router.input_layernorm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router.input_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe_router_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scales") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "router.scale") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale"));
+        moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router_norm.weight"));
     const int router_has_internal_weight_scale =
         moe_router_has_internal_weight_scale_contract_f32(engine, layer);
     const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
@@ -2565,17 +2561,13 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
     const int router_has_plausible_input_scale =
         moe_router_has_contract_input_scale_f32(engine, layer, hidden_size);
     const int router_has_internal_norm_scale = router_has_plausible_input_scale && (
+        moe_router_has_direct_input_scale_contract_f32(engine, layer) ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router.input_layernorm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "router.input_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe_router_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scale") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "ffn_gate_inp.scales") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "router.scale") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router.scale") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate.scale"));
+        moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router_norm.weight"));
     const int router_has_internal_weight_scale =
         moe_router_has_internal_weight_scale_contract_f32(engine, layer);
     const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);

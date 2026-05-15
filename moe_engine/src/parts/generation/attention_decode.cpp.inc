@@ -226,7 +226,10 @@
         moe_hybrid_layer_is_full_attention(engine, layer) &&
         moe_engine_metadata_mentions(engine, "proportional");
     const uint32_t rope_frequency_dim = rope_proportional_freq ? head_dim : rope_dim;
-    if (rope_dim >= 2u) {
+    // RoPE at absolute position 0 is mathematically identity: cos(0)=1,
+    // sin(0)=0 for both table and dynamic-frequency paths. Avoid spending the
+    // PPL/decode hot path on a no-op rotation for the first token.
+    if (rope_dim >= 2u && position != 0u) {
         static const std::vector<float> empty_rope_table;
         const std::vector<float>& q_cos = use_dynamic_rope ? empty_rope_table : s->rope_q_cos;
         const std::vector<float>& q_sin = use_dynamic_rope ? empty_rope_table : s->rope_q_sin;
