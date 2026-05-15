@@ -450,9 +450,11 @@ static int moe_layer_has_ple_tensors(
         (moe_engine_has_common_tensor_suffix(engine, layer, "inp_gate.weight") ||
          moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_inp_gate.weight") ||
          moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_input_gate.weight")) &&
-        (moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_proj.weight") ||
+        (moe_engine_has_common_tensor_suffix(engine, layer, "proj.weight") ||
+         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_proj.weight") ||
          moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_projection.weight")) &&
-        (moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_post_norm.weight") ||
+        (moe_engine_has_common_tensor_suffix(engine, layer, "post_norm.weight") ||
+         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_post_norm.weight") ||
          moe_engine_has_common_tensor_suffix(engine, layer, "post_per_layer_input_norm.weight"));
 }
 

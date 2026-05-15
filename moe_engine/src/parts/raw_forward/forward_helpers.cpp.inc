@@ -553,48 +553,13 @@ static int moe_engine_contract_uses_unit_qk_norm_global(
 static int moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract(
     const moe_pc_engine* engine
 ) {
-    if (!engine) {
-        return 0;
-    }
-
-    static const char* const ple_global_suffixes[] = {
-        "per_layer_model_proj.weight",
-        "per_layer_model_projection.weight",
-        "per_layer_token_embd.weight",
-        "per_layer_token_embedding.weight",
-        "per_layer_embed.weight",
-        "embed_tokens_per_layer.weight"
-    };
-    if (moe_engine_contract_has_global_tensor_suffix_any(
-            engine, ple_global_suffixes,
-            sizeof(ple_global_suffixes) / sizeof(ple_global_suffixes[0]))) {
-        return 1;
-    }
-
-    static const char* const ple_layer_suffixes[] = {
-        "per_layer_inp_gate.weight",
-        "per_layer_input_gate.weight",
-        "per_layer_proj.weight",
-        "per_layer_projection.weight",
-        "per_layer_post_norm.weight",
-        "post_per_layer_input_norm.weight"
-    };
-    if (moe_engine_contract_has_layer_tensor_suffix_any(
-            engine, 0, ple_layer_suffixes,
-            sizeof(ple_layer_suffixes) / sizeof(ple_layer_suffixes[0]))) {
-        return 1;
-    }
-
-    const int has_q_norm =
-        moe_engine_has_common_tensor_suffix(engine, 0, "attn_q_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, 0, "q_norm.weight");
-    const int has_k_norm =
-        moe_engine_has_common_tensor_suffix(engine, 0, "attn_k_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, 0, "k_norm.weight");
-    const int has_block_output_contract =
-        moe_engine_has_common_tensor_suffix(engine, 0, "post_ffw_norm.weight") &&
-        moe_engine_has_common_tensor_suffix(engine, 0, "layer_output_scale.weight");
-    return (has_q_norm && has_k_norm && has_block_output_contract) ? 1 : 0;
+    (void)engine;
+    // RMSNorm weight semantics are not inferable from tensor topology.  Models
+    // with q/k norm, post-FFW norm, layer output scales, or PLE tensors may use
+    // either direct gamma (x * weight) or unit-offset gamma (x * (1 + weight)).
+    // Treat this helper as a hard no-op unless an explicit metadata/GraphIR
+    // semantics flag says otherwise in moe_engine_contract_uses_rmsnorm_unit_offset().
+    return 0;
 }
 
 static int moe_engine_contract_uses_direct_rmsnorm_weight(
@@ -650,32 +615,30 @@ static int moe_engine_contract_uses_rmsnorm_unit_offset(
         "rmsnorm_add_unit"
     };
     for (const char* key : unit_bool_keys) {
-        if ((moe_json_get_bool_local(engine->offload_gguf_metadata_json, key, &unit_offset) ||
-             moe_json_get_bool_local(engine->offload_graph_ir_json, key, &unit_offset)) &&
-            unit_offset) {
-            return 1;
+        if (moe_json_get_bool_local(engine->offload_gguf_metadata_json, key, &unit_offset) ||
+            moe_json_get_bool_local(engine->offload_graph_ir_json, key, &unit_offset)) {
+            return unit_offset ? 1 : 0;
         }
     }
-    if (moe_engine_graph_ir_mentions(engine, "rms_norm_unit_offset") ||
-        moe_engine_graph_ir_mentions(engine, "rmsnorm_unit_offset") ||
-        moe_engine_graph_ir_mentions(engine, "rms_norm_weight_unit_offset") ||
-        moe_engine_graph_ir_mentions(engine, "rmsnorm_weight_unit_offset") ||
-        moe_engine_graph_ir_mentions(engine, "rms_norm_weight_plus_one") ||
-        moe_engine_graph_ir_mentions(engine, "rmsnorm_weight_plus_one") ||
-        moe_engine_graph_ir_mentions(engine, "rmsnorm_weight_semantics\":\"unit_offset") ||
+    // Do not treat the mere presence of a bool key name (for example
+    // "rmsnorm_unit_offset": false) as a true contract. Only explicit string
+    // semantics may opt into x * (1 + weight).
+    if (moe_engine_graph_ir_mentions(engine, "rmsnorm_weight_semantics\":\"unit_offset") ||
         moe_engine_graph_ir_mentions(engine, "rms_norm_weight_semantics\":\"unit_offset") ||
+        moe_engine_graph_ir_mentions(engine, "rmsnorm_weight_semantics\": \"unit_offset") ||
+        moe_engine_graph_ir_mentions(engine, "rms_norm_weight_semantics\": \"unit_offset") ||
         moe_engine_graph_ir_mentions(engine, "rmsnorm_weight_semantics\":\"plus_one") ||
         moe_engine_graph_ir_mentions(engine, "rms_norm_weight_semantics\":\"plus_one") ||
-        moe_engine_metadata_mentions(engine, "rms_norm_unit_offset") ||
-        moe_engine_metadata_mentions(engine, "rmsnorm_unit_offset") ||
-        moe_engine_metadata_mentions(engine, "rms_norm_weight_unit_offset") ||
-        moe_engine_metadata_mentions(engine, "rmsnorm_weight_unit_offset") ||
-        moe_engine_metadata_mentions(engine, "rms_norm_weight_plus_one") ||
-        moe_engine_metadata_mentions(engine, "rmsnorm_weight_plus_one") ||
+        moe_engine_graph_ir_mentions(engine, "rmsnorm_weight_semantics\": \"plus_one") ||
+        moe_engine_graph_ir_mentions(engine, "rms_norm_weight_semantics\": \"plus_one") ||
         moe_engine_metadata_mentions(engine, "rmsnorm_weight_semantics\":\"unit_offset") ||
         moe_engine_metadata_mentions(engine, "rms_norm_weight_semantics\":\"unit_offset") ||
+        moe_engine_metadata_mentions(engine, "rmsnorm_weight_semantics\": \"unit_offset") ||
+        moe_engine_metadata_mentions(engine, "rms_norm_weight_semantics\": \"unit_offset") ||
         moe_engine_metadata_mentions(engine, "rmsnorm_weight_semantics\":\"plus_one") ||
-        moe_engine_metadata_mentions(engine, "rms_norm_weight_semantics\":\"plus_one")) {
+        moe_engine_metadata_mentions(engine, "rms_norm_weight_semantics\":\"plus_one") ||
+        moe_engine_metadata_mentions(engine, "rmsnorm_weight_semantics\": \"plus_one") ||
+        moe_engine_metadata_mentions(engine, "rms_norm_weight_semantics\": \"plus_one")) {
         return 1;
     }
     return moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract(engine);

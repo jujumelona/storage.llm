@@ -847,6 +847,7 @@ int moe_pc_engine_load_codec_table(
         std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
         engine->raw_tensor_cache.clear();
     }
+    engine->cached_rmsnorm_unit_offset.store(-1, std::memory_order_relaxed);
     {
         std::unique_lock<std::shared_mutex> lock(engine->rmsnorm_unit_offset_cache_mutex);
         engine->rmsnorm_unit_offset_cache.clear();

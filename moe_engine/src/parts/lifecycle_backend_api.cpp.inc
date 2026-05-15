@@ -92,6 +92,7 @@ void moe_pc_engine_destroy(moe_pc_engine_t* engine) {
         std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
         engine->raw_tensor_cache.clear();
     }
+    engine->cached_rmsnorm_unit_offset.store(-1, std::memory_order_relaxed);
     {
         std::unique_lock<std::shared_mutex> lock(engine->rmsnorm_unit_offset_cache_mutex);
         engine->rmsnorm_unit_offset_cache.clear();

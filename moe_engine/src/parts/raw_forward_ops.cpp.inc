@@ -59,6 +59,10 @@ static int moe_engine_rmsnorm_unit_offset(
     if (!engine) {
         return 0;
     }
+    const int cached_global = engine->cached_rmsnorm_unit_offset.load(std::memory_order_acquire);
+    if (cached_global >= 0) {
+        return cached_global ? 1 : 0;
+    }
     const uint64_t cache_key = moe_rmsnorm_unit_offset_cache_key(raw);
     if (cache_key) {
         std::shared_lock<std::shared_mutex> lock(engine->rmsnorm_unit_offset_cache_mutex);
@@ -88,20 +92,18 @@ static int moe_engine_rmsnorm_unit_offset(
     const int direct_contract = moe_engine_contract_uses_direct_rmsnorm_weight(engine);
     const int unit_contract = moe_engine_contract_uses_rmsnorm_unit_offset(engine);
 
-    // Contract priority must be deterministic.  unit-offset RMSNorm is architecture/config math.
-    // Use explicit metadata/GraphIR plus structural tensor-contract helpers to choose
-    // semantics.  A generated false/default flag is not allowed to suppress a
-    // layer/tensor contract that requires x * (1 + weight). Tensor-value statistics
-    // are intentionally not used to infer or override the math.
-    if (unit_contract) {
-        value = 1;
-        source = "unit_offset_contract";
+    // Contract priority must be deterministic.  An explicit metadata/GraphIR
+    // boolean is authoritative even when it is false; false must not be undone
+    // by a later substring or tensor-topology heuristic.
+    if (metadata_found) {
+        value = metadata_value ? 1 : 0;
+        source = metadata_source;
     } else if (direct_contract) {
         value = 0;
         source = "direct_rmsnorm_contract";
-    } else if (metadata_found) {
-        value = metadata_value ? 1 : 0;
-        source = metadata_source;
+    } else if (unit_contract) {
+        value = 1;
+        source = "unit_offset_contract";
     }
 
     moe_profile_log(
@@ -114,6 +116,7 @@ static int moe_engine_rmsnorm_unit_offset(
         direct_contract ? 1 : 0,
         unit_contract ? 1 : 0,
         (unsigned long long)cache_key);
+    engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0, std::memory_order_release);
     if (cache_key) {
         std::unique_lock<std::shared_mutex> lock(engine->rmsnorm_unit_offset_cache_mutex);
         engine->rmsnorm_unit_offset_cache[cache_key] = value ? 1 : 0;

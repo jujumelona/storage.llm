@@ -423,12 +423,14 @@ def test_qkv_single_token_attention_uses_paper_quantized_decode_path():
 
 def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
     raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_ops.cpp.inc").read_text()
-    assert "unit-offset RMSNorm is architecture/config math" in raw_ops_text
-    assert "Use explicit metadata/GraphIR plus structural tensor-contract helpers" in raw_ops_text
+    assert "An explicit metadata/GraphIR" in raw_ops_text
+    assert "false must not be undone" in raw_ops_text
     helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
     assert "moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract" in helper_text
-    assert '"per_layer_model_proj.weight"' in helper_text
-    assert '"layer_output_scale.weight"' in helper_text
+    assert "RMSNorm weight semantics are not inferable from tensor topology" in helper_text
+    assert "return 0;" in helper_text[helper_text.index("moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract"):helper_text.index("moe_engine_contract_uses_direct_rmsnorm_weight")]
+    assert "\"rmsnorm_unit_offset\": false" in helper_text
+    assert "return unit_offset ? 1 : 0" in helper_text
     assert "weight_stats_override_metadata_false" not in raw_ops_text
     assert "metadata_false_stats_inconclusive" not in raw_ops_text
     assert "mean_abs_raw < 0.75" not in raw_ops_text
@@ -438,6 +440,7 @@ def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
     assert "moe_rmsnorm_unit_offset_from_json(engine->offload_graph_ir_json" in raw_ops_text
     assert "moe_engine_contract_uses_rmsnorm_unit_offset(engine)" in raw_ops_text
     assert "moe_engine_contract_uses_direct_rmsnorm_weight(engine)" in raw_ops_text
+    assert "cached_rmsnorm_unit_offset" in raw_ops_text
 
 
 def test_router_contract_reads_graph_ir_sigmoid_scale_and_norm_topk():
@@ -506,6 +509,16 @@ def test_router_scale_accepts_bare_ffn_gate_inp_scale_and_rejects_weight_sidecar
     assert "reason=weight_sidecar" in router_text
     assert "router_scale_contract_reject" in router_text
     assert "router_scale_apply" in router_text
+
+
+def test_mlp_router_input_scale_filter_accepts_bare_ffn_gate_inp_scale():
+    mlp_norm_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
+    sidecar_block = mlp_norm_text[mlp_norm_text.index("static int moe_router_contract_scale_name_is_weight_sidecar_f32"):mlp_norm_text.index("static int moe_router_contract_name_list_has_activation_scale_f32")]
+    assert '"ffn_gate_inp.scale"' not in sidecar_block
+    assert '"ffn_gate_inp.scales"' not in sidecar_block
+    assert '"ffn_gate_inp.weight.scale"' in sidecar_block
+    assert '"ffn_gate_inp.weight.scales"' in sidecar_block
+    assert "Bare ffn_gate_inp.scale/scales are learned" in mlp_norm_text
 
 
 def test_router_input_mode_uses_bare_ffn_gate_inp_as_internal_router_scale():
@@ -646,6 +659,8 @@ def test_ple_vocab_masking_allows_smaller_per_layer_vocab():
     assert '"per_layer_inp_gate.weight"' in mlp_common
     assert '"per_layer_proj.weight"' in mlp_common
     assert '"per_layer_post_norm.weight"' in mlp_common
+    assert '"proj.weight"' in mlp_common
+    assert '"post_norm.weight"' in mlp_common
 
 
 def test_expert_down_scale_is_legacy_runtime_scale_but_not_direct_contract_scale():

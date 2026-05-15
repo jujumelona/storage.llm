@@ -410,8 +410,6 @@ static int moe_layer_dense_mlp_from_suffixes_f32(
 static int moe_router_contract_scale_name_is_weight_sidecar_f32(const std::string& name) {
     const std::string lower = moe_lower_ascii_copy(name);
     static const char* const markers[] = {
-        "ffn_gate_inp.scale",
-        "ffn_gate_inp.scales",
         "ffn_gate_inp.weight.scale",
         "ffn_gate_inp.weight.scales",
         ".weight.scale",
@@ -486,7 +484,9 @@ static int moe_layer_router_contract_has_hidden_input_f32(
             lowered_rule.find("hidden_when_router_has_internal_scale") != std::string::npos) {
             // This rule is conditional: hidden/raw residual input is valid only
             // when the router op has a real activation/input scale.  Weight
-            // sidecars such as ffn_gate_inp.scale must not trigger raw hidden.
+            // weight-quant sidecars such as ffn_gate_inp.weight.scale must not
+            // trigger raw hidden. Bare ffn_gate_inp.scale/scales are learned
+            // router-input activation scales and are valid.
             if (moe_router_contract_object_has_activation_scale_f32(doc, obj_begin, obj_end)) {
                 return 1;
             }
@@ -537,7 +537,7 @@ static int moe_layer_execution_contract_router_uses_hidden_f32(
             // The boolean means "use hidden when an internal router input
             // scale/norm is present".  It is not itself proof that raw hidden is
             // valid.  Filter out router-weight quant sidecars such as
-            // ffn_gate_inp.scale; without a real activation scale the router must
+            // ffn_gate_inp.weight.scale; without a real activation scale the router must
             // consume the expert FFN norm output.
             return moe_router_contract_object_has_activation_scale_f32(
                 doc, router_begin, router_end) ? 1 : 0;
