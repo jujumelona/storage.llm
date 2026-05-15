@@ -161,24 +161,32 @@ static int moe_raw_lm_head_ready(const moe_pc_engine* engine) {
     const moe_storage_constants_t* c = &runtime_c;
     const int32_t lm_head_layer = c ? (int32_t)c->num_hidden_layers + 1 : 80;
     const moe_storage_raw_span_spec_t* span = find_raw_role_span(lm_head_layer, moe_RAW_ROLE_LM_HEAD);
+    auto is_embedding_candidate = [](const char* name) -> bool {
+        return name && (std::strcmp(name, "token_embd.weight") == 0 ||
+            std::strcmp(name, "model.embed_tokens.weight") == 0 ||
+            std::strcmp(name, "embed_tokens.weight") == 0);
+    };
+    auto shape_matches = [c](const moe_raw_tensor_desc& desc, bool tied_embedding) -> bool {
+        if (!c) {
+            return false;
+        }
+        if (desc.cols == c->hidden_size && desc.rows >= c->vocab_size) {
+            return true;
+        }
+        return tied_embedding && desc.rows == c->hidden_size && desc.cols >= c->vocab_size;
+    };
     std::string graph_name;
     if (engine && c && moe_graph_ir_tensor_binding_name(engine, "lm_head", &graph_name)) {
         moe_raw_tensor_desc desc{};
         const char* exact_name = graph_name.c_str();
         const moe_gguf_common_tensor_record* rec =
             find_common_tensor_by_names(engine, &exact_name, 1, &desc);
-        return rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size ?
+        const bool tied_embedding = is_embedding_candidate(exact_name) &&
+            moe_graph_ir_lm_head_tied_to_token_embedding(engine);
+        return rec && shape_matches(desc, tied_embedding) ?
             common_tensor_backing_file_ready(engine, rec) : 0;
     }
-    int lm_head_tied_to_embedding = 0;
-    if (engine) {
-        (void)moe_json_get_bool_local(engine->offload_graph_ir_json, "lm_head_tied_to_token_embedding", &lm_head_tied_to_embedding);
-    }
-    auto is_embedding_candidate = [](const char* name) -> bool {
-        return name && (std::strcmp(name, "token_embd.weight") == 0 ||
-            std::strcmp(name, "model.embed_tokens.weight") == 0 ||
-            std::strcmp(name, "embed_tokens.weight") == 0);
-    };
+    const int lm_head_tied_to_embedding = moe_graph_ir_lm_head_tied_to_token_embedding(engine);
     static const char* const lm_head_names[] = {
         "output.weight",
         "lm_head.weight",
@@ -190,7 +198,7 @@ static int moe_raw_lm_head_ready(const moe_pc_engine* engine) {
         moe_raw_tensor_desc desc{};
         const moe_gguf_common_tensor_record* rec =
             find_common_tensor_by_op_role(engine, "lm_head", -1, &desc);
-        if (rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size) {
+        if (rec && shape_matches(desc, false)) {
             return common_tensor_backing_file_ready(engine, rec);
         }
     }
@@ -198,8 +206,9 @@ static int moe_raw_lm_head_ready(const moe_pc_engine* engine) {
         moe_raw_tensor_desc desc{};
         const moe_gguf_common_tensor_record* rec =
             find_common_tensor_by_names(engine, &lm_head_names[i], 1, &desc);
-        if (rec && c && desc.cols == c->hidden_size && desc.rows >= c->vocab_size) {
-            if (is_embedding_candidate(lm_head_names[i]) && !lm_head_tied_to_embedding) {
+        const bool tied_embedding = is_embedding_candidate(lm_head_names[i]) && lm_head_tied_to_embedding;
+        if (rec && c && shape_matches(desc, tied_embedding)) {
+            if (is_embedding_candidate(lm_head_names[i]) && !tied_embedding) {
                 continue;
             }
             return common_tensor_backing_file_ready(engine, rec);

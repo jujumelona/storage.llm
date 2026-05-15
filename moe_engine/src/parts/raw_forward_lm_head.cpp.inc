@@ -31,17 +31,33 @@ static int moe_map_lm_head_tensor(
     if (!engine || !c || !out) {
         return 0;
     }
+    auto is_embedding_candidate = [](const char* name) -> bool {
+        return name && (
+            std::strcmp(name, "token_embd.weight") == 0 ||
+            std::strcmp(name, "model.embed_tokens.weight") == 0 ||
+            std::strcmp(name, "embed_tokens.weight") == 0);
+    };
+    auto shape_matches = [c](const moe_raw_tensor_desc& desc, bool tied_embedding) -> bool {
+        if (!c) {
+            return false;
+        }
+        if (desc.cols == c->hidden_size && desc.rows >= c->vocab_size) {
+            return true;
+        }
+        return tied_embedding && desc.rows == c->hidden_size && desc.cols >= c->vocab_size;
+    };
     std::string graph_name;
     if (moe_graph_ir_tensor_binding_name(engine, "lm_head", &graph_name)) {
         moe_raw_tensor_desc desc{};
         const char* exact_name = graph_name.c_str();
         const moe_gguf_common_tensor_record* rec =
             find_common_tensor_by_names(engine, &exact_name, 1, &desc);
-        if (rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size) {
+        const bool tied_embedding = is_embedding_candidate(exact_name) &&
+            moe_graph_ir_lm_head_tied_to_token_embedding(engine);
+        if (rec && shape_matches(desc, tied_embedding)) {
             static std::atomic<uint32_t> logged{0};
             if (logged.fetch_add(1, std::memory_order_relaxed) == 0) {
-                int tied = 0;
-                (void)moe_json_get_bool_local(engine->offload_graph_ir_json, "lm_head_tied_to_token_embedding", &tied);
+                const int tied = moe_graph_ir_lm_head_tied_to_token_embedding(engine);
                 moe_profile_log(
                     "lm_head_contract_binding",
                     "name=%s tied=%d rows=%u cols=%u vocab=%u hidden=%u",
@@ -54,14 +70,7 @@ static int moe_map_lm_head_tensor(
             "name=%s rows=%u cols=%u vocab=%u hidden=%u",
             graph_name.c_str(), desc.rows, desc.cols, c->vocab_size, c->hidden_size);
     }
-    int lm_head_tied_to_embedding = 0;
-    (void)moe_json_get_bool_local(engine->offload_graph_ir_json, "lm_head_tied_to_token_embedding", &lm_head_tied_to_embedding);
-    auto is_embedding_candidate = [](const char* name) -> bool {
-        return name && (
-            std::strcmp(name, "token_embd.weight") == 0 ||
-            std::strcmp(name, "model.embed_tokens.weight") == 0 ||
-            std::strcmp(name, "embed_tokens.weight") == 0);
-    };
+    const int lm_head_tied_to_embedding = moe_graph_ir_lm_head_tied_to_token_embedding(engine);
     static const char* const lm_head_names[] = {
         "output.weight",
         "lm_head.weight",
@@ -73,7 +82,7 @@ static int moe_map_lm_head_tensor(
         moe_raw_tensor_desc desc{};
         const moe_gguf_common_tensor_record* rec =
             find_common_tensor_by_op_role(engine, "lm_head", -1, &desc);
-        if (rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size) {
+        if (rec && shape_matches(desc, false)) {
             return map_common_tensor_record(engine, *rec, desc, out);
         }
     }
@@ -84,7 +93,8 @@ static int moe_map_lm_head_tensor(
         if (!rec) {
             continue;
         }
-        if (desc.cols != c->hidden_size || desc.rows < c->vocab_size) {
+        const bool tied_embedding = is_embedding_candidate(lm_head_names[i]) && lm_head_tied_to_embedding;
+        if (!shape_matches(desc, tied_embedding)) {
             moe_profile_log(
                 "lm_head_candidate_shape_rejected",
                 "name=%s rows=%u cols=%u vocab=%u hidden=%u",
@@ -95,7 +105,7 @@ static int moe_map_lm_head_tensor(
                 c->hidden_size);
             continue;
         }
-        if (is_embedding_candidate(lm_head_names[i]) && !lm_head_tied_to_embedding) {
+        if (is_embedding_candidate(lm_head_names[i]) && !tied_embedding) {
             moe_profile_log(
                 "lm_head_embedding_fallback_blocked",
                 "name=%s tied=%d rows=%u cols=%u vocab=%u hidden=%u",
