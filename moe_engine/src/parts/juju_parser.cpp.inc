@@ -1,6 +1,8 @@
 // JUJU 포맷 파싱 유틸리티
 // JUJU 텐서 인덱스, 메타데이터, 섹션 읽기
 
+static constexpr uint64_t moe_JUJU_TEXT_INDEX_MAX_BYTES = 1024ull * 1024ull * 1024ull;
+
 struct moe_juju_tensor_json_entry_t {
     std::string name;
     std::string bucket;
@@ -346,7 +348,7 @@ static int moe_read_binary_range_to_string(
     // Problem: offset + bytes can overflow uint64_t if values are malformed
     // Causes offset > file_bytes check to pass incorrectly
     // Solution: Check bytes <= file_bytes - offset instead
-    if (!out || path.empty() || bytes == 0 || bytes > 256ull * 1024ull * 1024ull ||
+    if (!out || path.empty() || bytes == 0 || bytes > moe_JUJU_TEXT_INDEX_MAX_BYTES ||
         offset > file_bytes || bytes > file_bytes - offset) {
         return 0;
     }
@@ -599,7 +601,7 @@ static int moe_read_text_file_local(const std::string& path, std::string* out) {
     // BUGFIX 330: Check file_size_bytes success before using bytes ★
     // Problem: If file_size_bytes fails, bytes remains 0 but function continues
     // Solution: Return 0 immediately if file_size_bytes fails
-    if (!file_size_bytes(path, &bytes) || bytes == 0 || bytes > 256ull * 1024ull * 1024ull) {
+    if (!file_size_bytes(path, &bytes) || bytes == 0 || bytes > moe_JUJU_TEXT_INDEX_MAX_BYTES) {
         return 0;
     }
     return moe_read_binary_range_to_string(path, 0, bytes, bytes, out);
@@ -620,7 +622,7 @@ static int moe_read_juju_tensor_index_json(
         // bootstrap metadata after an empty/unreadable/malformed sidecar silently
         // revives stale index contracts and makes sidecar repair workflows
         // ineffective.
-        if (!sidecar_present || sidecar_bytes == 0 || sidecar_bytes > 256ull * 1024ull * 1024ull ||
+        if (!sidecar_present || sidecar_bytes == 0 || sidecar_bytes > moe_JUJU_TEXT_INDEX_MAX_BYTES ||
             !moe_read_text_file_local(sidecar_path, &sidecar)) {
             std::fprintf(stderr,
                 "[storagellm] JUJU sidecar idx rejected: unreadable authoritative sidecar idx=%s bytes=%llu\n",

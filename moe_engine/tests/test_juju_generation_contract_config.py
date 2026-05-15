@@ -288,6 +288,8 @@ def test_gguf_byte_diagnostics_allows_large_declared_source_alignment_padding():
 
 def test_cpp_juju_sidecar_presence_is_fail_closed_even_when_unreadable():
     parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
+    assert "moe_JUJU_TEXT_INDEX_MAX_BYTES = 1024ull * 1024ull * 1024ull" in parser_text
+    assert "sidecar_bytes > moe_JUJU_TEXT_INDEX_MAX_BYTES" in parser_text
     assert "const int sidecar_present = file_size_bytes(sidecar_path, &sidecar_bytes);" in parser_text
     assert "unreadable authoritative sidecar" in parser_text
     sidecar_present_pos = parser_text.index("const int sidecar_present = file_size_bytes(sidecar_path, &sidecar_bytes);")
