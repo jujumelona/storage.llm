@@ -1047,10 +1047,9 @@ static int moe_attention_layer_rope_contract_f32(
             if (moe_json_get_double_local(rope_scope, "partial_rotary_factor", &dvalue) &&
                 dvalue > 0.0 && dvalue <= 1.0 && std::isfinite(dvalue) &&
                 head_dim > 0) {
-                uint32_t base_dim = resolved.rope_dim > 0 ? resolved.rope_dim : head_dim;
-                uint32_t partial_dim = (uint32_t)std::round((double)base_dim * dvalue);
+                uint32_t partial_dim = (uint32_t)std::round((double)head_dim * dvalue);
                 if (partial_dim < 2u) partial_dim = 2u;
-                if (partial_dim > base_dim) partial_dim = base_dim;
+                if (partial_dim > head_dim) partial_dim = head_dim;
                 resolved.rope_dim = partial_dim;
             }
             if (moe_json_get_bool_local(rope_scope, "rotate_half", &bvalue)) {
