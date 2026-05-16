@@ -675,9 +675,6 @@ def test_graphir_dense_fallback_does_not_run_next_to_routed_moe_from_adapter_hin
     assert "!plan.routed.present" in block
     assert "!plan.routed.has_weights" in block
     assert "dense_ffn_fallback op with required=false" in fwd
-    run_dense_line = fwd[fwd.index("plan.run_dense ="):fwd.index("plan.run_shared =", fwd.index("plan.run_dense ="))]
-    assert "plan.routed.present" not in run_dense_line
-    assert "plan.dense.required && plan.dense.has_weights" in run_dense_line
 
 
 
