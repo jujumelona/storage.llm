@@ -338,7 +338,7 @@ static int moe_decode_scratch_resize(
 
     const uint32_t hidden = c->hidden_size;
     const uint32_t expert_intermediate = c->expert_intermediate_size;
-    const moe_attn_config_t cfg = attn_cfg ? *attn_cfg : moe_legacy_mla_attn_config();
+    const moe_attn_config_t cfg = attn_cfg ? *attn_cfg : (engine ? moe_generation_attn_config(engine) : moe_attn_config_t{});
     const uint32_t q_lora_rank = cfg.q_lora_rank ? cfg.q_lora_rank : 2048u;
     const uint32_t kv_a_dim = moe_attn_kv_a_proj_dim(cfg);
     const uint32_t kv_entry_dim = moe_attn_kv_entry_dim(cfg);

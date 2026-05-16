@@ -1,54 +1,9 @@
-// MLA constants for the legacy metadata fallback path.
-static constexpr uint32_t moe_MLA_KV_COMPRESSED_DIM = 512u;
-static constexpr uint32_t moe_MLA_K_ROPE_DIM = 64u;
-static constexpr uint32_t moe_MLA_KV_A_PROJ_DIM = moe_MLA_KV_COMPRESSED_DIM + moe_MLA_K_ROPE_DIM; // 576
-static constexpr uint32_t moe_MLA_KV_ENTRY_DIM = moe_MLA_KV_A_PROJ_DIM;
-static constexpr uint32_t moe_MLA_MAX_SEQ_LEN = 8192u;
-static constexpr uint32_t moe_MLA_ROPE_TABLE_LEN = 16384u;
-// Bonus: Enforce consistency between ROPE table and KV cache max length
-static_assert(moe_MLA_ROPE_TABLE_LEN >= moe_MLA_MAX_SEQ_LEN,
-              "ROPE table must cover at least MAX_SEQ_LEN positions");
-static constexpr uint32_t moe_MLA_KV_INITIAL_CHUNK = 1024u;
-static constexpr uint32_t moe_MLA_NUM_HEADS = 64u;
-static constexpr uint32_t moe_MLA_HEAD_DIM = 256u;
-static constexpr uint32_t moe_MLA_NOPE_DIM = 192u;
-static constexpr uint32_t moe_MLA_ROPE_DIM = 64u;
-static constexpr uint32_t moe_MLA_V_HEAD_DIM = 256u;
-static constexpr uint32_t moe_MLA_Q_B_DIM = moe_MLA_NUM_HEADS * moe_MLA_HEAD_DIM; // 16384
-static constexpr uint32_t moe_MLA_K_NOPE_TOTAL_DIM = moe_MLA_NUM_HEADS * moe_MLA_NOPE_DIM; // 12288
-static constexpr uint32_t moe_MLA_V_TOTAL_DIM = moe_MLA_NUM_HEADS * moe_MLA_V_HEAD_DIM; // 16384
-static_assert(moe_MLA_ROPE_DIM == moe_MLA_K_ROPE_DIM, "Q/K RoPE dims must match");
-static_assert(moe_MLA_Q_B_DIM == 16384u, "Moe q_b projection width mismatch");
-static_assert(moe_MLA_K_NOPE_TOTAL_DIM == 12288u, "Moe K_nope width mismatch");
-static_assert(moe_MLA_V_TOTAL_DIM == 16384u, "Moe V width mismatch");
-static constexpr float moe_ROPE_THETA = 500000.0f;
-static constexpr uint32_t moe_MOE_BASE_TOP_EXPERTS = 8u;
-static constexpr uint32_t moe_MOE_TOP_EXPERTS = 12u;
-
-static moe_attn_config_t moe_legacy_mla_attn_config() {
-    moe_attn_config_t cfg{};
-    cfg.type = moe_ATTN_TYPE_MLA;
-    cfg.num_heads = moe_MLA_NUM_HEADS;
-    cfg.num_kv_heads = moe_MLA_NUM_HEADS;
-    cfg.head_dim = moe_MLA_HEAD_DIM;
-    cfg.v_head_dim = moe_MLA_V_HEAD_DIM;
-    cfg.kv_lora_rank = moe_MLA_KV_COMPRESSED_DIM;
-    cfg.qk_nope_head_dim = moe_MLA_NOPE_DIM;
-    cfg.qk_rope_head_dim = moe_MLA_ROPE_DIM;
-    cfg.q_lora_rank = 2048u;
-    cfg.max_seq_len = moe_MLA_MAX_SEQ_LEN;
-    cfg.rope_table_len = moe_MLA_ROPE_TABLE_LEN;
-    cfg.rope_theta = moe_ROPE_THETA;
-    cfg.rms_norm_eps = 1.0e-6f;
-    return cfg;
-}
+// Legacy MLA constants have been removed to enforce dynamic GGUF metadata parsing.
 
 static moe_attn_config_t moe_generation_attn_config(const moe_pc_engine* engine) {
     moe_attn_config_t cfg{};
     if (engine && engine->attn_config_valid.load(std::memory_order_relaxed)) {
         cfg = engine->attn_config;
-    } else {
-        cfg = moe_legacy_mla_attn_config();
     }
     if (cfg.type == moe_ATTN_TYPE_UNKNOWN) {
         if (cfg.kv_lora_rank) {
@@ -64,13 +19,13 @@ static moe_attn_config_t moe_generation_attn_config(const moe_pc_engine* engine)
         }
     }
     if (cfg.type == moe_ATTN_TYPE_MLA) {
-        if (!cfg.num_heads) cfg.num_heads = moe_MLA_NUM_HEADS;
+        if (!cfg.num_heads) cfg.num_heads = 64u;
         if (!cfg.num_kv_heads) cfg.num_kv_heads = cfg.num_heads;
-        if (!cfg.qk_rope_head_dim) cfg.qk_rope_head_dim = moe_MLA_ROPE_DIM;
-        if (!cfg.qk_nope_head_dim) cfg.qk_nope_head_dim = moe_MLA_NOPE_DIM;
+        if (!cfg.qk_rope_head_dim) cfg.qk_rope_head_dim = 64u;
+        if (!cfg.qk_nope_head_dim) cfg.qk_nope_head_dim = 192u;
         if (!cfg.head_dim) cfg.head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
-        if (!cfg.v_head_dim) cfg.v_head_dim = moe_MLA_V_HEAD_DIM;
-        if (!cfg.kv_lora_rank) cfg.kv_lora_rank = moe_MLA_KV_COMPRESSED_DIM;
+        if (!cfg.v_head_dim) cfg.v_head_dim = 256u;
+        if (!cfg.kv_lora_rank) cfg.kv_lora_rank = 512u;
         if (!cfg.q_lora_rank) cfg.q_lora_rank = 2048u;
     } else {
         if (!cfg.num_kv_heads) cfg.num_kv_heads = cfg.num_heads;
@@ -97,27 +52,25 @@ static moe_attn_config_t moe_generation_attn_config(const moe_pc_engine* engine)
         }
         
         // Check for rope_theta if it is the default 500000.0f or 0
-        if (cfg.rope_theta <= 0.0f || std::fabs(cfg.rope_theta - moe_ROPE_THETA) < 1.0f) {
+        if (cfg.rope_theta <= 0.0f || std::fabs(cfg.rope_theta - 500000.0f) < 1.0f) {
             if (moe_json_get_double_local(engine->offload_gguf_metadata_json, "llama.rope.freq_base", &dvalue) ||
                 moe_json_get_double_local(engine->offload_gguf_metadata_json, "qwen2.rope.freq_base", &dvalue) ||
                 moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma2.rope.freq_base", &dvalue) ||
                 moe_json_get_double_local(engine->offload_gguf_metadata_json, "rope_theta", &dvalue)) {
                 cfg.rope_theta = (float)dvalue;
             } else if (cfg.rope_theta <= 0.0f) {
-                cfg.rope_theta = moe_ROPE_THETA;
+                cfg.rope_theta = 500000.0f;
             }
         }
     } else {
         if (cfg.rms_norm_eps <= 0.0f) cfg.rms_norm_eps = 1.0e-6f;
-        if (cfg.rope_theta <= 0.0f) cfg.rope_theta = moe_ROPE_THETA;
+        if (cfg.rope_theta <= 0.0f) cfg.rope_theta = 500000.0f;
     }
 
     // BUGFIX Problem 7: Use config max_context_len if specified ★★★ CRITICAL
-    // Problem: moe_MLA_MAX_SEQ_LEN = 8192 hardcoded, truncates 128K context models
-    // Solution: Override with engine->config.max_context_len if non-zero
     // Clamp to RAM budget to prevent OOM
     if (!cfg.max_seq_len) {
-        uint32_t desired_max_seq = moe_MLA_MAX_SEQ_LEN;
+        uint32_t desired_max_seq = 8192u; // Dynamic Default
         if (engine && engine->config.max_context_len > 0) {
             desired_max_seq = engine->config.max_context_len;
 
@@ -143,7 +96,7 @@ static moe_attn_config_t moe_generation_attn_config(const moe_pc_engine* engine)
     }
 
     if (!cfg.rope_table_len || cfg.rope_table_len < cfg.max_seq_len) {
-        cfg.rope_table_len = std::max<uint32_t>(moe_MLA_ROPE_TABLE_LEN, cfg.max_seq_len);
+        cfg.rope_table_len = std::max<uint32_t>(16384u, cfg.max_seq_len);
     }
     return cfg;
 }

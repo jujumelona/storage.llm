@@ -888,6 +888,11 @@ static float moe_attention_logit_softcap_value(
         double layer_value = 0.0;
         const char* layer_source = nullptr;
         static const char* const softcap_keys[] = {
+            "gemma4.attention.logit_softcapping",
+            "gemma4.attn_logit_softcapping",
+            "gemma2.attention.logit_softcapping",
+            "gemma.attention.logit_softcapping",
+            "gemma2.attn_logit_softcapping",
             "attn_logit_softcapping",
             "attn_logit_softcap",
             "attention_logit_softcapping",
@@ -911,7 +916,12 @@ static float moe_attention_logit_softcap_value(
     double value = 0.0;
     if (engine &&
         !engine->offload_graph_ir_json.empty() &&
-        (moe_json_get_double_local(engine->offload_graph_ir_json, "attn_logit_softcapping", &value) ||
+        (moe_json_get_double_local(engine->offload_graph_ir_json, "gemma4.attention.logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "gemma4.attn_logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "gemma2.attention.logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "gemma.attention.logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "gemma2.attn_logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_graph_ir_json, "attn_logit_softcapping", &value) ||
          moe_json_get_double_local(engine->offload_graph_ir_json, "attn_logit_softcap", &value) ||
          moe_json_get_double_local(engine->offload_graph_ir_json, "attention_logit_softcapping", &value) ||
          moe_json_get_double_local(engine->offload_graph_ir_json, "attention_logit_softcap", &value)) &&
@@ -921,7 +931,12 @@ static float moe_attention_logit_softcap_value(
     }
     if (engine &&
         !engine->offload_gguf_metadata_json.empty() &&
-        (moe_json_get_double_local(engine->offload_gguf_metadata_json, "attn_logit_softcapping", &value) ||
+        (moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.attention.logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.attn_logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma2.attention.logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma.attention.logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma2.attn_logit_softcapping", &value) ||
+         moe_json_get_double_local(engine->offload_gguf_metadata_json, "attn_logit_softcapping", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "attn_logit_softcap", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_logit_softcapping", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "attention_logit_softcap", &value)) &&

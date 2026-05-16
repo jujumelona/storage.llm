@@ -66,7 +66,14 @@
         engine->model_config_global_head_dim = moe_u64_to_u32_clamped(value, 0);
         attention_valid = 1;
     }
-    if (moe_json_get_u64_local(text_config, "sliding_window", &value)) {
+    if (moe_json_get_u64_local(text_config, "qwen2.attention.sliding_window", &value) ||
+        moe_json_get_u64_local(text_config, "chatglm.attention.sliding_window", &value) ||
+        moe_json_get_u64_local(text_config, "glm.attention.sliding_window", &value) ||
+        moe_json_get_u64_local(text_config, "gemma4.attention.sliding_window", &value) ||
+        moe_json_get_u64_local(text_config, "gemma2.attention.sliding_window", &value) ||
+        moe_json_get_u64_local(text_config, "gemma.attention.sliding_window", &value) ||
+        moe_json_get_u64_local(text_config, "sliding_window", &value) ||
+        moe_json_get_u64_local(config_json, "sliding_window", &value)) {
         engine->model_config_sliding_window = moe_u64_to_u32_clamped(value, 0);
         attention_valid = 1;
     }
@@ -383,6 +390,18 @@ static void moe_juju_probe_apply(moe_pc_engine* engine, moe_juju_runtime_probe_t
     if (!engine || !probe) {
         return;
     }
+    
+    // BUGFIX: Engine config fallback for custom formats where tensor size inference fails
+    if (!probe->attn.num_heads && engine->model_config_num_attention_heads) {
+        probe->attn.num_heads = engine->model_config_num_attention_heads;
+    }
+    if (!probe->attn.num_kv_heads && engine->model_config_num_key_value_heads) {
+        probe->attn.num_kv_heads = engine->model_config_num_key_value_heads;
+    }
+    if (!probe->attn.head_dim && engine->model_config_head_dim) {
+        probe->attn.head_dim = engine->model_config_head_dim;
+    }
+    
     moe_juju_probe_finalize_attention(probe);
     if (probe->shape.experts_per_moe_layer && probe->shape.projection_count == 0) {
         probe->shape.projection_count = 3;
