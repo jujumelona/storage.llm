@@ -141,6 +141,14 @@ static uint32_t moe_router_fnv1a_hash_string(const char* str) {
     return hash;
 }
 
+static int moe_prepare_router_weight_sidecar_input_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const float* hidden,
+    uint32_t hidden_size,
+    std::vector<float>* out
+);
+
 static int moe_map_router_tensor(
     moe_pc_engine* engine,
     int32_t layer,
@@ -226,8 +234,14 @@ static int moe_router_logits_f32(
         if (common.bytes < row_bytes * (uint64_t)experts) {
             return 0;
         }
+        std::vector<float> weight_sidecar_input;
+        const float* dot_input = hidden;
+        if (moe_prepare_router_weight_sidecar_input_f32(
+                engine, layer, hidden, hidden_size, &weight_sidecar_input)) {
+            dot_input = weight_sidecar_input.data();
+        }
         return moe_parallel_rows(engine, experts, 0, [&](uint32_t row) {
-            const float logit = moe_raw_tensor_dot_row(common, row, hidden, hidden_size);
+            const float logit = moe_raw_tensor_dot_row(common, row, dot_input, hidden_size);
             if (!std::isfinite(logit)) {
                 return 0;
             }
@@ -916,6 +930,176 @@ static int moe_map_router_scale_tensor(
     {
         std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
         engine->raw_tensor_cache[key] = *out;
+    }
+    return 1;
+}
+
+static int moe_map_router_weight_scale_sidecar_tensor(
+    moe_pc_engine* engine,
+    int32_t layer,
+    uint32_t hidden_size,
+    moe_raw_tensor_cache_entry* out
+) {
+    if (!engine || !out || layer < 0 || hidden_size == 0 || hidden_size > 100000) {
+        return 0;
+    }
+    struct router_weight_sidecar_cache_entry {
+        const moe_pc_engine* engine = nullptr;
+        uint64_t generation = 0;
+        int32_t layer = INT32_MIN;
+        uint32_t hidden_size = 0;
+        uint64_t key = 0;
+        uint8_t found = 0;
+        moe_raw_tensor_cache_entry raw{};
+    };
+    static thread_local std::vector<router_weight_sidecar_cache_entry> tls_cache;
+    static const char* const role_names[] = {
+        "router_weight_scale_sidecar",
+        "moe_router_weight_scale_sidecar",
+        "ffn_gate_inp_scale",
+        "ffn_gate_inp_scales"
+    };
+    static const char* const suffixes[] = {
+        "ffn_gate_inp.scale",
+        "ffn_gate_inp.scales",
+        "ffn_gate_inp.weight.scale",
+        "ffn_gate_inp.weight.scales"
+    };
+    const uint32_t cache_hash = moe_router_fnv1a_hash_string("router_weight_scale_sidecar");
+    const uint64_t key = ((uint64_t)(uint32_t)layer << 32) | cache_hash | 0xA0000000ull;
+    const uint64_t generation = engine->engine_generation;
+    for (const router_weight_sidecar_cache_entry& entry : tls_cache) {
+        if (entry.engine == engine && entry.generation == generation &&
+            entry.layer == layer && entry.hidden_size == hidden_size && entry.key == key) {
+            if (!entry.found || !entry.raw.base) {
+                return 0;
+            }
+            *out = entry.raw;
+            return 1;
+        }
+    }
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        auto found = engine->raw_tensor_cache.find(key);
+        if (found != engine->raw_tensor_cache.end() && found->second.base) {
+            *out = found->second;
+            router_weight_sidecar_cache_entry entry{};
+            entry.engine = engine;
+            entry.generation = generation;
+            entry.layer = layer;
+            entry.hidden_size = hidden_size;
+            entry.key = key;
+            entry.found = 1;
+            entry.raw = *out;
+            if (tls_cache.size() > 256u) {
+                tls_cache.erase(tls_cache.begin(), tls_cache.begin() + 64);
+            }
+            tls_cache.push_back(entry);
+            return 1;
+        }
+    }
+    moe_raw_tensor_desc desc{};
+    const moe_gguf_common_tensor_record* rec = nullptr;
+    for (const char* role : role_names) {
+        rec = find_common_tensor_by_op_role(engine, role, layer, &desc);
+        if (rec) {
+            break;
+        }
+    }
+    if (!rec) {
+        std::vector<std::string> names;
+        moe_push_layer_tensor_candidates(&names, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+        rec = moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
+    }
+
+    moe_raw_tensor_cache_entry raw{};
+    uint8_t found_ok = 0;
+    if (rec && moe_router_scale_record_is_weight_sidecar_f32(*rec) &&
+        map_common_tensor_record(engine, *rec, desc, &raw)) {
+        const uint64_t count = moe_router_raw_scalar_count(raw);
+        if (count == 1u || count == (uint64_t)hidden_size) {
+            found_ok = 1;
+        } else {
+            moe_profile_log(
+                "router_weight_sidecar_reject",
+                "layer=%d name=%s count=%llu hidden=%u rows=%u cols=%u",
+                layer,
+                rec->name.c_str(),
+                (unsigned long long)count,
+                hidden_size,
+                raw.rows,
+                raw.cols);
+        }
+    }
+
+    router_weight_sidecar_cache_entry entry{};
+    entry.engine = engine;
+    entry.generation = generation;
+    entry.layer = layer;
+    entry.hidden_size = hidden_size;
+    entry.key = key;
+    entry.found = found_ok;
+    entry.raw = raw;
+    if (tls_cache.size() > 256u) {
+        tls_cache.erase(tls_cache.begin(), tls_cache.begin() + 64);
+    }
+    tls_cache.push_back(entry);
+    if (!found_ok) {
+        return 0;
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        engine->raw_tensor_cache[key] = raw;
+    }
+    *out = raw;
+    return 1;
+}
+
+static int moe_prepare_router_weight_sidecar_input_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const float* hidden,
+    uint32_t hidden_size,
+    std::vector<float>* out
+) {
+    if (!engine || !hidden || !out || hidden_size == 0 || hidden_size > 100000) {
+        return 0;
+    }
+    moe_raw_tensor_cache_entry sidecar{};
+    if (!moe_map_router_weight_scale_sidecar_tensor(engine, layer, hidden_size, &sidecar)) {
+        return 0;
+    }
+    const uint64_t count = moe_router_raw_scalar_count(sidecar);
+    if (count != 1u && count != (uint64_t)hidden_size) {
+        return 0;
+    }
+    out->assign(hidden_size, 0.0f);
+    double abs_sum = 0.0;
+    double max_abs = 0.0;
+    for (uint32_t i = 0; i < hidden_size; ++i) {
+        float scale = 1.0f;
+        if (!moe_router_raw_scalar_at_f32(sidecar, count == 1u ? 0u : (uint64_t)i, &scale) ||
+            !std::isfinite(scale) || !std::isfinite(hidden[i])) {
+            return 0;
+        }
+        const float v = hidden[i] * scale;
+        if (!std::isfinite(v)) {
+            return 0;
+        }
+        (*out)[i] = v;
+        const double a = std::fabs((double)scale);
+        abs_sum += a;
+        max_abs = std::max(max_abs, a);
+    }
+    if (moe_profile_level() >= 2) {
+        moe_profile_log(
+            "router_weight_sidecar_apply",
+            "layer=%d hidden=%u count=%llu mean_abs=%.6g max_abs=%.6g source=weight_sidecar",
+            layer,
+            hidden_size,
+            (unsigned long long)count,
+            abs_sum / (double)hidden_size,
+            max_abs);
     }
     return 1;
 }
