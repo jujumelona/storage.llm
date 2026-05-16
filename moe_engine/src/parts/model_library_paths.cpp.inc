@@ -68,7 +68,15 @@ static std::string model_lib_default_cache_dir(const moe_pc_engine* e) {
 
 static std::string model_lib_filename(const moe_pc_engine* e) {
     std::ostringstream os;
-    os << "moe_1_nvfp4_" << model_lib_backend_tag(e ? e->backend_caps.backend : moe_BACKEND_CPU)
+    // Model-agnostic: derive library name from runtime weight encoding info
+    // instead of hardcoding a model-specific prefix.
+    if (e && !e->offload_weight_quant_family.empty()) {
+        os << "moe_" << e->offload_weight_quant_family << "_"
+           << e->offload_weight_quant_bits.load(std::memory_order_relaxed) << "b_";
+    } else {
+        os << "moe_engine_";
+    }
+    os << model_lib_backend_tag(e ? e->backend_caps.backend : moe_BACKEND_CPU)
        << model_lib_ext();
     return os.str();
 }

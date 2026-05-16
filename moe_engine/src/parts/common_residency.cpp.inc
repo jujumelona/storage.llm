@@ -37,7 +37,7 @@ static uint64_t common_vram_wanted_bytes(const moe_pc_engine* engine) {
         // → Fallback underestimates by 10-15x → embedding/lm_head evicted every token
         // Solution: Add MLA latent buffer estimate: num_experts × latent_dim × max_seq_len × 2
         // Impact: Correct VRAM reservation for MLA models, prevents reload thrashing
-        const uint64_t hidden = s ? s->hidden_size : 6144ull;
+        const uint64_t hidden = s ? s->hidden_size : 4096ull;
         uint32_t max_seq = 8192u;
         if (engine && engine->attn_config_valid.load(std::memory_order_relaxed) &&
             engine->attn_config.max_seq_len > 0) {
