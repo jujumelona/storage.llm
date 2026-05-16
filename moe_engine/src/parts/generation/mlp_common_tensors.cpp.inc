@@ -446,16 +446,60 @@ static int moe_layer_has_ple_tensors(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
-    return
-        (moe_engine_has_common_tensor_suffix(engine, layer, "inp_gate.weight") ||
-         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_inp_gate.weight") ||
-         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_input_gate.weight")) &&
-        (moe_engine_has_common_tensor_suffix(engine, layer, "proj.weight") ||
-         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_proj.weight") ||
-         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_projection.weight")) &&
-        (moe_engine_has_common_tensor_suffix(engine, layer, "post_norm.weight") ||
-         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_post_norm.weight") ||
-         moe_engine_has_common_tensor_suffix(engine, layer, "post_per_layer_input_norm.weight"));
+    static const char* const gate_roles[] = {
+        "per_layer_inp_gate",
+        "per_layer_input_gate",
+        "ple_inp_gate",
+        "ple_input_gate",
+        "inp_gate"
+    };
+    static const char* const proj_roles[] = {
+        "per_layer_proj",
+        "per_layer_projection",
+        "ple_proj",
+        "ple_projection",
+        "proj"
+    };
+    static const char* const norm_roles[] = {
+        "per_layer_post_norm",
+        "post_per_layer_input_norm",
+        "ple_post_norm",
+        "post_norm"
+    };
+    const int has_gate =
+        moe_graph_ir_layer_has_op_role_any(engine, layer, gate_roles, sizeof(gate_roles) / sizeof(gate_roles[0])) ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "inp_gate.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_inp_gate.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_input_gate.weight");
+    const int has_proj =
+        moe_graph_ir_layer_has_op_role_any(engine, layer, proj_roles, sizeof(proj_roles) / sizeof(proj_roles[0])) ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "proj.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_proj.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_projection.weight");
+    const int has_norm =
+        moe_graph_ir_layer_has_op_role_any(engine, layer, norm_roles, sizeof(norm_roles) / sizeof(norm_roles[0])) ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_post_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "post_per_layer_input_norm.weight");
+    return has_gate && has_proj && has_norm;
+}
+
+static int moe_map_layer_ple_tensor_role_or_suffix_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* roles,
+    size_t role_count,
+    const char* const* suffixes,
+    size_t suffix_count,
+    moe_raw_tensor_cache_entry* out
+) {
+    if (!engine || !out) {
+        return 0;
+    }
+    if (moe_graph_ir_map_layer_op_role_any(engine, layer, roles, role_count, out)) {
+        return 1;
+    }
+    return moe_map_layer_common_tensor(engine, layer, suffixes, suffix_count, out);
 }
 
 static int moe_layer_apply_ple_f32(
@@ -467,8 +511,15 @@ static int moe_layer_apply_ple_f32(
     uint32_t num_layers,
     float eps
 ) {
-    if (!engine || !s || !hidden || layer < 0 || hidden_size == 0 ||
-        s->ple_inputs.empty()) {
+    if (!engine || !s || !hidden || layer < 0 || hidden_size == 0) {
+        return 0;
+    }
+    const int ple_required = moe_layer_has_ple_tensors(engine, layer);
+    if (s->ple_inputs.empty()) {
+        if (ple_required) {
+            moe_profile_log("ple_layer_missing_inputs", "layer=%d hidden=%u", layer, hidden_size);
+            return 0;
+        }
         return 1;
     }
     if (num_layers == 0 ||
@@ -478,6 +529,26 @@ static int moe_layer_apply_ple_f32(
     }
     const uint32_t expected_layer_dim =
         (uint32_t)(s->ple_inputs.size() / (size_t)num_layers);
+    static const char* const gate_roles[] = {
+        "per_layer_inp_gate",
+        "per_layer_input_gate",
+        "ple_inp_gate",
+        "ple_input_gate",
+        "inp_gate"
+    };
+    static const char* const proj_roles[] = {
+        "per_layer_proj",
+        "per_layer_projection",
+        "ple_proj",
+        "ple_projection",
+        "proj"
+    };
+    static const char* const norm_roles[] = {
+        "per_layer_post_norm",
+        "post_per_layer_input_norm",
+        "ple_post_norm",
+        "post_norm"
+    };
     static const char* const gate_suffixes[] = {
         "inp_gate.weight",
         "per_layer_inp_gate.weight",
@@ -495,11 +566,15 @@ static int moe_layer_apply_ple_f32(
     };
     moe_raw_tensor_cache_entry gate_raw{};
     moe_raw_tensor_cache_entry proj_raw{};
-    if (!moe_map_layer_common_tensor(
-            engine, layer, gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0]), &gate_raw) ||
-        !moe_map_layer_common_tensor(
-            engine, layer, proj_suffixes, sizeof(proj_suffixes) / sizeof(proj_suffixes[0]), &proj_raw)) {
-        if (moe_layer_has_ple_tensors(engine, layer)) {
+    if (!moe_map_layer_ple_tensor_role_or_suffix_f32(
+            engine, layer,
+            gate_roles, sizeof(gate_roles) / sizeof(gate_roles[0]),
+            gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0]), &gate_raw) ||
+        !moe_map_layer_ple_tensor_role_or_suffix_f32(
+            engine, layer,
+            proj_roles, sizeof(proj_roles) / sizeof(proj_roles[0]),
+            proj_suffixes, sizeof(proj_suffixes) / sizeof(proj_suffixes[0]), &proj_raw)) {
+        if (ple_required) {
             moe_profile_log("ple_layer_map_failed", "layer=%d hidden=%u", layer, hidden_size);
             return 0;
         }
@@ -540,7 +615,10 @@ static int moe_layer_apply_ple_f32(
     if (!moe_common_linear_f32(engine, proj_raw, s->gate.data(), layer_dim, s->norm.data(), hidden_size)) {
         return 0;
     }
-    if (!moe_layer_rmsnorm_suffixes_f32(
+    if (!moe_graph_ir_apply_rmsnorm_role_any_f32(
+            engine, layer, norm_roles, sizeof(norm_roles) / sizeof(norm_roles[0]),
+            s->norm.data(), hidden_size, s->attn.data(), eps) &&
+        !moe_layer_rmsnorm_suffixes_f32(
             engine, layer, norm_suffixes, sizeof(norm_suffixes) / sizeof(norm_suffixes[0]),
             s->norm.data(), hidden_size, s->attn.data(), eps)) {
         return 0;

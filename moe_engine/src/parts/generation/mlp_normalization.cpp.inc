@@ -513,6 +513,60 @@ static int moe_router_contract_object_has_activation_scale_f32(
     return 0;
 }
 
+static int moe_router_input_text_is_raw_hidden_f32(const std::string& text) {
+    const std::string v = moe_lower_ascii_copy(text);
+    if (v.empty()) {
+        return 0;
+    }
+    if (v.find("raw_hidden") != std::string::npos ||
+        v.find("raw_residual") != std::string::npos ||
+        v == "hidden" ||
+        v == "hidden_states" ||
+        v == "residual" ||
+        v == "layer_input" ||
+        v == "block_input" ||
+        v.find("residual_input") != std::string::npos) {
+        return 1;
+    }
+    return 0;
+}
+
+static int moe_router_contract_object_has_raw_hidden_input_f32(
+    const std::string& doc,
+    size_t obj_begin,
+    size_t obj_end
+) {
+    static const char* const string_keys[] = {
+        "router_input_source", "input_source", "source", "input",
+        "producer", "input_producer", "router_input", "from"
+    };
+    std::string value;
+    for (const char* key : string_keys) {
+        value.clear();
+        if (moe_json_get_string_slice(doc, obj_begin, obj_end, key, &value) &&
+            moe_router_input_text_is_raw_hidden_f32(value)) {
+            return 1;
+        }
+    }
+    static const char* const array_keys[] = {
+        "inputs", "input_names", "source_inputs", "producers",
+        "input_producers", "router_inputs"
+    };
+    std::vector<std::string> names;
+    for (const char* key : array_keys) {
+        names.clear();
+        if (!moe_json_get_string_array_slice(doc, obj_begin, obj_end, key, &names)) {
+            continue;
+        }
+        for (const std::string& name : names) {
+            if (moe_router_input_text_is_raw_hidden_f32(name)) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int moe_layer_router_contract_has_hidden_input_f32(
     const std::string& doc,
     size_t obj_begin,
@@ -523,12 +577,7 @@ static int moe_layer_router_contract_has_hidden_input_f32(
         raw_contract) {
         return 1;
     }
-    std::string source;
-    if ((moe_json_get_string_slice(doc, obj_begin, obj_end, "router_input_source", &source) ||
-         moe_json_get_string_slice(doc, obj_begin, obj_end, "input_source", &source)) &&
-        (moe_lower_ascii_copy(source) == "hidden" ||
-         moe_lower_ascii_copy(source) == "raw_hidden" ||
-         moe_lower_ascii_copy(source) == "raw_residual")) {
+    if (moe_router_contract_object_has_raw_hidden_input_f32(doc, obj_begin, obj_end)) {
         return 1;
     }
     std::string rule;

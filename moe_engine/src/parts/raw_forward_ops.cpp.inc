@@ -59,10 +59,11 @@ static int moe_engine_rmsnorm_unit_offset(
     if (!engine) {
         return 0;
     }
-    const int cached_global = engine->cached_rmsnorm_unit_offset.load(std::memory_order_acquire);
-    if (cached_global >= 0) {
-        return cached_global ? 1 : 0;
-    }
+    // Do not use the legacy process-wide RMSNorm semantics cache here.
+    // JUJU/GraphIR contracts can mix direct scalar scales and RMSNorm weights
+    // with different semantics in the same model; caching one global answer
+    // makes the first mapped norm tensor decide all later roles.  The cache
+    // below is keyed by the concrete raw tensor instead.
     const uint64_t cache_key = moe_rmsnorm_unit_offset_cache_key(raw);
     if (cache_key) {
         std::shared_lock<std::shared_mutex> lock(engine->rmsnorm_unit_offset_cache_mutex);
@@ -116,7 +117,6 @@ static int moe_engine_rmsnorm_unit_offset(
         direct_contract ? 1 : 0,
         unit_contract ? 1 : 0,
         (unsigned long long)cache_key);
-    engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0, std::memory_order_release);
     if (cache_key) {
         std::unique_lock<std::shared_mutex> lock(engine->rmsnorm_unit_offset_cache_mutex);
         engine->rmsnorm_unit_offset_cache[cache_key] = value ? 1 : 0;
