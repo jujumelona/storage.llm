@@ -16,11 +16,11 @@ static int prefetch_under_queue_pressure(
     if (!engine) {
         return 0;
     }
-    if (engine->disk_stage_depth_cap > 0 &&
-        prefetch_stage_load(engine->disk_stage) * 4u >= engine->disk_stage_depth_cap * 3u) { return 1; }
     if (moe_storage_runtime_cpu_ram_path(engine)) {
         return 0;
     }
+    if (engine->disk_stage_depth_cap > 0 &&
+        prefetch_stage_load(engine->disk_stage) * 4u >= engine->disk_stage_depth_cap * 3u) { return 1; }
     if (item.target_tier == moe_TIER_VRAM &&
         ((engine->pinned_stage_depth_cap > 0 &&
           prefetch_stage_load(engine->pinned_stage) * 4u >= engine->pinned_stage_depth_cap * 3u) ||

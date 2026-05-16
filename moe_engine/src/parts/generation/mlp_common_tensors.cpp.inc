@@ -277,7 +277,11 @@ static int moe_map_ple_binding(
         "per_layer_model_proj.weight",
         "per_layer_model_projection.weight",
         "model.per_layer_model_projection.weight",
-        "model.per_layer_model_proj.weight"
+        "model.per_layer_model_proj.weight",
+        "language_model.model.per_layer_model_projection.weight",
+        "language_model.model.per_layer_model_proj.weight",
+        "model.language_model.model.per_layer_model_projection.weight",
+        "model.language_model.model.per_layer_model_proj.weight"
     };
     moe_raw_tensor_desc proj_desc{};
     moe_raw_tensor_cache_entry model_projection{};
@@ -285,6 +289,10 @@ static int moe_map_ple_binding(
             engine, proj_roles, sizeof(proj_roles) / sizeof(proj_roles[0]),
             proj_names, sizeof(proj_names) / sizeof(proj_names[0]),
             &model_projection, &proj_desc)) {
+        static std::atomic<uint32_t> logged_missing_proj{0};
+        if (logged_missing_proj.fetch_add(1, std::memory_order_relaxed) == 0) {
+            moe_profile_log("ple_model_projection_missing", "hidden=%u layers=%u", c->hidden_size, c->num_hidden_layers);
+        }
         return 0;
     }
     if (proj_desc.cols != c->hidden_size ||
@@ -310,7 +318,11 @@ static int moe_map_ple_binding(
         "per_layer_proj_norm.weight",
         "per_layer_projection_norm.weight",
         "model.per_layer_projection_norm.weight",
-        "model.per_layer_proj_norm.weight"
+        "model.per_layer_proj_norm.weight",
+        "language_model.model.per_layer_projection_norm.weight",
+        "language_model.model.per_layer_proj_norm.weight",
+        "model.language_model.model.per_layer_projection_norm.weight",
+        "model.language_model.model.per_layer_proj_norm.weight"
     };
     moe_raw_tensor_desc norm_desc{};
     moe_raw_tensor_cache_entry projection_norm{};
@@ -335,9 +347,18 @@ static int moe_map_ple_binding(
         "per_layer_token_embd.weight",
         "per_layer_token_embedding.weight",
         "per_layer_embed.weight",
+        "per_layer_input_embedding.weight",
+        "per_layer_embedding.weight",
         "embed_tokens_per_layer.weight",
         "model.embed_tokens_per_layer.weight",
-        "model.per_layer_token_embd.weight"
+        "model.per_layer_token_embd.weight",
+        "model.per_layer_token_embedding.weight",
+        "language_model.model.embed_tokens_per_layer.weight",
+        "language_model.model.per_layer_token_embd.weight",
+        "language_model.model.per_layer_token_embedding.weight",
+        "model.language_model.model.embed_tokens_per_layer.weight",
+        "model.language_model.model.per_layer_token_embd.weight",
+        "model.language_model.model.per_layer_token_embedding.weight"
     };
     moe_raw_tensor_desc token_desc{};
     moe_raw_tensor_cache_entry token_embedding{};
@@ -555,21 +576,26 @@ static int moe_layer_apply_ple_f32(
         "post_per_layer_input_norm",
         "ple_post_norm"
     };
-    // Generic aliases such as "inp_gate.weight", "proj.weight", and
-    // "post_norm.weight" are intentionally not used for automatic PLE binding:
-    // they collide with router/attention/tail tensors.  Only explicit
-    // per_layer_* suffixes or generator contract roles bind PLE.
+    // Generic aliases are only considered here, after global PLE inputs are
+    // proven to exist.  That keeps them out of ple_required detection and lets
+    // the shape checks below reject attention/FFN collisions without forcing a
+    // hard failure when a model has no PLE block.
     static const char* const gate_suffixes[] = {
         "per_layer_inp_gate.weight",
-        "per_layer_input_gate.weight"
+        "per_layer_input_gate.weight",
+        "inp_gate.weight",
+        "input_gate.weight"
     };
     static const char* const proj_suffixes[] = {
         "per_layer_proj.weight",
-        "per_layer_projection.weight"
+        "per_layer_projection.weight",
+        "proj.weight",
+        "projection.weight"
     };
     static const char* const norm_suffixes[] = {
         "per_layer_post_norm.weight",
-        "post_per_layer_input_norm.weight"
+        "post_per_layer_input_norm.weight",
+        "post_norm.weight"
     };
     moe_raw_tensor_cache_entry gate_raw{};
     moe_raw_tensor_cache_entry proj_raw{};
@@ -1125,6 +1151,34 @@ static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* 
     if (!engine || layer < 0) {
         return 0;
     }
+    static thread_local const moe_pc_engine* tls_engine = nullptr;
+    static thread_local uint64_t tls_generation = 0;
+    static thread_local std::vector<int8_t> tls_cache;
+    const uint64_t generation = engine->engine_generation;
+    const size_t layer_index = (size_t)layer;
+    if (layer_index < 10000u) {
+        if (tls_engine != engine || tls_generation != generation) {
+            tls_engine = engine;
+            tls_generation = generation;
+            tls_cache.clear();
+        }
+        if (tls_cache.size() <= layer_index) {
+            tls_cache.resize(layer_index + 1u, -1);
+        }
+        if (tls_cache[layer_index] >= 0) {
+            return tls_cache[layer_index] ? 1 : 0;
+        }
+    }
+    auto cache_and_return = [&](int value) -> int {
+        if (layer_index < 10000u) {
+            if (tls_cache.size() <= layer_index) {
+                tls_cache.resize(layer_index + 1u, -1);
+            }
+            tls_cache[layer_index] = value ? 1 : 0;
+        }
+        return value ? 1 : 0;
+    };
+
     const std::string* docs[] = {
         &engine->offload_graph_ir_json,
         &engine->offload_gguf_metadata_json,
@@ -1133,6 +1187,7 @@ static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* 
         "graph_ir",
         "metadata",
     };
+    int matched_contract_row = 0;
     for (size_t doc_i = 0; doc_i < sizeof(docs) / sizeof(docs[0]); ++doc_i) {
         const std::string* docp = docs[doc_i];
         if (!docp || docp->empty()) {
@@ -1159,6 +1214,7 @@ static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* 
                         doc, obj_begin, obj_end, layer, this_row_ordinal)) {
                     continue;
                 }
+                matched_contract_row = 1;
                 int flag = 0;
                 static const char* const bool_keys[] = {
                     "attention_residual_before_ffn_norm",
@@ -1174,7 +1230,7 @@ static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* 
                             "graphir_attention_residual_order",
                             "layer=%d residual_first=%d source=%s.contract key=%s",
                             layer, flag ? 1 : 0, doc_names[doc_i], key);
-                        return flag ? 1 : 0;
+                        return cache_and_return(flag ? 1 : 0);
                     }
                 }
                 std::string order;
@@ -1189,7 +1245,7 @@ static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* 
                             "graphir_attention_residual_order",
                             "layer=%d residual_first=1 source=%s.contract_string value=%s",
                             layer, doc_names[doc_i], order.c_str());
-                        return 1;
+                        return cache_and_return(1);
                     }
                     if (lowered.find("attention_output") != std::string::npos ||
                         lowered.find("attn_output") != std::string::npos) {
@@ -1197,13 +1253,32 @@ static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* 
                             "graphir_attention_residual_order",
                             "layer=%d residual_first=0 source=%s.contract_string value=%s",
                             layer, doc_names[doc_i], order.c_str());
-                        return 0;
+                        return cache_and_return(0);
                     }
                 }
-                break;
+                // Keep scanning: runtime sidecars can contain stub rows before
+                // the authoritative .juju.idx row.  If no explicit order exists
+                // in any row, the generated contract default is attention norm
+                // before residual (residual_first=0), so we do not rescan the
+                // whole GraphIR ops array on every layer.
             }
         }
+    }
+    if (matched_contract_row) {
+        moe_profile_log(
+            "graphir_attention_residual_order",
+            "layer=%d residual_first=0 source=layer_execution_contract_table.default",
+            layer);
+        return cache_and_return(0);
+    }
 
+    // Legacy fallback for artifacts without a layer execution contract.
+    for (size_t doc_i = 0; doc_i < sizeof(docs) / sizeof(docs[0]); ++doc_i) {
+        const std::string* docp = docs[doc_i];
+        if (!docp || docp->empty()) {
+            continue;
+        }
+        const std::string& doc = *docp;
         size_t layers_begin = 0;
         size_t layers_end = 0;
         if (!moe_json_find_graph_layers_array_f32(doc, &layers_begin, &layers_end)) {
@@ -1275,12 +1350,12 @@ static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* 
                     "graphir_attention_residual_order",
                     "layer=%d residual_first=%d source=%s.layers.ops residual_index=%d post_norm_index=%d",
                     layer, residual_first, doc_names[doc_i], residual_index, post_norm_index);
-                return residual_first;
+                return cache_and_return(residual_first);
             }
             break;
         }
     }
-    return 0;
+    return cache_and_return(0);
 }
 
 
@@ -1543,6 +1618,36 @@ static int moe_graph_ir_layer_contract_tensor_names_for_role(
     if (!engine || layer < 0 || !role_key || !role_key[0] || !out_names) {
         return 0;
     }
+    static thread_local const moe_pc_engine* tls_cache_engine = nullptr;
+    static thread_local uint64_t tls_cache_generation = 0;
+    static thread_local size_t tls_cache_graph_size = 0;
+    static thread_local size_t tls_cache_metadata_size = 0;
+    static thread_local std::unordered_map<std::string, std::vector<std::string>> tls_names_cache;
+    const uint64_t generation = engine->engine_generation;
+    const size_t graph_size = engine->offload_graph_ir_json.size();
+    const size_t metadata_size = engine->offload_gguf_metadata_json.size();
+    if (tls_cache_engine != engine ||
+        tls_cache_generation != generation ||
+        tls_cache_graph_size != graph_size ||
+        tls_cache_metadata_size != metadata_size) {
+        tls_cache_engine = engine;
+        tls_cache_generation = generation;
+        tls_cache_graph_size = graph_size;
+        tls_cache_metadata_size = metadata_size;
+        tls_names_cache.clear();
+    }
+    std::string cache_key = std::to_string(layer);
+    cache_key.push_back('\n');
+    cache_key.append(section_key && section_key[0] ? section_key : "");
+    cache_key.push_back('\n');
+    cache_key.append(role_key);
+    {
+        const auto found = tls_names_cache.find(cache_key);
+        if (found != tls_names_cache.end()) {
+            *out_names = found->second;
+            return out_names->empty() ? 0 : 1;
+        }
+    }
     const size_t start_count = out_names->size();
     const std::string* docs[] = {
         &engine->offload_graph_ir_json,
@@ -1629,9 +1734,12 @@ static int moe_graph_ir_layer_contract_tensor_names_for_role(
         }
     }
     if (out_names->size() > start_count) {
+        tls_names_cache[cache_key] = *out_names;
         return 1;
     }
-    return moe_graph_ir_layer_ops_tensor_names_for_role(engine, layer, role_key, out_names);
+    const int found_in_ops = moe_graph_ir_layer_ops_tensor_names_for_role(engine, layer, role_key, out_names);
+    tls_names_cache[cache_key] = *out_names;
+    return found_in_ops ? 1 : 0;
 }
 
 static int moe_graph_ir_layer_contract_declares_tensor_role(

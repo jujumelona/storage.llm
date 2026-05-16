@@ -164,8 +164,10 @@
 #endif
     const uint64_t qkv_norm_start_us = moe_profile_now_us();
     moe_raw_tensor_cache_entry v_norm_shape{};
+    const int try_weighted_v_norm =
+        has_v ? moe_layer_has_weighted_v_norm_tensor(engine, layer) : 0;
     const int has_v_norm =
-        has_v ? get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_V_A_LAYER_NORM, &v_norm_shape) : 0;
+        try_weighted_v_norm ? get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_V_A_LAYER_NORM, &v_norm_shape) : 0;
     if (!moe_apply_optional_head_rmsnorm_f32(
             engine, layer, moe_RAW_TENSOR_Q_A_LAYER_NORM,
             s->q_b.data(), num_heads, head_dim, cfg.rms_norm_eps) ||

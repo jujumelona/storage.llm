@@ -216,9 +216,39 @@ static moe_attn_config_t moe_generation_layer_attn_config(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
+    static thread_local const moe_pc_engine* tls_engine = nullptr;
+    static thread_local uint64_t tls_generation = 0;
+    static thread_local std::vector<moe_attn_config_t> tls_cfg;
+    static thread_local std::vector<uint8_t> tls_ready;
+    if (engine && layer >= 0 && layer < 10000) {
+        const uint64_t generation = engine->engine_generation;
+        const size_t idx = (size_t)layer;
+        if (tls_engine != engine || tls_generation != generation) {
+            tls_engine = engine;
+            tls_generation = generation;
+            tls_cfg.clear();
+            tls_ready.clear();
+        }
+        if (tls_ready.size() > idx && tls_ready[idx]) {
+            return tls_cfg[idx];
+        }
+    }
+    auto cache_and_return = [&](const moe_attn_config_t& value_cfg) -> moe_attn_config_t {
+        if (engine && layer >= 0 && layer < 10000) {
+            const size_t idx = (size_t)layer;
+            if (tls_cfg.size() <= idx) {
+                tls_cfg.resize(idx + 1u);
+                tls_ready.resize(idx + 1u, 0u);
+            }
+            tls_cfg[idx] = value_cfg;
+            tls_ready[idx] = 1u;
+        }
+        return value_cfg;
+    };
+
     moe_attn_config_t cfg = moe_generation_attn_config(engine);
     if (!engine || cfg.type == moe_ATTN_TYPE_MLA || !moe_engine_uses_hybrid_local_global_attention(engine)) {
-        return cfg;
+        return cache_and_return(cfg);
     }
 
     uint64_t value = 0;
@@ -294,7 +324,7 @@ static moe_attn_config_t moe_generation_layer_attn_config(
         }
     }
     cfg.v_head_dim = cfg.head_dim;
-    return cfg;
+    return cache_and_return(cfg);
 }
 
 static uint32_t moe_attn_q_b_dim(const moe_attn_config_t& cfg) {

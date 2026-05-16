@@ -405,6 +405,59 @@ static int moe_attention_layer_contract_double_f32(
     return 0;
 }
 
+static int moe_layer_has_weighted_v_norm_tensor(
+    moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    static thread_local const moe_pc_engine* tls_cached_engine = nullptr;
+    static thread_local uint64_t tls_cached_generation = 0;
+    static thread_local size_t tls_cached_graph_size = 0;
+    static thread_local size_t tls_cached_metadata_size = 0;
+    static thread_local std::vector<int8_t> tls_cached_results;
+    const uint64_t generation = engine->engine_generation;
+    const size_t graph_size = engine->offload_graph_ir_json.size();
+    const size_t metadata_size = engine->offload_gguf_metadata_json.size();
+    const size_t layer_index = (size_t)layer;
+    int8_t* cached = nullptr;
+    if (layer_index < 10000u) {
+        if (tls_cached_engine != engine ||
+            tls_cached_generation != generation ||
+            tls_cached_graph_size != graph_size ||
+            tls_cached_metadata_size != metadata_size) {
+            tls_cached_engine = engine;
+            tls_cached_generation = generation;
+            tls_cached_graph_size = graph_size;
+            tls_cached_metadata_size = metadata_size;
+            tls_cached_results.clear();
+        }
+        if (tls_cached_results.size() <= layer_index) {
+            tls_cached_results.resize(layer_index + 1u, -1);
+        }
+        cached = &tls_cached_results[layer_index];
+        if (*cached >= 0) {
+            return *cached ? 1 : 0;
+        }
+    }
+
+    int result = 0;
+    if (moe_engine_has_common_tensor_suffix(engine, layer, "attn_v_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "value_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "v_norm.weight")) {
+        result = 1;
+    }
+    // Do not use graph-wide role text here: for current JUJU contracts
+    // value_norm=true often means unweighted V RMSNorm.  Trying the raw
+    // moe_RAW_TENSOR_V_A_LAYER_NORM path without a real layer-local tensor
+    // triggers a very expensive static fallback scan on every layer.
+    if (cached) {
+        *cached = result ? 1 : 0;
+    }
+    return result;
+}
+
 static int moe_layer_uses_unweighted_v_norm(
     moe_pc_engine* engine,
     int32_t layer
@@ -1219,7 +1272,10 @@ static int moe_layer_standard_attention_f32(
     moe_raw_tensor_cache_entry k_norm_shape{};
     const int has_q = get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_Q_A_PROJ, &q_shape);
     const int has_k = get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_KV_A_PROJ_WITH_MQA, &k_shape);
-    const int has_v = get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_KV_B_PROJ, &v_shape);
+    const int v_projection_absent_by_contract =
+        moe_engine_contract_allows_missing_v_projection(engine, layer);
+    const int has_v = v_projection_absent_by_contract ?
+        0 : get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_KV_B_PROJ, &v_shape);
     const int has_o = get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_O_PROJ, &o_shape);
     const int has_q_norm = get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_Q_A_LAYER_NORM, &q_norm_shape);
     const int has_k_norm = get_cached_raw_tensor(engine, layer, moe_RAW_TENSOR_KV_A_LAYER_NORM, &k_norm_shape);

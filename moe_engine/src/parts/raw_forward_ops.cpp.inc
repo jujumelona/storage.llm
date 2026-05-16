@@ -75,6 +75,17 @@ static int moe_engine_rmsnorm_unit_offset(
         }
     }
 
+    // Fast path: an explicit global RMSNorm semantics flag in metadata or the
+    // authoritative GraphIR applies to all RMSNorm weights in current JUJU
+    // artifacts.  Cache only that explicit global answer here; if there is no
+    // explicit flag, keep the per-raw-tensor cache below so mixed-semantics
+    // artifacts still work.  This avoids a full JSON scan for every q/k/post
+    // norm tensor on the first token.
+    const int global_cached = engine->cached_rmsnorm_unit_offset.load(std::memory_order_acquire);
+    if (global_cached >= 0) {
+        return global_cached ? 1 : 0;
+    }
+
     int value = 0;
     int metadata_value = -1;
     const char* metadata_source = "none";
@@ -92,8 +103,8 @@ static int moe_engine_rmsnorm_unit_offset(
         metadata_source = "graph_ir";
     }
 
-    const int direct_contract = moe_engine_contract_uses_direct_rmsnorm_weight(engine);
-    const int unit_contract = moe_engine_contract_uses_rmsnorm_unit_offset(engine);
+    int direct_contract = 0;
+    int unit_contract = 0;
 
     // Contract priority must be deterministic.  An explicit metadata/GraphIR
     // boolean is authoritative even when it is false; false must not be undone
@@ -101,24 +112,30 @@ static int moe_engine_rmsnorm_unit_offset(
     if (metadata_found) {
         value = metadata_value ? 1 : 0;
         source = metadata_source;
-    } else if (direct_contract) {
-        value = 0;
-        source = "direct_rmsnorm_contract";
-    } else if (unit_contract) {
-        value = 1;
-        source = "unit_offset_contract";
+        engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0, std::memory_order_release);
+    } else {
+        direct_contract = moe_engine_contract_uses_direct_rmsnorm_weight(engine);
+        unit_contract = moe_engine_contract_uses_rmsnorm_unit_offset(engine);
+        if (direct_contract) {
+            value = 0;
+            source = "direct_rmsnorm_contract";
+        } else if (unit_contract) {
+            value = 1;
+            source = "unit_offset_contract";
+        }
     }
 
     moe_profile_log(
         "rmsnorm_unit_offset",
-        "source=%s value=%d metadata=%d metadata_source=%s direct_contract=%d unit_contract=%d cache_key=%llu",
+        "source=%s value=%d metadata=%d metadata_source=%s direct_contract=%d unit_contract=%d cache_key=%llu global_cached=%d",
         source,
         value ? 1 : 0,
         metadata_value,
         metadata_source,
         direct_contract ? 1 : 0,
         unit_contract ? 1 : 0,
-        (unsigned long long)cache_key);
+        (unsigned long long)cache_key,
+        engine->cached_rmsnorm_unit_offset.load(std::memory_order_relaxed));
     if (cache_key) {
         std::unique_lock<std::shared_mutex> lock(engine->rmsnorm_unit_offset_cache_mutex);
         engine->rmsnorm_unit_offset_cache[cache_key] = value ? 1 : 0;

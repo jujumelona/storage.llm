@@ -935,14 +935,42 @@ static int map_common_tensor_record(
         return 0;
     }
     const std::string& path = engine->tensor_paths[rec.resolved_path_index];
-    mmap_context_t* mapped = get_or_map_shard_partial(engine, path, rec.file_offset, rec.bytes);
-    if (!mapped || !mmap_get_ptr(mapped, 0) || rec.bytes > (uint64_t)mmap_get_size(mapped)) {
-        return 0;
+    // CPU-RAM JUJU execution already builds full-shard hot views.  Reusing the
+    // full shard mmap here avoids creating one partial mmap/VMA per Q/K/V/norm
+    // tensor during the first token.  The previous partial-mmap path made the
+    // raw descriptor resolver spend seconds per layer before any dot product
+    // ran, which showed up as attn_standard_map / rmsnorm / qkv_norm stalls.
+    mmap_context_t* mapped = nullptr;
+    const uint8_t* mapped_base = nullptr;
+    uint64_t mapped_size = 0;
+    int common_tensor_full_shard = 0;
+    if (engine->cpu_only_runtime.load(std::memory_order_relaxed) ||
+        engine->cpu_hot_tensor_views_ready.load(std::memory_order_acquire)) {
+        mapped = get_or_map_shard(engine, path);
+        mapped_base = mapped ? static_cast<const uint8_t*>(mmap_get_ptr(mapped, 0)) : nullptr;
+        mapped_size = mapped ? (uint64_t)mmap_get_size(mapped) : 0ull;
+        if (!mapped || !mapped_base || rec.file_offset > mapped_size ||
+            rec.bytes > mapped_size - rec.file_offset) {
+            mapped = nullptr;
+            mapped_base = nullptr;
+            mapped_size = 0;
+            common_tensor_full_shard = 0;
+        } else {
+            common_tensor_full_shard = 1;
+        }
+    }
+    if (!mapped) {
+        mapped = get_or_map_shard_partial(engine, path, rec.file_offset, rec.bytes);
+        mapped_base = mapped ? static_cast<const uint8_t*>(mmap_get_ptr(mapped, 0)) : nullptr;
+        mapped_size = mapped ? (uint64_t)mmap_get_size(mapped) : 0ull;
+        if (!mapped || !mapped_base || rec.bytes > mapped_size) {
+            return 0;
+        }
     }
     moe_raw_tensor_cache_entry entry{};
     entry.span = nullptr;
     entry.mapped = mapped;
-    entry.base = static_cast<const uint8_t*>(mmap_get_ptr(mapped, 0));
+    entry.base = mapped_base + (common_tensor_full_shard ? rec.file_offset : 0ull);
     entry.rel_offset = 0;
     entry.bytes = rec.bytes;
     entry.rows = desc.rows;

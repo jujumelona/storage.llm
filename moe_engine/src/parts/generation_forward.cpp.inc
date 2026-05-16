@@ -291,6 +291,22 @@ static moe_decoder_layer_plan_t moe_build_decoder_layer_plan(
     const moe_attn_config_t* base_attn_cfg,
     uint32_t layer
 ) {
+    static thread_local const moe_pc_engine* tls_engine = nullptr;
+    static thread_local uint64_t tls_generation = 0;
+    static thread_local std::vector<moe_decoder_layer_plan_t> tls_plans;
+    static thread_local std::vector<uint8_t> tls_plan_ready;
+    if (engine && layer < 10000u) {
+        const uint64_t generation = engine->engine_generation;
+        if (tls_engine != engine || tls_generation != generation) {
+            tls_engine = engine;
+            tls_generation = generation;
+            tls_plans.clear();
+            tls_plan_ready.clear();
+        }
+        if (tls_plan_ready.size() > layer && tls_plan_ready[layer]) {
+            return tls_plans[layer];
+        }
+    }
     moe_decoder_layer_plan_t plan{};
     plan.graph_required = moe_graph_ir_math_required(engine) ? 1 : 0;
     plan.split_post_norm_block =
@@ -334,6 +350,14 @@ static moe_decoder_layer_plan_t moe_build_decoder_layer_plan(
         }
     } else {
         plan.apply_layer_output_scale = 1;
+    }
+    if (engine && layer < 10000u) {
+        if (tls_plans.size() <= layer) {
+            tls_plans.resize((size_t)layer + 1u);
+            tls_plan_ready.resize((size_t)layer + 1u, 0u);
+        }
+        tls_plans[layer] = plan;
+        tls_plan_ready[layer] = 1u;
     }
     return plan;
 }
