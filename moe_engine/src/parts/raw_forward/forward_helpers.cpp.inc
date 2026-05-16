@@ -53,6 +53,266 @@ static int moe_ascii_contains_ci(const std::string& haystack, const char* needle
     return 0;
 }
 
+static uint64_t moe_contract_cache_key_f32(uint32_t doc_index, int32_t layer) {
+    const uint64_t d = (uint64_t)(doc_index & 0xffffu);
+    const uint64_t l = (uint64_t)(uint32_t)std::max<int32_t>(0, layer);
+    return (d << 48) | l;
+}
+
+static const std::string* moe_contract_doc_by_index_f32(
+    const moe_pc_engine* engine,
+    uint32_t doc_index
+) {
+    if (!engine) {
+        return nullptr;
+    }
+    if (doc_index == 0u) {
+        return &engine->offload_graph_ir_json;
+    }
+    if (doc_index == 1u) {
+        return &engine->offload_gguf_metadata_json;
+    }
+    return nullptr;
+}
+
+static const char* moe_contract_doc_name_f32(uint32_t doc_index) {
+    return doc_index == 0u ? "graph_ir" : (doc_index == 1u ? "metadata" : "unknown");
+}
+
+static int moe_contract_slice_matches_layer_f32(
+    const std::string& doc,
+    size_t begin,
+    size_t end,
+    int32_t layer,
+    uint64_t implicit_index
+) {
+    if (doc.empty() || begin >= end || end > doc.size() || layer < 0) {
+        return 0;
+    }
+    uint64_t parsed = UINT64_MAX;
+    int saw_explicit = 0;
+    static const char* const u64_keys[] = {
+        "layer", "layer_index", "layer_id", "block", "block_index", "idx", "index"
+    };
+    for (const char* key : u64_keys) {
+        if (moe_json_get_u64_slice(doc, begin, end, key, &parsed)) {
+            saw_explicit = 1;
+            if (parsed == (uint64_t)layer) {
+                return 1;
+            }
+        }
+    }
+    std::string text;
+    const std::string want = std::to_string((long long)layer);
+    static const char* const string_keys[] = {
+        "layer", "layer_index", "layer_id", "block", "block_index"
+    };
+    for (const char* key : string_keys) {
+        if (moe_json_get_string_slice(doc, begin, end, key, &text)) {
+            saw_explicit = 1;
+            if (text == want) {
+                return 1;
+            }
+        }
+    }
+    return (!saw_explicit && implicit_index != UINT64_MAX && implicit_index == (uint64_t)layer) ? 1 : 0;
+}
+
+static int moe_parse_nonnegative_i32_text_f32(const std::string& text, int32_t* out) {
+    if (out) {
+        *out = -1;
+    }
+    if (!out || text.empty()) {
+        return 0;
+    }
+    uint64_t v = 0;
+    for (char ch : text) {
+        if (ch < '0' || ch > '9') {
+            return 0;
+        }
+        v = v * 10u + (uint64_t)(ch - '0');
+        if (v > (uint64_t)INT32_MAX) {
+            return 0;
+        }
+    }
+    *out = (int32_t)v;
+    return 1;
+}
+
+static int moe_contract_slice_layer_index_f32(
+    const std::string& doc,
+    size_t begin,
+    size_t end,
+    uint64_t implicit_index,
+    int32_t* out_layer
+) {
+    if (out_layer) {
+        *out_layer = -1;
+    }
+    if (doc.empty() || begin >= end || end > doc.size() || !out_layer) {
+        return 0;
+    }
+    uint64_t parsed = UINT64_MAX;
+    int saw_explicit = 0;
+    static const char* const u64_keys[] = {
+        "layer", "layer_index", "layer_id", "block", "block_index", "idx", "index"
+    };
+    for (const char* key : u64_keys) {
+        if (moe_json_get_u64_slice(doc, begin, end, key, &parsed)) {
+            saw_explicit = 1;
+            if (parsed <= (uint64_t)INT32_MAX) {
+                *out_layer = (int32_t)parsed;
+                return 1;
+            }
+        }
+    }
+    std::string text;
+    static const char* const string_keys[] = {
+        "layer", "layer_index", "layer_id", "block", "block_index"
+    };
+    for (const char* key : string_keys) {
+        if (moe_json_get_string_slice(doc, begin, end, key, &text)) {
+            saw_explicit = 1;
+            if (moe_parse_nonnegative_i32_text_f32(text, out_layer)) {
+                return 1;
+            }
+        }
+    }
+    if (!saw_explicit && implicit_index != UINT64_MAX && implicit_index <= (uint64_t)INT32_MAX) {
+        *out_layer = (int32_t)implicit_index;
+        return 1;
+    }
+    return 0;
+}
+
+static int moe_contract_all_layer_rows_uncached_f32(
+    const std::string& doc,
+    uint32_t doc_index,
+    std::unordered_map<uint64_t, std::vector<std::pair<size_t, size_t>>>* out_rows
+) {
+    if (!out_rows || doc.empty()) {
+        return 0;
+    }
+    out_rows->clear();
+    size_t search_pos = 0;
+    size_t arr_begin = 0;
+    size_t arr_end = 0;
+    while (moe_json_find_next_array_local(
+               doc, "layer_execution_contract_table", search_pos,
+               &arr_begin, &arr_end) != std::string::npos) {
+        search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
+        size_t cursor = arr_begin + 1u;
+        uint64_t row_ordinal = 0;
+        while (cursor < arr_end) {
+            size_t obj_begin = 0;
+            size_t obj_end = 0;
+            if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+                break;
+            }
+            const uint64_t this_row_ordinal = row_ordinal++;
+            int32_t row_layer = -1;
+            if (moe_contract_slice_layer_index_f32(
+                    doc, obj_begin, obj_end, this_row_ordinal, &row_layer) &&
+                row_layer >= 0) {
+                (*out_rows)[moe_contract_cache_key_f32(doc_index, row_layer)].push_back(
+                    std::make_pair(obj_begin, obj_end));
+            }
+        }
+    }
+    return out_rows->empty() ? 0 : 1;
+}
+
+static int moe_contract_layer_rows_uncached_f32(
+    const std::string& doc,
+    int32_t layer,
+    std::vector<std::pair<size_t, size_t>>* out_rows
+) {
+    if (out_rows) {
+        out_rows->clear();
+    }
+    if (!out_rows || doc.empty() || layer < 0) {
+        return 0;
+    }
+    size_t search_pos = 0;
+    size_t arr_begin = 0;
+    size_t arr_end = 0;
+    while (moe_json_find_next_array_local(
+               doc, "layer_execution_contract_table", search_pos,
+               &arr_begin, &arr_end) != std::string::npos) {
+        search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
+        size_t cursor = arr_begin + 1u;
+        uint64_t row_ordinal = 0;
+        while (cursor < arr_end) {
+            size_t obj_begin = 0;
+            size_t obj_end = 0;
+            if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+                break;
+            }
+            const uint64_t this_row_ordinal = row_ordinal++;
+            if (moe_contract_slice_matches_layer_f32(
+                    doc, obj_begin, obj_end, layer, this_row_ordinal)) {
+                out_rows->push_back(std::make_pair(obj_begin, obj_end));
+            }
+        }
+    }
+    return out_rows->empty() ? 0 : 1;
+}
+
+static int moe_contract_layer_rows_cached_f32(
+    const moe_pc_engine* engine,
+    uint32_t doc_index,
+    int32_t layer,
+    std::vector<std::pair<size_t, size_t>>* out_rows
+) {
+    if (out_rows) {
+        out_rows->clear();
+    }
+    const std::string* doc = moe_contract_doc_by_index_f32(engine, doc_index);
+    if (!engine || !doc || doc->empty() || layer < 0 || !out_rows) {
+        return 0;
+    }
+    const uint64_t key = moe_contract_cache_key_f32(doc_index, layer);
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->layer_contract_rows_cache_mutex);
+        auto it = engine->layer_contract_rows_cache.find(key);
+        if (it != engine->layer_contract_rows_cache.end()) {
+            *out_rows = it->second;
+            return out_rows->empty() ? 0 : 1;
+        }
+        if (engine->layer_contract_rows_cache_built_docs.find(doc_index) !=
+            engine->layer_contract_rows_cache_built_docs.end()) {
+            return 0;
+        }
+    }
+
+    std::unordered_map<uint64_t, std::vector<std::pair<size_t, size_t>>> all_rows;
+    const int built_any = moe_contract_all_layer_rows_uncached_f32(*doc, doc_index, &all_rows);
+    if (!built_any) {
+        std::vector<std::pair<size_t, size_t>> rows;
+        (void)moe_contract_layer_rows_uncached_f32(*doc, layer, &rows);
+        all_rows[key] = rows;
+    } else if (all_rows.find(key) == all_rows.end()) {
+        all_rows[key] = std::vector<std::pair<size_t, size_t>>{};
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->layer_contract_rows_cache_mutex);
+        if (engine->layer_contract_rows_cache_built_docs.find(doc_index) ==
+            engine->layer_contract_rows_cache_built_docs.end()) {
+            for (auto& kv : all_rows) {
+                engine->layer_contract_rows_cache[kv.first] = std::move(kv.second);
+            }
+            engine->layer_contract_rows_cache_built_docs.insert(doc_index);
+        }
+        auto it = engine->layer_contract_rows_cache.find(key);
+        if (it != engine->layer_contract_rows_cache.end()) {
+            *out_rows = it->second;
+            return out_rows->empty() ? 0 : 1;
+        }
+    }
+    return 0;
+}
+
 static int moe_graph_ir_tensor_binding_name(
     const moe_pc_engine* engine,
     const char* key,
@@ -513,43 +773,20 @@ static int moe_engine_contract_has_router_input_scale(
         }
         return 0;
     };
-    const std::string* docs[] = {
-        &engine->offload_graph_ir_json,
-        &engine->offload_gguf_metadata_json,
-    };
-    for (const std::string* docp : docs) {
+    for (uint32_t doc_i = 0; doc_i < 2u; ++doc_i) {
+        const std::string* docp = moe_contract_doc_by_index_f32(engine, doc_i);
         if (!docp || docp->empty()) {
             continue;
         }
         const std::string& doc = *docp;
-        size_t search_pos = 0;
-        size_t arr_begin = 0;
-        size_t arr_end = 0;
-        while (moe_json_find_next_array_local(
-                   doc, "layer_execution_contract_table", search_pos,
-                   &arr_begin, &arr_end) != std::string::npos) {
-            search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
-            size_t cursor = arr_begin + 1u;
-            uint64_t ordinal = 0;
-            while (cursor < arr_end) {
-            size_t obj_begin = 0;
-            size_t obj_end = 0;
-            if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
-                break;
-            }
-            const uint64_t this_ordinal = ordinal++;
-            uint64_t parsed = UINT64_MAX;
-            int match = 0;
-            if (moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed) ||
-                moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer_index", &parsed) ||
-                moe_json_get_u64_slice(doc, obj_begin, obj_end, "idx", &parsed) ||
-                moe_json_get_u64_slice(doc, obj_begin, obj_end, "block", &parsed) ||
-                moe_json_get_u64_slice(doc, obj_begin, obj_end, "block_index", &parsed)) {
-                match = parsed == (uint64_t)layer ? 1 : 0;
-            } else {
-                match = this_ordinal == (uint64_t)layer ? 1 : 0;
-            }
-            if (!match) {
+        std::vector<std::pair<size_t, size_t>> rows;
+        if (!moe_contract_layer_rows_cached_f32(engine, doc_i, layer, &rows)) {
+            continue;
+        }
+        for (const auto& row_range : rows) {
+            const size_t obj_begin = row_range.first;
+            const size_t obj_end = row_range.second;
+            if (obj_begin >= obj_end || obj_end > doc.size()) {
                 continue;
             }
             const std::string row = doc.substr(obj_begin, obj_end - obj_begin);
@@ -567,7 +804,6 @@ static int moe_engine_contract_has_router_input_scale(
             }
             if (scope_declares_scale(doc, obj_begin, obj_end)) {
                 return 1;
-            }
             }
         }
     }
@@ -636,61 +872,37 @@ static int moe_engine_contract_declares_direct_router_input_activation_scale(
         }
         return 0;
     };
-    const std::string* docs[] = {
-        &engine->offload_graph_ir_json,
-        &engine->offload_gguf_metadata_json,
-    };
-    for (const std::string* docp : docs) {
+    for (uint32_t doc_i = 0; doc_i < 2u; ++doc_i) {
+        const std::string* docp = moe_contract_doc_by_index_f32(engine, doc_i);
         if (!docp || docp->empty()) {
             continue;
         }
         const std::string& doc = *docp;
-        size_t search_pos = 0;
-        size_t arr_begin = 0;
-        size_t arr_end = 0;
-        while (moe_json_find_next_array_local(
-                   doc, "layer_execution_contract_table", search_pos,
-                   &arr_begin, &arr_end) != std::string::npos) {
-            search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
-            size_t cursor = arr_begin + 1u;
-            uint64_t ordinal = 0;
-            while (cursor < arr_end) {
-                size_t obj_begin = 0;
-                size_t obj_end = 0;
-                if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
-                    break;
-                }
-                const uint64_t this_ordinal = ordinal++;
-                uint64_t parsed = UINT64_MAX;
-                int match = 0;
-                if (moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed) ||
-                    moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer_index", &parsed) ||
-                    moe_json_get_u64_slice(doc, obj_begin, obj_end, "idx", &parsed) ||
-                    moe_json_get_u64_slice(doc, obj_begin, obj_end, "block", &parsed) ||
-                    moe_json_get_u64_slice(doc, obj_begin, obj_end, "block_index", &parsed)) {
-                    match = parsed == (uint64_t)layer ? 1 : 0;
-                } else {
-                    match = this_ordinal == (uint64_t)layer ? 1 : 0;
-                }
-                if (!match) {
-                    continue;
-                }
-                const std::string row = doc.substr(obj_begin, obj_end - obj_begin);
-                size_t router_begin = 0;
-                size_t router_end = 0;
-                if (moe_json_find_object_local(row, "router", &router_begin, &router_end) &&
-                    scope_declares_direct_scale(doc, obj_begin + router_begin, obj_begin + router_end)) {
-                    return 1;
-                }
-                size_t semantic_begin = 0;
-                size_t semantic_end = 0;
-                if (moe_json_find_object_local(row, "semantic_contract", &semantic_begin, &semantic_end) &&
-                    scope_declares_direct_scale(doc, obj_begin + semantic_begin, obj_begin + semantic_end)) {
-                    return 1;
-                }
-                if (scope_declares_direct_scale(doc, obj_begin, obj_end)) {
-                    return 1;
-                }
+        std::vector<std::pair<size_t, size_t>> rows;
+        if (!moe_contract_layer_rows_cached_f32(engine, doc_i, layer, &rows)) {
+            continue;
+        }
+        for (const auto& row_range : rows) {
+            const size_t obj_begin = row_range.first;
+            const size_t obj_end = row_range.second;
+            if (obj_begin >= obj_end || obj_end > doc.size()) {
+                continue;
+            }
+            const std::string row = doc.substr(obj_begin, obj_end - obj_begin);
+            size_t router_begin = 0;
+            size_t router_end = 0;
+            if (moe_json_find_object_local(row, "router", &router_begin, &router_end) &&
+                scope_declares_direct_scale(doc, obj_begin + router_begin, obj_begin + router_end)) {
+                return 1;
+            }
+            size_t semantic_begin = 0;
+            size_t semantic_end = 0;
+            if (moe_json_find_object_local(row, "semantic_contract", &semantic_begin, &semantic_end) &&
+                scope_declares_direct_scale(doc, obj_begin + semantic_begin, obj_begin + semantic_end)) {
+                return 1;
+            }
+            if (scope_declares_direct_scale(doc, obj_begin, obj_end)) {
+                return 1;
             }
         }
     }
@@ -958,33 +1170,20 @@ static int moe_engine_contract_allows_missing_v_projection_explicit(
     if (!engine || layer < 0) {
         return 0;
     }
-    const std::string* docs[] = {
-        &engine->offload_graph_ir_json,
-        &engine->offload_gguf_metadata_json,
-    };
-    for (const std::string* docp : docs) {
+    for (uint32_t doc_i = 0; doc_i < 2u; ++doc_i) {
+        const std::string* docp = moe_contract_doc_by_index_f32(engine, doc_i);
         if (!docp || docp->empty()) {
             continue;
         }
         const std::string& doc = *docp;
-        size_t search_pos = 0;
-        size_t arr_begin = 0;
-        size_t arr_end = 0;
-        while (moe_json_find_next_array_local(
-                   doc, "layer_execution_contract_table", search_pos,
-                   &arr_begin, &arr_end) != std::string::npos) {
-            search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
-            size_t cursor = arr_begin + 1u;
-            uint64_t row_ordinal = 0;
-            while (cursor < arr_end) {
-            size_t obj_begin = 0;
-            size_t obj_end = 0;
-            if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
-                break;
-            }
-            const uint64_t this_row_ordinal = row_ordinal++;
-            if (!moe_engine_contract_row_matches_layer_raw(
-                    doc, obj_begin, obj_end, layer, this_row_ordinal)) {
+        std::vector<std::pair<size_t, size_t>> rows;
+        if (!moe_contract_layer_rows_cached_f32(engine, doc_i, layer, &rows)) {
+            continue;
+        }
+        for (const auto& row_range : rows) {
+            const size_t obj_begin = row_range.first;
+            const size_t obj_end = row_range.second;
+            if (obj_begin >= obj_end || obj_end > doc.size()) {
                 continue;
             }
             size_t attn_begin = obj_begin;
@@ -1029,7 +1228,6 @@ static int moe_engine_contract_allows_missing_v_projection_explicit(
             // A matching row without any V-projection semantic keys can be
             // a small runtime/stub contract. Keep scanning later contract
             // tables for the generated .juju.idx authoritative row.
-        }
         }
     }
     return 0;

@@ -339,67 +339,45 @@ static int moe_attention_layer_contract_double_f32(
     if (!engine || layer < 0 || !keys || !out) {
         return 0;
     }
-    const std::string* docs[] = {
-        &engine->offload_graph_ir_json,
-        &engine->offload_gguf_metadata_json,
-    };
-    const char* doc_names[] = {
+    static const char* const doc_names[] = {
         "graph_ir.layer_execution_contract_table",
         "metadata.layer_execution_contract_table",
     };
-    for (size_t doc_i = 0; doc_i < sizeof(docs) / sizeof(docs[0]); ++doc_i) {
-        const std::string* doc = docs[doc_i];
+    for (uint32_t doc_i = 0; doc_i < 2u; ++doc_i) {
+        const std::string* doc = moe_contract_doc_by_index_f32(engine, doc_i);
         if (!doc || doc->empty()) {
             continue;
         }
-        size_t search_pos = 0;
-        size_t arr_begin = 0;
-        size_t arr_end = 0;
-        while (moe_json_find_next_array_for_key_local(
-            *doc, "layer_execution_contract_table", search_pos, &arr_begin, &arr_end) != std::string::npos) {
-            size_t cursor = arr_begin + 1u;
-            uint64_t row_ordinal = 0;
-            while (cursor < arr_end) {
-                size_t obj_begin = 0;
-                size_t obj_end = 0;
-                if (!moe_json_next_object_in_array(*doc, &cursor, arr_end, &obj_begin, &obj_end)) {
-                    break;
-                }
-                const uint64_t this_row_ordinal = row_ordinal++;
-                uint64_t row_layer = UINT64_MAX;
-                int layer_match = 0;
-                if (moe_json_get_u64_slice(*doc, obj_begin, obj_end, "layer", &row_layer) ||
-                    moe_json_get_u64_slice(*doc, obj_begin, obj_end, "layer_index", &row_layer) ||
-                    moe_json_get_u64_slice(*doc, obj_begin, obj_end, "idx", &row_layer)) {
-                    layer_match = row_layer == (uint64_t)layer ? 1 : 0;
-                } else {
-                    layer_match = this_row_ordinal == (uint64_t)layer ? 1 : 0;
-                }
-                if (!layer_match) {
+        std::vector<std::pair<size_t, size_t>> rows;
+        if (!moe_contract_layer_rows_cached_f32(engine, doc_i, layer, &rows)) {
+            continue;
+        }
+        for (const auto& row_pair : rows) {
+            const size_t obj_begin = row_pair.first;
+            const size_t obj_end = row_pair.second;
+            if (obj_begin >= obj_end || obj_end > doc->size()) {
+                continue;
+            }
+            size_t attn_begin = 0;
+            size_t attn_end = 0;
+            const std::string row = doc->substr(obj_begin, obj_end - obj_begin);
+            const int has_attention = moe_json_find_object_local(row, "attention", &attn_begin, &attn_end);
+            for (size_t i = 0; i < key_count; ++i) {
+                if (!keys[i]) {
                     continue;
                 }
-                size_t attn_begin = 0;
-                size_t attn_end = 0;
-                const std::string row = doc->substr(obj_begin, obj_end - obj_begin);
-                const int has_attention = moe_json_find_object_local(row, "attention", &attn_begin, &attn_end);
-                for (size_t i = 0; i < key_count; ++i) {
-                    if (!keys[i]) {
-                        continue;
-                    }
-                    if (has_attention && moe_json_get_double_slice(
-                            row, attn_begin, attn_end, keys[i], out) &&
-                        *out > 0.0 && std::isfinite(*out)) {
-                        if (out_source) *out_source = doc_names[doc_i];
-                        return 1;
-                    }
-                    if (moe_json_get_double_slice(*doc, obj_begin, obj_end, keys[i], out) &&
-                        *out > 0.0 && std::isfinite(*out)) {
-                        if (out_source) *out_source = doc_names[doc_i];
-                        return 1;
-                    }
+                if (has_attention && moe_json_get_double_slice(
+                        row, attn_begin, attn_end, keys[i], out) &&
+                    *out > 0.0 && std::isfinite(*out)) {
+                    if (out_source) *out_source = doc_names[doc_i];
+                    return 1;
+                }
+                if (moe_json_get_double_slice(*doc, obj_begin, obj_end, keys[i], out) &&
+                    *out > 0.0 && std::isfinite(*out)) {
+                    if (out_source) *out_source = doc_names[doc_i];
+                    return 1;
                 }
             }
-            search_pos = arr_end;
         }
     }
     return 0;
@@ -991,141 +969,118 @@ static int moe_attention_layer_rope_contract_f32(
     if (!engine || layer < 0 || !out) {
         return 0;
     }
-    const std::string* docs[] = {
-        &engine->offload_graph_ir_json,
-        &engine->offload_gguf_metadata_json,
-    };
-    const char* doc_names[] = { "graph_ir", "metadata" };
-    for (size_t doc_i = 0; doc_i < sizeof(docs) / sizeof(docs[0]); ++doc_i) {
-        const std::string* doc = docs[doc_i];
+    static const char* const doc_names[] = { "graph_ir", "metadata" };
+    for (uint32_t doc_i = 0; doc_i < 2u; ++doc_i) {
+        const std::string* doc = moe_contract_doc_by_index_f32(engine, doc_i);
         if (!doc || doc->empty()) {
             continue;
         }
-        size_t search_pos = 0;
-        size_t arr_begin = 0;
-        size_t arr_end = 0;
-        while (moe_json_find_next_array_for_key_local(
-            *doc, "layer_execution_contract_table", search_pos, &arr_begin, &arr_end) != std::string::npos) {
-            size_t cursor = arr_begin + 1u;
-            uint64_t row_ordinal = 0;
-            while (cursor < arr_end) {
-                size_t obj_begin = 0;
-                size_t obj_end = 0;
-                if (!moe_json_next_object_in_array(*doc, &cursor, arr_end, &obj_begin, &obj_end)) {
-                    break;
-                }
-                const uint64_t this_row_ordinal = row_ordinal++;
-                uint64_t row_layer = UINT64_MAX;
-                int layer_match = 0;
-                if (moe_json_get_u64_slice(*doc, obj_begin, obj_end, "layer", &row_layer) ||
-                    moe_json_get_u64_slice(*doc, obj_begin, obj_end, "layer_index", &row_layer) ||
-                    moe_json_get_u64_slice(*doc, obj_begin, obj_end, "idx", &row_layer)) {
-                    layer_match = row_layer == (uint64_t)layer ? 1 : 0;
-                } else {
-                    layer_match = this_row_ordinal == (uint64_t)layer ? 1 : 0;
-                }
-                if (!layer_match) {
-                    continue;
-                }
-
-                std::string attention_kind;
-                (void)moe_json_get_string_slice(*doc, obj_begin, obj_end, "attention_kind", &attention_kind);
-
-                const std::string row = doc->substr(obj_begin, obj_end - obj_begin);
-                std::string scope = row;
-                size_t attn_begin = 0;
-                size_t attn_end = 0;
-                if (moe_json_find_object_local(row, "attention", &attn_begin, &attn_end) && attn_end > attn_begin) {
-                    scope = row.substr(attn_begin, attn_end - attn_begin);
-                }
-                size_t rope_begin = 0;
-                size_t rope_end = 0;
-                std::string rope_scope;
-                if (moe_json_find_object_local(scope, "rope_contract", &rope_begin, &rope_end) && rope_end > rope_begin) {
-                    rope_scope = scope.substr(rope_begin, rope_end - rope_begin);
-                } else if (moe_json_find_object_local(row, "rope_contract", &rope_begin, &rope_end) && rope_end > rope_begin) {
-                    rope_scope = row.substr(rope_begin, rope_end - rope_begin);
-                } else {
-                    continue;
-                }
-
-                moe_attention_rope_contract_t resolved{};
-                resolved.present = 1;
-                uint64_t uvalue = 0;
-                double dvalue = 0.0;
-                int bvalue = 0;
-                if (moe_json_get_u64_local(rope_scope, "rope_dim", &uvalue) ||
-                    moe_json_get_u64_local(rope_scope, "rope_dimension_count", &uvalue) ||
-                    moe_json_get_u64_local(rope_scope, "qk_rope_head_dim", &uvalue)) {
-                    if (uvalue > 0 && uvalue <= UINT32_MAX) {
-                        resolved.rope_dim = (uint32_t)uvalue;
-                    }
-                }
-                if (moe_json_get_u64_local(rope_scope, "frequency_dim", &uvalue) ||
-                    moe_json_get_u64_local(rope_scope, "rope_frequency_dim", &uvalue)) {
-                    if (uvalue > 0 && uvalue <= UINT32_MAX) {
-                        resolved.frequency_dim = (uint32_t)uvalue;
-                    }
-                }
-                if ((moe_json_get_double_local(rope_scope, "theta", &dvalue) ||
-                     moe_json_get_double_local(rope_scope, "rope_theta", &dvalue)) &&
-                    dvalue > 0.0 && std::isfinite(dvalue)) {
-                    resolved.theta = (float)dvalue;
-                }
-                if (moe_json_get_double_local(rope_scope, "partial_rotary_factor", &dvalue) &&
-                    dvalue > 0.0 && dvalue <= 1.0 && std::isfinite(dvalue) &&
-                    head_dim > 0 && resolved.rope_dim == 0) {
-                    uint32_t partial_dim = (uint32_t)std::round((double)head_dim * dvalue);
-                    if (partial_dim < 2u) partial_dim = 2u;
-                    if (partial_dim > head_dim) partial_dim = head_dim;
-                    resolved.rope_dim = partial_dim;
-                }
-                if (moe_json_get_bool_local(rope_scope, "rotate_half", &bvalue)) {
-                    resolved.rotate_half_known = 1;
-                    resolved.rotate_half = bvalue ? 1 : 0;
-                }
-                if (moe_json_get_bool_local(
-                        rope_scope,
-                        "proportional_frequency_dim_uses_full_head_dim",
-                        &bvalue)) {
-                    resolved.proportional_frequency_known = 1;
-                    resolved.proportional_frequency_dim_uses_full_head_dim = bvalue ? 1 : 0;
-                }
-                std::string rope_type;
-                if (moe_json_get_string_local(rope_scope, "rope_type", &rope_type) ||
-                    moe_json_get_string_local(rope_scope, "type", &rope_type)) {
-                    if (moe_ascii_contains_ci(rope_type, "proportional")) {
-                        resolved.proportional_frequency_known = 1;
-                        resolved.proportional_frequency_dim_uses_full_head_dim = 1;
-                    }
-                }
-                if (resolved.frequency_dim == 0 && resolved.proportional_frequency_dim_uses_full_head_dim && head_dim > 0) {
-                    resolved.frequency_dim = head_dim;
-                }
-                if (resolved.frequency_dim == 0 && resolved.rope_dim > 0) {
-                    resolved.frequency_dim = resolved.rope_dim;
-                }
-                if (resolved.rope_dim > 0 && head_dim > 0 && resolved.rope_dim > head_dim) {
-                    resolved.rope_dim = head_dim;
-                }
-                if (resolved.frequency_dim > 0 && head_dim > 0 && resolved.frequency_dim > head_dim) {
-                    resolved.frequency_dim = head_dim;
-                }
-                *out = resolved;
-                moe_profile_log(
-                    "attn_rope_contract",
-                    "layer=%d source=%s attention_kind=%s rope_dim=%u freq_dim=%u theta=%.6g rotate_half=%d proportional=%d",
-                    layer,
-                    doc_names[doc_i],
-                    attention_kind.empty() ? "" : attention_kind.c_str(),
-                    resolved.rope_dim,
-                    resolved.frequency_dim,
-                    (double)resolved.theta,
-                    resolved.rotate_half_known ? resolved.rotate_half : -1,
-                    resolved.proportional_frequency_known ? resolved.proportional_frequency_dim_uses_full_head_dim : -1);
-                return 1;
+        std::vector<std::pair<size_t, size_t>> rows;
+        if (!moe_contract_layer_rows_cached_f32(engine, doc_i, layer, &rows)) {
+            continue;
+        }
+        for (const auto& row_pair : rows) {
+            const size_t obj_begin = row_pair.first;
+            const size_t obj_end = row_pair.second;
+            if (obj_begin >= obj_end || obj_end > doc->size()) {
+                continue;
             }
-            search_pos = arr_end;
+            std::string attention_kind;
+            (void)moe_json_get_string_slice(*doc, obj_begin, obj_end, "attention_kind", &attention_kind);
+
+            const std::string row = doc->substr(obj_begin, obj_end - obj_begin);
+            std::string scope = row;
+            size_t attn_begin = 0;
+            size_t attn_end = 0;
+            if (moe_json_find_object_local(row, "attention", &attn_begin, &attn_end) && attn_end > attn_begin) {
+                scope = row.substr(attn_begin, attn_end - attn_begin);
+            }
+            size_t rope_begin = 0;
+            size_t rope_end = 0;
+            std::string rope_scope;
+            if (moe_json_find_object_local(scope, "rope_contract", &rope_begin, &rope_end) && rope_end > rope_begin) {
+                rope_scope = scope.substr(rope_begin, rope_end - rope_begin);
+            } else if (moe_json_find_object_local(row, "rope_contract", &rope_begin, &rope_end) && rope_end > rope_begin) {
+                rope_scope = row.substr(rope_begin, rope_end - rope_begin);
+            } else {
+                continue;
+            }
+
+            moe_attention_rope_contract_t resolved{};
+            resolved.present = 1;
+            uint64_t uvalue = 0;
+            double dvalue = 0.0;
+            int bvalue = 0;
+            if (moe_json_get_u64_local(rope_scope, "rope_dim", &uvalue) ||
+                moe_json_get_u64_local(rope_scope, "rope_dimension_count", &uvalue) ||
+                moe_json_get_u64_local(rope_scope, "qk_rope_head_dim", &uvalue)) {
+                if (uvalue > 0 && uvalue <= UINT32_MAX) {
+                    resolved.rope_dim = (uint32_t)uvalue;
+                }
+            }
+            if (moe_json_get_u64_local(rope_scope, "frequency_dim", &uvalue) ||
+                moe_json_get_u64_local(rope_scope, "rope_frequency_dim", &uvalue)) {
+                if (uvalue > 0 && uvalue <= UINT32_MAX) {
+                    resolved.frequency_dim = (uint32_t)uvalue;
+                }
+            }
+            if ((moe_json_get_double_local(rope_scope, "theta", &dvalue) ||
+                 moe_json_get_double_local(rope_scope, "rope_theta", &dvalue)) &&
+                dvalue > 0.0 && std::isfinite(dvalue)) {
+                resolved.theta = (float)dvalue;
+            }
+            if (moe_json_get_double_local(rope_scope, "partial_rotary_factor", &dvalue) &&
+                dvalue > 0.0 && dvalue <= 1.0 && std::isfinite(dvalue) &&
+                head_dim > 0 && resolved.rope_dim == 0) {
+                uint32_t partial_dim = (uint32_t)std::round((double)head_dim * dvalue);
+                if (partial_dim < 2u) partial_dim = 2u;
+                if (partial_dim > head_dim) partial_dim = head_dim;
+                resolved.rope_dim = partial_dim;
+            }
+            if (moe_json_get_bool_local(rope_scope, "rotate_half", &bvalue)) {
+                resolved.rotate_half_known = 1;
+                resolved.rotate_half = bvalue ? 1 : 0;
+            }
+            if (moe_json_get_bool_local(
+                    rope_scope,
+                    "proportional_frequency_dim_uses_full_head_dim",
+                    &bvalue)) {
+                resolved.proportional_frequency_known = 1;
+                resolved.proportional_frequency_dim_uses_full_head_dim = bvalue ? 1 : 0;
+            }
+            std::string rope_type;
+            if (moe_json_get_string_local(rope_scope, "rope_type", &rope_type) ||
+                moe_json_get_string_local(rope_scope, "type", &rope_type)) {
+                if (moe_ascii_contains_ci(rope_type, "proportional")) {
+                    resolved.proportional_frequency_known = 1;
+                    resolved.proportional_frequency_dim_uses_full_head_dim = 1;
+                }
+            }
+            if (resolved.frequency_dim == 0 && resolved.proportional_frequency_dim_uses_full_head_dim && head_dim > 0) {
+                resolved.frequency_dim = head_dim;
+            }
+            if (resolved.frequency_dim == 0 && resolved.rope_dim > 0) {
+                resolved.frequency_dim = resolved.rope_dim;
+            }
+            if (resolved.rope_dim > 0 && head_dim > 0 && resolved.rope_dim > head_dim) {
+                resolved.rope_dim = head_dim;
+            }
+            if (resolved.frequency_dim > 0 && head_dim > 0 && resolved.frequency_dim > head_dim) {
+                resolved.frequency_dim = head_dim;
+            }
+            *out = resolved;
+            moe_profile_log(
+                "attn_rope_contract",
+                "layer=%d source=%s attention_kind=%s rope_dim=%u freq_dim=%u theta=%.6g rotate_half=%d proportional=%d",
+                layer,
+                doc_names[doc_i],
+                attention_kind.empty() ? "" : attention_kind.c_str(),
+                resolved.rope_dim,
+                resolved.frequency_dim,
+                (double)resolved.theta,
+                resolved.rotate_half_known ? resolved.rotate_half : -1,
+                resolved.proportional_frequency_known ? resolved.proportional_frequency_dim_uses_full_head_dim : -1);
+            return 1;
         }
     }
     return 0;

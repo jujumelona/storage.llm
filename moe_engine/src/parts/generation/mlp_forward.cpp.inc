@@ -132,41 +132,91 @@ static void moe_graph_ir_layer_scan_mlp_op_f32(
     if (!engine || layer < 0 || !op_tokens || !out) {
         return;
     }
-    const std::string* docs[] = {
-        &engine->offload_graph_ir_json,
-        &engine->offload_gguf_metadata_json,
-    };
-    for (const std::string* docp : docs) {
+    for (uint32_t doc_i = 0; doc_i < 2u; ++doc_i) {
+        const std::string* docp = moe_contract_doc_by_index_f32(engine, doc_i);
         if (!docp || docp->empty()) {
             continue;
         }
         const std::string& doc = *docp;
-        size_t layers_begin = 0;
-        size_t layers_end = 0;
-        if (!moe_json_find_graph_layers_array_f32(doc, &layers_begin, &layers_end)) {
+        size_t ops_begin = 0;
+        size_t ops_end = 0;
+        if (!moe_router_layer_ops_object_slice_cached_f32(engine, doc_i, layer, &ops_begin, &ops_end)) {
             continue;
         }
-        size_t cursor = layers_begin + 1u;
-        uint64_t layer_ordinal = 0;
-        while (cursor < layers_end) {
-            size_t layer_obj_begin = 0;
-            size_t layer_obj_end = 0;
-            if (!moe_json_next_object_in_array(doc, &cursor, layers_end, &layer_obj_begin, &layer_obj_end)) {
+        size_t op_cursor = ops_begin + 1u;
+        while (op_cursor < ops_end) {
+            size_t op_begin = 0;
+            size_t op_end = 0;
+            if (!moe_json_next_object_in_array(doc, &op_cursor, ops_end, &op_begin, &op_end)) {
                 break;
             }
-            const uint64_t this_layer_ordinal = layer_ordinal++;
-            if (!moe_json_slice_matches_layer_index_f32(
-                    doc, layer_obj_begin, layer_obj_end, layer, this_layer_ordinal)) {
+            std::string merged;
+            std::string value;
+            static const char* const fields[] = {
+                "op", "name", "execution_op", "op_role", "role", "graph_role",
+                "graph_role_text", "bundle_member_role", "type"
+            };
+            for (const char* field : fields) {
+                if (moe_json_get_string_slice(doc, op_begin, op_end, field, &value)) {
+                    merged += " ";
+                    merged += moe_lower_ascii_copy(value);
+                }
+            }
+            if (!moe_graph_ir_text_matches_any_token_f32(
+                    merged, op_tokens, op_token_count)) {
                 continue;
             }
+            out->present = 1;
+            int required = 0;
+            if (moe_json_get_bool_slice(doc, op_begin, op_end, "required", &required) && required) {
+                out->required = 1;
+            }
+            std::vector<std::string> weights;
+            if (moe_json_get_string_array_slice(doc, op_begin, op_end, "weights", &weights)) {
+                out->weight_count += weights.size();
+                if (!weights.empty()) {
+                    out->has_weights = 1;
+                }
+            }
+        }
+    }
+}
+
+
+static void moe_graph_ir_layer_scan_contract_table_mlp_op_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* op_tokens,
+    size_t op_token_count,
+    moe_graph_ir_mlp_op_info_f32* out
+) {
+    if (!engine || layer < 0 || !op_tokens || !out) {
+        return;
+    }
+    for (uint32_t doc_i = 0; doc_i < 2u; ++doc_i) {
+        const std::string* docp = moe_contract_doc_by_index_f32(engine, doc_i);
+        if (!docp || docp->empty()) {
+            continue;
+        }
+        const std::string& doc = *docp;
+        std::vector<std::pair<size_t, size_t>> rows;
+        if (!moe_contract_layer_rows_cached_f32(engine, doc_i, layer, &rows)) {
+            continue;
+        }
+        for (const auto& row : rows) {
+            const size_t row_begin = row.first;
+            const size_t row_end = row.second;
+            if (row_begin >= row_end || row_end > doc.size()) {
+                continue;
+            }
+            const std::string row_slice = doc.substr(row_begin, row_end - row_begin);
             size_t ops_begin = 0;
             size_t ops_end = 0;
-            const std::string layer_slice = doc.substr(layer_obj_begin, layer_obj_end - layer_obj_begin);
-            if (!moe_json_find_array_local(layer_slice, "ops", &ops_begin, &ops_end)) {
+            if (!moe_json_find_array_local(row_slice, "ops", &ops_begin, &ops_end)) {
                 continue;
             }
-            ops_begin += layer_obj_begin;
-            ops_end += layer_obj_begin;
+            ops_begin += row_begin;
+            ops_end += row_begin;
             size_t op_cursor = ops_begin + 1u;
             while (op_cursor < ops_end) {
                 size_t op_begin = 0;
@@ -203,95 +253,6 @@ static void moe_graph_ir_layer_scan_mlp_op_f32(
                     }
                 }
             }
-        }
-    }
-}
-
-
-static void moe_graph_ir_layer_scan_contract_table_mlp_op_f32(
-    const moe_pc_engine* engine,
-    int32_t layer,
-    const char* const* op_tokens,
-    size_t op_token_count,
-    moe_graph_ir_mlp_op_info_f32* out
-) {
-    if (!engine || layer < 0 || !op_tokens || !out) {
-        return;
-    }
-    const std::string* docs[] = {
-        &engine->offload_graph_ir_json,
-        &engine->offload_gguf_metadata_json,
-    };
-    for (const std::string* docp : docs) {
-        if (!docp || docp->empty()) {
-            continue;
-        }
-        const std::string& doc = *docp;
-        size_t search_pos = 0;
-        size_t arr_begin = 0;
-        size_t arr_end = 0;
-        while (moe_json_find_next_array_for_key_local(
-            doc, "layer_execution_contract_table", search_pos,
-            &arr_begin, &arr_end) != std::string::npos) {
-            size_t row_cursor = arr_begin + 1u;
-            uint64_t row_ordinal = 0;
-            while (row_cursor < arr_end) {
-                size_t row_begin = 0;
-                size_t row_end = 0;
-                if (!moe_json_next_object_in_array(doc, &row_cursor, arr_end, &row_begin, &row_end)) {
-                    break;
-                }
-                const uint64_t this_row_ordinal = row_ordinal++;
-                if (!moe_json_slice_matches_layer_index_f32(
-                        doc, row_begin, row_end, layer, this_row_ordinal)) {
-                    continue;
-                }
-                const std::string row_slice = doc.substr(row_begin, row_end - row_begin);
-                size_t ops_begin = 0;
-                size_t ops_end = 0;
-                if (!moe_json_find_array_local(row_slice, "ops", &ops_begin, &ops_end)) {
-                    continue;
-                }
-                ops_begin += row_begin;
-                ops_end += row_begin;
-                size_t op_cursor = ops_begin + 1u;
-                while (op_cursor < ops_end) {
-                    size_t op_begin = 0;
-                    size_t op_end = 0;
-                    if (!moe_json_next_object_in_array(doc, &op_cursor, ops_end, &op_begin, &op_end)) {
-                        break;
-                    }
-                    std::string merged;
-                    std::string value;
-                    static const char* const fields[] = {
-                        "op", "name", "execution_op", "op_role", "role", "graph_role",
-                        "graph_role_text", "bundle_member_role", "type"
-                    };
-                    for (const char* field : fields) {
-                        if (moe_json_get_string_slice(doc, op_begin, op_end, field, &value)) {
-                            merged += " ";
-                            merged += moe_lower_ascii_copy(value);
-                        }
-                    }
-                    if (!moe_graph_ir_text_matches_any_token_f32(
-                            merged, op_tokens, op_token_count)) {
-                        continue;
-                    }
-                    out->present = 1;
-                    int required = 0;
-                    if (moe_json_get_bool_slice(doc, op_begin, op_end, "required", &required) && required) {
-                        out->required = 1;
-                    }
-                    std::vector<std::string> weights;
-                    if (moe_json_get_string_array_slice(doc, op_begin, op_end, "weights", &weights)) {
-                        out->weight_count += weights.size();
-                        if (!weights.empty()) {
-                            out->has_weights = 1;
-                        }
-                    }
-                }
-            }
-            search_pos = arr_end;
         }
     }
 }
@@ -343,6 +304,21 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
     plan.graph_required = moe_graph_ir_math_required(engine) ? 1 : 0;
     if (!plan.graph_required || !engine || layer < 0) {
         return plan;
+    }
+    struct mlp_layer_plan_cache_entry {
+        const moe_pc_engine* engine = nullptr;
+        uint64_t generation = 0;
+        int32_t layer = INT32_MIN;
+        moe_graph_ir_mlp_layer_plan_f32 plan{};
+    };
+    static thread_local std::vector<mlp_layer_plan_cache_entry> tls_plan_cache;
+    const uint64_t generation = engine->engine_generation;
+    for (const mlp_layer_plan_cache_entry& entry : tls_plan_cache) {
+        if (entry.engine == engine &&
+            entry.generation == generation &&
+            entry.layer == layer) {
+            return entry.plan;
+        }
     }
     static const char* const routed_tokens[] = {
         "moe_expert_mlp", "moe_experts", "expert_mlp", "routed_expert_mlp"
@@ -440,6 +416,15 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
         plan.shared.present, plan.shared.required, plan.shared.weight_count, plan.run_shared,
         plan.dense.present, plan.dense.required, plan.dense.weight_count, plan.run_dense,
         dense_uses_shared_path, split_dense_branch_by_norm1, plan.post_norm1.present, plan.post_norm1.weight_count);
+    if (tls_plan_cache.size() > 256u) {
+        tls_plan_cache.erase(tls_plan_cache.begin(), tls_plan_cache.begin() + 64);
+    }
+    mlp_layer_plan_cache_entry entry{};
+    entry.engine = engine;
+    entry.generation = generation;
+    entry.layer = layer;
+    entry.plan = plan;
+    tls_plan_cache.push_back(entry);
     return plan;
 }
 

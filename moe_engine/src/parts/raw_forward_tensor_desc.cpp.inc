@@ -11,6 +11,13 @@ struct moe_raw_tensor_desc {
     uint8_t math_transposed;
 };
 
+static const moe_gguf_common_tensor_record* find_common_tensor_by_op_role(
+    const moe_pc_engine* engine,
+    const char* role,
+    int32_t layer,
+    moe_raw_tensor_desc* out_desc
+);
+
 static uint8_t moe_raw_scalar_encoding_from_common_tensor(
     const moe_gguf_common_tensor_record& rec,
     uint32_t rows,
@@ -481,6 +488,7 @@ static int moe_json_find_next_array_key_raw(
     return 0;
 }
 
+
 static void moe_raw_tensor_kind_contract_fields(
     moe_raw_tensor_kind_t kind,
     const char** out_section,
@@ -550,13 +558,13 @@ static void moe_raw_tensor_kind_contract_fields(
     }
 }
 
-static void moe_raw_contract_tensor_names_from_doc(
+static void moe_raw_contract_tensor_names_from_doc_rows(
     const std::string& doc,
-    int32_t layer,
+    const std::vector<std::pair<size_t, size_t>>& rows,
     moe_raw_tensor_kind_t kind,
     std::vector<std::string>* out_names
 ) {
-    if (!out_names || doc.empty() || layer < 0) {
+    if (!out_names || doc.empty() || rows.empty()) {
         return;
     }
     const char* section_key = nullptr;
@@ -565,61 +573,72 @@ static void moe_raw_contract_tensor_names_from_doc(
     if (field_keys.empty()) {
         return;
     }
-    size_t search_pos = 0;
-    size_t arr_begin = 0;
-    size_t arr_end = 0;
-    while (moe_json_find_next_array_key_raw(
-        doc, "layer_execution_contract_table", search_pos, &arr_begin, &arr_end)) {
-        size_t cursor = arr_begin + 1;
-        size_t obj_begin = 0;
-        size_t obj_end = 0;
-        while (moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
-            uint64_t row_layer = UINT64_MAX;
-            if (!moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &row_layer) ||
-                row_layer != (uint64_t)layer) {
+    for (const auto& row_range : rows) {
+        const size_t obj_begin = row_range.first;
+        const size_t obj_end = row_range.second;
+        if (obj_begin >= obj_end || obj_end > doc.size()) {
+            continue;
+        }
+        size_t sec_begin = 0;
+        size_t sec_end = 0;
+        int has_section = 0;
+        if (section_key && section_key[0]) {
+            const std::string row = doc.substr(obj_begin, obj_end - obj_begin);
+            has_section = moe_json_find_object_local(row, section_key, &sec_begin, &sec_end) ? 1 : 0;
+        }
+        for (const char* key : field_keys) {
+            if (!key || !key[0]) {
                 continue;
             }
-            size_t sec_begin = 0;
-            size_t sec_end = 0;
-            const int has_section = section_key &&
-                moe_json_find_object_local(doc.substr(obj_begin, obj_end - obj_begin), section_key, &sec_begin, &sec_end);
-            for (const char* key : field_keys) {
-                if (!key || !key[0]) {
-                    continue;
-                }
-                std::string name;
-                std::vector<std::string> names;
-                if (has_section) {
-                    const size_t abs_sec_begin = obj_begin + sec_begin;
-                    const size_t abs_sec_end = obj_begin + sec_end;
-                    if (moe_json_get_string_array_slice(doc, abs_sec_begin, abs_sec_end, key, &names)) {
-                        for (const std::string& n : names) {
-                            if (!n.empty()) {
-                                moe_raw_push_unique_tensor_name(out_names, n);
-                            }
-                        }
-                    }
-                    if (moe_json_get_string_slice(doc, abs_sec_begin, abs_sec_end, key, &name) &&
-                        !name.empty()) {
-                        moe_raw_push_unique_tensor_name(out_names, name);
-                    }
-                }
-                names.clear();
-                if (moe_json_get_string_array_slice(doc, obj_begin, obj_end, key, &names)) {
+            std::string name;
+            std::vector<std::string> names;
+            if (has_section) {
+                const size_t abs_sec_begin = obj_begin + sec_begin;
+                const size_t abs_sec_end = obj_begin + sec_end;
+                if (moe_json_get_string_array_slice(doc, abs_sec_begin, abs_sec_end, key, &names)) {
                     for (const std::string& n : names) {
                         if (!n.empty()) {
                             moe_raw_push_unique_tensor_name(out_names, n);
                         }
                     }
                 }
-                name.clear();
-                if (moe_json_get_string_slice(doc, obj_begin, obj_end, key, &name) && !name.empty()) {
+                if (moe_json_get_string_slice(doc, abs_sec_begin, abs_sec_end, key, &name) &&
+                    !name.empty()) {
                     moe_raw_push_unique_tensor_name(out_names, name);
                 }
             }
+            names.clear();
+            if (moe_json_get_string_array_slice(doc, obj_begin, obj_end, key, &names)) {
+                for (const std::string& n : names) {
+                    if (!n.empty()) {
+                        moe_raw_push_unique_tensor_name(out_names, n);
+                    }
+                }
+            }
+            name.clear();
+            if (moe_json_get_string_slice(doc, obj_begin, obj_end, key, &name) && !name.empty()) {
+                moe_raw_push_unique_tensor_name(out_names, name);
+            }
         }
-        search_pos = arr_end;
     }
+}
+
+static void moe_raw_contract_tensor_names_from_doc_cached(
+    const moe_pc_engine* engine,
+    uint32_t doc_index,
+    int32_t layer,
+    moe_raw_tensor_kind_t kind,
+    std::vector<std::string>* out_names
+) {
+    const std::string* doc = moe_contract_doc_by_index_f32(engine, doc_index);
+    if (!engine || !doc || doc->empty() || layer < 0 || !out_names) {
+        return;
+    }
+    std::vector<std::pair<size_t, size_t>> rows;
+    if (!moe_contract_layer_rows_cached_f32(engine, doc_index, layer, &rows)) {
+        return;
+    }
+    moe_raw_contract_tensor_names_from_doc_rows(*doc, rows, kind, out_names);
 }
 
 static const moe_gguf_common_tensor_record* find_common_raw_tensor_record_by_contract(
@@ -632,8 +651,8 @@ static const moe_gguf_common_tensor_record* find_common_raw_tensor_record_by_con
         return nullptr;
     }
     std::vector<std::string> names;
-    moe_raw_contract_tensor_names_from_doc(engine->offload_graph_ir_json, layer, kind, &names);
-    moe_raw_contract_tensor_names_from_doc(engine->offload_gguf_metadata_json, layer, kind, &names);
+    moe_raw_contract_tensor_names_from_doc_cached(engine, 0u, layer, kind, &names);
+    moe_raw_contract_tensor_names_from_doc_cached(engine, 1u, layer, kind, &names);
     if (names.empty()) {
         return nullptr;
     }
@@ -749,31 +768,18 @@ static const moe_gguf_common_tensor_record* find_common_raw_tensor_record_by_rol
     if (roles.empty()) {
         return nullptr;
     }
-    for (const moe_gguf_common_tensor_record& rec : engine->gguf_common_tensors) {
-        if (!moe_common_tensor_layer_matches(rec, layer)) {
+    // Use the shared op-role lookup cache instead of rescanning every common
+    // tensor for each Q/K/V/O/norm probe.  Contract names remain authoritative
+    // (find_common_raw_tensor_record_by_contract runs first); this path is the
+    // IR role fallback and must be cheap on first-token raw tensor mapping.
+    for (const char* role : roles) {
+        if (!role || !role[0]) {
             continue;
         }
-        int role_match = 0;
-        for (const char* role : roles) {
-            if (moe_common_tensor_op_role_matches(rec, role)) {
-                role_match = 1;
-                break;
-            }
+        if (const moe_gguf_common_tensor_record* rec =
+                find_common_tensor_by_op_role(engine, role, layer, out_desc)) {
+            return rec;
         }
-        if (!role_match) {
-            continue;
-        }
-        moe_raw_tensor_desc desc{};
-        if (!moe_common_tensor_record_to_raw_desc(rec, &desc)) {
-            continue;
-        }
-        if (!moe_common_tensor_record_raw_compatible(rec, desc)) {
-            continue;
-        }
-        if (out_desc) {
-            *out_desc = desc;
-        }
-        return &rec;
     }
     return nullptr;
 }

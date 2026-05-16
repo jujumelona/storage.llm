@@ -234,7 +234,45 @@ static const moe_gguf_common_tensor_record* moe_find_common_tensor_by_roles_or_n
             }
         }
     }
-    return find_common_tensor_by_names(engine, names, name_count, out_desc);
+    if (const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_names(engine, names, name_count, out_desc)) {
+        return rec;
+    }
+    if (names) {
+        for (const moe_gguf_common_tensor_record& rec : engine->gguf_common_tensors) {
+            const std::string lowered = moe_lower_ascii_copy(rec.name);
+            for (size_t i = 0; i < name_count; ++i) {
+                if (!names[i] || !names[i][0]) {
+                    continue;
+                }
+                const std::string suffix = moe_lower_ascii_copy(names[i]);
+                if (lowered.size() < suffix.size() ||
+                    lowered.compare(lowered.size() - suffix.size(), suffix.size(), suffix) != 0) {
+                    continue;
+                }
+                if (lowered.size() > suffix.size()) {
+                    const char prev = lowered[lowered.size() - suffix.size() - 1u];
+                    if (prev != '.' && prev != '/' && prev != '_') {
+                        continue;
+                    }
+                }
+                moe_raw_tensor_desc desc{};
+                if (!moe_common_tensor_record_to_raw_desc(rec, &desc) ||
+                    !moe_common_tensor_record_raw_compatible(rec, desc)) {
+                    continue;
+                }
+                if (out_desc) {
+                    *out_desc = desc;
+                }
+                moe_profile_log(
+                    "ple_global_tensor_suffix_bind",
+                    "name=%s suffix=%s rows=%u cols=%u",
+                    rec.name.c_str(), names[i], desc.rows, desc.cols);
+                return &rec;
+            }
+        }
+    }
+    return nullptr;
 }
 
 static int moe_map_common_tensor_by_roles_or_names(
@@ -276,6 +314,9 @@ static int moe_map_ple_binding(
     static const char* const proj_names[] = {
         "per_layer_model_proj.weight",
         "per_layer_model_projection.weight",
+        "per_layer_input_model_proj.weight",
+        "per_layer_input_projection.weight",
+        "per_layer_model_embedding_projection.weight",
         "model.per_layer_model_projection.weight",
         "model.per_layer_model_proj.weight",
         "language_model.model.per_layer_model_projection.weight",
@@ -317,6 +358,8 @@ static int moe_map_ple_binding(
     static const char* const norm_names[] = {
         "per_layer_proj_norm.weight",
         "per_layer_projection_norm.weight",
+        "per_layer_model_projection_norm.weight",
+        "per_layer_input_projection_norm.weight",
         "model.per_layer_projection_norm.weight",
         "model.per_layer_proj_norm.weight",
         "language_model.model.per_layer_projection_norm.weight",
@@ -1086,62 +1129,46 @@ static int moe_graph_ir_layer_contract_bool_key_f32(
     if (!engine || layer < 0 || !key || !key[0] || !out) {
         return 0;
     }
-    const std::string* docs[] = {
-        &engine->offload_graph_ir_json,
-        &engine->offload_gguf_metadata_json,
-    };
-    const char* doc_names[] = { "graph_ir", "metadata" };
-    for (size_t doc_i = 0; doc_i < sizeof(docs) / sizeof(docs[0]); ++doc_i) {
-        const std::string* docp = docs[doc_i];
+    static const char* const doc_names[] = { "graph_ir", "metadata" };
+    for (uint32_t doc_i = 0; doc_i < 2u; ++doc_i) {
+        const std::string* docp = moe_contract_doc_by_index_f32(engine, doc_i);
         if (!docp || docp->empty()) {
             continue;
         }
         const std::string& doc = *docp;
-        size_t search_pos = 0;
-        size_t arr_begin = 0;
-        size_t arr_end = 0;
-        while (moe_json_find_next_array_local(
-                   doc, "layer_execution_contract_table", search_pos,
-                   &arr_begin, &arr_end) != std::string::npos) {
-            search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
-            size_t cursor = arr_begin + 1u;
-            uint64_t row_ordinal = 0;
-            while (cursor < arr_end) {
-                size_t obj_begin = 0;
-                size_t obj_end = 0;
-                if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
-                    break;
-                }
-                const uint64_t this_row_ordinal = row_ordinal++;
-                if (!moe_json_slice_matches_layer_index_f32(
-                        doc, obj_begin, obj_end, layer, this_row_ordinal)) {
-                    continue;
-                }
-                int value = 0;
-                if (section && section[0]) {
-                    std::string row = doc.substr(obj_begin, obj_end - obj_begin);
-                    size_t section_begin = 0;
-                    size_t section_end = 0;
-                    if (moe_json_find_object_local(row, section, &section_begin, &section_end) &&
-                        moe_json_get_bool_slice(row, section_begin, section_end, key, &value)) {
-                        *out = value ? 1 : 0;
-                        if (out_source) {
-                            *out_source = doc_names[doc_i];
-                        }
-                        return 1;
-                    }
-                }
-                if (moe_json_get_bool_slice(doc, obj_begin, obj_end, key, &value)) {
+        std::vector<std::pair<size_t, size_t>> rows;
+        if (!moe_contract_layer_rows_cached_f32(engine, doc_i, layer, &rows)) {
+            continue;
+        }
+        for (const auto& row : rows) {
+            const size_t obj_begin = row.first;
+            const size_t obj_end = row.second;
+            if (obj_begin >= obj_end || obj_end > doc.size()) {
+                continue;
+            }
+            int value = 0;
+            if (section && section[0]) {
+                std::string row_text = doc.substr(obj_begin, obj_end - obj_begin);
+                size_t section_begin = 0;
+                size_t section_end = 0;
+                if (moe_json_find_object_local(row_text, section, &section_begin, &section_end) &&
+                    moe_json_get_bool_slice(row_text, section_begin, section_end, key, &value)) {
                     *out = value ? 1 : 0;
                     if (out_source) {
                         *out_source = doc_names[doc_i];
                     }
                     return 1;
                 }
-                // Do not stop after a matching but incomplete row. Runtime
-                // sidecars can carry stub layer_execution_contract_table rows;
-                // keep scanning for the generated .juju.idx authoritative row.
             }
+            if (moe_json_get_bool_slice(doc, obj_begin, obj_end, key, &value)) {
+                *out = value ? 1 : 0;
+                if (out_source) {
+                    *out_source = doc_names[doc_i];
+                }
+                return 1;
+            }
+            // Do not stop after a matching but incomplete row. Runtime sidecars can
+            // carry stub rows before the generated .juju.idx authoritative row.
         }
     }
     return 0;
@@ -1188,80 +1215,68 @@ static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* 
         "metadata",
     };
     int matched_contract_row = 0;
-    for (size_t doc_i = 0; doc_i < sizeof(docs) / sizeof(docs[0]); ++doc_i) {
-        const std::string* docp = docs[doc_i];
+    for (uint32_t doc_i = 0; doc_i < 2u; ++doc_i) {
+        const std::string* docp = moe_contract_doc_by_index_f32(engine, doc_i);
         if (!docp || docp->empty()) {
             continue;
         }
         const std::string& doc = *docp;
-        size_t search_pos = 0;
-        size_t arr_begin = 0;
-        size_t arr_end = 0;
-        while (moe_json_find_next_array_local(
-                   doc, "layer_execution_contract_table", search_pos,
-                   &arr_begin, &arr_end) != std::string::npos) {
-            search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
-            size_t cursor = arr_begin + 1u;
-            uint64_t row_ordinal = 0;
-            while (cursor < arr_end) {
-                size_t obj_begin = 0;
-                size_t obj_end = 0;
-                if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
-                    break;
-                }
-                const uint64_t this_row_ordinal = row_ordinal++;
-                if (!moe_json_slice_matches_layer_index_f32(
-                        doc, obj_begin, obj_end, layer, this_row_ordinal)) {
-                    continue;
-                }
-                matched_contract_row = 1;
-                int flag = 0;
-                static const char* const bool_keys[] = {
-                    "attention_residual_before_ffn_norm",
-                    "post_attention_residual_before_norm",
-                    "residual_before_post_attention_norm",
-                    "post_attention_norm_after_residual",
-                    "attention_norm_after_residual",
-                    "graph_residual_first"
-                };
-                for (const char* key : bool_keys) {
-                    if (moe_json_get_bool_slice(doc, obj_begin, obj_end, key, &flag)) {
-                        moe_profile_log(
-                            "graphir_attention_residual_order",
-                            "layer=%d residual_first=%d source=%s.contract key=%s",
-                            layer, flag ? 1 : 0, doc_names[doc_i], key);
-                        return cache_and_return(flag ? 1 : 0);
-                    }
-                }
-                std::string order;
-                if ((moe_json_get_string_slice(doc, obj_begin, obj_end, "post_attention_norm_input", &order) ||
-                     moe_json_get_string_slice(doc, obj_begin, obj_end, "attention_norm_input", &order) ||
-                     moe_json_get_string_slice(doc, obj_begin, obj_end, "post_attention_order", &order))) {
-                    const std::string lowered = moe_lower_ascii_copy(order);
-                    if (lowered.find("residual") != std::string::npos ||
-                        lowered.find("attn_plus_hidden") != std::string::npos ||
-                        lowered.find("hidden_plus_attn") != std::string::npos) {
-                        moe_profile_log(
-                            "graphir_attention_residual_order",
-                            "layer=%d residual_first=1 source=%s.contract_string value=%s",
-                            layer, doc_names[doc_i], order.c_str());
-                        return cache_and_return(1);
-                    }
-                    if (lowered.find("attention_output") != std::string::npos ||
-                        lowered.find("attn_output") != std::string::npos) {
-                        moe_profile_log(
-                            "graphir_attention_residual_order",
-                            "layer=%d residual_first=0 source=%s.contract_string value=%s",
-                            layer, doc_names[doc_i], order.c_str());
-                        return cache_and_return(0);
-                    }
-                }
-                // Keep scanning: runtime sidecars can contain stub rows before
-                // the authoritative .juju.idx row.  If no explicit order exists
-                // in any row, the generated contract default is attention norm
-                // before residual (residual_first=0), so we do not rescan the
-                // whole GraphIR ops array on every layer.
+        std::vector<std::pair<size_t, size_t>> rows;
+        if (!moe_contract_layer_rows_cached_f32(engine, doc_i, layer, &rows)) {
+            continue;
+        }
+        for (const auto& row : rows) {
+            const size_t obj_begin = row.first;
+            const size_t obj_end = row.second;
+            if (obj_begin >= obj_end || obj_end > doc.size()) {
+                continue;
             }
+            matched_contract_row = 1;
+            int flag = 0;
+            static const char* const bool_keys[] = {
+                "attention_residual_before_ffn_norm",
+                "post_attention_residual_before_norm",
+                "residual_before_post_attention_norm",
+                "post_attention_norm_after_residual",
+                "attention_norm_after_residual",
+                "graph_residual_first"
+            };
+            for (const char* key : bool_keys) {
+                if (moe_json_get_bool_slice(doc, obj_begin, obj_end, key, &flag)) {
+                    moe_profile_log(
+                        "graphir_attention_residual_order",
+                        "layer=%d residual_first=%d source=%s.contract key=%s",
+                        layer, flag ? 1 : 0, doc_names[doc_i], key);
+                    return cache_and_return(flag ? 1 : 0);
+                }
+            }
+            std::string order;
+            if ((moe_json_get_string_slice(doc, obj_begin, obj_end, "post_attention_norm_input", &order) ||
+                 moe_json_get_string_slice(doc, obj_begin, obj_end, "attention_norm_input", &order) ||
+                 moe_json_get_string_slice(doc, obj_begin, obj_end, "post_attention_order", &order))) {
+                const std::string lowered = moe_lower_ascii_copy(order);
+                if (lowered.find("residual") != std::string::npos ||
+                    lowered.find("attn_plus_hidden") != std::string::npos ||
+                    lowered.find("hidden_plus_attn") != std::string::npos) {
+                    moe_profile_log(
+                        "graphir_attention_residual_order",
+                        "layer=%d residual_first=1 source=%s.contract_string value=%s",
+                        layer, doc_names[doc_i], order.c_str());
+                    return cache_and_return(1);
+                }
+                if (lowered.find("attention_output") != std::string::npos ||
+                    lowered.find("attn_output") != std::string::npos) {
+                    moe_profile_log(
+                        "graphir_attention_residual_order",
+                        "layer=%d residual_first=0 source=%s.contract_string value=%s",
+                        layer, doc_names[doc_i], order.c_str());
+                    return cache_and_return(0);
+                }
+            }
+            // Keep scanning: runtime sidecars can contain stub rows before the
+            // authoritative .juju.idx row.  If no explicit order exists in any
+            // row, the generated contract default is attention norm before
+            // residual (residual_first=0), so we do not rescan all rows.
         }
     }
     if (matched_contract_row) {
@@ -1538,66 +1553,41 @@ static int moe_graph_ir_layer_ops_tensor_names_for_role(
         return 0;
     }
     const size_t start_count = out_names->size();
-    const std::string* docs[] = {
-        &engine->offload_graph_ir_json,
-        &engine->offload_gguf_metadata_json,
-    };
-    const char* doc_names[] = {
+    // Cached rows are selected from "layer_execution_contract_table" once per layer/doc.
+    static const char* const doc_names[] = {
         "graph_ir",
         "metadata",
     };
-    for (size_t doc_i = 0; doc_i < sizeof(docs) / sizeof(docs[0]); ++doc_i) {
-        const std::string* docp = docs[doc_i];
+    for (uint32_t doc_i = 0; doc_i < 2u; ++doc_i) {
+        const std::string* docp = moe_contract_doc_by_index_f32(engine, doc_i);
         if (!docp || docp->empty()) {
             continue;
         }
         const std::string& doc = *docp;
-        size_t layers_begin = 0;
-        size_t layers_end = 0;
-        if (!moe_json_find_graph_layers_array_f32(doc, &layers_begin, &layers_end)) {
+        size_t ops_begin = 0;
+        size_t ops_end = 0;
+        if (!moe_router_layer_ops_object_slice_cached_f32(engine, doc_i, layer, &ops_begin, &ops_end)) {
             continue;
         }
-        size_t cursor = layers_begin + 1u;
-        uint64_t layer_ordinal = 0;
-        while (cursor < layers_end) {
-            size_t layer_obj_begin = 0;
-            size_t layer_obj_end = 0;
-            if (!moe_json_next_object_in_array(doc, &cursor, layers_end, &layer_obj_begin, &layer_obj_end)) {
+        size_t op_cursor = ops_begin + 1u;
+        while (op_cursor < ops_end) {
+            size_t op_begin = 0;
+            size_t op_end = 0;
+            if (!moe_json_next_object_in_array(doc, &op_cursor, ops_end, &op_begin, &op_end)) {
                 break;
             }
-            const uint64_t this_layer_ordinal = layer_ordinal++;
-            if (!moe_json_slice_matches_layer_index_f32(
-                    doc, layer_obj_begin, layer_obj_end, layer, this_layer_ordinal)) {
+            if (!moe_graph_ir_layer_op_matches_tensor_role_f32(doc, op_begin, op_end, role_key)) {
                 continue;
             }
-            size_t ops_begin = 0;
-            size_t ops_end = 0;
-            const std::string layer_slice = doc.substr(layer_obj_begin, layer_obj_end - layer_obj_begin);
-            if (!moe_json_find_array_local(layer_slice, "ops", &ops_begin, &ops_end)) {
-                continue;
-            }
-            ops_begin += layer_obj_begin;
-            ops_end += layer_obj_begin;
-            size_t op_cursor = ops_begin + 1u;
-            while (op_cursor < ops_end) {
-                size_t op_begin = 0;
-                size_t op_end = 0;
-                if (!moe_json_next_object_in_array(doc, &op_cursor, ops_end, &op_begin, &op_end)) {
-                    break;
-                }
-                if (!moe_graph_ir_layer_op_matches_tensor_role_f32(doc, op_begin, op_end, role_key)) {
-                    continue;
-                }
-                std::vector<std::string> names;
-                if (moe_json_get_string_array_slice(doc, op_begin, op_end, "weights", &names) && !names.empty()) {
-                    const size_t before = out_names->size();
-                    moe_graph_ir_push_unique_names_f32(out_names, names);
-                    if (out_names->size() > before) {
-                        moe_profile_log(
-                            "graphir_contract_tensor_names",
-                            "layer=%d role=%s count=%zu source=%s.layers.ops.weights",
-                            layer, role_key, out_names->size() - before, doc_names[doc_i]);
-                    }
+            std::vector<std::string> names;
+            if (moe_json_get_string_array_slice(doc, op_begin, op_end, "weights", &names) && !names.empty()) {
+                const size_t before = out_names->size();
+                moe_graph_ir_push_unique_names_f32(out_names, names);
+                if (out_names->size() > before) {
+                    moe_profile_log(
+                        "graphir_contract_tensor_names",
+                        "layer=%d role=%s count=%zu source=%s.layers.ops.weights",
+                        layer, role_key, out_names->size() - before, doc_names[doc_i]);
                 }
             }
         }
@@ -1649,88 +1639,75 @@ static int moe_graph_ir_layer_contract_tensor_names_for_role(
         }
     }
     const size_t start_count = out_names->size();
-    const std::string* docs[] = {
-        &engine->offload_graph_ir_json,
-        &engine->offload_gguf_metadata_json,
-    };
-    const char* doc_names[] = {
+    // Cached rows are selected from "layer_execution_contract_table" once per layer/doc.
+    static const char* const doc_names[] = {
         "graph_ir",
         "metadata",
     };
-    for (size_t doc_i = 0; doc_i < sizeof(docs) / sizeof(docs[0]); ++doc_i) {
-        const std::string* docp = docs[doc_i];
+    for (uint32_t doc_i = 0; doc_i < 2u; ++doc_i) {
+        const std::string* docp = moe_contract_doc_by_index_f32(engine, doc_i);
         if (!docp || docp->empty()) {
             continue;
         }
         const std::string& doc = *docp;
-        size_t search_pos = 0;
-        size_t arr_begin = 0;
-        size_t arr_end = 0;
-        while (moe_json_find_next_contract_array_f32(
-            doc, "layer_execution_contract_table", search_pos, &arr_begin, &arr_end) != std::string::npos) {
-            size_t cursor = arr_begin + 1u;
-            uint64_t row_ordinal = 0;
-            while (cursor < arr_end) {
-                size_t obj_begin = 0;
-                size_t obj_end = 0;
-                if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
-                    break;
+        std::vector<std::pair<size_t, size_t>> rows;
+        if (!moe_contract_layer_rows_cached_f32(engine, doc_i, layer, &rows)) {
+            continue;
+        }
+        for (const auto& row_pair : rows) {
+            const size_t obj_begin = row_pair.first;
+            const size_t obj_end = row_pair.second;
+            if (obj_begin >= obj_end || obj_end > doc.size()) {
+                continue;
+            }
+            size_t scope_begin = obj_begin;
+            size_t scope_end = obj_end;
+            int section_found = 0;
+            if (section_key && section_key[0]) {
+                const std::string row = doc.substr(obj_begin, obj_end - obj_begin);
+                size_t local_scope_begin = 0;
+                size_t local_scope_end = 0;
+                if (moe_json_find_object_local(row, section_key, &local_scope_begin, &local_scope_end)) {
+                    scope_begin = obj_begin + local_scope_begin;
+                    scope_end = obj_begin + local_scope_end;
+                    section_found = 1;
                 }
-                const uint64_t this_row_ordinal = row_ordinal++;
-                if (!moe_json_slice_matches_layer_index_f32(
-                        doc, obj_begin, obj_end, layer, this_row_ordinal)) {
-                    continue;
-                }
-                size_t scope_begin = obj_begin;
-                size_t scope_end = obj_end;
-                int section_found = 0;
-                if (section_key && section_key[0]) {
-                    const std::string row = doc.substr(obj_begin, obj_end - obj_begin);
-                    size_t local_scope_begin = 0;
-                    size_t local_scope_end = 0;
-                    if (moe_json_find_object_local(row, section_key, &local_scope_begin, &local_scope_end)) {
-                        scope_begin = obj_begin + local_scope_begin;
-                        scope_end = obj_begin + local_scope_end;
-                        section_found = 1;
-                    }
-                }
-                const size_t before = out_names->size();
-                std::vector<std::string> names;
-                if ((!section_key || !section_key[0] || section_found) &&
-                    moe_json_get_string_array_slice(doc, scope_begin, scope_end, role_key, &names) &&
+            }
+            const size_t before = out_names->size();
+            std::vector<std::string> names;
+            if ((!section_key || !section_key[0] || section_found) &&
+                moe_json_get_string_array_slice(doc, scope_begin, scope_end, role_key, &names) &&
+                !names.empty()) {
+                moe_graph_ir_push_unique_names_f32(out_names, names);
+            }
+            std::string single_name;
+            if ((!section_key || !section_key[0] || section_found) &&
+                moe_json_get_string_slice(doc, scope_begin, scope_end, role_key, &single_name) &&
+                !single_name.empty()) {
+                moe_graph_ir_push_unique_names_f32(out_names, std::vector<std::string>{single_name});
+            }
+            // Generator tables may place a role at row top-level even when the
+            // semantic section exists. Treat the row as a fallback only after the
+            // requested section was checked.
+            if (section_key && section_key[0]) {
+                names.clear();
+                if (moe_json_get_string_array_slice(doc, obj_begin, obj_end, role_key, &names) &&
                     !names.empty()) {
                     moe_graph_ir_push_unique_names_f32(out_names, names);
                 }
-                std::string single_name;
-                if ((!section_key || !section_key[0] || section_found) &&
-                    moe_json_get_string_slice(doc, scope_begin, scope_end, role_key, &single_name) &&
+                single_name.clear();
+                if (moe_json_get_string_slice(doc, obj_begin, obj_end, role_key, &single_name) &&
                     !single_name.empty()) {
                     moe_graph_ir_push_unique_names_f32(out_names, std::vector<std::string>{single_name});
                 }
-                // Generator tables may place a role at row top-level even when
-                // the semantic section exists.  Treat the row as a fallback only
-                // after the requested section was checked.
-                if (section_key && section_key[0]) {
-                    names.clear();
-                    if (moe_json_get_string_array_slice(doc, obj_begin, obj_end, role_key, &names) &&
-                        !names.empty()) {
-                        moe_graph_ir_push_unique_names_f32(out_names, names);
-                    }
-                    single_name.clear();
-                    if (moe_json_get_string_slice(doc, obj_begin, obj_end, role_key, &single_name) &&
-                        !single_name.empty()) {
-                        moe_graph_ir_push_unique_names_f32(out_names, std::vector<std::string>{single_name});
-                    }
-                }
-                if (out_names->size() > before) {
-                    moe_profile_log(
-                        "graphir_contract_tensor_names",
-                        "layer=%d role=%s count=%zu source=%s.layer_execution_contract_table.%s",
-                        layer, role_key, out_names->size() - before, doc_names[doc_i],
-                        section_key && section_key[0] ? section_key : "row");
-                }
             }
-            search_pos = arr_end;
+            if (out_names->size() > before) {
+                moe_profile_log(
+                    "graphir_contract_tensor_names",
+                    "layer=%d role=%s count=%zu source=%s.layer_execution_contract_table.%s",
+                    layer, role_key, out_names->size() - before, doc_names[doc_i],
+                    section_key && section_key[0] ? section_key : "row");
+            }
         }
     }
     if (out_names->size() > start_count) {

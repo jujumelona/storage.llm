@@ -315,6 +315,16 @@ int moe_pc_engine_set_model_root(
     {
         std::unique_lock<std::shared_mutex> lock(engine->router_layer_contract_slice_cache_mutex);
         engine->router_layer_contract_slice_cache.clear();
+        {
+            std::unique_lock<std::shared_mutex> layer_lock(engine->layer_contract_rows_cache_mutex);
+            engine->layer_contract_rows_cache.clear();
+            engine->layer_contract_rows_cache_built_docs.clear();
+        }
+        {
+            std::unique_lock<std::shared_mutex> ops_lock(engine->graph_layer_ops_slice_cache_mutex);
+            engine->graph_layer_ops_slice_cache.clear();
+            engine->graph_layer_ops_slice_cache_built_docs.clear();
+        }
     }
     engine->cached_rmsnorm_unit_offset.store(-1, std::memory_order_relaxed);
     {
