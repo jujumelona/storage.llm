@@ -281,11 +281,11 @@ static int moe_graph_ir_executor_compiled(const moe_pc_engine* engine) {
     }
     if (graph_required) {
         uint64_t tail_declared = 0;
-        (void)moe_json_get_u64_local(graph, "layers_with_post_ffw_norm", &tail_declared);
+        (void)moe_json_get_u64_max_local(graph, "layers_with_post_ffw_norm", &tail_declared);
         uint64_t tmp = 0;
-        if (moe_json_get_u64_local(graph, "layers_with_post_ffw_norm_1", &tmp)) tail_declared += tmp;
-        if (moe_json_get_u64_local(graph, "layers_with_post_ffw_norm_2", &tmp)) tail_declared += tmp;
-        if (moe_json_get_u64_local(graph, "layers_with_layer_output_scale", &tmp)) tail_declared += tmp;
+        if (moe_json_get_u64_max_local(graph, "layers_with_post_ffw_norm_1", &tmp)) tail_declared += tmp;
+        if (moe_json_get_u64_max_local(graph, "layers_with_post_ffw_norm_2", &tmp)) tail_declared += tmp;
+        if (moe_json_get_u64_max_local(graph, "layers_with_layer_output_scale", &tmp)) tail_declared += tmp;
         if (tail_declared > 0 && engine->gguf_common_tensors.empty()) {
             return 0;
         }

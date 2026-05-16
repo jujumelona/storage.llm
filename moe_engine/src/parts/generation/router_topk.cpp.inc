@@ -70,6 +70,31 @@ static int moe_router_json_get_bool_any(
     return 0;
 }
 
+static int moe_router_json_array_has_graph_layer_ops_f32(
+    const std::string& doc,
+    size_t arr_begin,
+    size_t arr_end
+) {
+    if (arr_begin >= arr_end || arr_end > doc.size()) {
+        return 0;
+    }
+    size_t cursor = arr_begin + 1u;
+    while (cursor < arr_end) {
+        size_t obj_begin = 0;
+        size_t obj_end = 0;
+        if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+            break;
+        }
+        const std::string obj = doc.substr(obj_begin, obj_end - obj_begin);
+        size_t ops_begin = 0;
+        size_t ops_end = 0;
+        if (moe_json_find_array_local(obj, "ops", &ops_begin, &ops_end)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int moe_router_json_find_graph_layers_array_f32(
     const std::string& doc,
     size_t* out_begin,
@@ -81,10 +106,31 @@ static int moe_router_json_find_graph_layers_array_f32(
     static const char* const keys[] = {
         "layers", "blocks", "decoder_layers", "transformer_layers", "layer_plans"
     };
+    size_t fallback_begin = 0;
+    size_t fallback_end = 0;
+    int saw_fallback = 0;
     for (const char* key : keys) {
-        if (moe_json_find_array_local(doc, key, out_begin, out_end)) {
-            return 1;
+        size_t search_pos = 0;
+        size_t arr_begin = 0;
+        size_t arr_end = 0;
+        while (moe_json_find_next_array_local(doc, key, search_pos, &arr_begin, &arr_end) != std::string::npos) {
+            if (!saw_fallback) {
+                fallback_begin = arr_begin;
+                fallback_end = arr_end;
+                saw_fallback = 1;
+            }
+            if (moe_router_json_array_has_graph_layer_ops_f32(doc, arr_begin, arr_end)) {
+                *out_begin = arr_begin;
+                *out_end = arr_end;
+                return 1;
+            }
+            search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
         }
+    }
+    if (saw_fallback) {
+        *out_begin = fallback_begin;
+        *out_end = fallback_end;
+        return 1;
     }
     return 0;
 }
@@ -225,6 +271,54 @@ static int moe_router_json_double_any_slice_f32(
     return 0;
 }
 
+static int moe_router_layer_contract_row_has_router_payload_f32(
+    const std::string& doc,
+    size_t obj_begin,
+    size_t obj_end
+) {
+    if (obj_begin >= obj_end || obj_end > doc.size()) {
+        return 0;
+    }
+    std::string row = doc.substr(obj_begin, obj_end - obj_begin);
+    size_t router_begin = 0;
+    size_t router_end = 0;
+    const int has_router_object =
+        moe_json_find_object_local(row, "router", &router_begin, &router_end) ? 1 : 0;
+    static const char* const router_keys[] = {
+        "router",
+        "router_scale",
+        "router_input_scale",
+        "router_weight_scale_sidecar",
+        "ffn_gate_inp_scale_is_weight_scale_sidecar",
+        "router_uses_hidden_when_internal_scale_present",
+        "routed_experts_per_token",
+        "top_k_experts",
+        "num_experts_per_tok",
+        "experts_per_moe_layer",
+        "num_experts",
+        "num_local_experts",
+        "norm_topk_prob",
+        "normalize_topk_prob",
+        "scoring_func",
+        "score_func",
+        "routed_scaling_factor"
+    };
+    if (has_router_object) {
+        const std::string router_scope = row.substr(router_begin, router_end - router_begin);
+        for (const char* key : router_keys) {
+            if (key && router_scope.find(key) != std::string::npos) {
+                return 1;
+            }
+        }
+    }
+    for (const char* key : router_keys) {
+        if (key && row.find(key) != std::string::npos) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int moe_router_layer_contract_object_slice_f32(
     const std::string& doc,
     int32_t layer,
@@ -236,27 +330,46 @@ static int moe_router_layer_contract_object_slice_f32(
     if (doc.empty() || layer < 0 || !out_begin || !out_end) {
         return 0;
     }
+    size_t fallback_begin = 0;
+    size_t fallback_end = 0;
+    int have_fallback = 0;
+    size_t search_pos = 0;
     size_t arr_begin = 0;
     size_t arr_end = 0;
-    if (!moe_json_find_array_local(doc, "layer_execution_contract_table", &arr_begin, &arr_end)) {
-        return 0;
-    }
-    size_t cursor = arr_begin + 1u;
-    uint64_t row_ordinal = 0;
-    while (cursor < arr_end) {
-        size_t obj_begin = 0;
-        size_t obj_end = 0;
-        if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
-            break;
+    while (moe_json_find_next_array_local(
+               doc, "layer_execution_contract_table", search_pos,
+               &arr_begin, &arr_end) != std::string::npos) {
+        search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
+        size_t cursor = arr_begin + 1u;
+        uint64_t row_ordinal = 0;
+        while (cursor < arr_end) {
+            size_t obj_begin = 0;
+            size_t obj_end = 0;
+            if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+                break;
+            }
+            const uint64_t this_row_ordinal = row_ordinal++;
+            if (!moe_router_json_slice_matches_layer_index_f32(
+                    doc, obj_begin, obj_end, layer, this_row_ordinal)) {
+                continue;
+            }
+            if (!have_fallback) {
+                fallback_begin = obj_begin;
+                fallback_end = obj_end;
+                have_fallback = 1;
+            }
+            if (moe_router_layer_contract_row_has_router_payload_f32(doc, obj_begin, obj_end)) {
+                *out_begin = obj_begin;
+                *out_end = obj_end;
+                return 1;
+            }
         }
-        const uint64_t this_row_ordinal = row_ordinal++;
-        if (moe_router_json_slice_matches_layer_index_f32(
-                doc, obj_begin, obj_end, layer, this_row_ordinal)) {
-            *out_begin = obj_begin;
-            *out_end = obj_end;
-            return 1;
-        }
     }
+    (void)fallback_begin;
+    (void)fallback_end;
+    (void)have_fallback;
+    // A layer row without router payload is usually a stub/default contract.
+    // Do not let it block GraphIR op scanning or metadata fallback.
     return 0;
 }
 

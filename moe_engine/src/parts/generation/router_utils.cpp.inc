@@ -577,8 +577,9 @@ static void moe_router_push_contract_scale_names_from_scope_f32(
         return;
     }
     static const char* const keys[] = {
-        "router_input_scale", "router_input_scales",
+        "router_input_scale", "router_input_scales", "router_input_scale_tensors",
         "router_scale", "router_scales",
+        "scale", "scales",
         "input_scale", "input_scales",
         "activation_scale", "activation_scales"
     };
@@ -648,6 +649,32 @@ static int moe_router_contract_scale_tensor_names_f32(
                     moe_router_push_contract_scale_names_from_scope_f32(
                         doc, obj_begin + router_begin, obj_begin + router_end, out_names);
                 }
+                size_t semantic_begin = 0;
+                size_t semantic_end = 0;
+                if (moe_json_find_object_local(row, "semantic_contract", &semantic_begin, &semantic_end)) {
+                    moe_router_push_contract_scale_names_from_scope_f32(
+                        doc, obj_begin + semantic_begin, obj_begin + semantic_end, out_names);
+                }
+                size_t ops_begin = 0;
+                size_t ops_end = 0;
+                if (moe_json_find_array_local(row, "ops", &ops_begin, &ops_end)) {
+                    size_t op_cursor = obj_begin + ops_begin + 1u;
+                    const size_t op_limit = obj_begin + ops_end;
+                    while (op_cursor < op_limit) {
+                        size_t op_begin = 0;
+                        size_t op_end = 0;
+                        if (!moe_json_next_object_in_array(doc, &op_cursor, op_limit, &op_begin, &op_end)) {
+                            break;
+                        }
+                        std::string op_name;
+                        if (moe_json_get_string_slice(doc, op_begin, op_end, "name", &op_name)) {
+                            const std::string lowered = moe_lower_ascii_copy(op_name);
+                            if (lowered == "router_input" || lowered == "moe_router" || lowered == "router") {
+                                moe_router_push_contract_scale_names_from_scope_f32(doc, op_begin, op_end, out_names);
+                            }
+                        }
+                    }
+                }
                 moe_router_push_contract_scale_names_from_scope_f32(doc, obj_begin, obj_end, out_names);
                 if (out_names->size() > before) {
                     moe_profile_log(
@@ -678,6 +705,18 @@ static int moe_router_has_direct_input_scale_contract_f32(
     for (const char* suffix : direct_suffixes) {
         if (moe_engine_has_common_tensor_suffix(engine, layer, suffix)) {
             return 1;
+        }
+    }
+    std::vector<std::string> contract_names;
+    if (moe_router_contract_scale_tensor_names_f32(engine, layer, &contract_names)) {
+        for (const std::string& name : contract_names) {
+            if (!name.empty() && !moe_router_scale_contract_name_is_sidecar_f32(name)) {
+                // Names came from the generator's router_input_scale/router_scale
+                // contract keys, not from a graph-wide suffix scan.  Within
+                // that scope a non-sidecar tensor is a direct router-input
+                // activation scale.
+                return 1;
+            }
         }
     }
     static const char* const direct_roles[] = {

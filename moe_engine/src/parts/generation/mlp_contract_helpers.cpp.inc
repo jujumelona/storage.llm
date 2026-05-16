@@ -24,6 +24,31 @@ static int moe_graph_ir_math_required(const moe_pc_engine* engine) {
         engine->offload_graph_ir_ready.load(std::memory_order_relaxed);
 }
 
+static int moe_json_array_has_graph_layer_ops_f32(
+    const std::string& doc,
+    size_t arr_begin,
+    size_t arr_end
+) {
+    if (arr_begin >= arr_end || arr_end > doc.size()) {
+        return 0;
+    }
+    size_t cursor = arr_begin + 1u;
+    while (cursor < arr_end) {
+        size_t obj_begin = 0;
+        size_t obj_end = 0;
+        if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+            break;
+        }
+        const std::string obj = doc.substr(obj_begin, obj_end - obj_begin);
+        size_t ops_begin = 0;
+        size_t ops_end = 0;
+        if (moe_json_find_array_local(obj, "ops", &ops_begin, &ops_end)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int moe_json_find_graph_layers_array_f32(
     const std::string& doc,
     size_t* out_begin,
@@ -35,10 +60,31 @@ static int moe_json_find_graph_layers_array_f32(
     static const char* const keys[] = {
         "layers", "blocks", "decoder_layers", "transformer_layers", "layer_plans"
     };
+    size_t fallback_begin = 0;
+    size_t fallback_end = 0;
+    int saw_fallback = 0;
     for (const char* key : keys) {
-        if (moe_json_find_array_local(doc, key, out_begin, out_end)) {
-            return 1;
+        size_t search_pos = 0;
+        size_t arr_begin = 0;
+        size_t arr_end = 0;
+        while (moe_json_find_next_array_local(doc, key, search_pos, &arr_begin, &arr_end) != std::string::npos) {
+            if (!saw_fallback) {
+                fallback_begin = arr_begin;
+                fallback_end = arr_end;
+                saw_fallback = 1;
+            }
+            if (moe_json_array_has_graph_layer_ops_f32(doc, arr_begin, arr_end)) {
+                *out_begin = arr_begin;
+                *out_end = arr_end;
+                return 1;
+            }
+            search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
         }
+    }
+    if (saw_fallback) {
+        *out_begin = fallback_begin;
+        *out_end = fallback_end;
+        return 1;
     }
     return 0;
 }

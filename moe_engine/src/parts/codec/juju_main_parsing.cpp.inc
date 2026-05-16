@@ -165,8 +165,34 @@ static void moe_ingest_juju_graph_ir(moe_pc_engine* engine, const std::string& i
             engine->juju_kv_layout_page_size_tokens.store(value, std::memory_order_relaxed);
         }
     }
-    if (engine->offload_graph_ir_json.empty()) {
-        engine->offload_graph_ir_json = index_json.substr(graph_pos);
+    {
+        const std::string authoritative_graph = index_json.substr(graph_pos);
+        const int index_graph_has_generator_contract =
+            authoritative_graph.find("\"generation_contract\"") != std::string::npos &&
+            authoritative_graph.find("\"layer_execution_contract_table\"") != std::string::npos &&
+            authoritative_graph.find("JUJU_LAYER_EXECUTION_CONTRACT_V1") != std::string::npos;
+        const int cached_missing_generator_contract =
+            engine->offload_graph_ir_json.find("\"generation_contract\"") == std::string::npos ||
+            engine->offload_graph_ir_json.find("\"layer_execution_contract_table\"") == std::string::npos ||
+            engine->offload_graph_ir_json.find("JUJU_LAYER_EXECUTION_CONTRACT_V1") == std::string::npos;
+        // The generated .juju.idx graph is authoritative.  Runtime sidecars can
+        // be valid JSON and can even contain the same contract marker strings,
+        // but they may still be reduced diagnostic views.  Forward helpers read
+        // engine->offload_graph_ir_json, so prefer the index graph whenever it
+        // carries the executable layer contract instead of letting an earlier
+        // sidecar cache decide v_norm/router/PLE/MLP execution.
+        if (engine->offload_graph_ir_json.empty() || cached_missing_generator_contract ||
+            index_graph_has_generator_contract) {
+            engine->offload_graph_ir_json = authoritative_graph;
+            {
+                std::unique_lock<std::shared_mutex> lock(engine->router_layer_contract_slice_cache_mutex);
+                engine->router_layer_contract_slice_cache.clear();
+            }
+            {
+                std::unique_lock<std::shared_mutex> lock(engine->text_mention_cache_mutex);
+                engine->graph_ir_mention_cache.clear();
+            }
+        }
     }
     engine->offload_graph_ir_version.store((uint32_t)std::min<uint64_t>(schema_version, UINT32_MAX), std::memory_order_relaxed);
 }

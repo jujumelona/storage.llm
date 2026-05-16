@@ -465,17 +465,14 @@ static int moe_layer_has_ple_tensors(
     };
     const int has_gate =
         moe_graph_ir_layer_has_op_role_any(engine, layer, gate_roles, sizeof(gate_roles) / sizeof(gate_roles[0])) ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "inp_gate.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_inp_gate.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_input_gate.weight");
     const int has_proj =
         moe_graph_ir_layer_has_op_role_any(engine, layer, proj_roles, sizeof(proj_roles) / sizeof(proj_roles[0])) ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "proj.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_proj.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_projection.weight");
     const int has_norm =
         moe_graph_ir_layer_has_op_role_any(engine, layer, norm_roles, sizeof(norm_roles) / sizeof(norm_roles[0])) ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "post_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "per_layer_post_norm.weight") ||
         moe_engine_has_common_tensor_suffix(engine, layer, "post_per_layer_input_norm.weight");
     return has_gate && has_proj && has_norm;
@@ -558,18 +555,19 @@ static int moe_layer_apply_ple_f32(
         "post_per_layer_input_norm",
         "ple_post_norm"
     };
+    // Generic aliases such as "inp_gate.weight", "proj.weight", and
+    // "post_norm.weight" are intentionally not used for automatic PLE binding:
+    // they collide with router/attention/tail tensors.  Only explicit
+    // per_layer_* suffixes or generator contract roles bind PLE.
     static const char* const gate_suffixes[] = {
-        "inp_gate.weight",
         "per_layer_inp_gate.weight",
         "per_layer_input_gate.weight"
     };
     static const char* const proj_suffixes[] = {
-        "proj.weight",
         "per_layer_proj.weight",
         "per_layer_projection.weight"
     };
     static const char* const norm_suffixes[] = {
-        "post_norm.weight",
         "per_layer_post_norm.weight",
         "post_per_layer_input_norm.weight"
     };
@@ -1073,46 +1071,51 @@ static int moe_graph_ir_layer_contract_bool_key_f32(
             continue;
         }
         const std::string& doc = *docp;
+        size_t search_pos = 0;
         size_t arr_begin = 0;
         size_t arr_end = 0;
-        if (!moe_json_find_array_local(doc, "layer_execution_contract_table", &arr_begin, &arr_end)) {
-            continue;
-        }
-        size_t cursor = arr_begin + 1u;
-        uint64_t row_ordinal = 0;
-        while (cursor < arr_end) {
-            size_t obj_begin = 0;
-            size_t obj_end = 0;
-            if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
-                break;
-            }
-            const uint64_t this_row_ordinal = row_ordinal++;
-            if (!moe_json_slice_matches_layer_index_f32(
-                    doc, obj_begin, obj_end, layer, this_row_ordinal)) {
-                continue;
-            }
-            int value = 0;
-            if (section && section[0]) {
-                std::string row = doc.substr(obj_begin, obj_end - obj_begin);
-                size_t section_begin = 0;
-                size_t section_end = 0;
-                if (moe_json_find_object_local(row, section, &section_begin, &section_end) &&
-                    moe_json_get_bool_slice(row, section_begin, section_end, key, &value)) {
+        while (moe_json_find_next_array_local(
+                   doc, "layer_execution_contract_table", search_pos,
+                   &arr_begin, &arr_end) != std::string::npos) {
+            search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
+            size_t cursor = arr_begin + 1u;
+            uint64_t row_ordinal = 0;
+            while (cursor < arr_end) {
+                size_t obj_begin = 0;
+                size_t obj_end = 0;
+                if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+                    break;
+                }
+                const uint64_t this_row_ordinal = row_ordinal++;
+                if (!moe_json_slice_matches_layer_index_f32(
+                        doc, obj_begin, obj_end, layer, this_row_ordinal)) {
+                    continue;
+                }
+                int value = 0;
+                if (section && section[0]) {
+                    std::string row = doc.substr(obj_begin, obj_end - obj_begin);
+                    size_t section_begin = 0;
+                    size_t section_end = 0;
+                    if (moe_json_find_object_local(row, section, &section_begin, &section_end) &&
+                        moe_json_get_bool_slice(row, section_begin, section_end, key, &value)) {
+                        *out = value ? 1 : 0;
+                        if (out_source) {
+                            *out_source = doc_names[doc_i];
+                        }
+                        return 1;
+                    }
+                }
+                if (moe_json_get_bool_slice(doc, obj_begin, obj_end, key, &value)) {
                     *out = value ? 1 : 0;
                     if (out_source) {
                         *out_source = doc_names[doc_i];
                     }
                     return 1;
                 }
+                // Do not stop after a matching but incomplete row. Runtime
+                // sidecars can carry stub layer_execution_contract_table rows;
+                // keep scanning for the generated .juju.idx authoritative row.
             }
-            if (moe_json_get_bool_slice(doc, obj_begin, obj_end, key, &value)) {
-                *out = value ? 1 : 0;
-                if (out_source) {
-                    *out_source = doc_names[doc_i];
-                }
-                return 1;
-            }
-            break;
         }
     }
     return 0;
@@ -1136,9 +1139,13 @@ static int moe_graph_ir_attention_residual_before_ffn_norm(const moe_pc_engine* 
             continue;
         }
         const std::string& doc = *docp;
+        size_t search_pos = 0;
         size_t arr_begin = 0;
         size_t arr_end = 0;
-        if (moe_json_find_array_local(doc, "layer_execution_contract_table", &arr_begin, &arr_end)) {
+        while (moe_json_find_next_array_local(
+                   doc, "layer_execution_contract_table", search_pos,
+                   &arr_begin, &arr_end) != std::string::npos) {
+            search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
             size_t cursor = arr_begin + 1u;
             uint64_t row_ordinal = 0;
             while (cursor < arr_end) {

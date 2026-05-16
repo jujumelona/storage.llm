@@ -44,6 +44,44 @@ static int moe_json_get_u64_local(const std::string& text, const char* key, uint
     return 1;
 }
 
+static int moe_json_get_u64_max_local(const std::string& text, const char* key, uint64_t* out) {
+    if (!key || !out) {
+        return 0;
+    }
+    const size_t key_len = std::strlen(key);
+    const size_t needle_len = key_len + 2;
+    size_t pos = 0;
+    int found = 0;
+    uint64_t best = 0;
+    while ((pos = text.find('\"', pos)) != std::string::npos) {
+        if (pos + 1 + key_len < text.size() &&
+            text.compare(pos + 1, key_len, key) == 0 &&
+            text[pos + 1 + key_len] == '\"') {
+            const size_t colon = text.find_first_not_of(" \t\r\n", pos + needle_len);
+            if (colon != std::string::npos && colon < text.size() && text[colon] == ':') {
+                const size_t value = text.find_first_not_of(" \t\r\n", colon + 1);
+                if (value != std::string::npos && value < text.size()) {
+                    char* end = nullptr;
+                    const char* begin = text.c_str() + value;
+                    const uint64_t parsed = std::strtoull(begin, &end, 10);
+                    if (end && end != begin) {
+                        if (!found || parsed > best) {
+                            best = parsed;
+                        }
+                        found = 1;
+                    }
+                }
+            }
+        }
+        ++pos;
+    }
+    if (!found) {
+        return 0;
+    }
+    *out = best;
+    return 1;
+}
+
 static int moe_json_get_double_local(const std::string& text, const char* key, double* out) {
     size_t value = 0;
     if (!out || !moe_json_find_scalar(text, key, &value) || value >= text.size()) {
@@ -166,6 +204,46 @@ static int moe_json_find_array_local(
     *begin = value;
     *end = close;
     return 1;
+}
+
+static size_t moe_json_find_next_array_local(
+    const std::string& text,
+    const char* key,
+    size_t search_pos,
+    size_t* begin,
+    size_t* end
+) {
+    if (begin) {
+        *begin = 0;
+    }
+    if (end) {
+        *end = 0;
+    }
+    if (!key || !key[0] || !begin || !end || search_pos >= text.size()) {
+        return std::string::npos;
+    }
+    const size_t key_len = std::strlen(key);
+    size_t pos = search_pos;
+    while ((pos = text.find('\"', pos)) != std::string::npos) {
+        if (pos + 1u + key_len < text.size() &&
+            text.compare(pos + 1u, key_len, key) == 0 &&
+            text[pos + 1u + key_len] == '\"') {
+            const size_t colon = text.find_first_not_of(" \t\r\n", pos + key_len + 2u);
+            if (colon != std::string::npos && colon < text.size() && text[colon] == ':') {
+                const size_t value = text.find_first_not_of(" \t\r\n", colon + 1u);
+                if (value != std::string::npos && value < text.size() && text[value] == '[') {
+                    const size_t close = moe_json_match_bracket_local(text, value, '[', ']');
+                    if (close != std::string::npos) {
+                        *begin = value;
+                        *end = close;
+                        return pos;
+                    }
+                }
+            }
+        }
+        ++pos;
+    }
+    return std::string::npos;
 }
 
 static int moe_json_find_top_level_array_local(

@@ -207,6 +207,95 @@ static void moe_graph_ir_layer_scan_mlp_op_f32(
     }
 }
 
+
+static void moe_graph_ir_layer_scan_contract_table_mlp_op_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* op_tokens,
+    size_t op_token_count,
+    moe_graph_ir_mlp_op_info_f32* out
+) {
+    if (!engine || layer < 0 || !op_tokens || !out) {
+        return;
+    }
+    const std::string* docs[] = {
+        &engine->offload_graph_ir_json,
+        &engine->offload_gguf_metadata_json,
+    };
+    for (const std::string* docp : docs) {
+        if (!docp || docp->empty()) {
+            continue;
+        }
+        const std::string& doc = *docp;
+        size_t search_pos = 0;
+        size_t arr_begin = 0;
+        size_t arr_end = 0;
+        while (moe_json_find_next_array_for_key_local(
+            doc, "layer_execution_contract_table", search_pos,
+            &arr_begin, &arr_end) != std::string::npos) {
+            size_t row_cursor = arr_begin + 1u;
+            uint64_t row_ordinal = 0;
+            while (row_cursor < arr_end) {
+                size_t row_begin = 0;
+                size_t row_end = 0;
+                if (!moe_json_next_object_in_array(doc, &row_cursor, arr_end, &row_begin, &row_end)) {
+                    break;
+                }
+                const uint64_t this_row_ordinal = row_ordinal++;
+                if (!moe_json_slice_matches_layer_index_f32(
+                        doc, row_begin, row_end, layer, this_row_ordinal)) {
+                    continue;
+                }
+                const std::string row_slice = doc.substr(row_begin, row_end - row_begin);
+                size_t ops_begin = 0;
+                size_t ops_end = 0;
+                if (!moe_json_find_array_local(row_slice, "ops", &ops_begin, &ops_end)) {
+                    continue;
+                }
+                ops_begin += row_begin;
+                ops_end += row_begin;
+                size_t op_cursor = ops_begin + 1u;
+                while (op_cursor < ops_end) {
+                    size_t op_begin = 0;
+                    size_t op_end = 0;
+                    if (!moe_json_next_object_in_array(doc, &op_cursor, ops_end, &op_begin, &op_end)) {
+                        break;
+                    }
+                    std::string merged;
+                    std::string value;
+                    static const char* const fields[] = {
+                        "op", "name", "execution_op", "op_role", "role", "graph_role",
+                        "graph_role_text", "bundle_member_role", "type"
+                    };
+                    for (const char* field : fields) {
+                        if (moe_json_get_string_slice(doc, op_begin, op_end, field, &value)) {
+                            merged += " ";
+                            merged += moe_lower_ascii_copy(value);
+                        }
+                    }
+                    if (!moe_graph_ir_text_matches_any_token_f32(
+                            merged, op_tokens, op_token_count)) {
+                        continue;
+                    }
+                    out->present = 1;
+                    int required = 0;
+                    if (moe_json_get_bool_slice(doc, op_begin, op_end, "required", &required) && required) {
+                        out->required = 1;
+                    }
+                    std::vector<std::string> weights;
+                    if (moe_json_get_string_array_slice(doc, op_begin, op_end, "weights", &weights)) {
+                        out->weight_count += weights.size();
+                        if (!weights.empty()) {
+                            out->has_weights = 1;
+                        }
+                    }
+                }
+            }
+            search_pos = arr_end;
+        }
+    }
+}
+
 static size_t moe_graph_ir_layer_contract_name_count_f32(
     const moe_pc_engine* engine,
     int32_t layer,
@@ -272,11 +361,19 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
     };
     moe_graph_ir_layer_scan_mlp_op_f32(
         engine, layer, routed_tokens, sizeof(routed_tokens) / sizeof(routed_tokens[0]), &plan.routed);
+    moe_graph_ir_layer_scan_contract_table_mlp_op_f32(
+        engine, layer, routed_tokens, sizeof(routed_tokens) / sizeof(routed_tokens[0]), &plan.routed);
     moe_graph_ir_layer_scan_mlp_op_f32(
+        engine, layer, shared_tokens, sizeof(shared_tokens) / sizeof(shared_tokens[0]), &plan.shared);
+    moe_graph_ir_layer_scan_contract_table_mlp_op_f32(
         engine, layer, shared_tokens, sizeof(shared_tokens) / sizeof(shared_tokens[0]), &plan.shared);
     moe_graph_ir_layer_scan_mlp_op_f32(
         engine, layer, dense_tokens, sizeof(dense_tokens) / sizeof(dense_tokens[0]), &plan.dense);
+    moe_graph_ir_layer_scan_contract_table_mlp_op_f32(
+        engine, layer, dense_tokens, sizeof(dense_tokens) / sizeof(dense_tokens[0]), &plan.dense);
     moe_graph_ir_layer_scan_mlp_op_f32(
+        engine, layer, post_norm1_tokens, sizeof(post_norm1_tokens) / sizeof(post_norm1_tokens[0]), &plan.post_norm1);
+    moe_graph_ir_layer_scan_contract_table_mlp_op_f32(
         engine, layer, post_norm1_tokens, sizeof(post_norm1_tokens) / sizeof(post_norm1_tokens[0]), &plan.post_norm1);
 
     const size_t contract_routed = moe_graph_ir_layer_contract_name_count_f32(

@@ -588,12 +588,28 @@ static void moe_raw_contract_tensor_names_from_doc(
                     continue;
                 }
                 std::string name;
+                std::vector<std::string> names;
                 if (has_section) {
                     const size_t abs_sec_begin = obj_begin + sec_begin;
                     const size_t abs_sec_end = obj_begin + sec_end;
+                    if (moe_json_get_string_array_slice(doc, abs_sec_begin, abs_sec_end, key, &names)) {
+                        for (const std::string& n : names) {
+                            if (!n.empty()) {
+                                moe_raw_push_unique_tensor_name(out_names, n);
+                            }
+                        }
+                    }
                     if (moe_json_get_string_slice(doc, abs_sec_begin, abs_sec_end, key, &name) &&
                         !name.empty()) {
                         moe_raw_push_unique_tensor_name(out_names, name);
+                    }
+                }
+                names.clear();
+                if (moe_json_get_string_array_slice(doc, obj_begin, obj_end, key, &names)) {
+                    for (const std::string& n : names) {
+                        if (!n.empty()) {
+                            moe_raw_push_unique_tensor_name(out_names, n);
+                        }
                     }
                 }
                 name.clear();

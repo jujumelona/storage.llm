@@ -490,8 +490,9 @@ static int moe_engine_contract_has_router_input_scale(
     };
     auto scope_declares_scale = [&](const std::string& doc, size_t begin, size_t end) -> int {
         static const char* const keys[] = {
-            "router_input_scale", "router_input_scales",
+            "router_input_scale", "router_input_scales", "router_input_scale_tensors",
             "router_scale", "router_scales",
+            "scale", "scales",
             "input_scale", "input_scales",
             "activation_scale", "activation_scales"
         };
@@ -521,14 +522,16 @@ static int moe_engine_contract_has_router_input_scale(
             continue;
         }
         const std::string& doc = *docp;
+        size_t search_pos = 0;
         size_t arr_begin = 0;
         size_t arr_end = 0;
-        if (!moe_json_find_array_local(doc, "layer_execution_contract_table", &arr_begin, &arr_end)) {
-            continue;
-        }
-        size_t cursor = arr_begin + 1u;
-        uint64_t ordinal = 0;
-        while (cursor < arr_end) {
+        while (moe_json_find_next_array_local(
+                   doc, "layer_execution_contract_table", search_pos,
+                   &arr_begin, &arr_end) != std::string::npos) {
+            search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
+            size_t cursor = arr_begin + 1u;
+            uint64_t ordinal = 0;
+            while (cursor < arr_end) {
             size_t obj_begin = 0;
             size_t obj_end = 0;
             if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
@@ -556,8 +559,15 @@ static int moe_engine_contract_has_router_input_scale(
                 scope_declares_scale(doc, obj_begin + router_begin, obj_begin + router_end)) {
                 return 1;
             }
+            size_t semantic_begin = 0;
+            size_t semantic_end = 0;
+            if (moe_json_find_object_local(row, "semantic_contract", &semantic_begin, &semantic_end) &&
+                scope_declares_scale(doc, obj_begin + semantic_begin, obj_begin + semantic_end)) {
+                return 1;
+            }
             if (scope_declares_scale(doc, obj_begin, obj_end)) {
                 return 1;
+            }
             }
         }
     }
@@ -588,6 +598,105 @@ static int moe_engine_contract_has_router_input_scale(
         sizeof(router_scale_suffixes) / sizeof(router_scale_suffixes[0]));
 }
 
+static int moe_engine_contract_declares_direct_router_input_activation_scale(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    auto name_is_weight_sidecar = [](const std::string& name) -> int {
+        const std::string lower = moe_lower_ascii_copy(name);
+        return lower.find("ffn_gate_inp" ".scale") != std::string::npos ||
+            lower.find("ffn_gate_inp" ".scales") != std::string::npos ||
+            lower.find("ffn_gate_inp" ".weight.scale") != std::string::npos ||
+            lower.find("ffn_gate_inp" ".weight.scales") != std::string::npos ||
+            lower.find("router_weight_scale_sidecar") != std::string::npos ||
+            lower.find("weight_sidecar") != std::string::npos ? 1 : 0;
+    };
+    auto scope_declares_direct_scale = [&](const std::string& doc, size_t begin, size_t end) -> int {
+        static const char* const keys[] = {
+            "router_input_scale", "router_input_scales", "router_input_scale_tensors",
+            "router_scale", "router_scales"
+        };
+        for (const char* key : keys) {
+            std::vector<std::string> names;
+            if (moe_json_get_string_array_slice(doc, begin, end, key, &names)) {
+                for (const std::string& name : names) {
+                    if (!name.empty() && !name_is_weight_sidecar(name)) {
+                        return 1;
+                    }
+                }
+            }
+            std::string single;
+            if (moe_json_get_string_slice(doc, begin, end, key, &single) &&
+                !single.empty() && !name_is_weight_sidecar(single)) {
+                return 1;
+            }
+        }
+        return 0;
+    };
+    const std::string* docs[] = {
+        &engine->offload_graph_ir_json,
+        &engine->offload_gguf_metadata_json,
+    };
+    for (const std::string* docp : docs) {
+        if (!docp || docp->empty()) {
+            continue;
+        }
+        const std::string& doc = *docp;
+        size_t search_pos = 0;
+        size_t arr_begin = 0;
+        size_t arr_end = 0;
+        while (moe_json_find_next_array_local(
+                   doc, "layer_execution_contract_table", search_pos,
+                   &arr_begin, &arr_end) != std::string::npos) {
+            search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
+            size_t cursor = arr_begin + 1u;
+            uint64_t ordinal = 0;
+            while (cursor < arr_end) {
+                size_t obj_begin = 0;
+                size_t obj_end = 0;
+                if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+                    break;
+                }
+                const uint64_t this_ordinal = ordinal++;
+                uint64_t parsed = UINT64_MAX;
+                int match = 0;
+                if (moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed) ||
+                    moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer_index", &parsed) ||
+                    moe_json_get_u64_slice(doc, obj_begin, obj_end, "idx", &parsed) ||
+                    moe_json_get_u64_slice(doc, obj_begin, obj_end, "block", &parsed) ||
+                    moe_json_get_u64_slice(doc, obj_begin, obj_end, "block_index", &parsed)) {
+                    match = parsed == (uint64_t)layer ? 1 : 0;
+                } else {
+                    match = this_ordinal == (uint64_t)layer ? 1 : 0;
+                }
+                if (!match) {
+                    continue;
+                }
+                const std::string row = doc.substr(obj_begin, obj_end - obj_begin);
+                size_t router_begin = 0;
+                size_t router_end = 0;
+                if (moe_json_find_object_local(row, "router", &router_begin, &router_end) &&
+                    scope_declares_direct_scale(doc, obj_begin + router_begin, obj_begin + router_end)) {
+                    return 1;
+                }
+                size_t semantic_begin = 0;
+                size_t semantic_end = 0;
+                if (moe_json_find_object_local(row, "semantic_contract", &semantic_begin, &semantic_end) &&
+                    scope_declares_direct_scale(doc, obj_begin + semantic_begin, obj_begin + semantic_end)) {
+                    return 1;
+                }
+                if (scope_declares_direct_scale(doc, obj_begin, obj_end)) {
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 static int moe_engine_contract_uses_direct_router_input_scale(
     const moe_pc_engine* engine,
     int32_t layer
@@ -604,6 +713,9 @@ static int moe_engine_contract_uses_direct_router_input_scale(
     // Direct router-input scale is narrower than "has router input scale".
     // Router_norm.weight-style tensors are RMSNorm gamma weights and must not
     // force hidden_size^-0.5 direct-scale semantics or unit_offset=0.
+    if (moe_engine_contract_declares_direct_router_input_activation_scale(engine, layer)) {
+        return 1;
+    }
     return moe_engine_contract_has_layer_tensor_suffix_any(
         engine, layer, direct_scale_suffixes,
         sizeof(direct_scale_suffixes) / sizeof(direct_scale_suffixes[0])) &&
@@ -855,14 +967,16 @@ static int moe_engine_contract_allows_missing_v_projection_explicit(
             continue;
         }
         const std::string& doc = *docp;
+        size_t search_pos = 0;
         size_t arr_begin = 0;
         size_t arr_end = 0;
-        if (!moe_json_find_array_local(doc, "layer_execution_contract_table", &arr_begin, &arr_end)) {
-            continue;
-        }
-        size_t cursor = arr_begin + 1u;
-        uint64_t row_ordinal = 0;
-        while (cursor < arr_end) {
+        while (moe_json_find_next_array_local(
+                   doc, "layer_execution_contract_table", search_pos,
+                   &arr_begin, &arr_end) != std::string::npos) {
+            search_pos = (arr_end > search_pos) ? arr_end : search_pos + 1u;
+            size_t cursor = arr_begin + 1u;
+            uint64_t row_ordinal = 0;
+            while (cursor < arr_end) {
             size_t obj_begin = 0;
             size_t obj_end = 0;
             if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
@@ -912,7 +1026,10 @@ static int moe_engine_contract_allows_missing_v_projection_explicit(
                 !v_projection.empty()) {
                 return 0;
             }
-            return 0;
+            // A matching row without any V-projection semantic keys can be
+            // a small runtime/stub contract. Keep scanning later contract
+            // tables for the generated .juju.idx authoritative row.
+        }
         }
     }
     return 0;

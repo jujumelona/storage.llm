@@ -535,7 +535,7 @@ static int moe_router_contract_object_has_activation_scale_f32(
     static const char* const scale_keys[] = {
         "router_scale", "router_scales", "scale", "scales",
         "input_scale", "input_scales", "router_input_scale", "router_input_scales",
-        "activation_scale", "activation_scales"
+        "router_input_scale_tensors", "activation_scale", "activation_scales"
     };
     std::vector<std::string> names;
     for (const char* key : scale_keys) {
@@ -692,16 +692,28 @@ static int moe_layer_execution_contract_router_uses_hidden_f32(
                 if (moe_layer_router_contract_has_hidden_input_f32(doc, router_begin, router_end)) {
                     return 1;
                 }
-                int uses_hidden = 0;
-                if (moe_json_get_bool_slice(
-                        doc, router_begin, router_end,
-                        "router_uses_hidden_when_internal_scale_present", &uses_hidden) &&
-                    uses_hidden) {
-                    // The boolean is conditional and becomes true only with a real
-                    // router input activation-scale/norm contract, not a weight
-                    // quantization sidecar.
-                    return moe_router_contract_object_has_activation_scale_f32(
-                        doc, router_begin, router_end) ? 1 : 0;
+                auto router_scope_uses_hidden = [&](size_t scope_begin, size_t scope_end) -> int {
+                    int uses_hidden = 0;
+                    if (moe_json_get_bool_slice(
+                            doc, scope_begin, scope_end,
+                            "router_uses_hidden_when_internal_scale_present", &uses_hidden) &&
+                        uses_hidden) {
+                        // The boolean is conditional and becomes true only with a real
+                        // router input activation-scale/norm contract, not a weight
+                        // quantization sidecar.
+                        return moe_router_contract_object_has_activation_scale_f32(
+                            doc, scope_begin, scope_end) ? 1 : 0;
+                    }
+                    return 0;
+                };
+                if (router_scope_uses_hidden(router_begin, router_end)) {
+                    return 1;
+                }
+                size_t semantic_begin = 0;
+                size_t semantic_end = 0;
+                if (moe_json_find_object_local(row_slice, "semantic_contract", &semantic_begin, &semantic_end) &&
+                    router_scope_uses_hidden(obj_begin + semantic_begin, obj_begin + semantic_end)) {
+                    return 1;
                 }
             }
         }

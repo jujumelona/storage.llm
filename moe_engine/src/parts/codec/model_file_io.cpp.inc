@@ -161,8 +161,21 @@ static void moe_append_runtime_sidecar_blob(
         data.find("\"priority_tables\"") != std::string::npos ||
         data.find("\"moe_offload_policy\"") != std::string::npos;
     if (graph_hint && engine->offload_graph_ir_json.size() < (4u << 20)) {
+        // Runtime sidecars can carry the generator's executable contract.
+        // Do not keep only the first megabyte when that sidecar contains the
+        // layer execution table; otherwise the later forward helpers see a
+        // syntactically valid but semantically truncated GraphIR cache and all
+        // per-layer contract lookups collapse to zero.
+        const int carries_execution_contract =
+            data.find("\"generation_contract\"") != std::string::npos ||
+            data.find("\"layer_execution_contract_table\"") != std::string::npos ||
+            data.find("JUJU_LAYER_EXECUTION_CONTRACT_V1") != std::string::npos ||
+            data.find("JUJU_VALUE_NORM_CONTRACT_V1") != std::string::npos;
+        const size_t copy_limit = carries_execution_contract ?
+            std::min<size_t>(data.size(), 16u << 20) :
+            std::min<size_t>(data.size(), 1u << 20);
         engine->offload_graph_ir_json.push_back('\n');
-        engine->offload_graph_ir_json += data.substr(0, std::min<size_t>(data.size(), 1u << 20));
+        engine->offload_graph_ir_json += data.substr(0, copy_limit);
     }
 }
 

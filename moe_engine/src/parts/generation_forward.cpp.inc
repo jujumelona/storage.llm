@@ -77,9 +77,13 @@ static int moe_generation_contract_get_u64_any_doc(
     }
     uint64_t graph_value = 0;
     uint64_t metadata_value = 0;
-    const int graph_ok = moe_json_get_u64_local(engine->offload_graph_ir_json, key, &graph_value);
-    const int metadata_ok = moe_json_get_u64_local(engine->offload_gguf_metadata_json, key, &metadata_value);
-    if (metadata_ok && (!graph_ok || graph_value == 0)) {
+    const int graph_ok = moe_json_get_u64_max_local(engine->offload_graph_ir_json, key, &graph_value);
+    const int metadata_ok = moe_json_get_u64_max_local(engine->offload_gguf_metadata_json, key, &metadata_value);
+    if (graph_ok && metadata_ok) {
+        *out = std::max<uint64_t>(graph_value, metadata_value);
+        return 1;
+    }
+    if (metadata_ok) {
         *out = metadata_value;
         return 1;
     }

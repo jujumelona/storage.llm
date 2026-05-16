@@ -232,55 +232,74 @@ static int moe_layer_contract_declares_unweighted_v_norm(
                 // Non-layer arrays such as global summaries must not enable every layer.
                 continue;
             }
-            const int role_matches = moe_json_slice_string_field_matches_any_ci(
-                doc, obj_begin, obj_end,
-                role_fields, sizeof(role_fields) / sizeof(role_fields[0]),
-                v_norm_roles, sizeof(v_norm_roles) / sizeof(v_norm_roles[0]));
-            int value_norm_declared = 0;
-            (void)moe_json_get_bool_slice(doc, obj_begin, obj_end, "value_norm_declared", &value_norm_declared);
-            std::string value_norm_input;
-            if (moe_json_get_string_slice(doc, obj_begin, obj_end, "value_norm_input", &value_norm_input) &&
-                moe_ascii_contains_ci(value_norm_input, "missing_value_projection")) {
-                continue;
-            }
-            int has_v_norm_key = role_matches;
-            std::string v_norm_name;
-            if ((moe_json_get_string_slice(doc, obj_begin, obj_end, "v_norm", &v_norm_name) ||
-                 moe_json_get_string_slice(doc, obj_begin, obj_end, "value_norm", &v_norm_name)) &&
-                !v_norm_name.empty()) {
-                has_v_norm_key = 1;
-            }
-            int unweighted = 0;
-            if ((value_norm_declared || has_v_norm_key) &&
-                moe_json_get_bool_slice(doc, obj_begin, obj_end, "unweighted", &unweighted) && unweighted) {
+            auto scope_declares_unweighted_v_norm = [&](size_t scope_begin, size_t scope_end) -> int {
+                const int role_matches = moe_json_slice_string_field_matches_any_ci(
+                    doc, scope_begin, scope_end,
+                    role_fields, sizeof(role_fields) / sizeof(role_fields[0]),
+                    v_norm_roles, sizeof(v_norm_roles) / sizeof(v_norm_roles[0]));
+                int value_norm_declared = 0;
+                (void)moe_json_get_bool_slice(doc, scope_begin, scope_end, "value_norm_declared", &value_norm_declared);
+                std::string value_norm_input;
+                if (moe_json_get_string_slice(doc, scope_begin, scope_end, "value_norm_input", &value_norm_input) &&
+                    moe_ascii_contains_ci(value_norm_input, "missing_value_projection")) {
+                    return 0;
+                }
+                int has_v_norm_key = role_matches;
+                std::string v_norm_name;
+                if ((moe_json_get_string_slice(doc, scope_begin, scope_end, "v_norm", &v_norm_name) ||
+                     moe_json_get_string_slice(doc, scope_begin, scope_end, "value_norm", &v_norm_name)) &&
+                    !v_norm_name.empty()) {
+                    has_v_norm_key = 1;
+                }
+                int unweighted = 0;
+                if ((value_norm_declared || has_v_norm_key) &&
+                    moe_json_get_bool_slice(doc, scope_begin, scope_end, "unweighted", &unweighted) && unweighted) {
+                    return 1;
+                }
+                int contractual_when_declared = 0;
+                if ((value_norm_declared || has_v_norm_key) &&
+                    moe_json_get_bool_slice(
+                        doc, scope_begin, scope_end,
+                        "unweighted_value_norm_is_contractual_when_declared", &contractual_when_declared) &&
+                    contractual_when_declared) {
+                    return 1;
+                }
+                int requires_local_weight = 1;
+                if ((value_norm_declared || has_v_norm_key) &&
+                    (moe_json_get_bool_slice(doc, scope_begin, scope_end, "requires_layer_local_weight_tensor", &requires_local_weight) ||
+                     moe_json_get_bool_slice(doc, scope_begin, scope_end, "value_norm_requires_layer_local_weight_tensor", &requires_local_weight)) &&
+                    !requires_local_weight) {
+                    return 1;
+                }
+                std::string mode;
+                if (moe_json_get_string_slice(doc, scope_begin, scope_end, "value_norm_mode", &mode) &&
+                    moe_ascii_contains_ci(mode, "unweighted_rmsnorm_contract")) {
+                    return 1;
+                }
+                if (moe_json_get_string_slice(doc, scope_begin, scope_end, "v_norm_mode", &mode) &&
+                    moe_ascii_contains_ci(mode, "unweighted_rmsnorm_contract")) {
+                    return 1;
+                }
+                if (moe_json_get_string_slice(doc, scope_begin, scope_end, "norm_mode", &mode) &&
+                    moe_ascii_contains_ci(mode, "unweighted_rmsnorm_contract")) {
+                    return 1;
+                }
+                return 0;
+            };
+            if (scope_declares_unweighted_v_norm(obj_begin, obj_end)) {
                 return 1;
             }
-            int contractual_when_declared = 0;
-            if ((value_norm_declared || has_v_norm_key) &&
-                moe_json_get_bool_slice(
-                    doc, obj_begin, obj_end,
-                    "unweighted_value_norm_is_contractual_when_declared", &contractual_when_declared) &&
-                contractual_when_declared) {
-                return 1;
-            }
-            int requires_local_weight = 1;
-            if (value_norm_declared &&
-                (moe_json_get_bool_slice(doc, obj_begin, obj_end, "requires_layer_local_weight_tensor", &requires_local_weight) ||
-                 moe_json_get_bool_slice(doc, obj_begin, obj_end, "value_norm_requires_layer_local_weight_tensor", &requires_local_weight)) &&
-                !requires_local_weight) {
-                return 1;
-            }
-            if (!role_matches && !value_norm_declared && !has_v_norm_key) {
-                continue;
-            }
-            std::string mode;
-            if (moe_json_get_string_slice(doc, obj_begin, obj_end, "value_norm_mode", &mode) &&
-                moe_ascii_contains_ci(mode, "unweighted_rmsnorm_contract")) {
-                return 1;
-            }
-            if (moe_json_get_string_slice(doc, obj_begin, obj_end, "norm_mode", &mode) &&
-                moe_ascii_contains_ci(mode, "unweighted_rmsnorm_contract")) {
-                return 1;
+            const std::string row_scope = doc.substr(obj_begin, obj_end - obj_begin);
+            static const char* const nested_scopes[] = {
+                "semantic_contract", "attention", "value_norm", "v_norm"
+            };
+            for (const char* nested_key : nested_scopes) {
+                size_t nested_begin = 0;
+                size_t nested_end = 0;
+                if (moe_json_find_object_local(row_scope, nested_key, &nested_begin, &nested_end) &&
+                    scope_declares_unweighted_v_norm(obj_begin + nested_begin, obj_begin + nested_end)) {
+                    return 1;
+                }
             }
         }
     }
