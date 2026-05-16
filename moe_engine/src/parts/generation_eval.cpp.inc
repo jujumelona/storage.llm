@@ -295,16 +295,21 @@ int moe_pc_engine_eval_token_ids_from(
         moe_eval_set_error(out_stats, "failed to allocate decode scratch");
         return 0;
     }
-    moe_profile_log(
-        "eval_prepare_end",
-        "kv_max_seq=%u qkv_cap=%u qkv_limit=%u plain_kv_bytes=%llu rope_q=%zu rope_k=%zu hidden=%zu",
-        eval_qkv_only ? 0u : scratch.kv_cache.max_seq_len,
-        scratch.qkv_capacity_tokens,
-        scratch.qkv_seq_limit,
-        (unsigned long long)(eval_qkv_only ? 0ull : moe_kv_cache_allocated_bytes(scratch.kv_cache)),
-        scratch.rope_q_cos.size(),
-        scratch.rope_k_cos.size(),
-        scratch.hidden.size());
+    {
+        const float eval_softcap = moe_final_logit_softcap_value(engine);
+        moe_profile_log(
+            "eval_prepare_end",
+            "kv_max_seq=%u qkv_cap=%u qkv_limit=%u plain_kv_bytes=%llu rope_q=%zu rope_k=%zu hidden=%zu final_logit_softcap=%.6g vocab=%u",
+            eval_qkv_only ? 0u : scratch.kv_cache.max_seq_len,
+            scratch.qkv_capacity_tokens,
+            scratch.qkv_seq_limit,
+            (unsigned long long)(eval_qkv_only ? 0ull : moe_kv_cache_allocated_bytes(scratch.kv_cache)),
+            scratch.rope_q_cos.size(),
+            scratch.rope_k_cos.size(),
+            scratch.hidden.size(),
+            (double)eval_softcap,
+            c->vocab_size);
+    }
     if (scratch.hidden.size() < c->hidden_size ||
         scratch.residual.size() < c->hidden_size ||
         scratch.norm.size() < c->hidden_size ||
@@ -447,9 +452,20 @@ int moe_pc_engine_eval_token_ids_from(
         out_stats->mean_nll = mean_nll;
         out_stats->perplexity = ppl;
     }
+    // PPL sanity diagnostic: warn when mean_nll > ln(vocab_size)
+    // This means the model performs worse than uniform random prediction.
+    const double random_nll = c->vocab_size > 1 ? std::log((double)c->vocab_size) : 0.0;
+    const int ppl_worse_than_random = std::isfinite(mean_nll) && random_nll > 0.0 && mean_nll > random_nll;
+    if (ppl_worse_than_random) {
+        moe_profile_log(
+            "eval_ppl_sanity_warning",
+            "mean_nll=%.6g exceeds ln(vocab=%u)=%.6g — model performs worse than uniform random. "
+            "Possible causes: wrong test input, quantization degradation, or misconfigured softcap",
+            mean_nll, c->vocab_size, random_nll);
+    }
     moe_profile_log(
         "eval_done",
-        "id=%llu input_tokens=%u first_target=%u evaluated=%u nll=%.9g mean_nll=%.9g ppl=%.9g total_ms=%.3f",
+        "id=%llu input_tokens=%u first_target=%u evaluated=%u nll=%.9g mean_nll=%.9g ppl=%.9g random_nll=%.6g worse_than_random=%d total_ms=%.3f",
         (unsigned long long)eval_scope.id,
         input_token_count,
         first_target_index,
@@ -457,6 +473,8 @@ int moe_pc_engine_eval_token_ids_from(
         nll,
         mean_nll,
         ppl,
+        random_nll,
+        ppl_worse_than_random,
         moe_profile_elapsed_ms(eval_start_us));
     eval_scope.ok = 1;
     return 1;

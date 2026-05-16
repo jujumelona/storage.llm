@@ -33,7 +33,7 @@ static uint64_t common_vram_wanted_bytes(const moe_pc_engine* engine) {
         // Fallback to 8192 if max_seq_len unavailable.
         // BUGFIX Problem 3: Account for MLA projection buffers ★★★ CRITICAL
         // Problem: MLA models have latent_dim projection buffers much larger than KQ matrix
-        // → GLM-5.1: latent_dim=512, num_experts=256 → projection scratch ~2GB
+        // → Large MoE models: latent_dim=512, num_experts=256 → projection scratch ~2GB
         // → Fallback underestimates by 10-15x → embedding/lm_head evicted every token
         // Solution: Add MLA latent buffer estimate: num_experts × latent_dim × max_seq_len × 2
         // Impact: Correct VRAM reservation for MLA models, prevents reload thrashing

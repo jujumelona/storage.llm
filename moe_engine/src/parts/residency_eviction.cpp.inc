@@ -58,7 +58,7 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
     // proactive_eviction_worker_loop runs every 5ms and compacts the heap offline.
     // Combined with 2048 cap for compact_needed and 512 for normal, this keeps
     // heap_mutex hold time under ~200μs worst case.
-    // Impact: Eliminates multi-ms latency spikes on GLM-5.1 (19,456 triplets).
+    // Impact: Eliminates multi-ms latency spikes on large MoE models (e.g. 256×79 = 19,456 triplets).
     const uint32_t raw_stale_limit = engine->evict_heap_urgent_compact.load(std::memory_order_relaxed)
         ? std::min(heap_size, 4096u)
         : (engine->evict_heap_compact_needed.load(std::memory_order_relaxed)
@@ -127,7 +127,7 @@ static int pop_valid_evict_candidate(moe_pc_engine* engine, moe_tier_t tier, moe
             }
             // BUGFIX 992: Batch scan on last retry to handle large stale heaps ★★★ CRITICAL
             // Problem: 6 single-pop retries scan at most 6 entries after compact.
-            // GLM-5.1 (256 experts × 79 layers = 19,456 triplets) can generate
+            // Large MoE models (e.g. 256 experts × 79 layers = 19,456 triplets) can generate
             // thousands of stale entries per second. 6 entries is insufficient.
             // Solution: On last retry (5), scan up to min(heap_size, 2048) entries
             // in a batch within a single heap_lock hold. This is bounded (~2048 pops,

@@ -1,5 +1,5 @@
 // Bug #1 Fix: Full MLA attention with Q projection, RoPE, scaled dot-product.
-// GLM4/Moe Multi-head Latent Attention (MLA):
+// Multi-head Latent Attention (MLA) RoPE implementation:
 //   KV path: hidden -> kv_a_proj(576) -> [kv_a_norm(512), mqa_rope(64)]
 //            kv_a_norm -> kv_b_proj(28672) -> [K_nope(12288), V(16384)]
 //   Q path:  hidden -> q_a_proj(2048) -> q_a_norm(2048) -> q_b_proj(12288+4096=16384)

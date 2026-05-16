@@ -294,6 +294,7 @@ static float moe_final_logit_softcap_value(const moe_pc_engine* engine) {
     double value = 0.0;
     float cap = 0.0f;
     int present = 0;
+    const char* source = "absent";
     if (!engine->offload_gguf_metadata_json.empty() &&
         (moe_json_get_double_local(engine->offload_gguf_metadata_json, "final_logit_softcapping", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "final_logit_softcap", &value) ||
@@ -301,6 +302,7 @@ static float moe_final_logit_softcap_value(const moe_pc_engine* engine) {
         value > 0.0 && std::isfinite(value)) {
         cap = (float)value;
         present = 1;
+        source = "gguf_metadata";
     } else if (!engine->offload_graph_ir_json.empty() &&
         (moe_json_get_double_local(engine->offload_graph_ir_json, "final_logit_softcapping", &value) ||
          moe_json_get_double_local(engine->offload_graph_ir_json, "final_logit_softcap", &value) ||
@@ -308,6 +310,15 @@ static float moe_final_logit_softcap_value(const moe_pc_engine* engine) {
         value > 0.0 && std::isfinite(value)) {
         cap = (float)value;
         present = 1;
+        source = "graph_ir";
+    }
+    // One-time trace of softcap configuration for PPL diagnostics
+    static std::atomic<uint32_t> softcap_traced{0};
+    if (softcap_traced.fetch_add(1, std::memory_order_relaxed) == 0) {
+        moe_profile_log(
+            "final_logit_softcap_resolved",
+            "present=%d value=%.6g source=%s",
+            present, (double)cap, source);
     }
     if (tls_cache.size() > 64u) {
         tls_cache.erase(tls_cache.begin(), tls_cache.begin() + 16);

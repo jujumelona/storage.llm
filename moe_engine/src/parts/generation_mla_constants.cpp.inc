@@ -97,7 +97,7 @@ static moe_attn_config_t moe_generation_attn_config(const moe_pc_engine* engine)
             // Reserve half of RAM budget for KV cache
             if (engine->config.ram_budget_bytes > 0) {
                 const moe_model_shape_t shape = moe_engine_model_shape_or_static(engine);
-                const uint32_t layers = shape.num_hidden_layers ? shape.num_hidden_layers : 79u;
+                const uint32_t layers = shape.num_hidden_layers ? shape.num_hidden_layers : 30u;
                 const uint64_t bytes_per_token = layers * 584ull;  // INT8 + scales + zeros
                 const uint64_t max_affordable = engine->config.ram_budget_bytes / (2 * bytes_per_token);
                 if (max_affordable < desired_max_seq) {

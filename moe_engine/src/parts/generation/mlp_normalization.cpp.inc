@@ -1258,7 +1258,30 @@ static int moe_layer_dense_mlp_f32(
             layer, ok, moe_profile_elapsed_ms(residual_start_us), moe_profile_elapsed_ms(total_start_us));
         return ok;
     }
-    const uint32_t dense_intermediate = 12288u;
+    // Dense MLP fallback path — only reached when graph IR common tensor
+    // binding fails AND offload_graph_ir is unavailable.  Derive intermediate
+    // size dynamically from engine metadata rather than hardcoding.
+    uint32_t dense_intermediate = 0;
+    if (engine) {
+        double ir_value = 0.0;
+        if (!engine->offload_gguf_metadata_json.empty() &&
+            (moe_json_get_double_local(engine->offload_gguf_metadata_json, "intermediate_size", &ir_value) ||
+             moe_json_get_double_local(engine->offload_gguf_metadata_json, "ffn_dim", &ir_value) ||
+             moe_json_get_double_local(engine->offload_gguf_metadata_json, "feed_forward_length", &ir_value)) &&
+            ir_value > 0.0 && ir_value < 1000000.0) {
+            dense_intermediate = (uint32_t)ir_value;
+        } else if (!engine->offload_graph_ir_json.empty() &&
+            (moe_json_get_double_local(engine->offload_graph_ir_json, "intermediate_size", &ir_value) ||
+             moe_json_get_double_local(engine->offload_graph_ir_json, "ffn_dim", &ir_value) ||
+             moe_json_get_double_local(engine->offload_graph_ir_json, "feed_forward_length", &ir_value)) &&
+            ir_value > 0.0 && ir_value < 1000000.0) {
+            dense_intermediate = (uint32_t)ir_value;
+        }
+    }
+    if (dense_intermediate == 0) {
+        // Universal default: 4 * hidden_size is the standard MLP expansion ratio
+        dense_intermediate = hidden_size * 4u;
+    }
     const uint64_t bytes =
         2ull * (uint64_t)dense_intermediate * (uint64_t)hidden_size * 2ull +
         (uint64_t)hidden_size * (uint64_t)dense_intermediate * 2ull;
