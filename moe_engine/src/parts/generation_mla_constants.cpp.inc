@@ -81,8 +81,36 @@ static moe_attn_config_t moe_generation_attn_config(const moe_pc_engine* engine)
             cfg.qk_nope_head_dim = cfg.head_dim - cfg.qk_rope_head_dim;
         }
     }
-    if (cfg.rms_norm_eps <= 0.0f) cfg.rms_norm_eps = 1.0e-6f;
-    if (cfg.rope_theta <= 0.0f) cfg.rope_theta = moe_ROPE_THETA;
+    // Parse architecture-specific RMS Norm Epsilon and RoPE Theta from GGUF KV metadata
+    if (engine) {
+        double dvalue = 0.0;
+        // Check for rms_norm_eps if it is the default 1e-6 or 0
+        if (cfg.rms_norm_eps <= 0.0f || std::fabs(cfg.rms_norm_eps - 1.0e-6f) < 1e-8f) {
+            if (moe_json_get_double_local(engine->offload_gguf_metadata_json, "llama.attention.layer_norm_rms_epsilon", &dvalue) ||
+                moe_json_get_double_local(engine->offload_gguf_metadata_json, "qwen2.attention.layer_norm_rms_epsilon", &dvalue) ||
+                moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma2.attention.layer_norm_rms_epsilon", &dvalue) ||
+                moe_json_get_double_local(engine->offload_gguf_metadata_json, "rms_norm_eps", &dvalue)) {
+                cfg.rms_norm_eps = (float)dvalue;
+            } else if (cfg.rms_norm_eps <= 0.0f) {
+                cfg.rms_norm_eps = 1.0e-6f;
+            }
+        }
+        
+        // Check for rope_theta if it is the default 500000.0f or 0
+        if (cfg.rope_theta <= 0.0f || std::fabs(cfg.rope_theta - moe_ROPE_THETA) < 1.0f) {
+            if (moe_json_get_double_local(engine->offload_gguf_metadata_json, "llama.rope.freq_base", &dvalue) ||
+                moe_json_get_double_local(engine->offload_gguf_metadata_json, "qwen2.rope.freq_base", &dvalue) ||
+                moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma2.rope.freq_base", &dvalue) ||
+                moe_json_get_double_local(engine->offload_gguf_metadata_json, "rope_theta", &dvalue)) {
+                cfg.rope_theta = (float)dvalue;
+            } else if (cfg.rope_theta <= 0.0f) {
+                cfg.rope_theta = moe_ROPE_THETA;
+            }
+        }
+    } else {
+        if (cfg.rms_norm_eps <= 0.0f) cfg.rms_norm_eps = 1.0e-6f;
+        if (cfg.rope_theta <= 0.0f) cfg.rope_theta = moe_ROPE_THETA;
+    }
 
     // BUGFIX Problem 7: Use config max_context_len if specified ★★★ CRITICAL
     // Problem: moe_MLA_MAX_SEQ_LEN = 8192 hardcoded, truncates 128K context models

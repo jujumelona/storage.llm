@@ -32,6 +32,10 @@ static moe_io_path_t choose_active_io_path(const moe_pc_engine* engine) {
 
 static int engine_bypass_staging_pipeline(const moe_pc_engine* engine) {
     if (!engine) return 0;
+    if (engine->gpu_path_disabled_for_cpu_only.load(std::memory_order_relaxed) ||
+        engine->cpu_only_runtime.load(std::memory_order_relaxed)) {
+        return 1;
+    }
     if (engine->backend_caps.backend == moe_BACKEND_METAL && engine->backend_caps.supports_unified_memory) {
         return !(engine->io_config.enable_pinned_host && engine->io_config.pinned_staging_bytes > 0);
     }
