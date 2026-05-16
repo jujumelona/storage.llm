@@ -278,22 +278,47 @@ static float moe_final_logit_softcap_value(const moe_pc_engine* engine) {
     if (!engine) {
         return 0.0f;
     }
+    struct final_logit_softcap_cache_entry {
+        const moe_pc_engine* engine = nullptr;
+        uint64_t generation = 0;
+        uint32_t value_bits = 0;
+        int present = 0;
+    };
+    static thread_local std::vector<final_logit_softcap_cache_entry> tls_cache;
+    const uint64_t generation = engine->engine_generation;
+    for (const final_logit_softcap_cache_entry& e : tls_cache) {
+        if (e.engine == engine && e.generation == generation) {
+            return e.present ? moe_f32_from_bits(e.value_bits) : 0.0f;
+        }
+    }
     double value = 0.0;
+    float cap = 0.0f;
+    int present = 0;
     if (!engine->offload_gguf_metadata_json.empty() &&
         (moe_json_get_double_local(engine->offload_gguf_metadata_json, "final_logit_softcapping", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "final_logit_softcap", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "logit_softcap", &value)) &&
         value > 0.0 && std::isfinite(value)) {
-        return (float)value;
-    }
-    if (!engine->offload_graph_ir_json.empty() &&
+        cap = (float)value;
+        present = 1;
+    } else if (!engine->offload_graph_ir_json.empty() &&
         (moe_json_get_double_local(engine->offload_graph_ir_json, "final_logit_softcapping", &value) ||
          moe_json_get_double_local(engine->offload_graph_ir_json, "final_logit_softcap", &value) ||
          moe_json_get_double_local(engine->offload_graph_ir_json, "logit_softcap", &value)) &&
         value > 0.0 && std::isfinite(value)) {
-        return (float)value;
+        cap = (float)value;
+        present = 1;
     }
-    return 0.0f;
+    if (tls_cache.size() > 64u) {
+        tls_cache.erase(tls_cache.begin(), tls_cache.begin() + 16);
+    }
+    final_logit_softcap_cache_entry entry{};
+    entry.engine = engine;
+    entry.generation = generation;
+    entry.value_bits = moe_f32_bits(cap);
+    entry.present = present;
+    tls_cache.push_back(entry);
+    return present ? cap : 0.0f;
 }
 
 static float moe_apply_final_logit_softcap(const moe_pc_engine* engine, float score) {

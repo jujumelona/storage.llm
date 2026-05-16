@@ -309,13 +309,46 @@ static int moe_map_router_bias_tensor(
         "moe.gate.e_score_correction_bias",
         "ffn_gate_inp.bias"
     };
+    struct router_bias_cache_entry {
+        const moe_pc_engine* engine = nullptr;
+        uint64_t generation = 0;
+        int32_t layer = INT32_MIN;
+        uint32_t experts = 0;
+        uint64_t key = 0;
+        uint8_t found = 0;
+        moe_raw_tensor_cache_entry raw{};
+    };
+    static thread_local std::vector<router_bias_cache_entry> tls_bias_cache;
     const uint32_t suffix_hash = moe_router_fnv1a_hash_string(suffixes[0]);
     const uint64_t key = ((uint64_t)(uint32_t)layer << 32) | suffix_hash | 0x90000000ull;
+    const uint64_t generation = engine->engine_generation;
+    for (const router_bias_cache_entry& e : tls_bias_cache) {
+        if (e.engine == engine && e.generation == generation &&
+            e.layer == layer && e.experts == experts && e.key == key) {
+            if (!e.found || !e.raw.base) {
+                return 0;
+            }
+            *out = e.raw;
+            return 1;
+        }
+    }
     {
         std::shared_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
         auto found = engine->raw_tensor_cache.find(key);
         if (found != engine->raw_tensor_cache.end() && found->second.base) {
             *out = found->second;
+            router_bias_cache_entry entry{};
+            entry.engine = engine;
+            entry.generation = generation;
+            entry.layer = layer;
+            entry.experts = experts;
+            entry.key = key;
+            entry.found = 1;
+            entry.raw = *out;
+            if (tls_bias_cache.size() > 256u) {
+                tls_bias_cache.erase(tls_bias_cache.begin(), tls_bias_cache.begin() + 64);
+            }
+            tls_bias_cache.push_back(entry);
             return 1;
         }
     }
@@ -324,19 +357,32 @@ static int moe_map_router_bias_tensor(
     moe_raw_tensor_desc desc{};
     const moe_gguf_common_tensor_record* rec =
         moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
-    if (!rec) {
-        return 0;
-    }
     moe_raw_tensor_cache_entry raw{};
-    if (!map_common_tensor_record(engine, *rec, desc, &raw)) {
-        return 0;
+    uint8_t found_ok = 0;
+    if (rec && map_common_tensor_record(engine, *rec, desc, &raw)) {
+        const uint64_t count = moe_router_raw_scalar_count(raw);
+        if (count == (uint64_t)experts) {
+            found_ok = 1;
+        } else {
+            moe_profile_log(
+                "router_bias_reject",
+                "layer=%d experts=%u count=%llu rows=%u cols=%u",
+                layer, experts, (unsigned long long)count, raw.rows, raw.cols);
+        }
     }
-    const uint64_t count = moe_router_raw_scalar_count(raw);
-    if (count != (uint64_t)experts) {
-        moe_profile_log(
-            "router_bias_reject",
-            "layer=%d experts=%u count=%llu rows=%u cols=%u",
-            layer, experts, (unsigned long long)count, raw.rows, raw.cols);
+    router_bias_cache_entry entry{};
+    entry.engine = engine;
+    entry.generation = generation;
+    entry.layer = layer;
+    entry.experts = experts;
+    entry.key = key;
+    entry.found = found_ok;
+    entry.raw = raw;
+    if (tls_bias_cache.size() > 256u) {
+        tls_bias_cache.erase(tls_bias_cache.begin(), tls_bias_cache.begin() + 64);
+    }
+    tls_bias_cache.push_back(entry);
+    if (!found_ok) {
         return 0;
     }
     *out = raw;

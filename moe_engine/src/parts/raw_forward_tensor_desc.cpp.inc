@@ -930,6 +930,42 @@ static int common_tensor_backing_file_ready(
         rec->bytes <= file_bytes - rec->file_offset ? 1 : 0;
 }
 
+static uint64_t moe_common_tensor_record_cache_mix_u64(uint64_t h, uint64_t v) {
+    h ^= v & 0xffu; h *= 1099511628211ull;
+    h ^= (v >> 8) & 0xffu; h *= 1099511628211ull;
+    h ^= (v >> 16) & 0xffu; h *= 1099511628211ull;
+    h ^= (v >> 24) & 0xffu; h *= 1099511628211ull;
+    h ^= (v >> 32) & 0xffu; h *= 1099511628211ull;
+    h ^= (v >> 40) & 0xffu; h *= 1099511628211ull;
+    h ^= (v >> 48) & 0xffu; h *= 1099511628211ull;
+    h ^= (v >> 56) & 0xffu; h *= 1099511628211ull;
+    return h;
+}
+
+static uint64_t moe_common_tensor_record_cache_key(
+    const moe_gguf_common_tensor_record& rec,
+    const moe_raw_tensor_desc& desc
+) {
+    // Keep this cache in a key range that cannot collide with layer/kind raw
+    // tensor keys (those occupy low bits and small layer numbers).  The key is
+    // based on the resolved physical tensor identity plus the mathematical view
+    // shape, so token_embedding/final_norm/lm_head/common-tensor probes can
+    // reuse the exact same mmap/row metadata without changing numerics.
+    uint64_t h = 1469598103934665603ull;
+    h = moe_common_tensor_record_cache_mix_u64(h, (uint64_t)rec.resolved_path_index);
+    h = moe_common_tensor_record_cache_mix_u64(h, rec.file_offset);
+    h = moe_common_tensor_record_cache_mix_u64(h, rec.bytes);
+    h = moe_common_tensor_record_cache_mix_u64(h, (uint64_t)rec.type);
+    h = moe_common_tensor_record_cache_mix_u64(h, (uint64_t)rec.weight_encoding);
+    h = moe_common_tensor_record_cache_mix_u64(h, (uint64_t)rec.weight_row_bytes);
+    h = moe_common_tensor_record_cache_mix_u64(h, (uint64_t)rec.math_transposed);
+    h = moe_common_tensor_record_cache_mix_u64(h, (uint64_t)desc.bytes);
+    h = moe_common_tensor_record_cache_mix_u64(h, (uint64_t)desc.rows);
+    h = moe_common_tensor_record_cache_mix_u64(h, (uint64_t)desc.cols);
+    h = moe_common_tensor_record_cache_mix_u64(h, (uint64_t)desc.math_transposed);
+    return 0xa000000000000000ull | (h & 0x0fffffffffffffffull);
+}
+
 static int map_common_tensor_record(
     moe_pc_engine* engine,
     const moe_gguf_common_tensor_record& rec,
@@ -939,6 +975,15 @@ static int map_common_tensor_record(
     if (!engine || !out_entry || rec.resolved_path_index >= engine->tensor_paths.size() ||
         rec.bytes == 0 || desc.bytes == 0) {
         return 0;
+    }
+    const uint64_t common_cache_key = moe_common_tensor_record_cache_key(rec, desc);
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        auto found = engine->raw_tensor_cache.find(common_cache_key);
+        if (found != engine->raw_tensor_cache.end() && found->second.base) {
+            *out_entry = found->second;
+            return 1;
+        }
     }
     const std::string& path = engine->tensor_paths[rec.resolved_path_index];
     // CPU-RAM JUJU execution already builds full-shard hot views.  Reusing the
@@ -1026,6 +1071,15 @@ static int map_common_tensor_record(
             entry.weight_row_bytes = entry.bytes / rows64;
         }
     }
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        auto found = engine->raw_tensor_cache.find(common_cache_key);
+        if (found != engine->raw_tensor_cache.end() && found->second.base) {
+            *out_entry = found->second;
+            return 1;
+        }
+        engine->raw_tensor_cache[common_cache_key] = entry;
+    }
     *out_entry = entry;
     return 1;
 }
@@ -1036,48 +1090,48 @@ static int raw_tensor_desc_for_kind(moe_raw_tensor_kind_t kind, moe_raw_tensor_d
     }
     switch (kind) {
         case moe_RAW_TENSOR_INPUT_LAYER_NORM:
-            *out = {moe_RAW_ROLE_NORM, 12288ull, 0u, 0ull, 12288ull, 6144u, 0u};
+            *out = {moe_RAW_ROLE_NORM, 12288ull, 0u, 0ull, 12288ull, 6144u, 0u, 0u};
             return 1;
         case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM:
-            *out = {moe_RAW_ROLE_NORM, 12288ull, 1u, 0ull, 12288ull, 6144u, 0u};
+            *out = {moe_RAW_ROLE_NORM, 12288ull, 1u, 0ull, 12288ull, 6144u, 0u, 0u};
             return 1;
         case moe_RAW_TENSOR_Q_A_LAYER_NORM:
-            *out = {moe_RAW_ROLE_NORM, 4096ull, 0u, 0ull, 4096ull, 2048u, 0u};
+            *out = {moe_RAW_ROLE_NORM, 4096ull, 0u, 0ull, 4096ull, 2048u, 0u, 0u};
             return 1;
         case moe_RAW_TENSOR_KV_A_LAYER_NORM:
-            *out = {moe_RAW_ROLE_NORM, 1024ull, 0u, 0ull, 1024ull, 512u, 0u};
+            *out = {moe_RAW_ROLE_NORM, 1024ull, 0u, 0ull, 1024ull, 512u, 0u, 0u};
             return 1;
         case moe_RAW_TENSOR_V_A_LAYER_NORM:
             return 0;
         case moe_RAW_TENSOR_Q_A_PROJ:
-            *out = {moe_RAW_ROLE_ATTENTION, 92274688ull, 0u, 0ull, 25165824ull, 2048u, 6144u};
+            *out = {moe_RAW_ROLE_ATTENTION, 92274688ull, 0u, 0ull, 25165824ull, 2048u, 6144u, 0u};
             return 1;
         case moe_RAW_TENSOR_Q_B_PROJ:
-            *out = {moe_RAW_ROLE_ATTENTION, 92274688ull, 0u, 25165824ull, 67108864ull, 16384u, 2048u};
+            *out = {moe_RAW_ROLE_ATTENTION, 92274688ull, 0u, 25165824ull, 67108864ull, 16384u, 2048u, 0u};
             return 1;
         case moe_RAW_TENSOR_KV_A_PROJ_WITH_MQA:
-            *out = {moe_RAW_ROLE_ATTENTION, 237764608ull, 0u, 0ull, 7077888ull, 576u, 6144u};
+            *out = {moe_RAW_ROLE_ATTENTION, 237764608ull, 0u, 0ull, 7077888ull, 576u, 6144u, 0u};
             return 1;
         case moe_RAW_TENSOR_KV_B_PROJ:
-            *out = {moe_RAW_ROLE_ATTENTION, 237764608ull, 0u, 7077888ull, 29360128ull, 28672u, 512u};
+            *out = {moe_RAW_ROLE_ATTENTION, 237764608ull, 0u, 7077888ull, 29360128ull, 28672u, 512u, 0u};
             return 1;
         case moe_RAW_TENSOR_O_PROJ:
-            *out = {moe_RAW_ROLE_ATTENTION, 237764608ull, 0u, 36438016ull, 201326592ull, 6144u, 16384u};
+            *out = {moe_RAW_ROLE_ATTENTION, 237764608ull, 0u, 36438016ull, 201326592ull, 6144u, 16384u, 0u};
             return 1;
         case moe_RAW_TENSOR_INDEXER_K_NORM_BIAS:
-            *out = {moe_RAW_ROLE_ATTENTION, 18743808ull, 0u, 0ull, 256ull, 128u, 0u};
+            *out = {moe_RAW_ROLE_ATTENTION, 18743808ull, 0u, 0ull, 256ull, 128u, 0u, 0u};
             return 1;
         case moe_RAW_TENSOR_INDEXER_K_NORM_WEIGHT:
-            *out = {moe_RAW_ROLE_ATTENTION, 18743808ull, 0u, 256ull, 256ull, 128u, 0u};
+            *out = {moe_RAW_ROLE_ATTENTION, 18743808ull, 0u, 256ull, 256ull, 128u, 0u, 0u};
             return 1;
         case moe_RAW_TENSOR_INDEXER_WEIGHTS_PROJ:
-            *out = {moe_RAW_ROLE_ATTENTION, 18743808ull, 0u, 512ull, 393216ull, 32u, 6144u};
+            *out = {moe_RAW_ROLE_ATTENTION, 18743808ull, 0u, 512ull, 393216ull, 32u, 6144u, 0u};
             return 1;
         case moe_RAW_TENSOR_INDEXER_WK:
-            *out = {moe_RAW_ROLE_ATTENTION, 18743808ull, 0u, 393728ull, 1572864ull, 128u, 6144u};
+            *out = {moe_RAW_ROLE_ATTENTION, 18743808ull, 0u, 393728ull, 1572864ull, 128u, 6144u, 0u};
             return 1;
         case moe_RAW_TENSOR_INDEXER_WQ_B:
-            *out = {moe_RAW_ROLE_ATTENTION, 18743808ull, 0u, 1966592ull, 16777216ull, 4096u, 2048u};
+            *out = {moe_RAW_ROLE_ATTENTION, 18743808ull, 0u, 1966592ull, 16777216ull, 4096u, 2048u, 0u};
             return 1;
         default:
             return 0;

@@ -854,7 +854,7 @@ static int moe_router_layer_score_contract_f32(
         }
         has_layer_contract_row = moe_router_layer_contract_row_exists_any_doc_f32(engine, layer);
     }
-    if (!has_layer_contract_row && layer >= 0 && !engine->offload_graph_ir_json.empty()) {
+    if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
         size_t obj_begin = 0;
         size_t obj_end = 0;
         if (moe_router_layer_contract_object_slice_cached_f32(engine, layer, &obj_begin, &obj_end)) {
@@ -868,17 +868,15 @@ static int moe_router_layer_score_contract_f32(
                 return 1;
             }
         }
-        if (!has_layer_contract_row) {
-            int use_sigmoid = 0;
-            const char* source = "none";
-            if (moe_router_layer_op_score_contract_f32(
-                    engine, 0u, layer,
-                    score_keys, sizeof(score_keys) / sizeof(score_keys[0]),
-                    &use_sigmoid, &source)) {
-                if (out_use_sigmoid) *out_use_sigmoid = use_sigmoid;
-                if (out_source) *out_source = source;
-                return 1;
-            }
+        int use_sigmoid = 0;
+        const char* source = "none";
+        if (moe_router_layer_op_score_contract_f32(
+                engine, 0u, layer,
+                score_keys, sizeof(score_keys) / sizeof(score_keys[0]),
+                &use_sigmoid, &source)) {
+            if (out_use_sigmoid) *out_use_sigmoid = use_sigmoid;
+            if (out_source) *out_source = source;
+            return 1;
         }
     }
     if (moe_router_json_string_equals_any(
@@ -894,9 +892,6 @@ static int moe_router_layer_score_contract_f32(
         if (out_use_sigmoid) *out_use_sigmoid = 0;
         if (out_source) *out_source = "metadata";
         return 1;
-    }
-    if (has_layer_contract_row) {
-        return 0;
     }
     const std::string* graph_ir_doc_for_score = &engine->offload_graph_ir_json;
     if (moe_router_json_string_equals_any(
@@ -933,6 +928,9 @@ static int moe_router_layer_score_contract_f32(
         "\"score_fn\":\"sigmoid\"",
         "\"score_fn\": \"sigmoid\""
     };
+    if (has_layer_contract_row) {
+        return 0;
+    }
     if (moe_router_json_mentions_any(
             engine->offload_gguf_metadata_json, sigmoid_needles,
             sizeof(sigmoid_needles) / sizeof(sigmoid_needles[0]))) {
@@ -954,6 +952,19 @@ static int moe_router_uses_sigmoid_scores_for_layer(const moe_pc_engine* engine,
     if (!engine) {
         return 0;
     }
+    struct router_score_cache_entry {
+        const moe_pc_engine* engine = nullptr;
+        uint64_t generation = 0;
+        int32_t layer = INT32_MIN;
+        int use_sigmoid = 0;
+    };
+    static thread_local std::vector<router_score_cache_entry> tls_cache;
+    const uint64_t generation = engine->engine_generation;
+    for (const router_score_cache_entry& e : tls_cache) {
+        if (e.engine == engine && e.generation == generation && e.layer == layer) {
+            return e.use_sigmoid ? 1 : 0;
+        }
+    }
     int use_sigmoid = 0;
     const char* source = "default";
     if (moe_router_layer_score_contract_f32(engine, layer, &use_sigmoid, &source)) {
@@ -961,17 +972,30 @@ static int moe_router_uses_sigmoid_scores_for_layer(const moe_pc_engine* engine,
             "router_score_contract",
             "layer=%d use_sigmoid=%d source=%s",
             layer, use_sigmoid, source ? source : "unknown");
-        return use_sigmoid ? 1 : 0;
-    }
-    if (layer < 0) {
-        const int cached = engine->cached_router_use_sigmoid.load(std::memory_order_acquire);
-        if (cached >= 0) {
-            return cached;
+    } else {
+        if (layer < 0) {
+            const int cached = engine->cached_router_use_sigmoid.load(std::memory_order_acquire);
+            if (cached >= 0) {
+                use_sigmoid = cached;
+            } else {
+                engine->cached_router_use_sigmoid.store(0, std::memory_order_release);
+                use_sigmoid = 0;
+            }
+        } else {
+            use_sigmoid = 0;
         }
-        engine->cached_router_use_sigmoid.store(0, std::memory_order_release);
+        moe_profile_log("router_score_contract", "layer=%d use_sigmoid=%d source=default", layer, use_sigmoid ? 1 : 0);
     }
-    moe_profile_log("router_score_contract", "layer=%d use_sigmoid=0 source=default", layer);
-    return 0;
+    if (tls_cache.size() > 256u) {
+        tls_cache.erase(tls_cache.begin(), tls_cache.begin() + 64);
+    }
+    router_score_cache_entry entry{};
+    entry.engine = engine;
+    entry.generation = generation;
+    entry.layer = layer;
+    entry.use_sigmoid = use_sigmoid ? 1 : 0;
+    tls_cache.push_back(entry);
+    return use_sigmoid ? 1 : 0;
 }
 
 static int moe_router_uses_sigmoid_scores(const moe_pc_engine* engine) {
@@ -991,7 +1015,6 @@ static int moe_router_layer_u32_contract_f32(
         return 0;
     }
     uint64_t value = 0;
-    int has_layer_contract_row = 0;
     if (layer >= 0) {
         uint32_t contract_value = 0;
         if (moe_router_layer_contract_u32_any_doc_f32(
@@ -999,13 +1022,11 @@ static int moe_router_layer_u32_contract_f32(
             *out = contract_value;
             return 1;
         }
-        has_layer_contract_row = moe_router_layer_contract_row_exists_any_doc_f32(engine, layer);
     }
-    if (!has_layer_contract_row && layer >= 0 && !engine->offload_graph_ir_json.empty()) {
+    if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
         size_t obj_begin = 0;
         size_t obj_end = 0;
         if (moe_router_layer_contract_object_slice_cached_f32(engine, layer, &obj_begin, &obj_end)) {
-            has_layer_contract_row = 1;
             for (size_t i = 0; i < key_count; ++i) {
                 if (keys[i] && moe_json_get_u64_slice(engine->offload_graph_ir_json, obj_begin, obj_end, keys[i], &value) && value > 0) {
                     *out = (uint32_t)std::min<uint64_t>(value, UINT32_MAX);
@@ -1016,7 +1037,7 @@ static int moe_router_layer_u32_contract_f32(
         }
         size_t ops_begin = 0;
         size_t ops_end = 0;
-        if (!has_layer_contract_row && moe_router_layer_ops_object_slice_cached_f32(engine, 0u, layer, &ops_begin, &ops_end)) {
+        if (moe_router_layer_ops_object_slice_cached_f32(engine, 0u, layer, &ops_begin, &ops_end)) {
             size_t cursor = ops_begin + 1u;
             while (cursor < ops_end) {
                 size_t op_begin = 0;
@@ -1044,9 +1065,6 @@ static int moe_router_layer_u32_contract_f32(
             return 1;
         }
     }
-    if (has_layer_contract_row) {
-        return 0;
-    }
     for (size_t i = 0; i < key_count; ++i) {
         if (keys[i] && moe_json_get_u64_local(engine->offload_graph_ir_json, keys[i], &value) && value > 0) {
             *out = (uint32_t)std::min<uint64_t>(value, UINT32_MAX);
@@ -1063,6 +1081,22 @@ static uint32_t moe_router_top_k_from_metadata_for_layer(
     uint32_t fallback,
     uint32_t experts
 ) {
+    struct router_topk_cache_entry {
+        const moe_pc_engine* engine = nullptr;
+        uint64_t generation = 0;
+        int32_t layer = INT32_MIN;
+        uint32_t fallback = 0;
+        uint32_t experts = 0;
+        uint32_t top_k = 0;
+    };
+    static thread_local std::vector<router_topk_cache_entry> tls_cache;
+    const uint64_t generation = engine ? engine->engine_generation : 0u;
+    for (const router_topk_cache_entry& e : tls_cache) {
+        if (e.engine == engine && e.generation == generation && e.layer == layer &&
+            e.fallback == fallback && e.experts == experts) {
+            return e.top_k;
+        }
+    }
     static const char* const topk_keys[] = {
         "num_experts_per_tok",
         "n_experts_per_tok",
@@ -1076,28 +1110,42 @@ static uint32_t moe_router_top_k_from_metadata_for_layer(
         "top_k"
     };
     uint32_t parsed = 0;
+    uint32_t result = 0;
     const char* source = "default";
     if (moe_router_layer_u32_contract_f32(
             engine, layer, topk_keys, sizeof(topk_keys) / sizeof(topk_keys[0]),
             &parsed, &source) && parsed > 0) {
-        const uint32_t limited = std::min<uint32_t>(parsed, experts ? experts : parsed);
+        result = std::min<uint32_t>(parsed, experts ? experts : parsed);
         moe_profile_log(
             "router_topk_contract",
             "layer=%d top_k=%u source=%s experts=%u",
-            layer, limited, source ? source : "unknown", experts);
-        return limited;
-    }
-    int cached = engine ? engine->cached_router_top_k_hint.load(std::memory_order_acquire) : -1;
-    if (cached < 0) {
-        cached = 0;
-        if (engine) {
-            engine->cached_router_top_k_hint.store(cached, std::memory_order_release);
+            layer, result, source ? source : "unknown", experts);
+    } else {
+        int cached = engine ? engine->cached_router_top_k_hint.load(std::memory_order_acquire) : -1;
+        if (cached < 0) {
+            cached = 0;
+            if (engine) {
+                engine->cached_router_top_k_hint.store(cached, std::memory_order_release);
+            }
+        }
+        if (cached > 0) {
+            result = (uint32_t)std::min<uint32_t>((uint32_t)cached, experts ? experts : (uint32_t)cached);
+        } else {
+            result = std::min(fallback, experts ? experts : fallback);
         }
     }
-    if (cached > 0) {
-        return (uint32_t)std::min<uint32_t>((uint32_t)cached, experts ? experts : (uint32_t)cached);
+    if (tls_cache.size() > 256u) {
+        tls_cache.erase(tls_cache.begin(), tls_cache.begin() + 64);
     }
-    return std::min(fallback, experts ? experts : fallback);
+    router_topk_cache_entry entry{};
+    entry.engine = engine;
+    entry.generation = generation;
+    entry.layer = layer;
+    entry.fallback = fallback;
+    entry.experts = experts;
+    entry.top_k = result;
+    tls_cache.push_back(entry);
+    return result;
 }
 
 static uint32_t moe_router_top_k_from_metadata(
@@ -1139,19 +1187,16 @@ static int moe_router_layer_double_contract_f32(
     if (!engine || !keys || !out) {
         return 0;
     }
-    int has_layer_contract_row = 0;
     if (layer >= 0) {
         if (moe_router_layer_contract_double_any_doc_f32(
                 engine, layer, keys, key_count, out, out_source)) {
             return 1;
         }
-        has_layer_contract_row = moe_router_layer_contract_row_exists_any_doc_f32(engine, layer);
     }
-    if (!has_layer_contract_row && layer >= 0 && !engine->offload_graph_ir_json.empty()) {
+    if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
         size_t obj_begin = 0;
         size_t obj_end = 0;
         if (moe_router_layer_contract_object_slice_cached_f32(engine, layer, &obj_begin, &obj_end)) {
-            has_layer_contract_row = 1;
             if (moe_router_json_double_any_slice_f32(
                     engine->offload_graph_ir_json, obj_begin, obj_end, keys, key_count, out)) {
                 if (out_source) *out_source = "layer_execution_contract_table";
@@ -1160,7 +1205,7 @@ static int moe_router_layer_double_contract_f32(
         }
         size_t ops_begin = 0;
         size_t ops_end = 0;
-        if (!has_layer_contract_row && moe_router_layer_ops_object_slice_cached_f32(engine, 0u, layer, &ops_begin, &ops_end)) {
+        if (moe_router_layer_ops_object_slice_cached_f32(engine, 0u, layer, &ops_begin, &ops_end)) {
             size_t cursor = ops_begin + 1u;
             while (cursor < ops_end) {
                 size_t op_begin = 0;
@@ -1183,7 +1228,7 @@ static int moe_router_layer_double_contract_f32(
         if (out_source) *out_source = "metadata";
         return 1;
     }
-    if (!has_layer_contract_row && moe_router_json_get_double_any(engine->offload_graph_ir_json, keys, key_count, out)) {
+    if (moe_router_json_get_double_any(engine->offload_graph_ir_json, keys, key_count, out)) {
         if (out_source) *out_source = "graph_ir";
         return 1;
     }
@@ -1202,19 +1247,16 @@ static int moe_router_layer_bool_contract_f32(
     if (!engine || !keys || !out) {
         return 0;
     }
-    int has_layer_contract_row = 0;
     if (layer >= 0) {
         if (moe_router_layer_contract_bool_any_doc_f32(
                 engine, layer, keys, key_count, out, out_source)) {
             return 1;
         }
-        has_layer_contract_row = moe_router_layer_contract_row_exists_any_doc_f32(engine, layer);
     }
-    if (!has_layer_contract_row && layer >= 0 && !engine->offload_graph_ir_json.empty()) {
+    if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
         size_t obj_begin = 0;
         size_t obj_end = 0;
         if (moe_router_layer_contract_object_slice_cached_f32(engine, layer, &obj_begin, &obj_end)) {
-            has_layer_contract_row = 1;
             if (moe_router_json_bool_any_slice_f32(
                     engine->offload_graph_ir_json, obj_begin, obj_end, keys, key_count, out)) {
                 if (out_source) *out_source = "layer_execution_contract_table";
@@ -1223,7 +1265,7 @@ static int moe_router_layer_bool_contract_f32(
         }
         size_t ops_begin = 0;
         size_t ops_end = 0;
-        if (!has_layer_contract_row && moe_router_layer_ops_object_slice_cached_f32(engine, 0u, layer, &ops_begin, &ops_end)) {
+        if (moe_router_layer_ops_object_slice_cached_f32(engine, 0u, layer, &ops_begin, &ops_end)) {
             size_t cursor = ops_begin + 1u;
             while (cursor < ops_end) {
                 size_t op_begin = 0;
@@ -1246,7 +1288,7 @@ static int moe_router_layer_bool_contract_f32(
         if (out_source) *out_source = "metadata";
         return 1;
     }
-    if (!has_layer_contract_row && moe_router_json_get_bool_any(engine->offload_graph_ir_json, keys, key_count, out)) {
+    if (moe_router_json_get_bool_any(engine->offload_graph_ir_json, keys, key_count, out)) {
         if (out_source) *out_source = "graph_ir";
         return 1;
     }
@@ -1324,6 +1366,21 @@ static int moe_router_norm_topk_prob_for_layer(
     if (!engine) {
         return use_sigmoid ? 1 : 0;
     }
+    struct router_norm_topk_cache_entry {
+        const moe_pc_engine* engine = nullptr;
+        uint64_t generation = 0;
+        int32_t layer = INT32_MIN;
+        int use_sigmoid = 0;
+        int result = 0;
+    };
+    static thread_local std::vector<router_norm_topk_cache_entry> tls_cache;
+    const uint64_t generation = engine->engine_generation;
+    for (const router_norm_topk_cache_entry& e : tls_cache) {
+        if (e.engine == engine && e.generation == generation &&
+            e.layer == layer && e.use_sigmoid == (use_sigmoid ? 1 : 0)) {
+            return e.result ? 1 : 0;
+        }
+    }
     int value = 0;
     int result = use_sigmoid ? 1 : 0;
     static const char* const norm_keys[] = {
@@ -1345,20 +1402,31 @@ static int moe_router_norm_topk_prob_for_layer(
             "router_norm_topk_contract",
             "layer=%d norm_topk=%d source=%s",
             layer, result, source ? source : "unknown");
-        return result;
-    }
-    if (!use_sigmoid && moe_engine_uses_hybrid_local_global_attention(engine)) {
-        result = 1;
-    }
-    if (layer < 0) {
-        const int cached = engine->cached_router_norm_topk_prob.load(std::memory_order_acquire);
-        if (cached >= 0) {
-            return cached;
+    } else {
+        if (!use_sigmoid && moe_engine_uses_hybrid_local_global_attention(engine)) {
+            result = 1;
         }
-        engine->cached_router_norm_topk_prob.store(result, std::memory_order_release);
+        if (layer < 0) {
+            const int cached = engine->cached_router_norm_topk_prob.load(std::memory_order_acquire);
+            if (cached >= 0) {
+                result = cached;
+            } else {
+                engine->cached_router_norm_topk_prob.store(result, std::memory_order_release);
+            }
+        }
+        moe_profile_log("router_norm_topk_contract", "layer=%d norm_topk=%d source=default", layer, result);
     }
-    moe_profile_log("router_norm_topk_contract", "layer=%d norm_topk=%d source=default", layer, result);
-    return result;
+    if (tls_cache.size() > 256u) {
+        tls_cache.erase(tls_cache.begin(), tls_cache.begin() + 64);
+    }
+    router_norm_topk_cache_entry entry{};
+    entry.engine = engine;
+    entry.generation = generation;
+    entry.layer = layer;
+    entry.use_sigmoid = use_sigmoid ? 1 : 0;
+    entry.result = result ? 1 : 0;
+    tls_cache.push_back(entry);
+    return result ? 1 : 0;
 }
 
 static int moe_router_norm_topk_prob(const moe_pc_engine* engine, int use_sigmoid) {

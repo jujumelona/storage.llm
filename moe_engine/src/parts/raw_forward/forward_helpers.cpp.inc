@@ -1240,19 +1240,52 @@ static int moe_engine_contract_allows_missing_v_projection(
     if (!engine) {
         return 0;
     }
-    if (moe_engine_contract_allows_missing_v_projection_explicit(engine, layer)) {
-        return 1;
+    struct missing_v_projection_cache_entry {
+        const moe_pc_engine* engine = nullptr;
+        uint64_t generation = 0;
+        int32_t layer = INT32_MIN;
+        int value = 0;
+    };
+    static thread_local std::vector<missing_v_projection_cache_entry> missing_v_projection_cache;
+    const uint64_t generation = engine->engine_generation;
+    for (const missing_v_projection_cache_entry& cached : missing_v_projection_cache) {
+        if (cached.engine == engine &&
+            cached.generation == generation &&
+            cached.layer == layer) {
+            return cached.value;
+        }
     }
-    // Missing V is a layer-local K-as-V contract.  A global summary/string such
-    // as layers_with_no_v_proj must not hide a failed V-projection bind on other
-    // layers.
-    static const char* const q_suffixes[] = {"attn_q.weight", "q_proj.weight", "self_attn.q_proj.weight"};
-    static const char* const k_suffixes[] = {"attn_k.weight", "k_proj.weight", "self_attn.k_proj.weight"};
-    static const char* const v_suffixes[] = {"attn_v.weight", "v_proj.weight", "self_attn.v_proj.weight"};
-    static const char* const o_suffixes[] = {"attn_output.weight", "o_proj.weight", "self_attn.o_proj.weight"};
-    const int has_q = moe_engine_contract_has_layer_tensor_suffix_any(engine, layer, q_suffixes, sizeof(q_suffixes) / sizeof(q_suffixes[0]));
-    const int has_k = moe_engine_contract_has_layer_tensor_suffix_any(engine, layer, k_suffixes, sizeof(k_suffixes) / sizeof(k_suffixes[0]));
-    const int has_v = moe_engine_contract_has_layer_tensor_suffix_any(engine, layer, v_suffixes, sizeof(v_suffixes) / sizeof(v_suffixes[0]));
-    const int has_o = moe_engine_contract_has_layer_tensor_suffix_any(engine, layer, o_suffixes, sizeof(o_suffixes) / sizeof(o_suffixes[0]));
-    return has_q && has_k && has_o && !has_v;
+
+    int value = 0;
+    if (moe_engine_contract_allows_missing_v_projection_explicit(engine, layer)) {
+        value = 1;
+    } else {
+        // Missing V is a layer-local K-as-V contract.  A global summary/string
+        // such as layers_with_no_v_proj must not hide a failed V-projection
+        // bind on other layers.  Cache the final decision because this check is
+        // reached repeatedly by decode/prefill mapping and otherwise rescans
+        // contract rows plus suffix candidates for the same layer/token path.
+        static const char* const q_suffixes[] = {"attn_q.weight", "q_proj.weight", "self_attn.q_proj.weight"};
+        static const char* const k_suffixes[] = {"attn_k.weight", "k_proj.weight", "self_attn.k_proj.weight"};
+        static const char* const v_suffixes[] = {"attn_v.weight", "v_proj.weight", "self_attn.v_proj.weight"};
+        static const char* const o_suffixes[] = {"attn_output.weight", "o_proj.weight", "self_attn.o_proj.weight"};
+        const int has_q = moe_engine_contract_has_layer_tensor_suffix_any(engine, layer, q_suffixes, sizeof(q_suffixes) / sizeof(q_suffixes[0]));
+        const int has_k = moe_engine_contract_has_layer_tensor_suffix_any(engine, layer, k_suffixes, sizeof(k_suffixes) / sizeof(k_suffixes[0]));
+        const int has_v = moe_engine_contract_has_layer_tensor_suffix_any(engine, layer, v_suffixes, sizeof(v_suffixes) / sizeof(v_suffixes[0]));
+        const int has_o = moe_engine_contract_has_layer_tensor_suffix_any(engine, layer, o_suffixes, sizeof(o_suffixes) / sizeof(o_suffixes[0]));
+        value = (has_q && has_k && has_o && !has_v) ? 1 : 0;
+    }
+
+    if (missing_v_projection_cache.size() > 128u) {
+        missing_v_projection_cache.erase(
+            missing_v_projection_cache.begin(),
+            missing_v_projection_cache.begin() + 32);
+    }
+    missing_v_projection_cache_entry entry{};
+    entry.engine = engine;
+    entry.generation = generation;
+    entry.layer = layer;
+    entry.value = value;
+    missing_v_projection_cache.push_back(entry);
+    return value;
 }

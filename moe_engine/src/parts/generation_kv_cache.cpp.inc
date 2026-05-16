@@ -487,11 +487,51 @@ static int moe_generation_should_use_layer_first_prefill(
     if (prefill_count <= 1u || hidden_size == 0) {
         return 0;
     }
-    if (engine &&
-        (moe_engine_graph_ir_mentions(engine, "post_ffw_norm") ||
-         moe_engine_graph_ir_mentions(engine, "layer_output_scale") ||
-         moe_engine_has_common_tensor_suffix(engine, 0, "post_ffw_norm.weight") ||
-         moe_engine_has_common_tensor_suffix(engine, 0, "layer_output_scale.weight"))) {
+    struct layer_first_prefill_contract_cache_entry {
+        const moe_pc_engine* engine = nullptr;
+        uint64_t generation = 0;
+        int unsafe_contract = 0;
+    };
+    static thread_local std::vector<layer_first_prefill_contract_cache_entry> tls_contract_cache;
+    int unsafe_contract = 0;
+    if (engine) {
+        const uint64_t generation = engine->engine_generation;
+        int cached = 0;
+        for (const layer_first_prefill_contract_cache_entry& e : tls_contract_cache) {
+            if (e.engine == engine && e.generation == generation) {
+                unsafe_contract = e.unsafe_contract ? 1 : 0;
+                cached = 1;
+                break;
+            }
+        }
+        if (!cached) {
+            unsafe_contract =
+                (moe_engine_graph_ir_mentions(engine, "post_ffw_norm") ||
+                 moe_engine_graph_ir_mentions(engine, "layer_output_scale") ||
+                 moe_engine_graph_ir_mentions(engine, "per_layer_inp_gate") ||
+                 moe_engine_graph_ir_mentions(engine, "per_layer_input_gate") ||
+                 moe_engine_graph_ir_mentions(engine, "per_layer_proj") ||
+                 moe_engine_graph_ir_mentions(engine, "per_layer_post_norm") ||
+                 moe_engine_graph_ir_mentions(engine, "per_layer_model_projection") ||
+                 moe_engine_graph_ir_mentions(engine, "per_layer_model_proj") ||
+                 moe_engine_has_common_tensor_suffix(engine, 0, "post_ffw_norm.weight") ||
+                 moe_engine_has_common_tensor_suffix(engine, 0, "layer_output_scale.weight") ||
+                 moe_engine_has_common_tensor_suffix(engine, 0, "per_layer_inp_gate.weight") ||
+                 moe_engine_has_common_tensor_suffix(engine, 0, "per_layer_input_gate.weight") ||
+                 moe_engine_has_common_tensor_suffix(engine, 0, "per_layer_proj.weight") ||
+                 moe_engine_has_common_tensor_suffix(engine, 0, "per_layer_projection.weight") ||
+                 moe_engine_has_common_tensor_suffix(engine, 0, "per_layer_post_norm.weight")) ? 1 : 0;
+            if (tls_contract_cache.size() > 64u) {
+                tls_contract_cache.erase(tls_contract_cache.begin(), tls_contract_cache.begin() + 16);
+            }
+            layer_first_prefill_contract_cache_entry entry{};
+            entry.engine = engine;
+            entry.generation = generation;
+            entry.unsafe_contract = unsafe_contract;
+            tls_contract_cache.push_back(entry);
+        }
+    }
+    if (unsafe_contract) {
         return 0;
     }
     if ((uint64_t)prefill_count > UINT64_MAX / (uint64_t)hidden_size ||

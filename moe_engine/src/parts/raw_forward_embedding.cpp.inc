@@ -116,6 +116,45 @@ static int moe_map_embedding_tensor(
     if (!engine || !c || !out) {
         return 0;
     }
+    struct embedding_map_cache_entry {
+        moe_pc_engine* engine = nullptr;
+        uint64_t generation = 0;
+        uint32_t vocab_size = 0;
+        uint32_t hidden_size = 0;
+        int found = 0;
+        moe_raw_tensor_cache_entry raw{};
+    };
+    static thread_local std::vector<embedding_map_cache_entry> tls_embedding_map_cache;
+    const uint64_t generation = engine->engine_generation;
+    for (const embedding_map_cache_entry& entry : tls_embedding_map_cache) {
+        if (entry.engine == engine &&
+            entry.generation == generation &&
+            entry.vocab_size == c->vocab_size &&
+            entry.hidden_size == c->hidden_size) {
+            if (entry.found && entry.raw.base) {
+                *out = entry.raw;
+                return 1;
+            }
+            return 0;
+        }
+    }
+    auto cache_embedding_map = [&](int found, const moe_raw_tensor_cache_entry* raw) {
+        if (tls_embedding_map_cache.size() > 64u) {
+            tls_embedding_map_cache.erase(
+                tls_embedding_map_cache.begin(),
+                tls_embedding_map_cache.begin() + 16);
+        }
+        embedding_map_cache_entry entry{};
+        entry.engine = engine;
+        entry.generation = generation;
+        entry.vocab_size = c->vocab_size;
+        entry.hidden_size = c->hidden_size;
+        entry.found = found ? 1 : 0;
+        if (found && raw) {
+            entry.raw = *raw;
+        }
+        tls_embedding_map_cache.push_back(entry);
+    };
     std::string graph_name;
     if (moe_graph_ir_tensor_binding_name(engine, "token_embedding", &graph_name)) {
         moe_raw_tensor_desc desc{};
@@ -130,7 +169,9 @@ static int moe_map_embedding_tensor(
                     "name=%s rows=%u cols=%u vocab=%u hidden=%u",
                     graph_name.c_str(), desc.rows, desc.cols, c->vocab_size, c->hidden_size);
             }
-            return map_common_tensor_record(engine, *rec, desc, out);
+            const int mapped = map_common_tensor_record(engine, *rec, desc, out);
+            cache_embedding_map(mapped, mapped ? out : nullptr);
+            return mapped;
         }
         moe_profile_log(
             "embedding_contract_binding_rejected",
@@ -147,14 +188,19 @@ static int moe_map_embedding_tensor(
     const moe_gguf_common_tensor_record* rec = find_common_tensor_by_op_role(
         engine, "token_embedding", -1, &desc);
     if (rec && desc.cols == c->hidden_size && desc.rows >= c->vocab_size) {
-        return map_common_tensor_record(engine, *rec, desc, out);
+        const int mapped = map_common_tensor_record(engine, *rec, desc, out);
+        cache_embedding_map(mapped, mapped ? out : nullptr);
+        return mapped;
     }
     rec =
         find_common_tensor_by_names(engine, embedding_names, sizeof(embedding_names) / sizeof(embedding_names[0]), &desc);
     if (!rec || desc.cols != c->hidden_size || desc.rows < c->vocab_size) {
+        cache_embedding_map(0, nullptr);
         return 0;
     }
-    return map_common_tensor_record(engine, *rec, desc, out);
+    const int mapped = map_common_tensor_record(engine, *rec, desc, out);
+    cache_embedding_map(mapped, mapped ? out : nullptr);
+    return mapped;
 }
 
 int moe_pc_engine_embed_token_f32(

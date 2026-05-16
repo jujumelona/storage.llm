@@ -1034,3 +1034,195 @@ def test_router_direct_input_scale_roles_are_distinct_from_norm_gamma_suffixes()
     prep = router[router.index("static int moe_prepare_scaled_router_input_f32"):]
     assert "const int direct_input_scale = moe_router_has_direct_input_scale_contract_f32(engine, layer);" in prep
     assert "const int unit_offset = direct_input_scale" in prep
+
+
+def test_layer_execution_contract_rows_are_indexed_once_per_doc_not_per_layer():
+    state = (ROOT / "moe_engine" / "src" / "parts" / "engine_state.cpp.inc").read_text()
+    helper = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
+    assert "layer_contract_rows_cache_built_docs" in state
+    assert "moe_contract_all_layer_rows_uncached_f32" in helper
+    cached = helper[helper.index("static int moe_contract_layer_rows_cached_f32"):helper.index("static int moe_graph_ir_tensor_binding_name")]
+    assert "layer_contract_rows_cache_built_docs" in cached
+    assert "moe_contract_all_layer_rows_uncached_f32" in cached
+    assert "moe_contract_layer_rows_uncached_f32(*doc, layer" in cached
+    assert "engine->layer_contract_rows_cache_built_docs.insert(doc_index)" in cached
+
+
+def test_graph_layer_ops_slices_are_indexed_once_per_doc_not_per_layer():
+    state = (ROOT / "moe_engine" / "src" / "parts" / "engine_state.cpp.inc").read_text()
+    router = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_topk.cpp.inc").read_text()
+    assert "graph_layer_ops_slice_cache_built_docs" in state
+    assert "moe_router_all_layer_ops_slices_f32" in router
+    cached = router[router.index("static int moe_router_layer_ops_object_slice_cached_f32"):router.index("static int moe_router_op_slice_is_router_f32")]
+    assert "graph_layer_ops_slice_cache_built_docs" in cached
+    assert "moe_router_all_layer_ops_slices_f32" in cached
+    assert "engine->graph_layer_ops_slice_cache_built_docs.insert(doc_index)" in cached
+
+
+def test_ple_global_binding_has_suffix_fallback_for_prefixed_runtime_tensors():
+    mlp_common = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_common_tensors.cpp.inc").read_text()
+    helper = mlp_common[mlp_common.index("static const moe_gguf_common_tensor_record* moe_find_common_tensor_by_roles_or_names"):
+                        mlp_common.index("static int moe_map_common_tensor_by_roles_or_names")]
+    assert "find_common_tensor_by_op_role" in helper
+    assert "find_common_tensor_by_names" in helper
+    assert "lowered.compare(lowered.size() - suffix.size()" in helper
+    assert "ple_global_tensor_suffix_bind" in helper
+    assert '"per_layer_input_model_proj.weight"' in mlp_common
+    assert '"per_layer_model_projection_norm.weight"' in mlp_common
+
+
+def test_ple_empty_global_inputs_do_not_run_speculative_local_adapter():
+    mlp_common = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_common_tensors.cpp.inc").read_text()
+    apply = mlp_common[mlp_common.index("static int moe_layer_apply_ple_f32"):
+                       mlp_common.index("static int moe_raw_tensor_scalar_at_f32")]
+    assert "s->ple_inputs.empty()" in apply
+    assert "moe_layer_has_explicit_ple_contract" in apply
+    assert "ple_layer_missing_inputs" in apply
+    assert "source=explicit_contract" in apply
+    assert "ple_layer_apply_local" not in apply
+    assert "s->gate[row] = v;" not in apply
+    assert "per_layer_inp_gate.weight" not in apply[:apply.index("if (num_layers == 0 ||")]
+    assert "per_layer_proj.weight" not in apply[:apply.index("if (num_layers == 0 ||")]
+
+
+def test_ple_required_detection_reads_layer_contract_table_roles():
+    mlp_common = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_common_tensors.cpp.inc").read_text()
+    detector = mlp_common[mlp_common.index("static int moe_layer_has_ple_tensors"):
+                          mlp_common.index("static int moe_map_layer_ple_tensor_role_or_suffix_f32")]
+    assert "contract_declares_any" in detector
+    assert "moe_graph_ir_layer_contract_declares_tensor_role" in detector
+    assert '"per_layer_input_proj"' in detector
+    assert '"per_layer_input_post_norm"' in detector
+    explicit = mlp_common[mlp_common.index("static int moe_layer_has_explicit_ple_contract"):
+                          mlp_common.index("static int moe_map_layer_ple_tensor_role_or_suffix_f32")]
+    assert "moe_engine_has_common_tensor_suffix" not in explicit
+    assert "moe_graph_ir_layer_has_op_role_any" in explicit
+
+
+def test_router_layer_row_does_not_block_graphir_op_score_or_norm_lookup():
+    router = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_topk.cpp.inc").read_text()
+    score_block = router[router.index("static int moe_router_layer_score_contract_f32"):
+                         router.index("static int moe_router_uses_sigmoid_scores_for_layer")]
+    bool_block = router[router.index("static int moe_router_layer_bool_contract_f32"):
+                        router.index("static float moe_router_routed_scaling_factor_for_layer")]
+    double_block = router[router.index("static int moe_router_layer_double_contract_f32"):
+                          router.index("static int moe_router_layer_bool_contract_f32")]
+    u32_block = router[router.index("static int moe_router_layer_u32_contract_f32"):
+                       router.index("static uint32_t moe_router_top_k_from_metadata_for_layer")]
+    for block in (score_block, bool_block, double_block, u32_block):
+        assert "if (!has_layer_contract_row && layer >= 0 && !engine->offload_graph_ir_json.empty())" not in block
+        assert "if (!has_layer_contract_row && moe_router_layer_ops_object_slice_cached_f32" not in block
+    assert "if (!has_layer_contract_row) {\n            int use_sigmoid" not in score_block
+    assert "moe_router_layer_op_score_contract_f32" in score_block
+    for block in (bool_block, double_block, u32_block):
+        assert "if (moe_router_layer_ops_object_slice_cached_f32" in block
+
+def test_layer_first_prefill_disabled_for_ple_contracts():
+    path = ROOT / "moe_engine" / "src" / "parts" / "generation_kv_cache.cpp.inc"
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    block = text[text.index("static int moe_generation_should_use_layer_first_prefill"):]
+    block = block[:block.index("return 1;")]
+    assert '"per_layer_inp_gate"' in block
+    assert '"per_layer_proj"' in block
+    assert '"per_layer_post_norm"' in block
+    assert '"per_layer_model_projection"' in block
+    assert '"per_layer_inp_gate.weight"' in block
+    assert '"per_layer_proj.weight"' in block
+    assert '"per_layer_post_norm.weight"' in block
+
+def test_final_logit_softcap_lookup_is_cached_per_engine_generation():
+    ops = (ROOT / "moe_engine/src/parts/raw_forward/forward_ops.cpp.inc").read_text()
+    start = ops.index("static float moe_final_logit_softcap_value")
+    end = ops.index("static float moe_apply_final_logit_softcap", start)
+    helper = ops[start:end]
+    assert "final_logit_softcap_cache_entry" in helper
+    assert "static thread_local std::vector" in helper
+    assert "engine->engine_generation" in helper
+    assert '"final_logit_softcap"' in helper
+    assert "moe_json_get_double_local(engine->offload_graph_ir_json" in helper
+
+def test_final_norm_mapping_is_cached_per_engine_generation():
+    mlp_common = (ROOT / "moe_engine/src/parts/generation/mlp_common_tensors.cpp.inc").read_text()
+    start = mlp_common.index("static int moe_final_norm_f32")
+    end = mlp_common.index("// Cache split/post-norm detection", start)
+    helper = mlp_common[start:end]
+    assert "final_norm_raw_cache_entry" in helper
+    assert "static thread_local std::vector" in helper
+    assert "engine->engine_generation" in helper
+    assert "cache_final_norm_raw(raw);" in helper
+    assert "moe_apply_rmsnorm_common_weight_f32(engine, e.raw" in helper
+
+def test_layer_first_prefill_contract_guard_is_cached():
+    kv = (ROOT / "moe_engine/src/parts/generation_kv_cache.cpp.inc").read_text()
+    start = kv.index("static int moe_generation_should_use_layer_first_prefill")
+    block = kv[start:]
+    assert "layer_first_prefill_contract_cache_entry" in block
+    assert "static thread_local std::vector" in block
+    assert "engine->engine_generation" in block
+    assert "unsafe_contract" in block
+    assert '"per_layer_inp_gate"' in block
+    assert '"layer_output_scale"' in block
+
+def test_rmsnorm_suffix_mapping_is_cached_per_engine_generation():
+    mlp_common = (ROOT / "moe_engine/src/parts/generation/mlp_common_tensors.cpp.inc").read_text()
+    start = mlp_common.index("static int moe_layer_rmsnorm_suffixes_f32")
+    end = mlp_common.index("static int moe_layer_ffn_norm_f32", start)
+    helper = mlp_common[start:end]
+    assert "rmsnorm_suffix_cache_entry" in helper
+    assert "static thread_local std::vector" in helper
+    assert "engine->engine_generation" in helper
+    assert "suffix_key" in helper
+    assert "cache_rmsnorm_suffix(1, &raw);" in helper
+    assert "cache_rmsnorm_suffix(0, nullptr);" in helper
+
+
+
+def test_missing_v_projection_contract_is_cached():
+    src = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
+    assert "missing_v_projection_cache_entry" in src
+    assert "missing_v_projection_cache" in src
+    assert "engine_generation" in src
+    assert "moe_engine_contract_allows_missing_v_projection_explicit(engine, layer)" in src
+    assert "moe_engine_contract_has_layer_tensor_suffix_any(engine, layer, q_suffixes" in src
+
+def test_router_bias_lookup_caches_absent_bias_per_generation():
+    src = (ROOT / "moe_engine/src/parts/generation/router_utils.cpp.inc").read_text()
+    start = src.index("static int moe_map_router_bias_tensor")
+    end = src.index("static int moe_router_apply_bias_f32", start)
+    helper = src[start:end]
+    assert "router_bias_cache_entry" in helper
+    assert "static thread_local std::vector" in helper
+    assert "engine->engine_generation" in helper
+    assert "entry.found = found_ok" in helper
+    assert "if (!e.found || !e.raw.base)" in helper
+    assert "moe_push_layer_tensor_candidates" in helper
+
+
+def test_embedding_tensor_mapping_is_cached_per_generation():
+    src = (ROOT / "moe_engine/src/parts/raw_forward_embedding.cpp.inc").read_text()
+    assert "tls_embedding_map_cache" in src
+    assert "engine_generation" in src
+    assert "vocab_size" in src and "hidden_size" in src
+    assert "cache_embedding_map(0, nullptr)" in src
+    assert "*out = entry.raw" in src
+
+
+def test_router_global_explicit_config_not_blocked_by_layer_contract_rows():
+    router = (ROOT / "moe_engine/src/parts/generation/router_topk.cpp.inc").read_text()
+    score_block = router[router.index("static int moe_router_layer_score_contract_f32"):
+                         router.index("static int moe_router_uses_sigmoid_scores_for_layer")]
+    exact_graph_pos = score_block.index("*graph_ir_doc_for_score, score_keys")
+    needle_guard_pos = score_block.index("if (has_layer_contract_row) {", exact_graph_pos)
+    assert exact_graph_pos < needle_guard_pos
+    bool_block = router[router.index("static int moe_router_layer_bool_contract_f32"):
+                        router.index("static float moe_router_routed_scaling_factor_for_layer")]
+    double_block = router[router.index("static int moe_router_layer_double_contract_f32"):
+                          router.index("static int moe_router_layer_bool_contract_f32")]
+    u32_block = router[router.index("static int moe_router_layer_u32_contract_f32"):
+                       router.index("static uint32_t moe_router_top_k_from_metadata_for_layer")]
+    assert "!has_layer_contract_row && moe_router_json_get" not in bool_block
+    assert "!has_layer_contract_row && moe_router_json_get" not in double_block
+    assert "if (moe_router_json_get_bool_any(engine->offload_graph_ir_json" in bool_block
+    assert "if (moe_router_json_get_double_any(engine->offload_graph_ir_json" in double_block
+    assert "if (has_layer_contract_row)" not in u32_block[u32_block.rindex("for (size_t i = 0; i < key_count; ++i)"):]
+    assert "moe_json_get_u64_local(engine->offload_graph_ir_json" in u32_block
