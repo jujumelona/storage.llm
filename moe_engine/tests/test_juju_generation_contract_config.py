@@ -561,6 +561,10 @@ def test_mlp_router_input_scale_filter_rejects_bare_ffn_gate_inp_scale_sidecar()
     assert '"ffn_gate_inp.weight.scale"' in sidecar_block
     assert '"ffn_gate_inp.weight.scales"' in sidecar_block
     assert "ffn_gate_inp.scale/scales or" in mlp_norm_text
+    mode_block = mlp_norm_text[mlp_norm_text.index("static int moe_router_rule_uses_hidden_only_with_activation_scale_f32"):mlp_norm_text.index("static int moe_layer_execution_contract_router_uses_hidden_f32")]
+    assert "use_hidden_only_when_explicit_router_input_scale_present" in mode_block
+    assert mode_block.index("moe_json_get_string_slice(doc, obj_begin, obj_end, \"rule\"") < mode_block.index("moe_router_contract_object_has_raw_hidden_input_f32")
+    assert "return 0;" in mode_block[mode_block.index("moe_router_rule_uses_hidden_only_with_activation_scale_f32"):]
 
 
 def test_router_input_mode_does_not_use_bare_ffn_gate_inp_as_internal_router_scale():
