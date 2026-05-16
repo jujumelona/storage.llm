@@ -240,9 +240,28 @@ static int moe_add_mlp_residual_f32(
         return 0;
     }
     const moe_attn_config_t cfg = moe_generation_attn_config(engine);
-    const int post_ffw_norm_required = moe_layer_has_post_ffw_norm_weight(engine, layer);
+    int combined_post_norm_contract = 0;
+    const char* combined_post_norm_source = nullptr;
+    const int has_combined_post_norm_contract = moe_graph_ir_layer_contract_bool_key_f32(
+        engine,
+        layer,
+        "mlp",
+        "post_ffw_norm_applies_to_combined_ffn_before_residual",
+        &combined_post_norm_contract,
+        &combined_post_norm_source);
+    const int post_ffw_norm_required =
+        moe_layer_has_post_ffw_norm_weight(engine, layer) ||
+        (has_combined_post_norm_contract && combined_post_norm_contract);
     float* branch = s->mlp.data();
     const char* branch_source = "mlp";
+    if (has_combined_post_norm_contract) {
+        moe_profile_log(
+            "mlp_post_ffw_norm_contract",
+            "layer=%d combined_before_residual=%d source=%s",
+            layer,
+            combined_post_norm_contract ? 1 : 0,
+            combined_post_norm_source ? combined_post_norm_source : "layer_execution_contract_table");
+    }
     if (moe_layer_post_ffw_norm_f32(
             engine, layer, s->mlp.data(), hidden_size, s->shared.data(), cfg.rms_norm_eps)) {
         branch = s->shared.data();
@@ -482,11 +501,27 @@ static int moe_router_contract_name_is_activation_scale_f32(const std::string& n
 }
 
 static int moe_router_contract_name_list_has_activation_scale_f32(
-    const std::vector<std::string>& names
+    const std::vector<std::string>& names,
+    int trust_contract_router_scale_names = 0
 ) {
     for (const std::string& name : names) {
         if (moe_router_contract_name_is_activation_scale_f32(name)) {
             return 1;
+        }
+        if (trust_contract_router_scale_names && !moe_router_contract_scale_name_is_weight_sidecar_f32(name)) {
+            const std::string lower = moe_lower_ascii_copy(name);
+            static const char* const contract_suffixes[] = {
+                "router.scale",
+                "mlp.router.scale",
+                "moe.gate.scale"
+            };
+            for (const char* suffix : contract_suffixes) {
+                const size_t n = std::strlen(suffix);
+                if (lower == suffix ||
+                    (lower.size() > n && lower.compare(lower.size() - n, n, suffix) == 0)) {
+                    return 1;
+                }
+            }
         }
     }
     return 0;
@@ -505,8 +540,19 @@ static int moe_router_contract_object_has_activation_scale_f32(
     std::vector<std::string> names;
     for (const char* key : scale_keys) {
         names.clear();
+        const int trust_generator_router_scale =
+            key && (std::strcmp(key, "router_scale") == 0 ||
+                    std::strcmp(key, "router_scales") == 0 ||
+                    std::strcmp(key, "router_input_scale") == 0 ||
+                    std::strcmp(key, "router_input_scales") == 0);
         if (moe_json_get_string_array_slice(doc, obj_begin, obj_end, key, &names) &&
-            moe_router_contract_name_list_has_activation_scale_f32(names)) {
+            moe_router_contract_name_list_has_activation_scale_f32(names, trust_generator_router_scale)) {
+            return 1;
+        }
+        std::string single_name;
+        if (moe_json_get_string_slice(doc, obj_begin, obj_end, key, &single_name) &&
+            moe_router_contract_name_list_has_activation_scale_f32(
+                std::vector<std::string>{single_name}, trust_generator_router_scale)) {
             return 1;
         }
     }
@@ -601,50 +647,64 @@ static int moe_layer_execution_contract_router_uses_hidden_f32(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
-    if (!engine || layer < 0 || engine->offload_graph_ir_json.empty()) {
+    if (!engine || layer < 0) {
         return 0;
     }
-    const std::string& doc = engine->offload_graph_ir_json;
-    size_t arr_begin = 0;
-    size_t arr_end = 0;
-    if (!moe_json_find_array_local(doc, "layer_execution_contract_table", &arr_begin, &arr_end)) {
-        return 0;
-    }
-    size_t cursor = arr_begin + 1u;
-    uint64_t row_ordinal = 0;
-    while (cursor < arr_end) {
-        size_t obj_begin = 0;
-        size_t obj_end = 0;
-        if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
-            break;
-        }
-        const uint64_t this_row_ordinal = row_ordinal++;
-        if (!moe_json_slice_matches_layer_index_f32(
-                doc, obj_begin, obj_end, layer, this_row_ordinal)) {
+    const std::string* docs[] = {
+        &engine->offload_graph_ir_json,
+        &engine->offload_gguf_metadata_json,
+    };
+    for (const std::string* docp : docs) {
+        if (!docp || docp->empty()) {
             continue;
         }
-        size_t router_begin = 0;
-        size_t router_end = 0;
-        const std::string row_slice = doc.substr(obj_begin, obj_end - obj_begin);
-        if (!moe_json_find_object_local(row_slice, "router", &router_begin, &router_end)) {
-            return 0;
+        const std::string& doc = *docp;
+        size_t search_pos = 0;
+        while (search_pos < doc.size()) {
+            size_t arr_begin = 0;
+            size_t arr_end = 0;
+            const size_t key_pos = moe_json_find_next_contract_array_f32(
+                doc, "layer_execution_contract_table", search_pos, &arr_begin, &arr_end);
+            if (key_pos == std::string::npos) {
+                break;
+            }
+            search_pos = arr_end > key_pos ? arr_end : key_pos + 1u;
+            size_t cursor = arr_begin + 1u;
+            uint64_t row_ordinal = 0;
+            while (cursor < arr_end) {
+                size_t obj_begin = 0;
+                size_t obj_end = 0;
+                if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+                    break;
+                }
+                const uint64_t this_row_ordinal = row_ordinal++;
+                if (!moe_json_slice_matches_layer_index_f32(
+                        doc, obj_begin, obj_end, layer, this_row_ordinal)) {
+                    continue;
+                }
+                size_t router_begin = obj_begin;
+                size_t router_end = obj_end;
+                const std::string row_slice = doc.substr(obj_begin, obj_end - obj_begin);
+                if (moe_json_find_object_local(row_slice, "router", &router_begin, &router_end)) {
+                    router_begin += obj_begin;
+                    router_end += obj_begin;
+                }
+                if (moe_layer_router_contract_has_hidden_input_f32(doc, router_begin, router_end)) {
+                    return 1;
+                }
+                int uses_hidden = 0;
+                if (moe_json_get_bool_slice(
+                        doc, router_begin, router_end,
+                        "router_uses_hidden_when_internal_scale_present", &uses_hidden) &&
+                    uses_hidden) {
+                    // The boolean is conditional and becomes true only with a real
+                    // router input activation-scale/norm contract, not a weight
+                    // quantization sidecar.
+                    return moe_router_contract_object_has_activation_scale_f32(
+                        doc, router_begin, router_end) ? 1 : 0;
+                }
+            }
         }
-        router_begin += obj_begin;
-        router_end += obj_begin;
-        int uses_hidden = 0;
-        if (moe_json_get_bool_slice(
-                doc, router_begin, router_end,
-                "router_uses_hidden_when_internal_scale_present", &uses_hidden) &&
-            uses_hidden) {
-            // The boolean means "use hidden when an internal router input
-            // scale/norm is present".  It is not itself proof that raw hidden is
-            // valid.  Filter out router-weight quant sidecars such as
-            // ffn_gate_inp.weight.scale; without a real activation scale the router must
-            // consume the expert FFN norm output.
-            return moe_router_contract_object_has_activation_scale_f32(
-                doc, router_begin, router_end) ? 1 : 0;
-        }
-        return 0;
     }
     return 0;
 }
@@ -653,54 +713,62 @@ static int moe_layer_ops_router_uses_hidden_f32(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
-    if (!engine || layer < 0 || engine->offload_graph_ir_json.empty()) {
+    if (!engine || layer < 0) {
         return 0;
     }
-    const std::string& doc = engine->offload_graph_ir_json;
-    size_t layers_begin = 0;
-    size_t layers_end = 0;
-    if (!moe_json_find_graph_layers_array_f32(doc, &layers_begin, &layers_end)) {
-        return 0;
-    }
-    size_t cursor = layers_begin + 1u;
-    uint64_t layer_ordinal = 0;
-    while (cursor < layers_end) {
-        size_t layer_obj_begin = 0;
-        size_t layer_obj_end = 0;
-        if (!moe_json_next_object_in_array(doc, &cursor, layers_end, &layer_obj_begin, &layer_obj_end)) {
-            break;
-        }
-        const uint64_t this_layer_ordinal = layer_ordinal++;
-        if (!moe_json_slice_matches_layer_index_f32(
-                doc, layer_obj_begin, layer_obj_end, layer, this_layer_ordinal)) {
+    const std::string* docs[] = {
+        &engine->offload_graph_ir_json,
+        &engine->offload_gguf_metadata_json,
+    };
+    for (const std::string* docp : docs) {
+        if (!docp || docp->empty()) {
             continue;
         }
-        size_t ops_begin = 0;
-        size_t ops_end = 0;
-        const std::string layer_slice = doc.substr(layer_obj_begin, layer_obj_end - layer_obj_begin);
-        if (!moe_json_find_array_local(layer_slice, "ops", &ops_begin, &ops_end)) {
-            return 0;
+        const std::string& doc = *docp;
+        size_t layers_begin = 0;
+        size_t layers_end = 0;
+        if (!moe_json_find_graph_layers_array_f32(doc, &layers_begin, &layers_end)) {
+            continue;
         }
-        ops_begin += layer_obj_begin;
-        ops_end += layer_obj_begin;
-        size_t op_cursor = ops_begin + 1u;
-        while (op_cursor < ops_end) {
-            size_t op_begin = 0;
-            size_t op_end = 0;
-            if (!moe_json_next_object_in_array(doc, &op_cursor, ops_end, &op_begin, &op_end)) {
+        size_t cursor = layers_begin + 1u;
+        uint64_t layer_ordinal = 0;
+        while (cursor < layers_end) {
+            size_t layer_obj_begin = 0;
+            size_t layer_obj_end = 0;
+            if (!moe_json_next_object_in_array(doc, &cursor, layers_end, &layer_obj_begin, &layer_obj_end)) {
                 break;
             }
-            std::string name;
-            const int has_name = moe_json_get_string_slice(doc, op_begin, op_end, "name", &name);
-            const std::string lowered_name = has_name ? moe_lower_ascii_copy(name) : std::string();
-            if (lowered_name != "router_input" && lowered_name != "moe_router") {
+            const uint64_t this_layer_ordinal = layer_ordinal++;
+            if (!moe_json_slice_matches_layer_index_f32(
+                    doc, layer_obj_begin, layer_obj_end, layer, this_layer_ordinal)) {
                 continue;
             }
-            if (moe_layer_router_contract_has_hidden_input_f32(doc, op_begin, op_end)) {
-                return 1;
+            size_t ops_begin = 0;
+            size_t ops_end = 0;
+            const std::string layer_slice = doc.substr(layer_obj_begin, layer_obj_end - layer_obj_begin);
+            if (!moe_json_find_array_local(layer_slice, "ops", &ops_begin, &ops_end)) {
+                continue;
+            }
+            ops_begin += layer_obj_begin;
+            ops_end += layer_obj_begin;
+            size_t op_cursor = ops_begin + 1u;
+            while (op_cursor < ops_end) {
+                size_t op_begin = 0;
+                size_t op_end = 0;
+                if (!moe_json_next_object_in_array(doc, &op_cursor, ops_end, &op_begin, &op_end)) {
+                    break;
+                }
+                std::string name;
+                const int has_name = moe_json_get_string_slice(doc, op_begin, op_end, "name", &name);
+                const std::string lowered_name = has_name ? moe_lower_ascii_copy(name) : std::string();
+                if (lowered_name != "router_input" && lowered_name != "moe_router" && lowered_name != "router") {
+                    continue;
+                }
+                if (moe_layer_router_contract_has_hidden_input_f32(doc, op_begin, op_end)) {
+                    return 1;
+                }
             }
         }
-        return 0;
     }
     return 0;
 }

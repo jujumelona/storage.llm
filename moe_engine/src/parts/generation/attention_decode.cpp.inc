@@ -219,13 +219,24 @@
         v_head_dim);
 #endif
     const uint64_t rope_start_us = moe_profile_now_us();
-    const int rope_rotate_half = moe_standard_rope_uses_rotate_half_cached(engine, cfg);
+    moe_attention_rope_contract_t layer_rope_contract{};
+    const int has_layer_rope_contract =
+        moe_attention_layer_rope_contract_f32(engine, layer, head_dim, &layer_rope_contract);
+    const int rope_rotate_half =
+        (has_layer_rope_contract && layer_rope_contract.rotate_half_known) ?
+        layer_rope_contract.rotate_half :
+        moe_standard_rope_uses_rotate_half_cached(engine, cfg);
     const int rope_partial_half_split = (rope_rotate_half && rope_dim < head_dim) ? 1 : 0;
     const int rope_proportional_freq =
-        rope_partial_half_split &&
-        moe_hybrid_layer_is_full_attention(engine, layer) &&
-        moe_engine_metadata_mentions(engine, "proportional");
-    const uint32_t rope_frequency_dim = rope_proportional_freq ? head_dim : rope_dim;
+        (has_layer_rope_contract && layer_rope_contract.proportional_frequency_known) ?
+        layer_rope_contract.proportional_frequency_dim_uses_full_head_dim :
+        (rope_partial_half_split &&
+         moe_hybrid_layer_is_full_attention(engine, layer) &&
+         moe_engine_metadata_mentions(engine, "proportional"));
+    uint32_t rope_frequency_dim = rope_proportional_freq ? head_dim : rope_dim;
+    if (has_layer_rope_contract && layer_rope_contract.frequency_dim > 0) {
+        rope_frequency_dim = std::min<uint32_t>(layer_rope_contract.frequency_dim, head_dim);
+    }
     // RoPE at absolute position 0 is mathematically identity: cos(0)=1,
     // sin(0)=0 for both table and dynamic-frequency paths. Avoid spending the
     // PPL/decode hot path on a no-op rotation for the first token.
@@ -357,7 +368,7 @@
 
     const char* scale_source = nullptr;
     const float scale = moe_standard_attention_score_scale(engine, layer, head_dim, &scale_source);
-    const float attn_logit_softcap = moe_attention_logit_softcap_value(engine);
+    const float attn_logit_softcap = moe_attention_logit_softcap_value(engine, layer);
     if (moe_attention_score_scale_violates_qk_norm_contract(engine, layer, scale, scale_source)) {
         std::fprintf(
             stderr,

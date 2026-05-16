@@ -65,11 +65,13 @@ static int moe_engine_rmsnorm_unit_offset(
     // makes the first mapped norm tensor decide all later roles.  The cache
     // below is keyed by the concrete raw tensor instead.
     const uint64_t cache_key = moe_rmsnorm_unit_offset_cache_key(raw);
+    int cached_rmsnorm_unit_offset = -1;
     if (cache_key) {
         std::shared_lock<std::shared_mutex> lock(engine->rmsnorm_unit_offset_cache_mutex);
         const auto found = engine->rmsnorm_unit_offset_cache.find(cache_key);
         if (found != engine->rmsnorm_unit_offset_cache.end()) {
-            return found->second ? 1 : 0;
+            cached_rmsnorm_unit_offset = found->second ? 1 : 0;
+            return cached_rmsnorm_unit_offset ? 1 : 0;
         }
     }
 

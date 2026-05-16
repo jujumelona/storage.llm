@@ -66,6 +66,53 @@ static void moe_forward_trace_vec(
         (unsigned long long)hash);
 }
 
+
+static int moe_generation_contract_get_u64_any_doc(
+    const moe_pc_engine* engine,
+    const char* key,
+    uint64_t* out
+) {
+    if (!engine || !key || !out) {
+        return 0;
+    }
+    uint64_t graph_value = 0;
+    uint64_t metadata_value = 0;
+    const int graph_ok = moe_json_get_u64_local(engine->offload_graph_ir_json, key, &graph_value);
+    const int metadata_ok = moe_json_get_u64_local(engine->offload_gguf_metadata_json, key, &metadata_value);
+    if (metadata_ok && (!graph_ok || graph_value == 0)) {
+        *out = metadata_value;
+        return 1;
+    }
+    if (graph_ok) {
+        *out = graph_value;
+        return 1;
+    }
+    return 0;
+}
+
+static int moe_generation_contract_get_bool_any_doc(
+    const moe_pc_engine* engine,
+    const char* key,
+    int* out
+) {
+    if (!engine || !key || !out) {
+        return 0;
+    }
+    int graph_value = 0;
+    int metadata_value = 0;
+    const int graph_ok = moe_json_get_bool_local(engine->offload_graph_ir_json, key, &graph_value);
+    const int metadata_ok = moe_json_get_bool_local(engine->offload_gguf_metadata_json, key, &metadata_value);
+    if (metadata_ok && (!graph_ok || graph_value == 0)) {
+        *out = metadata_value;
+        return 1;
+    }
+    if (graph_ok) {
+        *out = graph_value;
+        return 1;
+    }
+    return 0;
+}
+
 static void moe_forward_trace_generation_contract(
     const moe_pc_engine* engine,
     const moe_storage_constants_t* c
@@ -105,16 +152,16 @@ static void moe_forward_trace_generation_contract(
     (void)moe_graph_ir_tensor_binding_name(engine, "token_embedding", &token_embedding);
     (void)moe_graph_ir_tensor_binding_name(engine, "lm_head", &lm_head);
     (void)moe_graph_ir_tensor_binding_name(engine, "final_norm", &final_norm);
-    (void)moe_json_get_bool_local(engine->offload_graph_ir_json, "lm_head_tied_to_token_embedding", &tied);
-    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_post_attention_norm", &post_attn);
-    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_expert_ffn_norm", &expert_norm);
-    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_post_ffw_norm", &post_ffw);
-    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_post_ffw_norm_1", &post_ffw1);
-    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_post_ffw_norm_2", &post_ffw2);
-    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_layer_output_scale", &output_scale);
-    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_without_v_projection", &no_v_proj);
-    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_v_norm", &v_norm);
-    (void)moe_json_get_u64_local(engine->offload_graph_ir_json, "layers_with_router_scale", &router_scale);
+    (void)moe_generation_contract_get_bool_any_doc(engine, "lm_head_tied_to_token_embedding", &tied);
+    (void)moe_generation_contract_get_u64_any_doc(engine, "layers_with_post_attention_norm", &post_attn);
+    (void)moe_generation_contract_get_u64_any_doc(engine, "layers_with_expert_ffn_norm", &expert_norm);
+    (void)moe_generation_contract_get_u64_any_doc(engine, "layers_with_post_ffw_norm", &post_ffw);
+    (void)moe_generation_contract_get_u64_any_doc(engine, "layers_with_post_ffw_norm_1", &post_ffw1);
+    (void)moe_generation_contract_get_u64_any_doc(engine, "layers_with_post_ffw_norm_2", &post_ffw2);
+    (void)moe_generation_contract_get_u64_any_doc(engine, "layers_with_layer_output_scale", &output_scale);
+    (void)moe_generation_contract_get_u64_any_doc(engine, "layers_without_v_projection", &no_v_proj);
+    (void)moe_generation_contract_get_u64_any_doc(engine, "layers_with_v_norm", &v_norm);
+    (void)moe_generation_contract_get_u64_any_doc(engine, "layers_with_router_scale", &router_scale);
     moe_profile_log(
         "generation_contract",
         "layers=%u hidden=%u vocab=%u token_embedding=%s lm_head=%s tied=%d final_norm=%s post_attn=%llu expert_norm=%llu post_ffw=%llu post_ffw1=%llu post_ffw2=%llu output_scale=%llu no_v_proj=%llu v_norm=%llu router_scale=%llu direct_rmsnorm=%d rmsnorm_unit_offset=%d gelu_tanh_mlp=%d runtime_manifest=%u access_plan=%u hotset=%llu file_groups=%llu tensor_refs=%llu layer_prefetch=%llu kv_layout=%u kv_entry_dim=%llu kv_page_tokens=%llu",
@@ -254,7 +301,17 @@ static moe_decoder_layer_plan_t moe_build_decoder_layer_plan(
         moe_layer_has_ffn_norm_weight(engine, (int32_t)layer) ? 1 : 0;
     if (plan.graph_required) {
         static const char* const roles[] = { "layer_output_scale" };
+        int layer_output_scale_after_residual = 0;
+        const char* layer_output_scale_contract_source = nullptr;
+        const int has_layer_output_scale_order_contract = moe_graph_ir_layer_contract_bool_key_f32(
+            engine,
+            (int32_t)layer,
+            "tail",
+            "layer_output_scale_after_ffn_residual",
+            &layer_output_scale_after_residual,
+            &layer_output_scale_contract_source);
         plan.apply_layer_output_scale =
+            (has_layer_output_scale_order_contract && layer_output_scale_after_residual) ||
             moe_graph_ir_layer_has_op_role_any(
                 engine, (int32_t)layer, roles, sizeof(roles) / sizeof(roles[0])) ||
             moe_graph_ir_layer_contract_declares_tensor_role(
@@ -262,6 +319,15 @@ static moe_decoder_layer_plan_t moe_build_decoder_layer_plan(
             moe_engine_has_common_tensor_suffix(engine, (int32_t)layer, "layer_output_scale.weight") ||
             moe_engine_has_common_tensor_suffix(engine, (int32_t)layer, "layer_scalar.weight") ||
             moe_engine_has_common_tensor_suffix(engine, (int32_t)layer, "layer_scalar");
+        if (has_layer_output_scale_order_contract) {
+            moe_profile_log(
+                "layer_output_scale_contract",
+                "layer=%u after_ffn_residual=%d source=%s apply=%d",
+                layer,
+                layer_output_scale_after_residual ? 1 : 0,
+                layer_output_scale_contract_source ? layer_output_scale_contract_source : "layer_execution_contract_table",
+                plan.apply_layer_output_scale);
+        }
     } else {
         plan.apply_layer_output_scale = 1;
     }

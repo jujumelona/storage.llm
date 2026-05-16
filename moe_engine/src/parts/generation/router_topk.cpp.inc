@@ -302,6 +302,158 @@ static int moe_router_layer_contract_object_slice_cached_f32(
 }
 
 
+static int moe_router_layer_contract_object_slice_any_doc_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const std::string** out_doc,
+    size_t* out_begin,
+    size_t* out_end,
+    const char** out_source
+) {
+    if (out_doc) *out_doc = nullptr;
+    if (out_begin) *out_begin = 0;
+    if (out_end) *out_end = 0;
+    if (out_source) *out_source = "none";
+    if (!engine || layer < 0 || !out_doc || !out_begin || !out_end) {
+        return 0;
+    }
+    const std::string* docs[] = {
+        &engine->offload_graph_ir_json,
+        &engine->offload_gguf_metadata_json
+    };
+    const char* sources[] = {
+        "graph_ir.layer_execution_contract_table",
+        "metadata.layer_execution_contract_table"
+    };
+    for (size_t i = 0; i < 2; ++i) {
+        if (!docs[i] || docs[i]->empty()) {
+            continue;
+        }
+        size_t begin = 0;
+        size_t end = 0;
+        if (moe_router_layer_contract_object_slice_f32(*docs[i], layer, &begin, &end)) {
+            *out_doc = docs[i];
+            *out_begin = begin;
+            *out_end = end;
+            if (out_source) *out_source = sources[i];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_router_layer_contract_row_exists_any_doc_f32(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    const std::string* doc = nullptr;
+    size_t begin = 0;
+    size_t end = 0;
+    const char* source = nullptr;
+    return moe_router_layer_contract_object_slice_any_doc_f32(
+        engine, layer, &doc, &begin, &end, &source);
+}
+
+static int moe_router_layer_contract_u32_any_doc_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* keys,
+    size_t key_count,
+    uint32_t* out,
+    const char** out_source
+) {
+    if (!out) {
+        return 0;
+    }
+    const std::string* doc = nullptr;
+    size_t begin = 0;
+    size_t end = 0;
+    const char* source = nullptr;
+    if (!moe_router_layer_contract_object_slice_any_doc_f32(
+            engine, layer, &doc, &begin, &end, &source)) {
+        return 0;
+    }
+    uint64_t value = 0;
+    for (size_t i = 0; i < key_count; ++i) {
+        if (keys[i] && moe_json_get_u64_slice(*doc, begin, end, keys[i], &value) && value > 0) {
+            *out = (uint32_t)std::min<uint64_t>(value, UINT32_MAX);
+            if (out_source) *out_source = source ? source : "layer_execution_contract_table";
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int moe_router_layer_contract_double_any_doc_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* keys,
+    size_t key_count,
+    double* out,
+    const char** out_source
+) {
+    const std::string* doc = nullptr;
+    size_t begin = 0;
+    size_t end = 0;
+    const char* source = nullptr;
+    if (!out || !moe_router_layer_contract_object_slice_any_doc_f32(
+            engine, layer, &doc, &begin, &end, &source)) {
+        return 0;
+    }
+    if (moe_router_json_double_any_slice_f32(*doc, begin, end, keys, key_count, out)) {
+        if (out_source) *out_source = source ? source : "layer_execution_contract_table";
+        return 1;
+    }
+    return 0;
+}
+
+static int moe_router_layer_contract_bool_any_doc_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* keys,
+    size_t key_count,
+    int* out,
+    const char** out_source
+) {
+    const std::string* doc = nullptr;
+    size_t begin = 0;
+    size_t end = 0;
+    const char* source = nullptr;
+    if (!out || !moe_router_layer_contract_object_slice_any_doc_f32(
+            engine, layer, &doc, &begin, &end, &source)) {
+        return 0;
+    }
+    if (moe_router_json_bool_any_slice_f32(*doc, begin, end, keys, key_count, out)) {
+        if (out_source) *out_source = source ? source : "layer_execution_contract_table";
+        return 1;
+    }
+    return 0;
+}
+
+static int moe_router_layer_contract_score_any_doc_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* keys,
+    size_t key_count,
+    int* out_use_sigmoid,
+    const char** out_source
+) {
+    const std::string* doc = nullptr;
+    size_t begin = 0;
+    size_t end = 0;
+    const char* source = nullptr;
+    if (!out_use_sigmoid || !moe_router_layer_contract_object_slice_any_doc_f32(
+            engine, layer, &doc, &begin, &end, &source)) {
+        return 0;
+    }
+    if (moe_router_json_string_score_any_slice_f32(
+            *doc, begin, end, keys, key_count, out_use_sigmoid)) {
+        if (out_source) *out_source = source ? source : "layer_execution_contract_table";
+        return 1;
+    }
+    return 0;
+}
+
 static int moe_router_layer_ops_object_slice_f32(
     const std::string& doc,
     int32_t layer,
@@ -450,7 +602,17 @@ static int moe_router_layer_score_contract_f32(
         "expert_score_type"
     };
     int has_layer_contract_row = 0;
-    if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
+    if (layer >= 0) {
+        int use_sigmoid = 0;
+        if (moe_router_layer_contract_score_any_doc_f32(
+                engine, layer, score_keys, sizeof(score_keys) / sizeof(score_keys[0]),
+                &use_sigmoid, out_source)) {
+            if (out_use_sigmoid) *out_use_sigmoid = use_sigmoid;
+            return 1;
+        }
+        has_layer_contract_row = moe_router_layer_contract_row_exists_any_doc_f32(engine, layer);
+    }
+    if (!has_layer_contract_row && layer >= 0 && !engine->offload_graph_ir_json.empty()) {
         size_t obj_begin = 0;
         size_t obj_end = 0;
         if (moe_router_layer_contract_object_slice_cached_f32(engine, layer, &obj_begin, &obj_end)) {
@@ -588,7 +750,16 @@ static int moe_router_layer_u32_contract_f32(
     }
     uint64_t value = 0;
     int has_layer_contract_row = 0;
-    if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
+    if (layer >= 0) {
+        uint32_t contract_value = 0;
+        if (moe_router_layer_contract_u32_any_doc_f32(
+                engine, layer, keys, key_count, &contract_value, out_source)) {
+            *out = contract_value;
+            return 1;
+        }
+        has_layer_contract_row = moe_router_layer_contract_row_exists_any_doc_f32(engine, layer);
+    }
+    if (!has_layer_contract_row && layer >= 0 && !engine->offload_graph_ir_json.empty()) {
         size_t obj_begin = 0;
         size_t obj_end = 0;
         if (moe_router_layer_contract_object_slice_cached_f32(engine, layer, &obj_begin, &obj_end)) {
@@ -727,7 +898,14 @@ static int moe_router_layer_double_contract_f32(
         return 0;
     }
     int has_layer_contract_row = 0;
-    if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
+    if (layer >= 0) {
+        if (moe_router_layer_contract_double_any_doc_f32(
+                engine, layer, keys, key_count, out, out_source)) {
+            return 1;
+        }
+        has_layer_contract_row = moe_router_layer_contract_row_exists_any_doc_f32(engine, layer);
+    }
+    if (!has_layer_contract_row && layer >= 0 && !engine->offload_graph_ir_json.empty()) {
         size_t obj_begin = 0;
         size_t obj_end = 0;
         if (moe_router_layer_contract_object_slice_cached_f32(engine, layer, &obj_begin, &obj_end)) {
@@ -783,7 +961,14 @@ static int moe_router_layer_bool_contract_f32(
         return 0;
     }
     int has_layer_contract_row = 0;
-    if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
+    if (layer >= 0) {
+        if (moe_router_layer_contract_bool_any_doc_f32(
+                engine, layer, keys, key_count, out, out_source)) {
+            return 1;
+        }
+        has_layer_contract_row = moe_router_layer_contract_row_exists_any_doc_f32(engine, layer);
+    }
+    if (!has_layer_contract_row && layer >= 0 && !engine->offload_graph_ir_json.empty()) {
         size_t obj_begin = 0;
         size_t obj_end = 0;
         if (moe_router_layer_contract_object_slice_cached_f32(engine, layer, &obj_begin, &obj_end)) {

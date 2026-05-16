@@ -61,17 +61,29 @@ static int moe_graph_ir_tensor_binding_name(
     if (out) {
         out->clear();
     }
-    if (!engine || !key || !key[0] || !out || engine->offload_graph_ir_json.empty()) {
+    if (!engine || !key || !key[0] || !out) {
         return 0;
     }
-    size_t begin = 0;
-    size_t end = 0;
-    if (moe_json_find_object_local(engine->offload_graph_ir_json, "tensor_bindings", &begin, &end) &&
-        moe_json_get_string_slice(engine->offload_graph_ir_json, begin, end, key, out) &&
-        !out->empty()) {
-        return 1;
+    const std::string* docs[] = {
+        &engine->offload_graph_ir_json,
+        &engine->offload_gguf_metadata_json
+    };
+    for (const std::string* doc : docs) {
+        if (!doc || doc->empty()) {
+            continue;
+        }
+        size_t begin = 0;
+        size_t end = 0;
+        if (moe_json_find_object_local(*doc, "tensor_bindings", &begin, &end) &&
+            moe_json_get_string_slice(*doc, begin, end, key, out) &&
+            !out->empty()) {
+            return 1;
+        }
+        if (moe_json_get_string_local(*doc, key, out) && !out->empty()) {
+            return 1;
+        }
     }
-    return moe_json_get_string_local(engine->offload_graph_ir_json, key, out) && !out->empty();
+    return 0;
 }
 
 static uint32_t moe_raw_scalar_size(uint8_t encoding) {
@@ -321,7 +333,7 @@ static int moe_engine_has_common_tensor_suffix(
 }
 
 static int moe_engine_graph_ir_mentions(const moe_pc_engine* engine, const char* needle) {
-    if (!engine || !needle || !needle[0] || engine->offload_graph_ir_json.empty()) {
+    if (!engine || !needle || !needle[0]) {
         return 0;
     }
     const std::string key = moe_lower_ascii_copy(std::string(needle));
@@ -332,7 +344,9 @@ static int moe_engine_graph_ir_mentions(const moe_pc_engine* engine, const char*
             return found->second;
         }
     }
-    const int result = moe_ascii_contains_ci(engine->offload_graph_ir_json, needle);
+    const int result =
+        moe_ascii_contains_ci(engine->offload_graph_ir_json, needle) ||
+        moe_ascii_contains_ci(engine->offload_gguf_metadata_json, needle);
     {
         std::unique_lock<std::shared_mutex> lock(engine->text_mention_cache_mutex);
         engine->graph_ir_mention_cache.emplace(key, result);
@@ -464,6 +478,88 @@ static int moe_engine_contract_has_router_input_scale(
 ) {
     if (!engine) {
         return 0;
+    }
+    auto name_is_weight_sidecar = [](const std::string& name) -> int {
+        const std::string lower = moe_lower_ascii_copy(name);
+        return lower.find("ffn_gate_inp" ".scale") != std::string::npos ||
+            lower.find("ffn_gate_inp" ".scales") != std::string::npos ||
+            lower.find("ffn_gate_inp" ".weight.scale") != std::string::npos ||
+            lower.find("ffn_gate_inp" ".weight.scales") != std::string::npos ||
+            lower.find("router_weight_scale_sidecar") != std::string::npos ||
+            lower.find("weight_sidecar") != std::string::npos ? 1 : 0;
+    };
+    auto scope_declares_scale = [&](const std::string& doc, size_t begin, size_t end) -> int {
+        static const char* const keys[] = {
+            "router_input_scale", "router_input_scales",
+            "router_scale", "router_scales",
+            "input_scale", "input_scales",
+            "activation_scale", "activation_scales"
+        };
+        for (const char* key : keys) {
+            std::vector<std::string> names;
+            if (moe_json_get_string_array_slice(doc, begin, end, key, &names)) {
+                for (const std::string& name : names) {
+                    if (!name.empty() && !name_is_weight_sidecar(name)) {
+                        return 1;
+                    }
+                }
+            }
+            std::string single;
+            if (moe_json_get_string_slice(doc, begin, end, key, &single) &&
+                !single.empty() && !name_is_weight_sidecar(single)) {
+                return 1;
+            }
+        }
+        return 0;
+    };
+    const std::string* docs[] = {
+        &engine->offload_graph_ir_json,
+        &engine->offload_gguf_metadata_json,
+    };
+    for (const std::string* docp : docs) {
+        if (!docp || docp->empty()) {
+            continue;
+        }
+        const std::string& doc = *docp;
+        size_t arr_begin = 0;
+        size_t arr_end = 0;
+        if (!moe_json_find_array_local(doc, "layer_execution_contract_table", &arr_begin, &arr_end)) {
+            continue;
+        }
+        size_t cursor = arr_begin + 1u;
+        uint64_t ordinal = 0;
+        while (cursor < arr_end) {
+            size_t obj_begin = 0;
+            size_t obj_end = 0;
+            if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+                break;
+            }
+            const uint64_t this_ordinal = ordinal++;
+            uint64_t parsed = UINT64_MAX;
+            int match = 0;
+            if (moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed) ||
+                moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer_index", &parsed) ||
+                moe_json_get_u64_slice(doc, obj_begin, obj_end, "idx", &parsed) ||
+                moe_json_get_u64_slice(doc, obj_begin, obj_end, "block", &parsed) ||
+                moe_json_get_u64_slice(doc, obj_begin, obj_end, "block_index", &parsed)) {
+                match = parsed == (uint64_t)layer ? 1 : 0;
+            } else {
+                match = this_ordinal == (uint64_t)layer ? 1 : 0;
+            }
+            if (!match) {
+                continue;
+            }
+            const std::string row = doc.substr(obj_begin, obj_end - obj_begin);
+            size_t router_begin = 0;
+            size_t router_end = 0;
+            if (moe_json_find_object_local(row, "router", &router_begin, &router_end) &&
+                scope_declares_scale(doc, obj_begin + router_begin, obj_begin + router_end)) {
+                return 1;
+            }
+            if (scope_declares_scale(doc, obj_begin, obj_end)) {
+                return 1;
+            }
+        }
     }
     static const char* const router_scale_suffixes[] = {
         // Direct router-input activation scales. Keep this list narrow: generic
@@ -681,12 +777,156 @@ static int moe_engine_contract_uses_gelu_tanh_mlp(
     return 0;
 }
 
+static int moe_engine_contract_row_matches_layer_raw(
+    const std::string& doc,
+    size_t begin,
+    size_t end,
+    int32_t layer,
+    uint64_t implicit_index
+) {
+    if (doc.empty() || begin >= end || end > doc.size() || layer < 0) {
+        return 0;
+    }
+    uint64_t parsed = UINT64_MAX;
+    int saw_explicit = 0;
+    static const char* const u64_keys[] = {
+        "layer", "layer_index", "layer_id", "block", "block_index", "idx", "index"
+    };
+    for (const char* key : u64_keys) {
+        if (moe_json_get_u64_slice(doc, begin, end, key, &parsed)) {
+            saw_explicit = 1;
+            if (parsed == (uint64_t)layer) {
+                return 1;
+            }
+        }
+    }
+    std::string text;
+    const std::string want = std::to_string((long long)layer);
+    static const char* const string_keys[] = {
+        "layer", "layer_index", "layer_id", "block", "block_index"
+    };
+    for (const char* key : string_keys) {
+        if (moe_json_get_string_slice(doc, begin, end, key, &text)) {
+            saw_explicit = 1;
+            if (text == want) {
+                return 1;
+            }
+        }
+    }
+    return (!saw_explicit && implicit_index != UINT64_MAX && implicit_index == (uint64_t)layer) ? 1 : 0;
+}
+
+static int moe_engine_contract_get_layer_attention_scope_raw(
+    const std::string& doc,
+    size_t row_begin,
+    size_t row_end,
+    size_t* out_begin,
+    size_t* out_end
+) {
+    if (out_begin) *out_begin = row_begin;
+    if (out_end) *out_end = row_end;
+    if (doc.empty() || row_begin >= row_end || row_end > doc.size() || !out_begin || !out_end) {
+        return 0;
+    }
+    const std::string row = doc.substr(row_begin, row_end - row_begin);
+    size_t local_begin = 0;
+    size_t local_end = 0;
+    if (moe_json_find_object_local(row, "attention", &local_begin, &local_end)) {
+        *out_begin = row_begin + local_begin;
+        *out_end = row_begin + local_end;
+        return 1;
+    }
+    return 0;
+}
+
+static int moe_engine_contract_allows_missing_v_projection_explicit(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    const std::string* docs[] = {
+        &engine->offload_graph_ir_json,
+        &engine->offload_gguf_metadata_json,
+    };
+    for (const std::string* docp : docs) {
+        if (!docp || docp->empty()) {
+            continue;
+        }
+        const std::string& doc = *docp;
+        size_t arr_begin = 0;
+        size_t arr_end = 0;
+        if (!moe_json_find_array_local(doc, "layer_execution_contract_table", &arr_begin, &arr_end)) {
+            continue;
+        }
+        size_t cursor = arr_begin + 1u;
+        uint64_t row_ordinal = 0;
+        while (cursor < arr_end) {
+            size_t obj_begin = 0;
+            size_t obj_end = 0;
+            if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+                break;
+            }
+            const uint64_t this_row_ordinal = row_ordinal++;
+            if (!moe_engine_contract_row_matches_layer_raw(
+                    doc, obj_begin, obj_end, layer, this_row_ordinal)) {
+                continue;
+            }
+            size_t attn_begin = obj_begin;
+            size_t attn_end = obj_end;
+            (void)moe_engine_contract_get_layer_attention_scope_raw(
+                doc, obj_begin, obj_end, &attn_begin, &attn_end);
+            int bool_value = 0;
+            if (moe_json_get_bool_slice(doc, attn_begin, attn_end, "value_projection_present", &bool_value) ||
+                moe_json_get_bool_slice(doc, obj_begin, obj_end, "value_projection_present", &bool_value)) {
+                if (!bool_value) {
+                    moe_profile_log("attn_missing_v_contract", "layer=%d allow=1 key=value_projection_present", layer);
+                    return 1;
+                }
+                return 0;
+            }
+            if (moe_json_get_bool_slice(doc, attn_begin, attn_end, "attention_k_eq_v", &bool_value) ||
+                moe_json_get_bool_slice(doc, obj_begin, obj_end, "attention_k_eq_v", &bool_value)) {
+                if (bool_value) {
+                    moe_profile_log("attn_missing_v_contract", "layer=%d allow=1 key=attention_k_eq_v", layer);
+                    return 1;
+                }
+            }
+            std::string value_source;
+            if (moe_json_get_string_slice(doc, attn_begin, attn_end, "value_source", &value_source) ||
+                moe_json_get_string_slice(doc, obj_begin, obj_end, "value_source", &value_source)) {
+                const std::string lowered = moe_lower_ascii_copy(value_source);
+                if (lowered.find("k_projection") != std::string::npos ||
+                    lowered.find("key_projection") != std::string::npos ||
+                    lowered.find("reuse_k") != std::string::npos ||
+                    lowered.find("k_as_v") != std::string::npos ||
+                    lowered.find("kv_a") != std::string::npos) {
+                    moe_profile_log("attn_missing_v_contract", "layer=%d allow=1 key=value_source value=%s", layer, value_source.c_str());
+                    return 1;
+                }
+            }
+            std::string v_projection;
+            if ((moe_json_get_string_slice(doc, attn_begin, attn_end, "v_projection", &v_projection) ||
+                 moe_json_get_string_slice(doc, obj_begin, obj_end, "v_projection", &v_projection)) &&
+                !v_projection.empty()) {
+                return 0;
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
 static int moe_engine_contract_allows_missing_v_projection(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
     if (!engine) {
         return 0;
+    }
+    if (moe_engine_contract_allows_missing_v_projection_explicit(engine, layer)) {
+        return 1;
     }
     // Missing V is a layer-local K-as-V contract.  A global summary/string such
     // as layers_with_no_v_proj must not hide a failed V-projection bind on other

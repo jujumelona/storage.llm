@@ -388,6 +388,7 @@ static int moe_router_name_has_suffix_f32(const std::string& name, const char* s
 }
 
 static int moe_router_scale_tensor_is_weight_sidecar_name_f32(const std::string& name) {
+    // Generator contract key: ffn_gate_inp_scale_is_weight_scale_sidecar.
     // ffn_gate_inp.scale/scales in GGUF/MXFP artifacts are router-weight
     // quantization sidecars, not router-input activation/RMSNorm scales.
     static const char* const sidecar_suffixes[] = {
@@ -467,6 +468,7 @@ static int moe_router_has_internal_weight_scale_contract_f32(
     return 0;
 }
 
+
 static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role_f32(
     const moe_pc_engine* engine,
     const char* role,
@@ -501,6 +503,163 @@ static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role
         return &rec;
     }
     return nullptr;
+}
+
+static int moe_router_utils_doc_next_array_key(
+    const std::string& doc,
+    const char* key,
+    size_t start_pos,
+    size_t* begin,
+    size_t* end
+) {
+    if (!key || !begin || !end || start_pos >= doc.size()) {
+        return 0;
+    }
+    const size_t key_len = std::strlen(key);
+    size_t pos = start_pos;
+    while ((pos = doc.find('"', pos)) != std::string::npos) {
+        if (pos + 1u + key_len < doc.size() &&
+            doc.compare(pos + 1u, key_len, key) == 0 &&
+            doc[pos + 1u + key_len] == '"') {
+            const size_t colon = doc.find_first_not_of(" \t\r\n", pos + key_len + 2u);
+            if (colon != std::string::npos && colon < doc.size() && doc[colon] == ':') {
+                const size_t value = doc.find_first_not_of(" \t\r\n", colon + 1u);
+                if (value != std::string::npos && value < doc.size() && doc[value] == '[') {
+                    const size_t close = moe_json_match_bracket_local(doc, value, '[', ']');
+                    if (close != std::string::npos) {
+                        *begin = value;
+                        *end = close;
+                        return 1;
+                    }
+                }
+            }
+        }
+        ++pos;
+    }
+    return 0;
+}
+
+static int moe_router_utils_slice_matches_layer(
+    const std::string& doc,
+    size_t obj_begin,
+    size_t obj_end,
+    int32_t layer,
+    uint64_t ordinal
+) {
+    uint64_t parsed = UINT64_MAX;
+    if (moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed) ||
+        moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer_index", &parsed) ||
+        moe_json_get_u64_slice(doc, obj_begin, obj_end, "idx", &parsed) ||
+        moe_json_get_u64_slice(doc, obj_begin, obj_end, "block", &parsed) ||
+        moe_json_get_u64_slice(doc, obj_begin, obj_end, "block_index", &parsed)) {
+        return parsed == (uint64_t)layer ? 1 : 0;
+    }
+    return ordinal == (uint64_t)layer ? 1 : 0;
+}
+
+static int moe_router_scale_contract_name_is_sidecar_f32(const std::string& name) {
+    const std::string lower = moe_lower_ascii_copy(name);
+    return lower.find("ffn_gate_inp.scale") != std::string::npos ||
+        lower.find("ffn_gate_inp.scales") != std::string::npos ||
+        lower.find("ffn_gate_inp.weight.scale") != std::string::npos ||
+        lower.find("ffn_gate_inp.weight.scales") != std::string::npos ||
+        lower.find("router_weight_scale_sidecar") != std::string::npos ||
+        lower.find("weight_sidecar") != std::string::npos ? 1 : 0;
+}
+
+static void moe_router_push_contract_scale_names_from_scope_f32(
+    const std::string& doc,
+    size_t scope_begin,
+    size_t scope_end,
+    std::vector<std::string>* out_names
+) {
+    if (!out_names || scope_begin >= scope_end || scope_end > doc.size()) {
+        return;
+    }
+    static const char* const keys[] = {
+        "router_input_scale", "router_input_scales",
+        "router_scale", "router_scales",
+        "input_scale", "input_scales",
+        "activation_scale", "activation_scales"
+    };
+    for (const char* key : keys) {
+        std::vector<std::string> names;
+        if (moe_json_get_string_array_slice(doc, scope_begin, scope_end, key, &names)) {
+            for (const std::string& name : names) {
+                if (name.empty() || moe_router_scale_contract_name_is_sidecar_f32(name)) {
+                    continue;
+                }
+                if (std::find(out_names->begin(), out_names->end(), name) == out_names->end()) {
+                    out_names->push_back(name);
+                }
+            }
+        }
+        std::string single;
+        if (moe_json_get_string_slice(doc, scope_begin, scope_end, key, &single) &&
+            !single.empty() && !moe_router_scale_contract_name_is_sidecar_f32(single) &&
+            std::find(out_names->begin(), out_names->end(), single) == out_names->end()) {
+            out_names->push_back(single);
+        }
+    }
+}
+
+static int moe_router_contract_scale_tensor_names_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    std::vector<std::string>* out_names
+) {
+    if (out_names) {
+        out_names->clear();
+    }
+    if (!engine || layer < 0 || !out_names) {
+        return 0;
+    }
+    const std::string* docs[] = {
+        &engine->offload_graph_ir_json,
+        &engine->offload_gguf_metadata_json,
+    };
+    for (const std::string* docp : docs) {
+        if (!docp || docp->empty()) {
+            continue;
+        }
+        const std::string& doc = *docp;
+        size_t search_pos = 0;
+        size_t arr_begin = 0;
+        size_t arr_end = 0;
+        while (moe_router_utils_doc_next_array_key(
+            doc, "layer_execution_contract_table", search_pos, &arr_begin, &arr_end)) {
+            size_t cursor = arr_begin + 1u;
+            uint64_t ordinal = 0;
+            while (cursor < arr_end) {
+                size_t obj_begin = 0;
+                size_t obj_end = 0;
+                if (!moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+                    break;
+                }
+                const uint64_t this_ordinal = ordinal++;
+                if (!moe_router_utils_slice_matches_layer(doc, obj_begin, obj_end, layer, this_ordinal)) {
+                    continue;
+                }
+                const size_t before = out_names->size();
+                const std::string row = doc.substr(obj_begin, obj_end - obj_begin);
+                size_t router_begin = 0;
+                size_t router_end = 0;
+                if (moe_json_find_object_local(row, "router", &router_begin, &router_end)) {
+                    moe_router_push_contract_scale_names_from_scope_f32(
+                        doc, obj_begin + router_begin, obj_begin + router_end, out_names);
+                }
+                moe_router_push_contract_scale_names_from_scope_f32(doc, obj_begin, obj_end, out_names);
+                if (out_names->size() > before) {
+                    moe_profile_log(
+                        "router_scale_contract_names",
+                        "layer=%d count=%zu source=layer_execution_contract_table",
+                        layer, out_names->size() - before);
+                }
+            }
+            search_pos = arr_end;
+        }
+    }
+    return out_names->empty() ? 0 : 1;
 }
 
 static int moe_router_has_direct_input_scale_contract_f32(
@@ -592,6 +751,26 @@ static int moe_map_router_scale_tensor(
         rec = moe_find_router_scale_record_by_role_f32(engine, role, layer, &desc);
         if (rec) {
             break;
+        }
+    }
+    if (!rec) {
+        std::vector<std::string> contract_names;
+        if (moe_router_contract_scale_tensor_names_f32(engine, layer, &contract_names)) {
+            for (const std::string& name : contract_names) {
+                const moe_gguf_common_tensor_record* by_contract =
+                    moe_common_tensor_find(engine, name.c_str());
+                if (!by_contract || moe_router_scale_record_is_weight_sidecar_f32(*by_contract) ||
+                    !moe_common_tensor_record_to_raw_desc(*by_contract, &desc) ||
+                    !moe_common_tensor_record_raw_compatible(*by_contract, desc)) {
+                    continue;
+                }
+                rec = by_contract;
+                moe_profile_log(
+                    "router_scale_contract_bind",
+                    "layer=%d name=%s source=layer_execution_contract_table",
+                    layer, name.c_str());
+                break;
+            }
         }
     }
     if (!rec) {

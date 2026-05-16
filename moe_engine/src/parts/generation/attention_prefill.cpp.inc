@@ -216,34 +216,70 @@ static int moe_layer_contract_declares_unweighted_v_norm(
                 break;
             }
             uint64_t parsed_layer = UINT64_MAX;
-            if (!moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed_layer) ||
-                parsed_layer != (uint64_t)layer) {
+            int saw_explicit_layer = 0;
+            if (moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &parsed_layer) ||
+                moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer_index", &parsed_layer) ||
+                moe_json_get_u64_slice(doc, obj_begin, obj_end, "idx", &parsed_layer) ||
+                moe_json_get_u64_slice(doc, obj_begin, obj_end, "block", &parsed_layer) ||
+                moe_json_get_u64_slice(doc, obj_begin, obj_end, "block_index", &parsed_layer)) {
+                saw_explicit_layer = 1;
+            }
+            if ((saw_explicit_layer && parsed_layer != (uint64_t)layer) ||
+                (!saw_explicit_layer && parsed_layer != UINT64_MAX && parsed_layer != (uint64_t)layer)) {
+                continue;
+            }
+            if (!saw_explicit_layer && parsed_layer == UINT64_MAX) {
+                // Non-layer arrays such as global summaries must not enable every layer.
                 continue;
             }
             const int role_matches = moe_json_slice_string_field_matches_any_ci(
                 doc, obj_begin, obj_end,
                 role_fields, sizeof(role_fields) / sizeof(role_fields[0]),
                 v_norm_roles, sizeof(v_norm_roles) / sizeof(v_norm_roles[0]));
+            int value_norm_declared = 0;
+            (void)moe_json_get_bool_slice(doc, obj_begin, obj_end, "value_norm_declared", &value_norm_declared);
+            std::string value_norm_input;
+            if (moe_json_get_string_slice(doc, obj_begin, obj_end, "value_norm_input", &value_norm_input) &&
+                moe_ascii_contains_ci(value_norm_input, "missing_value_projection")) {
+                continue;
+            }
+            int has_v_norm_key = role_matches;
+            std::string v_norm_name;
+            if ((moe_json_get_string_slice(doc, obj_begin, obj_end, "v_norm", &v_norm_name) ||
+                 moe_json_get_string_slice(doc, obj_begin, obj_end, "value_norm", &v_norm_name)) &&
+                !v_norm_name.empty()) {
+                has_v_norm_key = 1;
+            }
             int unweighted = 0;
-            if (moe_json_get_bool_slice(doc, obj_begin, obj_end, "unweighted", &unweighted) && unweighted) {
+            if ((value_norm_declared || has_v_norm_key) &&
+                moe_json_get_bool_slice(doc, obj_begin, obj_end, "unweighted", &unweighted) && unweighted) {
                 return 1;
             }
-            int declared = 0;
-            if (moe_json_get_bool_slice(
+            int contractual_when_declared = 0;
+            if ((value_norm_declared || has_v_norm_key) &&
+                moe_json_get_bool_slice(
                     doc, obj_begin, obj_end,
-                    "unweighted_value_norm_is_contractual_when_declared", &declared) && declared) {
+                    "unweighted_value_norm_is_contractual_when_declared", &contractual_when_declared) &&
+                contractual_when_declared) {
                 return 1;
             }
-            if (!role_matches) {
+            int requires_local_weight = 1;
+            if (value_norm_declared &&
+                (moe_json_get_bool_slice(doc, obj_begin, obj_end, "requires_layer_local_weight_tensor", &requires_local_weight) ||
+                 moe_json_get_bool_slice(doc, obj_begin, obj_end, "value_norm_requires_layer_local_weight_tensor", &requires_local_weight)) &&
+                !requires_local_weight) {
+                return 1;
+            }
+            if (!role_matches && !value_norm_declared && !has_v_norm_key) {
                 continue;
             }
             std::string mode;
             if (moe_json_get_string_slice(doc, obj_begin, obj_end, "value_norm_mode", &mode) &&
-                mode == "unweighted_rmsnorm_contract") {
+                moe_ascii_contains_ci(mode, "unweighted_rmsnorm_contract")) {
                 return 1;
             }
             if (moe_json_get_string_slice(doc, obj_begin, obj_end, "norm_mode", &mode) &&
-                mode == "unweighted_rmsnorm_contract") {
+                moe_ascii_contains_ci(mode, "unweighted_rmsnorm_contract")) {
                 return 1;
             }
         }
@@ -267,6 +303,87 @@ static int moe_layer_object_contract_declares_unweighted_v_norm(
     }
     return moe_layer_contract_declares_unweighted_v_norm(
         doc.substr(object_begin, object_end - object_begin), array_key, layer);
+}
+
+
+static int moe_attention_layer_contract_double_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* keys,
+    size_t key_count,
+    double* out,
+    const char** out_source
+) {
+    if (out_source) {
+        *out_source = "none";
+    }
+    if (!engine || layer < 0 || !keys || !out) {
+        return 0;
+    }
+    const std::string* docs[] = {
+        &engine->offload_graph_ir_json,
+        &engine->offload_gguf_metadata_json,
+    };
+    const char* doc_names[] = {
+        "graph_ir.layer_execution_contract_table",
+        "metadata.layer_execution_contract_table",
+    };
+    for (size_t doc_i = 0; doc_i < sizeof(docs) / sizeof(docs[0]); ++doc_i) {
+        const std::string* doc = docs[doc_i];
+        if (!doc || doc->empty()) {
+            continue;
+        }
+        size_t search_pos = 0;
+        size_t arr_begin = 0;
+        size_t arr_end = 0;
+        while (moe_json_find_next_array_for_key_local(
+            *doc, "layer_execution_contract_table", search_pos, &arr_begin, &arr_end) != std::string::npos) {
+            size_t cursor = arr_begin + 1u;
+            uint64_t row_ordinal = 0;
+            while (cursor < arr_end) {
+                size_t obj_begin = 0;
+                size_t obj_end = 0;
+                if (!moe_json_next_object_in_array(*doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+                    break;
+                }
+                const uint64_t this_row_ordinal = row_ordinal++;
+                uint64_t row_layer = UINT64_MAX;
+                int layer_match = 0;
+                if (moe_json_get_u64_slice(*doc, obj_begin, obj_end, "layer", &row_layer) ||
+                    moe_json_get_u64_slice(*doc, obj_begin, obj_end, "layer_index", &row_layer) ||
+                    moe_json_get_u64_slice(*doc, obj_begin, obj_end, "idx", &row_layer)) {
+                    layer_match = row_layer == (uint64_t)layer ? 1 : 0;
+                } else {
+                    layer_match = this_row_ordinal == (uint64_t)layer ? 1 : 0;
+                }
+                if (!layer_match) {
+                    continue;
+                }
+                size_t attn_begin = 0;
+                size_t attn_end = 0;
+                const std::string row = doc->substr(obj_begin, obj_end - obj_begin);
+                const int has_attention = moe_json_find_object_local(row, "attention", &attn_begin, &attn_end);
+                for (size_t i = 0; i < key_count; ++i) {
+                    if (!keys[i]) {
+                        continue;
+                    }
+                    if (has_attention && moe_json_get_double_slice(
+                            row, attn_begin, attn_end, keys[i], out) &&
+                        *out > 0.0 && std::isfinite(*out)) {
+                        if (out_source) *out_source = doc_names[doc_i];
+                        return 1;
+                    }
+                    if (moe_json_get_double_slice(*doc, obj_begin, obj_end, keys[i], out) &&
+                        *out > 0.0 && std::isfinite(*out)) {
+                        if (out_source) *out_source = doc_names[doc_i];
+                        return 1;
+                    }
+                }
+            }
+            search_pos = arr_end;
+        }
+    }
+    return 0;
 }
 
 static int moe_layer_uses_unweighted_v_norm(
@@ -567,6 +684,22 @@ static float moe_standard_attention_score_scale(
                 resolved_source = 5;
                 resolved_value = config_attention_scale;
             }
+            if (resolved_source == 0) {
+                double layer_scale = 0.0;
+                const char* layer_scale_source = nullptr;
+                static const char* const layer_scale_keys[] = {
+                    "attention_scale", "attn_scale", "attention_score_scale",
+                    "f_attn_scale", "qk_scale"
+                };
+                if (moe_attention_layer_contract_double_f32(
+                        engine, layer, layer_scale_keys,
+                        sizeof(layer_scale_keys) / sizeof(layer_scale_keys[0]),
+                        &layer_scale, &layer_scale_source) &&
+                    layer_scale > 0.0 && layer_scale <= 1024.0 && std::isfinite(layer_scale)) {
+                    resolved_source = 5;
+                    resolved_value = (float)layer_scale;
+                }
+            }
             if (resolved_source == 0 && !engine->offload_graph_ir_json.empty()) {
                 double direct_scale = 0.0;
                 if ((moe_json_get_double_local(engine->offload_graph_ir_json, "attention_scale", &direct_scale) ||
@@ -592,6 +725,21 @@ static float moe_standard_attention_score_scale(
                 }
             }
             float query_pre_attn_scalar = engine->model_config_query_pre_attn_scalar;
+            if (resolved_source == 0 && !(query_pre_attn_scalar > 0.0f)) {
+                double layer_qpre = 0.0;
+                const char* layer_qpre_source = nullptr;
+                static const char* const layer_qpre_keys[] = {
+                    "query_pre_attn_scalar", "attention_query_pre_attn_scalar",
+                    "attn_query_pre_attn_scalar"
+                };
+                if (moe_attention_layer_contract_double_f32(
+                        engine, layer, layer_qpre_keys,
+                        sizeof(layer_qpre_keys) / sizeof(layer_qpre_keys[0]),
+                        &layer_qpre, &layer_qpre_source) &&
+                    layer_qpre > 0.0 && layer_qpre <= 65536.0 && std::isfinite(layer_qpre)) {
+                    query_pre_attn_scalar = (float)layer_qpre;
+                }
+            }
             if (resolved_source == 0 && !(query_pre_attn_scalar > 0.0f) && !engine->offload_graph_ir_json.empty()) {
                 double value = 0.0;
                 if (moe_json_get_double_local(engine->offload_graph_ir_json, "query_pre_attn_scalar", &value) ||
@@ -683,8 +831,26 @@ static int moe_attention_score_scale_violates_qk_norm_contract(
 }
 
 static float moe_attention_logit_softcap_value(
-    const moe_pc_engine* engine
+    const moe_pc_engine* engine,
+    int32_t layer = -1
 ) {
+    if (engine && layer >= 0) {
+        double layer_value = 0.0;
+        const char* layer_source = nullptr;
+        static const char* const softcap_keys[] = {
+            "attn_logit_softcapping",
+            "attn_logit_softcap",
+            "attention_logit_softcapping",
+            "attention_logit_softcap"
+        };
+        if (moe_attention_layer_contract_double_f32(
+                engine, layer, softcap_keys,
+                sizeof(softcap_keys) / sizeof(softcap_keys[0]),
+                &layer_value, &layer_source) &&
+            layer_value > 0.0 && layer_value <= 100000.0 && std::isfinite(layer_value)) {
+            return (float)layer_value;
+        }
+    }
     if (engine) {
         int cached_state = -1;
         float cached_value = 0.0f;
@@ -729,6 +895,170 @@ static float moe_apply_attention_logit_softcap(
     return std::tanh(score / cap) * cap;
 }
 
+
+struct moe_attention_rope_contract_t {
+    int present = 0;
+    uint32_t rope_dim = 0;
+    uint32_t frequency_dim = 0;
+    float theta = 0.0f;
+    int rotate_half_known = 0;
+    int rotate_half = 1;
+    int proportional_frequency_known = 0;
+    int proportional_frequency_dim_uses_full_head_dim = 0;
+};
+
+static int moe_attention_layer_rope_contract_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    uint32_t head_dim,
+    moe_attention_rope_contract_t* out
+) {
+    if (out) {
+        *out = moe_attention_rope_contract_t{};
+    }
+    if (!engine || layer < 0 || !out) {
+        return 0;
+    }
+    const std::string* docs[] = {
+        &engine->offload_graph_ir_json,
+        &engine->offload_gguf_metadata_json,
+    };
+    const char* doc_names[] = { "graph_ir", "metadata" };
+    for (size_t doc_i = 0; doc_i < sizeof(docs) / sizeof(docs[0]); ++doc_i) {
+        const std::string* doc = docs[doc_i];
+        if (!doc || doc->empty()) {
+            continue;
+        }
+        size_t search_pos = 0;
+        size_t arr_begin = 0;
+        size_t arr_end = 0;
+        while (moe_json_find_next_array_for_key_local(
+            *doc, "layer_execution_contract_table", search_pos, &arr_begin, &arr_end) != std::string::npos) {
+            size_t cursor = arr_begin + 1u;
+            uint64_t row_ordinal = 0;
+            while (cursor < arr_end) {
+                size_t obj_begin = 0;
+                size_t obj_end = 0;
+                if (!moe_json_next_object_in_array(*doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+                    break;
+                }
+                const uint64_t this_row_ordinal = row_ordinal++;
+                uint64_t row_layer = UINT64_MAX;
+                int layer_match = 0;
+                if (moe_json_get_u64_slice(*doc, obj_begin, obj_end, "layer", &row_layer) ||
+                    moe_json_get_u64_slice(*doc, obj_begin, obj_end, "layer_index", &row_layer) ||
+                    moe_json_get_u64_slice(*doc, obj_begin, obj_end, "idx", &row_layer)) {
+                    layer_match = row_layer == (uint64_t)layer ? 1 : 0;
+                } else {
+                    layer_match = this_row_ordinal == (uint64_t)layer ? 1 : 0;
+                }
+                if (!layer_match) {
+                    continue;
+                }
+
+                std::string attention_kind;
+                (void)moe_json_get_string_slice(*doc, obj_begin, obj_end, "attention_kind", &attention_kind);
+
+                const std::string row = doc->substr(obj_begin, obj_end - obj_begin);
+                std::string scope = row;
+                size_t attn_begin = 0;
+                size_t attn_end = 0;
+                if (moe_json_find_object_local(row, "attention", &attn_begin, &attn_end) && attn_end > attn_begin) {
+                    scope = row.substr(attn_begin, attn_end - attn_begin);
+                }
+                size_t rope_begin = 0;
+                size_t rope_end = 0;
+                std::string rope_scope;
+                if (moe_json_find_object_local(scope, "rope_contract", &rope_begin, &rope_end) && rope_end > rope_begin) {
+                    rope_scope = scope.substr(rope_begin, rope_end - rope_begin);
+                } else if (moe_json_find_object_local(row, "rope_contract", &rope_begin, &rope_end) && rope_end > rope_begin) {
+                    rope_scope = row.substr(rope_begin, rope_end - rope_begin);
+                } else {
+                    continue;
+                }
+
+                moe_attention_rope_contract_t resolved{};
+                resolved.present = 1;
+                uint64_t uvalue = 0;
+                double dvalue = 0.0;
+                int bvalue = 0;
+                if (moe_json_get_u64_local(rope_scope, "rope_dim", &uvalue) ||
+                    moe_json_get_u64_local(rope_scope, "rope_dimension_count", &uvalue) ||
+                    moe_json_get_u64_local(rope_scope, "qk_rope_head_dim", &uvalue)) {
+                    if (uvalue > 0 && uvalue <= UINT32_MAX) {
+                        resolved.rope_dim = (uint32_t)uvalue;
+                    }
+                }
+                if (moe_json_get_u64_local(rope_scope, "frequency_dim", &uvalue) ||
+                    moe_json_get_u64_local(rope_scope, "rope_frequency_dim", &uvalue)) {
+                    if (uvalue > 0 && uvalue <= UINT32_MAX) {
+                        resolved.frequency_dim = (uint32_t)uvalue;
+                    }
+                }
+                if ((moe_json_get_double_local(rope_scope, "theta", &dvalue) ||
+                     moe_json_get_double_local(rope_scope, "rope_theta", &dvalue)) &&
+                    dvalue > 0.0 && std::isfinite(dvalue)) {
+                    resolved.theta = (float)dvalue;
+                }
+                if (moe_json_get_double_local(rope_scope, "partial_rotary_factor", &dvalue) &&
+                    dvalue > 0.0 && dvalue <= 1.0 && std::isfinite(dvalue) &&
+                    head_dim > 0 && resolved.rope_dim == 0) {
+                    uint32_t partial_dim = (uint32_t)std::round((double)head_dim * dvalue);
+                    if (partial_dim < 2u) partial_dim = 2u;
+                    if (partial_dim > head_dim) partial_dim = head_dim;
+                    resolved.rope_dim = partial_dim;
+                }
+                if (moe_json_get_bool_local(rope_scope, "rotate_half", &bvalue)) {
+                    resolved.rotate_half_known = 1;
+                    resolved.rotate_half = bvalue ? 1 : 0;
+                }
+                if (moe_json_get_bool_local(
+                        rope_scope,
+                        "proportional_frequency_dim_uses_full_head_dim",
+                        &bvalue)) {
+                    resolved.proportional_frequency_known = 1;
+                    resolved.proportional_frequency_dim_uses_full_head_dim = bvalue ? 1 : 0;
+                }
+                std::string rope_type;
+                if (moe_json_get_string_local(rope_scope, "rope_type", &rope_type) ||
+                    moe_json_get_string_local(rope_scope, "type", &rope_type)) {
+                    if (moe_ascii_contains_ci(rope_type, "proportional")) {
+                        resolved.proportional_frequency_known = 1;
+                        resolved.proportional_frequency_dim_uses_full_head_dim = 1;
+                    }
+                }
+                if (resolved.frequency_dim == 0 && resolved.proportional_frequency_dim_uses_full_head_dim && head_dim > 0) {
+                    resolved.frequency_dim = head_dim;
+                }
+                if (resolved.frequency_dim == 0 && resolved.rope_dim > 0) {
+                    resolved.frequency_dim = resolved.rope_dim;
+                }
+                if (resolved.rope_dim > 0 && head_dim > 0 && resolved.rope_dim > head_dim) {
+                    resolved.rope_dim = head_dim;
+                }
+                if (resolved.frequency_dim > 0 && head_dim > 0 && resolved.frequency_dim > head_dim) {
+                    resolved.frequency_dim = head_dim;
+                }
+                *out = resolved;
+                moe_profile_log(
+                    "attn_rope_contract",
+                    "layer=%d source=%s attention_kind=%s rope_dim=%u freq_dim=%u theta=%.6g rotate_half=%d proportional=%d",
+                    layer,
+                    doc_names[doc_i],
+                    attention_kind.empty() ? "" : attention_kind.c_str(),
+                    resolved.rope_dim,
+                    resolved.frequency_dim,
+                    (double)resolved.theta,
+                    resolved.rotate_half_known ? resolved.rotate_half : -1,
+                    resolved.proportional_frequency_known ? resolved.proportional_frequency_dim_uses_full_head_dim : -1);
+                return 1;
+            }
+            search_pos = arr_end;
+        }
+    }
+    return 0;
+}
+
 static void moe_standard_attention_rope_params(
     const moe_pc_engine* engine,
     int32_t layer,
@@ -741,6 +1071,21 @@ static void moe_standard_attention_rope_params(
 ) {
     if (!io_rope_dim || !io_rope_theta || head_dim == 0) {
         return;
+    }
+    if (engine && layer >= 0) {
+        moe_attention_rope_contract_t rope_contract{};
+        if (moe_attention_layer_rope_contract_f32(engine, layer, head_dim, &rope_contract) &&
+            rope_contract.present) {
+            if (rope_contract.rope_dim > 0) {
+                *io_rope_dim = std::min<uint32_t>(rope_contract.rope_dim, head_dim);
+            }
+            if (rope_contract.theta > 0.0f && std::isfinite(rope_contract.theta)) {
+                *io_rope_theta = rope_contract.theta;
+            }
+            if (rope_contract.rope_dim > 0 || rope_contract.theta > 0.0f) {
+                return;
+            }
+        }
     }
     if (!moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
         if (engine &&

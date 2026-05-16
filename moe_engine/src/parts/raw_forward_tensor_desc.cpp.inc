@@ -432,6 +432,208 @@ static const moe_gguf_common_tensor_record* moe_common_tensor_find_first_raw_com
     return nullptr;
 }
 
+static void moe_raw_push_unique_tensor_name(
+    std::vector<std::string>* out,
+    const std::string& name
+) {
+    if (!out || name.empty()) {
+        return;
+    }
+    for (const std::string& existing : *out) {
+        if (existing == name) {
+            return;
+        }
+    }
+    out->push_back(name);
+}
+
+static int moe_json_find_next_array_key_raw(
+    const std::string& text,
+    const char* key,
+    size_t start_pos,
+    size_t* begin,
+    size_t* end
+) {
+    if (!key || !begin || !end || start_pos >= text.size()) {
+        return 0;
+    }
+    const size_t key_len = std::strlen(key);
+    size_t pos = start_pos;
+    while ((pos = text.find('"', pos)) != std::string::npos) {
+        if (pos + 1 + key_len < text.size() &&
+            text.compare(pos + 1, key_len, key) == 0 &&
+            text[pos + 1 + key_len] == '"') {
+            const size_t colon = text.find_first_not_of(" \t\r\n", pos + key_len + 2);
+            if (colon != std::string::npos && colon < text.size() && text[colon] == ':') {
+                const size_t value = text.find_first_not_of(" \t\r\n", colon + 1);
+                if (value != std::string::npos && value < text.size() && text[value] == '[') {
+                    const size_t close = moe_json_match_bracket_local(text, value, '[', ']');
+                    if (close != std::string::npos) {
+                        *begin = value;
+                        *end = close;
+                        return 1;
+                    }
+                }
+            }
+        }
+        ++pos;
+    }
+    return 0;
+}
+
+static void moe_raw_tensor_kind_contract_fields(
+    moe_raw_tensor_kind_t kind,
+    const char** out_section,
+    std::vector<const char*>* out_keys
+) {
+    if (out_section) {
+        *out_section = nullptr;
+    }
+    if (!out_keys) {
+        return;
+    }
+    out_keys->clear();
+    switch (kind) {
+        case moe_RAW_TENSOR_INPUT_LAYER_NORM:
+            if (out_section) *out_section = "norms";
+            out_keys->push_back("attention_input_norm");
+            out_keys->push_back("input_layer_norm");
+            break;
+        case moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM:
+            if (out_section) *out_section = "norms";
+            out_keys->push_back("post_attention_norm");
+            out_keys->push_back("post_attn_norm");
+            break;
+        case moe_RAW_TENSOR_Q_A_LAYER_NORM:
+            if (out_section) *out_section = "attention";
+            out_keys->push_back("q_norm");
+            break;
+        case moe_RAW_TENSOR_KV_A_LAYER_NORM:
+            if (out_section) *out_section = "attention";
+            out_keys->push_back("k_norm");
+            break;
+        case moe_RAW_TENSOR_V_A_LAYER_NORM:
+            if (out_section) *out_section = "attention";
+            out_keys->push_back("v_norm");
+            out_keys->push_back("value_norm");
+            break;
+        case moe_RAW_TENSOR_Q_A_PROJ:
+            if (out_section) *out_section = "attention";
+            out_keys->push_back("q_projection");
+            out_keys->push_back("query_projection");
+            break;
+        case moe_RAW_TENSOR_Q_B_PROJ:
+            if (out_section) *out_section = "attention";
+            out_keys->push_back("q_b_projection");
+            out_keys->push_back("query_b_projection");
+            break;
+        case moe_RAW_TENSOR_KV_A_PROJ_WITH_MQA:
+            if (out_section) *out_section = "attention";
+            out_keys->push_back("k_projection");
+            out_keys->push_back("key_projection");
+            out_keys->push_back("kv_a_projection");
+            break;
+        case moe_RAW_TENSOR_KV_B_PROJ:
+            if (out_section) *out_section = "attention";
+            out_keys->push_back("v_projection");
+            out_keys->push_back("value_projection");
+            out_keys->push_back("kv_b_projection");
+            break;
+        case moe_RAW_TENSOR_O_PROJ:
+            if (out_section) *out_section = "attention";
+            out_keys->push_back("o_projection");
+            out_keys->push_back("attention_output");
+            out_keys->push_back("out_projection");
+            break;
+        default:
+            break;
+    }
+}
+
+static void moe_raw_contract_tensor_names_from_doc(
+    const std::string& doc,
+    int32_t layer,
+    moe_raw_tensor_kind_t kind,
+    std::vector<std::string>* out_names
+) {
+    if (!out_names || doc.empty() || layer < 0) {
+        return;
+    }
+    const char* section_key = nullptr;
+    std::vector<const char*> field_keys;
+    moe_raw_tensor_kind_contract_fields(kind, &section_key, &field_keys);
+    if (field_keys.empty()) {
+        return;
+    }
+    size_t search_pos = 0;
+    size_t arr_begin = 0;
+    size_t arr_end = 0;
+    while (moe_json_find_next_array_key_raw(
+        doc, "layer_execution_contract_table", search_pos, &arr_begin, &arr_end)) {
+        size_t cursor = arr_begin + 1;
+        size_t obj_begin = 0;
+        size_t obj_end = 0;
+        while (moe_json_next_object_in_array(doc, &cursor, arr_end, &obj_begin, &obj_end)) {
+            uint64_t row_layer = UINT64_MAX;
+            if (!moe_json_get_u64_slice(doc, obj_begin, obj_end, "layer", &row_layer) ||
+                row_layer != (uint64_t)layer) {
+                continue;
+            }
+            size_t sec_begin = 0;
+            size_t sec_end = 0;
+            const int has_section = section_key &&
+                moe_json_find_object_local(doc.substr(obj_begin, obj_end - obj_begin), section_key, &sec_begin, &sec_end);
+            for (const char* key : field_keys) {
+                if (!key || !key[0]) {
+                    continue;
+                }
+                std::string name;
+                if (has_section) {
+                    const size_t abs_sec_begin = obj_begin + sec_begin;
+                    const size_t abs_sec_end = obj_begin + sec_end;
+                    if (moe_json_get_string_slice(doc, abs_sec_begin, abs_sec_end, key, &name) &&
+                        !name.empty()) {
+                        moe_raw_push_unique_tensor_name(out_names, name);
+                    }
+                }
+                name.clear();
+                if (moe_json_get_string_slice(doc, obj_begin, obj_end, key, &name) && !name.empty()) {
+                    moe_raw_push_unique_tensor_name(out_names, name);
+                }
+            }
+        }
+        search_pos = arr_end;
+    }
+}
+
+static const moe_gguf_common_tensor_record* find_common_raw_tensor_record_by_contract(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    moe_raw_tensor_kind_t kind,
+    moe_raw_tensor_desc* out_desc
+) {
+    if (!engine || layer < 0) {
+        return nullptr;
+    }
+    std::vector<std::string> names;
+    moe_raw_contract_tensor_names_from_doc(engine->offload_graph_ir_json, layer, kind, &names);
+    moe_raw_contract_tensor_names_from_doc(engine->offload_gguf_metadata_json, layer, kind, &names);
+    if (names.empty()) {
+        return nullptr;
+    }
+    const moe_gguf_common_tensor_record* rec =
+        moe_common_tensor_find_first_raw_compatible(engine, names, out_desc);
+    if (rec) {
+        moe_profile_log(
+            "raw_tensor_contract_map",
+            "layer=%d kind=%u name=%s source=layer_execution_contract_table",
+            (int)layer,
+            (unsigned)kind,
+            rec->name.c_str());
+    }
+    return rec;
+}
+
 static int moe_common_tensor_layer_matches(
     const moe_gguf_common_tensor_record& rec,
     int32_t layer
@@ -566,6 +768,10 @@ static const moe_gguf_common_tensor_record* find_common_raw_tensor_record(
     moe_raw_tensor_kind_t kind,
     moe_raw_tensor_desc* out_desc
 ) {
+    if (const moe_gguf_common_tensor_record* rec =
+            find_common_raw_tensor_record_by_contract(engine, layer, kind, out_desc)) {
+        return rec;
+    }
     if (const moe_gguf_common_tensor_record* rec =
             find_common_raw_tensor_record_by_role(engine, layer, kind, out_desc)) {
         return rec;
