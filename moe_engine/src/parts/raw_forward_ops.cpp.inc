@@ -112,16 +112,6 @@ static int moe_engine_rmsnorm_unit_offset(
     if (metadata_found) {
         value = metadata_value ? 1 : 0;
         source = metadata_source;
-        // BUGFIX: Gemma architectures ALWAYS require +1 unit offset regardless of
-        // what metadata/graph_ir says.  Some generator versions emit
-        // rmsnorm_unit_offset=false in the graph_ir which is incorrect for Gemma.
-        if (!value && !engine->dynamic_architecture.empty()) {
-            const std::string arch = moe_lower_ascii_copy(engine->dynamic_architecture);
-            if (arch.find("gemma") != std::string::npos) {
-                value = 1;
-                source = "gemma_architecture_override";
-            }
-        }
         engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0, std::memory_order_release);
     } else {
         direct_contract = moe_engine_contract_uses_direct_rmsnorm_weight(engine);

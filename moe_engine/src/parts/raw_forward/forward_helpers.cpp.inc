@@ -1075,17 +1075,6 @@ static int moe_engine_contract_uses_rmsnorm_unit_offset(
         moe_engine_metadata_mentions(engine, "rms_norm_weight_semantics\": \"plus_one")) {
         return 1;
     }
-    
-    // BUGFIX: Gemma architectures strictly require RMSNorm +1 offset.
-    // If GGUF is missing the specific boolean flags above, enforce it via architecture name.
-    if (!engine->dynamic_architecture.empty()) {
-        const std::string arch = moe_lower_ascii_copy(engine->dynamic_architecture);
-        if (arch.find("gemma") != std::string::npos) {
-            moe_profile_log("rmsnorm_unit_offset_contract", "Enforcing +1 offset for architecture=%s", arch.c_str());
-            return 1;
-        }
-    }
-    
     return moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract(engine);
 }
 
