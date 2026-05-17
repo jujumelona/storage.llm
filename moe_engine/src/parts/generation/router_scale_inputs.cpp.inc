@@ -304,9 +304,12 @@ static int moe_prepare_router_weight_sidecar_input_f32(
         if (!std::isfinite(ss)) {
             return 0;
         }
+        // Contract-gated router sidecars are learned router-input scales.  The
+        // RMSNorm part normalizes by mean square, then the model graph applies
+        // the hidden-size root factor before the learned per-hidden scale.
         norm =
             (1.0f / std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f)) *
-            (1.0f / std::sqrt((float)hidden_size));
+            std::sqrt((float)hidden_size);
         if (!std::isfinite(norm) || !(norm > 0.0f)) {
             return 0;
         }

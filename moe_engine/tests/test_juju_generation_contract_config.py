@@ -663,14 +663,15 @@ def test_router_weight_sidecar_rms_root_transform_is_ir_contract_gated():
     assert '"router_input_rms_root_transform"' in router_utils_text
     assert "moe_router_row_has_rms_root_graph_signature_f32" in router_utils_text
     assert '"ffn_gate_inp_scale_is_weight_scale_sidecar"' in router_utils_text
-    assert '"expert_ffn_norm"' in router_utils_text
+    assert "expert_ffn_norm" in router_utils_text
     start = router_scale_text.index("static int moe_prepare_router_weight_sidecar_input_f32")
     end = router_scale_text.index("static int moe_router_has_contract_input_scale_f32", start)
     block = router_scale_text[start:end]
     assert "moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer)" in block
     assert "ss += v * v;" in block
     assert "std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f)" in block
-    assert "1.0f / std::sqrt((float)hidden_size)" in block
+    assert "std::sqrt((float)hidden_size)" in block
+    assert "1.0f / std::sqrt((float)hidden_size)" not in block
     assert "hidden[i] * norm * scale" in block
     assert "weight_sidecar_ir_rms_root" in block
     assert "weight_sidecar\"" in block
