@@ -62,6 +62,42 @@ static int moe_layer_shared_expert_gate_f32(
     return std::isfinite(*out_gate) ? 1 : 0;
 }
 
+static int moe_map_layer_expert_down_scale_tensor_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    moe_raw_tensor_cache_entry* out
+) {
+    if (!engine || !out) {
+        return 0;
+    }
+    static const char* const suffixes[] = {
+        "ffn_down_exps.scale",
+        "ffn_gate_inp.per_expert_scale",
+        "router.per_expert_scale",
+        "mlp.router.per_expert_scale",
+        "moe.gate.per_expert_scale"
+    };
+    static const char* const direct_contract_suffixes[] = {
+        "per_expert_scale",
+        "moe.per_expert_scale",
+        "mlp.moe.per_expert_scale",
+        "experts.per_expert_scale",
+        "ffn_gate_inp.per_expert_scale",
+        "router.per_expert_scale",
+        "mlp.router.per_expert_scale",
+        "moe.gate.per_expert_scale"
+    };
+    const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
+    // ffn_down_exps.scale is stored as a routed expert projection scale sidecar.
+    // When it has a scalar/per-expert/per-channel shape, it is part of the down
+    // projection math and must be applied after the down projection. Explicit
+    // direct-per-expert-scale contracts still bind only per_expert_scale names.
+    const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
+    const size_t scale_suffix_count = direct_scale_contract ?
+        (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :
+        (sizeof(suffixes) / sizeof(suffixes[0]));
+    return moe_map_layer_common_tensor(engine, layer, scale_suffixes, scale_suffix_count, out);
+}
 
 static int moe_layer_get_expert_down_uniform_scale_f32(
     moe_pc_engine* engine,
@@ -82,32 +118,8 @@ static int moe_layer_get_expert_down_uniform_scale_f32(
     // the CPU-only MLP path fuse down_proj and expert accumulation without first
     // materializing a full [top_k, hidden] output buffer.  Per-channel scale tensors
     // still fall back to the fully general path for correctness.
-    static const char* const suffixes[] = {
-        "ffn_gate_inp.per_expert_scale",
-        "router.per_expert_scale",
-        "mlp.router.per_expert_scale",
-        "moe.gate.per_expert_scale"
-    };
-    static const char* const direct_contract_suffixes[] = {
-        "per_expert_scale",
-        "moe.per_expert_scale",
-        "mlp.moe.per_expert_scale",
-        "experts.per_expert_scale",
-        "ffn_gate_inp.per_expert_scale",
-        "router.per_expert_scale",
-        "mlp.router.per_expert_scale",
-        "moe.gate.per_expert_scale"
-    };
-    const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
-    // ffn_down_exps.scale is the routed expert down-projection weight sidecar in
-    // JUJU/GGUF contracts, not a runtime expert-output scale. Runtime expert
-    // scales must come from explicit per_expert_scale-style tensors.
-    const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
-    const size_t scale_suffix_count = direct_scale_contract ?
-        (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :
-        (sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_cache_entry raw{};
-    if (!moe_map_layer_common_tensor(engine, layer, scale_suffixes, scale_suffix_count, &raw)) {
+    if (!moe_map_layer_expert_down_scale_tensor_f32(engine, layer, &raw)) {
         *out_scale = 1.0f;
         return 1;
     }
@@ -158,32 +170,8 @@ static int moe_layer_apply_expert_down_scale_f32(
         return 0;
     }
 
-    static const char* const suffixes[] = {
-        "ffn_gate_inp.per_expert_scale",
-        "router.per_expert_scale",
-        "mlp.router.per_expert_scale",
-        "moe.gate.per_expert_scale"
-    };
-    static const char* const direct_contract_suffixes[] = {
-        "per_expert_scale",
-        "moe.per_expert_scale",
-        "mlp.moe.per_expert_scale",
-        "experts.per_expert_scale",
-        "ffn_gate_inp.per_expert_scale",
-        "router.per_expert_scale",
-        "mlp.router.per_expert_scale",
-        "moe.gate.per_expert_scale"
-    };
-    const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
-    // ffn_down_exps.scale is the routed expert down-projection weight sidecar in
-    // JUJU/GGUF contracts, not a runtime expert-output scale. Runtime expert
-    // scales must come from explicit per_expert_scale-style tensors.
-    const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
-    const size_t scale_suffix_count = direct_scale_contract ?
-        (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :
-        (sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_cache_entry raw{};
-    if (!moe_map_layer_common_tensor(engine, layer, scale_suffixes, scale_suffix_count, &raw)) {
+    if (!moe_map_layer_expert_down_scale_tensor_f32(engine, layer, &raw)) {
         return 1;
     }
     const uint64_t count = moe_raw_tensor_scalar_count(raw);
