@@ -1037,14 +1037,9 @@ static int moe_attention_layer_rope_contract_f32(
             uint64_t uvalue = 0;
             double dvalue = 0.0;
             int bvalue = 0;
-            int has_explicit_qk_rope_dim = 0;
-            if (moe_json_get_u64_local(rope_scope, "qk_rope_head_dim", &uvalue)) {
-                has_explicit_qk_rope_dim = 1;
-                if (uvalue > 0 && uvalue <= UINT32_MAX) {
-                    resolved.rope_dim = (uint32_t)uvalue;
-                }
-            } else if (moe_json_get_u64_local(rope_scope, "rope_dim", &uvalue) ||
-                       moe_json_get_u64_local(rope_scope, "rope_dimension_count", &uvalue)) {
+            if (moe_json_get_u64_local(rope_scope, "rope_dim", &uvalue) ||
+                moe_json_get_u64_local(rope_scope, "rope_dimension_count", &uvalue) ||
+                moe_json_get_u64_local(rope_scope, "qk_rope_head_dim", &uvalue)) {
                 if (uvalue > 0 && uvalue <= UINT32_MAX) {
                     resolved.rope_dim = (uint32_t)uvalue;
                 }
@@ -1060,11 +1055,9 @@ static int moe_attention_layer_rope_contract_f32(
                 dvalue > 0.0 && std::isfinite(dvalue)) {
                 resolved.theta = (float)dvalue;
             }
-            const int has_partial_rotary_factor =
-                moe_json_get_double_local(rope_scope, "partial_rotary_factor", &dvalue) &&
+            if (moe_json_get_double_local(rope_scope, "partial_rotary_factor", &dvalue) &&
                 dvalue > 0.0 && dvalue <= 1.0 && std::isfinite(dvalue) &&
-                head_dim > 0;
-            if (has_partial_rotary_factor) {
+                head_dim > 0) {
                 uint32_t partial_dim = (uint32_t)std::round((double)head_dim * dvalue);
                 if (partial_dim < 2u) partial_dim = 2u;
                 if (partial_dim > head_dim) partial_dim = head_dim;
@@ -1088,16 +1081,6 @@ static int moe_attention_layer_rope_contract_f32(
                     resolved.proportional_frequency_known = 1;
                     resolved.proportional_frequency_dim_uses_full_head_dim = 1;
                 }
-            }
-            if (has_partial_rotary_factor &&
-                !has_explicit_qk_rope_dim &&
-                !resolved.proportional_frequency_dim_uses_full_head_dim &&
-                (moe_ascii_contains_ci(attention_kind, "sliding") ||
-                 moe_ascii_contains_ci(attention_kind, "local")) &&
-                (!rope_type.empty() && moe_ascii_contains_ci(rope_type, "default")) &&
-                head_dim > 0) {
-                resolved.rope_dim = head_dim;
-                resolved.frequency_dim = head_dim;
             }
             if (resolved.frequency_dim == 0 && resolved.proportional_frequency_dim_uses_full_head_dim && head_dim > 0) {
                 resolved.frequency_dim = head_dim;
