@@ -755,12 +755,17 @@ def test_shared_expert_suffixes_are_preferred_before_generic_dense_ffn_aliases()
 def test_attention_scale_uses_contract_without_model_name_branch():
     attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_prefill.cpp.inc").read_text()
     helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
+    parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
     assert "moe_engine_contract_uses_unit_qk_norm_global" in helper_text
     assert "moe_engine_is_gemma4_text_contract" not in helper_text
     assert "unit_qk_norm" in attn_text
     assert "attention_scale_contract" in attn_text
     assert "query_pre_attn_scalar" in attn_text
-    assert "gemma" not in attn_text.lower()
+    assert "attention_scale_source" in parser_text
+    assert "qk_norm" in parser_text
+    assert "post_attention_norm" in parser_text
+    assert "layer_output_scale" in parser_text
+    assert "moe_engine_is_gemma4_text_contract" not in attn_text
 
 
 

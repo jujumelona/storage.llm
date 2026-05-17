@@ -772,6 +772,40 @@ static int moe_juju_attention_contract_uses_unit_scale(const std::string& json) 
         unit_scale) {
         return 1;
     }
+    std::string source;
+    const int has_scale_source =
+        moe_json_get_string_local(json, "attention_scale_source", &source) ||
+        moe_json_get_string_local(json, "attention_score_scale_source", &source);
+    if (!has_scale_source) {
+        return 0;
+    }
+    const std::string lower_source = moe_lower_ascii_copy(source);
+    if (lower_source.find("unit") != std::string::npos ||
+        lower_source.find("qk_norm") != std::string::npos ||
+        lower_source.find("q_norm") != std::string::npos ||
+        lower_source.find("k_norm") != std::string::npos) {
+        return 1;
+    }
+    if (lower_source.find("head_dim") == std::string::npos) {
+        return 0;
+    }
+    const int has_q_norm_contract =
+        json.find("\"op_role\":\"q_norm\"") != std::string::npos ||
+        json.find("\"role\":\"q_norm\"") != std::string::npos ||
+        json.find("attn_q_norm.weight") != std::string::npos ||
+        json.find("q_norm.weight") != std::string::npos;
+    const int has_k_norm_contract =
+        json.find("\"op_role\":\"k_norm\"") != std::string::npos ||
+        json.find("\"role\":\"k_norm\"") != std::string::npos ||
+        json.find("attn_k_norm.weight") != std::string::npos ||
+        json.find("k_norm.weight") != std::string::npos;
+    const int has_scaled_block_contract =
+        json.find("post_attention_norm") != std::string::npos &&
+        json.find("post_ffw_norm") != std::string::npos &&
+        json.find("layer_output_scale") != std::string::npos;
+    if (has_q_norm_contract && has_k_norm_contract && has_scaled_block_contract) {
+        return 1;
+    }
     return 0;
 }
 
