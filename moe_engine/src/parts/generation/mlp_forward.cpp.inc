@@ -405,11 +405,7 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
             plan.dense.weight_count = 3u;
         }
     }
-    if (plan.routed.present && plan.dense.has_weights && !plan.shared.has_weights) {
-        plan.run_dense = 1;
-    } else {
-        plan.run_dense = ((plan.dense.required && plan.dense.has_weights) || split_dense_branch_by_norm1) ? 1 : 0;
-    }
+    plan.run_dense = ((plan.dense.required && plan.dense.has_weights) || split_dense_branch_by_norm1) ? 1 : 0;
     plan.run_shared = plan.shared.has_weights ? 1 : 0;
     plan.shared_required = plan.shared.required ? 1 : 0;
     moe_profile_log(
