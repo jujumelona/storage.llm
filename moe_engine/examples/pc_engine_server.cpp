@@ -2259,13 +2259,38 @@ static bool encode_chat_response_only_eval(
     }
     bool enable_thinking = false;
     (void)json_read_bool_in_range(body, 0, body.size(), "enable_thinking", &enable_thinking);
+    std::vector<int32_t> full_ids;
+
+    const std::string full_templated = apply_sidecar_chat_template(opts, messages, false, enable_thinking);
+    if (!full_templated.empty()) {
+        const size_t content_pos = full_templated.rfind(last.content);
+        if (content_pos != std::string::npos) {
+            const std::string full_prefix = full_templated.substr(0, content_pos);
+            std::vector<int32_t> full_prefix_ids;
+            if (tokenizer_encode_greedy(tok, full_templated, &full_ids) &&
+                tokenizer_encode_greedy(tok, full_prefix, &full_prefix_ids) &&
+                !full_prefix_ids.empty() &&
+                full_ids.size() > full_prefix_ids.size() &&
+                tokens_have_prefix(full_ids, full_prefix_ids)) {
+                *out_ids = std::move(full_ids);
+                *out_first_target_index = static_cast<uint32_t>(full_prefix_ids.size());
+                std::cerr << "[storagellm request] eval response_only_chat prompt_tokens="
+                          << full_prefix_ids.size()
+                          << " target_tokens=" << (out_ids->size() - full_prefix_ids.size())
+                          << " input_tokens=" << out_ids->size()
+                          << " template_mode=full_messages"
+                          << "\n" << std::flush;
+                return true;
+            }
+        }
+    }
+
     std::vector<server_chat_message> prompt_messages(messages.begin(), messages.end() - 1);
     const std::string prompt = apply_sidecar_chat_template(opts, prompt_messages, true, enable_thinking);
     if (prompt.empty()) {
         return false;
     }
     std::vector<int32_t> prompt_ids;
-    std::vector<int32_t> full_ids;
     if (!tokenizer_encode_greedy(tok, prompt, &prompt_ids) || prompt_ids.empty()) {
         return false;
     }
@@ -2288,39 +2313,13 @@ static bool encode_chat_response_only_eval(
                   << prompt_ids.size()
                   << " target_tokens=" << (out_ids->size() - prompt_ids.size())
                   << " input_tokens=" << out_ids->size()
-                  << " template_mode=generation_prompt"
+                  << " template_mode=generation_prompt_fallback"
                   << "\n" << std::flush;
         return true;
     }
 
-    const std::string full_templated = apply_sidecar_chat_template(opts, messages, false, enable_thinking);
-    if (!full_templated.empty()) {
-        const size_t content_pos = full_templated.rfind(last.content);
-        if (content_pos != std::string::npos) {
-            const std::string full_prefix = full_templated.substr(0, content_pos);
-            std::vector<int32_t> full_prefix_ids;
-            if (tokenizer_encode_greedy(tok, full_templated, &full_ids) &&
-                tokenizer_encode_greedy(tok, full_prefix, &full_prefix_ids) &&
-                !full_prefix_ids.empty() &&
-                full_ids.size() > full_prefix_ids.size() &&
-                tokens_have_prefix(full_ids, full_prefix_ids)) {
-                *out_ids = std::move(full_ids);
-                *out_first_target_index = static_cast<uint32_t>(full_prefix_ids.size());
-                std::cerr << "[storagellm request] eval response_only_chat prompt_tokens="
-                          << full_prefix_ids.size()
-                          << " target_tokens=" << (out_ids->size() - full_prefix_ids.size())
-                          << " input_tokens=" << out_ids->size()
-                          << " template_mode=full_messages_fallback"
-                          << " generation_prompt_tokens=" << prompt_ids.size()
-                          << "\n" << std::flush;
-                return true;
-            }
-        }
-    }
-
     std::cerr << "[storagellm request] eval response_only_chat rejected"
               << " reason=no_template_token_prefix"
-              << " prompt_tokens=" << prompt_ids.size()
               << "\n" << std::flush;
     return false;
 }
