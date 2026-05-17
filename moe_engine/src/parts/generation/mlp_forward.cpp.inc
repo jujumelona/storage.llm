@@ -146,6 +146,145 @@ static void moe_graph_ir_mlp_note_op_policy_f32(
     }
 }
 
+static int moe_graph_ir_op_text_matches_any_token_f32(
+    const std::string& doc,
+    size_t op_begin,
+    size_t op_end,
+    const char* const* op_tokens,
+    size_t op_token_count
+) {
+    if (op_begin >= op_end || op_end > doc.size()) {
+        return 0;
+    }
+    std::string merged;
+    std::string value;
+    static const char* const fields[] = {
+        "op", "name", "execution_op", "op_role", "role", "graph_role",
+        "graph_role_text", "bundle_member_role", "type"
+    };
+    for (const char* field : fields) {
+        if (moe_json_get_string_slice(doc, op_begin, op_end, field, &value)) {
+            merged += " ";
+            merged += moe_lower_ascii_copy(value);
+        }
+    }
+    return moe_graph_ir_text_matches_any_token_f32(
+        merged, op_tokens, op_token_count);
+}
+
+static int moe_graph_ir_ops_dense_output_is_required_branch_input_f32(
+    const std::string& doc,
+    size_t ops_begin,
+    size_t ops_end
+) {
+    if (ops_begin >= ops_end || ops_end > doc.size()) {
+        return 0;
+    }
+    static const char* const dense_tokens[] = {
+        "dense_mlp", "dense_ffn", "dense_ffn_mlp", "dense_ffn_fallback"
+    };
+    static const char* const branch_sum_tokens[] = {
+        "ffn_branch_sum", "branch_sum", "add"
+    };
+    std::vector<std::string> dense_outputs;
+    size_t cursor = ops_begin + 1u;
+    while (cursor < ops_end) {
+        size_t op_begin = 0;
+        size_t op_end = 0;
+        if (!moe_json_next_object_in_array(doc, &cursor, ops_end, &op_begin, &op_end)) {
+            break;
+        }
+        if (!moe_graph_ir_op_text_matches_any_token_f32(
+                doc, op_begin, op_end,
+                dense_tokens, sizeof(dense_tokens) / sizeof(dense_tokens[0]))) {
+            continue;
+        }
+        std::string output;
+        if (moe_json_get_string_slice(doc, op_begin, op_end, "output", &output) &&
+            !output.empty()) {
+            dense_outputs.push_back(output);
+        }
+    }
+    if (dense_outputs.empty()) {
+        return 0;
+    }
+    cursor = ops_begin + 1u;
+    while (cursor < ops_end) {
+        size_t op_begin = 0;
+        size_t op_end = 0;
+        if (!moe_json_next_object_in_array(doc, &cursor, ops_end, &op_begin, &op_end)) {
+            break;
+        }
+        if (!moe_graph_ir_op_text_matches_any_token_f32(
+                doc, op_begin, op_end,
+                branch_sum_tokens, sizeof(branch_sum_tokens) / sizeof(branch_sum_tokens[0]))) {
+            continue;
+        }
+        int required = 0;
+        if (!moe_json_get_bool_slice(doc, op_begin, op_end, "required", &required) || !required) {
+            continue;
+        }
+        std::vector<std::string> inputs;
+        if (!moe_json_get_string_array_slice(doc, op_begin, op_end, "inputs", &inputs)) {
+            continue;
+        }
+        for (const std::string& output : dense_outputs) {
+            for (const std::string& input : inputs) {
+                if (input == output) {
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static int moe_graph_ir_layer_dense_output_is_required_branch_input_f32(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    for (uint32_t doc_i = 0; doc_i < 2u; ++doc_i) {
+        const std::string* docp = moe_contract_doc_by_index_f32(engine, doc_i);
+        if (!docp || docp->empty()) {
+            continue;
+        }
+        const std::string& doc = *docp;
+        size_t ops_begin = 0;
+        size_t ops_end = 0;
+        if (moe_router_layer_ops_object_slice_cached_f32(engine, doc_i, layer, &ops_begin, &ops_end) &&
+            moe_graph_ir_ops_dense_output_is_required_branch_input_f32(doc, ops_begin, ops_end)) {
+            return 1;
+        }
+        std::vector<std::pair<size_t, size_t>> rows;
+        if (!moe_contract_layer_rows_cached_f32(engine, doc_i, layer, &rows)) {
+            continue;
+        }
+        for (const auto& row : rows) {
+            const size_t row_begin = row.first;
+            const size_t row_end = row.second;
+            if (row_begin >= row_end || row_end > doc.size()) {
+                continue;
+            }
+            const std::string row_slice = doc.substr(row_begin, row_end - row_begin);
+            size_t row_ops_begin = 0;
+            size_t row_ops_end = 0;
+            if (!moe_json_find_array_local(row_slice, "ops", &row_ops_begin, &row_ops_end)) {
+                continue;
+            }
+            row_ops_begin += row_begin;
+            row_ops_end += row_begin;
+            if (moe_graph_ir_ops_dense_output_is_required_branch_input_f32(
+                    doc, row_ops_begin, row_ops_end)) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static void moe_graph_ir_layer_scan_mlp_op_f32(
     const moe_pc_engine* engine,
     int32_t layer,
@@ -177,20 +316,8 @@ static void moe_graph_ir_layer_scan_mlp_op_f32(
             if (!moe_json_next_object_in_array(doc, &op_cursor, ops_end, &op_begin, &op_end)) {
                 break;
             }
-            std::string merged;
-            std::string value;
-            static const char* const fields[] = {
-                "op", "name", "execution_op", "op_role", "role", "graph_role",
-                "graph_role_text", "bundle_member_role", "type"
-            };
-            for (const char* field : fields) {
-                if (moe_json_get_string_slice(doc, op_begin, op_end, field, &value)) {
-                    merged += " ";
-                    merged += moe_lower_ascii_copy(value);
-                }
-            }
-            if (!moe_graph_ir_text_matches_any_token_f32(
-                    merged, op_tokens, op_token_count)) {
+            if (!moe_graph_ir_op_text_matches_any_token_f32(
+                    doc, op_begin, op_end, op_tokens, op_token_count)) {
                 continue;
             }
             out->present = 1;
@@ -252,20 +379,8 @@ static void moe_graph_ir_layer_scan_contract_table_mlp_op_f32(
                 if (!moe_json_next_object_in_array(doc, &op_cursor, ops_end, &op_begin, &op_end)) {
                     break;
                 }
-                std::string merged;
-                std::string value;
-                static const char* const fields[] = {
-                    "op", "name", "execution_op", "op_role", "role", "graph_role",
-                    "graph_role_text", "bundle_member_role", "type"
-                };
-                for (const char* field : fields) {
-                    if (moe_json_get_string_slice(doc, op_begin, op_end, field, &value)) {
-                        merged += " ";
-                        merged += moe_lower_ascii_copy(value);
-                    }
-                }
-                if (!moe_graph_ir_text_matches_any_token_f32(
-                        merged, op_tokens, op_token_count)) {
+                if (!moe_graph_ir_op_text_matches_any_token_f32(
+                        doc, op_begin, op_end, op_tokens, op_token_count)) {
                     continue;
                 }
                 out->present = 1;
@@ -418,12 +533,16 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
     // dense_mlp rather than shared_expert_mlp.
     const int dense_uses_shared_path =
         moe_graph_ir_dense_mlp_uses_shared_path_f32(engine, layer);
+    const int dense_output_is_required_branch_input =
+        moe_graph_ir_layer_dense_output_is_required_branch_input_f32(engine, layer);
     const int dense_forbidden_by_routed =
         (plan.routed.has_weights &&
+         !dense_output_is_required_branch_input &&
          (plan.dense.forbid_parallel_with_routed_moe ||
           plan.dense.fallback_only_when_no_moe_or_shared)) ? 1 : 0;
     const int dense_forbidden_by_shared =
         (plan.shared.has_weights &&
+         !dense_output_is_required_branch_input &&
          plan.dense.fallback_only_when_no_moe_or_shared) ? 1 : 0;
     const int dense_forbidden_by_active_branch =
         (dense_forbidden_by_routed || dense_forbidden_by_shared) ? 1 : 0;
@@ -450,12 +569,13 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
     plan.shared_required = plan.shared.required ? 1 : 0;
     moe_profile_log(
         "graphir_mlp_layer_plan",
-        "layer=%d routed_present=%d routed_weights=%zu shared_present=%d shared_required=%d shared_weights=%zu run_shared=%d dense_present=%d dense_required=%d dense_weights=%zu run_dense=%d dense_uses_shared_path=%d dense_fallback_only=%d dense_forbid_parallel_routed=%d dense_forbidden=%d graphir_dense_by_norm1=%d split_dense_by_norm1=%d post_norm1_present=%d post_norm1_weights=%zu",
+        "layer=%d routed_present=%d routed_weights=%zu shared_present=%d shared_required=%d shared_weights=%zu run_shared=%d dense_present=%d dense_required=%d dense_weights=%zu run_dense=%d dense_uses_shared_path=%d dense_required_branch_input=%d dense_fallback_only=%d dense_forbid_parallel_routed=%d dense_forbidden=%d graphir_dense_by_norm1=%d split_dense_by_norm1=%d post_norm1_present=%d post_norm1_weights=%zu",
         layer,
         plan.routed.present, plan.routed.weight_count,
         plan.shared.present, plan.shared.required, plan.shared.weight_count, plan.run_shared,
         plan.dense.present, plan.dense.required, plan.dense.weight_count, plan.run_dense,
         dense_uses_shared_path,
+        dense_output_is_required_branch_input,
         plan.dense.fallback_only_when_no_moe_or_shared,
         plan.dense.forbid_parallel_with_routed_moe,
         dense_forbidden_by_active_branch,

@@ -706,6 +706,7 @@ def test_graphir_dense_fallback_does_not_run_next_to_routed_moe_from_adapter_hin
     assert "dense_forbidden_by_active_branch" in block
     assert "plan.dense.fallback_only_when_no_moe_or_shared" in block
     assert "plan.dense.forbid_parallel_with_routed_moe" in block
+    assert "dense_output_is_required_branch_input" in block
 
 
 def test_graphir_dense_branch_execution_uses_split_branch_structure_not_routed_presence():
@@ -721,6 +722,7 @@ def test_graphir_dense_branch_execution_uses_split_branch_structure_not_routed_p
     assert "!plan.shared.has_weights" in planner
     assert "fallback_only_when_no_moe_or_shared" in planner
     assert "forbid_parallel_with_routed_moe" in planner
+    assert "moe_graph_ir_layer_dense_output_is_required_branch_input_f32" in planner
     assert "plan.run_dense = (!dense_forbidden_by_active_branch && dense_requested) ? 1 : 0;" in planner
 
 
@@ -815,6 +817,8 @@ def test_routed_graph_suppresses_dense_fallback_even_with_split_ffn_aliases():
     assert "moe_layer_dense_mlp_should_run_f32" in mlp_text
     helper = mlp_text[mlp_text.index("static int moe_layer_has_common_dense_mlp_tensors_f32"):mlp_text.index("static int moe_layer_dense_mlp_should_run_f32")]
     block = mlp_text[mlp_text.index("static int moe_layer_dense_mlp_should_run_f32"):mlp_text.index("static int moe_layer_moe_mlp_f32")]
+    planner_pos = mlp_text.index("static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32")
+    planner = mlp_text[planner_pos:mlp_text.index("static int moe_layer_has_common_dense_mlp_tensors_f32", planner_pos)]
     assert '"ffn_gate.weight"' in helper
     assert '"ffn_up.weight"' in helper
     assert '"ffn_down.weight"' in helper
@@ -822,10 +826,8 @@ def test_routed_graph_suppresses_dense_fallback_even_with_split_ffn_aliases():
     assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" not in block
     assert '"moe_expert_mlp"' in block
     assert "GraphIR routed roles own the FFN branch" in block
-    routed_pos = block.index('"moe_expert_mlp"')
-    suppress_pos = block.index("return 0;", routed_pos)
-    dense_pos = block.index('"dense_mlp"')
-    assert routed_pos < suppress_pos < dense_pos
+    assert "dense_forbidden_by_routed" in planner
+    assert "!dense_output_is_required_branch_input" in planner
     assert "split-FFN router input scale is required" in mlp_text
 
 
