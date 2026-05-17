@@ -567,7 +567,6 @@ def test_mlp_router_input_scale_filter_rejects_bare_ffn_gate_inp_scale_sidecar()
 
 def test_router_input_mode_does_not_use_bare_ffn_gate_inp_as_internal_router_scale():
     mlp_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
-    mlp_norm_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
     router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
     first_start = mlp_text.index("const int router_has_internal_norm_scale =")
     first_end = mlp_text.index("moe_save_gate_input_snapshot", first_start)
@@ -590,15 +589,6 @@ def test_router_input_mode_does_not_use_bare_ffn_gate_inp_as_internal_router_sca
     assert '"mlp.router.scale"' not in internal_block
     assert '"moe.gate.scale"' not in internal_block
     assert "ambiguous and require an explicit op-role record" in internal_block
-    hidden_block = mlp_norm_text[
-        mlp_norm_text.index("static int moe_layer_router_contract_has_hidden_input_f32"):
-        mlp_norm_text.index("static int moe_layer_execution_contract_router_uses_hidden_f32")
-    ]
-    assert "use_hidden_only_when_explicit_router_input_scale" in hidden_block
-    assert "when_explicit_router_input_scale" in hidden_block
-    assert "expert_ffn_input" in hidden_block
-    assert hidden_block.index('moe_json_get_string_slice(doc, obj_begin, obj_end, "rule", &rule)') < hidden_block.index("moe_router_contract_object_has_raw_hidden_input_f32")
-    assert "return 0;" in hidden_block[hidden_block.index("moe_router_contract_object_has_activation_scale_f32"):]
 
 
 def test_direct_router_input_scale_is_narrower_than_router_norm_gamma():

@@ -623,15 +623,14 @@ static int moe_layer_router_contract_has_hidden_input_f32(
         raw_contract) {
         return 1;
     }
+    if (moe_router_contract_object_has_raw_hidden_input_f32(doc, obj_begin, obj_end)) {
+        return 1;
+    }
     std::string rule;
     if (moe_json_get_string_slice(doc, obj_begin, obj_end, "rule", &rule)) {
         const std::string lowered_rule = moe_lower_ascii_copy(rule);
         if (lowered_rule.find("use_hidden_when_router_has_internal_scale") != std::string::npos ||
-            lowered_rule.find("hidden_when_router_has_internal_scale") != std::string::npos ||
-            lowered_rule.find("use_hidden_only_when_explicit_router_input_scale") != std::string::npos ||
-            lowered_rule.find("when_explicit_router_input_scale") != std::string::npos ||
-            (lowered_rule.find("explicit_router_input_scale") != std::string::npos &&
-             lowered_rule.find("expert_ffn_input") != std::string::npos)) {
+            lowered_rule.find("hidden_when_router_has_internal_scale") != std::string::npos) {
             // This rule is conditional: hidden/raw residual input is valid only
             // when the router op has a real activation/input scale.  Router
             // weight-quant sidecars such as ffn_gate_inp.scale/scales or
@@ -639,11 +638,7 @@ static int moe_layer_router_contract_has_hidden_input_f32(
             if (moe_router_contract_object_has_activation_scale_f32(doc, obj_begin, obj_end)) {
                 return 1;
             }
-            return 0;
         }
-    }
-    if (moe_router_contract_object_has_raw_hidden_input_f32(doc, obj_begin, obj_end)) {
-        return 1;
     }
     return 0;
 }
