@@ -83,7 +83,6 @@ static int moe_layer_get_expert_down_uniform_scale_f32(
     // materializing a full [top_k, hidden] output buffer.  Per-channel scale tensors
     // still fall back to the fully general path for correctness.
     static const char* const suffixes[] = {
-        "ffn_down_exps.scale",
         "ffn_gate_inp.per_expert_scale",
         "router.per_expert_scale",
         "mlp.router.per_expert_scale",
@@ -100,9 +99,9 @@ static int moe_layer_get_expert_down_uniform_scale_f32(
         "moe.gate.per_expert_scale"
     };
     const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
-    // ffn_down_exps.scale is a runtime expert-down branch scale in legacy/common
-    // tensor contracts.  Exclude it only from explicit direct_per_expert_scale
-    // contracts, where the scale tensor must be named per_expert_scale.
+    // ffn_down_exps.scale is the routed expert down-projection weight sidecar in
+    // JUJU/GGUF contracts, not a runtime expert-output scale. Runtime expert
+    // scales must come from explicit per_expert_scale-style tensors.
     const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
     const size_t scale_suffix_count = direct_scale_contract ?
         (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :
@@ -160,7 +159,6 @@ static int moe_layer_apply_expert_down_scale_f32(
     }
 
     static const char* const suffixes[] = {
-        "ffn_down_exps.scale",
         "ffn_gate_inp.per_expert_scale",
         "router.per_expert_scale",
         "mlp.router.per_expert_scale",
@@ -177,9 +175,9 @@ static int moe_layer_apply_expert_down_scale_f32(
         "moe.gate.per_expert_scale"
     };
     const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
-    // ffn_down_exps.scale is a runtime expert-down branch scale in legacy/common
-    // tensor contracts.  Exclude it only from explicit direct_per_expert_scale
-    // contracts, where the scale tensor must be named per_expert_scale.
+    // ffn_down_exps.scale is the routed expert down-projection weight sidecar in
+    // JUJU/GGUF contracts, not a runtime expert-output scale. Runtime expert
+    // scales must come from explicit per_expert_scale-style tensors.
     const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
     const size_t scale_suffix_count = direct_scale_contract ?
         (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :
