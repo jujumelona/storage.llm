@@ -729,7 +729,7 @@ static int moe_router_row_has_rms_root_graph_signature_f32(
         lower.find("\"router_input_scale\": []") != std::string::npos ||
         lower.find("\"router_input_scale\":[]") != std::string::npos;
     const int has_split_moe_branch_norms =
-        lower.find("\"pre_ffw_norm_2\"") != std::string::npos &&
+        lower.find("\"expert_ffn_norm\"") != std::string::npos &&
         lower.find("\"post_ffw_norm_1\"") != std::string::npos &&
         lower.find("\"post_ffw_norm_2\"") != std::string::npos;
     return has_router_sidecar && no_direct_router_input_scale &&
