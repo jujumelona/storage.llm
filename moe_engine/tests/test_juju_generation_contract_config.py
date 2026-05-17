@@ -695,18 +695,22 @@ def test_materializer_classifies_ffn_gate_inp_scale_as_router_weight_sidecar():
 def test_graphir_dense_fallback_does_not_run_next_to_routed_moe_from_adapter_hint():
     fwd = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
     block = fwd[fwd.index("const int dense_uses_shared_path ="):fwd.index("plan.run_dense =", fwd.index("const int dense_uses_shared_path ="))]
-    assert "!plan.routed.present" in block
-    assert "!plan.routed.has_weights" in block
-    assert "dense_ffn_fallback op with required=false" in fwd
+    assert "dense_uses_shared_path || graphir_dense_branch_by_norm1" in block
+    assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" in block
+    assert "plan.post_norm1.has_weights" in block
 
 
-def test_graphir_dense_fallback_execution_follows_required_contract_not_routed_weights():
+def test_graphir_dense_branch_execution_uses_split_branch_structure_not_routed_presence():
     fwd = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
     materializer = MAT_PATH.read_text()
     planner = fwd[fwd.index("static moe_graph_ir_mlp_layer_plan_f32"):fwd.index("plan.run_shared =")]
     assert "execute_only_when_no_moe_or_shared_expert_weights_on_layer" in materializer
     assert '"forbid_parallel_with_routed_moe": bool(moe_weights or shared_expert_weights)' in materializer
     assert "if (plan.routed.present && plan.dense.has_weights && !plan.shared.has_weights)" not in planner
+    assert "graphir_dense_branch_by_norm1" in planner
+    assert "plan.dense.has_weights &&" in planner
+    assert "plan.post_norm1.has_weights &&" in planner
+    assert "!plan.shared.has_weights" in planner
     assert "plan.run_dense = ((plan.dense.required && plan.dense.has_weights) || split_dense_branch_by_norm1) ? 1 : 0;" in planner
 
 
