@@ -783,4 +783,4 @@ static int moe_router_has_direct_input_scale_contract_f32(
     return 0;
 }
 
-#include "generation/router_scale_inputs.cpp.inc"
+#include "router_scale_inputs.cpp.inc"
