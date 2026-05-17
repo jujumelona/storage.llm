@@ -709,6 +709,33 @@ static int moe_router_scope_declares_rms_root_input_transform_f32(
     return text_declares_transform(doc.substr(begin, end - begin));
 }
 
+static int moe_router_row_has_rms_root_graph_signature_f32(
+    const std::string& doc,
+    size_t begin,
+    size_t end
+) {
+    if (begin >= end || end > doc.size()) {
+        return 0;
+    }
+    const std::string lower = moe_lower_ascii_copy(doc.substr(begin, end - begin));
+    int sidecar_is_weight_scale = 0;
+    const int has_router_sidecar =
+        lower.find("\"router_weight_scale_sidecar\"") != std::string::npos &&
+        moe_json_get_bool_slice(
+            doc, begin, end, "ffn_gate_inp_scale_is_weight_scale_sidecar",
+            &sidecar_is_weight_scale) &&
+        sidecar_is_weight_scale;
+    const int no_direct_router_input_scale =
+        lower.find("\"router_input_scale\": []") != std::string::npos ||
+        lower.find("\"router_input_scale\":[]") != std::string::npos;
+    const int has_split_moe_branch_norms =
+        lower.find("\"expert_ffn_norm\"") != std::string::npos &&
+        lower.find("\"post_ffw_norm_1\"") != std::string::npos &&
+        lower.find("\"post_ffw_norm_2\"") != std::string::npos;
+    return has_router_sidecar && no_direct_router_input_scale &&
+        has_split_moe_branch_norms ? 1 : 0;
+}
+
 static int moe_router_weight_sidecar_requires_rms_root_transform_uncached_f32(
     const moe_pc_engine* engine,
     int32_t layer
@@ -767,6 +794,9 @@ static int moe_router_weight_sidecar_requires_rms_root_transform_uncached_f32(
                         }
                     }
                 }
+            }
+            if (moe_router_row_has_rms_root_graph_signature_f32(doc, obj_begin, obj_end)) {
+                return 1;
             }
         }
     }
