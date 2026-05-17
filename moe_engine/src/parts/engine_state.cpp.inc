@@ -632,6 +632,7 @@ std::atomic<int> storage_format_plan_available{0};
     uint32_t model_config_sliding_window = 0;
     float model_config_query_pre_attn_scalar = 0.0f;
     float model_config_attention_scale = 0.0f;
+    std::atomic<int> model_config_attention_unit_scale{0};
     std::atomic<int> juju_attention_contract_ready{0};
     std::atomic<int> juju_exact_ppl_contract_ready{0};
     std::atomic<int> juju_required_features_contract_ready{0};

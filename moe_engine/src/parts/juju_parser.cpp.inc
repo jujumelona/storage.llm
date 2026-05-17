@@ -762,16 +762,44 @@ static int moe_juju_required_feature_present(
     return 0;
 }
 
+static int moe_juju_attention_contract_uses_unit_scale(const std::string& json) {
+    if (json.empty()) {
+        return 0;
+    }
+    int unit_scale = 0;
+    if ((moe_json_get_bool_local(json, "unit_attention_scale", &unit_scale) ||
+         moe_json_get_bool_local(json, "qk_norm_unit_scale", &unit_scale)) &&
+        unit_scale) {
+        return 1;
+    }
+    std::string source;
+    const int has_head_dim_source =
+        (moe_json_get_string_local(json, "attention_scale_source", &source) &&
+         moe_lower_ascii_copy(source).find("head_dim") != std::string::npos) ||
+        (moe_json_get_string_local(json, "attention_score_scale_source", &source) &&
+         moe_lower_ascii_copy(source).find("head_dim") != std::string::npos);
+    if (!has_head_dim_source) {
+        return 0;
+    }
+    return json.find("metadata_or_qk_norm_contract") != std::string::npos &&
+        json.find("attn_q_norm.weight") != std::string::npos &&
+        json.find("attn_k_norm.weight") != std::string::npos;
+}
+
 static int moe_juju_extract_attention_contract(
     const std::string& json,
     double* out_query_pre_attn_scalar,
-    double* out_attention_scale
+    double* out_attention_scale,
+    int* out_unit_attention_scale = nullptr
 ) {
     if (out_query_pre_attn_scalar) {
         *out_query_pre_attn_scalar = 0.0;
     }
     if (out_attention_scale) {
         *out_attention_scale = 0.0;
+    }
+    if (out_unit_attention_scale) {
+        *out_unit_attention_scale = 0;
     }
     if (json.empty()) {
         return 0;
@@ -803,6 +831,18 @@ static int moe_juju_extract_attention_contract(
         std::fprintf(stderr, "[storagellm] JUJU idx missing/invalid attention_scale: %.17g\n", attention_scale);
         return 0;
     }
+    if (moe_juju_attention_contract_uses_unit_scale(json)) {
+        if (out_query_pre_attn_scalar) {
+            *out_query_pre_attn_scalar = query_pre_attn_scalar;
+        }
+        if (out_attention_scale) {
+            *out_attention_scale = 1.0;
+        }
+        if (out_unit_attention_scale) {
+            *out_unit_attention_scale = 1;
+        }
+        return 1;
+    }
     const double expected_attention_scale = 1.0 / std::sqrt(query_pre_attn_scalar);
     const double tolerance = std::max(1.0e-8, std::fabs(expected_attention_scale) * 1.0e-5);
     if (std::fabs(attention_scale - expected_attention_scale) > tolerance) {
@@ -823,18 +863,21 @@ static int moe_juju_extract_attention_contract(
 static std::string moe_juju_attention_contract_compact_json(const std::string& json) {
     double query_pre_attn_scalar = 0.0;
     double attention_scale = 0.0;
-    if (!moe_juju_extract_attention_contract(json, &query_pre_attn_scalar, &attention_scale)) {
+    int unit_attention_scale = 0;
+    if (!moe_juju_extract_attention_contract(json, &query_pre_attn_scalar, &attention_scale, &unit_attention_scale)) {
         return std::string();
     }
     char buffer[512];
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "{\"format\":\"JUJU_RUNTIME_ATTENTION_CONTRACT_V1\",\"query_pre_attn_scalar\":%.17g,\"attention_query_pre_attn_scalar\":%.17g,\"attention_scale\":%.17g,\"attention_score_scale\":%.17g,\"attention_scale_source\":\"juju_idx_contract\"}",
+        "{\"format\":\"JUJU_RUNTIME_ATTENTION_CONTRACT_V1\",\"query_pre_attn_scalar\":%.17g,\"attention_query_pre_attn_scalar\":%.17g,\"attention_scale\":%.17g,\"attention_score_scale\":%.17g,\"attention_scale_source\":\"%s\",\"unit_attention_scale\":%s}",
         query_pre_attn_scalar,
         query_pre_attn_scalar,
         attention_scale,
-        attention_scale);
+        attention_scale,
+        unit_attention_scale ? "qk_norm_contract" : "juju_idx_contract",
+        unit_attention_scale ? "true" : "false");
     return std::string(buffer);
 }
 
@@ -844,11 +887,13 @@ static void moe_ingest_juju_attention_contract(moe_pc_engine* engine, const std:
     }
     double query_pre_attn_scalar = 0.0;
     double attention_scale = 0.0;
-    if (!moe_juju_extract_attention_contract(json, &query_pre_attn_scalar, &attention_scale)) {
+    int unit_attention_scale = 0;
+    if (!moe_juju_extract_attention_contract(json, &query_pre_attn_scalar, &attention_scale, &unit_attention_scale)) {
         return;
     }
     engine->model_config_query_pre_attn_scalar = (float)query_pre_attn_scalar;
     engine->model_config_attention_scale = (float)attention_scale;
+    engine->model_config_attention_unit_scale.store(unit_attention_scale ? 1 : 0, std::memory_order_release);
     engine->juju_attention_contract_ready.store(1, std::memory_order_release);
     engine->juju_exact_ppl_contract_ready.store(
         moe_juju_required_feature_present(json, "exact_ppl_mode") ? 1 : 0,

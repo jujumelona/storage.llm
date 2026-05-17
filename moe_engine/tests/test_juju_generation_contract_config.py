@@ -210,6 +210,7 @@ def test_exact_ppl_eval_is_fail_closed_on_runtime_contract_and_fallbacks():
     assert "juju_required_features_contract_ready" in state_text
     assert "juju_attention_contract_ready" in state_text
     assert "model_config_attention_scale" in state_text
+    assert "model_config_attention_unit_scale" in state_text
     assert "moe_eval_exact_ppl_contract_ready" in eval_text
     assert "JUJU exact_ppl_mode required_features contract is not loaded" in eval_text
     assert "JUJU attention scale contract is not loaded" in eval_text
@@ -223,6 +224,7 @@ def test_exact_ppl_eval_is_fail_closed_on_runtime_contract_and_fallbacks():
     assert "non-finite lm_head logprob" in eval_text
     assert "moe_juju_required_feature_present(json, \"exact_ppl_mode\")" in parser_text
     assert "engine->model_config_attention_scale = (float)attention_scale" in parser_text
+    assert "unit_attention_scale" in parser_text
 
 
 def test_gguf_byte_diagnostics_treats_alignment_padding_as_ok():

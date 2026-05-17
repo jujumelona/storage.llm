@@ -212,6 +212,7 @@ static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {
     engine->model_config_sliding_window = 0;
     engine->model_config_query_pre_attn_scalar = 0.0f;
     engine->model_config_attention_scale = 0.0f;
+    engine->model_config_attention_unit_scale.store(0, std::memory_order_relaxed);
     engine->model_config_sliding_rope_theta = 0.0f;
     engine->model_config_full_rope_theta = 0.0f;
     engine->model_config_partial_rotary_factor = 0.0f;

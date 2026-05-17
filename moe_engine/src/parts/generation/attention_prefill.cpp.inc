@@ -605,6 +605,7 @@ struct moe_attention_runtime_cache_t {
     size_t metadata_size = 0;
     uint32_t query_pre_attn_scalar_bits = 0;
     uint32_t attention_scale_bits = 0;
+    int unit_attention_scale = 0;
     int scale_source = -1;
     uint32_t scale_bits = 0;
     int softcap_state = -1;
@@ -623,17 +624,22 @@ static void moe_attention_runtime_cache_prepare_locked(const moe_pc_engine* engi
     const uint32_t attention_scale_bits = engine
         ? moe_attention_float_to_bits(engine->model_config_attention_scale)
         : 0;
+    const int unit_attention_scale = engine
+        ? engine->model_config_attention_unit_scale.load(std::memory_order_acquire)
+        : 0;
     if (g_moe_attention_runtime_cache.engine != engine ||
         g_moe_attention_runtime_cache.graph_size != graph_size ||
         g_moe_attention_runtime_cache.metadata_size != metadata_size ||
         g_moe_attention_runtime_cache.query_pre_attn_scalar_bits != query_bits ||
-        g_moe_attention_runtime_cache.attention_scale_bits != attention_scale_bits) {
+        g_moe_attention_runtime_cache.attention_scale_bits != attention_scale_bits ||
+        g_moe_attention_runtime_cache.unit_attention_scale != unit_attention_scale) {
         g_moe_attention_runtime_cache = moe_attention_runtime_cache_t{};
         g_moe_attention_runtime_cache.engine = engine;
         g_moe_attention_runtime_cache.graph_size = graph_size;
         g_moe_attention_runtime_cache.metadata_size = metadata_size;
         g_moe_attention_runtime_cache.query_pre_attn_scalar_bits = query_bits;
         g_moe_attention_runtime_cache.attention_scale_bits = attention_scale_bits;
+        g_moe_attention_runtime_cache.unit_attention_scale = unit_attention_scale;
     }
 }
 
@@ -727,10 +733,15 @@ static float moe_standard_attention_score_scale(
         } else {
             int resolved_source = 0;
             float resolved_value = 0.0f;
+            if (engine->model_config_attention_unit_scale.load(std::memory_order_acquire) == 1) {
+                resolved_source = 4;
+                resolved_value = 1.0f;
+            }
             const float config_attention_scale = engine->model_config_attention_scale;
             if (config_attention_scale > 0.0f &&
                 config_attention_scale <= 1024.0f &&
-                std::isfinite(config_attention_scale)) {
+                std::isfinite(config_attention_scale) &&
+                resolved_source == 0) {
                 resolved_source = 5;
                 resolved_value = config_attention_scale;
             }
