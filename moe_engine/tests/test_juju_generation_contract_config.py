@@ -882,7 +882,7 @@ def test_embedding_scale_is_cast_to_embedding_tensor_dtype_not_model_name():
 
 
 def test_post_ffw_norms_use_layer_local_suffix_fallback_in_graphir_mode():
-    text = (ROOT / "moe_engine/src/parts/generation/mlp_common_tensors.cpp.inc").read_text()
+    text = (ROOT / "moe_engine/src/parts/generation/mlp_post_ffw_norms.cpp.inc").read_text()
     for name, suffix in (
         ("moe_layer_post_ffw_norm_f32", '"post_ffw_norm.weight"'),
         ("moe_layer_post_ffw_norm1_f32", '"post_ffw_norm_1.weight"'),
@@ -909,7 +909,7 @@ def test_post_ffw_norms_use_layer_local_suffix_fallback_in_graphir_mode():
 
 
 def test_layer_output_scale_plan_and_apply_use_role_or_layer_suffix_not_graphwide_count():
-    common = (ROOT / "moe_engine/src/parts/generation/mlp_common_tensors.cpp.inc").read_text()
+    common = (ROOT / "moe_engine/src/parts/generation/mlp_post_ffw_norms.cpp.inc").read_text()
     forward = (ROOT / "moe_engine/src/parts/generation_forward.cpp.inc").read_text()
     apply_block = common[common.index("static int moe_layer_output_scale_f32("):]
     assert "moe_graph_ir_map_layer_op_role_any" in apply_block
@@ -928,7 +928,9 @@ def test_layer_output_scale_plan_and_apply_use_role_or_layer_suffix_not_graphwid
 
 
 def test_layer_execution_contract_table_norms_and_tail_are_runtime_bindings():
-    text = (ROOT / "moe_engine/src/parts/generation/mlp_common_tensors.cpp.inc").read_text()
+    common = (ROOT / "moe_engine/src/parts/generation/mlp_common_tensors.cpp.inc").read_text()
+    post_ffw = (ROOT / "moe_engine/src/parts/generation/mlp_post_ffw_norms.cpp.inc").read_text()
+    text = common + post_ffw
     helper_start = text.rindex("static int moe_graph_ir_layer_contract_tensor_names_for_role")
     helper_end = text.index("static int moe_graph_ir_apply_rmsnorm_role_any_f32", helper_start)
     helper = text[helper_start:helper_end]
