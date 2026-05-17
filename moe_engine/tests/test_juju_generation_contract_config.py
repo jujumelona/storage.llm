@@ -656,6 +656,18 @@ def test_materializer_router_scale_sidecar_contract_matches_engine():
     assert "graph-wide text mentions" in router_helper
 
 
+def test_router_weight_sidecar_input_applies_gemma4_rms_root_transform():
+    router_scale_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_scale_inputs.cpp.inc").read_text()
+    start = router_scale_text.index("static int moe_prepare_router_weight_sidecar_input_f32")
+    end = router_scale_text.index("static int moe_router_has_contract_input_scale_f32", start)
+    block = router_scale_text[start:end]
+    assert "ss += v * v;" in block
+    assert "std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f)" in block
+    assert "1.0f / std::sqrt((float)hidden_size)" in block
+    assert "hidden[i] * norm * scale" in block
+    assert "source=weight_sidecar_rms_root" in block
+
+
 
 def test_materializer_classifies_ffn_gate_inp_scale_as_router_weight_sidecar():
     mat = MAT_PATH.read_text()

@@ -289,15 +289,35 @@ static int moe_prepare_router_weight_sidecar_input_f32(
         return 0;
     }
     out->assign(hidden_size, 0.0f);
+    double ss = 0.0;
+    for (uint32_t i = 0; i < hidden_size; ++i) {
+        const double v = (double)hidden[i];
+        if (!std::isfinite(v)) {
+            return 0;
+        }
+        ss += v * v;
+    }
+    if (!std::isfinite(ss)) {
+        return 0;
+    }
+    // Gemma4 router sidecar scale is applied after a scale-free RMSNorm and
+    // hidden_size^-0.5. Applying the sidecar directly to raw residuals makes
+    // router logits saturate and collapses top-k probabilities to 1.0.
+    const float norm =
+        (1.0f / std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f)) *
+        (1.0f / std::sqrt((float)hidden_size));
+    if (!std::isfinite(norm) || !(norm > 0.0f)) {
+        return 0;
+    }
     double abs_sum = 0.0;
     double max_abs = 0.0;
     for (uint32_t i = 0; i < hidden_size; ++i) {
         float scale = 1.0f;
         if (!moe_router_raw_scalar_at_f32(sidecar, count == 1u ? 0u : (uint64_t)i, &scale) ||
-            !std::isfinite(scale) || !std::isfinite(hidden[i])) {
+            !std::isfinite(scale)) {
             return 0;
         }
-        const float v = hidden[i] * scale;
+        const float v = hidden[i] * norm * scale;
         if (!std::isfinite(v)) {
             return 0;
         }
@@ -309,12 +329,13 @@ static int moe_prepare_router_weight_sidecar_input_f32(
     if (moe_profile_level() >= 2) {
         moe_profile_log(
             "router_weight_sidecar_apply",
-            "layer=%d hidden=%u count=%llu mean_abs=%.6g max_abs=%.6g source=weight_sidecar",
+            "layer=%d hidden=%u count=%llu mean_abs=%.6g max_abs=%.6g input_norm=%.6g source=weight_sidecar_rms_root",
             layer,
             hidden_size,
             (unsigned long long)count,
             abs_sum / (double)hidden_size,
-            max_abs);
+            max_abs,
+            (double)norm);
     }
     return 1;
 }
