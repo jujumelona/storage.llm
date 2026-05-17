@@ -662,6 +662,8 @@ def test_router_weight_sidecar_rms_root_transform_is_ir_contract_gated():
     assert "moe_router_weight_sidecar_requires_rms_root_transform_f32" in router_utils_text
     assert '"router_input_rms_root_transform"' in router_utils_text
     assert "moe_router_row_has_rms_root_graph_signature_f32" in router_utils_text
+    assert '"ffn_gate_inp_scale_is_weight_scale_sidecar"' in router_utils_text
+    assert '"pre_ffw_norm_2"' in router_utils_text
     start = router_scale_text.index("static int moe_prepare_router_weight_sidecar_input_f32")
     end = router_scale_text.index("static int moe_router_has_contract_input_scale_f32", start)
     block = router_scale_text[start:end]

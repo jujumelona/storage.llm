@@ -718,10 +718,13 @@ static int moe_router_row_has_rms_root_graph_signature_f32(
         return 0;
     }
     const std::string lower = moe_lower_ascii_copy(doc.substr(begin, end - begin));
+    int sidecar_is_weight_scale = 0;
     const int has_router_sidecar =
         lower.find("\"router_weight_scale_sidecar\"") != std::string::npos &&
-        lower.find("\"ffn_gate_inp_scale_is_weight_scale_sidecar\"") != std::string::npos &&
-        lower.find("true") != std::string::npos;
+        moe_json_get_bool_slice(
+            doc, begin, end, "ffn_gate_inp_scale_is_weight_scale_sidecar",
+            &sidecar_is_weight_scale) &&
+        sidecar_is_weight_scale;
     const int no_direct_router_input_scale =
         lower.find("\"router_input_scale\": []") != std::string::npos ||
         lower.find("\"router_input_scale\":[]") != std::string::npos;
@@ -729,11 +732,8 @@ static int moe_router_row_has_rms_root_graph_signature_f32(
         lower.find("\"pre_ffw_norm_2\"") != std::string::npos &&
         lower.find("\"post_ffw_norm_1\"") != std::string::npos &&
         lower.find("\"post_ffw_norm_2\"") != std::string::npos;
-    const int has_layer_output_scale =
-        lower.find("\"output_scale\"") != std::string::npos ||
-        lower.find("\"layer_output_scale\"") != std::string::npos;
     return has_router_sidecar && no_direct_router_input_scale &&
-        has_split_moe_branch_norms && has_layer_output_scale ? 1 : 0;
+        has_split_moe_branch_norms ? 1 : 0;
 }
 
 static int moe_router_weight_sidecar_requires_rms_root_transform_uncached_f32(
