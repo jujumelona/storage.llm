@@ -964,24 +964,17 @@ static int moe_engine_contract_uses_unit_qk_norm_global(
     if (!engine) {
         return 0;
     }
-    if (moe_engine_graph_ir_mentions(engine, "unit_qk_norm") ||
-        moe_engine_graph_ir_mentions(engine, "qk_norm_unit_scale") ||
-        moe_engine_graph_ir_mentions(engine, "unit_attention_scale")) {
+    int unit_scale = 0;
+    if ((moe_json_get_bool_local(engine->offload_graph_ir_json, "unit_qk_norm", &unit_scale) ||
+         moe_json_get_bool_local(engine->offload_graph_ir_json, "qk_norm_unit_scale", &unit_scale) ||
+         moe_json_get_bool_local(engine->offload_graph_ir_json, "unit_attention_scale", &unit_scale) ||
+         moe_json_get_bool_local(engine->offload_gguf_metadata_json, "unit_qk_norm", &unit_scale) ||
+         moe_json_get_bool_local(engine->offload_gguf_metadata_json, "qk_norm_unit_scale", &unit_scale) ||
+         moe_json_get_bool_local(engine->offload_gguf_metadata_json, "unit_attention_scale", &unit_scale)) &&
+        unit_scale) {
         return 1;
     }
-    static const char* const q_norm_suffixes[] = {"attn_q_norm.weight", "q_norm.weight"};
-    static const char* const k_norm_suffixes[] = {"attn_k_norm.weight", "k_norm.weight"};
-    static const char* const block_scale_suffixes[] = {
-        "post_attention_norm.weight",
-        "post_ffw_norm.weight",
-        "layer_output_scale.weight"
-    };
-    return moe_engine_contract_has_global_tensor_suffix_any(
-               engine, q_norm_suffixes, sizeof(q_norm_suffixes) / sizeof(q_norm_suffixes[0])) &&
-        moe_engine_contract_has_global_tensor_suffix_any(
-               engine, k_norm_suffixes, sizeof(k_norm_suffixes) / sizeof(k_norm_suffixes[0])) &&
-        moe_engine_contract_has_global_tensor_suffix_any(
-               engine, block_scale_suffixes, sizeof(block_scale_suffixes) / sizeof(block_scale_suffixes[0]));
+    return 0;
 }
 
 

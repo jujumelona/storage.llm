@@ -383,6 +383,48 @@ static int moe_attention_layer_contract_double_f32(
     return 0;
 }
 
+static int moe_attention_layer_contract_bool_f32(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    const char* key,
+    int* out
+) {
+    if (!engine || layer < 0 || !key || !out) {
+        return 0;
+    }
+    for (uint32_t doc_i = 0; doc_i < 2u; ++doc_i) {
+        const std::string* doc = moe_contract_doc_by_index_f32(engine, doc_i);
+        if (!doc || doc->empty()) {
+            continue;
+        }
+        std::vector<std::pair<size_t, size_t>> rows;
+        if (!moe_contract_layer_rows_cached_f32(engine, doc_i, layer, &rows)) {
+            continue;
+        }
+        for (const auto& row_pair : rows) {
+            const size_t obj_begin = row_pair.first;
+            const size_t obj_end = row_pair.second;
+            if (obj_begin >= obj_end || obj_end > doc->size()) {
+                continue;
+            }
+            int value = 0;
+            const std::string row = doc->substr(obj_begin, obj_end - obj_begin);
+            size_t attn_begin = 0;
+            size_t attn_end = 0;
+            if (moe_json_find_object_local(row, "attention", &attn_begin, &attn_end) &&
+                moe_json_get_bool_slice(row, attn_begin, attn_end, key, &value)) {
+                *out = value ? 1 : 0;
+                return 1;
+            }
+            if (moe_json_get_bool_slice(*doc, obj_begin, obj_end, key, &value)) {
+                *out = value ? 1 : 0;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int moe_layer_has_weighted_v_norm_tensor(
     moe_pc_engine* engine,
     int32_t layer
@@ -568,9 +610,11 @@ static int moe_layer_uses_unit_qk_norm_contract(
     if (!engine || !moe_layer_has_qk_norm_scaled_standard_layout(engine, layer)) {
         return 0;
     }
-    if (moe_engine_graph_ir_mentions(engine, "unit_qk_norm") ||
-        moe_engine_graph_ir_mentions(engine, "qk_norm_unit_scale") ||
-        moe_engine_graph_ir_mentions(engine, "unit_attention_scale")) {
+    int unit_scale = 0;
+    if ((moe_attention_layer_contract_bool_f32(engine, layer, "unit_qk_norm", &unit_scale) ||
+         moe_attention_layer_contract_bool_f32(engine, layer, "qk_norm_unit_scale", &unit_scale) ||
+         moe_attention_layer_contract_bool_f32(engine, layer, "unit_attention_scale", &unit_scale)) &&
+        unit_scale) {
         return 1;
     }
     return moe_engine_contract_uses_unit_qk_norm_global(engine);

@@ -772,18 +772,7 @@ static int moe_juju_attention_contract_uses_unit_scale(const std::string& json) 
         unit_scale) {
         return 1;
     }
-    std::string source;
-    const int has_head_dim_source =
-        (moe_json_get_string_local(json, "attention_scale_source", &source) &&
-         moe_lower_ascii_copy(source).find("head_dim") != std::string::npos) ||
-        (moe_json_get_string_local(json, "attention_score_scale_source", &source) &&
-         moe_lower_ascii_copy(source).find("head_dim") != std::string::npos);
-    if (!has_head_dim_source) {
-        return 0;
-    }
-    return json.find("metadata_or_qk_norm_contract") != std::string::npos &&
-        json.find("attn_q_norm.weight") != std::string::npos &&
-        json.find("attn_k_norm.weight") != std::string::npos;
+    return 0;
 }
 
 static int moe_juju_extract_attention_contract(
