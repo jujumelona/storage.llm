@@ -673,9 +673,16 @@ def test_router_weight_sidecar_rms_root_transform_is_ir_contract_gated():
     router_scale_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_scale_inputs.cpp.inc").read_text()
     assert "moe_router_weight_sidecar_requires_rms_root_transform_f32" in router_utils_text
     assert '"router_input_rms_root_transform"' in router_utils_text
-    assert "moe_router_row_has_rms_root_graph_signature_f32" in router_utils_text
+    assert "moe_router_row_has_rms_root_graph_signature_f32" not in router_utils_text
     assert '"ffn_gate_inp_scale_is_weight_scale_sidecar"' in router_utils_text
     assert "expert_ffn_norm" in router_utils_text
+    uncached = router_utils_text[
+        router_utils_text.index("static int moe_router_weight_sidecar_requires_rms_root_transform_uncached_f32"):
+        router_utils_text.index("static int moe_router_weight_sidecar_requires_rms_root_transform_f32")
+    ]
+    assert "moe_router_scope_declares_rms_root_input_transform_f32" in uncached
+    assert "ffn_gate_inp_scale_is_weight_scale_sidecar" not in uncached
+    assert "expert_ffn_norm" not in uncached
     start = router_scale_text.index("static int moe_prepare_router_weight_sidecar_input_f32")
     end = router_scale_text.index("static int moe_router_has_contract_input_scale_f32", start)
     block = router_scale_text[start:end]
