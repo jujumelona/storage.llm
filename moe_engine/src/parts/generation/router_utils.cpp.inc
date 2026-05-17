@@ -1074,15 +1074,34 @@ static int moe_prepare_router_weight_sidecar_input_f32(
         return 0;
     }
     out->assign(hidden_size, 0.0f);
+    double ss = 0.0;
+    for (uint32_t i = 0; i < hidden_size; ++i) {
+        if (!std::isfinite(hidden[i])) {
+            return 0;
+        }
+        const double v = (double)hidden[i];
+        ss += v * v;
+    }
+    if (!std::isfinite(ss)) {
+        return 0;
+    }
+    const moe_attn_config_t attn_cfg = moe_generation_attn_config(engine);
+    const float eps = attn_cfg.rms_norm_eps > 0.0f ? attn_cfg.rms_norm_eps : 1.0e-6f;
+    const float rms_norm = 1.0f / std::sqrt((float)(ss / (double)hidden_size) + eps);
+    const float root_size = 1.0f / std::sqrt((float)hidden_size);
+    const float input_norm = rms_norm * root_size;
+    if (!std::isfinite(input_norm) || !(input_norm > 0.0f)) {
+        return 0;
+    }
     double abs_sum = 0.0;
     double max_abs = 0.0;
     for (uint32_t i = 0; i < hidden_size; ++i) {
         float scale = 1.0f;
         if (!moe_router_raw_scalar_at_f32(sidecar, count == 1u ? 0u : (uint64_t)i, &scale) ||
-            !std::isfinite(scale) || !std::isfinite(hidden[i])) {
+            !std::isfinite(scale)) {
             return 0;
         }
-        const float v = hidden[i] * scale;
+        const float v = hidden[i] * input_norm * scale;
         if (!std::isfinite(v)) {
             return 0;
         }
@@ -1094,12 +1113,14 @@ static int moe_prepare_router_weight_sidecar_input_f32(
     if (moe_profile_level() >= 2) {
         moe_profile_log(
             "router_weight_sidecar_apply",
-            "layer=%d hidden=%u count=%llu mean_abs=%.6g max_abs=%.6g source=weight_sidecar",
+            "layer=%d hidden=%u count=%llu mean_abs=%.6g max_abs=%.6g input_norm=%.6g root_size=%.6g source=weight_sidecar_rmsnorm_root",
             layer,
             hidden_size,
             (unsigned long long)count,
             abs_sum / (double)hidden_size,
-            max_abs);
+            max_abs,
+            (double)input_norm,
+            (double)root_size);
     }
     return 1;
 }
