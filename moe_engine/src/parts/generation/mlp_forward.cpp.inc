@@ -85,6 +85,8 @@ struct moe_graph_ir_mlp_op_info_f32 {
     int present = 0;
     int required = 0;
     int has_weights = 0;
+    int fallback_only_when_no_moe_or_shared = 0;
+    int forbid_parallel_with_routed_moe = 0;
     size_t weight_count = 0;
 };
 
@@ -117,6 +119,31 @@ static int moe_graph_ir_text_matches_any_token_f32(
         }
     }
     return 0;
+}
+
+static void moe_graph_ir_mlp_note_op_policy_f32(
+    const std::string& doc,
+    size_t op_begin,
+    size_t op_end,
+    moe_graph_ir_mlp_op_info_f32* out
+) {
+    if (!out || op_begin >= op_end || op_end > doc.size()) {
+        return;
+    }
+    int forbid_parallel = 0;
+    if (moe_json_get_bool_slice(doc, op_begin, op_end, "forbid_parallel_with_routed_moe", &forbid_parallel) &&
+        forbid_parallel) {
+        out->forbid_parallel_with_routed_moe = 1;
+    }
+    std::string fallback_semantics;
+    if (moe_json_get_string_slice(doc, op_begin, op_end, "fallback_semantics", &fallback_semantics)) {
+        const std::string lower = moe_lower_ascii_copy(fallback_semantics);
+        if (lower.find("execute_only_when_no_moe_or_shared") != std::string::npos ||
+            lower.find("only_when_no_moe_or_shared") != std::string::npos ||
+            lower.find("only_when_no_moe") != std::string::npos) {
+            out->fallback_only_when_no_moe_or_shared = 1;
+        }
+    }
 }
 
 static void moe_graph_ir_layer_scan_mlp_op_f32(
@@ -178,6 +205,7 @@ static void moe_graph_ir_layer_scan_mlp_op_f32(
                     out->has_weights = 1;
                 }
             }
+            moe_graph_ir_mlp_note_op_policy_f32(doc, op_begin, op_end, out);
         }
     }
 }
@@ -252,6 +280,7 @@ static void moe_graph_ir_layer_scan_contract_table_mlp_op_f32(
                         out->has_weights = 1;
                     }
                 }
+                moe_graph_ir_mlp_note_op_policy_f32(doc, op_begin, op_end, out);
             }
         }
     }
@@ -389,11 +418,21 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
     // dense_mlp rather than shared_expert_mlp.
     const int dense_uses_shared_path =
         moe_graph_ir_dense_mlp_uses_shared_path_f32(engine, layer);
+    const int dense_forbidden_by_routed =
+        (plan.routed.has_weights &&
+         (plan.dense.forbid_parallel_with_routed_moe ||
+          plan.dense.fallback_only_when_no_moe_or_shared)) ? 1 : 0;
+    const int dense_forbidden_by_shared =
+        (plan.shared.has_weights &&
+         plan.dense.fallback_only_when_no_moe_or_shared) ? 1 : 0;
+    const int dense_forbidden_by_active_branch =
+        (dense_forbidden_by_routed || dense_forbidden_by_shared) ? 1 : 0;
     const int graphir_dense_branch_by_norm1 =
         (plan.dense.has_weights &&
          plan.post_norm1.has_weights &&
          moe_layer_has_common_dense_mlp_tensors_f32(engine, layer) &&
-         !plan.shared.has_weights) ? 1 : 0;
+         !plan.shared.has_weights &&
+         !dense_forbidden_by_active_branch) ? 1 : 0;
     const int split_dense_branch_by_norm1 =
         (dense_uses_shared_path || graphir_dense_branch_by_norm1) ? 1 : 0;
     if (split_dense_branch_by_norm1) {
@@ -404,17 +443,23 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
             plan.dense.weight_count = 3u;
         }
     }
-    plan.run_dense = ((plan.dense.required && plan.dense.has_weights) || split_dense_branch_by_norm1) ? 1 : 0;
+    const int dense_requested =
+        ((plan.dense.required && plan.dense.has_weights) || split_dense_branch_by_norm1) ? 1 : 0;
+    plan.run_dense = (!dense_forbidden_by_active_branch && dense_requested) ? 1 : 0;
     plan.run_shared = plan.shared.has_weights ? 1 : 0;
     plan.shared_required = plan.shared.required ? 1 : 0;
     moe_profile_log(
         "graphir_mlp_layer_plan",
-        "layer=%d routed_present=%d routed_weights=%zu shared_present=%d shared_required=%d shared_weights=%zu run_shared=%d dense_present=%d dense_required=%d dense_weights=%zu run_dense=%d dense_uses_shared_path=%d graphir_dense_by_norm1=%d split_dense_by_norm1=%d post_norm1_present=%d post_norm1_weights=%zu",
+        "layer=%d routed_present=%d routed_weights=%zu shared_present=%d shared_required=%d shared_weights=%zu run_shared=%d dense_present=%d dense_required=%d dense_weights=%zu run_dense=%d dense_uses_shared_path=%d dense_fallback_only=%d dense_forbid_parallel_routed=%d dense_forbidden=%d graphir_dense_by_norm1=%d split_dense_by_norm1=%d post_norm1_present=%d post_norm1_weights=%zu",
         layer,
         plan.routed.present, plan.routed.weight_count,
         plan.shared.present, plan.shared.required, plan.shared.weight_count, plan.run_shared,
         plan.dense.present, plan.dense.required, plan.dense.weight_count, plan.run_dense,
-        dense_uses_shared_path, graphir_dense_branch_by_norm1,
+        dense_uses_shared_path,
+        plan.dense.fallback_only_when_no_moe_or_shared,
+        plan.dense.forbid_parallel_with_routed_moe,
+        dense_forbidden_by_active_branch,
+        graphir_dense_branch_by_norm1,
         split_dense_branch_by_norm1, plan.post_norm1.present, plan.post_norm1.weight_count);
     if (tls_plan_cache.size() > 256u) {
         tls_plan_cache.erase(tls_plan_cache.begin(), tls_plan_cache.begin() + 64);
