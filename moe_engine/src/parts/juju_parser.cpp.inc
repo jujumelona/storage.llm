@@ -772,20 +772,23 @@ static int moe_juju_attention_contract_uses_unit_scale(const std::string& json) 
         unit_scale) {
         return 1;
     }
-    std::string source;
-    const int has_scale_source =
-        moe_json_get_string_local(json, "attention_scale_source", &source) ||
-        moe_json_get_string_local(json, "attention_score_scale_source", &source) ||
-        moe_json_get_string_local(json, "score_scale_source", &source);
-    if (!has_scale_source) {
-        return 0;
-    }
-    const std::string lower_source = moe_lower_ascii_copy(source);
-    if (lower_source.find("unit") != std::string::npos ||
-        lower_source.find("qk_norm") != std::string::npos ||
-        lower_source.find("q_norm") != std::string::npos ||
-        lower_source.find("k_norm") != std::string::npos) {
-        return 1;
+    static const char* const scale_source_keys[] = {
+        "attention_scale_source",
+        "attention_score_scale_source",
+        "score_scale_source"
+    };
+    for (const char* key : scale_source_keys) {
+        std::string source;
+        if (!moe_json_get_string_local(json, key, &source)) {
+            continue;
+        }
+        const std::string lower_source = moe_lower_ascii_copy(source);
+        if (lower_source.find("unit") != std::string::npos ||
+            lower_source.find("qk_norm") != std::string::npos ||
+            lower_source.find("q_norm") != std::string::npos ||
+            lower_source.find("k_norm") != std::string::npos) {
+            return 1;
+        }
     }
     // Source strings such as "head_dim" or "query_pre_attn_scalar" are
     // numeric scale contracts.  Do not infer unit-QK scaling from nearby
