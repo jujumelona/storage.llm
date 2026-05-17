@@ -786,26 +786,9 @@ static int moe_juju_attention_contract_uses_unit_scale(const std::string& json) 
         lower_source.find("k_norm") != std::string::npos) {
         return 1;
     }
-    if (lower_source.find("head_dim") == std::string::npos) {
-        return 0;
-    }
-    const int has_q_norm_contract =
-        json.find("\"op_role\":\"q_norm\"") != std::string::npos ||
-        json.find("\"role\":\"q_norm\"") != std::string::npos ||
-        json.find("attn_q_norm.weight") != std::string::npos ||
-        json.find("q_norm.weight") != std::string::npos;
-    const int has_k_norm_contract =
-        json.find("\"op_role\":\"k_norm\"") != std::string::npos ||
-        json.find("\"role\":\"k_norm\"") != std::string::npos ||
-        json.find("attn_k_norm.weight") != std::string::npos ||
-        json.find("k_norm.weight") != std::string::npos;
-    const int has_scaled_block_contract =
-        json.find("post_attention_norm") != std::string::npos &&
-        json.find("post_ffw_norm") != std::string::npos &&
-        json.find("layer_output_scale") != std::string::npos;
-    if (has_q_norm_contract && has_k_norm_contract && has_scaled_block_contract) {
-        return 1;
-    }
+    // Source strings such as "head_dim" or "query_pre_attn_scalar" are
+    // numeric scale contracts.  Do not infer unit-QK scaling from nearby
+    // tensor names; mixed contracts must be selected by explicit metadata.
     return 0;
 }
 
