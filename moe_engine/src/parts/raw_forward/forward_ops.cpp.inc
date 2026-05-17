@@ -125,10 +125,6 @@ static float moe_embedding_scale_value(const moe_pc_engine* engine, uint32_t hid
     } else if (moe_engine_metadata_mentions(engine, "sqrt_hidden_size")) {
         scale = std::sqrt((float)hidden_size);
         source = "metadata_text_sqrt_hidden";
-    } else if (!engine->dynamic_architecture.empty() && 
-               moe_lower_ascii_copy(engine->dynamic_architecture).find("gemma") != std::string::npos) {
-        scale = std::sqrt((float)hidden_size);
-        source = "architecture_gemma_sqrt_hidden";
     }
     moe_profile_log(
         "embedding_scale_contract",
@@ -300,10 +296,7 @@ static float moe_final_logit_softcap_value(const moe_pc_engine* engine) {
     int present = 0;
     const char* source = "absent";
     if (!engine->offload_gguf_metadata_json.empty() &&
-        (moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma4.final_logit_softcapping", &value) ||
-         moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma2.final_logit_softcapping", &value) ||
-         moe_json_get_double_local(engine->offload_gguf_metadata_json, "gemma.final_logit_softcapping", &value) ||
-         moe_json_get_double_local(engine->offload_gguf_metadata_json, "final_logit_softcapping", &value) ||
+        (moe_json_get_double_local(engine->offload_gguf_metadata_json, "final_logit_softcapping", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "final_logit_softcap", &value) ||
          moe_json_get_double_local(engine->offload_gguf_metadata_json, "logit_softcap", &value)) &&
         value > 0.0 && std::isfinite(value)) {
@@ -311,10 +304,7 @@ static float moe_final_logit_softcap_value(const moe_pc_engine* engine) {
         present = 1;
         source = "gguf_metadata";
     } else if (!engine->offload_graph_ir_json.empty() &&
-        (moe_json_get_double_local(engine->offload_graph_ir_json, "gemma4.final_logit_softcapping", &value) ||
-         moe_json_get_double_local(engine->offload_graph_ir_json, "gemma2.final_logit_softcapping", &value) ||
-         moe_json_get_double_local(engine->offload_graph_ir_json, "gemma.final_logit_softcapping", &value) ||
-         moe_json_get_double_local(engine->offload_graph_ir_json, "final_logit_softcapping", &value) ||
+        (moe_json_get_double_local(engine->offload_graph_ir_json, "final_logit_softcapping", &value) ||
          moe_json_get_double_local(engine->offload_graph_ir_json, "final_logit_softcap", &value) ||
          moe_json_get_double_local(engine->offload_graph_ir_json, "logit_softcap", &value)) &&
         value > 0.0 && std::isfinite(value)) {
