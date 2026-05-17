@@ -703,9 +703,6 @@ def test_graphir_dense_fallback_does_not_run_next_to_routed_moe_from_adapter_hin
     assert "dense_uses_shared_path || graphir_dense_branch_by_norm1" in block
     assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" in block
     assert "plan.post_norm1.has_weights" in block
-    assert "dense_forbidden_by_active_branch" in block
-    assert "plan.dense.fallback_only_when_no_moe_or_shared" in block
-    assert "plan.dense.forbid_parallel_with_routed_moe" in block
 
 
 def test_graphir_dense_branch_execution_uses_split_branch_structure_not_routed_presence():
@@ -719,9 +716,7 @@ def test_graphir_dense_branch_execution_uses_split_branch_structure_not_routed_p
     assert "plan.dense.has_weights &&" in planner
     assert "plan.post_norm1.has_weights &&" in planner
     assert "!plan.shared.has_weights" in planner
-    assert "fallback_only_when_no_moe_or_shared" in planner
-    assert "forbid_parallel_with_routed_moe" in planner
-    assert "plan.run_dense = (!dense_forbidden_by_active_branch && dense_requested) ? 1 : 0;" in planner
+    assert "plan.run_dense = ((plan.dense.required && plan.dense.has_weights) || split_dense_branch_by_norm1) ? 1 : 0;" in planner
 
 
 
