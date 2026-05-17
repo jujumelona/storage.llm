@@ -288,26 +288,28 @@ static int moe_prepare_router_weight_sidecar_input_f32(
     if (count != 1u && count != (uint64_t)hidden_size) {
         return 0;
     }
+    const int use_rms_root =
+        moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer);
     out->assign(hidden_size, 0.0f);
-    double ss = 0.0;
-    for (uint32_t i = 0; i < hidden_size; ++i) {
-        const double v = (double)hidden[i];
-        if (!std::isfinite(v)) {
+    float norm = 1.0f;
+    if (use_rms_root) {
+        double ss = 0.0;
+        for (uint32_t i = 0; i < hidden_size; ++i) {
+            const double v = (double)hidden[i];
+            if (!std::isfinite(v)) {
+                return 0;
+            }
+            ss += v * v;
+        }
+        if (!std::isfinite(ss)) {
             return 0;
         }
-        ss += v * v;
-    }
-    if (!std::isfinite(ss)) {
-        return 0;
-    }
-    // Gemma4 router sidecar scale is applied after a scale-free RMSNorm and
-    // hidden_size^-0.5. Applying the sidecar directly to raw residuals makes
-    // router logits saturate and collapses top-k probabilities to 1.0.
-    const float norm =
-        (1.0f / std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f)) *
-        (1.0f / std::sqrt((float)hidden_size));
-    if (!std::isfinite(norm) || !(norm > 0.0f)) {
-        return 0;
+        norm =
+            (1.0f / std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f)) *
+            (1.0f / std::sqrt((float)hidden_size));
+        if (!std::isfinite(norm) || !(norm > 0.0f)) {
+            return 0;
+        }
     }
     double abs_sum = 0.0;
     double max_abs = 0.0;
@@ -329,13 +331,14 @@ static int moe_prepare_router_weight_sidecar_input_f32(
     if (moe_profile_level() >= 2) {
         moe_profile_log(
             "router_weight_sidecar_apply",
-            "layer=%d hidden=%u count=%llu mean_abs=%.6g max_abs=%.6g input_norm=%.6g source=weight_sidecar_rms_root",
+            "layer=%d hidden=%u count=%llu mean_abs=%.6g max_abs=%.6g input_norm=%.6g source=%s",
             layer,
             hidden_size,
             (unsigned long long)count,
             abs_sum / (double)hidden_size,
             max_abs,
-            (double)norm);
+            (double)norm,
+            use_rms_root ? "weight_sidecar_ir_rms_root" : "weight_sidecar");
     }
     return 1;
 }

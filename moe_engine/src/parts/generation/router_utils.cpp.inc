@@ -642,4 +642,199 @@ static int moe_router_has_direct_input_scale_contract_f32(
     return 0;
 }
 
+static int moe_router_scope_declares_rms_root_input_transform_f32(
+    const std::string& doc,
+    size_t begin,
+    size_t end
+) {
+    if (begin >= end || end > doc.size()) {
+        return 0;
+    }
+    static const char* const bool_keys[] = {
+        "router_input_rms_root_transform",
+        "router_rms_root_input",
+        "router_input_uses_rmsnorm_and_hidden_root",
+        "router_input_hidden_size_root_scale",
+        "scale_free_router_rmsnorm"
+    };
+    int bool_value = 0;
+    for (const char* key : bool_keys) {
+        if (moe_json_get_bool_slice(doc, begin, end, key, &bool_value) && bool_value) {
+            return 1;
+        }
+    }
+    static const char* const string_keys[] = {
+        "router_input_transform",
+        "input_transform",
+        "router_input_norm_mode",
+        "router_norm_mode",
+        "scale_semantics",
+        "router_scale_semantics",
+        "rule",
+        "formula",
+        "expression"
+    };
+    auto text_declares_transform = [](const std::string& text) -> int {
+        const std::string lower = moe_lower_ascii_copy(text);
+        const int has_rms =
+            lower.find("rmsnorm") != std::string::npos ||
+            lower.find("rms_norm") != std::string::npos ||
+            lower.find("router_norm") != std::string::npos;
+        const int has_root =
+            lower.find("hidden_size**-0.5") != std::string::npos ||
+            lower.find("hidden_size^-0.5") != std::string::npos ||
+            lower.find("hidden_dim**-0.5") != std::string::npos ||
+            lower.find("hidden_dim^-0.5") != std::string::npos ||
+            lower.find("rsqrt_hidden") != std::string::npos ||
+            lower.find("sqrt_hidden") != std::string::npos ||
+            lower.find("root_hidden") != std::string::npos ||
+            lower.find("1/sqrt") != std::string::npos;
+        const int scale_free =
+            lower.find("scale_free") != std::string::npos ||
+            lower.find("unweighted") != std::string::npos ||
+            lower.find("no_scale") != std::string::npos ||
+            lower.find("without_scale") != std::string::npos ||
+            lower.find("with_scale:false") != std::string::npos ||
+            lower.find("with_scale\":false") != std::string::npos;
+        return has_rms && has_root && scale_free ? 1 : 0;
+    };
+    std::string value;
+    for (const char* key : string_keys) {
+        value.clear();
+        if (moe_json_get_string_slice(doc, begin, end, key, &value) &&
+            text_declares_transform(value)) {
+            return 1;
+        }
+    }
+    return text_declares_transform(doc.substr(begin, end - begin));
+}
+
+static int moe_router_row_has_rms_root_graph_signature_f32(
+    const std::string& doc,
+    size_t begin,
+    size_t end
+) {
+    if (begin >= end || end > doc.size()) {
+        return 0;
+    }
+    const std::string lower = moe_lower_ascii_copy(doc.substr(begin, end - begin));
+    const int has_router_sidecar =
+        lower.find("\"router_weight_scale_sidecar\"") != std::string::npos &&
+        lower.find("\"ffn_gate_inp_scale_is_weight_scale_sidecar\"") != std::string::npos &&
+        lower.find("true") != std::string::npos;
+    const int no_direct_router_input_scale =
+        lower.find("\"router_input_scale\": []") != std::string::npos ||
+        lower.find("\"router_input_scale\":[]") != std::string::npos;
+    const int has_split_moe_branch_norms =
+        lower.find("\"pre_ffw_norm_2\"") != std::string::npos &&
+        lower.find("\"post_ffw_norm_1\"") != std::string::npos &&
+        lower.find("\"post_ffw_norm_2\"") != std::string::npos;
+    const int has_layer_output_scale =
+        lower.find("\"output_scale\"") != std::string::npos ||
+        lower.find("\"layer_output_scale\"") != std::string::npos;
+    return has_router_sidecar && no_direct_router_input_scale &&
+        has_split_moe_branch_norms && has_layer_output_scale ? 1 : 0;
+}
+
+static int moe_router_weight_sidecar_requires_rms_root_transform_uncached_f32(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    for (uint32_t doc_i = 0; doc_i < 2u; ++doc_i) {
+        const std::string* docp = moe_contract_doc_by_index_f32(engine, doc_i);
+        if (!docp || docp->empty()) {
+            continue;
+        }
+        const std::string& doc = *docp;
+        std::vector<std::pair<size_t, size_t>> rows;
+        if (!moe_contract_layer_rows_cached_f32(engine, doc_i, layer, &rows)) {
+            continue;
+        }
+        for (const auto& row_pair : rows) {
+            const size_t obj_begin = row_pair.first;
+            const size_t obj_end = row_pair.second;
+            if (obj_begin >= obj_end || obj_end > doc.size()) {
+                continue;
+            }
+            const std::string row = doc.substr(obj_begin, obj_end - obj_begin);
+            size_t router_begin = 0;
+            size_t router_end = 0;
+            if (moe_json_find_object_local(row, "router", &router_begin, &router_end) &&
+                moe_router_scope_declares_rms_root_input_transform_f32(
+                    doc, obj_begin + router_begin, obj_begin + router_end)) {
+                return 1;
+            }
+            size_t semantic_begin = 0;
+            size_t semantic_end = 0;
+            if (moe_json_find_object_local(row, "semantic_contract", &semantic_begin, &semantic_end) &&
+                moe_router_scope_declares_rms_root_input_transform_f32(
+                    doc, obj_begin + semantic_begin, obj_begin + semantic_end)) {
+                return 1;
+            }
+            size_t ops_begin = 0;
+            size_t ops_end = 0;
+            if (moe_json_find_array_local(row, "ops", &ops_begin, &ops_end)) {
+                size_t op_cursor = obj_begin + ops_begin + 1u;
+                const size_t op_limit = obj_begin + ops_end;
+                while (op_cursor < op_limit) {
+                    size_t op_begin = 0;
+                    size_t op_end = 0;
+                    if (!moe_json_next_object_in_array(doc, &op_cursor, op_limit, &op_begin, &op_end)) {
+                        break;
+                    }
+                    std::string op_name;
+                    if (moe_json_get_string_slice(doc, op_begin, op_end, "name", &op_name)) {
+                        const std::string lowered = moe_lower_ascii_copy(op_name);
+                        if ((lowered == "router_input" || lowered == "moe_router" || lowered == "router") &&
+                            moe_router_scope_declares_rms_root_input_transform_f32(doc, op_begin, op_end)) {
+                            return 1;
+                        }
+                    }
+                }
+            }
+            if (moe_router_row_has_rms_root_graph_signature_f32(doc, obj_begin, obj_end)) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int moe_router_weight_sidecar_requires_rms_root_transform_f32(
+    const moe_pc_engine* engine,
+    int32_t layer
+) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    struct router_sidecar_transform_cache_entry {
+        const moe_pc_engine* engine = nullptr;
+        uint64_t generation = 0;
+        int32_t layer = INT32_MIN;
+        uint8_t value = 0;
+    };
+    static thread_local std::vector<router_sidecar_transform_cache_entry> tls_cache;
+    const uint64_t generation = engine->engine_generation;
+    for (const router_sidecar_transform_cache_entry& entry : tls_cache) {
+        if (entry.engine == engine && entry.generation == generation && entry.layer == layer) {
+            return entry.value ? 1 : 0;
+        }
+    }
+    const int value =
+        moe_router_weight_sidecar_requires_rms_root_transform_uncached_f32(engine, layer);
+    if (tls_cache.size() > 256u) {
+        tls_cache.erase(tls_cache.begin(), tls_cache.begin() + 64);
+    }
+    router_sidecar_transform_cache_entry entry{};
+    entry.engine = engine;
+    entry.generation = generation;
+    entry.layer = layer;
+    entry.value = value ? 1u : 0u;
+    tls_cache.push_back(entry);
+    return value;
+}
+
 #include "router_scale_inputs.cpp.inc"
