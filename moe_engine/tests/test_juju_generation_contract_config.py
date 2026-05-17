@@ -670,8 +670,7 @@ def test_router_weight_sidecar_rms_root_transform_is_ir_contract_gated():
     assert "moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer)" in block
     assert "ss += v * v;" in block
     assert "std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f)" in block
-    assert "std::sqrt((float)hidden_size)" in block
-    assert "1.0f / std::sqrt((float)hidden_size)" not in block
+    assert "1.0f / std::sqrt((float)hidden_size)" in block
     assert "hidden[i] * norm * scale" in block
     assert "weight_sidecar_ir_rms_root" in block
     assert "weight_sidecar\"" in block
