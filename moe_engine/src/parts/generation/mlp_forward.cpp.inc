@@ -2530,7 +2530,6 @@ static int moe_layer_expert_down_scalar_scale_f32(
     }
 
     static const char* const suffixes[] = {
-        "ffn_down_exps.scale",
         "ffn_gate_inp.per_expert_scale",
         "router.per_expert_scale",
         "mlp.router.per_expert_scale",
@@ -2547,10 +2546,10 @@ static int moe_layer_expert_down_scalar_scale_f32(
         "moe.gate.per_expert_scale"
     };
     const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
-    // Gemma4-style JUJU indices store router per-expert learned scales as
-    // ffn_down_exps.scale: a layer-local F32 vector with one scalar per expert.
-    // This belongs to the selected expert weights after top-k normalization.
-    // Explicit direct-per-expert-scale contracts still bind only direct names.
+    // Do not bind ffn_down_exps.scale here. In the current JUJU contract it is
+    // listed as a routed expert tensor, but applying it as an expert-output
+    // multiplier regresses chat PPL. Runtime expert scales require explicit
+    // per_expert_scale-style names.
     const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
     const size_t scale_suffix_count = direct_scale_contract ?
         (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :
