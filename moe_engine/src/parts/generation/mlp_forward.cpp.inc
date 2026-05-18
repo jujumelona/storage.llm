@@ -382,20 +382,13 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
     }
 
     // Execute dense only when GraphIR makes it a complete branch: either the
-    // op is required, the adapter explicitly routes dense through the shared
-    // path, or the layer has dense weights plus the branch-1 post norm and no
-    // separate shared-expert weights.  The latter is the structural split-FFN
-    // contract used by routed layers that materialize the shared branch as
-    // dense_mlp rather than shared_expert_mlp.
+    // op is required, or the adapter explicitly routes dense through the shared
+    // path.  A bare dense_mlp binding beside routed experts is a fallback tensor
+    // set; running it as a parallel branch double-counts FFN output.
     const int dense_uses_shared_path =
         moe_graph_ir_dense_mlp_uses_shared_path_f32(engine, layer);
-    const int graphir_dense_branch_by_norm1 =
-        (plan.dense.has_weights &&
-         plan.post_norm1.has_weights &&
-         moe_layer_has_common_dense_mlp_tensors_f32(engine, layer) &&
-         !plan.shared.has_weights) ? 1 : 0;
     const int split_dense_branch_by_norm1 =
-        (dense_uses_shared_path || graphir_dense_branch_by_norm1) ? 1 : 0;
+        dense_uses_shared_path ? 1 : 0;
     if (split_dense_branch_by_norm1) {
         plan.dense.present = 1;
         plan.dense.required = 1;
@@ -414,7 +407,7 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
         plan.routed.present, plan.routed.weight_count,
         plan.shared.present, plan.shared.required, plan.shared.weight_count, plan.run_shared,
         plan.dense.present, plan.dense.required, plan.dense.weight_count, plan.run_dense,
-        dense_uses_shared_path, graphir_dense_branch_by_norm1,
+        dense_uses_shared_path, 0,
         split_dense_branch_by_norm1, plan.post_norm1.present, plan.post_norm1.weight_count);
     if (tls_plan_cache.size() > 256u) {
         tls_plan_cache.erase(tls_plan_cache.begin(), tls_plan_cache.begin() + 64);
