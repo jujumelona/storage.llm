@@ -7626,7 +7626,7 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
         {"op": "rms_norm", "name": "post_ffw_norm_1", "inputs": ["shared_branch_raw"], "weights": post_ffw_norm1_weights, "output": "shared_branch", "optional_behavior": "pass_shared_branch_raw_when_weight_absent", "required": bool(post_ffw_norm1_weights)},
         {"op": "moe_expert_mlp", "name": "moe_experts", "inputs": ["expert_ffn_input", "selected_experts"], "weights": moe_weights, "per_expert_output_scale": expert_output_scale_weights, "output": "expert_sum_raw", "required": bool(moe_weights)},
         {"op": "rms_norm", "name": "post_ffw_norm_2", "inputs": ["expert_sum_raw"], "weights": post_ffw_norm2_weights, "output": "expert_branch", "optional_behavior": "pass_expert_sum_raw_when_weight_absent", "required": bool(post_ffw_norm2_weights)},
-        {"op": "dense_mlp", "name": "dense_ffn_fallback", "inputs": ["shared_ffn_input"], "weights": dense_weights, "output": "dense_branch", "required": bool(dense_weights and not moe_weights and not shared_expert_weights), "fallback_semantics": "execute_only_when_no_moe_or_shared_expert_weights_on_layer", "forbid_parallel_with_routed_moe": bool(moe_weights or shared_expert_weights)},
+        {"op": "dense_mlp", "name": "dense_ffn_fallback", "inputs": ["shared_ffn_input"], "weights": dense_weights, "output": "dense_branch", "required": bool(dense_weights and (not moe_weights and not shared_expert_weights or (moe_weights and post_ffw_norm1_weights and not shared_expert_weights))), "fallback_semantics": "execute_only_when_no_moe_or_shared_expert_weights_on_layer_unless_post_ffw_norm_1_declares_primary_dense_branch", "forbid_parallel_with_routed_moe": bool((moe_weights or shared_expert_weights) and not (moe_weights and post_ffw_norm1_weights and not shared_expert_weights))},
         {"op": "add", "name": "ffn_branch_sum", "inputs": ["shared_branch", "expert_branch", "dense_branch"], "output": "ffn_out", "missing_input": "zero", "required": bool(moe_weights or shared_expert_weights or dense_weights)},
         {"op": "rms_norm", "name": "post_ffw_norm", "inputs": ["ffn_out"], "weights": post_ffw_norm_weights, "output": "ffn_branch", "optional_behavior": "pass_ffn_out_when_weight_absent", "required": bool(post_ffw_norm_weights)},
         {"op": "residual", "name": "ffn_residual", "inputs": ["hidden", "ffn_branch"], "output": "hidden", "required": True},
@@ -9375,10 +9375,19 @@ def validate_juju_ppl_contract_clean(generation_contract):
                 has_moe = True
             if op.get("name") in {"router_input", "moe_router"}:
                 bad_router_scale_list(op.get("scale") or [], f"graph_ir_layers[{layer}].ops.{op.get('name')}.scale")
+        has_post_norm1 = any(
+            isinstance(op, dict) and op.get("name") == "post_ffw_norm_1" and op.get("weights")
+            for op in ops
+        )
         for op in ops:
             if not isinstance(op, dict):
                 continue
-            if op.get("name") == "dense_ffn_fallback" and has_moe and op.get("required") is True:
+            if (
+                op.get("name") == "dense_ffn_fallback" and
+                has_moe and
+                op.get("required") is True and
+                not has_post_norm1
+            ):
                 errors.append(f"graph_ir_layers[{layer}]: dense fallback is required beside routed MoE")
     if errors:
         raise RuntimeError("JUJU PPL contract validation failed: " + "; ".join(errors[:20]))

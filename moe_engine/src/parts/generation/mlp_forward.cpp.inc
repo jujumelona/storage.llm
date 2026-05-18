@@ -381,14 +381,16 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
         plan.post_norm1.weight_count += contract_norm1;
     }
 
-    // Execute dense only when GraphIR makes it a complete branch: either the
-    // op is required, or the adapter explicitly routes dense through the shared
-    // path.  A bare dense_mlp binding beside routed experts is a fallback tensor
-    // set; running it as a parallel branch double-counts FFN output.
+    // Execute dense only when GraphIR makes it a complete branch.  Some MoE
+    // graphs use dense_mlp + post_ffw_norm_1 as the primary non-routed FFN
+    // branch before adding routed experts; other graphs keep dense_mlp as a
+    // fallback for non-MoE layers.  Use the IR structure, not model names, to
+    // distinguish those cases.
     const int dense_uses_shared_path =
         moe_graph_ir_dense_mlp_uses_shared_path_f32(engine, layer);
     const int split_dense_branch_by_norm1 =
-        dense_uses_shared_path ? 1 : 0;
+        (dense_uses_shared_path ||
+         (plan.routed.has_weights && plan.dense.has_weights && plan.post_norm1.has_weights)) ? 1 : 0;
     if (split_dense_branch_by_norm1) {
         plan.dense.present = 1;
         plan.dense.required = 1;
@@ -519,12 +521,11 @@ static int moe_layer_dense_mlp_should_run_f32(
     if (!moe_graph_ir_math_required(engine)) {
         return 1;
     }
-    // The IR plan explicitly scans routed roles such as "moe_expert_mlp".
-    // GraphIR routed roles own the FFN branch; the old local test shape was:
-    // return moe_graph_ir_layer_has_op_role_any(...) ? return 0; then scan
-    // dense fallback roles such as "dense_mlp", "dense_ffn", and
-    // "dense_ffn_mlp".  The real decision is now centralized in
-    // moe_build_graph_ir_mlp_layer_plan_f32(), not suffix aliases.
+    // The IR plan explicitly scans routed, dense, and post-FFW norm roles.
+    // A routed layer can still own a primary dense branch when the graph also
+    // declares post_ffw_norm_1; otherwise dense remains a fallback.  The real
+    // decision is centralized in moe_build_graph_ir_mlp_layer_plan_f32(), not
+    // suffix aliases.
     const moe_graph_ir_mlp_layer_plan_f32 plan =
         moe_build_graph_ir_mlp_layer_plan_f32(engine, layer);
     return plan.run_dense ? 1 : 0;
