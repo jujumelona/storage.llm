@@ -1193,6 +1193,17 @@ def test_ple_required_detection_reads_layer_contract_table_roles():
     assert "moe_graph_ir_layer_has_op_role_any" in explicit
 
 
+def test_conditional_router_hidden_rule_does_not_force_raw_input():
+    mlp_norm = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
+    helper = mlp_norm[mlp_norm.index("static int moe_layer_router_contract_has_hidden_input_f32"):
+                      mlp_norm.index("static int moe_layer_execution_contract_router_uses_hidden_f32")]
+    assert "moe_router_rule_uses_hidden_only_with_activation_scale_f32" in mlp_norm
+    assert '"use_hidden_only_when_explicit_router_input_scale_present"' in mlp_norm
+    assert "moe_json_get_string_slice(doc, obj_begin, obj_end, \"rule\", &rule)" in helper
+    assert helper.index("moe_json_get_string_slice(doc, obj_begin, obj_end, \"rule\", &rule)") < helper.index("moe_router_contract_object_has_raw_hidden_input_f32")
+    assert "return moe_router_contract_object_has_activation_scale_f32(doc, obj_begin, obj_end) ? 1 : 0;" in helper
+
+
 def test_router_layer_row_does_not_block_graphir_op_score_or_norm_lookup():
     router = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_topk.cpp.inc").read_text()
     score_block = router[router.index("static int moe_router_layer_score_contract_f32"):
