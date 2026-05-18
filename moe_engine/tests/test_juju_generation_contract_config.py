@@ -667,9 +667,10 @@ def test_router_weight_sidecar_rms_root_transform_is_ir_contract_gated():
     assert '"router_input_rms_root_transform"' in router_utils_text
     assert '"ffn_gate_inp_scale_is_weight_scale_sidecar"' in router_utils_text
     assert "moe_router_row_has_rms_root_graph_signature_f32" not in router_utils_text
-    assert "moe_router_row_contract_implies_sidecar_rms_root_transform_f32" in router_utils_text
-    assert '"expert_branch_uses_expert_ffn_norm"' in router_utils_text
-    assert '"shared_and_expert_post_norms_apply_before_branch_sum"' in router_utils_text
+    uncached = router_utils_text[router_utils_text.index("static int moe_router_weight_sidecar_requires_rms_root_transform_uncached_f32"):
+                                 router_utils_text.index("static int moe_router_weight_sidecar_requires_rms_root_transform_f32")]
+    assert "moe_router_row_contract_implies_sidecar_rms_root_transform_f32(doc, obj_begin, obj_end)" not in uncached
+    assert "A router weight-scale sidecar is not itself a router-input" in uncached
     assert "moe_router_scope_declares_rms_root_input_transform_f32" in router_utils_text
     start = router_scale_text.index("static int moe_prepare_router_weight_sidecar_input_f32")
     end = router_scale_text.index("static int moe_router_has_contract_input_scale_f32", start)

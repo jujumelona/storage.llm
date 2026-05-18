@@ -1000,9 +1000,9 @@ static int moe_router_weight_sidecar_requires_rms_root_transform_uncached_f32(
                     }
                 }
             }
-            if (moe_router_row_contract_implies_sidecar_rms_root_transform_f32(doc, obj_begin, obj_end)) {
-                return 1;
-            }
+            // A router weight-scale sidecar is not itself a router-input
+            // transform.  Only explicit RMS/root transform declarations above
+            // may enable activation-side normalization for the sidecar path.
         }
     }
     return 0;
