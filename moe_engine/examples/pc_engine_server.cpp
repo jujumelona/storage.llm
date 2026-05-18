@@ -3803,6 +3803,7 @@ static std::string route_request(
     if (req.method == "POST" &&
         (req.path == "/v1/storagellm/eval" ||
          req.path == "/v1/storagellm/perplexity" ||
+         req.path == "/v1/eval/ppl" ||
          req.path == "/v1/perplexity")) {
         const server_eval_result evaluated = run_server_eval(engine, engine_mutex, opts, req.body);
         if (!evaluated.ok) {
@@ -4102,6 +4103,7 @@ static void print_usage() {
         << "  POST /v1/completions\n"
         << "  POST /v1/responses\n"
         << "  POST /v1/storagellm/eval\n"
+        << "  POST /v1/eval/ppl\n"
         << "  GET  /openclaw/config\n";
 }
 

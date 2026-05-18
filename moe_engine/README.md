@@ -490,6 +490,7 @@ Default endpoints:
 - `POST /v1/responses`
 - `POST /v1/storagellm/eval`
 - `POST /v1/storagellm/perplexity`
+- `POST /v1/eval/ppl`
 - `POST /v1/perplexity`
 - `GET /openclaw/config` (returns the same OpenClaw provider config JSON)
 
@@ -517,6 +518,7 @@ Eval/perplexity routes:
 
 - `POST /v1/storagellm/eval`
 - `POST /v1/storagellm/perplexity`
+- `POST /v1/eval/ppl`
 - `POST /v1/perplexity`
 
 ### Benchmarking
