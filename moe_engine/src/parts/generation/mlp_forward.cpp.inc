@@ -744,7 +744,9 @@ static int moe_layer_moe_mlp_f32(
     const int router_has_internal_weight_scale =
         moe_router_has_internal_weight_scale_contract_f32(engine, layer);
     const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
-    const int router_uses_raw_residual = router_uses_raw_residual_contract;
+    const int router_uses_raw_residual =
+        router_uses_raw_residual_contract ||
+        (router_has_internal_weight_scale && moe_engine_contract_uses_split_ffn_norm(engine, layer));
     if (router_uses_raw_residual_contract &&
         moe_engine_contract_uses_direct_router_input_scale(engine, layer) &&
         !router_has_plausible_input_scale) {
@@ -2528,6 +2530,7 @@ static int moe_layer_expert_down_scalar_scale_f32(
     }
 
     static const char* const suffixes[] = {
+        "ffn_down_exps.scale",
         "ffn_gate_inp.per_expert_scale",
         "router.per_expert_scale",
         "mlp.router.per_expert_scale",
@@ -2544,9 +2547,10 @@ static int moe_layer_expert_down_scalar_scale_f32(
         "moe.gate.per_expert_scale"
     };
     const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
-    // ffn_down_exps.scale is the routed expert down-projection weight sidecar in
-    // JUJU/GGUF contracts, not a runtime expert-output scale. Runtime expert
-    // scales must come from explicit per_expert_scale-style tensors.
+    // Gemma4-style JUJU indices store router per-expert learned scales as
+    // ffn_down_exps.scale: a layer-local F32 vector with one scalar per expert.
+    // This belongs to the selected expert weights after top-k normalization.
+    // Explicit direct-per-expert-scale contracts still bind only direct names.
     const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
     const size_t scale_suffix_count = direct_scale_contract ?
         (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :
@@ -2676,7 +2680,9 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
     const int router_has_internal_weight_scale =
         moe_router_has_internal_weight_scale_contract_f32(engine, layer);
     const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
-    const int router_uses_raw_residual = router_uses_raw_residual_contract;
+    const int router_uses_raw_residual =
+        router_uses_raw_residual_contract ||
+        (router_has_internal_weight_scale && moe_engine_contract_uses_split_ffn_norm(engine, layer));
     if (router_uses_raw_residual_contract &&
         moe_engine_contract_uses_direct_router_input_scale(engine, layer) &&
         !router_has_plausible_input_scale) {
