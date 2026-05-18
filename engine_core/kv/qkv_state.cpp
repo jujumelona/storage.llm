@@ -420,9 +420,6 @@ int qkv_state_init(
         }
 
         const int* src = config->outlier_channel_indices;
-        state->outlier_indices_explicit = src ? 1 : 0;
-        state->k_outlier_indices_ready = src ? 1 : 0;
-        state->v_outlier_indices_ready = src ? 1 : 0;
         for (int i = 0; i < n_out; i++) {
             int ch = src ? src[i] : i;
             // BUGFIX 414: ch 범위 체크
