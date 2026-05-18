@@ -7559,12 +7559,24 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
     post_ffw_norm2_weights = bind("post_ffw_norm_2.weight", "ffn_post_norm_2.weight")
     post_ffw_norm_weights = bind("post_ffw_norm.weight", "ffn_post_norm.weight")
     layer_output_scale_weights = bind("layer_output_scale.weight", "layer_scalar.weight", "layer_scalar")
-    expert_down_scale_weights = bind(
+    # GGUF Gemma4 stores router.per_expert_scale under ffn_down_exps.scale.
+    # It scales selected top-k routing weights, not the expert down projection
+    # output tensor.
+    router_per_expert_scale_weights = bind(
         "ffn_down_exps.scale",
         "ffn_gate_inp.per_expert_scale",
         "router.per_expert_scale",
+        "router.per_expert_scale.weight",
         "mlp.router.per_expert_scale",
+        "mlp.router.per_expert_scale.weight",
         "moe.gate.per_expert_scale",
+        "moe.gate.per_expert_scale.weight",
+    )
+    expert_output_scale_weights = bind(
+        "expert_output_scale",
+        "experts.output_scale",
+        "moe.experts.output_scale",
+        "moe_experts.output_scale",
     )
     attention_k_eq_v = _juju_bool_or_none(runtime_arch.get("attention_k_eq_v")) is True
     value_projection_present = bool(v_weights)
@@ -7609,10 +7621,10 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
         {"op": "select", "name": "router_input", "inputs": ["hidden", "expert_ffn_input"], "output": "router_input", "rule": "use_hidden_only_when_explicit_router_input_scale_present_else_expert_ffn_input", "scale": router_scale_weights, "weight_scale_sidecars": router_weight_scale_sidecars, "required": False},
         {"op": "hidden_snapshot", "name": "fate_gate_input_snapshot", "inputs": ["router_input"], "target": "engine_state.gate_input_snapshots[layer]", "required": False},
         {"op": "linear", "name": "moe_router", "inputs": ["router_input"], "weights": router_weights, "scale": router_scale_weights, "weight_scale_sidecars": router_weight_scale_sidecars, "output": "expert_scores", "required": bool(router_weights)},
-        {"op": "topk", "name": "expert_select", "inputs": ["expert_scores"], "config_key": "adaptive_seq_topk_entropy", "required": bool(router_weights)},
+        {"op": "topk", "name": "expert_select", "inputs": ["expert_scores"], "config_key": "adaptive_seq_topk_entropy", "per_expert_scale": router_per_expert_scale_weights, "required": bool(router_weights)},
         {"op": "shared_expert_mlp", "name": "shared_experts", "inputs": ["shared_ffn_input"], "weights": shared_expert_weights, "gate": shared_gate_weights, "output": "shared_branch_raw", "required": bool(shared_expert_weights)},
         {"op": "rms_norm", "name": "post_ffw_norm_1", "inputs": ["shared_branch_raw"], "weights": post_ffw_norm1_weights, "output": "shared_branch", "optional_behavior": "pass_shared_branch_raw_when_weight_absent", "required": bool(post_ffw_norm1_weights)},
-        {"op": "moe_expert_mlp", "name": "moe_experts", "inputs": ["expert_ffn_input", "selected_experts"], "weights": moe_weights, "per_expert_output_scale": expert_down_scale_weights, "output": "expert_sum_raw", "required": bool(moe_weights)},
+        {"op": "moe_expert_mlp", "name": "moe_experts", "inputs": ["expert_ffn_input", "selected_experts"], "weights": moe_weights, "per_expert_output_scale": expert_output_scale_weights, "output": "expert_sum_raw", "required": bool(moe_weights)},
         {"op": "rms_norm", "name": "post_ffw_norm_2", "inputs": ["expert_sum_raw"], "weights": post_ffw_norm2_weights, "output": "expert_branch", "optional_behavior": "pass_expert_sum_raw_when_weight_absent", "required": bool(post_ffw_norm2_weights)},
         {"op": "dense_mlp", "name": "dense_ffn_fallback", "inputs": ["shared_ffn_input"], "weights": dense_weights, "output": "dense_branch", "required": bool(dense_weights and not moe_weights and not shared_expert_weights), "fallback_semantics": "execute_only_when_no_moe_or_shared_expert_weights_on_layer", "forbid_parallel_with_routed_moe": bool(moe_weights or shared_expert_weights)},
         {"op": "add", "name": "ffn_branch_sum", "inputs": ["shared_branch", "expert_branch", "dense_branch"], "output": "ffn_out", "missing_input": "zero", "required": bool(moe_weights or shared_expert_weights or dense_weights)},
@@ -7638,6 +7650,7 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
             "expert_branch_uses_expert_ffn_norm": bool(expert_norm_weights),
             "router_uses_hidden_when_internal_scale_present": bool(router_scale_weights),
             "router_input_scale_tensors": router_scale_weights,
+            "router_per_expert_scale_tensors": router_per_expert_scale_weights,
             "router_weight_scale_sidecar_tensors": router_weight_scale_sidecars,
             "ffn_gate_inp_scale_is_weight_scale_sidecar": bool(router_weight_scale_sidecars),
             "value_uses_raw_k_projection_when_v_projection_missing": not bool(v_weights),
@@ -7792,6 +7805,16 @@ def _juju_layer_execution_contract_table(tensor_records, runtime_arch):
         # quantization sidecars.  They are not direct router-input activation
         # scales and must not trigger router_scale/router_input_scale.
         router_weight_scale_sidecar_refs = refs({"ffn_gate_inp.scale", "ffn_gate_inp.scales"})
+        router_per_expert_scale_refs = refs({
+            "ffn_down_exps.scale",
+            "ffn_gate_inp.per_expert_scale",
+            "router.per_expert_scale",
+            "router.per_expert_scale.weight",
+            "mlp.router.per_expert_scale",
+            "mlp.router.per_expert_scale.weight",
+            "moe.gate.per_expert_scale",
+            "moe.gate.per_expert_scale.weight",
+        })
         post_ffw_norm1_refs = refs({"post_ffw_norm_1.weight", "ffn_post_norm_1.weight"})
         post_ffw_norm2_refs = refs({"post_ffw_norm_2.weight", "ffn_post_norm_2.weight"})
         post_ffw_norm_refs = refs({"post_ffw_norm.weight", "ffn_post_norm.weight"})
@@ -7860,6 +7883,7 @@ def _juju_layer_execution_contract_table(tensor_records, runtime_arch):
                 "router": refs({"ffn_gate_inp.weight", "router.weight", "mlp.router.weight", "moe.gate.weight"}),
                 "router_scale": router_scale_refs,
                 "router_input_scale": router_scale_refs,
+                "router_per_expert_scale": router_per_expert_scale_refs,
                 "router_weight_scale_sidecar": router_weight_scale_sidecar_refs,
                 "ffn_gate_inp_scale_is_weight_scale_sidecar": bool(router_weight_scale_sidecar_refs),
                 "router_uses_hidden_when_internal_scale_present": bool(router_scale_refs),
@@ -8004,6 +8028,7 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
         "layers_with_sliding_attention": 0,
         "layers_with_router": 0,
         "layers_with_router_scale": 0,
+        "layers_with_router_per_expert_scale": 0,
         "layers_with_router_weight_scale_sidecar": 0,
         "layers_with_moe_experts": 0,
         "layers_with_dense_ffn": 0,
@@ -8069,6 +8094,17 @@ def build_generation_contract(*, contract, tensor_records, runtime_arch, token_e
             feature_counts["layers_with_router"] += 1
         if any(x in suffixes for x in {"router.scale", "mlp.router.scale", "moe.gate.scale"}):
             feature_counts["layers_with_router_scale"] += 1
+        if any(x in suffixes for x in {
+            "ffn_down_exps.scale",
+            "ffn_gate_inp.per_expert_scale",
+            "router.per_expert_scale",
+            "router.per_expert_scale.weight",
+            "mlp.router.per_expert_scale",
+            "mlp.router.per_expert_scale.weight",
+            "moe.gate.per_expert_scale",
+            "moe.gate.per_expert_scale.weight",
+        }):
+            feature_counts["layers_with_router_per_expert_scale"] += 1
         if any(x in suffixes for x in {"ffn_gate_inp.scale", "ffn_gate_inp.scales"}):
             feature_counts["layers_with_router_weight_scale_sidecar"] += 1
         if any("exps." in x or "_exps." in x for x in suffixes):

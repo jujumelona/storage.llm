@@ -840,6 +840,9 @@ def test_ple_vocab_masking_allows_smaller_per_layer_vocab():
 def test_expert_down_scale_is_legacy_runtime_scale_but_not_direct_contract_scale():
     norm_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
     fwd_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
+    router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
+    topk_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_topk.cpp.inc").read_text()
+    materializer_text = MAT_PATH.read_text()
     for text in (norm_text, fwd_text):
         assert "direct_contract_suffixes" in text
         direct_block = text[text.index("static const char* const direct_contract_suffixes[]"):
@@ -848,10 +851,26 @@ def test_expert_down_scale_is_legacy_runtime_scale_but_not_direct_contract_scale
         assert '"per_expert_scale"' in direct_block
         assert '"experts.per_expert_scale"' in direct_block
         assert "moe_engine_contract_uses_direct_per_expert_scale(engine, layer)" in text
-        legacy_scale_pos = text.index('"ffn_down_exps.scale"')
-        direct_pos = text.index("static const char* const direct_contract_suffixes[]")
-        assert legacy_scale_pos < direct_pos
-        assert "runtime expert-down branch scale" in text
+        if '"ffn_down_exps.scale"' in text:
+            legacy_scale_pos = text.index('"ffn_down_exps.scale"')
+            direct_pos = text.index("static const char* const direct_contract_suffixes[]")
+            assert legacy_scale_pos < direct_pos
+            assert "runtime expert-down branch scale" in text
+    router_block = router_text[router_text.index("moe_map_router_per_expert_scale_tensor_f32"):
+                               router_text.index("static int moe_router_apply_per_expert_scales_f32")]
+    assert '"ffn_down_exps.scale"' in router_block
+    assert '"router.per_expert_scale.weight"' in router_block
+    assert "count != 1u && count != (uint64_t)experts" in router_block
+    assert "moe_router_apply_per_expert_scales_f32" in topk_text
+    assert topk_text.count("moe_router_apply_per_expert_scales_f32") >= 2
+    graph_block = materializer_text[materializer_text.index("router_per_expert_scale_weights = bind("):
+                                  materializer_text.index("expert_output_scale_weights = bind(")]
+    assert '"ffn_down_exps.scale"' in graph_block
+    experts_op = materializer_text[materializer_text.index('"name": "moe_experts"'):
+                                   materializer_text.index('"name": "post_ffw_norm_2"', materializer_text.index('"name": "moe_experts"'))]
+    assert "per_expert_output_scale" in experts_op
+    assert "expert_output_scale_weights" in experts_op
+    assert "ffn_down_exps.scale" not in experts_op
 
 
 def test_raw_residual_router_input_requires_explicit_graph_contract():

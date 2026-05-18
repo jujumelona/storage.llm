@@ -1829,6 +1829,9 @@ static int moe_router_topk_f32(
                 w *= route_scale;
             }
         }
+        if (!moe_router_apply_per_expert_scales_f32(engine, layer, experts, out_experts, out_weights)) {
+            return 0;
+        }
         if (session) {
             session->session_router_entropy_milli = 500u;
         }
@@ -1979,6 +1982,9 @@ static int moe_router_topk_f32(
             w *= scale;
         }
     }
+    if (!moe_router_apply_per_expert_scales_f32(engine, layer, experts, out_experts, out_weights)) {
+        return 0;
+    }
     moe_profile_log(
         "router_topk",
         "layer=%d experts=%u top_k=%u use_sigmoid=%d norm_topk=%d entropy=%.3f scale=%.6g raw_min=%.6g raw_max=%.6g raw_span=%.6g sigmoid_topk_raw=1 first_expert=%d first_weight=%.6g",
@@ -1988,4 +1994,3 @@ static int moe_router_topk_f32(
         out_weights->empty() ? 0.0 : (double)(*out_weights)[0]);
     return 1;
 }
-

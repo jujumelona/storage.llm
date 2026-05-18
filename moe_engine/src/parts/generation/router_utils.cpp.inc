@@ -298,6 +298,110 @@ static int moe_router_apply_bias_f32(
     return 1;
 }
 
+static int moe_map_router_per_expert_scale_tensor_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    uint32_t experts,
+    moe_raw_tensor_cache_entry* out
+) {
+    if (!engine || !out || layer < 0 || experts == 0) {
+        return 0;
+    }
+    static const char* const suffixes[] = {
+        "ffn_down_exps.scale",
+        "ffn_gate_inp.per_expert_scale",
+        "router.per_expert_scale",
+        "router.per_expert_scale.weight",
+        "mlp.router.per_expert_scale",
+        "mlp.router.per_expert_scale.weight",
+        "moe.gate.per_expert_scale",
+        "moe.gate.per_expert_scale.weight"
+    };
+    const uint32_t suffix_hash = moe_router_fnv1a_hash_string("router_per_expert_scale");
+    const uint64_t key = ((uint64_t)(uint32_t)layer << 32) | suffix_hash | 0xa0000000ull;
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        auto found = engine->raw_tensor_cache.find(key);
+        if (found != engine->raw_tensor_cache.end() && found->second.base) {
+            *out = found->second;
+            return 1;
+        }
+    }
+    std::vector<std::string> names;
+    moe_push_layer_tensor_candidates(&names, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+    moe_raw_tensor_desc desc{};
+    const moe_gguf_common_tensor_record* rec =
+        moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
+    if (!rec) {
+        return 0;
+    }
+    moe_raw_tensor_cache_entry raw{};
+    if (!map_common_tensor_record(engine, *rec, desc, &raw)) {
+        return 0;
+    }
+    const uint64_t count = moe_router_raw_scalar_count(raw);
+    if (count != 1u && count != (uint64_t)experts) {
+        moe_profile_log(
+            "router_per_expert_scale_reject",
+            "layer=%d experts=%u count=%llu name=%s",
+            layer, experts, (unsigned long long)count, rec->name.c_str());
+        return 0;
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->raw_tensor_cache_mutex);
+        engine->raw_tensor_cache[key] = raw;
+    }
+    *out = raw;
+    return 1;
+}
+
+static int moe_router_apply_per_expert_scales_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    uint32_t experts,
+    std::vector<int>* selected_experts,
+    std::vector<float>* selected_weights
+) {
+    if (!engine || !selected_experts || !selected_weights || selected_experts->size() != selected_weights->size()) {
+        return 0;
+    }
+    if (selected_experts->empty() || experts == 0) {
+        return 1;
+    }
+    moe_raw_tensor_cache_entry scale_raw{};
+    if (!moe_map_router_per_expert_scale_tensor_f32(engine, layer, experts, &scale_raw)) {
+        return 1;
+    }
+    const uint64_t count = moe_router_raw_scalar_count(scale_raw);
+    double scale_abs_sum = 0.0;
+    float max_abs = 0.0f;
+    for (size_t i = 0; i < selected_experts->size(); ++i) {
+        const int expert = (*selected_experts)[i];
+        if (expert < 0 || (uint32_t)expert >= experts) {
+            return 0;
+        }
+        float scale = 1.0f;
+        const uint64_t offset = count == 1u ? 0u : (uint64_t)(uint32_t)expert;
+        if (!moe_router_raw_scalar_at_f32(scale_raw, offset, &scale) || !std::isfinite(scale)) {
+            return 0;
+        }
+        (*selected_weights)[i] *= scale;
+        const float ab = std::fabs(scale);
+        scale_abs_sum += (double)ab;
+        if (ab > max_abs) {
+            max_abs = ab;
+        }
+    }
+    moe_profile_log(
+        "router_per_expert_scale_apply",
+        "layer=%d selected=%zu count=%llu mean_abs=%.6g max_abs=%.6g first_expert=%d first_scale_weight=%.6g",
+        layer, selected_experts->size(), (unsigned long long)count,
+        scale_abs_sum / (double)selected_experts->size(), (double)max_abs,
+        selected_experts->empty() ? -1 : (*selected_experts)[0],
+        selected_weights->empty() ? 0.0 : (double)(*selected_weights)[0]);
+    return 1;
+}
+
 
 static int moe_router_name_has_suffix_f32(const std::string& name, const char* suffix) {
     if (!suffix || !suffix[0] || name.size() < std::strlen(suffix)) {
