@@ -1054,6 +1054,38 @@ def test_standard_attention_skips_noop_rope_at_position_zero():
     assert "attn_standard_rope" in attn_text
 
 
+def test_sliding_rope_does_not_inherit_full_attention_partial_factor():
+    arch = {
+        "head_dim": 256,
+        "global_head_dim": 512,
+        "partial_rotary_factor": 0.25,
+        "qk_rope_head_dim": 512,
+        "rope_parameters": {
+            "full_attention": {
+                "rope_type": "proportional",
+                "rope_theta": 1000000.0,
+                "partial_rotary_factor": 0.25,
+            },
+            "sliding_attention": {
+                "rope_type": "default",
+                "rope_theta": 10000.0,
+            },
+        },
+        "layer_types": ["sliding_attention", "full_attention"],
+    }
+    sliding = mat._juju_layer_rope_contract(0, arch)
+    full = mat._juju_layer_rope_contract(1, arch)
+    assert sliding["rope_dim"] == 256
+    assert sliding["frequency_dim"] == 256
+    assert sliding["partial_rotary_factor"] is None
+    assert full["rope_dim"] == 128
+    assert full["frequency_dim"] == 512
+    attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_prefill.cpp.inc").read_text()
+    assert "sliding_default_rope" in attn_text
+    assert "inherited_full_rope_dim" in attn_text
+    assert "head_dim > 0 && !inherited_full_rope_dim" in attn_text
+
+
 def test_router_contract_layer_slice_is_cached_and_cleared_on_reload_paths():
     state = (ROOT / "moe_engine" / "src" / "parts" / "engine_state.cpp.inc").read_text()
     router = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_topk.cpp.inc").read_text()

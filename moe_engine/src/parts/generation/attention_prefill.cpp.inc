@@ -1099,9 +1099,19 @@ static int moe_attention_layer_rope_contract_f32(
                 dvalue > 0.0 && std::isfinite(dvalue)) {
                 resolved.theta = (float)dvalue;
             }
+            std::string rope_type;
+            const int has_rope_type =
+                moe_json_get_string_local(rope_scope, "rope_type", &rope_type) ||
+                moe_json_get_string_local(rope_scope, "type", &rope_type);
+            const int proportional_rope =
+                has_rope_type && moe_ascii_contains_ci(rope_type, "proportional");
+            const int sliding_default_rope =
+                moe_ascii_contains_ci(attention_kind, "sliding") && !proportional_rope;
+            const int inherited_full_rope_dim =
+                sliding_default_rope && head_dim > 0 && resolved.rope_dim > head_dim;
             if (moe_json_get_double_local(rope_scope, "partial_rotary_factor", &dvalue) &&
                 dvalue > 0.0 && dvalue <= 1.0 && std::isfinite(dvalue) &&
-                head_dim > 0) {
+                head_dim > 0 && !inherited_full_rope_dim) {
                 uint32_t partial_dim = (uint32_t)std::round((double)head_dim * dvalue);
                 if (partial_dim < 2u) partial_dim = 2u;
                 if (partial_dim > head_dim) partial_dim = head_dim;
@@ -1118,13 +1128,9 @@ static int moe_attention_layer_rope_contract_f32(
                 resolved.proportional_frequency_known = 1;
                 resolved.proportional_frequency_dim_uses_full_head_dim = bvalue ? 1 : 0;
             }
-            std::string rope_type;
-            if (moe_json_get_string_local(rope_scope, "rope_type", &rope_type) ||
-                moe_json_get_string_local(rope_scope, "type", &rope_type)) {
-                if (moe_ascii_contains_ci(rope_type, "proportional")) {
-                    resolved.proportional_frequency_known = 1;
-                    resolved.proportional_frequency_dim_uses_full_head_dim = 1;
-                }
+            if (proportional_rope) {
+                resolved.proportional_frequency_known = 1;
+                resolved.proportional_frequency_dim_uses_full_head_dim = 1;
             }
             if (resolved.frequency_dim == 0 && resolved.proportional_frequency_dim_uses_full_head_dim && head_dim > 0) {
                 resolved.frequency_dim = head_dim;
