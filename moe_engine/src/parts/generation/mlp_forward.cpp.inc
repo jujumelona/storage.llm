@@ -737,9 +737,12 @@ static int moe_layer_moe_mlp_f32(
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router_norm.weight"));
     const int router_has_internal_weight_scale =
         moe_router_has_internal_weight_scale_contract_f32(engine, layer);
+    const int router_sidecar_requires_rms_root =
+        moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer);
     const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
     const int router_uses_raw_residual =
         router_uses_raw_residual_contract ||
+        router_sidecar_requires_rms_root ||
         (router_has_internal_weight_scale && moe_engine_contract_uses_split_ffn_norm(engine, layer));
     if (router_uses_raw_residual_contract &&
         moe_engine_contract_uses_direct_router_input_scale(engine, layer) &&
@@ -2672,9 +2675,12 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router_norm.weight"));
     const int router_has_internal_weight_scale =
         moe_router_has_internal_weight_scale_contract_f32(engine, layer);
+    const int router_sidecar_requires_rms_root =
+        moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer);
     const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
     const int router_uses_raw_residual =
         router_uses_raw_residual_contract ||
+        router_sidecar_requires_rms_root ||
         (router_has_internal_weight_scale && moe_engine_contract_uses_split_ffn_norm(engine, layer));
     if (router_uses_raw_residual_contract &&
         moe_engine_contract_uses_direct_router_input_scale(engine, layer) &&

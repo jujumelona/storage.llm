@@ -1204,6 +1204,18 @@ def test_conditional_router_hidden_rule_does_not_force_raw_input():
     assert "return moe_router_contract_object_has_activation_scale_f32(doc, obj_begin, obj_end) ? 1 : 0;" in helper
 
 
+def test_router_rms_root_sidecar_uses_raw_residual_input():
+    mlp = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
+    first = mlp[mlp.index("static int moe_layer_moe_mlp_f32"):
+                mlp.index("static uint32_t moe_mlp_prefill_expert_batch_limit")]
+    assert "moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer)" in first
+    assert "router_sidecar_requires_rms_root ||" in first
+    assert first.count("router_sidecar_requires_rms_root ||") >= 1
+    batch = mlp[mlp.index("static int moe_layer_moe_mlp_prefill_batch_f32"):]
+    assert "moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer)" in batch
+    assert "router_sidecar_requires_rms_root ||" in batch
+
+
 def test_router_layer_row_does_not_block_graphir_op_score_or_norm_lookup():
     router = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_topk.cpp.inc").read_text()
     score_block = router[router.index("static int moe_router_layer_score_contract_f32"):
