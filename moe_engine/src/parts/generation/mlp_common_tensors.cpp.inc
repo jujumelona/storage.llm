@@ -1736,24 +1736,6 @@ static int moe_graph_ir_layer_ops_tensor_names_for_role(
             if (!moe_json_next_object_in_array(doc, &op_cursor, ops_end, &op_begin, &op_end)) {
                 break;
             }
-            std::vector<std::string> role_names;
-            const size_t before_role = out_names->size();
-            if (moe_json_get_string_array_slice(doc, op_begin, op_end, role_key, &role_names) &&
-                !role_names.empty()) {
-                moe_graph_ir_push_unique_names_f32(out_names, role_names);
-            }
-            std::string single_role_name;
-            if (moe_json_get_string_slice(doc, op_begin, op_end, role_key, &single_role_name) &&
-                !single_role_name.empty()) {
-                moe_graph_ir_push_unique_names_f32(out_names, std::vector<std::string>{single_role_name});
-            }
-            if (out_names->size() > before_role) {
-                moe_profile_log(
-                    "graphir_contract_tensor_names",
-                    "layer=%d role=%s count=%zu source=%s.layers.ops.%s",
-                    layer, role_key, out_names->size() - before_role,
-                    doc_names[doc_i], role_key);
-            }
             if (!moe_graph_ir_layer_op_matches_tensor_role_f32(doc, op_begin, op_end, role_key)) {
                 continue;
             }
@@ -1951,41 +1933,6 @@ static int moe_graph_ir_map_layer_contract_tensor_role_f32(
         return 1;
     }
     return 0;
-}
-
-static int moe_graph_ir_map_layer_expert_output_scale_f32(
-    moe_pc_engine* engine,
-    int32_t layer,
-    moe_raw_tensor_cache_entry* out
-) {
-    static const char* const roles[] = {
-        "per_expert_output_scale",
-        "expert_output_scale",
-        "routed_expert_output_scale",
-        "moe_expert_output_scale"
-    };
-    for (const char* role : roles) {
-        if (moe_graph_ir_map_layer_contract_tensor_role_f32(engine, layer, "mlp", role, out)) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static int moe_map_layer_expert_output_scale_tensor_f32(
-    moe_pc_engine* engine,
-    int32_t layer,
-    const char* const* fallback_suffixes,
-    size_t fallback_suffix_count,
-    moe_raw_tensor_cache_entry* out
-) {
-    if (!engine || !out) {
-        return 0;
-    }
-    if (moe_graph_ir_map_layer_expert_output_scale_f32(engine, layer, out)) {
-        return 1;
-    }
-    return moe_map_layer_common_tensor(engine, layer, fallback_suffixes, fallback_suffix_count, out);
 }
 
 static int moe_graph_ir_apply_rmsnorm_role_any_f32(

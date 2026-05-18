@@ -837,15 +837,9 @@ def test_ple_vocab_masking_allows_smaller_per_layer_vocab():
     assert '"post_norm.weight"' in mlp_common
 
 
-def test_expert_down_scale_uses_graphir_role_before_legacy_suffix_fallback():
-    common_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_common_tensors.cpp.inc").read_text()
+def test_expert_down_scale_is_legacy_runtime_scale_but_not_direct_contract_scale():
     norm_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
     fwd_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
-    assert "moe_map_layer_expert_output_scale_tensor_f32" in common_text
-    assert '"per_expert_output_scale"' in common_text
-    assert "moe_graph_ir_map_layer_contract_tensor_role_f32(engine, layer, \"mlp\", role, out)" in common_text
-    assert '"ffn_down_exps.scale"' not in norm_text
-    assert '"ffn_down_exps.scale"' not in fwd_text
     for text in (norm_text, fwd_text):
         assert "direct_contract_suffixes" in text
         direct_block = text[text.index("static const char* const direct_contract_suffixes[]"):
@@ -854,7 +848,10 @@ def test_expert_down_scale_uses_graphir_role_before_legacy_suffix_fallback():
         assert '"per_expert_scale"' in direct_block
         assert '"experts.per_expert_scale"' in direct_block
         assert "moe_engine_contract_uses_direct_per_expert_scale(engine, layer)" in text
-        assert "moe_map_layer_expert_output_scale_tensor_f32(engine, layer, scale_suffixes, scale_suffix_count, &raw)" in text
+        legacy_scale_pos = text.index('"ffn_down_exps.scale"')
+        direct_pos = text.index("static const char* const direct_contract_suffixes[]")
+        assert legacy_scale_pos < direct_pos
+        assert "runtime expert-down branch scale" in text
 
 
 def test_raw_residual_router_input_requires_explicit_graph_contract():
