@@ -2234,6 +2234,105 @@ static bool body_requests_response_only_chat_eval(const std::string& body) {
     return role_is_assistant_like(last.role) && !last.content.empty();
 }
 
+static bool encode_chat_response_only_generation_prompt_eval(
+    const server_options& opts,
+    const server_tokenizer& tok,
+    const std::vector<server_chat_message>& messages,
+    bool enable_thinking,
+    std::vector<int32_t>* out_ids,
+    uint32_t* out_first_target_index
+) {
+    if (!out_ids || !out_first_target_index || messages.size() < 2u) {
+        return false;
+    }
+    const server_chat_message& last = messages.back();
+    if (!role_is_assistant_like(last.role) || last.content.empty()) {
+        return false;
+    }
+
+    std::vector<server_chat_message> prompt_messages(messages.begin(), messages.end() - 1);
+    const std::string prompt = apply_sidecar_chat_template(opts, prompt_messages, true, enable_thinking);
+    if (prompt.empty()) {
+        return false;
+    }
+
+    std::vector<int32_t> prompt_ids;
+    if (!tokenizer_encode_greedy(tok, prompt, &prompt_ids) || prompt_ids.empty()) {
+        return false;
+    }
+
+    std::vector<int32_t> full_ids;
+    if (!tokenizer_encode_greedy(tok, prompt + last.content, &full_ids) ||
+        full_ids.size() <= prompt_ids.size() ||
+        !tokens_have_prefix(full_ids, prompt_ids)) {
+        const size_t common = token_common_prefix_len(full_ids, prompt_ids);
+        std::cerr << "[storagellm request] eval response_only_chat generation_prompt_rejected"
+                  << " reason=prompt_prefix_mismatch"
+                  << " prompt_tokens=" << prompt_ids.size()
+                  << " full_tokens=" << full_ids.size()
+                  << " common_prefix=" << common
+                  << "\n" << std::flush;
+        return false;
+    }
+
+    *out_ids = std::move(full_ids);
+    *out_first_target_index = static_cast<uint32_t>(prompt_ids.size());
+    std::cerr << "[storagellm request] eval response_only_chat prompt_tokens="
+              << prompt_ids.size()
+              << " target_tokens=" << (out_ids->size() - prompt_ids.size())
+              << " input_tokens=" << out_ids->size()
+              << " template_mode=generation_prompt"
+              << "\n" << std::flush;
+    return true;
+}
+
+static bool encode_chat_response_only_full_messages_eval(
+    const server_options& opts,
+    const server_tokenizer& tok,
+    const std::vector<server_chat_message>& messages,
+    bool enable_thinking,
+    std::vector<int32_t>* out_ids,
+    uint32_t* out_first_target_index
+) {
+    if (!out_ids || !out_first_target_index || messages.size() < 2u) {
+        return false;
+    }
+    const server_chat_message& last = messages.back();
+    if (!role_is_assistant_like(last.role) || last.content.empty()) {
+        return false;
+    }
+
+    const std::string full_templated = apply_sidecar_chat_template(opts, messages, false, enable_thinking);
+    if (full_templated.empty()) {
+        return false;
+    }
+    const size_t content_pos = full_templated.rfind(last.content);
+    if (content_pos == std::string::npos) {
+        return false;
+    }
+
+    const std::string full_prefix = full_templated.substr(0, content_pos);
+    std::vector<int32_t> full_ids;
+    std::vector<int32_t> full_prefix_ids;
+    if (!tokenizer_encode_greedy(tok, full_templated, &full_ids) ||
+        !tokenizer_encode_greedy(tok, full_prefix, &full_prefix_ids) ||
+        full_prefix_ids.empty() ||
+        full_ids.size() <= full_prefix_ids.size() ||
+        !tokens_have_prefix(full_ids, full_prefix_ids)) {
+        return false;
+    }
+
+    *out_ids = std::move(full_ids);
+    *out_first_target_index = static_cast<uint32_t>(full_prefix_ids.size());
+    std::cerr << "[storagellm request] eval response_only_chat prompt_tokens="
+              << full_prefix_ids.size()
+              << " target_tokens=" << (out_ids->size() - full_prefix_ids.size())
+              << " input_tokens=" << out_ids->size()
+              << " template_mode=full_messages"
+              << "\n" << std::flush;
+    return true;
+}
+
 static bool encode_chat_response_only_eval(
     const server_options& opts,
     const server_tokenizer& tok,
@@ -2259,62 +2358,13 @@ static bool encode_chat_response_only_eval(
     }
     bool enable_thinking = false;
     (void)json_read_bool_in_range(body, 0, body.size(), "enable_thinking", &enable_thinking);
-    std::vector<int32_t> full_ids;
 
-    const std::string full_templated = apply_sidecar_chat_template(opts, messages, false, enable_thinking);
-    if (!full_templated.empty()) {
-        const size_t content_pos = full_templated.rfind(last.content);
-        if (content_pos != std::string::npos) {
-            const std::string full_prefix = full_templated.substr(0, content_pos);
-            std::vector<int32_t> full_prefix_ids;
-            if (tokenizer_encode_greedy(tok, full_templated, &full_ids) &&
-                tokenizer_encode_greedy(tok, full_prefix, &full_prefix_ids) &&
-                !full_prefix_ids.empty() &&
-                full_ids.size() > full_prefix_ids.size() &&
-                tokens_have_prefix(full_ids, full_prefix_ids)) {
-                *out_ids = std::move(full_ids);
-                *out_first_target_index = static_cast<uint32_t>(full_prefix_ids.size());
-                std::cerr << "[storagellm request] eval response_only_chat prompt_tokens="
-                          << full_prefix_ids.size()
-                          << " target_tokens=" << (out_ids->size() - full_prefix_ids.size())
-                          << " input_tokens=" << out_ids->size()
-                          << " template_mode=full_messages"
-                          << "\n" << std::flush;
-                return true;
-            }
-        }
+    if (encode_chat_response_only_generation_prompt_eval(
+            opts, tok, messages, enable_thinking, out_ids, out_first_target_index)) {
+        return true;
     }
-
-    std::vector<server_chat_message> prompt_messages(messages.begin(), messages.end() - 1);
-    const std::string prompt = apply_sidecar_chat_template(opts, prompt_messages, true, enable_thinking);
-    if (prompt.empty()) {
-        return false;
-    }
-    std::vector<int32_t> prompt_ids;
-    if (!tokenizer_encode_greedy(tok, prompt, &prompt_ids) || prompt_ids.empty()) {
-        return false;
-    }
-
-    if (!tokenizer_encode_greedy(tok, prompt + last.content, &full_ids) ||
-        full_ids.size() <= prompt_ids.size() ||
-        !tokens_have_prefix(full_ids, prompt_ids)) {
-        const size_t common = token_common_prefix_len(full_ids, prompt_ids);
-        std::cerr << "[storagellm request] eval response_only_chat generation_prompt_rejected"
-                  << " reason=prompt_prefix_mismatch"
-                  << " prompt_tokens=" << prompt_ids.size()
-                  << " full_tokens=" << full_ids.size()
-                  << " common_prefix=" << common
-                  << "\n" << std::flush;
-        full_ids.clear();
-    } else {
-        *out_ids = std::move(full_ids);
-        *out_first_target_index = static_cast<uint32_t>(prompt_ids.size());
-        std::cerr << "[storagellm request] eval response_only_chat prompt_tokens="
-                  << prompt_ids.size()
-                  << " target_tokens=" << (out_ids->size() - prompt_ids.size())
-                  << " input_tokens=" << out_ids->size()
-                  << " template_mode=generation_prompt_fallback"
-                  << "\n" << std::flush;
+    if (encode_chat_response_only_full_messages_eval(
+            opts, tok, messages, enable_thinking, out_ids, out_first_target_index)) {
         return true;
     }
 
