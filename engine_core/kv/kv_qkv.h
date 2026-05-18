@@ -219,6 +219,9 @@ typedef struct {
     int* outlier_indices;     // [outlier_channels] indices of outlier channels
     int* k_outlier_indices;   // [outlier_channels] key-specific outlier channels
     int* v_outlier_indices;   // [outlier_channels] value-specific outlier channels
+    int outlier_indices_explicit;
+    int k_outlier_indices_ready;
+    int v_outlier_indices_ready;
     uint8_t* k_is_outlier;    // [head_dim] O(1) boolean lookup
     uint8_t* v_is_outlier;    // [head_dim] O(1) boolean lookup
     uint8_t* k_idx_outlier;   // Packed indices for outlier channels

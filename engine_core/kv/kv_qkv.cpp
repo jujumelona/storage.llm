@@ -19,6 +19,7 @@
 #include <string.h>
 #include <algorithm>
 #include <climits>
+#include <vector>
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
@@ -367,6 +368,96 @@ static int qkv_quantize_split_vector_with_state(
     return 1;
 }
 
+static int qkv_prepare_dynamic_outlier_indices(
+    qkv_state_t* state,
+    const qkv_config_t* config,
+    int target,
+    const float* current,
+    int token_idx
+) {
+    if (!state || !config || !current || state->outlier_indices_explicit ||
+        !qkv_outlier_split_ready(state, config, target)) {
+        return 1;
+    }
+    int* indices = qkv_outlier_indices_for_target(state, target);
+    uint8_t* is_outlier = (target == QKV_TARGET_KEY) ? state->k_is_outlier :
+        (target == QKV_TARGET_VALUE) ? state->v_is_outlier : nullptr;
+    int* ready = (target == QKV_TARGET_KEY) ? &state->k_outlier_indices_ready :
+        (target == QKV_TARGET_VALUE) ? &state->v_outlier_indices_ready : nullptr;
+    const float* sink = (target == QKV_TARGET_KEY) ? state->k_sink :
+        (target == QKV_TARGET_VALUE) ? state->v_sink : nullptr;
+    if (!indices || !is_outlier || !ready) {
+        return 0;
+    }
+    if (*ready) {
+        return 1;
+    }
+
+    const int dim = config->head_dim;
+    const int n_out = config->outlier_channels;
+    if (dim <= 0 || dim > 16384 || n_out <= 0 || n_out >= dim) {
+        return 0;
+    }
+    if (sink && (uint32_t)token_idx < state->sink_tokens) {
+        // Sink tokens are consumed from exact storage by attention. Keep the
+        // constructor's temporary 0..N split until there is at least one
+        // compressed token, then select channels from the exact sink prefix
+        // plus that first compressed vector and replay the sink quantization.
+        return 1;
+    }
+
+    std::vector<std::pair<float, int>> scores;
+    scores.reserve((size_t)dim);
+    const uint32_t usable_sink = sink
+        ? std::min<uint32_t>(state->sink_tokens, (uint32_t)std::max(0, token_idx))
+        : 0u;
+    for (int ch = 0; ch < dim; ++ch) {
+        double sum_sq = (double)current[ch] * (double)current[ch];
+        for (uint32_t t = 0; t < usable_sink; ++t) {
+            const float v = sink[(size_t)t * (size_t)dim + (size_t)ch];
+            sum_sq += (double)v * (double)v;
+        }
+        scores.emplace_back((float)sum_sq, ch);
+    }
+    std::partial_sort(
+        scores.begin(),
+        scores.begin() + n_out,
+        scores.end(),
+        [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+            if (a.first != b.first) {
+                return a.first > b.first;
+            }
+            return a.second < b.second;
+        });
+    memset(is_outlier, 0, (size_t)dim);
+    for (int i = 0; i < n_out; ++i) {
+        const int ch = scores[(size_t)i].second;
+        if (ch < 0 || ch >= dim) {
+            return 0;
+        }
+        indices[i] = ch;
+        is_outlier[ch] = 1;
+    }
+    *ready = 1;
+
+    const uint32_t replay = std::min<uint32_t>(usable_sink, state->sink_tokens);
+    float dummy_norm = 0.0f;
+    for (uint32_t t = 0; t < replay; ++t) {
+        if (!qkv_quantize_split_vector_with_state(
+                state,
+                config,
+                target,
+                sink + (size_t)t * (size_t)dim,
+                (int)t,
+                &dummy_norm,
+                target == QKV_TARGET_KEY ? state->k_qjl : state->v_qjl,
+                target == QKV_TARGET_KEY ? state->k_residual_norms : state->v_residual_norms)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 
 static int qkv_store_qjl_residual_for_token(
     qkv_state_t* state,
@@ -476,6 +567,10 @@ int qkv_quantize_token(
     uint8_t* k_out = state->k_idx + (size_t)token_idx * k_stride;
     const bool k_split = qkv_outlier_split_ready(state, config, QKV_TARGET_KEY);
     if (k_split) {
+        if (!qkv_prepare_dynamic_outlier_indices(
+                state, config, QKV_TARGET_KEY, key, token_idx)) {
+            return 0;
+        }
         if (!qkv_quantize_split_vector_with_state(
                 state, config, QKV_TARGET_KEY, key, token_idx,
                 &state->k_norms[token_idx], state->k_qjl, state->k_residual_norms)) {
@@ -495,6 +590,10 @@ int qkv_quantize_token(
     uint8_t* v_out = state->v_idx + (size_t)token_idx * v_stride;
     const bool v_split = qkv_outlier_split_ready(state, config, QKV_TARGET_VALUE);
     if (v_split) {
+        if (!qkv_prepare_dynamic_outlier_indices(
+                state, config, QKV_TARGET_VALUE, value, token_idx)) {
+            return 0;
+        }
         if (!qkv_quantize_split_vector_with_state(
                 state, config, QKV_TARGET_VALUE, value, token_idx,
                 &state->v_norms[token_idx], state->v_qjl, state->v_residual_norms)) {
@@ -552,6 +651,10 @@ int qkv_quantize(
         uint8_t* k_out = state->k_idx + k_offset;
         const bool k_split = qkv_outlier_split_ready(state, config, QKV_TARGET_KEY);
         if (k_split) {
+            if (!qkv_prepare_dynamic_outlier_indices(
+                    state, config, QKV_TARGET_KEY, key_data + t * dim, t)) {
+                return 0;
+            }
             if (!qkv_quantize_split_vector_with_state(
                     state, config, QKV_TARGET_KEY,
                     key_data + t * dim, t, &state->k_norms[t],
@@ -762,6 +865,10 @@ int qkv_quantize(
         uint8_t* v_out = state->v_idx + v_offset;
         const bool v_split = qkv_outlier_split_ready(state, config, QKV_TARGET_VALUE);
         if (v_split) {
+            if (!qkv_prepare_dynamic_outlier_indices(
+                    state, config, QKV_TARGET_VALUE, value_data + t * dim, t)) {
+                return 0;
+            }
             if (!qkv_quantize_split_vector_with_state(
                     state, config, QKV_TARGET_VALUE,
                     value_data + t * dim, t, &state->v_norms[t],
