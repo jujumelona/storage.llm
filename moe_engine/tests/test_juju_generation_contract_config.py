@@ -578,7 +578,7 @@ def test_router_input_mode_does_not_use_bare_ffn_gate_inp_as_internal_router_sca
     assert "moe_router_has_internal_weight_scale_contract_f32" in first_block
     assert "router_uses_raw_residual_contract && router_has_plausible_input_scale" not in first_block
     assert "router_uses_raw_residual_contract || router_has_internal_weight_scale" not in first_block
-    assert "const int router_uses_raw_residual = router_uses_raw_residual_contract;" in first_block
+    assert "moe_layer_router_should_use_raw_residual_f32(" in first_block
     assert "(router_has_internal_norm_scale || router_uses_raw_residual) ?" in first_block
     assert "router_scale_available=%d" in mlp_text
     internal_start = router_text.index("moe_router_has_internal_weight_scale_contract_f32")
@@ -1206,14 +1206,17 @@ def test_conditional_router_hidden_rule_does_not_force_raw_input():
 
 def test_router_rms_root_sidecar_uses_raw_residual_input():
     mlp = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
+    helper = mlp[mlp.index("static int moe_layer_router_should_use_raw_residual_f32"):
+                 mlp.index("static int moe_layer_moe_mlp_f32")]
+    assert "router_sidecar_requires_rms_root" in helper
+    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer)" in helper
     first = mlp[mlp.index("static int moe_layer_moe_mlp_f32"):
                 mlp.index("static uint32_t moe_mlp_prefill_expert_batch_limit")]
     assert "moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer)" in first
-    assert "router_sidecar_requires_rms_root ||" in first
-    assert first.count("router_sidecar_requires_rms_root ||") >= 1
+    assert "moe_layer_router_should_use_raw_residual_f32(" in first
     batch = mlp[mlp.index("static int moe_layer_moe_mlp_prefill_batch_f32"):]
     assert "moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer)" in batch
-    assert "router_sidecar_requires_rms_root ||" in batch
+    assert "moe_layer_router_should_use_raw_residual_f32(" in batch
 
 
 def test_router_layer_row_does_not_block_graphir_op_score_or_norm_lookup():
