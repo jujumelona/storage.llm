@@ -672,6 +672,9 @@ struct server_tokenizer {
     bool has_bos = false;
     bool has_eos = false;
     bool has_unk = false;
+    bool bos_token_id_from_piece = false;
+    bool eos_token_id_from_piece = false;
+    bool unk_token_id_from_piece = false;
     bool add_bos_token = false;
     bool add_bos_token_explicit = false;
     bool add_eos_token = false;
@@ -1313,6 +1316,62 @@ static bool tokenizer_is_control_token_text(const std::string& piece) {
     return false;
 }
 
+static bool tokenizer_exact_piece_is_special(const std::string& piece, const char* name) {
+    if (!name || !*name) {
+        return false;
+    }
+    const std::string lowered = lower_ascii(piece);
+    const std::string bare(name);
+    return lowered == ("<" + bare + ">") ||
+           lowered == ("<|" + bare + "|>") ||
+           lowered == ("[" + bare + "]");
+}
+
+static bool tokenizer_find_piece_id(
+    const server_tokenizer* tok,
+    const std::string& piece,
+    uint32_t* out_id
+) {
+    if (!tok || piece.empty() || !out_id) {
+        return false;
+    }
+    auto pit = tok->piece_to_id.find(piece);
+    if (pit != tok->piece_to_id.end()) {
+        *out_id = pit->second;
+        return true;
+    }
+    auto tit = tok->text_to_id.find(piece);
+    if (tit != tok->text_to_id.end()) {
+        *out_id = tit->second;
+        return true;
+    }
+    return false;
+}
+
+static bool tokenizer_set_special_from_piece(
+    server_tokenizer* tok,
+    const std::string& piece,
+    const char* name,
+    uint32_t* token_id,
+    bool* has_token,
+    bool* from_piece
+) {
+    if (!tok || !token_id || !has_token || !from_piece || piece.empty()) {
+        return false;
+    }
+    if (!tokenizer_exact_piece_is_special(piece, name)) {
+        return false;
+    }
+    uint32_t id = 0;
+    if (!tokenizer_find_piece_id(tok, piece, &id)) {
+        return false;
+    }
+    *token_id = id;
+    *has_token = true;
+    *from_piece = true;
+    return true;
+}
+
 static void tokenizer_add_special_piece(server_tokenizer* tok, const std::string& piece, uint32_t id) {
     if (!tok || piece.empty()) {
         return;
@@ -1346,20 +1405,20 @@ static void tokenizer_add_piece(server_tokenizer* tok, const std::string& raw_pi
     if (text_piece != raw_piece && tokenizer_is_control_token_text(text_piece)) {
         tokenizer_add_special_piece(tok, text_piece, id);
     }
-    const std::string lowered = lower_ascii(raw_piece);
-    if (!tok->has_bos && lowered.find("bos") != std::string::npos) {
+    if (!tok->has_bos && tokenizer_exact_piece_is_special(raw_piece, "bos")) {
         tok->bos_token_id = id;
         tok->has_bos = true;
+        tok->bos_token_id_from_piece = true;
     }
-    if (!tok->has_unk && lowered.find("unk") != std::string::npos) {
+    if (!tok->has_unk && tokenizer_exact_piece_is_special(raw_piece, "unk")) {
         tok->unk_token_id = id;
         tok->has_unk = true;
+        tok->unk_token_id_from_piece = true;
     }
-    if (!tok->has_eos && (lowered.find("eos") != std::string::npos ||
-                          lowered.find("end") != std::string::npos ||
-                          lowered.find("eot") != std::string::npos)) {
+    if (!tok->has_eos && tokenizer_exact_piece_is_special(raw_piece, "eos")) {
         tok->eos_token_id = id;
         tok->has_eos = true;
+        tok->eos_token_id_from_piece = true;
     }
 }
 
@@ -1589,43 +1648,56 @@ static void tokenizer_apply_runtime_config(server_tokenizer* tok, const std::str
         tok->add_space_prefix = add_space;
     }
     uint32_t bos_id = 0;
-    if (json_read_u32_in_range(json, 0, json.size(), "bos_token_id", &bos_id) ||
-        json_read_u32_in_range(json, 0, json.size(), "tokenizer.ggml.bos_token_id", &bos_id)) {
+    if (!tok->bos_token_id_from_piece &&
+        (json_read_u32_in_range(json, 0, json.size(), "bos_token_id", &bos_id) ||
+         json_read_u32_in_range(json, 0, json.size(), "tokenizer.ggml.bos_token_id", &bos_id))) {
         tok->bos_token_id = bos_id;
         tok->has_bos = true;
     }
     uint32_t eos_id = 0;
-    if (json_read_u32_in_range(json, 0, json.size(), "eos_token_id", &eos_id) ||
-        json_read_u32_in_range(json, 0, json.size(), "tokenizer.ggml.eos_token_id", &eos_id)) {
+    if (!tok->eos_token_id_from_piece &&
+        (json_read_u32_in_range(json, 0, json.size(), "eos_token_id", &eos_id) ||
+         json_read_u32_in_range(json, 0, json.size(), "tokenizer.ggml.eos_token_id", &eos_id))) {
         tok->eos_token_id = eos_id;
         tok->has_eos = true;
     }
     uint32_t unk_id = 0;
-    if (json_read_u32_in_range(json, 0, json.size(), "unk_token_id", &unk_id) ||
-        json_read_u32_in_range(json, 0, json.size(), "unknown_token_id", &unk_id) ||
-        json_read_u32_in_range(json, 0, json.size(), "tokenizer.ggml.unknown_token_id", &unk_id)) {
+    if (!tok->unk_token_id_from_piece &&
+        (json_read_u32_in_range(json, 0, json.size(), "unk_token_id", &unk_id) ||
+         json_read_u32_in_range(json, 0, json.size(), "unknown_token_id", &unk_id) ||
+         json_read_u32_in_range(json, 0, json.size(), "tokenizer.ggml.unknown_token_id", &unk_id))) {
         tok->unk_token_id = unk_id;
         tok->has_unk = true;
     }
     std::string bos_piece;
     if (json_read_string_value(json, "bos_token", &bos_piece) && !bos_piece.empty()) {
-        auto pit = tok->piece_to_id.find(bos_piece);
-        if (pit != tok->piece_to_id.end()) {
-            tok->bos_token_id = pit->second;
-            tok->has_bos = true;
-        } else {
-            auto tit = tok->text_to_id.find(bos_piece);
-            if (tit != tok->text_to_id.end()) {
-                tok->bos_token_id = tit->second;
-                tok->has_bos = true;
-            }
-        }
+        (void)tokenizer_set_special_from_piece(
+            tok, bos_piece, "bos", &tok->bos_token_id, &tok->has_bos, &tok->bos_token_id_from_piece);
+    }
+    std::string eos_piece;
+    if (json_read_string_value(json, "eos_token", &eos_piece) && !eos_piece.empty()) {
+        (void)tokenizer_set_special_from_piece(
+            tok, eos_piece, "eos", &tok->eos_token_id, &tok->has_eos, &tok->eos_token_id_from_piece);
+    }
+    std::string unk_piece;
+    if (json_read_string_value(json, "unk_token", &unk_piece) && !unk_piece.empty()) {
+        (void)tokenizer_set_special_from_piece(
+            tok, unk_piece, "unk", &tok->unk_token_id, &tok->has_unk, &tok->unk_token_id_from_piece);
     }
     if (!tok->has_bos) {
         auto it = tok->piece_to_id.find("<bos>");
         if (it != tok->piece_to_id.end()) {
             tok->bos_token_id = it->second;
             tok->has_bos = true;
+            tok->bos_token_id_from_piece = true;
+        }
+    }
+    if (!tok->has_eos) {
+        auto it = tok->piece_to_id.find("<eos>");
+        if (it != tok->piece_to_id.end()) {
+            tok->eos_token_id = it->second;
+            tok->has_eos = true;
+            tok->eos_token_id_from_piece = true;
         }
     }
     std::string tokenizer_class;

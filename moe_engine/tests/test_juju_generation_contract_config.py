@@ -1361,3 +1361,18 @@ def test_router_global_explicit_config_not_blocked_by_layer_contract_rows():
     assert "if (moe_router_json_get_double_any(engine->offload_graph_ir_json" in double_block
     assert "if (has_layer_contract_row)" not in u32_block[u32_block.rindex("for (size_t i = 0; i < key_count; ++i)"):]
     assert "moe_json_get_u64_local(engine->offload_graph_ir_json" in u32_block
+
+
+def test_server_tokenizer_keeps_exact_eos_piece_over_generation_eot_ids():
+    src = (ROOT / "moe_engine/examples/pc_engine_server.cpp").read_text(encoding="utf-8", errors="ignore")
+    add_piece = src[src.index("static void tokenizer_add_piece"):
+                    src.index("static void tokenizer_add_unigram_piece")]
+    assert 'tokenizer_exact_piece_is_special(raw_piece, "eos")' in add_piece
+    assert 'lowered.find("eot")' not in add_piece
+    assert 'lowered.find("end")' not in add_piece
+
+    runtime = src[src.index("static void tokenizer_apply_runtime_config"):
+                  src.index("static void tokenizer_prepend_bos_if_needed")]
+    assert "!tok->eos_token_id_from_piece" in runtime
+    assert '"eos_token"' in runtime
+    assert "tokenizer_set_special_from_piece(" in runtime
