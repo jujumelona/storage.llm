@@ -352,12 +352,29 @@ static int moe_map_router_per_expert_scale_tensor_f32(
         "moe.gate.per_expert_scale",
         "moe.gate.per_expert_scale.weight"
     };
+    static const char* const legacy_generated_juju_suffixes[] = {
+        "ffn_down_exps.scale"
+    };
     if (!mapped) {
         std::vector<std::string> names;
         moe_push_layer_tensor_candidates(&names, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
         moe_raw_tensor_desc desc{};
         const moe_gguf_common_tensor_record* rec =
             moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
+        if (!rec && moe_graph_ir_math_required(engine)) {
+            // Older generated JUJU indexes placed Gemma4 router per-expert
+            // scale in graph_ir.layers[].ops.moe_experts.per_expert_output_scale
+            // while the materializer contract and HF reference semantics use
+            // it as top-k router weight scale. Keep this as a migration fallback
+            // only after explicit GraphIR/router contract lookup failed.
+            names.clear();
+            moe_push_layer_tensor_candidates(
+                &names,
+                layer,
+                legacy_generated_juju_suffixes,
+                sizeof(legacy_generated_juju_suffixes) / sizeof(legacy_generated_juju_suffixes[0]));
+            rec = moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
+        }
         if (!rec) {
             return 0;
         }

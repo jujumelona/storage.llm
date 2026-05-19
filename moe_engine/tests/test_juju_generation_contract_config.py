@@ -891,9 +891,10 @@ def test_expert_down_scale_is_legacy_runtime_scale_but_not_direct_contract_scale
             assert "runtime expert-down branch scale" in text
     router_block = router_text[router_text.index("moe_map_router_per_expert_scale_tensor_f32"):
                                router_text.index("static int moe_router_apply_per_expert_scales_f32")]
-    assert '"ffn_down_exps.scale"' not in router_block
     assert "moe_graph_ir_map_layer_op_role_any" in router_block
     assert "moe_graph_ir_map_layer_contract_tensor_role_f32" in router_block
+    assert "legacy_generated_juju_suffixes" in router_block
+    assert '"ffn_down_exps.scale"' in router_block
     assert '"router.per_expert_scale.weight"' in router_block
     assert "count != 1u && count != (uint64_t)experts" in router_block
     assert "moe_router_apply_per_expert_scales_f32" in topk_text
