@@ -1027,6 +1027,38 @@ struct moe_attention_rope_contract_t {
     int proportional_frequency_dim_uses_full_head_dim = 0;
 };
 
+static int moe_attention_json_get_valid_double_any_f32(
+    const std::string& text,
+    const char* key,
+    double min_value,
+    double max_value,
+    double* out
+) {
+    if (!key || !out) {
+        return 0;
+    }
+    const std::string needle = std::string("\"") + key + "\"";
+    size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::string::npos) {
+        const size_t colon = text.find_first_not_of(" \t\r\n", pos + needle.size());
+        if (colon != std::string::npos && colon < text.size() && text[colon] == ':') {
+            const size_t value_pos = text.find_first_not_of(" \t\r\n", colon + 1);
+            if (value_pos != std::string::npos && value_pos < text.size()) {
+                char* end = nullptr;
+                const char* begin = text.c_str() + value_pos;
+                const double value = std::strtod(begin, &end);
+                if (end && end != begin && std::isfinite(value) &&
+                    value > min_value && value <= max_value) {
+                    *out = value;
+                    return 1;
+                }
+            }
+        }
+        pos += needle.size();
+    }
+    return 0;
+}
+
 static int moe_attention_partial_rotary_factor_f32(
     const moe_pc_engine* engine,
     const std::string& doc,
@@ -1041,11 +1073,13 @@ static int moe_attention_partial_rotary_factor_f32(
     double value = 0.0;
     if ((moe_json_get_double_local(rope_scope, "partial_rotary_factor", &value) ||
          moe_json_get_double_local(row, "partial_rotary_factor", &value) ||
-         moe_json_get_double_local(doc, "partial_rotary_factor", &value) ||
+         moe_attention_json_get_valid_double_any_f32(
+             doc, "partial_rotary_factor", 0.0, 1.0, &value) ||
          (engine && engine->model_config_partial_rotary_factor > 0.0f &&
           (value = (double)engine->model_config_partial_rotary_factor) > 0.0) ||
          (engine && !engine->offload_gguf_metadata_json.empty() &&
-          moe_json_get_double_local(engine->offload_gguf_metadata_json, "partial_rotary_factor", &value))) &&
+          moe_attention_json_get_valid_double_any_f32(
+              engine->offload_gguf_metadata_json, "partial_rotary_factor", 0.0, 1.0, &value))) &&
         value > 0.0 && value <= 1.0 && std::isfinite(value)) {
         *out_partial = value;
         return 1;
