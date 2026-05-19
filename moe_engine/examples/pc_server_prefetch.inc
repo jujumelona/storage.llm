@@ -13,7 +13,14 @@ static bool validate_prefetch_request(
 ) {
     // Get model shape
     const auto shape = moe_pc_Moe1_model_shape();
-    const int layer_count = static_cast<int>(shape.num_hidden_layers);
+    int layer_count = static_cast<int>(shape.num_hidden_layers);
+    if (layer_count <= 0 && engine) {
+        moe_forward_status_t status{};
+        if (moe_pc_engine_get_forward_status(engine, &status) &&
+            status.dynamic_num_hidden_layers > 0) {
+            layer_count = static_cast<int>(status.dynamic_num_hidden_layers);
+        }
+    }
 
     // Validate layer range
     if (current_layer < 0 || current_layer >= layer_count) {
@@ -37,7 +44,7 @@ static bool validate_prefetch_request(
 
         // Validate each expert ID
         for (int id : ids) {
-            if (id < 0 || id >= expert_count) {
+            if (id < 0 || (expert_count > 0 && id >= expert_count)) {
                 if (err) *err = std::string(field) + " contains invalid expert id " +
                                 std::to_string(id) + " (valid range: [0, " +
                                 std::to_string(expert_count) + "))";
@@ -89,10 +96,22 @@ static void server_orchestrate_request_prefetch(
     const server_options& opts,
     const std::string& body
 ) {
+    size_t key_colon = 0;
+    const bool has_current_layer = storagellm::find_top_level_key_colon(body, "current_layer", key_colon);
+    const bool has_selected_experts = storagellm::find_top_level_key_colon(body, "selected_experts", key_colon);
+    const bool has_next_experts = storagellm::find_top_level_key_colon(body, "next_experts", key_colon);
+    if (!has_current_layer && !has_selected_experts && !has_next_experts) {
+        return;
+    }
+
     int layer = static_cast<int>(moe_pc_Moe1_model_shape().first_moe_layer);
+    if (layer < 0) layer = 0;
     storagellm::json_read_int(body, "current_layer", &layer);
     std::vector<int> selected = storagellm::json_read_int_array(body, "selected_experts");
     std::vector<int> next = storagellm::json_read_int_array(body, "next_experts");
+    if (selected.empty() && next.empty()) {
+        return;
+    }
 
     // Validate request (Bug B2: semantic validation)
     std::string validation_error;
