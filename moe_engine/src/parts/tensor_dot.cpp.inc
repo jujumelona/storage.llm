@@ -344,7 +344,10 @@ static inline moe_simple_row_dot_fn moe_cpu_simple_row_dot_for_format(int weight
         case moe_WEIGHT_ENCODING_RAW_FP16: return &moe_dot_raw_fp16_row;
         case moe_WEIGHT_ENCODING_RAW_BF16: return &moe_dot_raw_bf16_row;
         case moe_WEIGHT_ENCODING_RAW_FP32: return &moe_dot_raw_fp32_row;
-        case moe_WEIGHT_ENCODING_MXFP4: return &moe_dot_gguf_mxfp4_row;
+        // MXFP4 row layout depends on the physical row stride carried by the
+        // tensor index.  The simple-dot ABI has no row-bytes argument, so using
+        // it would silently decode 16-value JUJU rows as legacy 32-value rows.
+        case moe_WEIGHT_ENCODING_MXFP4: return nullptr;
         case moe_WEIGHT_ENCODING_GGUF_Q4_0: return &moe_dot_gguf_q4_0_row;
         case moe_WEIGHT_ENCODING_GGUF_Q4_1: return &moe_dot_gguf_q4_1_row;
         case moe_WEIGHT_ENCODING_GGUF_Q5_0: return &moe_dot_gguf_q5_0_row;
