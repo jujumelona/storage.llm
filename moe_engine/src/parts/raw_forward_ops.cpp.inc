@@ -93,9 +93,6 @@ static int moe_engine_rmsnorm_unit_offset(
     int parsed_value = 0;
     int metadata_found = 0;
 
-    int direct_contract = moe_engine_contract_uses_direct_rmsnorm_weight(engine);
-    int unit_contract = 0;
-
     if (moe_rmsnorm_unit_offset_from_json(engine->offload_gguf_metadata_json, &parsed_value)) {
         metadata_found = 1;
         metadata_value = parsed_value ? 1 : 0;
@@ -106,23 +103,18 @@ static int moe_engine_rmsnorm_unit_offset(
         metadata_source = "graph_ir";
     }
 
+    int direct_contract = 0;
+    int unit_contract = 0;
+
     // Contract priority must be deterministic.  An explicit metadata/GraphIR
-    // true is authoritative.  A false value from older JUJU artifacts may be a
-    // default, so treat it as authoritative only when a direct RMSNorm contract
-    // is also present.
+    // boolean is authoritative even when it is false; false must not be undone
+    // by a later substring or tensor-topology heuristic.
     if (metadata_found) {
-        if (metadata_value || direct_contract) {
-            value = metadata_value ? 1 : 0;
-            source = metadata_source;
-            engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0, std::memory_order_release);
-        } else {
-            metadata_found = 0;
-            source = "metadata_false_without_direct_contract";
-        }
+        value = metadata_value ? 1 : 0;
+        source = metadata_source;
+        engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0, std::memory_order_release);
     } else {
-        direct_contract = direct_contract ? 1 : 0;
-    }
-    if (!metadata_found) {
+        direct_contract = moe_engine_contract_uses_direct_rmsnorm_weight(engine);
         unit_contract = moe_engine_contract_uses_rmsnorm_unit_offset(engine);
         if (direct_contract) {
             value = 0;

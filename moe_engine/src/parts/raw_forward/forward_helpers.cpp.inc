@@ -981,45 +981,13 @@ static int moe_engine_contract_uses_unit_qk_norm_global(
 static int moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract(
     const moe_pc_engine* engine
 ) {
-    if (!engine) {
-        return 0;
-    }
-    // RMSNorm weight semantics are not inferable from tensor names alone.
-    // However, some legacy JUJU artifacts wrote "rmsnorm_unit_offset": false as
-    // a default even when the source architecture uses centered RMSNorm gamma.
-    // Use only non-name architecture contract signals that travel with the IR:
-    // scaled embeddings, GELU-tanh blocks, final logit softcap, tied embeddings,
-    // and layer-local post-FFW norms.  These together identify the centered
-    // RMSNorm contract without branching on a model family string.
-    const int has_scaled_embedding =
-        moe_engine_metadata_mentions(engine, "sqrt_hidden_size") ||
-        moe_engine_graph_ir_mentions(engine, "sqrt_hidden_size") ||
-        moe_engine_metadata_mentions(engine, "embedding_scale") ||
-        moe_engine_graph_ir_mentions(engine, "embedding_scale") ||
-        moe_engine_metadata_mentions(engine, "scale_embedding") ||
-        moe_engine_graph_ir_mentions(engine, "scale_embedding");
-    const int has_gelu_tanh =
-        moe_engine_metadata_mentions(engine, "gelu_pytorch_tanh") ||
-        moe_engine_graph_ir_mentions(engine, "gelu_pytorch_tanh") ||
-        moe_engine_metadata_mentions(engine, "gelu_tanh") ||
-        moe_engine_graph_ir_mentions(engine, "gelu_tanh");
-    const int has_final_softcap =
-        moe_engine_metadata_mentions(engine, "final_logit_softcapping") ||
-        moe_engine_graph_ir_mentions(engine, "final_logit_softcapping") ||
-        moe_engine_metadata_mentions(engine, "final_logit_softcap") ||
-        moe_engine_graph_ir_mentions(engine, "final_logit_softcap");
-    const int has_tied_embeddings =
-        moe_engine_metadata_mentions(engine, "tie_word_embeddings") ||
-        moe_engine_graph_ir_mentions(engine, "tie_word_embeddings") ||
-        moe_engine_metadata_mentions(engine, "\"lm_head\":\"token_embd.weight\"") ||
-        moe_engine_graph_ir_mentions(engine, "\"lm_head\":\"token_embd.weight\"");
-    const int has_layer_local_post_norms =
-        moe_engine_graph_ir_mentions(engine, "post_ffw_norm_1") ||
-        moe_engine_graph_ir_mentions(engine, "post_ffw_norm_2") ||
-        moe_engine_metadata_mentions(engine, "post_ffw_norm_1") ||
-        moe_engine_metadata_mentions(engine, "post_ffw_norm_2");
-    return has_scaled_embedding && has_gelu_tanh && has_final_softcap &&
-           has_tied_embeddings && has_layer_local_post_norms;
+    (void)engine;
+    // RMSNorm weight semantics are not inferable from tensor topology.  Models
+    // with q/k norm, post-FFW norm, layer output scales, or PLE tensors may use
+    // either direct gamma (x * weight) or unit-offset gamma (x * (1 + weight)).
+    // Treat this helper as a hard no-op unless an explicit metadata/GraphIR
+    // semantics flag says otherwise in moe_engine_contract_uses_rmsnorm_unit_offset().
+    return 0;
 }
 
 static int moe_engine_contract_uses_direct_rmsnorm_weight(
@@ -1077,15 +1045,12 @@ static int moe_engine_contract_uses_rmsnorm_unit_offset(
     for (const char* key : unit_bool_keys) {
         if (moe_json_get_bool_local(engine->offload_gguf_metadata_json, key, &unit_offset) ||
             moe_json_get_bool_local(engine->offload_graph_ir_json, key, &unit_offset)) {
-            if (unit_offset) {
-                return 1;
-            }
+            return unit_offset ? 1 : 0;
         }
     }
-    // Do not treat the mere presence of a false bool key name (for example
-    // "rmsnorm_unit_offset": false) as a direct RMSNorm contract. Older JUJU
-    // artifacts emitted that false as a default. Direct semantics are handled
-    // by moe_engine_contract_uses_direct_rmsnorm_weight().
+    // Do not treat the mere presence of a bool key name (for example
+    // "rmsnorm_unit_offset": false) as a true contract. Only explicit string
+    // semantics may opt into x * (1 + weight).
     if (moe_engine_graph_ir_mentions(engine, "rmsnorm_weight_semantics\":\"unit_offset") ||
         moe_engine_graph_ir_mentions(engine, "rms_norm_weight_semantics\":\"unit_offset") ||
         moe_engine_graph_ir_mentions(engine, "rmsnorm_weight_semantics\": \"unit_offset") ||

@@ -451,22 +451,13 @@ def test_qkv_single_token_attention_uses_paper_quantized_decode_path():
 def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
     raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_ops.cpp.inc").read_text()
     assert "An explicit metadata/GraphIR" in raw_ops_text
-    assert "false value from older JUJU artifacts may be a" in raw_ops_text
+    assert "false must not be undone" in raw_ops_text
     helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
     assert "moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract" in helper_text
     assert "RMSNorm weight semantics are not inferable from tensor topology" in helper_text
-    helper_block = helper_text[
-        helper_text.index("moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract"):
-        helper_text.index("moe_engine_contract_uses_direct_rmsnorm_weight")
-    ]
-    assert "has_scaled_embedding" in helper_block
-    assert "has_gelu_tanh" in helper_block
-    assert "has_final_softcap" in helper_block
-    assert "has_tied_embeddings" in helper_block
-    assert "has_layer_local_post_norms" in helper_block
+    assert "return 0;" in helper_text[helper_text.index("moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract"):helper_text.index("moe_engine_contract_uses_direct_rmsnorm_weight")]
     assert "\"rmsnorm_unit_offset\": false" in helper_text
-    assert "if (unit_offset)" in helper_text
-    assert "direct RMSNorm contract" in helper_text
+    assert "return unit_offset ? 1 : 0" in helper_text
     assert "weight_stats_override_metadata_false" not in raw_ops_text
     assert "metadata_false_stats_inconclusive" not in raw_ops_text
     assert "mean_abs_raw < 0.75" not in raw_ops_text
