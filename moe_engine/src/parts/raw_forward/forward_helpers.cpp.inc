@@ -1031,6 +1031,11 @@ static int moe_engine_contract_model_family_uses_rmsnorm_unit_offset(
     if (!engine) {
         return 0;
     }
+    if (moe_ascii_contains_ci(engine->dynamic_architecture, "gemma") ||
+        moe_ascii_contains_ci(engine->dynamic_model_id, "gemma") ||
+        moe_ascii_contains_ci(engine->model_root, "gemma")) {
+        return 1;
+    }
     static const char* const model_keys[] = {
         "model_type",
         "declared_architecture",
