@@ -19,6 +19,21 @@ static int moe_apply_rmsnorm_common_weight_f32(
     float* output,
     float eps
 );
+static int moe_graph_ir_math_required(const moe_pc_engine* engine);
+static int moe_graph_ir_map_layer_op_role_any(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const char* const* roles,
+    size_t role_count,
+    moe_raw_tensor_cache_entry* out
+);
+static int moe_graph_ir_map_layer_contract_tensor_role_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const char* section_key,
+    const char* role_key,
+    moe_raw_tensor_cache_entry* out
+);
 
 // Error handling (no dependencies)
 #include "generation_error.cpp.inc"
