@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -1048,6 +1049,54 @@ static bool json_read_bool_in_range(
     if (p + 5 <= end && text.compare(p, 5, "false") == 0) {
         *out = false;
         return true;
+    }
+    return false;
+}
+
+static bool model_ppl_requires_reference_input_ids(const server_options& opts, std::string* out_source) {
+    if (opts.model_root.empty()) {
+        return false;
+    }
+    auto disallows_server_text = [](const std::string& json) -> bool {
+        bool allowed = true;
+        const bool has_allowed = json_read_bool_in_range(
+            json, 0, json.size(), "server_text_tokenization_allowed", &allowed);
+        std::string tokenizer_policy;
+        const bool has_policy = json_read_string_in_range(
+            json, 0, json.size(), "tokenizer_policy", &tokenizer_policy);
+        return has_allowed && !allowed &&
+               (!has_policy || tokenizer_policy == "server_ppl_endpoint_requires_reference_input_ids");
+    };
+    const char* root_candidates[] = {
+        "storagellm_runtime_contract.json",
+        "runtime_assets_manifest.json"
+    };
+    for (const char* rel : root_candidates) {
+        std::string json;
+        const std::string path = join_model_file(opts.model_root, rel);
+        if (read_text_file(path, &json) && disallows_server_text(json)) {
+            if (out_source) *out_source = rel;
+            return true;
+        }
+    }
+    try {
+        const std::filesystem::path verify_dir = std::filesystem::path(opts.model_root) / "verify";
+        if (std::filesystem::exists(verify_dir) && std::filesystem::is_directory(verify_dir)) {
+            for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(verify_dir)) {
+                if (!entry.is_regular_file() || entry.path().extension() != ".json") {
+                    continue;
+                }
+                std::string json;
+                if (read_text_file(entry.path().u8string(), &json) && disallows_server_text(json)) {
+                    if (out_source) {
+                        *out_source = std::string("verify/") + entry.path().filename().u8string();
+                    }
+                    return true;
+                }
+            }
+        }
+    } catch (const std::exception&) {
+        return false;
     }
     return false;
 }
@@ -2682,38 +2731,51 @@ static server_eval_result run_server_eval(
         if (storagellm::json_read_int(body, "first_target_index", &parsed_first_target) && parsed_first_target > 0) {
             first_target_index = static_cast<uint32_t>(parsed_first_target);
         }
-    } else if (body_requests_response_only_chat_eval(body)) {
-        if (!tok.loaded) {
-            result.http_status = 503;
-            result.error_code = "tokenizer_unavailable";
-            result.error_message = tok.error.empty() ? "tokenizer.json is not loaded" : tok.error;
-            return result;
-        }
-        if (!encode_chat_response_only_eval(opts, tok, body, &input_ids, &first_target_index)) {
-            result.http_status = 422;
-            result.error_code = "chat_eval_tokenization_failed";
-            result.error_message = "could not tokenize response-only chat eval; send input_ids instead";
-            return result;
-        }
     } else {
-        const std::string text = extract_generation_text(opts, body, false);
-        if (text.empty()) {
+        std::string ppl_contract_source;
+        if (model_ppl_requires_reference_input_ids(opts, &ppl_contract_source)) {
             result.http_status = 400;
-            result.error_code = "input_ids_required";
-            result.error_message = "perplexity requires input_ids, messages with final assistant response, or input/prompt text";
+            result.error_code = "input_ids_required_by_ppl_contract";
+            result.error_message =
+                "model PPL contract requires reference input_ids; server text/chat tokenization is disabled";
+            std::cerr << "[storagellm request] eval rejected input_ids_required_by_ppl_contract"
+                      << " source=" << (ppl_contract_source.empty() ? "model_contract" : ppl_contract_source)
+                      << "\n" << std::flush;
             return result;
         }
-        if (!tok.loaded) {
-            result.http_status = 503;
-            result.error_code = "tokenizer_unavailable";
-            result.error_message = tok.error.empty() ? "tokenizer.json is not loaded" : tok.error;
-            return result;
-        }
-        if (!tokenizer_encode_greedy(tok, text, &input_ids)) {
-            result.http_status = 422;
-            result.error_code = "tokenization_failed";
-            result.error_message = "tokenizer vocab could not encode PPL request text";
-            return result;
+        if (body_requests_response_only_chat_eval(body)) {
+            if (!tok.loaded) {
+                result.http_status = 503;
+                result.error_code = "tokenizer_unavailable";
+                result.error_message = tok.error.empty() ? "tokenizer.json is not loaded" : tok.error;
+                return result;
+            }
+            if (!encode_chat_response_only_eval(opts, tok, body, &input_ids, &first_target_index)) {
+                result.http_status = 422;
+                result.error_code = "chat_eval_tokenization_failed";
+                result.error_message = "could not tokenize response-only chat eval; send input_ids instead";
+                return result;
+            }
+        } else {
+            const std::string text = extract_generation_text(opts, body, false);
+            if (text.empty()) {
+                result.http_status = 400;
+                result.error_code = "input_ids_required";
+                result.error_message = "perplexity requires input_ids, messages with final assistant response, or input/prompt text";
+                return result;
+            }
+            if (!tok.loaded) {
+                result.http_status = 503;
+                result.error_code = "tokenizer_unavailable";
+                result.error_message = tok.error.empty() ? "tokenizer.json is not loaded" : tok.error;
+                return result;
+            }
+            if (!tokenizer_encode_greedy(tok, text, &input_ids)) {
+                result.http_status = 422;
+                result.error_code = "tokenization_failed";
+                result.error_message = "tokenizer vocab could not encode PPL request text";
+                return result;
+            }
         }
     }
     int parsed_first_target = 0;
