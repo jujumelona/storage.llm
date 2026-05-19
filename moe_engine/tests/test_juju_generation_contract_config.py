@@ -484,7 +484,7 @@ def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
     assert "unit_offset_contract_over_metadata_false" in raw_ops_text
     false_pos = helper_text.index("if (saw_explicit_unit_false)")
     family_pos = helper_text.index("moe_engine_contract_model_family_uses_rmsnorm_unit_offset(engine)")
-    assert family_pos < false_pos
+    assert false_pos < family_pos
 
 
 def test_runtime_arch_defaults_gemma_rmsnorm_to_unit_offset_contract():
