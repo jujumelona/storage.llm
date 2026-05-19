@@ -453,10 +453,10 @@ def test_qkv_single_token_attention_uses_paper_quantized_decode_path():
 
 
 def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
-    raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_ops.cpp.inc").read_text()
+    raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_ops.cpp.inc").read_text(encoding="utf-8", errors="ignore")
     assert "An explicit metadata/GraphIR" in raw_ops_text
     assert "false must not be undone" in raw_ops_text
-    helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
+    helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text(encoding="utf-8", errors="ignore")
     assert "moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract" in helper_text
     assert "RMSNorm weight semantics are not inferable from tensor topology" in helper_text
     assert "return 0;" in helper_text[helper_text.index("moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract"):helper_text.index("moe_engine_contract_uses_direct_rmsnorm_weight")]
@@ -472,6 +472,29 @@ def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
     assert "moe_engine_contract_uses_rmsnorm_unit_offset(engine)" in raw_ops_text
     assert "moe_engine_contract_uses_direct_rmsnorm_weight(engine)" in raw_ops_text
     assert "cached_rmsnorm_unit_offset" in raw_ops_text
+    assert "moe_engine_contract_model_family_uses_rmsnorm_unit_offset" in helper_text
+    assert 'moe_json_get_string_local(engine->offload_graph_ir_json, key, &value)' in helper_text
+
+
+def test_runtime_arch_defaults_gemma_rmsnorm_to_unit_offset_contract():
+    runtime = mat.juju_runtime_arch_metadata({
+        "arch_meta": {
+            "model_type": "gemma4_text",
+            "rms_norm_eps": 1e-6,
+        }
+    })
+    assert runtime["rms_norm_unit_offset"] is True
+    assert runtime["rmsnorm_unit_offset"] is True
+    assert runtime["rmsnorm_weight_semantics"] == "unit_offset"
+
+    explicit_direct = mat.juju_runtime_arch_metadata({
+        "arch_meta": {
+            "model_type": "gemma4_text",
+            "rms_norm_unit_offset": False,
+        }
+    })
+    assert explicit_direct["rms_norm_unit_offset"] is False
+    assert explicit_direct["rmsnorm_unit_offset"] is False
 
 
 def test_router_contract_reads_graph_ir_sigmoid_scale_and_norm_topk():

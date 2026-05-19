@@ -1025,6 +1025,33 @@ static int moe_engine_contract_uses_direct_rmsnorm_weight(
     return 0;
 }
 
+static int moe_engine_contract_model_family_uses_rmsnorm_unit_offset(
+    const moe_pc_engine* engine
+) {
+    if (!engine) {
+        return 0;
+    }
+    static const char* const model_keys[] = {
+        "model_type",
+        "declared_architecture",
+        "architecture",
+        "family"
+    };
+    std::string value;
+    for (const char* key : model_keys) {
+        if ((moe_json_get_string_local(engine->offload_graph_ir_json, key, &value) ||
+             moe_json_get_string_local(engine->offload_gguf_metadata_json, key, &value)) &&
+            moe_ascii_contains_ci(value, "gemma")) {
+            return 1;
+        }
+    }
+    if (moe_engine_graph_ir_mentions(engine, "\"Gemma") ||
+        moe_engine_metadata_mentions(engine, "\"Gemma")) {
+        return 1;
+    }
+    return 0;
+}
+
 static int moe_engine_contract_uses_rmsnorm_unit_offset(
     const moe_pc_engine* engine
 ) {
@@ -1066,6 +1093,9 @@ static int moe_engine_contract_uses_rmsnorm_unit_offset(
         moe_engine_metadata_mentions(engine, "rmsnorm_weight_semantics\":\"plus_one") ||
         moe_engine_metadata_mentions(engine, "rms_norm_weight_semantics\":\"plus_one") ||
         moe_engine_metadata_mentions(engine, "rms_norm_weight_semantics\": \"plus_one")) {
+        return 1;
+    }
+    if (moe_engine_contract_model_family_uses_rmsnorm_unit_offset(engine)) {
         return 1;
     }
     return moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract(engine);

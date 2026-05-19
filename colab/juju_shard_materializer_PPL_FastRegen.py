@@ -7353,6 +7353,33 @@ def juju_runtime_arch_metadata(contract, directory=None):
     runtime = dict((directory or {}).get("gguf_runtime") or {})
     out = dict(runtime)
     cfg = lambda *keys: _juju_first_config_value(contract, *keys)
+    rmsnorm_unit_offset_family_default = True if any(
+        "gemma" in str(v).lower()
+        for v in (
+            contract.get("architecture"),
+            contract.get("model_type"),
+            arch.get("architecture"),
+            arch.get("model_type"),
+            runtime.get("declared_architecture"),
+            runtime.get("architecture"),
+            runtime.get("model_type"),
+            cfg("model_type"),
+        )
+        if v is not None
+    ) else None
+    rmsnorm_unit_offset_explicit = first_present(
+        _juju_bool_or_none(arch.get("rms_norm_unit_offset")),
+        _juju_bool_or_none(arch.get("rmsnorm_unit_offset")),
+        _juju_bool_or_none(arch.get("rms_norm_weight_unit_offset")),
+        _juju_bool_or_none(runtime.get("rms_norm_unit_offset")),
+        _juju_bool_or_none(runtime.get("rmsnorm_unit_offset")),
+        _juju_bool_or_none(runtime.get("rms_norm_weight_unit_offset")),
+    )
+    rmsnorm_unit_offset_value = first_present(
+        rmsnorm_unit_offset_explicit,
+        rmsnorm_unit_offset_family_default,
+        None,
+    )
 
     fields = {
         "declared_architecture": first_present(contract.get("architecture"), arch.get("architecture"), runtime.get("declared_architecture"), runtime.get("architecture")),
@@ -7393,23 +7420,14 @@ def juju_runtime_arch_metadata(contract, directory=None):
         "rms_norm_eps": first_present(cfg("rms_norm_eps", "norm_eps"), arch.get("rms_norm_eps"), arch.get("norm_eps"), runtime.get("rms_norm_eps"), runtime.get("norm_eps")),
         "norm_eps": first_present(cfg("norm_eps", "rms_norm_eps"), arch.get("norm_eps"), arch.get("rms_norm_eps"), runtime.get("norm_eps"), runtime.get("rms_norm_eps")),
         "rms_norm_unit_offset": first_present(
-            _juju_bool_or_none(arch.get("rms_norm_unit_offset")),
-            _juju_bool_or_none(arch.get("rmsnorm_unit_offset")),
-            _juju_bool_or_none(arch.get("rms_norm_weight_unit_offset")),
-            _juju_bool_or_none(runtime.get("rms_norm_unit_offset")),
-            _juju_bool_or_none(runtime.get("rmsnorm_unit_offset")),
-            _juju_bool_or_none(runtime.get("rms_norm_weight_unit_offset")),
+            rmsnorm_unit_offset_value,
             None,
         ),
         "rmsnorm_unit_offset": first_present(
-            _juju_bool_or_none(arch.get("rms_norm_unit_offset")),
-            _juju_bool_or_none(arch.get("rmsnorm_unit_offset")),
-            _juju_bool_or_none(arch.get("rms_norm_weight_unit_offset")),
-            _juju_bool_or_none(runtime.get("rms_norm_unit_offset")),
-            _juju_bool_or_none(runtime.get("rmsnorm_unit_offset")),
-            _juju_bool_or_none(runtime.get("rms_norm_weight_unit_offset")),
+            rmsnorm_unit_offset_value,
             None,
         ),
+        "rmsnorm_weight_semantics": "unit_offset" if rmsnorm_unit_offset_value is True else first_present(runtime.get("rmsnorm_weight_semantics"), arch.get("rmsnorm_weight_semantics")),
         "rope_theta": first_present(cfg("rope_theta", "theta"), arch.get("rope_theta"), runtime.get("rope_theta"), runtime.get("theta")),
         "theta": first_present(cfg("theta", "rope_theta"), arch.get("rope_theta"), runtime.get("theta"), runtime.get("rope_theta")),
         "sliding_window": first_present(cfg("sliding_window"), arch.get("sliding_window"), runtime.get("sliding_window")),
