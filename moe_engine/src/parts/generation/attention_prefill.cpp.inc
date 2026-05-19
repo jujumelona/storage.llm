@@ -1029,6 +1029,7 @@ struct moe_attention_rope_contract_t {
 
 static int moe_attention_partial_rotary_factor_f32(
     const moe_pc_engine* engine,
+    const std::string& doc,
     const std::string& rope_scope,
     const std::string& row,
     double* out_partial
@@ -1040,6 +1041,7 @@ static int moe_attention_partial_rotary_factor_f32(
     double value = 0.0;
     if ((moe_json_get_double_local(rope_scope, "partial_rotary_factor", &value) ||
          moe_json_get_double_local(row, "partial_rotary_factor", &value) ||
+         moe_json_get_double_local(doc, "partial_rotary_factor", &value) ||
          (engine && engine->model_config_partial_rotary_factor > 0.0f &&
           (value = (double)engine->model_config_partial_rotary_factor) > 0.0) ||
          (engine && !engine->offload_gguf_metadata_json.empty() &&
@@ -1135,7 +1137,7 @@ static int moe_attention_layer_rope_contract_f32(
                 sliding_default_rope && head_dim > 0 && resolved.rope_dim > head_dim;
             double partial_rotary_factor = 0.0;
             const int has_partial_rotary_factor =
-                moe_attention_partial_rotary_factor_f32(engine, rope_scope, row, &partial_rotary_factor);
+                moe_attention_partial_rotary_factor_f32(engine, *doc, rope_scope, row, &partial_rotary_factor);
             if (has_partial_rotary_factor &&
                 head_dim > 0 && !inherited_full_rope_dim) {
                 uint32_t partial_dim = (uint32_t)std::round((double)head_dim * partial_rotary_factor);
