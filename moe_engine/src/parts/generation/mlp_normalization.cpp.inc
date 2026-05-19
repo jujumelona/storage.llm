@@ -675,6 +675,9 @@ static int moe_layer_execution_contract_router_uses_hidden_f32(
             if (obj_begin >= obj_end || obj_end > doc.size()) {
                 continue;
             }
+            if (moe_router_row_contract_implies_sidecar_rms_root_transform_f32(doc, obj_begin, obj_end)) {
+                return 1;
+            }
             size_t router_begin = obj_begin;
             size_t router_end = obj_end;
             const std::string row_slice = doc.substr(obj_begin, obj_end - obj_begin);

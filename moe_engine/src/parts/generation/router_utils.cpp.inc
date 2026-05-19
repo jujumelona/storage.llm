@@ -884,13 +884,40 @@ static int moe_router_row_contract_implies_sidecar_rms_root_transform_f32(
     size_t begin,
     size_t end
 ) {
-    (void)doc;
-    (void)begin;
-    (void)end;
-    // A router weight sidecar is not an activation-scale contract.  RMS-root
-    // input transforms must be explicit in the IR; structural split-FFN norms
-    // only describe which activation feeds the router.
-    return 0;
+    if (begin >= end || end > doc.size()) {
+        return 0;
+    }
+    const int has_router_sidecar =
+        moe_router_scope_has_nonempty_array_f32(doc, begin, end, "router_weight_scale_sidecar_tensors") ||
+        moe_router_scope_has_nonempty_array_f32(doc, begin, end, "weight_scale_sidecars") ||
+        moe_router_scope_bool_true_f32(doc, begin, end, "ffn_gate_inp_scale_is_weight_scale_sidecar");
+    if (!has_router_sidecar) {
+        return 0;
+    }
+    const int has_direct_router_scale =
+        moe_router_scope_has_nonempty_array_f32(doc, begin, end, "router_input_scale_tensors") ||
+        moe_router_scope_has_nonempty_array_f32(doc, begin, end, "router_input_scales") ||
+        moe_router_scope_has_nonempty_array_f32(doc, begin, end, "router_scales");
+    if (has_direct_router_scale) {
+        return 0;
+    }
+    const std::string lower = moe_lower_ascii_copy(doc.substr(begin, end - begin));
+    const int has_split_moe_branches =
+        lower.find("routed_experts") != std::string::npos &&
+        lower.find("dense_mlp") != std::string::npos &&
+        lower.find("post_ffw_norm_1") != std::string::npos &&
+        lower.find("post_ffw_norm_2") != std::string::npos &&
+        (lower.find("pre_ffw_norm_2") != std::string::npos ||
+         lower.find("expert_ffn_input") != std::string::npos);
+    if (!has_split_moe_branches) {
+        return 0;
+    }
+    // In this split-MoE contract the sidecar is the learned per-hidden router
+    // scale from a router-local unweighted RMSNorm path.  It is stored as a
+    // column/weight sidecar because scaling the input is algebraically identical
+    // to scaling router columns, but the forward contract still includes
+    // RMSNorm(input) * hidden_size^-0.5 before the learned scale.
+    return 1;
 }
 
 static int moe_router_weight_sidecar_requires_rms_root_transform_uncached_f32(
