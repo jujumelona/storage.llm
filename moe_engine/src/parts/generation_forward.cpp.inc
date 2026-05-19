@@ -285,6 +285,56 @@ struct moe_decoder_layer_plan_t {
     int apply_layer_output_scale = 0;
 };
 
+static int moe_apply_attention_residual_contract_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const moe_decoder_layer_plan_t& layer_plan,
+    const float* residual,
+    const float* attention_output,
+    float* hidden,
+    float* norm_buffer,
+    float* shared_buffer,
+    uint32_t hidden_size,
+    float eps
+) {
+    if (!engine || !residual || !attention_output || !hidden || !norm_buffer ||
+        !shared_buffer || hidden_size == 0) {
+        return 0;
+    }
+    int post_norm_used = 0;
+    if (layer_plan.attention_residual_before_ffn_norm) {
+        for (uint32_t i = 0; i < hidden_size; ++i) {
+            shared_buffer[i] = residual[i] + attention_output[i];
+        }
+        post_norm_used = moe_layer_post_attention_output_norm_f32(
+            engine, layer, shared_buffer, hidden_size, hidden, eps);
+        if (layer_plan.post_attention_norm_required && !post_norm_used) {
+            return 0;
+        }
+        if (!post_norm_used) {
+            std::memcpy(hidden, shared_buffer, (size_t)hidden_size * sizeof(float));
+        }
+    } else {
+        const float* attn_residual = attention_output;
+        post_norm_used = moe_layer_post_attention_output_norm_f32(
+            engine, layer, attention_output, hidden_size, norm_buffer, eps);
+        if (layer_plan.post_attention_norm_required && !post_norm_used) {
+            return 0;
+        }
+        if (post_norm_used) {
+            attn_residual = norm_buffer;
+        }
+        for (uint32_t i = 0; i < hidden_size; ++i) {
+            hidden[i] = residual[i] + attn_residual[i];
+        }
+    }
+    moe_profile_log(
+        "forward_post_attention_contract",
+        "layer=%d used=%d residual_first=%d",
+        layer, post_norm_used, layer_plan.attention_residual_before_ffn_norm);
+    return 1;
+}
+
 static moe_decoder_layer_plan_t moe_build_decoder_layer_plan(
     moe_pc_engine* engine,
     const moe_storage_constants_t* c,
@@ -475,46 +525,18 @@ static int moe_forward_one_token_f32(
                 "position=%u layer=%u ms=%.3f",
                 position, layer, moe_profile_elapsed_ms(split_standard_attn_start_us));
             const uint64_t split_post_norm_start_us = moe_profile_now_us();
-            const int graph_residual_first = layer_plan.attention_residual_before_ffn_norm;
-            const int post_attention_norm_required = layer_plan.post_attention_norm_required;
-            int post_norm_used = 0;
-            if (graph_residual_first) {
-                // GraphIR order: residual add feeds post_attention_norm.  The old
-                // branch only skipped the norm and then added raw attention, so a
-                // true residual-first contract was impossible to execute correctly.
-                for (uint32_t i = 0; i < c->hidden_size; ++i) {
-                    s->shared[i] = s->residual[i] + s->attn[i];
-                }
-                post_norm_used = moe_layer_post_attention_output_norm_f32(
-                    engine, (int32_t)layer, s->shared.data(), c->hidden_size,
-                    hidden, layer_attn_cfg.rms_norm_eps);
-                if (post_attention_norm_required && !post_norm_used) {
-                    moe_generation_set_error(stats, "post-attention norm tensor is required but could not be mapped");
-                    return 0;
-                }
-                if (!post_norm_used) {
-                    std::memcpy(hidden, s->shared.data(), (size_t)c->hidden_size * sizeof(float));
-                }
-            } else {
-                const float* attn_residual = s->attn.data();
-                post_norm_used = moe_layer_post_attention_output_norm_f32(
-                    engine, (int32_t)layer, s->attn.data(), c->hidden_size,
-                    s->norm.data(), layer_attn_cfg.rms_norm_eps);
-                if (post_attention_norm_required && !post_norm_used) {
-                    moe_generation_set_error(stats, "post-attention norm tensor is required but could not be mapped");
-                    return 0;
-                }
-                if (post_norm_used) {
-                    attn_residual = s->norm.data();
-                }
-                for (uint32_t i = 0; i < c->hidden_size; ++i) {
-                    hidden[i] = s->residual[i] + attn_residual[i];
-                }
+            if (!moe_apply_attention_residual_contract_f32(
+                    engine, (int32_t)layer, layer_plan,
+                    s->residual.data(), s->attn.data(), hidden,
+                    s->norm.data(), s->shared.data(),
+                    c->hidden_size, layer_attn_cfg.rms_norm_eps)) {
+                moe_generation_set_error(stats, "post-attention norm tensor is required but could not be mapped");
+                return 0;
             }
             moe_profile_log(
                 "forward_split_post_attention_norm",
-                "position=%u layer=%u used=%d graph_residual_first=%d ms=%.3f",
-                position, layer, post_norm_used, graph_residual_first,
+                "position=%u layer=%u graph_residual_first=%d ms=%.3f",
+                position, layer, layer_plan.attention_residual_before_ffn_norm,
                 moe_profile_elapsed_ms(split_post_norm_start_us));
             const uint64_t split_residual_start_us = moe_profile_now_us();
             moe_profile_log(
@@ -571,16 +593,42 @@ static int moe_forward_one_token_f32(
             continue;
         }
         const uint64_t attn_start_us = moe_profile_now_us();
-        if (!moe_layer_attention_f32(engine, (int32_t)layer, s, s->hidden.data(), c->hidden_size, position)) {
+        if (layer_attn_cfg.type != moe_ATTN_TYPE_MLA) {
+            std::memcpy(s->residual.data(), hidden, (size_t)c->hidden_size * sizeof(float));
+            if (!moe_layer_standard_attention_f32(
+                    engine, (int32_t)layer, s, hidden, c->hidden_size, position,
+                    layer_attn_cfg, nullptr, 0)) {
+                moe_generation_set_error(stats, "attention block failed");
+                return 0;
+            }
+            if (!moe_apply_attention_residual_contract_f32(
+                    engine, (int32_t)layer, layer_plan,
+                    s->residual.data(), s->attn.data(), hidden,
+                    s->norm.data(), s->shared.data(),
+                    c->hidden_size, layer_attn_cfg.rms_norm_eps)) {
+                moe_generation_set_error(stats, "post-attention norm tensor is required but could not be mapped");
+                return 0;
+            }
+        } else if (!moe_layer_attention_f32(engine, (int32_t)layer, s, s->hidden.data(), c->hidden_size, position)) {
             moe_generation_set_error(stats, "attention block failed");
             return 0;
         }
         moe_forward_trace_vec("after_attention", position, layer, hidden, c->hidden_size);
-        if (!moe_pc_engine_raw_rmsnorm_f32(
-                engine, (int32_t)layer, moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM,
-                hidden, c->hidden_size, s->norm.data(), c->hidden_size, layer_attn_cfg.rms_norm_eps)) {
-            moe_generation_set_error(stats, "post-attention rmsnorm failed");
-            return 0;
+        if (layer_attn_cfg.type == moe_ATTN_TYPE_MLA) {
+            if (!moe_pc_engine_raw_rmsnorm_f32(
+                    engine, (int32_t)layer, moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM,
+                    hidden, c->hidden_size, s->norm.data(), c->hidden_size, layer_attn_cfg.rms_norm_eps)) {
+                moe_generation_set_error(stats, "post-attention rmsnorm failed");
+                return 0;
+            }
+        } else if (!moe_layer_ffn_norm_f32(
+                engine, (int32_t)layer, hidden, c->hidden_size,
+                s->norm.data(), layer_attn_cfg.rms_norm_eps)) {
+            if (layer_plan.ffn_norm_required) {
+                moe_generation_set_error(stats, "ffn norm tensor is required but could not be mapped");
+                return 0;
+            }
+            std::memcpy(s->norm.data(), hidden, (size_t)c->hidden_size * sizeof(float));
         }
         const double attention_ms = moe_profile_elapsed_ms(attn_start_us);
         const int is_moe = layer_plan.is_moe;

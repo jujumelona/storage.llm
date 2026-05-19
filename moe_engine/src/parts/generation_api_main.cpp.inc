@@ -331,16 +331,46 @@ int moe_pc_engine_generate_token_ids(
                     engine->generation_token.store(t, std::memory_order_relaxed);
 
                     engine->generation_phase.store(moe_GEN_PHASE_ATTENTION, std::memory_order_relaxed);
-                    if (!moe_layer_attention_f32(engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs, t)) {
-                        moe_generation_set_error(out_stats, "prefill attention failed");
-                        return 0;
-                    }
-
-                    if (!moe_pc_engine_raw_rmsnorm_f32(
-                            engine, (int32_t)layer, moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM,
-                            current_hidden, (uint32_t)hs, scratch.norm.data(), (uint32_t)hs, attn_cfg.rms_norm_eps)) {
-                        moe_generation_set_error(out_stats, "prefill post-attention norm failed");
-                        return 0;
+                    const moe_attn_config_t layer_attn_cfg =
+                        moe_generation_layer_attn_config(engine, (int32_t)layer);
+                    const moe_decoder_layer_plan_t layer_plan =
+                        moe_build_decoder_layer_plan(engine, c, &attn_cfg, layer);
+                    if (layer_attn_cfg.type != moe_ATTN_TYPE_MLA) {
+                        std::memcpy(scratch.residual.data(), current_hidden, hs * sizeof(float));
+                        if (!moe_layer_standard_attention_f32(
+                                engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs, t,
+                                layer_attn_cfg, nullptr, 0)) {
+                            moe_generation_set_error(out_stats, "prefill attention failed");
+                            return 0;
+                        }
+                        if (!moe_apply_attention_residual_contract_f32(
+                                engine, (int32_t)layer, layer_plan,
+                                scratch.residual.data(), scratch.attn.data(), current_hidden,
+                                scratch.norm.data(), scratch.shared.data(),
+                                (uint32_t)hs, layer_attn_cfg.rms_norm_eps)) {
+                            moe_generation_set_error(out_stats, "prefill post-attention norm failed");
+                            return 0;
+                        }
+                        if (!moe_layer_ffn_norm_f32(
+                                engine, (int32_t)layer, current_hidden, (uint32_t)hs,
+                                scratch.norm.data(), layer_attn_cfg.rms_norm_eps)) {
+                            if (layer_plan.ffn_norm_required) {
+                                moe_generation_set_error(out_stats, "prefill ffn norm failed");
+                                return 0;
+                            }
+                            std::memcpy(scratch.norm.data(), current_hidden, hs * sizeof(float));
+                        }
+                    } else {
+                        if (!moe_layer_attention_f32(engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs, t)) {
+                            moe_generation_set_error(out_stats, "prefill attention failed");
+                            return 0;
+                        }
+                        if (!moe_pc_engine_raw_rmsnorm_f32(
+                                engine, (int32_t)layer, moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM,
+                                current_hidden, (uint32_t)hs, scratch.norm.data(), (uint32_t)hs, layer_attn_cfg.rms_norm_eps)) {
+                            moe_generation_set_error(out_stats, "prefill post-attention norm failed");
+                            return 0;
+                        }
                     }
                     std::memcpy(
                         batch_norm.data() + (size_t)t * hs,
