@@ -1027,6 +1027,30 @@ struct moe_attention_rope_contract_t {
     int proportional_frequency_dim_uses_full_head_dim = 0;
 };
 
+static int moe_attention_partial_rotary_factor_f32(
+    const moe_pc_engine* engine,
+    const std::string& rope_scope,
+    const std::string& row,
+    double* out_partial
+) {
+    if (!out_partial) {
+        return 0;
+    }
+    *out_partial = 0.0;
+    double value = 0.0;
+    if ((moe_json_get_double_local(rope_scope, "partial_rotary_factor", &value) ||
+         moe_json_get_double_local(row, "partial_rotary_factor", &value) ||
+         (engine && engine->model_config_partial_rotary_factor > 0.0f &&
+          (value = (double)engine->model_config_partial_rotary_factor) > 0.0) ||
+         (engine && !engine->offload_gguf_metadata_json.empty() &&
+          moe_json_get_double_local(engine->offload_gguf_metadata_json, "partial_rotary_factor", &value))) &&
+        value > 0.0 && value <= 1.0 && std::isfinite(value)) {
+        *out_partial = value;
+        return 1;
+    }
+    return 0;
+}
+
 static int moe_attention_layer_rope_contract_f32(
     const moe_pc_engine* engine,
     int32_t layer,
@@ -1109,13 +1133,20 @@ static int moe_attention_layer_rope_contract_f32(
                 moe_ascii_contains_ci(attention_kind, "sliding") && !proportional_rope;
             const int inherited_full_rope_dim =
                 sliding_default_rope && head_dim > 0 && resolved.rope_dim > head_dim;
-            if (moe_json_get_double_local(rope_scope, "partial_rotary_factor", &dvalue) &&
-                dvalue > 0.0 && dvalue <= 1.0 && std::isfinite(dvalue) &&
+            double partial_rotary_factor = 0.0;
+            const int has_partial_rotary_factor =
+                moe_attention_partial_rotary_factor_f32(engine, rope_scope, row, &partial_rotary_factor);
+            if (has_partial_rotary_factor &&
                 head_dim > 0 && !inherited_full_rope_dim) {
-                uint32_t partial_dim = (uint32_t)std::round((double)head_dim * dvalue);
+                uint32_t partial_dim = (uint32_t)std::round((double)head_dim * partial_rotary_factor);
                 if (partial_dim < 2u) partial_dim = 2u;
                 if (partial_dim > head_dim) partial_dim = head_dim;
-                resolved.rope_dim = partial_dim;
+                if (!sliding_default_rope ||
+                    resolved.rope_dim == 0 ||
+                    resolved.rope_dim == head_dim ||
+                    resolved.rope_dim == partial_dim) {
+                    resolved.rope_dim = partial_dim;
+                }
             }
             if (moe_json_get_bool_local(rope_scope, "rotate_half", &bvalue)) {
                 resolved.rotate_half_known = 1;
@@ -1131,6 +1162,10 @@ static int moe_attention_layer_rope_contract_f32(
             if (proportional_rope) {
                 resolved.proportional_frequency_known = 1;
                 resolved.proportional_frequency_dim_uses_full_head_dim = 1;
+            }
+            if (resolved.frequency_dim == 0 && sliding_default_rope &&
+                has_partial_rotary_factor && head_dim > 0) {
+                resolved.frequency_dim = head_dim;
             }
             if (resolved.frequency_dim == 0 && resolved.proportional_frequency_dim_uses_full_head_dim && head_dim > 0) {
                 resolved.frequency_dim = head_dim;

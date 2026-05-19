@@ -4936,7 +4936,7 @@ def _juju_layer_rope_contract(layer, runtime_arch):
         runtime_arch.get("head_dim"),
     )
     partial = _juju_float_or_none(selected.get("partial_rotary_factor"))
-    if partial is None and kind != "sliding_window_attention":
+    if partial is None:
         partial = _juju_float_or_none(runtime_arch.get("partial_rotary_factor"))
     rope_dim = _juju_first_int(
         selected.get("rope_dimension_count"),
@@ -4946,7 +4946,16 @@ def _juju_layer_rope_contract(layer, runtime_arch):
         head_dim,
     )
     rope_type = first_present(selected.get("rope_type"), selected.get("type"), runtime_arch.get("rope_type"), "default")
-    frequency_dim = head_dim if str(rope_type).lower() == "proportional" and head_dim else rope_dim
+    sliding_partial_default = (
+        kind == "sliding_window_attention"
+        and str(rope_type).lower() != "proportional"
+        and partial is not None
+        and head_dim
+    )
+    frequency_dim = head_dim if (
+        (str(rope_type).lower() == "proportional" and head_dim) or
+        sliding_partial_default
+    ) else rope_dim
     return {
         "kind": kind,
         "rope_type": rope_type,
