@@ -423,10 +423,12 @@ def test_mxfp4_dot_and_cache_decode_use_physical_row_stride_from_index():
     raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_ops.cpp.inc").read_text(encoding="utf-8")
     cache_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_cache.cpp.inc").read_text(encoding="utf-8")
     assert "moe_mxfp4_row_layout_for_bytes" in kernel_text
-    assert "MXFP4 is a 32-value block format" in kernel_text
-    assert "physical row stride" in kernel_text
-    assert "moe_mxfp4_row_bytes_for_block_cols(cols, 16u)" not in kernel_text
-    assert "layout.block_cols = 16u" not in kernel_text
+    assert "Standard GGML MXFP4 is a 32-value block" in kernel_text
+    assert "index row stride is the only reliable runtime discriminator" in kernel_text
+    assert "moe_mxfp4_row_bytes_for_block_cols(cols, 16u)" in kernel_text
+    assert "layout.block_cols = 16u" in kernel_text
+    assert "layout.bytewise_codes = 1u" in kernel_text
+    assert "layout.bytewise_codes = 0u" in kernel_text
     assert "moe_dot_gguf_mxfp4_row_strided" in kernel_text
     assert "moe_dot_gguf_mxfp4_two_rows_strided" in kernel_text
     assert "moe_dot_gguf_mxfp4_row_strided(packed, x, rec->info.cols, rec->weight_row_bytes)" in tensor_dot_text

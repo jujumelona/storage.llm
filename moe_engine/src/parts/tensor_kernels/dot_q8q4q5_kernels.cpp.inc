@@ -354,14 +354,20 @@ static inline uint64_t moe_mxfp4_row_bytes_for_block_cols(uint32_t cols, uint32_
 }
 
 static moe_mxfp4_row_layout_t moe_mxfp4_row_layout_for_bytes(uint32_t cols, uint64_t physical_row_bytes) {
-    // MXFP4 is a 32-value block format: one E8M0 scale byte plus 16 bytes of
-    // packed E2M1 values.  Tensor-index row bytes are a physical row stride,
-    // not proof that the codec block size changed.  Rows such as 2816 -> 2992
-    // bytes have a 1496-byte logical MXFP4 payload plus stride padding/side
-    // data; decoding them as 16-value bytewise blocks consumes the second half
-    // of the stride as weights and corrupts MLP/lm_head outputs.
+    // Standard GGML MXFP4 is a 32-value block: one E8M0 scale byte plus
+    // sixteen packed E2M1 bytes.  Some JUJU/GGUF_MXFP4_MOE artifacts carry an
+    // expanded physical row layout instead: one scale byte plus sixteen
+    // bytewise low-nibble FP4 codes for each 16 logical values.  The tensor
+    // index row stride is the only reliable runtime discriminator here; do not
+    // force either layout from model names or global feature flags.
     moe_mxfp4_row_layout_t layout{32u, 17u, 0u};
     if (cols == 0 || physical_row_bytes == 0) {
+        return layout;
+    }
+    const uint64_t bytes_16_expanded = moe_mxfp4_row_bytes_for_block_cols(cols, 16u);
+    if (physical_row_bytes == bytes_16_expanded) {
+        layout.block_cols = 16u;
+        layout.bytewise_codes = 1u;
         return layout;
     }
     const uint64_t bytes_32 = moe_mxfp4_row_bytes_for_block_cols(cols, 32u);
@@ -370,8 +376,6 @@ static moe_mxfp4_row_layout_t moe_mxfp4_row_layout_for_bytes(uint32_t cols, uint
         layout.bytewise_codes = 0u;
         return layout;
     }
-    // Short legacy rows are kept as the packed 32-value contract rather than
-    // guessing a different quantization family from byte counts.
     return layout;
 }
 
