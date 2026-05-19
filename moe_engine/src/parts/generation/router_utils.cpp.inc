@@ -307,16 +307,6 @@ static int moe_map_router_per_expert_scale_tensor_f32(
     if (!engine || !out || layer < 0 || experts == 0) {
         return 0;
     }
-    static const char* const suffixes[] = {
-        "ffn_down_exps.scale",
-        "ffn_gate_inp.per_expert_scale",
-        "router.per_expert_scale",
-        "router.per_expert_scale.weight",
-        "mlp.router.per_expert_scale",
-        "mlp.router.per_expert_scale.weight",
-        "moe.gate.per_expert_scale",
-        "moe.gate.per_expert_scale.weight"
-    };
     const uint32_t suffix_hash = moe_router_fnv1a_hash_string("router_per_expert_scale");
     const uint64_t key = ((uint64_t)(uint32_t)layer << 32) | suffix_hash | 0xa0000000ull;
     {
@@ -327,24 +317,62 @@ static int moe_map_router_per_expert_scale_tensor_f32(
             return 1;
         }
     }
-    std::vector<std::string> names;
-    moe_push_layer_tensor_candidates(&names, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
-    moe_raw_tensor_desc desc{};
-    const moe_gguf_common_tensor_record* rec =
-        moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
-    if (!rec) {
-        return 0;
-    }
     moe_raw_tensor_cache_entry raw{};
-    if (!map_common_tensor_record(engine, *rec, desc, &raw)) {
-        return 0;
+    int mapped = 0;
+    if (moe_graph_ir_math_required(engine)) {
+        static const char* const roles[] = {
+            "router_per_expert_scale",
+            "per_expert_scale",
+            "moe_router_per_expert_scale"
+        };
+        mapped = moe_graph_ir_map_layer_op_role_any(
+            engine, layer, roles, sizeof(roles) / sizeof(roles[0]), &raw);
+        if (!mapped) {
+            static const char* const sections[] = { "router", "topk", "moe" };
+            for (const char* section : sections) {
+                for (const char* role : roles) {
+                    if (moe_graph_ir_map_layer_contract_tensor_role_f32(engine, layer, section, role, &raw)) {
+                        mapped = 1;
+                        break;
+                    }
+                }
+                if (mapped) {
+                    break;
+                }
+            }
+        }
+    }
+    std::string mapped_name;
+    static const char* const suffixes[] = {
+        "ffn_gate_inp.per_expert_scale",
+        "router.per_expert_scale",
+        "router.per_expert_scale.weight",
+        "mlp.router.per_expert_scale",
+        "mlp.router.per_expert_scale.weight",
+        "moe.gate.per_expert_scale",
+        "moe.gate.per_expert_scale.weight"
+    };
+    if (!mapped) {
+        std::vector<std::string> names;
+        moe_push_layer_tensor_candidates(&names, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]));
+        moe_raw_tensor_desc desc{};
+        const moe_gguf_common_tensor_record* rec =
+            moe_common_tensor_find_first_raw_compatible(engine, names, &desc);
+        if (!rec) {
+            return 0;
+        }
+        if (!map_common_tensor_record(engine, *rec, desc, &raw)) {
+            return 0;
+        }
+        mapped_name = rec->name;
     }
     const uint64_t count = moe_router_raw_scalar_count(raw);
     if (count != 1u && count != (uint64_t)experts) {
         moe_profile_log(
             "router_per_expert_scale_reject",
             "layer=%d experts=%u count=%llu name=%s",
-            layer, experts, (unsigned long long)count, rec->name.c_str());
+            layer, experts, (unsigned long long)count,
+            mapped_name.empty() ? "<graph_ir_contract>" : mapped_name.c_str());
         return 0;
     }
     {
