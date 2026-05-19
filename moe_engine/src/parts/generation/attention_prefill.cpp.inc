@@ -1071,12 +1071,12 @@ static int moe_attention_partial_rotary_factor_f32(
     }
     *out_partial = 0.0;
     double value = 0.0;
-    if ((moe_json_get_double_local(rope_scope, "partial_rotary_factor", &value) ||
+    if (((engine && engine->model_config_partial_rotary_factor > 0.0f &&
+          (value = (double)engine->model_config_partial_rotary_factor) > 0.0) ||
+         moe_json_get_double_local(rope_scope, "partial_rotary_factor", &value) ||
          moe_json_get_double_local(row, "partial_rotary_factor", &value) ||
          moe_attention_json_get_valid_double_any_f32(
              doc, "partial_rotary_factor", 0.0, 1.0, &value) ||
-         (engine && engine->model_config_partial_rotary_factor > 0.0f &&
-          (value = (double)engine->model_config_partial_rotary_factor) > 0.0) ||
          (engine && !engine->offload_gguf_metadata_json.empty() &&
           moe_attention_json_get_valid_double_any_f32(
               engine->offload_gguf_metadata_json, "partial_rotary_factor", 0.0, 1.0, &value))) &&
