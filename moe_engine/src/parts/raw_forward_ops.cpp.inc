@@ -127,11 +127,9 @@ static int moe_engine_rmsnorm_unit_offset(
         if (direct_contract) {
             value = 0;
             source = "direct_rmsnorm_contract";
-            engine->cached_rmsnorm_unit_offset.store(0, std::memory_order_release);
         } else if (unit_contract) {
             value = 1;
             source = "unit_offset_contract";
-            engine->cached_rmsnorm_unit_offset.store(1, std::memory_order_release);
         }
     }
 
