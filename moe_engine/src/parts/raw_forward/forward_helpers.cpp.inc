@@ -1088,10 +1088,14 @@ static int moe_engine_contract_uses_rmsnorm_unit_offset(
         "rms_norm_add_unit",
         "rmsnorm_add_unit"
     };
+    int saw_explicit_unit_false = 0;
     for (const char* key : unit_bool_keys) {
         if (moe_json_get_bool_local(engine->offload_gguf_metadata_json, key, &unit_offset) ||
             moe_json_get_bool_local(engine->offload_graph_ir_json, key, &unit_offset)) {
-            return unit_offset ? 1 : 0;
+            if (unit_offset) {
+                return 1;
+            }
+            saw_explicit_unit_false = 1;
         }
     }
     // Do not treat the mere presence of a bool key name (for example
@@ -1116,6 +1120,9 @@ static int moe_engine_contract_uses_rmsnorm_unit_offset(
     }
     if (moe_engine_contract_model_family_uses_rmsnorm_unit_offset(engine)) {
         return 1;
+    }
+    if (saw_explicit_unit_false) {
+        return 0;
     }
     return moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract(engine);
 }

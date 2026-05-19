@@ -461,7 +461,8 @@ def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
     assert "RMSNorm weight semantics are not inferable from tensor topology" in helper_text
     assert "return 0;" in helper_text[helper_text.index("moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract"):helper_text.index("moe_engine_contract_uses_direct_rmsnorm_weight")]
     assert "\"rmsnorm_unit_offset\": false" in helper_text
-    assert "return unit_offset ? 1 : 0" in helper_text
+    assert "saw_explicit_unit_false" in helper_text
+    assert "return unit_offset ? 1 : 0" not in helper_text
     assert "weight_stats_override_metadata_false" not in raw_ops_text
     assert "metadata_false_stats_inconclusive" not in raw_ops_text
     assert "mean_abs_raw < 0.75" not in raw_ops_text
@@ -481,6 +482,9 @@ def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
     assert '"source_repo_id"' in helper_text
     assert 'moe_engine_metadata_mentions(engine, "gemma")' in helper_text
     assert "unit_offset_contract_over_metadata_false" in raw_ops_text
+    false_pos = helper_text.index("if (saw_explicit_unit_false)")
+    family_pos = helper_text.index("moe_engine_contract_model_family_uses_rmsnorm_unit_offset(engine)")
+    assert family_pos < false_pos
 
 
 def test_runtime_arch_defaults_gemma_rmsnorm_to_unit_offset_contract():
