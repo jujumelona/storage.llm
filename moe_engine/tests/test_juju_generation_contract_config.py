@@ -418,13 +418,15 @@ def test_qkv_decode_requires_appended_tokens_not_just_capacity():
 
 
 def test_mxfp4_dot_and_cache_decode_use_physical_row_stride_from_index():
-    kernel_text = (ROOT / "moe_engine" / "src" / "parts" / "tensor_kernels" / "dot_q8q4q5_kernels.cpp.inc").read_text()
-    tensor_dot_text = (ROOT / "moe_engine" / "src" / "parts" / "tensor_dot.cpp.inc").read_text()
-    raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_ops.cpp.inc").read_text()
-    cache_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_cache.cpp.inc").read_text()
+    kernel_text = (ROOT / "moe_engine" / "src" / "parts" / "tensor_kernels" / "dot_q8q4q5_kernels.cpp.inc").read_text(encoding="utf-8")
+    tensor_dot_text = (ROOT / "moe_engine" / "src" / "parts" / "tensor_dot.cpp.inc").read_text(encoding="utf-8")
+    raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_ops.cpp.inc").read_text(encoding="utf-8")
+    cache_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_cache.cpp.inc").read_text(encoding="utf-8")
     assert "moe_mxfp4_row_layout_for_bytes" in kernel_text
-    assert "moe_mxfp4_row_bytes_for_block_cols(cols, 16u)" in kernel_text
-    assert "layout.bytewise_codes ? (qs[index] & 0x0fu)" in kernel_text
+    assert "MXFP4 is a 32-value block format" in kernel_text
+    assert "physical row stride" in kernel_text
+    assert "moe_mxfp4_row_bytes_for_block_cols(cols, 16u)" not in kernel_text
+    assert "layout.block_cols = 16u" not in kernel_text
     assert "moe_dot_gguf_mxfp4_row_strided" in kernel_text
     assert "moe_dot_gguf_mxfp4_two_rows_strided" in kernel_text
     assert "moe_dot_gguf_mxfp4_row_strided(packed, x, rec->info.cols, rec->weight_row_bytes)" in tensor_dot_text

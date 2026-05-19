@@ -354,30 +354,24 @@ static inline uint64_t moe_mxfp4_row_bytes_for_block_cols(uint32_t cols, uint32_
 }
 
 static moe_mxfp4_row_layout_t moe_mxfp4_row_layout_for_bytes(uint32_t cols, uint64_t physical_row_bytes) {
-    // The real MXFP4_MOE logs show rows such as 2816 -> 2992 bytes and
-    // 2112 -> 2244 bytes: exactly 17 bytes per 16 values.  Older JUJU/GGUF
-    // paths used 17 bytes per 32 values with nibble-packed codes.  The row
-    // stride recorded in the tensor index is therefore part of the codec
-    // contract and must drive decoding; otherwise the dot kernel reads every
-    // second scale block as payload and corrupts lm_head/MLP from token 0.
+    // MXFP4 is a 32-value block format: one E8M0 scale byte plus 16 bytes of
+    // packed E2M1 values.  Tensor-index row bytes are a physical row stride,
+    // not proof that the codec block size changed.  Rows such as 2816 -> 2992
+    // bytes have a 1496-byte logical MXFP4 payload plus stride padding/side
+    // data; decoding them as 16-value bytewise blocks consumes the second half
+    // of the stride as weights and corrupts MLP/lm_head outputs.
     moe_mxfp4_row_layout_t layout{32u, 17u, 0u};
     if (cols == 0 || physical_row_bytes == 0) {
         return layout;
     }
-    const uint64_t bytes_16 = moe_mxfp4_row_bytes_for_block_cols(cols, 16u);
     const uint64_t bytes_32 = moe_mxfp4_row_bytes_for_block_cols(cols, 32u);
-    if (physical_row_bytes == bytes_16) {
-        layout.block_cols = 16u;
-        layout.bytewise_codes = 1u;
-        return layout;
-    }
-    if (physical_row_bytes == bytes_32) {
+    if (physical_row_bytes >= bytes_32) {
         layout.block_cols = 32u;
         layout.bytewise_codes = 0u;
         return layout;
     }
-    // If the source row has extra stride padding, keep the legacy packed
-    // contract rather than guessing a different quantization family.
+    // Short legacy rows are kept as the packed 32-value contract rather than
+    // guessing a different quantization family from byte counts.
     return layout;
 }
 
