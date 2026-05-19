@@ -108,10 +108,20 @@ static int moe_engine_rmsnorm_unit_offset(
 
     // Contract priority must be deterministic.  An explicit metadata/GraphIR
     // boolean is authoritative even when it is false; false must not be undone
-    // by a later substring or tensor-topology heuristic.
+    // by a later substring or tensor-topology heuristic.  Legacy JUJU artifacts
+    // emitted the default false even when the source model family requires
+    // unit-offset RMSNorm; allow that model-family contract to repair only the
+    // false default, while an explicit direct semantics contract still wins.
     if (metadata_found) {
-        value = metadata_value ? 1 : 0;
-        source = metadata_source;
+        direct_contract = moe_engine_contract_uses_direct_rmsnorm_weight(engine);
+        unit_contract = moe_engine_contract_uses_rmsnorm_unit_offset(engine);
+        if (!metadata_value && !direct_contract && unit_contract) {
+            value = 1;
+            source = "unit_offset_contract_over_metadata_false";
+        } else {
+            value = metadata_value ? 1 : 0;
+            source = metadata_source;
+        }
         engine->cached_rmsnorm_unit_offset.store(value ? 1 : 0, std::memory_order_release);
     } else {
         direct_contract = moe_engine_contract_uses_direct_rmsnorm_weight(engine);

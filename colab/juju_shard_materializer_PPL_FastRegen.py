@@ -7427,7 +7427,11 @@ def juju_runtime_arch_metadata(contract, directory=None):
             rmsnorm_unit_offset_value,
             None,
         ),
-        "rmsnorm_weight_semantics": "unit_offset" if rmsnorm_unit_offset_value is True else first_present(runtime.get("rmsnorm_weight_semantics"), arch.get("rmsnorm_weight_semantics")),
+        "rmsnorm_weight_semantics": (
+            "unit_offset" if rmsnorm_unit_offset_value is True else
+            "direct" if rmsnorm_unit_offset_explicit is False else
+            first_present(runtime.get("rmsnorm_weight_semantics"), arch.get("rmsnorm_weight_semantics"))
+        ),
         "rope_theta": first_present(cfg("rope_theta", "theta"), arch.get("rope_theta"), runtime.get("rope_theta"), runtime.get("theta")),
         "theta": first_present(cfg("theta", "rope_theta"), arch.get("rope_theta"), runtime.get("theta"), runtime.get("rope_theta")),
         "sliding_window": first_present(cfg("sliding_window"), arch.get("sliding_window"), runtime.get("sliding_window")),

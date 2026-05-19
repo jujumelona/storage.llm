@@ -474,6 +474,7 @@ def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
     assert "cached_rmsnorm_unit_offset" in raw_ops_text
     assert "moe_engine_contract_model_family_uses_rmsnorm_unit_offset" in helper_text
     assert 'moe_json_get_string_local(engine->offload_graph_ir_json, key, &value)' in helper_text
+    assert "unit_offset_contract_over_metadata_false" in raw_ops_text
 
 
 def test_runtime_arch_defaults_gemma_rmsnorm_to_unit_offset_contract():
@@ -495,6 +496,7 @@ def test_runtime_arch_defaults_gemma_rmsnorm_to_unit_offset_contract():
     })
     assert explicit_direct["rms_norm_unit_offset"] is False
     assert explicit_direct["rmsnorm_unit_offset"] is False
+    assert explicit_direct["rmsnorm_weight_semantics"] == "direct"
 
 
 def test_router_contract_reads_graph_ir_sigmoid_scale_and_norm_topk():
