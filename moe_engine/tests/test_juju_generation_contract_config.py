@@ -474,6 +474,8 @@ def test_rmsnorm_unit_offset_is_contract_driven_not_weight_stats():
     assert "cached_rmsnorm_unit_offset" in raw_ops_text
     assert "moe_engine_contract_model_family_uses_rmsnorm_unit_offset" in helper_text
     assert 'moe_json_get_string_local(engine->offload_graph_ir_json, key, &value)' in helper_text
+    assert '"source_repo_id"' in helper_text
+    assert 'moe_engine_metadata_mentions(engine, "gemma")' in helper_text
     assert "unit_offset_contract_over_metadata_false" in raw_ops_text
 
 

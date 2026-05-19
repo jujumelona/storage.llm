@@ -1035,7 +1035,14 @@ static int moe_engine_contract_model_family_uses_rmsnorm_unit_offset(
         "model_type",
         "declared_architecture",
         "architecture",
-        "family"
+        "family",
+        "model_id",
+        "source_model_id",
+        "source_repo_id",
+        "base_model_id",
+        "model_name",
+        "source_name",
+        "name"
     };
     std::string value;
     for (const char* key : model_keys) {
@@ -1046,7 +1053,9 @@ static int moe_engine_contract_model_family_uses_rmsnorm_unit_offset(
         }
     }
     if (moe_engine_graph_ir_mentions(engine, "\"Gemma") ||
-        moe_engine_metadata_mentions(engine, "\"Gemma")) {
+        moe_engine_metadata_mentions(engine, "\"Gemma") ||
+        moe_engine_graph_ir_mentions(engine, "gemma") ||
+        moe_engine_metadata_mentions(engine, "gemma")) {
         return 1;
     }
     return 0;
