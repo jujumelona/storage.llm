@@ -1100,6 +1100,16 @@ def test_sliding_rope_uses_partial_dim_with_full_frequency_base():
     assert "head_dim > 0 && !inherited_full_rope_dim" in attn_text
 
 
+def test_partial_rotate_half_pairs_inside_active_rope_block():
+    rope_text = (ROOT / "moe_engine" / "src" / "parts" / "generation_rope.cpp.inc").read_text(encoding="utf-8")
+    fn = rope_text[
+        rope_text.index("static void moe_rope_rotate_half_partial_inplace"):
+        rope_text.index("static void moe_standard_rope_apply_inplace_with_layout")
+    ]
+    assert "const uint32_t partner_stride = active_half_dim;" in fn
+    assert "full_dim / 2u" not in fn
+
+
 def test_router_contract_layer_slice_is_cached_and_cleared_on_reload_paths():
     state = (ROOT / "moe_engine" / "src" / "parts" / "engine_state.cpp.inc").read_text()
     router = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_topk.cpp.inc").read_text()
