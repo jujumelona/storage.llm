@@ -1036,6 +1036,11 @@ static int moe_engine_contract_model_family_uses_rmsnorm_unit_offset(
         moe_ascii_contains_ci(engine->model_root, "gemma")) {
         return 1;
     }
+    if (moe_engine_graph_ir_mentions(engine, "post_ffw_norm_1") &&
+        moe_engine_graph_ir_mentions(engine, "post_ffw_norm_2") &&
+        moe_engine_graph_ir_mentions(engine, "gelu_pytorch_tanh")) {
+        return 1;
+    }
     static const char* const model_keys[] = {
         "model_type",
         "declared_architecture",
