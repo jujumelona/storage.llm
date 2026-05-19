@@ -538,14 +538,15 @@ static int moe_layer_router_should_use_raw_residual_f32(
     int router_sidecar_requires_rms_root,
     int router_has_internal_weight_scale
 ) {
+    (void)engine;
+    (void)layer;
+    (void)router_sidecar_requires_rms_root;
+    (void)router_has_internal_weight_scale;
+    // Router input selection is a graph contract, not a sidecar property.
+    // Weight-scale sidecars dequantize router weights by scaling the dot input;
+    // they must not override the IR rule that routes from expert_ffn_input
+    // unless the graph explicitly says the router consumes the residual stream.
     if (router_uses_raw_residual_contract) {
-        return 1;
-    }
-    if (router_sidecar_requires_rms_root) {
-        return 1;
-    }
-    if (router_has_internal_weight_scale &&
-        moe_engine_contract_uses_split_ffn_norm(engine, layer)) {
         return 1;
     }
     return 0;

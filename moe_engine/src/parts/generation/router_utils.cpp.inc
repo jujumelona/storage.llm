@@ -879,66 +879,18 @@ static int moe_router_scope_bool_true_f32(
         moe_json_get_bool_slice(doc, begin, end, key, &value) && value ? 1 : 0;
 }
 
-static int moe_router_scope_has_structural_split_expert_norms_f32(
-    const std::string& doc,
-    size_t begin,
-    size_t end
-) {
-    if (begin >= end || end > doc.size()) {
-        return 0;
-    }
-    if (moe_router_scope_bool_true_f32(doc, begin, end, "expert_branch_uses_expert_ffn_norm") &&
-        moe_router_scope_bool_true_f32(doc, begin, end, "shared_and_expert_post_norms_apply_before_branch_sum")) {
-        return 1;
-    }
-    size_t norms_begin = 0;
-    size_t norms_end = 0;
-    const std::string row = doc.substr(begin, end - begin);
-    if (!moe_json_find_object_local(row, "norms", &norms_begin, &norms_end)) {
-        return 0;
-    }
-    norms_begin += begin;
-    norms_end += begin;
-    return
-        moe_router_scope_has_nonempty_array_f32(doc, norms_begin, norms_end, "expert_ffn_norm") &&
-        moe_router_scope_has_nonempty_array_f32(doc, norms_begin, norms_end, "post_ffw_norm_1") &&
-        moe_router_scope_has_nonempty_array_f32(doc, norms_begin, norms_end, "post_ffw_norm_2");
-}
-
 static int moe_router_row_contract_implies_sidecar_rms_root_transform_f32(
     const std::string& doc,
     size_t begin,
     size_t end
 ) {
-    if (begin >= end || end > doc.size()) {
-        return 0;
-    }
-    const std::string row = doc.substr(begin, end - begin);
-    size_t router_begin = 0;
-    size_t router_end = 0;
-    const int has_router_scope = moe_json_find_object_local(row, "router", &router_begin, &router_end);
-    const size_t rb = has_router_scope ? begin + router_begin : begin;
-    const size_t re = has_router_scope ? begin + router_end : end;
-    const int has_sidecar =
-        moe_router_scope_has_nonempty_array_f32(doc, rb, re, "router_weight_scale_sidecar") ||
-        moe_router_scope_has_nonempty_array_f32(doc, rb, re, "router_weight_scale_sidecar_tensors");
-    const int sidecar_is_weight =
-        moe_router_scope_bool_true_f32(doc, rb, re, "ffn_gate_inp_scale_is_weight_scale_sidecar") ||
-        moe_router_scope_bool_true_f32(doc, begin, end, "ffn_gate_inp_scale_is_weight_scale_sidecar");
-    const int no_direct_input_scale =
-        moe_router_scope_has_empty_array_f32(doc, rb, re, "router_input_scale") ||
-        moe_router_scope_has_empty_array_f32(doc, rb, re, "router_input_scale_tensors");
-    if (!has_sidecar || !sidecar_is_weight || !no_direct_input_scale) {
-        return 0;
-    }
-    size_t semantic_begin = 0;
-    size_t semantic_end = 0;
-    if (moe_json_find_object_local(row, "semantic_contract", &semantic_begin, &semantic_end) &&
-        moe_router_scope_has_structural_split_expert_norms_f32(
-            doc, begin + semantic_begin, begin + semantic_end)) {
-        return 1;
-    }
-    return moe_router_scope_has_structural_split_expert_norms_f32(doc, begin, end);
+    (void)doc;
+    (void)begin;
+    (void)end;
+    // A router weight sidecar is not an activation-scale contract.  RMS-root
+    // input transforms must be explicit in the IR; structural split-FFN norms
+    // only describe which activation feeds the router.
+    return 0;
 }
 
 static int moe_router_weight_sidecar_requires_rms_root_transform_uncached_f32(
