@@ -185,6 +185,9 @@ def test_engine_ingests_idx_attention_contract_into_runtime_metadata():
     assert "JUJU_RUNTIME_ATTENTION_CONTRACT_V1" in parser_text
     assert 'lower_source.find("head_dim")' not in parser_text
     assert 'has_q_norm_contract' not in parser_text
+    extract_fn = parser_text[parser_text.index("static int moe_juju_extract_attention_contract"):parser_text.index("static std::string moe_juju_attention_contract_compact_json")]
+    assert extract_fn.index("expected_attention_scale") < extract_fn.index("moe_juju_attention_contract_uses_unit_scale")
+    assert 'std::fabs(attention_scale - 1.0) <= 1.0e-6' in extract_fn
     assert "engine->model_config_query_pre_attn_scalar = (float)query_pre_attn_scalar" in parser_text
     assert main_parse_text.count("moe_ingest_juju_attention_contract(engine, index_json);") >= 2
     assert "moe_juju_attention_contract_compact_json(index_json)" in readers_text
