@@ -798,6 +798,9 @@ def test_attention_scale_uses_contract_without_model_name_branch():
     attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_prefill.cpp.inc").read_text()
     helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
     parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
+    scale_fn = attn_text[attn_text.index("static float moe_standard_attention_score_scale"):attn_text.index("static float moe_attention_logit_softcap_value")]
+    assert scale_fn.index('"attention_scale"') < scale_fn.index("model_config_attention_unit_scale")
+    assert scale_fn.index('"query_pre_attn_scalar"') < scale_fn.index("model_config_attention_unit_scale")
     assert "moe_engine_contract_uses_unit_qk_norm_global" in helper_text
     assert "moe_engine_is_gemma4_text_contract" not in helper_text
     assert "unit_qk_norm" in attn_text

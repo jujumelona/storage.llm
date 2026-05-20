@@ -777,10 +777,6 @@ static float moe_standard_attention_score_scale(
         } else {
             int resolved_source = 0;
             float resolved_value = 0.0f;
-            if (engine->model_config_attention_unit_scale.load(std::memory_order_acquire) == 1) {
-                resolved_source = 4;
-                resolved_value = 1.0f;
-            }
             const float config_attention_scale = engine->model_config_attention_scale;
             if (config_attention_scale > 0.0f &&
                 config_attention_scale <= 1024.0f &&
@@ -872,7 +868,9 @@ static float moe_standard_attention_score_scale(
                     resolved_value = result;
                 }
             }
-            if (resolved_source == 0 && moe_layer_uses_unit_qk_norm_contract(engine, layer)) {
+            if (resolved_source == 0 &&
+                (engine->model_config_attention_unit_scale.load(std::memory_order_acquire) == 1 ||
+                 moe_layer_uses_unit_qk_norm_contract(engine, layer))) {
                 // Unit-QK-Norm is a fallback only when no numeric attention
                 // contract is available.  Numeric query_pre_attn_scalar,
                 // attention_scale, and qk_scale contracts are authoritative.
