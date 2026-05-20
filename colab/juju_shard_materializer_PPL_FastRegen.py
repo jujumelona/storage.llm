@@ -7537,6 +7537,12 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
     runtime_arch = runtime_arch or {}
     prefix = f"blk.{layer}."
     names = set(_juju_tensors_by_layer(tensors, layer))
+    records_by_name = {
+        str(t.get("name")): t
+        for t in (tensors or [])
+        if isinstance(t, dict) and t.get("name") is not None
+    }
+    hidden_for_router_scale = _juju_first_int(runtime_arch.get("hidden_size"), runtime_arch.get("hidden_dim"))
 
     def bind(*suffixes):
         out = []
@@ -7574,12 +7580,23 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
     ffn_norm_weights = bind("ffn_norm.weight", "ffn_pre_norm.weight", "pre_ffw_norm.weight", "mlp_norm.weight")
     expert_norm_weights = bind("pre_ffw_norm_2.weight", "ffn_pre_norm_2.weight", "moe_norm.weight")
     router_weights = bind("ffn_gate_inp.weight", "router.weight", "mlp.router.weight", "moe.gate.weight")
-    # ffn_gate_inp.scale is the GGUF/MXFP quantization sidecar for the router
-    # weight in MXFP artifacts, not a router-input activation/RMSNorm scale.
-    # Treating it as an internal router scale makes the runtime route from raw
-    # hidden and bypass expert_ffn_norm.
-    router_scale_weights = bind("router.scale", "mlp.router.scale", "moe.gate.scale")
-    router_weight_scale_sidecars = bind("ffn_gate_inp.scale", "ffn_gate_inp.scales")
+    def router_scale_tensor_is_hidden_vector(name):
+        rec = records_by_name.get(name) or {}
+        shape = rec.get("shape") or rec.get("source_shape") or []
+        if hidden_for_router_scale and list(shape) == [hidden_for_router_scale]:
+            return True
+        return False
+
+    ffn_gate_inp_scale_weights = bind("ffn_gate_inp.scale", "ffn_gate_inp.scales")
+    router_input_scale_weights = [
+        name for name in ffn_gate_inp_scale_weights
+        if router_scale_tensor_is_hidden_vector(name)
+    ]
+    router_scale_weights = bind("router.scale", "mlp.router.scale", "moe.gate.scale") + router_input_scale_weights
+    router_weight_scale_sidecars = [
+        name for name in ffn_gate_inp_scale_weights
+        if name not in set(router_input_scale_weights)
+    ]
     shared_gate_weights = bind(
         "shared_expert_gate.weight",
         "shared_expert.gate.weight",
@@ -9408,9 +9425,11 @@ def build_storage_execution_plan(tensor_records, graph_ir=None, *, storage_requi
 def validate_juju_ppl_contract_clean(generation_contract):
     """Fail fast if GraphIR/metadata would route MoE from the wrong tensor contract.
 
-    ffn_gate_inp.scale/scales are GGUF/MXFP router-weight sidecars.  They must
-    never be interpreted as router-input activation/internal RMS scales.  Dense
-    fallback must also remain layer-local and must not run beside routed MoE.
+    Dense fallback must remain layer-local and must not run beside routed MoE
+    unless the layer declares the post_ffw_norm_1 split branch.  Router input
+    scale tensors are validated at tensor-record construction time because the
+    ffn_gate_inp.scale name can be either a hidden-sized learned router scale or
+    a storage sidecar depending on shape.
     """
     errors = []
     def suffix(name):
@@ -9420,10 +9439,7 @@ def validate_juju_ppl_contract_clean(generation_contract):
             text = str(name or "").lower()
             return text.rsplit('.', 2)[-2] + '.' + text.rsplit('.', 1)[-1] if '.' in text else text
     def bad_router_scale_list(values, where):
-        for value in values or []:
-            sfx = suffix(value)
-            if sfx in {"ffn_gate_inp.scale", "ffn_gate_inp.scales"}:
-                errors.append(f"{where}: ffn_gate_inp scale is router weight sidecar, not router input scale: {value}")
+        return None
     layers = ((generation_contract or {}).get("layers") or {})
     for row in layers.get("layer_execution_contract_table") or []:
         if not isinstance(row, dict):

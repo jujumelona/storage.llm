@@ -371,9 +371,10 @@ static int moe_prepare_scaled_router_input_f32(
     int32_t layer,
     const float* hidden,
     uint32_t hidden_size,
+    uint32_t experts,
     std::vector<float>* out
 ) {
-    if (!engine || !hidden || !out || hidden_size == 0) {
+    if (!engine || !hidden || !out || hidden_size == 0 || experts == 0) {
         return 0;
     }
     // BUGFIX 599: Check hidden_size upper bound ??
@@ -384,8 +385,38 @@ static int moe_prepare_scaled_router_input_f32(
         return 0;
     }
     moe_raw_tensor_cache_entry scale_raw{};
+    int legacy_weight_sidecar_input_scale = 0;
     if (!moe_map_router_scale_tensor(engine, layer, &scale_raw)) {
-        return 0;
+        moe_raw_tensor_cache_entry sidecar{};
+        moe_raw_tensor_cache_entry router{};
+        if (moe_map_router_weight_scale_sidecar_tensor(engine, layer, hidden_size, &sidecar) &&
+            !moe_map_router_tensor(engine, layer, hidden_size, experts, &router)) {
+            return 0;
+        }
+        const uint32_t sidecar_elem = moe_raw_scalar_size(sidecar.scalar_encoding);
+        const uint32_t mapped_router_elem = moe_raw_scalar_size(router.scalar_encoding);
+        const int router_is_dense_raw_matrix =
+            mapped_router_elem > 0u &&
+            router.rows > 0u &&
+            router.cols == hidden_size &&
+            router.weight_row_bytes == (uint64_t)hidden_size * (uint64_t)mapped_router_elem &&
+            (router.weight_format == moe_WEIGHT_ENCODING_RAW_FP32 ||
+             router.weight_format == moe_WEIGHT_ENCODING_RAW_BF16 ||
+             router.weight_format == moe_WEIGHT_ENCODING_RAW_FP16);
+        if (!sidecar.base ||
+            sidecar_elem == 0u ||
+            moe_router_raw_scalar_count(sidecar) != (uint64_t)hidden_size ||
+            !router_is_dense_raw_matrix) {
+            return 0;
+        }
+        scale_raw = sidecar;
+        legacy_weight_sidecar_input_scale = 1;
+        if (moe_profile_level() >= 2) {
+            moe_profile_log(
+                "router_scale_contract_bind",
+                "layer=%d source=legacy_weight_sidecar_as_input_scale hidden=%u router_rows=%u",
+                layer, hidden_size, router.rows);
+        }
     }
     out->assign(hidden_size, 0.0f);
     // BUGFIX 220: Division by zero clarification (same pattern as BUGFIX 208)
@@ -406,7 +437,9 @@ static int moe_prepare_scaled_router_input_f32(
     // input scale tensors apply RMSNorm, then hidden_size^-0.5, then the
     // learned router scale.
     float norm = 1.0f / std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f);
-    const int direct_input_scale = moe_router_has_direct_input_scale_contract_f32(engine, layer);
+    const int direct_input_scale =
+        legacy_weight_sidecar_input_scale ||
+        moe_router_has_direct_input_scale_contract_f32(engine, layer);
     if (direct_input_scale) {
         const float root = 1.0f / std::sqrt((float)hidden_size);
         if (!std::isfinite(root) || !(root > 0.0f)) {
@@ -451,12 +484,13 @@ static int moe_prepare_scaled_router_input_f32(
     if (moe_profile_level() >= 2) {
         moe_profile_log(
             "router_scale_apply",
-            "layer=%d hidden=%u count=%llu unit_offset=%d input_norm=%.6g source=contract",
+            "layer=%d hidden=%u count=%llu unit_offset=%d input_norm=%.6g source=%s",
             layer,
             hidden_size,
             (unsigned long long)scale_count,
             unit_offset,
-            (double)norm);
+            (double)norm,
+            legacy_weight_sidecar_input_scale ? "legacy_weight_sidecar_as_input_scale" : "contract");
     }
     return 1;
 }
