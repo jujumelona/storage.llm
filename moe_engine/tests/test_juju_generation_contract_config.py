@@ -452,8 +452,11 @@ def test_mxfp4_dot_and_cache_decode_use_physical_row_stride_from_index():
     tensor_dot_text = (ROOT / "moe_engine" / "src" / "parts" / "tensor_dot.cpp.inc").read_text(encoding="utf-8")
     raw_ops_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_ops.cpp.inc").read_text(encoding="utf-8")
     cache_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_cache.cpp.inc").read_text(encoding="utf-8")
+    materializer_text = (ROOT / "colab" / "juju_shard_materializer_PPL_FastRegen.py").read_text(encoding="utf-8")
     assert "moe_mxfp4_row_layout_for_bytes" in kernel_text
     assert "Standard GGML MXFP4 is a 32-value block" in kernel_text
+    assert "low nibbles decode logical columns 0..15" in kernel_text
+    assert '"split16_low_nibbles_first_half_high_nibbles_second_half"' in materializer_text
     assert "index row stride is the only reliable runtime discriminator" in kernel_text
     assert "moe_mxfp4_row_bytes_for_block_cols(cols, 16u)" in kernel_text
     assert "layout.block_cols = 16u" in kernel_text

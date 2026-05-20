@@ -321,15 +321,17 @@ static float moe_mxfp4_value_from_code(uint8_t code) {
 }
 
 static int moe_mxfp4_pairwise_nibble_order_enabled() {
-    // JUJU/Colab MXFP4 contract declares pairwise packing:
-    // even logical value -> low nibble, odd logical value -> high nibble.
-    // Legacy GGUF split16 can be explicitly restored for old artifacts.
+    // GGML MXFP4 stores a 32-value block as sixteen payload bytes:
+    // low nibbles decode logical columns 0..15 and high nibbles decode
+    // columns 16..31.  JUJU materialization preserves source quant rows, so
+    // use that split-16 layout unless a repaired artifact explicitly asks for
+    // the older pairwise experiment.
     static int mode = -1;
     if (mode < 0) {
         const char* env = std::getenv("STORAGELLM_MXFP4_NIBBLE_ORDER");
-        mode = (!env || !*env ||
-                std::strcmp(env, "pairwise") == 0 ||
-                std::strcmp(env, "juju_pairwise") == 0) ? 1 : 0;
+        mode = (env && *env &&
+                (std::strcmp(env, "pairwise") == 0 ||
+                 std::strcmp(env, "juju_pairwise") == 0)) ? 1 : 0;
     }
     return mode != 0;
 }
