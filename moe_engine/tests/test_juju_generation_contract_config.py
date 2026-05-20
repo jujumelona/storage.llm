@@ -639,7 +639,7 @@ def test_mlp_router_input_scale_filter_rejects_bare_ffn_gate_inp_scale_sidecar()
     assert "ffn_gate_inp.scale/scales or" in mlp_norm_text
 
 
-def test_router_input_mode_does_not_use_bare_ffn_gate_inp_as_internal_router_scale():
+def test_router_input_mode_uses_ffn_gate_inp_sidecar_as_weight_scale_not_activation_scale():
     mlp_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
     router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
     first_start = mlp_text.index("const int router_has_internal_norm_scale =")
@@ -655,8 +655,10 @@ def test_router_input_mode_does_not_use_bare_ffn_gate_inp_as_internal_router_sca
     assert "router_scale_available=%d" in mlp_text
     internal_start = router_text.index("moe_router_has_internal_weight_scale_contract_f32")
     internal_block = router_text[internal_start:router_text.index("static const moe_gguf_common_tensor_record* moe_find_router_scale_record_by_role_f32", internal_start)]
-    assert '"ffn_gate_inp.scale"' not in internal_block
-    assert '"ffn_gate_inp.weight.scale"' not in internal_block
+    assert '"router_weight_scale_sidecar"' in internal_block
+    assert '"ffn_gate_inp.scale"' in internal_block
+    assert '"ffn_gate_inp.weight.scale"' in internal_block
+    assert "moe_router_scale_record_is_weight_sidecar_f32(*rec)" in internal_block
     assert '"router_input_scale"' in internal_block
     assert '"router.input_scale"' in internal_block
     assert '"router.scale"' not in internal_block

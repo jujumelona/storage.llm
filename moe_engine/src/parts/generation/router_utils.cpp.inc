@@ -517,6 +517,19 @@ static int moe_router_has_internal_weight_scale_contract_f32(
             return 1;
         }
     }
+    static const char* const sidecar_roles[] = {
+        "router_weight_scale_sidecar",
+        "moe_router_weight_scale_sidecar",
+        "ffn_gate_inp_scale",
+        "ffn_gate_inp_scales"
+    };
+    for (const char* role : sidecar_roles) {
+        const moe_gguf_common_tensor_record* rec =
+            find_common_tensor_by_op_role(engine, role, layer, &desc);
+        if (rec && moe_router_scale_record_is_weight_sidecar_f32(*rec)) {
+            return 1;
+        }
+    }
     static const char* const suffixes[] = {
         // Availability here means router-input activation scale, not MXFP/GGUF
         // weight sidecar tensors. Bare ffn_gate_inp.scale/scales are router
@@ -529,6 +542,17 @@ static int moe_router_has_internal_weight_scale_contract_f32(
         "moe.gate_input_scale"
     };
     for (const char* suffix : suffixes) {
+        if (moe_engine_has_common_tensor_suffix(engine, layer, suffix)) {
+            return 1;
+        }
+    }
+    static const char* const sidecar_suffixes[] = {
+        "ffn_gate_inp.scale",
+        "ffn_gate_inp.scales",
+        "ffn_gate_inp.weight.scale",
+        "ffn_gate_inp.weight.scales"
+    };
+    for (const char* suffix : sidecar_suffixes) {
         if (moe_engine_has_common_tensor_suffix(engine, layer, suffix)) {
             return 1;
         }
