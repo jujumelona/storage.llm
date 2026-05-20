@@ -144,6 +144,33 @@ def test_qk_norm_layer_contract_declares_unit_attention_scale():
     assert router_select.get("scale", []) == []
 
 
+def test_gemma4_dual_dense_moe_branch_is_not_serialized_as_fallback_only():
+    tensors = [
+        {"name": "blk.0.ffn_norm.weight"},
+        {"name": "blk.0.pre_ffw_norm_2.weight"},
+        {"name": "blk.0.ffn_gate_inp.weight"},
+        {"name": "blk.0.ffn_gate.weight"},
+        {"name": "blk.0.ffn_up.weight"},
+        {"name": "blk.0.ffn_down.weight"},
+        {"name": "blk.0.ffn_gate_exps.weight"},
+        {"name": "blk.0.ffn_up_exps.weight"},
+        {"name": "blk.0.ffn_down_exps.weight"},
+        {"name": "blk.0.post_ffw_norm_1.weight"},
+        {"name": "blk.0.post_ffw_norm_2.weight"},
+        {"name": "blk.0.post_ffw_norm.weight"},
+    ]
+    graph = mat.build_layer_graph_ir(0, tensors, {"num_experts": 128, "top_k_experts": 8})
+    dense = next(op for op in graph["ops"] if op["op"] == "dense_mlp")
+    assert dense["name"] == "dense_ffn_primary"
+    assert dense["required"] is True
+    assert dense["forbid_parallel_with_routed_moe"] is False
+    assert "execute_only_when_no_moe" not in dense["fallback_semantics"]
+
+    mlp_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text(encoding="utf-8", errors="ignore")
+    assert "structural_dense_moe_branch" in mlp_text
+    assert "plan.routed.has_weights && !split_dense_branch_by_norm1" in mlp_text
+
+
 
 def test_cpp_reader_accepts_all_declared_juju_required_features():
     contract_path = ROOT / "colab" / "juju_modules" / "format_contract.py"

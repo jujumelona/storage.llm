@@ -426,13 +426,13 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
     // distinguish those cases.
     const int dense_uses_shared_path =
         moe_graph_ir_dense_mlp_uses_shared_path_f32(engine, layer);
-    const int dense_forbidden_with_routed =
-        plan.routed.has_weights &&
-        (plan.dense.forbid_parallel_with_routed_moe || plan.dense.fallback_only);
+    const int structural_dense_moe_branch =
+        (plan.routed.has_weights && plan.dense.has_weights && plan.post_norm1.has_weights) ? 1 : 0;
     const int split_dense_branch_by_norm1 =
-        (!dense_forbidden_with_routed &&
-         (dense_uses_shared_path ||
-          (plan.routed.has_weights && plan.dense.has_weights && plan.post_norm1.has_weights))) ? 1 : 0;
+        (dense_uses_shared_path || structural_dense_moe_branch) ? 1 : 0;
+    const int dense_forbidden_with_routed =
+        plan.routed.has_weights && !split_dense_branch_by_norm1 &&
+        (plan.dense.forbid_parallel_with_routed_moe || plan.dense.fallback_only);
     if (split_dense_branch_by_norm1) {
         plan.dense.present = 1;
         plan.dense.required = 1;

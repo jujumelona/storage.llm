@@ -7631,6 +7631,18 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
         "qkv_update_mode": "append_current_token_before_decode_no_full_context_requantize",
         "forbid_plain_kv_runtime_fallback": True,
     }
+    dense_primary_branch = bool(moe_weights and post_ffw_norm1_weights and not shared_expert_weights)
+    dense_required = bool(
+        dense_weights and (
+            (not moe_weights and not shared_expert_weights) or
+            dense_primary_branch
+        )
+    )
+    dense_fallback_semantics = (
+        "primary_dense_branch_parallel_with_routed_moe_declared_by_post_ffw_norm_1"
+        if dense_primary_branch else
+        "execute_only_when_no_moe_or_shared_expert_weights_on_layer"
+    )
 
     ops = [
         {"op": "rms_norm", "name": "attention_input_norm", "inputs": ["hidden"], "weights": attention_norm_weights, "output": "attention_norm", "optional_behavior": "pass_hidden_when_weight_absent", "required": bool(attention_norm_weights)},
@@ -7657,7 +7669,7 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
         {"op": "rms_norm", "name": "post_ffw_norm_1", "inputs": ["shared_branch_raw"], "weights": post_ffw_norm1_weights, "output": "shared_branch", "optional_behavior": "pass_shared_branch_raw_when_weight_absent", "required": bool(post_ffw_norm1_weights)},
         {"op": "moe_expert_mlp", "name": "moe_experts", "inputs": ["expert_ffn_input", "selected_experts"], "weights": moe_weights, "per_expert_output_scale": expert_output_scale_weights, "output": "expert_sum_raw", "required": bool(moe_weights)},
         {"op": "rms_norm", "name": "post_ffw_norm_2", "inputs": ["expert_sum_raw"], "weights": post_ffw_norm2_weights, "output": "expert_branch", "optional_behavior": "pass_expert_sum_raw_when_weight_absent", "required": bool(post_ffw_norm2_weights)},
-        {"op": "dense_mlp", "name": "dense_ffn_fallback", "inputs": ["shared_ffn_input"], "weights": dense_weights, "output": "dense_branch", "required": bool(dense_weights and (not moe_weights and not shared_expert_weights or (moe_weights and post_ffw_norm1_weights and not shared_expert_weights))), "fallback_semantics": "execute_only_when_no_moe_or_shared_expert_weights_on_layer_unless_post_ffw_norm_1_declares_primary_dense_branch", "forbid_parallel_with_routed_moe": bool((moe_weights or shared_expert_weights) and not (moe_weights and post_ffw_norm1_weights and not shared_expert_weights))},
+        {"op": "dense_mlp", "name": "dense_ffn_primary" if dense_primary_branch else "dense_ffn_fallback", "inputs": ["shared_ffn_input"], "weights": dense_weights, "output": "dense_branch", "required": dense_required, "fallback_semantics": dense_fallback_semantics, "forbid_parallel_with_routed_moe": bool((moe_weights or shared_expert_weights) and not dense_primary_branch)},
         {"op": "add", "name": "ffn_branch_sum", "inputs": ["shared_branch", "expert_branch", "dense_branch"], "output": "ffn_out", "missing_input": "zero", "required": bool(moe_weights or shared_expert_weights or dense_weights)},
         {"op": "rms_norm", "name": "post_ffw_norm", "inputs": ["ffn_out"], "weights": post_ffw_norm_weights, "output": "ffn_branch", "optional_behavior": "pass_ffn_out_when_weight_absent", "required": bool(post_ffw_norm_weights)},
         {"op": "residual", "name": "ffn_residual", "inputs": ["hidden", "ffn_branch"], "output": "hidden", "required": True},
