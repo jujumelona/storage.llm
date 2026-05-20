@@ -786,7 +786,9 @@ def test_graphir_dense_branch_execution_uses_split_branch_structure_not_routed_p
     assert "if (plan.routed.present && plan.dense.has_weights && !plan.shared.has_weights)" not in planner
     assert "graphir_dense_branch_by_norm1 =" not in planner
     assert "dense_mlp + post_ffw_norm_1 as the primary non-routed FFN" in planner
-    assert "plan.run_dense = ((plan.dense.required && plan.dense.has_weights) || split_dense_branch_by_norm1) ? 1 : 0;" in planner
+    assert "dense_forbidden_with_routed" in planner
+    assert "plan.dense.forbid_parallel_with_routed_moe || plan.dense.fallback_only" in planner
+    assert "((plan.dense.required && plan.dense.has_weights) || split_dense_branch_by_norm1)" in planner
 
 
 
@@ -882,14 +884,19 @@ def test_routed_graph_runs_dense_only_when_ir_declares_primary_branch_shape():
     mlp_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
     assert "moe_layer_dense_mlp_should_run_f32" in mlp_text
     helper = mlp_text[mlp_text.index("static int moe_layer_has_common_dense_mlp_tensors_f32"):mlp_text.index("static int moe_layer_dense_mlp_should_run_f32")]
-    block = mlp_text[mlp_text.index("static int moe_layer_dense_mlp_should_run_f32"):mlp_text.index("static int moe_layer_moe_mlp_f32")]
+    planner_start = mlp_text.index("static moe_graph_ir_mlp_layer_plan_f32")
+    planner = mlp_text[planner_start:mlp_text.index("static int moe_layer_has_common_dense_mlp_tensors_f32", planner_start)]
+    should_block = mlp_text[mlp_text.index("static int moe_layer_dense_mlp_should_run_f32"):mlp_text.index("static int moe_layer_moe_mlp_f32")]
     assert '"ffn_gate.weight"' in helper
     assert '"ffn_up.weight"' in helper
     assert '"ffn_down.weight"' in helper
-    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer) &&" not in block
-    assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" not in block
-    assert "post_ffw_norm_1" in block
-    assert "A routed layer can still own a primary dense branch" in block
+    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer) &&" not in should_block
+    assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" not in should_block
+    assert "post_ffw_norm_1" in planner
+    assert "A routed layer can still own a primary dense branch" in mlp_text
+    assert "forbid_parallel_with_routed_moe" in mlp_text
+    assert "fallback_semantics" in mlp_text
+    assert "dense_forbidden_with_routed" in planner
     assert "split-FFN router input scale is required" in mlp_text
 
 
@@ -979,11 +986,15 @@ def test_dense_branch_uses_graph_role_not_common_alias_presence():
         assert suffix in helper_block
     should_pos = mlp_text.index("static int moe_layer_dense_mlp_should_run_f32")
     should_block = mlp_text[should_pos:mlp_text.index("static int moe_layer_moe_mlp_f32", should_pos)]
+    planner_block = mlp_text[mlp_text.index("static moe_graph_ir_mlp_layer_plan_f32"):should_pos]
     assert "moe_layer_has_common_dense_mlp_tensors_f32(engine, layer)" not in should_block
-    assert '"dense_mlp"' in should_block
-    assert '"dense_ffn"' in should_block
-    assert '"moe_expert_mlp"' in should_block
-    assert "return moe_graph_ir_layer_has_op_role_any" in should_block
+    assert '"dense_mlp"' in planner_block
+    assert '"dense_ffn"' in planner_block
+    assert '"moe_expert_mlp"' in planner_block
+    assert "forbid_parallel_with_routed_moe" in mlp_text
+    assert "fallback_semantics" in mlp_text
+    assert "dense_forbidden_with_routed" in planner_block
+    assert "return plan.run_dense ? 1 : 0;" in should_block
 
 
 

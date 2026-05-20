@@ -85,6 +85,8 @@ struct moe_graph_ir_mlp_op_info_f32 {
     int present = 0;
     int required = 0;
     int has_weights = 0;
+    int forbid_parallel_with_routed_moe = 0;
+    int fallback_only = 0;
     size_t weight_count = 0;
 };
 
@@ -171,6 +173,24 @@ static void moe_graph_ir_layer_scan_mlp_op_f32(
             if (moe_json_get_bool_slice(doc, op_begin, op_end, "required", &required) && required) {
                 out->required = 1;
             }
+            int forbid_parallel = 0;
+            if (moe_json_get_bool_slice(
+                    doc, op_begin, op_end,
+                    "forbid_parallel_with_routed_moe", &forbid_parallel) &&
+                forbid_parallel) {
+                out->forbid_parallel_with_routed_moe = 1;
+            }
+            std::string fallback_semantics;
+            if (moe_json_get_string_slice(
+                    doc, op_begin, op_end,
+                    "fallback_semantics", &fallback_semantics)) {
+                const std::string fallback_lower = moe_lower_ascii_copy(fallback_semantics);
+                if (fallback_lower.find("fallback") != std::string::npos ||
+                    fallback_lower.find("execute_only_when_no_moe") != std::string::npos ||
+                    fallback_lower.find("only_when_no_moe") != std::string::npos) {
+                    out->fallback_only = 1;
+                }
+            }
             std::vector<std::string> weights;
             if (moe_json_get_string_array_slice(doc, op_begin, op_end, "weights", &weights)) {
                 out->weight_count += weights.size();
@@ -244,6 +264,24 @@ static void moe_graph_ir_layer_scan_contract_table_mlp_op_f32(
                 int required = 0;
                 if (moe_json_get_bool_slice(doc, op_begin, op_end, "required", &required) && required) {
                     out->required = 1;
+                }
+                int forbid_parallel = 0;
+                if (moe_json_get_bool_slice(
+                        doc, op_begin, op_end,
+                        "forbid_parallel_with_routed_moe", &forbid_parallel) &&
+                    forbid_parallel) {
+                    out->forbid_parallel_with_routed_moe = 1;
+                }
+                std::string fallback_semantics;
+                if (moe_json_get_string_slice(
+                        doc, op_begin, op_end,
+                        "fallback_semantics", &fallback_semantics)) {
+                    const std::string fallback_lower = moe_lower_ascii_copy(fallback_semantics);
+                    if (fallback_lower.find("fallback") != std::string::npos ||
+                        fallback_lower.find("execute_only_when_no_moe") != std::string::npos ||
+                        fallback_lower.find("only_when_no_moe") != std::string::npos) {
+                        out->fallback_only = 1;
+                    }
                 }
                 std::vector<std::string> weights;
                 if (moe_json_get_string_array_slice(doc, op_begin, op_end, "weights", &weights)) {
@@ -388,9 +426,13 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
     // distinguish those cases.
     const int dense_uses_shared_path =
         moe_graph_ir_dense_mlp_uses_shared_path_f32(engine, layer);
+    const int dense_forbidden_with_routed =
+        plan.routed.has_weights &&
+        (plan.dense.forbid_parallel_with_routed_moe || plan.dense.fallback_only);
     const int split_dense_branch_by_norm1 =
-        (dense_uses_shared_path ||
-         (plan.routed.has_weights && plan.dense.has_weights && plan.post_norm1.has_weights)) ? 1 : 0;
+        (!dense_forbidden_with_routed &&
+         (dense_uses_shared_path ||
+          (plan.routed.has_weights && plan.dense.has_weights && plan.post_norm1.has_weights))) ? 1 : 0;
     if (split_dense_branch_by_norm1) {
         plan.dense.present = 1;
         plan.dense.required = 1;
@@ -399,16 +441,19 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
             plan.dense.weight_count = 3u;
         }
     }
-    plan.run_dense = ((plan.dense.required && plan.dense.has_weights) || split_dense_branch_by_norm1) ? 1 : 0;
+    plan.run_dense =
+        (!dense_forbidden_with_routed &&
+         ((plan.dense.required && plan.dense.has_weights) || split_dense_branch_by_norm1)) ? 1 : 0;
     plan.run_shared = plan.shared.has_weights ? 1 : 0;
     plan.shared_required = plan.shared.required ? 1 : 0;
     moe_profile_log(
         "graphir_mlp_layer_plan",
-        "layer=%d routed_present=%d routed_weights=%zu shared_present=%d shared_required=%d shared_weights=%zu run_shared=%d dense_present=%d dense_required=%d dense_weights=%zu run_dense=%d dense_uses_shared_path=%d graphir_dense_by_norm1=%d split_dense_by_norm1=%d post_norm1_present=%d post_norm1_weights=%zu",
+        "layer=%d routed_present=%d routed_weights=%zu shared_present=%d shared_required=%d shared_weights=%zu run_shared=%d dense_present=%d dense_required=%d dense_weights=%zu dense_forbid_parallel=%d dense_fallback_only=%d run_dense=%d dense_uses_shared_path=%d graphir_dense_by_norm1=%d split_dense_by_norm1=%d post_norm1_present=%d post_norm1_weights=%zu",
         layer,
         plan.routed.present, plan.routed.weight_count,
         plan.shared.present, plan.shared.required, plan.shared.weight_count, plan.run_shared,
-        plan.dense.present, plan.dense.required, plan.dense.weight_count, plan.run_dense,
+        plan.dense.present, plan.dense.required, plan.dense.weight_count,
+        plan.dense.forbid_parallel_with_routed_moe, plan.dense.fallback_only, plan.run_dense,
         dense_uses_shared_path, 0,
         split_dense_branch_by_norm1, plan.post_norm1.present, plan.post_norm1.weight_count);
     if (tls_plan_cache.size() > 256u) {
