@@ -675,10 +675,13 @@ static int moe_layer_moe_mlp_f32(
     const moe_storage_raw_span_spec_t* shared = find_raw_role_span_bytes(layer, moe_RAW_ROLE_SHARED, shared_bytes, 0);
     const int common_shared_enabled = moe_graph_ir_math_required(engine) ?
         0 : moe_layer_common_ffn_is_shared_branch_f32(engine, layer);
+    const int explicit_shared_enabled = moe_graph_ir_math_required(engine) ?
+        (mlp_plan.run_shared ? 1 : 0) : 1;
     int shared_ok = 0;
     int common_shared_ok = 0;
     const uint64_t shared_start_us = moe_profile_now_us();
-    if (moe_layer_shared_expert_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->residual.data())) {
+    if (explicit_shared_enabled &&
+        moe_layer_shared_expert_dense_mlp_f32(engine, layer, s, shared_input, hidden_size, s->residual.data())) {
         shared_ok = 1;
     } else if (!moe_graph_ir_math_required(engine) && shared &&
         moe_raw_mlp_span_f32(
@@ -701,7 +704,7 @@ static int moe_layer_moe_mlp_f32(
             shared_branch = s->shared.data();
             moe_mlp_trace_vec_f32("mlp_shared_branch_post_norm1", layer, shared_branch, hidden_size);
         } else if (moe_layer_has_post_ffw_norm1_weight(engine, layer) &&
-                   (moe_graph_ir_math_required(engine) ? mlp_plan.shared.present : moe_layer_graph_shared_expert_declared_f32(engine, layer))) {
+                   (moe_graph_ir_math_required(engine) ? mlp_plan.run_shared : moe_layer_graph_shared_expert_declared_f32(engine, layer))) {
             std::fprintf(stderr,
                 "[storagellm mlp] shared post-ffw norm1 tensor is required but could not be mapped layer=%d\n",
                 layer);
@@ -732,7 +735,7 @@ static int moe_layer_moe_mlp_f32(
         }
         common_shared_ok = 1;
         moe_mlp_trace_vec_f32("mlp_common_shared_branch", layer, common_branch, hidden_size);
-    } else if (moe_graph_ir_math_required(engine) ? mlp_plan.shared.present : moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
+    } else if (moe_graph_ir_math_required(engine) ? mlp_plan.run_shared : moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
         // Shared branches are optional unless the tensor binding is explicit and
         // mappable.  Do not fail or substitute the plain dense FFN when GraphIR
         // only contains an abstract/shared op with no common tensor span; doing so
@@ -2764,7 +2767,10 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         float* shared_out_buf = local.residual.data();
         int shared_ok = 0;
         int common_shared_ok = 0;
-        if (moe_layer_shared_expert_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, shared_out_buf)) {
+        const int explicit_shared_enabled = moe_graph_ir_math_required(engine) ?
+            (mlp_plan.run_shared ? 1 : 0) : 1;
+        if (explicit_shared_enabled &&
+            moe_layer_shared_expert_dense_mlp_f32(engine, layer, &local, shared_input, hidden_size, shared_out_buf)) {
             shared_ok = 1;
         } else if (!moe_graph_ir_math_required(engine) && shared &&
             moe_raw_mlp_span_f32(
@@ -2786,7 +2792,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                     local.shared.data(), attn_cfg.rms_norm_eps)) {
                 branch1 = local.shared.data();
             } else if (moe_layer_has_post_ffw_norm1_weight(engine, layer) &&
-                       (moe_graph_ir_math_required(engine) ? mlp_plan.shared.present : moe_layer_graph_shared_expert_declared_f32(engine, layer))) {
+                       (moe_graph_ir_math_required(engine) ? mlp_plan.run_shared : moe_layer_graph_shared_expert_declared_f32(engine, layer))) {
                 std::fprintf(stderr,
                     "[storagellm mlp] batch shared post-ffw norm1 tensor is required but could not be mapped layer=%d token=%u\n",
                     layer, t);
@@ -2817,7 +2823,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                 return 0;
             }
             common_shared_ok = 1;
-        } else if (moe_graph_ir_math_required(engine) ? mlp_plan.shared.present : moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
+        } else if (moe_graph_ir_math_required(engine) ? mlp_plan.run_shared : moe_layer_graph_shared_expert_declared_f32(engine, layer)) {
             moe_profile_log(
                 "prefill_shared_graph_role_unmapped",
                 "layer=%d token=%u action=skip_optional_shared_branch",
