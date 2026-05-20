@@ -1118,11 +1118,11 @@ static int moe_engine_contract_uses_rmsnorm_unit_offset(
         moe_engine_metadata_mentions(engine, "rms_norm_weight_semantics\": \"plus_one")) {
         return 1;
     }
-    if (saw_explicit_unit_false) {
-        return 0;
-    }
     if (moe_engine_contract_model_family_uses_rmsnorm_unit_offset(engine)) {
         return 1;
+    }
+    if (saw_explicit_unit_false) {
+        return 0;
     }
     return moe_engine_contract_uses_rmsnorm_unit_offset_tensor_contract(engine);
 }
