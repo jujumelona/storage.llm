@@ -955,12 +955,17 @@ def test_expert_down_scale_is_legacy_runtime_scale_but_not_direct_contract_scale
 
 def test_raw_residual_router_input_requires_explicit_graph_contract():
     norm_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_normalization.cpp.inc").read_text()
+    fwd_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
     block = norm_text[norm_text.index("static int moe_layer_router_uses_raw_residual_input"):norm_text.index("static int moe_layer_common_dense_mlp_f32")]
+    selector = fwd_text[fwd_text.index("static int moe_layer_router_should_use_raw_residual_f32"):
+                        fwd_text.index("static int moe_layer_moe_mlp_f32")]
     assert "moe_engine_contract_uses_split_ffn_norm(engine, layer)" not in block
     assert '"ffn_gate_inp.weight"' not in block
     assert "ffn_gate_inp.weight" not in block
     assert "use_hidden_when_router_has_internal_scale_else_expert_ffn_input" not in block
     assert "return 0;" in block
+    assert "router_has_internal_weight_scale" in selector
+    assert "return 1;" in selector
 
 def test_no_v_proj_contract_is_layer_local_not_graphwide_string():
     attn_text = (ROOT / "moe_engine/src/parts/generation/attention_decode.cpp.inc").read_text()
@@ -1119,9 +1124,13 @@ def test_router_input_does_not_use_raw_residual_without_internal_scale():
     norm = (ROOT / "moe_engine/src/parts/generation/mlp_normalization.cpp.inc").read_text()
     fwd = (ROOT / "moe_engine/src/parts/generation/mlp_forward.cpp.inc").read_text()
     block = norm[norm.index("static int moe_layer_router_uses_raw_residual_input"):norm.index("static int moe_layer_common_dense_mlp_f32")]
+    selector = fwd[fwd.index("static int moe_layer_router_should_use_raw_residual_f32"):
+                   fwd.index("static int moe_layer_moe_mlp_f32")]
     assert '"ffn_gate_inp.weight"' not in block
     assert '"moe_router"' not in block
     assert "return 0;" in block
+    assert "router_has_internal_weight_scale" in selector
+    assert "router-column scale" in selector
     assert "router_has_internal_norm_scale || router_uses_raw_residual" in fwd
 
 
@@ -1310,7 +1319,8 @@ def test_router_rms_root_sidecar_uses_raw_residual_input():
     helper = mlp[mlp.index("static int moe_layer_router_should_use_raw_residual_f32"):
                  mlp.index("static int moe_layer_moe_mlp_f32")]
     assert "router_sidecar_requires_rms_root" in helper
-    assert "moe_engine_contract_uses_split_ffn_norm(engine, layer)" in helper
+    assert "router_has_internal_weight_scale" in helper
+    assert "Gemma4-style" in helper
     first = mlp[mlp.index("static int moe_layer_moe_mlp_f32"):
                 mlp.index("static uint32_t moe_mlp_prefill_expert_batch_limit")]
     assert "moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer)" in first

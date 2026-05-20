@@ -7649,7 +7649,7 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
         {"op": "residual", "name": "attention_residual", "inputs": ["hidden", "attention_branch"], "output": "hidden", "required": True},
         {"op": "rms_norm", "name": "ffn_norm", "inputs": ["hidden"], "weights": ffn_norm_weights, "output": "shared_ffn_input", "optional_behavior": "pass_hidden_when_weight_absent", "required": bool(ffn_norm_weights)},
         {"op": "rms_norm", "name": "expert_ffn_norm", "inputs": ["hidden"], "weights": expert_norm_weights, "output": "expert_ffn_input", "optional_behavior": "use_shared_ffn_input_when_weight_absent", "required": bool(expert_norm_weights)},
-        {"op": "select", "name": "router_input", "inputs": ["hidden", "expert_ffn_input"], "output": "router_input", "rule": "use_hidden_only_when_explicit_router_input_scale_present_else_expert_ffn_input", "scale": router_scale_weights, "weight_scale_sidecars": router_weight_scale_sidecars, "required": False},
+        {"op": "select", "name": "router_input", "inputs": ["hidden", "expert_ffn_input"], "output": "router_input", "rule": "use_hidden_for_moe_router_experts_use_expert_ffn_input_weight_sidecars_are_router_column_scales", "scale": router_scale_weights, "weight_scale_sidecars": router_weight_scale_sidecars, "required": False},
         {"op": "hidden_snapshot", "name": "fate_gate_input_snapshot", "inputs": ["router_input"], "target": "engine_state.gate_input_snapshots[layer]", "required": False},
         {"op": "linear", "name": "moe_router", "inputs": ["router_input"], "weights": router_weights, "scale": router_scale_weights, "weight_scale_sidecars": router_weight_scale_sidecars, "output": "expert_scores", "required": bool(router_weights)},
         {"op": "topk", "name": "expert_select", "inputs": ["expert_scores"], "config_key": "adaptive_seq_topk_entropy", "per_expert_scale": router_per_expert_scale_weights, "required": bool(router_weights)},
@@ -7679,7 +7679,7 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
         "semantic_contract": {
             "attention_post_norm_is_separate_from_ffn_norm": True,
             "expert_branch_uses_expert_ffn_norm": bool(expert_norm_weights),
-            "router_uses_hidden_when_internal_scale_present": bool(router_scale_weights),
+            "router_uses_hidden_when_internal_scale_present": bool(router_scale_weights or router_weight_scale_sidecars),
             "router_input_scale_tensors": router_scale_weights,
             "router_per_expert_scale_tensors": router_per_expert_scale_weights,
             "router_weight_scale_sidecar_tensors": router_weight_scale_sidecars,
@@ -7945,7 +7945,7 @@ def _juju_layer_execution_contract_table(tensor_records, runtime_arch):
                 "router_per_expert_scale": router_per_expert_scale_refs,
                 "router_weight_scale_sidecar": router_weight_scale_sidecar_refs,
                 "ffn_gate_inp_scale_is_weight_scale_sidecar": bool(router_weight_scale_sidecar_refs),
-                "router_uses_hidden_when_internal_scale_present": bool(router_scale_refs),
+                "router_uses_hidden_when_internal_scale_present": bool(router_scale_refs or router_weight_scale_sidecar_refs),
                 "routed_experts_per_token": runtime_arch.get("routed_experts_per_token"),
                 "top_k_experts": runtime_arch.get("top_k_experts"),
                 "num_experts_per_tok": runtime_arch.get("num_experts_per_tok"),
@@ -9419,8 +9419,11 @@ def validate_juju_ppl_contract_clean(generation_contract):
         layer = row.get("layer")
         router = row.get("router") if isinstance(row.get("router"), dict) else {}
         bad_router_scale_list(router.get("router_scale") or [], f"layer_execution_contract_table[{layer}].router.router_scale")
-        if router.get("router_uses_hidden_when_internal_scale_present") and not (router.get("router_scale") or []):
-            errors.append(f"layer_execution_contract_table[{layer}]: internal router scale flag set with no explicit router.scale tensor")
+        if (
+            router.get("router_uses_hidden_when_internal_scale_present") and
+            not (router.get("router_scale") or router.get("router_weight_scale_sidecar") or [])
+        ):
+            errors.append(f"layer_execution_contract_table[{layer}]: router hidden-input flag set with no router scale or weight sidecar tensor")
     for layer_ir in layers.get("graph_ir_layers") or []:
         if not isinstance(layer_ir, dict):
             continue
