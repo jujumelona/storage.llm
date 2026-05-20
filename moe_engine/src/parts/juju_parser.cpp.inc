@@ -841,19 +841,7 @@ static int moe_juju_extract_attention_contract(
         std::fprintf(stderr, "[storagellm] JUJU idx missing/invalid attention_scale: %.17g\n", attention_scale);
         return 0;
     }
-    const double expected_attention_scale = 1.0 / std::sqrt(query_pre_attn_scalar);
-    const double tolerance = std::max(1.0e-8, std::fabs(expected_attention_scale) * 1.0e-5);
-    if (std::fabs(attention_scale - expected_attention_scale) <= tolerance) {
-        if (out_query_pre_attn_scalar) {
-            *out_query_pre_attn_scalar = query_pre_attn_scalar;
-        }
-        if (out_attention_scale) {
-            *out_attention_scale = attention_scale;
-        }
-        return 1;
-    }
-    if (moe_juju_attention_contract_uses_unit_scale(json) &&
-        std::fabs(attention_scale - 1.0) <= 1.0e-6) {
+    if (moe_juju_attention_contract_uses_unit_scale(json)) {
         if (out_query_pre_attn_scalar) {
             *out_query_pre_attn_scalar = query_pre_attn_scalar;
         }
@@ -865,10 +853,21 @@ static int moe_juju_extract_attention_contract(
         }
         return 1;
     }
-    std::fprintf(stderr,
-        "[storagellm] JUJU idx attention scale mismatch: scale=%.17g expected=%.17g qpre=%.17g\n",
-        attention_scale, expected_attention_scale, query_pre_attn_scalar);
-    return 0;
+    const double expected_attention_scale = 1.0 / std::sqrt(query_pre_attn_scalar);
+    const double tolerance = std::max(1.0e-8, std::fabs(expected_attention_scale) * 1.0e-5);
+    if (std::fabs(attention_scale - expected_attention_scale) > tolerance) {
+        std::fprintf(stderr,
+            "[storagellm] JUJU idx attention scale mismatch: scale=%.17g expected=%.17g qpre=%.17g\n",
+            attention_scale, expected_attention_scale, query_pre_attn_scalar);
+        return 0;
+    }
+    if (out_query_pre_attn_scalar) {
+        *out_query_pre_attn_scalar = query_pre_attn_scalar;
+    }
+    if (out_attention_scale) {
+        *out_attention_scale = attention_scale;
+    }
+    return 1;
 }
 
 static std::string moe_juju_attention_contract_compact_json(const std::string& json) {

@@ -113,6 +113,34 @@ def test_layer_graph_ir_carries_attention_and_router_contracts():
     graph = mat.build_layer_graph_ir(0, tensors, arch)
     router_select = next(op for op in graph["ops"] if op["name"] == "router_input")
     assert router_select.get("raw_residual_contract", True) is True
+
+
+def test_qk_norm_layer_contract_declares_unit_attention_scale():
+    tensors = [
+        {"name": "blk.0.attn_q.weight"},
+        {"name": "blk.0.attn_k.weight"},
+        {"name": "blk.0.attn_v.weight"},
+        {"name": "blk.0.attn_output.weight"},
+        {"name": "blk.0.attn_q_norm.weight"},
+        {"name": "blk.0.attn_k_norm.weight"},
+        {"name": "blk.0.attn_v_norm.weight"},
+    ]
+    arch = {
+        "head_dim": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "query_pre_attn_scalar": 256.0,
+        "attention_scale": 0.0625,
+        "attention_scale_source": "head_dim",
+    }
+    row = mat._juju_layer_execution_contract_table(tensors, arch)[0]
+    attn_row = mat._juju_attention_layer_contract_table(tensors, arch)[0]
+    assert row["attention"]["unit_attention_scale"] is True
+    assert row["attention"]["attention_scale"] == 1.0
+    assert row["attention"]["attention_scale_source"] == "qk_norm_contract"
+    assert attn_row["unit_attention_scale"] is True
+    assert attn_row["attention_scale"] == 1.0
+    assert attn_row["attention_scale_source"] == "qk_norm_contract"
     assert router_select.get("scale", []) == []
 
 
@@ -186,8 +214,7 @@ def test_engine_ingests_idx_attention_contract_into_runtime_metadata():
     assert 'lower_source.find("head_dim")' not in parser_text
     assert 'has_q_norm_contract' not in parser_text
     extract_fn = parser_text[parser_text.index("static int moe_juju_extract_attention_contract"):parser_text.index("static std::string moe_juju_attention_contract_compact_json")]
-    assert extract_fn.index("expected_attention_scale") < extract_fn.index("moe_juju_attention_contract_uses_unit_scale")
-    assert 'std::fabs(attention_scale - 1.0) <= 1.0e-6' in extract_fn
+    assert extract_fn.index("moe_juju_attention_contract_uses_unit_scale") < extract_fn.index("expected_attention_scale")
     assert "engine->model_config_query_pre_attn_scalar = (float)query_pre_attn_scalar" in parser_text
     assert main_parse_text.count("moe_ingest_juju_attention_contract(engine, index_json);") >= 2
     assert "moe_juju_attention_contract_compact_json(index_json)" in readers_text
@@ -220,7 +247,7 @@ def test_exact_ppl_eval_is_fail_closed_on_runtime_contract_and_fallbacks():
     assert "JUJU exact_ppl_mode required_features contract is not loaded" in eval_text
     assert "JUJU attention scale contract is not loaded" in eval_text
     assert "JUJU attention scale does not match runtime attention contract" in eval_text
-    assert "Numeric attention-scale contracts are authoritative" in eval_text
+    assert "Non-unit numeric attention-scale contracts are checked" in eval_text
     assert "moe_engine_contract_uses_unit_qk_norm_global(engine)" not in eval_text
     assert "JUJU storage format plan is not available for exact PPL" in eval_text
     assert "JUJU expert index is not ready for exact PPL" in eval_text

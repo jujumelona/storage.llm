@@ -7772,6 +7772,16 @@ def _juju_attention_layer_contract_table(tensor_records, runtime_arch):
             missing.append("attention_output")
         if not v_refs and not attention_k_eq_v:
             missing.append("v_projection_or_attention_k_eq_v_contract")
+        unit_qk_attention_scale = bool(q_norm_refs and k_norm_refs)
+        attention_scale = 1.0 if unit_qk_attention_scale else first_present(
+            runtime_arch.get("attention_scale"),
+            runtime_arch.get("attn_scale"),
+            runtime_arch.get("attention_score_scale"),
+            runtime_arch.get("qk_scale"),
+        )
+        attention_scale_source = (
+            "qk_norm_contract" if unit_qk_attention_scale else runtime_arch.get("attention_scale_source")
+        )
         table.append({
             "format": "JUJU_LAYER_ATTENTION_CONTRACT_V1",
             "layer": int(layer),
@@ -7798,8 +7808,11 @@ def _juju_attention_layer_contract_table(tensor_records, runtime_arch):
             "unweighted_value_norm_is_contractual_when_declared": bool(implicit_unweighted_v_norm),
             "rope_contract": _juju_layer_rope_contract(layer, runtime_arch),
             "query_pre_attn_scalar": first_present(runtime_arch.get("query_pre_attn_scalar"), runtime_arch.get("attention_query_pre_attn_scalar"), runtime_arch.get("attn_query_pre_attn_scalar")),
-            "attention_scale": first_present(runtime_arch.get("attention_scale"), runtime_arch.get("attn_scale"), runtime_arch.get("attention_score_scale"), runtime_arch.get("qk_scale")),
-            "attention_scale_source": runtime_arch.get("attention_scale_source"),
+            "attention_scale": attention_scale,
+            "attention_score_scale": attention_scale,
+            "attention_scale_source": attention_scale_source,
+            "unit_attention_scale": unit_qk_attention_scale,
+            "qk_norm_unit_scale": unit_qk_attention_scale,
             "attn_logit_softcap": first_present(runtime_arch.get("attn_logit_softcap"), runtime_arch.get("attn_logit_softcapping"), runtime_arch.get("attention_logit_softcap"), runtime_arch.get("attention_logit_softcapping")),
             "qkv_cache_backend": "qkv_quantized_per_layer_head_cache",
             "ppl_kv_backend": "qkv_quantized_per_layer_head_cache",
@@ -7854,6 +7867,17 @@ def _juju_layer_execution_contract_table(tensor_records, runtime_arch):
         k_norm_refs = refs(JUJU_K_NORM_SUFFIXES)
         attention_k_eq_v = _juju_bool_or_none(runtime_arch.get("attention_k_eq_v")) is True
         value_norm_input = _juju_value_raw_input_name(bool(v_refs), attention_k_eq_v)
+        unit_qk_attention_scale = bool(q_norm_refs and k_norm_refs)
+        attention_scale = 1.0 if unit_qk_attention_scale else first_present(
+            runtime_arch.get("attention_scale"),
+            runtime_arch.get("attn_scale"),
+            runtime_arch.get("attention_score_scale"),
+            runtime_arch.get("f_attn_scale"),
+            runtime_arch.get("qk_scale"),
+        )
+        attention_scale_source = (
+            "qk_norm_contract" if unit_qk_attention_scale else runtime_arch.get("attention_scale_source")
+        )
         out.append({
             "format": "JUJU_LAYER_EXECUTION_CONTRACT_V1",
             "layer": int(layer),
@@ -7895,7 +7919,11 @@ def _juju_layer_execution_contract_table(tensor_records, runtime_arch):
                 "value_norm_requires_layer_local_weight_tensor": bool(v_norm_refs),
                 "unweighted_value_norm_is_contractual_when_declared": bool(implicit_unweighted_v_norm),
                 "rope_contract": _juju_layer_rope_contract(layer, runtime_arch),
-                "attention_scale": first_present(runtime_arch.get("attention_scale"), runtime_arch.get("attn_scale"), runtime_arch.get("attention_score_scale"), runtime_arch.get("f_attn_scale"), runtime_arch.get("qk_scale")),
+                "attention_scale": attention_scale,
+                "attention_score_scale": attention_scale,
+                "attention_scale_source": attention_scale_source,
+                "unit_attention_scale": unit_qk_attention_scale,
+                "qk_norm_unit_scale": unit_qk_attention_scale,
                 "query_pre_attn_scalar": first_present(runtime_arch.get("query_pre_attn_scalar"), runtime_arch.get("attention_query_pre_attn_scalar"), runtime_arch.get("attn_query_pre_attn_scalar")),
                 "attn_logit_softcap": first_present(runtime_arch.get("attn_logit_softcap"), runtime_arch.get("attn_logit_softcapping"), runtime_arch.get("attention_logit_softcap"), runtime_arch.get("attention_logit_softcapping")),
             },

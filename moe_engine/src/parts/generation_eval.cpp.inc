@@ -30,9 +30,8 @@ static int moe_eval_exact_ppl_contract_ready(
             moe_eval_set_error(out_stats, "JUJU attention scale contract is not loaded");
             return 0;
         }
-    // Numeric attention-scale contracts are authoritative for exact-PPL mode.
-    // A textual/unit-QK marker is only a runtime fallback when no numeric scale
-    // exists; it must not mask query_pre_attn_scalar or attention_scale here.
+    // Non-unit numeric attention-scale contracts are checked against
+    // query_pre_attn_scalar; explicit unit-QK contracts are handled above.
         const double expected = 1.0 / std::sqrt((double)engine->model_config_query_pre_attn_scalar);
         const double actual = (double)engine->model_config_attention_scale;
         const double tol = std::max(1.0e-8, std::fabs(expected) * 1.0e-5);
