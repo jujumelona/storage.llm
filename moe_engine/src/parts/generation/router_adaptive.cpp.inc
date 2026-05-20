@@ -316,7 +316,7 @@ static int moe_router_expert_choice_f32(
     for (uint32_t t = 0; t < batch_size; ++t) {
         std::vector<float> scaled_router_input;
         const float* router_input = hidden_batch + t * hidden_size;
-        if (moe_prepare_scaled_router_input_f32(engine, layer, router_input, hidden_size, &scaled_router_input)) {
+        if (moe_prepare_scaled_router_input_f32(engine, layer, router_input, hidden_size, experts, &scaled_router_input)) {
             router_input = scaled_router_input.data();
         }
         if (!moe_router_logits_f32(
