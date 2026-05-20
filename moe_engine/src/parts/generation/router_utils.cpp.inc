@@ -95,9 +95,27 @@ static int moe_router_logits_f32(
         }
         std::vector<float> weight_sidecar_input;
         const float* dot_input = hidden;
-        if (moe_prepare_router_weight_sidecar_input_f32(
+        const uint32_t common_elem = moe_raw_scalar_size(common.scalar_encoding);
+        const int common_is_dense_raw_matrix =
+            common_elem > 0u &&
+            common.weight_row_bytes == (uint64_t)hidden_size * (uint64_t)common_elem &&
+            (common.weight_format == moe_WEIGHT_ENCODING_RAW_FP32 ||
+             common.weight_format == moe_WEIGHT_ENCODING_RAW_BF16 ||
+             common.weight_format == moe_WEIGHT_ENCODING_RAW_FP16);
+        if (!common_is_dense_raw_matrix &&
+            moe_prepare_router_weight_sidecar_input_f32(
                 engine, layer, hidden, hidden_size, &weight_sidecar_input)) {
             dot_input = weight_sidecar_input.data();
+        } else if (common_is_dense_raw_matrix && moe_profile_level() >= 2) {
+            moe_profile_log(
+                "router_weight_sidecar_skip",
+                "layer=%d reason=raw_router_matrix_already_scaled rows=%u cols=%u row_bytes=%llu elem=%u format=%u",
+                layer,
+                common.rows,
+                common.cols,
+                (unsigned long long)common.weight_row_bytes,
+                common_elem,
+                (unsigned)common.weight_format);
         }
         return moe_parallel_rows(engine, experts, 0, [&](uint32_t row) {
             const float logit = moe_raw_tensor_dot_row(common, row, dot_input, hidden_size);

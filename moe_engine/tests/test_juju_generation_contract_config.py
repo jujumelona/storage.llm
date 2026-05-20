@@ -642,6 +642,8 @@ def test_mlp_router_input_scale_filter_rejects_bare_ffn_gate_inp_scale_sidecar()
 def test_router_input_mode_uses_ffn_gate_inp_sidecar_as_weight_scale_not_activation_scale():
     mlp_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "mlp_forward.cpp.inc").read_text()
     router_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_utils.cpp.inc").read_text()
+    logits_block = router_text[router_text.index("static int moe_router_logits_f32"):
+                               router_text.index("static float moe_router_sigmoid")]
     first_start = mlp_text.index("const int router_has_internal_norm_scale =")
     first_end = mlp_text.index("moe_save_gate_input_snapshot", first_start)
     first_block = mlp_text[first_start:first_end]
@@ -665,6 +667,9 @@ def test_router_input_mode_uses_ffn_gate_inp_sidecar_as_weight_scale_not_activat
     assert '"mlp.router.scale"' not in internal_block
     assert '"moe.gate.scale"' not in internal_block
     assert "ambiguous and require an explicit op-role record" in internal_block
+    assert "common_is_dense_raw_matrix" in logits_block
+    assert "router_weight_sidecar_skip" in logits_block
+    assert "raw_router_matrix_already_scaled" in logits_block
 
 
 def test_direct_router_input_scale_is_narrower_than_router_norm_gamma():
