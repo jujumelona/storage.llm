@@ -253,15 +253,10 @@ static void moe_rope_rotate_half_partial_inplace(
     if (frequency_dim < active_dim || frequency_dim > full_dim) {
         frequency_dim = active_dim;
     }
-    // Default partial RoPE rotates inside the active rotary block.  HF
-    // proportional RoPE is different: it builds a full-head cos/sin vector with
-    // zero inverse frequencies for the non-rotary slots, then applies
-    // rotate_half over the whole head.  In that case the active first-half
-    // channels pair with the matching channels in the full head's second half.
-    const int proportional_full_head_layout =
-        frequency_dim > active_dim && frequency_dim <= full_dim && full_dim >= 2u;
-    const uint32_t partner_stride =
-        proportional_full_head_layout ? (full_dim / 2u) : active_half_dim;
+    // rotate_half is applied within the rotary sub-vector.  A larger
+    // frequency_dim changes the frequency schedule only; it must not pair the
+    // first rotary half with non-rotary channels later in the full head.
+    const uint32_t partner_stride = active_half_dim;
     if (partner_stride == 0u || (uint64_t)partner_stride + active_pairs > full_dim) {
         return;
     }
