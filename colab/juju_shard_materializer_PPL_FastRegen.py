@@ -7542,8 +7542,6 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
         for t in (tensors or [])
         if isinstance(t, dict) and t.get("name") is not None
     }
-    hidden_for_router_scale = _juju_first_int(runtime_arch.get("hidden_size"), runtime_arch.get("hidden_dim"))
-
     def bind(*suffixes):
         out = []
         wanted = {str(suffix or "").lower() for suffix in suffixes if suffix}
@@ -7580,23 +7578,9 @@ def build_layer_graph_ir(layer, tensors, runtime_arch=None):
     ffn_norm_weights = bind("ffn_norm.weight", "ffn_pre_norm.weight", "pre_ffw_norm.weight", "mlp_norm.weight")
     expert_norm_weights = bind("pre_ffw_norm_2.weight", "ffn_pre_norm_2.weight", "moe_norm.weight")
     router_weights = bind("ffn_gate_inp.weight", "router.weight", "mlp.router.weight", "moe.gate.weight")
-    def router_scale_tensor_is_hidden_vector(name):
-        rec = records_by_name.get(name) or {}
-        shape = rec.get("shape") or rec.get("source_shape") or []
-        if hidden_for_router_scale and list(shape) == [hidden_for_router_scale]:
-            return True
-        return False
-
     ffn_gate_inp_scale_weights = bind("ffn_gate_inp.scale", "ffn_gate_inp.scales")
-    router_input_scale_weights = [
-        name for name in ffn_gate_inp_scale_weights
-        if router_scale_tensor_is_hidden_vector(name)
-    ]
-    router_scale_weights = bind("router.scale", "mlp.router.scale", "moe.gate.scale") + router_input_scale_weights
-    router_weight_scale_sidecars = [
-        name for name in ffn_gate_inp_scale_weights
-        if name not in set(router_input_scale_weights)
-    ]
+    router_scale_weights = bind("router.scale", "mlp.router.scale", "moe.gate.scale")
+    router_weight_scale_sidecars = list(ffn_gate_inp_scale_weights)
     shared_gate_weights = bind(
         "shared_expert_gate.weight",
         "shared_expert.gate.weight",
@@ -9426,10 +9410,9 @@ def validate_juju_ppl_contract_clean(generation_contract):
     """Fail fast if GraphIR/metadata would route MoE from the wrong tensor contract.
 
     Dense fallback must remain layer-local and must not run beside routed MoE
-    unless the layer declares the post_ffw_norm_1 split branch.  Router input
-    scale tensors are validated at tensor-record construction time because the
-    ffn_gate_inp.scale name can be either a hidden-sized learned router scale or
-    a storage sidecar depending on shape.
+    unless the layer declares the post_ffw_norm_1 split branch.  Bare
+    ffn_gate_inp.scale tensors are router-weight sidecars; direct router-input
+    activation scales must use the explicit router scale contract.
     """
     errors = []
     def suffix(name):

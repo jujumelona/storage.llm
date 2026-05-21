@@ -171,7 +171,7 @@ def test_gemma4_dual_dense_moe_branch_is_not_serialized_as_fallback_only():
     assert "plan.routed.has_weights && !split_dense_branch_by_norm1" in mlp_text
 
 
-def test_hidden_sized_ffn_gate_input_scale_is_router_input_scale_contract():
+def test_hidden_sized_ffn_gate_input_scale_is_router_weight_sidecar_contract():
     tensors = [
         {"name": "blk.0.ffn_gate_inp.weight", "shape": [2816, 128]},
         {"name": "blk.0.ffn_gate_inp.scale", "shape": [2816]},
@@ -180,13 +180,14 @@ def test_hidden_sized_ffn_gate_input_scale_is_router_input_scale_contract():
     graph = mat.build_layer_graph_ir(0, tensors, {"hidden_size": 2816, "num_experts": 128, "top_k_experts": 8})
     router_select = next(op for op in graph["ops"] if op["name"] == "router_input")
     router_linear = next(op for op in graph["ops"] if op["name"] == "moe_router")
-    assert router_select["scale"] == ["blk.0.ffn_gate_inp.scale"]
-    assert router_select["weight_scale_sidecars"] == []
-    assert router_linear["scale"] == ["blk.0.ffn_gate_inp.scale"]
-    assert router_linear["weight_scale_sidecars"] == []
+    assert router_select["scale"] == []
+    assert router_select["weight_scale_sidecars"] == ["blk.0.ffn_gate_inp.scale"]
+    assert router_linear["scale"] == []
+    assert router_linear["weight_scale_sidecars"] == ["blk.0.ffn_gate_inp.scale"]
 
     router_scale_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_scale_inputs.cpp.inc").read_text(encoding="utf-8", errors="ignore")
-    assert "legacy_weight_sidecar_as_input_scale" in router_scale_text
+    assert "legacy_weight_sidecar_as_input_scale" not in router_scale_text
+    assert "weight_sidecar_matrix_scaled_rms_root" in router_scale_text
 
 
 

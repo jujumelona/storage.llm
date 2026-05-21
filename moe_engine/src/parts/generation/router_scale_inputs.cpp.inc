@@ -385,7 +385,6 @@ static int moe_prepare_scaled_router_input_f32(
         return 0;
     }
     moe_raw_tensor_cache_entry scale_raw{};
-    int legacy_weight_sidecar_input_scale = 0;
     if (!moe_map_router_scale_tensor(engine, layer, &scale_raw)) {
         moe_raw_tensor_cache_entry sidecar{};
         moe_raw_tensor_cache_entry router{};
@@ -409,14 +408,38 @@ static int moe_prepare_scaled_router_input_f32(
             !router_is_dense_raw_matrix) {
             return 0;
         }
-        scale_raw = sidecar;
-        legacy_weight_sidecar_input_scale = 1;
+        double ss = 0.0;
+        for (uint32_t i = 0; i < hidden_size; ++i) {
+            const double val = (double)hidden[i];
+            if (!std::isfinite(val)) {
+                return 0;
+            }
+            ss += val * val;
+        }
+        if (!std::isfinite(ss)) {
+            return 0;
+        }
+        float norm =
+            (1.0f / std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f)) *
+            (1.0f / std::sqrt((float)hidden_size));
+        if (!std::isfinite(norm) || !(norm > 0.0f)) {
+            return 0;
+        }
+        out->assign(hidden_size, 0.0f);
+        for (uint32_t i = 0; i < hidden_size; ++i) {
+            const float result = hidden[i] * norm;
+            if (!std::isfinite(result)) {
+                return 0;
+            }
+            (*out)[i] = result;
+        }
         if (moe_profile_level() >= 2) {
             moe_profile_log(
-                "router_scale_contract_bind",
-                "layer=%d source=legacy_weight_sidecar_as_input_scale hidden=%u router_rows=%u",
-                layer, hidden_size, router.rows);
+                "router_scale_apply",
+                "layer=%d hidden=%u count=0 unit_offset=0 input_norm=%.6g source=weight_sidecar_matrix_scaled_rms_root router_rows=%u",
+                layer, hidden_size, (double)norm, router.rows);
         }
+        return 1;
     }
     out->assign(hidden_size, 0.0f);
     // BUGFIX 220: Division by zero clarification (same pattern as BUGFIX 208)
@@ -437,9 +460,7 @@ static int moe_prepare_scaled_router_input_f32(
     // input scale tensors apply RMSNorm, then hidden_size^-0.5, then the
     // learned router scale.
     float norm = 1.0f / std::sqrt((float)(ss / (double)hidden_size) + 1.0e-6f);
-    const int direct_input_scale =
-        legacy_weight_sidecar_input_scale ||
-        moe_router_has_direct_input_scale_contract_f32(engine, layer);
+    const int direct_input_scale = moe_router_has_direct_input_scale_contract_f32(engine, layer);
     if (direct_input_scale) {
         const float root = 1.0f / std::sqrt((float)hidden_size);
         if (!std::isfinite(root) || !(root > 0.0f)) {
@@ -490,7 +511,7 @@ static int moe_prepare_scaled_router_input_f32(
             (unsigned long long)scale_count,
             unit_offset,
             (double)norm,
-            legacy_weight_sidecar_input_scale ? "legacy_weight_sidecar_as_input_scale" : "contract");
+            "contract");
     }
     return 1;
 }
