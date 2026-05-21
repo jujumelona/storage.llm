@@ -627,6 +627,7 @@ std::atomic<int> storage_format_plan_available{0};
     uint32_t model_config_num_attention_heads = 0;
     uint32_t model_config_num_key_value_heads = 0;
     uint32_t model_config_num_global_key_value_heads = 0;
+    uint32_t model_config_num_kv_shared_layers = 0;
     uint32_t model_config_head_dim = 0;
     uint32_t model_config_global_head_dim = 0;
     uint32_t model_config_sliding_window = 0;

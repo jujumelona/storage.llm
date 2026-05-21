@@ -58,6 +58,11 @@
         engine->model_config_num_global_key_value_heads = moe_u64_to_u32_clamped(value, 0);
         attention_valid = 1;
     }
+    if (moe_json_get_u64_local(text_config, "num_kv_shared_layers", &value) ||
+        moe_json_get_u64_local(config_json, "num_kv_shared_layers", &value)) {
+        engine->model_config_num_kv_shared_layers = moe_u64_to_u32_clamped(value, 0);
+        attention_valid = 1;
+    }
     if (moe_json_get_u64_local(text_config, "head_dim", &value)) {
         engine->model_config_head_dim = moe_u64_to_u32_clamped(value, 0);
         attention_valid = 1;
@@ -157,10 +162,11 @@
     if (attention_valid) {
         engine->model_config_attention_valid.store(1, std::memory_order_relaxed);
         std::fprintf(stderr,
-            "[storagellm] model config attention loaded: heads=%u kv=%u global_kv=%u head_dim=%u global_head_dim=%u kv_lora=%u q_lora=%u qk_nope=%u qk_rope=%u layers=%zu qpre=%.6g sliding_rope=%.6g full_rope=%.6g partial=%.6g\n",
+            "[storagellm] model config attention loaded: heads=%u kv=%u global_kv=%u kv_shared_layers=%u head_dim=%u global_head_dim=%u kv_lora=%u q_lora=%u qk_nope=%u qk_rope=%u layers=%zu qpre=%.6g sliding_rope=%.6g full_rope=%.6g partial=%.6g\n",
             engine->model_config_num_attention_heads,
             engine->model_config_num_key_value_heads,
             engine->model_config_num_global_key_value_heads,
+            engine->model_config_num_kv_shared_layers,
             engine->model_config_head_dim,
             engine->model_config_global_head_dim,
             probe->attn.kv_lora_rank,

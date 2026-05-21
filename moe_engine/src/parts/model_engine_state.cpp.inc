@@ -207,6 +207,7 @@ static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {
     engine->model_config_num_attention_heads = 0;
     engine->model_config_num_key_value_heads = 0;
     engine->model_config_num_global_key_value_heads = 0;
+    engine->model_config_num_kv_shared_layers = 0;
     engine->model_config_head_dim = 0;
     engine->model_config_global_head_dim = 0;
     engine->model_config_sliding_window = 0;
