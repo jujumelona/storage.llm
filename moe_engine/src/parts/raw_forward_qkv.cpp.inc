@@ -155,6 +155,20 @@ static uint64_t moe_qkv_config_policy_hash(const qkv_config_t& cfg) {
     return h ? h : 1ull;
 }
 
+static void moe_qkv_drop_unbound_outlier_split(qkv_config_t& cfg, uint32_t head_dim) {
+    if (cfg.outlier_channels <= 0 || cfg.outlier_channel_indices) {
+        return;
+    }
+    const int dropped = cfg.outlier_channels;
+    cfg.outlier_channels = 0;
+    cfg.policy_hash = 0;
+    moe_profile_log(
+        "qkv_outlier_split_disabled",
+        "head_dim=%u requested_channels=%d reason=missing_explicit_outlier_channel_indices",
+        head_dim,
+        dropped);
+}
+
 static qkv_config_t moe_qkv_contract_config_for_head_dim(
     const moe_pc_engine* engine,
     uint32_t head_dim
@@ -245,6 +259,7 @@ static qkv_config_t moe_qkv_contract_config_for_head_dim(
     if (cfg.outlier_channels > (int)head_dim) {
         cfg.outlier_channels = (int)head_dim;
     }
+    moe_qkv_drop_unbound_outlier_split(cfg, head_dim);
     if (cfg.rotation_backend != QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL &&
         cfg.rotation_backend != QKV_ROTATION_BACKEND_HADAMARD_SIGN_FAST) {
         cfg.rotation_backend = QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL;
@@ -799,4 +814,3 @@ static void save_gate_input_snapshot(moe_pc_engine* engine, int layer, const flo
         }
     }
 }
-
