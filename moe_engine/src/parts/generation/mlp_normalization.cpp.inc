@@ -62,6 +62,51 @@ static int moe_layer_shared_expert_gate_f32(
     return std::isfinite(*out_gate) ? 1 : 0;
 }
 
+static int moe_map_expert_output_scale_tensor_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    moe_raw_tensor_cache_entry* out
+) {
+    if (!engine || layer < 0 || !out) {
+        return 0;
+    }
+    if (moe_graph_ir_math_required(engine)) {
+        static const char* const roles[] = {
+            "expert_output_scale",
+            "per_expert_output_scale",
+            "moe_expert_output_scale",
+            "expert_down_output_scale",
+            "down_output_scale"
+        };
+        if (moe_graph_ir_map_layer_op_role_any(engine, layer, roles, sizeof(roles) / sizeof(roles[0]), out)) {
+            return 1;
+        }
+        static const char* const sections[] = {
+            "moe_experts",
+            "experts",
+            "expert",
+            "mlp"
+        };
+        for (const char* section : sections) {
+            for (const char* role : roles) {
+                if (moe_graph_ir_map_layer_contract_tensor_role_f32(engine, layer, section, role, out)) {
+                    return 1;
+                }
+            }
+        }
+    }
+    static const char* const suffixes[] = {
+        "expert_output_scale",
+        "per_expert_output_scale",
+        "moe.expert_output_scale",
+        "moe.per_expert_output_scale",
+        "experts.expert_output_scale",
+        "experts.per_expert_output_scale",
+        "ffn_down_exps.output_scale"
+    };
+    return moe_map_layer_common_tensor(engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]), out);
+}
+
 
 static int moe_layer_get_expert_down_uniform_scale_f32(
     moe_pc_engine* engine,
@@ -82,33 +127,8 @@ static int moe_layer_get_expert_down_uniform_scale_f32(
     // the CPU-only MLP path fuse down_proj and expert accumulation without first
     // materializing a full [top_k, hidden] output buffer.  Per-channel scale tensors
     // still fall back to the fully general path for correctness.
-    static const char* const suffixes[] = {
-        "ffn_gate_inp.per_expert_scale",
-        "router.per_expert_scale",
-        "mlp.router.per_expert_scale",
-        "moe.gate.per_expert_scale"
-    };
-    static const char* const direct_contract_suffixes[] = {
-        "per_expert_scale",
-        "moe.per_expert_scale",
-        "mlp.moe.per_expert_scale",
-        "experts.per_expert_scale",
-        "ffn_gate_inp.per_expert_scale",
-        "router.per_expert_scale",
-        "mlp.router.per_expert_scale",
-        "moe.gate.per_expert_scale"
-    };
-    const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
-    // Do not bind ffn_down_exps.scale here. In the current JUJU contract it is
-    // listed as a routed expert tensor, but applying it as an expert-output
-    // multiplier regresses chat PPL. Runtime expert scales require explicit
-    // per_expert_scale-style names.
-    const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
-    const size_t scale_suffix_count = direct_scale_contract ?
-        (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :
-        (sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_cache_entry raw{};
-    if (!moe_map_layer_common_tensor(engine, layer, scale_suffixes, scale_suffix_count, &raw)) {
+    if (!moe_map_expert_output_scale_tensor_f32(engine, layer, &raw)) {
         *out_scale = 1.0f;
         return 1;
     }
@@ -159,33 +179,8 @@ static int moe_layer_apply_expert_down_scale_f32(
         return 0;
     }
 
-    static const char* const suffixes[] = {
-        "ffn_gate_inp.per_expert_scale",
-        "router.per_expert_scale",
-        "mlp.router.per_expert_scale",
-        "moe.gate.per_expert_scale"
-    };
-    static const char* const direct_contract_suffixes[] = {
-        "per_expert_scale",
-        "moe.per_expert_scale",
-        "mlp.moe.per_expert_scale",
-        "experts.per_expert_scale",
-        "ffn_gate_inp.per_expert_scale",
-        "router.per_expert_scale",
-        "mlp.router.per_expert_scale",
-        "moe.gate.per_expert_scale"
-    };
-    const int direct_scale_contract = moe_engine_contract_uses_direct_per_expert_scale(engine, layer);
-    // Do not bind ffn_down_exps.scale here. In the current JUJU contract it is
-    // listed as a routed expert tensor, but applying it as an expert-output
-    // multiplier regresses chat PPL. Runtime expert scales require explicit
-    // per_expert_scale-style names.
-    const char* const* scale_suffixes = direct_scale_contract ? direct_contract_suffixes : suffixes;
-    const size_t scale_suffix_count = direct_scale_contract ?
-        (sizeof(direct_contract_suffixes) / sizeof(direct_contract_suffixes[0])) :
-        (sizeof(suffixes) / sizeof(suffixes[0]));
     moe_raw_tensor_cache_entry raw{};
-    if (!moe_map_layer_common_tensor(engine, layer, scale_suffixes, scale_suffix_count, &raw)) {
+    if (!moe_map_expert_output_scale_tensor_f32(engine, layer, &raw)) {
         return 1;
     }
     const uint64_t count = moe_raw_tensor_scalar_count(raw);
