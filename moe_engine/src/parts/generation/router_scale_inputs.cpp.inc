@@ -388,11 +388,6 @@ static int moe_prepare_scaled_router_input_f32(
     if (!moe_map_router_scale_tensor(engine, layer, &scale_raw)) {
         moe_raw_tensor_cache_entry sidecar{};
         moe_raw_tensor_cache_entry router{};
-        const int sidecar_requires_rms_root =
-            moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer);
-        if (!sidecar_requires_rms_root) {
-            return 0;
-        }
         if (moe_map_router_weight_scale_sidecar_tensor(engine, layer, hidden_size, &sidecar) &&
             !moe_map_router_tensor(engine, layer, hidden_size, experts, &router)) {
             return 0;

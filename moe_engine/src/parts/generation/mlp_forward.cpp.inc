@@ -583,14 +583,17 @@ static int moe_layer_router_should_use_raw_residual_f32(
     int router_sidecar_requires_rms_root,
     int router_has_internal_weight_scale
 ) {
-    // Router input selection is a graph/architecture contract.  Gemma4-style
-    // MoE gates consume the pre-MLP residual while experts consume the expert
-    // FFN norm path only when the IR says so.  A router weight sidecar is a
-    // router-column scale; by itself it must not switch the activation source.
     (void)engine;
     (void)layer;
-    (void)router_has_internal_weight_scale;
+    // Router input selection is a graph/architecture contract.  Gemma4-style
+    // MoE gates consume the pre-MLP residual while experts consume the expert
+    // FFN norm path.  A router weight sidecar is a router-column scale; it does
+    // not imply RMS-root input normalization, but it does identify this separate
+    // router input path in generated contracts.
     if (router_uses_raw_residual_contract) {
+        return 1;
+    }
+    if (router_has_internal_weight_scale) {
         return 1;
     }
     if (router_sidecar_requires_rms_root) {
