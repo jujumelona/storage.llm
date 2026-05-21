@@ -494,6 +494,16 @@ def test_qkv_decode_requires_appended_tokens_not_just_capacity():
     assert filled_pos < qkv_call_pos
 
 
+def test_qkv_contract_keeps_default_outlier_split_without_explicit_indices():
+    qkv_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward_qkv.cpp.inc").read_text(encoding="utf-8")
+    state_text = (ROOT / "engine_core" / "kv" / "qkv_state.cpp").read_text(encoding="utf-8")
+    header_text = (ROOT / "engine_core" / "kv" / "kv_qkv.h").read_text(encoding="utf-8")
+    assert "qkv_outlier_split_disabled" not in qkv_text
+    assert "missing_explicit_outlier_channel_indices" not in qkv_text
+    assert "outlier_channel_indices = nullptr" in header_text
+    assert "int ch = src ? src[i] : i;" in state_text
+
+
 def test_mxfp4_dot_and_cache_decode_use_physical_row_stride_from_index():
     kernel_text = (ROOT / "moe_engine" / "src" / "parts" / "tensor_kernels" / "dot_q8q4q5_kernels.cpp.inc").read_text(encoding="utf-8")
     tensor_dot_text = (ROOT / "moe_engine" / "src" / "parts" / "tensor_dot.cpp.inc").read_text(encoding="utf-8")
