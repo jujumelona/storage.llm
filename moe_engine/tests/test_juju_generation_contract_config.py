@@ -1262,14 +1262,16 @@ def test_sliding_default_rope_uses_full_head_dim_not_full_attention_partial():
     assert "!sliding_default_rope" in attn_text
 
 
-def test_partial_rotate_half_pairs_inside_active_rope_block():
+def test_partial_rotate_half_pairs_inside_active_rope_block_except_proportional_full_head():
     rope_text = (ROOT / "moe_engine" / "src" / "parts" / "generation_rope.cpp.inc").read_text(encoding="utf-8")
     fn = rope_text[
         rope_text.index("static void moe_rope_rotate_half_partial_inplace"):
         rope_text.index("static void moe_standard_rope_apply_inplace_with_layout")
     ]
-    assert "const uint32_t partner_stride = active_half_dim;" in fn
-    assert "full_dim / 2u" not in fn
+    assert "proportional_full_head_layout" in fn
+    assert "frequency_dim > active_dim" in fn
+    assert "full_dim / 2u" in fn
+    assert ": active_half_dim" in fn
 
 
 def test_router_contract_layer_slice_is_cached_and_cleared_on_reload_paths():
