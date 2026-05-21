@@ -253,10 +253,10 @@ static void moe_rope_rotate_half_partial_inplace(
     if (frequency_dim < active_dim || frequency_dim > full_dim) {
         frequency_dim = active_dim;
     }
-    // HF proportional RoPE builds full-head cos/sin with zero-frequency
-    // no-op lanes, then applies rotate_half over the full head.  When the
-    // frequency schedule is full-head, the active lanes pair with full_dim/2.
-    const uint32_t partner_stride = (frequency_dim > active_dim) ? (full_dim / 2u) : active_half_dim;
+    // rotate_half is applied within the rotary sub-vector.  A larger
+    // frequency_dim changes the frequency schedule only; it must not pair the
+    // first rotary half with non-rotary channels later in the full head.
+    const uint32_t partner_stride = active_half_dim;
     if (partner_stride == 0u || (uint64_t)partner_stride + active_pairs > full_dim) {
         return;
     }
