@@ -4935,8 +4935,9 @@ def _juju_layer_rope_contract(layer, runtime_arch):
         runtime_arch.get("global_head_dim") if kind == "global_full_attention" else runtime_arch.get("head_dim"),
         runtime_arch.get("head_dim"),
     )
+    rope_type = first_present(selected.get("rope_type"), selected.get("type"), runtime_arch.get("rope_type"), "default")
     partial = _juju_float_or_none(selected.get("partial_rotary_factor"))
-    if partial is None:
+    if partial is None and kind == "global_full_attention":
         partial = _juju_float_or_none(runtime_arch.get("partial_rotary_factor"))
     rope_dim = _juju_first_int(
         selected.get("rope_dimension_count"),
@@ -4945,7 +4946,6 @@ def _juju_layer_rope_contract(layer, runtime_arch):
         runtime_arch.get("qk_rope_head_dim") if kind == "standard_attention" else None,
         head_dim,
     )
-    rope_type = first_present(selected.get("rope_type"), selected.get("type"), runtime_arch.get("rope_type"), "default")
     sliding_partial_default = (
         kind == "sliding_window_attention"
         and str(rope_type).lower() != "proportional"

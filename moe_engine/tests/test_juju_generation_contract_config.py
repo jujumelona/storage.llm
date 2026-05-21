@@ -1228,7 +1228,7 @@ def test_standard_attention_skips_noop_rope_at_position_zero():
     assert "attn_standard_rope" in attn_text
 
 
-def test_sliding_rope_uses_partial_dim_with_full_frequency_base():
+def test_sliding_default_rope_uses_full_head_dim_not_full_attention_partial():
     arch = {
         "head_dim": 256,
         "global_head_dim": 512,
@@ -1249,16 +1249,15 @@ def test_sliding_rope_uses_partial_dim_with_full_frequency_base():
     }
     sliding = mat._juju_layer_rope_contract(0, arch)
     full = mat._juju_layer_rope_contract(1, arch)
-    assert sliding["rope_dim"] == 64
+    assert sliding["rope_dim"] == 256
     assert sliding["frequency_dim"] == 256
-    assert sliding["partial_rotary_factor"] == 0.25
+    assert sliding["partial_rotary_factor"] is None
     assert full["rope_dim"] == 128
     assert full["frequency_dim"] == 512
     attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_prefill.cpp.inc").read_text()
     assert "sliding_default_rope" in attn_text
-    assert "inherited_full_rope_dim" in attn_text
-    assert "moe_attention_partial_rotary_factor_f32" in attn_text
-    assert "head_dim > 0 && !inherited_full_rope_dim" in attn_text
+    assert "resolved.rope_dim = head_dim" in attn_text
+    assert "!sliding_default_rope" in attn_text
 
 
 def test_partial_rotate_half_pairs_inside_active_rope_block():
