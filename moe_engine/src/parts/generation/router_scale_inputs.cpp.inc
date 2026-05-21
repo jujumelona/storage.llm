@@ -426,18 +426,29 @@ static int moe_prepare_scaled_router_input_f32(
             return 0;
         }
         out->assign(hidden_size, 0.0f);
+        double scale_abs_sum = 0.0;
+        double scale_max_abs = 0.0;
         for (uint32_t i = 0; i < hidden_size; ++i) {
-            const float result = hidden[i] * norm;
+            float scale = 1.0f;
+            if (!moe_router_raw_scalar_at_f32(sidecar, i, &scale) ||
+                !std::isfinite(scale)) {
+                return 0;
+            }
+            const float result = hidden[i] * norm * scale;
             if (!std::isfinite(result)) {
                 return 0;
             }
             (*out)[i] = result;
+            const double a = std::fabs((double)scale);
+            scale_abs_sum += a;
+            scale_max_abs = std::max(scale_max_abs, a);
         }
         if (moe_profile_level() >= 2) {
             moe_profile_log(
                 "router_scale_apply",
-                "layer=%d hidden=%u count=0 unit_offset=0 input_norm=%.6g source=weight_sidecar_matrix_scaled_rms_root router_rows=%u",
-                layer, hidden_size, (double)norm, router.rows);
+                "layer=%d hidden=%u count=%u unit_offset=0 input_norm=%.6g mean_abs=%.6g max_abs=%.6g source=weight_sidecar_dense_raw_rms_root router_rows=%u",
+                layer, hidden_size, hidden_size, (double)norm,
+                scale_abs_sum / (double)hidden_size, scale_max_abs, router.rows);
         }
         return 1;
     }

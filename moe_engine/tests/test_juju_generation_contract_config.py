@@ -187,7 +187,8 @@ def test_hidden_sized_ffn_gate_input_scale_is_router_weight_sidecar_contract():
 
     router_scale_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "router_scale_inputs.cpp.inc").read_text(encoding="utf-8", errors="ignore")
     assert "legacy_weight_sidecar_as_input_scale" not in router_scale_text
-    assert "weight_sidecar_matrix_scaled_rms_root" in router_scale_text
+    assert "weight_sidecar_dense_raw_rms_root" in router_scale_text
+    assert "hidden[i] * norm * scale" in router_scale_text
 
 
 
