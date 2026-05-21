@@ -766,28 +766,6 @@ static int moe_juju_attention_contract_uses_unit_scale(const std::string& json) 
     if (json.empty()) {
         return 0;
     }
-    double query_pre_attn_scalar = 0.0;
-    double attention_scale = 0.0;
-    const int has_numeric_qpre =
-        (moe_json_get_double_local(json, "query_pre_attn_scalar", &query_pre_attn_scalar) ||
-         moe_json_get_double_local(json, "attention_query_pre_attn_scalar", &query_pre_attn_scalar) ||
-         moe_json_get_double_local(json, "attn_query_pre_attn_scalar", &query_pre_attn_scalar));
-    const int has_numeric_scale =
-        (moe_json_get_double_local(json, "attention_scale", &attention_scale) ||
-         moe_json_get_double_local(json, "attention_score_scale", &attention_scale) ||
-         moe_json_get_double_local(json, "attn_scale", &attention_scale) ||
-         moe_json_get_double_local(json, "qk_scale", &attention_scale));
-    if (has_numeric_qpre && has_numeric_scale &&
-        query_pre_attn_scalar > 0.0 && query_pre_attn_scalar <= 65536.0 &&
-        attention_scale > 0.0 && attention_scale <= 1024.0 &&
-        std::isfinite(query_pre_attn_scalar) && std::isfinite(attention_scale)) {
-        const double expected_attention_scale = 1.0 / std::sqrt(query_pre_attn_scalar);
-        const double tolerance = std::max(1.0e-8, std::fabs(expected_attention_scale) * 1.0e-5);
-        if (std::fabs(attention_scale - expected_attention_scale) <= tolerance &&
-            std::fabs(attention_scale - 1.0) > tolerance) {
-            return 0;
-        }
-    }
     int unit_scale = 0;
     if ((moe_json_get_bool_local(json, "unit_attention_scale", &unit_scale) ||
          moe_json_get_bool_local(json, "qk_norm_unit_scale", &unit_scale)) &&

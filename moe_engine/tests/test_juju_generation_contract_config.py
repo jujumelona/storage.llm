@@ -905,18 +905,6 @@ def test_attention_scale_uses_contract_without_model_name_branch():
 
 
 
-def test_attention_scale_source_does_not_override_numeric_scale_contract():
-    parser_text = (ROOT / "moe_engine" / "src" / "parts" / "juju_parser.cpp.inc").read_text()
-    unit_helper = parser_text[
-        parser_text.index("static int moe_juju_attention_contract_uses_unit_scale"):
-        parser_text.index("static int moe_juju_extract_attention_contract")
-    ]
-    assert "expected_attention_scale" in unit_helper
-    assert "std::fabs(attention_scale - expected_attention_scale) <= tolerance" in unit_helper
-    assert "std::fabs(attention_scale - 1.0) > tolerance" in unit_helper
-    assert "return 0;" in unit_helper[:unit_helper.index("int unit_scale = 0;")]
-
-
 def test_engine_runtime_contracts_do_not_use_model_name_metadata_keys():
     helper_text = (ROOT / "moe_engine" / "src" / "parts" / "raw_forward" / "forward_helpers.cpp.inc").read_text()
     attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_prefill.cpp.inc").read_text()
