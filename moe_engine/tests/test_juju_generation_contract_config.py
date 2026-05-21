@@ -1218,7 +1218,7 @@ def test_standard_attention_skips_noop_rope_at_position_zero():
     assert "attn_standard_rope" in attn_text
 
 
-def test_sliding_rope_uses_partial_dim_with_full_frequency_base():
+def test_sliding_default_rope_uses_full_head_dim_without_global_partial():
     arch = {
         "head_dim": 256,
         "global_head_dim": 512,
@@ -1239,26 +1239,25 @@ def test_sliding_rope_uses_partial_dim_with_full_frequency_base():
     }
     sliding = mat._juju_layer_rope_contract(0, arch)
     full = mat._juju_layer_rope_contract(1, arch)
-    assert sliding["rope_dim"] == 64
+    assert sliding["rope_dim"] == 256
     assert sliding["frequency_dim"] == 256
-    assert sliding["partial_rotary_factor"] == 0.25
+    assert sliding["partial_rotary_factor"] is None
     assert full["rope_dim"] == 128
     assert full["frequency_dim"] == 512
-    attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_prefill.cpp.inc").read_text()
+    attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_prefill.cpp.inc").read_text(encoding="utf-8")
     assert "sliding_default_rope" in attn_text
     assert "inherited_full_rope_dim" in attn_text
     assert "moe_attention_partial_rotary_factor_f32" in attn_text
-    assert "head_dim > 0 && !inherited_full_rope_dim" in attn_text
+    assert "if (sliding_default_rope)" in attn_text
 
 
-def test_partial_rotate_half_pairs_inside_active_rope_block():
+def test_proportional_partial_rotate_half_pairs_against_full_head_half():
     rope_text = (ROOT / "moe_engine" / "src" / "parts" / "generation_rope.cpp.inc").read_text(encoding="utf-8")
     fn = rope_text[
         rope_text.index("static void moe_rope_rotate_half_partial_inplace"):
         rope_text.index("static void moe_standard_rope_apply_inplace_with_layout")
     ]
-    assert "const uint32_t partner_stride = active_half_dim;" in fn
-    assert "full_dim / 2u" not in fn
+    assert "const uint32_t partner_stride = (frequency_dim > active_dim) ? (full_dim / 2u) : active_half_dim;" in fn
 
 
 def test_router_contract_layer_slice_is_cached_and_cleared_on_reload_paths():
