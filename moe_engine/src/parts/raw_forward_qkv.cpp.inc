@@ -155,6 +155,16 @@ static uint64_t moe_qkv_config_policy_hash(const qkv_config_t& cfg) {
     return h ? h : 1ull;
 }
 
+static int moe_qkv_drop_unbound_outlier_split(qkv_config_t& cfg) {
+    if (cfg.outlier_channels <= 0 || cfg.outlier_channel_indices) {
+        return 0;
+    }
+    const int dropped = cfg.outlier_channels;
+    cfg.outlier_channels = 0;
+    cfg.policy_hash = 0;
+    return dropped;
+}
+
 static qkv_config_t moe_qkv_contract_config_for_head_dim(
     const moe_pc_engine* engine,
     uint32_t head_dim
@@ -245,6 +255,7 @@ static qkv_config_t moe_qkv_contract_config_for_head_dim(
     if (cfg.outlier_channels > (int)head_dim) {
         cfg.outlier_channels = (int)head_dim;
     }
+    moe_qkv_drop_unbound_outlier_split(cfg);
     if (cfg.rotation_backend != QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL &&
         cfg.rotation_backend != QKV_ROTATION_BACKEND_HADAMARD_SIGN_FAST) {
         cfg.rotation_backend = QKV_ROTATION_BACKEND_GAUSSIAN_QR_ORTHOGONAL;
@@ -313,6 +324,20 @@ static void moe_qkv_apply_contract_config_locked(
         // forward_ok=1.
         engine->qkv_cfg = desired;
         engine->qkv_cfg_initialized.store(true, std::memory_order_release);
+        const int disabled_outlier_channels =
+            engine->offload_qkv_cfg_available.load(std::memory_order_acquire) &&
+            engine->offload_qkv_cfg.outlier_channels > 0 &&
+            !engine->offload_qkv_cfg.outlier_channel_indices &&
+            desired.outlier_channels == 0
+                ? engine->offload_qkv_cfg.outlier_channels
+                : 0;
+        if (disabled_outlier_channels > 0) {
+            moe_profile_log(
+                "qkv_outlier_split_disabled",
+                "head_dim=%u requested_channels=%d reason=missing_explicit_outlier_channel_indices",
+                head_dim,
+                disabled_outlier_channels);
+        }
         moe_profile_log(
             "qkv_config",
             "head_dim=%u k_bits=%d v_bits=%d group=%u page=%u sink=%u "
