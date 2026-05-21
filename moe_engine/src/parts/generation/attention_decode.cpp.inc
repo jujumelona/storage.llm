@@ -460,12 +460,14 @@
                 layer, head_dim, v_head_dim);
             return 0;
         }
-        // TurboQuant/QJL KV mode must use the same quantize/dequantize contract
-        // for every generated token, including the seq_len==1 self-attention
-        // case. Bypassing the just-appended current value with the scratch FP32
-        // V made PPL evaluate a hybrid path that is not the paper algorithm and
-        // hid cache/dequant errors for the first token. Append first, then read
-        // it back through the QKV decode path below.
+        if (s->kv_entry.size() < kv_entry_dim) {
+            s->kv_entry.resize(kv_entry_dim);
+        }
+        std::memcpy(s->kv_entry.data(), s->attn_kv_a.data(), (size_t)k_dim * sizeof(float));
+        std::memcpy(s->kv_entry.data() + k_dim, s->attn_value.data(), (size_t)kv_v_dim * sizeof(float));
+        // Persist the current token into QKV for future positions. The active
+        // causal self-attention step still consumes this exact scratch K/V,
+        // matching the plain KV cache entry semantics.
         for (uint32_t kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
             const float* key = s->attn_kv_a.data() + (uint64_t)kv_h * head_dim;
             const float* value = s->attn_value.data() + (uint64_t)kv_h * v_head_dim;
@@ -504,7 +506,7 @@
             engine->qkv_cfg.value_outlier_bits,
             engine->qkv_cfg.value_normal_bits,
             qkv_sink_exact_current,
-            qkv_sink_exact_current,
+            1,
             (double)scale,
             scale_source ? scale_source : "unknown",
             (double)attn_logit_softcap,
@@ -532,12 +534,20 @@
         const float* q = s->q_b.data() + (uint64_t)h * head_dim;
         float* out_h = s->attn_value.data() + (uint64_t)h * v_head_dim;
         if (qkv_decode) {
+            const float* current_key = (!shared_kv_reuse && s->kv_entry.size() >= kv_entry_dim)
+                ? (s->kv_entry.data() + (uint64_t)kv_h * head_dim)
+                : nullptr;
+            const float* current_value = (!shared_kv_reuse && s->kv_entry.size() >= kv_entry_dim)
+                ? (s->kv_entry.data() + k_dim + (uint64_t)kv_h * v_head_dim)
+                : nullptr;
             return moe_pc_engine_attention_decode_layer_head_qkv_f32(
                 engine,
                 kv_storage_layer,
                 kv_h,
                 qkv_head_stride,
                 q,
+                current_key,
+                current_value,
                 seq_len,
                 qkv_capacity_tokens,
                 head_dim,

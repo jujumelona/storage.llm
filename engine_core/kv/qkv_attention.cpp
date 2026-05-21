@@ -50,12 +50,15 @@ int qkv_attention_decode_impl(
     const qkv_config_t* cfg,
     uint32_t ctx,
     uint32_t hdim,
-    float* output
+    float* output,
+    const float* current_key,
+    const float* current_value
 ) {
     // BUGFIX 349: 모든 포인터 null 체크 및 파라미터 유효성 체크
     if (!query || !s || !cfg || !output || ctx == 0 || hdim == 0) return 0;
     if (hdim > 16384) return 0;  // 비정상적으로 큰 차원 방지
     const int d = (int)hdim, n = (int)ctx;
+    const int exact_current_idx = (current_key && current_value) ? (n - 1) : -1;
     const bool qjl = cfg->enable_qjl && s->k_bits > 1 && s->v_bits > 1 &&
         qkv_bits_codebook(s->k_bits) && qkv_bits_codebook(s->v_bits) &&
         s->k_qjl && s->v_qjl;
@@ -208,6 +211,14 @@ int qkv_attention_decode_impl(
                 float norm_k = s->k_norms[t];
                 float dot = 0.0f;
 
+                if (t == exact_current_idx) {
+                    for (int i = 0; i < d; ++i) {
+                        dot += query[i] * current_key[i];
+                    }
+                    att[t] = qkv_attention_apply_logit_softcap(attn_logit_softcap, dot * sc);
+                    continue;
+                }
+
                 if ((uint32_t)t < s->sink_tokens && s->k_sink) {
                     const float* exact_k = s->k_sink + (size_t)t * (size_t)d;
                     for (int i = 0; i < d; ++i) {
@@ -311,6 +322,14 @@ int qkv_attention_decode_impl(
         for (int t = 0; t < n; t++) {
             float norm_k = s->k_norms[t];
             float dot = 0.0f;
+
+            if (t == exact_current_idx) {
+                for (int i = 0; i < d; ++i) {
+                    dot += query[i] * current_key[i];
+                }
+                att[t] = qkv_attention_apply_logit_softcap(attn_logit_softcap, dot * sc);
+                continue;
+            }
 
             if ((uint32_t)t < s->sink_tokens && s->k_sink) {
                 const float* exact_k = s->k_sink + (size_t)t * (size_t)d;
@@ -417,10 +436,14 @@ int qkv_attention_decode_impl(
             float* local_row = work_row.data() + (size_t)w * (size_t)d;
 
             for (int t = begin; t < end; ++t) {
-                if (!qkv_dequant_one(&local, cfg, local.v_idx, local.v_qjl,
-                        local.v_residual_norms, local.v_norms, t, local.v_bits, qjl, local_row)) {
-                    ok_flags[(size_t)w] = 0;
-                    return;
+                if (t == exact_current_idx) {
+                    memcpy(local_row, current_value, (size_t)d * sizeof(float));
+                } else {
+                    if (!qkv_dequant_one(&local, cfg, local.v_idx, local.v_qjl,
+                            local.v_residual_norms, local.v_norms, t, local.v_bits, qjl, local_row)) {
+                        ok_flags[(size_t)w] = 0;
+                        return;
+                    }
                 }
                 const float weight = att[t];
                 for (int i = 0; i < d; ++i) {
@@ -449,9 +472,13 @@ int qkv_attention_decode_impl(
     // Serial V accumulation for small context
     memset(output, 0, d * sizeof(float));
     for (int t = 0; t < n; t++) {
-        if (!qkv_dequant_one(s, cfg, s->v_idx, s->v_qjl,
-                s->v_residual_norms, s->v_norms, t, s->v_bits, qjl, row))
-            return 0;
+        if (t == exact_current_idx) {
+            memcpy(row, current_value, (size_t)d * sizeof(float));
+        } else {
+            if (!qkv_dequant_one(s, cfg, s->v_idx, s->v_qjl,
+                    s->v_residual_norms, s->v_norms, t, s->v_bits, qjl, row))
+                return 0;
+        }
         float w = att[t];
         for (int i = 0; i < d; i++) output[i] += w * row[i];
     }

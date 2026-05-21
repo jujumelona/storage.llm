@@ -618,6 +618,8 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
     uint32_t kv_head,
     uint32_t head_stride,
     const float* query,
+    const float* current_key,
+    const float* current_value,
     uint32_t context_tokens,
     uint32_t capacity_tokens,
     uint32_t head_dim,
@@ -664,7 +666,11 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
         slot,
         &qkv_decode_cfg);
 #endif
-    const int ok = qkv_attention_decode(query, slot, &qkv_decode_cfg, context_tokens, head_dim, output);
+    const int ok = (current_key && current_value)
+        ? qkv_attention_decode_exact_current(
+            query, slot, &qkv_decode_cfg, context_tokens, head_dim,
+            current_key, current_value, output)
+        : qkv_attention_decode(query, slot, &qkv_decode_cfg, context_tokens, head_dim, output);
     if (!ok) {
 #ifdef STORAGELLM_PPL_DIAG_ENABLED
         storagellm_ppl_diag_qkv_decode_failed(

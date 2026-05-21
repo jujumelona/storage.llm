@@ -314,6 +314,17 @@ int qkv_attention_decode(
     float* output                  // [head_dim]  — attention output
 );
 
+int qkv_attention_decode_exact_current(
+    const float* query,
+    const qkv_state_t* kv_state,
+    const qkv_config_t* kv_config,
+    uint32_t context_tokens,
+    uint32_t head_dim,
+    const float* current_key,
+    const float* current_value,
+    float* output
+);
+
 #ifdef __cplusplus
 }
 #endif

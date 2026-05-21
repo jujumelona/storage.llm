@@ -13,5 +13,7 @@ int qkv_attention_decode_impl(
     const qkv_config_t* kv_config,
     uint32_t context_tokens,
     uint32_t head_dim,
-    float* output
+    float* output,
+    const float* current_key,
+    const float* current_value
 );
