@@ -664,7 +664,7 @@ static std::string model_lib_source_text(const moe_pc_engine* e) {
     s << "}\n";
     s << "\n";
     s << "static float moe_model_e8m0_to_f32(uint8_t v) {\n";
-    s << "    uint32_t bits = v ? ((uint32_t)v << 23u) : 0x00400000u;\n";
+    s << "    uint32_t bits = v < 2u ? (0x00200000u << v) : ((uint32_t)(v - 1u) << 23u);\n";
     s << "    float f;\n";
     s << "    memcpy(&f, &bits, sizeof(f));\n";
     s << "    return f;\n";

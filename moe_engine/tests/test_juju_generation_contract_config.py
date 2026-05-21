@@ -516,6 +516,16 @@ def test_mxfp4_dot_and_cache_decode_use_physical_row_stride_from_index():
     assert "moe_mxfp4_row_layout_for_bytes(out_count, row_bytes)" in cache_text
 
 
+def test_mxfp4_e8m0_decode_uses_ggml_half_scale():
+    kernel_text = (ROOT / "moe_engine" / "src" / "parts" / "tensor_kernels" / "dot_q8q4q5_kernels.cpp.inc").read_text(encoding="utf-8")
+    model_lib_text = (ROOT / "moe_engine" / "src" / "parts" / "model_library_source.cpp.inc").read_text(encoding="utf-8")
+    expected = "v < 2u ? (0x00200000u << v) : ((uint32_t)(v - 1u) << 23u)"
+    assert expected in kernel_text
+    assert expected in model_lib_text
+    assert "v ? ((uint32_t)v << 23u) : 0x00400000u" not in kernel_text
+    assert "v ? ((uint32_t)v << 23u) : 0x00400000u" not in model_lib_text
+
+
 def test_qkv_single_token_attention_uses_paper_quantized_decode_path():
     attn_text = (ROOT / "moe_engine" / "src" / "parts" / "generation" / "attention_decode.cpp.inc").read_text()
     assert "TurboQuant/QJL KV mode must use the same quantize/dequantize contract" in attn_text

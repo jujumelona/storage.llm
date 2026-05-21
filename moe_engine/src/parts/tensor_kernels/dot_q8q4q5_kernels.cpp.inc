@@ -296,13 +296,7 @@ static void moe_dequant_gguf_iq4_xs_row(const uint8_t* packed, float* out, uint3
     (void)moe_gguf_iq4_xs_row_impl(packed, nullptr, out, cols);
 }
 static float moe_e8m0_to_f32_half(uint8_t v) {
-    if (v == 0u) {
-        uint32_t bits = 0x00400000u;
-        float out = 0.0f;
-        std::memcpy(&out, &bits, sizeof(out));
-        return out;
-    }
-    uint32_t bits = (uint32_t)v << 23u;
+    uint32_t bits = v < 2u ? (0x00200000u << v) : ((uint32_t)(v - 1u) << 23u);
     float out = 0.0f;
     std::memcpy(&out, &bits, sizeof(out));
     return out;
