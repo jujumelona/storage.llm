@@ -562,6 +562,29 @@ static int moe_dot_tensor_fast_view_row(
     return std::isfinite(*out_value) ? 1 : 0;
 }
 
+static int moe_dot_tensor_fast_view_row_q8(
+    moe_pc_engine_t* engine,
+    const moe_tensor_row_fast_view_t* view,
+    uint32_t row,
+    const float* q8_scales,
+    const int8_t* q8_values,
+    uint32_t x_count,
+    float* out_value
+) {
+    if (!engine || !view || !view->rec || !q8_scales || !q8_values ||
+        !out_value || x_count != view->cols ||
+        view->weight_format != moe_WEIGHT_ENCODING_MXFP4) {
+        return 0;
+    }
+    const uint8_t* packed = moe_tensor_row_fast_ptr(view, row);
+    if (!packed) {
+        return 0;
+    }
+    *out_value = moe_dot_gguf_mxfp4_row_q8_strided(
+        packed, q8_scales, q8_values, view->cols, view->row_bytes);
+    return std::isfinite(*out_value) ? 1 : 0;
+}
+
 static int moe_dot_tensor_fast_view_two_rows(
     moe_pc_engine_t* engine,
     const moe_tensor_row_fast_view_t* a,
@@ -587,6 +610,33 @@ static int moe_dot_tensor_fast_view_two_rows(
     }
     return moe_dot_tensor_fast_view_row(engine, a, row, x, x_count, out_a) &&
            moe_dot_tensor_fast_view_row(engine, b, row, x, x_count, out_b);
+}
+
+static int moe_dot_tensor_fast_view_two_rows_q8(
+    moe_pc_engine_t* engine,
+    const moe_tensor_row_fast_view_t* a,
+    const moe_tensor_row_fast_view_t* b,
+    uint32_t row,
+    const float* q8_scales,
+    const int8_t* q8_values,
+    uint32_t x_count,
+    float* out_a,
+    float* out_b
+) {
+    if (!engine || !a || !b || !out_a || !out_b ||
+        !q8_scales || !q8_values || a->cols != b->cols || x_count != a->cols ||
+        a->weight_format != moe_WEIGHT_ENCODING_MXFP4 ||
+        b->weight_format != moe_WEIGHT_ENCODING_MXFP4) {
+        return 0;
+    }
+    const uint8_t* pa = moe_tensor_row_fast_ptr(a, row);
+    const uint8_t* pb = moe_tensor_row_fast_ptr(b, row);
+    if (!pa || !pb) {
+        return 0;
+    }
+    moe_dot_gguf_mxfp4_two_rows_q8_strided(
+        pa, pb, q8_scales, q8_values, a->cols, a->row_bytes, b->row_bytes, out_a, out_b);
+    return std::isfinite(*out_a) && std::isfinite(*out_b) ? 1 : 0;
 }
 
 // ============================================================================
