@@ -434,7 +434,16 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
             warm_room += vram_limit - planned_vram;
         }
         if (ram_limit > planned_ram) {
-            const uint64_t ram_room = ram_limit - planned_ram;
+            uint64_t ram_warm_limit = (ram_limit * 68ull) / 100ull;
+            if (const char* pct_env = std::getenv("STORAGELLM_STARTUP_WARM_RAM_LIMIT_PCT")) {
+                char* end = nullptr;
+                const unsigned long parsed = std::strtoul(pct_env, &end, 10);
+                if (end && end != pct_env && parsed > 0ul) {
+                    const uint64_t pct = std::min<uint64_t>(100ull, std::max<uint64_t>(25ull, (uint64_t)parsed));
+                    ram_warm_limit = (ram_limit * pct) / 100ull;
+                }
+            }
+            const uint64_t ram_room = ram_warm_limit > planned_ram ? ram_warm_limit - planned_ram : 0;
             uint64_t system_room = ram_room;
             const uint64_t available = storagellm::available_ram_bytes();
             const uint64_t reserve = 1024ull * 1024ull * 1024ull;
