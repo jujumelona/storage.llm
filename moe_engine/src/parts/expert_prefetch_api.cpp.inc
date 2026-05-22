@@ -309,6 +309,25 @@ static bool startup_warm_disk_has_byte_room(moe_pc_engine_t* engine, uint64_t by
     return used <= cap && bytes <= cap - used;
 }
 
+static bool startup_warm_io_idle(moe_pc_engine_t* engine) {
+    if (!engine) {
+        return true;
+    }
+    const moe_io_path_t path = choose_active_io_path(engine);
+    const bool device_copy_path =
+        engine_has_device_upload_workers(engine) ||
+        path == moe_IO_PATH_GPUDIRECT_STORAGE ||
+        path == moe_IO_PATH_DIRECTSTORAGE_GPU;
+    const bool gds_idle =
+        !device_copy_path ||
+        engine->gds_blocking_pending.load(std::memory_order_acquire) == 0;
+    return engine->total_queue_depth.load(std::memory_order_acquire) == 0 &&
+           startup_warm_stage_load(engine->disk_stage) == 0 &&
+           startup_warm_stage_load(engine->pinned_stage) == 0 &&
+           startup_warm_stage_load(engine->gpu_stage) == 0 &&
+           gds_idle;
+}
+
 int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
     if (!engine || engine->tensors.empty()) {
         return 0;
@@ -478,6 +497,7 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
             }
         }
 
+        int last_reported_second = -1;
         // BUGFIX 95: Cache atomic loads in wait loop
         while (true) {
             const bool stop = engine->io_stop.load(std::memory_order_relaxed);
@@ -489,34 +509,38 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
             const uint32_t processed_failed = failed >= initial_failed ? failed - initial_failed : 0;
             const uint32_t processed = processed_completed + processed_failed;
 
-            // PIPELINE FIX 15: Check inflight counters to ensure all DMA completed ?�★??            // Old: depth==0 only checks queue empty, not actual work completion
-            // New: Also check inflight==0 for all stages ??ensures GPU DMA finished
-            // Prevents "ready" state while cuMemcpyHtoDAsync still in progress
-            const bool all_idle =
-                engine->disk_stage.inflight.load(std::memory_order_acquire) == 0 &&
-                engine->pinned_stage.inflight.load(std::memory_order_acquire) == 0 &&
-                engine->gpu_stage.inflight.load(std::memory_order_acquire) == 0 &&
-                engine->gds_blocking_pending.load(std::memory_order_acquire) == 0;
-
-            // Check if all queued experts are processed
-            if (depth == 0 && all_idle && processed >= queued) {
+            // Completion is a queue/stage property. queued counts experts, while
+            // completed_requests counts tensor tasks and can use a different unit.
+            if (startup_warm_io_idle(engine)) {
                 fprintf(stderr, "[storagellm] startup warm: complete (processed=%u)\n", processed);
                 break;
             }
 
             // Progress report every 2 seconds
             const auto elapsed = std::chrono::steady_clock::now() - start_time;
-            if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() % 2 == 0) {
-                fprintf(stderr, "[storagellm] startup warm: queue=%u completed=%u failed=%u ram=%llu vram=%llu\n",
-                    depth, processed, failed,
+            const int elapsed_sec = (int)std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+            if ((elapsed_sec % 2) == 0 && elapsed_sec != last_reported_second) {
+                last_reported_second = elapsed_sec;
+                fprintf(stderr, "[storagellm] startup warm: queue=%u disk=%u pinned=%u gpu=%u completed=%u failed=%u ram=%llu vram=%llu\n",
+                    depth,
+                    startup_warm_stage_load(engine->disk_stage),
+                    startup_warm_stage_load(engine->pinned_stage),
+                    startup_warm_stage_load(engine->gpu_stage),
+                    processed,
+                    failed,
                     (unsigned long long)tier_used(engine, moe_TIER_RAM),
                     (unsigned long long)tier_used(engine, moe_TIER_VRAM));
             }
 
-            if ((uint32_t)std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() > timeout_sec) {
-                fprintf(stderr, "[storageLLM ERROR] startup warm timeout after %us (queue=%u completed=%u failed=%u)\n",
+            if ((uint32_t)elapsed_sec > timeout_sec) {
+                fprintf(stderr, "[storageLLM ERROR] startup warm timeout after %us (queue=%u disk=%u pinned=%u gpu=%u completed=%u failed=%u)\n",
                     timeout_sec,
-                    depth, processed, failed);
+                    depth,
+                    startup_warm_stage_load(engine->disk_stage),
+                    startup_warm_stage_load(engine->pinned_stage),
+                    startup_warm_stage_load(engine->gpu_stage),
+                    processed,
+                    failed);
                 return 0;
             }
 
@@ -525,19 +549,8 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
             // Reduces startup latency by up to 100ms per check iteration
             std::unique_lock<std::mutex> lock(engine->done_mutex);
             engine->io_done_cv.wait_for(lock, std::chrono::milliseconds(100), [&] {
-                const uint32_t depth = engine->total_queue_depth.load(std::memory_order_relaxed);
-                const uint32_t completed = engine->io_atomic.completed_requests.load();
-                const uint32_t failed = engine->io_atomic.failed_requests.load();
-                const uint32_t processed_completed = completed >= initial_completed ? completed - initial_completed : 0;
-                const uint32_t processed_failed = failed >= initial_failed ? failed - initial_failed : 0;
-                const uint32_t processed = processed_completed + processed_failed;
-                const bool all_idle =
-                    engine->disk_stage.inflight.load(std::memory_order_acquire) == 0 &&
-                    engine->pinned_stage.inflight.load(std::memory_order_acquire) == 0 &&
-                    engine->gpu_stage.inflight.load(std::memory_order_acquire) == 0 &&
-                    engine->gds_blocking_pending.load(std::memory_order_acquire) == 0;
                 return engine->io_stop.load(std::memory_order_relaxed) ||
-                       (depth == 0 && all_idle && processed >= queued);
+                       startup_warm_io_idle(engine);
             });
         }
     }
