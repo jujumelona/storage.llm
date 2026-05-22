@@ -291,6 +291,24 @@ static uint32_t startup_warm_stage_load(const moe_stage_queue& stage) {
            stage.inflight.load(std::memory_order_relaxed);
 }
 
+static uint64_t startup_warm_stage_byte_load(const moe_stage_queue& stage) {
+    const uint64_t queued = stage.queued_bytes.load(std::memory_order_relaxed);
+    const uint64_t inflight = stage.inflight_bytes.load(std::memory_order_relaxed);
+    return queued > UINT64_MAX - inflight ? UINT64_MAX : queued + inflight;
+}
+
+static bool startup_warm_disk_has_byte_room(moe_pc_engine_t* engine, uint64_t bytes) {
+    if (!engine || bytes == 0) {
+        return true;
+    }
+    const uint64_t cap = moe_stage_byte_cap(engine, engine->disk_stage);
+    if (cap == 0) {
+        return true;
+    }
+    const uint64_t used = startup_warm_stage_byte_load(engine->disk_stage);
+    return used <= cap && bytes <= cap - used;
+}
+
 int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
     if (!engine || engine->tensors.empty()) {
         return 0;
@@ -391,7 +409,8 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
                 const bool stop = engine->io_stop.load(std::memory_order_relaxed);
                 const uint32_t total_depth = engine->total_queue_depth.load(std::memory_order_relaxed);
                 const uint32_t disk_depth = startup_warm_stage_load(engine->disk_stage);
-                if (stop || (total_depth < total_queue_high && disk_depth < disk_queue_high)) break;
+                const bool disk_byte_room = startup_warm_disk_has_byte_room(engine, bytes);
+                if (stop || (total_depth < total_queue_high && disk_depth < disk_queue_high && disk_byte_room)) break;
                 // BUGFIX 24: Use cv wait instead of polling ?�★
                 // Old: 10ms sleep polling ??slow response, unnecessary wakeups
                 // New: io_done_cv wait ??immediate response when queue drains
@@ -399,7 +418,8 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
                 engine->io_done_cv.wait_for(lock, std::chrono::milliseconds(100), [&] {
                     return engine->io_stop.load(std::memory_order_relaxed) ||
                            (engine->total_queue_depth.load(std::memory_order_relaxed) < total_queue_high &&
-                            startup_warm_stage_load(engine->disk_stage) < disk_queue_high);
+                            startup_warm_stage_load(engine->disk_stage) < disk_queue_high &&
+                            startup_warm_disk_has_byte_room(engine, bytes));
                 });
             }
             if (engine->io_stop.load(std::memory_order_relaxed)) {
@@ -449,6 +469,14 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
         const auto start_time = std::chrono::steady_clock::now();
         const uint32_t initial_completed = engine->io_atomic.completed_requests.load();
         const uint32_t initial_failed = engine->io_atomic.failed_requests.load();
+        uint32_t timeout_sec = 300u;
+        if (const char* env = std::getenv("STORAGELLM_STARTUP_WARM_TIMEOUT_SEC")) {
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(env, &end, 10);
+            if (end && end != env && parsed > 0ul) {
+                timeout_sec = (uint32_t)std::min<unsigned long>(parsed, 3600ul);
+            }
+        }
 
         // BUGFIX 95: Cache atomic loads in wait loop
         while (true) {
@@ -485,9 +513,9 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
                     (unsigned long long)tier_used(engine, moe_TIER_VRAM));
             }
 
-            // Timeout after 60 seconds
-            if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() > 60) {
-                fprintf(stderr, "[storageLLM ERROR] startup warm timeout after 60s (queue=%u completed=%u failed=%u)\n",
+            if ((uint32_t)std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() > timeout_sec) {
+                fprintf(stderr, "[storageLLM ERROR] startup warm timeout after %us (queue=%u completed=%u failed=%u)\n",
+                    timeout_sec,
                     depth, processed, failed);
                 return 0;
             }
