@@ -375,14 +375,6 @@ static moe_mxfp4_row_layout_t moe_mxfp4_row_layout_for_bytes(uint32_t cols, uint
     return layout;
 }
 
-static inline uint8_t moe_mxfp4_code_at_layout(
-    const uint8_t* qs,
-    uint32_t index,
-    const moe_mxfp4_row_layout_t& layout
-) {
-    return layout.bytewise_codes ? (qs[index] & 0x0fu) : moe_mxfp4_code_at(qs, index);
-}
-
 static inline float moe_mxfp4_block_dot(
     const uint8_t* qs,
     const float* x,
