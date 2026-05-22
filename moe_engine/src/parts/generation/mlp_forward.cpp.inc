@@ -1365,6 +1365,8 @@ static int moe_layer_moe_mlp_f32(
             float up_v = 0.0f;
             moe_tensor_row_fast_prefetch(&shards[e].gate_view, r + 1u);
             moe_tensor_row_fast_prefetch(&shards[e].up_view, r + 1u);
+            moe_tensor_row_fast_prefetch(&shards[e].gate_view, r + 4u);
+            moe_tensor_row_fast_prefetch(&shards[e].up_view, r + 4u);
             if (!moe_dot_tensor_fast_view_two_rows(
                     engine, &shards[e].gate_view, &shards[e].up_view, r,
                     expert_input, hidden_size, &gate_v, &up_v)) {
@@ -1448,6 +1450,7 @@ static int moe_layer_moe_mlp_f32(
                     const uint32_t e = active_experts[ai];
                     float v = 0.0f;
                     moe_tensor_row_fast_prefetch(&shards[e].down_view, row + 1u);
+                    moe_tensor_row_fast_prefetch(&shards[e].down_view, row + 8u);
                     if (!moe_dot_tensor_fast_view_row(engine, &shards[e].down_view,
                             row, work[e].gate, expert_intermediate, &v) || !std::isfinite(v)) {
                         fused_ok.store(0, std::memory_order_relaxed);

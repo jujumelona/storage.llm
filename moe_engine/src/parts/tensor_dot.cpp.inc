@@ -449,6 +449,8 @@ static inline void moe_tensor_row_fast_prefetch(
     moe_cpu_prefetch_read(p);
     if (view->row_bytes > 64u) moe_cpu_prefetch_read(p + 64u);
     if (view->row_bytes > 256u) moe_cpu_prefetch_read(p + 256u);
+    if (view->row_bytes > 512u) moe_cpu_prefetch_read(p + 512u);
+    if (view->row_bytes > 1024u) moe_cpu_prefetch_read(p + 1024u);
 }
 
 static int moe_dot_tensor_fast_view_row(
