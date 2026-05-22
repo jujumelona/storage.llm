@@ -1342,21 +1342,24 @@ static int moe_layer_moe_mlp_f32(
             mxfp4_q8_dot_enabled = 0;
         }
     }
-    int use_mxfp4_q8_dot = mxfp4_q8_dot_enabled;
-    for (size_t e = 0; e < num_selected && use_mxfp4_q8_dot; ++e) {
+    int use_mxfp4_q8_gate_up = mxfp4_q8_dot_enabled;
+    int use_mxfp4_q8_down = mxfp4_q8_dot_enabled;
+    for (size_t e = 0; e < num_selected && (use_mxfp4_q8_gate_up || use_mxfp4_q8_down); ++e) {
         if (!expert_ready[e]) {
             continue;
         }
         if (shards[e].gate_view.weight_format != moe_WEIGHT_ENCODING_MXFP4 ||
-            shards[e].up_view.weight_format != moe_WEIGHT_ENCODING_MXFP4 ||
-            shards[e].down_view.weight_format != moe_WEIGHT_ENCODING_MXFP4) {
-            use_mxfp4_q8_dot = 0;
+            shards[e].up_view.weight_format != moe_WEIGHT_ENCODING_MXFP4) {
+            use_mxfp4_q8_gate_up = 0;
+        }
+        if (shards[e].down_view.weight_format != moe_WEIGHT_ENCODING_MXFP4) {
+            use_mxfp4_q8_down = 0;
         }
     }
     const uint32_t expert_input_q8_blocks = moe_q8_0_block_count(hidden_size);
     const float* expert_input_q8_scales = nullptr;
     const int8_t* expert_input_q8_values = nullptr;
-    if (use_mxfp4_q8_dot) {
+    if (use_mxfp4_q8_gate_up) {
         s->cpu_q8_scales.resize(expert_input_q8_blocks);
         s->cpu_q8_values.resize((size_t)expert_input_q8_blocks * 32u);
         moe_quantize_q8_0_f32(
@@ -1396,7 +1399,7 @@ static int moe_layer_moe_mlp_f32(
             float up_v = 0.0f;
             moe_tensor_row_fast_prefetch(&shards[e].gate_view, r + 1u);
             moe_tensor_row_fast_prefetch(&shards[e].up_view, r + 1u);
-            const int dot_ok = use_mxfp4_q8_dot ?
+            const int dot_ok = use_mxfp4_q8_gate_up ?
                 moe_dot_tensor_fast_view_two_rows_q8(
                     engine, &shards[e].gate_view, &shards[e].up_view, r,
                     expert_input_q8_scales, expert_input_q8_values,
@@ -1419,9 +1422,10 @@ static int moe_layer_moe_mlp_f32(
     });
     moe_profile_log(
         "mlp_moe_gate_up",
-        "layer=%d ok=%d activation_mode=%d selected=%zu rows=%u blocks=%u tile=%u hidden=%u intermediate=%u mxfp4_q8=%d ms=%.3f",
+        "layer=%d ok=%d activation_mode=%d selected=%zu rows=%u blocks=%u tile=%u hidden=%u intermediate=%u mxfp4_q8=%d down_mxfp4_q8=%d ms=%.3f",
         layer, gate_up_ok, activation_mode, num_selected, total_gate_rows, total_gate_blocks, gate_tile_rows, hidden_size, expert_intermediate,
-        use_mxfp4_q8_dot,
+        use_mxfp4_q8_gate_up,
+        use_mxfp4_q8_down,
         moe_profile_elapsed_ms(gate_up_start_us));
     if (!gate_up_ok || gate_up_failed.load(std::memory_order_relaxed)) return 0;
 
@@ -1476,7 +1480,7 @@ static int moe_layer_moe_mlp_f32(
             const uint32_t active_expert_count = (uint32_t)s->cpu_active_expert_indices.size();
             const uint32_t* active_experts = s->cpu_active_expert_indices.data();
             const uint32_t gate_q8_blocks = moe_q8_0_block_count(expert_intermediate);
-            if (use_mxfp4_q8_dot) {
+            if (use_mxfp4_q8_down) {
                 s->cpu_gate_q8_scales.resize((size_t)num_selected * gate_q8_blocks);
                 s->cpu_gate_q8_values.resize((size_t)num_selected * gate_q8_blocks * 32u);
                 for (size_t e = 0; e < num_selected; ++e) {
@@ -1501,7 +1505,7 @@ static int moe_layer_moe_mlp_f32(
                     const uint32_t e = active_experts[ai];
                     float v = 0.0f;
                     moe_tensor_row_fast_prefetch(&shards[e].down_view, row + 1u);
-                    const int dot_ok = use_mxfp4_q8_dot ?
+                    const int dot_ok = use_mxfp4_q8_down ?
                         moe_dot_tensor_fast_view_row_q8(
                             engine, &shards[e].down_view, row,
                             s->cpu_gate_q8_scales.data() + e * (size_t)gate_q8_blocks,
