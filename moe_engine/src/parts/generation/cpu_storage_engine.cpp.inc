@@ -172,6 +172,34 @@ static int moe_cpu_storage_page_touch_enabled() {
     return moe_cpu_storage_env_truthy("STORAGELLM_CPU_PAGE_TOUCH");
 }
 
+static int moe_cpu_storage_selected_page_touch_enabled() {
+    return !moe_cpu_storage_env_false("STORAGELLM_CPU_SELECTED_PAGE_TOUCH");
+}
+
+static void moe_cpu_storage_touch_hot_view_pages(
+    moe_pc_engine* engine,
+    const moe_cpu_hot_tensor_view_t& view,
+    uint64_t offset,
+    uint64_t bytes
+) {
+    if (!engine || !view.ready || !view.base || !view.shard || bytes == 0) {
+        return;
+    }
+    const uint64_t shard_size = (uint64_t)mmap_get_size(view.shard);
+    if (offset > shard_size || bytes > shard_size - offset) {
+        return;
+    }
+    volatile const uint8_t* p = view.base + offset;
+    uint64_t sink = 0;
+    const uint64_t step = 64ull * 1024ull;
+    for (uint64_t o = 0; o < bytes; o += step) {
+        sink += p[o];
+    }
+    sink += p[bytes - 1u];
+    (void)sink;
+    engine->storage_io_page_touch_count.fetch_add(1, std::memory_order_relaxed);
+}
+
 
 static uint32_t moe_storage_io_parse_profile() {
     const std::string value = moe_autotune_value("STORAGELLM_STORAGE_PROFILE");
@@ -764,6 +792,20 @@ static void moe_storage_io_prefetch_hot_view_range(
 ) {
     if (!view.ready || !view.base || !view.shard || !view.rec) return;
     moe_storage_io_prefetch_range(engine, view.shard, view.base, offset, bytes, bytes_io);
+}
+
+static void moe_storage_io_prefetch_required_hot_view_range(
+    moe_pc_engine* engine,
+    const moe_cpu_hot_tensor_view_t& view,
+    uint64_t offset,
+    uint64_t bytes,
+    uint64_t* bytes_io
+) {
+    if (!view.ready || !view.base || !view.shard || !view.rec) return;
+    moe_storage_io_prefetch_range_execute(engine, view.shard, view.base, offset, bytes, bytes_io);
+    if (moe_cpu_storage_selected_page_touch_enabled()) {
+        moe_cpu_storage_touch_hot_view_pages(engine, view, offset, bytes);
+    }
 }
 
 static void moe_storage_io_build_span_plan(moe_pc_engine* engine) {
@@ -1363,7 +1405,7 @@ static void moe_cpu_storage_after_router_selected(
                     if (view_idx >= engine->cpu_hot_tensor_views.size()) continue;
                     const moe_cpu_hot_tensor_view_t& view = engine->cpu_hot_tensor_views[view_idx];
                     if (!view.ready || !view.rec) continue;
-                    moe_storage_io_prefetch_hot_view_range(engine, view, view.base_offset, view.rec->info.weight_byte_length, &bytes);
+                    moe_storage_io_prefetch_required_hot_view_range(engine, view, view.base_offset, view.rec->info.weight_byte_length, &bytes);
                 }
                 engine->storage_selected_expert_index_hits.fetch_add(1, std::memory_order_relaxed);
             }
@@ -1377,7 +1419,7 @@ static void moe_cpu_storage_after_router_selected(
                     if ((int32_t)rec.info.layer != layer) continue;
                     if ((int32_t)rec.info.expert != (int32_t)expert_id) continue;
                     if (!(rec.info.proj == moe_PROJ_GATE || rec.info.proj == moe_PROJ_UP || rec.info.proj == moe_PROJ_DOWN)) continue;
-                    moe_storage_io_prefetch_hot_view_range(engine, view, view.base_offset, rec.info.weight_byte_length, &bytes);
+                    moe_storage_io_prefetch_required_hot_view_range(engine, view, view.base_offset, rec.info.weight_byte_length, &bytes);
                 }
             }
         }
