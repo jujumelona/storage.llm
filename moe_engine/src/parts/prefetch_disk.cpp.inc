@@ -59,18 +59,11 @@ static int prefetch_tensor_disk_to_ram(
                 if (!src) {
                     return 0;
                 }
-#if defined(__linux__)
-                if (!hint_issued) {
-                    touch_mapped_range(engine, src, length);
-                    engine->io_atomic.bytes_touch_fallback.fetch_add(length, std::memory_order_relaxed);
-                }
-#else
                 touch_mapped_range(engine, src, length);
                 if (!hint_issued) {
                     // BUGFIX 155: Add memory_order_relaxed for statistics counter
                     engine->io_atomic.bytes_touch_fallback.fetch_add(length, std::memory_order_relaxed);
                 }
-#endif
                 prefetched += length;
             }
         }
