@@ -519,82 +519,6 @@ static float moe_dot_bf16_row(const uint8_t* row, const float* hidden, uint32_t 
     return acc;
 }
 
-static float moe_dot_fp32_row(const uint8_t* row, const float* hidden, uint32_t hidden_count) {
-    if (!row || !hidden) {
-        return 0.0f;
-    }
-    const float* w = reinterpret_cast<const float*>(row);
-    uint32_t i = 0;
-    float acc = 0.0f;
-#if defined(__AVX2__)
-    __m256 sum0 = _mm256_setzero_ps();
-    __m256 sum1 = _mm256_setzero_ps();
-    for (; i + 15u < hidden_count; i += 16u) {
-        const __m256 w0 = _mm256_loadu_ps(w + i);
-        const __m256 w1 = _mm256_loadu_ps(w + i + 8u);
-        const __m256 x0 = _mm256_loadu_ps(hidden + i);
-        const __m256 x1 = _mm256_loadu_ps(hidden + i + 8u);
-        sum0 = moe_madd_ps(w0, x0, sum0);
-        sum1 = moe_madd_ps(w1, x1, sum1);
-    }
-    sum0 = _mm256_add_ps(sum0, sum1);
-    float buf[8];
-    _mm256_storeu_ps(buf, sum0);
-    acc += buf[0] + buf[1] + buf[2] + buf[3] + buf[4] + buf[5] + buf[6] + buf[7];
-#endif
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-    for (; i + 3u < hidden_count; i += 4u) {
-        a0 += w[i + 0u] * hidden[i + 0u];
-        a1 += w[i + 1u] * hidden[i + 1u];
-        a2 += w[i + 2u] * hidden[i + 2u];
-        a3 += w[i + 3u] * hidden[i + 3u];
-    }
-    acc += (a0 + a1) + (a2 + a3);
-    for (; i < hidden_count; ++i) {
-        acc += w[i] * hidden[i];
-    }
-    return std::isfinite(acc) ? acc : 0.0f;
-}
-
-static float moe_dot_fp16_row(const uint8_t* row, const float* hidden, uint32_t hidden_count) {
-    if (!row || !hidden) {
-        return 0.0f;
-    }
-    const uint16_t* w = reinterpret_cast<const uint16_t*>(row);
-    uint32_t i = 0;
-    float acc = 0.0f;
-#if defined(__AVX2__) && defined(__F16C__)
-    __m256 sum0 = _mm256_setzero_ps();
-    __m256 sum1 = _mm256_setzero_ps();
-    for (; i + 15u < hidden_count; i += 16u) {
-        const __m128i h0 = _mm_loadu_si128((const __m128i*)(w + i));
-        const __m128i h1 = _mm_loadu_si128((const __m128i*)(w + i + 8u));
-        const __m256 f0 = _mm256_cvtph_ps(h0);
-        const __m256 f1 = _mm256_cvtph_ps(h1);
-        const __m256 x0 = _mm256_loadu_ps(hidden + i);
-        const __m256 x1 = _mm256_loadu_ps(hidden + i + 8u);
-        sum0 = moe_madd_ps(f0, x0, sum0);
-        sum1 = moe_madd_ps(f1, x1, sum1);
-    }
-    sum0 = _mm256_add_ps(sum0, sum1);
-    float buf[8];
-    _mm256_storeu_ps(buf, sum0);
-    acc += buf[0] + buf[1] + buf[2] + buf[3] + buf[4] + buf[5] + buf[6] + buf[7];
-#endif
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-    for (; i + 3u < hidden_count; i += 4u) {
-        a0 += moe_raw_fp16_to_f32(w[i + 0u]) * hidden[i + 0u];
-        a1 += moe_raw_fp16_to_f32(w[i + 1u]) * hidden[i + 1u];
-        a2 += moe_raw_fp16_to_f32(w[i + 2u]) * hidden[i + 2u];
-        a3 += moe_raw_fp16_to_f32(w[i + 3u]) * hidden[i + 3u];
-    }
-    acc += (a0 + a1) + (a2 + a3);
-    for (; i < hidden_count; ++i) {
-        acc += moe_raw_fp16_to_f32(w[i]) * hidden[i];
-    }
-    return std::isfinite(acc) ? acc : 0.0f;
-}
-
 static float moe_dot_raw_row(
     const uint8_t* row,
     uint8_t encoding,
@@ -609,12 +533,6 @@ static float moe_dot_raw_row(
     }
     if (encoding == moe_RAW_SCALAR_BF16) {
         return moe_dot_bf16_row(row, hidden, hidden_count);
-    }
-    if (encoding == moe_RAW_SCALAR_F16) {
-        return moe_dot_fp16_row(row, hidden, hidden_count);
-    }
-    if (encoding == moe_RAW_SCALAR_F32) {
-        return moe_dot_fp32_row(row, hidden, hidden_count);
     }
     const uint32_t elem = moe_raw_scalar_size(encoding);
     if (!elem) {
