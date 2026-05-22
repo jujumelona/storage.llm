@@ -526,3 +526,64 @@ static int moe_prepare_scaled_router_input_f32(
     }
     return 1;
 }
+
+static void moe_router_touch_mapped_entry_f32(
+    moe_pc_engine* engine,
+    const moe_raw_tensor_cache_entry& raw,
+    uint64_t* touched_bytes,
+    uint64_t* touched_entries
+) {
+    if (!engine || !raw.base || raw.bytes == 0) {
+        return;
+    }
+    touch_mapped_range(engine, raw.base, raw.bytes);
+    if (touched_bytes) {
+        *touched_bytes += raw.bytes;
+    }
+    if (touched_entries) {
+        *touched_entries += 1u;
+    }
+}
+
+static void moe_router_prewarm_bindings_f32(
+    moe_pc_engine* engine,
+    uint32_t hidden_size,
+    uint32_t experts,
+    uint32_t layers
+) {
+    if (!engine || hidden_size == 0 || experts == 0 || layers == 0 ||
+        hidden_size > 100000u || experts > 10000u) {
+        return;
+    }
+    const uint64_t start_us = moe_profile_now_us();
+    uint64_t mapped_entries = 0;
+    uint64_t touched_entries = 0;
+    uint64_t touched_bytes = 0;
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+        moe_raw_tensor_cache_entry raw{};
+        if (moe_map_router_scale_tensor(engine, (int32_t)layer, &raw)) {
+            ++mapped_entries;
+            moe_router_touch_mapped_entry_f32(engine, raw, &touched_bytes, &touched_entries);
+        }
+        raw = moe_raw_tensor_cache_entry{};
+        if (moe_map_router_weight_scale_sidecar_tensor(engine, (int32_t)layer, hidden_size, &raw)) {
+            ++mapped_entries;
+            moe_router_touch_mapped_entry_f32(engine, raw, &touched_bytes, &touched_entries);
+        }
+        raw = moe_raw_tensor_cache_entry{};
+        if (moe_map_router_tensor(engine, (int32_t)layer, hidden_size, experts, &raw)) {
+            ++mapped_entries;
+            moe_router_touch_mapped_entry_f32(engine, raw, &touched_bytes, &touched_entries);
+        }
+    }
+    moe_profile_log(
+        "router_binding_prewarm",
+        "layers=%u hidden=%u experts=%u mapped=%llu touched=%llu bytes=%llu ms=%.3f",
+        layers,
+        hidden_size,
+        experts,
+        (unsigned long long)mapped_entries,
+        (unsigned long long)touched_entries,
+        (unsigned long long)touched_bytes,
+        moe_profile_elapsed_ms(start_us));
+}

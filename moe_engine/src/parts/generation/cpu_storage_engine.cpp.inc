@@ -1178,6 +1178,13 @@ static void moe_cpu_storage_build_execution_plan(moe_pc_engine* engine) {
         engine->offload_gguf_metadata_json.find("\"runtime_access_plan\"") != std::string::npos;
     engine->storage_format_plan_available.store(storage_plan_ready ? 1 : 0, std::memory_order_relaxed);
     moe_cpu_storage_build_hot_tensor_views(engine);
+    {
+        const moe_storage_constants_t c = moe_engine_storage_constants_or_static(engine);
+        const uint32_t layers = c.num_hidden_layers ? c.num_hidden_layers : engine->dynamic_shape.num_hidden_layers;
+        const uint32_t hidden = c.hidden_size ? c.hidden_size : engine->dynamic_shape.hidden_size;
+        const uint32_t experts = c.experts_per_moe_layer ? c.experts_per_moe_layer : engine->dynamic_shape.experts_per_moe_layer;
+        moe_router_prewarm_bindings_f32(engine, hidden, experts, layers);
+    }
     moe_storage_io_build_span_plan(engine);
     moe_storage_io_build_expert_index(engine);
     engine->cpu_storage_execution_plan_ready.store(1, std::memory_order_release);
