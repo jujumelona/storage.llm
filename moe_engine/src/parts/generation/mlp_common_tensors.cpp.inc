@@ -428,78 +428,6 @@ static int moe_map_ple_binding(
     return 1;
 }
 
-static int moe_raw_tensor_matvec_transposed_blocks_f32(
-    moe_pc_engine* engine,
-    const moe_raw_tensor_cache_entry& raw,
-    const float* hidden,
-    uint32_t hidden_count,
-    float* output,
-    uint32_t output_count,
-    float scale
-) {
-    if (!engine || !raw.base || !hidden || !output || !raw.math_transposed ||
-        hidden_count == 0 || output_count == 0) {
-        return 0;
-    }
-    if (raw.weight_format != moe_WEIGHT_ENCODING_UNKNOWN &&
-        raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP16 &&
-        raw.weight_format != moe_WEIGHT_ENCODING_RAW_BF16 &&
-        raw.weight_format != moe_WEIGHT_ENCODING_RAW_FP32) {
-        return 0;
-    }
-    const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
-    if (!elem) {
-        return 0;
-    }
-    const uint32_t physical_cols = raw.physical_cols ? raw.physical_cols : raw.rows;
-    const uint32_t physical_rows = raw.physical_rows ? raw.physical_rows : raw.cols;
-    if (output_count > physical_cols || hidden_count > physical_rows) {
-        return 0;
-    }
-    const uint64_t physical_row_bytes = raw.weight_row_bytes ?
-        raw.weight_row_bytes : (uint64_t)physical_cols * (uint64_t)elem;
-    if (physical_row_bytes == 0 || physical_row_bytes > raw.bytes ||
-        hidden_count > raw.bytes / physical_row_bytes) {
-        return 0;
-    }
-    constexpr uint32_t block_cols = 64u;
-    const uint32_t blocks = (output_count + block_cols - 1u) / block_cols;
-    return moe_parallel_rows(engine, blocks, 0, [&](uint32_t block) {
-        const uint32_t start = block * block_cols;
-        const uint32_t count = std::min<uint32_t>(block_cols, output_count - start);
-        double acc[block_cols];
-        for (uint32_t j = 0; j < count; ++j) {
-            acc[j] = 0.0;
-        }
-        for (uint32_t i = 0; i < hidden_count; ++i) {
-            const float h = hidden[i];
-            if (!std::isfinite(h)) {
-                return 0;
-            }
-            const uint64_t row_off =
-                (uint64_t)i * physical_row_bytes + (uint64_t)start * (uint64_t)elem;
-            if (row_off > raw.bytes ||
-                (uint64_t)count * (uint64_t)elem > raw.bytes - row_off) {
-                return 0;
-            }
-            const uint8_t* row_ptr = raw.base + row_off;
-            for (uint32_t j = 0; j < count; ++j) {
-                const float w = moe_raw_scalar_to_f32(
-                    row_ptr + (uint64_t)j * (uint64_t)elem,
-                    raw.scalar_encoding);
-                if (!std::isfinite(w)) {
-                    return 0;
-                }
-                acc[j] += (double)w * (double)h;
-            }
-        }
-        for (uint32_t j = 0; j < count; ++j) {
-            output[start + j] = (float)acc[j] * scale;
-        }
-        return 1;
-    });
-}
-
 static int moe_prepare_ple_inputs_f32(
     moe_pc_engine* engine,
     const moe_storage_constants_t* c,
@@ -544,27 +472,14 @@ static int moe_prepare_ple_inputs_f32(
     }
 
     const float projection_scale = 1.0f / std::sqrt((float)c->hidden_size);
-    int projected_ok = 0;
-    if (ple.model_projection.math_transposed) {
-        projected_ok = moe_raw_tensor_matvec_transposed_blocks_f32(
-            engine,
-            ple.model_projection,
-            s->hidden.data(),
-            c->hidden_size,
-            s->ple_projected.data(),
-            ple.total_dim,
-            projection_scale);
-    }
-    if (!projected_ok) {
-        projected_ok = moe_parallel_rows(engine, ple.total_dim, 0, [&](uint32_t row) {
-            float v = moe_raw_tensor_dot_row(ple.model_projection, row, s->hidden.data(), c->hidden_size);
-            if (!std::isfinite(v)) {
-                v = 0.0f;
-            }
-            s->ple_projected[row] = v * projection_scale;
-            return 1;
-        });
-    }
+    const int projected_ok = moe_parallel_rows(engine, ple.total_dim, 0, [&](uint32_t row) {
+        float v = moe_raw_tensor_dot_row(ple.model_projection, row, s->hidden.data(), c->hidden_size);
+        if (!std::isfinite(v)) {
+            v = 0.0f;
+        }
+        s->ple_projected[row] = v * projection_scale;
+        return 1;
+    });
     if (!projected_ok) {
         return 0;
     }
