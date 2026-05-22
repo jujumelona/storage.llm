@@ -1365,13 +1365,35 @@ static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, c
     if (!engine || !c || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
     engine->cpu_layer_begin_count.fetch_add(1, std::memory_order_relaxed);
     const uint32_t depth = moe_cpu_storage_layer_lookahead_depth(engine, c->num_hidden_layers);
+    const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
     for (uint32_t d = 1; d <= depth; ++d) {
         const uint32_t next = layer + d;
         if (next >= c->num_hidden_layers) break;
         moe_cpu_storage_schedule_layer_hot_prefetch(engine, next);
         moe_enqueue_attention_prefetch(engine, (int32_t)next);
         // Shared router/common spans can be prefetched before router top-k is known.
-        moe_pc_engine_prefetch_moe_lookahead(engine, (int)next, nullptr, 0, nullptr, 0);
+        // During decode, co-activation history gives a generic, format-derived
+        // next-layer expert hint. Submit it from layer-begin so storage I/O can
+        // overlap attention/router instead of arriving after same-layer top-k.
+        std::vector<int> predicted;
+        if (phase != moe_GEN_PHASE_PREFILL && next > 0 &&
+            engine->io_config.enable_lookahead_prefetch &&
+            engine->juju_co_activation_bank_initialized.load(std::memory_order_acquire) &&
+            moe_layer_is_moe_runtime(engine, c, (int)next)) {
+            const uint32_t router_top_k = moe_router_top_k_from_metadata_for_layer(
+                engine, (int)next, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer);
+            const uint32_t predict_limit = std::min<uint32_t>(
+                c->experts_per_moe_layer,
+                std::max<uint32_t>(1u, router_top_k) * 2u);
+            predicted = moe_juju_predict_co_activation(engine, (int)next, (int)predict_limit);
+        }
+        moe_pc_engine_prefetch_moe_lookahead(
+            engine,
+            (int)next - 1,
+            nullptr,
+            0,
+            predicted.empty() ? nullptr : predicted.data(),
+            (uint32_t)predicted.size());
         engine->cpu_prefetch_scheduled.fetch_add(1, std::memory_order_relaxed);
     }
 }
