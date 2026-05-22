@@ -86,7 +86,7 @@ static int moe_router_logits_f32(
     if (hidden_size > 100000) {
         return 0;
     }
-    scratch_logits->resize(experts);
+    scratch_logits->assign(experts, 0.0f);
     moe_raw_tensor_cache_entry common{};
     if (moe_map_router_tensor(engine, layer, hidden_size, experts, &common)) {
         const uint64_t row_bytes = moe_raw_tensor_row_bytes(common, hidden_size);
