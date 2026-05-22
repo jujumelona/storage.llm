@@ -171,6 +171,16 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
         }
         return 0;
     }
+    if (had_before_state &&
+        before_state.active &&
+        before_state.tier != moe_TIER_STREAM &&
+        before_state.bytes == bytes &&
+        tier_speed_rank(before_state.tier) <= tier_speed_rank(preferred_tier)) {
+        if (effective_reservation.valid) {
+            device_vram_release_reservation_token(engine, effective_reservation);
+        }
+        return 1;
+    }
     if (preferred_tier == moe_TIER_DB || preferred_tier == moe_TIER_STREAM) {
         if (effective_reservation.valid) {
             device_vram_release_reservation_token(engine, effective_reservation);
