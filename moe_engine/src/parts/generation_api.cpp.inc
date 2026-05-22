@@ -89,8 +89,5 @@ static int moe_graph_ir_map_layer_contract_tensor_role_f32(
 // Main API (depends on: forward, kv_cache, scratch, error)
 #include "generation_api_main.cpp.inc"
 
-// Shared prompt prefill used by eval after the generation API helpers are visible.
-#include "generation_prefill.cpp.inc"
-
-// Eval API (depends on: forward, prefill, lm_head logprob, kv_cache, scratch, error)
+// Eval API (depends on: forward, lm_head logprob, kv_cache, scratch, error)
 #include "generation_eval.cpp.inc"
