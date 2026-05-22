@@ -946,12 +946,9 @@ static void moe_cpu_storage_build_layer_hot_plan(moe_pc_engine* engine) {
         std::sort(vec.begin(), vec.end(), [engine](uint32_t a, uint32_t b) {
             const moe_tensor_record* ra = engine->cpu_hot_tensor_views[a].rec;
             const moe_tensor_record* rb = engine->cpu_hot_tensor_views[b].rec;
-            const uint32_t rpa = ra ? (uint32_t)ra->runtime_priority : 100000u;
-            const uint32_t rpb = rb ? (uint32_t)rb->runtime_priority : 100000u;
-            if (rpa != rpb) return rpa < rpb;
-            const uint32_t ppa = ra ? (uint32_t)ra->prefetch_priority : 0u;
-            const uint32_t ppb = rb ? (uint32_t)rb->prefetch_priority : 0u;
-            if (ppa != ppb) return ppa > ppb;
+            const uint32_t pa = ra ? ((uint32_t)ra->runtime_priority * 4u + (uint32_t)ra->prefetch_priority) : 100000u;
+            const uint32_t pb = rb ? ((uint32_t)rb->runtime_priority * 4u + (uint32_t)rb->prefetch_priority) : 100000u;
+            if (pa != pb) return pa < pb;
             const uint32_t ea = ra ? (uint32_t)ra->execution_order : 100000u;
             const uint32_t eb = rb ? (uint32_t)rb->execution_order : 100000u;
             if (ea != eb) return ea < eb;
