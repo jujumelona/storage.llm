@@ -51,48 +51,6 @@ static int moe_eval_exact_ppl_contract_ready(
     return 1;
 }
 
-static int moe_eval_env_false(const char* name) {
-    const char* v = name ? std::getenv(name) : nullptr;
-    if (!v || !*v) return 0;
-    return std::strcmp(v, "0") == 0 ||
-           std::strcmp(v, "false") == 0 ||
-           std::strcmp(v, "FALSE") == 0 ||
-           std::strcmp(v, "off") == 0 ||
-           std::strcmp(v, "OFF") == 0 ||
-           std::strcmp(v, "no") == 0 ||
-           std::strcmp(v, "NO") == 0;
-}
-
-static int moe_eval_layer_first_prefill_enabled(
-    const moe_pc_engine_t* engine,
-    uint32_t prefill_count,
-    uint32_t hidden_size
-) {
-    if (moe_eval_env_false("STORAGELLM_EVAL_LAYER_FIRST_PREFILL")) {
-        return 0;
-    }
-    if (!engine || prefill_count <= 1u || hidden_size == 0) {
-        return 0;
-    }
-    if ((uint64_t)prefill_count > UINT64_MAX / (uint64_t)hidden_size ||
-        (uint64_t)prefill_count * (uint64_t)hidden_size > UINT64_MAX / sizeof(float)) {
-        return 0;
-    }
-    const uint64_t batch_bytes = (uint64_t)prefill_count * (uint64_t)hidden_size * sizeof(float);
-    const uint64_t small_batch = 64ull * 1024ull * 1024ull;
-    if (batch_bytes <= small_batch) {
-        return 1;
-    }
-    if (engine->config.ram_budget_bytes != 0 && batch_bytes > engine->config.ram_budget_bytes / 8ull) {
-        return 0;
-    }
-    const uint64_t available = storagellm::available_ram_bytes();
-    if (available != 0 && batch_bytes > available / 8ull) {
-        return 0;
-    }
-    return 1;
-}
-
 int moe_pc_engine_eval_token_ids_from(
     moe_pc_engine_t* engine,
     const int32_t* input_token_ids,
@@ -380,7 +338,8 @@ int moe_pc_engine_eval_token_ids_from(
         engine->storage_selected_expert_linear_fallbacks.load(std::memory_order_acquire);
     const uint32_t prefill_count = input_token_count - 1u;
     const int use_layer_first_eval =
-        moe_eval_layer_first_prefill_enabled(engine, prefill_count, c->hidden_size);
+        prefill_count >= 2u &&
+        moe_generation_should_use_layer_first_prefill(engine, prefill_count, c->hidden_size);
     if (use_layer_first_eval) {
         const uint64_t prefill_start_us = moe_profile_now_us();
         const size_t hs = c->hidden_size;
