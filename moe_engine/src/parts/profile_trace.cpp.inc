@@ -4,7 +4,7 @@ static int moe_profile_level() {
     if (value >= 0) {
         return value;
     }
-    int parsed = 2;
+    int parsed = 0;
     const char* env = std::getenv("STORAGELLM_TRACE_LEVEL");
     if (!env || !env[0]) {
         env = std::getenv("STORAGELLM_TRACE");

@@ -392,6 +392,38 @@ static inline float moe_mxfp4_dot_block(
     const float* table,
     int pairwise_order
 ) {
+#if defined(__AVX2__)
+    if (!pairwise_order && limit == 32u && !layout.bytewise_codes) {
+        const __m128i mask = _mm_set1_epi8(0x0f);
+        auto lookup = [&](const uint8_t* p, int high) -> __m256 {
+            __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+            bytes = high ? _mm_and_si128(_mm_srli_epi16(bytes, 4), mask)
+                         : _mm_and_si128(bytes, mask);
+            const __m256i idx = _mm256_cvtepu8_epi32(bytes);
+            return _mm256_i32gather_ps(table, idx, 4);
+        };
+        __m256 acc = _mm256_setzero_ps();
+        acc = moe_madd_ps(lookup(qs, 0), _mm256_loadu_ps(x + start), acc);
+        acc = moe_madd_ps(lookup(qs + 8u, 0), _mm256_loadu_ps(x + start + 8u), acc);
+        acc = moe_madd_ps(lookup(qs, 1), _mm256_loadu_ps(x + start + 16u), acc);
+        acc = moe_madd_ps(lookup(qs + 8u, 1), _mm256_loadu_ps(x + start + 24u), acc);
+        return moe_dot_hsum256_ps(acc);
+    }
+    if (!pairwise_order && limit == 16u && layout.bytewise_codes) {
+        const __m128i mask = _mm_set1_epi8(0x0f);
+        auto lookup_codes = [&](const uint8_t* p) -> __m256 {
+            const __m128i bytes = _mm_and_si128(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p)),
+                mask);
+            const __m256i idx = _mm256_cvtepu8_epi32(bytes);
+            return _mm256_i32gather_ps(table, idx, 4);
+        };
+        __m256 acc = _mm256_setzero_ps();
+        acc = moe_madd_ps(lookup_codes(qs), _mm256_loadu_ps(x + start), acc);
+        acc = moe_madd_ps(lookup_codes(qs + 8u), _mm256_loadu_ps(x + start + 8u), acc);
+        return moe_dot_hsum256_ps(acc);
+    }
+#endif
     float acc = 0.0f;
     if (layout.bytewise_codes) {
         for (uint32_t j = 0; j < limit; ++j) {
@@ -433,6 +465,56 @@ static inline void moe_mxfp4_dot_block_two_rows(
     float* out0,
     float* out1
 ) {
+#if defined(__AVX2__)
+    if (!pairwise_order && limit == 32u && !layout.bytewise_codes) {
+        const __m128i mask = _mm_set1_epi8(0x0f);
+        auto lookup = [&](const uint8_t* p, int high) -> __m256 {
+            __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+            bytes = high ? _mm_and_si128(_mm_srli_epi16(bytes, 4), mask)
+                         : _mm_and_si128(bytes, mask);
+            const __m256i idx = _mm256_cvtepu8_epi32(bytes);
+            return _mm256_i32gather_ps(table, idx, 4);
+        };
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        const __m256 x0 = _mm256_loadu_ps(x + start);
+        const __m256 x1 = _mm256_loadu_ps(x + start + 8u);
+        const __m256 x2 = _mm256_loadu_ps(x + start + 16u);
+        const __m256 x3 = _mm256_loadu_ps(x + start + 24u);
+        acc0 = moe_madd_ps(lookup(qs0, 0), x0, acc0);
+        acc1 = moe_madd_ps(lookup(qs1, 0), x0, acc1);
+        acc0 = moe_madd_ps(lookup(qs0 + 8u, 0), x1, acc0);
+        acc1 = moe_madd_ps(lookup(qs1 + 8u, 0), x1, acc1);
+        acc0 = moe_madd_ps(lookup(qs0, 1), x2, acc0);
+        acc1 = moe_madd_ps(lookup(qs1, 1), x2, acc1);
+        acc0 = moe_madd_ps(lookup(qs0 + 8u, 1), x3, acc0);
+        acc1 = moe_madd_ps(lookup(qs1 + 8u, 1), x3, acc1);
+        *out0 = moe_dot_hsum256_ps(acc0);
+        *out1 = moe_dot_hsum256_ps(acc1);
+        return;
+    }
+    if (!pairwise_order && limit == 16u && layout.bytewise_codes) {
+        const __m128i mask = _mm_set1_epi8(0x0f);
+        auto lookup_codes = [&](const uint8_t* p) -> __m256 {
+            const __m128i bytes = _mm_and_si128(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p)),
+                mask);
+            const __m256i idx = _mm256_cvtepu8_epi32(bytes);
+            return _mm256_i32gather_ps(table, idx, 4);
+        };
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        const __m256 x0 = _mm256_loadu_ps(x + start);
+        const __m256 x1 = _mm256_loadu_ps(x + start + 8u);
+        acc0 = moe_madd_ps(lookup_codes(qs0), x0, acc0);
+        acc1 = moe_madd_ps(lookup_codes(qs1), x0, acc1);
+        acc0 = moe_madd_ps(lookup_codes(qs0 + 8u), x1, acc0);
+        acc1 = moe_madd_ps(lookup_codes(qs1 + 8u), x1, acc1);
+        *out0 = moe_dot_hsum256_ps(acc0);
+        *out1 = moe_dot_hsum256_ps(acc1);
+        return;
+    }
+#endif
     float acc0 = 0.0f;
     float acc1 = 0.0f;
     if (layout.bytewise_codes) {
