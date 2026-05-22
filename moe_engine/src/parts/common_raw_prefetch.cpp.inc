@@ -147,6 +147,25 @@ static uint64_t prefetch_raw_layer_roles(
     return bytes;
 }
 
+static int common_tensor_text_mentions_router_startup(
+    const std::string& name,
+    const std::string& role_text
+) {
+    return role_text.find("router") != std::string::npos ||
+        role_text.find("moe_gate") != std::string::npos ||
+        role_text.find("gate_inp") != std::string::npos ||
+        name.find("ffn_gate_inp") != std::string::npos ||
+        name.find("router.weight") != std::string::npos ||
+        name.find("router_input_scale") != std::string::npos ||
+        name.find("router.input_scale") != std::string::npos ||
+        name.find("router_norm.weight") != std::string::npos ||
+        name.find("moe_router_norm.weight") != std::string::npos ||
+        name.find("moe.gate_input_scale") != std::string::npos ||
+        name.find("moe.gate_norm.weight") != std::string::npos ||
+        name.find("mlp.router_input_scale") != std::string::npos ||
+        name.find("mlp.router_norm.weight") != std::string::npos;
+}
+
 static int common_tensor_is_startup_core(const moe_gguf_common_tensor_record& rec) {
     if (rec.hotset_rank <= 256 ||
         rec.prefetch_class == moe_JUJU_PREFETCH_STARTUP_HOT ||
@@ -154,6 +173,15 @@ static int common_tensor_is_startup_core(const moe_gguf_common_tensor_record& re
         return 1;
     }
     const std::string name = moe_lower_ascii_copy(rec.name);
+    const std::string op_role = moe_lower_ascii_copy(rec.op_role);
+    const std::string exec_op = moe_lower_ascii_copy(rec.execution_op);
+    const std::string member_role = moe_lower_ascii_copy(rec.bundle_member_role);
+    const std::string graph_role_text = moe_lower_ascii_copy(rec.graph_role_text);
+    const std::string role_text =
+        op_role + " " + exec_op + " " + member_role + " " + graph_role_text;
+    if (common_tensor_text_mentions_router_startup(name, role_text)) {
+        return 1;
+    }
     return name == "output.weight" ||
         name == "lm_head.weight" ||
         name == "token_embd.weight" ||
@@ -163,6 +191,26 @@ static int common_tensor_is_startup_core(const moe_gguf_common_tensor_record& re
         name == "final_norm.weight" ||
         name == "model.norm.weight" ||
         name == "rope_freqs.weight";
+}
+
+static uint64_t prefetch_raw_all_layers_roles(
+    moe_pc_engine* e,
+    uint32_t roles,
+    uint8_t pool,
+    uint64_t budget,
+    uint32_t num_layers
+) {
+    uint64_t bytes = 0;
+    for (uint32_t layer = 0; layer < num_layers && bytes < budget; ++layer) {
+        bytes += prefetch_raw_layer_roles(
+            e,
+            (int32_t)layer,
+            roles,
+            pool,
+            budget - bytes
+        );
+    }
+    return bytes;
 }
 
 static int common_tensor_seen(
@@ -287,6 +335,15 @@ static int prefetch_fixed_core_raw(moe_pc_engine* e) {
                 bytes += prefetch_raw_layer_roles(e, -1, moe_RAW_ROLE_EMBED, moe_DEVICE_POOL_FIXED, ram_room - bytes);
             }
             if (bytes < ram_room) {
+                bytes += prefetch_raw_all_layers_roles(
+                    e,
+                    moe_RAW_ROLE_ROUTER,
+                    moe_DEVICE_POOL_FIXED,
+                    ram_room - bytes,
+                    storage ? storage->num_hidden_layers : 0
+                );
+            }
+            if (bytes < ram_room) {
                 bytes += prefetch_common_tensor_records_to_ram(e, ram_room - bytes);
             }
             std::fprintf(stderr, "[storagellm] common raw RAM warm done: bytes=%llu ram_used=%llu budget=%llu\n",
@@ -307,6 +364,15 @@ static int prefetch_fixed_core_raw(moe_pc_engine* e) {
     bytes += prefetch_raw_layer_roles(e, lm_head_layer, moe_RAW_ROLE_LM_HEAD, moe_DEVICE_POOL_FIXED, budget - bytes);
     if (bytes < budget) {
         bytes += prefetch_raw_layer_roles(e, -1, moe_RAW_ROLE_EMBED, moe_DEVICE_POOL_FIXED, budget - bytes);
+    }
+    if (bytes < budget) {
+        bytes += prefetch_raw_all_layers_roles(
+            e,
+            moe_RAW_ROLE_ROUTER,
+            moe_DEVICE_POOL_FIXED,
+            budget - bytes,
+            storage ? storage->num_hidden_layers : 0
+        );
     }
     std::fprintf(stderr, "[storagellm] common raw device pin done: bytes=%llu reserve=%llu device=%llu allocs=%llu failures=%llu\n",
         (unsigned long long)bytes,
