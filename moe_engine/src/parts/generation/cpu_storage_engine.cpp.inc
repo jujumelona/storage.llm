@@ -1372,6 +1372,7 @@ static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, c
         moe_cpu_storage_schedule_layer_hot_prefetch(engine, next);
         moe_enqueue_attention_prefetch(engine, (int32_t)next);
         // Shared router/common spans can be prefetched before router top-k is known.
+        moe_pc_engine_prefetch_moe_lookahead(engine, (int)next, nullptr, 0, nullptr, 0);
         // During decode, co-activation history gives a generic, format-derived
         // next-layer expert hint. Submit it from layer-begin so storage I/O can
         // overlap attention/router instead of arriving after same-layer top-k.
@@ -1387,13 +1388,15 @@ static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, c
                 std::max<uint32_t>(1u, router_top_k) * 2u);
             predicted = moe_juju_predict_co_activation(engine, (int)next, (int)predict_limit);
         }
-        moe_pc_engine_prefetch_moe_lookahead(
-            engine,
-            (int)next - 1,
-            nullptr,
-            0,
-            predicted.empty() ? nullptr : predicted.data(),
-            (uint32_t)predicted.size());
+        if (!predicted.empty()) {
+            moe_pc_engine_prefetch_moe_lookahead(
+                engine,
+                (int)next - 1,
+                nullptr,
+                0,
+                predicted.data(),
+                (uint32_t)predicted.size());
+        }
         engine->cpu_prefetch_scheduled.fetch_add(1, std::memory_order_relaxed);
     }
 }
