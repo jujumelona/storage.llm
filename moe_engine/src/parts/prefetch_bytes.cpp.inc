@@ -9,6 +9,14 @@ static inline bool staging_slot_valid(const moe_pc_engine* e, uint32_t slot_inde
 #if defined(__linux__)
 static volatile uint8_t g_moe_mmap_touch_sink = 0;
 
+static void hint_mapped_range(const moe_pc_engine* engine, const uint8_t* src, uint64_t bytes) {
+    (void)engine;
+    if (!src || bytes == 0) {
+        return;
+    }
+    madvise(const_cast<uint8_t*>(src), (size_t)bytes, MADV_WILLNEED);
+}
+
 static void touch_linux_mapped_pages(const moe_pc_engine* engine, const uint8_t* src, uint64_t bytes) {
     if (!src || bytes == 0) {
         return;
@@ -255,6 +263,14 @@ static void touch_mapped_range(const moe_pc_engine* engine, const uint8_t* src, 
     touch_linux_mapped_pages(engine, src, bytes);
 #endif
 }
+
+#if !defined(__linux__)
+static void hint_mapped_range(const moe_pc_engine* engine, const uint8_t* src, uint64_t bytes) {
+    (void)engine;
+    (void)src;
+    (void)bytes;
+}
+#endif
 
 // Fix 20: Coalesce adjacent madvise calls to reduce kernel syscall overhead
 static void touch_mapped_ranges(const moe_pc_engine* engine, const std::vector<std::pair<const uint8_t*, uint64_t>>& ranges) {

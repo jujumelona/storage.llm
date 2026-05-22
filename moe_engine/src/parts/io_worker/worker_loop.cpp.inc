@@ -227,7 +227,7 @@
                     // Solution: Check size > 0 before touch
                     const uint64_t touch_size = tensor_stream_bytes(next_rec);
                     if (next_src && touch_size > 0) {
-                        touch_mapped_range(engine, next_src, touch_size);
+                        hint_mapped_range(engine, next_src, touch_size);
                     }
                 }
             }
