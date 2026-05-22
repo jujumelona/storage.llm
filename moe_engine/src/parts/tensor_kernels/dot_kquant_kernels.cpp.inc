@@ -147,6 +147,39 @@ static float moe_gguf_q4_k_row_impl(const uint8_t* packed, const float* x, float
         const uint8_t* scales = packed + 4u;
         const uint8_t* q = packed + 16u;
         uint32_t is = 0;
+#if defined(__AVX2__)
+        if (x && !out && (cols % 256u) == 0u) {
+            const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+            for (uint32_t j = 0; j < 256u; j += 64u) {
+                uint8_t sc = 0;
+                uint8_t mn = 0;
+                moe_get_scale_min_k4(is + 0u, scales, &sc, &mn);
+                const __m256 d1 = _mm256_set1_ps(d * (float)sc);
+                const __m256 m1 = _mm256_set1_ps(minv * (float)mn);
+                moe_get_scale_min_k4(is + 1u, scales, &sc, &mn);
+                const __m256 d2 = _mm256_set1_ps(d * (float)sc);
+                const __m256 m2 = _mm256_set1_ps(minv * (float)mn);
+                __m256 vacc = _mm256_setzero_ps();
+                for (uint32_t l = 0; l < 32u; l += 8u) {
+                    const __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(q + l));
+                    const __m128i lo = _mm_and_si128(bytes, nibble_mask);
+                    const __m128i hi = _mm_and_si128(_mm_srli_epi16(bytes, 4), nibble_mask);
+                    const __m256 xlo = _mm256_loadu_ps(x + base + j + l);
+                    const __m256 xhi = _mm256_loadu_ps(x + base + j + 32u + l);
+                    const __m256 vlo = _mm256_sub_ps(
+                        _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo)), d1), m1);
+                    const __m256 vhi = _mm256_sub_ps(
+                        _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi)), d2), m2);
+                    vacc = moe_madd_ps(vlo, xlo, vacc);
+                    vacc = moe_madd_ps(vhi, xhi, vacc);
+                }
+                acc += moe_dot_hsum256_ps(vacc);
+                q += 32u;
+                is += 2u;
+            }
+            continue;
+        }
+#endif
         for (uint32_t j = 0; j < 256u; j += 64u) {
             uint8_t sc = 0;
             uint8_t mn = 0;
@@ -192,6 +225,51 @@ static float moe_gguf_q5_k_row_impl(const uint8_t* packed, const float* x, float
         uint32_t is = 0;
         uint8_t u1 = 1;
         uint8_t u2 = 2;
+#if defined(__AVX2__)
+        if (x && !out && (cols % 256u) == 0u) {
+            const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+            const __m128i high_value = _mm_set1_epi8(16);
+            const __m128i zero = _mm_setzero_si128();
+            for (uint32_t j = 0; j < 256u; j += 64u) {
+                uint8_t sc = 0;
+                uint8_t mn = 0;
+                moe_get_scale_min_k4(is + 0u, scales, &sc, &mn);
+                const __m256 d1 = _mm256_set1_ps(d * (float)sc);
+                const __m256 m1 = _mm256_set1_ps(minv * (float)mn);
+                moe_get_scale_min_k4(is + 1u, scales, &sc, &mn);
+                const __m256 d2 = _mm256_set1_ps(d * (float)sc);
+                const __m256 m2 = _mm256_set1_ps(minv * (float)mn);
+                const __m128i high_mask1 = _mm_set1_epi8((char)u1);
+                const __m128i high_mask2 = _mm_set1_epi8((char)u2);
+                __m256 vacc = _mm256_setzero_ps();
+                for (uint32_t l = 0; l < 32u; l += 8u) {
+                    const __m128i qbytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ql + l));
+                    const __m128i hbytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qh + l));
+                    const __m128i lo_hi = _mm_andnot_si128(
+                        _mm_cmpeq_epi8(_mm_and_si128(hbytes, high_mask1), zero), high_value);
+                    const __m128i hi_hi = _mm_andnot_si128(
+                        _mm_cmpeq_epi8(_mm_and_si128(hbytes, high_mask2), zero), high_value);
+                    const __m128i lo = _mm_or_si128(_mm_and_si128(qbytes, nibble_mask), lo_hi);
+                    const __m128i hi = _mm_or_si128(
+                        _mm_and_si128(_mm_srli_epi16(qbytes, 4), nibble_mask), hi_hi);
+                    const __m256 xlo = _mm256_loadu_ps(x + base + j + l);
+                    const __m256 xhi = _mm256_loadu_ps(x + base + j + 32u + l);
+                    const __m256 vlo = _mm256_sub_ps(
+                        _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo)), d1), m1);
+                    const __m256 vhi = _mm256_sub_ps(
+                        _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi)), d2), m2);
+                    vacc = moe_madd_ps(vlo, xlo, vacc);
+                    vacc = moe_madd_ps(vhi, xhi, vacc);
+                }
+                acc += moe_dot_hsum256_ps(vacc);
+                ql += 32u;
+                is += 2u;
+                u1 = (uint8_t)(u1 << 2);
+                u2 = (uint8_t)(u2 << 2);
+            }
+            continue;
+        }
+#endif
         for (uint32_t j = 0; j < 256u; j += 64u) {
             uint8_t sc = 0;
             uint8_t mn = 0;
@@ -237,6 +315,54 @@ static float moe_gguf_q6_k_row_impl(const uint8_t* packed, const float* x, float
         if (!std::isfinite(d)) {
             continue;
         }
+#if defined(__AVX2__)
+        if (x && !out && (cols % 256u) == 0u) {
+            const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+            const __m128i two_bit_mask = _mm_set1_epi8(0x03);
+            const __m256 bias = _mm256_set1_ps(32.0f);
+            auto q6_to_ps = [&](const __m128i values) -> __m256 {
+                return _mm256_sub_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(values)),
+                    bias);
+            };
+            for (uint32_t n = 0; n < 256u; n += 128u) {
+                for (uint32_t l = 0; l < 32u; l += 8u) {
+                    const uint32_t is = l / 16u;
+                    const __m128i qlo = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ql + l));
+                    const __m128i qhi = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ql + 32u + l));
+                    const __m128i h = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qh + l));
+                    const __m128i h0 = _mm_slli_epi16(_mm_and_si128(h, two_bit_mask), 4);
+                    const __m128i h1 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 2), two_bit_mask), 4);
+                    const __m128i h2 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 4), two_bit_mask), 4);
+                    const __m128i h3 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 6), two_bit_mask), 4);
+                    const __m256 q1 = q6_to_ps(_mm_or_si128(_mm_and_si128(qlo, nibble_mask), h0));
+                    const __m256 q2 = q6_to_ps(_mm_or_si128(_mm_and_si128(qhi, nibble_mask), h1));
+                    const __m256 q3 = q6_to_ps(_mm_or_si128(
+                        _mm_and_si128(_mm_srli_epi16(qlo, 4), nibble_mask), h2));
+                    const __m256 q4 = q6_to_ps(_mm_or_si128(
+                        _mm_and_si128(_mm_srli_epi16(qhi, 4), nibble_mask), h3));
+                    __m256 vacc = _mm256_setzero_ps();
+                    vacc = moe_madd_ps(
+                        _mm256_mul_ps(_mm256_set1_ps(d * (float)sc[is + 0u]), q1),
+                        _mm256_loadu_ps(x + base + n + l), vacc);
+                    vacc = moe_madd_ps(
+                        _mm256_mul_ps(_mm256_set1_ps(d * (float)sc[is + 2u]), q2),
+                        _mm256_loadu_ps(x + base + n + 32u + l), vacc);
+                    vacc = moe_madd_ps(
+                        _mm256_mul_ps(_mm256_set1_ps(d * (float)sc[is + 4u]), q3),
+                        _mm256_loadu_ps(x + base + n + 64u + l), vacc);
+                    vacc = moe_madd_ps(
+                        _mm256_mul_ps(_mm256_set1_ps(d * (float)sc[is + 6u]), q4),
+                        _mm256_loadu_ps(x + base + n + 96u + l), vacc);
+                    acc += moe_dot_hsum256_ps(vacc);
+                }
+                ql += 64u;
+                qh += 32u;
+                sc += 8u;
+            }
+            continue;
+        }
+#endif
         for (uint32_t n = 0; n < 256u; n += 128u) {
             for (uint32_t l = 0; l < 32u; ++l) {
                 const uint32_t is = l / 16u;
