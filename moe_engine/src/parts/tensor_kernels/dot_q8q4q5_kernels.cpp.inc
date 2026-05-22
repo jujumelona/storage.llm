@@ -314,14 +314,6 @@ static float moe_mxfp4_value_from_code(uint8_t code) {
     return moe_mxfp4_value_table()[code & 0x0fu];
 }
 
-static const int8_t* moe_mxfp4_i8_value_table() {
-    static constexpr int8_t kMxfp4I8Table[16] = {
-        0, 1, 2, 3, 4, 6, 8, 12,
-        0, -1, -2, -3, -4, -6, -8, -12,
-    };
-    return kMxfp4I8Table;
-}
-
 static int moe_mxfp4_pairwise_nibble_order_enabled() {
     // GGML MXFP4 stores a 32-value block as sixteen payload bytes:
     // low nibbles decode logical columns 0..15 and high nibbles decode
@@ -398,116 +390,6 @@ static float moe_dot_gguf_mxfp4_row_strided(
     uint64_t physical_row_bytes
 );
 
-#if defined(__AVX2__)
-static inline __m256 moe_mxfp4_i8x8_to_ps(__m128i bytes) {
-    return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes));
-}
-
-static inline __m256 moe_mxfp4_load_codes8_ps(__m128i codes, int high_half) {
-    const __m128i values = _mm_loadu_si128(reinterpret_cast<const __m128i*>(moe_mxfp4_i8_value_table()));
-    const __m128i mask = _mm_set1_epi8(0x0f);
-    const __m128i nibbles = high_half ?
-        _mm_and_si128(_mm_srli_epi16(codes, 4), mask) :
-        _mm_and_si128(codes, mask);
-    return moe_mxfp4_i8x8_to_ps(_mm_shuffle_epi8(values, nibbles));
-}
-
-static inline float moe_dot_gguf_mxfp4_standard32_avx2(
-    const uint8_t* packed,
-    const float* x,
-    uint32_t cols
-) {
-    const uint32_t full_cols = cols & ~31u;
-    __m256 acc0 = _mm256_setzero_ps();
-    __m256 acc1 = _mm256_setzero_ps();
-    __m256 acc2 = _mm256_setzero_ps();
-    __m256 acc3 = _mm256_setzero_ps();
-    uint32_t start = 0;
-    for (; start < full_cols; start += 32u) {
-        const float scale = moe_e8m0_to_f32_half(packed[0]) * 0.5f;
-        const __m256 vscale = _mm256_set1_ps(scale);
-        const __m128i q = _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed + 1u));
-
-        const __m256 q0 = _mm256_mul_ps(moe_mxfp4_load_codes8_ps(q, 0), vscale);
-        const __m256 q1 = _mm256_mul_ps(moe_mxfp4_load_codes8_ps(_mm_srli_si128(q, 8), 0), vscale);
-        const __m256 q2 = _mm256_mul_ps(moe_mxfp4_load_codes8_ps(q, 1), vscale);
-        const __m256 q3 = _mm256_mul_ps(moe_mxfp4_load_codes8_ps(_mm_srli_si128(q, 8), 1), vscale);
-
-        acc0 = moe_madd_ps(q0, _mm256_loadu_ps(x + start), acc0);
-        acc1 = moe_madd_ps(q1, _mm256_loadu_ps(x + start + 8u), acc1);
-        acc2 = moe_madd_ps(q2, _mm256_loadu_ps(x + start + 16u), acc2);
-        acc3 = moe_madd_ps(q3, _mm256_loadu_ps(x + start + 24u), acc3);
-        packed += 17u;
-    }
-    float acc = moe_dot_hsum256_ps(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)));
-    const float* table = moe_mxfp4_value_table();
-    for (; start < cols; ) {
-        const float scale = moe_e8m0_to_f32_half(packed[0]);
-        const uint8_t* qs = packed + 1u;
-        const uint32_t limit = std::min<uint32_t>(32u, cols - start);
-        float block_acc = 0.0f;
-        for (uint32_t j = 0; j < limit; ++j) {
-            block_acc += table[moe_mxfp4_code_at(qs, j)] * x[start + j];
-        }
-        acc += block_acc * scale;
-        start += limit;
-        packed += 17u;
-    }
-    return acc;
-}
-
-static inline void moe_dot_gguf_mxfp4_standard32_two_rows_avx2(
-    const uint8_t* packed0,
-    const uint8_t* packed1,
-    const float* x,
-    uint32_t cols,
-    float* out0,
-    float* out1
-) {
-    const uint32_t full_cols = cols & ~31u;
-    __m256 a00 = _mm256_setzero_ps();
-    __m256 a01 = _mm256_setzero_ps();
-    __m256 a02 = _mm256_setzero_ps();
-    __m256 a03 = _mm256_setzero_ps();
-    __m256 a10 = _mm256_setzero_ps();
-    __m256 a11 = _mm256_setzero_ps();
-    __m256 a12 = _mm256_setzero_ps();
-    __m256 a13 = _mm256_setzero_ps();
-    uint32_t start = 0;
-    for (; start < full_cols; start += 32u) {
-        const __m256 x0 = _mm256_loadu_ps(x + start);
-        const __m256 x1 = _mm256_loadu_ps(x + start + 8u);
-        const __m256 x2 = _mm256_loadu_ps(x + start + 16u);
-        const __m256 x3 = _mm256_loadu_ps(x + start + 24u);
-
-        const __m256 s0 = _mm256_set1_ps(moe_e8m0_to_f32_half(packed0[0]) * 0.5f);
-        const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed0 + 1u));
-        a00 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_load_codes8_ps(q0, 0), s0), x0, a00);
-        a01 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_load_codes8_ps(_mm_srli_si128(q0, 8), 0), s0), x1, a01);
-        a02 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_load_codes8_ps(q0, 1), s0), x2, a02);
-        a03 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_load_codes8_ps(_mm_srli_si128(q0, 8), 1), s0), x3, a03);
-
-        const __m256 s1 = _mm256_set1_ps(moe_e8m0_to_f32_half(packed1[0]) * 0.5f);
-        const __m128i q1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed1 + 1u));
-        a10 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_load_codes8_ps(q1, 0), s1), x0, a10);
-        a11 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_load_codes8_ps(_mm_srli_si128(q1, 8), 0), s1), x1, a11);
-        a12 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_load_codes8_ps(q1, 1), s1), x2, a12);
-        a13 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_load_codes8_ps(_mm_srli_si128(q1, 8), 1), s1), x3, a13);
-
-        packed0 += 17u;
-        packed1 += 17u;
-    }
-    float acc0 = moe_dot_hsum256_ps(_mm256_add_ps(_mm256_add_ps(a00, a01), _mm256_add_ps(a02, a03)));
-    float acc1 = moe_dot_hsum256_ps(_mm256_add_ps(_mm256_add_ps(a10, a11), _mm256_add_ps(a12, a13)));
-    if (start < cols) {
-        acc0 += moe_dot_gguf_mxfp4_row_strided(packed0, x + start, cols - start, 0ull);
-        acc1 += moe_dot_gguf_mxfp4_row_strided(packed1, x + start, cols - start, 0ull);
-    }
-    *out0 = acc0;
-    *out1 = acc1;
-}
-#endif
-
 static void moe_dot_gguf_mxfp4_two_rows_strided(
     const uint8_t* packed0,
     const uint8_t* packed1,
@@ -534,12 +416,6 @@ static void moe_dot_gguf_mxfp4_two_rows_strided(
         *out1 = moe_dot_gguf_mxfp4_row_strided(packed1, x, cols, row_bytes1);
         return;
     }
-#if defined(__AVX2__)
-    if (layout0.block_cols == 32u && layout0.bytewise_codes == 0u) {
-        moe_dot_gguf_mxfp4_standard32_two_rows_avx2(packed0, packed1, x, cols, out0, out1);
-        return;
-    }
-#endif
     const float* table = moe_mxfp4_value_table();
     float acc0 = 0.0f;
     float acc1 = 0.0f;
@@ -590,11 +466,6 @@ static float moe_dot_gguf_mxfp4_row_strided(
         return 0.0f;
     }
     const moe_mxfp4_row_layout_t layout = moe_mxfp4_row_layout_for_bytes(cols, physical_row_bytes);
-#if defined(__AVX2__)
-    if (layout.block_cols == 32u && layout.bytewise_codes == 0u) {
-        return moe_dot_gguf_mxfp4_standard32_avx2(packed, x, cols);
-    }
-#endif
     const float* table = moe_mxfp4_value_table();
     float acc = 0.0f;
     uint32_t start = 0;
