@@ -1175,6 +1175,16 @@ static int moe_cpu_storage_fast_view_for_record(
 static uint32_t moe_cpu_storage_layer_lookahead_depth(const moe_pc_engine* engine, uint32_t layers);
 static void moe_cpu_storage_startup_prefetch_first_layers(moe_pc_engine* engine);
 
+static void moe_cpu_storage_prewarm_rmsnorm_contract(moe_pc_engine* engine) {
+    if (!engine || engine->cached_rmsnorm_unit_offset.load(std::memory_order_acquire) >= 0) {
+        return;
+    }
+    moe_raw_tensor_cache_entry raw{};
+    if (get_cached_raw_tensor(engine, 0, moe_RAW_TENSOR_INPUT_LAYER_NORM, &raw)) {
+        (void)moe_engine_rmsnorm_unit_offset(engine, raw);
+    }
+}
+
 static void moe_cpu_storage_build_execution_plan(moe_pc_engine* engine) {
     if (!engine) return;
     if (engine->cpu_storage_execution_plan_ready.load(std::memory_order_acquire)) return;
@@ -1219,6 +1229,7 @@ static void moe_cpu_storage_build_execution_plan(moe_pc_engine* engine) {
     moe_storage_io_build_expert_index(engine);
     engine->cpu_storage_execution_plan_ready.store(1, std::memory_order_release);
     engine->cpu_storage_engine_ready.store(1, std::memory_order_release);
+    moe_cpu_storage_prewarm_rmsnorm_contract(engine);
     moe_cpu_storage_startup_prefetch_first_layers(engine);
 }
 
