@@ -901,6 +901,9 @@ static int moe_router_layer_score_contract_f32(
             return 1;
         }
     }
+    if (has_layer_contract_row) {
+        return 0;
+    }
     if (moe_router_json_string_equals_any(
             engine->offload_gguf_metadata_json, score_keys,
             sizeof(score_keys) / sizeof(score_keys[0]), "sigmoid")) {
@@ -950,9 +953,6 @@ static int moe_router_layer_score_contract_f32(
         "\"score_fn\":\"sigmoid\"",
         "\"score_fn\": \"sigmoid\""
     };
-    if (has_layer_contract_row) {
-        return 0;
-    }
     if (moe_router_json_mentions_any(
             engine->offload_gguf_metadata_json, sigmoid_needles,
             sizeof(sigmoid_needles) / sizeof(sigmoid_needles[0]))) {
@@ -1293,16 +1293,19 @@ static int moe_router_layer_bool_contract_f32(
     if (!engine || !keys || !out) {
         return 0;
     }
+    int has_layer_contract_row = 0;
     if (layer >= 0) {
         if (moe_router_layer_contract_bool_any_doc_f32(
                 engine, layer, keys, key_count, out, out_source)) {
             return 1;
         }
+        has_layer_contract_row = moe_router_layer_contract_row_exists_any_doc_f32(engine, layer);
     }
     if (layer >= 0 && !engine->offload_graph_ir_json.empty()) {
         size_t obj_begin = 0;
         size_t obj_end = 0;
         if (moe_router_layer_contract_object_slice_cached_f32(engine, layer, &obj_begin, &obj_end)) {
+            has_layer_contract_row = 1;
             if (moe_router_json_bool_any_slice_f32(
                     engine->offload_graph_ir_json, obj_begin, obj_end, keys, key_count, out)) {
                 if (out_source) *out_source = "layer_execution_contract_table";
@@ -1329,6 +1332,9 @@ static int moe_router_layer_bool_contract_f32(
                 }
             }
         }
+    }
+    if (has_layer_contract_row) {
+        return 0;
     }
     if (moe_router_json_get_bool_any(engine->offload_gguf_metadata_json, keys, key_count, out)) {
         if (out_source) *out_source = "metadata";
