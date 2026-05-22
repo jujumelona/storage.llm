@@ -1,5 +1,27 @@
 // Router top-K selection
 
+static uint64_t moe_router_contract_value_cache_key_f32(
+    int32_t layer,
+    uint32_t kind,
+    uint32_t a,
+    uint32_t b
+) {
+    uint64_t h = 1469598103934665603ull;
+    const uint64_t vals[] = {
+        (uint64_t)(uint32_t)layer,
+        (uint64_t)kind,
+        (uint64_t)a,
+        (uint64_t)b
+    };
+    for (uint64_t v : vals) {
+        h ^= v & 0xffu; h *= 1099511628211ull;
+        h ^= (v >> 8) & 0xffu; h *= 1099511628211ull;
+        h ^= (v >> 16) & 0xffu; h *= 1099511628211ull;
+        h ^= (v >> 24) & 0xffu; h *= 1099511628211ull;
+    }
+    return h;
+}
+
 static int moe_router_json_string_equals_any(
     const std::string& text,
     const char* const* keys,
@@ -952,6 +974,14 @@ static int moe_router_uses_sigmoid_scores_for_layer(const moe_pc_engine* engine,
     if (!engine) {
         return 0;
     }
+    const uint64_t value_key = moe_router_contract_value_cache_key_f32(layer, 1u, 0u, 0u);
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->router_contract_value_cache_mutex);
+        auto it = engine->router_score_value_cache.find(value_key);
+        if (it != engine->router_score_value_cache.end()) {
+            return it->second ? 1 : 0;
+        }
+    }
     struct router_score_cache_entry {
         const moe_pc_engine* engine = nullptr;
         uint64_t generation = 0;
@@ -995,6 +1025,10 @@ static int moe_router_uses_sigmoid_scores_for_layer(const moe_pc_engine* engine,
     entry.layer = layer;
     entry.use_sigmoid = use_sigmoid ? 1 : 0;
     tls_cache.push_back(entry);
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->router_contract_value_cache_mutex);
+        engine->router_score_value_cache[value_key] = use_sigmoid ? 1 : 0;
+    }
     return use_sigmoid ? 1 : 0;
 }
 
@@ -1081,6 +1115,14 @@ static uint32_t moe_router_top_k_from_metadata_for_layer(
     uint32_t fallback,
     uint32_t experts
 ) {
+    const uint64_t value_key = moe_router_contract_value_cache_key_f32(layer, 2u, fallback, experts);
+    if (engine) {
+        std::shared_lock<std::shared_mutex> lock(engine->router_contract_value_cache_mutex);
+        auto it = engine->router_topk_value_cache.find(value_key);
+        if (it != engine->router_topk_value_cache.end()) {
+            return it->second;
+        }
+    }
     struct router_topk_cache_entry {
         const moe_pc_engine* engine = nullptr;
         uint64_t generation = 0;
@@ -1145,6 +1187,10 @@ static uint32_t moe_router_top_k_from_metadata_for_layer(
     entry.experts = experts;
     entry.top_k = result;
     tls_cache.push_back(entry);
+    if (engine) {
+        std::unique_lock<std::shared_mutex> lock(engine->router_contract_value_cache_mutex);
+        engine->router_topk_value_cache[value_key] = result;
+    }
     return result;
 }
 
@@ -1366,6 +1412,15 @@ static int moe_router_norm_topk_prob_for_layer(
     if (!engine) {
         return use_sigmoid ? 1 : 0;
     }
+    const uint64_t value_key = moe_router_contract_value_cache_key_f32(
+        layer, 3u, use_sigmoid ? 1u : 0u, 0u);
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->router_contract_value_cache_mutex);
+        auto it = engine->router_norm_topk_value_cache.find(value_key);
+        if (it != engine->router_norm_topk_value_cache.end()) {
+            return it->second ? 1 : 0;
+        }
+    }
     struct router_norm_topk_cache_entry {
         const moe_pc_engine* engine = nullptr;
         uint64_t generation = 0;
@@ -1426,11 +1481,42 @@ static int moe_router_norm_topk_prob_for_layer(
     entry.use_sigmoid = use_sigmoid ? 1 : 0;
     entry.result = result ? 1 : 0;
     tls_cache.push_back(entry);
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->router_contract_value_cache_mutex);
+        engine->router_norm_topk_value_cache[value_key] = result ? 1 : 0;
+    }
     return result ? 1 : 0;
 }
 
 static int moe_router_norm_topk_prob(const moe_pc_engine* engine, int use_sigmoid) {
     return moe_router_norm_topk_prob_for_layer(engine, -1, use_sigmoid);
+}
+
+static void moe_router_prewarm_contracts_f32(
+    const moe_pc_engine* engine,
+    uint32_t experts,
+    uint32_t layers
+) {
+    if (!engine || experts == 0 || layers == 0 || experts > 10000u) {
+        return;
+    }
+    const uint64_t start_us = moe_profile_now_us();
+    uint64_t warmed = 0;
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+        const uint32_t top_k = moe_router_top_k_from_metadata_for_layer(
+            engine, (int32_t)layer, moe_MOE_BASE_TOP_EXPERTS, experts);
+        const int use_sigmoid = moe_router_uses_sigmoid_scores_for_layer(engine, (int32_t)layer);
+        (void)moe_router_norm_topk_prob_for_layer(engine, (int32_t)layer, use_sigmoid);
+        (void)moe_router_effective_routed_scaling_factor_for_layer(engine, (int32_t)layer, use_sigmoid);
+        warmed += top_k > 0 ? 1u : 0u;
+    }
+    moe_profile_log(
+        "router_contract_prewarm",
+        "layers=%u experts=%u warmed=%llu ms=%.3f",
+        layers,
+        experts,
+        (unsigned long long)warmed,
+        moe_profile_elapsed_ms(start_us));
 }
 
 static void moe_router_apply_group_limit(

@@ -91,6 +91,12 @@ static void moe_engine_reset_storage_execution_state(moe_pc_engine* engine) {
     engine->storage_selected_expert_prefetch_bytes.store(0, std::memory_order_relaxed);
     engine->storage_selected_expert_duplicate_skips.store(0, std::memory_order_relaxed);
     engine->storage_format_plan_available.store(0, std::memory_order_relaxed);
+    {
+        std::unique_lock<std::shared_mutex> lock(engine->router_contract_value_cache_mutex);
+        engine->router_score_value_cache.clear();
+        engine->router_topk_value_cache.clear();
+        engine->router_norm_topk_value_cache.clear();
+    }
 }
 
 static void moe_engine_reset_qkv_cache(moe_pc_engine* engine) {

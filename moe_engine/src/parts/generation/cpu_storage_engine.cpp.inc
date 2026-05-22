@@ -1184,6 +1184,7 @@ static void moe_cpu_storage_build_execution_plan(moe_pc_engine* engine) {
         const uint32_t hidden = c.hidden_size ? c.hidden_size : engine->dynamic_shape.hidden_size;
         const uint32_t experts = c.experts_per_moe_layer ? c.experts_per_moe_layer : engine->dynamic_shape.experts_per_moe_layer;
         moe_router_prewarm_bindings_f32(engine, hidden, experts, layers);
+        moe_router_prewarm_contracts_f32(engine, experts, layers);
     }
     moe_storage_io_build_span_plan(engine);
     moe_storage_io_build_expert_index(engine);
