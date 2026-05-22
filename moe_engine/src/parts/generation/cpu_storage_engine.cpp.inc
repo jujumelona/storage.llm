@@ -1379,7 +1379,6 @@ static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, c
         std::vector<int> predicted;
         if (phase != moe_GEN_PHASE_PREFILL && next > 0 &&
             engine->io_config.enable_lookahead_prefetch &&
-            engine->juju_co_activation_bank_initialized.load(std::memory_order_acquire) &&
             moe_layer_is_moe_runtime(engine, c, (int)next)) {
             const uint32_t router_top_k = moe_router_top_k_from_metadata_for_layer(
                 engine, (int)next, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer);

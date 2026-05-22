@@ -1273,6 +1273,7 @@ static void moe_ingest_juju_cross_layer_transition_prior(moe_pc_engine* engine, 
         return;
     }
     std::unique_lock<std::shared_mutex> lock(engine->co_activation_mutex);
+    uint64_t ingested = 0;
     size_t cursor = arr_begin + 1;
     size_t obj_begin = 0;
     size_t obj_end = 0;
@@ -1300,6 +1301,10 @@ static void moe_ingest_juju_cross_layer_transition_prior(moe_pc_engine* engine, 
             engine->co_activation_stats.resize((size_t)to_layer64 + 1u);
         }
         engine->co_activation_stats[(size_t)to_layer64][(int)from_expert64][(int)to_expert64] += score;
+        ++ingested;
+    }
+    if (ingested > 0) {
+        engine->juju_co_activation_bank_initialized.store(true, std::memory_order_release);
     }
 }
 
