@@ -484,6 +484,32 @@ static int moe_storage_async_prefetch_enqueue(
     return 1;
 }
 
+static uint64_t moe_storage_startup_prefetch_wait_ms() {
+    return moe_cpu_storage_env_u64_default(
+        "STORAGELLM_STARTUP_STORAGE_WARM_WAIT_MS",
+        60000ull);
+}
+
+static void moe_storage_async_prefetch_wait_completed(
+    moe_pc_engine* engine,
+    uint64_t target_completed,
+    uint64_t timeout_ms
+) {
+    if (!engine || timeout_ms == 0 || target_completed == 0) return;
+    if (!engine->storage_async_prefetch_enabled.load(std::memory_order_relaxed)) return;
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    uint32_t spins = 0;
+    while (engine->storage_async_prefetch_completed.load(std::memory_order_relaxed) < target_completed) {
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        if (++spins < 64u) {
+            std::this_thread::yield();
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+}
+
 static void moe_storage_io_prefetch_range_execute(
     moe_pc_engine* engine,
     mmap_context_t* shard,
@@ -1146,6 +1172,9 @@ static int moe_cpu_storage_fast_view_for_record(
     return 1;
 }
 
+static uint32_t moe_cpu_storage_layer_lookahead_depth(const moe_pc_engine* engine, uint32_t layers);
+static void moe_cpu_storage_startup_prefetch_first_layers(moe_pc_engine* engine);
+
 static void moe_cpu_storage_build_execution_plan(moe_pc_engine* engine) {
     if (!engine) return;
     if (engine->cpu_storage_execution_plan_ready.load(std::memory_order_acquire)) return;
@@ -1190,6 +1219,7 @@ static void moe_cpu_storage_build_execution_plan(moe_pc_engine* engine) {
     moe_storage_io_build_expert_index(engine);
     engine->cpu_storage_execution_plan_ready.store(1, std::memory_order_release);
     engine->cpu_storage_engine_ready.store(1, std::memory_order_release);
+    moe_cpu_storage_startup_prefetch_first_layers(engine);
 }
 
 static void moe_cpu_storage_select_forward_adapter(moe_pc_engine* engine) {
@@ -1263,6 +1293,29 @@ static uint32_t moe_cpu_storage_layer_lookahead_depth(const moe_pc_engine* engin
         if (bottleneck == "ram-copy") cap = std::min<uint32_t>(cap, 12u);
     }
     return std::max<uint32_t>(1u, std::min<uint32_t>(configured, std::min<uint32_t>(cap, layers)));
+}
+
+static void moe_cpu_storage_startup_prefetch_first_layers(moe_pc_engine* engine) {
+    if (!engine || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
+    const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
+    const uint32_t layers = runtime_c.num_hidden_layers;
+    const uint32_t depth = moe_cpu_storage_layer_lookahead_depth(engine, layers);
+    if (layers == 0 || depth == 0) return;
+
+    engine->cpu_prefetch_epoch.fetch_add(1u, std::memory_order_relaxed);
+    for (uint32_t l = 0; l < layers && l < depth; ++l) {
+        moe_cpu_storage_schedule_layer_hot_prefetch(engine, l);
+        moe_enqueue_attention_prefetch(engine, (int32_t)l);
+        moe_pc_engine_prefetch_moe_lookahead(engine, (int)l, nullptr, 0, nullptr, 0);
+        engine->cpu_prefetch_scheduled.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const uint64_t target_completed =
+        engine->storage_async_prefetch_enqueued.load(std::memory_order_relaxed);
+    moe_storage_async_prefetch_wait_completed(
+        engine,
+        target_completed,
+        moe_storage_startup_prefetch_wait_ms());
 }
 
 static void moe_cpu_storage_begin_token(moe_pc_engine* engine, uint32_t position, uint32_t token_id) {
