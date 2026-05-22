@@ -1888,7 +1888,9 @@ static int moe_router_topk_f32(
     if (experts > 10000) {
         return 0;
     }
-    std::vector<float> scaled_router_input;
+    std::vector<float> local_scaled_router_input;
+    std::vector<float>& scaled_router_input =
+        session ? session->router_scaled_input : local_scaled_router_input;
     const float* router_input = hidden;
     const int router_scale_declared = moe_engine_contract_has_router_input_scale(engine, layer);
     if (moe_prepare_scaled_router_input_f32(engine, layer, hidden, hidden_size, experts, &scaled_router_input)) {

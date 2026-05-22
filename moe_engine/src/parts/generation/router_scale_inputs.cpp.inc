@@ -290,7 +290,7 @@ static int moe_prepare_router_weight_sidecar_input_f32(
     }
     const int use_rms_root =
         moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer);
-    out->assign(hidden_size, 0.0f);
+    out->resize(hidden_size);
     float norm = 1.0f;
     if (use_rms_root) {
         double ss = 0.0;
@@ -425,7 +425,7 @@ static int moe_prepare_scaled_router_input_f32(
         if (!std::isfinite(norm) || !(norm > 0.0f)) {
             return 0;
         }
-        out->assign(hidden_size, 0.0f);
+        out->resize(hidden_size);
         double scale_abs_sum = 0.0;
         double scale_max_abs = 0.0;
         for (uint32_t i = 0; i < hidden_size; ++i) {
@@ -452,7 +452,7 @@ static int moe_prepare_scaled_router_input_f32(
         }
         return 1;
     }
-    out->assign(hidden_size, 0.0f);
+    out->resize(hidden_size);
     // BUGFIX 220: Division by zero clarification (same pattern as BUGFIX 208)
     // Problem: hidden_size == 0 check exists but no comment explaining division safety
     // Solution: Add explicit comment for code clarity

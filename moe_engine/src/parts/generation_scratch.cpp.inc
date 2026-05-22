@@ -42,6 +42,7 @@ struct moe_decode_scratch {
     std::vector<float> gate;
     std::vector<float> up;
     std::vector<float> router_logits;
+    std::vector<float> router_scaled_input;
     std::vector<uint32_t> router_order;
     std::vector<int> selected_experts;
     std::vector<float> selected_weights;
