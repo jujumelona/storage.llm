@@ -99,6 +99,20 @@
          (has_k_raw && k_raw.cols == hidden_size && (!has_v || (has_v_raw && v_raw.cols == hidden_size))));
     const int allow_v_equals_k = !engine || !engine->offload_graph_ir_required.load(std::memory_order_relaxed) ||
         (!has_v && moe_engine_contract_allows_missing_v_projection(engine, layer));
+    std::shared_ptr<moe_attention_f32_weight_cache_entry> q_f32_cache;
+    std::shared_ptr<moe_attention_f32_weight_cache_entry> k_f32_cache;
+    std::shared_ptr<moe_attention_f32_weight_cache_entry> v_f32_cache;
+    if (qkv_parallel_path) {
+        q_f32_cache = moe_attention_get_f32_weight_cache(q_raw, hidden_size);
+        if (!shared_kv_reuse) {
+            k_f32_cache = moe_attention_get_f32_weight_cache(k_raw, hidden_size);
+            if (has_v) {
+                v_f32_cache = moe_attention_get_f32_weight_cache(v_raw, hidden_size);
+            }
+        }
+    }
+    const int qkv_f32_cache_path = q_f32_cache &&
+        (shared_kv_reuse || (k_f32_cache && (!has_v || v_f32_cache)));
 
     if (qkv_parallel_path) {
         // BUGFIX 216: Add scratch buffer size validation before parallel Q/K/V
@@ -123,17 +137,23 @@
             if (!moe_parallel_rows(engine, total_rows, 0, [&](uint32_t row) {
                 if (row < q_dim) {
                     // Q projection
-                    s->q_b[row] = moe_raw_tensor_dot_row(q_raw, row, attn_input, hidden_size);
+                    s->q_b[row] = q_f32_cache ?
+                        moe_attention_f32_weight_dot_row(q_f32_cache.get(), row, attn_input) :
+                        moe_raw_tensor_dot_row(q_raw, row, attn_input, hidden_size);
                     if (!std::isfinite(s->q_b[row])) return 0;
                 } else if (row < q_dim + k_dim) {
                     // K projection
                     const uint32_t k_row = row - q_dim;
-                    s->attn_kv_a[k_row] = moe_raw_tensor_dot_row(k_raw, k_row, attn_input, hidden_size);
+                    s->attn_kv_a[k_row] = k_f32_cache ?
+                        moe_attention_f32_weight_dot_row(k_f32_cache.get(), k_row, attn_input) :
+                        moe_raw_tensor_dot_row(k_raw, k_row, attn_input, hidden_size);
                     if (!std::isfinite(s->attn_kv_a[k_row])) return 0;
                 } else if (has_v) {
                     // V projection
                     const uint32_t v_row = row - q_dim - k_dim;
-                    s->attn_value[v_row] = moe_raw_tensor_dot_row(v_raw, v_row, attn_input, hidden_size);
+                    s->attn_value[v_row] = v_f32_cache ?
+                        moe_attention_f32_weight_dot_row(v_f32_cache.get(), v_row, attn_input) :
+                        moe_raw_tensor_dot_row(v_raw, v_row, attn_input, hidden_size);
                     if (!std::isfinite(s->attn_value[v_row])) return 0;
                 }
                 return 1;
@@ -181,8 +201,8 @@
     }
     moe_profile_log(
         "attn_standard_qkv",
-        "layer=%d pos=%u parallel=%d shared_kv=%d source_layer=%u q_rows=%u k_rows=%u v_rows=%u input=%u ms=%.3f",
-        layer, position, qkv_parallel_path, shared_kv_reuse, kv_storage_layer, q_dim,
+        "layer=%d pos=%u parallel=%d f32_cache=%d shared_kv=%d source_layer=%u q_rows=%u k_rows=%u v_rows=%u input=%u ms=%.3f",
+        layer, position, qkv_parallel_path, qkv_f32_cache_path, shared_kv_reuse, kv_storage_layer, q_dim,
         shared_kv_reuse ? 0u : k_dim,
         shared_kv_reuse ? 0u : kv_v_dim,
         hidden_size,

@@ -1365,6 +1365,120 @@ static int moe_standard_kv_cache_ensure(
     return position < s->kv_cache.max_seq_len ? 1 : 0;
 }
 
+struct moe_attention_f32_weight_cache_entry {
+    uint64_t key = 0;
+    uint32_t rows = 0;
+    uint32_t cols = 0;
+    std::shared_ptr<std::vector<float>> weights;
+};
+
+static uint64_t moe_attention_f32_weight_cache_key(const moe_raw_tensor_cache_entry& raw) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+    mix((uint64_t)(uintptr_t)raw.base);
+    mix(raw.bytes);
+    mix(raw.weight_row_bytes);
+    mix(raw.rows);
+    mix(raw.cols);
+    mix(raw.physical_rows);
+    mix(raw.physical_cols);
+    mix(raw.weight_format);
+    mix(raw.scalar_encoding);
+    return h;
+}
+
+static std::shared_ptr<moe_attention_f32_weight_cache_entry> moe_attention_get_f32_weight_cache(
+    const moe_raw_tensor_cache_entry& raw,
+    uint32_t cols
+) {
+    if (!raw.base || raw.math_transposed || raw.rows == 0 || cols == 0 ||
+        raw.cols != cols || raw.rows > 16384u || cols > 16384u) {
+        return nullptr;
+    }
+    if (!(raw.weight_format == moe_WEIGHT_ENCODING_MXFP4 ||
+          raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0 ||
+          raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_1 ||
+          raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_0 ||
+          raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1 ||
+          raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0 ||
+          raw.weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_1)) {
+        return nullptr;
+    }
+    const uint64_t key = moe_attention_f32_weight_cache_key(raw);
+    static std::mutex cache_mutex;
+    static std::unordered_map<uint64_t, std::shared_ptr<moe_attention_f32_weight_cache_entry>> cache;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            auto hit = it->second;
+            if (hit && hit->rows == raw.rows && hit->cols == cols && hit->weights) {
+                return hit;
+            }
+        }
+    }
+    const uint64_t total = (uint64_t)raw.rows * (uint64_t)cols;
+    if (total == 0 || total > (uint64_t)SIZE_MAX / sizeof(float)) {
+        return nullptr;
+    }
+    auto entry = std::make_shared<moe_attention_f32_weight_cache_entry>();
+    entry->key = key;
+    entry->rows = raw.rows;
+    entry->cols = cols;
+    entry->weights = std::make_shared<std::vector<float>>((size_t)total);
+    for (uint32_t row = 0; row < raw.rows; ++row) {
+        float* dst = entry->weights->data() + (size_t)row * (size_t)cols;
+        if (!moe_raw_tensor_copy_row_f32(raw, row, dst, cols)) {
+            return nullptr;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            auto hit = it->second;
+            if (hit && hit->rows == raw.rows && hit->cols == cols && hit->weights) {
+                return hit;
+            }
+        }
+        cache[key] = entry;
+    }
+    return entry;
+}
+
+static inline float moe_attention_f32_weight_dot_row(
+    const moe_attention_f32_weight_cache_entry* cache,
+    uint32_t row,
+    const float* hidden
+) {
+    if (!cache || !cache->weights || !hidden || row >= cache->rows) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+    const float* w = cache->weights->data() + (size_t)row * (size_t)cache->cols;
+    float acc = 0.0f;
+#if defined(__AVX2__)
+    __m256 vacc = _mm256_setzero_ps();
+    uint32_t i = 0;
+    for (; i + 7u < cache->cols; i += 8u) {
+        const __m256 wv = _mm256_loadu_ps(w + i);
+        const __m256 xv = _mm256_loadu_ps(hidden + i);
+        vacc = moe_madd_ps(wv, xv, vacc);
+    }
+    acc += moe_dot_hsum256_ps(vacc);
+    for (; i < cache->cols; ++i) {
+        acc += w[i] * hidden[i];
+    }
+#else
+    for (uint32_t i = 0; i < cache->cols; ++i) {
+        acc += w[i] * hidden[i];
+    }
+#endif
+    return acc;
+}
+
 static int moe_layer_standard_attention_f32(
     moe_pc_engine* engine,
     int32_t layer,
