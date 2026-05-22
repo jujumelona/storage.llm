@@ -296,10 +296,19 @@ static void moe_dequant_gguf_iq4_xs_row(const uint8_t* packed, float* out, uint3
     (void)moe_gguf_iq4_xs_row_impl(packed, nullptr, out, cols);
 }
 static float moe_e8m0_to_f32_half(uint8_t v) {
-    uint32_t bits = v < 2u ? (0x00200000u << v) : ((uint32_t)(v - 1u) << 23u);
-    float out = 0.0f;
-    std::memcpy(&out, &bits, sizeof(out));
-    return out;
+    struct moe_e8m0_scale_table_t {
+        float values[256];
+        moe_e8m0_scale_table_t() {
+            for (uint32_t i = 0; i < 256u; ++i) {
+                const uint32_t bits = i < 2u ? (0x00200000u << i) : ((i - 1u) << 23u);
+                float out = 0.0f;
+                std::memcpy(&out, &bits, sizeof(out));
+                values[i] = out;
+            }
+        }
+    };
+    static const moe_e8m0_scale_table_t table{};
+    return table.values[v];
 }
 
 static const float* moe_mxfp4_value_table() {
