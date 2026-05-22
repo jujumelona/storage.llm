@@ -383,73 +383,6 @@ static inline uint8_t moe_mxfp4_code_at_layout(
     return layout.bytewise_codes ? (qs[index] & 0x0fu) : moe_mxfp4_code_at(qs, index);
 }
 
-#if defined(__AVX2__)
-static inline __m256 moe_mxfp4_codes8_to_ps_avx2(__m128i codes, __m128i lut) {
-    const __m128i vals = _mm_shuffle_epi8(lut, codes);
-    return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vals));
-}
-
-static inline float moe_mxfp4_dot_block_split16_avx2(
-    const uint8_t* qs,
-    const float* x,
-    uint32_t start
-) {
-    static constexpr int8_t kHalfUnits[16] = {
-        0, 1, 2, 3, 4, 6, 8, 12,
-        0, -1, -2, -3, -4, -6, -8, -12,
-    };
-    const __m128i lut = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kHalfUnits));
-    const __m128i mask = _mm_set1_epi8(0x0f);
-    const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs));
-    const __m128i low = _mm_and_si128(bytes, mask);
-    const __m128i high = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
-    __m256 acc = _mm256_setzero_ps();
-    acc = moe_madd_ps(moe_mxfp4_codes8_to_ps_avx2(low, lut), _mm256_loadu_ps(x + start), acc);
-    acc = moe_madd_ps(moe_mxfp4_codes8_to_ps_avx2(_mm_srli_si128(low, 8), lut), _mm256_loadu_ps(x + start + 8u), acc);
-    acc = moe_madd_ps(moe_mxfp4_codes8_to_ps_avx2(high, lut), _mm256_loadu_ps(x + start + 16u), acc);
-    acc = moe_madd_ps(moe_mxfp4_codes8_to_ps_avx2(_mm_srli_si128(high, 8), lut), _mm256_loadu_ps(x + start + 24u), acc);
-    return moe_dot_hsum256_ps(acc) * 0.5f;
-}
-
-static inline void moe_mxfp4_dot_block_split16_two_rows_avx2(
-    const uint8_t* qs0,
-    const uint8_t* qs1,
-    const float* x,
-    uint32_t start,
-    float* out0,
-    float* out1
-) {
-    static constexpr int8_t kHalfUnits[16] = {
-        0, 1, 2, 3, 4, 6, 8, 12,
-        0, -1, -2, -3, -4, -6, -8, -12,
-    };
-    const __m128i lut = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kHalfUnits));
-    const __m128i mask = _mm_set1_epi8(0x0f);
-    const __m128i bytes0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs0));
-    const __m128i bytes1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs1));
-    const __m128i low0 = _mm_and_si128(bytes0, mask);
-    const __m128i low1 = _mm_and_si128(bytes1, mask);
-    const __m128i high0 = _mm_and_si128(_mm_srli_epi16(bytes0, 4), mask);
-    const __m128i high1 = _mm_and_si128(_mm_srli_epi16(bytes1, 4), mask);
-    __m256 acc0 = _mm256_setzero_ps();
-    __m256 acc1 = _mm256_setzero_ps();
-    __m256 xv = _mm256_loadu_ps(x + start);
-    acc0 = moe_madd_ps(moe_mxfp4_codes8_to_ps_avx2(low0, lut), xv, acc0);
-    acc1 = moe_madd_ps(moe_mxfp4_codes8_to_ps_avx2(low1, lut), xv, acc1);
-    xv = _mm256_loadu_ps(x + start + 8u);
-    acc0 = moe_madd_ps(moe_mxfp4_codes8_to_ps_avx2(_mm_srli_si128(low0, 8), lut), xv, acc0);
-    acc1 = moe_madd_ps(moe_mxfp4_codes8_to_ps_avx2(_mm_srli_si128(low1, 8), lut), xv, acc1);
-    xv = _mm256_loadu_ps(x + start + 16u);
-    acc0 = moe_madd_ps(moe_mxfp4_codes8_to_ps_avx2(high0, lut), xv, acc0);
-    acc1 = moe_madd_ps(moe_mxfp4_codes8_to_ps_avx2(high1, lut), xv, acc1);
-    xv = _mm256_loadu_ps(x + start + 24u);
-    acc0 = moe_madd_ps(moe_mxfp4_codes8_to_ps_avx2(_mm_srli_si128(high0, 8), lut), xv, acc0);
-    acc1 = moe_madd_ps(moe_mxfp4_codes8_to_ps_avx2(_mm_srli_si128(high1, 8), lut), xv, acc1);
-    *out0 = moe_dot_hsum256_ps(acc0) * 0.5f;
-    *out1 = moe_dot_hsum256_ps(acc1) * 0.5f;
-}
-#endif
-
 static inline float moe_mxfp4_dot_block(
     const uint8_t* qs,
     const float* x,
@@ -478,11 +411,6 @@ static inline float moe_mxfp4_dot_block(
         }
         return acc;
     }
-#if defined(__AVX2__)
-    if (limit == 32u) {
-        return moe_mxfp4_dot_block_split16_avx2(qs, x, start);
-    }
-#endif
     const uint32_t low_limit = std::min<uint32_t>(limit, 16u);
     for (uint32_t j = 0; j < low_limit; ++j) {
         acc += table[qs[j] & 0x0fu] * x[start + j];
@@ -533,12 +461,6 @@ static inline void moe_mxfp4_dot_block_two_rows(
             acc1 += table[b1 & 0x0fu] * xv;
         }
     } else {
-#if defined(__AVX2__)
-        if (limit == 32u) {
-            moe_mxfp4_dot_block_split16_two_rows_avx2(qs0, qs1, x, start, out0, out1);
-            return;
-        }
-#endif
         const uint32_t low_limit = std::min<uint32_t>(limit, 16u);
         for (uint32_t j = 0; j < low_limit; ++j) {
             const float xv = x[start + j];
