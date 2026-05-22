@@ -336,6 +336,285 @@ int moe_pc_engine_eval_token_ids_from(
     uint32_t evaluated = 0;
     const uint64_t linear_fallbacks_before =
         engine->storage_selected_expert_linear_fallbacks.load(std::memory_order_acquire);
+    const uint32_t prefill_count = input_token_count - 1u;
+    const int use_layer_first_eval =
+        prefill_count >= 2u &&
+        moe_generation_should_use_layer_first_prefill(engine, prefill_count, c->hidden_size);
+    if (use_layer_first_eval) {
+        const uint64_t prefill_start_us = moe_profile_now_us();
+        const size_t hs = c->hidden_size;
+        std::vector<float> batch_hidden((size_t)prefill_count * hs);
+        std::vector<float> batch_norm((size_t)prefill_count * hs);
+
+        engine->generation_phase.store(moe_GEN_PHASE_PREFILL, std::memory_order_relaxed);
+        const uint64_t batch_embed_start_us = moe_profile_now_us();
+        std::atomic<int> embed_ok{1};
+        if (prefill_count >= 2u && moe_generation_parallel_prefill_embed_enabled()) {
+            const int rows_ok = moe_parallel_rows(engine, prefill_count, 0, [&](uint32_t i) {
+                if (!moe_pc_engine_embed_token_f32(
+                        engine, (uint32_t)input_token_ids[i],
+                        batch_hidden.data() + (size_t)i * hs, (uint32_t)hs)) {
+                    embed_ok.store(0, std::memory_order_relaxed);
+                }
+            });
+            if (!rows_ok) embed_ok.store(0, std::memory_order_relaxed);
+        } else {
+            for (uint32_t i = 0; i < prefill_count; ++i) {
+                if (!moe_pc_engine_embed_token_f32(
+                        engine, (uint32_t)input_token_ids[i],
+                        batch_hidden.data() + (size_t)i * hs, (uint32_t)hs)) {
+                    embed_ok.store(0, std::memory_order_relaxed);
+                    break;
+                }
+            }
+        }
+        if (!embed_ok.load(std::memory_order_relaxed)) {
+            moe_eval_set_error(out_stats, "eval prefill embedding failed");
+            return 0;
+        }
+        moe_profile_log(
+            "eval_prefill_batch_embed",
+            "id=%llu tokens=%u hidden=%u parallel=%d ms=%.3f",
+            (unsigned long long)eval_scope.id,
+            prefill_count,
+            c->hidden_size,
+            (prefill_count >= 2u && moe_generation_parallel_prefill_embed_enabled()) ? 1 : 0,
+            moe_profile_elapsed_ms(batch_embed_start_us));
+
+        if (!moe_decode_scratch_resize(&scratch, c, &attn_cfg, pre_allocate_kv, engine)) {
+            moe_eval_set_error(out_stats, "eval prefill scratch allocation failed");
+            return 0;
+        }
+        if (!eval_qkv_only) {
+            moe_kv_cache_track_ram(engine, &scratch.kv_cache);
+        }
+        if (eval_qkv_only) {
+            if (!moe_qkv_only_ensure_capacity(engine, &scratch, attn_cfg, prefill_count - 1u, 0)) {
+                moe_eval_set_error(out_stats, "eval prefill QKV capacity allocation failed");
+                return 0;
+            }
+        } else if (prefill_count > scratch.kv_cache.max_seq_len) {
+            if (!scratch.kv_cache.ensure_capacity(prefill_count - 1u)) {
+                moe_eval_set_error(out_stats, "eval prefill KV cache allocation failed");
+                return 0;
+            }
+            moe_kv_cache_track_ram(engine, &scratch.kv_cache);
+        }
+
+        for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
+            const uint64_t prefill_layer_start_us = moe_profile_now_us();
+            engine->generation_layer.store(layer, std::memory_order_relaxed);
+            if (layer + 2u < c->num_hidden_layers &&
+                moe_can_enqueue_attention_lookahead(engine, (int32_t)(layer + 2u))) {
+                moe_enqueue_attention_prefetch(engine, (int32_t)(layer + 2u));
+            }
+            if (layer + 1u < c->num_hidden_layers) {
+                moe_enqueue_attention_prefetch(engine, (int32_t)(layer + 1u));
+            }
+
+            for (uint32_t t = 0; t < prefill_count; ++t) {
+                const uint64_t prefill_attention_start_us = moe_profile_now_us();
+                float* current_hidden = batch_hidden.data() + (size_t)t * hs;
+                engine->generation_token.store(t, std::memory_order_relaxed);
+
+                engine->generation_phase.store(moe_GEN_PHASE_ATTENTION, std::memory_order_relaxed);
+                const moe_attn_config_t layer_attn_cfg =
+                    moe_generation_layer_attn_config(engine, (int32_t)layer);
+                const moe_decoder_layer_plan_t layer_plan =
+                    moe_build_decoder_layer_plan(engine, c, &attn_cfg, layer);
+                if (layer_attn_cfg.type != moe_ATTN_TYPE_MLA) {
+                    std::memcpy(scratch.residual.data(), current_hidden, hs * sizeof(float));
+                    if (!moe_layer_standard_attention_f32(
+                            engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs, t,
+                            layer_attn_cfg, nullptr, 0)) {
+                        moe_eval_set_error(out_stats, "eval prefill attention failed");
+                        return 0;
+                    }
+                    if (!moe_apply_attention_residual_contract_f32(
+                            engine, (int32_t)layer, layer_plan,
+                            scratch.residual.data(), scratch.attn.data(), current_hidden,
+                            scratch.norm.data(), scratch.shared.data(),
+                            (uint32_t)hs, layer_attn_cfg.rms_norm_eps)) {
+                        moe_eval_set_error(out_stats, "eval prefill post-attention norm failed");
+                        return 0;
+                    }
+                    if (!moe_layer_ffn_norm_f32(
+                            engine, (int32_t)layer, current_hidden, (uint32_t)hs,
+                            scratch.norm.data(), layer_attn_cfg.rms_norm_eps)) {
+                        if (layer_plan.ffn_norm_required) {
+                            moe_eval_set_error(out_stats, "eval prefill ffn norm failed");
+                            return 0;
+                        }
+                        std::memcpy(scratch.norm.data(), current_hidden, hs * sizeof(float));
+                    }
+                } else {
+                    if (!moe_layer_attention_f32(engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs, t)) {
+                        moe_eval_set_error(out_stats, "eval prefill attention failed");
+                        return 0;
+                    }
+                    if (!moe_pc_engine_raw_rmsnorm_f32(
+                            engine, (int32_t)layer, moe_RAW_TENSOR_POST_ATTENTION_LAYER_NORM,
+                            current_hidden, (uint32_t)hs, scratch.norm.data(), (uint32_t)hs, layer_attn_cfg.rms_norm_eps)) {
+                        moe_eval_set_error(out_stats, "eval prefill post-attention norm failed");
+                        return 0;
+                    }
+                }
+                std::memcpy(
+                    batch_norm.data() + (size_t)t * hs,
+                    scratch.norm.data(),
+                    hs * sizeof(float));
+                moe_profile_log(
+                    "eval_prefill_layer_attention_token",
+                    "id=%llu layer=%u token_index=%u ms=%.3f",
+                    (unsigned long long)eval_scope.id,
+                    layer,
+                    t,
+                    moe_profile_elapsed_ms(prefill_attention_start_us));
+            }
+
+            engine->generation_phase.store(moe_GEN_PHASE_MLP, std::memory_order_relaxed);
+            const int is_moe = moe_layer_is_moe_runtime(engine, c, (int32_t)layer);
+            const uint64_t prefill_mlp_start_us = moe_profile_now_us();
+            int mlp_batch_ok = 0;
+            if (is_moe && prefill_count >= 2u) {
+                mlp_batch_ok = moe_layer_moe_mlp_prefill_batch_f32(
+                    engine, (int32_t)layer,
+                    batch_hidden.data(), batch_norm.data(),
+                    prefill_count, c);
+            }
+            if (mlp_batch_ok == moe_PREFILL_BATCH_MLP_FAST_KERNEL_REQUIRED) {
+                moe_eval_set_error(out_stats, "eval prefill requires moe_model_lib_run_expert_triplet_batch_f32");
+                return 0;
+            }
+            if (!mlp_batch_ok) {
+                for (uint32_t t = 0; t < prefill_count; ++t) {
+                    const uint64_t prefill_step_start_us = moe_profile_now_us();
+                    float* current_hidden = batch_hidden.data() + (size_t)t * hs;
+                    std::memcpy(
+                        scratch.norm.data(),
+                        batch_norm.data() + (size_t)t * hs,
+                        hs * sizeof(float));
+                    engine->generation_token.store(t, std::memory_order_relaxed);
+                    const int mlp_ok = is_moe ?
+                        moe_layer_moe_mlp_f32(engine, (int32_t)layer, &scratch, current_hidden, c) :
+                        moe_layer_dense_mlp_f32(engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs);
+                    if (!mlp_ok) {
+                        moe_eval_set_error(out_stats, "eval prefill mlp failed");
+                        return 0;
+                    }
+                    moe_profile_log(
+                        "eval_prefill_layer_token",
+                        "id=%llu layer=%u token_index=%u is_moe=%d batch_fallback=1 ms=%.3f",
+                        (unsigned long long)eval_scope.id,
+                        layer,
+                        t,
+                        is_moe,
+                        moe_profile_elapsed_ms(prefill_step_start_us));
+                }
+            }
+            moe_profile_log(
+                "eval_prefill_layer_mlp",
+                "id=%llu layer=%u tokens=%u is_moe=%d batch=%d ms=%.3f",
+                (unsigned long long)eval_scope.id,
+                layer,
+                prefill_count,
+                is_moe,
+                mlp_batch_ok,
+                moe_profile_elapsed_ms(prefill_mlp_start_us));
+            moe_profile_log(
+                "eval_prefill_layer",
+                "id=%llu layer=%u tokens=%u ms=%.3f",
+                (unsigned long long)eval_scope.id,
+                layer,
+                prefill_count,
+                moe_profile_elapsed_ms(prefill_layer_start_us));
+        }
+
+        const uint64_t linear_fallbacks_now =
+            engine->storage_selected_expert_linear_fallbacks.load(std::memory_order_acquire);
+        if (linear_fallbacks_now != linear_fallbacks_before) {
+            moe_eval_set_error(out_stats, "exact PPL aborted: selected-expert linear fallback was used");
+            return 0;
+        }
+        for (uint32_t i = 0; i < prefill_count; ++i) {
+            engine->generation_token.store(i, std::memory_order_relaxed);
+            moe_profile_log(
+                "eval_forward_call_begin",
+                "pos=%u token=%u target=%u mode=layer_first",
+                i,
+                (uint32_t)input_token_ids[i],
+                (uint32_t)input_token_ids[i + 1u]);
+            float* current_hidden = batch_hidden.data() + (size_t)i * hs;
+            if (!moe_final_norm_f32(
+                    engine, c, current_hidden, (uint32_t)hs,
+                    scratch.norm.data(), attn_cfg.rms_norm_eps)) {
+                moe_eval_set_error(out_stats, "eval prefill final norm failed");
+                return 0;
+            }
+            for (uint32_t h = 0; h < c->hidden_size; ++h) {
+                if (!std::isfinite(scratch.norm[h])) {
+                    moe_eval_set_error(out_stats, "exact PPL aborted: non-finite hidden state");
+                    return 0;
+                }
+            }
+            const uint32_t target_index = i + 1u;
+            const int score_target = target_index >= first_target_index;
+            moe_profile_log(
+                "eval_forward_call_end",
+                "pos=%u token=%u score=%d",
+                i,
+                (uint32_t)input_token_ids[i],
+                score_target);
+            if (!score_target) {
+                continue;
+            }
+
+            float target_logit = 0.0f;
+            float logsumexp = 0.0f;
+            float logprob = 0.0f;
+            if (!moe_pc_engine_lm_head_token_logprob_f32(
+                    engine,
+                    scratch.norm.data(),
+                    c->hidden_size,
+                    (uint32_t)input_token_ids[i + 1u],
+                    &target_logit,
+                    &logsumexp,
+                    &logprob)) {
+                moe_eval_set_error(out_stats, "failed to score target token");
+                return 0;
+            }
+            if (!std::isfinite(target_logit) ||
+                !std::isfinite(logsumexp) ||
+                !std::isfinite(logprob)) {
+                moe_eval_set_error(out_stats, "exact PPL aborted: non-finite lm_head logprob");
+                return 0;
+            }
+            moe_profile_log(
+                "eval_token_logprob",
+                "pos=%u token=%u target=%u target_logit=%.6g logsumexp=%.6g logprob=%.6g",
+                i,
+                (uint32_t)input_token_ids[i],
+                (uint32_t)input_token_ids[i + 1u],
+                (double)target_logit,
+                (double)logsumexp,
+                (double)logprob);
+            const double neg_logprob = -(double)logprob;
+            if (nll > std::numeric_limits<double>::max() - neg_logprob) {
+                moe_eval_set_error(out_stats, "NLL overflow on long sequence");
+                return 0;
+            }
+            nll += neg_logprob;
+            ++evaluated;
+        }
+        scratch.position = prefill_count;
+        moe_profile_log(
+            "eval_prefill_end",
+            "id=%llu tokens=%u evaluated=%u ms=%.3f",
+            (unsigned long long)eval_scope.id,
+            prefill_count,
+            evaluated,
+            moe_profile_elapsed_ms(prefill_start_us));
+    } else {
     moe_generation_stats_t gen_stats{};
     for (uint32_t i = 0; i + 1u < input_token_count; ++i) {
         engine->generation_token.store(i, std::memory_order_relaxed);
@@ -428,6 +707,7 @@ int moe_pc_engine_eval_token_ids_from(
         nll += neg_logprob;
         ++evaluated;
         ++scratch.position;
+    }
     }
 
     // BUGFIX 295: Check division by zero before computing mean_nll ★
