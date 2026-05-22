@@ -343,8 +343,12 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
     // BUGFIX 99: Precompute percentage thresholds
     const uint64_t vram_limit = tier_budget(engine, moe_TIER_VRAM) ?
         (tier_budget(engine, moe_TIER_VRAM) * 92ull) / 100ull : 0;
+    const uint64_t ram_warm_pct = std::min<uint64_t>(
+        engine->io_config.ram_eviction_target_fill_pct > 0
+            ? engine->io_config.ram_eviction_target_fill_pct : 75ull,
+        85ull);
     const uint64_t ram_limit = tier_budget(engine, moe_TIER_RAM) ?
-        (tier_budget(engine, moe_TIER_RAM) * 95ull) / 100ull : 0;
+        (tier_budget(engine, moe_TIER_RAM) * ram_warm_pct) / 100ull : 0;
     uint64_t planned_vram = tier_used(engine, moe_TIER_VRAM);
     uint64_t planned_ram = tier_used(engine, moe_TIER_RAM);
     uint32_t queued = 0;
