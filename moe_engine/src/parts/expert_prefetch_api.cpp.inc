@@ -421,7 +421,35 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
             return a.layer < b.layer;
         });
 
+    size_t warm_candidate_limit = candidates.size();
+    if (const char* env = std::getenv("STORAGELLM_STARTUP_WARM_MAX_EXPERTS")) {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(env, &end, 10);
+        if (end && end != env && parsed > 0ul) {
+            warm_candidate_limit = std::min<size_t>(warm_candidate_limit, (size_t)parsed);
+        }
+    } else if (moe_storage_runtime_cpu_ram_path(engine) && layer_count > 0) {
+        const uint64_t experts_per_layer =
+            std::min<uint64_t>((uint64_t)c->experts_per_moe_layer, 64ull);
+        const uint64_t cpu_storage_cap =
+            layer_count > UINT64_MAX / experts_per_layer ?
+            UINT64_MAX : layer_count * experts_per_layer;
+        warm_candidate_limit = std::min<size_t>(
+            warm_candidate_limit,
+            (size_t)std::min<uint64_t>(cpu_storage_cap, (uint64_t)SIZE_MAX));
+    }
+    if (warm_candidate_limit < candidates.size()) {
+        std::fprintf(stderr,
+            "[storagellm] startup warm capped: candidates=%zu cap=%zu cpu_storage=%d\n",
+            candidates.size(),
+            warm_candidate_limit,
+            moe_storage_runtime_cpu_ram_path(engine) ? 1 : 0);
+    }
+    size_t warm_candidate_index = 0;
     for (const startup_expert_candidate_t& cand : candidates) {
+            if (warm_candidate_index++ >= warm_candidate_limit) {
+                break;
+            }
             const uint32_t layer = cand.layer;
             const uint32_t expert = cand.expert;
             const uint64_t bytes = cand.bytes;
