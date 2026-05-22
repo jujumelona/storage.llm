@@ -21,40 +21,6 @@ static float moe_dot_gguf_q5_1_row(
         const float m = moe_raw_fp16_to_f32(m16);
         const uint8_t* qs = packed + 8u;
         const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
-#if defined(__AVX2__)
-        if (limit == block_cols) {
-            const __m256 vd = _mm256_set1_ps(d);
-            const __m256 vm = _mm256_set1_ps(m);
-            __m256 vacc = _mm256_setzero_ps();
-            const __m128i qbytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs));
-            const __m128i lo_nibbles = _mm_and_si128(qbytes, _mm_set1_epi8(0x0f));
-            const __m128i hi_nibbles = _mm_and_si128(_mm_srli_epi16(qbytes, 4), _mm_set1_epi8(0x0f));
-#define MOE_Q5_1_ACCUM8(nibbles, base_idx) do { \
-                const __m256i qlo = _mm256_cvtepu8_epi32(_mm_srli_si128((nibbles), (base_idx) & 8)); \
-                const __m256i qhi = _mm256_setr_epi32( \
-                    (int)(((qh >> ((base_idx) + 0u)) & 1u) << 4u), \
-                    (int)(((qh >> ((base_idx) + 1u)) & 1u) << 4u), \
-                    (int)(((qh >> ((base_idx) + 2u)) & 1u) << 4u), \
-                    (int)(((qh >> ((base_idx) + 3u)) & 1u) << 4u), \
-                    (int)(((qh >> ((base_idx) + 4u)) & 1u) << 4u), \
-                    (int)(((qh >> ((base_idx) + 5u)) & 1u) << 4u), \
-                    (int)(((qh >> ((base_idx) + 6u)) & 1u) << 4u), \
-                    (int)(((qh >> ((base_idx) + 7u)) & 1u) << 4u)); \
-                const __m256 q = _mm256_cvtepi32_ps(_mm256_or_si256(qlo, qhi)); \
-                const __m256 w = _mm256_add_ps(_mm256_mul_ps(vd, q), vm); \
-                const __m256 xv = _mm256_loadu_ps(x + start + (base_idx)); \
-                vacc = moe_madd_ps(w, xv, vacc); \
-            } while (0)
-            MOE_Q5_1_ACCUM8(lo_nibbles, 0u);
-            MOE_Q5_1_ACCUM8(lo_nibbles, 8u);
-            MOE_Q5_1_ACCUM8(hi_nibbles, 16u);
-            MOE_Q5_1_ACCUM8(hi_nibbles, 24u);
-#undef MOE_Q5_1_ACCUM8
-            acc += moe_dot_hsum256_ps(vacc);
-            packed += block_bytes;
-            continue;
-        }
-#endif
         for (uint32_t i = 0; i < limit; ++i) {
             const uint8_t byte = qs[i & 15u];
             const uint32_t low = (i < 16u) ? (byte & 0x0fu) : (byte >> 4);
