@@ -383,6 +383,100 @@ static inline uint8_t moe_mxfp4_code_at_layout(
     return layout.bytewise_codes ? (qs[index] & 0x0fu) : moe_mxfp4_code_at(qs, index);
 }
 
+static inline float moe_mxfp4_dot_block(
+    const uint8_t* qs,
+    const float* x,
+    uint32_t start,
+    uint32_t limit,
+    const moe_mxfp4_row_layout_t& layout,
+    const float* table,
+    int pairwise_order
+) {
+    float acc = 0.0f;
+    if (layout.bytewise_codes) {
+        for (uint32_t j = 0; j < limit; ++j) {
+            acc += table[qs[j] & 0x0fu] * x[start + j];
+        }
+        return acc;
+    }
+    if (pairwise_order) {
+        uint32_t j = 0;
+        for (; j + 1u < limit; j += 2u) {
+            const uint8_t byte = qs[j >> 1u];
+            acc += table[byte & 0x0fu] * x[start + j];
+            acc += table[byte >> 4] * x[start + j + 1u];
+        }
+        if (j < limit) {
+            acc += table[qs[j >> 1u] & 0x0fu] * x[start + j];
+        }
+        return acc;
+    }
+    const uint32_t low_limit = std::min<uint32_t>(limit, 16u);
+    for (uint32_t j = 0; j < low_limit; ++j) {
+        acc += table[qs[j] & 0x0fu] * x[start + j];
+    }
+    for (uint32_t j = 16u; j < limit; ++j) {
+        acc += table[qs[j - 16u] >> 4] * x[start + j];
+    }
+    return acc;
+}
+
+static inline void moe_mxfp4_dot_block_two_rows(
+    const uint8_t* qs0,
+    const uint8_t* qs1,
+    const float* x,
+    uint32_t start,
+    uint32_t limit,
+    const moe_mxfp4_row_layout_t& layout,
+    const float* table,
+    int pairwise_order,
+    float* out0,
+    float* out1
+) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    if (layout.bytewise_codes) {
+        for (uint32_t j = 0; j < limit; ++j) {
+            const float xv = x[start + j];
+            acc0 += table[qs0[j] & 0x0fu] * xv;
+            acc1 += table[qs1[j] & 0x0fu] * xv;
+        }
+    } else if (pairwise_order) {
+        uint32_t j = 0;
+        for (; j + 1u < limit; j += 2u) {
+            const uint8_t b0 = qs0[j >> 1u];
+            const uint8_t b1 = qs1[j >> 1u];
+            const float x0 = x[start + j];
+            const float x1 = x[start + j + 1u];
+            acc0 += table[b0 & 0x0fu] * x0;
+            acc0 += table[b0 >> 4] * x1;
+            acc1 += table[b1 & 0x0fu] * x0;
+            acc1 += table[b1 >> 4] * x1;
+        }
+        if (j < limit) {
+            const uint8_t b0 = qs0[j >> 1u];
+            const uint8_t b1 = qs1[j >> 1u];
+            const float xv = x[start + j];
+            acc0 += table[b0 & 0x0fu] * xv;
+            acc1 += table[b1 & 0x0fu] * xv;
+        }
+    } else {
+        const uint32_t low_limit = std::min<uint32_t>(limit, 16u);
+        for (uint32_t j = 0; j < low_limit; ++j) {
+            const float xv = x[start + j];
+            acc0 += table[qs0[j] & 0x0fu] * xv;
+            acc1 += table[qs1[j] & 0x0fu] * xv;
+        }
+        for (uint32_t j = 16u; j < limit; ++j) {
+            const float xv = x[start + j];
+            acc0 += table[qs0[j - 16u] >> 4] * xv;
+            acc1 += table[qs1[j - 16u] >> 4] * xv;
+        }
+    }
+    *out0 = acc0;
+    *out1 = acc1;
+}
+
 static float moe_dot_gguf_mxfp4_row_strided(
     const uint8_t* packed,
     const float* x,
@@ -417,6 +511,7 @@ static void moe_dot_gguf_mxfp4_two_rows_strided(
         return;
     }
     const float* table = moe_mxfp4_value_table();
+    const int pairwise_order = moe_mxfp4_pairwise_nibble_order_enabled();
     float acc0 = 0.0f;
     float acc1 = 0.0f;
     uint32_t start = 0;
@@ -430,11 +525,17 @@ static void moe_dot_gguf_mxfp4_two_rows_strided(
         const uint8_t* qs1 = packed1 + 1u;
         float block0 = 0.0f;
         float block1 = 0.0f;
-        for (uint32_t j = 0; j < limit; ++j) {
-            const float xv = x[start + j];
-            block0 += table[moe_mxfp4_code_at_layout(qs0, j, layout0)] * xv;
-            block1 += table[moe_mxfp4_code_at_layout(qs1, j, layout1)] * xv;
-        }
+        moe_mxfp4_dot_block_two_rows(
+            qs0,
+            qs1,
+            x,
+            start,
+            limit,
+            layout0,
+            table,
+            pairwise_order,
+            &block0,
+            &block1);
         acc0 += block0 * scale0;
         acc1 += block1 * scale1;
         start += limit;
@@ -467,16 +568,14 @@ static float moe_dot_gguf_mxfp4_row_strided(
     }
     const moe_mxfp4_row_layout_t layout = moe_mxfp4_row_layout_for_bytes(cols, physical_row_bytes);
     const float* table = moe_mxfp4_value_table();
+    const int pairwise_order = moe_mxfp4_pairwise_nibble_order_enabled();
     float acc = 0.0f;
     uint32_t start = 0;
     while (start < cols) {
         const float scale = moe_e8m0_to_f32_half(packed[0]);
         const uint8_t* qs = packed + 1u;
         const uint32_t limit = std::min<uint32_t>(layout.block_cols, cols - start);
-        float block_acc = 0.0f;
-        for (uint32_t j = 0; j < limit; ++j) {
-            block_acc += table[moe_mxfp4_code_at_layout(qs, j, layout)] * x[start + j];
-        }
+        const float block_acc = moe_mxfp4_dot_block(qs, x, start, limit, layout, table, pairwise_order);
         acc += block_acc * scale;
         start += limit;
         packed += layout.block_bytes;
