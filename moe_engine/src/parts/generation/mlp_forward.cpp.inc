@@ -1439,7 +1439,11 @@ static int moe_layer_moe_mlp_f32(
             const uint32_t* active_experts = s->cpu_active_expert_indices.data();
             std::atomic<int> fused_ok{1};
             moe_profile_parallel_label_scope fused_down_rows_label("moe_mlp_down_accum_fused");
-            const int down_fused_ok = moe_parallel_rows(engine, hidden_size, 0, [&](uint32_t row) {
+            static const uint32_t fused_down_block_rows = []() -> uint32_t {
+                const uint32_t env_block = moe_parse_env_u32("STORAGELLM_MLP_FUSED_DOWN_BLOCK_ROWS");
+                return env_block > 0 ? std::max(1u, std::min<uint32_t>(env_block, 128u)) : 16u;
+            }();
+            const int down_fused_ok = moe_parallel_rows(engine, hidden_size, fused_down_block_rows, [&](uint32_t row) {
                 if (row >= hidden_size) {
                     return 0;
                 }
