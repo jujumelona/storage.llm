@@ -427,6 +427,20 @@ int moe_pc_engine_generate_token_ids(
                             moe_profile_elapsed_ms(prefill_step_start_us));
                     }
                 }
+                for (uint32_t t = 0; t < prefill_count; ++t) {
+                    float* current_hidden = batch_hidden.data() + (size_t)t * hs;
+                    if (!moe_layer_apply_ple_f32(
+                            engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs,
+                            c->num_hidden_layers, layer_attn_cfg.rms_norm_eps)) {
+                        moe_generation_set_error(out_stats, "prefill per-layer input block failed");
+                        return 0;
+                    }
+                    if (layer_plan.apply_layer_output_scale &&
+                        !moe_layer_output_scale_f32(engine, (int32_t)layer, current_hidden, (uint32_t)hs)) {
+                        moe_generation_set_error(out_stats, "prefill layer output scale failed");
+                        return 0;
+                    }
+                }
                 moe_profile_log(
                     "prefill_layer_mlp",
                     "id=%llu layer=%u tokens=%u is_moe=%d batch=%d ms=%.3f",

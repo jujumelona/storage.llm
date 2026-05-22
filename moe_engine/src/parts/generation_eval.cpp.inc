@@ -334,10 +334,36 @@ int moe_pc_engine_eval_token_ids_from(
 
     double nll = 0.0;
     uint32_t evaluated = 0;
+    moe_generation_stats_t gen_stats{};
     const uint64_t linear_fallbacks_before =
         engine->storage_selected_expert_linear_fallbacks.load(std::memory_order_acquire);
-    moe_generation_stats_t gen_stats{};
-    for (uint32_t i = 0; i + 1u < input_token_count; ++i) {
+    const uint32_t eval_prefill_count =
+        first_target_index > 1u ? std::min<uint32_t>(first_target_index - 1u, input_token_count - 1u) : 0u;
+    if (eval_prefill_count > 0u) {
+        if (!moe_prefill_prompt_f32(
+                engine,
+                c,
+                attn_cfg,
+                input_token_ids,
+                eval_prefill_count,
+                0u,
+                &scratch,
+                &gen_stats,
+                pre_allocate_kv,
+                eval_qkv_only,
+                0ull,
+                "eval_prefix")) {
+            moe_eval_set_error(out_stats, gen_stats.error[0] ? gen_stats.error : "eval prefix prefill failed");
+            return 0;
+        }
+        const uint64_t linear_fallbacks_now =
+            engine->storage_selected_expert_linear_fallbacks.load(std::memory_order_acquire);
+        if (linear_fallbacks_now != linear_fallbacks_before) {
+            moe_eval_set_error(out_stats, "exact PPL aborted: selected-expert linear fallback was used");
+            return 0;
+        }
+    }
+    for (uint32_t i = eval_prefill_count; i + 1u < input_token_count; ++i) {
         engine->generation_token.store(i, std::memory_order_relaxed);
         moe_profile_log(
             "eval_forward_call_begin",
