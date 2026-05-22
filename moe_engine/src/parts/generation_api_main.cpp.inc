@@ -325,16 +325,16 @@ int moe_pc_engine_generate_token_ids(
                     moe_enqueue_attention_prefetch(engine, (int32_t)(layer + 1u));
                 }
 
+                const moe_attn_config_t layer_attn_cfg =
+                    moe_generation_layer_attn_config(engine, (int32_t)layer);
+                const moe_decoder_layer_plan_t layer_plan =
+                    moe_build_decoder_layer_plan(engine, c, &attn_cfg, layer);
                 for (uint32_t t = 0; t < prefill_count; ++t) {
                     const uint64_t prefill_attention_start_us = moe_profile_now_us();
                     float* current_hidden = batch_hidden.data() + t * hs;
                     engine->generation_token.store(t, std::memory_order_relaxed);
 
                     engine->generation_phase.store(moe_GEN_PHASE_ATTENTION, std::memory_order_relaxed);
-                    const moe_attn_config_t layer_attn_cfg =
-                        moe_generation_layer_attn_config(engine, (int32_t)layer);
-                    const moe_decoder_layer_plan_t layer_plan =
-                        moe_build_decoder_layer_plan(engine, c, &attn_cfg, layer);
                     if (layer_attn_cfg.type != moe_ATTN_TYPE_MLA) {
                         std::memcpy(scratch.residual.data(), current_hidden, hs * sizeof(float));
                         if (!moe_layer_standard_attention_f32(
