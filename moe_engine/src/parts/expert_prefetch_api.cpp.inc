@@ -154,6 +154,14 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
         preferred_tier,
         prefetch_reason);
     preferred_tier = moe_hot_miss_preferred_tier(engine, layer, expert, bytes, preferred_tier);
+    if (had_before_state &&
+        before_state.active &&
+        !before_state.pending_evict &&
+        before_state.tier != moe_TIER_STREAM &&
+        before_state.bytes == bytes &&
+        tier_speed_rank(before_state.tier) <= tier_speed_rank(preferred_tier)) {
+        return 1;
+    }
     vram_reservation_token effective_reservation = reservation;
     if (preferred_tier == moe_TIER_VRAM && !effective_reservation.valid) {
         if (!device_vram_try_reserve_token(
