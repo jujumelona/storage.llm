@@ -1280,6 +1280,9 @@ static void moe_cpu_storage_select_forward_adapter(moe_pc_engine* engine) {
 static void moe_cpu_storage_ensure_runtime(moe_pc_engine* engine) {
     if (!engine) return;
     moe_cpu_storage_select_forward_adapter(engine);
+    if (engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) {
+        moe_cpu_storage_prewarm_rmsnorm_contract(engine);
+    }
 }
 
 static int moe_cpu_storage_forward_allowed(moe_pc_engine* engine, moe_generation_stats_t* stats) {
