@@ -55,6 +55,10 @@ struct moe_decode_scratch {
     std::vector<float> cpu_down_scales;
     std::vector<moe_cpu_expert_plan_t> cpu_expert_plan;
     std::vector<uint32_t> cpu_active_expert_indices;
+    std::vector<float> cpu_q8_scales;
+    std::vector<int8_t> cpu_q8_values;
+    std::vector<float> cpu_gate_q8_scales;
+    std::vector<int8_t> cpu_gate_q8_values;
     std::vector<float> ple_inputs;
     std::vector<float> ple_projected;
     // Legacy/plain KV cache. QKV-only models must not allocate or use this; it
