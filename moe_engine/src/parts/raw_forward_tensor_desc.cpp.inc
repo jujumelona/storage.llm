@@ -986,18 +986,23 @@ static int map_common_tensor_record(
         }
     }
     const std::string& path = engine->tensor_paths[rec.resolved_path_index];
-    // CPU-RAM JUJU execution already builds full-shard hot views.  Reusing the
-    // full shard mmap here avoids creating one partial mmap/VMA per Q/K/V/norm
-    // tensor during the first token.  The previous partial-mmap path made the
-    // raw descriptor resolver spend seconds per layer before any dot product
-    // ran, which showed up as attn_standard_map / rmsnorm / qkv_norm stalls.
+    // Reuse a full-shard mmap only when startup or another hot path already
+    // created it.  Creating a new full-shard mapping from the first request can
+    // dominate first-token latency; the partial path reuses common raw warmup
+    // mappings and avoids synchronously mapping unrelated shard contents.
     mmap_context_t* mapped = nullptr;
     const uint8_t* mapped_base = nullptr;
     uint64_t mapped_size = 0;
     int common_tensor_full_shard = 0;
     if (engine->cpu_only_runtime.load(std::memory_order_relaxed) ||
         engine->cpu_hot_tensor_views_ready.load(std::memory_order_acquire)) {
-        mapped = get_or_map_shard(engine, path);
+        {
+            std::shared_lock<std::shared_mutex> lock(engine->shard_mutex);
+            auto found = engine->shard_mmaps.find(path);
+            if (found != engine->shard_mmaps.end() && is_mmap_valid(found->second)) {
+                mapped = found->second;
+            }
+        }
         mapped_base = mapped ? static_cast<const uint8_t*>(mmap_get_ptr(mapped, 0)) : nullptr;
         mapped_size = mapped ? (uint64_t)mmap_get_size(mapped) : 0ull;
         if (!mapped || !mapped_base || rec.file_offset > mapped_size ||

@@ -429,22 +429,41 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
             warm_candidate_limit = std::min<size_t>(warm_candidate_limit, (size_t)parsed);
         }
     } else if (moe_storage_runtime_cpu_ram_path(engine) && layer_count > 0) {
-        const uint64_t experts_per_layer =
-            std::min<uint64_t>((uint64_t)c->experts_per_moe_layer, 64ull);
-        const uint64_t cpu_storage_cap =
-            layer_count > UINT64_MAX / experts_per_layer ?
-            UINT64_MAX : layer_count * experts_per_layer;
-        const uint64_t cpu_storage_default_cap = std::min<uint64_t>(cpu_storage_cap, 256ull);
-        warm_candidate_limit = std::min<size_t>(
-            warm_candidate_limit,
-            (size_t)std::min<uint64_t>(cpu_storage_default_cap, (uint64_t)SIZE_MAX));
+        uint64_t warm_room = 0;
+        if (vram_limit > planned_vram) {
+            warm_room += vram_limit - planned_vram;
+        }
+        if (ram_limit > planned_ram) {
+            const uint64_t ram_room = ram_limit - planned_ram;
+            uint64_t system_room = ram_room;
+            const uint64_t available = storagellm::available_ram_bytes();
+            const uint64_t reserve = 1024ull * 1024ull * 1024ull;
+            if (available > reserve) {
+                system_room = std::min<uint64_t>(system_room, available - reserve);
+            }
+            warm_room = warm_room > UINT64_MAX - system_room ?
+                UINT64_MAX : warm_room + system_room;
+        }
+        size_t budget_limited = 0;
+        uint64_t bytes_planned = 0;
+        for (const startup_expert_candidate_t& cand : candidates) {
+            if (cand.bytes == 0 || bytes_planned > warm_room ||
+                cand.bytes > warm_room - bytes_planned) {
+                break;
+            }
+            bytes_planned += cand.bytes;
+            ++budget_limited;
+        }
+        warm_candidate_limit = std::min(warm_candidate_limit, budget_limited);
     }
     if (warm_candidate_limit < candidates.size()) {
         std::fprintf(stderr,
-            "[storagellm] startup warm capped: candidates=%zu cap=%zu cpu_storage=%d\n",
+            "[storagellm] startup warm capped: candidates=%zu cap=%zu cpu_storage=%d ram_limit=%llu vram_limit=%llu\n",
             candidates.size(),
             warm_candidate_limit,
-            moe_storage_runtime_cpu_ram_path(engine) ? 1 : 0);
+            moe_storage_runtime_cpu_ram_path(engine) ? 1 : 0,
+            (unsigned long long)ram_limit,
+            (unsigned long long)vram_limit);
     }
     size_t warm_candidate_index = 0;
     for (const startup_expert_candidate_t& cand : candidates) {
