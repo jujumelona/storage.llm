@@ -956,15 +956,19 @@ static int moe_layer_moe_mlp_f32(
             predicted_experts_count = 0;
         }
 
-        // Primary lookahead: layer+1
-        moe_pc_engine_prefetch_moe_lookahead(
-            engine,
-            layer,
-            s->selected_experts.data(),
-            (uint32_t)s->selected_experts.size(),
-            predicted_experts_count > 0 ? predicted_experts_buf : nullptr,
-            (uint32_t)predicted_experts_count
-        );
+        // Primary lookahead: layer+1. CPUStorageEngine has an indexed selected
+        // expert prefetch below; avoid also submitting the broader generic
+        // topology path for the same selected experts on the token hot path.
+        if (!cpu_storage_no_heap_predictor) {
+            moe_pc_engine_prefetch_moe_lookahead(
+                engine,
+                layer,
+                s->selected_experts.data(),
+                (uint32_t)s->selected_experts.size(),
+                predicted_experts_count > 0 ? predicted_experts_buf : nullptr,
+                (uint32_t)predicted_experts_count
+            );
+        }
 
         // Deep speculative prefetch: layers +2 to +depth.
         // CPUStorageEngine uses a format-derived layer pipeline; skip this vector
