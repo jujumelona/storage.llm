@@ -2948,7 +2948,6 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
     uint32_t total_assignments = 0;
     uint32_t failed_assignments = 0;
     const uint64_t expert_start_us = moe_profile_now_us();
-    const uint32_t ordered_top_k = std::max<uint32_t>(1u, top_k);
     auto grouped_chunk_key = [](uint32_t expert, size_t begin) -> uint64_t {
         return (uint64_t(expert) << 32) ^ (uint64_t(begin) & 0xffffffffull);
     };
@@ -3521,213 +3520,93 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
             }
         }
     }
-
-    int cpu_parallel_experts_done = 0;
-    if (!gpu_batch_ready && moe_parse_env_u32("STORAGELLM_PREFILL_EXPERT_GROUP_PARALLEL") > 0) {
-        std::vector<uint8_t> assignment_status((size_t)batch_size * ordered_top_k, 0u);
-        for (const auto& group : active_experts) {
-            if (group.expert >= c->experts_per_moe_layer) {
+    for (const auto& group : active_experts) {
+        const uint32_t expert = group.expert;
+        if (expert >= c->experts_per_moe_layer) {
+            continue;
+        }
+        const auto& assignments = grouped[expert];
+        if (assignments.empty()) {
+            continue;
+        }
+        ++active_groups;
+        total_assignments += (uint32_t)assignments.size();
+        for (size_t begin = 0; begin < assignments.size(); begin += expert_batch_limit) {
+            if (grouped_done_chunks.find(grouped_chunk_key(expert, begin)) != grouped_done_chunks.end()) {
                 continue;
             }
-            const auto& assignments = grouped[group.expert];
-            if (!assignments.empty()) {
-                ++active_groups;
-                total_assignments += (uint32_t)assignments.size();
+            const uint32_t chunk = (uint32_t)std::min<size_t>(expert_batch_limit, assignments.size() - begin);
+            for (uint32_t b = 0; b < chunk; ++b) {
+                input_ptrs[b] = expert_inputs[assignments[begin + b].token];
             }
-        }
-        const int parallel_ok = moe_parallel_rows(engine, (uint32_t)active_experts.size(), 1, [&](uint32_t group_index) {
-            if (group_index >= active_experts.size()) {
-                return 1;
+            const float* contiguous_inputs = input_ptrs[0];
+            uint32_t contiguous_stride = hidden_size;
+            int inputs_are_contiguous = contiguous_inputs ? 1 : 0;
+            for (uint32_t b = 0; b < chunk; ++b) {
+                if (!input_ptrs[b] ||
+                    input_ptrs[b] != contiguous_inputs + (size_t)b * hidden_size) {
+                    inputs_are_contiguous = 0;
+                    break;
+                }
             }
-            const uint32_t expert = active_experts[group_index].expert;
-            if (expert >= c->experts_per_moe_layer) {
-                return 1;
-            }
-            const auto& assignments = grouped[expert];
-            if (assignments.empty()) {
-                return 1;
-            }
-            std::vector<const float*> local_input_ptrs(expert_batch_limit, nullptr);
-            std::vector<float> local_group_input_pool((size_t)expert_batch_limit * hidden_size);
-            std::vector<float> local_gate_pool((size_t)expert_batch_limit * intermediate_size);
-            std::vector<float> local_up_pool((size_t)expert_batch_limit * intermediate_size);
-            std::vector<float> local_out_pool((size_t)expert_batch_limit * hidden_size);
-            for (size_t begin = 0; begin < assignments.size(); begin += expert_batch_limit) {
-                const uint32_t chunk = (uint32_t)std::min<size_t>(expert_batch_limit, assignments.size() - begin);
+            if (!inputs_are_contiguous) {
                 for (uint32_t b = 0; b < chunk; ++b) {
-                    local_input_ptrs[b] = expert_inputs[assignments[begin + b].token];
-                }
-                const float* contiguous_inputs = local_input_ptrs[0];
-                uint32_t contiguous_stride = hidden_size;
-                int inputs_are_contiguous = contiguous_inputs ? 1 : 0;
-                for (uint32_t b = 0; b < chunk; ++b) {
-                    if (!local_input_ptrs[b] ||
-                        local_input_ptrs[b] != contiguous_inputs + (size_t)b * hidden_size) {
-                        inputs_are_contiguous = 0;
-                        break;
-                    }
-                }
-                if (!inputs_are_contiguous) {
-                    for (uint32_t b = 0; b < chunk; ++b) {
-                        if (!local_input_ptrs[b]) {
-                            continue;
-                        }
-                        std::memcpy(
-                            local_group_input_pool.data() + (size_t)b * hidden_size,
-                            local_input_ptrs[b],
-                            (size_t)hidden_size * sizeof(float));
-                    }
-                    contiguous_inputs = local_group_input_pool.data();
-                }
-                (void)contiguous_inputs;
-                (void)contiguous_stride;
-                const int expert_ok = moe_run_expert_triplet_row_batch_f32(
-                    engine, layer, (int)expert,
-                    local_input_ptrs.data(), chunk, hidden_size,
-                    local_gate_pool.data(), local_up_pool.data(), intermediate_size,
-                    local_out_pool.data(), hidden_size, activation_mode);
-                if (!expert_ok) {
-                    for (uint32_t b = 0; b < chunk; ++b) {
-                        const moe_mlp_batch_assignment_t& a = assignments[begin + b];
-                        if (a.token < batch_size && a.router_rank < ordered_top_k) {
-                            assignment_status[(size_t)a.token * ordered_top_k + a.router_rank] = 2u;
-                        }
-                    }
-                    continue;
-                }
-                for (uint32_t b = 0; b < chunk; ++b) {
-                    const moe_mlp_batch_assignment_t& a = assignments[begin + b];
-                    float* expert_out = local_out_pool.data() + (size_t)b * hidden_size;
-                    if (!moe_layer_apply_expert_down_scale_f32(
-                            engine, layer, (int)expert, c->experts_per_moe_layer,
-                            expert_out, hidden_size) ||
-                        !moe_store_ordered_expert_contribution_f32(
-                            ordered_expert_contrib, batch_size, ordered_top_k,
-                            hidden_size, a, expert_out, a.weight)) {
-                        if (a.token < batch_size && a.router_rank < ordered_top_k) {
-                            assignment_status[(size_t)a.token * ordered_top_k + a.router_rank] = 2u;
-                        }
+                    if (!input_ptrs[b]) {
                         continue;
                     }
-                    assignment_status[(size_t)a.token * ordered_top_k + a.router_rank] = 1u;
+                    std::memcpy(
+                        group_input_pool.data() + (size_t)b * hidden_size,
+                        input_ptrs[b],
+                        (size_t)hidden_size * sizeof(float));
+                }
+                contiguous_inputs = group_input_pool.data();
+            }
+            int expert_ok = 0;
+            if (gpu_batch_ready && moe_expert_triplet_resident_in_vram(engine, layer, (int)expert)) {
+                expert_ok = moe_run_expert_triplet_gpu_batch_contiguous_f32(
+                    engine, layer, (int)expert,
+                    contiguous_inputs, contiguous_stride,
+                    chunk, hidden_size, intermediate_size,
+                    out_pool.data(), hidden_size, activation_mode);
+                if (expert_ok) {
+                    engine->io_atomic.gpu_grouped_d2h_expert_output_bytes.fetch_add(
+                        (uint64_t)chunk * (uint64_t)hidden_size * (uint64_t)sizeof(float),
+                        std::memory_order_relaxed);
                 }
             }
-            return 1;
-        });
-        if (!parallel_ok) {
-            return 0;
-        }
-        for (const auto& group : active_experts) {
-            const uint32_t expert = group.expert;
-            if (expert >= c->experts_per_moe_layer) {
+            if (!expert_ok) {
+                expert_ok = moe_run_expert_triplet_row_batch_f32(
+                    engine, layer, (int)expert,
+                    input_ptrs.data(), chunk, hidden_size,
+                    gate_pool.data(), up_pool.data(), intermediate_size,
+                    out_pool.data(), hidden_size, activation_mode);
+            }
+            if (!expert_ok) {
+                failed_assignments += chunk;
+                for (uint32_t b = 0; b < chunk; ++b) {
+                    ++failed_count[assignments[begin + b].token];
+                }
                 continue;
             }
-            const auto& assignments = grouped[expert];
-            for (const moe_mlp_batch_assignment_t& a : assignments) {
-                if (a.token >= batch_size || a.router_rank >= ordered_top_k) {
-                    continue;
-                }
-                const uint8_t status = assignment_status[(size_t)a.token * ordered_top_k + a.router_rank];
-                if (status == 1u) {
-                    ++success_count[a.token];
-                } else {
+            for (uint32_t b = 0; b < chunk; ++b) {
+                const moe_mlp_batch_assignment_t& a = assignments[begin + b];
+                float* expert_out = out_pool.data() + (size_t)b * hidden_size;
+                if (!moe_layer_apply_expert_down_scale_f32(
+                        engine, layer, (int)expert, c->experts_per_moe_layer,
+                        expert_out, hidden_size)) {
                     ++failed_count[a.token];
                     ++failed_assignments;
-                }
-            }
-        }
-        cpu_parallel_experts_done = 1;
-    }
-
-    if (!cpu_parallel_experts_done) {
-        for (const auto& group : active_experts) {
-            const uint32_t expert = group.expert;
-            if (expert >= c->experts_per_moe_layer) {
-                continue;
-            }
-            const auto& assignments = grouped[expert];
-            if (assignments.empty()) {
-                continue;
-            }
-            ++active_groups;
-            total_assignments += (uint32_t)assignments.size();
-            for (size_t begin = 0; begin < assignments.size(); begin += expert_batch_limit) {
-                if (grouped_done_chunks.find(grouped_chunk_key(expert, begin)) != grouped_done_chunks.end()) {
                     continue;
                 }
-                const uint32_t chunk = (uint32_t)std::min<size_t>(expert_batch_limit, assignments.size() - begin);
-                for (uint32_t b = 0; b < chunk; ++b) {
-                    input_ptrs[b] = expert_inputs[assignments[begin + b].token];
-                }
-                const float* contiguous_inputs = input_ptrs[0];
-                uint32_t contiguous_stride = hidden_size;
-                int inputs_are_contiguous = contiguous_inputs ? 1 : 0;
-                for (uint32_t b = 0; b < chunk; ++b) {
-                    if (!input_ptrs[b] ||
-                        input_ptrs[b] != contiguous_inputs + (size_t)b * hidden_size) {
-                        inputs_are_contiguous = 0;
-                        break;
-                    }
-                }
-                if (!inputs_are_contiguous) {
-                    for (uint32_t b = 0; b < chunk; ++b) {
-                        if (!input_ptrs[b]) {
-                            continue;
-                        }
-                        std::memcpy(
-                            group_input_pool.data() + (size_t)b * hidden_size,
-                            input_ptrs[b],
-                            (size_t)hidden_size * sizeof(float));
-                    }
-                    contiguous_inputs = group_input_pool.data();
-                }
-                int expert_ok = 0;
-                if (gpu_batch_ready && moe_expert_triplet_resident_in_vram(engine, layer, (int)expert)) {
-                    expert_ok = moe_run_expert_triplet_gpu_batch_contiguous_f32(
-                        engine, layer, (int)expert,
-                        contiguous_inputs, contiguous_stride,
-                        chunk, hidden_size, intermediate_size,
-                        out_pool.data(), hidden_size, activation_mode);
-                    if (expert_ok) {
-                        engine->io_atomic.gpu_grouped_d2h_expert_output_bytes.fetch_add(
-                            (uint64_t)chunk * (uint64_t)hidden_size * (uint64_t)sizeof(float),
-                            std::memory_order_relaxed);
-                    }
-                }
-                if (!expert_ok) {
-                    expert_ok = moe_run_expert_triplet_row_batch_f32(
-                        engine, layer, (int)expert,
-                        input_ptrs.data(), chunk, hidden_size,
-                        gate_pool.data(), up_pool.data(), intermediate_size,
-                        out_pool.data(), hidden_size, activation_mode);
-                }
-                if (!expert_ok) {
-                    failed_assignments += chunk;
-                    for (uint32_t b = 0; b < chunk; ++b) {
-                        ++failed_count[assignments[begin + b].token];
-                    }
+                if (!moe_store_ordered_expert_contribution_f32(
+                        ordered_expert_contrib, batch_size, std::max<uint32_t>(1u, top_k),
+                        hidden_size, a, expert_out, a.weight)) {
+                    ++failed_count[a.token];
+                    ++failed_assignments;
                     continue;
                 }
-                for (uint32_t b = 0; b < chunk; ++b) {
-                    const moe_mlp_batch_assignment_t& a = assignments[begin + b];
-                    float* expert_out = out_pool.data() + (size_t)b * hidden_size;
-                    if (!moe_layer_apply_expert_down_scale_f32(
-                            engine, layer, (int)expert, c->experts_per_moe_layer,
-                            expert_out, hidden_size)) {
-                        ++failed_count[a.token];
-                        ++failed_assignments;
-                        continue;
-                    }
-                    if (!moe_store_ordered_expert_contribution_f32(
-                            ordered_expert_contrib, batch_size, ordered_top_k,
-                            hidden_size, a, expert_out, a.weight)) {
-                        ++failed_count[a.token];
-                        ++failed_assignments;
-                        continue;
-                    }
-                    success_weight_sum[a.token] += a.weight;
-                    ++success_count[a.token];
-                }
+                success_weight_sum[a.token] += a.weight;
+                ++success_count[a.token];
             }
         }
     }
@@ -3738,6 +3617,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         expert_batch_limit, moe_profile_elapsed_ms(expert_start_us));
 
     std::fill(batch_expert_sum.begin(), batch_expert_sum.end(), 0.0f);
+    const uint32_t ordered_top_k = std::max<uint32_t>(1u, top_k);
     for (uint32_t t = 0; t < batch_size; ++t) {
         float* dst = batch_expert_sum.data() + (size_t)t * hidden_size;
         const uint32_t ranks = (uint32_t)selected_experts[t].size();
