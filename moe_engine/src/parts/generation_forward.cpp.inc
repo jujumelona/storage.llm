@@ -445,9 +445,12 @@ static int moe_forward_one_token_f32(
         moe_kv_cache_track_ram(engine, &s->kv_cache);  // ensure_capacity delta tracking
     }
     moe_forward_trace_runtime_resources(engine, s, position, 0xffffffffu, "after_scratch");
+    const uint32_t token_entry_phase = engine->generation_phase.load(std::memory_order_relaxed);
     moe_cpu_storage_begin_token(engine, position, token_id);
     float* hidden = s->hidden.data();
-    engine->generation_phase.store(moe_GEN_PHASE_INIT, std::memory_order_relaxed);
+    engine->generation_phase.store(
+        token_entry_phase == moe_GEN_PHASE_PREFILL ? moe_GEN_PHASE_PREFILL : moe_GEN_PHASE_INIT,
+        std::memory_order_relaxed);
     engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
     engine->generation_token.store(position, std::memory_order_relaxed);
 

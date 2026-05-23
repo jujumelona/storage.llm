@@ -1340,6 +1340,8 @@ static void moe_cpu_storage_begin_token(moe_pc_engine* engine, uint32_t position
     if (!engine || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
     (void)position;
     (void)token_id;
+    const uint32_t entry_phase = engine->generation_phase.load(std::memory_order_relaxed);
+    const bool prefill_phase = entry_phase == moe_GEN_PHASE_PREFILL;
     const int graph_contract_active =
         engine->offload_graph_ir_required.load(std::memory_order_relaxed) &&
         engine->offload_graph_ir_ready.load(std::memory_order_relaxed);
@@ -1349,8 +1351,11 @@ static void moe_cpu_storage_begin_token(moe_pc_engine* engine, uint32_t position
         engine->forward_adapter_executable.store(1, std::memory_order_relaxed);
     }
     engine->graph_ir_used_for_forward.store(graph_contract_active ? 1 : 0, std::memory_order_relaxed);
-    engine->generation_phase.store(moe_GEN_PHASE_INIT, std::memory_order_relaxed);
+    engine->generation_phase.store(prefill_phase ? moe_GEN_PHASE_PREFILL : moe_GEN_PHASE_INIT, std::memory_order_relaxed);
     engine->cpu_prefetch_epoch.fetch_add(1u, std::memory_order_relaxed);
+    if (!prefill_phase) {
+        return;
+    }
     // Warm the first layers before the loop reaches them.  Existing IO queues
     // fetch required spans; CPU layer-hot plan issues cheap page-cache hints
     // without scanning all tensors.
@@ -1393,10 +1398,14 @@ static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, c
     for (uint32_t d = 1; d <= depth; ++d) {
         const uint32_t next = layer + d;
         if (next >= c->num_hidden_layers) break;
-        moe_cpu_storage_schedule_layer_hot_prefetch(engine, next);
+        if (phase == moe_GEN_PHASE_PREFILL) {
+            moe_cpu_storage_schedule_layer_hot_prefetch(engine, next);
+        }
         moe_enqueue_attention_prefetch(engine, (int32_t)next);
         // Shared router/common spans can be prefetched before router top-k is known.
-        moe_pc_engine_prefetch_moe_lookahead(engine, (int)next, nullptr, 0, nullptr, 0);
+        if (phase == moe_GEN_PHASE_PREFILL) {
+            moe_pc_engine_prefetch_moe_lookahead(engine, (int)next, nullptr, 0, nullptr, 0);
+        }
         // During decode, co-activation history gives a generic, format-derived
         // next-layer expert hint. Submit it from layer-begin so storage I/O can
         // overlap attention/router instead of arriving after same-layer top-k.
