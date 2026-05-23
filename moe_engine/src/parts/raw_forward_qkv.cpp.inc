@@ -625,8 +625,7 @@ struct moe_qkv_decode_tls_scratch {
     std::vector<int> indices;
     std::vector<int> work_codes;
     std::vector<float> batch_key;
-    std::vector<float> batch_values;
-    std::vector<float> batch_scores;
+    std::vector<float> batch_value;
     std::vector<float> batch_max;
     std::vector<float> batch_denom;
 };
@@ -894,8 +893,7 @@ static int moe_pc_engine_attention_decode_layer_head_group_qkv_f32(
     thread_local moe_qkv_decode_tls_scratch tls;
     try {
         tls.batch_key.resize(head_dim);
-        tls.batch_values.resize((size_t)context_tokens * (size_t)head_dim);
-        tls.batch_scores.resize((size_t)query_heads * (size_t)context_tokens);
+        tls.batch_value.resize(head_dim);
         tls.batch_max.resize(query_heads);
         tls.batch_denom.resize(query_heads);
     } catch (const std::bad_alloc&) {
@@ -909,20 +907,22 @@ static int moe_pc_engine_attention_decode_layer_head_group_qkv_f32(
         local_slot.k_qjl && local_slot.v_qjl;
     std::fill(tls.batch_max.begin(), tls.batch_max.begin() + query_heads,
         -std::numeric_limits<float>::infinity());
+    std::fill(tls.batch_denom.begin(), tls.batch_denom.begin() + query_heads, 0.0f);
+    for (uint32_t h = 0; h < query_heads; ++h) {
+        float* out_h = output + (size_t)h * (size_t)output_stride;
+        std::fill(out_h, out_h + head_dim, 0.0f);
+    }
 
     const int exact_current_idx = (current_key && current_value) ? (int)context_tokens - 1 : -1;
     for (uint32_t t = 0; t < context_tokens; ++t) {
         const float* key = nullptr;
         const float* value = nullptr;
-        float* value_dst = tls.batch_values.data() + (size_t)t * (size_t)head_dim;
         if ((int)t == exact_current_idx) {
             key = current_key;
             value = current_value;
-            std::memcpy(value_dst, current_value, (size_t)head_dim * sizeof(float));
         } else if (t < (uint32_t)local_slot.sink_tokens && local_slot.k_sink && local_slot.v_sink) {
             key = local_slot.k_sink + (size_t)t * (size_t)head_dim;
             value = local_slot.v_sink + (size_t)t * (size_t)head_dim;
-            std::memcpy(value_dst, value, (size_t)head_dim * sizeof(float));
         } else {
             if (!qkv_dequant_one(
                     &local_slot,
@@ -945,44 +945,43 @@ static int moe_pc_engine_attention_decode_layer_head_group_qkv_f32(
                     (int)t,
                     local_slot.v_bits,
                     qjl,
-                    value_dst)) {
+                    tls.batch_value.data())) {
                 return 0;
             }
             key = tls.batch_key.data();
+            value = tls.batch_value.data();
         }
         for (uint32_t h = 0; h < query_heads; ++h) {
             const float* q = queries + (size_t)h * (size_t)query_stride;
+            float* out_h = output + (size_t)h * (size_t)output_stride;
             const float dot = moe_qkv_dot_f32_local(q, key, head_dim);
             const float score = moe_qkv_apply_logit_softcap_local(
                 attn_logit_softcap, dot * score_scale);
             if (!std::isfinite(score)) {
                 return 0;
             }
-            tls.batch_scores[(size_t)h * (size_t)context_tokens + t] = score;
             if (score > tls.batch_max[h]) {
+                const float rescale = std::exp(tls.batch_max[h] - score);
+                tls.batch_denom[h] *= rescale;
+                moe_qkv_scale_f32_local(out_h, rescale, head_dim);
                 tls.batch_max[h] = score;
             }
+            const float w = std::exp(score - tls.batch_max[h]);
+            if (!std::isfinite(w)) {
+                return 0;
+            }
+            tls.batch_denom[h] += w;
+            moe_qkv_axpy_f32_local(out_h, value, w, head_dim);
         }
     }
 
     for (uint32_t h = 0; h < query_heads; ++h) {
         float* out_h = output + (size_t)h * (size_t)output_stride;
-        std::fill(out_h, out_h + head_dim, 0.0f);
-        float denom = 0.0f;
         const float max_score = tls.batch_max[h];
         if (!std::isfinite(max_score)) {
             return 0;
         }
-        for (uint32_t t = 0; t < context_tokens; ++t) {
-            const float w = std::exp(
-                tls.batch_scores[(size_t)h * (size_t)context_tokens + t] - max_score);
-            if (!std::isfinite(w)) {
-                return 0;
-            }
-            denom += w;
-            const float* value = tls.batch_values.data() + (size_t)t * (size_t)head_dim;
-            moe_qkv_axpy_f32_local(out_h, value, w, head_dim);
-        }
+        const float denom = tls.batch_denom[h];
         if (!(denom > 1e-10f) || !std::isfinite(denom)) {
             return 0;
         }
