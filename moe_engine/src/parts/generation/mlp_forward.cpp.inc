@@ -2350,6 +2350,14 @@ static int moe_run_expert_triplet_row_batch_f32(
         !mmap_get_ptr(down_shard, 0)) {
         return 0;
     }
+    moe_tensor_row_fast_view_t gate_view{};
+    moe_tensor_row_fast_view_t up_view{};
+    moe_tensor_row_fast_view_t down_view{};
+    if (!moe_tensor_row_fast_view_init(engine, gate, gate_shard, hidden_size, &gate_view) ||
+        !moe_tensor_row_fast_view_init(engine, up, up_shard, hidden_size, &up_view) ||
+        !moe_tensor_row_fast_view_init(engine, down, down_shard, intermediate_size, &down_view)) {
+        return 0;
+    }
 
     auto tile_rows_for_input = [](uint32_t input_floats) -> uint32_t {
         const uint32_t env_tile = moe_parse_env_u32("STORAGELLM_MLP_ROW_TILE");
@@ -2375,11 +2383,13 @@ static int moe_run_expert_triplet_row_batch_f32(
             row_end = intermediate_size;
         }
         for (uint32_t row = row_begin; row < row_end; ++row) {
-            if (!moe_dot_tensor_record_row_batch(
-                    engine, gate, gate_shard, row,
+            moe_tensor_row_fast_prefetch(&gate_view, row + 1u);
+            moe_tensor_row_fast_prefetch(&up_view, row + 1u);
+            if (!moe_dot_tensor_fast_view_row_batch(
+                    engine, &gate_view, row,
                     batch_hidden, batch_size, hidden_size, gate_values) ||
-                !moe_dot_tensor_record_row_batch(
-                    engine, up, up_shard, row,
+                !moe_dot_tensor_fast_view_row_batch(
+                    engine, &up_view, row,
                     batch_hidden, batch_size, hidden_size, up_values)) {
                 return 0;
             }
@@ -2411,8 +2421,9 @@ static int moe_run_expert_triplet_row_batch_f32(
             row_end = out_count;
         }
         for (uint32_t row = row_begin; row < row_end; ++row) {
-            if (!moe_dot_tensor_record_row_batch(
-                    engine, down, down_shard, row,
+            moe_tensor_row_fast_prefetch(&down_view, row + 1u);
+            if (!moe_dot_tensor_fast_view_row_batch(
+                    engine, &down_view, row,
                     activated_inputs, batch_size, intermediate_size, down_values)) {
                 return 0;
             }

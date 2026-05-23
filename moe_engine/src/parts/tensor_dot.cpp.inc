@@ -562,6 +562,51 @@ static int moe_dot_tensor_fast_view_row(
     return std::isfinite(*out_value) ? 1 : 0;
 }
 
+static int moe_dot_tensor_fast_view_row_batch(
+    moe_pc_engine_t* engine,
+    const moe_tensor_row_fast_view_t* view,
+    uint32_t row,
+    const float** batch_x,
+    uint32_t batch_size,
+    uint32_t x_count,
+    float* out_values
+) {
+    if (!engine || !view || !view->rec || !batch_x || !out_values ||
+        batch_size == 0 || x_count != view->cols) {
+        return 0;
+    }
+    const uint8_t* packed = moe_tensor_row_fast_ptr(view, row);
+    if (!packed) {
+        return 0;
+    }
+    if (view->weight_format == moe_WEIGHT_ENCODING_MXFP4) {
+        moe_dot_gguf_mxfp4_row_batch_strided(
+            packed,
+            batch_x,
+            batch_size,
+            view->cols,
+            view->row_bytes,
+            out_values);
+        for (uint32_t b = 0; b < batch_size; ++b) {
+            if (!std::isfinite(out_values[b])) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+    for (uint32_t b = 0; b < batch_size; ++b) {
+        if (!batch_x[b]) {
+            out_values[b] = 0.0f;
+            continue;
+        }
+        if (!moe_dot_tensor_fast_view_row(
+                engine, view, row, batch_x[b], x_count, &out_values[b])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int moe_dot_tensor_fast_view_two_rows(
     moe_pc_engine_t* engine,
     const moe_tensor_row_fast_view_t* a,
