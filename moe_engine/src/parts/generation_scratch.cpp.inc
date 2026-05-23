@@ -89,6 +89,10 @@ struct moe_decode_scratch {
     std::vector<float> rope_q_cos;
     std::vector<float> rope_q_sin;
     std::vector<float> kv_entry;
+    std::vector<std::vector<float>> qkv_shadow_layers;
+    std::vector<uint32_t> qkv_shadow_layer_tokens;
+    uint32_t qkv_shadow_entry_dim = 0;
+    uint32_t qkv_shadow_layer_count = 0;
     // Fix 38: kv_decode_buf removed (legacy dead allocation, same pattern as BUGFIX 53)
     std::vector<float> kv_decode_flat;
     std::vector<uint32_t> kv_decoded_up_to;
@@ -206,8 +210,127 @@ static void moe_decode_scratch_drop_transient_buffers(moe_pc_engine* engine, moe
     std::vector<float>().swap(s->rope_k_sin);
     std::vector<float>().swap(s->rope_q_cos);
     std::vector<float>().swap(s->rope_q_sin);
+    std::vector<std::vector<float>>().swap(s->qkv_shadow_layers);
+    std::vector<uint32_t>().swap(s->qkv_shadow_layer_tokens);
+    s->qkv_shadow_entry_dim = 0;
+    s->qkv_shadow_layer_count = 0;
     std::vector<float>().swap(s->kv_decode_flat);
     std::vector<uint32_t>().swap(s->kv_decoded_up_to);
+}
+
+static uint32_t moe_qkv_shadow_max_tokens() {
+    static const uint32_t cached = []() -> uint32_t {
+        const uint32_t env_value = moe_parse_env_u32("STORAGELLM_QKV_SHADOW_MAX_TOKENS");
+        if (env_value > 0) {
+            return std::min<uint32_t>(env_value, 4096u);
+        }
+        return 512u;
+    }();
+    return cached;
+}
+
+static void moe_qkv_shadow_reset(moe_decode_scratch* s) {
+    if (!s) {
+        return;
+    }
+    for (std::vector<float>& layer : s->qkv_shadow_layers) {
+        std::vector<float>().swap(layer);
+    }
+    s->qkv_shadow_layers.clear();
+    s->qkv_shadow_layer_tokens.clear();
+    s->qkv_shadow_entry_dim = 0;
+    s->qkv_shadow_layer_count = 0;
+}
+
+static int moe_qkv_shadow_prepare(
+    moe_decode_scratch* s,
+    uint32_t layer_count,
+    uint32_t entry_dim
+) {
+    if (!s || layer_count == 0 || entry_dim == 0) {
+        return 0;
+    }
+    if (s->qkv_shadow_entry_dim != 0 &&
+        (s->qkv_shadow_entry_dim != entry_dim ||
+         s->qkv_shadow_layer_count != layer_count)) {
+        moe_qkv_shadow_reset(s);
+    }
+    if (s->qkv_shadow_layers.size() != layer_count) {
+        try {
+            s->qkv_shadow_layers.resize(layer_count);
+            s->qkv_shadow_layer_tokens.assign(layer_count, 0u);
+        } catch (const std::bad_alloc&) {
+            moe_qkv_shadow_reset(s);
+            return 0;
+        }
+    }
+    s->qkv_shadow_entry_dim = entry_dim;
+    s->qkv_shadow_layer_count = layer_count;
+    return 1;
+}
+
+static int moe_qkv_shadow_store_entry(
+    moe_decode_scratch* s,
+    uint32_t layer,
+    uint32_t position,
+    const float* entry,
+    uint32_t entry_dim,
+    uint32_t layer_count
+) {
+    if (!s || !entry || entry_dim == 0 || layer >= layer_count) {
+        return 0;
+    }
+    const uint32_t max_tokens = moe_qkv_shadow_max_tokens();
+    if (max_tokens == 0 || position >= max_tokens) {
+        return 0;
+    }
+    if (!moe_qkv_shadow_prepare(s, layer_count, entry_dim)) {
+        return 0;
+    }
+    std::vector<float>& layer_entries = s->qkv_shadow_layers[layer];
+    const size_t needed = (size_t)(position + 1u) * (size_t)entry_dim;
+    try {
+        if (layer_entries.size() < needed) {
+            layer_entries.resize(needed);
+        }
+    } catch (const std::bad_alloc&) {
+        std::vector<float>().swap(layer_entries);
+        if (layer < s->qkv_shadow_layer_tokens.size()) {
+            s->qkv_shadow_layer_tokens[layer] = 0;
+        }
+        return 0;
+    }
+    std::memcpy(
+        layer_entries.data() + (size_t)position * (size_t)entry_dim,
+        entry,
+        (size_t)entry_dim * sizeof(float));
+    if (layer < s->qkv_shadow_layer_tokens.size()) {
+        s->qkv_shadow_layer_tokens[layer] =
+            std::max(s->qkv_shadow_layer_tokens[layer], position + 1u);
+    }
+    return 1;
+}
+
+static const float* moe_qkv_shadow_get_entry(
+    const moe_decode_scratch* s,
+    uint32_t layer,
+    uint32_t position,
+    uint32_t entry_dim
+) {
+    if (!s || entry_dim == 0 ||
+        s->qkv_shadow_entry_dim != entry_dim ||
+        layer >= s->qkv_shadow_layers.size() ||
+        layer >= s->qkv_shadow_layer_tokens.size() ||
+        position >= s->qkv_shadow_layer_tokens[layer]) {
+        return nullptr;
+    }
+    const std::vector<float>& layer_entries = s->qkv_shadow_layers[layer];
+    const size_t offset = (size_t)position * (size_t)entry_dim;
+    if (offset > layer_entries.size() ||
+        layer_entries.size() - offset < entry_dim) {
+        return nullptr;
+    }
+    return layer_entries.data() + offset;
 }
 
 static int moe_kv_decode_layer_cache_prepare(
