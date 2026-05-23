@@ -468,7 +468,8 @@
         // Persist the current token into QKV for future positions. The active
         // causal self-attention step still consumes this exact scratch K/V,
         // matching the plain KV cache entry semantics.
-        for (uint32_t kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
+        moe_profile_parallel_label_scope append_label("attn_qkv_append");
+        if (!moe_parallel_rows(engine, num_kv_heads, 0, [&](uint32_t kv_h) {
             const float* key = s->attn_kv_a.data() + (uint64_t)kv_h * head_dim;
             const float* value = s->attn_value.data() + (uint64_t)kv_h * v_head_dim;
             if (!moe_qkv_append_layer_head_token(
@@ -486,6 +487,9 @@
                     layer, position, kv_h, seq_len, qkv_capacity_tokens, head_dim);
                 return 0;
             }
+            return 1;
+        })) {
+            return 0;
         }
         const int qkv_sink_exact_current =
             (seq_len > 0u && (seq_len - 1u) < engine->qkv_cfg.sink_tokens) ? 1 : 0;
