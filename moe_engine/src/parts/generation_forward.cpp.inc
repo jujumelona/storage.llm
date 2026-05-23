@@ -490,7 +490,15 @@ static int moe_forward_one_token_f32(
     }
 
     for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
+        const uint64_t storage_begin_layer_start_us = moe_profile_now_us();
         moe_cpu_storage_begin_layer(engine, layer, c);
+        moe_profile_log(
+            "cpu_storage_begin_layer",
+            "position=%u layer=%u phase=%u ms=%.3f",
+            position,
+            layer,
+            engine->generation_phase.load(std::memory_order_relaxed),
+            moe_profile_elapsed_ms(storage_begin_layer_start_us));
         const uint64_t layer_start_us = moe_profile_now_us();
         // Pipeline Fix 2: Removed layer+2 lookahead to eliminate duplicate attention prefetch
         // layer+2 prefetch here + layer+1 prefetch after attention = same layer queued twice.
