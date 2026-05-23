@@ -2360,7 +2360,7 @@ static int moe_run_expert_triplet_row_batch_f32(
     }
 
     auto tile_rows_for_input = [](uint32_t input_floats) -> uint32_t {
-        static const uint32_t env_tile = moe_parse_env_u32("STORAGELLM_MLP_ROW_TILE");
+        const uint32_t env_tile = moe_parse_env_u32("STORAGELLM_MLP_ROW_TILE");
         if (env_tile > 0) {
             return std::max(1u, std::min<uint32_t>(env_tile, 64u));
         }
@@ -2372,17 +2372,11 @@ static int moe_run_expert_triplet_row_batch_f32(
 
     const uint32_t gate_tile_rows = std::max(1u, std::min(intermediate_size, tile_rows_for_input(hidden_size)));
     const uint32_t gate_block_count = (intermediate_size + gate_tile_rows - 1u) / gate_tile_rows;
-    thread_local std::vector<float> tls_gate_values_all;
-    thread_local std::vector<float> tls_up_values_all;
-    thread_local std::vector<const float*> tls_activated_inputs_all;
-    thread_local std::vector<float> tls_down_values_all;
-    tls_gate_values_all.resize((size_t)gate_block_count * batch_size);
-    tls_up_values_all.resize((size_t)gate_block_count * batch_size);
-    float* gate_values_all = tls_gate_values_all.data();
-    float* up_values_all = tls_up_values_all.data();
+    std::vector<float> gate_values_all((size_t)gate_block_count * batch_size);
+    std::vector<float> up_values_all((size_t)gate_block_count * batch_size);
     const int gate_up_ok = moe_parallel_rows(engine, gate_block_count, 0, [&](uint32_t block) {
-        float* gate_values = gate_values_all + (size_t)block * batch_size;
-        float* up_values = up_values_all + (size_t)block * batch_size;
+        float* gate_values = gate_values_all.data() + (size_t)block * batch_size;
+        float* up_values = up_values_all.data() + (size_t)block * batch_size;
         const uint32_t row_begin = block * gate_tile_rows;
         uint32_t row_end = row_begin + gate_tile_rows;
         if (row_end > intermediate_size) {
@@ -2411,17 +2405,16 @@ static int moe_run_expert_triplet_row_batch_f32(
         return 0;
     }
 
-    tls_activated_inputs_all.resize(batch_size);
-    const float** activated_inputs = tls_activated_inputs_all.data();
+    std::vector<const float*> activated_inputs_all(batch_size);
+    const float** activated_inputs = activated_inputs_all.data();
     for (uint32_t b = 0; b < batch_size; ++b) {
         activated_inputs[b] = gate_pool + (size_t)b * (size_t)intermediate_size;
     }
     const uint32_t down_tile_rows = std::max(1u, std::min(out_count, tile_rows_for_input(intermediate_size)));
     const uint32_t down_block_count = (out_count + down_tile_rows - 1u) / down_tile_rows;
-    tls_down_values_all.resize((size_t)down_block_count * batch_size);
-    float* down_values_all = tls_down_values_all.data();
+    std::vector<float> down_values_all((size_t)down_block_count * batch_size);
     return moe_parallel_rows(engine, down_block_count, 0, [&](uint32_t block) {
-        float* down_values = down_values_all + (size_t)block * batch_size;
+        float* down_values = down_values_all.data() + (size_t)block * batch_size;
         const uint32_t row_begin = block * down_tile_rows;
         uint32_t row_end = row_begin + down_tile_rows;
         if (row_end > out_count) {
