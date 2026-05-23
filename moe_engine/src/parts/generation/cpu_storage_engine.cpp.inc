@@ -1455,12 +1455,7 @@ static void moe_cpu_storage_after_router_selected(
                 if (expert_id < 0 || (uint32_t)expert_id >= experts) continue;
                 const size_t b = (size_t)(uint32_t)layer * (size_t)experts + (uint32_t)expert_id;
                 if (b + 1u >= engine->storage_expert_view_offsets.size()) continue;
-                uint32_t epoch = engine->cpu_prefetch_epoch.load(std::memory_order_relaxed);
-                if (engine->generation_phase.load(std::memory_order_relaxed) != moe_GEN_PHASE_PREFILL) {
-                    const uint32_t token_epoch = engine->generation_token.load(std::memory_order_relaxed) + 1u;
-                    epoch = (epoch * 16777619u) ^ token_epoch;
-                    if (epoch == 0u) epoch = token_epoch;
-                }
+                const uint32_t epoch = engine->cpu_prefetch_epoch.load(std::memory_order_relaxed);
                 bool duplicate_bucket = false;
                 {
                     std::lock_guard<std::mutex> lock(engine->storage_expert_prefetch_mutex);
