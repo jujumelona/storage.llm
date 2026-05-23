@@ -321,43 +321,6 @@ static float moe_mxfp4_value_from_code(uint8_t code) {
     return moe_mxfp4_value_table()[code & 0x0fu];
 }
 
-static inline uint32_t moe_q8_0_block_count(uint32_t cols) {
-    return (cols + 31u) / 32u;
-}
-
-static void moe_quantize_q8_0_activation_f32(
-    const float* x,
-    uint32_t cols,
-    int8_t* q,
-    float* scales
-) {
-    if (!x || !q || !scales || cols == 0) {
-        return;
-    }
-    const uint32_t blocks = moe_q8_0_block_count(cols);
-    for (uint32_t block = 0; block < blocks; ++block) {
-        const uint32_t start = block * 32u;
-        const uint32_t limit = std::min<uint32_t>(32u, cols - start);
-        float max_abs = 0.0f;
-        for (uint32_t i = 0; i < limit; ++i) {
-            max_abs = std::max(max_abs, std::fabs(x[start + i]));
-        }
-        const float d = max_abs > 0.0f && std::isfinite(max_abs) ? (max_abs / 127.0f) : 0.0f;
-        scales[block] = d;
-        const float inv_d = d > 0.0f ? (1.0f / d) : 0.0f;
-        int8_t* qb = q + (size_t)block * 32u;
-        uint32_t i = 0;
-        for (; i < limit; ++i) {
-            int v = d > 0.0f ? (int)std::lrintf(x[start + i] * inv_d) : 0;
-            v = std::max(-127, std::min(127, v));
-            qb[i] = (int8_t)v;
-        }
-        for (; i < 32u; ++i) {
-            qb[i] = 0;
-        }
-    }
-}
-
 static int moe_mxfp4_pairwise_nibble_order_enabled() {
     // GGML MXFP4 stores a 32-value block as sixteen payload bytes:
     // low nibbles decode logical columns 0..15 and high nibbles decode
@@ -399,30 +362,6 @@ static inline __m256 moe_mxfp4_lookup8_fast(const uint8_t* p, int high) {
     bytes = high ? _mm_and_si128(_mm_srli_epi16(bytes, 4), mask)
                  : _mm_and_si128(bytes, mask);
     return moe_mxfp4_codes8_to_ps(bytes);
-}
-
-static inline __m128i moe_mxfp4_codes16_to_i8(__m128i codes) {
-    const __m128i table = _mm_setr_epi8(
-        0, 1, 2, 3, 4, 6, 8, 12,
-        0, -1, -2, -3, -4, -6, -8, -12);
-    return _mm_shuffle_epi8(table, codes);
-}
-
-static inline int32_t moe_hsum256_epi32(__m256i v) {
-    __m128i lo = _mm256_castsi256_si128(v);
-    __m128i hi = _mm256_extracti128_si256(v, 1);
-    __m128i sum = _mm_add_epi32(lo, hi);
-    sum = _mm_add_epi32(sum, _mm_srli_si128(sum, 8));
-    sum = _mm_add_epi32(sum, _mm_srli_si128(sum, 4));
-    return _mm_cvtsi128_si32(sum);
-}
-
-static inline int32_t moe_dot_i8x16_i8x16_sum(__m128i a_i8, __m128i b_i8) {
-    const __m256i a16 = _mm256_cvtepi8_epi16(a_i8);
-    const __m256i b16 = _mm256_cvtepi8_epi16(b_i8);
-    const __m256i prod16 = _mm256_mullo_epi16(a16, b16);
-    const __m256i ones = _mm256_set1_epi16(1);
-    return moe_hsum256_epi32(_mm256_madd_epi16(prod16, ones));
 }
 #endif
 
@@ -625,14 +564,6 @@ static float moe_dot_gguf_mxfp4_row_strided(
     uint64_t physical_row_bytes
 );
 
-static float moe_dot_gguf_mxfp4_row_q8_strided(
-    const uint8_t* packed,
-    const int8_t* q,
-    const float* q_scales,
-    uint32_t cols,
-    uint64_t physical_row_bytes
-);
-
 static void moe_dot_gguf_mxfp4_two_rows_strided(
     const uint8_t* packed0,
     const uint8_t* packed1,
@@ -726,88 +657,6 @@ static float moe_dot_gguf_mxfp4_row_strided(
         const uint32_t limit = std::min<uint32_t>(layout.block_cols, cols - start);
         const float block_acc = moe_mxfp4_dot_block(qs, x, start, limit, layout, table, pairwise_order);
         acc += block_acc * scale;
-        start += limit;
-        packed += layout.block_bytes;
-    }
-    return acc;
-}
-
-static float moe_dot_gguf_mxfp4_row_q8_strided(
-    const uint8_t* packed,
-    const int8_t* q,
-    const float* q_scales,
-    uint32_t cols,
-    uint64_t physical_row_bytes
-) {
-    if (!packed || !q || !q_scales || cols == 0) {
-        return 0.0f;
-    }
-    static constexpr int8_t kMxfp4I8[16] = {
-        0, 1, 2, 3, 4, 6, 8, 12,
-        0, -1, -2, -3, -4, -6, -8, -12,
-    };
-    const moe_mxfp4_row_layout_t layout = moe_mxfp4_row_layout_for_bytes(cols, physical_row_bytes);
-    const int pairwise_order = moe_mxfp4_pairwise_nibble_order_enabled();
-    float acc = 0.0f;
-    uint32_t start = 0;
-    while (start < cols) {
-        const uint32_t limit = std::min<uint32_t>(layout.block_cols, cols - start);
-        const float scale = moe_e8m0_to_f32_half(packed[0]);
-        const float q_scale = q_scales[start / 32u];
-        const uint8_t* qs = packed + 1u;
-        const int8_t* qv = q + (size_t)(start / 32u) * 32u + (start & 31u);
-        int32_t isum = 0;
-#if defined(__AVX2__)
-        if (!pairwise_order && limit == 32u && !layout.bytewise_codes) {
-            const __m128i mask = _mm_set1_epi8(0x0f);
-            const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs));
-            const __m128i low = moe_mxfp4_codes16_to_i8(_mm_and_si128(bytes, mask));
-            const __m128i high = moe_mxfp4_codes16_to_i8(_mm_and_si128(_mm_srli_epi16(bytes, 4), mask));
-            const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qv));
-            const __m128i q1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qv + 16u));
-            isum += moe_dot_i8x16_i8x16_sum(low, q0);
-            isum += moe_dot_i8x16_i8x16_sum(high, q1);
-            acc += (0.5f * scale * q_scale) * (float)isum;
-            start += limit;
-            packed += layout.block_bytes;
-            continue;
-        }
-        if (!pairwise_order && limit == 16u && layout.bytewise_codes) {
-            const __m128i mask = _mm_set1_epi8(0x0f);
-            const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs));
-            const __m128i vals = moe_mxfp4_codes16_to_i8(_mm_and_si128(bytes, mask));
-            const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qv));
-            isum += moe_dot_i8x16_i8x16_sum(vals, q0);
-            acc += (0.5f * scale * q_scale) * (float)isum;
-            start += limit;
-            packed += layout.block_bytes;
-            continue;
-        }
-#endif
-        if (layout.bytewise_codes) {
-            for (uint32_t j = 0; j < limit; ++j) {
-                isum += (int32_t)kMxfp4I8[qs[j] & 0x0fu] * (int32_t)qv[j];
-            }
-        } else if (pairwise_order) {
-            uint32_t j = 0;
-            for (; j + 1u < limit; j += 2u) {
-                const uint8_t byte = qs[j >> 1u];
-                isum += (int32_t)kMxfp4I8[byte & 0x0fu] * (int32_t)qv[j];
-                isum += (int32_t)kMxfp4I8[byte >> 4] * (int32_t)qv[j + 1u];
-            }
-            if (j < limit) {
-                isum += (int32_t)kMxfp4I8[qs[j >> 1u] & 0x0fu] * (int32_t)qv[j];
-            }
-        } else {
-            const uint32_t low_limit = std::min<uint32_t>(limit, 16u);
-            for (uint32_t j = 0; j < low_limit; ++j) {
-                isum += (int32_t)kMxfp4I8[qs[j] & 0x0fu] * (int32_t)qv[j];
-            }
-            for (uint32_t j = 16u; j < limit; ++j) {
-                isum += (int32_t)kMxfp4I8[qs[j - 16u] >> 4] * (int32_t)qv[j];
-            }
-        }
-        acc += (0.5f * scale * q_scale) * (float)isum;
         start += limit;
         packed += layout.block_bytes;
     }
