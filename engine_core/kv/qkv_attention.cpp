@@ -105,6 +105,239 @@ static void qkv_attention_project_qjl_query(
 #endif
 }
 
+static int qkv_attention_mse_bits_for_total_bits(int bits, bool use_qjl) {
+    if (qkv_bits_raw(bits)) return bits;
+    const int mse_bits = use_qjl ? bits - 1 : bits;
+    return qkv_bits_codebook(mse_bits) ? mse_bits : 0;
+}
+
+static int qkv_attention_apply_split_inverse(
+    const qkv_config_t* cfg,
+    const float* matrix,
+    const float* signs,
+    const float* input,
+    float* output,
+    int dim
+) {
+    if (!input || !output || dim <= 0 || dim > 16384) return 0;
+    if (cfg && cfg->enable_rotation && matrix) {
+        if (signs && qkv_apply_hadamard_rotation_inverse(input, signs, output, dim)) return 1;
+        for (int i = 0; i < dim; ++i) output[i] = 0.0f;
+        for (int j = 0; j < dim; ++j) {
+            const float y = input[j];
+            const float* row = matrix + (size_t)j * (size_t)dim;
+            for (int i = 0; i < dim; ++i) output[i] += row[i] * y;
+        }
+        for (int i = 0; i < dim; ++i) if (!std::isfinite(output[i])) return 0;
+        return 1;
+    }
+    memcpy(output, input, (size_t)dim * sizeof(float));
+    return 1;
+}
+
+static int qkv_attention_project_qjl_t_weighted(
+    const float* matrix,
+    const float* weighted_signs,
+    float* out,
+    int dim
+) {
+    if (!matrix || !weighted_signs || !out || dim <= 0 || dim > 16384) return 0;
+#if defined(__AVX2__)
+    for (int i = 0; i < dim; ++i) {
+        __m256 acc = _mm256_setzero_ps();
+        int j = 0;
+        for (; j + 7 < dim; j += 8) {
+            const __m256 m = _mm256_set_ps(
+                matrix[(size_t)(j + 7) * (size_t)dim + (size_t)i],
+                matrix[(size_t)(j + 6) * (size_t)dim + (size_t)i],
+                matrix[(size_t)(j + 5) * (size_t)dim + (size_t)i],
+                matrix[(size_t)(j + 4) * (size_t)dim + (size_t)i],
+                matrix[(size_t)(j + 3) * (size_t)dim + (size_t)i],
+                matrix[(size_t)(j + 2) * (size_t)dim + (size_t)i],
+                matrix[(size_t)(j + 1) * (size_t)dim + (size_t)i],
+                matrix[(size_t)j * (size_t)dim + (size_t)i]);
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(m, _mm256_loadu_ps(weighted_signs + j)));
+        }
+        __m128 hi = _mm256_extractf128_ps(acc, 1);
+        __m128 lo = _mm256_castps256_ps128(acc);
+        __m128 sum4 = _mm_add_ps(lo, hi);
+        sum4 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+        sum4 = _mm_add_ss(sum4, _mm_shuffle_ps(sum4, sum4, 1));
+        float sum = _mm_cvtss_f32(sum4);
+        for (; j < dim; ++j) {
+            sum += matrix[(size_t)j * (size_t)dim + (size_t)i] * weighted_signs[j];
+        }
+        if (!std::isfinite(sum)) return 0;
+        out[i] = sum;
+    }
+#else
+    for (int i = 0; i < dim; ++i) {
+        float sum = 0.0f;
+        for (int j = 0; j < dim; ++j) {
+            sum += matrix[(size_t)j * (size_t)dim + (size_t)i] * weighted_signs[j];
+        }
+        if (!std::isfinite(sum)) return 0;
+        out[i] = sum;
+    }
+#endif
+    return 1;
+}
+
+static int qkv_attention_accumulate_value_split_weighted(
+    const qkv_state_t* s,
+    const qkv_config_t* cfg,
+    const float* att,
+    int n,
+    int d,
+    const float* current_value,
+    int exact_current_idx,
+    bool qjl,
+    float* output
+) {
+    if (!s || !cfg || !att || !output || n <= 0 || d <= 0 ||
+        !qkv_outlier_split_ready(s, cfg, QKV_TARGET_VALUE)) {
+        return 0;
+    }
+    const int n_out = cfg->outlier_channels;
+    const int n_norm = d - n_out;
+    if (n_out <= 0 || n_out >= d || n_norm <= 0) return 0;
+    const int* outlier_channels = qkv_outlier_indices_for_target_const(s, QKV_TARGET_VALUE);
+    const uint8_t* split_outlier = qkv_idx_outlier_for_target_const(s, QKV_TARGET_VALUE);
+    const uint8_t* split_normal = qkv_idx_normal_for_target_const(s, QKV_TARGET_VALUE);
+    const uint8_t* is_outlier = qkv_is_outlier_for_target_const(s, QKV_TARGET_VALUE);
+    if (!outlier_channels || !split_outlier || !split_normal || !is_outlier ||
+        !s->v_norms_outlier || !s->v_norms_normal) {
+        return 0;
+    }
+    const int outlier_total_bits = qkv_outlier_bits_for_target(cfg, QKV_TARGET_VALUE);
+    const int normal_total_bits = qkv_normal_bits_for_target(cfg, QKV_TARGET_VALUE);
+    const bool split_qjl = qjl &&
+        qkv_bits_codebook(outlier_total_bits) &&
+        qkv_bits_codebook(normal_total_bits) &&
+        outlier_total_bits > 1 &&
+        normal_total_bits > 1 &&
+        s->v_qjl && s->v_residual_norms_outlier && s->v_residual_norms_normal &&
+        s->qjl_matrix_outlier && s->qjl_matrix_normal;
+    const int out_bits = qkv_attention_mse_bits_for_total_bits(outlier_total_bits, split_qjl);
+    const int norm_bits = qkv_attention_mse_bits_for_total_bits(normal_total_bits, split_qjl);
+    if (!qkv_bits_valid(out_bits) || !qkv_bits_valid(norm_bits) ||
+        n_out > INT_MAX / out_bits || n_norm > INT_MAX / norm_bits) {
+        return 0;
+    }
+    const int out_stride = (n_out * out_bits + 7) / 8;
+    const int norm_stride = (n_norm * norm_bits + 7) / 8;
+    const size_t qjl_out_stride = qkv_split_qjl_outlier_bytes(cfg);
+    const size_t qjl_stride = qkv_qjl_token_bytes(s);
+    if (split_qjl && qjl_stride < qjl_out_stride + qkv_split_qjl_normal_bytes(cfg)) return 0;
+
+    struct split_tls_t {
+        std::vector<float> y_out, y_norm, qjl_out, qjl_norm, tmp_out, tmp_norm, qjl_tmp, signs;
+        std::vector<int> codes;
+    };
+    thread_local split_tls_t tls;
+    try {
+        tls.y_out.assign((size_t)n_out, 0.0f);
+        tls.y_norm.assign((size_t)n_norm, 0.0f);
+        tls.tmp_out.resize((size_t)n_out);
+        tls.tmp_norm.resize((size_t)n_norm);
+        tls.codes.resize((size_t)std::max(n_out, n_norm));
+        if (split_qjl) {
+            tls.qjl_out.assign((size_t)n_out, 0.0f);
+            tls.qjl_norm.assign((size_t)n_norm, 0.0f);
+            tls.qjl_tmp.resize((size_t)std::max(n_out, n_norm));
+            tls.signs.resize((size_t)std::max(n_out, n_norm));
+        }
+    } catch (const std::bad_alloc&) {
+        return 0;
+    }
+
+    memset(output, 0, (size_t)d * sizeof(float));
+    const bool out_raw = qkv_bits_raw(out_bits);
+    const bool norm_raw = qkv_bits_raw(norm_bits);
+    const float* out_centroids = out_raw ? nullptr : qkv_codebook_for_bits(s, out_bits);
+    const float* norm_centroids = norm_raw ? nullptr : qkv_codebook_for_bits(s, norm_bits);
+    if ((!out_raw && !out_centroids) || (!norm_raw && !norm_centroids)) return 0;
+
+    for (int t = 0; t < n; ++t) {
+        const float weight = att[t];
+        if (weight == 0.0f) continue;
+        if (t == exact_current_idx) {
+            if (!current_value) return 0;
+            for (int i = 0; i < d; ++i) output[i] += weight * current_value[i];
+            continue;
+        }
+        if ((uint32_t)t < s->sink_tokens && s->v_sink) {
+            const float* exact_v = s->v_sink + (size_t)t * (size_t)d;
+            for (int i = 0; i < d; ++i) output[i] += weight * exact_v[i];
+            continue;
+        }
+        const uint8_t* out_src = split_outlier + (size_t)t * (size_t)out_stride;
+        const uint8_t* norm_src = split_normal + (size_t)t * (size_t)norm_stride;
+        const float out_scale = weight * s->v_norms_outlier[t];
+        const float norm_scale = weight * s->v_norms_normal[t];
+        if (!std::isfinite(out_scale) || !std::isfinite(norm_scale)) return 0;
+        if (out_scale != 0.0f) {
+            if (!out_raw) qkv_unpack_indices(out_src, tls.codes.data(), n_out, out_bits);
+            for (int i = 0; i < n_out; ++i) {
+                const float y = out_raw ? qkv_attention_load_raw_scalar(out_src, i, out_bits) :
+                    out_centroids[tls.codes[(size_t)i]];
+                tls.y_out[(size_t)i] += out_scale * y;
+            }
+        }
+        if (norm_scale != 0.0f) {
+            if (!norm_raw) qkv_unpack_indices(norm_src, tls.codes.data(), n_norm, norm_bits);
+            for (int i = 0; i < n_norm; ++i) {
+                const float y = norm_raw ? qkv_attention_load_raw_scalar(norm_src, i, norm_bits) :
+                    norm_centroids[tls.codes[(size_t)i]];
+                tls.y_norm[(size_t)i] += norm_scale * y;
+            }
+        }
+        if (split_qjl) {
+            const uint8_t* qjl_token = s->v_qjl + (size_t)t * qjl_stride;
+            const float out_r = s->v_residual_norms_outlier[t];
+            if (out_r > 1e-10f && out_scale != 0.0f) {
+                qkv_unpack_signs(qjl_token, tls.signs.data(), n_out);
+                const float s_out = out_scale * out_r;
+                for (int i = 0; i < n_out; ++i) tls.qjl_out[(size_t)i] += s_out * tls.signs[(size_t)i];
+            }
+            const float norm_r = s->v_residual_norms_normal[t];
+            if (norm_r > 1e-10f && norm_scale != 0.0f) {
+                qkv_unpack_signs(qjl_token + qjl_out_stride, tls.signs.data(), n_norm);
+                const float s_norm = norm_scale * norm_r;
+                for (int i = 0; i < n_norm; ++i) tls.qjl_norm[(size_t)i] += s_norm * tls.signs[(size_t)i];
+            }
+        }
+    }
+
+    if (!qkv_attention_apply_split_inverse(cfg, s->rotation_matrix_outlier, s->rotation_signs_outlier,
+            tls.y_out.data(), tls.tmp_out.data(), n_out) ||
+        !qkv_attention_apply_split_inverse(cfg, s->rotation_matrix_normal, s->rotation_signs_normal,
+            tls.y_norm.data(), tls.tmp_norm.data(), n_norm)) {
+        return 0;
+    }
+    if (split_qjl) {
+        const float qjl_out_scale = sqrtf((float)M_PI / 2.0f) / (float)n_out;
+        const float qjl_norm_scale = sqrtf((float)M_PI / 2.0f) / (float)n_norm;
+        if (!std::isfinite(qjl_out_scale) || !std::isfinite(qjl_norm_scale)) return 0;
+        if (!qkv_attention_project_qjl_t_weighted(s->qjl_matrix_outlier, tls.qjl_out.data(), tls.qjl_tmp.data(), n_out)) return 0;
+        for (int i = 0; i < n_out; ++i) tls.tmp_out[(size_t)i] += qjl_out_scale * tls.qjl_tmp[(size_t)i];
+        if (!qkv_attention_project_qjl_t_weighted(s->qjl_matrix_normal, tls.qjl_norm.data(), tls.qjl_tmp.data(), n_norm)) return 0;
+        for (int i = 0; i < n_norm; ++i) tls.tmp_norm[(size_t)i] += qjl_norm_scale * tls.qjl_tmp[(size_t)i];
+    }
+    for (int i = 0; i < n_out; ++i) {
+        const int ch = outlier_channels[i];
+        if (ch < 0 || ch >= d) return 0;
+        output[ch] += tls.tmp_out[(size_t)i];
+    }
+    int pos = 0;
+    for (int ch = 0; ch < d; ++ch) {
+        if (is_outlier[ch]) continue;
+        if (pos >= n_norm) return 0;
+        output[ch] += tls.tmp_norm[(size_t)pos++];
+    }
+    return pos == n_norm ? 1 : 0;
+}
+
 // Paper: Attention decode directly on quantized KV cache
 // Avoids full dequantize → attention → discard cycle
 int qkv_attention_decode_impl(
@@ -521,6 +754,14 @@ int qkv_attention_decode_impl(
                 output[i] += src[i];
             }
         }
+        return 1;
+    }
+
+    // Split QKV value dequant is linear in attention weights.  For short
+    // decode contexts, accumulate packed-domain MSE/QJL terms and apply inverse
+    // rotation once instead of once per token.
+    if (qkv_attention_accumulate_value_split_weighted(
+            s, cfg, att, n, d, current_value, exact_current_idx, qjl, output)) {
         return 1;
     }
 
