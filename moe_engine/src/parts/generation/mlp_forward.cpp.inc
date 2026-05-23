@@ -2387,9 +2387,12 @@ static int moe_run_expert_triplet_row_batch_f32(
         for (uint32_t row = row_begin; row < row_end; ++row) {
             moe_tensor_row_fast_prefetch(&gate_view, row + 1u);
             moe_tensor_row_fast_prefetch(&up_view, row + 1u);
-            if (!moe_dot_tensor_fast_view_two_rows_batch(
-                    engine, &gate_view, &up_view, row, row,
-                    batch_hidden, batch_size, hidden_size, gate_values, up_values)) {
+            if (!moe_dot_tensor_fast_view_row_batch(
+                    engine, &gate_view, row,
+                    batch_hidden, batch_size, hidden_size, gate_values) ||
+                !moe_dot_tensor_fast_view_row_batch(
+                    engine, &up_view, row,
+                    batch_hidden, batch_size, hidden_size, up_values)) {
                 return 0;
             }
             for (uint32_t b = 0; b < batch_size; ++b) {
@@ -2421,40 +2424,23 @@ static int moe_run_expert_triplet_row_batch_f32(
     }
     const uint32_t down_tile_rows = std::max(1u, std::min(out_count, tile_rows_for_input(intermediate_size)));
     const uint32_t down_block_count = (out_count + down_tile_rows - 1u) / down_tile_rows;
-    std::vector<float> down_values_all((size_t)down_block_count * batch_size * 2u);
+    std::vector<float> down_values_all((size_t)down_block_count * batch_size);
     auto run_down_block = [&](uint32_t block) -> int {
-        float* down_values = down_values_all.data() + (size_t)block * batch_size * 2u;
+        float* down_values = down_values_all.data() + (size_t)block * batch_size;
         const uint32_t row_begin = block * down_tile_rows;
         uint32_t row_end = row_begin + down_tile_rows;
         if (row_end > out_count) {
             row_end = out_count;
         }
-        for (uint32_t row = row_begin; row < row_end;) {
+        for (uint32_t row = row_begin; row < row_end; ++row) {
             moe_tensor_row_fast_prefetch(&down_view, row + 1u);
-            if (row + 1u < row_end) {
-                moe_tensor_row_fast_prefetch(&down_view, row + 2u);
-                float* down_values_next = down_values + batch_size;
-                if (!moe_dot_tensor_fast_view_two_rows_batch(
-                        engine, &down_view, &down_view, row, row + 1u,
-                        activated_inputs, batch_size, intermediate_size, down_values, down_values_next)) {
-                    return 0;
-                }
-                for (uint32_t b = 0; b < batch_size; ++b) {
-                    float* out = out_pool + (size_t)b * (size_t)out_count;
-                    out[row] = down_values[b];
-                    out[row + 1u] = down_values_next[b];
-                }
-                row += 2u;
-            } else {
-                if (!moe_dot_tensor_fast_view_row_batch(
-                        engine, &down_view, row,
-                        activated_inputs, batch_size, intermediate_size, down_values)) {
-                    return 0;
-                }
-                for (uint32_t b = 0; b < batch_size; ++b) {
-                    out_pool[(size_t)b * (size_t)out_count + row] = down_values[b];
-                }
-                ++row;
+            if (!moe_dot_tensor_fast_view_row_batch(
+                    engine, &down_view, row,
+                    activated_inputs, batch_size, intermediate_size, down_values)) {
+                return 0;
+            }
+            for (uint32_t b = 0; b < batch_size; ++b) {
+                out_pool[(size_t)b * (size_t)out_count + row] = down_values[b];
             }
         }
         return 1;
