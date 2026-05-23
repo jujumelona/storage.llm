@@ -13,6 +13,7 @@
 #include "../../loader/wide_path.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>

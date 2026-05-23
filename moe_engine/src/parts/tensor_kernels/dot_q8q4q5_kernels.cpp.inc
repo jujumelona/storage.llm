@@ -296,10 +296,17 @@ static void moe_dequant_gguf_iq4_xs_row(const uint8_t* packed, float* out, uint3
     (void)moe_gguf_iq4_xs_row_impl(packed, nullptr, out, cols);
 }
 static float moe_e8m0_to_f32_half(uint8_t v) {
-    uint32_t bits = v < 2u ? (0x00200000u << v) : ((uint32_t)(v - 1u) << 23u);
-    float out = 0.0f;
-    std::memcpy(&out, &bits, sizeof(out));
-    return out;
+    static const std::array<float, 256> kScale = []() {
+        std::array<float, 256> values{};
+        for (uint32_t i = 0; i < 256u; ++i) {
+            const uint32_t bits = i < 2u ? (0x00200000u << i) : ((i - 1u) << 23u);
+            float out = 0.0f;
+            std::memcpy(&out, &bits, sizeof(out));
+            values[i] = out;
+        }
+        return values;
+    }();
+    return kScale[v];
 }
 
 static const float* moe_mxfp4_value_table() {
@@ -338,6 +345,25 @@ static uint8_t moe_mxfp4_code_at(const uint8_t* qs, uint32_t index) {
     const uint8_t byte = qs[index & 15u];
     return (index < 16u) ? (byte & 0x0fu) : (byte >> 4);
 }
+
+#if defined(__AVX2__)
+static inline __m256 moe_mxfp4_codes8_to_ps(__m128i codes) {
+    const __m128i table = _mm_setr_epi8(
+        0, 1, 2, 3, 4, 6, 8, 12,
+        0, -1, -2, -3, -4, -6, -8, -12);
+    const __m128i vals_i8 = _mm_shuffle_epi8(table, codes);
+    const __m256 vals = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vals_i8));
+    return _mm256_mul_ps(vals, _mm256_set1_ps(0.5f));
+}
+
+static inline __m256 moe_mxfp4_lookup8_fast(const uint8_t* p, int high) {
+    const __m128i mask = _mm_set1_epi8(0x0f);
+    __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+    bytes = high ? _mm_and_si128(_mm_srli_epi16(bytes, 4), mask)
+                 : _mm_and_si128(bytes, mask);
+    return moe_mxfp4_codes8_to_ps(bytes);
+}
+#endif
 
 struct moe_mxfp4_row_layout_t {
     uint32_t block_cols;
@@ -394,33 +420,19 @@ static inline float moe_mxfp4_dot_block(
 ) {
 #if defined(__AVX2__)
     if (!pairwise_order && limit == 32u && !layout.bytewise_codes) {
-        const __m128i mask = _mm_set1_epi8(0x0f);
-        auto lookup = [&](const uint8_t* p, int high) -> __m256 {
-            __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
-            bytes = high ? _mm_and_si128(_mm_srli_epi16(bytes, 4), mask)
-                         : _mm_and_si128(bytes, mask);
-            const __m256i idx = _mm256_cvtepu8_epi32(bytes);
-            return _mm256_i32gather_ps(table, idx, 4);
-        };
+        (void)table;
         __m256 acc = _mm256_setzero_ps();
-        acc = moe_madd_ps(lookup(qs, 0), _mm256_loadu_ps(x + start), acc);
-        acc = moe_madd_ps(lookup(qs + 8u, 0), _mm256_loadu_ps(x + start + 8u), acc);
-        acc = moe_madd_ps(lookup(qs, 1), _mm256_loadu_ps(x + start + 16u), acc);
-        acc = moe_madd_ps(lookup(qs + 8u, 1), _mm256_loadu_ps(x + start + 24u), acc);
+        acc = moe_madd_ps(moe_mxfp4_lookup8_fast(qs, 0), _mm256_loadu_ps(x + start), acc);
+        acc = moe_madd_ps(moe_mxfp4_lookup8_fast(qs + 8u, 0), _mm256_loadu_ps(x + start + 8u), acc);
+        acc = moe_madd_ps(moe_mxfp4_lookup8_fast(qs, 1), _mm256_loadu_ps(x + start + 16u), acc);
+        acc = moe_madd_ps(moe_mxfp4_lookup8_fast(qs + 8u, 1), _mm256_loadu_ps(x + start + 24u), acc);
         return moe_dot_hsum256_ps(acc);
     }
     if (!pairwise_order && limit == 16u && layout.bytewise_codes) {
-        const __m128i mask = _mm_set1_epi8(0x0f);
-        auto lookup_codes = [&](const uint8_t* p) -> __m256 {
-            const __m128i bytes = _mm_and_si128(
-                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p)),
-                mask);
-            const __m256i idx = _mm256_cvtepu8_epi32(bytes);
-            return _mm256_i32gather_ps(table, idx, 4);
-        };
+        (void)table;
         __m256 acc = _mm256_setzero_ps();
-        acc = moe_madd_ps(lookup_codes(qs), _mm256_loadu_ps(x + start), acc);
-        acc = moe_madd_ps(lookup_codes(qs + 8u), _mm256_loadu_ps(x + start + 8u), acc);
+        acc = moe_madd_ps(moe_mxfp4_lookup8_fast(qs, 0), _mm256_loadu_ps(x + start), acc);
+        acc = moe_madd_ps(moe_mxfp4_lookup8_fast(qs + 8u, 0), _mm256_loadu_ps(x + start + 8u), acc);
         return moe_dot_hsum256_ps(acc);
     }
 #endif
@@ -467,49 +479,35 @@ static inline void moe_mxfp4_dot_block_two_rows(
 ) {
 #if defined(__AVX2__)
     if (!pairwise_order && limit == 32u && !layout.bytewise_codes) {
-        const __m128i mask = _mm_set1_epi8(0x0f);
-        auto lookup = [&](const uint8_t* p, int high) -> __m256 {
-            __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
-            bytes = high ? _mm_and_si128(_mm_srli_epi16(bytes, 4), mask)
-                         : _mm_and_si128(bytes, mask);
-            const __m256i idx = _mm256_cvtepu8_epi32(bytes);
-            return _mm256_i32gather_ps(table, idx, 4);
-        };
+        (void)table;
         __m256 acc0 = _mm256_setzero_ps();
         __m256 acc1 = _mm256_setzero_ps();
         const __m256 x0 = _mm256_loadu_ps(x + start);
         const __m256 x1 = _mm256_loadu_ps(x + start + 8u);
         const __m256 x2 = _mm256_loadu_ps(x + start + 16u);
         const __m256 x3 = _mm256_loadu_ps(x + start + 24u);
-        acc0 = moe_madd_ps(lookup(qs0, 0), x0, acc0);
-        acc1 = moe_madd_ps(lookup(qs1, 0), x0, acc1);
-        acc0 = moe_madd_ps(lookup(qs0 + 8u, 0), x1, acc0);
-        acc1 = moe_madd_ps(lookup(qs1 + 8u, 0), x1, acc1);
-        acc0 = moe_madd_ps(lookup(qs0, 1), x2, acc0);
-        acc1 = moe_madd_ps(lookup(qs1, 1), x2, acc1);
-        acc0 = moe_madd_ps(lookup(qs0 + 8u, 1), x3, acc0);
-        acc1 = moe_madd_ps(lookup(qs1 + 8u, 1), x3, acc1);
+        acc0 = moe_madd_ps(moe_mxfp4_lookup8_fast(qs0, 0), x0, acc0);
+        acc1 = moe_madd_ps(moe_mxfp4_lookup8_fast(qs1, 0), x0, acc1);
+        acc0 = moe_madd_ps(moe_mxfp4_lookup8_fast(qs0 + 8u, 0), x1, acc0);
+        acc1 = moe_madd_ps(moe_mxfp4_lookup8_fast(qs1 + 8u, 0), x1, acc1);
+        acc0 = moe_madd_ps(moe_mxfp4_lookup8_fast(qs0, 1), x2, acc0);
+        acc1 = moe_madd_ps(moe_mxfp4_lookup8_fast(qs1, 1), x2, acc1);
+        acc0 = moe_madd_ps(moe_mxfp4_lookup8_fast(qs0 + 8u, 1), x3, acc0);
+        acc1 = moe_madd_ps(moe_mxfp4_lookup8_fast(qs1 + 8u, 1), x3, acc1);
         *out0 = moe_dot_hsum256_ps(acc0);
         *out1 = moe_dot_hsum256_ps(acc1);
         return;
     }
     if (!pairwise_order && limit == 16u && layout.bytewise_codes) {
-        const __m128i mask = _mm_set1_epi8(0x0f);
-        auto lookup_codes = [&](const uint8_t* p) -> __m256 {
-            const __m128i bytes = _mm_and_si128(
-                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p)),
-                mask);
-            const __m256i idx = _mm256_cvtepu8_epi32(bytes);
-            return _mm256_i32gather_ps(table, idx, 4);
-        };
+        (void)table;
         __m256 acc0 = _mm256_setzero_ps();
         __m256 acc1 = _mm256_setzero_ps();
         const __m256 x0 = _mm256_loadu_ps(x + start);
         const __m256 x1 = _mm256_loadu_ps(x + start + 8u);
-        acc0 = moe_madd_ps(lookup_codes(qs0), x0, acc0);
-        acc1 = moe_madd_ps(lookup_codes(qs1), x0, acc1);
-        acc0 = moe_madd_ps(lookup_codes(qs0 + 8u), x1, acc0);
-        acc1 = moe_madd_ps(lookup_codes(qs1 + 8u), x1, acc1);
+        acc0 = moe_madd_ps(moe_mxfp4_lookup8_fast(qs0, 0), x0, acc0);
+        acc1 = moe_madd_ps(moe_mxfp4_lookup8_fast(qs1, 0), x0, acc1);
+        acc0 = moe_madd_ps(moe_mxfp4_lookup8_fast(qs0 + 8u, 0), x1, acc0);
+        acc1 = moe_madd_ps(moe_mxfp4_lookup8_fast(qs1 + 8u, 0), x1, acc1);
         *out0 = moe_dot_hsum256_ps(acc0);
         *out1 = moe_dot_hsum256_ps(acc1);
         return;
