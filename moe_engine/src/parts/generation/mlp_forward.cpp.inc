@@ -2300,7 +2300,8 @@ static int moe_run_expert_triplet_row_batch_f32(
     uint32_t intermediate_size,
     float* out_pool,
     uint32_t out_count,
-    int activation_mode
+    int activation_mode,
+    int row_parallel = 1
 ) {
     if (!engine || !batch_hidden || !gate_pool || !up_pool || !out_pool ||
         batch_size == 0 || batch_size > 4096u ||
@@ -2374,7 +2375,7 @@ static int moe_run_expert_triplet_row_batch_f32(
     const uint32_t gate_block_count = (intermediate_size + gate_tile_rows - 1u) / gate_tile_rows;
     std::vector<float> gate_values_all((size_t)gate_block_count * batch_size);
     std::vector<float> up_values_all((size_t)gate_block_count * batch_size);
-    const int gate_up_ok = moe_parallel_rows(engine, gate_block_count, 0, [&](uint32_t block) {
+    auto run_gate_block = [&](uint32_t block) -> int {
         float* gate_values = gate_values_all.data() + (size_t)block * batch_size;
         float* up_values = up_values_all.data() + (size_t)block * batch_size;
         const uint32_t row_begin = block * gate_tile_rows;
@@ -2400,7 +2401,18 @@ static int moe_run_expert_triplet_row_batch_f32(
             }
         }
         return 1;
-    });
+    };
+    int gate_up_ok = 1;
+    if (row_parallel) {
+        gate_up_ok = moe_parallel_rows(engine, gate_block_count, 0, run_gate_block);
+    } else {
+        for (uint32_t block = 0; block < gate_block_count; ++block) {
+            if (!run_gate_block(block)) {
+                gate_up_ok = 0;
+                break;
+            }
+        }
+    }
     if (!gate_up_ok) {
         return 0;
     }
@@ -2413,7 +2425,7 @@ static int moe_run_expert_triplet_row_batch_f32(
     const uint32_t down_tile_rows = std::max(1u, std::min(out_count, tile_rows_for_input(intermediate_size)));
     const uint32_t down_block_count = (out_count + down_tile_rows - 1u) / down_tile_rows;
     std::vector<float> down_values_all((size_t)down_block_count * batch_size);
-    return moe_parallel_rows(engine, down_block_count, 0, [&](uint32_t block) {
+    auto run_down_block = [&](uint32_t block) -> int {
         float* down_values = down_values_all.data() + (size_t)block * batch_size;
         const uint32_t row_begin = block * down_tile_rows;
         uint32_t row_end = row_begin + down_tile_rows;
@@ -2432,7 +2444,16 @@ static int moe_run_expert_triplet_row_batch_f32(
             }
         }
         return 1;
-    });
+    };
+    if (row_parallel) {
+        return moe_parallel_rows(engine, down_block_count, 0, run_down_block);
+    }
+    for (uint32_t block = 0; block < down_block_count; ++block) {
+        if (!run_down_block(block)) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 struct moe_mlp_batch_assignment_t {
@@ -3535,6 +3556,112 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
             }
         }
     }
+    const int cpu_group_parallel =
+        !gpu_batch_ready &&
+        grouped_done_chunks.empty() &&
+        active_experts.size() > 1u &&
+        row_hw_threads() > 1u;
+    if (cpu_group_parallel) {
+        const uint32_t worker_count = std::min<uint32_t>(
+            row_hw_threads(),
+            (uint32_t)std::min<size_t>(active_experts.size(), 256u));
+        std::atomic<uint32_t> next_group{0};
+        std::atomic<uint32_t> active_groups_parallel{0};
+        std::atomic<uint32_t> total_assignments_parallel{0};
+        std::atomic<uint32_t> failed_assignments_parallel{0};
+        std::vector<std::mutex> token_mutex(batch_size);
+        auto run_group_worker = [&]() {
+            moe_cpu_enable_fast_fp_mode();
+            std::vector<const float*> local_input_ptrs(expert_batch_limit, nullptr);
+            std::vector<float> local_gate_pool((size_t)expert_batch_limit * intermediate_size);
+            std::vector<float> local_up_pool((size_t)expert_batch_limit * intermediate_size);
+            std::vector<float> local_out_pool((size_t)expert_batch_limit * hidden_size);
+            for (;;) {
+                const uint32_t group_index = next_group.fetch_add(1, std::memory_order_relaxed);
+                if (group_index >= active_experts.size()) {
+                    break;
+                }
+                const auto& group = active_experts[group_index];
+                const uint32_t expert = group.expert;
+                if (expert >= c->experts_per_moe_layer) {
+                    continue;
+                }
+                const auto& assignments = grouped[expert];
+                if (assignments.empty()) {
+                    continue;
+                }
+                active_groups_parallel.fetch_add(1, std::memory_order_relaxed);
+                total_assignments_parallel.fetch_add((uint32_t)assignments.size(), std::memory_order_relaxed);
+                for (size_t begin = 0; begin < assignments.size(); begin += expert_batch_limit) {
+                    const uint32_t chunk = (uint32_t)std::min<size_t>(expert_batch_limit, assignments.size() - begin);
+                    for (uint32_t b = 0; b < chunk; ++b) {
+                        local_input_ptrs[b] = expert_inputs[assignments[begin + b].token];
+                    }
+                    const int expert_ok = moe_run_expert_triplet_row_batch_f32(
+                        engine, layer, (int)expert,
+                        local_input_ptrs.data(), chunk, hidden_size,
+                        local_gate_pool.data(), local_up_pool.data(), intermediate_size,
+                        local_out_pool.data(), hidden_size, activation_mode, 0);
+                    if (!expert_ok) {
+                        failed_assignments_parallel.fetch_add(chunk, std::memory_order_relaxed);
+                        for (uint32_t b = 0; b < chunk; ++b) {
+                            const moe_mlp_batch_assignment_t& a = assignments[begin + b];
+                            if (a.token < batch_size) {
+                                std::lock_guard<std::mutex> lock(token_mutex[a.token]);
+                                ++failed_count[a.token];
+                            }
+                        }
+                        continue;
+                    }
+                    for (uint32_t b = 0; b < chunk; ++b) {
+                        const moe_mlp_batch_assignment_t& a = assignments[begin + b];
+                        float* expert_out = local_out_pool.data() + (size_t)b * hidden_size;
+                        if (!moe_layer_apply_expert_down_scale_f32(
+                                engine, layer, (int)expert, c->experts_per_moe_layer,
+                                expert_out, hidden_size)) {
+                            failed_assignments_parallel.fetch_add(1, std::memory_order_relaxed);
+                            if (a.token < batch_size) {
+                                std::lock_guard<std::mutex> lock(token_mutex[a.token]);
+                                ++failed_count[a.token];
+                            }
+                            continue;
+                        }
+                        if (a.token >= batch_size) {
+                            failed_assignments_parallel.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(token_mutex[a.token]);
+                            if (!moe_store_ordered_expert_contribution_f32(
+                                    ordered_expert_contrib, batch_size, std::max<uint32_t>(1u, top_k),
+                                    hidden_size, a, expert_out, a.weight)) {
+                                ++failed_count[a.token];
+                                failed_assignments_parallel.fetch_add(1, std::memory_order_relaxed);
+                                continue;
+                            }
+                            success_weight_sum[a.token] += a.weight;
+                            ++success_count[a.token];
+                        }
+                    }
+                }
+            }
+        };
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count > 1u ? worker_count - 1u : 0u);
+        for (uint32_t i = 1; i < worker_count; ++i) {
+            workers.emplace_back(run_group_worker);
+        }
+        run_group_worker();
+        for (std::thread& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        active_groups = active_groups_parallel.load(std::memory_order_relaxed);
+        total_assignments = total_assignments_parallel.load(std::memory_order_relaxed);
+        failed_assignments = failed_assignments_parallel.load(std::memory_order_relaxed);
+    }
+    if (!cpu_group_parallel) {
     for (const auto& group : active_experts) {
         const uint32_t expert = group.expert;
         if (expert >= c->experts_per_moe_layer) {
@@ -3624,6 +3751,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                 ++success_count[a.token];
             }
         }
+    }
     }
     moe_profile_log(
         "prefill_mlp_batch_experts",
