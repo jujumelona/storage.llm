@@ -469,7 +469,8 @@
         // causal self-attention step still consumes this exact scratch K/V,
         // matching the plain KV cache entry semantics.
         moe_profile_parallel_label_scope append_label("attn_qkv_append");
-        if (!moe_parallel_rows(engine, num_kv_heads, 0, [&](uint32_t kv_h) {
+        const uint32_t qkv_append_block_rows = num_kv_heads <= 16u ? 1u : 0u;
+        if (!moe_parallel_rows(engine, num_kv_heads, qkv_append_block_rows, [&](uint32_t kv_h) {
             const float* key = s->attn_kv_a.data() + (uint64_t)kv_h * head_dim;
             const float* value = s->attn_value.data() + (uint64_t)kv_h * v_head_dim;
             if (!moe_qkv_append_layer_head_token(

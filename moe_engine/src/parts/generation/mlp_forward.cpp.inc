@@ -1327,6 +1327,11 @@ static int moe_layer_moe_mlp_f32(
         if (input_bytes <= 32ull * 1024ull) return 8u;
         return 4u;
     };
+    auto mlp_dispatch_block_rows = [](const char* env_name, uint32_t default_rows, uint32_t max_rows) -> uint32_t {
+        const uint32_t env_rows = moe_parse_env_u32(env_name);
+        const uint32_t rows = env_rows > 0 ? env_rows : default_rows;
+        return std::max(1u, std::min<uint32_t>(rows, max_rows));
+    };
     const uint32_t gate_tile_rows = std::max(1u, std::min(expert_intermediate, mlp_input_reuse_tile(hidden_size)));
     const uint32_t gate_blocks_per_expert = (expert_intermediate + gate_tile_rows - 1u) / gate_tile_rows;
     if (gate_blocks_per_expert == 0 ||
@@ -1340,7 +1345,9 @@ static int moe_layer_moe_mlp_f32(
     const int activation_mode = moe_engine_gelu_activation_mode(engine);
     std::atomic<int> gate_up_failed{0};
     moe_profile_parallel_label_scope gate_up_rows_label("moe_mlp_gate_up");
-    const int gate_up_ok = moe_parallel_rows(engine, total_gate_blocks, 0, [&](uint32_t block_index) {
+    const uint32_t gate_up_dispatch_block_rows =
+        mlp_dispatch_block_rows("STORAGELLM_MLP_GATE_UP_DISPATCH_BLOCKS", 1u, 32u);
+    const int gate_up_ok = moe_parallel_rows(engine, total_gate_blocks, gate_up_dispatch_block_rows, [&](uint32_t block_index) {
         const uint32_t e = block_index / gate_blocks_per_expert;
         const uint32_t block = block_index % gate_blocks_per_expert;
         // Guard row-to-expert decoding before indexing per-expert arrays.
@@ -1441,7 +1448,7 @@ static int moe_layer_moe_mlp_f32(
             moe_profile_parallel_label_scope fused_down_rows_label("moe_mlp_down_accum_fused");
             static const uint32_t fused_down_block_rows = []() -> uint32_t {
                 const uint32_t env_block = moe_parse_env_u32("STORAGELLM_MLP_FUSED_DOWN_BLOCK_ROWS");
-                return env_block > 0 ? std::max(1u, std::min<uint32_t>(env_block, 128u)) : 16u;
+                return env_block > 0 ? std::max(1u, std::min<uint32_t>(env_block, 128u)) : 4u;
             }();
             const int down_fused_ok = moe_parallel_rows(engine, hidden_size, fused_down_block_rows, [&](uint32_t row) {
                 if (row >= hidden_size) {
