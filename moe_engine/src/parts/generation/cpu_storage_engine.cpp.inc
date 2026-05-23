@@ -527,7 +527,11 @@ static void moe_storage_io_apply_profile(moe_pc_engine* engine) {
     engine->storage_iouring_enabled.store((engine->ring_adapter.initialized && moe_storage_io_iouring_default_enabled(engine)) ? 1 : 0, std::memory_order_relaxed);
     engine->storage_gpu_staging_plan_ready.store(moe_storage_io_gpu_consumer_active(engine) ? 1 : 0, std::memory_order_relaxed);
     const uint32_t planned_workers = moe_storage_io_default_workers(profile);
-    const uint32_t planned_depth = moe_storage_io_default_queue_depth(profile);
+    uint32_t planned_depth = moe_storage_io_default_queue_depth(profile);
+    if (moe_cpu_storage_runtime_detected(engine) && engine->io_config.max_prefetch_queue > planned_depth) {
+        const uint32_t cpu_depth_floor = std::min<uint32_t>(engine->io_config.max_prefetch_queue, 4096u);
+        planned_depth = std::max<uint32_t>(planned_depth, cpu_depth_floor);
+    }
     engine->storage_prefetch_workers.store(planned_workers, std::memory_order_relaxed);
     engine->storage_prefetch_queue_depth.store(planned_depth, std::memory_order_relaxed);
 
