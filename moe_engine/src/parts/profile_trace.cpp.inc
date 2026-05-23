@@ -60,6 +60,7 @@ static int moe_profile_tag_enabled(const char* tag) {
         "decode_sample",
         "forward_token_end",
         "forward_layer",
+        "ple_prepare",
         "embedding_scale_contract",
         "activation_mode",
         "rmsnorm_unit_offset",

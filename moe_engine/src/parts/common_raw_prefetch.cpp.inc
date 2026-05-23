@@ -166,6 +166,21 @@ static int common_tensor_text_mentions_router_startup(
         name.find("mlp.router_norm.weight") != std::string::npos;
 }
 
+static int common_tensor_text_mentions_ple_startup(
+    const std::string& name,
+    const std::string& role_text
+) {
+    return role_text.find("per_layer_model_projection") != std::string::npos ||
+        role_text.find("per_layer_model_proj") != std::string::npos ||
+        role_text.find("per_layer_projection_norm") != std::string::npos ||
+        role_text.find("per_layer_proj_norm") != std::string::npos ||
+        name.find("per_layer_model_projection.weight") != std::string::npos ||
+        name.find("per_layer_model_proj.weight") != std::string::npos ||
+        name.find("per_layer_model_projection_norm.weight") != std::string::npos ||
+        name.find("per_layer_projection_norm.weight") != std::string::npos ||
+        name.find("per_layer_proj_norm.weight") != std::string::npos;
+}
+
 static int common_tensor_is_startup_core(const moe_gguf_common_tensor_record& rec) {
     if (rec.hotset_rank <= 256 ||
         rec.prefetch_class == moe_JUJU_PREFETCH_STARTUP_HOT ||
@@ -180,6 +195,9 @@ static int common_tensor_is_startup_core(const moe_gguf_common_tensor_record& re
     const std::string role_text =
         op_role + " " + exec_op + " " + member_role + " " + graph_role_text;
     if (common_tensor_text_mentions_router_startup(name, role_text)) {
+        return 1;
+    }
+    if (common_tensor_text_mentions_ple_startup(name, role_text)) {
         return 1;
     }
     return name == "output.weight" ||

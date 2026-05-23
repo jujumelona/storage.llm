@@ -438,6 +438,7 @@ static int moe_prepare_ple_inputs_f32(
     if (!engine || !c || !s) {
         return 0;
     }
+    const uint64_t ple_prepare_start_us = moe_profile_now_us();
     moe_ple_binding_t ple{};
     if (!moe_map_ple_binding(engine, c, &ple)) {
         s->ple_inputs.clear();
@@ -495,14 +496,11 @@ static int moe_prepare_ple_inputs_f32(
     for (uint32_t i = 0; i < ple.total_dim; ++i) {
         s->ple_inputs[i] = (s->ple_inputs[i] + s->ple_projected[i]) * combine_scale;
     }
-    static std::atomic<uint32_t> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) == 0) {
-        moe_profile_log(
-            "ple_prepare",
-            "total_dim=%u layer_dim=%u layers=%u token_embedding=%d token_vocab=%u projection_scale=%.9g",
-            ple.total_dim, ple.layer_dim, c->num_hidden_layers, ple.has_token_embedding, ple.token_vocab_size,
-            (double)projection_scale);
-    }
+    moe_profile_log(
+        "ple_prepare",
+        "token=%u total_dim=%u layer_dim=%u layers=%u token_embedding=%d token_vocab=%u projection_scale=%.9g ms=%.3f",
+        token_id, ple.total_dim, ple.layer_dim, c->num_hidden_layers, ple.has_token_embedding, ple.token_vocab_size,
+        (double)projection_scale, moe_profile_elapsed_ms(ple_prepare_start_us));
     return 1;
 }
 
