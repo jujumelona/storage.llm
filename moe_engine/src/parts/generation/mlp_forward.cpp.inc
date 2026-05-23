@@ -1664,9 +1664,37 @@ static uint32_t moe_mlp_prefill_expert_batch_limit() {
     return 256u; // Default dynamic limit
 }
 
+static int moe_gpu_batch_expert_kernel_available(moe_pc_engine* engine);
+
 static int moe_mlp_prefill_batch_enabled() {
     const char* env = std::getenv("STORAGELLM_PREFILL_BATCH_MLP");
     return !(env && env[0] == '0');
+}
+
+static int moe_mlp_prefill_batch_enabled_for(
+    moe_pc_engine* engine,
+    uint32_t prefill_count
+) {
+    if (!moe_mlp_prefill_batch_enabled()) {
+        return 0;
+    }
+    if (!engine || prefill_count < 2u) {
+        return 0;
+    }
+    const uint32_t force_threshold = moe_parse_env_u32("STORAGELLM_PREFILL_BATCH_MLP_MIN_TOKENS");
+    if (force_threshold > 0) {
+        return prefill_count >= force_threshold;
+    }
+    const int has_device_batch_path =
+        moe_gpu_batch_expert_kernel_available(engine) != 0 &&
+        engine->config.prefer_gpu &&
+        engine->config.vram_budget_bytes > 0;
+    if (has_device_batch_path) {
+        return 1;
+    }
+    const uint32_t cpu_threshold = moe_parse_env_u32("STORAGELLM_CPU_PREFILL_BATCH_MLP_MIN_TOKENS");
+    const uint32_t min_tokens = cpu_threshold > 0 ? cpu_threshold : 64u;
+    return prefill_count >= min_tokens;
 }
 
 static constexpr int moe_PREFILL_BATCH_MLP_FAST_KERNEL_REQUIRED = -2;
@@ -2686,7 +2714,8 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
     uint32_t batch_size,
     const moe_storage_constants_t* c
 ) {
-    if (!moe_mlp_prefill_batch_enabled() || !engine || !batch_hidden || !batch_norm || !c ||
+    if (!engine || !moe_mlp_prefill_batch_enabled_for(engine, batch_size) ||
+        !batch_hidden || !batch_norm || !c ||
         batch_size < 2 || batch_size > 4096u ||
         c->hidden_size == 0 || c->expert_intermediate_size == 0 ||
         c->experts_per_moe_layer == 0 || c->experts_per_moe_layer > 10000u) {
