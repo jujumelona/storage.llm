@@ -3558,11 +3558,8 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
             }
         }
     }
-    const uint32_t cpu_prefill_io_depth =
-        engine ? engine->total_queue_depth.load(std::memory_order_relaxed) : 0u;
     const int cpu_group_parallel =
         !gpu_batch_ready &&
-        cpu_prefill_io_depth == 0u &&
         grouped_done_chunks.empty() &&
         active_experts.size() > 1u &&
         row_hw_threads() > 1u;
@@ -3759,9 +3756,9 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
     }
     moe_profile_log(
         "prefill_mlp_batch_experts",
-        "layer=%d tokens=%u activation_mode=%d active_groups=%u assignments=%u failed=%u chunk=%u cpu_group_parallel=%d io_depth=%u ms=%.3f",
+        "layer=%d tokens=%u activation_mode=%d active_groups=%u assignments=%u failed=%u chunk=%u ms=%.3f",
         layer, batch_size, activation_mode, active_groups, total_assignments, failed_assignments,
-        expert_batch_limit, cpu_group_parallel, cpu_prefill_io_depth, moe_profile_elapsed_ms(expert_start_us));
+        expert_batch_limit, moe_profile_elapsed_ms(expert_start_us));
 
     std::fill(batch_expert_sum.begin(), batch_expert_sum.end(), 0.0f);
     const uint32_t ordered_top_k = std::max<uint32_t>(1u, top_k);
