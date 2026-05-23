@@ -535,18 +535,29 @@
         const int qkv_group_decode =
             qkv_decode && !shared_kv_reuse && v_head_dim == head_dim &&
             num_kv_heads > 0u && num_heads > num_kv_heads;
-        const uint32_t row_count = qkv_group_decode ? num_kv_heads : num_heads;
+        const uint32_t qkv_group_splits = qkv_group_decode
+            ? std::max<uint32_t>(
+                1u,
+                std::min<uint32_t>(
+                    (num_heads + num_kv_heads - 1u) / num_kv_heads,
+                    std::max<uint32_t>(1u, row_hw_threads() / num_kv_heads)))
+            : 1u;
+        const uint32_t row_count = qkv_group_decode ? num_kv_heads * qkv_group_splits : num_heads;
         const uint32_t head_block_rows =
             ((uint64_t)seq_len * (uint64_t)head_dim >= 1024ull && row_count > 1u) ? 1u : 0u;
         if (!moe_parallel_rows(engine, row_count, head_block_rows, [&](uint32_t row) {
         if (qkv_group_decode) {
-            const uint32_t kv_h = row;
-            const uint32_t h_begin =
+            const uint32_t kv_h = row / qkv_group_splits;
+            const uint32_t split = row % qkv_group_splits;
+            const uint32_t h_all_begin =
                 (uint32_t)(((uint64_t)kv_h * (uint64_t)num_heads + (uint64_t)num_kv_heads - 1ull) /
                            (uint64_t)num_kv_heads);
-            const uint32_t h_end =
+            const uint32_t h_all_end =
                 (uint32_t)((((uint64_t)kv_h + 1ull) * (uint64_t)num_heads + (uint64_t)num_kv_heads - 1ull) /
                            (uint64_t)num_kv_heads);
+            const uint32_t h_count = h_all_end > h_all_begin ? h_all_end - h_all_begin : 0u;
+            const uint32_t h_begin = h_all_begin + (uint32_t)(((uint64_t)h_count * split) / qkv_group_splits);
+            const uint32_t h_end = h_all_begin + (uint32_t)(((uint64_t)h_count * (split + 1u)) / qkv_group_splits);
             if (h_begin >= h_end || h_end > num_heads) {
                 return 0;
             }
@@ -650,10 +661,11 @@
     }
     moe_profile_log(
         "attn_standard_heads",
-        "layer=%d pos=%u heads=%u seq=%u head_dim=%u v_head_dim=%u qkv=%d kv_backend=%s scale=%.6g scale_source=%s attn_softcap=%.6g ms=%.3f",
+        "layer=%d pos=%u heads=%u seq=%u head_dim=%u v_head_dim=%u qkv=%d kv_backend=%s qkv_group_splits=%u scale=%.6g scale_source=%s attn_softcap=%.6g ms=%.3f",
         layer, position, num_heads, seq_len, head_dim, v_head_dim,
         qkv_decode,
         qkv_decode ? "qkv_layer_head_append" : "plain_kv_cache",
+        qkv_group_splits,
         (double)scale,
         scale_source ? scale_source : "unknown",
         (double)attn_logit_softcap,
