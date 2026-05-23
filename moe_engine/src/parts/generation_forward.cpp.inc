@@ -8,7 +8,9 @@ static void moe_forward_trace_vec(
 #ifdef STORAGELLM_PPL_DIAG_ENABLED
     storagellm_ppl_diag_forward_vec(stage, position, layer, values, count);
 #endif
-    if (!moe_profile_enabled() || !values || count == 0) {
+    if (!values || count == 0 ||
+        (!moe_profile_tag_enabled("forward_vec") &&
+         !moe_profile_tag_enabled("op_parity_vec"))) {
         return;
     }
     double ss = 0.0;
@@ -207,6 +209,10 @@ static void moe_forward_trace_runtime_resources(
     const char* stage
 ) {
     if (!engine || !moe_profile_enabled()) {
+        return;
+    }
+    const int level = moe_profile_level();
+    if (level < 2 && stage && std::strcmp(stage, "after_layer") == 0) {
         return;
     }
     const uint64_t ram_tier = tier_used(engine, moe_TIER_RAM);
@@ -490,15 +496,7 @@ static int moe_forward_one_token_f32(
     }
 
     for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
-        const uint64_t storage_begin_layer_start_us = moe_profile_now_us();
         moe_cpu_storage_begin_layer(engine, layer, c);
-        moe_profile_log(
-            "cpu_storage_begin_layer",
-            "position=%u layer=%u phase=%u ms=%.3f",
-            position,
-            layer,
-            engine->generation_phase.load(std::memory_order_relaxed),
-            moe_profile_elapsed_ms(storage_begin_layer_start_us));
         const uint64_t layer_start_us = moe_profile_now_us();
         // Pipeline Fix 2: Removed layer+2 lookahead to eliminate duplicate attention prefetch
         // layer+2 prefetch here + layer+1 prefetch after attention = same layer queued twice.
