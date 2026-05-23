@@ -314,7 +314,13 @@ static void moe_storage_io_prefetch_range_execute(
 static int moe_storage_prefetch_inline_on_overflow_enabled() {
     // Queue-overflow behavior is a runtime policy, not per-request data.  Cache
     // it so the token hot path does not call getenv while saturated.
-    static const int enabled = moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_PREFETCH_INLINE_ON_OVERFLOW");
+    static const int enabled = []() -> int {
+        const std::string value = moe_autotune_value("STORAGELLM_STORAGE_PREFETCH_INLINE_ON_OVERFLOW");
+        if (!value.empty()) {
+            return moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_PREFETCH_INLINE_ON_OVERFLOW");
+        }
+        return 1;
+    }();
     return enabled;
 }
 
