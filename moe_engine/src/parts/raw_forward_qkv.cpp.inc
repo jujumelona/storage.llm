@@ -624,7 +624,19 @@ struct moe_qkv_decode_tls_scratch {
     std::vector<float> work_qjl;
     std::vector<int> indices;
     std::vector<int> work_codes;
+    std::vector<float> batch_key;
+    std::vector<float> batch_values;
+    std::vector<float> batch_scores;
+    std::vector<float> batch_max;
+    std::vector<float> batch_denom;
 };
+
+static float moe_qkv_apply_logit_softcap_local(float cap, float score) {
+    if (!(cap > 0.0f) || !std::isfinite(cap) || !std::isfinite(score)) {
+        return score;
+    }
+    return std::tanh(score / cap) * cap;
+}
 
 static int moe_qkv_make_decode_local_state(
     const qkv_state_t* src,
@@ -750,6 +762,165 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
 #endif
     }
     return ok;
+}
+
+static int moe_pc_engine_attention_decode_layer_head_group_qkv_f32(
+    moe_pc_engine_t* engine,
+    uint32_t layer,
+    uint32_t kv_head,
+    uint32_t head_stride,
+    const float* queries,
+    uint32_t query_stride,
+    uint32_t query_heads,
+    const float* current_key,
+    const float* current_value,
+    uint32_t context_tokens,
+    uint32_t capacity_tokens,
+    uint32_t head_dim,
+    float score_scale,
+    float attn_logit_softcap,
+    float* output,
+    uint32_t output_stride
+) {
+    if (!engine || !queries || !output || query_heads == 0 || query_stride < head_dim ||
+        output_stride < head_dim || context_tokens == 0 || capacity_tokens < context_tokens ||
+        head_dim == 0 || head_dim > 16384u) {
+        return 0;
+    }
+    size_t slot_index = 0;
+    qkv_state_t* slot = moe_qkv_ensure_layer_head_state_locked(
+        engine, layer, kv_head, head_stride, capacity_tokens, head_dim, &slot_index);
+    if (!slot || slot_index >= engine->qkv_head_state_locks.size() ||
+        !engine->qkv_head_state_locks[slot_index]) {
+        return 0;
+    }
+    if (!(score_scale > 0.0f) || !std::isfinite(score_scale)) {
+        return 0;
+    }
+
+    qkv_config_t qkv_decode_cfg = engine->qkv_cfg;
+    qkv_decode_cfg.attention_score_scale = score_scale;
+    qkv_decode_cfg.attention_logit_softcap = attn_logit_softcap;
+    qkv_state_t local_slot{};
+    {
+        std::lock_guard<std::mutex> head_guard(*engine->qkv_head_state_locks[slot_index]);
+        slot = &engine->qkv_head_state_slots[slot_index];
+        if (slot_index >= engine->qkv_head_state_valid.size() ||
+            !engine->qkv_head_state_valid[slot_index] ||
+            slot_index >= engine->qkv_head_state_filled_tokens.size() ||
+            engine->qkv_head_state_filled_tokens[slot_index] < context_tokens ||
+            slot->n_tokens < (int)context_tokens ||
+            !moe_qkv_make_decode_local_state(slot, context_tokens, head_dim, &local_slot)) {
+            return 0;
+        }
+    }
+
+    thread_local moe_qkv_decode_tls_scratch tls;
+    try {
+        tls.batch_key.resize(head_dim);
+        tls.batch_values.resize((size_t)context_tokens * (size_t)head_dim);
+        tls.batch_scores.resize((size_t)query_heads * (size_t)context_tokens);
+        tls.batch_max.resize(query_heads);
+        tls.batch_denom.resize(query_heads);
+    } catch (const std::bad_alloc&) {
+        return 0;
+    }
+
+    const bool qjl = qkv_decode_cfg.enable_qjl &&
+        local_slot.k_bits > 1 && local_slot.v_bits > 1 &&
+        qkv_bits_codebook(local_slot.k_bits) &&
+        qkv_bits_codebook(local_slot.v_bits) &&
+        local_slot.k_qjl && local_slot.v_qjl;
+    std::fill(tls.batch_max.begin(), tls.batch_max.begin() + query_heads,
+        -std::numeric_limits<float>::infinity());
+
+    const int exact_current_idx = (current_key && current_value) ? (int)context_tokens - 1 : -1;
+    for (uint32_t t = 0; t < context_tokens; ++t) {
+        const float* key = nullptr;
+        const float* value = nullptr;
+        float* value_dst = tls.batch_values.data() + (size_t)t * (size_t)head_dim;
+        if ((int)t == exact_current_idx) {
+            key = current_key;
+            value = current_value;
+            std::memcpy(value_dst, current_value, (size_t)head_dim * sizeof(float));
+        } else if (t < (uint32_t)local_slot.sink_tokens && local_slot.k_sink && local_slot.v_sink) {
+            key = local_slot.k_sink + (size_t)t * (size_t)head_dim;
+            value = local_slot.v_sink + (size_t)t * (size_t)head_dim;
+            std::memcpy(value_dst, value, (size_t)head_dim * sizeof(float));
+        } else {
+            if (!qkv_dequant_one(
+                    &local_slot,
+                    &qkv_decode_cfg,
+                    local_slot.k_idx,
+                    local_slot.k_qjl,
+                    local_slot.k_residual_norms,
+                    local_slot.k_norms,
+                    (int)t,
+                    local_slot.k_bits,
+                    qjl,
+                    tls.batch_key.data()) ||
+                !qkv_dequant_one(
+                    &local_slot,
+                    &qkv_decode_cfg,
+                    local_slot.v_idx,
+                    local_slot.v_qjl,
+                    local_slot.v_residual_norms,
+                    local_slot.v_norms,
+                    (int)t,
+                    local_slot.v_bits,
+                    qjl,
+                    value_dst)) {
+                return 0;
+            }
+            key = tls.batch_key.data();
+        }
+        for (uint32_t h = 0; h < query_heads; ++h) {
+            const float* q = queries + (size_t)h * (size_t)query_stride;
+            float dot = 0.0f;
+            for (uint32_t i = 0; i < head_dim; ++i) {
+                dot += q[i] * key[i];
+            }
+            const float score = moe_qkv_apply_logit_softcap_local(
+                attn_logit_softcap, dot * score_scale);
+            if (!std::isfinite(score)) {
+                return 0;
+            }
+            tls.batch_scores[(size_t)h * (size_t)context_tokens + t] = score;
+            if (score > tls.batch_max[h]) {
+                tls.batch_max[h] = score;
+            }
+        }
+    }
+
+    for (uint32_t h = 0; h < query_heads; ++h) {
+        float* out_h = output + (size_t)h * (size_t)output_stride;
+        std::fill(out_h, out_h + head_dim, 0.0f);
+        float denom = 0.0f;
+        const float max_score = tls.batch_max[h];
+        if (!std::isfinite(max_score)) {
+            return 0;
+        }
+        for (uint32_t t = 0; t < context_tokens; ++t) {
+            const float w = std::exp(
+                tls.batch_scores[(size_t)h * (size_t)context_tokens + t] - max_score);
+            if (!std::isfinite(w)) {
+                return 0;
+            }
+            denom += w;
+            const float* value = tls.batch_values.data() + (size_t)t * (size_t)head_dim;
+            for (uint32_t i = 0; i < head_dim; ++i) {
+                out_h[i] += w * value[i];
+            }
+        }
+        if (!(denom > 1e-10f) || !std::isfinite(denom)) {
+            return 0;
+        }
+        const float inv = 1.0f / denom;
+        for (uint32_t i = 0; i < head_dim; ++i) {
+            out_h[i] *= inv;
+        }
+    }
+    return 1;
 }
 
 int moe_pc_engine_attention_decode_f32(

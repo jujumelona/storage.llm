@@ -532,9 +532,51 @@
     std::fill(s->attn_value.begin(), s->attn_value.begin() + v_total_dim, 0.0f);
     {
         moe_profile_parallel_label_scope rows_label("attn_heads");
+        const int qkv_group_decode =
+            qkv_decode && !shared_kv_reuse && v_head_dim == head_dim &&
+            num_kv_heads > 0u && num_heads >= num_kv_heads * 4u;
+        const uint32_t row_count = qkv_group_decode ? num_kv_heads : num_heads;
         const uint32_t head_block_rows =
-            ((uint64_t)seq_len * (uint64_t)head_dim >= 1024ull && num_heads > 1u) ? 1u : 0u;
-        if (!moe_parallel_rows(engine, num_heads, head_block_rows, [&](uint32_t h) {
+            ((uint64_t)seq_len * (uint64_t)head_dim >= 1024ull && row_count > 1u) ? 1u : 0u;
+        if (!moe_parallel_rows(engine, row_count, head_block_rows, [&](uint32_t row) {
+        if (qkv_group_decode) {
+            const uint32_t kv_h = row;
+            const uint32_t h_begin =
+                (uint32_t)(((uint64_t)kv_h * (uint64_t)num_heads + (uint64_t)num_kv_heads - 1ull) /
+                           (uint64_t)num_kv_heads);
+            const uint32_t h_end =
+                (uint32_t)((((uint64_t)kv_h + 1ull) * (uint64_t)num_heads + (uint64_t)num_kv_heads - 1ull) /
+                           (uint64_t)num_kv_heads);
+            if (h_begin >= h_end || h_end > num_heads) {
+                return 0;
+            }
+            const float* q = s->q_b.data() + (uint64_t)h_begin * head_dim;
+            float* out_h = s->attn_value.data() + (uint64_t)h_begin * v_head_dim;
+            const float* current_key = s->kv_entry.size() >= kv_entry_dim
+                ? (s->kv_entry.data() + (uint64_t)kv_h * head_dim)
+                : nullptr;
+            const float* current_value = s->kv_entry.size() >= kv_entry_dim
+                ? (s->kv_entry.data() + k_dim + (uint64_t)kv_h * v_head_dim)
+                : nullptr;
+            return moe_pc_engine_attention_decode_layer_head_group_qkv_f32(
+                engine,
+                kv_storage_layer,
+                kv_h,
+                qkv_head_stride,
+                q,
+                head_dim,
+                h_end - h_begin,
+                current_key,
+                current_value,
+                seq_len,
+                qkv_capacity_tokens,
+                head_dim,
+                scale,
+                attn_logit_softcap,
+                out_h,
+                v_head_dim);
+        }
+        const uint32_t h = row;
         const uint32_t kv_h = (uint32_t)(((uint64_t)h * (uint64_t)num_kv_heads) / (uint64_t)num_heads);
         const float* q = s->q_b.data() + (uint64_t)h * head_dim;
         float* out_h = s->attn_value.data() + (uint64_t)h * v_head_dim;
