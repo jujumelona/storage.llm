@@ -1361,11 +1361,31 @@ static void moe_cpu_storage_begin_token(moe_pc_engine* engine, uint32_t position
     }
 }
 
+static void moe_cpu_storage_after_router_selected(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const std::vector<int>& selected_experts
+);
+
 static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, const moe_storage_constants_t* c) {
     if (!engine || !c || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
     engine->cpu_layer_begin_count.fetch_add(1, std::memory_order_relaxed);
     const uint32_t depth = moe_cpu_storage_layer_lookahead_depth(engine, c->num_hidden_layers);
     const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
+    if (phase != moe_GEN_PHASE_PREFILL) {
+        std::vector<int> previous_token_experts;
+        {
+            std::shared_lock<std::shared_mutex> lock(engine->co_activation_mutex, std::try_to_lock);
+            if (lock.owns_lock() &&
+                layer < engine->last_selected_experts.size() &&
+                !engine->last_selected_experts[layer].empty()) {
+                previous_token_experts = engine->last_selected_experts[layer];
+            }
+        }
+        if (!previous_token_experts.empty()) {
+            moe_cpu_storage_after_router_selected(engine, (int32_t)layer, previous_token_experts);
+        }
+    }
     for (uint32_t d = 1; d <= depth; ++d) {
         const uint32_t next = layer + d;
         if (next >= c->num_hidden_layers) break;
