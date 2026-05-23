@@ -638,6 +638,82 @@ static float moe_qkv_apply_logit_softcap_local(float cap, float score) {
     return std::tanh(score / cap) * cap;
 }
 
+#if defined(__AVX2__)
+static inline float moe_qkv_hsum256_ps_local(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+#endif
+
+static inline float moe_qkv_dot_f32_local(const float* a, const float* b, uint32_t count) {
+    float sum = 0.0f;
+    uint32_t i = 0;
+#if defined(__AVX2__)
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+    for (; i + 31u < count; i += 32u) {
+        acc0 = moe_madd_ps(_mm256_loadu_ps(a + i),       _mm256_loadu_ps(b + i),       acc0);
+        acc1 = moe_madd_ps(_mm256_loadu_ps(a + i + 8u),  _mm256_loadu_ps(b + i + 8u),  acc1);
+        acc2 = moe_madd_ps(_mm256_loadu_ps(a + i + 16u), _mm256_loadu_ps(b + i + 16u), acc2);
+        acc3 = moe_madd_ps(_mm256_loadu_ps(a + i + 24u), _mm256_loadu_ps(b + i + 24u), acc3);
+    }
+    for (; i + 15u < count; i += 16u) {
+        acc0 = moe_madd_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i),      acc0);
+        acc1 = moe_madd_ps(_mm256_loadu_ps(a + i + 8u), _mm256_loadu_ps(b + i + 8u), acc1);
+    }
+    for (; i + 7u < count; i += 8u) {
+        acc0 = moe_madd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
+    }
+    sum = moe_qkv_hsum256_ps_local(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)));
+#endif
+    for (; i < count; ++i) {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+
+static inline void moe_qkv_axpy_f32_local(float* dst, const float* src, float alpha, uint32_t count) {
+    uint32_t i = 0;
+#if defined(__AVX2__)
+    const __m256 a = _mm256_set1_ps(alpha);
+    for (; i + 31u < count; i += 32u) {
+        _mm256_storeu_ps(dst + i,       moe_madd_ps(a, _mm256_loadu_ps(src + i),       _mm256_loadu_ps(dst + i)));
+        _mm256_storeu_ps(dst + i + 8u,  moe_madd_ps(a, _mm256_loadu_ps(src + i + 8u),  _mm256_loadu_ps(dst + i + 8u)));
+        _mm256_storeu_ps(dst + i + 16u, moe_madd_ps(a, _mm256_loadu_ps(src + i + 16u), _mm256_loadu_ps(dst + i + 16u)));
+        _mm256_storeu_ps(dst + i + 24u, moe_madd_ps(a, _mm256_loadu_ps(src + i + 24u), _mm256_loadu_ps(dst + i + 24u)));
+    }
+    for (; i + 15u < count; i += 16u) {
+        _mm256_storeu_ps(dst + i,      moe_madd_ps(a, _mm256_loadu_ps(src + i),      _mm256_loadu_ps(dst + i)));
+        _mm256_storeu_ps(dst + i + 8u, moe_madd_ps(a, _mm256_loadu_ps(src + i + 8u), _mm256_loadu_ps(dst + i + 8u)));
+    }
+    for (; i + 7u < count; i += 8u) {
+        _mm256_storeu_ps(dst + i, moe_madd_ps(a, _mm256_loadu_ps(src + i), _mm256_loadu_ps(dst + i)));
+    }
+#endif
+    for (; i < count; ++i) {
+        dst[i] += alpha * src[i];
+    }
+}
+
+static inline void moe_qkv_scale_f32_local(float* values, float scale, uint32_t count) {
+    uint32_t i = 0;
+#if defined(__AVX2__)
+    const __m256 s = _mm256_set1_ps(scale);
+    for (; i + 7u < count; i += 8u) {
+        _mm256_storeu_ps(values + i, _mm256_mul_ps(_mm256_loadu_ps(values + i), s));
+    }
+#endif
+    for (; i < count; ++i) {
+        values[i] *= scale;
+    }
+}
+
 static int moe_qkv_make_decode_local_state(
     const qkv_state_t* src,
     uint32_t context_tokens,
@@ -876,10 +952,7 @@ static int moe_pc_engine_attention_decode_layer_head_group_qkv_f32(
         }
         for (uint32_t h = 0; h < query_heads; ++h) {
             const float* q = queries + (size_t)h * (size_t)query_stride;
-            float dot = 0.0f;
-            for (uint32_t i = 0; i < head_dim; ++i) {
-                dot += q[i] * key[i];
-            }
+            const float dot = moe_qkv_dot_f32_local(q, key, head_dim);
             const float score = moe_qkv_apply_logit_softcap_local(
                 attn_logit_softcap, dot * score_scale);
             if (!std::isfinite(score)) {
@@ -908,17 +981,12 @@ static int moe_pc_engine_attention_decode_layer_head_group_qkv_f32(
             }
             denom += w;
             const float* value = tls.batch_values.data() + (size_t)t * (size_t)head_dim;
-            for (uint32_t i = 0; i < head_dim; ++i) {
-                out_h[i] += w * value[i];
-            }
+            moe_qkv_axpy_f32_local(out_h, value, w, head_dim);
         }
         if (!(denom > 1e-10f) || !std::isfinite(denom)) {
             return 0;
         }
-        const float inv = 1.0f / denom;
-        for (uint32_t i = 0; i < head_dim; ++i) {
-            out_h[i] *= inv;
-        }
+        moe_qkv_scale_f32_local(out_h, 1.0f / denom, head_dim);
     }
     return 1;
 }
