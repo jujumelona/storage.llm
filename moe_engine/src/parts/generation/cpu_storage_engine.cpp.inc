@@ -884,19 +884,9 @@ static void moe_storage_io_build_expert_index(moe_pc_engine* engine) {
     uint64_t view_count = 0;
     for (size_t b = 0; b < bucket_count; ++b) {
         auto& v = buckets[b];
-        auto proj_order = [](const moe_tensor_record* rec) -> uint32_t {
-            if (!rec) return 100u;
-            if (rec->info.proj == moe_PROJ_GATE) return 0u;
-            if (rec->info.proj == moe_PROJ_UP) return 1u;
-            if (rec->info.proj == moe_PROJ_DOWN) return 2u;
-            return 100u;
-        };
-        std::sort(v.begin(), v.end(), [engine, proj_order](uint32_t a, uint32_t bidx) {
+        std::sort(v.begin(), v.end(), [engine](uint32_t a, uint32_t bidx) {
             const moe_cpu_hot_tensor_view_t& va = engine->cpu_hot_tensor_views[a];
             const moe_cpu_hot_tensor_view_t& vb = engine->cpu_hot_tensor_views[bidx];
-            const uint32_t pa = proj_order(va.rec);
-            const uint32_t pb = proj_order(vb.rec);
-            if (pa != pb) return pa < pb;
             if (va.shard != vb.shard) return va.shard < vb.shard;
             if (va.base_offset != vb.base_offset) return va.base_offset < vb.base_offset;
             return va.row_bytes < vb.row_bytes;
