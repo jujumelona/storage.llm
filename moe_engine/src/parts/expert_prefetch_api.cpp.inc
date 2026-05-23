@@ -144,6 +144,7 @@ static int moe_pc_engine_prefetch_expert_triplet_impl(
     (void)notify_workers;
     const int required_now =
         prefetch_reason == moe_PREFETCH_REASON_ROUTER_SELECTED ||
+        prefetch_reason == moe_PREFETCH_REASON_BATCH_SELECTED ||
         urgent_required != 0 ? 1 : 0;
     const int effective_allow_sync_fallback =
         required_now && engine->io_config.allow_required_sync_fallback ? 1 : 0;
