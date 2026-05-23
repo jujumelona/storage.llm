@@ -2943,7 +2943,10 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
 
     std::vector<moe_active_expert_group_t> active_experts;
     moe_build_active_expert_groups(engine, layer, grouped, &active_experts);
-    const bool gpu_batch_ready = moe_gpu_batch_expert_kernel_available(engine) != 0;
+    const bool gpu_batch_ready =
+        moe_gpu_batch_expert_kernel_available(engine) != 0 &&
+        engine->config.prefer_gpu &&
+        engine->config.vram_budget_bytes > 0;
     for (const auto& group : active_experts) {
         if (group.current_tier == moe_TIER_VRAM) {
             continue;
@@ -3556,7 +3559,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         }
     }
     const int cpu_group_parallel =
-        (!gpu_batch_ready || !engine->config.prefer_gpu || engine->config.vram_budget_bytes == 0) &&
+        !gpu_batch_ready &&
         grouped_done_chunks.empty() &&
         active_experts.size() > 1u &&
         row_hw_threads() > 1u;
