@@ -3546,11 +3546,6 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         }
         ++active_groups;
         total_assignments += (uint32_t)assignments.size();
-        float expert_down_scale = 1.0f;
-        int expert_down_scalar_supported = 1;
-        const int expert_down_scalar_ready = moe_layer_expert_down_scalar_scale_f32(
-            engine, layer, (int)expert, c->experts_per_moe_layer,
-            hidden_size, &expert_down_scale, &expert_down_scalar_supported);
         for (size_t begin = 0; begin < assignments.size(); begin += expert_batch_limit) {
             if (grouped_done_chunks.find(grouped_chunk_key(expert, begin)) != grouped_done_chunks.end()) {
                 continue;
@@ -3611,21 +3606,16 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
             for (uint32_t b = 0; b < chunk; ++b) {
                 const moe_mlp_batch_assignment_t& a = assignments[begin + b];
                 float* expert_out = out_pool.data() + (size_t)b * hidden_size;
-                float contribution_weight = a.weight;
-                if (expert_down_scalar_ready && expert_down_scalar_supported) {
-                    contribution_weight *= expert_down_scale;
-                } else {
-                    if (!moe_layer_apply_expert_down_scale_f32(
-                            engine, layer, (int)expert, c->experts_per_moe_layer,
-                            expert_out, hidden_size)) {
-                        ++failed_count[a.token];
-                        ++failed_assignments;
-                        continue;
-                    }
+                if (!moe_layer_apply_expert_down_scale_f32(
+                        engine, layer, (int)expert, c->experts_per_moe_layer,
+                        expert_out, hidden_size)) {
+                    ++failed_count[a.token];
+                    ++failed_assignments;
+                    continue;
                 }
                 if (!moe_store_ordered_expert_contribution_f32(
                         ordered_expert_contrib, batch_size, std::max<uint32_t>(1u, top_k),
-                        hidden_size, a, expert_out, contribution_weight)) {
+                        hidden_size, a, expert_out, a.weight)) {
                     ++failed_count[a.token];
                     ++failed_assignments;
                     continue;
