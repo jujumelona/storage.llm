@@ -311,7 +311,7 @@ static void moe_storage_io_prefetch_range_execute(
     uint64_t* bytes_io);
 
 
-static int moe_storage_prefetch_inline_on_overflow_enabled() {
+static int moe_storage_prefetch_inline_on_overflow_enabled(moe_pc_engine* engine) {
     // Queue-overflow behavior is a runtime policy, not per-request data.  Cache
     // it so the token hot path does not call getenv while saturated.
     static const int enabled = []() -> int {
@@ -321,6 +321,13 @@ static int moe_storage_prefetch_inline_on_overflow_enabled() {
         }
         return 1;
     }();
+    if (!enabled || !engine) return 0;
+    const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
+    if (phase == moe_GEN_PHASE_IDLE ||
+        phase == moe_GEN_PHASE_INIT ||
+        phase == moe_GEN_PHASE_PREFILL) {
+        return 0;
+    }
     return enabled;
 }
 
@@ -458,7 +465,7 @@ static int moe_storage_async_prefetch_enqueue(
     const uint32_t depth = std::max<uint32_t>(1u, engine->storage_prefetch_queue_depth.load(std::memory_order_relaxed));
     if (engine->storage_async_prefetch_pending.load(std::memory_order_relaxed) >= depth) {
         engine->storage_async_prefetch_dropped.fetch_add(1, std::memory_order_relaxed);
-        return moe_storage_prefetch_inline_on_overflow_enabled() ? 0 : 1;
+        return moe_storage_prefetch_inline_on_overflow_enabled(engine) ? 0 : 1;
     }
     moe_storage_prefetch_request_t req{};
     req.shard = shard;
@@ -473,7 +480,7 @@ static int moe_storage_async_prefetch_enqueue(
         if (engine->storage_prefetch_stop.load(std::memory_order_acquire)) return 0;
         if (engine->storage_prefetch_queue.size() >= (size_t)depth) {
             engine->storage_async_prefetch_dropped.fetch_add(1, std::memory_order_relaxed);
-            if (!moe_storage_prefetch_inline_on_overflow_enabled()) {
+            if (!moe_storage_prefetch_inline_on_overflow_enabled(engine)) {
                 return 1;  // Drop prefetch instead of stalling token compute.
             }
             return 0;
