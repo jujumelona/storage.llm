@@ -2385,9 +2385,12 @@ static int moe_run_expert_triplet_row_batch_f32(
         for (uint32_t row = row_begin; row < row_end; ++row) {
             moe_tensor_row_fast_prefetch(&gate_view, row + 1u);
             moe_tensor_row_fast_prefetch(&up_view, row + 1u);
-            if (!moe_dot_tensor_fast_view_two_rows_batch(
-                    engine, &gate_view, &up_view, row,
-                    batch_hidden, batch_size, hidden_size, gate_values, up_values)) {
+            if (!moe_dot_tensor_fast_view_row_batch(
+                    engine, &gate_view, row,
+                    batch_hidden, batch_size, hidden_size, gate_values) ||
+                !moe_dot_tensor_fast_view_row_batch(
+                    engine, &up_view, row,
+                    batch_hidden, batch_size, hidden_size, up_values)) {
                 return 0;
             }
             for (uint32_t b = 0; b < batch_size; ++b) {
