@@ -233,15 +233,10 @@ int moe_pc_engine_lm_head_top1_f32(
             uint32_t t = start;
             for (; t + batch <= end; t += batch) {
                 alignas(32) float scores[batch];
-                for (uint32_t i = 0; i < batch; i += 2u) {
-                    float v0 = 0.0f;
-                    float v1 = 0.0f;
-                    if (!moe_raw_tensor_dot_two_rows(raw, t + i, hidden, hidden_count, &v0, &v1)) {
-                        return 0;
-                    }
-                    scores[i] = moe_apply_final_logit_softcap_cached(logit_softcap, v0);
-                    scores[i + 1u] = moe_apply_final_logit_softcap_cached(logit_softcap, v1);
-                    if (!std::isfinite(scores[i]) || !std::isfinite(scores[i + 1u])) {
+                for (uint32_t i = 0; i < batch; ++i) {
+                    scores[i] = moe_apply_final_logit_softcap_cached(
+                        logit_softcap, moe_raw_tensor_dot_row(raw, t + i, hidden, hidden_count));
+                    if (!std::isfinite(scores[i])) {
                         return 0;
                     }
                 }
@@ -485,15 +480,10 @@ int moe_pc_engine_lm_head_token_logprob_f32(
             uint32_t t = start;
             for (; t + batch <= end; t += batch) {
                 alignas(32) float scores[batch];
-                for (uint32_t i = 0; i < batch; i += 2u) {
-                    float v0 = 0.0f;
-                    float v1 = 0.0f;
-                    if (!moe_raw_tensor_dot_two_rows(raw, t + i, hidden, hidden_count, &v0, &v1)) {
-                        return 0;
-                    }
-                    scores[i] = moe_apply_final_logit_softcap_cached(logit_softcap, v0);
-                    scores[i + 1u] = moe_apply_final_logit_softcap_cached(logit_softcap, v1);
-                    if (!std::isfinite(scores[i]) || !std::isfinite(scores[i + 1u])) {
+                for (uint32_t i = 0; i < batch; ++i) {
+                    scores[i] = moe_apply_final_logit_softcap_cached(
+                        logit_softcap, moe_raw_tensor_dot_row(raw, t + i, hidden, hidden_count));
+                    if (!std::isfinite(scores[i])) {
                         return 0;
                     }
                 }
