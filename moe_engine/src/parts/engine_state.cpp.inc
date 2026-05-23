@@ -656,6 +656,10 @@ std::atomic<int> storage_format_plan_available{0};
     std::vector<uint64_t> qkv_head_state_fingerprints;
     std::vector<uint64_t> qkv_head_state_epochs;
     std::vector<uint32_t> qkv_head_state_filled_tokens;
+    std::vector<std::vector<float>> qkv_head_decode_keys;
+    std::vector<std::vector<float>> qkv_head_decode_values;
+    std::vector<uint32_t> qkv_head_decode_filled_tokens;
+    std::vector<uint64_t> qkv_head_decode_fingerprints;
     qkv_config_t qkv_cfg{};
     std::atomic<bool> qkv_cfg_initialized{false};
     uint32_t qkv_last_ctx = 0;  // Track context size for reallocation

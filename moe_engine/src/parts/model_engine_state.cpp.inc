@@ -116,6 +116,11 @@ static void moe_engine_reset_qkv_cache(moe_pc_engine* engine) {
     engine->qkv_head_state_heads.clear();
     engine->qkv_head_state_fingerprints.clear();
     engine->qkv_head_state_epochs.clear();
+    engine->qkv_head_state_filled_tokens.clear();
+    engine->qkv_head_decode_keys.clear();
+    engine->qkv_head_decode_values.clear();
+    engine->qkv_head_decode_filled_tokens.clear();
+    engine->qkv_head_decode_fingerprints.clear();
     engine->qkv_cfg_initialized.store(false, std::memory_order_release);
     engine->qkv_last_ctx = 0;
 }
