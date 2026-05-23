@@ -1322,11 +1322,6 @@ static int moe_layer_moe_mlp_f32(
         if (env_tile_cached > 0) {
             return std::max(1u, std::min<uint32_t>(env_tile_cached, 64u));
         }
-        if (moe_cpu_storage_env_truthy("STORAGELLM_CPU_STORAGE_MAX") ||
-            moe_cpu_storage_env_truthy("STORAGELLM_CPU_ONLY") ||
-            moe_cpu_storage_env_truthy("STORAGELLM_CPU_STORAGE_ENGINE")) {
-            return 4u;
-        }
         const uint64_t input_bytes = (uint64_t)input_floats * sizeof(float);
         if (input_bytes <= 16ull * 1024ull) return 16u;
         if (input_bytes <= 32ull * 1024ull) return 8u;
@@ -1446,15 +1441,7 @@ static int moe_layer_moe_mlp_f32(
             moe_profile_parallel_label_scope fused_down_rows_label("moe_mlp_down_accum_fused");
             static const uint32_t fused_down_block_rows = []() -> uint32_t {
                 const uint32_t env_block = moe_parse_env_u32("STORAGELLM_MLP_FUSED_DOWN_BLOCK_ROWS");
-                if (env_block > 0) {
-                    return std::max(1u, std::min<uint32_t>(env_block, 128u));
-                }
-                if (moe_cpu_storage_env_truthy("STORAGELLM_CPU_STORAGE_MAX") ||
-                    moe_cpu_storage_env_truthy("STORAGELLM_CPU_ONLY") ||
-                    moe_cpu_storage_env_truthy("STORAGELLM_CPU_STORAGE_ENGINE")) {
-                    return 4u;
-                }
-                return 16u;
+                return env_block > 0 ? std::max(1u, std::min<uint32_t>(env_block, 128u)) : 16u;
             }();
             const int down_fused_ok = moe_parallel_rows(engine, hidden_size, fused_down_block_rows, [&](uint32_t row) {
                 if (row >= hidden_size) {
