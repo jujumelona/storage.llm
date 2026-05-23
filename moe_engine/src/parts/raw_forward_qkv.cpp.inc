@@ -612,6 +612,64 @@ static int moe_qkv_append_layer_head_token(
     return 1;
 }
 
+struct moe_qkv_decode_tls_scratch {
+    std::vector<float> residual;
+    std::vector<float> s_times_r;
+    std::vector<float> qjl_signs;
+    std::vector<float> s_t_qjl;
+    std::vector<float> y_tilde;
+    std::vector<float> x_tilde;
+    std::vector<float> attention;
+    std::vector<float> rotated_q;
+    std::vector<float> work_qjl;
+    std::vector<int> indices;
+    std::vector<int> work_codes;
+};
+
+static int moe_qkv_make_decode_local_state(
+    const qkv_state_t* src,
+    uint32_t context_tokens,
+    uint32_t head_dim,
+    qkv_state_t* dst
+) {
+    if (!src || !dst || context_tokens == 0 || head_dim == 0 || head_dim > 16384u) {
+        return 0;
+    }
+    thread_local moe_qkv_decode_tls_scratch tls;
+    try {
+        tls.residual.resize(head_dim);
+        tls.s_times_r.resize(head_dim);
+        tls.qjl_signs.resize(head_dim);
+        tls.s_t_qjl.resize(head_dim);
+        tls.y_tilde.resize(head_dim);
+        tls.x_tilde.resize(head_dim);
+        tls.attention.resize(context_tokens);
+        tls.rotated_q.resize(head_dim);
+        tls.indices.resize(head_dim);
+        tls.work_codes.resize(head_dim);
+        tls.work_qjl.resize(head_dim);
+    } catch (const std::bad_alloc&) {
+        return 0;
+    }
+    *dst = *src;
+    dst->scratch_residual = tls.residual.data();
+    dst->scratch_s_times_r = tls.s_times_r.data();
+    dst->scratch_qjl_signs = tls.qjl_signs.data();
+    dst->scratch_s_t_qjl = tls.s_t_qjl.data();
+    dst->scratch_y_tilde = tls.y_tilde.data();
+    dst->scratch_x_tilde = tls.x_tilde.data();
+    dst->scratch_attention = tls.attention.data();
+    dst->scratch_rotated_q = tls.rotated_q.data();
+    dst->scratch_indices = tls.indices.data();
+    dst->work_codes_buf = tls.work_codes.data();
+    dst->work_qjl_buf = tls.work_qjl.data();
+    dst->work_buf_stride = (int)head_dim;
+    dst->work_buf_workers = 1;
+    dst->thread_pool = nullptr;
+    dst->computed_workers = 1;
+    return 1;
+}
+
 static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
     moe_pc_engine_t* engine,
     uint32_t layer,
@@ -640,18 +698,22 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
     if (!(score_scale > 0.0f) || !std::isfinite(score_scale)) {
         return 0;
     }
-    std::lock_guard<std::mutex> head_guard(*engine->qkv_head_state_locks[slot_index]);
-    slot = &engine->qkv_head_state_slots[slot_index];
-    if (slot_index >= engine->qkv_head_state_valid.size() ||
-        !engine->qkv_head_state_valid[slot_index] ||
-        slot_index >= engine->qkv_head_state_filled_tokens.size() ||
-        engine->qkv_head_state_filled_tokens[slot_index] < context_tokens ||
-        slot->n_tokens < (int)context_tokens) {
-        return 0;
-    }
     qkv_config_t qkv_decode_cfg = engine->qkv_cfg;
     qkv_decode_cfg.attention_score_scale = score_scale;
     qkv_decode_cfg.attention_logit_softcap = attn_logit_softcap;
+    qkv_state_t local_slot{};
+    {
+        std::lock_guard<std::mutex> head_guard(*engine->qkv_head_state_locks[slot_index]);
+        slot = &engine->qkv_head_state_slots[slot_index];
+        if (slot_index >= engine->qkv_head_state_valid.size() ||
+            !engine->qkv_head_state_valid[slot_index] ||
+            slot_index >= engine->qkv_head_state_filled_tokens.size() ||
+            engine->qkv_head_state_filled_tokens[slot_index] < context_tokens ||
+            slot->n_tokens < (int)context_tokens ||
+            !moe_qkv_make_decode_local_state(slot, context_tokens, head_dim, &local_slot)) {
+            return 0;
+        }
+    }
 #ifdef STORAGELLM_PPL_DIAG_ENABLED
     storagellm_ppl_diag_qkv_decode_enter(
         layer,
@@ -663,14 +725,14 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
         score_scale,
         attn_logit_softcap,
         query,
-        slot,
+        &local_slot,
         &qkv_decode_cfg);
 #endif
     const int ok = (current_key && current_value)
         ? qkv_attention_decode_exact_current(
-            query, slot, &qkv_decode_cfg, context_tokens, head_dim,
+            query, &local_slot, &qkv_decode_cfg, context_tokens, head_dim,
             current_key, current_value, output)
-        : qkv_attention_decode(query, slot, &qkv_decode_cfg, context_tokens, head_dim, output);
+        : qkv_attention_decode(query, &local_slot, &qkv_decode_cfg, context_tokens, head_dim, output);
     if (!ok) {
 #ifdef STORAGELLM_PPL_DIAG_ENABLED
         storagellm_ppl_diag_qkv_decode_failed(
@@ -678,7 +740,7 @@ static int moe_pc_engine_attention_decode_layer_head_qkv_f32(
             kv_head,
             head_stride,
             query,
-            slot,
+            &local_slot,
             &qkv_decode_cfg,
             context_tokens,
             capacity_tokens,
