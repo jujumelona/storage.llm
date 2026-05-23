@@ -2924,14 +2924,13 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
     moe_build_active_expert_groups(engine, layer, grouped, &active_experts);
     const bool gpu_batch_ready = moe_gpu_batch_expert_kernel_available(engine) != 0;
     for (const auto& group : active_experts) {
+        if (group.current_tier == moe_TIER_VRAM) {
+            continue;
+        }
+        if (group.assignment_count < engine->io_config.expert_group_gpu_min_assignments) {
+            continue;
+        }
         const moe_tier_t target_tier = gpu_batch_ready ? moe_TIER_VRAM : moe_TIER_RAM;
-        if (tier_speed_rank(group.current_tier) <= tier_speed_rank(target_tier)) {
-            continue;
-        }
-        if (gpu_batch_ready &&
-            group.assignment_count < engine->io_config.expert_group_gpu_min_assignments) {
-            continue;
-        }
         moe_pc_engine_prefetch_expert_triplet_impl(
             engine,
             layer,
