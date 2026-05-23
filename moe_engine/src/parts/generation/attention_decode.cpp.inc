@@ -534,7 +534,7 @@
         moe_profile_parallel_label_scope rows_label("attn_heads");
         const int qkv_group_decode =
             qkv_decode && !shared_kv_reuse && v_head_dim == head_dim &&
-            num_kv_heads > 0u && num_heads >= num_kv_heads * 2u;
+            num_kv_heads > 0u && num_heads >= num_kv_heads * 4u;
         const uint32_t row_count = qkv_group_decode ? num_kv_heads : num_heads;
         const uint32_t head_block_rows =
             ((uint64_t)seq_len * (uint64_t)head_dim >= 1024ull && row_count > 1u) ? 1u : 0u;
