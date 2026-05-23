@@ -530,12 +530,13 @@
     }
     const uint64_t heads_start_us = moe_profile_now_us();
     std::fill(s->attn_value.begin(), s->attn_value.begin() + v_total_dim, 0.0f);
+    uint32_t qkv_group_splits = 1u;
     {
         moe_profile_parallel_label_scope rows_label("attn_heads");
         const int qkv_group_decode =
             qkv_decode && !shared_kv_reuse && v_head_dim == head_dim &&
             num_kv_heads > 0u && num_heads > num_kv_heads;
-        const uint32_t qkv_group_splits = qkv_group_decode
+        qkv_group_splits = qkv_group_decode
             ? std::max<uint32_t>(
                 1u,
                 std::min<uint32_t>(
