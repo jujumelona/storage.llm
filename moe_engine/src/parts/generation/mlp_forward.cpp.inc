@@ -3556,7 +3556,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         }
     }
     const int cpu_group_parallel =
-        !gpu_batch_ready &&
+        (!gpu_batch_ready || !engine->config.prefer_gpu || tier_budget(engine, moe_TIER_VRAM) == 0) &&
         grouped_done_chunks.empty() &&
         active_experts.size() > 1u &&
         row_hw_threads() > 1u;
