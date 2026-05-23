@@ -535,18 +535,31 @@
         const int qkv_group_decode =
             qkv_decode && !shared_kv_reuse && v_head_dim == head_dim &&
             num_kv_heads > 0u && num_heads > num_kv_heads;
-        const uint32_t row_count = qkv_group_decode ? num_kv_heads : num_heads;
+        const uint32_t qkv_group_max_query_heads = qkv_group_decode
+            ? (uint32_t)(((uint64_t)num_heads + (uint64_t)num_kv_heads - 1ull) /
+                         (uint64_t)num_kv_heads)
+            : 1u;
+        const uint32_t qkv_group_query_chunk =
+            qkv_group_max_query_heads > 4u ? 4u : qkv_group_max_query_heads;
+        const uint32_t qkv_group_chunks_per_kv = qkv_group_decode
+            ? (uint32_t)(((uint64_t)qkv_group_max_query_heads + (uint64_t)qkv_group_query_chunk - 1ull) /
+                         (uint64_t)qkv_group_query_chunk)
+            : 1u;
+        const uint32_t row_count = qkv_group_decode ? num_kv_heads * qkv_group_chunks_per_kv : num_heads;
         const uint32_t head_block_rows =
             ((uint64_t)seq_len * (uint64_t)head_dim >= 1024ull && row_count > 1u) ? 1u : 0u;
         if (!moe_parallel_rows(engine, row_count, head_block_rows, [&](uint32_t row) {
         if (qkv_group_decode) {
-            const uint32_t kv_h = row;
-            const uint32_t h_begin =
+            const uint32_t kv_h = row / qkv_group_chunks_per_kv;
+            const uint32_t chunk_index = row % qkv_group_chunks_per_kv;
+            const uint32_t full_h_begin =
                 (uint32_t)(((uint64_t)kv_h * (uint64_t)num_heads + (uint64_t)num_kv_heads - 1ull) /
                            (uint64_t)num_kv_heads);
-            const uint32_t h_end =
+            const uint32_t full_h_end =
                 (uint32_t)((((uint64_t)kv_h + 1ull) * (uint64_t)num_heads + (uint64_t)num_kv_heads - 1ull) /
                            (uint64_t)num_kv_heads);
+            const uint32_t h_begin = full_h_begin + chunk_index * qkv_group_query_chunk;
+            const uint32_t h_end = std::min<uint32_t>(full_h_end, h_begin + qkv_group_query_chunk);
             if (h_begin >= h_end || h_end > num_heads) {
                 return 0;
             }
