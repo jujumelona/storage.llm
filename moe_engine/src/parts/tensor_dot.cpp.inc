@@ -631,6 +631,22 @@ static int moe_dot_tensor_record_row_batch(
     const uint8_t* packed = static_cast<const uint8_t*>(mmap_get_ptr(shard, static_cast<size_t>(row_offset)));
     if (!packed) return 0;
 
+    if (weight_format == moe_WEIGHT_ENCODING_MXFP4) {
+        moe_dot_gguf_mxfp4_row_batch_strided(
+            packed,
+            batch_x,
+            batch_size,
+            rec->info.cols,
+            rec->weight_row_bytes,
+            out_values);
+        for (uint32_t b = 0; b < batch_size; ++b) {
+            if (!std::isfinite(out_values[b])) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+
     // TODO: A fully optimized SIMD SGEMM kernel would interleave the token vectors
     // to maximize register usage. For now, we reuse the L1 cache for the packed weights.
     for (uint32_t b = 0; b < batch_size; ++b) {
@@ -654,9 +670,6 @@ static int moe_dot_tensor_record_row_batch(
         }
         else if (weight_format == moe_WEIGHT_ENCODING_NVFP4) {
             out_values[b] = moe_dot_fp4_row(*rec, shard, packed, batch_x[b], engine, row);
-        }
-        else if (weight_format == moe_WEIGHT_ENCODING_MXFP4) {
-            out_values[b] = moe_dot_gguf_mxfp4_row_strided(packed, batch_x[b], rec->info.cols, rec->weight_row_bytes);
         }
         else if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q4_0) {
             out_values[b] = moe_dot_gguf_q4_0_row(packed, batch_x[b], rec->info.cols);
