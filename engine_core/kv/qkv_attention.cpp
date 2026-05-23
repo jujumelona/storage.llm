@@ -11,6 +11,11 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -40,6 +45,64 @@ static float qkv_attention_apply_logit_softcap(float cap, float score) {
         return score;
     }
     return tanhf(score / cap) * cap;
+}
+
+static void qkv_attention_project_qjl_query(
+    const float* qjl_matrix,
+    const float* query,
+    int dim,
+    float* out
+) {
+    if (!qjl_matrix || !query || !out || dim <= 0) {
+        return;
+    }
+#if defined(__AVX2__)
+    for (int i = 0; i < dim; ++i) {
+        const float* row = qjl_matrix + (size_t)i * (size_t)dim;
+        __m256 sum_vec = _mm256_setzero_ps();
+        int j = 0;
+        for (; j + 7 < dim; j += 8) {
+            const __m256 a = _mm256_loadu_ps(row + j);
+            const __m256 b = _mm256_loadu_ps(query + j);
+            sum_vec = _mm256_add_ps(sum_vec, _mm256_mul_ps(a, b));
+        }
+        __m128 hi = _mm256_extractf128_ps(sum_vec, 1);
+        __m128 lo = _mm256_castps256_ps128(sum_vec);
+        __m128 sum4 = _mm_add_ps(lo, hi);
+        sum4 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+        sum4 = _mm_add_ss(sum4, _mm_shuffle_ps(sum4, sum4, 1));
+        float sum = _mm_cvtss_f32(sum4);
+        for (; j < dim; ++j) {
+            sum += row[j] * query[j];
+        }
+        out[i] = sum;
+    }
+#elif defined(__ARM_NEON)
+    for (int i = 0; i < dim; ++i) {
+        const float* row = qjl_matrix + (size_t)i * (size_t)dim;
+        float32x4_t sum_vec = vdupq_n_f32(0.0f);
+        int j = 0;
+        for (; j + 3 < dim; j += 4) {
+            const float32x4_t a = vld1q_f32(row + j);
+            const float32x4_t b = vld1q_f32(query + j);
+            sum_vec = vmlaq_f32(sum_vec, a, b);
+        }
+        float sum = vaddvq_f32(sum_vec);
+        for (; j < dim; ++j) {
+            sum += row[j] * query[j];
+        }
+        out[i] = sum;
+    }
+#else
+    for (int i = 0; i < dim; ++i) {
+        const float* row = qjl_matrix + (size_t)i * (size_t)dim;
+        float sum = 0.0f;
+        for (int j = 0; j < dim; ++j) {
+            sum += row[j] * query[j];
+        }
+        out[i] = sum;
+    }
+#endif
 }
 
 // Paper: Attention decode directly on quantized KV cache
@@ -147,15 +210,7 @@ int qkv_attention_decode_impl(
     // q_eff is only for the rotated MSE codebook dot product.
     if (use_qjl_key_residual) {
         if (!s_q_precomputed || !qjl_z) return 0;
-        // BUGFIX 356: qjl_matrix 범위 체크
-        for (int i = 0; i < d; i++) {
-            float sum = 0.0f;
-            for (int j = 0; j < d; j++) {
-                size_t idx = (size_t)i * (size_t)d + (size_t)j;
-                sum += s->qjl_matrix[idx] * query[j];
-            }
-            s_q_precomputed[i] = sum;
-        }
+        qkv_attention_project_qjl_query(s->qjl_matrix, query, d, s_q_precomputed);
     }
 
     // Parallel K scoring for large context (n >= 1024)
