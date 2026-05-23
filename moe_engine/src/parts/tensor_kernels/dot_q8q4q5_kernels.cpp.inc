@@ -676,28 +676,136 @@ static void moe_dot_gguf_mxfp4_row_batch_strided(
     if (!packed || !batch_x || !out_values || batch_size == 0) {
         return;
     }
+    if (batch_size == 1u) {
+        out_values[0] = batch_x[0]
+            ? moe_dot_gguf_mxfp4_row_strided(packed, batch_x[0], cols, physical_row_bytes)
+            : 0.0f;
+        return;
+    }
     const moe_mxfp4_row_layout_t layout = moe_mxfp4_row_layout_for_bytes(cols, physical_row_bytes);
     const float* table = moe_mxfp4_value_table();
     const int pairwise_order = moe_mxfp4_pairwise_nibble_order_enabled();
     for (uint32_t b = 0; b < batch_size; ++b) {
-        const float* x = batch_x[b];
-        if (!x) {
-            out_values[b] = 0.0f;
-            continue;
-        }
-        const uint8_t* row = packed;
-        float acc = 0.0f;
-        uint32_t start = 0;
-        while (start < cols) {
-            const float scale = moe_e8m0_to_f32_half(row[0]);
-            const uint8_t* qs = row + 1u;
-            const uint32_t limit = std::min<uint32_t>(layout.block_cols, cols - start);
-            const float block_acc = moe_mxfp4_dot_block(qs, x, start, limit, layout, table, pairwise_order);
-            acc += block_acc * scale;
+        out_values[b] = 0.0f;
+    }
+    uint32_t start = 0;
+    const uint8_t* row = packed;
+    while (start < cols) {
+        const float scale = moe_e8m0_to_f32_half(row[0]);
+        const uint8_t* qs = row + 1u;
+        const uint32_t limit = std::min<uint32_t>(layout.block_cols, cols - start);
+#if defined(__AVX2__)
+        if (!pairwise_order && limit == 32u && !layout.bytewise_codes) {
+            const __m128i mask = _mm_set1_epi8(0x0f);
+            auto lookup = [&](const uint8_t* p, int high) -> __m256 {
+                __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+                bytes = high ? _mm_and_si128(_mm_srli_epi16(bytes, 4), mask)
+                             : _mm_and_si128(bytes, mask);
+                const __m256i idx = _mm256_cvtepu8_epi32(bytes);
+                return _mm256_i32gather_ps(table, idx, 4);
+            };
+            const __m256 w0 = _mm256_mul_ps(lookup(qs, 0), _mm256_set1_ps(scale));
+            const __m256 w1 = _mm256_mul_ps(lookup(qs + 8u, 0), _mm256_set1_ps(scale));
+            const __m256 w2 = _mm256_mul_ps(lookup(qs, 1), _mm256_set1_ps(scale));
+            const __m256 w3 = _mm256_mul_ps(lookup(qs + 8u, 1), _mm256_set1_ps(scale));
+            for (uint32_t b = 0; b < batch_size; ++b) {
+                const float* x = batch_x[b];
+                if (!x) {
+                    continue;
+                }
+                __m256 acc = _mm256_setzero_ps();
+                acc = moe_madd_ps(w0, _mm256_loadu_ps(x + start), acc);
+                acc = moe_madd_ps(w1, _mm256_loadu_ps(x + start + 8u), acc);
+                acc = moe_madd_ps(w2, _mm256_loadu_ps(x + start + 16u), acc);
+                acc = moe_madd_ps(w3, _mm256_loadu_ps(x + start + 24u), acc);
+                out_values[b] += moe_dot_hsum256_ps(acc);
+            }
             start += limit;
             row += layout.block_bytes;
+            continue;
         }
-        out_values[b] = acc;
+        if (!pairwise_order && limit == 16u && layout.bytewise_codes) {
+            const __m128i mask = _mm_set1_epi8(0x0f);
+            auto lookup_codes = [&](const uint8_t* p) -> __m256 {
+                const __m128i bytes = _mm_and_si128(
+                    _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p)),
+                    mask);
+                const __m256i idx = _mm256_cvtepu8_epi32(bytes);
+                return _mm256_i32gather_ps(table, idx, 4);
+            };
+            const __m256 w0 = _mm256_mul_ps(lookup_codes(qs), _mm256_set1_ps(scale));
+            const __m256 w1 = _mm256_mul_ps(lookup_codes(qs + 8u), _mm256_set1_ps(scale));
+            for (uint32_t b = 0; b < batch_size; ++b) {
+                const float* x = batch_x[b];
+                if (!x) {
+                    continue;
+                }
+                __m256 acc = _mm256_setzero_ps();
+                acc = moe_madd_ps(w0, _mm256_loadu_ps(x + start), acc);
+                acc = moe_madd_ps(w1, _mm256_loadu_ps(x + start + 8u), acc);
+                out_values[b] += moe_dot_hsum256_ps(acc);
+            }
+            start += limit;
+            row += layout.block_bytes;
+            continue;
+        }
+#endif
+        if (layout.bytewise_codes) {
+            for (uint32_t j = 0; j < limit; ++j) {
+                const float w = table[qs[j] & 0x0fu] * scale;
+                for (uint32_t b = 0; b < batch_size; ++b) {
+                    const float* x = batch_x[b];
+                    if (x) {
+                        out_values[b] += w * x[start + j];
+                    }
+                }
+            }
+        } else if (pairwise_order) {
+            uint32_t j = 0;
+            for (; j + 1u < limit; j += 2u) {
+                const uint8_t byte = qs[j >> 1u];
+                const float w0 = table[byte & 0x0fu] * scale;
+                const float w1 = table[byte >> 4] * scale;
+                for (uint32_t b = 0; b < batch_size; ++b) {
+                    const float* x = batch_x[b];
+                    if (x) {
+                        out_values[b] += w0 * x[start + j];
+                        out_values[b] += w1 * x[start + j + 1u];
+                    }
+                }
+            }
+            if (j < limit) {
+                const float w = table[qs[j >> 1u] & 0x0fu] * scale;
+                for (uint32_t b = 0; b < batch_size; ++b) {
+                    const float* x = batch_x[b];
+                    if (x) {
+                        out_values[b] += w * x[start + j];
+                    }
+                }
+            }
+        } else {
+            const uint32_t low_limit = std::min<uint32_t>(limit, 16u);
+            for (uint32_t j = 0; j < low_limit; ++j) {
+                const float w = table[qs[j] & 0x0fu] * scale;
+                for (uint32_t b = 0; b < batch_size; ++b) {
+                    const float* x = batch_x[b];
+                    if (x) {
+                        out_values[b] += w * x[start + j];
+                    }
+                }
+            }
+            for (uint32_t j = 16u; j < limit; ++j) {
+                const float w = table[qs[j - 16u] >> 4] * scale;
+                for (uint32_t b = 0; b < batch_size; ++b) {
+                    const float* x = batch_x[b];
+                    if (x) {
+                        out_values[b] += w * x[start + j];
+                    }
+                }
+            }
+        }
+        start += limit;
+        row += layout.block_bytes;
     }
 }
 
