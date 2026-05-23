@@ -1299,11 +1299,30 @@ static int moe_layer_moe_mlp_f32(
         work[e].up = nullptr;
         work[e].out = nullptr;
     }
+    const int q8_gate_up_enabled =
+        gate_effective_format == moe_WEIGHT_ENCODING_MXFP4 &&
+        up_effective_format == moe_WEIGHT_ENCODING_MXFP4;
+    const uint32_t q8_hidden_blocks = moe_q8_0_block_count(hidden_size);
+    const int8_t* q8_hidden = nullptr;
+    const float* q8_hidden_scales = nullptr;
+    if (q8_gate_up_enabled) {
+        const size_t q8_hidden_values = (size_t)q8_hidden_blocks * 32u;
+        if (s->cpu_q8_hidden.size() < q8_hidden_values) {
+            s->cpu_q8_hidden.resize(q8_hidden_values);
+        }
+        if (s->cpu_q8_hidden_scales.size() < q8_hidden_blocks) {
+            s->cpu_q8_hidden_scales.resize(q8_hidden_blocks);
+        }
+        moe_quantize_q8_0_activation_f32(
+            expert_input, hidden_size, s->cpu_q8_hidden.data(), s->cpu_q8_hidden_scales.data());
+        q8_hidden = s->cpu_q8_hidden.data();
+        q8_hidden_scales = s->cpu_q8_hidden_scales.data();
+    }
     moe_profile_log(
         "mlp_moe_alloc",
-        "layer=%d selected=%zu intermediate=%u hidden=%u gate_floats=%zu out_floats_deferred=%zu ms=%.3f",
+        "layer=%d selected=%zu intermediate=%u hidden=%u gate_floats=%zu out_floats_deferred=%zu q8_gate_up=%d ms=%.3f",
         layer, num_selected, expert_intermediate, hidden_size,
-        needed_gate, needed_out, moe_profile_elapsed_ms(alloc_start_us));
+        needed_gate, needed_out, q8_gate_up_enabled, moe_profile_elapsed_ms(alloc_start_us));
 
     // Phase 2a: Flat dispatch: gate+up+SiLU for all experts simultaneously.
     // Total rows = num_selected * intermediate_size, row i maps to expert e and row r.
@@ -1369,9 +1388,14 @@ static int moe_layer_moe_mlp_f32(
             float up_v = 0.0f;
             moe_tensor_row_fast_prefetch(&shards[e].gate_view, r + 1u);
             moe_tensor_row_fast_prefetch(&shards[e].up_view, r + 1u);
-            if (!moe_dot_tensor_fast_view_two_rows(
+            const int dot_ok = q8_hidden ?
+                moe_dot_tensor_fast_view_two_rows_q8(
                     engine, &shards[e].gate_view, &shards[e].up_view, r,
-                    expert_input, hidden_size, &gate_v, &up_v)) {
+                    q8_hidden, q8_hidden_scales, hidden_size, &gate_v, &up_v) :
+                moe_dot_tensor_fast_view_two_rows(
+                    engine, &shards[e].gate_view, &shards[e].up_view, r,
+                    expert_input, hidden_size, &gate_v, &up_v);
+            if (!dot_ok) {
                 gate_up_failed.store(1, std::memory_order_relaxed);
                 return 1;
             }
@@ -1394,6 +1418,32 @@ static int moe_layer_moe_mlp_f32(
     // expert_ready already holds the stable map readiness snapshot.  Gate/up
     // failures are fatal in CPUStorageEngine mode, so no per-expert atomic
     // refresh is needed before down accumulation.
+    const int q8_down_enabled = down_effective_format == moe_WEIGHT_ENCODING_MXFP4;
+    const uint32_t q8_gate_blocks = moe_q8_0_block_count(expert_intermediate);
+    const int8_t* q8_gate_base = nullptr;
+    const float* q8_gate_scale_base = nullptr;
+    if (q8_down_enabled) {
+        const size_t q8_gate_values = (size_t)num_selected * (size_t)q8_gate_blocks * 32u;
+        const size_t q8_gate_scale_values = (size_t)num_selected * (size_t)q8_gate_blocks;
+        if (s->cpu_q8_gate.size() < q8_gate_values) {
+            s->cpu_q8_gate.resize(q8_gate_values);
+        }
+        if (s->cpu_q8_gate_scales.size() < q8_gate_scale_values) {
+            s->cpu_q8_gate_scales.resize(q8_gate_scale_values);
+        }
+        for (size_t e = 0; e < num_selected; ++e) {
+            if (!expert_ready[e]) {
+                continue;
+            }
+            moe_quantize_q8_0_activation_f32(
+                work[e].gate,
+                expert_intermediate,
+                s->cpu_q8_gate.data() + e * (size_t)q8_gate_blocks * 32u,
+                s->cpu_q8_gate_scales.data() + e * (size_t)q8_gate_blocks);
+        }
+        q8_gate_base = s->cpu_q8_gate.data();
+        q8_gate_scale_base = s->cpu_q8_gate_scales.data();
+    }
 
     // Phase 2b fast path: fuse down_proj + expert scaling + router-weighted accumulation.
     // CPU-only decode is memory-bandwidth limited.  Materializing out_pool for every
@@ -1456,8 +1506,16 @@ static int moe_layer_moe_mlp_f32(
                     const uint32_t e = active_experts[ai];
                     float v = 0.0f;
                     moe_tensor_row_fast_prefetch(&shards[e].down_view, row + 1u);
-                    if (!moe_dot_tensor_fast_view_row(engine, &shards[e].down_view,
-                            row, work[e].gate, expert_intermediate, &v) || !std::isfinite(v)) {
+                    const int dot_ok = q8_gate_base ?
+                        moe_dot_tensor_fast_view_row_q8(
+                            engine, &shards[e].down_view, row,
+                            q8_gate_base + e * (size_t)q8_gate_blocks * 32u,
+                            q8_gate_scale_base + e * (size_t)q8_gate_blocks,
+                            expert_intermediate, &v) :
+                        moe_dot_tensor_fast_view_row(
+                            engine, &shards[e].down_view, row,
+                            work[e].gate, expert_intermediate, &v);
+                    if (!dot_ok || !std::isfinite(v)) {
                         fused_ok.store(0, std::memory_order_relaxed);
                         return 1;
                     }
@@ -1557,8 +1615,16 @@ static int moe_layer_moe_mlp_f32(
         }
         for (uint32_t r = row_begin; r < row_end; ++r) {
             moe_tensor_row_fast_prefetch(&shards[e].down_view, r + 1u);
-            if (!moe_dot_tensor_fast_view_row(engine, &shards[e].down_view,
-                    r, work[e].gate, expert_intermediate, &work[e].out[r])) {
+            const int dot_ok = q8_gate_base ?
+                moe_dot_tensor_fast_view_row_q8(
+                    engine, &shards[e].down_view, r,
+                    q8_gate_base + e * (size_t)q8_gate_blocks * 32u,
+                    q8_gate_scale_base + e * (size_t)q8_gate_blocks,
+                    expert_intermediate, &work[e].out[r]) :
+                moe_dot_tensor_fast_view_row(
+                    engine, &shards[e].down_view, r,
+                    work[e].gate, expert_intermediate, &work[e].out[r]);
+            if (!dot_ok) {
                 down_failed.store(1, std::memory_order_relaxed);
                 return 1;
             }

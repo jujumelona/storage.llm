@@ -55,6 +55,10 @@ struct moe_decode_scratch {
     std::vector<float> cpu_down_scales;
     std::vector<moe_cpu_expert_plan_t> cpu_expert_plan;
     std::vector<uint32_t> cpu_active_expert_indices;
+    std::vector<int8_t> cpu_q8_hidden;
+    std::vector<float> cpu_q8_hidden_scales;
+    std::vector<int8_t> cpu_q8_gate;
+    std::vector<float> cpu_q8_gate_scales;
     std::vector<float> ple_inputs;
     std::vector<float> ple_projected;
     // Legacy/plain KV cache. QKV-only models must not allocate or use this; it
@@ -192,6 +196,10 @@ static void moe_decode_scratch_drop_transient_buffers(moe_pc_engine* engine, moe
     std::vector<float>().swap(s->cpu_down_scales);
     std::vector<moe_cpu_expert_plan_t>().swap(s->cpu_expert_plan);
     std::vector<uint32_t>().swap(s->cpu_active_expert_indices);
+    std::vector<int8_t>().swap(s->cpu_q8_hidden);
+    std::vector<float>().swap(s->cpu_q8_hidden_scales);
+    std::vector<int8_t>().swap(s->cpu_q8_gate);
+    std::vector<float>().swap(s->cpu_q8_gate_scales);
     std::vector<float>().swap(s->ple_inputs);
     std::vector<float>().swap(s->ple_projected);
     std::vector<float>().swap(s->q_a);
@@ -393,6 +401,12 @@ static int moe_decode_scratch_resize(
         s->cpu_expert_ready.resize(moe_MOE_TOP_EXPERTS);
         s->cpu_down_scales.resize(moe_MOE_TOP_EXPERTS);
         s->cpu_active_expert_indices.reserve(moe_MOE_TOP_EXPERTS);
+        const uint32_t q8_hidden_blocks = moe_q8_0_block_count(hidden);
+        const uint32_t q8_expert_blocks = moe_q8_0_block_count(expert_intermediate);
+        s->cpu_q8_hidden.resize((size_t)q8_hidden_blocks * 32u);
+        s->cpu_q8_hidden_scales.resize(q8_hidden_blocks);
+        s->cpu_q8_gate.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)q8_expert_blocks * 32u);
+        s->cpu_q8_gate_scales.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)q8_expert_blocks);
         s->expert_gate_pool.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)expert_intermediate);
         s->expert_up_pool.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)expert_intermediate);
         // CPUStorageEngine fuses down+accumulation and normally never needs
@@ -427,6 +441,10 @@ static int moe_decode_scratch_resize(
             s->cpu_expert_ready.shrink_to_fit();
             s->cpu_down_scales.shrink_to_fit();
             s->cpu_active_expert_indices.shrink_to_fit();
+            s->cpu_q8_hidden.shrink_to_fit();
+            s->cpu_q8_hidden_scales.shrink_to_fit();
+            s->cpu_q8_gate.shrink_to_fit();
+            s->cpu_q8_gate_scales.shrink_to_fit();
         }
         moe_rope_table_resize(&s->rope_k_cos, &s->rope_k_sin, cfg.qk_rope_head_dim, cfg.rope_theta, cfg.rope_table_len);
         moe_rope_table_resize(&s->rope_q_cos, &s->rope_q_sin, cfg.qk_rope_head_dim, cfg.rope_theta, cfg.rope_table_len);

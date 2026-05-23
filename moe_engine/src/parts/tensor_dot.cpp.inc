@@ -607,6 +607,58 @@ static int moe_dot_tensor_fast_view_row_batch(
     return 1;
 }
 
+static int moe_dot_tensor_fast_view_row_q8(
+    moe_pc_engine_t* engine,
+    const moe_tensor_row_fast_view_t* view,
+    uint32_t row,
+    const int8_t* q,
+    const float* q_scales,
+    uint32_t x_count,
+    float* out_value
+) {
+    if (!engine || !view || !view->rec || !q || !q_scales || !out_value || x_count != view->cols) {
+        return 0;
+    }
+    const uint8_t* packed = moe_tensor_row_fast_ptr(view, row);
+    if (!packed) {
+        return 0;
+    }
+    if (view->weight_format != moe_WEIGHT_ENCODING_MXFP4) {
+        return 0;
+    }
+    *out_value = moe_dot_gguf_mxfp4_row_q8_strided(packed, q, q_scales, view->cols, view->row_bytes);
+    return std::isfinite(*out_value) ? 1 : 0;
+}
+
+static int moe_dot_tensor_fast_view_two_rows_q8(
+    moe_pc_engine_t* engine,
+    const moe_tensor_row_fast_view_t* a,
+    const moe_tensor_row_fast_view_t* b,
+    uint32_t row,
+    const int8_t* q,
+    const float* q_scales,
+    uint32_t x_count,
+    float* out_a,
+    float* out_b
+) {
+    if (!engine || !a || !b || !q || !q_scales || !out_a || !out_b ||
+        a->cols != b->cols || x_count != a->cols) {
+        return 0;
+    }
+    if (a->weight_format != moe_WEIGHT_ENCODING_MXFP4 ||
+        b->weight_format != moe_WEIGHT_ENCODING_MXFP4) {
+        return 0;
+    }
+    const uint8_t* pa = moe_tensor_row_fast_ptr(a, row);
+    const uint8_t* pb = moe_tensor_row_fast_ptr(b, row);
+    if (!pa || !pb) {
+        return 0;
+    }
+    *out_a = moe_dot_gguf_mxfp4_row_q8_strided(pa, q, q_scales, a->cols, a->row_bytes);
+    *out_b = moe_dot_gguf_mxfp4_row_q8_strided(pb, q, q_scales, b->cols, b->row_bytes);
+    return std::isfinite(*out_a) && std::isfinite(*out_b) ? 1 : 0;
+}
+
 static int moe_dot_tensor_fast_view_two_rows(
     moe_pc_engine_t* engine,
     const moe_tensor_row_fast_view_t* a,
