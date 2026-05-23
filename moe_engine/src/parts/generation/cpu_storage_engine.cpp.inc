@@ -1440,15 +1440,13 @@ static void moe_cpu_storage_after_router_selected(
 ) {
     if (!engine || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
     if (layer < 0 || selected_experts.empty()) return;
-    if (!engine->cpu_only_runtime.load(std::memory_order_relaxed)) {
-        moe_pc_engine_prefetch_moe_lookahead(
-            engine,
-            (int)layer,
-            selected_experts.data(),
-            (uint32_t)selected_experts.size(),
-            nullptr,
-            0);
-    }
+    moe_pc_engine_prefetch_moe_lookahead(
+        engine,
+        (int)layer,
+        selected_experts.data(),
+        (uint32_t)selected_experts.size(),
+        nullptr,
+        0);
 
     // Storage-required mode: router-selected experts are no longer speculative.
     // Use the per-(layer, expert) index built from JUJU/IDX offsets; this avoids
