@@ -8,11 +8,6 @@
 #include <string.h>
 #include <climits>
 #include <algorithm>
-#if defined(__AVX2__)
-#include <immintrin.h>
-#elif defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -45,34 +40,11 @@ static int qkv_apply_split_rotation_inverse_deq(
 
 static int qkv_project_qjl_t_deq(const float* matrix, const float* signs, float* out, int dim) {
     if (!matrix || !signs || !out || dim <= 0 || dim > 16384) return 0;
-    memset(out, 0, (size_t)dim * sizeof(float));
-    for (int j = 0; j < dim; ++j) {
-        const float sign = signs[j];
-        const float* row = matrix + (size_t)j * (size_t)dim;
-        int i = 0;
-#if defined(__AVX2__)
-        const __m256 sign_vec = _mm256_set1_ps(sign);
-        for (; i + 7 < dim; i += 8) {
-            const __m256 acc = _mm256_loadu_ps(out + i);
-            const __m256 m = _mm256_loadu_ps(row + i);
-            _mm256_storeu_ps(out + i, _mm256_add_ps(acc, _mm256_mul_ps(m, sign_vec)));
-        }
-#elif defined(__ARM_NEON)
-        const float32x4_t sign_vec = vdupq_n_f32(sign);
-        for (; i + 3 < dim; i += 4) {
-            const float32x4_t acc = vld1q_f32(out + i);
-            const float32x4_t m = vld1q_f32(row + i);
-            vst1q_f32(out + i, vmlaq_f32(acc, m, sign_vec));
-        }
-#endif
-        for (; i < dim; ++i) {
-            out[i] += row[i] * sign;
-        }
-    }
     for (int i = 0; i < dim; ++i) {
-        if (!std::isfinite(out[i])) {
-            return 0;
-        }
+        float sum = 0.0f;
+        for (int j = 0; j < dim; ++j) sum += matrix[(size_t)j * (size_t)dim + (size_t)i] * signs[j];
+        if (!std::isfinite(sum)) return 0;
+        out[i] = sum;
     }
     return 1;
 }
