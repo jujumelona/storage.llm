@@ -443,16 +443,27 @@ static int moe_forward_one_token_f32(
         "position=%u token=%u layers=%u hidden=%u vocab=%u prealloc_kv=%d",
         position, token_id, c->num_hidden_layers, c->hidden_size, c->vocab_size, pre_allocate_kv);
     moe_forward_trace_generation_contract(engine, c);
+    const uint64_t scratch_start_us = moe_profile_now_us();
     if (!moe_decode_scratch_resize(s, c, &attn_cfg, pre_allocate_kv, engine)) {
         moe_generation_set_error(stats, "decode scratch allocation failed");
         return 0;
     }
+    moe_profile_log(
+        "forward_scratch",
+        "position=%u token=%u prealloc_kv=%d qkv_only=%u qkv_cap=%u qkv_limit=%u ms=%.3f",
+        position, token_id, pre_allocate_kv, (unsigned)s->qkv_only_runtime,
+        s->qkv_capacity_tokens, s->qkv_seq_limit, moe_profile_elapsed_ms(scratch_start_us));
     if (!moe_engine_qkv_only_required(engine)) {
         moe_kv_cache_track_ram(engine, &s->kv_cache);  // ensure_capacity delta tracking
     }
     moe_forward_trace_runtime_resources(engine, s, position, 0xffffffffu, "after_scratch");
     const uint32_t token_entry_phase = engine->generation_phase.load(std::memory_order_relaxed);
+    const uint64_t begin_token_start_us = moe_profile_now_us();
     moe_cpu_storage_begin_token(engine, position, token_id);
+    moe_profile_log(
+        "cpu_storage_begin_token",
+        "position=%u token=%u entry_phase=%u ms=%.3f",
+        position, token_id, token_entry_phase, moe_profile_elapsed_ms(begin_token_start_us));
     float* hidden = s->hidden.data();
     engine->generation_phase.store(
         token_entry_phase == moe_GEN_PHASE_PREFILL ? moe_GEN_PHASE_PREFILL : moe_GEN_PHASE_INIT,
@@ -490,10 +501,15 @@ static int moe_forward_one_token_f32(
         position, token_id, c->hidden_size, (double)embedding_scale,
         moe_profile_elapsed_ms(embed_start_us));
     moe_forward_trace_vec("embed", position, 0xffffffffu, hidden, c->hidden_size);
+    const uint64_t prepare_ple_start_us = moe_profile_now_us();
     if (!moe_prepare_ple_inputs_f32(engine, c, s, token_id, attn_cfg.rms_norm_eps)) {
         moe_generation_set_error(stats, "per-layer input prepare failed");
         return 0;
     }
+    moe_profile_log(
+        "forward_prepare_ple",
+        "position=%u token=%u ms=%.3f",
+        position, token_id, moe_profile_elapsed_ms(prepare_ple_start_us));
 
     for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
         moe_cpu_storage_begin_layer(engine, layer, c);
