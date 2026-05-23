@@ -2303,11 +2303,12 @@ static int moe_run_expert_triplet_row_batch_f32(
     int activation_mode,
     int row_parallel = 1
 ) {
-    if (!engine || !batch_hidden || !gate_pool || !up_pool || !out_pool ||
+    if (!engine || !batch_hidden || !gate_pool || !out_pool ||
         batch_size == 0 || batch_size > 4096u ||
         hidden_size == 0 || intermediate_size == 0 || out_count != hidden_size) {
         return 0;
     }
+    (void)up_pool;
     for (uint32_t i = 0; i < batch_size; ++i) {
         if (!batch_hidden[i]) {
             return 0;
@@ -2397,7 +2398,6 @@ static int moe_run_expert_triplet_row_batch_f32(
             for (uint32_t b = 0; b < batch_size; ++b) {
                 const size_t idx = (size_t)b * (size_t)intermediate_size + row;
                 gate_pool[idx] = moe_generation_gated_activation_cached(activation_mode, gate_values[b], up_values[b]);
-                up_pool[idx] = up_values[b];
             }
         }
         return 1;
@@ -2978,7 +2978,6 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
     std::vector<const float*> input_ptrs(expert_batch_limit, nullptr);
     std::vector<float> group_input_pool((size_t)expert_batch_limit * hidden_size);
     std::vector<float> gate_pool((size_t)expert_batch_limit * intermediate_size);
-    std::vector<float> up_pool((size_t)expert_batch_limit * intermediate_size);
     std::vector<float> out_pool((size_t)expert_batch_limit * hidden_size);
     uint32_t active_groups = 0;
     uint32_t total_assignments = 0;
@@ -3574,7 +3573,6 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
             moe_cpu_enable_fast_fp_mode();
             std::vector<const float*> local_input_ptrs(expert_batch_limit, nullptr);
             std::vector<float> local_gate_pool((size_t)expert_batch_limit * intermediate_size);
-            std::vector<float> local_up_pool((size_t)expert_batch_limit * intermediate_size);
             std::vector<float> local_out_pool((size_t)expert_batch_limit * hidden_size);
             for (;;) {
                 const uint32_t group_index = next_group.fetch_add(1, std::memory_order_relaxed);
@@ -3600,7 +3598,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                     const int expert_ok = moe_run_expert_triplet_row_batch_f32(
                         engine, layer, (int)expert,
                         local_input_ptrs.data(), chunk, hidden_size,
-                        local_gate_pool.data(), local_up_pool.data(), intermediate_size,
+                        local_gate_pool.data(), nullptr, intermediate_size,
                         local_out_pool.data(), hidden_size, activation_mode, 0);
                     if (!expert_ok) {
                         failed_assignments_parallel.fetch_add(chunk, std::memory_order_relaxed);
@@ -3720,7 +3718,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                 expert_ok = moe_run_expert_triplet_row_batch_f32(
                     engine, layer, (int)expert,
                     input_ptrs.data(), chunk, hidden_size,
-                    gate_pool.data(), up_pool.data(), intermediate_size,
+                    gate_pool.data(), nullptr, intermediate_size,
                     out_pool.data(), hidden_size, activation_mode);
             }
             if (!expert_ok) {
