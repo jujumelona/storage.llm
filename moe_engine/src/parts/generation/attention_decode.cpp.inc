@@ -492,16 +492,6 @@
         })) {
             return 0;
         }
-        const moe_model_shape_t shadow_shape = moe_engine_model_shape_or_static(engine);
-        if (layer >= 0 && shadow_shape.num_hidden_layers > 0) {
-            (void)moe_qkv_shadow_store_entry(
-                s,
-                (uint32_t)layer,
-                position,
-                s->kv_entry.data(),
-                kv_entry_dim,
-                shadow_shape.num_hidden_layers);
-        }
         const int qkv_sink_exact_current =
             (seq_len > 0u && (seq_len - 1u) < engine->qkv_cfg.sink_tokens) ? 1 : 0;
         moe_profile_log(
@@ -542,55 +532,13 @@
     std::fill(s->attn_value.begin(), s->attn_value.begin() + v_total_dim, 0.0f);
     {
         moe_profile_parallel_label_scope rows_label("attn_heads");
-        const int qkv_shadow_decode =
-            qkv_decode &&
-            v_head_dim == head_dim &&
-            seq_len > 0u &&
-            seq_len <= moe_qkv_shadow_max_tokens() &&
-            moe_qkv_shadow_get_entry(s, kv_storage_layer, seq_len - 1u, kv_entry_dim) != nullptr;
         const int qkv_group_decode =
             qkv_decode && !shared_kv_reuse && v_head_dim == head_dim &&
-            num_kv_heads > 0u && num_heads > num_kv_heads && !qkv_shadow_decode;
+            num_kv_heads > 0u && num_heads > num_kv_heads;
         const uint32_t row_count = qkv_group_decode ? num_kv_heads : num_heads;
         const uint32_t head_block_rows =
             ((uint64_t)seq_len * (uint64_t)head_dim >= 1024ull && row_count > 1u) ? 1u : 0u;
         if (!moe_parallel_rows(engine, row_count, head_block_rows, [&](uint32_t row) {
-        if (qkv_shadow_decode) {
-            const uint32_t h = row;
-            const uint32_t kv_h = (uint32_t)(((uint64_t)h * (uint64_t)num_kv_heads) / (uint64_t)num_heads);
-            const float* q = s->q_b.data() + (uint64_t)h * head_dim;
-            float* out_h = s->attn_value.data() + (uint64_t)h * v_head_dim;
-            float max_score = -std::numeric_limits<float>::infinity();
-            float denom = 0.0f;
-            for (uint32_t p = 0; p < seq_len; ++p) {
-                const float* entry = moe_qkv_shadow_get_entry(s, kv_storage_layer, p, kv_entry_dim);
-                if (!entry) {
-                    return 0;
-                }
-                const float* k = entry + (uint64_t)kv_h * head_dim;
-                float score = moe_apply_attention_logit_softcap(
-                    attn_logit_softcap,
-                    moe_dot_f32(q, k, head_dim) * scale);
-                if (!std::isfinite(score)) {
-                    return 0;
-                }
-                if (score > max_score) {
-                    const float rescale = std::exp(max_score - score);
-                    denom *= rescale;
-                    moe_scale_f32(out_h, rescale, v_head_dim);
-                    max_score = score;
-                }
-                const float w = std::exp(score - max_score);
-                denom += w;
-                const float* v = entry + k_dim + (uint64_t)kv_h * v_head_dim;
-                moe_axpy_f32(out_h, v, w, v_head_dim);
-            }
-            if (denom > 1e-10f && std::isfinite(denom)) {
-                moe_scale_f32(out_h, 1.0f / denom, v_head_dim);
-                return 1;
-            }
-            return 0;
-        }
         if (qkv_group_decode) {
             const uint32_t kv_h = row;
             const uint32_t h_begin =
@@ -705,11 +653,7 @@
         "layer=%d pos=%u heads=%u seq=%u head_dim=%u v_head_dim=%u qkv=%d kv_backend=%s scale=%.6g scale_source=%s attn_softcap=%.6g ms=%.3f",
         layer, position, num_heads, seq_len, head_dim, v_head_dim,
         qkv_decode,
-        (qkv_decode && seq_len > 0u &&
-         seq_len <= moe_qkv_shadow_max_tokens() &&
-         moe_qkv_shadow_get_entry(s, kv_storage_layer, seq_len - 1u, kv_entry_dim) != nullptr)
-            ? "qkv_shadow_exact"
-            : (qkv_decode ? "qkv_layer_head_append" : "plain_kv_cache"),
+        qkv_decode ? "qkv_layer_head_append" : "plain_kv_cache",
         (double)scale,
         scale_source ? scale_source : "unknown",
         (double)attn_logit_softcap,
