@@ -465,6 +465,74 @@ static inline float moe_mxfp4_dot_block(
     return acc;
 }
 
+#if defined(__AVX2__)
+static inline int moe_mxfp4_dot_row_accum_avx2(
+    const uint8_t* packed,
+    const float* x,
+    uint32_t cols,
+    const moe_mxfp4_row_layout_t& layout,
+    int pairwise_order,
+    float* out_value
+) {
+    if (!packed || !x || !out_value || pairwise_order) {
+        return 0;
+    }
+    const int standard_32 = (layout.block_cols == 32u && !layout.bytewise_codes);
+    const int bytewise_16 = (layout.block_cols == 16u && layout.bytewise_codes);
+    if (!standard_32 && !bytewise_16) {
+        return 0;
+    }
+
+    __m256 vacc = _mm256_setzero_ps();
+    float scalar_tail = 0.0f;
+    const float* table = moe_mxfp4_value_table();
+    uint32_t start = 0;
+    while (start + layout.block_cols <= cols) {
+        const __m256 vscale = _mm256_set1_ps(moe_e8m0_to_f32_half(packed[0]));
+        const uint8_t* qs = packed + 1u;
+        if (standard_32) {
+            vacc = moe_madd_ps(
+                _mm256_mul_ps(moe_mxfp4_lookup8_fast(qs, 0), vscale),
+                _mm256_loadu_ps(x + start),
+                vacc);
+            vacc = moe_madd_ps(
+                _mm256_mul_ps(moe_mxfp4_lookup8_fast(qs + 8u, 0), vscale),
+                _mm256_loadu_ps(x + start + 8u),
+                vacc);
+            vacc = moe_madd_ps(
+                _mm256_mul_ps(moe_mxfp4_lookup8_fast(qs, 1), vscale),
+                _mm256_loadu_ps(x + start + 16u),
+                vacc);
+            vacc = moe_madd_ps(
+                _mm256_mul_ps(moe_mxfp4_lookup8_fast(qs + 8u, 1), vscale),
+                _mm256_loadu_ps(x + start + 24u),
+                vacc);
+        } else {
+            vacc = moe_madd_ps(
+                _mm256_mul_ps(moe_mxfp4_lookup8_fast(qs, 0), vscale),
+                _mm256_loadu_ps(x + start),
+                vacc);
+            vacc = moe_madd_ps(
+                _mm256_mul_ps(moe_mxfp4_lookup8_fast(qs + 8u, 0), vscale),
+                _mm256_loadu_ps(x + start + 8u),
+                vacc);
+        }
+        start += layout.block_cols;
+        packed += layout.block_bytes;
+    }
+    while (start < cols) {
+        const float scale = moe_e8m0_to_f32_half(packed[0]);
+        const uint8_t* qs = packed + 1u;
+        const uint32_t limit = std::min<uint32_t>(layout.block_cols, cols - start);
+        scalar_tail += moe_mxfp4_dot_block(qs, x, start, limit, layout, table, pairwise_order) * scale;
+        start += limit;
+        packed += layout.block_bytes;
+    }
+    *out_value = moe_dot_hsum256_ps(vacc) + scalar_tail;
+    return 1;
+}
+#endif
+
 static inline void moe_mxfp4_dot_block_two_rows(
     const uint8_t* qs0,
     const uint8_t* qs1,
@@ -649,6 +717,12 @@ static float moe_dot_gguf_mxfp4_row_strided(
     const moe_mxfp4_row_layout_t layout = moe_mxfp4_row_layout_for_bytes(cols, physical_row_bytes);
     const float* table = moe_mxfp4_value_table();
     const int pairwise_order = moe_mxfp4_pairwise_nibble_order_enabled();
+#if defined(__AVX2__)
+    float avx_acc = 0.0f;
+    if (moe_mxfp4_dot_row_accum_avx2(packed, x, cols, layout, pairwise_order, &avx_acc)) {
+        return avx_acc;
+    }
+#endif
     float acc = 0.0f;
     uint32_t start = 0;
     while (start < cols) {
