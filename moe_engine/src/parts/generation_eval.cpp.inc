@@ -57,7 +57,13 @@ static int moe_eval_layer_first_enabled(
     uint32_t hidden_size
 ) {
     const char* env = std::getenv("STORAGELLM_EVAL_LAYER_FIRST_PREFILL");
-    if (env && env[0] == '0') {
+    if (!env ||
+        env[0] == '\0' ||
+        env[0] == '0' ||
+        std::strcmp(env, "false") == 0 ||
+        std::strcmp(env, "FALSE") == 0 ||
+        std::strcmp(env, "off") == 0 ||
+        std::strcmp(env, "OFF") == 0) {
         return 0;
     }
     return moe_generation_should_use_layer_first_prefill(engine, prefill_count, hidden_size);
