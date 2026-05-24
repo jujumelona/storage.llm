@@ -1447,6 +1447,100 @@ static int moe_layer_moe_mlp_f32(
                 const uint32_t env_block = moe_parse_env_u32("STORAGELLM_MLP_FUSED_DOWN_BLOCK_ROWS");
                 return env_block > 0 ? std::max(1u, std::min<uint32_t>(env_block, 128u)) : 16u;
             }();
+            auto finish_fused_down_accum = [&](uint64_t fused_start_us) -> int {
+                const float* expert_branch = s->residual.data();
+                if (moe_layer_post_ffw_norm2_f32(
+                        engine, layer, s->residual.data(), hidden_size, s->expert.data(), attn_cfg.rms_norm_eps)) {
+                    expert_branch = s->expert.data();
+                } else if (moe_layer_has_post_ffw_norm2_weight(engine, layer)) {
+                    std::fprintf(stderr,
+                        "[storagellm mlp] post-ffw norm2 tensor is required but could not be mapped layer=%d\n",
+                        layer);
+                    return 0;
+                }
+                if (!expert_branch) {
+                    std::fprintf(stderr, "[storagellm mlp] NULL expert_branch layer=%d\n", layer);
+                    return 0;
+                }
+                moe_mlp_trace_vec_f32("mlp_expert_branch", layer, expert_branch, hidden_size);
+                if (!moe_accumulate_branch_checked_f32(s->mlp.data(), expert_branch, hidden_size, layer, "expert")) {
+                    return 0;
+                }
+                if (dense_ok &&
+                    !moe_accumulate_branch_checked_f32(s->mlp.data(), s->shared.data(), hidden_size, layer, "dense")) {
+                    return 0;
+                }
+                moe_mlp_trace_vec_f32("mlp_branch_sum_pre_residual", layer, s->mlp.data(), hidden_size);
+                const uint64_t residual_start_us = moe_profile_now_us();
+                const int residual_ok = moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
+                moe_profile_log(
+                    "mlp_moe_fused_down_accum_end",
+                    "layer=%d ok=%d selected=%zu mapped=%u hidden=%u intermediate=%u fused_ms=%.3f residual_ms=%.3f total_ms=%.3f",
+                    layer, residual_ok, num_selected, mapped_experts, hidden_size, expert_intermediate,
+                    moe_profile_elapsed_ms(fused_start_us), moe_profile_elapsed_ms(residual_start_us), moe_profile_elapsed_ms(total_start_us));
+                return residual_ok;
+            };
+            int q5_1_down_pair_path = active_expert_count > 0u ? 1 : 0;
+            for (uint32_t ai = 0; ai < active_expert_count; ++ai) {
+                const uint32_t e = active_experts[ai];
+                if (e >= num_selected ||
+                    shards[e].down_view.weight_format != moe_WEIGHT_ENCODING_GGUF_Q5_1 ||
+                    shards[e].down_view.cols != expert_intermediate ||
+                    shards[e].down_view.rows < hidden_size) {
+                    q5_1_down_pair_path = 0;
+                    break;
+                }
+            }
+            if (q5_1_down_pair_path) {
+                const uint64_t q5_pair_start_us = moe_profile_now_us();
+                const uint32_t row_pairs = (hidden_size + 1u) / 2u;
+                const int q5_pair_ok = moe_parallel_rows(engine, row_pairs, 0, [&](uint32_t pair_index) {
+                    const uint32_t row0 = pair_index * 2u;
+                    const uint32_t row1 = row0 + 1u;
+                    if (row0 >= hidden_size) {
+                        return 0;
+                    }
+                    float acc0 = 0.0f;
+                    float acc1 = 0.0f;
+                    for (uint32_t ai = 0; ai < active_expert_count; ++ai) {
+                        const uint32_t e = active_experts[ai];
+                        const uint8_t* packed0 = moe_tensor_row_fast_ptr_unchecked(&shards[e].down_view, row0);
+                        float v0 = 0.0f;
+                        if (row1 < hidden_size) {
+                            const uint8_t* packed1 = moe_tensor_row_fast_ptr_unchecked(&shards[e].down_view, row1);
+                            float v1 = 0.0f;
+                            moe_dot_gguf_q5_1_two_rows(
+                                packed0, packed1, work[e].gate, expert_intermediate, &v0, &v1);
+                            if (!std::isfinite(v0) || !std::isfinite(v1)) {
+                                fused_ok.store(0, std::memory_order_relaxed);
+                                return 1;
+                            }
+                            acc1 += v1 * expert_down_scales[ai];
+                        } else {
+                            v0 = moe_dot_gguf_q5_1_row(packed0, work[e].gate, expert_intermediate);
+                            if (!std::isfinite(v0)) {
+                                fused_ok.store(0, std::memory_order_relaxed);
+                                return 1;
+                            }
+                        }
+                        acc0 += v0 * expert_down_scales[ai];
+                    }
+                    if (!std::isfinite(acc0) || (row1 < hidden_size && !std::isfinite(acc1))) {
+                        fused_ok.store(0, std::memory_order_relaxed);
+                        return 1;
+                    }
+                    s->residual[row0] = acc0;
+                    if (row1 < hidden_size) {
+                        s->residual[row1] = acc1;
+                    }
+                    return 1;
+                });
+                if (!q5_pair_ok || !fused_ok.load(std::memory_order_acquire)) {
+                    std::fprintf(stderr, "[storagellm mlp] paired Q5_1 down/accum failed layer=%d\n", layer);
+                    return 0;
+                }
+                return finish_fused_down_accum(q5_pair_start_us);
+            }
             const int down_fused_ok = moe_parallel_rows(engine, hidden_size, fused_down_block_rows, [&](uint32_t row) {
                 if (row >= hidden_size) {
                     return 0;
@@ -1474,38 +1568,7 @@ static int moe_layer_moe_mlp_f32(
                 std::fprintf(stderr, "[storagellm mlp] fused down/accum failed layer=%d\n", layer);
                 return 0;
             }
-
-            const float* expert_branch = s->residual.data();
-            if (moe_layer_post_ffw_norm2_f32(
-                    engine, layer, s->residual.data(), hidden_size, s->expert.data(), attn_cfg.rms_norm_eps)) {
-                expert_branch = s->expert.data();
-            } else if (moe_layer_has_post_ffw_norm2_weight(engine, layer)) {
-                std::fprintf(stderr,
-                    "[storagellm mlp] post-ffw norm2 tensor is required but could not be mapped layer=%d\n",
-                    layer);
-                return 0;
-            }
-            if (!expert_branch) {
-                std::fprintf(stderr, "[storagellm mlp] NULL expert_branch layer=%d\n", layer);
-                return 0;
-            }
-            moe_mlp_trace_vec_f32("mlp_expert_branch", layer, expert_branch, hidden_size);
-            if (!moe_accumulate_branch_checked_f32(s->mlp.data(), expert_branch, hidden_size, layer, "expert")) {
-                return 0;
-            }
-            if (dense_ok &&
-                !moe_accumulate_branch_checked_f32(s->mlp.data(), s->shared.data(), hidden_size, layer, "dense")) {
-                return 0;
-            }
-            moe_mlp_trace_vec_f32("mlp_branch_sum_pre_residual", layer, s->mlp.data(), hidden_size);
-            const uint64_t residual_start_us = moe_profile_now_us();
-            const int residual_ok = moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
-            moe_profile_log(
-                "mlp_moe_fused_down_accum_end",
-                "layer=%d ok=%d selected=%zu mapped=%u hidden=%u intermediate=%u fused_ms=%.3f residual_ms=%.3f total_ms=%.3f",
-                layer, residual_ok, num_selected, mapped_experts, hidden_size, expert_intermediate,
-                moe_profile_elapsed_ms(fused_start_us), moe_profile_elapsed_ms(residual_start_us), moe_profile_elapsed_ms(total_start_us));
-            return residual_ok;
+            return finish_fused_down_accum(fused_start_us);
         }
     }
 
