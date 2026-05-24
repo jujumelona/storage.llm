@@ -333,7 +333,8 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     }
 
 #ifdef _OPENMP
-    if (workers > 1 && row_count >= 64u) {
+    static const int use_openmp_rows = moe_parallel_env_truthy("STORAGELLM_USE_OPENMP_ROWS");
+    if (use_openmp_rows && workers > 1 && row_count >= 64u) {
         std::atomic<int> ok{1};
         const uint32_t block_count = (row_count + block_rows - 1u) / block_rows;
 #pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
