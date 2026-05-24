@@ -1920,6 +1920,10 @@ static void log_token_ids_preview(
     std::cerr << "\n" << std::flush;
 }
 
+static bool server_request_snapshots_enabled() {
+    return server_env_truthy("STORAGELLM_REQUEST_SNAPSHOTS");
+}
+
 static bool tokenizer_match_special_at(
     const server_tokenizer& tok,
     const std::string& text,
@@ -2532,7 +2536,9 @@ static server_generation_result run_server_generation(
               << " batch=" << (server_real_batch_generation_enabled() ? 1 : 0)
               << resource_log_suffix()
               << "\n" << std::flush;
-    log_engine_snapshot("generation_engine_begin", engine);
+    if (server_request_snapshots_enabled()) {
+        log_engine_snapshot("generation_engine_begin", engine);
+    }
     const auto generation_start = std::chrono::steady_clock::now();
     if (server_real_batch_generation_enabled()) {
         const uint64_t request_id =
@@ -2661,7 +2667,9 @@ static server_generation_result run_server_generation(
               << " total_ms=" << elapsed_ms_since(request_start)
               << resource_log_suffix()
               << "\n" << std::flush;
-    log_engine_snapshot("generation_engine_end", engine);
+    if (server_request_snapshots_enabled()) {
+        log_engine_snapshot("generation_engine_end", engine);
+    }
     return result;
 }
 
@@ -2813,7 +2821,9 @@ static server_eval_result run_server_eval(
               << " body_bytes=" << body.size()
               << resource_log_suffix()
               << "\n" << std::flush;
-    log_engine_snapshot("eval_engine_begin", engine);
+    if (server_request_snapshots_enabled()) {
+        log_engine_snapshot("eval_engine_begin", engine);
+    }
     moe_eval_stats_t stats{};
     int evaluated = 0;
     const auto eval_tokens = [&]() -> int {
@@ -2871,7 +2881,9 @@ static server_eval_result run_server_eval(
               << " total_ms=" << elapsed_ms_since(eval_start)
               << resource_log_suffix()
               << "\n" << std::flush;
-    log_engine_snapshot("eval_engine_end", engine);
+    if (server_request_snapshots_enabled()) {
+        log_engine_snapshot("eval_engine_end", engine);
+    }
     return result;
 }
 
