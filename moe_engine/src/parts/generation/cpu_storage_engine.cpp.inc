@@ -1380,24 +1380,11 @@ static void moe_cpu_storage_after_router_selected(
     const std::vector<int>& selected_experts
 );
 
-static int moe_cpu_storage_decode_expert_lookahead_enabled() {
-    // Decode lookahead can issue RAM-tier expert promotions before the current
-    // layer is timed. Keep it opt-in on CPU storage until the predictor path is
-    // proven cheaper than the cold misses it avoids.
-    static const int enabled =
-        moe_cpu_storage_env_truthy("STORAGELLM_CPU_DECODE_EXPERT_LOOKAHEAD") ||
-        moe_cpu_storage_env_truthy("STORAGELLM_CPU_DECODE_LOOKAHEAD_EXPERTS");
-    return enabled;
-}
-
 static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, const moe_storage_constants_t* c) {
     if (!engine || !c || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
-    const uint64_t begin_start_us = moe_profile_now_us();
     engine->cpu_layer_begin_count.fetch_add(1, std::memory_order_relaxed);
     const uint32_t depth = moe_cpu_storage_layer_lookahead_depth(engine, c->num_hidden_layers);
     const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
-    const int decode_expert_lookahead =
-        phase != moe_GEN_PHASE_PREFILL && moe_cpu_storage_decode_expert_lookahead_enabled();
     if (phase != moe_GEN_PHASE_PREFILL) {
         std::vector<int> previous_token_experts;
         {
@@ -1427,7 +1414,7 @@ static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, c
         // next-layer expert hint. Submit it from layer-begin so storage I/O can
         // overlap attention/router instead of arriving after same-layer top-k.
         std::vector<int> predicted;
-        if (decode_expert_lookahead && next > 0 &&
+        if (phase != moe_GEN_PHASE_PREFILL && next > 0 &&
             engine->io_config.enable_lookahead_prefetch &&
             moe_layer_is_moe_runtime(engine, c, (int)next)) {
             const uint32_t router_top_k = moe_router_top_k_from_metadata_for_layer(
@@ -1448,14 +1435,6 @@ static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, c
         }
         engine->cpu_prefetch_scheduled.fetch_add(1, std::memory_order_relaxed);
     }
-    moe_profile_log(
-        "cpu_storage_begin_layer",
-        "layer=%u phase=%u depth=%u decode_expert_lookahead=%d ms=%.3f",
-        layer,
-        phase,
-        depth,
-        decode_expert_lookahead,
-        moe_profile_elapsed_ms(begin_start_us));
 }
 
 static void moe_cpu_storage_after_router_selected(
