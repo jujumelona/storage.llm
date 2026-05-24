@@ -867,6 +867,54 @@ static int moe_apply_rmsnorm_common_weight_f32(
     // Safe: valid_count > 0 guaranteed by check above
     const float norm = 1.0f / std::sqrt((float)(ss / (double)valid_count) + (eps > 0.0f ? eps : 1.0e-6f));
     const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, raw);
+    const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
+    if (!unit_offset && raw.base && elem != 0 && (uint64_t)count * (uint64_t)elem <= raw.bytes) {
+#if defined(__AVX2__)
+        uint32_t i = 0;
+        const __m256 vnorm = _mm256_set1_ps(norm);
+        if (raw.scalar_encoding == moe_RAW_SCALAR_F32) {
+            for (; i + 7u < count; i += 8u) {
+                const __m256 in = _mm256_loadu_ps(input + i);
+                const __m256 w = _mm256_loadu_ps(reinterpret_cast<const float*>(raw.base + (uint64_t)i * 4ull));
+                _mm256_storeu_ps(output + i, _mm256_mul_ps(_mm256_mul_ps(in, vnorm), w));
+            }
+            for (; i < count; ++i) {
+                float w = 0.0f;
+                std::memcpy(&w, raw.base + (uint64_t)i * 4ull, sizeof(w));
+                output[i] = input[i] * norm * w;
+            }
+            return 1;
+        }
+        if (raw.scalar_encoding == moe_RAW_SCALAR_BF16) {
+            for (; i + 7u < count; i += 8u) {
+                const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(raw.base + (uint64_t)i * 2ull));
+                const __m256 w = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
+                const __m256 in = _mm256_loadu_ps(input + i);
+                _mm256_storeu_ps(output + i, _mm256_mul_ps(_mm256_mul_ps(in, vnorm), w));
+            }
+            for (; i < count; ++i) {
+                output[i] = input[i] * norm *
+                    moe_raw_scalar_to_f32(raw.base + (uint64_t)i * 2ull, raw.scalar_encoding);
+            }
+            return 1;
+        }
+#if defined(__F16C__)
+        if (raw.scalar_encoding == moe_RAW_SCALAR_F16) {
+            for (; i + 7u < count; i += 8u) {
+                const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(raw.base + (uint64_t)i * 2ull));
+                const __m256 w = _mm256_cvtph_ps(h);
+                const __m256 in = _mm256_loadu_ps(input + i);
+                _mm256_storeu_ps(output + i, _mm256_mul_ps(_mm256_mul_ps(in, vnorm), w));
+            }
+            for (; i < count; ++i) {
+                output[i] = input[i] * norm *
+                    moe_raw_scalar_to_f32(raw.base + (uint64_t)i * 2ull, raw.scalar_encoding);
+            }
+            return 1;
+        }
+#endif
+#endif
+    }
     for (uint32_t i = 0; i < count; ++i) {
         float w = 0.0f;
         if (!moe_raw_tensor_scalar_at_f32(raw, i, &w)) {
@@ -912,6 +960,56 @@ static int moe_apply_rmsnorm_common_weight_add_f32(
     const uint64_t needed = (uint64_t)count * (uint64_t)elem;
     if (needed > raw.bytes) {
         return 0;
+    }
+    if (!unit_offset) {
+#if defined(__AVX2__)
+        uint32_t i = 0;
+        const __m256 vnorm = _mm256_set1_ps(norm);
+        if (raw.scalar_encoding == moe_RAW_SCALAR_F32) {
+            for (; i + 7u < count; i += 8u) {
+                const __m256 in = _mm256_loadu_ps(input + i);
+                const __m256 w = _mm256_loadu_ps(reinterpret_cast<const float*>(raw.base + (uint64_t)i * 4ull));
+                const __m256 prev = _mm256_loadu_ps(acc + i);
+                _mm256_storeu_ps(acc + i, _mm256_add_ps(prev, _mm256_mul_ps(_mm256_mul_ps(in, vnorm), w)));
+            }
+            for (; i < count; ++i) {
+                float w = 0.0f;
+                std::memcpy(&w, raw.base + (uint64_t)i * 4ull, sizeof(w));
+                acc[i] += input[i] * norm * w;
+            }
+            return 1;
+        }
+        if (raw.scalar_encoding == moe_RAW_SCALAR_BF16) {
+            for (; i + 7u < count; i += 8u) {
+                const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(raw.base + (uint64_t)i * 2ull));
+                const __m256 w = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
+                const __m256 in = _mm256_loadu_ps(input + i);
+                const __m256 prev = _mm256_loadu_ps(acc + i);
+                _mm256_storeu_ps(acc + i, _mm256_add_ps(prev, _mm256_mul_ps(_mm256_mul_ps(in, vnorm), w)));
+            }
+            for (; i < count; ++i) {
+                acc[i] += input[i] * norm *
+                    moe_raw_scalar_to_f32(raw.base + (uint64_t)i * 2ull, raw.scalar_encoding);
+            }
+            return 1;
+        }
+#if defined(__F16C__)
+        if (raw.scalar_encoding == moe_RAW_SCALAR_F16) {
+            for (; i + 7u < count; i += 8u) {
+                const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(raw.base + (uint64_t)i * 2ull));
+                const __m256 w = _mm256_cvtph_ps(h);
+                const __m256 in = _mm256_loadu_ps(input + i);
+                const __m256 prev = _mm256_loadu_ps(acc + i);
+                _mm256_storeu_ps(acc + i, _mm256_add_ps(prev, _mm256_mul_ps(_mm256_mul_ps(in, vnorm), w)));
+            }
+            for (; i < count; ++i) {
+                acc[i] += input[i] * norm *
+                    moe_raw_scalar_to_f32(raw.base + (uint64_t)i * 2ull, raw.scalar_encoding);
+            }
+            return 1;
+        }
+#endif
+#endif
     }
     for (uint32_t i = 0; i < count; ++i) {
         const float w = moe_raw_scalar_to_f32(raw.base + (uint64_t)i * (uint64_t)elem, raw.scalar_encoding);
