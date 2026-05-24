@@ -23,6 +23,65 @@ static uint32_t moe_lm_head_worker_hint() {
     return std::max<uint32_t>(row_hw_threads(), 1u);
 }
 
+static inline float moe_lm_head_dot_row_cached(
+    const moe_raw_tensor_cache_entry& raw,
+    uint32_t row,
+    const float* hidden,
+    uint32_t hidden_count,
+    uint64_t row_bytes,
+    uint8_t effective_weight_format,
+    int mxfp4_direct,
+    moe_mxfp4_row_layout_t mxfp4_layout,
+    int mxfp4_pairwise_order
+) {
+    if (raw.math_transposed) {
+        return moe_raw_tensor_dot_row(raw, row, hidden, hidden_count);
+    }
+    if (!raw.base || !hidden || row >= raw.rows || row_bytes == 0 ||
+        row > UINT64_MAX / row_bytes ||
+        (uint64_t)row * row_bytes > raw.bytes ||
+        row_bytes > raw.bytes - (uint64_t)row * row_bytes) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+    const uint8_t* row_ptr = raw.base + (uint64_t)row * row_bytes;
+    if (mxfp4_direct) {
+        return moe_dot_gguf_mxfp4_row_with_layout(
+            row_ptr, hidden, hidden_count, mxfp4_layout, mxfp4_pairwise_order);
+    }
+    switch (effective_weight_format) {
+        case moe_WEIGHT_ENCODING_GGUF_Q8_0: return moe_dot_gguf_q8_0_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_Q8_1: return moe_dot_gguf_q8_1_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_Q8_K: return moe_dot_gguf_q8_k_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_Q4_0: return moe_dot_gguf_q4_0_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_Q4_1: return moe_dot_gguf_q4_1_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_Q5_0: return moe_dot_gguf_q5_0_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_Q5_1: return moe_dot_gguf_q5_1_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_Q2_K: return moe_dot_gguf_q2_k_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_Q3_K: return moe_dot_gguf_q3_k_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_Q4_K: return moe_dot_gguf_q4_k_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_Q5_K: return moe_dot_gguf_q5_k_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_Q6_K: return moe_dot_gguf_q6_k_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_IQ2_XXS: return moe_dot_gguf_iq2_xxs_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_IQ2_XS: return moe_dot_gguf_iq2_xs_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_IQ2_S: return moe_dot_gguf_iq2_s_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_IQ3_XXS: return moe_dot_gguf_iq3_xxs_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_IQ3_S: return moe_dot_gguf_iq3_s_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_IQ4_NL: return moe_dot_gguf_iq4_nl_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_IQ4_XS: return moe_dot_gguf_iq4_xs_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_IQ1_S: return moe_dot_gguf_iq1_s_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_GGUF_IQ1_M: return moe_dot_gguf_iq1_m_row(row_ptr, hidden, hidden_count);
+        case moe_WEIGHT_ENCODING_RAW_FP16:
+        case moe_WEIGHT_ENCODING_RAW_BF16:
+        case moe_WEIGHT_ENCODING_RAW_FP32:
+        case moe_WEIGHT_ENCODING_UNKNOWN: {
+            const float raw_dot = moe_dot_raw_row(row_ptr, raw.scalar_encoding, hidden, hidden_count);
+            return std::isfinite(raw_dot) ? raw_dot : std::numeric_limits<float>::quiet_NaN();
+        }
+        default:
+            return moe_raw_tensor_dot_row(raw, row, hidden, hidden_count);
+    }
+}
+
 static int moe_map_lm_head_tensor(
     moe_pc_engine* engine,
     const moe_storage_constants_t* c,
@@ -202,12 +261,9 @@ int moe_pc_engine_lm_head_top1_f32(
     const int lm_head_mxfp4_pairwise_order =
         lm_head_mxfp4_direct ? moe_mxfp4_pairwise_nibble_order_enabled() : 0;
     auto lm_head_dot_row = [&](uint32_t row) -> float {
-        if (lm_head_mxfp4_direct) {
-            const uint8_t* row_ptr = raw.base + (uint64_t)row * row_bytes;
-            return moe_dot_gguf_mxfp4_row_with_layout(
-                row_ptr, hidden, hidden_count, lm_head_mxfp4_layout, lm_head_mxfp4_pairwise_order);
-        }
-        return moe_raw_tensor_dot_row(raw, row, hidden, hidden_count);
+        return moe_lm_head_dot_row_cached(
+            raw, row, hidden, hidden_count, row_bytes, effective_weight_format,
+            lm_head_mxfp4_direct, lm_head_mxfp4_layout, lm_head_mxfp4_pairwise_order);
     };
     moe_profile_log(
         "lm_head_top1_begin",
@@ -437,12 +493,9 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     const int lm_head_mxfp4_pairwise_order =
         lm_head_mxfp4_direct ? moe_mxfp4_pairwise_nibble_order_enabled() : 0;
     auto lm_head_dot_row = [&](uint32_t row) -> float {
-        if (lm_head_mxfp4_direct) {
-            const uint8_t* row_ptr = raw.base + (uint64_t)row * row_bytes;
-            return moe_dot_gguf_mxfp4_row_with_layout(
-                row_ptr, hidden, hidden_count, lm_head_mxfp4_layout, lm_head_mxfp4_pairwise_order);
-        }
-        return moe_raw_tensor_dot_row(raw, row, hidden, hidden_count);
+        return moe_lm_head_dot_row_cached(
+            raw, row, hidden, hidden_count, row_bytes, effective_weight_format,
+            lm_head_mxfp4_direct, lm_head_mxfp4_layout, lm_head_mxfp4_pairwise_order);
     };
     const float target_score_precomputed = moe_apply_final_logit_softcap_cached(
         logit_softcap,
