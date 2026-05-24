@@ -249,7 +249,7 @@ static uint32_t moe_storage_io_default_workers(uint32_t profile) {
     const int max_mode = moe_storage_max_parallel_env_enabled();
     switch (profile) {
         case moe_STORAGE_PROFILE_NVME:
-            if (hw <= 4u) return std::min<uint32_t>(cap, max_mode ? 4u : 2u);
+            if (hw <= 4u) return std::min<uint32_t>(cap, 2u);
             if (hw <= 8u) return std::min<uint32_t>(cap, max_mode ? 6u : 4u);
             return std::min<uint32_t>(cap, std::max<uint32_t>(max_mode ? 16u : 8u, max_mode ? hw : hw / 2u));
         case moe_STORAGE_PROFILE_SATA_SSD:
@@ -263,7 +263,7 @@ static uint32_t moe_storage_io_default_workers(uint32_t profile) {
         case moe_STORAGE_PROFILE_RAMDISK:
             return 0u;
         default:
-            if (hw <= 4u) return std::min<uint32_t>(cap, max_mode ? 4u : 2u);
+            if (hw <= 4u) return std::min<uint32_t>(cap, 2u);
             if (hw <= 8u) return std::min<uint32_t>(cap, max_mode ? 6u : 3u);
             return std::min<uint32_t>(cap, std::max<uint32_t>(max_mode ? 8u : 6u, max_mode ? hw / 2u : hw / 3u));
     }
