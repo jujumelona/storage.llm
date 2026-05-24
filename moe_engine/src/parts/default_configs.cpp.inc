@@ -68,8 +68,7 @@ moe_pc_engine_config_t moe_pc_default_config(void) {
     moe_pc_engine_config_t cfg{};
     cfg.vram_budget_bytes = 0;
     cfg.common_vram_reserve_bytes = 0;
-    cfg.ram_budget_bytes = storagellm::default_ram_budget_bytes(
-        moe_cpu_storage_max_enabled() ? 80u : 60u);
+    cfg.ram_budget_bytes = storagellm::default_ram_budget_bytes(60);
     cfg.db_budget_bytes = UINT64_MAX / 4;
     cfg.kv_mode = moe_KV_MODE_QKV;
     cfg.prefer_gpu = moe_cpu_storage_max_enabled() ? 0 : 1;

@@ -22,7 +22,7 @@ static int server_cpu_storage_max_enabled(const moe_backend_caps_t& caps) {
            server_env_truthy_local("STORAGELLM_CPU_PIPELINE");
 }
 
-static uint64_t server_auto_ram_budget_bytes(int cpu_storage_mode) {
+static uint64_t server_auto_ram_budget_bytes() {
     const uint64_t available = storagellm::available_ram_bytes();
     const uint64_t gib = 1024ull * 1024ull * 1024ull;
     if (const char* env = std::getenv("STORAGELLM_RAM_RESERVE_BYTES")) {
@@ -39,16 +39,7 @@ static uint64_t server_auto_ram_budget_bytes(int cpu_storage_mode) {
         available >= 64ull * gib ? 3ull * gib :
         available >= 32ull * gib ? 2ull * gib : 768ull * 1024ull * 1024ull;
     if (available > reserve * 2ull) {
-        const uint64_t available_budget = available - reserve;
-        if (cpu_storage_mode) {
-            const uint64_t total = storagellm::total_ram_bytes();
-            const uint64_t total_budget = total > 0 ? (total * 80ull) / 100ull : 0ull;
-            const uint64_t reclaim_cap = available + 8ull * gib;
-            if (total_budget > available_budget) {
-                return std::min<uint64_t>(total_budget, reclaim_cap);
-            }
-        }
-        return available_budget;
+        return available - reserve;
     }
     return (available * 9ull) / 10ull;
 }
@@ -57,8 +48,7 @@ static void apply_detected_budgets(server_options* opts, const moe_backend_caps_
     if (!opts) {
         return;
     }
-    const int cpu_storage_mode = server_cpu_storage_max_enabled(caps);
-    if (cpu_storage_mode) {
+    if (server_cpu_storage_max_enabled(caps)) {
         opts->engine_config.prefer_gpu = 0;
         opts->engine_config.preferred_backend = moe_BACKEND_CPU;
         opts->engine_config.platform = moe_PLATFORM_CPU_ONLY;
@@ -76,7 +66,7 @@ static void apply_detected_budgets(server_options* opts, const moe_backend_caps_
         }
     }
     if (!opts->ram_budget_override) {
-        opts->engine_config.ram_budget_bytes = server_auto_ram_budget_bytes(cpu_storage_mode);
+        opts->engine_config.ram_budget_bytes = server_auto_ram_budget_bytes();
     }
     opts->engine_config.allow_db_streaming = 1;
 }
@@ -110,19 +100,14 @@ static moe_io_config_t make_server_io_config(const server_options& opts, const m
     io.topology_max_edges_per_source = std::max<uint32_t>(io.topology_max_edges_per_source, 64u);
     io.directstorage_staging_queue_capacity = std::max<uint32_t>(io.directstorage_staging_queue_capacity, 4096u);
     io.directstorage_gpu_queue_capacity = std::max<uint32_t>(io.directstorage_gpu_queue_capacity, 8192u);
-    const int cpu_storage_mode = server_cpu_storage_max_enabled(caps);
-    io.ram_eviction_target_fill_pct = std::max<uint8_t>(
-        io.ram_eviction_target_fill_pct,
-        cpu_storage_mode ? 97u : 85u);
-    io.ram_eviction_threshold_pct = std::max<uint8_t>(
-        io.ram_eviction_threshold_pct,
-        cpu_storage_mode ? 98u : 90u);
-    if (cpu_storage_mode) {
+    io.ram_eviction_target_fill_pct = std::max<uint8_t>(io.ram_eviction_target_fill_pct, 85u);
+    io.ram_eviction_threshold_pct = std::max<uint8_t>(io.ram_eviction_threshold_pct, 90u);
+    if (server_cpu_storage_max_enabled(caps)) {
         const uint32_t hw_cpu = std::max<uint32_t>(1u, std::thread::hardware_concurrency());
         const uint32_t cpu_io_workers =
             hw_cpu >= 32u ? 10u :
             hw_cpu >= 16u ? 6u :
-            4u;
+            hw_cpu >= 8u  ? 4u : 1u;
         io.io_worker_threads = cpu_io_workers;
         io.disk_worker_threads = cpu_io_workers;
         io.pinned_worker_threads = 0;
@@ -134,7 +119,7 @@ static moe_io_config_t make_server_io_config(const server_options& opts, const m
         io.directstorage_gpu_queue_capacity = 0;
         io.allow_required_sync_fallback = 1;
         io.enable_cold_expert_cpu_fallback = 1;
-        io.ram_eviction_target_fill_pct = 97;
+        io.ram_eviction_target_fill_pct = 94;
         io.ram_eviction_threshold_pct = 98;
         io.internal_require_gpu_expert_batch_kernel = 0;
         io.internal_verified_backend_only = 0;
