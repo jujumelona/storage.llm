@@ -1444,48 +1444,27 @@ static int moe_layer_moe_mlp_f32(
                 const uint32_t env_block = moe_parse_env_u32("STORAGELLM_MLP_FUSED_DOWN_BLOCK_ROWS");
                 return env_block > 0 ? std::max(1u, std::min<uint32_t>(env_block, 128u)) : 16u;
             }();
-            const uint32_t fused_down_row_pairs = (hidden_size + 1u) / 2u;
-            const int down_fused_ok = moe_parallel_rows(engine, fused_down_row_pairs, fused_down_block_rows, [&](uint32_t pair) {
-                const uint32_t row = pair * 2u;
+            const int down_fused_ok = moe_parallel_rows(engine, hidden_size, fused_down_block_rows, [&](uint32_t row) {
                 if (row >= hidden_size) {
                     return 0;
                 }
                 float acc = 0.0f;
-                float acc_next = 0.0f;
-                const int has_next = row + 1u < hidden_size;
                 for (uint32_t ai = 0; ai < active_expert_count; ++ai) {
                     const uint32_t e = active_experts[ai];
                     float v = 0.0f;
-                    float v_next = 0.0f;
-                    moe_tensor_row_fast_prefetch(&shards[e].down_view, row + 2u);
-                    int dot_ok = 0;
-                    if (has_next) {
-                        dot_ok = moe_dot_tensor_fast_view_adjacent_rows(
-                            engine, &shards[e].down_view, row, work[e].gate,
-                            expert_intermediate, &v, &v_next);
-                    } else {
-                        dot_ok = moe_dot_tensor_fast_view_row(
-                            engine, &shards[e].down_view, row, work[e].gate,
-                            expert_intermediate, &v);
-                    }
-                    if (!dot_ok || !std::isfinite(v) || (has_next && !std::isfinite(v_next))) {
+                    moe_tensor_row_fast_prefetch(&shards[e].down_view, row + 1u);
+                    if (!moe_dot_tensor_fast_view_row(engine, &shards[e].down_view,
+                            row, work[e].gate, expert_intermediate, &v) || !std::isfinite(v)) {
                         fused_ok.store(0, std::memory_order_relaxed);
                         return 1;
                     }
-                    const float scale = expert_down_scales[ai];
-                    acc += v * scale;
-                    if (has_next) {
-                        acc_next += v_next * scale;
-                    }
+                    acc += v * expert_down_scales[ai];
                 }
-                if (!std::isfinite(acc) || (has_next && !std::isfinite(acc_next))) {
+                if (!std::isfinite(acc)) {
                     fused_ok.store(0, std::memory_order_relaxed);
                     return 1;
                 }
                 s->residual[row] = acc;
-                if (has_next) {
-                    s->residual[row + 1u] = acc_next;
-                }
                 return 1;
             });
             if (!down_fused_ok || !fused_ok.load(std::memory_order_acquire)) {
