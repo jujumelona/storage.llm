@@ -110,9 +110,14 @@ static moe_io_config_t make_server_io_config(const server_options& opts, const m
     io.topology_max_edges_per_source = std::max<uint32_t>(io.topology_max_edges_per_source, 64u);
     io.directstorage_staging_queue_capacity = std::max<uint32_t>(io.directstorage_staging_queue_capacity, 4096u);
     io.directstorage_gpu_queue_capacity = std::max<uint32_t>(io.directstorage_gpu_queue_capacity, 8192u);
-    io.ram_eviction_target_fill_pct = std::max<uint8_t>(io.ram_eviction_target_fill_pct, 85u);
-    io.ram_eviction_threshold_pct = std::max<uint8_t>(io.ram_eviction_threshold_pct, 90u);
-    if (server_cpu_storage_max_enabled(caps)) {
+    const int cpu_storage_mode = server_cpu_storage_max_enabled(caps);
+    io.ram_eviction_target_fill_pct = std::max<uint8_t>(
+        io.ram_eviction_target_fill_pct,
+        cpu_storage_mode ? 97u : 85u);
+    io.ram_eviction_threshold_pct = std::max<uint8_t>(
+        io.ram_eviction_threshold_pct,
+        cpu_storage_mode ? 98u : 90u);
+    if (cpu_storage_mode) {
         const uint32_t hw_cpu = std::max<uint32_t>(1u, std::thread::hardware_concurrency());
         const uint32_t cpu_io_workers =
             hw_cpu >= 32u ? 10u :
