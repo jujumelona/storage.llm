@@ -9,9 +9,6 @@ static int moe_profile_level() {
     if (!env || !env[0]) {
         env = std::getenv("STORAGELLM_TRACE");
     }
-    if (!env || !env[0]) {
-        env = std::getenv("STORAGELLM_PROFILE");
-    }
     if (env && env[0]) {
         if (std::strcmp(env, "0") == 0 ||
             std::strcmp(env, "off") == 0 ||
