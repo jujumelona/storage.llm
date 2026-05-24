@@ -41,7 +41,9 @@ static int moe_cpu_storage_env_enabled_default_on(const char* name) {
 static int moe_storage_max_parallel_env_enabled() {
     return moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_MAX") ||
            moe_cpu_storage_env_truthy("STORAGELLM_MAX_PARALLELISM") ||
-           moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_AUTOTUNE_MAX");
+           moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_AUTOTUNE_MAX") ||
+           moe_cpu_storage_env_truthy("STORAGELLM_CPU_STORAGE_MAX") ||
+           moe_cpu_storage_env_truthy("STORAGELLM_CPU_PIPELINE");
 }
 
 static int moe_storage_always_env_enabled() {
