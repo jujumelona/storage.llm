@@ -305,7 +305,12 @@ static float moe_dot_raw_bf16_row(const uint8_t* packed, const float* x, uint32_
         acc1 = moe_madd_ps(f1, _mm256_loadu_ps(x + i + 8u), acc1);
     }
     acc0 = _mm256_add_ps(acc0, acc1);
-    float acc = moe_dot_hsum256_ps(acc0);
+    __m128 lo = _mm256_castps256_ps128(acc0);
+    __m128 hi = _mm256_extractf128_ps(acc0, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float acc = _mm_cvtss_f32(lo);
     for (; i < cols; ++i) {
         uint16_t v = 0;
         std::memcpy(&v, packed + (uint64_t)i * 2ull, sizeof(v));
