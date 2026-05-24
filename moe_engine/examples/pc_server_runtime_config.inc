@@ -122,7 +122,7 @@ static moe_io_config_t make_server_io_config(const server_options& opts, const m
         const uint32_t cpu_io_workers =
             hw_cpu >= 32u ? 10u :
             hw_cpu >= 16u ? 6u :
-            hw_cpu >= 8u  ? 4u : 1u;
+            4u;
         io.io_worker_threads = cpu_io_workers;
         io.disk_worker_threads = cpu_io_workers;
         io.pinned_worker_threads = 0;
