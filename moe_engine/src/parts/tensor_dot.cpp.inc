@@ -645,6 +645,33 @@ static int moe_dot_tensor_fast_view_two_rows(
            moe_dot_tensor_fast_view_row(engine, b, row, x, x_count, out_b);
 }
 
+static int moe_dot_tensor_fast_view_adjacent_rows(
+    moe_pc_engine_t* engine,
+    const moe_tensor_row_fast_view_t* view,
+    uint32_t row,
+    const float* x,
+    uint32_t x_count,
+    float* out0,
+    float* out1
+) {
+    if (!engine || !view || !out0 || !out1 || x_count != view->cols ||
+        row + 1u >= view->rows) {
+        return 0;
+    }
+    const uint8_t* p0 = moe_tensor_row_fast_ptr(view, row);
+    const uint8_t* p1 = moe_tensor_row_fast_ptr(view, row + 1u);
+    if (!p0 || !p1) {
+        return 0;
+    }
+    if (view->weight_format == moe_WEIGHT_ENCODING_MXFP4) {
+        moe_dot_gguf_mxfp4_two_rows_with_layout(
+            p0, p1, x, view->cols, view->mxfp4_layout, view->mxfp4_pairwise_order, out0, out1);
+        return std::isfinite(*out0) && std::isfinite(*out1) ? 1 : 0;
+    }
+    return moe_dot_tensor_fast_view_row(engine, view, row, x, x_count, out0) &&
+           moe_dot_tensor_fast_view_row(engine, view, row + 1u, x, x_count, out1);
+}
+
 // ============================================================================
 // Batched Matrix-Vector Multiplication (GEMM Wrapper)
 // ============================================================================
