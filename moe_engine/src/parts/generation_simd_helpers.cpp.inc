@@ -83,54 +83,6 @@ static inline void moe_axpy_f32(float* dst, const float* src, float alpha, uint3
     }
 }
 
-static inline int moe_add_checked_f32(float* dst, const float* src, uint32_t count, uint32_t* out_bad_index) {
-    if (!dst || !src) {
-        if (out_bad_index) {
-            *out_bad_index = 0;
-        }
-        return 0;
-    }
-    uint32_t i = 0;
-#if defined(__AVX2__)
-    for (; i + 31u < count; i += 32u) {
-        const __m256 s0 = _mm256_loadu_ps(src + i);
-        const __m256 s1 = _mm256_loadu_ps(src + i + 8u);
-        const __m256 s2 = _mm256_loadu_ps(src + i + 16u);
-        const __m256 s3 = _mm256_loadu_ps(src + i + 24u);
-        const int finite =
-            (_mm256_movemask_ps(_mm256_cmp_ps(s0, s0, _CMP_ORD_Q)) == 0xff) &&
-            (_mm256_movemask_ps(_mm256_cmp_ps(s1, s1, _CMP_ORD_Q)) == 0xff) &&
-            (_mm256_movemask_ps(_mm256_cmp_ps(s2, s2, _CMP_ORD_Q)) == 0xff) &&
-            (_mm256_movemask_ps(_mm256_cmp_ps(s3, s3, _CMP_ORD_Q)) == 0xff);
-        if (!finite) {
-            break;
-        }
-        _mm256_storeu_ps(dst + i, _mm256_add_ps(_mm256_loadu_ps(dst + i), s0));
-        _mm256_storeu_ps(dst + i + 8u, _mm256_add_ps(_mm256_loadu_ps(dst + i + 8u), s1));
-        _mm256_storeu_ps(dst + i + 16u, _mm256_add_ps(_mm256_loadu_ps(dst + i + 16u), s2));
-        _mm256_storeu_ps(dst + i + 24u, _mm256_add_ps(_mm256_loadu_ps(dst + i + 24u), s3));
-    }
-    for (; i + 7u < count; i += 8u) {
-        const __m256 s = _mm256_loadu_ps(src + i);
-        if (_mm256_movemask_ps(_mm256_cmp_ps(s, s, _CMP_ORD_Q)) != 0xff) {
-            break;
-        }
-        _mm256_storeu_ps(dst + i, _mm256_add_ps(_mm256_loadu_ps(dst + i), s));
-    }
-#endif
-    for (; i < count; ++i) {
-        const float v = src[i];
-        if (!std::isfinite(v)) {
-            if (out_bad_index) {
-                *out_bad_index = i;
-            }
-            return 0;
-        }
-        dst[i] += v;
-    }
-    return 1;
-}
-
 static inline void moe_axpy_bf16_row_f32(float* dst, const uint8_t* row, float alpha, uint32_t count) {
     uint32_t i = 0;
 #if defined(__AVX2__)

@@ -834,84 +834,6 @@ static uint64_t moe_raw_tensor_scalar_count(const moe_raw_tensor_cache_entry& ra
     return raw.bytes / (uint64_t)elem;
 }
 
-static int moe_apply_rmsnorm_weight_rows_f32(
-    const moe_raw_tensor_cache_entry& raw,
-    const float* input,
-    uint32_t count,
-    float* output,
-    float norm,
-    int unit_offset
-) {
-    if (!raw.base || !input || !output || count == 0) {
-        return 0;
-    }
-    uint32_t i = 0;
-#if defined(__AVX2__)
-    const __m256 vnorm = _mm256_set1_ps(norm);
-    const __m256 vone = _mm256_set1_ps(1.0f);
-    const auto apply_vec = [&](uint32_t idx, __m256 w) -> int {
-        const __m256 x = _mm256_loadu_ps(input + idx);
-        if (_mm256_movemask_ps(_mm256_cmp_ps(x, x, _CMP_ORD_Q)) != 0xff ||
-            _mm256_movemask_ps(_mm256_cmp_ps(w, w, _CMP_ORD_Q)) != 0xff) {
-            return 0;
-        }
-        if (unit_offset) {
-            w = _mm256_add_ps(w, vone);
-        }
-        const __m256 out = _mm256_mul_ps(_mm256_mul_ps(x, vnorm), w);
-        if (_mm256_movemask_ps(_mm256_cmp_ps(out, out, _CMP_ORD_Q)) != 0xff) {
-            return 0;
-        }
-        _mm256_storeu_ps(output + idx, out);
-        return 1;
-    };
-    if (raw.scalar_encoding == moe_RAW_SCALAR_F32) {
-        const float* w = reinterpret_cast<const float*>(raw.base);
-        for (; i + 7u < count; i += 8u) {
-            if (!apply_vec(i, _mm256_loadu_ps(w + i))) {
-                return 0;
-            }
-        }
-    } else if (raw.scalar_encoding == moe_RAW_SCALAR_BF16) {
-        const uint16_t* w = reinterpret_cast<const uint16_t*>(raw.base);
-        for (; i + 7u < count; i += 8u) {
-            const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(w + i));
-            const __m256 weight = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(packed), 16));
-            if (!apply_vec(i, weight)) {
-                return 0;
-            }
-        }
-#if defined(__F16C__)
-    } else if (raw.scalar_encoding == moe_RAW_SCALAR_F16) {
-        const uint16_t* w = reinterpret_cast<const uint16_t*>(raw.base);
-        for (; i + 7u < count; i += 8u) {
-            const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(w + i));
-            if (!apply_vec(i, _mm256_cvtph_ps(packed))) {
-                return 0;
-            }
-        }
-#endif
-    }
-#endif
-    const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
-    if (elem == 0) {
-        return 0;
-    }
-    for (; i < count; ++i) {
-        const float w_raw = moe_raw_scalar_to_f32(raw.base + (uint64_t)i * (uint64_t)elem, raw.scalar_encoding);
-        if (!std::isfinite(w_raw) || !std::isfinite(input[i])) {
-            return 0;
-        }
-        const float w = unit_offset ? (1.0f + w_raw) : w_raw;
-        const float result = input[i] * norm * w;
-        if (!std::isfinite(result)) {
-            return 0;
-        }
-        output[i] = result;
-    }
-    return 1;
-}
-
 static int moe_apply_rmsnorm_common_weight_f32(
     const moe_pc_engine* engine,
     const moe_raw_tensor_cache_entry& raw,
@@ -945,7 +867,21 @@ static int moe_apply_rmsnorm_common_weight_f32(
     // Safe: valid_count > 0 guaranteed by check above
     const float norm = 1.0f / std::sqrt((float)(ss / (double)valid_count) + (eps > 0.0f ? eps : 1.0e-6f));
     const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, raw);
-    return moe_apply_rmsnorm_weight_rows_f32(raw, input, count, output, norm, unit_offset);
+    for (uint32_t i = 0; i < count; ++i) {
+        float w = 0.0f;
+        if (!moe_raw_tensor_scalar_at_f32(raw, i, &w)) {
+            return 0;
+        }
+        if (!std::isfinite(w) || !std::isfinite(input[i])) {
+            return 0;
+        }
+        const float result = input[i] * norm * (unit_offset ? (1.0f + w) : w);
+        if (!std::isfinite(result)) {
+            return 0;
+        }
+        output[i] = result;
+    }
+    return 1;
 }
 
 static int moe_layer_rmsnorm_suffixes_f32(

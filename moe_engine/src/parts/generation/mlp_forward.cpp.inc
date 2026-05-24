@@ -56,12 +56,15 @@ static int moe_accumulate_branch_checked_f32(
     if (!acc || !branch || hidden_size == 0) {
         return 0;
     }
-    uint32_t bad_index = 0;
-    if (!moe_add_checked_f32(acc, branch, hidden_size, &bad_index)) {
-        std::fprintf(stderr,
-            "[storagellm mlp] non-finite %s branch layer=%d index=%u\n",
-            branch_name ? branch_name : "unknown", layer, bad_index);
-        return 0;
+    for (uint32_t i = 0; i < hidden_size; ++i) {
+        const float v = branch[i];
+        if (!std::isfinite(v)) {
+            std::fprintf(stderr,
+                "[storagellm mlp] non-finite %s branch layer=%d index=%u\n",
+                branch_name ? branch_name : "unknown", layer, i);
+            return 0;
+        }
+        acc[i] += v;
     }
     return 1;
 }

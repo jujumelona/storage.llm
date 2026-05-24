@@ -267,12 +267,14 @@ static int moe_add_mlp_residual_f32(
             layer);
         return 0;
     }
-    uint32_t bad_index = 0;
-    if (!moe_add_checked_f32(hidden, branch, hidden_size, &bad_index)) {
-        std::fprintf(stderr,
-            "[storagellm mlp] non-finite mlp branch layer=%d index=%u source=%s\n",
-            layer, bad_index, branch_source);
-        return 0;
+    for (uint32_t i = 0; i < hidden_size; ++i) {
+        if (!std::isfinite(branch[i])) {
+            std::fprintf(stderr,
+                "[storagellm mlp] non-finite mlp branch layer=%d index=%u source=%s\n",
+                layer, i, branch_source);
+            return 0;
+        }
+        hidden[i] += branch[i];
     }
     return 1;
 }
