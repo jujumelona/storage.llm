@@ -5,6 +5,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+foreach(_storagellm_cfg RELEASE RELWITHDEBINFO MINSIZEREL)
+    string(REPLACE "-DNDEBUG" "" CMAKE_CXX_FLAGS_${_storagellm_cfg} "${CMAKE_CXX_FLAGS_${_storagellm_cfg}}")
+endforeach()
+
 # Options
 option(STORAGELLM_BUILD_TESTS "Build tests" ON)
 option(STORAGELLM_PPL_DIAG "Enable PPL diagnostics" OFF)
@@ -120,7 +124,7 @@ if(STORAGELLM_ENABLE_NATIVE_OPTIMIZE)
     if(MSVC)
         target_compile_options(storagellm_engine PRIVATE /O2 /Oi /Ot)
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-        target_compile_options(storagellm_engine PRIVATE -O3 -march=native -mtune=native -UNDEBUG)
+        target_compile_options(storagellm_engine PRIVATE -O3 -march=native -mtune=native)
     endif()
 endif()
 
@@ -294,7 +298,7 @@ if(STORAGELLM_ENABLE_NATIVE_OPTIMIZE)
     if(MSVC)
         target_compile_options(storagellm_server PRIVATE /O2 /Oi /Ot)
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-        target_compile_options(storagellm_server PRIVATE -O3 -march=native -mtune=native -UNDEBUG)
+        target_compile_options(storagellm_server PRIVATE -O3 -march=native -mtune=native)
     endif()
 endif()
 
