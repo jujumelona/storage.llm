@@ -1361,32 +1361,7 @@ static int moe_layer_moe_mlp_f32(
         if (row_end > expert_intermediate) {
             row_end = expert_intermediate;
         }
-        uint32_t r = row_begin;
-        for (; r + 4u <= row_end; r += 4u) {
-            float gate_v[4] = {};
-            float up_v[4] = {};
-            moe_tensor_row_fast_prefetch(&shards[e].gate_view, r + 4u);
-            moe_tensor_row_fast_prefetch(&shards[e].up_view, r + 4u);
-            const int gate_ok = moe_dot_tensor_fast_view_adjacent_four_rows(
-                engine, &shards[e].gate_view, r, expert_input, hidden_size,
-                &gate_v[0], &gate_v[1], &gate_v[2], &gate_v[3]);
-            const int up_ok = gate_ok ? moe_dot_tensor_fast_view_adjacent_four_rows(
-                engine, &shards[e].up_view, r, expert_input, hidden_size,
-                &up_v[0], &up_v[1], &up_v[2], &up_v[3]) : 0;
-            if (!gate_ok || !up_ok) {
-                gate_up_failed.store(1, std::memory_order_relaxed);
-                return 1;
-            }
-            for (uint32_t j = 0; j < 4u; ++j) {
-                if (!std::isfinite(gate_v[j]) || !std::isfinite(up_v[j])) {
-                    gate_up_failed.store(1, std::memory_order_relaxed);
-                    return 1;
-                }
-                work[e].gate[r + j] =
-                    moe_generation_gated_activation_cached(activation_mode, gate_v[j], up_v[j]);
-            }
-        }
-        for (; r < row_end; ++r) {
+        for (uint32_t r = row_begin; r < row_end; ++r) {
             // CPU fast path: gate/up are fused so the hidden vector is read once.
             // Up is consumed immediately and is not written to the scratch pool, which
             // removes one large memory write per selected expert.
