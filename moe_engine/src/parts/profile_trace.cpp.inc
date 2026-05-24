@@ -192,7 +192,7 @@ static void moe_profile_resource_snapshot(
     const double wall_delta = (double)(now_us - prev_wall);
     const double cpu_delta = (double)(cpu_us - prev_cpu);
     core_pct = wall_delta > 0.0 ? (100.0 * cpu_delta / wall_delta) : 0.0;
-    const uint32_t hw = std::max<uint32_t>(1u, std::thread::hardware_concurrency());
+    const uint32_t hw = std::max<uint32_t>(1u, moe_cpu_thread_count_hint());
     host_pct = core_pct / (double)hw;
     cached_core_milli.store(store_pct(core_pct), std::memory_order_relaxed);
     cached_host_milli.store(store_pct(host_pct), std::memory_order_relaxed);

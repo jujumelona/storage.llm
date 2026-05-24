@@ -7,6 +7,66 @@ static int server_env_truthy_local(const char* name) {
     return 1;
 }
 
+static uint32_t server_cpu_thread_count_hint() {
+    const uint32_t override_threads = server_env_u32("STORAGELLM_CPU_THREADS", 0u, 1u, 256u);
+    if (override_threads > 0) {
+        return override_threads;
+    }
+    uint32_t threads = UINT32_MAX;
+    const unsigned int cpp_threads = std::thread::hardware_concurrency();
+    if (cpp_threads > 0) {
+        threads = std::min<uint32_t>(threads, (uint32_t)cpp_threads);
+    }
+#ifdef _WIN32
+    const DWORD active = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (active > 0) {
+        threads = std::min<uint32_t>(threads, (uint32_t)active);
+    }
+#else
+#ifdef _SC_NPROCESSORS_ONLN
+    const long online = sysconf(_SC_NPROCESSORS_ONLN);
+    if (online > 0) {
+        threads = std::min<uint32_t>(threads, (uint32_t)online);
+    }
+#endif
+#if defined(__linux__) && defined(CPU_SETSIZE)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        uint32_t affinity = 0;
+        for (int i = 0; i < CPU_SETSIZE; ++i) {
+            if (CPU_ISSET(i, &set)) {
+                ++affinity;
+            }
+        }
+        if (affinity > 0) {
+            threads = std::min<uint32_t>(threads, affinity);
+        }
+    }
+#endif
+#if defined(__linux__)
+    std::ifstream cpu_max("/sys/fs/cgroup/cpu.max");
+    std::string quota;
+    std::string period;
+    if (cpu_max >> quota >> period && quota != "max") {
+        char* end_q = nullptr;
+        char* end_p = nullptr;
+        const unsigned long long q = std::strtoull(quota.c_str(), &end_q, 10);
+        const unsigned long long p = std::strtoull(period.c_str(), &end_p, 10);
+        if (end_q && *end_q == '\0' && end_p && *end_p == '\0' && q > 0 && p > 0) {
+            threads = std::min<uint32_t>(
+                threads,
+                (uint32_t)std::max<unsigned long long>(1ull, (q + p - 1ull) / p));
+        }
+    }
+#endif
+#endif
+    if (threads == 0 || threads == UINT32_MAX) {
+        threads = 1;
+    }
+    return std::min<uint32_t>(threads, 256u);
+}
+
 
 static int server_strict_fast_path_enabled() {
     return server_env_truthy_local("STORAGELLM_STRICT_FAST_PATH") ||
@@ -103,7 +163,7 @@ static moe_io_config_t make_server_io_config(const server_options& opts, const m
     io.ram_eviction_target_fill_pct = std::max<uint8_t>(io.ram_eviction_target_fill_pct, 85u);
     io.ram_eviction_threshold_pct = std::max<uint8_t>(io.ram_eviction_threshold_pct, 90u);
     if (server_cpu_storage_max_enabled(caps)) {
-        const uint32_t hw_cpu = std::max<uint32_t>(1u, std::thread::hardware_concurrency());
+        const uint32_t hw_cpu = std::max<uint32_t>(1u, server_cpu_thread_count_hint());
         const uint32_t cpu_io_workers =
             hw_cpu >= 32u ? 16u :
             hw_cpu >= 16u ? 10u :
@@ -125,7 +185,7 @@ static moe_io_config_t make_server_io_config(const server_options& opts, const m
         io.internal_require_gpu_expert_batch_kernel = 0;
         io.internal_verified_backend_only = 0;
     } else {
-        const uint32_t hw_gpu = std::max<uint32_t>(1u, std::thread::hardware_concurrency());
+        const uint32_t hw_gpu = std::max<uint32_t>(1u, server_cpu_thread_count_hint());
         const uint32_t stream_workers = std::max<uint32_t>(2u, caps.copy_streams ? caps.copy_streams * 2u : 2u);
         io.disk_worker_threads = hw_gpu >= 32u ? 12u : (hw_gpu >= 16u ? 8u : 4u);
         io.pinned_worker_threads = std::min<uint32_t>(16u, std::max<uint32_t>(4u, stream_workers));

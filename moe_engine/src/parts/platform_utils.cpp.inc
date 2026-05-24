@@ -1,6 +1,10 @@
 // Platform-specific utility functions
 // UTF-8 conversion, path utilities, string utilities
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 static void copy_check_path(char* out, size_t out_size, const std::string& path) {
     if (!out || out_size == 0) {
         return;
@@ -40,30 +44,88 @@ static uint32_t moe_parse_env_u32(const char* name) {
     return (uint32_t)parsed;
 }
 
+static uint32_t moe_linux_cpu_affinity_count() {
+#if defined(__linux__) && defined(CPU_SETSIZE)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        uint32_t count = 0;
+        for (int i = 0; i < CPU_SETSIZE; ++i) {
+            if (CPU_ISSET(i, &set)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+#endif
+    return 0;
+}
+
+static uint32_t moe_linux_cpu_quota_count() {
+#if defined(__linux__)
+    const char* paths[] = {
+        "/sys/fs/cgroup/cpu.max",
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
+    };
+    {
+        std::ifstream in(paths[0]);
+        std::string quota;
+        std::string period;
+        if (in >> quota >> period && quota != "max") {
+            char* end_q = nullptr;
+            char* end_p = nullptr;
+            const unsigned long long q = std::strtoull(quota.c_str(), &end_q, 10);
+            const unsigned long long p = std::strtoull(period.c_str(), &end_p, 10);
+            if (end_q && *end_q == '\0' && end_p && *end_p == '\0' && q > 0 && p > 0) {
+                return (uint32_t)std::max<unsigned long long>(1ull, (q + p - 1ull) / p);
+            }
+        }
+    }
+    {
+        std::ifstream quota_in(paths[1]);
+        std::ifstream period_in("/sys/fs/cgroup/cpu/cpu.cfs_period_us");
+        long long q = 0;
+        long long p = 0;
+        if ((quota_in >> q) && (period_in >> p) && q > 0 && p > 0) {
+            return (uint32_t)std::max<long long>(1, (q + p - 1) / p);
+        }
+    }
+#endif
+    return 0;
+}
+
 static uint32_t moe_cpu_thread_count_hint() {
     const uint32_t override_threads = moe_parse_env_u32("STORAGELLM_CPU_THREADS");
     if (override_threads > 0) {
         return std::min<uint32_t>(override_threads, 256u);
     }
-    uint32_t threads = 0;
+    uint32_t threads = UINT32_MAX;
     const unsigned int cpp_threads = std::thread::hardware_concurrency();
     if (cpp_threads > 0) {
-        threads = std::max<uint32_t>(threads, (uint32_t)cpp_threads);
+        threads = std::min<uint32_t>(threads, (uint32_t)cpp_threads);
     }
 #ifdef _WIN32
     const DWORD active = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     if (active > 0) {
-        threads = std::max<uint32_t>(threads, (uint32_t)active);
+        threads = std::min<uint32_t>(threads, (uint32_t)active);
     }
 #else
 #ifdef _SC_NPROCESSORS_ONLN
     const long online = sysconf(_SC_NPROCESSORS_ONLN);
     if (online > 0) {
-        threads = std::max<uint32_t>(threads, (uint32_t)online);
+        threads = std::min<uint32_t>(threads, (uint32_t)online);
     }
 #endif
+    const uint32_t affinity = moe_linux_cpu_affinity_count();
+    if (affinity > 0) {
+        threads = std::min<uint32_t>(threads, affinity);
+    }
+    const uint32_t quota = moe_linux_cpu_quota_count();
+    if (quota > 0) {
+        threads = std::min<uint32_t>(threads, quota);
+    }
 #endif
-    if (threads == 0) {
+    if (threads == 0 || threads == UINT32_MAX) {
         threads = 1;
     }
     return std::min<uint32_t>(threads, 256u);

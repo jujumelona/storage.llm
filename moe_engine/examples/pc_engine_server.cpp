@@ -38,6 +38,9 @@ static const socket_handle_t invalid_socket_handle = INVALID_SOCKET;
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -335,7 +338,7 @@ static std::string resource_log_suffix() {
     double host_pct = 0.0;
     if (prev_wall && prev_cpu && wall_us > prev_wall && cpu_us >= prev_cpu) {
         core_pct = 100.0 * (double)(cpu_us - prev_cpu) / (double)(wall_us - prev_wall);
-        const uint32_t hw = std::max<uint32_t>(1u, std::thread::hardware_concurrency());
+        const uint32_t hw = std::max<uint32_t>(1u, server_cpu_thread_count_hint());
         host_pct = core_pct / (double)hw;
     }
     std::ostringstream out;
