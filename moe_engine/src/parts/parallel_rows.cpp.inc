@@ -80,7 +80,19 @@ static inline void moe_cpu_apply_row_worker_qos() {
 #endif
 }
 
-static uint32_t moe_cpu_row_min_block() {
+static int moe_cpu_row_engine_storage_mode(const moe_pc_engine* engine) {
+    if (!engine) {
+        return 0;
+    }
+    return engine->cpu_only_runtime.load(std::memory_order_relaxed) ||
+           engine->gpu_path_disabled_for_cpu_only.load(std::memory_order_relaxed) ||
+           engine->backend_caps.backend == moe_BACKEND_CPU ||
+           engine->config.platform == moe_PLATFORM_CPU_ONLY ||
+           engine->config.preferred_backend == moe_BACKEND_CPU ||
+           !engine->config.prefer_gpu;
+}
+
+static uint32_t moe_cpu_row_min_block(const moe_pc_engine* engine, uint32_t workers) {
     const uint32_t override_block = moe_parse_env_u32("STORAGELLM_CPU_ROW_MIN_BLOCK");
     if (override_block > 0) {
         return std::min<uint32_t>(override_block, 4096u);
@@ -88,19 +100,23 @@ static uint32_t moe_cpu_row_min_block() {
     // Keep blocks small enough that MoE gate/up/down work can occupy all row
     // workers. CPU storage-max uses smaller blocks because mmap page latency can
     // vary per shard; dynamic work stealing hides those stalls better.
-    if (moe_parallel_env_truthy("STORAGELLM_CPU_STORAGE_MAX") ||
+    if (moe_cpu_row_engine_storage_mode(engine) ||
+        moe_parallel_env_truthy("STORAGELLM_CPU_STORAGE_MAX") ||
         moe_parallel_env_truthy("STORAGELLM_CPU_PIPELINE") ||
         moe_parallel_env_truthy("STORAGELLM_CPU_ONLY") ||
         moe_parallel_env_truthy("STORAGELLM_CPU_STORAGE_ENGINE")) {
-        return 4u;
+        return workers <= 8u ? 4u : 8u;
     }
     return 16u;
 }
 
-static uint32_t moe_cpu_row_blocks_per_worker() {
+static uint32_t moe_cpu_row_blocks_per_worker(const moe_pc_engine* engine, uint32_t workers) {
     const uint32_t override_blocks = moe_parse_env_u32("STORAGELLM_CPU_ROW_BLOCKS_PER_WORKER");
     if (override_blocks > 0) {
         return std::min<uint32_t>(override_blocks, 64u);
+    }
+    if (moe_cpu_row_engine_storage_mode(engine)) {
+        return workers <= 8u ? 16u : 12u;
     }
     return 8u;
 }
@@ -110,13 +126,13 @@ static uint32_t moe_cpu_row_blocks_per_worker() {
 //   False sharing + cache ping-pong on next_row atomic degrades throughput.
 // Solution: min_block = 16 ensures at most (rows / 16) atomic ops regardless of worker count.
 //   For 256 rows → 16 ops instead of 64. 16 rows ≈ 4 cache lines of work per steal.
-static uint32_t auto_row_block(uint32_t rows, uint32_t workers) {
+static uint32_t auto_row_block(const moe_pc_engine* engine, uint32_t rows, uint32_t workers) {
     if (workers == 0) {
         workers = 1;
     }
-    const uint32_t blocks_per_worker = moe_cpu_row_blocks_per_worker();
+    const uint32_t blocks_per_worker = moe_cpu_row_blocks_per_worker(engine, workers);
     const uint32_t block = rows / (workers * blocks_per_worker);
-    const uint32_t min_block = moe_cpu_row_min_block();
+    const uint32_t min_block = moe_cpu_row_min_block(engine, workers);
     return std::max(block ? block : 1u, min_block);
 }
 
@@ -270,7 +286,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     const char* trace_label = moe_profile_parallel_label();
     uint32_t workers = row_hw_threads();
     if (block_rows == 0) {
-        block_rows = auto_row_block(row_count, workers);
+        block_rows = auto_row_block(engine, row_count, workers);
     }
     const uint32_t max_blocks = (row_count + block_rows - 1u) / block_rows;
     if (workers > max_blocks) {

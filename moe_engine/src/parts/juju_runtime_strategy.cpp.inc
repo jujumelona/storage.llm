@@ -418,7 +418,13 @@ static void moe_rt_apply_juju_io_flags(
                 // Max-speed mode keeps the prefetch pipeline active even for
                 // CPU_WITH_CACHE/unified-memory paths; users can still cap it with
                 // STORAGELLM_IO_WORKERS/STORAGELLM_DISK_WORKERS if their desktop is noisy.
-                io->io_worker_threads = std::max<uint32_t>(io->io_worker_threads, 4u);
+                const uint32_t hw = std::max<uint32_t>(1u, moe_cpu_thread_count_hint());
+                const uint32_t cpu_io_workers =
+                    hw >= 32u ? 16u :
+                    hw >= 16u ? 10u :
+                    hw >= 8u  ? 6u  :
+                    hw >= 4u  ? 2u  : 1u;
+                io->io_worker_threads = std::max<uint32_t>(io->io_worker_threads, cpu_io_workers);
                 io->disk_worker_threads = io->io_worker_threads;
             }
         } else {
