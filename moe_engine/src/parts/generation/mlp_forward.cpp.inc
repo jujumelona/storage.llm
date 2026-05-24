@@ -1447,31 +1447,47 @@ static int moe_layer_moe_mlp_f32(
                 const uint32_t env_block = moe_parse_env_u32("STORAGELLM_MLP_FUSED_DOWN_BLOCK_ROWS");
                 return env_block > 0 ? std::max(1u, std::min<uint32_t>(env_block, 128u)) : 32u;
             }();
-            const uint32_t row_pair_count = (hidden_size + 1u) >> 1u;
-            const uint32_t fused_down_pair_block_rows = std::max(1u, fused_down_block_rows >> 1u);
-            const int down_fused_ok = moe_parallel_rows(engine, row_pair_count, fused_down_pair_block_rows, [&](uint32_t row_pair) {
-                const uint32_t row0 = row_pair << 1u;
+            const uint32_t row_group_count = (hidden_size + 3u) >> 2u;
+            const uint32_t fused_down_group_block_rows = std::max(1u, fused_down_block_rows >> 2u);
+            const int down_fused_ok = moe_parallel_rows(engine, row_group_count, fused_down_group_block_rows, [&](uint32_t row_group) {
+                const uint32_t row0 = row_group << 2u;
                 const uint32_t row1 = row0 + 1u;
+                const uint32_t row2 = row0 + 2u;
+                const uint32_t row3 = row0 + 3u;
                 if (row0 >= hidden_size) {
                     return 0;
                 }
                 float acc0 = 0.0f;
                 float acc1 = 0.0f;
+                float acc2 = 0.0f;
+                float acc3 = 0.0f;
                 const int has_pair = row1 < hidden_size;
+                const int has_row2 = row2 < hidden_size;
+                const int has_quad = row3 < hidden_size;
                 for (uint32_t ai = 0; ai < active_expert_count; ++ai) {
                     const uint32_t e = active_experts[ai];
                     float v0 = 0.0f;
                     float v1 = 0.0f;
-                    moe_tensor_row_fast_prefetch(&shards[e].down_view, row0 + 1u);
-                    if (has_pair) {
-                        moe_tensor_row_fast_prefetch(&shards[e].down_view, row1 + 1u);
-                    }
-                    const int dot_ok = has_pair ?
-                        moe_dot_tensor_fast_view_adjacent_rows(
-                            engine, &shards[e].down_view, row0, work[e].gate, expert_intermediate, &v0, &v1) :
-                        moe_dot_tensor_fast_view_row(
+                    float v2 = 0.0f;
+                    float v3 = 0.0f;
+                    moe_tensor_row_fast_prefetch(&shards[e].down_view, row0 + 4u);
+                    int dot_ok = 0;
+                    if (has_quad) {
+                        dot_ok = moe_dot_tensor_fast_view_adjacent_four_rows(
+                            engine, &shards[e].down_view, row0, work[e].gate, expert_intermediate, &v0, &v1, &v2, &v3);
+                    } else if (has_pair) {
+                        dot_ok = moe_dot_tensor_fast_view_adjacent_rows(
+                            engine, &shards[e].down_view, row0, work[e].gate, expert_intermediate, &v0, &v1);
+                        if (dot_ok && has_row2) {
+                            dot_ok = moe_dot_tensor_fast_view_row(
+                                engine, &shards[e].down_view, row2, work[e].gate, expert_intermediate, &v2);
+                        }
+                    } else {
+                        dot_ok = moe_dot_tensor_fast_view_row(
                             engine, &shards[e].down_view, row0, work[e].gate, expert_intermediate, &v0);
-                    if (!dot_ok || !std::isfinite(v0) || (has_pair && !std::isfinite(v1))) {
+                    }
+                    if (!dot_ok || !std::isfinite(v0) || (has_pair && !std::isfinite(v1)) ||
+                        (has_row2 && !std::isfinite(v2)) || (has_quad && !std::isfinite(v3))) {
                         fused_ok.store(0, std::memory_order_relaxed);
                         return 1;
                     }
@@ -1480,14 +1496,27 @@ static int moe_layer_moe_mlp_f32(
                     if (has_pair) {
                         acc1 += v1 * scale;
                     }
+                    if (has_quad) {
+                        acc2 += v2 * scale;
+                        acc3 += v3 * scale;
+                    } else if (has_row2) {
+                        acc2 += v2 * scale;
+                    }
                 }
-                if (!std::isfinite(acc0) || (has_pair && !std::isfinite(acc1))) {
+                if (!std::isfinite(acc0) || (has_pair && !std::isfinite(acc1)) ||
+                    (has_row2 && !std::isfinite(acc2)) || (has_quad && !std::isfinite(acc3))) {
                     fused_ok.store(0, std::memory_order_relaxed);
                     return 1;
                 }
                 s->residual[row0] = acc0;
                 if (has_pair) {
                     s->residual[row1] = acc1;
+                }
+                if (has_quad) {
+                    s->residual[row2] = acc2;
+                    s->residual[row3] = acc3;
+                } else if (has_row2) {
+                    s->residual[row2] = acc2;
                 }
                 return 1;
             });

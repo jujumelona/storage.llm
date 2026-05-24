@@ -620,6 +620,123 @@ static inline int moe_mxfp4_dot_two_rows_accum_avx2(
     *out1 = moe_dot_hsum256_ps(acc1) + tail1;
     return 1;
 }
+
+static inline int moe_mxfp4_dot_four_rows_accum_avx2(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const uint8_t* packed2,
+    const uint8_t* packed3,
+    const float* x,
+    uint32_t cols,
+    const moe_mxfp4_row_layout_t& layout,
+    int pairwise_order,
+    float* out0,
+    float* out1,
+    float* out2,
+    float* out3
+) {
+    if (!packed0 || !packed1 || !packed2 || !packed3 || !x ||
+        !out0 || !out1 || !out2 || !out3 || pairwise_order) {
+        return 0;
+    }
+    const int standard_32 = (layout.block_cols == 32u && !layout.bytewise_codes);
+    const int bytewise_16 = (layout.block_cols == 16u && layout.bytewise_codes);
+    if (!standard_32 && !bytewise_16) {
+        return 0;
+    }
+
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+    float tail0 = 0.0f;
+    float tail1 = 0.0f;
+    float tail2 = 0.0f;
+    float tail3 = 0.0f;
+    const float* table = moe_mxfp4_value_table();
+    uint32_t start = 0;
+    while (start + layout.block_cols <= cols) {
+        const __m256 scale0 = _mm256_set1_ps(moe_e8m0_to_f32_half(packed0[0]));
+        const __m256 scale1 = _mm256_set1_ps(moe_e8m0_to_f32_half(packed1[0]));
+        const __m256 scale2 = _mm256_set1_ps(moe_e8m0_to_f32_half(packed2[0]));
+        const __m256 scale3 = _mm256_set1_ps(moe_e8m0_to_f32_half(packed3[0]));
+        const uint8_t* qs0 = packed0 + 1u;
+        const uint8_t* qs1 = packed1 + 1u;
+        const uint8_t* qs2 = packed2 + 1u;
+        const uint8_t* qs3 = packed3 + 1u;
+        if (standard_32) {
+            const __m256 x0 = _mm256_loadu_ps(x + start);
+            const __m256 x1 = _mm256_loadu_ps(x + start + 8u);
+            const __m256 x2 = _mm256_loadu_ps(x + start + 16u);
+            const __m256 x3 = _mm256_loadu_ps(x + start + 24u);
+            acc0 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs0, 0), scale0), x0, acc0);
+            acc1 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs1, 0), scale1), x0, acc1);
+            acc2 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs2, 0), scale2), x0, acc2);
+            acc3 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs3, 0), scale3), x0, acc3);
+            acc0 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs0 + 8u, 0), scale0), x1, acc0);
+            acc1 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs1 + 8u, 0), scale1), x1, acc1);
+            acc2 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs2 + 8u, 0), scale2), x1, acc2);
+            acc3 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs3 + 8u, 0), scale3), x1, acc3);
+            acc0 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs0, 1), scale0), x2, acc0);
+            acc1 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs1, 1), scale1), x2, acc1);
+            acc2 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs2, 1), scale2), x2, acc2);
+            acc3 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs3, 1), scale3), x2, acc3);
+            acc0 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs0 + 8u, 1), scale0), x3, acc0);
+            acc1 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs1 + 8u, 1), scale1), x3, acc1);
+            acc2 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs2 + 8u, 1), scale2), x3, acc2);
+            acc3 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs3 + 8u, 1), scale3), x3, acc3);
+        } else {
+            const __m256 x0 = _mm256_loadu_ps(x + start);
+            const __m256 x1 = _mm256_loadu_ps(x + start + 8u);
+            acc0 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs0, 0), scale0), x0, acc0);
+            acc1 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs1, 0), scale1), x0, acc1);
+            acc2 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs2, 0), scale2), x0, acc2);
+            acc3 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs3, 0), scale3), x0, acc3);
+            acc0 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs0 + 8u, 0), scale0), x1, acc0);
+            acc1 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs1 + 8u, 0), scale1), x1, acc1);
+            acc2 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs2 + 8u, 0), scale2), x1, acc2);
+            acc3 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(qs3 + 8u, 0), scale3), x1, acc3);
+        }
+        start += layout.block_cols;
+        packed0 += layout.block_bytes;
+        packed1 += layout.block_bytes;
+        packed2 += layout.block_bytes;
+        packed3 += layout.block_bytes;
+    }
+    while (start < cols) {
+        const float scale0 = moe_e8m0_to_f32_half(packed0[0]);
+        const float scale1 = moe_e8m0_to_f32_half(packed1[0]);
+        const float scale2 = moe_e8m0_to_f32_half(packed2[0]);
+        const float scale3 = moe_e8m0_to_f32_half(packed3[0]);
+        const uint8_t* qs0 = packed0 + 1u;
+        const uint8_t* qs1 = packed1 + 1u;
+        const uint8_t* qs2 = packed2 + 1u;
+        const uint8_t* qs3 = packed3 + 1u;
+        const uint32_t limit = std::min<uint32_t>(layout.block_cols, cols - start);
+        float block0 = 0.0f;
+        float block1 = 0.0f;
+        float block2 = 0.0f;
+        float block3 = 0.0f;
+        moe_mxfp4_dot_block_two_rows(
+            qs0, qs1, x, start, limit, layout, table, pairwise_order, &block0, &block1);
+        moe_mxfp4_dot_block_two_rows(
+            qs2, qs3, x, start, limit, layout, table, pairwise_order, &block2, &block3);
+        tail0 += block0 * scale0;
+        tail1 += block1 * scale1;
+        tail2 += block2 * scale2;
+        tail3 += block3 * scale3;
+        start += limit;
+        packed0 += layout.block_bytes;
+        packed1 += layout.block_bytes;
+        packed2 += layout.block_bytes;
+        packed3 += layout.block_bytes;
+    }
+    *out0 = moe_dot_hsum256_ps(acc0) + tail0;
+    *out1 = moe_dot_hsum256_ps(acc1) + tail1;
+    *out2 = moe_dot_hsum256_ps(acc2) + tail2;
+    *out3 = moe_dot_hsum256_ps(acc3) + tail3;
+    return 1;
+}
 #endif
 
 static inline void moe_mxfp4_dot_block_two_rows(
@@ -740,6 +857,21 @@ static void moe_dot_gguf_mxfp4_two_rows_with_layout(
     float* out1
 );
 
+static void moe_dot_gguf_mxfp4_four_rows_with_layout(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const uint8_t* packed2,
+    const uint8_t* packed3,
+    const float* x,
+    uint32_t cols,
+    const moe_mxfp4_row_layout_t& layout,
+    int pairwise_order,
+    float* out0,
+    float* out1,
+    float* out2,
+    float* out3
+);
+
 static void moe_dot_gguf_mxfp4_two_rows_strided(
     const uint8_t* packed0,
     const uint8_t* packed1,
@@ -829,6 +961,46 @@ static void moe_dot_gguf_mxfp4_two_rows_with_layout(
     }
     *out0 = acc0;
     *out1 = acc1;
+}
+
+static void moe_dot_gguf_mxfp4_four_rows_with_layout(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const uint8_t* packed2,
+    const uint8_t* packed3,
+    const float* x,
+    uint32_t cols,
+    const moe_mxfp4_row_layout_t& layout,
+    int pairwise_order,
+    float* out0,
+    float* out1,
+    float* out2,
+    float* out3
+) {
+    if (!out0 || !out1 || !out2 || !out3) {
+        return;
+    }
+    if (!packed0 || !packed1 || !packed2 || !packed3 || !x || cols == 0) {
+        *out0 = 0.0f;
+        *out1 = 0.0f;
+        *out2 = 0.0f;
+        *out3 = 0.0f;
+        return;
+    }
+    const moe_mxfp4_row_layout_t active_layout =
+        (layout.block_cols != 0u && layout.block_bytes != 0u) ?
+        layout : moe_mxfp4_row_layout_for_bytes(cols, 0ull);
+#if defined(__AVX2__)
+    if (moe_mxfp4_dot_four_rows_accum_avx2(
+            packed0, packed1, packed2, packed3, x, cols, active_layout, pairwise_order,
+            out0, out1, out2, out3)) {
+        return;
+    }
+#endif
+    moe_dot_gguf_mxfp4_two_rows_with_layout(
+        packed0, packed1, x, cols, active_layout, pairwise_order, out0, out1);
+    moe_dot_gguf_mxfp4_two_rows_with_layout(
+        packed2, packed3, x, cols, active_layout, pairwise_order, out2, out3);
 }
 
 static void moe_dot_gguf_mxfp4_two_rows(
