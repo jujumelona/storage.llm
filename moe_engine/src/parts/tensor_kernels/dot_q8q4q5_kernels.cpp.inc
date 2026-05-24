@@ -789,10 +789,13 @@ static void moe_dot_gguf_mxfp4_two_rows_with_layout(
         *out1 = 0.0f;
         return;
     }
+    const moe_mxfp4_row_layout_t active_layout =
+        (layout.block_cols != 0u && layout.block_bytes != 0u) ?
+        layout : moe_mxfp4_row_layout_for_bytes(cols, 0ull);
     const float* table = moe_mxfp4_value_table();
 #if defined(__AVX2__)
     if (moe_mxfp4_dot_two_rows_accum_avx2(
-            packed0, packed1, x, cols, layout, pairwise_order, out0, out1)) {
+            packed0, packed1, x, cols, active_layout, pairwise_order, out0, out1)) {
         return;
     }
 #endif
@@ -800,7 +803,7 @@ static void moe_dot_gguf_mxfp4_two_rows_with_layout(
     float acc1 = 0.0f;
     uint32_t start = 0;
     while (start < cols) {
-        const uint32_t limit = std::min<uint32_t>(layout.block_cols, cols - start);
+        const uint32_t limit = std::min<uint32_t>(active_layout.block_cols, cols - start);
         const float scale0 = moe_e8m0_to_f32_half(packed0[0]);
         const float scale1 = moe_e8m0_to_f32_half(packed1[0]);
         const uint8_t* qs0 = packed0 + 1u;
@@ -813,7 +816,7 @@ static void moe_dot_gguf_mxfp4_two_rows_with_layout(
             x,
             start,
             limit,
-            layout,
+            active_layout,
             table,
             pairwise_order,
             &block0,
@@ -821,8 +824,8 @@ static void moe_dot_gguf_mxfp4_two_rows_with_layout(
         acc0 += block0 * scale0;
         acc1 += block1 * scale1;
         start += limit;
-        packed0 += layout.block_bytes;
-        packed1 += layout.block_bytes;
+        packed0 += active_layout.block_bytes;
+        packed1 += active_layout.block_bytes;
     }
     *out0 = acc0;
     *out1 = acc1;
@@ -863,10 +866,13 @@ static float moe_dot_gguf_mxfp4_row_with_layout(
     if (!packed || !x) {
         return 0.0f;
     }
+    const moe_mxfp4_row_layout_t active_layout =
+        (layout.block_cols != 0u && layout.block_bytes != 0u) ?
+        layout : moe_mxfp4_row_layout_for_bytes(cols, 0ull);
     const float* table = moe_mxfp4_value_table();
 #if defined(__AVX2__)
     float avx_acc = 0.0f;
-    if (moe_mxfp4_dot_row_accum_avx2(packed, x, cols, layout, pairwise_order, &avx_acc)) {
+    if (moe_mxfp4_dot_row_accum_avx2(packed, x, cols, active_layout, pairwise_order, &avx_acc)) {
         return avx_acc;
     }
 #endif
@@ -875,11 +881,11 @@ static float moe_dot_gguf_mxfp4_row_with_layout(
     while (start < cols) {
         const float scale = moe_e8m0_to_f32_half(packed[0]);
         const uint8_t* qs = packed + 1u;
-        const uint32_t limit = std::min<uint32_t>(layout.block_cols, cols - start);
-        const float block_acc = moe_mxfp4_dot_block(qs, x, start, limit, layout, table, pairwise_order);
+        const uint32_t limit = std::min<uint32_t>(active_layout.block_cols, cols - start);
+        const float block_acc = moe_mxfp4_dot_block(qs, x, start, limit, active_layout, table, pairwise_order);
         acc += block_acc * scale;
         start += limit;
-        packed += layout.block_bytes;
+        packed += active_layout.block_bytes;
     }
     return acc;
 }
@@ -902,6 +908,9 @@ static void moe_dot_gguf_mxfp4_row_batch_strided(
         return;
     }
     const moe_mxfp4_row_layout_t layout = moe_mxfp4_row_layout_for_bytes(cols, physical_row_bytes);
+    const moe_mxfp4_row_layout_t active_layout =
+        (layout.block_cols != 0u && layout.block_bytes != 0u) ?
+        layout : moe_mxfp4_row_layout_for_bytes(cols, 0ull);
     const float* table = moe_mxfp4_value_table();
     const int pairwise_order = moe_mxfp4_pairwise_nibble_order_enabled();
     for (uint32_t b = 0; b < batch_size; ++b) {
@@ -914,8 +923,8 @@ static void moe_dot_gguf_mxfp4_row_batch_strided(
     while (start < cols) {
         const float scale = moe_e8m0_to_f32_half(row[0]);
         const uint8_t* qs = row + 1u;
-        const uint32_t limit = std::min<uint32_t>(layout.block_cols, cols - start);
-        if (layout.bytewise_codes) {
+        const uint32_t limit = std::min<uint32_t>(active_layout.block_cols, cols - start);
+        if (active_layout.bytewise_codes) {
             for (uint32_t j = 0; j < limit; ++j) {
                 values[j] = table[qs[j] & 0x0fu] * scale;
             }
@@ -969,7 +978,7 @@ static void moe_dot_gguf_mxfp4_row_batch_strided(
             out_values[b] += acc;
         }
         start += limit;
-        row += layout.block_bytes;
+        row += active_layout.block_bytes;
     }
 }
 

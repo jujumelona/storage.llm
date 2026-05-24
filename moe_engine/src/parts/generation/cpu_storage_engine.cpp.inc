@@ -1171,6 +1171,10 @@ static int moe_cpu_storage_fast_view_for_record(
     out->rows = v.rows;
     out->cols = v.cols;
     out->weight_format = v.weight_format;
+    if (out->weight_format == moe_WEIGHT_ENCODING_MXFP4) {
+        out->mxfp4_layout = moe_mxfp4_row_layout_for_bytes(out->cols, out->row_bytes);
+        out->mxfp4_pairwise_order = moe_mxfp4_pairwise_nibble_order_enabled();
+    }
     out->simple_dot = moe_cpu_simple_row_dot_for_format(v.weight_format);
     engine->cpu_hot_tensor_reused.fetch_add(1, std::memory_order_relaxed);
     return 1;
