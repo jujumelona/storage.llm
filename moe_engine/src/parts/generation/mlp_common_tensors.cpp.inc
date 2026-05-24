@@ -84,6 +84,15 @@ static int moe_common_linear_f32(
     if (row_bytes == 0 || raw.bytes < row_bytes * (uint64_t)raw.rows) {
         return 0;
     }
+    const uint8_t effective_weight_format = moe_effective_weight_format_for_row_bytes(raw, raw.cols);
+    if (!raw.math_transposed && effective_weight_format == moe_WEIGHT_ENCODING_MXFP4) {
+        moe_profile_parallel_label_scope rows_label("common_linear_mxfp4");
+        return moe_parallel_rows(engine, raw.rows, 0, [&](uint32_t row) {
+            const uint8_t* row_ptr = raw.base + (uint64_t)row * row_bytes;
+            output[row] = moe_dot_gguf_mxfp4_row_strided(row_ptr, input, input_count, row_bytes);
+            return 1;
+        });
+    }
     moe_profile_parallel_label_scope rows_label("common_linear");
     return moe_parallel_rows(engine, raw.rows, 0, [&](uint32_t row) {
         output[row] = moe_raw_tensor_dot_row(raw, row, input, input_count);

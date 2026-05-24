@@ -195,6 +195,15 @@ int moe_pc_engine_lm_head_top1_f32(
     const uint32_t chunk_size = std::max(64u, (c->vocab_size + target_chunks - 1u) / target_chunks);
     const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
     const uint32_t chunk_block = 1u;
+    const int lm_head_mxfp4_direct =
+        !raw.math_transposed && effective_weight_format == moe_WEIGHT_ENCODING_MXFP4;
+    auto lm_head_dot_row = [&](uint32_t row) -> float {
+        if (lm_head_mxfp4_direct) {
+            const uint8_t* row_ptr = raw.base + (uint64_t)row * row_bytes;
+            return moe_dot_gguf_mxfp4_row_strided(row_ptr, hidden, hidden_count, row_bytes);
+        }
+        return moe_raw_tensor_dot_row(raw, row, hidden, hidden_count);
+    };
     moe_profile_log(
         "lm_head_top1_begin",
         "vocab=%u hidden=%u fmt=%u eff_fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.6g row_workers=%u chunk_size=%u chunks=%u",
@@ -235,7 +244,7 @@ int moe_pc_engine_lm_head_top1_f32(
                 alignas(32) float scores[batch];
                 for (uint32_t i = 0; i < batch; ++i) {
                     scores[i] = moe_apply_final_logit_softcap_cached(
-                        logit_softcap, moe_raw_tensor_dot_row(raw, t + i, hidden, hidden_count));
+                        logit_softcap, lm_head_dot_row(t + i));
                     if (!std::isfinite(scores[i])) {
                         return 0;
                     }
@@ -293,7 +302,7 @@ int moe_pc_engine_lm_head_top1_f32(
             }
             for (; t < end; ++t) {
                 const float s = moe_apply_final_logit_softcap_cached(
-                    logit_softcap, moe_raw_tensor_dot_row(raw, t, hidden, hidden_count));
+                    logit_softcap, lm_head_dot_row(t));
                 if (!std::isfinite(s)) {
                     return 0;
                 }
@@ -416,9 +425,18 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     const uint32_t chunk_size = std::max(64u, (c->vocab_size + target_chunks - 1u) / target_chunks);
     const uint32_t num_chunks = (c->vocab_size + chunk_size - 1) / chunk_size;
     const uint32_t chunk_block = 1u;
+    const int lm_head_mxfp4_direct =
+        !raw.math_transposed && effective_weight_format == moe_WEIGHT_ENCODING_MXFP4;
+    auto lm_head_dot_row = [&](uint32_t row) -> float {
+        if (lm_head_mxfp4_direct) {
+            const uint8_t* row_ptr = raw.base + (uint64_t)row * row_bytes;
+            return moe_dot_gguf_mxfp4_row_strided(row_ptr, hidden, hidden_count, row_bytes);
+        }
+        return moe_raw_tensor_dot_row(raw, row, hidden, hidden_count);
+    };
     const float target_score_precomputed = moe_apply_final_logit_softcap_cached(
         logit_softcap,
-        moe_raw_tensor_dot_row(raw, target_token_id, hidden, hidden_count));
+        lm_head_dot_row(target_token_id));
     if (!std::isfinite(target_score_precomputed)) {
         return 0;
     }
@@ -482,7 +500,7 @@ int moe_pc_engine_lm_head_token_logprob_f32(
                 alignas(32) float scores[batch];
                 for (uint32_t i = 0; i < batch; ++i) {
                     scores[i] = moe_apply_final_logit_softcap_cached(
-                        logit_softcap, moe_raw_tensor_dot_row(raw, t + i, hidden, hidden_count));
+                        logit_softcap, lm_head_dot_row(t + i));
                     if (!std::isfinite(scores[i])) {
                         return 0;
                     }
@@ -513,7 +531,7 @@ int moe_pc_engine_lm_head_token_logprob_f32(
             }
             for (; t < end; ++t) {
                 const float score = moe_apply_final_logit_softcap_cached(
-                    logit_softcap, moe_raw_tensor_dot_row(raw, t, hidden, hidden_count));
+                    logit_softcap, lm_head_dot_row(t));
                 if (!std::isfinite(score)) {
                     return 0;
                 }
