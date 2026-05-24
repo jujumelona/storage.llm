@@ -291,12 +291,34 @@ static float moe_dot_raw_bf16_row(const uint8_t* packed, const float* x, uint32_
     if (cols > UINT32_MAX / 2) {
         return 0.0f;
     }
+#if defined(__AVX2__)
+    const uint16_t* bf16 = reinterpret_cast<const uint16_t*>(packed);
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    uint32_t i = 0;
+    for (; i + 15u < cols; i += 16u) {
+        const __m128i h0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bf16 + i));
+        const __m128i h1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bf16 + i + 8u));
+        const __m256 f0 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h0), 16));
+        const __m256 f1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h1), 16));
+        acc0 = moe_madd_ps(f0, _mm256_loadu_ps(x + i), acc0);
+        acc1 = moe_madd_ps(f1, _mm256_loadu_ps(x + i + 8u), acc1);
+    }
+    acc0 = _mm256_add_ps(acc0, acc1);
+    float acc = moe_dot_hsum256_ps(acc0);
+    for (; i < cols; ++i) {
+        uint16_t v = 0;
+        std::memcpy(&v, packed + (uint64_t)i * 2ull, sizeof(v));
+        acc += moe_tensor_bf16_to_f32(v) * x[i];
+    }
+#else
     float acc = 0.0f;
     for (uint32_t i = 0; i < cols; ++i) {
         uint16_t v = 0;
         std::memcpy(&v, packed + (uint64_t)i * 2ull, sizeof(v));
         acc += moe_tensor_bf16_to_f32(v) * x[i];
     }
+#endif
     // BUGFIX 701: Final NaN/Inf check
     if (!std::isfinite(acc)) {
         return 0.0f;
