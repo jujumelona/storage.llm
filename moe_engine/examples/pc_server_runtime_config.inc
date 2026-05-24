@@ -105,9 +105,10 @@ static moe_io_config_t make_server_io_config(const server_options& opts, const m
     if (server_cpu_storage_max_enabled(caps)) {
         const uint32_t hw_cpu = std::max<uint32_t>(1u, std::thread::hardware_concurrency());
         const uint32_t cpu_io_workers =
-            hw_cpu >= 32u ? 10u :
-            hw_cpu >= 16u ? 6u :
-            hw_cpu >= 8u  ? 4u : 1u;
+            hw_cpu >= 32u ? 16u :
+            hw_cpu >= 16u ? 10u :
+            hw_cpu >= 8u  ? 6u  :
+            hw_cpu >= 4u  ? 2u  : 1u;
         io.io_worker_threads = cpu_io_workers;
         io.disk_worker_threads = cpu_io_workers;
         io.pinned_worker_threads = 0;
