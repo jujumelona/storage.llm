@@ -48,6 +48,54 @@ static int moe_layer_post_ffw_norm_f32(
         input, hidden_size, output, eps);
 }
 
+static int moe_layer_post_ffw_norm_add_residual_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const float* input,
+    uint32_t hidden_size,
+    float* residual,
+    float eps,
+    int* attempted
+) {
+    if (attempted) {
+        *attempted = 0;
+    }
+    if (!engine || !input || !residual || hidden_size == 0) {
+        return 0;
+    }
+    static const char* const roles[] = { "post_ffw_norm" };
+    moe_raw_tensor_cache_entry raw{};
+    if (moe_graph_ir_math_required(engine) &&
+        moe_graph_ir_map_layer_op_role_any(
+            engine, layer, roles, sizeof(roles) / sizeof(roles[0]), &raw)) {
+        if (attempted) {
+            *attempted = 1;
+        }
+        const int ok = moe_apply_rmsnorm_common_weight_add_f32(
+            engine, raw, input, hidden_size, residual, eps);
+        moe_profile_log(
+            "rmsnorm_common_add",
+            "layer=%d suffix0=post_ffw_norm ok=%d hidden=%u source=op_role",
+            layer, ok, hidden_size);
+        return ok;
+    }
+    if (moe_graph_ir_math_required(engine) &&
+        moe_graph_ir_map_layer_contract_tensor_role_f32(
+            engine, layer, "norms", "post_ffw_norm", &raw)) {
+        if (attempted) {
+            *attempted = 1;
+        }
+        const int ok = moe_apply_rmsnorm_common_weight_add_f32(
+            engine, raw, input, hidden_size, residual, eps);
+        moe_profile_log(
+            "rmsnorm_common_add",
+            "layer=%d suffix0=post_ffw_norm ok=%d hidden=%u source=contract",
+            layer, ok, hidden_size);
+        return ok;
+    }
+    return 0;
+}
+
 static int moe_layer_has_post_ffw_norm_weight(
     const moe_pc_engine* engine,
     int32_t layer

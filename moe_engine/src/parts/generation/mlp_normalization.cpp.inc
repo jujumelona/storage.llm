@@ -257,6 +257,18 @@ static int moe_add_mlp_residual_f32(
             combined_post_norm_contract ? 1 : 0,
             combined_post_norm_source ? combined_post_norm_source : "layer_execution_contract_table");
     }
+    int fused_post_norm_attempted = 0;
+    if (moe_layer_post_ffw_norm_add_residual_f32(
+            engine, layer, s->mlp.data(), hidden_size, hidden, cfg.rms_norm_eps,
+            &fused_post_norm_attempted)) {
+        return 1;
+    }
+    if (fused_post_norm_attempted) {
+        std::fprintf(stderr,
+            "[storagellm mlp] fused post-ffw residual add failed layer=%d\n",
+            layer);
+        return 0;
+    }
     if (moe_layer_post_ffw_norm_f32(
             engine, layer, s->mlp.data(), hidden_size, s->shared.data(), cfg.rms_norm_eps)) {
         branch = s->shared.data();

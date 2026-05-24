@@ -884,6 +884,49 @@ static int moe_apply_rmsnorm_common_weight_f32(
     return 1;
 }
 
+static int moe_apply_rmsnorm_common_weight_add_f32(
+    const moe_pc_engine* engine,
+    const moe_raw_tensor_cache_entry& raw,
+    const float* input,
+    uint32_t count,
+    float* acc,
+    float eps
+) {
+    if (!input || !acc || count == 0 || moe_raw_tensor_scalar_count(raw) < count) {
+        return 0;
+    }
+    double ss = 0.0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const float v = input[i];
+        if (!std::isfinite(v)) {
+            return 0;
+        }
+        ss += (double)v * (double)v;
+    }
+    const float norm = 1.0f / std::sqrt((float)(ss / (double)count) + (eps > 0.0f ? eps : 1.0e-6f));
+    const int unit_offset = moe_engine_rmsnorm_unit_offset(engine, raw);
+    const uint32_t elem = moe_raw_scalar_size(raw.scalar_encoding);
+    if (!raw.base || elem == 0) {
+        return 0;
+    }
+    const uint64_t needed = (uint64_t)count * (uint64_t)elem;
+    if (needed > raw.bytes) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const float w = moe_raw_scalar_to_f32(raw.base + (uint64_t)i * (uint64_t)elem, raw.scalar_encoding);
+        if (!std::isfinite(w)) {
+            return 0;
+        }
+        const float result = input[i] * norm * (unit_offset ? (1.0f + w) : w);
+        if (!std::isfinite(result)) {
+            return 0;
+        }
+        acc[i] += result;
+    }
+    return 1;
+}
+
 static int moe_layer_rmsnorm_suffixes_f32(
     moe_pc_engine* engine,
     int32_t layer,
