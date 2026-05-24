@@ -279,7 +279,29 @@ static int moe_add_mlp_residual_f32(
             layer);
         return 0;
     }
-    for (uint32_t i = 0; i < hidden_size; ++i) {
+    uint32_t i = 0;
+#if defined(__AVX2__)
+    const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffffu));
+    const __m256 finite_limit = _mm256_set1_ps(std::numeric_limits<float>::max());
+    for (; i + 8u <= hidden_size; i += 8u) {
+        const __m256 b = _mm256_loadu_ps(branch + i);
+        const __m256 ab = _mm256_and_ps(b, abs_mask);
+        const __m256 finite = _mm256_cmp_ps(ab, finite_limit, _CMP_LE_OQ);
+        if (_mm256_movemask_ps(finite) != 0xff) {
+            for (uint32_t j = 0; j < 8u; ++j) {
+                if (!std::isfinite(branch[i + j])) {
+                    std::fprintf(stderr,
+                        "[storagellm mlp] non-finite mlp branch layer=%d index=%u source=%s\n",
+                        layer, i + j, branch_source);
+                    return 0;
+                }
+            }
+        }
+        const __m256 h = _mm256_loadu_ps(hidden + i);
+        _mm256_storeu_ps(hidden + i, _mm256_add_ps(h, b));
+    }
+#endif
+    for (; i < hidden_size; ++i) {
         if (!std::isfinite(branch[i])) {
             std::fprintf(stderr,
                 "[storagellm mlp] non-finite mlp branch layer=%d index=%u source=%s\n",
