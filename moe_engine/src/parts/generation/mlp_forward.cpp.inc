@@ -3726,15 +3726,18 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
                 }
             }
         };
-        std::vector<std::thread> workers;
-        workers.reserve(worker_count > 1u ? worker_count - 1u : 0u);
-        for (uint32_t i = 1; i < worker_count; ++i) {
-            workers.emplace_back(run_group_worker);
-        }
-        run_group_worker();
-        for (std::thread& worker : workers) {
-            if (worker.joinable()) {
-                worker.join();
+        {
+            // Reuse the persistent CPU row pool instead of creating short-lived
+            // threads for every MoE layer.  Each pool worker owns whole expert
+            // groups; nested row kernels then run serial inside that group, which
+            // keeps all cores busy without oversubscribing them.
+            moe_profile_parallel_label_scope group_rows_label("moe_mlp_group_workers");
+            const int group_ok = moe_parallel_rows(engine, worker_count, 1, [&](uint32_t) {
+                run_group_worker();
+                return 1;
+            });
+            if (!group_ok) {
+                failed_assignments_parallel.fetch_add(1, std::memory_order_relaxed);
             }
         }
         active_groups = active_groups_parallel.load(std::memory_order_relaxed);
