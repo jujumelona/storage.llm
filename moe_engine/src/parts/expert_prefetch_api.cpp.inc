@@ -415,10 +415,10 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
             if (a.priority != b.priority) {
                 return a.priority > b.priority;
             }
-            if (a.layer != b.layer) {
-                return a.layer < b.layer;
+            if (a.expert != b.expert) {
+                return a.expert < b.expert;
             }
-            return a.expert < b.expert;
+            return a.layer < b.layer;
         });
 
     size_t warm_candidate_limit = candidates.size();
