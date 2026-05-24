@@ -429,15 +429,10 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
             warm_candidate_limit = std::min<size_t>(warm_candidate_limit, (size_t)parsed);
         }
     } else if (moe_storage_runtime_cpu_ram_path(engine) && layer_count > 0) {
-        const uint64_t experts_per_layer =
-            std::min<uint64_t>((uint64_t)c->experts_per_moe_layer, 64ull);
-        const uint64_t cpu_storage_cap =
-            layer_count > UINT64_MAX / experts_per_layer ?
-            UINT64_MAX : layer_count * experts_per_layer;
-        const uint64_t cpu_storage_default_cap = std::min<uint64_t>(cpu_storage_cap, 256ull);
-        warm_candidate_limit = std::min<size_t>(
-            warm_candidate_limit,
-            (size_t)std::min<uint64_t>(cpu_storage_default_cap, (uint64_t)SIZE_MAX));
+        // CPU-storage decode is dominated by selected expert misses if the
+        // startup warm path only loads a small fixed prefix. Let the RAM budget
+        // below stop the loop instead of capping the candidate list at 256.
+        warm_candidate_limit = candidates.size();
     }
     if (warm_candidate_limit < candidates.size()) {
         std::fprintf(stderr,
