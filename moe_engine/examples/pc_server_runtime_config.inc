@@ -22,7 +22,7 @@ static int server_cpu_storage_max_enabled(const moe_backend_caps_t& caps) {
            server_env_truthy_local("STORAGELLM_CPU_PIPELINE");
 }
 
-static uint64_t server_auto_ram_budget_bytes() {
+static uint64_t server_auto_ram_budget_bytes(int cpu_storage_mode) {
     const uint64_t available = storagellm::available_ram_bytes();
     const uint64_t gib = 1024ull * 1024ull * 1024ull;
     if (const char* env = std::getenv("STORAGELLM_RAM_RESERVE_BYTES")) {
@@ -39,7 +39,16 @@ static uint64_t server_auto_ram_budget_bytes() {
         available >= 64ull * gib ? 3ull * gib :
         available >= 32ull * gib ? 2ull * gib : 768ull * 1024ull * 1024ull;
     if (available > reserve * 2ull) {
-        return available - reserve;
+        const uint64_t available_budget = available - reserve;
+        if (cpu_storage_mode) {
+            const uint64_t total = storagellm::total_ram_bytes();
+            const uint64_t total_budget = total > 0 ? (total * 80ull) / 100ull : 0ull;
+            const uint64_t reclaim_cap = available + 8ull * gib;
+            if (total_budget > available_budget) {
+                return std::min<uint64_t>(total_budget, reclaim_cap);
+            }
+        }
+        return available_budget;
     }
     return (available * 9ull) / 10ull;
 }
@@ -48,7 +57,8 @@ static void apply_detected_budgets(server_options* opts, const moe_backend_caps_
     if (!opts) {
         return;
     }
-    if (server_cpu_storage_max_enabled(caps)) {
+    const int cpu_storage_mode = server_cpu_storage_max_enabled(caps);
+    if (cpu_storage_mode) {
         opts->engine_config.prefer_gpu = 0;
         opts->engine_config.preferred_backend = moe_BACKEND_CPU;
         opts->engine_config.platform = moe_PLATFORM_CPU_ONLY;
@@ -66,7 +76,7 @@ static void apply_detected_budgets(server_options* opts, const moe_backend_caps_
         }
     }
     if (!opts->ram_budget_override) {
-        opts->engine_config.ram_budget_bytes = server_auto_ram_budget_bytes();
+        opts->engine_config.ram_budget_bytes = server_auto_ram_budget_bytes(cpu_storage_mode);
     }
     opts->engine_config.allow_db_streaming = 1;
 }
