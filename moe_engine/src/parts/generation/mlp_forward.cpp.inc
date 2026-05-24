@@ -56,29 +56,7 @@ static int moe_accumulate_branch_checked_f32(
     if (!acc || !branch || hidden_size == 0) {
         return 0;
     }
-    uint32_t i = 0;
-#if defined(__AVX2__)
-    const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffffu));
-    const __m256 finite_limit = _mm256_set1_ps(std::numeric_limits<float>::max());
-    for (; i + 8u <= hidden_size; i += 8u) {
-        const __m256 v = _mm256_loadu_ps(branch + i);
-        const __m256 av = _mm256_and_ps(v, abs_mask);
-        const __m256 finite = _mm256_cmp_ps(av, finite_limit, _CMP_LE_OQ);
-        if (_mm256_movemask_ps(finite) != 0xff) {
-            for (uint32_t j = 0; j < 8u; ++j) {
-                if (!std::isfinite(branch[i + j])) {
-                    std::fprintf(stderr,
-                        "[storagellm mlp] non-finite %s branch layer=%d index=%u\n",
-                        branch_name ? branch_name : "unknown", layer, i + j);
-                    return 0;
-                }
-            }
-        }
-        const __m256 a = _mm256_loadu_ps(acc + i);
-        _mm256_storeu_ps(acc + i, _mm256_add_ps(a, v));
-    }
-#endif
-    for (; i < hidden_size; ++i) {
+    for (uint32_t i = 0; i < hidden_size; ++i) {
         const float v = branch[i];
         if (!std::isfinite(v)) {
             std::fprintf(stderr,
