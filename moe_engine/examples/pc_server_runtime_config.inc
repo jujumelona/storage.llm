@@ -134,7 +134,7 @@ static moe_io_config_t make_server_io_config(const server_options& opts, const m
         io.directstorage_gpu_queue_capacity = 0;
         io.allow_required_sync_fallback = 1;
         io.enable_cold_expert_cpu_fallback = 1;
-        io.ram_eviction_target_fill_pct = 94;
+        io.ram_eviction_target_fill_pct = 97;
         io.ram_eviction_threshold_pct = 98;
         io.internal_require_gpu_expert_batch_kernel = 0;
         io.internal_verified_backend_only = 0;
