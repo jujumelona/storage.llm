@@ -60,21 +60,7 @@ static int moe_eval_layer_first_enabled(
     if (env && env[0] == '0') {
         return 0;
     }
-    if (prefill_count <= 1u || hidden_size == 0) {
-        return 0;
-    }
-    if ((uint64_t)prefill_count > UINT64_MAX / (uint64_t)hidden_size ||
-        (uint64_t)prefill_count * (uint64_t)hidden_size > UINT64_MAX / sizeof(float)) {
-        return 0;
-    }
-    const uint64_t batch_bytes =
-        (uint64_t)prefill_count * (uint64_t)hidden_size * sizeof(float);
-    if (engine && engine->config.ram_budget_bytes != 0 &&
-        batch_bytes > engine->config.ram_budget_bytes / 8ull) {
-        return 0;
-    }
-    const uint64_t available = storagellm::available_ram_bytes();
-    return available == 0 || batch_bytes <= available / 8ull;
+    return moe_generation_should_use_layer_first_prefill(engine, prefill_count, hidden_size);
 }
 
 static int moe_eval_layer_first_forward_all_f32(
