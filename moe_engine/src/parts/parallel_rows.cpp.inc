@@ -332,6 +332,40 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
         return ok;
     }
 
+#ifdef _OPENMP
+    if (workers > 1 && row_count >= 64u) {
+        std::atomic<int> ok{1};
+        const uint32_t block_count = (row_count + block_rows - 1u) / block_rows;
+#pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
+        for (int64_t block = 0; block < (int64_t)block_count; ++block) {
+            if (!ok.load(std::memory_order_acquire)) {
+                continue;
+            }
+            const uint32_t start = (uint32_t)block * block_rows;
+            uint32_t end = start + block_rows;
+            if (end > row_count) {
+                end = row_count;
+            }
+            for (uint32_t row = start; row < end && ok.load(std::memory_order_acquire); ++row) {
+                if (!moe_parallel_rows_call(fn, row)) {
+                    ok.store(0, std::memory_order_release);
+                    break;
+                }
+            }
+        }
+        --tl_cpu_row_active;
+        if (engine) {
+            engine->cpu_row_active.fetch_sub(1, std::memory_order_relaxed);
+        }
+        moe_profile_log(
+            "parallel_rows",
+            "label=%s rows=%u block=%u workers=%u mode=omp ok=%d ms=%.3f",
+            trace_label, row_count, block_rows, workers,
+            ok.load(std::memory_order_acquire), moe_profile_elapsed_ms(trace_start_us));
+        return ok.load(std::memory_order_acquire) ? 1 : 0;
+    }
+#endif
+
     // BUGFIX 704: Use persistent thread pool instead of per-call fork/join
     // Old: std::thread creation + join per call → 50-100µs/thread overhead
     // New: Static pool with CV dispatch → ~1µs wake latency
