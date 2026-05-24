@@ -197,10 +197,15 @@ int moe_pc_engine_lm_head_top1_f32(
     const uint32_t chunk_block = 1u;
     const int lm_head_mxfp4_direct =
         !raw.math_transposed && effective_weight_format == moe_WEIGHT_ENCODING_MXFP4;
+    const moe_mxfp4_row_layout_t lm_head_mxfp4_layout =
+        lm_head_mxfp4_direct ? moe_mxfp4_row_layout_for_bytes(c->hidden_size, row_bytes) : moe_mxfp4_row_layout_t{};
+    const int lm_head_mxfp4_pairwise_order =
+        lm_head_mxfp4_direct ? moe_mxfp4_pairwise_nibble_order_enabled() : 0;
     auto lm_head_dot_row = [&](uint32_t row) -> float {
         if (lm_head_mxfp4_direct) {
             const uint8_t* row_ptr = raw.base + (uint64_t)row * row_bytes;
-            return moe_dot_gguf_mxfp4_row_strided(row_ptr, hidden, hidden_count, row_bytes);
+            return moe_dot_gguf_mxfp4_row_with_layout(
+                row_ptr, hidden, hidden_count, lm_head_mxfp4_layout, lm_head_mxfp4_pairwise_order);
         }
         return moe_raw_tensor_dot_row(raw, row, hidden, hidden_count);
     };
@@ -427,10 +432,15 @@ int moe_pc_engine_lm_head_token_logprob_f32(
     const uint32_t chunk_block = 1u;
     const int lm_head_mxfp4_direct =
         !raw.math_transposed && effective_weight_format == moe_WEIGHT_ENCODING_MXFP4;
+    const moe_mxfp4_row_layout_t lm_head_mxfp4_layout =
+        lm_head_mxfp4_direct ? moe_mxfp4_row_layout_for_bytes(c->hidden_size, row_bytes) : moe_mxfp4_row_layout_t{};
+    const int lm_head_mxfp4_pairwise_order =
+        lm_head_mxfp4_direct ? moe_mxfp4_pairwise_nibble_order_enabled() : 0;
     auto lm_head_dot_row = [&](uint32_t row) -> float {
         if (lm_head_mxfp4_direct) {
             const uint8_t* row_ptr = raw.base + (uint64_t)row * row_bytes;
-            return moe_dot_gguf_mxfp4_row_strided(row_ptr, hidden, hidden_count, row_bytes);
+            return moe_dot_gguf_mxfp4_row_with_layout(
+                row_ptr, hidden, hidden_count, lm_head_mxfp4_layout, lm_head_mxfp4_pairwise_order);
         }
         return moe_raw_tensor_dot_row(raw, row, hidden, hidden_count);
     };

@@ -325,6 +325,8 @@ struct moe_tensor_row_fast_view_t {
     uint32_t rows = 0;
     uint32_t cols = 0;
     int weight_format = 0;
+    moe_mxfp4_row_layout_t mxfp4_layout{};
+    int mxfp4_pairwise_order = 0;
     moe_simple_row_dot_fn simple_dot = nullptr;
 };
 
@@ -421,6 +423,10 @@ static int moe_tensor_row_fast_view_init(
     out->rows = rec->info.rows;
     out->cols = rec->info.cols;
     out->weight_format = weight_format;
+    if (weight_format == moe_WEIGHT_ENCODING_MXFP4) {
+        out->mxfp4_layout = moe_mxfp4_row_layout_for_bytes(rec->info.cols, rec->weight_row_bytes);
+        out->mxfp4_pairwise_order = moe_mxfp4_pairwise_nibble_order_enabled();
+    }
     out->simple_dot = moe_cpu_simple_row_dot_for_format(weight_format);
     return 1;
 }
@@ -484,7 +490,8 @@ static int moe_dot_tensor_fast_view_row(
             *out_value = moe_dot_fp4_row(*view->rec, view->shard, packed, x, engine, row);
             break;
         case moe_WEIGHT_ENCODING_MXFP4:
-            *out_value = moe_dot_gguf_mxfp4_row_strided(packed, x, view->cols, view->row_bytes);
+            *out_value = moe_dot_gguf_mxfp4_row_with_layout(
+                packed, x, view->cols, view->mxfp4_layout, view->mxfp4_pairwise_order);
             break;
         case moe_WEIGHT_ENCODING_GGUF_Q4_0:
             *out_value = moe_dot_gguf_q4_0_row(packed, x, view->cols);
@@ -626,8 +633,12 @@ static int moe_dot_tensor_fast_view_two_rows(
         return 0;
     }
     if (a->weight_format == moe_WEIGHT_ENCODING_MXFP4 &&
-        b->weight_format == moe_WEIGHT_ENCODING_MXFP4) {
-        moe_dot_gguf_mxfp4_two_rows_strided(pa, pb, x, a->cols, a->row_bytes, b->row_bytes, out_a, out_b);
+        b->weight_format == moe_WEIGHT_ENCODING_MXFP4 &&
+        a->mxfp4_layout.block_cols == b->mxfp4_layout.block_cols &&
+        a->mxfp4_layout.bytewise_codes == b->mxfp4_layout.bytewise_codes &&
+        a->mxfp4_pairwise_order == b->mxfp4_pairwise_order) {
+        moe_dot_gguf_mxfp4_two_rows_with_layout(
+            pa, pb, x, a->cols, a->mxfp4_layout, a->mxfp4_pairwise_order, out_a, out_b);
         return std::isfinite(*out_a) && std::isfinite(*out_b) ? 1 : 0;
     }
     return moe_dot_tensor_fast_view_row(engine, a, row, x, x_count, out_a) &&

@@ -721,6 +721,25 @@ static float moe_dot_gguf_mxfp4_row_strided(
     uint64_t physical_row_bytes
 );
 
+static float moe_dot_gguf_mxfp4_row_with_layout(
+    const uint8_t* packed,
+    const float* x,
+    uint32_t cols,
+    const moe_mxfp4_row_layout_t& layout,
+    int pairwise_order
+);
+
+static void moe_dot_gguf_mxfp4_two_rows_with_layout(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const float* x,
+    uint32_t cols,
+    const moe_mxfp4_row_layout_t& layout,
+    int pairwise_order,
+    float* out0,
+    float* out1
+);
+
 static void moe_dot_gguf_mxfp4_two_rows_strided(
     const uint8_t* packed0,
     const uint8_t* packed1,
@@ -747,11 +766,33 @@ static void moe_dot_gguf_mxfp4_two_rows_strided(
         *out1 = moe_dot_gguf_mxfp4_row_strided(packed1, x, cols, row_bytes1);
         return;
     }
-    const float* table = moe_mxfp4_value_table();
     const int pairwise_order = moe_mxfp4_pairwise_nibble_order_enabled();
+    moe_dot_gguf_mxfp4_two_rows_with_layout(
+        packed0, packed1, x, cols, layout0, pairwise_order, out0, out1);
+}
+
+static void moe_dot_gguf_mxfp4_two_rows_with_layout(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const float* x,
+    uint32_t cols,
+    const moe_mxfp4_row_layout_t& layout,
+    int pairwise_order,
+    float* out0,
+    float* out1
+) {
+    if (!out0 || !out1) {
+        return;
+    }
+    if (!packed0 || !packed1 || !x || cols == 0) {
+        *out0 = 0.0f;
+        *out1 = 0.0f;
+        return;
+    }
+    const float* table = moe_mxfp4_value_table();
 #if defined(__AVX2__)
     if (moe_mxfp4_dot_two_rows_accum_avx2(
-            packed0, packed1, x, cols, layout0, pairwise_order, out0, out1)) {
+            packed0, packed1, x, cols, layout, pairwise_order, out0, out1)) {
         return;
     }
 #endif
@@ -759,9 +800,7 @@ static void moe_dot_gguf_mxfp4_two_rows_strided(
     float acc1 = 0.0f;
     uint32_t start = 0;
     while (start < cols) {
-        const uint32_t limit0 = std::min<uint32_t>(layout0.block_cols, cols - start);
-        const uint32_t limit1 = std::min<uint32_t>(layout1.block_cols, cols - start);
-        const uint32_t limit = std::min<uint32_t>(limit0, limit1);
+        const uint32_t limit = std::min<uint32_t>(layout.block_cols, cols - start);
         const float scale0 = moe_e8m0_to_f32_half(packed0[0]);
         const float scale1 = moe_e8m0_to_f32_half(packed1[0]);
         const uint8_t* qs0 = packed0 + 1u;
@@ -774,7 +813,7 @@ static void moe_dot_gguf_mxfp4_two_rows_strided(
             x,
             start,
             limit,
-            layout0,
+            layout,
             table,
             pairwise_order,
             &block0,
@@ -782,8 +821,8 @@ static void moe_dot_gguf_mxfp4_two_rows_strided(
         acc0 += block0 * scale0;
         acc1 += block1 * scale1;
         start += limit;
-        packed0 += layout0.block_bytes;
-        packed1 += layout1.block_bytes;
+        packed0 += layout.block_bytes;
+        packed1 += layout.block_bytes;
     }
     *out0 = acc0;
     *out1 = acc1;
@@ -810,8 +849,21 @@ static float moe_dot_gguf_mxfp4_row_strided(
         return 0.0f;
     }
     const moe_mxfp4_row_layout_t layout = moe_mxfp4_row_layout_for_bytes(cols, physical_row_bytes);
-    const float* table = moe_mxfp4_value_table();
     const int pairwise_order = moe_mxfp4_pairwise_nibble_order_enabled();
+    return moe_dot_gguf_mxfp4_row_with_layout(packed, x, cols, layout, pairwise_order);
+}
+
+static float moe_dot_gguf_mxfp4_row_with_layout(
+    const uint8_t* packed,
+    const float* x,
+    uint32_t cols,
+    const moe_mxfp4_row_layout_t& layout,
+    int pairwise_order
+) {
+    if (!packed || !x) {
+        return 0.0f;
+    }
+    const float* table = moe_mxfp4_value_table();
 #if defined(__AVX2__)
     float avx_acc = 0.0f;
     if (moe_mxfp4_dot_row_accum_avx2(packed, x, cols, layout, pairwise_order, &avx_acc)) {
