@@ -1380,6 +1380,28 @@ static void moe_cpu_storage_after_router_selected(
     const std::vector<int>& selected_experts
 );
 
+static void moe_cpu_storage_prefetch_previous_selected_to_ram(
+    moe_pc_engine* engine,
+    int32_t layer,
+    const std::vector<int>& selected_experts
+) {
+    if (!engine || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
+    if (layer < 0 || selected_experts.empty()) return;
+
+    // Previous-token selections are the only expert IDs available before this
+    // layer's router runs. Queue them as speculative RAM work so disk/RAM IO can
+    // overlap attention/router without forcing a same-layer synchronous miss.
+    prefetch_expert_batch_raw(
+        engine,
+        layer,
+        selected_experts.data(),
+        (uint32_t)selected_experts.size(),
+        moe_TIER_RAM,
+        0,
+        moe_PREFETCH_REASON_LOOKAHEAD,
+        0);
+}
+
 static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, const moe_storage_constants_t* c) {
     if (!engine || !c || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
     engine->cpu_layer_begin_count.fetch_add(1, std::memory_order_relaxed);
@@ -1396,6 +1418,7 @@ static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, c
             }
         }
         if (!previous_token_experts.empty()) {
+            moe_cpu_storage_prefetch_previous_selected_to_ram(engine, (int32_t)layer, previous_token_experts);
             moe_cpu_storage_after_router_selected(engine, (int32_t)layer, previous_token_experts);
         }
     }
