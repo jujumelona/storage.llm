@@ -61,6 +61,114 @@ static int moe_map_layer_common_tensor(
     return 1;
 }
 
+static int moe_raw_tensor_dot_adjacent_four_rows_direct(
+    const moe_raw_tensor_cache_entry& raw,
+    uint32_t row,
+    uint64_t row_bytes,
+    const float* input,
+    uint32_t input_count,
+    uint8_t effective_weight_format,
+    const moe_mxfp4_row_layout_t& mxfp4_layout,
+    int mxfp4_pairwise_order,
+    float* out0,
+    float* out1,
+    float* out2,
+    float* out3
+) {
+    if (!raw.base || !input || !out0 || !out1 || !out2 || !out3 ||
+        raw.math_transposed || raw.cols != input_count || row + 3u >= raw.rows ||
+        row_bytes == 0 || raw.bytes < row_bytes * (uint64_t)raw.rows) {
+        return 0;
+    }
+    const uint8_t* p0 = raw.base + (uint64_t)row * row_bytes;
+    const uint8_t* p1 = p0 + row_bytes;
+    const uint8_t* p2 = p1 + row_bytes;
+    const uint8_t* p3 = p2 + row_bytes;
+    if (effective_weight_format == moe_WEIGHT_ENCODING_MXFP4) {
+        moe_dot_gguf_mxfp4_four_rows_with_layout(
+            p0, p1, p2, p3, input, input_count,
+            mxfp4_layout, mxfp4_pairwise_order, out0, out1, out2, out3);
+        return std::isfinite(*out0) && std::isfinite(*out1) &&
+               std::isfinite(*out2) && std::isfinite(*out3);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
+        return moe_dot_gguf_q8_0_four_rows(
+                   p0, p1, p2, p3, input, input_count, out0, out1, out2, out3) &&
+               std::isfinite(*out0) && std::isfinite(*out1) &&
+               std::isfinite(*out2) && std::isfinite(*out3);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
+        return moe_dot_gguf_q5_1_four_rows(
+                   p0, p1, p2, p3, input, input_count, out0, out1, out2, out3) &&
+               std::isfinite(*out0) && std::isfinite(*out1) &&
+               std::isfinite(*out2) && std::isfinite(*out3);
+    }
+    if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
+        return moe_dot_gguf_q5_k_four_rows(
+                   p0, p1, p2, p3, input, input_count, out0, out1, out2, out3) &&
+               std::isfinite(*out0) && std::isfinite(*out1) &&
+               std::isfinite(*out2) && std::isfinite(*out3);
+    }
+    return 0;
+}
+
+static int moe_raw_tensor_dot_same_row_two_tensors_direct(
+    const moe_raw_tensor_cache_entry& gate,
+    const moe_raw_tensor_cache_entry& up,
+    uint32_t row,
+    uint64_t gate_row_bytes,
+    uint64_t up_row_bytes,
+    const float* input,
+    uint32_t input_count,
+    uint8_t gate_effective_format,
+    uint8_t up_effective_format,
+    float* out_gate,
+    float* out_up
+) {
+    if (!gate.base || !up.base || !input || !out_gate || !out_up ||
+        gate.math_transposed || up.math_transposed ||
+        gate.cols != input_count || up.cols != input_count ||
+        row >= gate.rows || row >= up.rows ||
+        gate_row_bytes == 0 || up_row_bytes == 0 ||
+        gate.bytes < gate_row_bytes * (uint64_t)gate.rows ||
+        up.bytes < up_row_bytes * (uint64_t)up.rows ||
+        gate_effective_format != up_effective_format) {
+        return 0;
+    }
+    const uint8_t* gate_row = gate.base + (uint64_t)row * gate_row_bytes;
+    const uint8_t* up_row = up.base + (uint64_t)row * up_row_bytes;
+    if (gate_effective_format == moe_WEIGHT_ENCODING_MXFP4) {
+        const moe_mxfp4_row_layout_t gate_layout =
+            moe_mxfp4_row_layout_for_bytes(input_count, gate_row_bytes);
+        const moe_mxfp4_row_layout_t up_layout =
+            moe_mxfp4_row_layout_for_bytes(input_count, up_row_bytes);
+        if (gate_layout.block_cols != up_layout.block_cols ||
+            gate_layout.bytewise_codes != up_layout.bytewise_codes) {
+            return 0;
+        }
+        moe_dot_gguf_mxfp4_two_rows_with_layout(
+            gate_row, up_row, input, input_count, gate_layout,
+            moe_mxfp4_pairwise_nibble_order_enabled(), out_gate, out_up);
+        return std::isfinite(*out_gate) && std::isfinite(*out_up);
+    }
+    if (gate_effective_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
+        return moe_dot_gguf_q8_0_two_rows(
+                   gate_row, up_row, input, input_count, out_gate, out_up) &&
+               std::isfinite(*out_gate) && std::isfinite(*out_up);
+    }
+    if (gate_effective_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
+        return moe_dot_gguf_q5_1_two_rows(
+                   gate_row, up_row, input, input_count, out_gate, out_up) &&
+               std::isfinite(*out_gate) && std::isfinite(*out_up);
+    }
+    if (gate_effective_format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
+        return moe_dot_gguf_q5_k_two_rows(
+                   gate_row, up_row, input, input_count, out_gate, out_up) &&
+               std::isfinite(*out_gate) && std::isfinite(*out_up);
+    }
+    return 0;
+}
+
 static int moe_common_linear_f32(
     moe_pc_engine* engine,
     const moe_raw_tensor_cache_entry& raw,
@@ -85,11 +193,37 @@ static int moe_common_linear_f32(
         return 0;
     }
     const uint8_t effective_weight_format = moe_effective_weight_format_for_row_bytes(raw, raw.cols);
-    if (!raw.math_transposed && effective_weight_format == moe_WEIGHT_ENCODING_MXFP4) {
-        moe_profile_parallel_label_scope rows_label("common_linear_mxfp4");
-        return moe_parallel_rows(engine, raw.rows, 0, [&](uint32_t row) {
-            const uint8_t* row_ptr = raw.base + (uint64_t)row * row_bytes;
-            output[row] = moe_dot_gguf_mxfp4_row_strided(row_ptr, input, input_count, row_bytes);
+    const int direct_four_row =
+        !raw.math_transposed &&
+        (effective_weight_format == moe_WEIGHT_ENCODING_MXFP4 ||
+         effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0 ||
+         effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1 ||
+         effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K);
+    if (direct_four_row) {
+        const moe_mxfp4_row_layout_t mxfp4_layout =
+            effective_weight_format == moe_WEIGHT_ENCODING_MXFP4 ?
+                moe_mxfp4_row_layout_for_bytes(raw.cols, row_bytes) :
+                moe_mxfp4_row_layout_t{};
+        const int mxfp4_pairwise_order =
+            effective_weight_format == moe_WEIGHT_ENCODING_MXFP4 ?
+                moe_mxfp4_pairwise_nibble_order_enabled() : 0;
+        const uint32_t row_blocks = (raw.rows + 3u) / 4u;
+        moe_profile_parallel_label_scope rows_label("common_linear_direct4");
+        return moe_parallel_rows(engine, row_blocks, 0, [&](uint32_t block) {
+            const uint32_t row = block * 4u;
+            if (row + 4u <= raw.rows) {
+                return moe_raw_tensor_dot_adjacent_four_rows_direct(
+                    raw, row, row_bytes, input, input_count, effective_weight_format,
+                    mxfp4_layout, mxfp4_pairwise_order,
+                    &output[row + 0u], &output[row + 1u],
+                    &output[row + 2u], &output[row + 3u]);
+            }
+            for (uint32_t r = row; r < raw.rows; ++r) {
+                output[r] = moe_raw_tensor_dot_row(raw, r, input, input_count);
+                if (!std::isfinite(output[r])) {
+                    return 0;
+                }
+            }
             return 1;
         });
     }
