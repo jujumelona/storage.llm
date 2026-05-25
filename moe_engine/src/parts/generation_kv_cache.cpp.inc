@@ -487,6 +487,11 @@ static int moe_generation_should_use_layer_first_prefill(
     if (prefill_count <= 1u || hidden_size == 0) {
         return 0;
     }
+    const uint32_t min_tokens_env = moe_parse_env_u32("STORAGELLM_LAYER_FIRST_PREFILL_MIN_TOKENS");
+    const uint32_t min_tokens = min_tokens_env > 0 ? min_tokens_env : 32u;
+    if (prefill_count < min_tokens) {
+        return 0;
+    }
     struct layer_first_prefill_contract_cache_entry {
         const moe_pc_engine* engine = nullptr;
         uint64_t generation = 0;
