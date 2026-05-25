@@ -31,6 +31,7 @@ static int moe_lm_head_fill_scores_f32(
     uint32_t start_row,
     uint32_t count,
     float logit_softcap,
+    uint8_t effective_weight_format,
     int mxfp4_direct,
     const moe_mxfp4_row_layout_t& mxfp4_layout,
     int mxfp4_pairwise_order,
@@ -40,26 +41,74 @@ static int moe_lm_head_fill_scores_f32(
         return count == 0;
     }
     uint32_t i = 0;
-    if (mxfp4_direct) {
+    const int q8_0_direct =
+        !raw.math_transposed && effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0;
+    const int q5_1_direct =
+        !raw.math_transposed && effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1;
+    const int q5_k_direct =
+        !raw.math_transposed && effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K;
+    if (mxfp4_direct || q8_0_direct || q5_1_direct || q5_k_direct) {
         for (; i + 4u <= count; i += 4u) {
             const uint8_t* row0 = raw.base + (uint64_t)(start_row + i) * row_bytes;
             float s0 = 0.0f;
             float s1 = 0.0f;
             float s2 = 0.0f;
             float s3 = 0.0f;
-            moe_dot_gguf_mxfp4_four_rows_with_layout(
-                row0,
-                row0 + row_bytes,
-                row0 + row_bytes * 2u,
-                row0 + row_bytes * 3u,
-                hidden,
-                hidden_count,
-                mxfp4_layout,
-                mxfp4_pairwise_order,
-                &s0,
-                &s1,
-                &s2,
-                &s3);
+            if (mxfp4_direct) {
+                moe_dot_gguf_mxfp4_four_rows_with_layout(
+                    row0,
+                    row0 + row_bytes,
+                    row0 + row_bytes * 2u,
+                    row0 + row_bytes * 3u,
+                    hidden,
+                    hidden_count,
+                    mxfp4_layout,
+                    mxfp4_pairwise_order,
+                    &s0,
+                    &s1,
+                    &s2,
+                    &s3);
+            } else if (q8_0_direct) {
+                if (!moe_dot_gguf_q8_0_four_rows(
+                        row0,
+                        row0 + row_bytes,
+                        row0 + row_bytes * 2u,
+                        row0 + row_bytes * 3u,
+                        hidden,
+                        hidden_count,
+                        &s0,
+                        &s1,
+                        &s2,
+                        &s3)) {
+                    return 0;
+                }
+            } else if (q5_1_direct) {
+                if (!moe_dot_gguf_q5_1_four_rows(
+                        row0,
+                        row0 + row_bytes,
+                        row0 + row_bytes * 2u,
+                        row0 + row_bytes * 3u,
+                        hidden,
+                        hidden_count,
+                        &s0,
+                        &s1,
+                        &s2,
+                        &s3)) {
+                    return 0;
+                }
+            } else if (!moe_dot_gguf_q5_k_four_rows(
+                    row0,
+                    row0 + row_bytes,
+                    row0 + row_bytes * 2u,
+                    row0 + row_bytes * 3u,
+                    hidden,
+                    hidden_count,
+                    &s0,
+                    &s1,
+                    &s2,
+                    &s3)) {
+                return 0;
+            }
             scores[i + 0u] = moe_apply_final_logit_softcap_cached(logit_softcap, s0);
             scores[i + 1u] = moe_apply_final_logit_softcap_cached(logit_softcap, s1);
             scores[i + 2u] = moe_apply_final_logit_softcap_cached(logit_softcap, s2);
@@ -311,6 +360,7 @@ int moe_pc_engine_lm_head_top1_f32(
                         t,
                         batch,
                         logit_softcap,
+                        effective_weight_format,
                         lm_head_mxfp4_direct,
                         lm_head_mxfp4_layout,
                         lm_head_mxfp4_pairwise_order,
@@ -379,6 +429,7 @@ int moe_pc_engine_lm_head_top1_f32(
                         t,
                         tail_batch,
                         logit_softcap,
+                        effective_weight_format,
                         lm_head_mxfp4_direct,
                         lm_head_mxfp4_layout,
                         lm_head_mxfp4_pairwise_order,
@@ -402,6 +453,7 @@ int moe_pc_engine_lm_head_top1_f32(
                         t,
                         1u,
                         logit_softcap,
+                        effective_weight_format,
                         lm_head_mxfp4_direct,
                         lm_head_mxfp4_layout,
                         lm_head_mxfp4_pairwise_order,
@@ -613,6 +665,7 @@ int moe_pc_engine_lm_head_token_logprob_f32(
                         t,
                         batch,
                         logit_softcap,
+                        effective_weight_format,
                         lm_head_mxfp4_direct,
                         lm_head_mxfp4_layout,
                         lm_head_mxfp4_pairwise_order,
@@ -654,6 +707,7 @@ int moe_pc_engine_lm_head_token_logprob_f32(
                         t,
                         tail_batch,
                         logit_softcap,
+                        effective_weight_format,
                         lm_head_mxfp4_direct,
                         lm_head_mxfp4_layout,
                         lm_head_mxfp4_pairwise_order,
@@ -694,6 +748,7 @@ int moe_pc_engine_lm_head_token_logprob_f32(
                         t,
                         1u,
                         logit_softcap,
+                        effective_weight_format,
                         lm_head_mxfp4_direct,
                         lm_head_mxfp4_layout,
                         lm_head_mxfp4_pairwise_order,
