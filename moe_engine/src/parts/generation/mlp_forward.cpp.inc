@@ -1400,9 +1400,19 @@ static int moe_layer_moe_mlp_f32(
     // selected expert writes num_selected*hidden floats and then immediately reads them
     // back for accumulation.  If expert down scaling is scalar-per-expert (or absent),
     // accumulate directly by output row and skip that intermediate buffer entirely.
-    static const int fused_down_accum_enabled = []() -> int {
-        const char* v = std::getenv("STORAGELLM_DISABLE_CPU_FUSED_DOWN_ACCUM");
-        return !(v && v[0] && v[0] != '0');
+    const int fused_down_accum_enabled = [&]() -> int {
+        const char* disable = std::getenv("STORAGELLM_DISABLE_CPU_FUSED_DOWN_ACCUM");
+        if (disable && disable[0] && disable[0] != '0') {
+            return 0;
+        }
+        const char* force = std::getenv("STORAGELLM_ENABLE_CPU_FUSED_DOWN_ACCUM");
+        if (force && force[0] && force[0] != '0') {
+            return 1;
+        }
+        if (moe_storage_runtime_cpu_ram_path(engine) && moe_cpu_thread_count_hint() <= 8u) {
+            return 0;
+        }
+        return 1;
     }();
     if (fused_down_accum_enabled) {
         if (s->cpu_down_scales.size() < num_selected) {
