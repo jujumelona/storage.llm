@@ -1239,33 +1239,23 @@ static int moe_final_norm_f32(
         uint32_t hidden_size = 0;
         moe_raw_tensor_cache_entry raw{};
     };
-    static std::shared_mutex final_norm_cache_mutex;
-    static std::vector<final_norm_raw_cache_entry> final_norm_cache;
+    static thread_local std::vector<final_norm_raw_cache_entry> tls_final_norm_cache;
     const uint64_t generation = engine->engine_generation;
-    {
-        std::shared_lock<std::shared_mutex> lock(final_norm_cache_mutex);
-        for (const final_norm_raw_cache_entry& e : final_norm_cache) {
-            if (e.engine == engine && e.generation == generation && e.hidden_size == hidden_size) {
-                return moe_apply_rmsnorm_common_weight_f32(engine, e.raw, input, hidden_size, output, eps);
-            }
+    for (const final_norm_raw_cache_entry& e : tls_final_norm_cache) {
+        if (e.engine == engine && e.generation == generation && e.hidden_size == hidden_size) {
+            return moe_apply_rmsnorm_common_weight_f32(engine, e.raw, input, hidden_size, output, eps);
         }
     }
     auto cache_final_norm_raw = [&](const moe_raw_tensor_cache_entry& raw) {
+        if (tls_final_norm_cache.size() > 64u) {
+            tls_final_norm_cache.erase(tls_final_norm_cache.begin(), tls_final_norm_cache.begin() + 16);
+        }
         final_norm_raw_cache_entry entry{};
         entry.engine = engine;
         entry.generation = generation;
         entry.hidden_size = hidden_size;
         entry.raw = raw;
-        std::unique_lock<std::shared_mutex> lock(final_norm_cache_mutex);
-        for (const final_norm_raw_cache_entry& e : final_norm_cache) {
-            if (e.engine == engine && e.generation == generation && e.hidden_size == hidden_size) {
-                return;
-            }
-        }
-        if (final_norm_cache.size() > 64u) {
-            final_norm_cache.erase(final_norm_cache.begin(), final_norm_cache.begin() + 16);
-        }
-        final_norm_cache.push_back(entry);
+        tls_final_norm_cache.push_back(entry);
     };
     std::string graph_name;
     if (moe_graph_ir_tensor_binding_name(engine, "final_norm", &graph_name)) {

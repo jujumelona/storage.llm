@@ -124,25 +124,26 @@ static int moe_map_embedding_tensor(
         int found = 0;
         moe_raw_tensor_cache_entry raw{};
     };
-    static std::shared_mutex embedding_map_cache_mutex;
-    static std::vector<embedding_map_cache_entry> embedding_map_cache;
+    static thread_local std::vector<embedding_map_cache_entry> tls_embedding_map_cache;
     const uint64_t generation = engine->engine_generation;
-    {
-        std::shared_lock<std::shared_mutex> lock(embedding_map_cache_mutex);
-        for (const embedding_map_cache_entry& entry : embedding_map_cache) {
-            if (entry.engine == engine &&
-                entry.generation == generation &&
-                entry.vocab_size == c->vocab_size &&
-                entry.hidden_size == c->hidden_size) {
-                if (entry.found && entry.raw.base) {
-                    *out = entry.raw;
-                    return 1;
-                }
-                return 0;
+    for (const embedding_map_cache_entry& entry : tls_embedding_map_cache) {
+        if (entry.engine == engine &&
+            entry.generation == generation &&
+            entry.vocab_size == c->vocab_size &&
+            entry.hidden_size == c->hidden_size) {
+            if (entry.found && entry.raw.base) {
+                *out = entry.raw;
+                return 1;
             }
+            return 0;
         }
     }
     auto cache_embedding_map = [&](int found, const moe_raw_tensor_cache_entry* raw) {
+        if (tls_embedding_map_cache.size() > 64u) {
+            tls_embedding_map_cache.erase(
+                tls_embedding_map_cache.begin(),
+                tls_embedding_map_cache.begin() + 16);
+        }
         embedding_map_cache_entry entry{};
         entry.engine = engine;
         entry.generation = generation;
@@ -152,21 +153,7 @@ static int moe_map_embedding_tensor(
         if (found && raw) {
             entry.raw = *raw;
         }
-        std::unique_lock<std::shared_mutex> lock(embedding_map_cache_mutex);
-        for (const embedding_map_cache_entry& cached : embedding_map_cache) {
-            if (cached.engine == engine &&
-                cached.generation == generation &&
-                cached.vocab_size == c->vocab_size &&
-                cached.hidden_size == c->hidden_size) {
-                return;
-            }
-        }
-        if (embedding_map_cache.size() > 64u) {
-            embedding_map_cache.erase(
-                embedding_map_cache.begin(),
-                embedding_map_cache.begin() + 16);
-        }
-        embedding_map_cache.push_back(entry);
+        tls_embedding_map_cache.push_back(entry);
     };
     std::string graph_name;
     if (moe_graph_ir_tensor_binding_name(engine, "token_embedding", &graph_name)) {
