@@ -1743,7 +1743,7 @@ static int moe_mlp_prefill_batch_enabled_for(
         return 1;
     }
     const uint32_t cpu_threshold = moe_parse_env_u32("STORAGELLM_CPU_PREFILL_BATCH_MLP_MIN_TOKENS");
-    const uint32_t min_tokens = cpu_threshold > 0 ? cpu_threshold : 2u;
+    const uint32_t min_tokens = cpu_threshold > 0 ? cpu_threshold : 64u;
     return prefill_count >= min_tokens;
 }
 
