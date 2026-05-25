@@ -1423,7 +1423,10 @@ static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, c
         // next-layer expert hint. Submit it from layer-begin so storage I/O can
         // overlap attention/router instead of arriving after same-layer top-k.
         std::vector<int> predicted;
+        static const int decode_broad_lookahead_prefetch =
+            moe_cpu_storage_env_truthy("STORAGELLM_CPU_DECODE_LOOKAHEAD_PREFETCH");
         if (phase != moe_GEN_PHASE_PREFILL && next > 0 &&
+            decode_broad_lookahead_prefetch &&
             engine->io_config.enable_lookahead_prefetch &&
             moe_layer_is_moe_runtime(engine, c, (int)next)) {
             const uint32_t router_top_k = moe_router_top_k_from_metadata_for_layer(
