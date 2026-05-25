@@ -69,6 +69,34 @@ static int moe_accumulate_branch_checked_f32(
     return 1;
 }
 
+static int moe_accumulate_branch_sum_checked_f32(
+    float* acc,
+    int* initialized,
+    const float* branch,
+    uint32_t hidden_size,
+    int32_t layer,
+    const char* branch_name
+) {
+    if (!acc || !initialized || !branch || hidden_size == 0) {
+        return 0;
+    }
+    if (!*initialized) {
+        for (uint32_t i = 0; i < hidden_size; ++i) {
+            const float v = branch[i];
+            if (!std::isfinite(v)) {
+                std::fprintf(stderr,
+                    "[storagellm mlp] non-finite %s branch layer=%d index=%u\n",
+                    branch_name ? branch_name : "unknown", layer, i);
+                return 0;
+            }
+            acc[i] = v;
+        }
+        *initialized = 1;
+        return 1;
+    }
+    return moe_accumulate_branch_checked_f32(acc, branch, hidden_size, layer, branch_name);
+}
+
 
 static int moe_layer_graph_has_any_role_f32(
     const moe_pc_engine* engine,
@@ -659,8 +687,7 @@ static int moe_layer_moe_mlp_f32(
             s ? s->residual.size() : 0u);
         return 0;
     }
-    std::fill(s->mlp.begin(), s->mlp.begin() + hidden_size, 0.0f);
-    moe_profile_log("mlp_moe_zero", "layer=%d hidden=%u", layer, hidden_size);
+    int branch_sum_initialized = 0;
 
     const uint64_t norm_start_us = moe_profile_now_us();
     const float* shared_input = s->norm.data();
@@ -758,7 +785,8 @@ static int moe_layer_moe_mlp_f32(
                 layer);
             return 0;
         }
-        if (!moe_accumulate_branch_checked_f32(s->mlp.data(), shared_branch, hidden_size, layer, "shared")) {
+        if (!moe_accumulate_branch_sum_checked_f32(
+                s->mlp.data(), &branch_sum_initialized, shared_branch, hidden_size, layer, "shared")) {
             return 0;
         }
     } else if (common_shared_enabled) {
@@ -778,7 +806,8 @@ static int moe_layer_moe_mlp_f32(
                 layer);
             return 0;
         }
-        if (!moe_accumulate_branch_checked_f32(s->mlp.data(), common_branch, hidden_size, layer, "common_shared")) {
+        if (!moe_accumulate_branch_sum_checked_f32(
+                s->mlp.data(), &branch_sum_initialized, common_branch, hidden_size, layer, "common_shared")) {
             return 0;
         }
         common_shared_ok = 1;
@@ -1540,16 +1569,25 @@ static int moe_layer_moe_mlp_f32(
                 return 0;
             }
             moe_mlp_trace_vec_f32("mlp_expert_branch", layer, expert_branch, hidden_size);
-            if (!moe_accumulate_branch_checked_f32(s->mlp.data(), expert_branch, hidden_size, layer, "expert")) {
-                return 0;
-            }
-            if (dense_ok &&
-                !moe_accumulate_branch_checked_f32(s->mlp.data(), s->shared.data(), hidden_size, layer, "dense")) {
-                return 0;
-            }
-            moe_mlp_trace_vec_f32("mlp_branch_sum_pre_residual", layer, s->mlp.data(), hidden_size);
             const uint64_t residual_start_us = moe_profile_now_us();
-            const int residual_ok = moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
+            int residual_ok = 0;
+            if (!branch_sum_initialized && !dense_ok) {
+                moe_mlp_trace_vec_f32("mlp_branch_sum_pre_residual", layer, expert_branch, hidden_size);
+                residual_ok = moe_add_mlp_branch_residual_f32(
+                    engine, layer, expert_branch, hidden_size, hidden, s->shared.data(), attn_cfg.rms_norm_eps);
+            } else {
+                if (!moe_accumulate_branch_sum_checked_f32(
+                        s->mlp.data(), &branch_sum_initialized, expert_branch, hidden_size, layer, "expert")) {
+                    return 0;
+                }
+                if (dense_ok &&
+                    !moe_accumulate_branch_sum_checked_f32(
+                        s->mlp.data(), &branch_sum_initialized, s->shared.data(), hidden_size, layer, "dense")) {
+                    return 0;
+                }
+                moe_mlp_trace_vec_f32("mlp_branch_sum_pre_residual", layer, s->mlp.data(), hidden_size);
+                residual_ok = moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
+            }
             moe_profile_log(
                 "mlp_moe_fused_down_accum_end",
                 "layer=%d ok=%d selected=%zu mapped=%u hidden=%u intermediate=%u fused_ms=%.3f residual_ms=%.3f total_ms=%.3f",
@@ -1685,18 +1723,27 @@ static int moe_layer_moe_mlp_f32(
         return 0;
     }
     moe_mlp_trace_vec_f32("mlp_expert_branch", layer, expert_branch, hidden_size);
-    if (!moe_accumulate_branch_checked_f32(s->mlp.data(), expert_branch, hidden_size, layer, "expert")) {
-        return 0;
-    }
-    if (dense_ok &&
-        !moe_accumulate_branch_checked_f32(s->mlp.data(), s->shared.data(), hidden_size, layer, "dense")) {
-        return 0;
-    }
-    moe_mlp_trace_vec_f32("mlp_branch_sum_pre_residual", layer, s->mlp.data(), hidden_size);
     const double accumulate_ms = moe_profile_elapsed_ms(accumulate_start_us);
 
     const uint64_t residual_start_us = moe_profile_now_us();
-    const int residual_ok = moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
+    int residual_ok = 0;
+    if (!branch_sum_initialized && !dense_ok) {
+        moe_mlp_trace_vec_f32("mlp_branch_sum_pre_residual", layer, expert_branch, hidden_size);
+        residual_ok = moe_add_mlp_branch_residual_f32(
+            engine, layer, expert_branch, hidden_size, hidden, s->shared.data(), attn_cfg.rms_norm_eps);
+    } else {
+        if (!moe_accumulate_branch_sum_checked_f32(
+                s->mlp.data(), &branch_sum_initialized, expert_branch, hidden_size, layer, "expert")) {
+            return 0;
+        }
+        if (dense_ok &&
+            !moe_accumulate_branch_sum_checked_f32(
+                s->mlp.data(), &branch_sum_initialized, s->shared.data(), hidden_size, layer, "dense")) {
+            return 0;
+        }
+        moe_mlp_trace_vec_f32("mlp_branch_sum_pre_residual", layer, s->mlp.data(), hidden_size);
+        residual_ok = moe_add_mlp_residual_f32(engine, layer, s, hidden, hidden_size);
+    }
     moe_profile_log(
         "mlp_moe_end",
         "layer=%d ok=%d selected=%zu mapped=%u hidden=%u intermediate=%u accumulate_ms=%.3f residual_ms=%.3f total_ms=%.3f",
