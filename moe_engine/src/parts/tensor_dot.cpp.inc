@@ -668,6 +668,11 @@ static int moe_dot_tensor_fast_view_adjacent_rows(
             p0, p1, x, view->cols, view->mxfp4_layout, view->mxfp4_pairwise_order, out0, out1);
         return std::isfinite(*out0) && std::isfinite(*out1) ? 1 : 0;
     }
+    if (view->weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
+        return moe_dot_gguf_q8_0_two_rows(
+            p0, p1, x, view->cols, out0, out1) &&
+            std::isfinite(*out0) && std::isfinite(*out1);
+    }
     return moe_dot_tensor_fast_view_row(engine, view, row, x, x_count, out0) &&
            moe_dot_tensor_fast_view_row(engine, view, row + 1u, x, x_count, out1);
 }
@@ -700,6 +705,12 @@ static int moe_dot_tensor_fast_view_adjacent_four_rows(
             view->mxfp4_pairwise_order, out0, out1, out2, out3);
         return std::isfinite(*out0) && std::isfinite(*out1) &&
                std::isfinite(*out2) && std::isfinite(*out3) ? 1 : 0;
+    }
+    if (view->weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
+        return moe_dot_gguf_q8_0_four_rows(
+            p0, p1, p2, p3, x, view->cols, out0, out1, out2, out3) &&
+            std::isfinite(*out0) && std::isfinite(*out1) &&
+            std::isfinite(*out2) && std::isfinite(*out3);
     }
     return moe_dot_tensor_fast_view_adjacent_rows(
                engine, view, row, x, x_count, out0, out1) &&

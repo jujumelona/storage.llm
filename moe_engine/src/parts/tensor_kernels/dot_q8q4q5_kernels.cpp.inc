@@ -42,6 +42,160 @@ static float moe_dot_gguf_q8_0_row(
     return acc;
 }
 
+static int moe_dot_gguf_q8_0_two_rows(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const float* x,
+    uint32_t cols,
+    float* out0,
+    float* out1
+) {
+    if (!packed0 || !packed1 || !x || !out0 || !out1) {
+        return 0;
+    }
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 34u;
+    for (uint32_t start = 0; start < cols; start += block_cols) {
+        uint16_t d16_0 = 0;
+        uint16_t d16_1 = 0;
+        std::memcpy(&d16_0, packed0, sizeof(d16_0));
+        std::memcpy(&d16_1, packed1, sizeof(d16_1));
+        const float d0 = moe_raw_fp16_to_f32(d16_0);
+        const float d1 = moe_raw_fp16_to_f32(d16_1);
+        if (!std::isfinite(d0) || !std::isfinite(d1)) {
+            return 0;
+        }
+        const int8_t* q0 = reinterpret_cast<const int8_t*>(packed0 + 2u);
+        const int8_t* q1 = reinterpret_cast<const int8_t*>(packed1 + 2u);
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
+#if defined(__AVX2__)
+        const __m256 scale0 = _mm256_set1_ps(d0);
+        const __m256 scale1 = _mm256_set1_ps(d1);
+        __m256 vacc0 = _mm256_setzero_ps();
+        __m256 vacc1 = _mm256_setzero_ps();
+        uint32_t i = 0;
+        for (; i + 7u < limit; i += 8u) {
+            const __m256 xv = _mm256_loadu_ps(x + start + i);
+            vacc0 = moe_madd_ps(_mm256_mul_ps(moe_i8x8_to_ps(q0 + i), scale0), xv, vacc0);
+            vacc1 = moe_madd_ps(_mm256_mul_ps(moe_i8x8_to_ps(q1 + i), scale1), xv, vacc1);
+        }
+        acc0 += moe_dot_hsum256_ps(vacc0);
+        acc1 += moe_dot_hsum256_ps(vacc1);
+        for (; i < limit; ++i) {
+            const float xv = x[start + i];
+            acc0 += d0 * (float)q0[i] * xv;
+            acc1 += d1 * (float)q1[i] * xv;
+        }
+#else
+        for (uint32_t i = 0; i < limit; ++i) {
+            const float xv = x[start + i];
+            acc0 += d0 * (float)q0[i] * xv;
+            acc1 += d1 * (float)q1[i] * xv;
+        }
+#endif
+        packed0 += block_bytes;
+        packed1 += block_bytes;
+    }
+    *out0 = acc0;
+    *out1 = acc1;
+    return 1;
+}
+
+static int moe_dot_gguf_q8_0_four_rows(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const uint8_t* packed2,
+    const uint8_t* packed3,
+    const float* x,
+    uint32_t cols,
+    float* out0,
+    float* out1,
+    float* out2,
+    float* out3
+) {
+    if (!packed0 || !packed1 || !packed2 || !packed3 || !x ||
+        !out0 || !out1 || !out2 || !out3) {
+        return 0;
+    }
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 34u;
+    for (uint32_t start = 0; start < cols; start += block_cols) {
+        uint16_t d16_0 = 0;
+        uint16_t d16_1 = 0;
+        uint16_t d16_2 = 0;
+        uint16_t d16_3 = 0;
+        std::memcpy(&d16_0, packed0, sizeof(d16_0));
+        std::memcpy(&d16_1, packed1, sizeof(d16_1));
+        std::memcpy(&d16_2, packed2, sizeof(d16_2));
+        std::memcpy(&d16_3, packed3, sizeof(d16_3));
+        const float d0 = moe_raw_fp16_to_f32(d16_0);
+        const float d1 = moe_raw_fp16_to_f32(d16_1);
+        const float d2 = moe_raw_fp16_to_f32(d16_2);
+        const float d3 = moe_raw_fp16_to_f32(d16_3);
+        if (!std::isfinite(d0) || !std::isfinite(d1) ||
+            !std::isfinite(d2) || !std::isfinite(d3)) {
+            return 0;
+        }
+        const int8_t* q0 = reinterpret_cast<const int8_t*>(packed0 + 2u);
+        const int8_t* q1 = reinterpret_cast<const int8_t*>(packed1 + 2u);
+        const int8_t* q2 = reinterpret_cast<const int8_t*>(packed2 + 2u);
+        const int8_t* q3 = reinterpret_cast<const int8_t*>(packed3 + 2u);
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
+#if defined(__AVX2__)
+        const __m256 scale0 = _mm256_set1_ps(d0);
+        const __m256 scale1 = _mm256_set1_ps(d1);
+        const __m256 scale2 = _mm256_set1_ps(d2);
+        const __m256 scale3 = _mm256_set1_ps(d3);
+        __m256 vacc0 = _mm256_setzero_ps();
+        __m256 vacc1 = _mm256_setzero_ps();
+        __m256 vacc2 = _mm256_setzero_ps();
+        __m256 vacc3 = _mm256_setzero_ps();
+        uint32_t i = 0;
+        for (; i + 7u < limit; i += 8u) {
+            const __m256 xv = _mm256_loadu_ps(x + start + i);
+            vacc0 = moe_madd_ps(_mm256_mul_ps(moe_i8x8_to_ps(q0 + i), scale0), xv, vacc0);
+            vacc1 = moe_madd_ps(_mm256_mul_ps(moe_i8x8_to_ps(q1 + i), scale1), xv, vacc1);
+            vacc2 = moe_madd_ps(_mm256_mul_ps(moe_i8x8_to_ps(q2 + i), scale2), xv, vacc2);
+            vacc3 = moe_madd_ps(_mm256_mul_ps(moe_i8x8_to_ps(q3 + i), scale3), xv, vacc3);
+        }
+        acc0 += moe_dot_hsum256_ps(vacc0);
+        acc1 += moe_dot_hsum256_ps(vacc1);
+        acc2 += moe_dot_hsum256_ps(vacc2);
+        acc3 += moe_dot_hsum256_ps(vacc3);
+        for (; i < limit; ++i) {
+            const float xv = x[start + i];
+            acc0 += d0 * (float)q0[i] * xv;
+            acc1 += d1 * (float)q1[i] * xv;
+            acc2 += d2 * (float)q2[i] * xv;
+            acc3 += d3 * (float)q3[i] * xv;
+        }
+#else
+        for (uint32_t i = 0; i < limit; ++i) {
+            const float xv = x[start + i];
+            acc0 += d0 * (float)q0[i] * xv;
+            acc1 += d1 * (float)q1[i] * xv;
+            acc2 += d2 * (float)q2[i] * xv;
+            acc3 += d3 * (float)q3[i] * xv;
+        }
+#endif
+        packed0 += block_bytes;
+        packed1 += block_bytes;
+        packed2 += block_bytes;
+        packed3 += block_bytes;
+    }
+    *out0 = acc0;
+    *out1 = acc1;
+    *out2 = acc2;
+    *out3 = acc3;
+    return 1;
+}
+
 static float moe_dot_gguf_q8_1_row(
     const uint8_t* packed,
     const float* x,
