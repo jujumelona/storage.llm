@@ -657,6 +657,16 @@ static int moe_dot_tensor_fast_view_two_rows(
             pa, pb, x, a->cols, a->mxfp4_layout, a->mxfp4_pairwise_order, out_a, out_b);
         return std::isfinite(*out_a) && std::isfinite(*out_b) ? 1 : 0;
     }
+    if (a->weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0 &&
+        b->weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
+        return moe_dot_gguf_q8_0_two_rows(pa, pb, x, a->cols, out_a, out_b) &&
+               std::isfinite(*out_a) && std::isfinite(*out_b);
+    }
+    if (a->weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1 &&
+        b->weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
+        return moe_dot_gguf_q5_1_two_rows(pa, pb, x, a->cols, out_a, out_b) &&
+               std::isfinite(*out_a) && std::isfinite(*out_b);
+    }
     return moe_dot_tensor_fast_view_row(engine, a, row, x, x_count, out_a) &&
            moe_dot_tensor_fast_view_row(engine, b, row, x, x_count, out_b);
 }
