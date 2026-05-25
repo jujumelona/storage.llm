@@ -762,6 +762,103 @@ static int moe_dot_gguf_q5_k_two_rows(
     return std::isfinite(*out0) && std::isfinite(*out1) ? 1 : 0;
 }
 
+static int moe_dot_gguf_q5_k_four_rows(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const uint8_t* packed2,
+    const uint8_t* packed3,
+    const float* x,
+    uint32_t cols,
+    float* out0,
+    float* out1,
+    float* out2,
+    float* out3
+) {
+    if (!packed0 || !packed1 || !packed2 || !packed3 || !x ||
+        !out0 || !out1 || !out2 || !out3) {
+        return 0;
+    }
+#if defined(__AVX2__)
+    if ((cols % 256u) == 0u) {
+        const uint8_t* rows[4] = { packed0, packed1, packed2, packed3 };
+        float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+        const __m128i high_value = _mm_set1_epi8(16);
+        const __m128i zero = _mm_setzero_si128();
+        for (uint32_t base = 0; base < cols; base += 256u) {
+            for (uint32_t j = 0, is = 0; j < 256u; j += 64u, is += 2u) {
+                const uint8_t u1 = (uint8_t)(1u << (j / 32u));
+                const uint8_t u2 = (uint8_t)(2u << (j / 32u));
+                const __m128i high_mask1 = _mm_set1_epi8((char)u1);
+                const __m128i high_mask2 = _mm_set1_epi8((char)u2);
+                __m256 da[4];
+                __m256 ma[4];
+                __m256 db[4];
+                __m256 mb[4];
+                const uint8_t* qh_rows[4];
+                const uint8_t* ql_rows[4];
+                for (uint32_t r = 0; r < 4u; ++r) {
+                    const float d = moe_load_f16le(rows[r]);
+                    const float minv = moe_load_f16le(rows[r] + 2u);
+                    if (!std::isfinite(d) || !std::isfinite(minv)) {
+                        return 0;
+                    }
+                    uint8_t sca = 0;
+                    uint8_t mna = 0;
+                    uint8_t scb = 0;
+                    uint8_t mnb = 0;
+                    const uint8_t* scales = rows[r] + 4u;
+                    moe_get_scale_min_k4(is + 0u, scales, &sca, &mna);
+                    moe_get_scale_min_k4(is + 1u, scales, &scb, &mnb);
+                    da[r] = _mm256_set1_ps(d * (float)sca);
+                    ma[r] = _mm256_set1_ps(minv * (float)mna);
+                    db[r] = _mm256_set1_ps(d * (float)scb);
+                    mb[r] = _mm256_set1_ps(minv * (float)mnb);
+                    qh_rows[r] = rows[r] + 16u;
+                    ql_rows[r] = rows[r] + 48u + j / 2u;
+                }
+                for (uint32_t l = 0; l < 32u; l += 8u) {
+                    const __m256 xlo = _mm256_loadu_ps(x + base + j + l);
+                    const __m256 xhi = _mm256_loadu_ps(x + base + j + 32u + l);
+                    for (uint32_t r = 0; r < 4u; ++r) {
+                        const __m128i qbytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ql_rows[r] + l));
+                        const __m128i hbytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qh_rows[r] + l));
+                        const __m128i lo_hi = _mm_andnot_si128(
+                            _mm_cmpeq_epi8(_mm_and_si128(hbytes, high_mask1), zero), high_value);
+                        const __m128i hi_hi = _mm_andnot_si128(
+                            _mm_cmpeq_epi8(_mm_and_si128(hbytes, high_mask2), zero), high_value);
+                        const __m128i lo = _mm_or_si128(_mm_and_si128(qbytes, nibble_mask), lo_hi);
+                        const __m128i hi = _mm_or_si128(
+                            _mm_and_si128(_mm_srli_epi16(qbytes, 4), nibble_mask), hi_hi);
+                        __m256 vacc = _mm256_setzero_ps();
+                        vacc = moe_madd_ps(
+                            _mm256_sub_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo)), da[r]), ma[r]),
+                            xlo,
+                            vacc);
+                        vacc = moe_madd_ps(
+                            _mm256_sub_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi)), db[r]), mb[r]),
+                            xhi,
+                            vacc);
+                        acc[r] += moe_dot_hsum256_ps(vacc);
+                    }
+                }
+            }
+            for (uint32_t r = 0; r < 4u; ++r) {
+                rows[r] += 176u;
+            }
+        }
+        *out0 = acc[0];
+        *out1 = acc[1];
+        *out2 = acc[2];
+        *out3 = acc[3];
+        return std::isfinite(acc[0]) && std::isfinite(acc[1]) &&
+               std::isfinite(acc[2]) && std::isfinite(acc[3]) ? 1 : 0;
+    }
+#endif
+    return moe_dot_gguf_q5_k_two_rows(packed0, packed1, x, cols, out0, out1) &&
+           moe_dot_gguf_q5_k_two_rows(packed2, packed3, x, cols, out2, out3);
+}
+
 static float moe_gguf_q6_k_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
     // BUGFIX 706: Q6_K NaN handling ★★
     // Problem: No validation of scale values or accumulated result
