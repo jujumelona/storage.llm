@@ -48,6 +48,7 @@ static int moe_profile_tag_enabled(const char* tag) {
         "generation_output_cache_hit",
         "generation_output_cache_insert",
         "generation_end",
+        "cpu_decode_expert_runway",
         "forward_embed",
         "prefill_batch_embed",
         "prefill_layer_attention_token",

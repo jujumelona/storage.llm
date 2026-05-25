@@ -1349,6 +1349,11 @@ static void moe_cpu_storage_startup_prefetch_first_layers(moe_pc_engine* engine)
         moe_storage_startup_prefetch_wait_ms());
 }
 
+static void moe_cpu_storage_schedule_decode_cached_experts(
+    moe_pc_engine* engine,
+    uint32_t position,
+    const moe_storage_constants_t& c);
+
 static void moe_cpu_storage_begin_token(moe_pc_engine* engine, uint32_t position, uint32_t token_id) {
     if (!engine || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
     (void)position;
@@ -1367,6 +1372,8 @@ static void moe_cpu_storage_begin_token(moe_pc_engine* engine, uint32_t position
     engine->generation_phase.store(prefill_phase ? moe_GEN_PHASE_PREFILL : moe_GEN_PHASE_INIT, std::memory_order_relaxed);
     engine->cpu_prefetch_epoch.fetch_add(1u, std::memory_order_relaxed);
     if (!prefill_phase) {
+        const moe_storage_constants_t runtime_c = moe_engine_storage_constants_or_static(engine);
+        moe_cpu_storage_schedule_decode_cached_experts(engine, position, runtime_c);
         return;
     }
     // Warm the first layers before the loop reaches them.  Existing IO queues
@@ -1388,6 +1395,46 @@ static void moe_cpu_storage_after_router_selected(
     int32_t layer,
     const std::vector<int>& selected_experts
 );
+
+static void moe_cpu_storage_schedule_decode_cached_experts(
+    moe_pc_engine* engine,
+    uint32_t position,
+    const moe_storage_constants_t& c
+) {
+    if (!engine || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
+    if (position == 0 || c.num_hidden_layers == 0) return;
+
+    uint32_t layers_scheduled = 0;
+    uint32_t expert_refs = 0;
+    std::vector<std::vector<int>> cached_experts;
+    {
+        std::shared_lock<std::shared_mutex> lock(engine->co_activation_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            return;
+        }
+        const uint32_t layer_count = std::min<uint32_t>(
+            c.num_hidden_layers,
+            (uint32_t)engine->last_selected_experts.size());
+        cached_experts.assign(
+            engine->last_selected_experts.begin(),
+            engine->last_selected_experts.begin() + layer_count);
+    }
+    for (uint32_t layer = 0; layer < (uint32_t)cached_experts.size(); ++layer) {
+        const std::vector<int>& previous = cached_experts[layer];
+        if (previous.empty()) {
+            continue;
+        }
+        moe_cpu_storage_after_router_selected(engine, (int32_t)layer, previous);
+        moe_cpu_storage_schedule_layer_hot_prefetch(engine, layer);
+        moe_enqueue_attention_prefetch(engine, (int32_t)layer);
+        ++layers_scheduled;
+        expert_refs += (uint32_t)previous.size();
+    }
+    moe_profile_log(
+        "cpu_decode_expert_runway",
+        "position=%u layers=%u expert_refs=%u",
+        position, layers_scheduled, expert_refs);
+}
 
 static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, const moe_storage_constants_t* c) {
     if (!engine || !c || !engine->cpu_storage_engine_ready.load(std::memory_order_relaxed)) return;
@@ -1467,7 +1514,7 @@ static void moe_cpu_storage_after_router_selected(
             engine->storage_expert_view_offsets.size() >= (size_t)layers * ((size_t)experts + 0u);
         if (indexed) {
             static const int prefetch_each_expert_bucket_once =
-                moe_cpu_storage_env_enabled_default_on("STORAGELLM_STORAGE_EXPERT_PREFETCH_ONCE");
+                moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_EXPERT_PREFETCH_ONCE");
             for (const int expert_id : selected_experts) {
                 if (expert_id < 0 || (uint32_t)expert_id >= experts) continue;
                 const size_t b = (size_t)(uint32_t)layer * (size_t)experts + (uint32_t)expert_id;
