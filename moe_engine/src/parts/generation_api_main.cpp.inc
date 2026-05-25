@@ -484,9 +484,10 @@ int moe_pc_engine_generate_token_ids(
         if (prefix_reuse_tokens > prefill_count) {
             prefix_reuse_tokens = prefill_count;
         }
+        const uint32_t remaining_prefill_count = prefill_count - prefix_reuse_tokens;
         const bool use_layer_first_prefill =
-            prefix_reuse_tokens == 0 &&
-            moe_generation_should_use_layer_first_prefill(engine, prefill_count, c->hidden_size);
+            remaining_prefill_count > 0 &&
+            moe_generation_should_use_layer_first_prefill(engine, remaining_prefill_count, c->hidden_size);
 
         if (!use_layer_first_prefill) {
             for (uint32_t i = prefix_reuse_tokens; i < prefill_count; ++i) {
@@ -508,10 +509,12 @@ int moe_pc_engine_generate_token_ids(
                 engine->generation_token.store(scratch.position, std::memory_order_relaxed);
             }
         } else {
+            const uint32_t layer_first_begin = prefix_reuse_tokens;
+            const uint32_t layer_first_count = remaining_prefill_count;
             // Allocate batch hidden states: one per prefill token
             const size_t hs = c->hidden_size;
-            std::vector<float> batch_hidden(prefill_count * hs);
-            std::vector<float> batch_norm(prefill_count * hs);
+            std::vector<float> batch_hidden((size_t)layer_first_count * hs);
+            std::vector<float> batch_norm((size_t)layer_first_count * hs);
 
             // Phase 1: Embed all tokens. Embedding is read-only on weights and writes
             // one independent hidden row per prompt token, so it can safely use the
@@ -519,19 +522,19 @@ int moe_pc_engine_generate_token_ids(
             // avoidable serial chunks in long-prompt prefill.
             const uint64_t batch_embed_start_us = moe_profile_now_us();
             std::atomic<int> embed_ok{1};
-            if (prefill_count >= 2u && moe_generation_parallel_prefill_embed_enabled()) {
-                const int rows_ok = moe_parallel_rows(engine, prefill_count, 0, [&](uint32_t i) {
+            if (layer_first_count >= 2u && moe_generation_parallel_prefill_embed_enabled()) {
+                const int rows_ok = moe_parallel_rows(engine, layer_first_count, 0, [&](uint32_t i) {
                     if (!moe_pc_engine_embed_token_f32(
-                            engine, (uint32_t)safe_input[i],
+                            engine, (uint32_t)safe_input[layer_first_begin + i],
                             batch_hidden.data() + (size_t)i * hs, (uint32_t)hs)) {
                         embed_ok.store(0, std::memory_order_relaxed);
                     }
                 });
                 if (!rows_ok) embed_ok.store(0, std::memory_order_relaxed);
             } else {
-                for (uint32_t i = 0; i < prefill_count; ++i) {
+                for (uint32_t i = 0; i < layer_first_count; ++i) {
                     if (!moe_pc_engine_embed_token_f32(
-                            engine, (uint32_t)safe_input[i],
+                            engine, (uint32_t)safe_input[layer_first_begin + i],
                             batch_hidden.data() + (size_t)i * hs, (uint32_t)hs)) {
                         embed_ok.store(0, std::memory_order_relaxed);
                         break;
@@ -544,11 +547,12 @@ int moe_pc_engine_generate_token_ids(
             }
             moe_profile_log(
                 "prefill_batch_embed",
-                "id=%llu tokens=%u hidden=%u parallel=%d ms=%.3f",
+                "id=%llu start=%u tokens=%u hidden=%u parallel=%d ms=%.3f",
                 (unsigned long long)generation_scope.id,
-                prefill_count,
+                layer_first_begin,
+                layer_first_count,
                 c->hidden_size,
-                (prefill_count >= 2u && moe_generation_parallel_prefill_embed_enabled()) ? 1 : 0,
+                (layer_first_count >= 2u && moe_generation_parallel_prefill_embed_enabled()) ? 1 : 0,
                 moe_profile_elapsed_ms(batch_embed_start_us));
 
             // Ensure scratch is sized
@@ -596,16 +600,18 @@ int moe_pc_engine_generate_token_ids(
                     moe_generation_layer_attn_config(engine, (int32_t)layer);
                 const moe_decoder_layer_plan_t layer_plan =
                     moe_build_decoder_layer_plan(engine, c, &attn_cfg, layer);
-                for (uint32_t t = 0; t < prefill_count; ++t) {
+                for (uint32_t t = 0; t < layer_first_count; ++t) {
+                    const uint32_t token_index = layer_first_begin + t;
                     const uint64_t prefill_attention_start_us = moe_profile_now_us();
                     float* current_hidden = batch_hidden.data() + t * hs;
-                    engine->generation_token.store(t, std::memory_order_relaxed);
+                    scratch.position = token_index;
+                    engine->generation_token.store(token_index, std::memory_order_relaxed);
 
                     engine->generation_phase.store(moe_GEN_PHASE_ATTENTION, std::memory_order_relaxed);
                     if (layer_attn_cfg.type != moe_ATTN_TYPE_MLA) {
                         std::memcpy(scratch.residual.data(), current_hidden, hs * sizeof(float));
                         if (!moe_layer_standard_attention_f32(
-                                engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs, t,
+                                engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs, token_index,
                                 layer_attn_cfg, nullptr, 0)) {
                             moe_generation_set_error(out_stats, "prefill attention failed");
                             return 0;
@@ -628,7 +634,7 @@ int moe_pc_engine_generate_token_ids(
                             std::memcpy(scratch.norm.data(), current_hidden, hs * sizeof(float));
                         }
                     } else {
-                        if (!moe_layer_attention_f32(engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs, t)) {
+                        if (!moe_layer_attention_f32(engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs, token_index)) {
                             moe_generation_set_error(out_stats, "prefill attention failed");
                             return 0;
                         }
@@ -648,7 +654,7 @@ int moe_pc_engine_generate_token_ids(
                         "id=%llu layer=%u token_index=%u ms=%.3f",
                         (unsigned long long)generation_scope.id,
                         layer,
-                        t,
+                        token_index,
                         moe_profile_elapsed_ms(prefill_attention_start_us));
                 }
 
@@ -656,11 +662,11 @@ int moe_pc_engine_generate_token_ids(
                 const int is_moe = moe_layer_is_moe_runtime(engine, c, (int32_t)layer);
                 const uint64_t prefill_mlp_start_us = moe_profile_now_us();
                 int mlp_batch_ok = 0;
-                if (is_moe && prefill_count >= 2u) {
+                if (is_moe && layer_first_count >= 2u) {
                     mlp_batch_ok = moe_layer_moe_mlp_prefill_batch_f32(
                         engine, (int32_t)layer,
                         batch_hidden.data(), batch_norm.data(),
-                        prefill_count, c);
+                        layer_first_count, c);
                 }
                 if (mlp_batch_ok == moe_PREFILL_BATCH_MLP_FAST_KERNEL_REQUIRED) {
                     moe_generation_set_error(
@@ -669,14 +675,16 @@ int moe_pc_engine_generate_token_ids(
                     return 0;
                 }
                 if (!mlp_batch_ok) {
-                    for (uint32_t t = 0; t < prefill_count; ++t) {
+                    for (uint32_t t = 0; t < layer_first_count; ++t) {
+                        const uint32_t token_index = layer_first_begin + t;
                         const uint64_t prefill_step_start_us = moe_profile_now_us();
                         float* current_hidden = batch_hidden.data() + (size_t)t * hs;
                         std::memcpy(
                             scratch.norm.data(),
                             batch_norm.data() + (size_t)t * hs,
                             hs * sizeof(float));
-                        engine->generation_token.store(t, std::memory_order_relaxed);
+                        scratch.position = token_index;
+                        engine->generation_token.store(token_index, std::memory_order_relaxed);
                         const int mlp_ok = is_moe ?
                             moe_layer_moe_mlp_f32(engine, (int32_t)layer, &scratch, current_hidden, c) :
                             moe_layer_dense_mlp_f32(engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs);
@@ -689,7 +697,7 @@ int moe_pc_engine_generate_token_ids(
                             "id=%llu layer=%u token_index=%u is_moe=%d batch_fallback=1 ms=%.3f",
                             (unsigned long long)generation_scope.id,
                             layer,
-                            t,
+                            token_index,
                             is_moe,
                             moe_profile_elapsed_ms(prefill_step_start_us));
                     }
@@ -698,10 +706,11 @@ int moe_pc_engine_generate_token_ids(
                     moe_generation_layer_attn_config(engine, (int32_t)layer);
                 const moe_decoder_layer_plan_t layer_post_mlp_plan =
                     moe_build_decoder_layer_plan(engine, c, &attn_cfg, layer);
-                for (uint32_t t = 0; t < prefill_count; ++t) {
+                for (uint32_t t = 0; t < layer_first_count; ++t) {
+                    const uint32_t token_index = layer_first_begin + t;
                     float* current_hidden = batch_hidden.data() + (size_t)t * hs;
-                    scratch.position = t;
-                    engine->generation_token.store(t, std::memory_order_relaxed);
+                    scratch.position = token_index;
+                    engine->generation_token.store(token_index, std::memory_order_relaxed);
                     if (!moe_layer_apply_ple_f32(
                             engine, (int32_t)layer, &scratch, current_hidden, (uint32_t)hs,
                             c->num_hidden_layers, layer_post_mlp_attn_cfg.rms_norm_eps)) {
@@ -722,23 +731,25 @@ int moe_pc_engine_generate_token_ids(
                 }
                 moe_profile_log(
                     "prefill_layer_mlp",
-                    "id=%llu layer=%u tokens=%u is_moe=%d batch=%d ms=%.3f",
+                    "id=%llu layer=%u start=%u tokens=%u is_moe=%d batch=%d ms=%.3f",
                     (unsigned long long)generation_scope.id,
                     layer,
-                    prefill_count,
+                    layer_first_begin,
+                    layer_first_count,
                     is_moe,
                     mlp_batch_ok,
                     moe_profile_elapsed_ms(prefill_mlp_start_us));
                 moe_profile_log(
                     "prefill_layer",
-                    "id=%llu layer=%u tokens=%u ms=%.3f",
+                    "id=%llu layer=%u start=%u tokens=%u ms=%.3f",
                     (unsigned long long)generation_scope.id,
                     layer,
-                    prefill_count,
+                    layer_first_begin,
+                    layer_first_count,
                     moe_profile_elapsed_ms(prefill_layer_start_us));
             }
 
-            float* last_hidden = batch_hidden.data() + (prefill_count - 1u) * hs;
+            float* last_hidden = batch_hidden.data() + (layer_first_count - 1u) * hs;
             if (!moe_final_norm_f32(
                     engine, c, last_hidden, (uint32_t)hs,
                     scratch.norm.data(), attn_cfg.rms_norm_eps)) {
