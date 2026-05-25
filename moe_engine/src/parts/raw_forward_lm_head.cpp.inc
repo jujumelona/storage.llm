@@ -23,6 +23,70 @@ static uint32_t moe_lm_head_worker_hint() {
     return std::max<uint32_t>(row_hw_threads(), 1u);
 }
 
+static int moe_lm_head_fill_scores_f32(
+    const moe_raw_tensor_cache_entry& raw,
+    const float* hidden,
+    uint32_t hidden_count,
+    uint64_t row_bytes,
+    uint32_t start_row,
+    uint32_t count,
+    float logit_softcap,
+    int mxfp4_direct,
+    const moe_mxfp4_row_layout_t& mxfp4_layout,
+    int mxfp4_pairwise_order,
+    float* scores
+) {
+    if (!hidden || !scores || count == 0) {
+        return count == 0;
+    }
+    uint32_t i = 0;
+    if (mxfp4_direct) {
+        for (; i + 4u <= count; i += 4u) {
+            const uint8_t* row0 = raw.base + (uint64_t)(start_row + i) * row_bytes;
+            float s0 = 0.0f;
+            float s1 = 0.0f;
+            float s2 = 0.0f;
+            float s3 = 0.0f;
+            moe_dot_gguf_mxfp4_four_rows_with_layout(
+                row0,
+                row0 + row_bytes,
+                row0 + row_bytes * 2u,
+                row0 + row_bytes * 3u,
+                hidden,
+                hidden_count,
+                mxfp4_layout,
+                mxfp4_pairwise_order,
+                &s0,
+                &s1,
+                &s2,
+                &s3);
+            scores[i + 0u] = moe_apply_final_logit_softcap_cached(logit_softcap, s0);
+            scores[i + 1u] = moe_apply_final_logit_softcap_cached(logit_softcap, s1);
+            scores[i + 2u] = moe_apply_final_logit_softcap_cached(logit_softcap, s2);
+            scores[i + 3u] = moe_apply_final_logit_softcap_cached(logit_softcap, s3);
+            if (!std::isfinite(scores[i + 0u]) || !std::isfinite(scores[i + 1u]) ||
+                !std::isfinite(scores[i + 2u]) || !std::isfinite(scores[i + 3u])) {
+                return 0;
+            }
+        }
+    }
+    for (; i < count; ++i) {
+        float score = 0.0f;
+        if (mxfp4_direct) {
+            const uint8_t* row_ptr = raw.base + (uint64_t)(start_row + i) * row_bytes;
+            score = moe_dot_gguf_mxfp4_row_with_layout(
+                row_ptr, hidden, hidden_count, mxfp4_layout, mxfp4_pairwise_order);
+        } else {
+            score = moe_raw_tensor_dot_row(raw, start_row + i, hidden, hidden_count);
+        }
+        scores[i] = moe_apply_final_logit_softcap_cached(logit_softcap, score);
+        if (!std::isfinite(scores[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int moe_map_lm_head_tensor(
     moe_pc_engine* engine,
     const moe_storage_constants_t* c,
@@ -201,14 +265,6 @@ int moe_pc_engine_lm_head_top1_f32(
         lm_head_mxfp4_direct ? moe_mxfp4_row_layout_for_bytes(c->hidden_size, row_bytes) : moe_mxfp4_row_layout_t{};
     const int lm_head_mxfp4_pairwise_order =
         lm_head_mxfp4_direct ? moe_mxfp4_pairwise_nibble_order_enabled() : 0;
-    auto lm_head_dot_row = [&](uint32_t row) -> float {
-        if (lm_head_mxfp4_direct) {
-            const uint8_t* row_ptr = raw.base + (uint64_t)row * row_bytes;
-            return moe_dot_gguf_mxfp4_row_with_layout(
-                row_ptr, hidden, hidden_count, lm_head_mxfp4_layout, lm_head_mxfp4_pairwise_order);
-        }
-        return moe_raw_tensor_dot_row(raw, row, hidden, hidden_count);
-    };
     moe_profile_log(
         "lm_head_top1_begin",
         "vocab=%u hidden=%u fmt=%u eff_fmt=%u scalar=%u row_bytes=%llu bytes=%llu softcap=%.6g row_workers=%u chunk_size=%u chunks=%u",
@@ -247,12 +303,19 @@ int moe_pc_engine_lm_head_top1_f32(
             uint32_t t = start;
             for (; t + batch <= end; t += batch) {
                 alignas(32) float scores[batch];
-                for (uint32_t i = 0; i < batch; ++i) {
-                    scores[i] = moe_apply_final_logit_softcap_cached(
-                        logit_softcap, lm_head_dot_row(t + i));
-                    if (!std::isfinite(scores[i])) {
-                        return 0;
-                    }
+                if (!moe_lm_head_fill_scores_f32(
+                        raw,
+                        hidden,
+                        hidden_count,
+                        row_bytes,
+                        t,
+                        batch,
+                        logit_softcap,
+                        lm_head_mxfp4_direct,
+                        lm_head_mxfp4_layout,
+                        lm_head_mxfp4_pairwise_order,
+                        scores)) {
+                    return 0;
                 }
 #if defined(__AVX512F__)
                 __m512 v_max = _mm512_set1_ps(local_max);
@@ -305,14 +368,48 @@ int moe_pc_engine_lm_head_top1_f32(
                 }
 #endif
             }
-            for (; t < end; ++t) {
-                const float s = moe_apply_final_logit_softcap_cached(
-                    logit_softcap, lm_head_dot_row(t));
-                if (!std::isfinite(s)) {
+            constexpr uint32_t tail_batch = 4;
+            for (; t + tail_batch <= end; t += tail_batch) {
+                float scores[tail_batch];
+                if (!moe_lm_head_fill_scores_f32(
+                        raw,
+                        hidden,
+                        hidden_count,
+                        row_bytes,
+                        t,
+                        tail_batch,
+                        logit_softcap,
+                        lm_head_mxfp4_direct,
+                        lm_head_mxfp4_layout,
+                        lm_head_mxfp4_pairwise_order,
+                        scores)) {
                     return 0;
                 }
-                if (s > local_max) {
-                    local_max = s;
+                for (uint32_t i = 0; i < tail_batch; ++i) {
+                    if (scores[i] > local_max) {
+                        local_max = scores[i];
+                        local_best = t + i;
+                    }
+                }
+            }
+            for (; t < end; ++t) {
+                float score = 0.0f;
+                if (!moe_lm_head_fill_scores_f32(
+                        raw,
+                        hidden,
+                        hidden_count,
+                        row_bytes,
+                        t,
+                        1u,
+                        logit_softcap,
+                        lm_head_mxfp4_direct,
+                        lm_head_mxfp4_layout,
+                        lm_head_mxfp4_pairwise_order,
+                        &score)) {
+                    return 0;
+                }
+                if (score > local_max) {
+                    local_max = score;
                     local_best = t;
                 }
             }
@@ -508,12 +605,19 @@ int moe_pc_engine_lm_head_token_logprob_f32(
             uint32_t t = start;
             for (; t + batch <= end; t += batch) {
                 alignas(32) float scores[batch];
-                for (uint32_t i = 0; i < batch; ++i) {
-                    scores[i] = moe_apply_final_logit_softcap_cached(
-                        logit_softcap, lm_head_dot_row(t + i));
-                    if (!std::isfinite(scores[i])) {
-                        return 0;
-                    }
+                if (!moe_lm_head_fill_scores_f32(
+                        raw,
+                        hidden,
+                        hidden_count,
+                        row_bytes,
+                        t,
+                        batch,
+                        logit_softcap,
+                        lm_head_mxfp4_direct,
+                        lm_head_mxfp4_layout,
+                        lm_head_mxfp4_pairwise_order,
+                        scores)) {
+                    return 0;
                 }
                 for (uint32_t i = 0; i < batch; ++i) {
                     const float score = scores[i];
@@ -539,10 +643,61 @@ int moe_pc_engine_lm_head_token_logprob_f32(
                     }
                 }
             }
+            constexpr uint32_t tail_batch = 4;
+            for (; t + tail_batch <= end; t += tail_batch) {
+                float scores[tail_batch];
+                if (!moe_lm_head_fill_scores_f32(
+                        raw,
+                        hidden,
+                        hidden_count,
+                        row_bytes,
+                        t,
+                        tail_batch,
+                        logit_softcap,
+                        lm_head_mxfp4_direct,
+                        lm_head_mxfp4_layout,
+                        lm_head_mxfp4_pairwise_order,
+                        scores)) {
+                    return 0;
+                }
+                for (uint32_t i = 0; i < tail_batch; ++i) {
+                    const float score = scores[i];
+                    if (score > local_best_score) {
+                        local_best_score = score;
+                        local_best_token = t + i;
+                    }
+                    if (score > target_score_precomputed) {
+                        ++local_greater_than_target;
+                    }
+                    if (score <= local_max) {
+                        local_sum += std::exp((double)score - (double)local_max);
+                    } else if (std::isfinite(local_max)) {
+                        local_sum = local_sum * std::exp((double)local_max - (double)score) + 1.0;
+                        local_max = score;
+                    } else {
+                        local_max = score;
+                        local_sum = 1.0;
+                    }
+                    if (t + i == target_token_id) {
+                        target_score = score;
+                        has_target = 1;
+                    }
+                }
+            }
             for (; t < end; ++t) {
-                const float score = moe_apply_final_logit_softcap_cached(
-                    logit_softcap, lm_head_dot_row(t));
-                if (!std::isfinite(score)) {
+                float score = 0.0f;
+                if (!moe_lm_head_fill_scores_f32(
+                        raw,
+                        hidden,
+                        hidden_count,
+                        row_bytes,
+                        t,
+                        1u,
+                        logit_softcap,
+                        lm_head_mxfp4_direct,
+                        lm_head_mxfp4_layout,
+                        lm_head_mxfp4_pairwise_order,
+                        &score)) {
                     return 0;
                 }
                 if (score > local_best_score) {
