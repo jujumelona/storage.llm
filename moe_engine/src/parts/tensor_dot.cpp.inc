@@ -645,45 +645,6 @@ static int moe_dot_tensor_fast_view_two_rows(
            moe_dot_tensor_fast_view_row(engine, b, row, x, x_count, out_b);
 }
 
-static int moe_dot_tensor_fast_view_two_views_adjacent_rows(
-    moe_pc_engine_t* engine,
-    const moe_tensor_row_fast_view_t* a,
-    const moe_tensor_row_fast_view_t* b,
-    uint32_t row,
-    const float* x,
-    uint32_t x_count,
-    float* out_a0,
-    float* out_b0,
-    float* out_a1,
-    float* out_b1
-) {
-    if (!engine || !a || !b || !out_a0 || !out_b0 || !out_a1 || !out_b1 ||
-        a->cols != b->cols || x_count != a->cols ||
-        row + 1u >= a->rows || row + 1u >= b->rows) {
-        return 0;
-    }
-    const uint8_t* pa0 = moe_tensor_row_fast_ptr(a, row);
-    const uint8_t* pb0 = moe_tensor_row_fast_ptr(b, row);
-    const uint8_t* pa1 = moe_tensor_row_fast_ptr(a, row + 1u);
-    const uint8_t* pb1 = moe_tensor_row_fast_ptr(b, row + 1u);
-    if (!pa0 || !pb0 || !pa1 || !pb1) {
-        return 0;
-    }
-    if (a->weight_format == moe_WEIGHT_ENCODING_MXFP4 &&
-        b->weight_format == moe_WEIGHT_ENCODING_MXFP4 &&
-        a->mxfp4_layout.block_cols == b->mxfp4_layout.block_cols &&
-        a->mxfp4_layout.bytewise_codes == b->mxfp4_layout.bytewise_codes &&
-        a->mxfp4_pairwise_order == b->mxfp4_pairwise_order) {
-        moe_dot_gguf_mxfp4_four_rows_with_layout(
-            pa0, pb0, pa1, pb1, x, a->cols, a->mxfp4_layout,
-            a->mxfp4_pairwise_order, out_a0, out_b0, out_a1, out_b1);
-        return std::isfinite(*out_a0) && std::isfinite(*out_b0) &&
-               std::isfinite(*out_a1) && std::isfinite(*out_b1) ? 1 : 0;
-    }
-    return moe_dot_tensor_fast_view_two_rows(engine, a, b, row, x, x_count, out_a0, out_b0) &&
-           moe_dot_tensor_fast_view_two_rows(engine, a, b, row + 1u, x, x_count, out_a1, out_b1);
-}
-
 static int moe_dot_tensor_fast_view_adjacent_rows(
     moe_pc_engine_t* engine,
     const moe_tensor_row_fast_view_t* view,
