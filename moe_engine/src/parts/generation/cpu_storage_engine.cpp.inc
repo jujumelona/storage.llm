@@ -1467,7 +1467,7 @@ static void moe_cpu_storage_after_router_selected(
             engine->storage_expert_view_offsets.size() >= (size_t)layers * ((size_t)experts + 0u);
         if (indexed) {
             static const int prefetch_each_expert_bucket_once =
-                moe_cpu_storage_env_enabled_default_on("STORAGELLM_STORAGE_EXPERT_PREFETCH_ONCE");
+                moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_EXPERT_PREFETCH_ONCE");
             for (const int expert_id : selected_experts) {
                 if (expert_id < 0 || (uint32_t)expert_id >= experts) continue;
                 const size_t b = (size_t)(uint32_t)layer * (size_t)experts + (uint32_t)expert_id;
