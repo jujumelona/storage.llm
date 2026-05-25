@@ -250,6 +250,34 @@ static void moe_rt_recompute_juju_depth(moe_juju_pipeline_config_t* cfg, double 
     cfg->io_threads = (uint32_t)moe_rt_clamp_u64((uint64_t)cfg->prefetch_depth * 2ull, 2ull, 16ull);
 }
 
+static void moe_rt_cap_cpu_juju_parallelism(
+    const moe_pc_engine* engine,
+    moe_juju_pipeline_config_t* cfg
+) {
+    if (!engine || !cfg) {
+        return;
+    }
+    const bool cpu_path =
+        engine->backend_caps.backend == moe_BACKEND_CPU ||
+        !engine->config.prefer_gpu ||
+        engine->backend_caps.supports_unified_memory;
+    if (!cpu_path) {
+        return;
+    }
+    const uint32_t hw = std::max<uint32_t>(1u, moe_cpu_thread_count_hint());
+    const uint32_t cpu_prefetch_depth =
+        hw >= 32u ? 8u :
+        hw >= 16u ? 6u :
+        hw >= 8u  ? 4u : 2u;
+    const uint32_t cpu_io_threads =
+        hw >= 32u ? 16u :
+        hw >= 16u ? 10u :
+        hw >= 8u  ? 6u :
+        hw >= 4u  ? 2u : 1u;
+    cfg->prefetch_depth = std::max<uint32_t>(1u, std::min<uint32_t>(cfg->prefetch_depth, cpu_prefetch_depth));
+    cfg->io_threads = std::max<uint32_t>(1u, std::min<uint32_t>(cfg->io_threads, cpu_io_threads));
+}
+
 static void moe_rt_build_tiers(
     const moe_pc_engine* engine,
     uint64_t expert_bytes,
@@ -731,6 +759,7 @@ static int moe_engine_apply_juju_strategy(
         cfg.prefetch_depth = 3u;
         cfg.io_threads = std::max<uint32_t>(cfg.io_threads, 6u);
     }
+    moe_rt_cap_cpu_juju_parallelism(engine, &cfg);
 
     moe_juju_execution_path_t path = moe_juju_select_execution_path(
         engine->config.prefer_gpu && caps_gpu_backend_available(engine->backend_caps),

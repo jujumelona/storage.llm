@@ -4,9 +4,12 @@
 #include <algorithm>
 #include <cstdlib>
 #include <atomic>
+#include <climits>
 #include <condition_variable>
 #include <cstring>
+#include <fstream>
 #include <functional>
+#include <string>
 #include <unordered_set>
 #include <unordered_map>
 #include <mutex>
@@ -16,6 +19,7 @@
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#include <unistd.h>
 #elif defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -48,13 +52,68 @@ inline bool env_truthy(const char* name) {
              std::strcmp(v, "OFF") == 0);
 }
 
+inline uint32_t effective_cpu_threads() {
+    const uint32_t forced = env_u32("STORAGELLM_CPU_THREADS", 0u, 0u, 256u);
+    if (forced > 0) {
+        return forced;
+    }
+    uint32_t threads = UINT32_MAX;
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    threads = std::min<uint32_t>(threads, static_cast<uint32_t>(hw));
+#if defined(__linux__)
+#if defined(_SC_NPROCESSORS_ONLN)
+    const long online = sysconf(_SC_NPROCESSORS_ONLN);
+    if (online > 0) {
+        threads = std::min<uint32_t>(threads, static_cast<uint32_t>(online));
+    }
+#endif
+#if defined(CPU_SETSIZE)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        uint32_t affinity = 0;
+        for (int i = 0; i < CPU_SETSIZE; ++i) {
+            if (CPU_ISSET(i, &set)) {
+                ++affinity;
+            }
+        }
+        if (affinity > 0) {
+            threads = std::min<uint32_t>(threads, affinity);
+        }
+    }
+#endif
+    std::ifstream cpu_max("/sys/fs/cgroup/cpu.max");
+    std::string quota;
+    std::string period;
+    if (cpu_max >> quota >> period && quota != "max") {
+        char* end_q = nullptr;
+        char* end_p = nullptr;
+        const unsigned long long q = std::strtoull(quota.c_str(), &end_q, 10);
+        const unsigned long long p = std::strtoull(period.c_str(), &end_p, 10);
+        if (end_q && *end_q == '\0' && end_p && *end_p == '\0' && q > 0 && p > 0) {
+            threads = std::min<uint32_t>(
+                threads,
+                static_cast<uint32_t>(std::max<unsigned long long>(1ull, (q + p - 1ull) / p)));
+        }
+    }
+#elif defined(_WIN32)
+    const DWORD active = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (active > 0) {
+        threads = std::min<uint32_t>(threads, static_cast<uint32_t>(active));
+    }
+#endif
+    if (threads == 0 || threads == UINT32_MAX) {
+        threads = 1;
+    }
+    return std::min<uint32_t>(threads, 256u);
+}
 
 inline void maybe_pin_current_worker(uint32_t worker_index) {
     if (!env_truthy("STORAGELLM_CPU_AFFINITY") &&
         !env_truthy("STORAGELLM_CPU_PIN_WORKERS")) {
         return;
     }
-    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned hw = std::max<uint32_t>(1u, effective_cpu_threads());
     const uint32_t core = hw ? (worker_index % hw) : 0u;
 #if defined(__linux__)
     cpu_set_t set;
@@ -72,7 +131,7 @@ inline void maybe_pin_current_worker(uint32_t worker_index) {
 }
 
 inline uint32_t choose_thread_count(uint32_t assignments, uint64_t work_per_assignment) {
-    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned hw = std::max<uint32_t>(1u, effective_cpu_threads());
     const uint32_t forced = env_u32("STORAGELLM_CPU_MOE_THREADS", 0u, 0u, hw);
     if (forced > 0) {
         return std::max<uint32_t>(1, std::min<uint32_t>(assignments ? assignments : 1u, forced));
