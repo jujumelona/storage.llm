@@ -3637,14 +3637,17 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
             }
         }
     }
+    const uint32_t cpu_row_threads = row_hw_threads();
+    const uint32_t cpu_group_parallel_min =
+        std::max<uint32_t>(2u, std::min<uint32_t>(cpu_row_threads, 16u));
     const int cpu_group_parallel =
         !gpu_batch_ready &&
         grouped_done_chunks.empty() &&
-        active_experts.size() > 1u &&
-        row_hw_threads() > 1u;
+        active_experts.size() >= cpu_group_parallel_min &&
+        cpu_row_threads > 1u;
     if (cpu_group_parallel) {
         const uint32_t worker_count = std::min<uint32_t>(
-            row_hw_threads(),
+            cpu_row_threads,
             (uint32_t)std::min<size_t>(active_experts.size(), 256u));
         std::atomic<uint32_t> next_group{0};
         std::atomic<uint32_t> active_groups_parallel{0};
