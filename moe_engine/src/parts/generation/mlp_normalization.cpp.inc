@@ -62,7 +62,7 @@ static int moe_layer_shared_expert_gate_f32(
     return std::isfinite(*out_gate) ? 1 : 0;
 }
 
-static int moe_map_expert_output_scale_tensor_f32(
+static int moe_map_expert_output_scale_tensor_uncached_f32(
     moe_pc_engine* engine,
     int32_t layer,
     moe_raw_tensor_cache_entry* out
@@ -105,6 +105,52 @@ static int moe_map_expert_output_scale_tensor_f32(
         "ffn_down_exps.output_scale"
     };
     return moe_map_layer_common_tensor(engine, layer, suffixes, sizeof(suffixes) / sizeof(suffixes[0]), out);
+}
+
+struct moe_expert_output_scale_cache_entry {
+    const moe_pc_engine* engine = nullptr;
+    uint64_t generation = 0;
+    int32_t layer = -1;
+    int ready = 0;
+    int mapped = 0;
+    moe_raw_tensor_cache_entry raw{};
+};
+
+static int moe_map_expert_output_scale_tensor_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    moe_raw_tensor_cache_entry* out
+) {
+    if (!engine || layer < 0 || !out) {
+        return 0;
+    }
+    thread_local std::vector<moe_expert_output_scale_cache_entry> cache;
+    const uint64_t generation = engine->engine_generation;
+    for (moe_expert_output_scale_cache_entry& entry : cache) {
+        if (entry.ready && entry.engine == engine && entry.generation == generation &&
+            entry.layer == layer) {
+            if (!entry.mapped) {
+                return 0;
+            }
+            *out = entry.raw;
+            return 1;
+        }
+    }
+    moe_expert_output_scale_cache_entry entry{};
+    entry.engine = engine;
+    entry.generation = generation;
+    entry.layer = layer;
+    entry.ready = 1;
+    entry.mapped = moe_map_expert_output_scale_tensor_uncached_f32(engine, layer, &entry.raw) ? 1 : 0;
+    if (cache.size() >= 256u) {
+        cache.erase(cache.begin());
+    }
+    cache.push_back(entry);
+    if (!entry.mapped) {
+        return 0;
+    }
+    *out = entry.raw;
+    return 1;
 }
 
 
