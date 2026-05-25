@@ -350,7 +350,6 @@ int moe_pc_engine_set_model_root(
     engine->model_root_valid.store(valid ? 1 : 0, std::memory_order_relaxed);
     engine->tokenizer_valid.store(-1, std::memory_order_relaxed);
     engine->attention_projector_valid.store(-1, std::memory_order_relaxed);  // Fix 72: invalidate cache
-    engine->expert_triplet_valid.store(-1, std::memory_order_relaxed);
 
     // Restart IO workers with new model_root
     {
