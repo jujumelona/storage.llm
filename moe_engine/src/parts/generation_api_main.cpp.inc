@@ -273,7 +273,68 @@ int moe_pc_engine_generate_token_ids(
                 engine->generation_phase.load(std::memory_order_relaxed),
                 moe_profile_elapsed_ms(start_us));
         }
-    } generation_scope(engine);
+    };
+
+    uint32_t max_new_tokens = config && config->max_new_tokens ? config->max_new_tokens : 128u;
+    if (max_new_tokens > out_token_capacity) {
+        max_new_tokens = out_token_capacity;
+    }
+    if (max_new_tokens == 0) {
+        moe_generation_set_error(out_stats, "max_new_tokens resolved to zero");
+        return 0;
+    }
+    if (input_token_count > attn_cfg.max_seq_len) {
+        moe_generation_set_error(out_stats, "input exceeds Moe MLA context length");
+        return 0;
+    }
+    const uint32_t max_new_by_context = attn_cfg.max_seq_len - input_token_count + 1u;
+    if (max_new_tokens > max_new_by_context) {
+        max_new_tokens = max_new_by_context;
+    }
+    if (max_new_tokens == 0) {
+        moe_generation_set_error(out_stats, "context window has no room for generation");
+        return 0;
+    }
+
+    std::vector<int32_t> safe_full_input(input_token_count);
+    for (uint32_t i = 0; i < input_token_count; ++i) {
+        if (input_token_ids[i] < 0 || (uint32_t)input_token_ids[i] >= c->vocab_size) {
+            safe_full_input[i] = config && config->eos_token_id ? config->eos_token_id : 0;
+        } else {
+            safe_full_input[i] = input_token_ids[i];
+        }
+    }
+    int32_t current = safe_full_input[input_token_count - 1u];
+
+    const uint32_t eos_token_id = config ? config->eos_token_id : 0u;
+    const int stop_on_eos = config ? config->stop_on_eos : 0;
+    const uint32_t cached_output_count = moe_generation_output_cache_lookup(
+        engine,
+        safe_full_input.data(),
+        input_token_count,
+        max_new_tokens,
+        eos_token_id,
+        stop_on_eos,
+        out_token_ids,
+        out_token_capacity);
+    if (cached_output_count > 0) {
+        if (out_stats) {
+            out_stats->prompt_tokens = input_token_count;
+            out_stats->completion_tokens = cached_output_count;
+            out_stats->finish_reason = cached_output_count >= max_new_tokens ? 1u : 0u;
+            out_stats->last_logit = 0.0f;
+        }
+        moe_profile_log(
+            "generation_output_cache_hit",
+            "id=%llu input_tokens=%u completion=%u max_new=%u",
+            0ull,
+            input_token_count,
+            cached_output_count,
+            max_new_tokens);
+        return 1;
+    }
+
+    generation_scope_t generation_scope(engine);
     moe_forward_status_t forward{};
     const int forward_status_ok = moe_pc_engine_get_forward_status(engine, &forward);
     if (forward_status_ok &&
@@ -329,66 +390,6 @@ int moe_pc_engine_generate_token_ids(
             forward.sampler_ready);
         moe_generation_set_error(out_stats, reason);
         return 0;
-    }
-
-    uint32_t max_new_tokens = config && config->max_new_tokens ? config->max_new_tokens : 128u;
-    if (max_new_tokens > out_token_capacity) {
-        max_new_tokens = out_token_capacity;
-    }
-    if (max_new_tokens == 0) {
-        moe_generation_set_error(out_stats, "max_new_tokens resolved to zero");
-        return 0;
-    }
-    if (input_token_count > attn_cfg.max_seq_len) {
-        moe_generation_set_error(out_stats, "input exceeds Moe MLA context length");
-        return 0;
-    }
-    const uint32_t max_new_by_context = attn_cfg.max_seq_len - input_token_count + 1u;
-    if (max_new_tokens > max_new_by_context) {
-        max_new_tokens = max_new_by_context;
-    }
-    if (max_new_tokens == 0) {
-        moe_generation_set_error(out_stats, "context window has no room for generation");
-        return 0;
-    }
-
-    std::vector<int32_t> safe_full_input(input_token_count);
-    for (uint32_t i = 0; i < input_token_count; ++i) {
-        if (input_token_ids[i] < 0 || (uint32_t)input_token_ids[i] >= c->vocab_size) {
-            safe_full_input[i] = config && config->eos_token_id ? config->eos_token_id : 0;
-        } else {
-            safe_full_input[i] = input_token_ids[i];
-        }
-    }
-    int32_t current = safe_full_input[input_token_count - 1u];
-
-    const uint32_t eos_token_id = config ? config->eos_token_id : 0u;
-    const int stop_on_eos = config ? config->stop_on_eos : 0;
-    const uint32_t cached_output_count = moe_generation_output_cache_lookup(
-        engine,
-        safe_full_input.data(),
-        input_token_count,
-        max_new_tokens,
-        eos_token_id,
-        stop_on_eos,
-        out_token_ids,
-        out_token_capacity);
-    if (cached_output_count > 0) {
-        if (out_stats) {
-            out_stats->prompt_tokens = input_token_count;
-            out_stats->completion_tokens = cached_output_count;
-            out_stats->finish_reason = cached_output_count >= max_new_tokens ? 1u : 0u;
-            out_stats->last_logit = 0.0f;
-        }
-        moe_profile_log(
-            "generation_output_cache_hit",
-            "id=%llu input_tokens=%u completion=%u max_new=%u",
-            (unsigned long long)generation_scope.id,
-            input_token_count,
-            cached_output_count,
-            max_new_tokens);
-        generation_scope.ok = 1;
-        return 1;
     }
 
     reset_staging_slots(engine);
