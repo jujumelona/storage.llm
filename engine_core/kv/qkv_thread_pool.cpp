@@ -57,6 +57,7 @@ QkvThreadPool::~QkvThreadPool() {
 }
 
 void QkvThreadPool::run(int num_tasks, std::function<void(int)> fn) {
+    std::unique_lock<std::mutex> run_lock(run_mtx);
     // BUGFIX 420: num_tasks 유효성 체크
     if (num_tasks <= 0 || num_tasks > INT_MAX / 2) return;
     // BUGFIX 909/940: Dynamic serialization threshold ★★ PERFORMANCE

@@ -14,6 +14,7 @@ public:
     std::condition_variable cv;
     std::condition_variable done_cv;
     std::mutex mtx;
+    std::mutex run_mtx;
     std::function<void(int)> task;
     std::atomic<int> total_tasks{0};
     std::atomic<int> current_task{0};

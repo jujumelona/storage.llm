@@ -84,6 +84,21 @@ static std::shared_ptr<std::vector<float>> qkv_cached_qjl(int dim, uint64_t seed
     return matrix;
 }
 
+static QkvThreadPool* qkv_shared_thread_pool(int workers) {
+    static std::mutex mutex;
+    static std::unique_ptr<QkvThreadPool> pool;
+    static int pool_workers = 0;
+    if (workers <= 0) {
+        workers = 1;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!pool || workers > pool_workers) {
+        pool.reset(new QkvThreadPool(workers));
+        pool_workers = workers;
+    }
+    return pool.get();
+}
+
 static int qkv_state_assign_codebook(qkv_state_t* state, int dim, int bits, unsigned distribution) {
     if (!state) return 0;
     if (qkv_bits_raw(bits)) return 1;
@@ -476,7 +491,7 @@ int qkv_state_init(
     state->work_buf_workers = workers;
     // BUGFIX 418: thread_pool 생성 실패 체크
     try {
-        state->thread_pool = new QkvThreadPool(workers);
+        state->thread_pool = qkv_shared_thread_pool(workers);
     } catch (...) {
         state->thread_pool = nullptr;
         qkv_state_free(state);
@@ -598,10 +613,9 @@ void qkv_state_free(qkv_state_t* state) {
     free(state->v_residual_norms_outlier);
     free(state->v_residual_norms_normal);
 
-    if (state->thread_pool) {
-        delete static_cast<QkvThreadPool*>(state->thread_pool);
-        state->thread_pool = nullptr;
-    }
+    // The QKV worker pool is process-wide and shared across layer states.
+    // Individual states do not own it.
+    state->thread_pool = nullptr;
 
     memset(state, 0, sizeof(*state));
 }
