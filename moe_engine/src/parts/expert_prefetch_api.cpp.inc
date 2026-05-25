@@ -338,6 +338,51 @@ static bool startup_warm_io_idle(moe_pc_engine_t* engine) {
            gds_idle;
 }
 
+static size_t startup_warm_cpu_ram_default_cap(
+    moe_pc_engine_t* engine,
+    const std::vector<uint64_t>& candidate_bytes,
+    uint64_t graph_cap
+) {
+    if (!engine || candidate_bytes.empty() || graph_cap == 0) {
+        return 0;
+    }
+    uint64_t total_bytes = 0;
+    for (uint64_t bytes : candidate_bytes) {
+        if (bytes > UINT64_MAX - total_bytes) {
+            total_bytes = UINT64_MAX;
+            break;
+        }
+        total_bytes += bytes;
+    }
+    const uint64_t avg_bytes = std::max<uint64_t>(
+        1ull,
+        total_bytes / (uint64_t)candidate_bytes.size());
+    const uint32_t hw = std::max<uint32_t>(1u, moe_cpu_thread_count_hint());
+    uint64_t concurrency_cap = 768ull;
+    if (hw > 8u) {
+        concurrency_cap = 1536ull;
+    } else if (hw > 4u) {
+        concurrency_cap = 1024ull;
+    }
+
+    uint64_t memory_cap = concurrency_cap;
+    const uint64_t available = storagellm::available_ram_bytes();
+    const uint64_t rss = storagellm::current_process_rss_bytes();
+    const uint64_t common_raw = engine->common_raw_prefetched_bytes.load(std::memory_order_relaxed);
+    const uint64_t reserve = std::max<uint64_t>(
+        2ull * 1024ull * 1024ull * 1024ull,
+        std::max<uint64_t>(rss >> 2u, common_raw >> 1u));
+    if (available > reserve) {
+        const uint64_t usable = (available - reserve) * 65ull / 100ull;
+        memory_cap = std::max<uint64_t>(128ull, usable / avg_bytes);
+    }
+
+    const uint64_t capped = std::min<uint64_t>(
+        graph_cap,
+        std::min<uint64_t>(concurrency_cap, memory_cap));
+    return (size_t)std::min<uint64_t>(capped, (uint64_t)SIZE_MAX);
+}
+
 int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
     if (!engine || engine->tensors.empty()) {
         return 0;
@@ -381,6 +426,7 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
         uint16_t priority = 0;
     };
     std::vector<startup_expert_candidate_t> candidates;
+    std::vector<uint64_t> candidate_bytes;
     const uint64_t layer_count =
         c->last_moe_layer >= c->first_moe_layer ?
         (uint64_t)c->last_moe_layer - (uint64_t)c->first_moe_layer + 1ull : 0ull;
@@ -388,6 +434,7 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
         c->experts_per_moe_layer <= 10000u &&
         layer_count <= UINT64_MAX / (uint64_t)c->experts_per_moe_layer) {
         candidates.reserve((size_t)(layer_count * (uint64_t)c->experts_per_moe_layer));
+        candidate_bytes.reserve((size_t)(layer_count * (uint64_t)c->experts_per_moe_layer));
         for (uint32_t layer = c->first_moe_layer; layer <= c->last_moe_layer; ++layer) {
             if (!moe_layer_is_moe_runtime(engine, c, (int32_t)layer)) {
                 continue;
@@ -407,6 +454,7 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
                 cand.bytes = bytes;
                 cand.priority = expert_prefetch_priority_hint(engine, (int)layer, (int)expert);
                 candidates.push_back(cand);
+                candidate_bytes.push_back(bytes);
             }
         }
     }
@@ -443,12 +491,14 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
     } else if (moe_storage_runtime_cpu_ram_path(engine) && layer_count > 0) {
         const uint64_t experts_per_layer =
             std::min<uint64_t>((uint64_t)c->experts_per_moe_layer, 64ull);
-        const uint64_t cpu_storage_cap =
+        const uint64_t graph_cap =
             layer_count > UINT64_MAX / experts_per_layer ?
             UINT64_MAX : layer_count * experts_per_layer;
-        warm_candidate_limit = std::min<size_t>(
-            warm_candidate_limit,
-            (size_t)std::min<uint64_t>(cpu_storage_cap, (uint64_t)SIZE_MAX));
+        const size_t cpu_storage_cap =
+            startup_warm_cpu_ram_default_cap(engine, candidate_bytes, graph_cap);
+        if (cpu_storage_cap > 0) {
+            warm_candidate_limit = std::min<size_t>(warm_candidate_limit, cpu_storage_cap);
+        }
     }
     if (warm_candidate_limit < candidates.size()) {
         std::fprintf(stderr,
