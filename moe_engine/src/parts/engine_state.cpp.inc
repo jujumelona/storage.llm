@@ -13,6 +13,15 @@ static constexpr size_t moe_GATE_SNAPSHOT_EPOCH_SLOTS = (moe_GATE_SNAPSHOT_MAX_L
 
 static std::atomic<uint64_t> g_moe_engine_generation{0};
 
+struct moe_generation_output_cache_entry_t {
+    std::vector<int32_t> input_tokens;
+    std::vector<uint32_t> output_tokens;
+    uint32_t max_new_tokens = 0;
+    uint32_t eos_token_id = 0;
+    int stop_on_eos = 0;
+    uint64_t last_used = 0;
+};
+
 struct moe_pc_engine {
     uint64_t engine_generation = 0;
     moe_pc_engine_config_t config{};
@@ -668,11 +677,8 @@ std::atomic<int> storage_format_plan_available{0};
     std::atomic<uint64_t> prefix_kv_cache_insertions{0};
     std::atomic<uint32_t> prefix_kv_cache_committed_tokens{0};
     std::mutex generation_output_cache_mutex;
-    std::vector<int32_t> generation_output_cache_input_tokens;
-    std::vector<uint32_t> generation_output_cache_output_tokens;
-    uint32_t generation_output_cache_max_new_tokens = 0;
-    uint32_t generation_output_cache_eos_token_id = 0;
-    int generation_output_cache_stop_on_eos = 0;
+    std::vector<moe_generation_output_cache_entry_t> generation_output_cache_entries;
+    uint64_t generation_output_cache_clock = 0;
     std::atomic<uint32_t> eval_plain_kv_active{0};
     std::vector<CUstream> stream_pool;
     std::mutex stream_pool_mutex;
