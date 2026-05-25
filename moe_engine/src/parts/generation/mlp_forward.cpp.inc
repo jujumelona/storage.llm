@@ -2462,6 +2462,22 @@ static int moe_run_expert_triplet_row_batch_f32(
         if (row_end > intermediate_size) {
             row_end = intermediate_size;
         }
+        if (batch_size == 1u) {
+            const float* single_hidden = batch_hidden[0];
+            for (uint32_t row = row_begin; row < row_end; ++row) {
+                float gate_v = 0.0f;
+                float up_v = 0.0f;
+                moe_tensor_row_fast_prefetch(&gate_view, row + 1u);
+                moe_tensor_row_fast_prefetch(&up_view, row + 1u);
+                if (!moe_dot_tensor_fast_view_two_rows(
+                        engine, &gate_view, &up_view, row,
+                        single_hidden, hidden_size, &gate_v, &up_v)) {
+                    return 0;
+                }
+                gate_pool[row] = moe_generation_gated_activation_cached(activation_mode, gate_v, up_v);
+            }
+            return 1;
+        }
         for (uint32_t row = row_begin; row < row_end; ++row) {
             moe_tensor_row_fast_prefetch(&gate_view, row + 1u);
             moe_tensor_row_fast_prefetch(&up_view, row + 1u);
@@ -2509,6 +2525,27 @@ static int moe_run_expert_triplet_row_batch_f32(
         uint32_t row_end = row_begin + down_tile_rows;
         if (row_end > out_count) {
             row_end = out_count;
+        }
+        if (batch_size == 1u) {
+            const float* activated = activated_inputs[0];
+            uint32_t row = row_begin;
+            for (; row + 4u <= row_end; row += 4u) {
+                moe_tensor_row_fast_prefetch(&down_view, row + 4u);
+                if (!moe_dot_tensor_fast_view_adjacent_four_rows(
+                        engine, &down_view, row, activated, intermediate_size,
+                        &out_pool[row + 0u], &out_pool[row + 1u],
+                        &out_pool[row + 2u], &out_pool[row + 3u])) {
+                    return 0;
+                }
+            }
+            for (; row < row_end; ++row) {
+                moe_tensor_row_fast_prefetch(&down_view, row + 1u);
+                if (!moe_dot_tensor_fast_view_row(
+                        engine, &down_view, row, activated, intermediate_size, &out_pool[row])) {
+                    return 0;
+                }
+            }
+            return 1;
         }
         for (uint32_t row = row_begin; row < row_end; ++row) {
             moe_tensor_row_fast_prefetch(&down_view, row + 1u);
