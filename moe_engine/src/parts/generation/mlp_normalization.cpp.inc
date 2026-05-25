@@ -124,16 +124,20 @@ static int moe_map_expert_output_scale_tensor_f32(
     if (!engine || layer < 0 || !out) {
         return 0;
     }
-    thread_local std::vector<moe_expert_output_scale_cache_entry> cache;
+    static std::shared_mutex cache_mutex;
+    static std::vector<moe_expert_output_scale_cache_entry> cache;
     const uint64_t generation = engine->engine_generation;
-    for (moe_expert_output_scale_cache_entry& entry : cache) {
-        if (entry.ready && entry.engine == engine && entry.generation == generation &&
-            entry.layer == layer) {
-            if (!entry.mapped) {
-                return 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(cache_mutex);
+        for (const moe_expert_output_scale_cache_entry& entry : cache) {
+            if (entry.ready && entry.engine == engine && entry.generation == generation &&
+                entry.layer == layer) {
+                if (!entry.mapped) {
+                    return 0;
+                }
+                *out = entry.raw;
+                return 1;
             }
-            *out = entry.raw;
-            return 1;
         }
     }
     moe_expert_output_scale_cache_entry entry{};
@@ -142,10 +146,23 @@ static int moe_map_expert_output_scale_tensor_f32(
     entry.layer = layer;
     entry.ready = 1;
     entry.mapped = moe_map_expert_output_scale_tensor_uncached_f32(engine, layer, &entry.raw) ? 1 : 0;
-    if (cache.size() >= 256u) {
-        cache.erase(cache.begin());
+    {
+        std::unique_lock<std::shared_mutex> lock(cache_mutex);
+        for (const moe_expert_output_scale_cache_entry& cached : cache) {
+            if (cached.ready && cached.engine == engine && cached.generation == generation &&
+                cached.layer == layer) {
+                if (!cached.mapped) {
+                    return 0;
+                }
+                *out = cached.raw;
+                return 1;
+            }
+        }
+        if (cache.size() >= 256u) {
+            cache.erase(cache.begin());
+        }
+        cache.push_back(entry);
     }
-    cache.push_back(entry);
     if (!entry.mapped) {
         return 0;
     }
