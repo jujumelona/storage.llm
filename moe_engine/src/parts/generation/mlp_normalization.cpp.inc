@@ -116,18 +116,6 @@ struct moe_expert_output_scale_cache_entry {
     moe_raw_tensor_cache_entry raw{};
 };
 
-struct moe_expert_down_uniform_scale_cache_entry {
-    const moe_pc_engine* engine = nullptr;
-    uint64_t generation = 0;
-    int32_t layer = -1;
-    uint32_t experts = 0;
-    int ready = 0;
-    int supported = 0;
-    int per_expert = 0;
-    float scalar = 1.0f;
-    std::vector<float> expert_scales;
-};
-
 static int moe_map_expert_output_scale_tensor_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -182,25 +170,6 @@ static int moe_map_expert_output_scale_tensor_f32(
     return 1;
 }
 
-static int moe_expert_down_uniform_scale_cache_read(
-    const moe_expert_down_uniform_scale_cache_entry& entry,
-    int expert_id,
-    float* out_scale
-) {
-    if (!out_scale || !entry.ready || !entry.supported || expert_id < 0) {
-        return 0;
-    }
-    if (entry.per_expert) {
-        if ((uint32_t)expert_id >= entry.expert_scales.size()) {
-            return 0;
-        }
-        *out_scale = entry.expert_scales[(uint32_t)expert_id];
-        return std::isfinite(*out_scale) ? 1 : 0;
-    }
-    *out_scale = entry.scalar;
-    return std::isfinite(*out_scale) ? 1 : 0;
-}
-
 
 static int moe_layer_get_expert_down_uniform_scale_f32(
     moe_pc_engine* engine,
@@ -221,66 +190,26 @@ static int moe_layer_get_expert_down_uniform_scale_f32(
     // the CPU-only MLP path fuse down_proj and expert accumulation without first
     // materializing a full [top_k, hidden] output buffer.  Per-channel scale tensors
     // still fall back to the fully general path for correctness.
-    static std::shared_mutex scale_cache_mutex;
-    static std::vector<moe_expert_down_uniform_scale_cache_entry> scale_cache;
-    const uint64_t generation = engine->engine_generation;
-    {
-        std::shared_lock<std::shared_mutex> lock(scale_cache_mutex);
-        for (const moe_expert_down_uniform_scale_cache_entry& entry : scale_cache) {
-            if (entry.ready && entry.engine == engine && entry.generation == generation &&
-                entry.layer == layer && entry.experts == experts) {
-                return moe_expert_down_uniform_scale_cache_read(entry, expert_id, out_scale);
-            }
-        }
-    }
-
-    moe_expert_down_uniform_scale_cache_entry entry{};
-    entry.engine = engine;
-    entry.generation = generation;
-    entry.layer = layer;
-    entry.experts = experts;
-    entry.ready = 1;
-    entry.supported = 1;
-    entry.scalar = 1.0f;
     moe_raw_tensor_cache_entry raw{};
     if (!moe_map_expert_output_scale_tensor_f32(engine, layer, &raw)) {
-        entry.scalar = 1.0f;
-    } else {
-        const uint64_t count = moe_raw_tensor_scalar_count(raw);
-        float scale = 1.0f;
-        if (count == 1u) {
-            if (!moe_raw_tensor_scalar_at_f32(raw, 0, &scale) || !std::isfinite(scale)) return 0;
-            entry.scalar = scale;
-        } else if (count == experts) {
-            entry.per_expert = 1;
-            entry.expert_scales.resize(experts);
-            for (uint32_t i = 0; i < experts; ++i) {
-                if (!moe_raw_tensor_scalar_at_f32(raw, (uint64_t)i, &scale) || !std::isfinite(scale)) {
-                    return 0;
-                }
-                entry.expert_scales[i] = scale;
-            }
-        } else {
-            // Vector/per-channel down scales require materializing each expert output before
-            // scaling, so the fused accumulator path must not be used.
-            entry.supported = 0;
-        }
+        *out_scale = 1.0f;
+        return 1;
     }
-
-    {
-        std::unique_lock<std::shared_mutex> lock(scale_cache_mutex);
-        for (const moe_expert_down_uniform_scale_cache_entry& cached : scale_cache) {
-            if (cached.ready && cached.engine == engine && cached.generation == generation &&
-                cached.layer == layer && cached.experts == experts) {
-                return moe_expert_down_uniform_scale_cache_read(cached, expert_id, out_scale);
-            }
-        }
-        if (scale_cache.size() >= 256u) {
-            scale_cache.erase(scale_cache.begin());
-        }
-        scale_cache.push_back(entry);
+    const uint64_t count = moe_raw_tensor_scalar_count(raw);
+    float scale = 1.0f;
+    if (count == 1u) {
+        if (!moe_raw_tensor_scalar_at_f32(raw, 0, &scale) || !std::isfinite(scale)) return 0;
+        *out_scale = scale;
+        return 1;
     }
-    return moe_expert_down_uniform_scale_cache_read(entry, expert_id, out_scale);
+    if (count == experts && (uint32_t)expert_id < experts) {
+        if (!moe_raw_tensor_scalar_at_f32(raw, (uint64_t)expert_id, &scale) || !std::isfinite(scale)) return 0;
+        *out_scale = scale;
+        return 1;
+    }
+    // Vector/per-channel down scales require materializing each expert output before
+    // scaling, so the fused accumulator path must not be used.
+    return 0;
 }
 
 static int moe_layer_apply_expert_down_scale_f32(
