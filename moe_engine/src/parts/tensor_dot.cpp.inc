@@ -601,6 +601,14 @@ static int moe_dot_tensor_fast_view_row_batch(
         }
         return 1;
     }
+    if (view->weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
+        return moe_dot_gguf_q8_0_row_batch(
+            packed,
+            batch_x,
+            batch_size,
+            view->cols,
+            out_values);
+    }
     for (uint32_t b = 0; b < batch_size; ++b) {
         if (!batch_x[b]) {
             out_values[b] = 0.0f;
@@ -779,6 +787,14 @@ static int moe_dot_tensor_record_row_batch(
             }
         }
         return 1;
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
+        return moe_dot_gguf_q8_0_row_batch(
+            packed,
+            batch_x,
+            batch_size,
+            rec->info.cols,
+            out_values);
     }
 
     // TODO: A fully optimized SIMD SGEMM kernel would interleave the token vectors

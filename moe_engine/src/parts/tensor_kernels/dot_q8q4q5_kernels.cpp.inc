@@ -196,6 +196,70 @@ static int moe_dot_gguf_q8_0_four_rows(
     return 1;
 }
 
+static int moe_dot_gguf_q8_0_row_batch(
+    const uint8_t* packed,
+    const float* const* batch_x,
+    uint32_t batch_size,
+    uint32_t cols,
+    float* out_values
+) {
+    if (!packed || !batch_x || !out_values || batch_size == 0) {
+        return 0;
+    }
+    for (uint32_t b = 0; b < batch_size; ++b) {
+        out_values[b] = 0.0f;
+    }
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 34u;
+    for (uint32_t start = 0; start < cols; start += block_cols) {
+        uint16_t d16 = 0;
+        std::memcpy(&d16, packed, sizeof(d16));
+        const float d = moe_raw_fp16_to_f32(d16);
+        if (!std::isfinite(d)) {
+            return 0;
+        }
+        const int8_t* q = reinterpret_cast<const int8_t*>(packed + 2u);
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
+#if defined(__AVX2__)
+        const __m256 vscale = _mm256_set1_ps(d);
+        for (uint32_t b = 0; b < batch_size; ++b) {
+            const float* x = batch_x[b];
+            if (!x) {
+                continue;
+            }
+            __m256 vacc = _mm256_setzero_ps();
+            uint32_t i = 0;
+            for (; i + 7u < limit; i += 8u) {
+                const __m256 qv = moe_i8x8_to_ps(q + i);
+                const __m256 xv = _mm256_loadu_ps(x + start + i);
+                vacc = moe_madd_ps(_mm256_mul_ps(qv, vscale), xv, vacc);
+            }
+            out_values[b] += moe_dot_hsum256_ps(vacc);
+            for (; i < limit; ++i) {
+                out_values[b] += d * (float)q[i] * x[start + i];
+            }
+        }
+#else
+        for (uint32_t b = 0; b < batch_size; ++b) {
+            const float* x = batch_x[b];
+            if (!x) {
+                continue;
+            }
+            for (uint32_t i = 0; i < limit; ++i) {
+                out_values[b] += d * (float)q[i] * x[start + i];
+            }
+        }
+#endif
+        packed += block_bytes;
+    }
+    for (uint32_t b = 0; b < batch_size; ++b) {
+        if (!std::isfinite(out_values[b])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static float moe_dot_gguf_q8_1_row(
     const uint8_t* packed,
     const float* x,
