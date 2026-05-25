@@ -660,6 +660,12 @@ std::atomic<int> storage_format_plan_available{0};
     std::atomic<bool> qkv_cfg_initialized{false};
     uint32_t qkv_last_ctx = 0;  // Track context size for reallocation
     uint64_t qkv_context_epoch = 1;
+    std::mutex prefix_kv_cache_mutex;
+    std::vector<int32_t> prefix_kv_cache_tokens;
+    std::atomic<uint64_t> prefix_kv_cache_hits{0};
+    std::atomic<uint64_t> prefix_kv_cache_misses{0};
+    std::atomic<uint64_t> prefix_kv_cache_insertions{0};
+    std::atomic<uint32_t> prefix_kv_cache_committed_tokens{0};
     std::atomic<uint32_t> eval_plain_kv_active{0};
     std::vector<CUstream> stream_pool;
     std::mutex stream_pool_mutex;

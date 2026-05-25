@@ -118,6 +118,11 @@ static void moe_engine_reset_qkv_cache(moe_pc_engine* engine) {
     engine->qkv_head_state_epochs.clear();
     engine->qkv_cfg_initialized.store(false, std::memory_order_release);
     engine->qkv_last_ctx = 0;
+    {
+        std::lock_guard<std::mutex> prefix_lock(engine->prefix_kv_cache_mutex);
+        engine->prefix_kv_cache_tokens.clear();
+        engine->prefix_kv_cache_committed_tokens.store(0, std::memory_order_relaxed);
+    }
 }
 
 static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {

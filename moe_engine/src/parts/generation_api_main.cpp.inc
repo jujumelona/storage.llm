@@ -16,6 +16,50 @@ static bool moe_generation_parallel_prefill_embed_enabled() {
     return moe_generation_api_main_env_truthy("STORAGELLM_PARALLEL_PREFILL_EMBED");
 }
 
+static bool moe_generation_prefix_kv_cache_enabled() {
+    const char* v = std::getenv("STORAGELLM_PREFIX_KV_CACHE");
+    if (!v) return true;
+    return moe_generation_api_main_env_truthy("STORAGELLM_PREFIX_KV_CACHE");
+}
+
+static uint32_t moe_generation_prefix_kv_cache_match(
+    moe_pc_engine_t* engine,
+    const int32_t* tokens,
+    uint32_t token_count
+) {
+    if (!engine || !tokens || token_count == 0 || !moe_generation_prefix_kv_cache_enabled()) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(engine->prefix_kv_cache_mutex);
+    const uint32_t cached_count =
+        (uint32_t)std::min<size_t>(engine->prefix_kv_cache_tokens.size(), (size_t)UINT32_MAX);
+    const uint32_t limit = std::min(token_count, cached_count);
+    uint32_t matched = 0;
+    while (matched < limit && engine->prefix_kv_cache_tokens[matched] == tokens[matched]) {
+        ++matched;
+    }
+    if (matched > 0) {
+        engine->prefix_kv_cache_hits.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        engine->prefix_kv_cache_misses.fetch_add(1, std::memory_order_relaxed);
+    }
+    return matched;
+}
+
+static void moe_generation_prefix_kv_cache_insert(
+    moe_pc_engine_t* engine,
+    const int32_t* tokens,
+    uint32_t token_count
+) {
+    if (!engine || !tokens || token_count == 0 || !moe_generation_prefix_kv_cache_enabled()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(engine->prefix_kv_cache_mutex);
+    engine->prefix_kv_cache_tokens.assign(tokens, tokens + token_count);
+    engine->prefix_kv_cache_committed_tokens.store(token_count, std::memory_order_relaxed);
+    engine->prefix_kv_cache_insertions.fetch_add(1, std::memory_order_relaxed);
+}
+
 int moe_pc_engine_generate_token_ids(
     moe_pc_engine_t* engine,
     const int32_t* input_token_ids,
@@ -47,7 +91,6 @@ int moe_pc_engine_generate_token_ids(
             id = moe_profile_next_generation_id();
             start_us = moe_profile_now_us();
             engine->generation_started.fetch_add(1, std::memory_order_relaxed);
-            moe_engine_reset_qkv_cache(engine);
             engine->generation_active.fetch_add(1, std::memory_order_relaxed);
             engine->generation_token.store(0, std::memory_order_relaxed);
             engine->generation_layer.store(0xffffffffu, std::memory_order_relaxed);
@@ -208,6 +251,9 @@ int moe_pc_engine_generate_token_ids(
         c->num_hidden_layers,
         c->first_moe_layer,
         c->last_moe_layer);
+    if (prefill_count == 0) {
+        moe_engine_reset_qkv_cache(engine);
+    }
     if (prefill_count > 0) {
         const uint64_t prefill_start_us = moe_profile_now_us();
         engine->generation_phase.store(moe_GEN_PHASE_PREFILL, std::memory_order_relaxed);
@@ -221,8 +267,47 @@ int moe_pc_engine_generate_token_ids(
             }
         }
 
-        if (!moe_generation_should_use_layer_first_prefill(engine, prefill_count, c->hidden_size)) {
-            for (uint32_t i = 0; i < prefill_count; ++i) {
+        uint32_t prefix_reuse_tokens = 0;
+        if (generation_qkv_only) {
+            prefix_reuse_tokens =
+                moe_generation_prefix_kv_cache_match(engine, safe_input.data(), prefill_count);
+            if (prefix_reuse_tokens > prefill_count) {
+                prefix_reuse_tokens = prefill_count;
+            }
+            if (prefix_reuse_tokens > 0) {
+                scratch.position = prefix_reuse_tokens;
+                if (!moe_qkv_only_ensure_capacity(
+                        engine, &scratch, attn_cfg, prefix_reuse_tokens - 1u, pre_allocate_kv)) {
+                    moe_generation_set_error(out_stats, "prefix QKV capacity allocation failed");
+                    return 0;
+                }
+                engine->generation_token.store(prefix_reuse_tokens, std::memory_order_relaxed);
+                moe_profile_log(
+                    "prefill_prefix_reuse",
+                    "id=%llu reused=%u requested=%u committed=%u hits=%llu misses=%llu",
+                    (unsigned long long)generation_scope.id,
+                    prefix_reuse_tokens,
+                    prefill_count,
+                    engine->prefix_kv_cache_committed_tokens.load(std::memory_order_relaxed),
+                    (unsigned long long)engine->prefix_kv_cache_hits.load(std::memory_order_relaxed),
+                    (unsigned long long)engine->prefix_kv_cache_misses.load(std::memory_order_relaxed));
+            } else {
+                moe_engine_reset_qkv_cache(engine);
+                scratch.position = 0;
+            }
+        } else {
+            moe_engine_reset_qkv_cache(engine);
+        }
+
+        if (prefix_reuse_tokens > prefill_count) {
+            prefix_reuse_tokens = prefill_count;
+        }
+        const bool use_layer_first_prefill =
+            prefix_reuse_tokens == 0 &&
+            moe_generation_should_use_layer_first_prefill(engine, prefill_count, c->hidden_size);
+
+        if (!use_layer_first_prefill) {
+            for (uint32_t i = prefix_reuse_tokens; i < prefill_count; ++i) {
                 const uint64_t prefill_token_start_us = moe_profile_now_us();
                 if (!moe_forward_one_token_dispatch_f32(
                         engine, (uint32_t)safe_input[i], &scratch, out_stats,
@@ -555,6 +640,34 @@ int moe_pc_engine_generate_token_ids(
         if (config && config->stop_on_eos && next_token == config->eos_token_id) {
             ++produced;
             break;
+        }
+    }
+
+    if (!failed && generation_qkv_only && produced > 0) {
+        const uint32_t committed_generated = produced - 1u;
+        uint32_t committed_tokens = input_token_count;
+        if (committed_generated <= UINT32_MAX - committed_tokens) {
+            committed_tokens += committed_generated;
+        }
+        std::vector<int32_t> committed;
+        committed.reserve(committed_tokens);
+        for (uint32_t i = 0; i < input_token_count; ++i) {
+            committed.push_back(input_token_ids[i]);
+        }
+        for (uint32_t i = 0; i < committed_generated; ++i) {
+            committed.push_back((int32_t)out_token_ids[i]);
+        }
+        if (!committed.empty()) {
+            moe_generation_prefix_kv_cache_insert(
+                engine, committed.data(), (uint32_t)committed.size());
+            moe_profile_log(
+                "prefill_prefix_insert",
+                "id=%llu committed=%u prompt=%u completion=%u insertions=%llu",
+                (unsigned long long)generation_scope.id,
+                (uint32_t)committed.size(),
+                input_token_count,
+                produced,
+                (unsigned long long)engine->prefix_kv_cache_insertions.load(std::memory_order_relaxed));
         }
     }
 
