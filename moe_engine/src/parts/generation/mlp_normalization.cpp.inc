@@ -266,22 +266,21 @@ static int moe_layer_apply_expert_down_scale_f32(
     return 0;
 }
 
-static int moe_add_mlp_branch_residual_f32(
+static int moe_add_mlp_residual_f32(
     moe_pc_engine* engine,
     int32_t layer,
-    const float* branch_input,
-    uint32_t hidden_size,
+    moe_decode_scratch* s,
     float* hidden,
-    float* post_norm_tmp,
-    float eps
+    uint32_t hidden_size
 ) {
     // Keep this helper branch-local: it forms the FFN/MoE branch, applies
     // optional post-FFW normalization to that branch when present, then adds it
     // to the residual stream. Layer-level output/cvec transforms are handled by
     // the layer plan after residual addition.
-    if (!engine || !branch_input || !hidden) {
+    if (!engine || !s || !hidden) {
         return 0;
     }
+    const moe_attn_config_t cfg = moe_generation_attn_config(engine);
     int combined_post_norm_contract = 0;
     const char* combined_post_norm_source = nullptr;
     const int has_combined_post_norm_contract = moe_graph_ir_layer_contract_bool_key_f32(
@@ -294,7 +293,7 @@ static int moe_add_mlp_branch_residual_f32(
     const int post_ffw_norm_required =
         moe_layer_has_post_ffw_norm_weight(engine, layer) ||
         (has_combined_post_norm_contract && combined_post_norm_contract);
-    const float* branch = branch_input;
+    float* branch = s->mlp.data();
     const char* branch_source = "mlp";
     if (has_combined_post_norm_contract) {
         moe_profile_log(
@@ -306,7 +305,7 @@ static int moe_add_mlp_branch_residual_f32(
     }
     int fused_post_norm_attempted = 0;
     if (moe_layer_post_ffw_norm_add_residual_f32(
-            engine, layer, branch_input, hidden_size, hidden, eps,
+            engine, layer, s->mlp.data(), hidden_size, hidden, cfg.rms_norm_eps,
             &fused_post_norm_attempted)) {
         return 1;
     }
@@ -317,8 +316,8 @@ static int moe_add_mlp_branch_residual_f32(
         return 0;
     }
     if (moe_layer_post_ffw_norm_f32(
-            engine, layer, branch_input, hidden_size, post_norm_tmp, eps)) {
-        branch = post_norm_tmp;
+            engine, layer, s->mlp.data(), hidden_size, s->shared.data(), cfg.rms_norm_eps)) {
+        branch = s->shared.data();
         branch_source = "post_ffw_norm";
     } else if (post_ffw_norm_required) {
         std::fprintf(stderr,
@@ -336,21 +335,6 @@ static int moe_add_mlp_branch_residual_f32(
         hidden[i] += branch[i];
     }
     return 1;
-}
-
-static int moe_add_mlp_residual_f32(
-    moe_pc_engine* engine,
-    int32_t layer,
-    moe_decode_scratch* s,
-    float* hidden,
-    uint32_t hidden_size
-) {
-    if (!engine || !s || !hidden) {
-        return 0;
-    }
-    const moe_attn_config_t cfg = moe_generation_attn_config(engine);
-    return moe_add_mlp_branch_residual_f32(
-        engine, layer, s->mlp.data(), hidden_size, hidden, s->shared.data(), cfg.rms_norm_eps);
 }
 
 static int moe_layer_dense_mlp_from_suffixes_f32(
