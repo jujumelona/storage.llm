@@ -424,7 +424,6 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
         uint32_t expert = 0;
         uint64_t bytes = 0;
         uint16_t priority = 0;
-        uint8_t residency_rank = 0;
     };
     std::vector<startup_expert_candidate_t> candidates;
     std::vector<uint64_t> candidate_bytes;
@@ -454,11 +453,6 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
                 cand.expert = expert;
                 cand.bytes = bytes;
                 cand.priority = expert_prefetch_priority_hint(engine, (int)layer, (int)expert);
-                const uint8_t residency = expert_residency_hint(engine, (int)layer, (int)expert);
-                cand.residency_rank =
-                    residency == moe_JUJU_RESIDENCY_FAST_MEM ? 3u :
-                    residency == moe_JUJU_RESIDENCY_FAST_MEM_STREAMABLE ? 2u :
-                    residency == moe_JUJU_RESIDENCY_AUTO ? 1u : 0u;
                 candidates.push_back(cand);
                 candidate_bytes.push_back(bytes);
             }
@@ -473,9 +467,6 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
     };
     std::stable_sort(candidates.begin(), candidates.end(),
         [&](const startup_expert_candidate_t& a, const startup_expert_candidate_t& b) {
-            if (a.residency_rank != b.residency_rank) {
-                return a.residency_rank > b.residency_rank;
-            }
             if (a.priority != b.priority) {
                 return a.priority > b.priority;
             }
