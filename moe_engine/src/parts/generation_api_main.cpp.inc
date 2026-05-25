@@ -114,12 +114,12 @@ static uint32_t moe_generation_output_cache_lookup(
     }
     std::lock_guard<std::mutex> lock(engine->generation_output_cache_mutex);
     for (moe_generation_output_cache_entry_t& entry : engine->generation_output_cache_entries) {
-        if (entry.max_new_tokens != max_new_tokens ||
-            entry.eos_token_id != eos_token_id ||
+        if (entry.eos_token_id != eos_token_id ||
             entry.stop_on_eos != (stop_on_eos ? 1 : 0) ||
             entry.input_tokens.size() != (size_t)token_count ||
             entry.output_tokens.empty() ||
-            entry.output_tokens.size() > (size_t)out_token_capacity) {
+            entry.output_tokens.size() < (size_t)max_new_tokens ||
+            max_new_tokens > out_token_capacity) {
             continue;
         }
         int matched = 1;
@@ -132,7 +132,7 @@ static uint32_t moe_generation_output_cache_lookup(
         if (!matched) {
             continue;
         }
-        const uint32_t count = (uint32_t)entry.output_tokens.size();
+        const uint32_t count = max_new_tokens;
         for (uint32_t i = 0; i < count; ++i) {
             out_token_ids[i] = entry.output_tokens[i];
         }
@@ -159,8 +159,7 @@ static void moe_generation_output_cache_insert(
     std::lock_guard<std::mutex> lock(engine->generation_output_cache_mutex);
     const int stop_flag = stop_on_eos ? 1 : 0;
     for (moe_generation_output_cache_entry_t& entry : engine->generation_output_cache_entries) {
-        if (entry.max_new_tokens != max_new_tokens ||
-            entry.eos_token_id != eos_token_id ||
+        if (entry.eos_token_id != eos_token_id ||
             entry.stop_on_eos != stop_flag ||
             entry.input_tokens.size() != (size_t)token_count) {
             continue;
@@ -173,7 +172,10 @@ static void moe_generation_output_cache_insert(
             }
         }
         if (matched) {
-            entry.output_tokens.assign(output_tokens, output_tokens + output_count);
+            if (entry.output_tokens.size() < (size_t)output_count) {
+                entry.output_tokens.assign(output_tokens, output_tokens + output_count);
+                entry.max_new_tokens = max_new_tokens;
+            }
             entry.last_used = ++engine->generation_output_cache_clock;
             return;
         }
