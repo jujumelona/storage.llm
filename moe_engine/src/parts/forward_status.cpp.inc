@@ -174,10 +174,16 @@ out_status->storage_format_plan_available = engine->storage_format_plan_availabl
         out_status->dynamic_max_seq_len = engine->attn_config.max_seq_len;
     }
     out_status->tensor_table_loaded = out_status->tensor_count > 0;
-    out_status->expert_triplet_available =
-        out_status->storage_state_valid &&
-        out_status->tensor_table_loaded &&
-        moe_forward_expert_triplet_records_ready(engine);
+    out_status->expert_triplet_available = 0;
+    if (out_status->storage_state_valid && out_status->tensor_table_loaded) {
+        int cached = engine->expert_triplet_valid.load(std::memory_order_relaxed);
+        if (cached == 1) {
+            out_status->expert_triplet_available = 1;
+        } else if (moe_forward_expert_triplet_records_ready(engine)) {
+            engine->expert_triplet_valid.store(1, std::memory_order_relaxed);
+            out_status->expert_triplet_available = 1;
+        }
+    }
     {
         int cached = engine->tokenizer_valid.load(std::memory_order_relaxed);
         if (cached < 0) {

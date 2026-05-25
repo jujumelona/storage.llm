@@ -27,6 +27,7 @@ static void moe_dynamic_shape_finalize_adapter(moe_pc_engine* engine) {
             engine->cpu_execution_plan_tensors.store(engine->tensors.size(), std::memory_order_relaxed);
         }
         engine->attention_projector_valid.store(-1, std::memory_order_relaxed);
+        engine->expert_triplet_valid.store(-1, std::memory_order_relaxed);
         return;
     }
     uint32_t adapter = moe_FORWARD_ADAPTER_GGUF_GENERIC;
@@ -52,6 +53,7 @@ static void moe_dynamic_shape_finalize_adapter(moe_pc_engine* engine) {
     engine->forward_adapter.store(adapter, std::memory_order_relaxed);
     engine->forward_adapter_executable.store(executable, std::memory_order_relaxed);
     engine->attention_projector_valid.store(-1, std::memory_order_relaxed);
+    engine->expert_triplet_valid.store(-1, std::memory_order_relaxed);
 }
 
 struct moe_juju_runtime_probe_t {

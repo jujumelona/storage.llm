@@ -608,6 +608,7 @@ std::atomic<int> storage_format_plan_available{0};
 
     mutable std::atomic<int> tokenizer_valid{-1};
     mutable std::atomic<int> attention_projector_valid{-1};  // Fix 72: -1=unchecked, 0=no, 1=yes
+    mutable std::atomic<int> expert_triplet_valid{-1};        // positive cache; 0 is recomputed until ready
     std::vector<std::thread> deferred_joins;  // Fix 44: engine-owned deferred worker joins
     std::atomic<uint32_t> staging_pinned_slot_count{0};
     std::atomic<uint32_t> staging_gpu_slot_count{0};

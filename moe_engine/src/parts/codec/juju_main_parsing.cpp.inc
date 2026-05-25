@@ -929,6 +929,7 @@ int moe_pc_engine_load_codec_table(
     engine->model_root_valid.store(root_valid ? 1 : 0, std::memory_order_relaxed);
     engine->tokenizer_valid.store(-1, std::memory_order_relaxed);
     engine->attention_projector_valid.store(-1, std::memory_order_relaxed);
+    engine->expert_triplet_valid.store(-1, std::memory_order_relaxed);
     if (engine->scale4) {
         moe_scale4_close(engine->scale4);
         engine->scale4 = nullptr;
