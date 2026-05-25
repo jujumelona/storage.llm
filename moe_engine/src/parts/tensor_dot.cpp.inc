@@ -667,6 +667,11 @@ static int moe_dot_tensor_fast_view_two_rows(
         return moe_dot_gguf_q5_1_two_rows(pa, pb, x, a->cols, out_a, out_b) &&
                std::isfinite(*out_a) && std::isfinite(*out_b);
     }
+    if (a->weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K &&
+        b->weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
+        return moe_dot_gguf_q5_k_two_rows(pa, pb, x, a->cols, out_a, out_b) &&
+               std::isfinite(*out_a) && std::isfinite(*out_b);
+    }
     return moe_dot_tensor_fast_view_row(engine, a, row, x, x_count, out_a) &&
            moe_dot_tensor_fast_view_row(engine, b, row, x, x_count, out_b);
 }
