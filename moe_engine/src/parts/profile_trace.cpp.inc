@@ -45,6 +45,8 @@ static int moe_profile_tag_enabled(const char* tag) {
     static const char* const summary_tags[] = {
         "generation_contract",
         "generation_begin",
+        "generation_output_cache_hit",
+        "generation_output_cache_insert",
         "generation_end",
         "forward_embed",
         "prefill_batch_embed",

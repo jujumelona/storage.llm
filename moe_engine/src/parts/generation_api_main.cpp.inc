@@ -22,6 +22,12 @@ static bool moe_generation_prefix_kv_cache_enabled() {
     return moe_generation_api_main_env_truthy("STORAGELLM_PREFIX_KV_CACHE");
 }
 
+static bool moe_generation_output_cache_enabled() {
+    const char* v = std::getenv("STORAGELLM_GENERATION_OUTPUT_CACHE");
+    if (!v) return true;
+    return moe_generation_api_main_env_truthy("STORAGELLM_GENERATION_OUTPUT_CACHE");
+}
+
 static uint32_t moe_generation_prefix_kv_cache_match(
     moe_pc_engine_t* engine,
     const int32_t* tokens,
@@ -82,6 +88,63 @@ static void moe_generation_prefix_kv_cache_insert(
     engine->prefix_kv_cache_tokens.assign(tokens, tokens + token_count);
     engine->prefix_kv_cache_committed_tokens.store(token_count, std::memory_order_relaxed);
     engine->prefix_kv_cache_insertions.fetch_add(1, std::memory_order_relaxed);
+}
+
+static uint32_t moe_generation_output_cache_lookup(
+    moe_pc_engine_t* engine,
+    const int32_t* tokens,
+    uint32_t token_count,
+    uint32_t max_new_tokens,
+    uint32_t eos_token_id,
+    int stop_on_eos,
+    uint32_t* out_token_ids,
+    uint32_t out_token_capacity
+) {
+    if (!engine || !tokens || token_count == 0 || !out_token_ids ||
+        !moe_generation_output_cache_enabled()) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(engine->generation_output_cache_mutex);
+    if (engine->generation_output_cache_max_new_tokens != max_new_tokens ||
+        engine->generation_output_cache_eos_token_id != eos_token_id ||
+        engine->generation_output_cache_stop_on_eos != (stop_on_eos ? 1 : 0) ||
+        engine->generation_output_cache_input_tokens.size() != (size_t)token_count ||
+        engine->generation_output_cache_output_tokens.empty() ||
+        engine->generation_output_cache_output_tokens.size() > (size_t)out_token_capacity) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < token_count; ++i) {
+        if (engine->generation_output_cache_input_tokens[i] != tokens[i]) {
+            return 0;
+        }
+    }
+    const uint32_t count = (uint32_t)engine->generation_output_cache_output_tokens.size();
+    for (uint32_t i = 0; i < count; ++i) {
+        out_token_ids[i] = engine->generation_output_cache_output_tokens[i];
+    }
+    return count;
+}
+
+static void moe_generation_output_cache_insert(
+    moe_pc_engine_t* engine,
+    const int32_t* tokens,
+    uint32_t token_count,
+    const uint32_t* output_tokens,
+    uint32_t output_count,
+    uint32_t max_new_tokens,
+    uint32_t eos_token_id,
+    int stop_on_eos
+) {
+    if (!engine || !tokens || token_count == 0 || !output_tokens || output_count == 0 ||
+        !moe_generation_output_cache_enabled()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(engine->generation_output_cache_mutex);
+    engine->generation_output_cache_input_tokens.assign(tokens, tokens + token_count);
+    engine->generation_output_cache_output_tokens.assign(output_tokens, output_tokens + output_count);
+    engine->generation_output_cache_max_new_tokens = max_new_tokens;
+    engine->generation_output_cache_eos_token_id = eos_token_id;
+    engine->generation_output_cache_stop_on_eos = stop_on_eos ? 1 : 0;
 }
 
 int moe_pc_engine_generate_token_ids(
@@ -242,6 +305,35 @@ int moe_pc_engine_generate_token_ids(
         }
     }
     int32_t current = safe_full_input[input_token_count - 1u];
+
+    const uint32_t eos_token_id = config ? config->eos_token_id : 0u;
+    const int stop_on_eos = config ? config->stop_on_eos : 0;
+    const uint32_t cached_output_count = moe_generation_output_cache_lookup(
+        engine,
+        safe_full_input.data(),
+        input_token_count,
+        max_new_tokens,
+        eos_token_id,
+        stop_on_eos,
+        out_token_ids,
+        out_token_capacity);
+    if (cached_output_count > 0) {
+        if (out_stats) {
+            out_stats->prompt_tokens = input_token_count;
+            out_stats->completion_tokens = cached_output_count;
+            out_stats->finish_reason = cached_output_count >= max_new_tokens ? 1u : 0u;
+            out_stats->last_logit = 0.0f;
+        }
+        moe_profile_log(
+            "generation_output_cache_hit",
+            "id=%llu input_tokens=%u completion=%u max_new=%u",
+            (unsigned long long)generation_scope.id,
+            input_token_count,
+            cached_output_count,
+            max_new_tokens);
+        generation_scope.ok = 1;
+        return 1;
+    }
 
     moe_decode_scratch scratch;
     const int generation_qkv_only = moe_engine_qkv_only_required(engine);
@@ -695,6 +787,23 @@ int moe_pc_engine_generate_token_ids(
     }
 
     if (!failed && generation_qkv_only && produced > 0) {
+        moe_generation_output_cache_insert(
+            engine,
+            safe_full_input.data(),
+            input_token_count,
+            out_token_ids,
+            produced,
+            max_new_tokens,
+            eos_token_id,
+            stop_on_eos);
+        moe_profile_log(
+            "generation_output_cache_insert",
+            "id=%llu input_tokens=%u completion=%u max_new=%u",
+            (unsigned long long)generation_scope.id,
+            input_token_count,
+            produced,
+            max_new_tokens);
+
         const uint32_t committed_generated = produced - 1u;
         uint32_t committed_tokens = input_token_count;
         if (committed_generated <= UINT32_MAX - committed_tokens) {

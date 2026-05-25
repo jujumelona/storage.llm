@@ -124,6 +124,14 @@ static void moe_engine_reset_qkv_cache(moe_pc_engine* engine) {
         engine->prefix_kv_cache_tokens.clear();
         engine->prefix_kv_cache_committed_tokens.store(0, std::memory_order_relaxed);
     }
+    {
+        std::lock_guard<std::mutex> output_lock(engine->generation_output_cache_mutex);
+        engine->generation_output_cache_input_tokens.clear();
+        engine->generation_output_cache_output_tokens.clear();
+        engine->generation_output_cache_max_new_tokens = 0;
+        engine->generation_output_cache_eos_token_id = 0;
+        engine->generation_output_cache_stop_on_eos = 0;
+    }
 }
 
 static void moe_engine_clear_offload_gguf_contract(moe_pc_engine* engine) {
