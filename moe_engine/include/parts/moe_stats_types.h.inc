@@ -71,6 +71,10 @@ typedef struct {
     uint64_t qkv_plain_kv_decode_cache_touches;
     uint64_t qkv_ppl_qkv_only_evals;
     uint64_t qkv_env_override_blocked;
+    uint64_t prefix_kv_cache_hits;
+    uint64_t prefix_kv_cache_misses;
+    uint64_t prefix_kv_cache_insertions;
+    uint32_t prefix_kv_cache_committed_tokens;
     uint32_t weight_quant_bits;
     uint32_t weight_quant_encoding;
     uint32_t weight_quant_block_size;

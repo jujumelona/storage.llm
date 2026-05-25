@@ -55,6 +55,8 @@ static int moe_profile_tag_enabled(const char* tag) {
         "prefill_mlp_batch_prepare",
         "prefill_mlp_batch_experts",
         "prefill_mlp_batch_finish",
+        "prefill_prefix_reuse",
+        "prefill_prefix_insert",
         "prefill_end",
         "decode_forward",
         "decode_sample",

@@ -124,6 +124,11 @@ int moe_pc_engine_get_stats(const moe_pc_engine_t* engine, moe_pc_engine_stats_t
     out_stats->qkv_plain_kv_decode_cache_touches = engine->qkv_plain_kv_decode_cache_touches.load(std::memory_order_relaxed);
     out_stats->qkv_ppl_qkv_only_evals = engine->qkv_ppl_qkv_only_evals.load(std::memory_order_relaxed);
     out_stats->qkv_env_override_blocked = engine->qkv_env_override_blocked.load(std::memory_order_relaxed);
+    out_stats->prefix_kv_cache_hits = engine->prefix_kv_cache_hits.load(std::memory_order_relaxed);
+    out_stats->prefix_kv_cache_misses = engine->prefix_kv_cache_misses.load(std::memory_order_relaxed);
+    out_stats->prefix_kv_cache_insertions = engine->prefix_kv_cache_insertions.load(std::memory_order_relaxed);
+    out_stats->prefix_kv_cache_committed_tokens =
+        engine->prefix_kv_cache_committed_tokens.load(std::memory_order_relaxed);
     out_stats->weight_quant_bits = engine->offload_weight_quant_bits.load(std::memory_order_relaxed);
     out_stats->weight_quant_encoding = engine->offload_weight_encoding.load(std::memory_order_relaxed);
     out_stats->weight_quant_block_size = engine->offload_weight_block_size.load(std::memory_order_relaxed);
