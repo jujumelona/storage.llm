@@ -1445,7 +1445,7 @@ static int moe_layer_moe_mlp_f32(
             moe_profile_parallel_label_scope fused_down_rows_label("moe_mlp_down_accum_fused");
             static const uint32_t fused_down_block_rows = []() -> uint32_t {
                 const uint32_t env_block = moe_parse_env_u32("STORAGELLM_MLP_FUSED_DOWN_BLOCK_ROWS");
-                return env_block > 0 ? std::max(1u, std::min<uint32_t>(env_block, 128u)) : 32u;
+                return env_block > 0 ? std::max(1u, std::min<uint32_t>(env_block, 128u)) : 64u;
             }();
             const uint32_t row_group_count = (hidden_size + 3u) >> 2u;
             const uint32_t fused_down_group_block_rows = std::max(1u, fused_down_block_rows >> 2u);
