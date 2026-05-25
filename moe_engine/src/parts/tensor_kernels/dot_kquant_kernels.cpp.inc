@@ -215,6 +215,85 @@ static int moe_dot_gguf_q5_1_two_rows(
     return std::isfinite(*out0) && std::isfinite(*out1) ? 1 : 0;
 }
 
+static int moe_dot_gguf_q5_1_row_batch(
+    const uint8_t* packed,
+    const float* const* batch_x,
+    uint32_t batch_size,
+    uint32_t cols,
+    float* out_values
+) {
+    if (!packed || !batch_x || !out_values || batch_size == 0) {
+        return 0;
+    }
+    for (uint32_t b = 0; b < batch_size; ++b) {
+        out_values[b] = 0.0f;
+    }
+#if defined(__AVX2__)
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 24u;
+    if ((cols % block_cols) == 0u) {
+        const moe_q5_high_mask_table_t& kQ5HighMask = moe_q5_high_mask_table();
+        const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+        for (uint32_t start = 0; start < cols; start += block_cols) {
+            uint16_t d16 = 0;
+            uint16_t m16 = 0;
+            uint32_t qh = 0;
+            std::memcpy(&d16, packed, sizeof(d16));
+            std::memcpy(&m16, packed + 2u, sizeof(m16));
+            std::memcpy(&qh, packed + 4u, sizeof(qh));
+            const float d = moe_raw_fp16_to_f32(d16);
+            const float m = moe_raw_fp16_to_f32(m16);
+            if (!std::isfinite(d) || !std::isfinite(m)) {
+                return 0;
+            }
+            const __m256 vd = _mm256_set1_ps(d);
+            const __m256 vm = _mm256_set1_ps(m);
+            const uint8_t* qs = packed + 8u;
+            const __m128i q0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs));
+            const __m128i q1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + 8u));
+            const __m256 v0 = moe_q5_1_values8_avx2(
+                _mm_and_si128(q0, nibble_mask), kQ5HighMask.masks[(qh >> 0u) & 0xffu], vd, vm);
+            const __m256 v1 = moe_q5_1_values8_avx2(
+                _mm_and_si128(q1, nibble_mask), kQ5HighMask.masks[(qh >> 8u) & 0xffu], vd, vm);
+            const __m256 v2 = moe_q5_1_values8_avx2(
+                _mm_and_si128(_mm_srli_epi16(q0, 4), nibble_mask), kQ5HighMask.masks[(qh >> 16u) & 0xffu], vd, vm);
+            const __m256 v3 = moe_q5_1_values8_avx2(
+                _mm_and_si128(_mm_srli_epi16(q1, 4), nibble_mask), kQ5HighMask.masks[(qh >> 24u) & 0xffu], vd, vm);
+            for (uint32_t b = 0; b < batch_size; ++b) {
+                const float* x = batch_x[b];
+                if (!x) {
+                    continue;
+                }
+                __m256 vacc = _mm256_setzero_ps();
+                vacc = moe_madd_ps(v0, _mm256_loadu_ps(x + start), vacc);
+                vacc = moe_madd_ps(v1, _mm256_loadu_ps(x + start + 8u), vacc);
+                vacc = moe_madd_ps(v2, _mm256_loadu_ps(x + start + 16u), vacc);
+                vacc = moe_madd_ps(v3, _mm256_loadu_ps(x + start + 24u), vacc);
+                out_values[b] += moe_dot_hsum256_ps(vacc);
+            }
+            packed += block_bytes;
+        }
+        for (uint32_t b = 0; b < batch_size; ++b) {
+            if (!std::isfinite(out_values[b])) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+#endif
+    for (uint32_t b = 0; b < batch_size; ++b) {
+        if (!batch_x[b]) {
+            out_values[b] = 0.0f;
+            continue;
+        }
+        out_values[b] = moe_dot_gguf_q5_1_row(packed, batch_x[b], cols);
+        if (!std::isfinite(out_values[b])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static float moe_gguf_q2_k_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
     // BUGFIX 702: Q2_K NaN handling ★★
     // Problem: No validation of scale/min values or accumulated result

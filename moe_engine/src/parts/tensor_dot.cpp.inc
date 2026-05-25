@@ -609,6 +609,14 @@ static int moe_dot_tensor_fast_view_row_batch(
             view->cols,
             out_values);
     }
+    if (view->weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
+        return moe_dot_gguf_q5_1_row_batch(
+            packed,
+            batch_x,
+            batch_size,
+            view->cols,
+            out_values);
+    }
     for (uint32_t b = 0; b < batch_size; ++b) {
         if (!batch_x[b]) {
             out_values[b] = 0.0f;
@@ -790,6 +798,14 @@ static int moe_dot_tensor_record_row_batch(
     }
     if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
         return moe_dot_gguf_q8_0_row_batch(
+            packed,
+            batch_x,
+            batch_size,
+            rec->info.cols,
+            out_values);
+    }
+    if (weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
+        return moe_dot_gguf_q5_1_row_batch(
             packed,
             batch_x,
             batch_size,
