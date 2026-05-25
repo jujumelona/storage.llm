@@ -753,6 +753,12 @@ static int moe_dot_tensor_fast_view_adjacent_four_rows(
             std::isfinite(*out0) && std::isfinite(*out1) &&
             std::isfinite(*out2) && std::isfinite(*out3);
     }
+    if (view->weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
+        return moe_dot_gguf_q5_1_four_rows(
+            p0, p1, p2, p3, x, view->cols, out0, out1, out2, out3) &&
+            std::isfinite(*out0) && std::isfinite(*out1) &&
+            std::isfinite(*out2) && std::isfinite(*out3);
+    }
     return moe_dot_tensor_fast_view_adjacent_rows(
                engine, view, row, x, x_count, out0, out1) &&
            moe_dot_tensor_fast_view_adjacent_rows(

@@ -215,6 +215,85 @@ static int moe_dot_gguf_q5_1_two_rows(
     return std::isfinite(*out0) && std::isfinite(*out1) ? 1 : 0;
 }
 
+static int moe_dot_gguf_q5_1_four_rows(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const uint8_t* packed2,
+    const uint8_t* packed3,
+    const float* x,
+    uint32_t cols,
+    float* out0,
+    float* out1,
+    float* out2,
+    float* out3
+) {
+    if (!packed0 || !packed1 || !packed2 || !packed3 || !x ||
+        !out0 || !out1 || !out2 || !out3) {
+        return 0;
+    }
+#if defined(__AVX2__)
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 24u;
+    if ((cols % block_cols) == 0u) {
+        const moe_q5_high_mask_table_t& kQ5HighMask = moe_q5_high_mask_table();
+        const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+        const uint8_t* rows[4] = { packed0, packed1, packed2, packed3 };
+        float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint32_t start = 0; start < cols; start += block_cols) {
+            const __m256 x0 = _mm256_loadu_ps(x + start);
+            const __m256 x1 = _mm256_loadu_ps(x + start + 8u);
+            const __m256 x2 = _mm256_loadu_ps(x + start + 16u);
+            const __m256 x3 = _mm256_loadu_ps(x + start + 24u);
+            for (uint32_t r = 0; r < 4u; ++r) {
+                uint16_t d16 = 0;
+                uint16_t m16 = 0;
+                uint32_t qh = 0;
+                std::memcpy(&d16, rows[r], sizeof(d16));
+                std::memcpy(&m16, rows[r] + 2u, sizeof(m16));
+                std::memcpy(&qh, rows[r] + 4u, sizeof(qh));
+                const float d = moe_raw_fp16_to_f32(d16);
+                const float m = moe_raw_fp16_to_f32(m16);
+                if (!std::isfinite(d) || !std::isfinite(m)) {
+                    return 0;
+                }
+                const __m256 vd = _mm256_set1_ps(d);
+                const __m256 vm = _mm256_set1_ps(m);
+                const uint8_t* qs = rows[r] + 8u;
+                const __m128i q0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs));
+                const __m128i q1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + 8u));
+                __m256 vacc = _mm256_setzero_ps();
+                vacc = moe_madd_ps(
+                    moe_q5_1_values8_avx2(_mm_and_si128(q0, nibble_mask), kQ5HighMask.masks[(qh >> 0u) & 0xffu], vd, vm),
+                    x0,
+                    vacc);
+                vacc = moe_madd_ps(
+                    moe_q5_1_values8_avx2(_mm_and_si128(q1, nibble_mask), kQ5HighMask.masks[(qh >> 8u) & 0xffu], vd, vm),
+                    x1,
+                    vacc);
+                vacc = moe_madd_ps(
+                    moe_q5_1_values8_avx2(_mm_and_si128(_mm_srli_epi16(q0, 4), nibble_mask), kQ5HighMask.masks[(qh >> 16u) & 0xffu], vd, vm),
+                    x2,
+                    vacc);
+                vacc = moe_madd_ps(
+                    moe_q5_1_values8_avx2(_mm_and_si128(_mm_srli_epi16(q1, 4), nibble_mask), kQ5HighMask.masks[(qh >> 24u) & 0xffu], vd, vm),
+                    x3,
+                    vacc);
+                acc[r] += moe_dot_hsum256_ps(vacc);
+                rows[r] += block_bytes;
+            }
+        }
+        *out0 = acc[0];
+        *out1 = acc[1];
+        *out2 = acc[2];
+        *out3 = acc[3];
+        return std::isfinite(acc[0]) && std::isfinite(acc[1]) &&
+               std::isfinite(acc[2]) && std::isfinite(acc[3]) ? 1 : 0;
+    }
+#endif
+    return moe_dot_gguf_q5_1_two_rows(packed0, packed1, x, cols, out0, out1) &&
+           moe_dot_gguf_q5_1_two_rows(packed2, packed3, x, cols, out2, out3);
+}
+
 static int moe_dot_gguf_q5_1_row_batch(
     const uint8_t* packed,
     const float* const* batch_x,
