@@ -410,15 +410,27 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
             }
         }
     }
+    auto startup_warm_expert_spread_key = [](uint32_t expert) -> uint32_t {
+        uint32_t x = expert * 2654435761u;
+        x ^= x >> 16u;
+        x *= 2246822519u;
+        x ^= x >> 13u;
+        return x;
+    };
     std::stable_sort(candidates.begin(), candidates.end(),
-        [](const startup_expert_candidate_t& a, const startup_expert_candidate_t& b) {
+        [&](const startup_expert_candidate_t& a, const startup_expert_candidate_t& b) {
             if (a.priority != b.priority) {
                 return a.priority > b.priority;
             }
-            if (a.expert != b.expert) {
-                return a.expert < b.expert;
+            const uint32_t a_key = startup_warm_expert_spread_key(a.expert);
+            const uint32_t b_key = startup_warm_expert_spread_key(b.expert);
+            if (a_key != b_key) {
+                return a_key < b_key;
             }
-            return a.layer < b.layer;
+            if (a.layer != b.layer) {
+                return a.layer < b.layer;
+            }
+            return a.expert < b.expert;
         });
 
     size_t warm_candidate_limit = candidates.size();
