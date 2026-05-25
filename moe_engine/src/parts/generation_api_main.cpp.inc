@@ -46,6 +46,30 @@ static uint32_t moe_generation_prefix_kv_cache_match(
     return matched;
 }
 
+static int moe_generation_prefix_kv_cache_next_token(
+    moe_pc_engine_t* engine,
+    const int32_t* tokens,
+    uint32_t token_count,
+    int32_t* out_next_token
+) {
+    if (!engine || !tokens || !out_next_token || token_count == 0 ||
+        !moe_generation_prefix_kv_cache_enabled()) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(engine->prefix_kv_cache_mutex);
+    const size_t cached_count = engine->prefix_kv_cache_tokens.size();
+    if (cached_count <= (size_t)token_count) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < token_count; ++i) {
+        if (engine->prefix_kv_cache_tokens[i] != tokens[i]) {
+            return 0;
+        }
+    }
+    *out_next_token = engine->prefix_kv_cache_tokens[token_count];
+    return 1;
+}
+
 static void moe_generation_prefix_kv_cache_insert(
     moe_pc_engine_t* engine,
     const int32_t* tokens,
@@ -209,10 +233,15 @@ int moe_pc_engine_generate_token_ids(
         return 0;
     }
 
-    int32_t current = input_token_ids[input_token_count - 1u];
-    if (current < 0 || (uint32_t)current >= c->vocab_size) {
-        current = config && config->eos_token_id ? config->eos_token_id : 0;
+    std::vector<int32_t> safe_full_input(input_token_count);
+    for (uint32_t i = 0; i < input_token_count; ++i) {
+        if (input_token_ids[i] < 0 || (uint32_t)input_token_ids[i] >= c->vocab_size) {
+            safe_full_input[i] = config && config->eos_token_id ? config->eos_token_id : 0;
+        } else {
+            safe_full_input[i] = input_token_ids[i];
+        }
     }
+    int32_t current = safe_full_input[input_token_count - 1u];
 
     moe_decode_scratch scratch;
     const int generation_qkv_only = moe_engine_qkv_only_required(engine);
@@ -240,6 +269,8 @@ int moe_pc_engine_generate_token_ids(
     // Attention remains O(N^2), but weights stay hotter across prompt tokens.
     // Memory is N*hidden_size*4 bytes, about 14.7 MiB for N=512 and hidden=7168.
     const uint32_t prefill_count = input_token_count - 1u;
+    int cached_first_token_available = 0;
+    int32_t cached_first_token = 0;
     moe_profile_log(
         "generation_begin",
         "id=%llu input_tokens=%u prefill=%u max_new=%u hidden=%u layers=%u first_moe=%u last_moe=%u",
@@ -258,14 +289,7 @@ int moe_pc_engine_generate_token_ids(
         const uint64_t prefill_start_us = moe_profile_now_us();
         engine->generation_phase.store(moe_GEN_PHASE_PREFILL, std::memory_order_relaxed);
         // Validate all prompt tokens first
-        std::vector<int32_t> safe_input(prefill_count);
-        for (uint32_t i = 0; i < prefill_count; ++i) {
-            if (input_token_ids[i] < 0 || (uint32_t)input_token_ids[i] >= c->vocab_size) {
-                safe_input[i] = config && config->eos_token_id ? config->eos_token_id : 0;
-            } else {
-                safe_input[i] = input_token_ids[i];
-            }
-        }
+        std::vector<int32_t> safe_input(safe_full_input.begin(), safe_full_input.begin() + prefill_count);
 
         uint32_t prefix_reuse_tokens = 0;
         if (generation_qkv_only) {
@@ -294,6 +318,13 @@ int moe_pc_engine_generate_token_ids(
             } else {
                 moe_engine_reset_qkv_cache(engine);
                 scratch.position = 0;
+            }
+            if (prefix_reuse_tokens == prefill_count && max_new_tokens >= 2u &&
+                moe_generation_prefix_kv_cache_next_token(
+                    engine, safe_full_input.data(), input_token_count, &cached_first_token) &&
+                cached_first_token >= 0 && (uint32_t)cached_first_token < c->vocab_size &&
+                !(config && config->stop_on_eos && cached_first_token == config->eos_token_id)) {
+                cached_first_token_available = 1;
             }
         } else {
             moe_engine_reset_qkv_cache(engine);
@@ -573,6 +604,26 @@ int moe_pc_engine_generate_token_ids(
             prefill_count,
             moe_profile_elapsed_ms(prefill_start_us));
     }
+    if (cached_first_token_available) {
+        if (!moe_qkv_only_ensure_capacity(
+                engine, &scratch, attn_cfg, input_token_count - 1u, pre_allocate_kv)) {
+            moe_generation_set_error(out_stats, "prefix generated-token QKV capacity allocation failed");
+            return 0;
+        }
+        scratch.position = input_token_count;
+        out_token_ids[0] = (uint32_t)cached_first_token;
+        current = cached_first_token;
+        produced = 1;
+        engine->generation_token.store(input_token_count, std::memory_order_relaxed);
+        moe_profile_log(
+            "prefix_decode_reuse",
+            "id=%llu prompt=%u position=%u token=%d committed=%u",
+            (unsigned long long)generation_scope.id,
+            input_token_count,
+            scratch.position,
+            cached_first_token,
+            engine->prefix_kv_cache_committed_tokens.load(std::memory_order_relaxed));
+    }
     // Decode: generate new tokens
     for (; produced < max_new_tokens; ++produced) {
         const uint64_t decode_start_us = moe_profile_now_us();
@@ -652,7 +703,7 @@ int moe_pc_engine_generate_token_ids(
         std::vector<int32_t> committed;
         committed.reserve(committed_tokens);
         for (uint32_t i = 0; i < input_token_count; ++i) {
-            committed.push_back(input_token_ids[i]);
+            committed.push_back(safe_full_input[i]);
         }
         for (uint32_t i = 0; i < committed_generated; ++i) {
             committed.push_back((int32_t)out_token_ids[i]);
