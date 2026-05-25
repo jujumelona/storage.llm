@@ -83,6 +83,7 @@ static void moe_engine_reset_storage_execution_state(moe_pc_engine* engine) {
     engine->storage_expert_view_offsets.clear();
     engine->storage_expert_view_indices.clear();
     engine->storage_expert_prefetch_epoch.clear();
+    engine->storage_expert_prefetched_once.clear();
     engine->storage_expert_index_ready.store(0, std::memory_order_relaxed);
     engine->storage_expert_index_entry_count.store(0, std::memory_order_relaxed);
     engine->storage_expert_index_view_count.store(0, std::memory_order_relaxed);

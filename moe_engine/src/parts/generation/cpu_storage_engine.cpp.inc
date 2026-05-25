@@ -891,6 +891,7 @@ static void moe_storage_io_build_expert_index(moe_pc_engine* engine) {
 
     engine->storage_expert_view_offsets.assign(bucket_count + 1u, 0u);
     engine->storage_expert_prefetch_epoch.assign(bucket_count, 0u);
+    engine->storage_expert_prefetched_once.assign(bucket_count, 0u);
     engine->storage_expert_view_indices.clear();
     uint64_t nonempty = 0;
     uint64_t view_count = 0;
@@ -1465,6 +1466,8 @@ static void moe_cpu_storage_after_router_selected(
             experts > 0 && (uint32_t)layer < layers &&
             engine->storage_expert_view_offsets.size() >= (size_t)layers * ((size_t)experts + 0u);
         if (indexed) {
+            static const int prefetch_each_expert_bucket_once =
+                moe_cpu_storage_env_enabled_default_on("STORAGELLM_STORAGE_EXPERT_PREFETCH_ONCE");
             for (const int expert_id : selected_experts) {
                 if (expert_id < 0 || (uint32_t)expert_id >= experts) continue;
                 const size_t b = (size_t)(uint32_t)layer * (size_t)experts + (uint32_t)expert_id;
@@ -1473,8 +1476,16 @@ static void moe_cpu_storage_after_router_selected(
                 bool duplicate_bucket = false;
                 {
                     std::lock_guard<std::mutex> lock(engine->storage_expert_prefetch_mutex);
+                    if (prefetch_each_expert_bucket_once &&
+                        b < engine->storage_expert_prefetched_once.size()) {
+                        if (engine->storage_expert_prefetched_once[b]) {
+                            duplicate_bucket = true;
+                        } else {
+                            engine->storage_expert_prefetched_once[b] = 1u;
+                        }
+                    }
                     if (b < engine->storage_expert_prefetch_epoch.size()) {
-                        if (engine->storage_expert_prefetch_epoch[b] == epoch) {
+                        if (!duplicate_bucket && engine->storage_expert_prefetch_epoch[b] == epoch) {
                             duplicate_bucket = true;
                         } else {
                             engine->storage_expert_prefetch_epoch[b] = epoch;

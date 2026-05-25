@@ -592,6 +592,7 @@ std::atomic<uint64_t> storage_selected_expert_prefetch_bytes{0};
 // A token can ask for the same (layer, expert) through multiple hooks; do not
 // repeat fadvise/readahead/madvise for the same storage bucket in one epoch.
 std::vector<uint32_t> storage_expert_prefetch_epoch;
+std::vector<uint8_t> storage_expert_prefetched_once;
 mutable std::mutex storage_expert_prefetch_mutex;
 std::atomic<uint64_t> storage_selected_expert_duplicate_skips{0};
 std::atomic<int> storage_format_plan_available{0};
