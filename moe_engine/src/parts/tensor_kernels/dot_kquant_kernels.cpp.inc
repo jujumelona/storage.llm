@@ -238,7 +238,10 @@ static int moe_dot_gguf_q5_1_four_rows(
         const moe_q5_high_mask_table_t& kQ5HighMask = moe_q5_high_mask_table();
         const __m128i nibble_mask = _mm_set1_epi8(0x0f);
         const uint8_t* rows[4] = { packed0, packed1, packed2, packed3 };
-        float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        __m256 vacc[4] = {
+            _mm256_setzero_ps(), _mm256_setzero_ps(),
+            _mm256_setzero_ps(), _mm256_setzero_ps()
+        };
         for (uint32_t start = 0; start < cols; start += block_cols) {
             const __m256 x0 = _mm256_loadu_ps(x + start);
             const __m256 x1 = _mm256_loadu_ps(x + start + 8u);
@@ -261,27 +264,29 @@ static int moe_dot_gguf_q5_1_four_rows(
                 const uint8_t* qs = rows[r] + 8u;
                 const __m128i q0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs));
                 const __m128i q1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + 8u));
-                __m256 vacc = _mm256_setzero_ps();
-                vacc = moe_madd_ps(
+                vacc[r] = moe_madd_ps(
                     moe_q5_1_values8_avx2(_mm_and_si128(q0, nibble_mask), kQ5HighMask.masks[(qh >> 0u) & 0xffu], vd, vm),
                     x0,
-                    vacc);
-                vacc = moe_madd_ps(
+                    vacc[r]);
+                vacc[r] = moe_madd_ps(
                     moe_q5_1_values8_avx2(_mm_and_si128(q1, nibble_mask), kQ5HighMask.masks[(qh >> 8u) & 0xffu], vd, vm),
                     x1,
-                    vacc);
-                vacc = moe_madd_ps(
+                    vacc[r]);
+                vacc[r] = moe_madd_ps(
                     moe_q5_1_values8_avx2(_mm_and_si128(_mm_srli_epi16(q0, 4), nibble_mask), kQ5HighMask.masks[(qh >> 16u) & 0xffu], vd, vm),
                     x2,
-                    vacc);
-                vacc = moe_madd_ps(
+                    vacc[r]);
+                vacc[r] = moe_madd_ps(
                     moe_q5_1_values8_avx2(_mm_and_si128(_mm_srli_epi16(q1, 4), nibble_mask), kQ5HighMask.masks[(qh >> 24u) & 0xffu], vd, vm),
                     x3,
-                    vacc);
-                acc[r] += moe_dot_hsum256_ps(vacc);
+                    vacc[r]);
                 rows[r] += block_bytes;
             }
         }
+        const float acc[4] = {
+            moe_dot_hsum256_ps(vacc[0]), moe_dot_hsum256_ps(vacc[1]),
+            moe_dot_hsum256_ps(vacc[2]), moe_dot_hsum256_ps(vacc[3])
+        };
         *out0 = acc[0];
         *out1 = acc[1];
         *out2 = acc[2];
