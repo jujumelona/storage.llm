@@ -713,6 +713,71 @@ static inline void moe_qkv_scale_f32_local(float* values, float scale, uint32_t 
     }
 }
 
+static int moe_qkv_dequant_cached_rows(
+    qkv_state_t* slot,
+    const qkv_config_t* cfg,
+    uint32_t token,
+    uint32_t head_dim,
+    int qjl,
+    float** key,
+    float** value
+) {
+    if (!slot || !cfg || !key || !value || token >= (uint32_t)slot->n_tokens ||
+        head_dim == 0 || head_dim > 16384u) {
+        return 0;
+    }
+    if (!slot->k_dequant_cache || !slot->v_dequant_cache || !slot->dequant_valid) {
+        const size_t elems = (size_t)slot->n_tokens * (size_t)head_dim;
+        if (slot->n_tokens <= 0 || elems / (size_t)head_dim != (size_t)slot->n_tokens) {
+            return 0;
+        }
+        slot->k_dequant_cache = (float*)std::malloc(elems * sizeof(float));
+        slot->v_dequant_cache = (float*)std::malloc(elems * sizeof(float));
+        slot->dequant_valid = (uint8_t*)std::calloc((size_t)slot->n_tokens, 1);
+        if (!slot->k_dequant_cache || !slot->v_dequant_cache || !slot->dequant_valid) {
+            free(slot->k_dequant_cache);
+            free(slot->v_dequant_cache);
+            free(slot->dequant_valid);
+            slot->k_dequant_cache = nullptr;
+            slot->v_dequant_cache = nullptr;
+            slot->dequant_valid = nullptr;
+            return 0;
+        }
+    }
+    float* k_row = slot->k_dequant_cache + (size_t)token * (size_t)head_dim;
+    float* v_row = slot->v_dequant_cache + (size_t)token * (size_t)head_dim;
+    if (!slot->dequant_valid[token]) {
+        if (!qkv_dequant_one(
+                slot,
+                cfg,
+                slot->k_idx,
+                slot->k_qjl,
+                slot->k_residual_norms,
+                slot->k_norms,
+                (int)token,
+                slot->k_bits,
+                qjl,
+                k_row) ||
+            !qkv_dequant_one(
+                slot,
+                cfg,
+                slot->v_idx,
+                slot->v_qjl,
+                slot->v_residual_norms,
+                slot->v_norms,
+                (int)token,
+                slot->v_bits,
+                qjl,
+                v_row)) {
+            return 0;
+        }
+        slot->dequant_valid[token] = 1u;
+    }
+    *key = k_row;
+    *value = v_row;
+    return 1;
+}
+
 static int moe_qkv_make_decode_local_state(
     const qkv_state_t* src,
     uint32_t context_tokens,
@@ -889,6 +954,7 @@ static int moe_pc_engine_attention_decode_layer_head_group_qkv_f32(
             return 0;
         }
     }
+    qkv_state_t* cache_slot = slot;
 
     thread_local moe_qkv_decode_tls_scratch tls;
     try {
@@ -925,32 +991,20 @@ static int moe_pc_engine_attention_decode_layer_head_group_qkv_f32(
             key = local_slot.k_sink + (size_t)t * (size_t)head_dim;
             value = local_slot.v_sink + (size_t)t * (size_t)head_dim;
         } else {
-            if (!qkv_dequant_one(
-                    &local_slot,
+            float* cached_key = nullptr;
+            float* cached_value = nullptr;
+            if (!moe_qkv_dequant_cached_rows(
+                    cache_slot,
                     &qkv_decode_cfg,
-                    local_slot.k_idx,
-                    local_slot.k_qjl,
-                    local_slot.k_residual_norms,
-                    local_slot.k_norms,
-                    (int)t,
-                    local_slot.k_bits,
+                    t,
+                    head_dim,
                     qjl,
-                    tls.batch_key.data()) ||
-                !qkv_dequant_one(
-                    &local_slot,
-                    &qkv_decode_cfg,
-                    local_slot.v_idx,
-                    local_slot.v_qjl,
-                    local_slot.v_residual_norms,
-                    local_slot.v_norms,
-                    (int)t,
-                    local_slot.v_bits,
-                    qjl,
-                    value_buf)) {
+                    &cached_key,
+                    &cached_value)) {
                 return 0;
             }
-            key = tls.batch_key.data();
-            value = value_buf;
+            key = cached_key;
+            value = cached_value;
         }
         for (uint32_t h = 0; h < query_heads; ++h) {
             const float* q = queries + (size_t)h * (size_t)query_stride;

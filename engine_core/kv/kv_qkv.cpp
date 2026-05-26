@@ -458,6 +458,9 @@ int qkv_quantize_token(
     if (dim <= 0 || dim > 16384) {
         return 0;
     }
+    if (state->dequant_valid) {
+        state->dequant_valid[token_idx] = 0;
+    }
     if ((uint32_t)token_idx < state->sink_tokens && state->k_sink && state->v_sink) {
         memcpy(state->k_sink + (size_t)token_idx * (size_t)dim, key, (size_t)dim * sizeof(float));
         memcpy(state->v_sink + (size_t)token_idx * (size_t)dim, value, (size_t)dim * sizeof(float));
