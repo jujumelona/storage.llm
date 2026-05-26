@@ -26,8 +26,20 @@ static constexpr uint32_t moe_MOE_BASE_TOP_EXPERTS = 8u;
 static constexpr uint32_t moe_MOE_TOP_EXPERTS = 12u;
 
 static moe_attn_config_t moe_generation_attn_config(const moe_pc_engine* engine) {
+    static thread_local const moe_pc_engine* tls_engine = nullptr;
+    static thread_local uint64_t tls_generation = 0;
+    static thread_local size_t tls_metadata_size = 0;
+    static thread_local moe_attn_config_t tls_resolved{};
+    static thread_local int tls_resolved_valid = 0;
+    const int config_ready =
+        engine && engine->attn_config_valid.load(std::memory_order_relaxed);
+    if (config_ready && tls_resolved_valid && tls_engine == engine &&
+        tls_generation == engine->engine_generation &&
+        tls_metadata_size == engine->offload_gguf_metadata_json.size()) {
+        return tls_resolved;
+    }
     moe_attn_config_t cfg{};
-    if (engine && engine->attn_config_valid.load(std::memory_order_relaxed)) {
+    if (config_ready) {
         cfg = engine->attn_config;
     }
     if (cfg.type == moe_ATTN_TYPE_UNKNOWN) {
@@ -122,6 +134,13 @@ static moe_attn_config_t moe_generation_attn_config(const moe_pc_engine* engine)
 
     if (!cfg.rope_table_len || cfg.rope_table_len < cfg.max_seq_len) {
         cfg.rope_table_len = std::max<uint32_t>(16384u, cfg.max_seq_len);
+    }
+    if (config_ready) {
+        tls_engine = engine;
+        tls_generation = engine->engine_generation;
+        tls_metadata_size = engine->offload_gguf_metadata_json.size();
+        tls_resolved = cfg;
+        tls_resolved_valid = 1;
     }
     return cfg;
 }
