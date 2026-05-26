@@ -286,6 +286,16 @@ static int moe_storage_io_enabled_default_on(const char* name) {
     return moe_cpu_storage_env_enabled_default_on(name);
 }
 
+static int moe_storage_io_readahead_enabled(const moe_pc_engine* engine) {
+    const std::string configured = moe_autotune_value("STORAGELLM_STORAGE_READAHEAD");
+    if (!configured.empty()) {
+        return moe_cpu_storage_env_enabled_default_on("STORAGELLM_STORAGE_READAHEAD");
+    }
+    // CPU storage reads the mmap pages directly. Issuing readahead in addition
+    // to fadvise/madvise can re-read sparse expert ranges and evict useful pages.
+    return !moe_cpu_storage_runtime_detected(engine);
+}
+
 static uint32_t moe_storage_io_auto_profile_for_model_root(const moe_pc_engine* engine, uint32_t parsed) {
     if (parsed != moe_STORAGE_PROFILE_AUTO || !engine) return parsed;
     const std::string& root = engine->model_root;
@@ -301,7 +311,7 @@ static uint32_t moe_storage_io_auto_profile_for_model_root(const moe_pc_engine* 
     }
     // Most Colab / local model directories in this project are SSD/NVMe-backed.
     // Keep AUTO as NVME-like so storage-required mode gets queue depth and
-    // readahead by default instead of the generic conservative profile.
+    // asynchronous prefetch planning instead of the generic conservative profile.
     if (moe_storage_always_env_enabled()) {
         return moe_STORAGE_PROFILE_NVME;
     }
@@ -742,7 +752,7 @@ static void moe_storage_io_prefetch_range_execute(
             engine->storage_io_fadvise_count.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    if (fd >= 0 && moe_storage_io_enabled_default_on("STORAGELLM_STORAGE_READAHEAD")) {
+    if (fd >= 0 && moe_storage_io_readahead_enabled(engine)) {
         // readahead is stronger than fadvise but still asynchronous enough for
         // SSD/NVMe.  Users can disable it on slow/network filesystems.
         if (readahead(fd, (off64_t)offset, (size_t)bytes) == 0) {
