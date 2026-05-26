@@ -536,13 +536,8 @@
         const int qkv_group_decode =
             qkv_decode && !shared_kv_reuse && v_head_dim == head_dim &&
             num_kv_heads > 0u && num_heads > num_kv_heads;
-        qkv_group_splits = qkv_group_decode
-            ? std::max<uint32_t>(
-                1u,
-                std::min<uint32_t>(
-                    (num_heads + num_kv_heads - 1u) / num_kv_heads,
-                    std::max<uint32_t>(1u, row_hw_threads() / num_kv_heads)))
-            : 1u;
+        // Keep each KV head in one task; splitting it repeats QKV dequant for the same K/V rows.
+        qkv_group_splits = 1u;
         const uint32_t row_count = qkv_group_decode ? num_kv_heads * qkv_group_splits : num_heads;
         const uint32_t head_block_rows =
             ((uint64_t)seq_len * (uint64_t)head_dim >= 1024ull && row_count > 1u) ? 1u : 0u;
