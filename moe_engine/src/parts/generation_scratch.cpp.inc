@@ -92,6 +92,7 @@ struct moe_decode_scratch {
     // Fix 38: kv_decode_buf removed (legacy dead allocation, same pattern as BUGFIX 53)
     std::vector<float> kv_decode_flat;
     std::vector<uint32_t> kv_decoded_up_to;
+    uint32_t kv_decode_stride_tokens = 0;
     uint64_t kv_decode_tracked_ram_bytes = 0;
 };
 
@@ -208,6 +209,7 @@ static void moe_decode_scratch_drop_transient_buffers(moe_pc_engine* engine, moe
     std::vector<float>().swap(s->rope_q_sin);
     std::vector<float>().swap(s->kv_decode_flat);
     std::vector<uint32_t>().swap(s->kv_decoded_up_to);
+    s->kv_decode_stride_tokens = 0;
 }
 
 static int moe_kv_decode_layer_cache_prepare(
@@ -222,7 +224,25 @@ static int moe_kv_decode_layer_cache_prepare(
         return 0;
     }
     const uint32_t entry_dim = s->kv_cache.entry_dim ? s->kv_cache.entry_dim : moe_MLA_KV_ENTRY_DIM;
-    const size_t total_needed = (size_t)s->kv_cache.num_layers * s->kv_cache.max_seq_len * entry_dim;
+    uint32_t needed_stride = decoded_count > 0 ? decoded_count : 1u;
+    if (needed_stride > s->kv_cache.max_seq_len) {
+        needed_stride = s->kv_cache.max_seq_len;
+    }
+    if (needed_stride == 0) {
+        needed_stride = 1u;
+    }
+    const uint32_t stride_chunk = 64u;
+    uint32_t target_stride = (needed_stride + stride_chunk - 1u) & ~(stride_chunk - 1u);
+    if (target_stride < needed_stride) {
+        target_stride = needed_stride;
+    }
+    if (target_stride > s->kv_cache.max_seq_len) {
+        target_stride = s->kv_cache.max_seq_len;
+    }
+    if (target_stride == 0) {
+        target_stride = needed_stride;
+    }
+    const size_t total_needed = (size_t)s->kv_cache.num_layers * target_stride * entry_dim;
 
     // BUGFIX 537: Check total_needed before resize to prevent overflow ★
     // Problem: num_layers * max_seq_len * entry_dim can overflow causing huge allocation
@@ -231,16 +251,38 @@ static int moe_kv_decode_layer_cache_prepare(
         return 0;
     }
 
-    // Fix 33: Reserve full capacity upfront to prevent mid-session realloc+memcpy spikes
-    // With 79 layers × 8192 seq_len × 576 entry_dim, this can be ~1.5GB.
-    // A single reserve() avoids std::vector's 2x growth pattern that peaks at 3GB.
+    // Decode only needs historical tokens that have actually been reached.
+    // Grow the per-layer decoded KV stride in chunks instead of allocating the
+    // full max_seq_len window for every short prompt.
     try {
-        if (s->kv_decode_flat.capacity() < total_needed) {
-            s->kv_decode_flat.reserve(total_needed);
-        }
-        if (s->kv_decode_flat.size() < total_needed) {
-            s->kv_decode_flat.resize(total_needed);
-            s->kv_decoded_up_to.assign(s->kv_cache.num_layers, 0u);
+        if (s->kv_decode_flat.size() < total_needed ||
+            s->kv_decode_stride_tokens < target_stride ||
+            s->kv_decode_stride_tokens == 0) {
+            const uint32_t old_stride = s->kv_decode_stride_tokens;
+            std::vector<float> next;
+            next.resize(total_needed);
+            if (!s->kv_decode_flat.empty() && old_stride > 0 &&
+                s->kv_decoded_up_to.size() == s->kv_cache.num_layers) {
+                for (uint32_t l = 0; l < s->kv_cache.num_layers; ++l) {
+                    uint32_t copy_tokens = s->kv_decoded_up_to[l];
+                    copy_tokens = std::min(copy_tokens, old_stride);
+                    copy_tokens = std::min(copy_tokens, target_stride);
+                    if (copy_tokens == 0) {
+                        continue;
+                    }
+                    const size_t old_off = (size_t)l * old_stride * entry_dim;
+                    const size_t new_off = (size_t)l * target_stride * entry_dim;
+                    std::memcpy(
+                        next.data() + new_off,
+                        s->kv_decode_flat.data() + old_off,
+                        (size_t)copy_tokens * entry_dim * sizeof(float));
+                }
+            }
+            s->kv_decode_flat.swap(next);
+            s->kv_decode_stride_tokens = target_stride;
+            if (s->kv_decoded_up_to.size() != s->kv_cache.num_layers) {
+                s->kv_decoded_up_to.assign(s->kv_cache.num_layers, 0u);
+            }
             moe_kv_decode_cache_track_ram(engine, s);
         }
         if (s->kv_decoded_up_to.size() != s->kv_cache.num_layers) {
@@ -250,12 +292,14 @@ static int moe_kv_decode_layer_cache_prepare(
         moe_kv_decode_cache_release_ram(engine, s);
         std::vector<float>().swap(s->kv_decode_flat);
         std::vector<uint32_t>().swap(s->kv_decoded_up_to);
+        s->kv_decode_stride_tokens = 0;
         moe_engine_signal_memory_pressure_recovery(
             engine, "kv_decode_cache_bad_alloc", (uint64_t)total_needed * sizeof(float));
         return 0;
     }
     *out_start = std::min(s->kv_decoded_up_to[layer], decoded_count);
-    *out_buf = s->kv_decode_flat.data() + (layer * s->kv_cache.max_seq_len * entry_dim);
+    const uint32_t stride = s->kv_decode_stride_tokens ? s->kv_decode_stride_tokens : target_stride;
+    *out_buf = s->kv_decode_flat.data() + ((size_t)layer * stride * entry_dim);
     return 1;
 }
 
@@ -300,6 +344,26 @@ static void moe_rope_table_resize(
     if (cos_table->size() == needed && sin_table->size() == needed) {
         return;
     }
+    struct moe_rope_table_cache_entry {
+        uint32_t dim = 0;
+        uint32_t table_len = 0;
+        float base = 0.0f;
+        std::vector<float> cos;
+        std::vector<float> sin;
+    };
+    static std::mutex rope_cache_mutex;
+    static std::vector<moe_rope_table_cache_entry> rope_cache;
+    {
+        std::lock_guard<std::mutex> lock(rope_cache_mutex);
+        for (const moe_rope_table_cache_entry& entry : rope_cache) {
+            if (entry.dim == dim && entry.table_len == table_len && entry.base == base &&
+                entry.cos.size() == needed && entry.sin.size() == needed) {
+                *cos_table = entry.cos;
+                *sin_table = entry.sin;
+                return;
+            }
+        }
+    }
     cos_table->resize(needed);
     sin_table->resize(needed);
     std::vector<float> freqs(half_dim);
@@ -318,6 +382,19 @@ static void moe_rope_table_resize(
             cos_row[j] = std::cos(theta);
             sin_row[j] = std::sin(theta);
         }
+    }
+    {
+        std::lock_guard<std::mutex> lock(rope_cache_mutex);
+        if (rope_cache.size() > 16u) {
+            rope_cache.erase(rope_cache.begin(), rope_cache.begin() + 4);
+        }
+        moe_rope_table_cache_entry entry{};
+        entry.dim = dim;
+        entry.table_len = table_len;
+        entry.base = base;
+        entry.cos = *cos_table;
+        entry.sin = *sin_table;
+        rope_cache.push_back(std::move(entry));
     }
 }
 
@@ -408,26 +485,7 @@ static int moe_decode_scratch_resize(
         if (!cpu_storage_fast) {
             s->expert_out_pool.resize((size_t)moe_MOE_TOP_EXPERTS * (size_t)hidden);
         }
-        // On first allocation, shrink all vectors to exact capacity to prevent
-        // 2x over-allocation from vector growth and to pack them tightly.
-        if (first_alloc) {
-            s->hidden.shrink_to_fit();
-            s->residual.shrink_to_fit();
-            s->norm.shrink_to_fit();
-            s->attn.shrink_to_fit();
-            s->mlp.shrink_to_fit();
-            s->shared.shrink_to_fit();
-            s->expert.shrink_to_fit();
-            s->gate.shrink_to_fit();
-            s->up.shrink_to_fit();
-            s->expert_gate_pool.shrink_to_fit();
-            s->expert_up_pool.shrink_to_fit();
-            s->expert_out_pool.shrink_to_fit();
-            s->cpu_expert_plan.shrink_to_fit();
-            s->cpu_expert_ready.shrink_to_fit();
-            s->cpu_down_scales.shrink_to_fit();
-            s->cpu_active_expert_indices.shrink_to_fit();
-        }
+        (void)first_alloc;
         moe_rope_table_resize(&s->rope_k_cos, &s->rope_k_sin, cfg.qk_rope_head_dim, cfg.rope_theta, cfg.rope_table_len);
         moe_rope_table_resize(&s->rope_q_cos, &s->rope_q_sin, cfg.qk_rope_head_dim, cfg.rope_theta, cfg.rope_table_len);
     } catch (const std::bad_alloc&) {
@@ -436,7 +494,8 @@ static int moe_decode_scratch_resize(
         moe_engine_signal_memory_pressure_recovery(engine, "decode_scratch_bad_alloc");
         return 0;
     }
-    const int qkv_only_required = engine &&
+    const int qkv_force_plain_ab = moe_qkv_force_plain_ab_enabled();
+    const int qkv_only_required = engine && !qkv_force_plain_ab &&
         (engine->qkv_forced_by_format.load(std::memory_order_acquire) ||
          engine->config.kv_mode == moe_KV_MODE_QKV);
     if (qkv_only_required) {
@@ -474,6 +533,7 @@ static int moe_decode_scratch_resize(
         s->kv_cache.entry_dim = kv_entry_dim;
         s->kv_cache.seq_limit = s->qkv_seq_limit;
         s->kv_decoded_up_to.clear();
+        s->kv_decode_stride_tokens = 0;
         if (engine) {
             engine->qkv_plain_kv_allocation_skips.fetch_add(1, std::memory_order_relaxed);
         }
@@ -494,6 +554,7 @@ static int moe_decode_scratch_resize(
             moe_kv_cache_track_ram(engine, &s->kv_cache);
         }
         s->kv_decoded_up_to.clear();
+        s->kv_decode_stride_tokens = 0;
         s->position = 0;
     }
     return s->hidden.size() >= hidden && s->norm.size() >= hidden && s->kv_cache.data != nullptr;

@@ -21,6 +21,31 @@
         "layer=%d pos=%u q=%d k=%d v=%d o=%d q_norm=%d k_norm=%d ms=%.3f",
         layer, position, has_q, has_k, has_v, has_o, has_q_norm, has_k_norm,
         moe_profile_elapsed_ms(map_start_us));
+    struct moe_attn_stage_diag_accum_t {
+        double map_ms = 0.0;
+        double input_norm_ms = 0.0;
+        double qkv_ms = 0.0;
+        double qkv_norm_ms = 0.0;
+        double rope_ms = 0.0;
+        double kv_ms = 0.0;
+        double append_ms = 0.0;
+        double heads_ms = 0.0;
+        double o_proj_ms = 0.0;
+        double residual_ms = 0.0;
+        double total_ms = 0.0;
+        uint32_t layers = 0;
+    };
+    static const int attn_stage_diag_enabled = []() -> int {
+        const char* v = std::getenv("STORAGELLM_MLP_STAGE_DIAG");
+        return v && v[0] && v[0] != '0';
+    }();
+    static thread_local moe_attn_stage_diag_accum_t attn_stage_diag{};
+    auto attn_diag_add = [&](double* bucket, double elapsed_ms) {
+        if (attn_stage_diag_enabled && bucket) {
+            *bucket += elapsed_ms;
+        }
+    };
+    attn_diag_add(&attn_stage_diag.map_ms, moe_profile_elapsed_ms(map_start_us));
     const uint64_t input_norm_start_us = moe_profile_now_us();
     const int input_norm_supplied = norm_input ? 1 : 0;
     const float* attn_input = norm_input;
@@ -38,6 +63,7 @@
         "layer=%d pos=%u supplied=%d ms=%.3f",
         layer, position, input_norm_supplied,
         moe_profile_elapsed_ms(input_norm_start_us));
+    attn_diag_add(&attn_stage_diag.input_norm_ms, moe_profile_elapsed_ms(input_norm_start_us));
 #ifdef STORAGELLM_PPL_DIAG_ENABLED
     storagellm_ppl_diag_print_vec_stats(
         "attn_input", layer, position, 0, "hidden", hidden, hidden_size);
@@ -187,6 +213,7 @@
         shared_kv_reuse ? 0u : kv_v_dim,
         hidden_size,
         moe_profile_elapsed_ms(qkv_start_us));
+    attn_diag_add(&attn_stage_diag.qkv_ms, moe_profile_elapsed_ms(qkv_start_us));
 #ifdef STORAGELLM_PPL_DIAG_ENABLED
     storagellm_ppl_diag_qkv_block(
         "after_qkv_proj",
@@ -245,6 +272,7 @@
         v_norm_mode != 0 ? 1 : 0,
         v_norm_mode == 2 ? 1 : 0,
         moe_profile_elapsed_ms(qkv_norm_start_us));
+    attn_diag_add(&attn_stage_diag.qkv_norm_ms, moe_profile_elapsed_ms(qkv_norm_start_us));
 #ifdef STORAGELLM_PPL_DIAG_ENABLED
     storagellm_ppl_diag_qkv_block(
         "after_qkv_norm",
@@ -324,6 +352,7 @@
         rope_proportional_freq,
         use_dynamic_rope,
         moe_profile_elapsed_ms(rope_start_us));
+    attn_diag_add(&attn_stage_diag.rope_ms, moe_profile_elapsed_ms(rope_start_us));
 #ifdef STORAGELLM_PPL_DIAG_ENABLED
     storagellm_ppl_diag_qkv_block(
         "after_rope",
@@ -408,6 +437,7 @@
         qkv_capacity_tokens,
         qkv_decode ? 0u : s->kv_cache.max_seq_len,
         moe_profile_elapsed_ms(kv_start_us));
+    attn_diag_add(&attn_stage_diag.kv_ms, moe_profile_elapsed_ms(kv_start_us));
 
     const char* scale_source = nullptr;
     const float scale = moe_standard_attention_score_scale(engine, layer, head_dim, &scale_source);
@@ -516,6 +546,7 @@
             scale_source ? scale_source : "unknown",
             (double)attn_logit_softcap,
             moe_profile_elapsed_ms(qkv_append_start_us));
+        attn_diag_add(&attn_stage_diag.append_ms, moe_profile_elapsed_ms(qkv_append_start_us));
     } else if (qkv_decode && shared_kv_reuse) {
         moe_profile_log(
             "attn_standard_qkv_reuse",
@@ -666,6 +697,7 @@
         scale_source ? scale_source : "unknown",
         (double)attn_logit_softcap,
         moe_profile_elapsed_ms(heads_start_us));
+    attn_diag_add(&attn_stage_diag.heads_ms, moe_profile_elapsed_ms(heads_start_us));
 #ifdef STORAGELLM_PPL_DIAG_ENABLED
     storagellm_ppl_diag_print_vec_stats(
         "after_attention_heads", layer, position, 0, "attn_value_all", s->attn_value.data(), v_total_dim);
@@ -683,6 +715,7 @@
         "layer=%d pos=%u in=%u out=%u ms=%.3f",
         layer, position, v_total_dim, hidden_size,
         moe_profile_elapsed_ms(o_start_us));
+    attn_diag_add(&attn_stage_diag.o_proj_ms, moe_profile_elapsed_ms(o_start_us));
 #ifdef STORAGELLM_PPL_DIAG_ENABLED
     storagellm_ppl_diag_print_vec_stats(
         "after_o_proj", layer, position, 0, "attn_output", s->attn.data(), hidden_size);
@@ -702,6 +735,32 @@
         layer, position, add_residual,
         moe_profile_elapsed_ms(residual_start_us),
         moe_profile_elapsed_ms(total_start_us));
+    if (attn_stage_diag_enabled) {
+        attn_diag_add(&attn_stage_diag.residual_ms, moe_profile_elapsed_ms(residual_start_us));
+        attn_diag_add(&attn_stage_diag.total_ms, moe_profile_elapsed_ms(total_start_us));
+        ++attn_stage_diag.layers;
+        const uint32_t layer_count = engine
+            ? engine->cpu_execution_plan_layers.load(std::memory_order_relaxed)
+            : 0u;
+        if (layer_count > 0u && (uint32_t)(layer + 1) >= layer_count) {
+            std::fprintf(
+                stderr,
+                "[storagellm diag] attn_stage_token layers=%u map_ms=%.3f input_norm_ms=%.3f qkv_ms=%.3f qkv_norm_ms=%.3f rope_ms=%.3f kv_ms=%.3f append_ms=%.3f heads_ms=%.3f o_proj_ms=%.3f residual_ms=%.3f total_ms=%.3f\n",
+                attn_stage_diag.layers,
+                attn_stage_diag.map_ms,
+                attn_stage_diag.input_norm_ms,
+                attn_stage_diag.qkv_ms,
+                attn_stage_diag.qkv_norm_ms,
+                attn_stage_diag.rope_ms,
+                attn_stage_diag.kv_ms,
+                attn_stage_diag.append_ms,
+                attn_stage_diag.heads_ms,
+                attn_stage_diag.o_proj_ms,
+                attn_stage_diag.residual_ms,
+                attn_stage_diag.total_ms);
+            attn_stage_diag = moe_attn_stage_diag_accum_t{};
+        }
+    }
     return 1;
 }
 

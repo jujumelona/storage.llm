@@ -38,6 +38,12 @@ static int moe_cpu_storage_env_enabled_default_on(const char* name) {
     return !(c0 == '0' || c0 == 'f' || c0 == 'F' || c0 == 'n' || c0 == 'N');
 }
 
+static int moe_cpu_storage_decode_layer_prefetch_disabled() {
+    return moe_cpu_storage_env_truthy("STORAGELLM_CPU_DISABLE_DECODE_LAYER_PREFETCH");
+}
+
+static uint64_t moe_cpu_storage_selected_prefetch_wait_ms();
+
 static int moe_storage_max_parallel_env_enabled() {
     return moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_MAX") ||
            moe_cpu_storage_env_truthy("STORAGELLM_MAX_PARALLELISM") ||
@@ -159,6 +165,12 @@ static uint64_t moe_cpu_storage_env_u64_default(const char* name, uint64_t defv)
     const unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
     if (end == value.c_str()) return defv;
     return (uint64_t)parsed;
+}
+
+static uint64_t moe_cpu_storage_selected_prefetch_wait_ms() {
+    return moe_cpu_storage_env_u64_default(
+        "STORAGELLM_CPU_SELECTED_PREFETCH_WAIT_MS",
+        0ull);
 }
 
 static uint64_t moe_cpu_storage_layer_prefetch_budget_bytes() {
@@ -1199,6 +1211,101 @@ static int moe_cpu_storage_fast_view_for_record(
     return 1;
 }
 
+static void moe_cpu_storage_assign_fast_view(
+    const moe_cpu_hot_tensor_view_t& src,
+    moe_tensor_row_fast_view_t* dst
+) {
+    *dst = moe_tensor_row_fast_view_t{};
+    dst->rec = src.rec;
+    dst->shard = src.shard;
+    dst->base = src.base;
+    dst->shard_size = src.shard_size;
+    dst->base_offset = src.base_offset;
+    dst->row_bytes = src.row_bytes;
+    dst->rows = src.rows;
+    dst->cols = src.cols;
+    dst->weight_format = src.weight_format;
+    if (dst->weight_format == moe_WEIGHT_ENCODING_MXFP4) {
+        dst->mxfp4_layout = moe_mxfp4_row_layout_for_bytes(dst->cols, dst->row_bytes);
+        dst->mxfp4_pairwise_order = moe_mxfp4_pairwise_nibble_order_enabled();
+    }
+    dst->simple_dot = moe_cpu_simple_row_dot_for_format(src.weight_format);
+}
+
+static int moe_cpu_storage_fast_expert_triplet(
+    moe_pc_engine* engine,
+    int32_t layer,
+    int32_t expert,
+    uint32_t expected_hidden_cols,
+    const moe_tensor_record** gate_rec,
+    const moe_tensor_record** up_rec,
+    const moe_tensor_record** down_rec,
+    moe_tensor_row_fast_view_t* gate_view,
+    moe_tensor_row_fast_view_t* up_view,
+    moe_tensor_row_fast_view_t* down_view
+) {
+    if (!engine || layer < 0 || expert < 0 || expected_hidden_cols == 0 ||
+        !gate_rec || !up_rec || !down_rec || !gate_view || !up_view || !down_view) {
+        return 0;
+    }
+    if (!engine->cpu_hot_tensor_views_ready.load(std::memory_order_acquire) ||
+        !engine->storage_expert_index_ready.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    const moe_storage_constants_t c = moe_engine_storage_constants_or_static(engine);
+    const uint32_t layers = c.num_hidden_layers ? c.num_hidden_layers : engine->dynamic_shape.num_hidden_layers;
+    const uint32_t experts = c.experts_per_moe_layer ? c.experts_per_moe_layer : engine->dynamic_shape.experts_per_moe_layer;
+    if (layers == 0 || experts == 0 || (uint32_t)layer >= layers || (uint32_t)expert >= experts) {
+        return 0;
+    }
+    const size_t bucket_count = (size_t)layers * (size_t)experts;
+    if (engine->storage_expert_view_offsets.size() < bucket_count + 1u) {
+        return 0;
+    }
+    const size_t bucket = (size_t)(uint32_t)layer * (size_t)experts + (uint32_t)expert;
+    const uint32_t begin = engine->storage_expert_view_offsets[bucket];
+    const uint32_t end = engine->storage_expert_view_offsets[bucket + 1u];
+    if (begin >= end || end > engine->storage_expert_view_indices.size()) {
+        return 0;
+    }
+
+    const moe_cpu_hot_tensor_view_t* gate = nullptr;
+    const moe_cpu_hot_tensor_view_t* up = nullptr;
+    const moe_cpu_hot_tensor_view_t* down = nullptr;
+    for (uint32_t p = begin; p < end; ++p) {
+        const uint32_t view_idx = engine->storage_expert_view_indices[p];
+        if (view_idx >= engine->cpu_hot_tensor_views.size()) continue;
+        const moe_cpu_hot_tensor_view_t& view = engine->cpu_hot_tensor_views[view_idx];
+        if (!view.ready || !view.rec || !view.base || !view.shard) continue;
+        const moe_tensor_record& rec = *view.rec;
+        if ((int32_t)rec.info.layer != layer || (int32_t)rec.info.expert != expert) continue;
+        if (rec.info.proj == moe_PROJ_GATE) {
+            gate = &view;
+        } else if (rec.info.proj == moe_PROJ_UP) {
+            up = &view;
+        } else if (rec.info.proj == moe_PROJ_DOWN) {
+            down = &view;
+        }
+    }
+    if (!gate || !up || !down || !gate->rec || !up->rec || !down->rec) {
+        return 0;
+    }
+    if (gate->cols != expected_hidden_cols || up->cols != expected_hidden_cols ||
+        gate->rows == 0 || gate->rows != up->rows ||
+        down->rows != expected_hidden_cols || down->cols != gate->rows) {
+        return 0;
+    }
+
+    *gate_rec = gate->rec;
+    *up_rec = up->rec;
+    *down_rec = down->rec;
+    moe_cpu_storage_assign_fast_view(*gate, gate_view);
+    moe_cpu_storage_assign_fast_view(*up, up_view);
+    moe_cpu_storage_assign_fast_view(*down, down_view);
+    engine->cpu_hot_tensor_reused.fetch_add(3, std::memory_order_relaxed);
+    return 1;
+}
+
 static uint32_t moe_cpu_storage_layer_lookahead_depth(const moe_pc_engine* engine, uint32_t layers);
 static void moe_cpu_storage_startup_prefetch_first_layers(moe_pc_engine* engine);
 
@@ -1404,6 +1511,9 @@ static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, c
     engine->cpu_layer_begin_count.fetch_add(1, std::memory_order_relaxed);
     const uint32_t depth = moe_cpu_storage_layer_lookahead_depth(engine, c->num_hidden_layers);
     const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
+    if (phase != moe_GEN_PHASE_PREFILL && moe_cpu_storage_decode_layer_prefetch_disabled()) {
+        return;
+    }
     if (phase != moe_GEN_PHASE_PREFILL) {
         std::vector<int> previous_token_experts;
         {
@@ -1429,29 +1539,10 @@ static void moe_cpu_storage_begin_layer(moe_pc_engine* engine, uint32_t layer, c
         if (phase == moe_GEN_PHASE_PREFILL) {
             moe_pc_engine_prefetch_moe_lookahead(engine, (int)next, nullptr, 0, nullptr, 0);
         }
-        // During decode, co-activation history gives a generic, format-derived
-        // next-layer expert hint. Submit it from layer-begin so storage I/O can
-        // overlap attention/router instead of arriving after same-layer top-k.
-        std::vector<int> predicted;
-        if (phase != moe_GEN_PHASE_PREFILL && next > 0 &&
-            engine->io_config.enable_lookahead_prefetch &&
-            moe_layer_is_moe_runtime(engine, c, (int)next)) {
-            const uint32_t router_top_k = moe_router_top_k_from_metadata_for_layer(
-                engine, (int)next, moe_MOE_BASE_TOP_EXPERTS, c->experts_per_moe_layer);
-            const uint32_t predict_limit = std::min<uint32_t>(
-                c->experts_per_moe_layer,
-                std::max<uint32_t>(1u, router_top_k) * 2u);
-            predicted = moe_juju_predict_co_activation(engine, (int)next, (int)predict_limit);
-        }
-        if (!predicted.empty()) {
-            moe_pc_engine_prefetch_moe_lookahead(
-                engine,
-                (int)next - 1,
-                nullptr,
-                0,
-                predicted.data(),
-                (uint32_t)predicted.size());
-        }
+        // During decode, selected experts are hinted from their indexed mmap
+        // views immediately after router top-k is known.  Submitting predicted
+        // experts through the generic path here materializes a duplicate RAM
+        // expert cache and adds memory pressure to direct-view execution.
         engine->cpu_prefetch_scheduled.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -1469,12 +1560,14 @@ static void moe_cpu_storage_after_router_selected(
     // scanning every tensor/view for every selected expert on the token hot path.
     if (engine->cpu_hot_tensor_views_ready.load(std::memory_order_acquire)) {
         uint64_t bytes = 0;
+        const uint64_t completed_before =
+            engine->storage_async_prefetch_completed.load(std::memory_order_relaxed);
         const moe_storage_constants_t c = moe_engine_storage_constants_or_static(engine);
         const uint32_t layers = c.num_hidden_layers ? c.num_hidden_layers : engine->dynamic_shape.num_hidden_layers;
         const uint32_t experts = c.experts_per_moe_layer ? c.experts_per_moe_layer : engine->dynamic_shape.experts_per_moe_layer;
         const bool indexed = engine->storage_expert_index_ready.load(std::memory_order_acquire) &&
             experts > 0 && (uint32_t)layer < layers &&
-            engine->storage_expert_view_offsets.size() >= (size_t)layers * ((size_t)experts + 0u);
+            engine->storage_expert_view_offsets.size() >= (size_t)layers * (size_t)experts + 1u;
         if (indexed) {
             static const int prefetch_each_expert_bucket_once =
                 moe_cpu_storage_env_truthy("STORAGELLM_STORAGE_EXPERT_PREFETCH_ONCE");
@@ -1532,6 +1625,14 @@ static void moe_cpu_storage_after_router_selected(
             }
         }
         engine->storage_selected_expert_prefetch_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        const uint64_t selected_wait_ms = moe_cpu_storage_selected_prefetch_wait_ms();
+        if (selected_wait_ms > 0 && bytes > 0) {
+            const uint64_t target_completed =
+                engine->storage_async_prefetch_enqueued.load(std::memory_order_relaxed);
+            if (target_completed > completed_before) {
+                moe_storage_async_prefetch_wait_completed(engine, target_completed, selected_wait_ms);
+            }
+        }
     }
     engine->cpu_selected_expert_prefetch_scheduled.fetch_add(1, std::memory_order_relaxed);
 }

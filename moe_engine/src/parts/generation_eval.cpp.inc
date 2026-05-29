@@ -151,7 +151,6 @@ static int moe_eval_layer_first_forward_all_f32(
             moe_kv_cache_track_ram(engine, &scratch->kv_cache);
         }
     }
-
     engine->generation_phase.store(moe_GEN_PHASE_PREFILL, std::memory_order_relaxed);
     for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
         const uint64_t layer_start_us = moe_profile_now_us();
@@ -510,6 +509,8 @@ int moe_pc_engine_eval_token_ids_from(
         input_token_count > eval_ids_limit ? " truncated=1" : "");
     const uint64_t eval_start_us = moe_profile_now_us();
     moe_decode_scratch scratch;
+    moe_qkv_force_plain_ab_scope_t eval_plain_kv_scope(
+        moe_eval_uses_plain_kv_for_ppl_default());
     const int eval_qkv_only = moe_engine_qkv_only_required(engine);
     if (eval_qkv_only) {
         engine->qkv_ppl_qkv_only_evals.fetch_add(1, std::memory_order_relaxed);
@@ -538,7 +539,7 @@ int moe_pc_engine_eval_token_ids_from(
         attn_cfg.rope_table_len,
         moe_attn_kv_entry_dim(attn_cfg),
         pre_allocate_kv,
-        (engine->config.kv_mode == moe_KV_MODE_QKV && qkv_is_enabled()) ? "qkv_contract" : "plain_kv_cache");
+        eval_qkv_only ? "qkv_contract" : "plain_kv_cache");
     // BUGFIX 563: Check moe_decode_scratch_resize success ★
     // Problem: moe_decode_scratch_resize can fail on allocation
     // Solution: Check return value (assuming it returns int)

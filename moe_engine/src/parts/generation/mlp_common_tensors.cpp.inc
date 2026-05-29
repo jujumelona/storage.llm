@@ -61,6 +61,21 @@ static int moe_map_layer_common_tensor(
     return 1;
 }
 
+static int moe_direct4_dot_enabled() {
+    static const int enabled = []() -> int {
+        const char* v = std::getenv("STORAGELLM_DIRECT4_DOT");
+        if (!v || !v[0]) {
+            return 1;
+        }
+        return (std::strcmp(v, "0") != 0 &&
+                std::strcmp(v, "false") != 0 &&
+                std::strcmp(v, "FALSE") != 0 &&
+                std::strcmp(v, "off") != 0 &&
+                std::strcmp(v, "OFF") != 0) ? 1 : 0;
+    }();
+    return enabled;
+}
+
 static int moe_raw_tensor_dot_adjacent_four_rows_direct(
     const moe_raw_tensor_cache_entry& raw,
     uint32_t row,
@@ -88,8 +103,7 @@ static int moe_raw_tensor_dot_adjacent_four_rows_direct(
         moe_dot_gguf_mxfp4_four_rows_with_layout(
             p0, p1, p2, p3, input, input_count,
             mxfp4_layout, mxfp4_pairwise_order, out0, out1, out2, out3);
-        return std::isfinite(*out0) && std::isfinite(*out1) &&
-               std::isfinite(*out2) && std::isfinite(*out3);
+        return 1;
     }
     if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
         return moe_dot_gguf_q8_0_four_rows(
@@ -149,7 +163,64 @@ static int moe_raw_tensor_dot_same_row_two_tensors_direct(
         moe_dot_gguf_mxfp4_two_rows_with_layout(
             gate_row, up_row, input, input_count, gate_layout,
             moe_mxfp4_pairwise_nibble_order_enabled(), out_gate, out_up);
-        return std::isfinite(*out_gate) && std::isfinite(*out_up);
+        return 1;
+    }
+    if (gate_effective_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
+        return moe_dot_gguf_q8_0_two_rows(
+                   gate_row, up_row, input, input_count, out_gate, out_up) &&
+               std::isfinite(*out_gate) && std::isfinite(*out_up);
+    }
+    if (gate_effective_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
+        return moe_dot_gguf_q5_1_two_rows(
+                   gate_row, up_row, input, input_count, out_gate, out_up) &&
+               std::isfinite(*out_gate) && std::isfinite(*out_up);
+    }
+    if (gate_effective_format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
+        return moe_dot_gguf_q5_k_two_rows(
+                   gate_row, up_row, input, input_count, out_gate, out_up) &&
+               std::isfinite(*out_gate) && std::isfinite(*out_up);
+    }
+    return 0;
+}
+
+static int moe_raw_tensor_dot_same_row_two_tensors_direct_prepared(
+    const moe_raw_tensor_cache_entry& gate,
+    const moe_raw_tensor_cache_entry& up,
+    uint32_t row,
+    uint64_t gate_row_bytes,
+    uint64_t up_row_bytes,
+    const float* input,
+    uint32_t input_count,
+    uint8_t gate_effective_format,
+    uint8_t up_effective_format,
+    const moe_mxfp4_row_layout_t& gate_layout,
+    const moe_mxfp4_row_layout_t& up_layout,
+    int mxfp4_pairwise_order,
+    float* out_gate,
+    float* out_up
+) {
+    if (!gate.base || !up.base || !input || !out_gate || !out_up ||
+        gate.math_transposed || up.math_transposed ||
+        gate.cols != input_count || up.cols != input_count ||
+        row >= gate.rows || row >= up.rows ||
+        gate_row_bytes == 0 || up_row_bytes == 0 ||
+        gate.bytes < gate_row_bytes * (uint64_t)gate.rows ||
+        up.bytes < up_row_bytes * (uint64_t)up.rows ||
+        gate_effective_format != up_effective_format) {
+        return 0;
+    }
+    const uint8_t* gate_row = gate.base + (uint64_t)row * gate_row_bytes;
+    const uint8_t* up_row = up.base + (uint64_t)row * up_row_bytes;
+    if (gate_effective_format == moe_WEIGHT_ENCODING_MXFP4) {
+        if (gate_layout.block_cols != up_layout.block_cols ||
+            gate_layout.bytewise_codes != up_layout.bytewise_codes ||
+            gate_layout.block_bytes == 0u || up_layout.block_bytes == 0u) {
+            return 0;
+        }
+        moe_dot_gguf_mxfp4_two_rows_with_layout(
+            gate_row, up_row, input, input_count, gate_layout,
+            mxfp4_pairwise_order, out_gate, out_up);
+        return 1;
     }
     if (gate_effective_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
         return moe_dot_gguf_q8_0_two_rows(
@@ -194,6 +265,7 @@ static int moe_common_linear_f32(
     }
     const uint8_t effective_weight_format = moe_effective_weight_format_for_row_bytes(raw, raw.cols);
     const int direct_four_row =
+        moe_direct4_dot_enabled() &&
         !raw.math_transposed &&
         (effective_weight_format == moe_WEIGHT_ENCODING_MXFP4 ||
          effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0 ||
@@ -255,6 +327,19 @@ static inline float moe_generation_gelu_tanh(float x) {
 }
 
 static inline float moe_generation_gated_activation_cached(int activation_mode, float gate, float up) {
+    static const int strict_finite = []() -> int {
+        const char* v = std::getenv("STORAGELLM_MLP_STRICT_FINITE");
+        return v && v[0] && v[0] != '0';
+    }();
+    if (!strict_finite) {
+        if (activation_mode == 2) {
+            const float k = 0.7978845608028654f;
+            const float inner = k * (gate + 0.044715f * gate * gate * gate);
+            return (0.5f * gate * (1.0f + std::tanh(inner))) * up;
+        }
+        const float activated = (activation_mode == 1 ? moe_generation_gelu(gate) : moe_generation_silu(gate));
+        return activated * up;
+    }
     if (!std::isfinite(gate) || !std::isfinite(up)) {
         return 0.0f;
     }
@@ -275,6 +360,7 @@ static inline float moe_generation_gated_activation_cached(int activation_mode, 
     }
     return result;
 }
+
 static int moe_apply_rmsnorm_common_weight_f32(
     const moe_pc_engine* engine,
     const moe_raw_tensor_cache_entry& raw,
@@ -616,15 +702,20 @@ static int moe_prepare_ple_inputs_f32(
     }
 
     const float projection_scale = 1.0f / std::sqrt((float)c->hidden_size);
-    const int projected_ok = moe_parallel_rows(engine, ple.total_dim, 0, [&](uint32_t row) {
-        float v = moe_raw_tensor_dot_row(ple.model_projection, row, s->hidden.data(), c->hidden_size);
+    if (!moe_common_linear_f32(
+            engine, ple.model_projection, s->hidden.data(), c->hidden_size,
+            s->ple_projected.data(), ple.total_dim)) {
+        return 0;
+    }
+    const int projected_scale_ok = moe_parallel_rows(engine, ple.total_dim, 0, [&](uint32_t row) {
+        float v = s->ple_projected[row];
         if (!std::isfinite(v)) {
             v = 0.0f;
         }
         s->ple_projected[row] = v * projection_scale;
         return 1;
     });
-    if (!projected_ok) {
+    if (!projected_scale_ok) {
         return 0;
     }
     for (uint32_t layer = 0; layer < c->num_hidden_layers; ++layer) {
@@ -644,6 +735,102 @@ static int moe_prepare_ple_inputs_f32(
         "token=%u total_dim=%u layer_dim=%u layers=%u token_embedding=%d token_vocab=%u projection_scale=%.9g ms=%.3f",
         token_id, ple.total_dim, ple.layer_dim, c->num_hidden_layers, ple.has_token_embedding, ple.token_vocab_size,
         (double)projection_scale, moe_profile_elapsed_ms(ple_prepare_start_us));
+    return 1;
+}
+
+static int moe_prepare_batch_ple_inputs_f32(
+    moe_pc_engine* engine,
+    const moe_storage_constants_t* c,
+    moe_decode_scratch* s,
+    const int32_t* token_ids,
+    uint32_t token_count,
+    const float* hidden_rows,
+    uint32_t hidden_size,
+    float eps,
+    std::vector<float>* out_batch_ple_inputs,
+    uint32_t* out_ple_total_dim
+) {
+    if (!engine || !c || !s || !token_ids || !hidden_rows ||
+        !out_batch_ple_inputs || !out_ple_total_dim || hidden_size == 0) {
+        return 0;
+    }
+    out_batch_ple_inputs->clear();
+    *out_ple_total_dim = 0;
+    if (token_count == 0) {
+        return 1;
+    }
+    try {
+        if (s->hidden.size() < hidden_size) {
+            s->hidden.resize(hidden_size);
+        }
+    } catch (const std::bad_alloc&) {
+        return 0;
+    }
+    for (uint32_t t = 0; t < token_count; ++t) {
+        std::memcpy(
+            s->hidden.data(),
+            hidden_rows + (size_t)t * (size_t)hidden_size,
+            (size_t)hidden_size * sizeof(float));
+        if (!moe_prepare_ple_inputs_f32(engine, c, s, (uint32_t)token_ids[t], eps)) {
+            return 0;
+        }
+        if (s->ple_inputs.empty()) {
+            if (*out_ple_total_dim != 0) {
+                return 0;
+            }
+            continue;
+        }
+        if (*out_ple_total_dim == 0) {
+            if (s->ple_inputs.size() > UINT32_MAX) {
+                return 0;
+            }
+            *out_ple_total_dim = (uint32_t)s->ple_inputs.size();
+            try {
+                out_batch_ple_inputs->assign(
+                    (size_t)token_count * (size_t)(*out_ple_total_dim),
+                    0.0f);
+            } catch (const std::bad_alloc&) {
+                return 0;
+            }
+        } else if (s->ple_inputs.size() != (size_t)(*out_ple_total_dim)) {
+            return 0;
+        }
+        std::memcpy(
+            out_batch_ple_inputs->data() + (size_t)t * (size_t)(*out_ple_total_dim),
+            s->ple_inputs.data(),
+            (size_t)(*out_ple_total_dim) * sizeof(float));
+    }
+    return 1;
+}
+
+static int moe_restore_batch_ple_inputs_f32(
+    moe_decode_scratch* s,
+    const std::vector<float>& batch_ple_inputs,
+    uint32_t ple_total_dim,
+    uint32_t token_offset
+) {
+    if (!s) {
+        return 0;
+    }
+    if (ple_total_dim == 0) {
+        return 1;
+    }
+    const size_t offset = (size_t)token_offset * (size_t)ple_total_dim;
+    if (offset > batch_ple_inputs.size() ||
+        (size_t)ple_total_dim > batch_ple_inputs.size() - offset) {
+        return 0;
+    }
+    try {
+        if (s->ple_inputs.size() != (size_t)ple_total_dim) {
+            s->ple_inputs.resize(ple_total_dim);
+        }
+    } catch (const std::bad_alloc&) {
+        return 0;
+    }
+    std::memcpy(
+        s->ple_inputs.data(),
+        batch_ple_inputs.data() + offset,
+        (size_t)ple_total_dim * sizeof(float));
     return 1;
 }
 
@@ -713,6 +900,28 @@ static int moe_layer_has_explicit_ple_contract(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
+    if (!engine || layer < 0) {
+        return 0;
+    }
+    struct ple_contract_cache_entry_t {
+        const moe_pc_engine* engine = nullptr;
+        uint64_t generation = 0;
+        int32_t layer = -1;
+        int value = 0;
+    };
+    static std::mutex cache_mutex;
+    static std::vector<ple_contract_cache_entry_t> cache;
+    const uint64_t generation = engine->engine_generation;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        for (const ple_contract_cache_entry_t& entry : cache) {
+            if (entry.engine == engine &&
+                entry.generation == generation &&
+                entry.layer == layer) {
+                return entry.value;
+            }
+        }
+    }
     static const char* const gate_roles[] = {
         "per_layer_inp_gate",
         "per_layer_input_gate",
@@ -758,7 +967,15 @@ static int moe_layer_has_explicit_ple_contract(
     const int has_norm =
         contract_declares_any(norm_roles, sizeof(norm_roles) / sizeof(norm_roles[0])) ||
         moe_graph_ir_layer_has_op_role_any(engine, layer, norm_roles, sizeof(norm_roles) / sizeof(norm_roles[0]));
-    return has_gate && has_proj && has_norm;
+    const int value = has_gate && has_proj && has_norm;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache.push_back(ple_contract_cache_entry_t{engine, generation, layer, value});
+        if (cache.size() > 4096u) {
+            cache.erase(cache.begin(), cache.begin() + (cache.size() - 4096u));
+        }
+    }
+    return value;
 }
 
 static int moe_map_layer_ple_tensor_role_or_suffix_f32(
@@ -792,6 +1009,63 @@ static int moe_map_layer_ple_tensor_role_or_suffix_f32(
         return 1;
     }
     return moe_map_layer_common_tensor(engine, layer, suffixes, suffix_count, out);
+}
+
+static int moe_map_layer_ple_tensor_cached_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    uint32_t kind,
+    const char* const* roles,
+    size_t role_count,
+    const char* const* suffixes,
+    size_t suffix_count,
+    moe_raw_tensor_cache_entry* out
+) {
+    if (!engine || !out || layer < 0) {
+        return 0;
+    }
+    struct ple_tensor_cache_entry_t {
+        moe_pc_engine* engine = nullptr;
+        uint64_t generation = 0;
+        int32_t layer = -1;
+        uint32_t kind = 0;
+        int ok = 0;
+        moe_raw_tensor_cache_entry raw{};
+    };
+    static std::mutex cache_mutex;
+    static std::vector<ple_tensor_cache_entry_t> cache;
+    const uint64_t generation = engine->engine_generation;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        for (const ple_tensor_cache_entry_t& entry : cache) {
+            if (entry.engine == engine &&
+                entry.generation == generation &&
+                entry.layer == layer &&
+                entry.kind == kind) {
+                if (entry.ok) {
+                    *out = entry.raw;
+                    return 1;
+                }
+                return 0;
+            }
+        }
+    }
+    moe_raw_tensor_cache_entry raw{};
+    const int ok = moe_map_layer_ple_tensor_role_or_suffix_f32(
+        engine, layer, roles, role_count, suffixes, suffix_count, &raw);
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache.push_back(ple_tensor_cache_entry_t{
+            engine, generation, layer, kind, ok, raw});
+        if (cache.size() > 4096u) {
+            cache.erase(cache.begin(), cache.begin() + (cache.size() - 4096u));
+        }
+    }
+    if (!ok) {
+        return 0;
+    }
+    *out = raw;
+    return 1;
 }
 
 static int moe_layer_apply_ple_f32(
@@ -861,12 +1135,14 @@ static int moe_layer_apply_ple_f32(
     };
     moe_raw_tensor_cache_entry gate_raw{};
     moe_raw_tensor_cache_entry proj_raw{};
-    if (!moe_map_layer_ple_tensor_role_or_suffix_f32(
+    if (!moe_map_layer_ple_tensor_cached_f32(
             engine, layer,
+            0u,
             gate_roles, sizeof(gate_roles) / sizeof(gate_roles[0]),
             gate_suffixes, sizeof(gate_suffixes) / sizeof(gate_suffixes[0]), &gate_raw) ||
-        !moe_map_layer_ple_tensor_role_or_suffix_f32(
+        !moe_map_layer_ple_tensor_cached_f32(
             engine, layer,
+            1u,
             proj_roles, sizeof(proj_roles) / sizeof(proj_roles[0]),
             proj_suffixes, sizeof(proj_suffixes) / sizeof(proj_suffixes[0]), &proj_raw)) {
         if (ple_required) {
@@ -1373,23 +1649,28 @@ static int moe_final_norm_f32(
         uint32_t hidden_size = 0;
         moe_raw_tensor_cache_entry raw{};
     };
-    static thread_local std::vector<final_norm_raw_cache_entry> tls_final_norm_cache;
+    static std::mutex final_norm_cache_mutex;
+    static std::vector<final_norm_raw_cache_entry> final_norm_cache;
     const uint64_t generation = engine->engine_generation;
-    for (const final_norm_raw_cache_entry& e : tls_final_norm_cache) {
-        if (e.engine == engine && e.generation == generation && e.hidden_size == hidden_size) {
-            return moe_apply_rmsnorm_common_weight_f32(engine, e.raw, input, hidden_size, output, eps);
+    {
+        std::lock_guard<std::mutex> lock(final_norm_cache_mutex);
+        for (const final_norm_raw_cache_entry& e : final_norm_cache) {
+            if (e.engine == engine && e.generation == generation && e.hidden_size == hidden_size) {
+                return moe_apply_rmsnorm_common_weight_f32(engine, e.raw, input, hidden_size, output, eps);
+            }
         }
     }
     auto cache_final_norm_raw = [&](const moe_raw_tensor_cache_entry& raw) {
-        if (tls_final_norm_cache.size() > 64u) {
-            tls_final_norm_cache.erase(tls_final_norm_cache.begin(), tls_final_norm_cache.begin() + 16);
-        }
         final_norm_raw_cache_entry entry{};
         entry.engine = engine;
         entry.generation = generation;
         entry.hidden_size = hidden_size;
         entry.raw = raw;
-        tls_final_norm_cache.push_back(entry);
+        std::lock_guard<std::mutex> lock(final_norm_cache_mutex);
+        if (final_norm_cache.size() > 64u) {
+            final_norm_cache.erase(final_norm_cache.begin(), final_norm_cache.begin() + 16);
+        }
+        final_norm_cache.push_back(entry);
     };
     std::string graph_name;
     if (moe_graph_ir_tensor_binding_name(engine, "final_norm", &graph_name)) {

@@ -223,11 +223,15 @@ struct moe_cpu_row_pool_t {
 
     void wait() {
         std::unique_lock<std::mutex> lk(mtx);
+        static const uint32_t stale_recover_ms = []() -> uint32_t {
+            const uint32_t env_ms = moe_parse_env_u32("STORAGELLM_CPU_ROW_STALE_RECOVER_MS");
+            return env_ms > 0 ? std::min<uint32_t>(env_ms, 1000u) : 25u;
+        }();
         for (;;) {
             if (pending.load(std::memory_order_acquire) == 0) {
                 return;
             }
-            if (done_cv.wait_for(lk, std::chrono::milliseconds(1), [this]() {
+            if (done_cv.wait_for(lk, std::chrono::milliseconds(stale_recover_ms), [this]() {
                     return pending.load(std::memory_order_acquire) == 0;
                 })) {
                 return;

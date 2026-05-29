@@ -5,6 +5,9 @@
 // explicit and countable.
 
 static int moe_qkv_force_plain_ab_enabled() {
+    if (moe_qkv_force_plain_ab_scope_depth > 0u) {
+        return 1;
+    }
     static int cached = -1;
     if (cached < 0) {
         const char* v = std::getenv("STORAGELLM_QKV_FORCE_PLAIN_AB");
@@ -16,6 +19,46 @@ static int moe_qkv_force_plain_ab_enabled() {
             std::strcmp(v, "OFF") != 0) ? 1 : 0;
     }
     return cached;
+}
+
+struct moe_qkv_force_plain_ab_scope_t {
+    int active = 0;
+    explicit moe_qkv_force_plain_ab_scope_t(int enable) : active(enable ? 1 : 0) {
+        if (active) {
+            ++moe_qkv_force_plain_ab_scope_depth;
+        }
+    }
+    ~moe_qkv_force_plain_ab_scope_t() {
+        if (active && moe_qkv_force_plain_ab_scope_depth > 0u) {
+            --moe_qkv_force_plain_ab_scope_depth;
+        }
+    }
+    moe_qkv_force_plain_ab_scope_t(const moe_qkv_force_plain_ab_scope_t&) = delete;
+    moe_qkv_force_plain_ab_scope_t& operator=(const moe_qkv_force_plain_ab_scope_t&) = delete;
+};
+
+static int moe_eval_uses_plain_kv_for_ppl_default() {
+    static const int enabled = []() -> int {
+        const char* compressed = std::getenv("STORAGELLM_EVAL_COMPRESSED_QKV");
+        if (compressed && compressed[0] &&
+            std::strcmp(compressed, "0") != 0 &&
+            std::strcmp(compressed, "false") != 0 &&
+            std::strcmp(compressed, "FALSE") != 0 &&
+            std::strcmp(compressed, "off") != 0 &&
+            std::strcmp(compressed, "OFF") != 0) {
+            return 0;
+        }
+        const char* exact = std::getenv("STORAGELLM_EVAL_PLAIN_KV");
+        if (!exact || !exact[0]) {
+            return 1;
+        }
+        return (std::strcmp(exact, "0") != 0 &&
+                std::strcmp(exact, "false") != 0 &&
+                std::strcmp(exact, "FALSE") != 0 &&
+                std::strcmp(exact, "off") != 0 &&
+                std::strcmp(exact, "OFF") != 0) ? 1 : 0;
+    }();
+    return enabled;
 }
 
 static int moe_engine_qkv_only_required(const moe_pc_engine* engine) {

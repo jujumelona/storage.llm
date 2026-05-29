@@ -955,6 +955,145 @@ static inline int moe_mxfp4_dot_four_rows_accum_avx2(
     *out3 = moe_dot_hsum256_ps(acc3) + tail3;
     return 1;
 }
+
+static inline int moe_mxfp4_dot_two_views_four_rows_accum_avx2(
+    const uint8_t* gate0,
+    const uint8_t* gate1,
+    const uint8_t* gate2,
+    const uint8_t* gate3,
+    const uint8_t* up0,
+    const uint8_t* up1,
+    const uint8_t* up2,
+    const uint8_t* up3,
+    const float* x,
+    uint32_t cols,
+    const moe_mxfp4_row_layout_t& layout,
+    int pairwise_order,
+    float* out_g0,
+    float* out_g1,
+    float* out_g2,
+    float* out_g3,
+    float* out_u0,
+    float* out_u1,
+    float* out_u2,
+    float* out_u3
+) {
+    if (!gate0 || !gate1 || !gate2 || !gate3 || !up0 || !up1 || !up2 || !up3 || !x ||
+        !out_g0 || !out_g1 || !out_g2 || !out_g3 ||
+        !out_u0 || !out_u1 || !out_u2 || !out_u3 || pairwise_order) {
+        return 0;
+    }
+    const int standard_32 = (layout.block_cols == 32u && !layout.bytewise_codes);
+    const int bytewise_16 = (layout.block_cols == 16u && layout.bytewise_codes);
+    if (!standard_32 && !bytewise_16) {
+        return 0;
+    }
+
+    __m256 gacc0 = _mm256_setzero_ps();
+    __m256 gacc1 = _mm256_setzero_ps();
+    __m256 gacc2 = _mm256_setzero_ps();
+    __m256 gacc3 = _mm256_setzero_ps();
+    __m256 uacc0 = _mm256_setzero_ps();
+    __m256 uacc1 = _mm256_setzero_ps();
+    __m256 uacc2 = _mm256_setzero_ps();
+    __m256 uacc3 = _mm256_setzero_ps();
+    float gtail0 = 0.0f, gtail1 = 0.0f, gtail2 = 0.0f, gtail3 = 0.0f;
+    float utail0 = 0.0f, utail1 = 0.0f, utail2 = 0.0f, utail3 = 0.0f;
+    const float* table = moe_mxfp4_value_table();
+    uint32_t start = 0;
+    while (start + layout.block_cols <= cols) {
+        const __m256 gs0 = _mm256_set1_ps(moe_e8m0_to_f32_half(gate0[0]));
+        const __m256 gs1 = _mm256_set1_ps(moe_e8m0_to_f32_half(gate1[0]));
+        const __m256 gs2 = _mm256_set1_ps(moe_e8m0_to_f32_half(gate2[0]));
+        const __m256 gs3 = _mm256_set1_ps(moe_e8m0_to_f32_half(gate3[0]));
+        const __m256 us0 = _mm256_set1_ps(moe_e8m0_to_f32_half(up0[0]));
+        const __m256 us1 = _mm256_set1_ps(moe_e8m0_to_f32_half(up1[0]));
+        const __m256 us2 = _mm256_set1_ps(moe_e8m0_to_f32_half(up2[0]));
+        const __m256 us3 = _mm256_set1_ps(moe_e8m0_to_f32_half(up3[0]));
+        const uint8_t* gq0 = gate0 + 1u;
+        const uint8_t* gq1 = gate1 + 1u;
+        const uint8_t* gq2 = gate2 + 1u;
+        const uint8_t* gq3 = gate3 + 1u;
+        const uint8_t* uq0 = up0 + 1u;
+        const uint8_t* uq1 = up1 + 1u;
+        const uint8_t* uq2 = up2 + 1u;
+        const uint8_t* uq3 = up3 + 1u;
+        const __m256 x0 = _mm256_loadu_ps(x + start);
+        const __m256 x1 = _mm256_loadu_ps(x + start + 8u);
+        gacc0 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq0, 0), gs0), x0, gacc0);
+        gacc1 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq1, 0), gs1), x0, gacc1);
+        gacc2 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq2, 0), gs2), x0, gacc2);
+        gacc3 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq3, 0), gs3), x0, gacc3);
+        uacc0 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq0, 0), us0), x0, uacc0);
+        uacc1 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq1, 0), us1), x0, uacc1);
+        uacc2 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq2, 0), us2), x0, uacc2);
+        uacc3 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq3, 0), us3), x0, uacc3);
+        gacc0 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq0 + 8u, 0), gs0), x1, gacc0);
+        gacc1 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq1 + 8u, 0), gs1), x1, gacc1);
+        gacc2 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq2 + 8u, 0), gs2), x1, gacc2);
+        gacc3 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq3 + 8u, 0), gs3), x1, gacc3);
+        uacc0 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq0 + 8u, 0), us0), x1, uacc0);
+        uacc1 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq1 + 8u, 0), us1), x1, uacc1);
+        uacc2 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq2 + 8u, 0), us2), x1, uacc2);
+        uacc3 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq3 + 8u, 0), us3), x1, uacc3);
+        if (standard_32) {
+            const __m256 x2 = _mm256_loadu_ps(x + start + 16u);
+            const __m256 x3 = _mm256_loadu_ps(x + start + 24u);
+            gacc0 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq0, 1), gs0), x2, gacc0);
+            gacc1 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq1, 1), gs1), x2, gacc1);
+            gacc2 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq2, 1), gs2), x2, gacc2);
+            gacc3 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq3, 1), gs3), x2, gacc3);
+            uacc0 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq0, 1), us0), x2, uacc0);
+            uacc1 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq1, 1), us1), x2, uacc1);
+            uacc2 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq2, 1), us2), x2, uacc2);
+            uacc3 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq3, 1), us3), x2, uacc3);
+            gacc0 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq0 + 8u, 1), gs0), x3, gacc0);
+            gacc1 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq1 + 8u, 1), gs1), x3, gacc1);
+            gacc2 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq2 + 8u, 1), gs2), x3, gacc2);
+            gacc3 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(gq3 + 8u, 1), gs3), x3, gacc3);
+            uacc0 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq0 + 8u, 1), us0), x3, uacc0);
+            uacc1 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq1 + 8u, 1), us1), x3, uacc1);
+            uacc2 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq2 + 8u, 1), us2), x3, uacc2);
+            uacc3 = moe_madd_ps(_mm256_mul_ps(moe_mxfp4_lookup8_fast(uq3 + 8u, 1), us3), x3, uacc3);
+        }
+        start += layout.block_cols;
+        gate0 += layout.block_bytes; gate1 += layout.block_bytes;
+        gate2 += layout.block_bytes; gate3 += layout.block_bytes;
+        up0 += layout.block_bytes; up1 += layout.block_bytes;
+        up2 += layout.block_bytes; up3 += layout.block_bytes;
+    }
+    while (start < cols) {
+        const uint32_t limit = std::min<uint32_t>(layout.block_cols, cols - start);
+        float bg0 = 0.0f, bg1 = 0.0f, bg2 = 0.0f, bg3 = 0.0f;
+        float bu0 = 0.0f, bu1 = 0.0f, bu2 = 0.0f, bu3 = 0.0f;
+        moe_mxfp4_dot_block_two_rows(gate0 + 1u, gate1 + 1u, x, start, limit, layout, table, pairwise_order, &bg0, &bg1);
+        moe_mxfp4_dot_block_two_rows(gate2 + 1u, gate3 + 1u, x, start, limit, layout, table, pairwise_order, &bg2, &bg3);
+        moe_mxfp4_dot_block_two_rows(up0 + 1u, up1 + 1u, x, start, limit, layout, table, pairwise_order, &bu0, &bu1);
+        moe_mxfp4_dot_block_two_rows(up2 + 1u, up3 + 1u, x, start, limit, layout, table, pairwise_order, &bu2, &bu3);
+        gtail0 += bg0 * moe_e8m0_to_f32_half(gate0[0]);
+        gtail1 += bg1 * moe_e8m0_to_f32_half(gate1[0]);
+        gtail2 += bg2 * moe_e8m0_to_f32_half(gate2[0]);
+        gtail3 += bg3 * moe_e8m0_to_f32_half(gate3[0]);
+        utail0 += bu0 * moe_e8m0_to_f32_half(up0[0]);
+        utail1 += bu1 * moe_e8m0_to_f32_half(up1[0]);
+        utail2 += bu2 * moe_e8m0_to_f32_half(up2[0]);
+        utail3 += bu3 * moe_e8m0_to_f32_half(up3[0]);
+        start += limit;
+        gate0 += layout.block_bytes; gate1 += layout.block_bytes;
+        gate2 += layout.block_bytes; gate3 += layout.block_bytes;
+        up0 += layout.block_bytes; up1 += layout.block_bytes;
+        up2 += layout.block_bytes; up3 += layout.block_bytes;
+    }
+    *out_g0 = moe_dot_hsum256_ps(gacc0) + gtail0;
+    *out_g1 = moe_dot_hsum256_ps(gacc1) + gtail1;
+    *out_g2 = moe_dot_hsum256_ps(gacc2) + gtail2;
+    *out_g3 = moe_dot_hsum256_ps(gacc3) + gtail3;
+    *out_u0 = moe_dot_hsum256_ps(uacc0) + utail0;
+    *out_u1 = moe_dot_hsum256_ps(uacc1) + utail1;
+    *out_u2 = moe_dot_hsum256_ps(uacc2) + utail2;
+    *out_u3 = moe_dot_hsum256_ps(uacc3) + utail3;
+    return 1;
+}
 #endif
 
 static inline void moe_mxfp4_dot_block_two_rows(
@@ -1219,6 +1358,55 @@ static void moe_dot_gguf_mxfp4_four_rows_with_layout(
         packed0, packed1, x, cols, active_layout, pairwise_order, out0, out1);
     moe_dot_gguf_mxfp4_two_rows_with_layout(
         packed2, packed3, x, cols, active_layout, pairwise_order, out2, out3);
+}
+
+static void moe_dot_gguf_mxfp4_two_views_four_rows_with_layout(
+    const uint8_t* gate0,
+    const uint8_t* gate1,
+    const uint8_t* gate2,
+    const uint8_t* gate3,
+    const uint8_t* up0,
+    const uint8_t* up1,
+    const uint8_t* up2,
+    const uint8_t* up3,
+    const float* x,
+    uint32_t cols,
+    const moe_mxfp4_row_layout_t& layout,
+    int pairwise_order,
+    float* out_g0,
+    float* out_g1,
+    float* out_g2,
+    float* out_g3,
+    float* out_u0,
+    float* out_u1,
+    float* out_u2,
+    float* out_u3
+) {
+    if (!out_g0 || !out_g1 || !out_g2 || !out_g3 || !out_u0 || !out_u1 || !out_u2 || !out_u3) {
+        return;
+    }
+    if (!gate0 || !gate1 || !gate2 || !gate3 || !up0 || !up1 || !up2 || !up3 || !x || cols == 0) {
+        *out_g0 = 0.0f; *out_g1 = 0.0f; *out_g2 = 0.0f; *out_g3 = 0.0f;
+        *out_u0 = 0.0f; *out_u1 = 0.0f; *out_u2 = 0.0f; *out_u3 = 0.0f;
+        return;
+    }
+    const moe_mxfp4_row_layout_t active_layout =
+        (layout.block_cols != 0u && layout.block_bytes != 0u) ?
+        layout : moe_mxfp4_row_layout_for_bytes(cols, 0ull);
+#if defined(__AVX2__)
+    if (moe_mxfp4_dot_two_views_four_rows_accum_avx2(
+            gate0, gate1, gate2, gate3, up0, up1, up2, up3, x, cols,
+            active_layout, pairwise_order,
+            out_g0, out_g1, out_g2, out_g3, out_u0, out_u1, out_u2, out_u3)) {
+        return;
+    }
+#endif
+    moe_dot_gguf_mxfp4_four_rows_with_layout(
+        gate0, gate1, gate2, gate3, x, cols, active_layout, pairwise_order,
+        out_g0, out_g1, out_g2, out_g3);
+    moe_dot_gguf_mxfp4_four_rows_with_layout(
+        up0, up1, up2, up3, x, cols, active_layout, pairwise_order,
+        out_u0, out_u1, out_u2, out_u3);
 }
 
 static void moe_dot_gguf_mxfp4_two_rows(

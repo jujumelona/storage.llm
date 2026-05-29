@@ -52,6 +52,9 @@ static int moe_graph_ir_map_layer_contract_tensor_role_f32(
 // KV cache (depends on: bf16_convert, mla_constants)
 #include "generation_kv_cache.cpp.inc"
 
+static thread_local uint32_t moe_qkv_force_plain_ab_scope_depth = 0;
+static int moe_qkv_force_plain_ab_enabled();
+
 // Scratch (depends on: kv_cache, mla_constants)
 #include "generation_scratch.cpp.inc"
 
