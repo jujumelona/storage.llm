@@ -1176,6 +1176,13 @@ static uint32_t moe_router_top_k_from_metadata_for_layer(
             result = std::min(fallback, experts ? experts : fallback);
         }
     }
+    static const uint32_t max_active_topk = []() -> uint32_t {
+        const uint32_t v = moe_parse_env_u32("STORAGELLM_ROUTER_MAX_ACTIVE_EXPERTS");
+        return v > 0 ? std::min<uint32_t>(v, 64u) : 0u;
+    }();
+    if (max_active_topk > 0u && result > max_active_topk) {
+        result = std::max<uint32_t>(1u, std::min<uint32_t>(result, max_active_topk));
+    }
     if (tls_cache.size() > 256u) {
         tls_cache.erase(tls_cache.begin(), tls_cache.begin() + 64);
     }
