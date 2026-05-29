@@ -227,7 +227,7 @@ struct moe_cpu_row_pool_t {
             if (pending.load(std::memory_order_acquire) == 0) {
                 return;
             }
-            if (done_cv.wait_for(lk, std::chrono::seconds(2), [this]() {
+            if (done_cv.wait_for(lk, std::chrono::milliseconds(1), [this]() {
                     return pending.load(std::memory_order_acquire) == 0;
                 })) {
                 return;
@@ -247,6 +247,17 @@ struct moe_cpu_row_pool_t {
                 done_cv.notify_all();
                 return;
             }
+        }
+    }
+
+    void cancel_if_idle() {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (pending.load(std::memory_order_acquire) > 0 &&
+            running.load(std::memory_order_acquire) == 0) {
+            active_count = 0;
+            work_fn = nullptr;
+            pending.store(0, std::memory_order_release);
+            done_cv.notify_all();
         }
     }
 
@@ -294,8 +305,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     }
     const int force_tiny_serial =
         trace_label &&
-        ((std::strcmp(trace_label, "attn_qkv_append") == 0 && row_count <= 16u) ||
-         (std::strcmp(trace_label, "attn_heads") == 0 && row_count <= 2u));
+        (std::strcmp(trace_label, "attn_heads") == 0 && row_count <= 2u);
     if (force_tiny_serial) {
         int ok = 1;
         for (uint32_t row = 0; row < row_count; ++row) {
@@ -451,6 +461,9 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
         // Dispatch to persistent pool
         pool.dispatch(run_rows, pool_workers);
         run_rows();  // Main thread participates
+        if (next_row.load(std::memory_order_acquire) >= row_count) {
+            pool.cancel_if_idle();
+        }
         pool.wait();
     } else {
         // Fallback to single-threaded or fork/join if pool not available or busy
