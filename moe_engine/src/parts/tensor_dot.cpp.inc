@@ -655,7 +655,7 @@ static int moe_dot_tensor_fast_view_two_rows(
         a->mxfp4_pairwise_order == b->mxfp4_pairwise_order) {
         moe_dot_gguf_mxfp4_two_rows_with_layout(
             pa, pb, x, a->cols, a->mxfp4_layout, a->mxfp4_pairwise_order, out_a, out_b);
-        return std::isfinite(*out_a) && std::isfinite(*out_b) ? 1 : 0;
+        return 1;
     }
     if (a->weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0 &&
         b->weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
@@ -697,7 +697,7 @@ static int moe_dot_tensor_fast_view_adjacent_rows(
     if (view->weight_format == moe_WEIGHT_ENCODING_MXFP4) {
         moe_dot_gguf_mxfp4_two_rows_with_layout(
             p0, p1, x, view->cols, view->mxfp4_layout, view->mxfp4_pairwise_order, out0, out1);
-        return std::isfinite(*out0) && std::isfinite(*out1) ? 1 : 0;
+        return 1;
     }
     if (view->weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
         return moe_dot_gguf_q8_0_two_rows(
@@ -744,8 +744,7 @@ static int moe_dot_tensor_fast_view_adjacent_four_rows(
         moe_dot_gguf_mxfp4_four_rows_with_layout(
             p0, p1, p2, p3, x, view->cols, view->mxfp4_layout,
             view->mxfp4_pairwise_order, out0, out1, out2, out3);
-        return std::isfinite(*out0) && std::isfinite(*out1) &&
-               std::isfinite(*out2) && std::isfinite(*out3) ? 1 : 0;
+        return 1;
     }
     if (view->weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
         return moe_dot_gguf_q8_0_four_rows(
@@ -769,6 +768,56 @@ static int moe_dot_tensor_fast_view_adjacent_four_rows(
                engine, view, row, x, x_count, out0, out1) &&
            moe_dot_tensor_fast_view_adjacent_rows(
                engine, view, row + 2u, x, x_count, out2, out3);
+}
+
+static int moe_dot_tensor_fast_view_two_views_adjacent_four_rows(
+    moe_pc_engine_t* engine,
+    const moe_tensor_row_fast_view_t* gate,
+    const moe_tensor_row_fast_view_t* up,
+    uint32_t row,
+    const float* x,
+    uint32_t x_count,
+    float* out_g0,
+    float* out_g1,
+    float* out_g2,
+    float* out_g3,
+    float* out_u0,
+    float* out_u1,
+    float* out_u2,
+    float* out_u3
+) {
+    if (!engine || !gate || !up || !out_g0 || !out_g1 || !out_g2 || !out_g3 ||
+        !out_u0 || !out_u1 || !out_u2 || !out_u3 ||
+        gate->cols != up->cols || x_count != gate->cols ||
+        row + 3u >= gate->rows || row + 3u >= up->rows) {
+        return 0;
+    }
+    const uint8_t* g0 = moe_tensor_row_fast_ptr(gate, row);
+    const uint8_t* g1 = moe_tensor_row_fast_ptr(gate, row + 1u);
+    const uint8_t* g2 = moe_tensor_row_fast_ptr(gate, row + 2u);
+    const uint8_t* g3 = moe_tensor_row_fast_ptr(gate, row + 3u);
+    const uint8_t* u0 = moe_tensor_row_fast_ptr(up, row);
+    const uint8_t* u1 = moe_tensor_row_fast_ptr(up, row + 1u);
+    const uint8_t* u2 = moe_tensor_row_fast_ptr(up, row + 2u);
+    const uint8_t* u3 = moe_tensor_row_fast_ptr(up, row + 3u);
+    if (!g0 || !g1 || !g2 || !g3 || !u0 || !u1 || !u2 || !u3) {
+        return 0;
+    }
+    if (gate->weight_format == moe_WEIGHT_ENCODING_MXFP4 &&
+        up->weight_format == moe_WEIGHT_ENCODING_MXFP4 &&
+        gate->mxfp4_layout.block_cols == up->mxfp4_layout.block_cols &&
+        gate->mxfp4_layout.bytewise_codes == up->mxfp4_layout.bytewise_codes &&
+        gate->mxfp4_pairwise_order == up->mxfp4_pairwise_order) {
+        moe_dot_gguf_mxfp4_two_views_four_rows_with_layout(
+            g0, g1, g2, g3, u0, u1, u2, u3, x, gate->cols,
+            gate->mxfp4_layout, gate->mxfp4_pairwise_order,
+            out_g0, out_g1, out_g2, out_g3, out_u0, out_u1, out_u2, out_u3);
+        return 1;
+    }
+    return moe_dot_tensor_fast_view_adjacent_four_rows(
+               engine, gate, row, x, x_count, out_g0, out_g1, out_g2, out_g3) &&
+           moe_dot_tensor_fast_view_adjacent_four_rows(
+               engine, up, row, x, x_count, out_u0, out_u1, out_u2, out_u3);
 }
 
 // ============================================================================

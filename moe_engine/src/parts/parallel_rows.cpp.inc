@@ -292,6 +292,24 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     if (workers > max_blocks) {
         workers = max_blocks;
     }
+    const int force_tiny_serial =
+        trace_label &&
+        ((std::strcmp(trace_label, "attn_qkv_append") == 0 && row_count <= 16u) ||
+         (std::strcmp(trace_label, "attn_heads") == 0 && row_count <= 2u));
+    if (force_tiny_serial) {
+        int ok = 1;
+        for (uint32_t row = 0; row < row_count; ++row) {
+            if (!moe_parallel_rows_call(fn, row)) {
+                ok = 0;
+                break;
+            }
+        }
+        moe_profile_log(
+            "parallel_rows",
+            "label=%s rows=%u block=%u workers=%u mode=tiny_serial ok=%d ms=%.3f",
+            trace_label, row_count, block_rows, workers, ok, moe_profile_elapsed_ms(trace_start_us));
+        return ok;
+    }
     if (!engine || workers <= 1) {
         int ok = 1;
         for (uint32_t row = 0; row < row_count; ++row) {
@@ -349,12 +367,18 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     }
 
 #ifdef _OPENMP
-    static const int use_openmp_rows = moe_parallel_env_truthy("STORAGELLM_USE_OPENMP_ROWS");
+    const char* openmp_rows_env = std::getenv("STORAGELLM_USE_OPENMP_ROWS");
+    const int use_openmp_rows =
+        openmp_rows_env &&
+        moe_parallel_env_truthy("STORAGELLM_USE_OPENMP_ROWS") &&
+        !moe_parallel_env_truthy("STORAGELLM_DISABLE_OPENMP_ROWS");
     if (use_openmp_rows && workers > 1 && row_count >= 64u) {
         std::atomic<int> ok{1};
         const uint32_t block_count = (row_count + block_rows - 1u) / block_rows;
 #pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
         for (int64_t block = 0; block < (int64_t)block_count; ++block) {
+            moe_cpu_enable_fast_fp_mode();
+            moe_cpu_apply_row_worker_qos();
             if (!ok.load(std::memory_order_acquire)) {
                 continue;
             }

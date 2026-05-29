@@ -56,6 +56,16 @@ static int moe_accumulate_branch_checked_f32(
     if (!acc || !branch || hidden_size == 0) {
         return 0;
     }
+    static const int strict_finite = []() -> int {
+        const char* v = std::getenv("STORAGELLM_MLP_STRICT_FINITE");
+        return v && v[0] && v[0] != '0';
+    }();
+    if (!strict_finite) {
+        for (uint32_t i = 0; i < hidden_size; ++i) {
+            acc[i] += branch[i];
+        }
+        return 1;
+    }
     for (uint32_t i = 0; i < hidden_size; ++i) {
         const float v = branch[i];
         if (!std::isfinite(v)) {
@@ -349,13 +359,17 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
         int32_t layer = INT32_MIN;
         moe_graph_ir_mlp_layer_plan_f32 plan{};
     };
-    static thread_local std::vector<mlp_layer_plan_cache_entry> tls_plan_cache;
+    static std::mutex plan_cache_mutex;
+    static std::vector<mlp_layer_plan_cache_entry> plan_cache;
     const uint64_t generation = engine->engine_generation;
-    for (const mlp_layer_plan_cache_entry& entry : tls_plan_cache) {
-        if (entry.engine == engine &&
-            entry.generation == generation &&
-            entry.layer == layer) {
-            return entry.plan;
+    {
+        std::lock_guard<std::mutex> lock(plan_cache_mutex);
+        for (const mlp_layer_plan_cache_entry& entry : plan_cache) {
+            if (entry.engine == engine &&
+                entry.generation == generation &&
+                entry.layer == layer) {
+                return entry.plan;
+            }
         }
     }
     static const char* const routed_tokens[] = {
@@ -456,15 +470,18 @@ static moe_graph_ir_mlp_layer_plan_f32 moe_build_graph_ir_mlp_layer_plan_f32(
         plan.dense.forbid_parallel_with_routed_moe, plan.dense.fallback_only, plan.run_dense,
         dense_uses_shared_path, 0,
         split_dense_branch_by_norm1, plan.post_norm1.present, plan.post_norm1.weight_count);
-    if (tls_plan_cache.size() > 256u) {
-        tls_plan_cache.erase(tls_plan_cache.begin(), tls_plan_cache.begin() + 64);
-    }
     mlp_layer_plan_cache_entry entry{};
     entry.engine = engine;
     entry.generation = generation;
     entry.layer = layer;
     entry.plan = plan;
-    tls_plan_cache.push_back(entry);
+    {
+        std::lock_guard<std::mutex> lock(plan_cache_mutex);
+        if (plan_cache.size() > 256u) {
+            plan_cache.erase(plan_cache.begin(), plan_cache.begin() + 64);
+        }
+        plan_cache.push_back(entry);
+    }
     return plan;
 }
 
@@ -602,6 +619,85 @@ static int moe_layer_router_should_use_raw_residual_f32(
     return 0;
 }
 
+struct moe_router_input_policy_f32 {
+    int has_plausible_input_scale = 0;
+    int has_internal_norm_scale = 0;
+    int has_internal_weight_scale = 0;
+    int sidecar_requires_rms_root = 0;
+    int uses_raw_residual_contract = 0;
+    int uses_raw_residual = 0;
+    int uses_direct_input_scale = 0;
+};
+
+static moe_router_input_policy_f32 moe_layer_router_input_policy_f32(
+    moe_pc_engine* engine,
+    int32_t layer,
+    uint32_t hidden_size
+) {
+    moe_router_input_policy_f32 policy{};
+    if (!engine || layer < 0 || hidden_size == 0) {
+        return policy;
+    }
+    struct router_input_policy_cache_entry {
+        const moe_pc_engine* engine = nullptr;
+        uint64_t generation = 0;
+        int32_t layer = INT32_MIN;
+        uint32_t hidden_size = 0;
+        moe_router_input_policy_f32 policy{};
+    };
+    static std::mutex policy_cache_mutex;
+    static std::vector<router_input_policy_cache_entry> policy_cache;
+    const uint64_t generation = engine->engine_generation;
+    {
+        std::lock_guard<std::mutex> lock(policy_cache_mutex);
+        for (const router_input_policy_cache_entry& entry : policy_cache) {
+            if (entry.engine == engine &&
+                entry.generation == generation &&
+                entry.layer == layer &&
+                entry.hidden_size == hidden_size) {
+                return entry.policy;
+            }
+        }
+    }
+    policy.has_plausible_input_scale =
+        moe_router_has_contract_input_scale_f32(engine, layer, hidden_size);
+    policy.has_internal_norm_scale = policy.has_plausible_input_scale && (
+        moe_router_has_direct_input_scale_contract_f32(engine, layer) ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "router_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "router.input_layernorm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "router.input_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "moe_router_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate_norm.weight") ||
+        moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router_norm.weight"));
+    policy.has_internal_weight_scale =
+        moe_router_has_internal_weight_scale_contract_f32(engine, layer);
+    policy.sidecar_requires_rms_root =
+        moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer);
+    policy.uses_raw_residual_contract =
+        moe_layer_router_uses_raw_residual_input(engine, layer);
+    policy.uses_raw_residual = moe_layer_router_should_use_raw_residual_f32(
+        engine, layer, policy.uses_raw_residual_contract,
+        policy.sidecar_requires_rms_root, policy.has_internal_weight_scale);
+    if (policy.uses_raw_residual_contract && !policy.has_plausible_input_scale) {
+        policy.uses_direct_input_scale =
+            moe_engine_contract_uses_direct_router_input_scale(engine, layer);
+    }
+    router_input_policy_cache_entry entry{};
+    entry.engine = engine;
+    entry.generation = generation;
+    entry.layer = layer;
+    entry.hidden_size = hidden_size;
+    entry.policy = policy;
+    {
+        std::lock_guard<std::mutex> lock(policy_cache_mutex);
+        if (policy_cache.size() > 256u) {
+            policy_cache.erase(policy_cache.begin(), policy_cache.begin() + 64);
+        }
+        policy_cache.push_back(entry);
+    }
+    return policy;
+}
+
 static int moe_layer_moe_mlp_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -610,6 +706,35 @@ static int moe_layer_moe_mlp_f32(
     const moe_storage_constants_t* c
 ) {
     const uint64_t total_start_us = moe_profile_now_us();
+    struct moe_mlp_stage_diag_accum_t {
+        uint64_t branch_setup_us = 0;
+        uint64_t norm_us = 0;
+        uint64_t dense_us = 0;
+        uint64_t shared_us = 0;
+        uint64_t router_us = 0;
+        uint64_t router_contract_us = 0;
+        uint64_t router_topk_us = 0;
+        uint64_t prefetch_us = 0;
+        uint64_t expert_map_us = 0;
+        uint64_t gate_up_us = 0;
+        uint64_t down_tail_us = 0;
+        uint64_t total_us = 0;
+        uint32_t layers = 0;
+    };
+    static const int stage_diag_enabled = []() -> int {
+        const char* v = std::getenv("STORAGELLM_MLP_STAGE_DIAG");
+        return v && v[0] && v[0] != '0';
+    }();
+    static thread_local moe_mlp_stage_diag_accum_t stage_diag{};
+    uint64_t stage_mark_us = total_start_us;
+    auto stage_add_us = [&](uint64_t* bucket) {
+        if (!stage_diag_enabled || !bucket) {
+            return;
+        }
+        const uint64_t now_us = moe_profile_now_us();
+        *bucket += now_us >= stage_mark_us ? now_us - stage_mark_us : 0u;
+        stage_mark_us = now_us;
+    };
     int split_branch_post_norm_contract = 0;
     const char* split_branch_post_norm_source = nullptr;
     const int has_split_branch_post_norm_contract = moe_graph_ir_layer_contract_bool_key_f32(
@@ -680,6 +805,9 @@ static int moe_layer_moe_mlp_f32(
         return 0;
     }
     moe_profile_log("mlp_moe_norm", "layer=%d ok=%d ms=%.3f", layer, moe_norm_ok, moe_profile_elapsed_ms(norm_start_us));
+    if (stage_diag_enabled) {
+        stage_diag.norm_us += moe_profile_now_us() - norm_start_us;
+    }
 
     const moe_graph_ir_mlp_layer_plan_f32 mlp_plan =
         moe_graph_ir_math_required(engine) ?
@@ -716,6 +844,9 @@ static int moe_layer_moe_mlp_f32(
         "mlp_moe_dense_branch",
         "layer=%d enabled=%d ok=%d deferred=1 ms=%.3f",
         layer, dense_enabled, dense_ok, moe_profile_elapsed_ms(dense_start_us));
+    if (stage_diag_enabled) {
+        stage_diag.dense_us += moe_profile_now_us() - dense_start_us;
+    }
 
     const uint64_t shared_bytes =
         2ull * (uint64_t)configured_expert_intermediate * (uint64_t)hidden_size * 2ull +
@@ -798,36 +929,28 @@ static int moe_layer_moe_mlp_f32(
         "layer=%d ok=%d common_enabled=%d common_ok=%d has_raw_span=%d ms=%.3f",
         layer, shared_ok, common_shared_enabled, common_shared_ok,
         shared ? 1 : 0, moe_profile_elapsed_ms(shared_start_us));
+    if (stage_diag_enabled) {
+        stage_diag.shared_us += moe_profile_now_us() - shared_start_us;
+    }
+    stage_add_us(&stage_diag.branch_setup_us);
 
-    const int router_has_plausible_input_scale =
-        moe_router_has_contract_input_scale_f32(engine, layer, hidden_size);
-    const int router_has_internal_norm_scale = router_has_plausible_input_scale && (
-        moe_router_has_direct_input_scale_contract_f32(engine, layer) ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "router_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "router.input_layernorm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "router.input_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "moe_router_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router_norm.weight"));
-    const int router_has_internal_weight_scale =
-        moe_router_has_internal_weight_scale_contract_f32(engine, layer);
-    const int router_sidecar_requires_rms_root =
-        moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer);
-    const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
-    const int router_uses_raw_residual = moe_layer_router_should_use_raw_residual_f32(
-        engine, layer, router_uses_raw_residual_contract,
-        router_sidecar_requires_rms_root, router_has_internal_weight_scale);
-    if (router_uses_raw_residual_contract &&
-        moe_engine_contract_uses_direct_router_input_scale(engine, layer) &&
-        !router_has_plausible_input_scale) {
+    const uint64_t router_contract_start_us = moe_profile_now_us();
+    const moe_router_input_policy_f32 router_policy =
+        moe_layer_router_input_policy_f32(engine, layer, hidden_size);
+    if (router_policy.uses_raw_residual_contract &&
+        router_policy.uses_direct_input_scale &&
+        !router_policy.has_plausible_input_scale) {
         std::fprintf(stderr,
             "[storagellm mlp] split-FFN router input scale is required but could not be mapped layer=%d\n",
             layer);
         return 0;
     }
-    const float* router_input = (router_has_internal_norm_scale || router_uses_raw_residual) ?
+    const float* router_input = (router_policy.has_internal_norm_scale || router_policy.uses_raw_residual) ?
         hidden : expert_input;
     moe_save_gate_input_snapshot(engine, layer, router_input, hidden_size);
+    if (stage_diag_enabled) {
+        stage_diag.router_contract_us += moe_profile_now_us() - router_contract_start_us;
+    }
     const uint64_t router_start_us = moe_profile_now_us();
     if (!moe_router_topk_f32(
             engine,
@@ -875,10 +998,14 @@ static int moe_layer_moe_mlp_f32(
         "mlp_moe_router",
         "layer=%d selected=%zu weights=%zu logits=%zu internal_norm_scale=%d raw_gate_input=%d router_scale_available=%d sidecar_rms_root=%d ms=%.3f",
         layer, s->selected_experts.size(), s->selected_weights.size(),
-        s->router_logits.size(), router_has_internal_norm_scale, router_uses_raw_residual,
-        (router_has_plausible_input_scale || router_has_internal_weight_scale || router_sidecar_requires_rms_root) ? 1 : 0,
-        router_sidecar_requires_rms_root,
+        s->router_logits.size(), router_policy.has_internal_norm_scale, router_policy.uses_raw_residual,
+        (router_policy.has_plausible_input_scale || router_policy.has_internal_weight_scale || router_policy.sidecar_requires_rms_root) ? 1 : 0,
+        router_policy.sidecar_requires_rms_root,
         moe_profile_elapsed_ms(router_start_us));
+    if (stage_diag_enabled) {
+        stage_diag.router_topk_us += moe_profile_now_us() - router_start_us;
+    }
+    stage_add_us(&stage_diag.router_us);
     const uint32_t phase = engine->generation_phase.load(std::memory_order_relaxed);
     const uint64_t prefetch_start_us = moe_profile_now_us();
     if (phase != moe_GEN_PHASE_PREFILL) {
@@ -1022,6 +1149,7 @@ static int moe_layer_moe_mlp_f32(
         engine ? engine->adaptive_prefetch_depth.load(std::memory_order_relaxed) : 0u,
         s ? s->session_adaptive_prefetch_depth : 0u,
         moe_profile_elapsed_ms(prefetch_start_us));
+    stage_add_us(&stage_diag.prefetch_us);
 
 
     // Phase 2: Run experts in parallel with per-expert scratch buffers.
@@ -1111,9 +1239,22 @@ static int moe_layer_moe_mlp_f32(
     uint32_t first_down_rows = 0, first_down_cols = 0;
     const uint64_t map_start_us = moe_profile_now_us();
     for (size_t e = 0; e < num_selected; ++e) {
-        shards[e].gate_rec = find_tensor_record(engine, layer, work[e].expert_id, moe_PROJ_GATE);
-        shards[e].up_rec = find_tensor_record(engine, layer, work[e].expert_id, moe_PROJ_UP);
-        shards[e].down_rec = find_tensor_record(engine, layer, work[e].expert_id, moe_PROJ_DOWN);
+        const int hot_triplet = moe_cpu_storage_fast_expert_triplet(
+            engine,
+            layer,
+            work[e].expert_id,
+            hidden_size,
+            &shards[e].gate_rec,
+            &shards[e].up_rec,
+            &shards[e].down_rec,
+            &shards[e].gate_view,
+            &shards[e].up_view,
+            &shards[e].down_view);
+        if (!hot_triplet) {
+            shards[e].gate_rec = find_tensor_record(engine, layer, work[e].expert_id, moe_PROJ_GATE);
+            shards[e].up_rec = find_tensor_record(engine, layer, work[e].expert_id, moe_PROJ_UP);
+            shards[e].down_rec = find_tensor_record(engine, layer, work[e].expert_id, moe_PROJ_DOWN);
+        }
         if (!shards[e].gate_rec || !shards[e].up_rec || !shards[e].down_rec) {
             ++missing_experts;
             if (first_bad_expert < 0) {
@@ -1172,11 +1313,11 @@ static int moe_layer_moe_mlp_f32(
             down_rows = cand_down_rows;
             down_cols = cand_down_cols;
         }
-        const int hot_gate =
+        const int hot_gate = hot_triplet ? 1 :
             moe_cpu_storage_fast_view_for_record(engine, shards[e].gate_rec, hidden_size, &shards[e].gate_view);
-        const int hot_up =
+        const int hot_up = hot_triplet ? 1 :
             moe_cpu_storage_fast_view_for_record(engine, shards[e].up_rec, hidden_size, &shards[e].up_view);
-        const int hot_down =
+        const int hot_down = hot_triplet ? 1 :
             moe_cpu_storage_fast_view_for_record(engine, shards[e].down_rec, cand_down_cols, &shards[e].down_view);
         if (hot_gate && hot_up && hot_down) {
             shards[e].gate_shard = shards[e].gate_view.shard ? const_cast<mmap_context_t*>(shards[e].gate_view.shard) : nullptr;
@@ -1230,6 +1371,7 @@ static int moe_layer_moe_mlp_f32(
         up_rows, up_cols, (unsigned)up_effective_format,
         down_rows, down_cols, (unsigned)down_effective_format,
         moe_profile_elapsed_ms(map_start_us));
+    stage_add_us(&stage_diag.expert_map_us);
 
     // BUGFIX 문제10: Handle partial expert failures with weight renormalization ?�★
     // Problem: If any expert is missing, entire layer fails (return 0)
@@ -1342,6 +1484,10 @@ static int moe_layer_moe_mlp_f32(
     const uint32_t total_gate_blocks = (uint32_t)num_selected * gate_blocks_per_expert;
     const uint64_t gate_up_start_us = moe_profile_now_us();
     const int activation_mode = moe_engine_gelu_activation_mode(engine);
+    static const int strict_hot_finite = []() -> int {
+        const char* v = std::getenv("STORAGELLM_MLP_STRICT_FINITE");
+        return v && v[0] && v[0] != '0';
+    }();
     std::atomic<int> gate_up_failed{0};
     moe_profile_parallel_label_scope gate_up_rows_label("moe_mlp_gate_up");
     const int gate_up_ok = moe_parallel_rows(engine, total_gate_blocks, 0, [&](uint32_t block_index) {
@@ -1361,14 +1507,42 @@ static int moe_layer_moe_mlp_f32(
         if (row_end > expert_intermediate) {
             row_end = expert_intermediate;
         }
-        for (uint32_t r = row_begin; r < row_end; ++r) {
+        uint32_t r = row_begin;
+        for (; r + 4u <= row_end; r += 4u) {
+            float g0 = 0.0f;
+            float g1 = 0.0f;
+            float g2 = 0.0f;
+            float g3 = 0.0f;
+            float u0 = 0.0f;
+            float u1 = 0.0f;
+            float u2 = 0.0f;
+            float u3 = 0.0f;
+            if (!moe_dot_tensor_fast_view_two_views_adjacent_four_rows(
+                    engine, &shards[e].gate_view, &shards[e].up_view, r,
+                    expert_input, hidden_size, &g0, &g1, &g2, &g3,
+                    &u0, &u1, &u2, &u3)) {
+                gate_up_failed.store(1, std::memory_order_relaxed);
+                return 1;
+            }
+            if (strict_hot_finite &&
+                (!std::isfinite(g0) || !std::isfinite(g1) ||
+                 !std::isfinite(g2) || !std::isfinite(g3) ||
+                 !std::isfinite(u0) || !std::isfinite(u1) ||
+                 !std::isfinite(u2) || !std::isfinite(u3))) {
+                gate_up_failed.store(1, std::memory_order_relaxed);
+                return 1;
+            }
+            work[e].gate[r + 0u] = moe_generation_gated_activation_cached(activation_mode, g0, u0);
+            work[e].gate[r + 1u] = moe_generation_gated_activation_cached(activation_mode, g1, u1);
+            work[e].gate[r + 2u] = moe_generation_gated_activation_cached(activation_mode, g2, u2);
+            work[e].gate[r + 3u] = moe_generation_gated_activation_cached(activation_mode, g3, u3);
+        }
+        for (; r < row_end; ++r) {
             // CPU fast path: gate/up are fused so the hidden vector is read once.
             // Up is consumed immediately and is not written to the scratch pool, which
             // removes one large memory write per selected expert.
             float gate_v = 0.0f;
             float up_v = 0.0f;
-            moe_tensor_row_fast_prefetch(&shards[e].gate_view, r + 1u);
-            moe_tensor_row_fast_prefetch(&shards[e].up_view, r + 1u);
             if (!moe_dot_tensor_fast_view_two_rows(
                     engine, &shards[e].gate_view, &shards[e].up_view, r,
                     expert_input, hidden_size, &gate_v, &up_v)) {
@@ -1376,7 +1550,7 @@ static int moe_layer_moe_mlp_f32(
                 return 1;
             }
             // BUGFIX 850: Check gate/up results for NaN before activation ★★★
-            if (!std::isfinite(gate_v) || !std::isfinite(up_v)) {
+            if (strict_hot_finite && (!std::isfinite(gate_v) || !std::isfinite(up_v))) {
                 gate_up_failed.store(1, std::memory_order_relaxed);
                 return 1;
             }
@@ -1389,6 +1563,7 @@ static int moe_layer_moe_mlp_f32(
         "layer=%d ok=%d activation_mode=%d selected=%zu rows=%u blocks=%u tile=%u hidden=%u intermediate=%u ms=%.3f",
         layer, gate_up_ok, activation_mode, num_selected, total_gate_rows, total_gate_blocks, gate_tile_rows, hidden_size, expert_intermediate,
         moe_profile_elapsed_ms(gate_up_start_us));
+    stage_add_us(&stage_diag.gate_up_us);
     if (!gate_up_ok || gate_up_failed.load(std::memory_order_relaxed)) return 0;
 
     // expert_ready already holds the stable map readiness snapshot.  Gate/up
@@ -1470,7 +1645,6 @@ static int moe_layer_moe_mlp_f32(
                     float v1 = 0.0f;
                     float v2 = 0.0f;
                     float v3 = 0.0f;
-                    moe_tensor_row_fast_prefetch(&shards[e].down_view, row0 + 4u);
                     int dot_ok = 0;
                     if (has_quad) {
                         dot_ok = moe_dot_tensor_fast_view_adjacent_four_rows(
@@ -1486,8 +1660,10 @@ static int moe_layer_moe_mlp_f32(
                         dot_ok = moe_dot_tensor_fast_view_row(
                             engine, &shards[e].down_view, row0, work[e].gate, expert_intermediate, &v0);
                     }
-                    if (!dot_ok || !std::isfinite(v0) || (has_pair && !std::isfinite(v1)) ||
-                        (has_row2 && !std::isfinite(v2)) || (has_quad && !std::isfinite(v3))) {
+                    if (!dot_ok ||
+                        (strict_hot_finite &&
+                         (!std::isfinite(v0) || (has_pair && !std::isfinite(v1)) ||
+                          (has_row2 && !std::isfinite(v2)) || (has_quad && !std::isfinite(v3))))) {
                         fused_ok.store(0, std::memory_order_relaxed);
                         return 1;
                     }
@@ -1503,8 +1679,9 @@ static int moe_layer_moe_mlp_f32(
                         acc2 += v2 * scale;
                     }
                 }
-                if (!std::isfinite(acc0) || (has_pair && !std::isfinite(acc1)) ||
-                    (has_row2 && !std::isfinite(acc2)) || (has_quad && !std::isfinite(acc3))) {
+                if (strict_hot_finite &&
+                    (!std::isfinite(acc0) || (has_pair && !std::isfinite(acc1)) ||
+                     (has_row2 && !std::isfinite(acc2)) || (has_quad && !std::isfinite(acc3)))) {
                     fused_ok.store(0, std::memory_order_relaxed);
                     return 1;
                 }
@@ -1555,6 +1732,31 @@ static int moe_layer_moe_mlp_f32(
                 "layer=%d ok=%d selected=%zu mapped=%u hidden=%u intermediate=%u fused_ms=%.3f residual_ms=%.3f total_ms=%.3f",
                 layer, residual_ok, num_selected, mapped_experts, hidden_size, expert_intermediate,
                 moe_profile_elapsed_ms(fused_start_us), moe_profile_elapsed_ms(residual_start_us), moe_profile_elapsed_ms(total_start_us));
+            if (stage_diag_enabled) {
+                stage_add_us(&stage_diag.down_tail_us);
+                const uint64_t done_us = moe_profile_now_us();
+                stage_diag.total_us += done_us >= total_start_us ? done_us - total_start_us : 0u;
+                ++stage_diag.layers;
+                if (layer + 1 >= (int32_t)c->num_hidden_layers) {
+                    std::fprintf(
+                        stderr,
+                        "[storagellm diag] mlp_stage_token layers=%u branch_setup_ms=%.3f norm_ms=%.3f dense_ms=%.3f shared_ms=%.3f router_ms=%.3f router_contract_ms=%.3f router_topk_ms=%.3f prefetch_ms=%.3f expert_map_ms=%.3f gate_up_ms=%.3f down_tail_ms=%.3f total_ms=%.3f\n",
+                        stage_diag.layers,
+                        (double)stage_diag.branch_setup_us / 1000.0,
+                        (double)stage_diag.norm_us / 1000.0,
+                        (double)stage_diag.dense_us / 1000.0,
+                        (double)stage_diag.shared_us / 1000.0,
+                        (double)stage_diag.router_us / 1000.0,
+                        (double)stage_diag.router_contract_us / 1000.0,
+                        (double)stage_diag.router_topk_us / 1000.0,
+                        (double)stage_diag.prefetch_us / 1000.0,
+                        (double)stage_diag.expert_map_us / 1000.0,
+                        (double)stage_diag.gate_up_us / 1000.0,
+                        (double)stage_diag.down_tail_us / 1000.0,
+                        (double)stage_diag.total_us / 1000.0);
+                    stage_diag = moe_mlp_stage_diag_accum_t{};
+                }
+            }
             return residual_ok;
         }
     }
@@ -2868,27 +3070,11 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
             moe_graph_ir_mlp_layer_plan_f32{};
     const int common_shared_enabled = moe_graph_ir_math_required(engine) ?
         0 : moe_layer_common_ffn_is_shared_branch_f32(engine, layer);
-    const int router_has_plausible_input_scale =
-        moe_router_has_contract_input_scale_f32(engine, layer, hidden_size);
-    const int router_has_internal_norm_scale = router_has_plausible_input_scale && (
-        moe_router_has_direct_input_scale_contract_f32(engine, layer) ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "router_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "router.input_layernorm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "router.input_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "moe_router_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "moe.gate_norm.weight") ||
-        moe_engine_has_common_tensor_suffix(engine, layer, "mlp.router_norm.weight"));
-    const int router_has_internal_weight_scale =
-        moe_router_has_internal_weight_scale_contract_f32(engine, layer);
-    const int router_sidecar_requires_rms_root =
-        moe_router_weight_sidecar_requires_rms_root_transform_f32(engine, layer);
-    const int router_uses_raw_residual_contract = moe_layer_router_uses_raw_residual_input(engine, layer);
-    const int router_uses_raw_residual = moe_layer_router_should_use_raw_residual_f32(
-        engine, layer, router_uses_raw_residual_contract,
-        router_sidecar_requires_rms_root, router_has_internal_weight_scale);
-    if (router_uses_raw_residual_contract &&
-        moe_engine_contract_uses_direct_router_input_scale(engine, layer) &&
-        !router_has_plausible_input_scale) {
+    const moe_router_input_policy_f32 router_policy =
+        moe_layer_router_input_policy_f32(engine, layer, hidden_size);
+    if (router_policy.uses_raw_residual_contract &&
+        router_policy.uses_direct_input_scale &&
+        !router_policy.has_plausible_input_scale) {
         std::fprintf(stderr,
             "[storagellm mlp] batch split-FFN router input scale is required but could not be mapped layer=%d\n",
             layer);
@@ -3017,7 +3203,7 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
         // Defer dense_branch until after expert_branch, matching the GraphIR branch-sum order.
         dense_branch_ok[t] = dense_ok ? 1u : 0u;
 
-        const float* router_input = (router_has_internal_norm_scale || router_uses_raw_residual) ?
+        const float* router_input = (router_policy.has_internal_norm_scale || router_policy.uses_raw_residual) ?
             hidden : expert_input;
         moe_save_gate_input_snapshot(engine, layer, router_input, hidden_size);
         if (!moe_router_topk_f32(

@@ -8,6 +8,23 @@ static int moe_prepare_router_weight_sidecar_input_f32(
     std::vector<float>* out
 );
 
+static int moe_direct4_dot_enabled();
+
+static int moe_raw_tensor_dot_adjacent_four_rows_direct(
+    const moe_raw_tensor_cache_entry& raw,
+    uint32_t row,
+    uint64_t row_bytes,
+    const float* input,
+    uint32_t input_count,
+    uint8_t effective_weight_format,
+    const moe_mxfp4_row_layout_t& mxfp4_layout,
+    int mxfp4_pairwise_order,
+    float* out0,
+    float* out1,
+    float* out2,
+    float* out3
+);
+
 static int moe_map_router_tensor(
     moe_pc_engine* engine,
     int32_t layer,
@@ -117,6 +134,47 @@ static int moe_router_logits_f32(
                 common_elem,
                 (unsigned)common.weight_format);
         }
+        const uint8_t effective_weight_format =
+            moe_effective_weight_format_for_row_bytes(common, hidden_size);
+        const int direct_four_row =
+            moe_direct4_dot_enabled() &&
+            !common.math_transposed &&
+            (effective_weight_format == moe_WEIGHT_ENCODING_MXFP4 ||
+             effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0 ||
+             effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1 ||
+             effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K);
+        if (direct_four_row) {
+            const moe_mxfp4_row_layout_t mxfp4_layout =
+                effective_weight_format == moe_WEIGHT_ENCODING_MXFP4 ?
+                    moe_mxfp4_row_layout_for_bytes(hidden_size, row_bytes) :
+                    moe_mxfp4_row_layout_t{};
+            const int mxfp4_pairwise_order =
+                effective_weight_format == moe_WEIGHT_ENCODING_MXFP4 ?
+                    moe_mxfp4_pairwise_nibble_order_enabled() : 0;
+            const uint32_t row_blocks = (experts + 3u) / 4u;
+            moe_profile_parallel_label_scope rows_label("router_logits_direct4");
+            return moe_parallel_rows(engine, row_blocks, 0, [&](uint32_t block) {
+                const uint32_t row = block * 4u;
+                if (row + 4u <= experts) {
+                    return moe_raw_tensor_dot_adjacent_four_rows_direct(
+                        common, row, row_bytes, dot_input, hidden_size,
+                        effective_weight_format, mxfp4_layout, mxfp4_pairwise_order,
+                        &(*scratch_logits)[row + 0u],
+                        &(*scratch_logits)[row + 1u],
+                        &(*scratch_logits)[row + 2u],
+                        &(*scratch_logits)[row + 3u]);
+                }
+                for (uint32_t r = row; r < experts; ++r) {
+                    const float logit = moe_raw_tensor_dot_row(common, r, dot_input, hidden_size);
+                    if (!std::isfinite(logit)) {
+                        return 0;
+                    }
+                    (*scratch_logits)[r] = logit;
+                }
+                return 1;
+            });
+        }
+        moe_profile_parallel_label_scope rows_label("router_logits");
         return moe_parallel_rows(engine, experts, 0, [&](uint32_t row) {
             const float logit = moe_raw_tensor_dot_row(common, row, dot_input, hidden_size);
             if (!std::isfinite(logit)) {
@@ -976,7 +1034,7 @@ static int moe_router_row_contract_implies_sidecar_rms_root_transform_f32(
     }
     (void)doc;
     // A router weight sidecar only scales router columns unless the IR
-    // explicitly declares a router-input transform.  Split-MoE shape alone is
+    // explicitly declares a router-input transform. Split-MoE shape alone is
     // not enough evidence to switch the router input from expert_ffn_input to
     // hidden or to apply RMS-root normalization.
     return 0;
