@@ -358,20 +358,24 @@ static size_t startup_warm_cpu_ram_default_cap(
         1ull,
         total_bytes / (uint64_t)candidate_bytes.size());
     const uint32_t hw = std::max<uint32_t>(1u, moe_cpu_thread_count_hint());
-    uint64_t concurrency_cap = 768ull;
+    uint64_t concurrency_cap = 640ull;
     if (hw > 8u) {
-        concurrency_cap = 1536ull;
+        concurrency_cap = 1280ull;
     } else if (hw > 4u) {
-        concurrency_cap = 1024ull;
+        concurrency_cap = 768ull;
     }
 
     uint64_t memory_cap = concurrency_cap;
     const uint64_t available = storagellm::available_ram_bytes();
     const uint64_t rss = storagellm::current_process_rss_bytes();
     const uint64_t common_raw = engine->common_raw_prefetched_bytes.load(std::memory_order_relaxed);
+    const uint64_t reserve_floor =
+        available <= 24ull * 1024ull * 1024ull * 1024ull
+            ? 4ull * 1024ull * 1024ull * 1024ull
+            : 2ull * 1024ull * 1024ull * 1024ull;
     const uint64_t reserve = std::max<uint64_t>(
-        2ull * 1024ull * 1024ull * 1024ull,
-        std::max<uint64_t>(rss >> 2u, common_raw >> 1u));
+        reserve_floor,
+        std::max<uint64_t>(rss >> 1u, common_raw));
     if (available > reserve) {
         const uint64_t usable = (available - reserve) * 65ull / 100ull;
         memory_cap = std::max<uint64_t>(128ull, usable / avg_bytes);
