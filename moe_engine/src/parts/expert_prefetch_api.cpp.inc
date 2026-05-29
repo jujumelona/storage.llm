@@ -358,7 +358,7 @@ static size_t startup_warm_cpu_ram_default_cap(
         1ull,
         total_bytes / (uint64_t)candidate_bytes.size());
     const uint32_t hw = std::max<uint32_t>(1u, moe_cpu_thread_count_hint());
-    uint64_t concurrency_cap = 640ull;
+    uint64_t concurrency_cap = 512ull;
     if (hw > 8u) {
         concurrency_cap = 1280ull;
     } else if (hw > 4u) {
