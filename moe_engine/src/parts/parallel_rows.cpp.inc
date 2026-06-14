@@ -115,7 +115,7 @@ static uint32_t moe_cpu_row_min_block(const moe_pc_engine* engine, uint32_t work
         moe_parallel_env_truthy("STORAGELLM_CPU_PIPELINE") ||
         moe_parallel_env_truthy("STORAGELLM_CPU_ONLY") ||
         moe_parallel_env_truthy("STORAGELLM_CPU_STORAGE_ENGINE")) {
-        return workers <= 8u ? 16u : 8u;
+        return workers <= 8u ? 24u : 8u;
     }
     return 16u;
 }
