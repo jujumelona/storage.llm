@@ -46,9 +46,13 @@ static int moe_perf_storage_required_enabled() {
 }
 
 static int moe_perf_real_continuous_batch_exec_requested() {
-    // Default to continuous batching to remove legacy engine mutex bottleneck
-    if (moe_perf_env_truthy("STORAGELLM_DISABLE_CONTINUOUS_BATCHING")) return 0;
-    return 1;
+    if (moe_perf_env_truthy("STORAGELLM_DISABLE_CONTINUOUS_BATCHING") ||
+        moe_perf_env_truthy("STORAGELLM_DISABLE_REAL_CONTINUOUS_BATCH_EXEC")) {
+        return 0;
+    }
+    return moe_perf_env_truthy("STORAGELLM_ENABLE_REAL_CONTINUOUS_BATCH_EXEC") ||
+           moe_perf_env_truthy("STORAGELLM_REAL_CONTINUOUS_BATCHING") ||
+           moe_perf_env_truthy("STORAGELLM_CONTINUOUS_BATCHING");
 }
 
 static int moe_perf_real_continuous_batch_exec_linked() {
