@@ -2,7 +2,6 @@
 #include <pthread/qos.h>
 #include <sys/sysctl.h>
 #endif
-
 #include <type_traits>
 
 static int moe_parallel_env_truthy(const char* name) {
@@ -29,7 +28,18 @@ static uint32_t moe_cpu_storage_row_threads(uint32_t hw) {
     const uint32_t reserve = reserve_env && *reserve_env
         ? std::min<uint32_t>(moe_parse_env_u32("STORAGELLM_CPU_RESERVE_THREADS"), hw - 1u)
         : 0u;
-    return hw > reserve ? hw - reserve : 1u;
+    const uint32_t usable = hw > reserve ? hw - reserve : 1u;
+    if (reserve_env && *reserve_env) {
+        return usable;
+    }
+    if (hw <= 8u) {
+        const uint32_t multiplier = moe_parallel_env_truthy("STORAGELLM_CPU_ROW_OVERSUBSCRIBE") ? 3u : 1u;
+        return std::min<uint32_t>(std::max<uint32_t>(usable, hw * multiplier), 256u);
+    }
+    const uint32_t extra = moe_parallel_env_truthy("STORAGELLM_CPU_ROW_OVERSUBSCRIBE")
+        ? std::max<uint32_t>(1u, hw / 2u)
+        : 0u;
+    return std::min<uint32_t>(usable + extra, 256u);
 }
 
 static uint32_t row_thread_override() {
@@ -105,7 +115,7 @@ static uint32_t moe_cpu_row_min_block(const moe_pc_engine* engine, uint32_t work
         moe_parallel_env_truthy("STORAGELLM_CPU_PIPELINE") ||
         moe_parallel_env_truthy("STORAGELLM_CPU_ONLY") ||
         moe_parallel_env_truthy("STORAGELLM_CPU_STORAGE_ENGINE")) {
-        return workers <= 8u ? 4u : 8u;
+        return workers <= 8u ? 16u : 8u;
     }
     return 16u;
 }
@@ -154,6 +164,7 @@ struct moe_cpu_row_pool_t {
 
     std::vector<std::thread> threads;
     std::mutex mtx;
+    std::mutex dispatch_mtx;
     std::condition_variable dispatch_cv;
     std::condition_variable done_cv;
 
@@ -200,8 +211,16 @@ struct moe_cpu_row_pool_t {
                         running.fetch_add(1, std::memory_order_acq_rel);
                     }
                     if (fn) fn();
-                    running.fetch_sub(1, std::memory_order_acq_rel);
-                    if (pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    bool notify_done = false;
+                    {
+                        // Keep the completion predicate synchronized with wait().
+                        // Otherwise the last notify can race between the predicate
+                        // check and the condition-variable sleep, adding a 5s stall.
+                        std::lock_guard<std::mutex> lk(mtx);
+                        running.fetch_sub(1, std::memory_order_acq_rel);
+                        notify_done = pending.fetch_sub(1, std::memory_order_acq_rel) == 1;
+                    }
+                    if (notify_done) {
                         done_cv.notify_all();
                     }
                 }
@@ -309,7 +328,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     }
     const int force_tiny_serial =
         trace_label &&
-        (std::strcmp(trace_label, "attn_heads") == 0 && row_count <= 2u);
+        (std::strcmp(trace_label, "attn_heads") == 0 && row_count <= 1u);
     if (force_tiny_serial) {
         int ok = 1;
         for (uint32_t row = 0; row < row_count; ++row) {
@@ -389,7 +408,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     if (use_openmp_rows && workers > 1 && row_count >= 64u) {
         std::atomic<int> ok{1};
         const uint32_t block_count = (row_count + block_rows - 1u) / block_rows;
-#pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
+#pragma omp parallel for schedule(static, 1) num_threads(workers)
         for (int64_t block = 0; block < (int64_t)block_count; ++block) {
             moe_cpu_enable_fast_fp_mode();
             moe_cpu_apply_row_worker_qos();
@@ -458,8 +477,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     // dispatch simultaneously → work_fn/pending overwritten → cross-engine blocking
     // Solution: Serialize dispatch with try_lock; fallback to single-threaded if busy
     // Trade-off: Second engine runs single-threaded instead of corrupting first engine's work
-    static std::mutex g_cpu_row_pool_dispatch_mutex;
-    std::unique_lock<std::mutex> dispatch_guard(g_cpu_row_pool_dispatch_mutex, std::try_to_lock);
+    std::unique_lock<std::mutex> dispatch_guard(pool.dispatch_mtx, std::try_to_lock);
 
     if (pool_workers > 0 && pool.initialized && dispatch_guard.owns_lock()) {
         // Dispatch to persistent pool
