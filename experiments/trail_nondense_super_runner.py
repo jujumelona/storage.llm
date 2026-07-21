@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import json, re, runpy
 from collections import defaultdict
+from pathlib import Path
 import trail_nondense_full_eval as m
+
+TRIGGER_RE=re.compile(r'(?i)\b(?:'+ '|'.join(sorted((re.escape(x) for x in m.TRIGGER_INDEX),key=len,reverse=True)) + r')\b')
 
 def compact_span_text(s):
     logs=[]
@@ -9,6 +12,14 @@ def compact_span_text(s):
         logs.append({'body':m.scrub(x.get('body')),'log_attributes':m.scrub(x.get('log_attributes')),'severity_text':x.get('severity_text')})
     obj={'span_name':s.get('span_name'),'span_kind':s.get('span_kind'),'status_code':s.get('status_code'),'status_message':s.get('status_message'),'span_attributes':m.scrub(s.get('span_attributes')),'events':m.scrub(s.get('events')),'logs':logs}
     return json.dumps(obj,ensure_ascii=False,sort_keys=True,default=str)
+
+def fast_load_events(path):
+    data=json.load(open(path,encoding='utf-8')); trace_id=str(data.get('trace_id') or Path(path).stem); ev=[]
+    for s in m.flatten_spans(data.get('spans') or []):
+        text=compact_span_text(s); low=text.lower(); name=str(s.get('span_name') or '')
+        trigger_tokens=frozenset(x.lower() for x in TRIGGER_RE.findall(low))
+        ev.append(m.Event(trace_id,str(s.get('span_id') or ''),str(s.get('parent_span_id') or ''),str(s.get('timestamp') or ''),name,str(s.get('span_kind') or ''),text,trigger_tokens,m.tool_name(text,name),bool(m.FINAL_WORDS.search(low) or 'final' in name.lower()),bool(m.PLAN_WORDS.search(low) or 'plan' in name.lower()),bool(m.ERROR_WORDS.search(low))))
+    ev.sort(key=lambda x:(x.timestamp,x.span_id)); return trace_id,ev
 
 def fast_sequence(events):
     out=[]; failures=[]; by_sig=defaultdict(list); seen_queries={}
@@ -35,5 +46,6 @@ def fast_sequence(events):
     return out
 
 m.span_local_text=compact_span_text
+m.load_events=fast_load_events
 m.sequence_predictions=fast_sequence
 runpy.run_path('experiments/trail_nondense_ultra_runner.py',run_name='__main__')
