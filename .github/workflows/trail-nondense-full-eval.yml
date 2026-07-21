@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'experiments/nondense_natural_v5.py'
+      - 'experiments/nondense_natural_v5_fast.py'
       - '.github/workflows/trail-nondense-full-eval.yml'
   workflow_dispatch:
 
@@ -31,7 +32,7 @@ jobs:
         run: |
           set -euxo pipefail
           rm -rf nondense_natural_v5_results
-          python -u experiments/nondense_natural_v5.py \
+          python -u experiments/nondense_natural_v5_fast.py \
             --logicbench /tmp/LogicBench \
             --logiqa /tmp/LogiQA-dataset \
             --out nondense_natural_v5_results | tee nondense_natural_v5_results.log
