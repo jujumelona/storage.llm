@@ -5,9 +5,8 @@ on:
     branches: [main]
     paths:
       - 'experiments/trail_nondense_full_eval.py'
-      - 'experiments/trail_nondense_fast_runner.py'
       - 'experiments/trail_nondense_ultra_runner.py'
-      - 'experiments/trail_nondense_super_runner.py'
+      - 'experiments/trail_nondense_v2_runner.py'
       - '.github/workflows/trail-nondense-full-eval.yml'
   workflow_dispatch:
 
@@ -37,7 +36,7 @@ jobs:
         run: |
           set -euxo pipefail
           rm -rf trail_nondense_results
-          python -u experiments/trail_nondense_super_runner.py \
+          python -u experiments/trail_nondense_v2_runner.py \
             --trail /tmp/trail-benchmark \
             --logicbench /tmp/LogicBench \
             --logiqa /tmp/LogiQA-dataset \
@@ -49,13 +48,13 @@ jobs:
         run: |
           python - <<'PY'
           import shutil
-          shutil.make_archive('TRAIL_NONDENSE_FULL_EVAL_RESULTS', 'zip', 'trail_nondense_results')
+          shutil.make_archive('TRAIL_NONDENSE_V2_RESULTS', 'zip', 'trail_nondense_results')
           PY
       - name: Upload result artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TRAIL_NONDENSE_FULL_EVAL_RESULTS
+          name: TRAIL_NONDENSE_V2_RESULTS
           path: |
-            TRAIL_NONDENSE_FULL_EVAL_RESULTS.zip
+            TRAIL_NONDENSE_V2_RESULTS.zip
             trail_nondense_results/
           retention-days: 7
