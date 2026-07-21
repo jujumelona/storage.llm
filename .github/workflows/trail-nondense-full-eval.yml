@@ -1,11 +1,9 @@
-name: Non-dense natural reasoning V5
+name: Export non-dense reasoning benchmarks
 
 on:
   pull_request:
     branches: [main]
     paths:
-      - 'experiments/nondense_natural_v5.py'
-      - 'experiments/nondense_natural_v5_fast.py'
       - '.github/workflows/trail-nondense-full-eval.yml'
   workflow_dispatch:
 
@@ -13,42 +11,30 @@ permissions:
   contents: read
 
 jobs:
-  evaluate:
+  export:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
       - name: Acquire public benchmarks
         shell: bash
         run: |
           set -euxo pipefail
           git clone --depth 1 https://github.com/Mihir3009/LogicBench.git /tmp/LogicBench
           git clone --depth 1 https://github.com/lgw863/LogiQA-dataset.git /tmp/LogiQA-dataset
-      - name: Run V5 natural reasoning
+          rm -rf /tmp/LogicBench/.git /tmp/LogiQA-dataset/.git
+      - name: Package benchmark sources
         shell: bash
         run: |
-          set -euxo pipefail
-          rm -rf nondense_natural_v5_results
-          python -u experiments/nondense_natural_v5_fast.py \
-            --logicbench /tmp/LogicBench \
-            --logiqa /tmp/LogiQA-dataset \
-            --out nondense_natural_v5_results | tee nondense_natural_v5_results.log
-          cp nondense_natural_v5_results.log nondense_natural_v5_results/run.log
-          cat nondense_natural_v5_results/summary.json
-      - name: Package results
-        shell: bash
-        run: |
+          mkdir -p benchmark_sources
+          cp -a /tmp/LogicBench benchmark_sources/
+          cp -a /tmp/LogiQA-dataset benchmark_sources/
           python - <<'PY'
           import shutil
-          shutil.make_archive('NONDENSE_NATURAL_V5_RESULTS','zip','nondense_natural_v5_results')
+          shutil.make_archive('NONDENSE_BENCHMARK_SOURCES','zip','benchmark_sources')
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: NONDENSE_NATURAL_V5_RESULTS
-          path: |
-            NONDENSE_NATURAL_V5_RESULTS.zip
-            nondense_natural_v5_results/
+          name: NONDENSE_BENCHMARK_SOURCES
+          path: NONDENSE_BENCHMARK_SOURCES.zip
           retention-days: 7
