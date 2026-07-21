@@ -1,13 +1,10 @@
-name: TRAIL non-dense full evaluation
+name: Non-dense natural reasoning V5
 
 on:
   pull_request:
     branches: [main]
     paths:
-      - 'experiments/trail_nondense_full_eval.py'
-      - 'experiments/trail_nondense_v3_runner.py'
-      - 'experiments/trail_nondense_v4_runner.py'
-      - 'experiments/trail_nondense_v4_fast_runner.py'
+      - 'experiments/nondense_natural_v5.py'
       - '.github/workflows/trail-nondense-full-eval.yml'
   workflow_dispatch:
 
@@ -19,43 +16,38 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - name: Checkout experiment branch
-        uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Acquire public benchmarks
         shell: bash
         run: |
           set -euxo pipefail
-          git clone --depth 1 https://github.com/patronus-ai/trail-benchmark.git /tmp/trail-benchmark
           git clone --depth 1 https://github.com/Mihir3009/LogicBench.git /tmp/LogicBench
           git clone --depth 1 https://github.com/lgw863/LogiQA-dataset.git /tmp/LogiQA-dataset
-      - name: Run strict non-dense evaluation
+      - name: Run V5 natural reasoning
         shell: bash
         run: |
           set -euxo pipefail
-          rm -rf trail_nondense_results
-          python -u experiments/trail_nondense_v4_fast_runner.py \
-            --trail /tmp/trail-benchmark \
+          rm -rf nondense_natural_v5_results
+          python -u experiments/nondense_natural_v5.py \
             --logicbench /tmp/LogicBench \
             --logiqa /tmp/LogiQA-dataset \
-            --out trail_nondense_results | tee trail_nondense_results.log
-          cat trail_nondense_results/summary.json
-          cp trail_nondense_results.log trail_nondense_results/run.log
-      - name: Package result bundle
+            --out nondense_natural_v5_results | tee nondense_natural_v5_results.log
+          cp nondense_natural_v5_results.log nondense_natural_v5_results/run.log
+          cat nondense_natural_v5_results/summary.json
+      - name: Package results
         shell: bash
         run: |
           python - <<'PY'
           import shutil
-          shutil.make_archive('TRAIL_NONDENSE_V4_RESULTS', 'zip', 'trail_nondense_results')
+          shutil.make_archive('NONDENSE_NATURAL_V5_RESULTS','zip','nondense_natural_v5_results')
           PY
-      - name: Upload result artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: TRAIL_NONDENSE_V4_RESULTS
+          name: NONDENSE_NATURAL_V5_RESULTS
           path: |
-            TRAIL_NONDENSE_V4_RESULTS.zip
-            trail_nondense_results/
+            NONDENSE_NATURAL_V5_RESULTS.zip
+            nondense_natural_v5_results/
           retention-days: 7
