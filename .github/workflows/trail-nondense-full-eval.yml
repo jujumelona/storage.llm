@@ -6,6 +6,7 @@ on:
     paths:
       - 'experiments/trail_nondense_full_eval.py'
       - 'experiments/trail_nondense_fast_runner.py'
+      - 'experiments/trail_nondense_ultra_runner.py'
       - '.github/workflows/trail-nondense-full-eval.yml'
   workflow_dispatch:
 
@@ -19,12 +20,10 @@ jobs:
     steps:
       - name: Checkout experiment branch
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Acquire public benchmarks
         shell: bash
         run: |
@@ -32,20 +31,18 @@ jobs:
           git clone --depth 1 https://github.com/patronus-ai/trail-benchmark.git /tmp/trail-benchmark
           git clone --depth 1 https://github.com/Mihir3009/LogicBench.git /tmp/LogicBench
           git clone --depth 1 https://github.com/lgw863/LogiQA-dataset.git /tmp/LogiQA-dataset
-
       - name: Run strict non-dense evaluation
         shell: bash
         run: |
           set -euxo pipefail
           rm -rf trail_nondense_results
-          python -u experiments/trail_nondense_fast_runner.py \
+          python -u experiments/trail_nondense_ultra_runner.py \
             --trail /tmp/trail-benchmark \
             --logicbench /tmp/LogicBench \
             --logiqa /tmp/LogiQA-dataset \
             --out trail_nondense_results | tee trail_nondense_results.log
           cat trail_nondense_results/summary.json
           cp trail_nondense_results.log trail_nondense_results/run.log
-
       - name: Package result bundle
         shell: bash
         run: |
@@ -53,7 +50,6 @@ jobs:
           import shutil
           shutil.make_archive('TRAIL_NONDENSE_FULL_EVAL_RESULTS', 'zip', 'trail_nondense_results')
           PY
-
       - name: Upload result artifact
         uses: actions/upload-artifact@v4
         with:
