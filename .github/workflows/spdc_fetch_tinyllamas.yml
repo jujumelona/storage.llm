@@ -1,0 +1,46 @@
+name: SPDC pretrained checkpoint fetch
+
+on:
+  push:
+    branches:
+      - spdc-pretrained-fetch-20260722
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  HF_HUB_DISABLE_XET: "1"
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download official Karpathy TinyStories checkpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pretrained
+          curl --fail --location --retry 8 --retry-all-errors --retry-delay 5 \
+            'https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin?download=true' \
+            -o pretrained/stories15M.bin
+          curl --fail --location --retry 8 --retry-all-errors --retry-delay 5 \
+            'https://huggingface.co/karpathy/tinyllamas/resolve/main/stories42M.bin?download=true' \
+            -o pretrained/stories42M.bin
+          curl --fail --location --retry 8 --retry-all-errors --retry-delay 5 \
+            'https://raw.githubusercontent.com/karpathy/llama2.c/master/tokenizer.bin' \
+            -o pretrained/tokenizer.bin
+          echo 'cd590644d963867a2b6e5a1107f51fad663c41d79c149fbecbbb1f95fa81f49a  pretrained/stories15M.bin' | sha256sum -c -
+          echo '9f65a100a00b9df9a9a9f31dd6d82f859b1cb5d4477c2be5f6899389f62ed923  pretrained/stories42M.bin' | sha256sum -c -
+          sha256sum pretrained/tokenizer.bin > pretrained/tokenizer.sha256
+          ls -lh pretrained
+
+      - name: Upload official checkpoints
+        uses: actions/upload-artifact@v4
+        with:
+          name: karpathy-tinyllamas-15m-42m
+          path: pretrained/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
