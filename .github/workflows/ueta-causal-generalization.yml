@@ -1,0 +1,51 @@
+name: UETA causal and cross-domain falsification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/ueta_causal_generalization.py'
+      - '.github/workflows/ueta-causal-generalization.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Acquire TRAIL
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/patronus-ai/trail-benchmark.git /tmp/trail-benchmark
+      - name: Run causal and generalization falsification
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf ueta_causal_generalization_results
+          python -u experiments/ueta_causal_generalization.py \
+            --trail /tmp/trail-benchmark \
+            --out ueta_causal_generalization_results | tee ueta_causal_generalization_results.log
+          cp ueta_causal_generalization_results.log ueta_causal_generalization_results/run.log
+          cat ueta_causal_generalization_results/summary.json
+      - name: Package
+        shell: bash
+        run: |
+          python - <<'PY'
+          import shutil
+          shutil.make_archive('UETA_CAUSAL_GENERALIZATION_RESULTS','zip','ueta_causal_generalization_results')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UETA_CAUSAL_GENERALIZATION_RESULTS
+          path: |
+            UETA_CAUSAL_GENERALIZATION_RESULTS.zip
+            ueta_causal_generalization_results/
+          retention-days: 7
