@@ -30,24 +30,22 @@ jobs:
         run: |
           python - <<'PY'
           import json, pathlib, re
-          root=pathlib.Path('/tmp/TraceElephantData');out=pathlib.Path('traceelephant_schema_probe');out.mkdir()
+          root=pathlib.Path('/tmp/TraceElephantData');out=pathlib.Path('traceelephant_schema_probe');out.mkdir(exist_ok=True)
           found=[]
           for mp in root.rglob('trace_metadata.json'):
             try:m=json.load(open(mp))
             except:continue
-            if str(m.get('system_name','')).lower()!='swe-agent':continue
+            inferred=str(m.get('system_name') or mp.parents[1].name).lower()
+            if 'swe' not in inferred:continue
             sp=mp.parent/'step_records.json'
             if not sp.exists():continue
             steps=json.load(open(sp))
-            # Keep exact structure but redact long values and IDs; labels not copied.
             def clean(x,d=0):
               if d>8:return '<depth>'
               if isinstance(x,dict):return {str(k):clean(v,d+1) for k,v in x.items()}
-              if isinstance(x,list):return [clean(v,d+1) for v in x[:20]]
-              s=str(x)
-              s=re.sub(r'[0-9a-f]{12,}','<id>',s,flags=re.I)
-              return s[:4000]
-            rec={'system_name':m.get('system_name'),'num_steps':len(steps),'steps':clean(steps[:25])}
+              if isinstance(x,list):return [clean(v,d+1) for v in x[:30]]
+              s=str(x);s=re.sub(r'[0-9a-f]{12,}','<id>',s,flags=re.I);return s[:6000]
+            rec={'system_name':m.get('system_name'),'inferred_system':inferred,'num_steps':len(steps),'steps':clean(steps[:30])}
             (out/f'swe_sample_{len(found)}.json').write_text(json.dumps(rec,indent=2))
             found.append(str(mp.parent))
             if len(found)>=2:break
