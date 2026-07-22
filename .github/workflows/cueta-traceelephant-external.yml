@@ -1,0 +1,65 @@
+name: C-UETA TraceElephant external falsification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/cueta_traceelephant_eval.py'
+      - 'experiments/cueta_trace_runtime.py'
+      - '.github/workflows/cueta-traceelephant-external.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Acquire TraceElephant public benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install -q 'huggingface_hub>=0.28'
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          p=snapshot_download(repo_id='TraceElephant/TraceElephant', repo_type='dataset', local_dir='/tmp/TraceElephantData')
+          print(p)
+          PY
+          du -sh /tmp/TraceElephantData
+          find /tmp/TraceElephantData -maxdepth 3 -type f | head -100 || true
+      - name: Run strict external evaluation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf cueta_traceelephant_results
+          python -u experiments/cueta_traceelephant_eval.py --data /tmp/TraceElephantData --out cueta_traceelephant_results | tee cueta_traceelephant_results.log
+          cp cueta_traceelephant_results.log cueta_traceelephant_results/run.log
+          cp experiments/cueta_traceelephant_eval.py cueta_traceelephant_results/
+          cp experiments/cueta_trace_runtime.py cueta_traceelephant_results/
+          cat cueta_traceelephant_results/summary.json
+      - name: Replay checkpoint
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -u experiments/cueta_trace_runtime.py --checkpoint cueta_traceelephant_results/CUETA_TRACE_SINGLE_CHECKPOINT.json.gz --trace-root /tmp/TraceElephantData --output cueta_traceelephant_results/checkpoint_replay_predictions.jsonl
+          test -s cueta_traceelephant_results/checkpoint_replay_predictions.jsonl
+      - name: Package
+        shell: bash
+        run: |
+          python - <<'PY'
+          import shutil
+          shutil.make_archive('CUETA_TRACEELEPHANT_EXTERNAL_RESULTS','zip','cueta_traceelephant_results')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CUETA_TRACEELEPHANT_EXTERNAL_RESULTS
+          path: |
+            CUETA_TRACEELEPHANT_EXTERNAL_RESULTS.zip
+            cueta_traceelephant_results/
+          retention-days: 7
