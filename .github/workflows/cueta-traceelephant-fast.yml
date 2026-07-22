@@ -1,0 +1,57 @@
+name: C-UETA TraceElephant fixed-grid falsification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/cueta_traceelephant_eval.py'
+      - 'experiments/cueta_traceelephant_fast.py'
+      - 'experiments/cueta_trace_runtime.py'
+      - '.github/workflows/cueta-traceelephant-fast.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Acquire TraceElephant
+        run: |
+          python -m pip install -q 'huggingface_hub>=0.28'
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download(repo_id='TraceElephant/TraceElephant',repo_type='dataset',local_dir='/tmp/TraceElephantData')
+          PY
+      - name: Run fixed-grid evaluation
+        run: |
+          set -euxo pipefail
+          rm -rf cueta_traceelephant_fast_results
+          python -u experiments/cueta_traceelephant_fast.py --data /tmp/TraceElephantData --out cueta_traceelephant_fast_results | tee cueta_traceelephant_fast_results.log
+          cp cueta_traceelephant_fast_results.log cueta_traceelephant_fast_results/run.log
+          cp experiments/cueta_traceelephant_eval.py cueta_traceelephant_fast_results/
+          cp experiments/cueta_traceelephant_fast.py cueta_traceelephant_fast_results/
+          cp experiments/cueta_trace_runtime.py cueta_traceelephant_fast_results/
+      - name: Replay checkpoint
+        run: |
+          python -u experiments/cueta_trace_runtime.py --checkpoint cueta_traceelephant_fast_results/CUETA_TRACE_SINGLE_CHECKPOINT.json.gz --trace-root /tmp/TraceElephantData --output cueta_traceelephant_fast_results/checkpoint_replay_predictions.jsonl
+          test -s cueta_traceelephant_fast_results/checkpoint_replay_predictions.jsonl
+      - name: Package
+        run: |
+          python - <<'PY'
+          import shutil
+          shutil.make_archive('CUETA_TRACEELEPHANT_FIXED_GRID_RESULTS','zip','cueta_traceelephant_fast_results')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CUETA_TRACEELEPHANT_FIXED_GRID_RESULTS
+          path: |
+            CUETA_TRACEELEPHANT_FIXED_GRID_RESULTS.zip
+            cueta_traceelephant_fast_results/
+          retention-days: 7
