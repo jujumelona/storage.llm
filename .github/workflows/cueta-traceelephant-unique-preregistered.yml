@@ -1,0 +1,53 @@
+name: C-UETA TraceElephant unique-id preregistered falsification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/cueta_traceelephant_eval.py'
+      - 'experiments/cueta_traceelephant_unique_preregistered.py'
+      - 'experiments/cueta_trace_runtime.py'
+      - '.github/workflows/cueta-traceelephant-unique-preregistered.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Acquire TraceElephant
+        run: |
+          python -m pip install -q 'huggingface_hub>=0.28'
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download(repo_id='TraceElephant/TraceElephant',repo_type='dataset',local_dir='/tmp/TraceElephantData')
+          PY
+      - name: Run unique-id preregistered evaluation
+        run: |
+          set -euxo pipefail
+          rm -rf cueta_traceelephant_unique_results
+          python -u experiments/cueta_traceelephant_unique_preregistered.py --data /tmp/TraceElephantData --out cueta_traceelephant_unique_results | tee cueta_traceelephant_unique_results.log
+          cp cueta_traceelephant_unique_results.log cueta_traceelephant_unique_results/run.log
+          cp experiments/cueta_traceelephant_eval.py cueta_traceelephant_unique_results/
+          cp experiments/cueta_traceelephant_unique_preregistered.py cueta_traceelephant_unique_results/
+          cp experiments/cueta_trace_runtime.py cueta_traceelephant_unique_results/
+      - name: Package
+        run: |
+          python - <<'PY'
+          import shutil
+          shutil.make_archive('CUETA_TRACEELEPHANT_UNIQUE_PREREGISTERED_RESULTS','zip','cueta_traceelephant_unique_results')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CUETA_TRACEELEPHANT_UNIQUE_PREREGISTERED_RESULTS
+          path: |
+            CUETA_TRACEELEPHANT_UNIQUE_PREREGISTERED_RESULTS.zip
+            cueta_traceelephant_unique_results/
+          retention-days: 7
