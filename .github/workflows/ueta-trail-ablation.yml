@@ -1,0 +1,42 @@
+name: UETA TRAIL strict ablations
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/ueta_trail_ablation.py'
+      - '.github/workflows/ueta-trail-ablation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Acquire TRAIL
+        run: git clone --depth 1 https://github.com/patronus-ai/trail-benchmark.git /tmp/trail-benchmark
+      - name: Run ablations
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf ueta_ablation_results
+          python -u experiments/ueta_trail_ablation.py \
+            --trail /tmp/trail-benchmark \
+            --out ueta_ablation_results | tee ueta_ablation_results.log
+          cp ueta_ablation_results.log ueta_ablation_results/run.log
+      - name: Package
+        run: python -c "import shutil; shutil.make_archive('UETA_TRAIL_ABLATION_RESULTS','zip','ueta_ablation_results')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UETA_TRAIL_ABLATION_RESULTS
+          path: |
+            UETA_TRAIL_ABLATION_RESULTS.zip
+            ueta_ablation_results/
+          retention-days: 7
