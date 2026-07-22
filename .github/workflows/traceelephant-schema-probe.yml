@@ -29,14 +29,17 @@ jobs:
       - name: Export schema-only samples
         run: |
           python - <<'PY'
-          import json, pathlib, re
-          root=pathlib.Path('/tmp/TraceElephantData');out=pathlib.Path('traceelephant_schema_probe');out.mkdir(exist_ok=True)
+          import json, pathlib, re, sys
+          sys.path.insert(0,'experiments')
+          import cueta_traceelephant_eval as ce
+          root=pathlib.Path('/tmp/TraceElephantData');ce.unpack(root);ce.unpack(root)
+          out=pathlib.Path('traceelephant_schema_probe');out.mkdir(exist_ok=True)
           found=[]
           for mp in root.rglob('trace_metadata.json'):
             try:m=json.load(open(mp))
             except:continue
             inferred=str(m.get('system_name') or mp.parents[1].name).lower()
-            if 'swe' not in inferred:continue
+            if 'swe' not in inferred and 'swe' not in str(mp).lower():continue
             sp=mp.parent/'step_records.json'
             if not sp.exists():continue
             steps=json.load(open(sp))
