@@ -1,0 +1,54 @@
+name: Resource-Obligation UETA TraceElephant falsification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/cueta_traceelephant_eval.py'
+      - 'experiments/boundary_ueta_traceelephant.py'
+      - 'experiments/resource_obligation_ueta.py'
+      - '.github/workflows/resource-obligation-ueta.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Acquire TraceElephant
+        run: |
+          python -m pip install -q 'huggingface_hub>=0.28'
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download(repo_id='TraceElephant/TraceElephant',repo_type='dataset',local_dir='/tmp/TraceElephantData')
+          PY
+      - name: Run Resource-Obligation UETA
+        run: |
+          set -euxo pipefail
+          rm -rf resource_obligation_ueta_results
+          python -u experiments/resource_obligation_ueta.py --data /tmp/TraceElephantData --out resource_obligation_ueta_results | tee resource_obligation_ueta_results.log
+          cp resource_obligation_ueta_results.log resource_obligation_ueta_results/run.log
+          cp experiments/resource_obligation_ueta.py resource_obligation_ueta_results/
+          cp experiments/boundary_ueta_traceelephant.py resource_obligation_ueta_results/
+          cp experiments/cueta_traceelephant_eval.py resource_obligation_ueta_results/
+          cat resource_obligation_ueta_results/summary.json
+      - name: Package
+        run: |
+          python - <<'PY'
+          import shutil
+          shutil.make_archive('RESOURCE_OBLIGATION_UETA_RESULTS','zip','resource_obligation_ueta_results')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RESOURCE_OBLIGATION_UETA_RESULTS
+          path: |
+            RESOURCE_OBLIGATION_UETA_RESULTS.zip
+            resource_obligation_ueta_results/
+          retention-days: 7
