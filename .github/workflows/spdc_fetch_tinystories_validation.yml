@@ -1,0 +1,38 @@
+name: SPDC TinyStories validation fetch
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  HF_HUB_DISABLE_XET: "1"
+
+jobs:
+  fetch-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download official TinyStories validation text
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p validation
+          curl --fail --location --retry 8 --retry-all-errors --retry-delay 5 \
+            'https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-valid.txt?download=true' \
+            -o validation/TinyStoriesV2-GPT4-valid.txt
+          echo '6874bae9a4c1a4e7edcf0e53b86c17817e9cf881fc75ff2368da457b80c0585d  validation/TinyStoriesV2-GPT4-valid.txt' | sha256sum -c -
+          ls -lh validation
+
+      - name: Upload validation text
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinystories-official-validation
+          path: validation/
+          compression-level: 6
+          retention-days: 1
+          if-no-files-found: error
