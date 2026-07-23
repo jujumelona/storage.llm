@@ -42,16 +42,26 @@ jobs:
           set -euxo pipefail
           rm -rf product_lifted_replay
           python -u experiments/product_lifted_agentprocess.py --data /tmp/AgentProcessBench --out product_lifted_replay >/tmp/replay.log
-          cmp product_lifted_results/summary.json product_lifted_replay/summary.json
           cmp product_lifted_results/predictions.csv product_lifted_replay/predictions.csv
+          python - <<'PY'
+          import gzip,json
+          a=json.load(gzip.open('product_lifted_results/PRODUCT_LIFTED_SINGLE_CHECKPOINT.json.gz','rt'))
+          b=json.load(gzip.open('product_lifted_replay/PRODUCT_LIFTED_SINGLE_CHECKPOINT.json.gz','rt'))
+          assert a==b
+          sa=json.load(open('product_lifted_results/summary.json'));sb=json.load(open('product_lifted_replay/summary.json'))
+          sa.pop('load_seconds',None);sb.pop('load_seconds',None);assert sa==sb
+          PY
           echo true > product_lifted_results/deterministic_replay.txt
       - name: Package
+        if: always()
         run: |
           python - <<'PY'
-          import shutil
-          shutil.make_archive('PRODUCT_LIFTED_AGENTPROCESS_RESULTS','zip','product_lifted_results')
+          import shutil, pathlib
+          if pathlib.Path('product_lifted_results').exists():
+              shutil.make_archive('PRODUCT_LIFTED_AGENTPROCESS_RESULTS','zip','product_lifted_results')
           PY
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: PRODUCT_LIFTED_AGENTPROCESS_RESULTS
           path: |
