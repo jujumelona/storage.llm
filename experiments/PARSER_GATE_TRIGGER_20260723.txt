@@ -1,0 +1,1 @@
+Trigger the existing CI workflow after PR head synchronization. No model, parser, label, threshold, or evaluation logic is changed.
