@@ -6,6 +6,11 @@ on:
     paths:
       - 'experiments/codetrace_parser_gate.py'
       - '.github/workflows/codetrace-parser-gate.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/codetrace_parser_gate.py'
+      - '.github/workflows/codetrace-parser-gate.yml'
   workflow_dispatch:
 
 permissions:
@@ -44,4 +49,3 @@ jobs:
           name: CODETRACE_PARSER_GATE_RESULTS
           path: CODETRACE_PARSER_GATE_RESULTS.zip
           retention-days: 7
-# trigger-after-workflow-install
