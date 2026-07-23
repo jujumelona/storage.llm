@@ -1,0 +1,59 @@
+name: CEDC real PDDL inventory
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/real_pddl_inventory.py'
+      - '.github/workflows/cedc-real-pddl.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout validation branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install parser
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'pddlpy==1.2.1'
+          python -m pip freeze > parser_environment.txt
+
+      - name: Clone exact public SIFT revision
+        run: |
+          git clone https://github.com/JonasGoesgens/SIFT.git public_sift
+          git -C public_sift checkout 0f4518ffa609322a24521609f80d70728f07ac09
+          test "$(git -C public_sift rev-parse HEAD)" = "0f4518ffa609322a24521609f80d70728f07ac09"
+
+      - name: Parse and ground public PDDL
+        run: |
+          mkdir -p real_pddl_results
+          python experiments/real_pddl_inventory.py public_sift real_pddl_results | tee real_pddl_results/run.log
+
+      - name: Record source hashes
+        if: always()
+        run: |
+          find public_sift/pddl_files -type f -name '*.pddl' -print0 | sort -z | xargs -0 sha256sum > real_pddl_results/PDDL_SHA256SUMS.txt
+          sha256sum experiments/real_pddl_inventory.py > real_pddl_results/VALIDATOR_SHA256.txt
+          cp parser_environment.txt real_pddl_results/
+
+      - name: Upload real PDDL results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cedc-real-pddl-inventory
+          path: real_pddl_results
+          if-no-files-found: error
+          retention-days: 30
