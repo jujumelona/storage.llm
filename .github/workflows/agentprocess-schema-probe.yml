@@ -1,0 +1,31 @@
+name: AgentProcessBench schema probe
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/agentprocess_schema_probe.py'
+      - '.github/workflows/agentprocess-schema-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: python -m pip install -q 'datasets>=3.0' 'huggingface_hub>=0.28'
+      - name: Probe public dataset
+        run: python -u experiments/agentprocess_schema_probe.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AGENTPROCESS_SCHEMA_PROBE
+          path: agentprocess_schema_probe/
+          retention-days: 3
