@@ -6,7 +6,7 @@
       "pass": true,
       "pddlpy": {
         "applicable_initial": 0,
-        "elapsed_sec": 0.03046,
+        "elapsed_sec": 0.041712,
         "goal_atom_count": 2,
         "ground_actions": 270,
         "grounding_truncated_at": null,
@@ -25,242 +25,242 @@
         "samples": [
           {
             "binding": {
-              "?p": "p3",
-              "?t": "t2",
-              "?x": "c_0_1"
-            },
-            "eff_neg": [
-              "('carrying', 't2', 'p3')"
-            ],
-            "eff_pos": [
-              "('at', 'p3', 'c_0_1')",
-              "('empty', 't2')"
-            ],
-            "name": "drop-package",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 't2', 'c_0_1')",
-              "('carrying', 't2', 'p3')"
-            ]
-          },
-          {
-            "binding": {
-              "?p": "p3",
-              "?t": "t2",
-              "?x": "c_0_2"
-            },
-            "eff_neg": [
-              "('carrying', 't2', 'p3')"
-            ],
-            "eff_pos": [
-              "('at', 'p3', 'c_0_2')",
-              "('empty', 't2')"
-            ],
-            "name": "drop-package",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 't2', 'c_0_2')",
-              "('carrying', 't2', 'p3')"
-            ]
-          },
-          {
-            "binding": {
-              "?p": "p3",
-              "?t": "t2",
-              "?x": "c_2_2"
-            },
-            "eff_neg": [
-              "('carrying', 't2', 'p3')"
-            ],
-            "eff_pos": [
-              "('at', 'p3', 'c_2_2')",
-              "('empty', 't2')"
-            ],
-            "name": "drop-package",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 't2', 'c_2_2')",
-              "('carrying', 't2', 'p3')"
-            ]
-          },
-          {
-            "binding": {
-              "?p": "p3",
-              "?t": "t2",
-              "?x": "c_1_1"
-            },
-            "eff_neg": [
-              "('carrying', 't2', 'p3')"
-            ],
-            "eff_pos": [
-              "('at', 'p3', 'c_1_1')",
-              "('empty', 't2')"
-            ],
-            "name": "drop-package",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 't2', 'c_1_1')",
-              "('carrying', 't2', 'p3')"
-            ]
-          },
-          {
-            "binding": {
-              "?p": "p3",
-              "?t": "t2",
+              "?p": "p1",
+              "?t": "t1",
               "?x": "c_1_2"
             },
             "eff_neg": [
-              "('carrying', 't2', 'p3')"
+              "('carrying', 't1', 'p1')"
             ],
             "eff_pos": [
-              "('at', 'p3', 'c_1_2')",
-              "('empty', 't2')"
+              "('at', 'p1', 'c_1_2')",
+              "('empty', 't1')"
             ],
             "name": "drop-package",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 't2', 'c_1_2')",
-              "('carrying', 't2', 'p3')"
+              "('at', 't1', 'c_1_2')",
+              "('carrying', 't1', 'p1')"
             ]
           },
           {
             "binding": {
-              "?p": "p3",
-              "?t": "t2",
-              "?x": "c_2_0"
-            },
-            "eff_neg": [
-              "('carrying', 't2', 'p3')"
-            ],
-            "eff_pos": [
-              "('at', 'p3', 'c_2_0')",
-              "('empty', 't2')"
-            ],
-            "name": "drop-package",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 't2', 'c_2_0')",
-              "('carrying', 't2', 'p3')"
-            ]
-          },
-          {
-            "binding": {
-              "?p": "p3",
-              "?t": "t2",
-              "?x": "c_1_0"
-            },
-            "eff_neg": [
-              "('carrying', 't2', 'p3')"
-            ],
-            "eff_pos": [
-              "('at', 'p3', 'c_1_0')",
-              "('empty', 't2')"
-            ],
-            "name": "drop-package",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 't2', 'c_1_0')",
-              "('carrying', 't2', 'p3')"
-            ]
-          },
-          {
-            "binding": {
-              "?p": "p3",
-              "?t": "t2",
-              "?x": "c_2_1"
-            },
-            "eff_neg": [
-              "('carrying', 't2', 'p3')"
-            ],
-            "eff_pos": [
-              "('at', 'p3', 'c_2_1')",
-              "('empty', 't2')"
-            ],
-            "name": "drop-package",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 't2', 'c_2_1')",
-              "('carrying', 't2', 'p3')"
-            ]
-          },
-          {
-            "binding": {
-              "?p": "p3",
-              "?t": "t2",
-              "?x": "c_0_0"
-            },
-            "eff_neg": [
-              "('carrying', 't2', 'p3')"
-            ],
-            "eff_pos": [
-              "('at', 'p3', 'c_0_0')",
-              "('empty', 't2')"
-            ],
-            "name": "drop-package",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 't2', 'c_0_0')",
-              "('carrying', 't2', 'p3')"
-            ]
-          },
-          {
-            "binding": {
-              "?p": "p2",
-              "?t": "t2",
+              "?p": "p1",
+              "?t": "t1",
               "?x": "c_0_1"
             },
             "eff_neg": [
-              "('carrying', 't2', 'p2')"
+              "('carrying', 't1', 'p1')"
             ],
             "eff_pos": [
-              "('at', 'p2', 'c_0_1')",
-              "('empty', 't2')"
+              "('at', 'p1', 'c_0_1')",
+              "('empty', 't1')"
             ],
             "name": "drop-package",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 't2', 'c_0_1')",
-              "('carrying', 't2', 'p2')"
+              "('at', 't1', 'c_0_1')",
+              "('carrying', 't1', 'p1')"
             ]
           },
           {
             "binding": {
-              "?p": "p2",
-              "?t": "t2",
-              "?x": "c_0_2"
+              "?p": "p1",
+              "?t": "t1",
+              "?x": "c_2_1"
             },
             "eff_neg": [
-              "('carrying', 't2', 'p2')"
+              "('carrying', 't1', 'p1')"
             ],
             "eff_pos": [
-              "('at', 'p2', 'c_0_2')",
-              "('empty', 't2')"
+              "('at', 'p1', 'c_2_1')",
+              "('empty', 't1')"
             ],
             "name": "drop-package",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 't2', 'c_0_2')",
-              "('carrying', 't2', 'p2')"
+              "('at', 't1', 'c_2_1')",
+              "('carrying', 't1', 'p1')"
             ]
           },
           {
             "binding": {
-              "?p": "p2",
-              "?t": "t2",
+              "?p": "p1",
+              "?t": "t1",
               "?x": "c_2_2"
             },
             "eff_neg": [
-              "('carrying', 't2', 'p2')"
+              "('carrying', 't1', 'p1')"
             ],
             "eff_pos": [
-              "('at', 'p2', 'c_2_2')",
-              "('empty', 't2')"
+              "('at', 'p1', 'c_2_2')",
+              "('empty', 't1')"
             ],
             "name": "drop-package",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 't2', 'c_2_2')",
-              "('carrying', 't2', 'p2')"
+              "('at', 't1', 'c_2_2')",
+              "('carrying', 't1', 'p1')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p1",
+              "?t": "t1",
+              "?x": "c_1_1"
+            },
+            "eff_neg": [
+              "('carrying', 't1', 'p1')"
+            ],
+            "eff_pos": [
+              "('at', 'p1', 'c_1_1')",
+              "('empty', 't1')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't1', 'c_1_1')",
+              "('carrying', 't1', 'p1')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p1",
+              "?t": "t1",
+              "?x": "c_0_0"
+            },
+            "eff_neg": [
+              "('carrying', 't1', 'p1')"
+            ],
+            "eff_pos": [
+              "('at', 'p1', 'c_0_0')",
+              "('empty', 't1')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't1', 'c_0_0')",
+              "('carrying', 't1', 'p1')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p1",
+              "?t": "t1",
+              "?x": "c_2_0"
+            },
+            "eff_neg": [
+              "('carrying', 't1', 'p1')"
+            ],
+            "eff_pos": [
+              "('at', 'p1', 'c_2_0')",
+              "('empty', 't1')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't1', 'c_2_0')",
+              "('carrying', 't1', 'p1')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p1",
+              "?t": "t1",
+              "?x": "c_0_2"
+            },
+            "eff_neg": [
+              "('carrying', 't1', 'p1')"
+            ],
+            "eff_pos": [
+              "('at', 'p1', 'c_0_2')",
+              "('empty', 't1')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't1', 'c_0_2')",
+              "('carrying', 't1', 'p1')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p1",
+              "?t": "t1",
+              "?x": "c_1_0"
+            },
+            "eff_neg": [
+              "('carrying', 't1', 'p1')"
+            ],
+            "eff_pos": [
+              "('at', 'p1', 'c_1_0')",
+              "('empty', 't1')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't1', 'c_1_0')",
+              "('carrying', 't1', 'p1')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p2",
+              "?t": "t1",
+              "?x": "c_1_2"
+            },
+            "eff_neg": [
+              "('carrying', 't1', 'p2')"
+            ],
+            "eff_pos": [
+              "('at', 'p2', 'c_1_2')",
+              "('empty', 't1')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't1', 'c_1_2')",
+              "('carrying', 't1', 'p2')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p2",
+              "?t": "t1",
+              "?x": "c_0_1"
+            },
+            "eff_neg": [
+              "('carrying', 't1', 'p2')"
+            ],
+            "eff_pos": [
+              "('at', 'p2', 'c_0_1')",
+              "('empty', 't1')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't1', 'c_0_1')",
+              "('carrying', 't1', 'p2')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p2",
+              "?t": "t1",
+              "?x": "c_2_1"
+            },
+            "eff_neg": [
+              "('carrying', 't1', 'p2')"
+            ],
+            "eff_pos": [
+              "('at', 'p2', 'c_2_1')",
+              "('empty', 't1')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't1', 'c_2_1')",
+              "('carrying', 't1', 'p2')"
             ]
           }
         ]
@@ -270,12 +270,12 @@
         "action_schema_count": 3,
         "engine": "fast-downward",
         "engine_metrics": {
-          "engine_internal_time": "0.1040043830871582"
+          "engine_internal_time": "0.4418208599090576"
         },
         "fluent_count": 4,
         "illegal_step": null,
         "object_count": 14,
-        "parser_elapsed_sec": 0.041095,
+        "parser_elapsed_sec": 0.062155,
         "plan": [
           "move(t2, c_1_1, c_0_1)",
           "pick-package(t2, p2, c_0_1)",
@@ -288,9 +288,9 @@
           "drop-package(t2, p1, c_2_1)"
         ],
         "plan_length": 9,
-        "problem_kind": "PROBLEM_CLASS: ['ACTION_BASED']\nCONDITIONS_KIND: ['EQUALITIES', 'NEGATIVE_CONDITIONS']\nTYPING: ['HIERARCHICAL_TYPING', 'FLAT_TYPING']",
+        "problem_kind": "PROBLEM_CLASS: ['ACTION_BASED']\nCONDITIONS_KIND: ['NEGATIVE_CONDITIONS', 'EQUALITIES']\nTYPING: ['FLAT_TYPING', 'HIERARCHICAL_TYPING']",
         "problem_name": "delivery-3x3-2-2",
-        "replay_elapsed_sec": 0.00782,
+        "replay_elapsed_sec": 0.010228,
         "replay_goal": true,
         "replay_samples": [
           {
@@ -348,7 +348,7 @@
             "state_hash_before": 1295067176460159063
           }
         ],
-        "solve_elapsed_sec": 0.122635,
+        "solve_elapsed_sec": 0.466487,
         "solve_status": "PlanGenerationResultStatus.SOLVED_SATISFICING",
         "solved": true,
         "validated": true,
@@ -361,7 +361,7 @@
       "pass": true,
       "pddlpy": {
         "applicable_initial": 0,
-        "elapsed_sec": 0.024761,
+        "elapsed_sec": 0.032549,
         "goal_atom_count": 2,
         "ground_actions": 80,
         "grounding_truncated_at": null,
@@ -380,111 +380,11 @@
         "samples": [
           {
             "binding": {
-              "?car": "car5",
-              "?loc": "loc1"
-            },
-            "eff_neg": [
-              "('at', 'car5', 'loc1')",
-              "('empty-ferry',)"
-            ],
-            "eff_pos": [
-              "('on', 'car5')"
-            ],
-            "name": "board",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 'car5', 'loc1')",
-              "('at-ferry', 'loc1')",
-              "('empty-ferry',)"
-            ]
-          },
-          {
-            "binding": {
-              "?car": "car5",
-              "?loc": "loc3"
-            },
-            "eff_neg": [
-              "('at', 'car5', 'loc3')",
-              "('empty-ferry',)"
-            ],
-            "eff_pos": [
-              "('on', 'car5')"
-            ],
-            "name": "board",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 'car5', 'loc3')",
-              "('at-ferry', 'loc3')",
-              "('empty-ferry',)"
-            ]
-          },
-          {
-            "binding": {
-              "?car": "car5",
-              "?loc": "loc5"
-            },
-            "eff_neg": [
-              "('at', 'car5', 'loc5')",
-              "('empty-ferry',)"
-            ],
-            "eff_pos": [
-              "('on', 'car5')"
-            ],
-            "name": "board",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 'car5', 'loc5')",
-              "('at-ferry', 'loc5')",
-              "('empty-ferry',)"
-            ]
-          },
-          {
-            "binding": {
-              "?car": "car5",
-              "?loc": "loc2"
-            },
-            "eff_neg": [
-              "('at', 'car5', 'loc2')",
-              "('empty-ferry',)"
-            ],
-            "eff_pos": [
-              "('on', 'car5')"
-            ],
-            "name": "board",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 'car5', 'loc2')",
-              "('at-ferry', 'loc2')",
-              "('empty-ferry',)"
-            ]
-          },
-          {
-            "binding": {
-              "?car": "car5",
+              "?car": "car1",
               "?loc": "loc4"
             },
             "eff_neg": [
-              "('at', 'car5', 'loc4')",
-              "('empty-ferry',)"
-            ],
-            "eff_pos": [
-              "('on', 'car5')"
-            ],
-            "name": "board",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 'car5', 'loc4')",
-              "('at-ferry', 'loc4')",
-              "('empty-ferry',)"
-            ]
-          },
-          {
-            "binding": {
-              "?car": "car1",
-              "?loc": "loc1"
-            },
-            "eff_neg": [
-              "('at', 'car1', 'loc1')",
+              "('at', 'car1', 'loc4')",
               "('empty-ferry',)"
             ],
             "eff_pos": [
@@ -493,8 +393,8 @@
             "name": "board",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 'car1', 'loc1')",
-              "('at-ferry', 'loc1')",
+              "('at', 'car1', 'loc4')",
+              "('at-ferry', 'loc4')",
               "('empty-ferry',)"
             ]
           },
@@ -521,10 +421,10 @@
           {
             "binding": {
               "?car": "car1",
-              "?loc": "loc5"
+              "?loc": "loc1"
             },
             "eff_neg": [
-              "('at', 'car1', 'loc5')",
+              "('at', 'car1', 'loc1')",
               "('empty-ferry',)"
             ],
             "eff_pos": [
@@ -533,8 +433,8 @@
             "name": "board",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 'car1', 'loc5')",
-              "('at-ferry', 'loc5')",
+              "('at', 'car1', 'loc1')",
+              "('at-ferry', 'loc1')",
               "('empty-ferry',)"
             ]
           },
@@ -561,10 +461,10 @@
           {
             "binding": {
               "?car": "car1",
-              "?loc": "loc4"
+              "?loc": "loc5"
             },
             "eff_neg": [
-              "('at', 'car1', 'loc4')",
+              "('at', 'car1', 'loc5')",
               "('empty-ferry',)"
             ],
             "eff_pos": [
@@ -573,47 +473,147 @@
             "name": "board",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 'car1', 'loc4')",
+              "('at', 'car1', 'loc5')",
+              "('at-ferry', 'loc5')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car2",
+              "?loc": "loc4"
+            },
+            "eff_neg": [
+              "('at', 'car2', 'loc4')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car2')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car2', 'loc4')",
               "('at-ferry', 'loc4')",
               "('empty-ferry',)"
             ]
           },
           {
             "binding": {
-              "?car": "car3",
-              "?loc": "loc1"
+              "?car": "car2",
+              "?loc": "loc3"
             },
             "eff_neg": [
-              "('at', 'car3', 'loc1')",
+              "('at', 'car2', 'loc3')",
               "('empty-ferry',)"
             ],
             "eff_pos": [
-              "('on', 'car3')"
+              "('on', 'car2')"
             ],
             "name": "board",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 'car3', 'loc1')",
+              "('at', 'car2', 'loc3')",
+              "('at-ferry', 'loc3')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car2",
+              "?loc": "loc1"
+            },
+            "eff_neg": [
+              "('at', 'car2', 'loc1')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car2')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car2', 'loc1')",
               "('at-ferry', 'loc1')",
               "('empty-ferry',)"
             ]
           },
           {
             "binding": {
-              "?car": "car3",
-              "?loc": "loc3"
+              "?car": "car2",
+              "?loc": "loc2"
             },
             "eff_neg": [
-              "('at', 'car3', 'loc3')",
+              "('at', 'car2', 'loc2')",
               "('empty-ferry',)"
             ],
             "eff_pos": [
-              "('on', 'car3')"
+              "('on', 'car2')"
             ],
             "name": "board",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 'car3', 'loc3')",
+              "('at', 'car2', 'loc2')",
+              "('at-ferry', 'loc2')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car2",
+              "?loc": "loc5"
+            },
+            "eff_neg": [
+              "('at', 'car2', 'loc5')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car2')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car2', 'loc5')",
+              "('at-ferry', 'loc5')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car6",
+              "?loc": "loc4"
+            },
+            "eff_neg": [
+              "('at', 'car6', 'loc4')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car6')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car6', 'loc4')",
+              "('at-ferry', 'loc4')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car6",
+              "?loc": "loc3"
+            },
+            "eff_neg": [
+              "('at', 'car6', 'loc3')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car6')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car6', 'loc3')",
               "('at-ferry', 'loc3')",
               "('empty-ferry',)"
             ]
@@ -625,12 +625,12 @@
         "action_schema_count": 3,
         "engine": "fast-downward",
         "engine_metrics": {
-          "engine_internal_time": "0.097259521484375"
+          "engine_internal_time": "0.12403416633605957"
         },
         "fluent_count": 5,
         "illegal_step": null,
         "object_count": 11,
-        "parser_elapsed_sec": 0.077158,
+        "parser_elapsed_sec": 0.090045,
         "plan": [
           "sail(loc2, loc1)",
           "board(car1, loc1)",
@@ -644,7 +644,7 @@
         "plan_length": 8,
         "problem_kind": "PROBLEM_CLASS: ['ACTION_BASED']\nCONDITIONS_KIND: ['NEGATIVE_CONDITIONS']\nTYPING: ['FLAT_TYPING']",
         "problem_name": "ferry-01",
-        "replay_elapsed_sec": 0.006002,
+        "replay_elapsed_sec": 0.007772,
         "replay_goal": true,
         "replay_samples": [
           {
@@ -696,7 +696,7 @@
             "state_hash_before": 9189911593531191785
           }
         ],
-        "solve_elapsed_sec": 0.112022,
+        "solve_elapsed_sec": 0.143156,
         "solve_status": "PlanGenerationResultStatus.SOLVED_SATISFICING",
         "solved": true,
         "validated": true,
@@ -709,7 +709,7 @@
       "pass": true,
       "pddlpy": {
         "applicable_initial": 0,
-        "elapsed_sec": 0.042603,
+        "elapsed_sec": 0.055464,
         "goal_atom_count": 3,
         "ground_actions": 98,
         "grounding_truncated_at": null,
@@ -728,29 +728,6 @@
         "samples": [
           {
             "binding": {
-              "?gripper": "middle",
-              "?obj": "ball6",
-              "?room": "roomb"
-            },
-            "eff_neg": [
-              "('carry', 'ball6', 'middle')"
-            ],
-            "eff_pos": [
-              "('at', 'ball6', 'roomb')",
-              "('free', 'middle')"
-            ],
-            "name": "drop",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at-robby', 'roomb')",
-              "('ball', 'ball6')",
-              "('carry', 'ball6', 'middle')",
-              "('gripper', 'middle')",
-              "('room', 'roomb')"
-            ]
-          },
-          {
-            "binding": {
               "?gripper": "left",
               "?obj": "ball6",
               "?room": "roomb"
@@ -768,6 +745,167 @@
               "('at-robby', 'roomb')",
               "('ball', 'ball6')",
               "('carry', 'ball6', 'left')",
+              "('gripper', 'left')",
+              "('room', 'roomb')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "left",
+              "?obj": "ball4",
+              "?room": "roomb"
+            },
+            "eff_neg": [
+              "('carry', 'ball4', 'left')"
+            ],
+            "eff_pos": [
+              "('at', 'ball4', 'roomb')",
+              "('free', 'left')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'roomb')",
+              "('ball', 'ball4')",
+              "('carry', 'ball4', 'left')",
+              "('gripper', 'left')",
+              "('room', 'roomb')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "left",
+              "?obj": "ball8",
+              "?room": "roomb"
+            },
+            "eff_neg": [
+              "('carry', 'ball8', 'left')"
+            ],
+            "eff_pos": [
+              "('at', 'ball8', 'roomb')",
+              "('free', 'left')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'roomb')",
+              "('ball', 'ball8')",
+              "('carry', 'ball8', 'left')",
+              "('gripper', 'left')",
+              "('room', 'roomb')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "left",
+              "?obj": "ball7",
+              "?room": "roomb"
+            },
+            "eff_neg": [
+              "('carry', 'ball7', 'left')"
+            ],
+            "eff_pos": [
+              "('at', 'ball7', 'roomb')",
+              "('free', 'left')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'roomb')",
+              "('ball', 'ball7')",
+              "('carry', 'ball7', 'left')",
+              "('gripper', 'left')",
+              "('room', 'roomb')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "left",
+              "?obj": "ball5",
+              "?room": "roomb"
+            },
+            "eff_neg": [
+              "('carry', 'ball5', 'left')"
+            ],
+            "eff_pos": [
+              "('at', 'ball5', 'roomb')",
+              "('free', 'left')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'roomb')",
+              "('ball', 'ball5')",
+              "('carry', 'ball5', 'left')",
+              "('gripper', 'left')",
+              "('room', 'roomb')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "left",
+              "?obj": "ball3",
+              "?room": "roomb"
+            },
+            "eff_neg": [
+              "('carry', 'ball3', 'left')"
+            ],
+            "eff_pos": [
+              "('at', 'ball3', 'roomb')",
+              "('free', 'left')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'roomb')",
+              "('ball', 'ball3')",
+              "('carry', 'ball3', 'left')",
+              "('gripper', 'left')",
+              "('room', 'roomb')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "left",
+              "?obj": "ball2",
+              "?room": "roomb"
+            },
+            "eff_neg": [
+              "('carry', 'ball2', 'left')"
+            ],
+            "eff_pos": [
+              "('at', 'ball2', 'roomb')",
+              "('free', 'left')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'roomb')",
+              "('ball', 'ball2')",
+              "('carry', 'ball2', 'left')",
+              "('gripper', 'left')",
+              "('room', 'roomb')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "left",
+              "?obj": "ball1",
+              "?room": "roomb"
+            },
+            "eff_neg": [
+              "('carry', 'ball1', 'left')"
+            ],
+            "eff_pos": [
+              "('at', 'ball1', 'roomb')",
+              "('free', 'left')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'roomb')",
+              "('ball', 'ball1')",
+              "('carry', 'ball1', 'left')",
               "('gripper', 'left')",
               "('room', 'roomb')"
             ]
@@ -797,209 +935,71 @@
           },
           {
             "binding": {
-              "?gripper": "middle",
-              "?obj": "ball6",
-              "?room": "rooma"
-            },
-            "eff_neg": [
-              "('carry', 'ball6', 'middle')"
-            ],
-            "eff_pos": [
-              "('at', 'ball6', 'rooma')",
-              "('free', 'middle')"
-            ],
-            "name": "drop",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at-robby', 'rooma')",
-              "('ball', 'ball6')",
-              "('carry', 'ball6', 'middle')",
-              "('gripper', 'middle')",
-              "('room', 'rooma')"
-            ]
-          },
-          {
-            "binding": {
-              "?gripper": "left",
-              "?obj": "ball6",
-              "?room": "rooma"
-            },
-            "eff_neg": [
-              "('carry', 'ball6', 'left')"
-            ],
-            "eff_pos": [
-              "('at', 'ball6', 'rooma')",
-              "('free', 'left')"
-            ],
-            "name": "drop",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at-robby', 'rooma')",
-              "('ball', 'ball6')",
-              "('carry', 'ball6', 'left')",
-              "('gripper', 'left')",
-              "('room', 'rooma')"
-            ]
-          },
-          {
-            "binding": {
               "?gripper": "right",
-              "?obj": "ball6",
-              "?room": "rooma"
-            },
-            "eff_neg": [
-              "('carry', 'ball6', 'right')"
-            ],
-            "eff_pos": [
-              "('at', 'ball6', 'rooma')",
-              "('free', 'right')"
-            ],
-            "name": "drop",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at-robby', 'rooma')",
-              "('ball', 'ball6')",
-              "('carry', 'ball6', 'right')",
-              "('gripper', 'right')",
-              "('room', 'rooma')"
-            ]
-          },
-          {
-            "binding": {
-              "?gripper": "middle",
-              "?obj": "ball5",
+              "?obj": "ball4",
               "?room": "roomb"
             },
             "eff_neg": [
-              "('carry', 'ball5', 'middle')"
+              "('carry', 'ball4', 'right')"
             ],
             "eff_pos": [
-              "('at', 'ball5', 'roomb')",
-              "('free', 'middle')"
-            ],
-            "name": "drop",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at-robby', 'roomb')",
-              "('ball', 'ball5')",
-              "('carry', 'ball5', 'middle')",
-              "('gripper', 'middle')",
-              "('room', 'roomb')"
-            ]
-          },
-          {
-            "binding": {
-              "?gripper": "left",
-              "?obj": "ball5",
-              "?room": "roomb"
-            },
-            "eff_neg": [
-              "('carry', 'ball5', 'left')"
-            ],
-            "eff_pos": [
-              "('at', 'ball5', 'roomb')",
-              "('free', 'left')"
-            ],
-            "name": "drop",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at-robby', 'roomb')",
-              "('ball', 'ball5')",
-              "('carry', 'ball5', 'left')",
-              "('gripper', 'left')",
-              "('room', 'roomb')"
-            ]
-          },
-          {
-            "binding": {
-              "?gripper": "right",
-              "?obj": "ball5",
-              "?room": "roomb"
-            },
-            "eff_neg": [
-              "('carry', 'ball5', 'right')"
-            ],
-            "eff_pos": [
-              "('at', 'ball5', 'roomb')",
+              "('at', 'ball4', 'roomb')",
               "('free', 'right')"
             ],
             "name": "drop",
             "pre_neg": [],
             "pre_pos": [
               "('at-robby', 'roomb')",
-              "('ball', 'ball5')",
-              "('carry', 'ball5', 'right')",
+              "('ball', 'ball4')",
+              "('carry', 'ball4', 'right')",
               "('gripper', 'right')",
               "('room', 'roomb')"
             ]
           },
           {
             "binding": {
-              "?gripper": "middle",
-              "?obj": "ball5",
-              "?room": "rooma"
-            },
-            "eff_neg": [
-              "('carry', 'ball5', 'middle')"
-            ],
-            "eff_pos": [
-              "('at', 'ball5', 'rooma')",
-              "('free', 'middle')"
-            ],
-            "name": "drop",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at-robby', 'rooma')",
-              "('ball', 'ball5')",
-              "('carry', 'ball5', 'middle')",
-              "('gripper', 'middle')",
-              "('room', 'rooma')"
-            ]
-          },
-          {
-            "binding": {
-              "?gripper": "left",
-              "?obj": "ball5",
-              "?room": "rooma"
-            },
-            "eff_neg": [
-              "('carry', 'ball5', 'left')"
-            ],
-            "eff_pos": [
-              "('at', 'ball5', 'rooma')",
-              "('free', 'left')"
-            ],
-            "name": "drop",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at-robby', 'rooma')",
-              "('ball', 'ball5')",
-              "('carry', 'ball5', 'left')",
-              "('gripper', 'left')",
-              "('room', 'rooma')"
-            ]
-          },
-          {
-            "binding": {
               "?gripper": "right",
-              "?obj": "ball5",
-              "?room": "rooma"
+              "?obj": "ball8",
+              "?room": "roomb"
             },
             "eff_neg": [
-              "('carry', 'ball5', 'right')"
+              "('carry', 'ball8', 'right')"
             ],
             "eff_pos": [
-              "('at', 'ball5', 'rooma')",
+              "('at', 'ball8', 'roomb')",
               "('free', 'right')"
             ],
             "name": "drop",
             "pre_neg": [],
             "pre_pos": [
-              "('at-robby', 'rooma')",
-              "('ball', 'ball5')",
-              "('carry', 'ball5', 'right')",
+              "('at-robby', 'roomb')",
+              "('ball', 'ball8')",
+              "('carry', 'ball8', 'right')",
               "('gripper', 'right')",
-              "('room', 'rooma')"
+              "('room', 'roomb')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "right",
+              "?obj": "ball7",
+              "?room": "roomb"
+            },
+            "eff_neg": [
+              "('carry', 'ball7', 'right')"
+            ],
+            "eff_pos": [
+              "('at', 'ball7', 'roomb')",
+              "('free', 'right')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'roomb')",
+              "('ball', 'ball7')",
+              "('carry', 'ball7', 'right')",
+              "('gripper', 'right')",
+              "('room', 'roomb')"
             ]
           }
         ]
@@ -1009,12 +1009,12 @@
         "action_schema_count": 3,
         "engine": "fast-downward",
         "engine_metrics": {
-          "engine_internal_time": "0.1161336898803711"
+          "engine_internal_time": "0.150712251663208"
         },
         "fluent_count": 8,
         "illegal_step": null,
         "object_count": 13,
-        "parser_elapsed_sec": 0.05475,
+        "parser_elapsed_sec": 0.068733,
         "plan": [
           "pick(ball1, rooma, left)",
           "pick(ball2, rooma, middle)",
@@ -1027,7 +1027,7 @@
         "plan_length": 7,
         "problem_kind": "PROBLEM_CLASS: ['ACTION_BASED']\nCONDITIONS_KIND: ['NEGATIVE_CONDITIONS']\nTYPING: ['FLAT_TYPING']",
         "problem_name": "gripper-3",
-        "replay_elapsed_sec": 0.009543,
+        "replay_elapsed_sec": 0.012291,
         "replay_goal": true,
         "replay_samples": [
           {
@@ -1073,7 +1073,7 @@
             "state_hash_before": -409069118845157151
           }
         ],
-        "solve_elapsed_sec": 0.143957,
+        "solve_elapsed_sec": 0.186393,
         "solve_status": "PlanGenerationResultStatus.SOLVED_SATISFICING",
         "solved": true,
         "validated": true,
@@ -1086,7 +1086,7 @@
       "pass": true,
       "pddlpy": {
         "applicable_initial": 0,
-        "elapsed_sec": 0.067772,
+        "elapsed_sec": 0.090931,
         "goal_atom_count": 10,
         "ground_actions": 2197,
         "grounding_truncated_at": null,
@@ -1101,288 +1101,288 @@
         "samples": [
           {
             "binding": {
-              "?disc": "d2",
-              "?from": "d2",
-              "?to": "d2"
-            },
-            "eff_neg": [
-              "('clear', 'd2')",
-              "('on', 'd2', 'd2')"
-            ],
-            "eff_pos": [
-              "('clear', 'd2')",
-              "('on', 'd2', 'd2')"
-            ],
-            "name": "move",
-            "pre_neg": [],
-            "pre_pos": [
-              "('clear', 'd2')",
-              "('on', 'd2', 'd2')",
-              "('smaller', 'd2', 'd2')"
-            ]
-          },
-          {
-            "binding": {
-              "?disc": "d2",
-              "?from": "d2",
-              "?to": "d8"
-            },
-            "eff_neg": [
-              "('clear', 'd8')",
-              "('on', 'd2', 'd2')"
-            ],
-            "eff_pos": [
-              "('clear', 'd2')",
-              "('on', 'd2', 'd8')"
-            ],
-            "name": "move",
-            "pre_neg": [],
-            "pre_pos": [
-              "('clear', 'd2')",
-              "('clear', 'd8')",
-              "('on', 'd2', 'd2')",
-              "('smaller', 'd2', 'd2')",
-              "('smaller', 'd2', 'd8')"
-            ]
-          },
-          {
-            "binding": {
-              "?disc": "d2",
-              "?from": "d2",
-              "?to": "d9"
-            },
-            "eff_neg": [
-              "('clear', 'd9')",
-              "('on', 'd2', 'd2')"
-            ],
-            "eff_pos": [
-              "('clear', 'd2')",
-              "('on', 'd2', 'd9')"
-            ],
-            "name": "move",
-            "pre_neg": [],
-            "pre_pos": [
-              "('clear', 'd2')",
-              "('clear', 'd9')",
-              "('on', 'd2', 'd2')",
-              "('smaller', 'd2', 'd2')",
-              "('smaller', 'd2', 'd9')"
-            ]
-          },
-          {
-            "binding": {
-              "?disc": "d2",
-              "?from": "d2",
-              "?to": "d5"
-            },
-            "eff_neg": [
-              "('clear', 'd5')",
-              "('on', 'd2', 'd2')"
-            ],
-            "eff_pos": [
-              "('clear', 'd2')",
-              "('on', 'd2', 'd5')"
-            ],
-            "name": "move",
-            "pre_neg": [],
-            "pre_pos": [
-              "('clear', 'd2')",
-              "('clear', 'd5')",
-              "('on', 'd2', 'd2')",
-              "('smaller', 'd2', 'd2')",
-              "('smaller', 'd2', 'd5')"
-            ]
-          },
-          {
-            "binding": {
-              "?disc": "d2",
-              "?from": "d2",
-              "?to": "peg1"
-            },
-            "eff_neg": [
-              "('clear', 'peg1')",
-              "('on', 'd2', 'd2')"
-            ],
-            "eff_pos": [
-              "('clear', 'd2')",
-              "('on', 'd2', 'peg1')"
-            ],
-            "name": "move",
-            "pre_neg": [],
-            "pre_pos": [
-              "('clear', 'd2')",
-              "('clear', 'peg1')",
-              "('on', 'd2', 'd2')",
-              "('smaller', 'd2', 'd2')",
-              "('smaller', 'd2', 'peg1')"
-            ]
-          },
-          {
-            "binding": {
-              "?disc": "d2",
-              "?from": "d2",
-              "?to": "d1"
-            },
-            "eff_neg": [
-              "('clear', 'd1')",
-              "('on', 'd2', 'd2')"
-            ],
-            "eff_pos": [
-              "('clear', 'd2')",
-              "('on', 'd2', 'd1')"
-            ],
-            "name": "move",
-            "pre_neg": [],
-            "pre_pos": [
-              "('clear', 'd1')",
-              "('clear', 'd2')",
-              "('on', 'd2', 'd2')",
-              "('smaller', 'd2', 'd1')",
-              "('smaller', 'd2', 'd2')"
-            ]
-          },
-          {
-            "binding": {
-              "?disc": "d2",
-              "?from": "d2",
-              "?to": "d6"
-            },
-            "eff_neg": [
-              "('clear', 'd6')",
-              "('on', 'd2', 'd2')"
-            ],
-            "eff_pos": [
-              "('clear', 'd2')",
-              "('on', 'd2', 'd6')"
-            ],
-            "name": "move",
-            "pre_neg": [],
-            "pre_pos": [
-              "('clear', 'd2')",
-              "('clear', 'd6')",
-              "('on', 'd2', 'd2')",
-              "('smaller', 'd2', 'd2')",
-              "('smaller', 'd2', 'd6')"
-            ]
-          },
-          {
-            "binding": {
-              "?disc": "d2",
-              "?from": "d2",
-              "?to": "d4"
-            },
-            "eff_neg": [
-              "('clear', 'd4')",
-              "('on', 'd2', 'd2')"
-            ],
-            "eff_pos": [
-              "('clear', 'd2')",
-              "('on', 'd2', 'd4')"
-            ],
-            "name": "move",
-            "pre_neg": [],
-            "pre_pos": [
-              "('clear', 'd2')",
-              "('clear', 'd4')",
-              "('on', 'd2', 'd2')",
-              "('smaller', 'd2', 'd2')",
-              "('smaller', 'd2', 'd4')"
-            ]
-          },
-          {
-            "binding": {
-              "?disc": "d2",
-              "?from": "d2",
-              "?to": "peg3"
-            },
-            "eff_neg": [
-              "('clear', 'peg3')",
-              "('on', 'd2', 'd2')"
-            ],
-            "eff_pos": [
-              "('clear', 'd2')",
-              "('on', 'd2', 'peg3')"
-            ],
-            "name": "move",
-            "pre_neg": [],
-            "pre_pos": [
-              "('clear', 'd2')",
-              "('clear', 'peg3')",
-              "('on', 'd2', 'd2')",
-              "('smaller', 'd2', 'd2')",
-              "('smaller', 'd2', 'peg3')"
-            ]
-          },
-          {
-            "binding": {
-              "?disc": "d2",
-              "?from": "d2",
+              "?disc": "peg2",
+              "?from": "peg2",
               "?to": "peg2"
             },
             "eff_neg": [
               "('clear', 'peg2')",
-              "('on', 'd2', 'd2')"
+              "('on', 'peg2', 'peg2')"
             ],
             "eff_pos": [
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'peg2')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'peg2')",
+              "('smaller', 'peg2', 'peg2')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "peg2",
+              "?from": "peg2",
+              "?to": "d7"
+            },
+            "eff_neg": [
+              "('clear', 'd7')",
+              "('on', 'peg2', 'peg2')"
+            ],
+            "eff_pos": [
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'd7')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd7')",
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'peg2')",
+              "('smaller', 'peg2', 'd7')",
+              "('smaller', 'peg2', 'peg2')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "peg2",
+              "?from": "peg2",
+              "?to": "peg1"
+            },
+            "eff_neg": [
+              "('clear', 'peg1')",
+              "('on', 'peg2', 'peg2')"
+            ],
+            "eff_pos": [
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'peg1')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'peg1')",
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'peg2')",
+              "('smaller', 'peg2', 'peg1')",
+              "('smaller', 'peg2', 'peg2')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "peg2",
+              "?from": "peg2",
+              "?to": "d10"
+            },
+            "eff_neg": [
+              "('clear', 'd10')",
+              "('on', 'peg2', 'peg2')"
+            ],
+            "eff_pos": [
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'd10')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd10')",
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'peg2')",
+              "('smaller', 'peg2', 'd10')",
+              "('smaller', 'peg2', 'peg2')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "peg2",
+              "?from": "peg2",
+              "?to": "peg3"
+            },
+            "eff_neg": [
+              "('clear', 'peg3')",
+              "('on', 'peg2', 'peg2')"
+            ],
+            "eff_pos": [
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'peg3')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'peg2')",
+              "('clear', 'peg3')",
+              "('on', 'peg2', 'peg2')",
+              "('smaller', 'peg2', 'peg2')",
+              "('smaller', 'peg2', 'peg3')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "peg2",
+              "?from": "peg2",
+              "?to": "d1"
+            },
+            "eff_neg": [
+              "('clear', 'd1')",
+              "('on', 'peg2', 'peg2')"
+            ],
+            "eff_pos": [
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'd1')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd1')",
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'peg2')",
+              "('smaller', 'peg2', 'd1')",
+              "('smaller', 'peg2', 'peg2')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "peg2",
+              "?from": "peg2",
+              "?to": "d4"
+            },
+            "eff_neg": [
+              "('clear', 'd4')",
+              "('on', 'peg2', 'peg2')"
+            ],
+            "eff_pos": [
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'd4')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd4')",
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'peg2')",
+              "('smaller', 'peg2', 'd4')",
+              "('smaller', 'peg2', 'peg2')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "peg2",
+              "?from": "peg2",
+              "?to": "d9"
+            },
+            "eff_neg": [
+              "('clear', 'd9')",
+              "('on', 'peg2', 'peg2')"
+            ],
+            "eff_pos": [
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'd9')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd9')",
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'peg2')",
+              "('smaller', 'peg2', 'd9')",
+              "('smaller', 'peg2', 'peg2')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "peg2",
+              "?from": "peg2",
+              "?to": "d5"
+            },
+            "eff_neg": [
+              "('clear', 'd5')",
+              "('on', 'peg2', 'peg2')"
+            ],
+            "eff_pos": [
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'd5')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd5')",
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'peg2')",
+              "('smaller', 'peg2', 'd5')",
+              "('smaller', 'peg2', 'peg2')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "peg2",
+              "?from": "peg2",
+              "?to": "d2"
+            },
+            "eff_neg": [
               "('clear', 'd2')",
-              "('on', 'd2', 'peg2')"
+              "('on', 'peg2', 'peg2')"
+            ],
+            "eff_pos": [
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'd2')"
             ],
             "name": "move",
             "pre_neg": [],
             "pre_pos": [
               "('clear', 'd2')",
               "('clear', 'peg2')",
-              "('on', 'd2', 'd2')",
-              "('smaller', 'd2', 'd2')",
-              "('smaller', 'd2', 'peg2')"
+              "('on', 'peg2', 'peg2')",
+              "('smaller', 'peg2', 'd2')",
+              "('smaller', 'peg2', 'peg2')"
             ]
           },
           {
             "binding": {
-              "?disc": "d2",
-              "?from": "d2",
-              "?to": "d7"
+              "?disc": "peg2",
+              "?from": "peg2",
+              "?to": "d8"
             },
             "eff_neg": [
-              "('clear', 'd7')",
-              "('on', 'd2', 'd2')"
+              "('clear', 'd8')",
+              "('on', 'peg2', 'peg2')"
             ],
             "eff_pos": [
-              "('clear', 'd2')",
-              "('on', 'd2', 'd7')"
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'd8')"
             ],
             "name": "move",
             "pre_neg": [],
             "pre_pos": [
-              "('clear', 'd2')",
-              "('clear', 'd7')",
-              "('on', 'd2', 'd2')",
-              "('smaller', 'd2', 'd2')",
-              "('smaller', 'd2', 'd7')"
+              "('clear', 'd8')",
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'peg2')",
+              "('smaller', 'peg2', 'd8')",
+              "('smaller', 'peg2', 'peg2')"
             ]
           },
           {
             "binding": {
-              "?disc": "d2",
-              "?from": "d2",
-              "?to": "d3"
+              "?disc": "peg2",
+              "?from": "peg2",
+              "?to": "d6"
             },
             "eff_neg": [
-              "('clear', 'd3')",
-              "('on', 'd2', 'd2')"
+              "('clear', 'd6')",
+              "('on', 'peg2', 'peg2')"
             ],
             "eff_pos": [
-              "('clear', 'd2')",
-              "('on', 'd2', 'd3')"
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'd6')"
             ],
             "name": "move",
             "pre_neg": [],
             "pre_pos": [
-              "('clear', 'd2')",
-              "('clear', 'd3')",
-              "('on', 'd2', 'd2')",
-              "('smaller', 'd2', 'd2')",
-              "('smaller', 'd2', 'd3')"
+              "('clear', 'd6')",
+              "('clear', 'peg2')",
+              "('on', 'peg2', 'peg2')",
+              "('smaller', 'peg2', 'd6')",
+              "('smaller', 'peg2', 'peg2')"
             ]
           }
         ]
@@ -1392,12 +1392,12 @@
         "action_schema_count": 1,
         "engine": "fast-downward",
         "engine_metrics": {
-          "engine_internal_time": "0.3318819999694824"
+          "engine_internal_time": "0.42450594902038574"
         },
         "fluent_count": 3,
         "illegal_step": null,
         "object_count": 13,
-        "parser_elapsed_sec": 0.05847,
+        "parser_elapsed_sec": 0.075065,
         "plan": [
           "move(d1, d2, peg2)",
           "move(d2, d3, peg3)",
@@ -2594,9 +2594,9 @@
           "move(d1, peg2, d2)"
         ],
         "plan_length": 1193,
-        "problem_kind": "PROBLEM_CLASS: ['ACTION_BASED']\nCONDITIONS_KIND: ['EQUALITIES', 'NEGATIVE_CONDITIONS']\nTYPING: ['FLAT_TYPING']",
+        "problem_kind": "PROBLEM_CLASS: ['ACTION_BASED']\nCONDITIONS_KIND: ['NEGATIVE_CONDITIONS', 'EQUALITIES']\nTYPING: ['FLAT_TYPING']",
         "problem_name": "hanoi-10",
-        "replay_elapsed_sec": 0.48478,
+        "replay_elapsed_sec": 0.646116,
         "replay_goal": true,
         "replay_samples": [
           {
@@ -2660,7 +2660,7 @@
             "state_hash_before": -1945721235112499195
           }
         ],
-        "solve_elapsed_sec": 0.422208,
+        "solve_elapsed_sec": 0.532287,
         "solve_status": "PlanGenerationResultStatus.SOLVED_SATISFICING",
         "solved": true,
         "validated": true,
@@ -2673,7 +2673,7 @@
       "pass": true,
       "pddlpy": {
         "applicable_initial": 0,
-        "elapsed_sec": 0.109601,
+        "elapsed_sec": 0.172271,
         "goal_atom_count": 1,
         "ground_actions": 2880,
         "grounding_truncated_at": null,
@@ -2694,323 +2694,322 @@
         "samples": [
           {
             "binding": {
-              "?by": "p_x_0",
-              "?omf": "t_14",
-              "?px": "p_y_3",
-              "?py": "p_x_1"
+              "?by": "p_y_1",
+              "?omf": "t_1",
+              "?px": "p_y_2",
+              "?py": "p_y_2"
             },
             "eff_neg": [
-              "('at', 't_14', 'p_y_3', 'p_x_1')",
-              "('blank', 'p_y_3', 'p_x_0')"
+              "('at', 't_1', 'p_y_2', 'p_y_2')",
+              "('blank', 'p_y_2', 'p_y_1')"
             ],
             "eff_pos": [
-              "('at', 't_14', 'p_y_3', 'p_x_0')",
-              "('blank', 'p_y_3', 'p_x_1')"
+              "('at', 't_1', 'p_y_2', 'p_y_1')",
+              "('blank', 'p_y_2', 'p_y_2')"
             ],
             "name": "move-down",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 't_14', 'p_y_3', 'p_x_1')",
-              "('blank', 'p_y_3', 'p_x_0')",
-              "('inc', 'p_x_0', 'p_x_1')",
-              "('position', 'p_x_0')",
-              "('position', 'p_x_1')",
-              "('position', 'p_y_3')",
-              "('tile', 't_14')"
+              "('at', 't_1', 'p_y_2', 'p_y_2')",
+              "('blank', 'p_y_2', 'p_y_1')",
+              "('inc', 'p_y_1', 'p_y_2')",
+              "('position', 'p_y_1')",
+              "('position', 'p_y_2')",
+              "('tile', 't_1')"
             ]
           },
           {
             "binding": {
-              "?by": "p_x_0",
-              "?omf": "t_14",
-              "?px": "p_x_0",
-              "?py": "p_x_1"
+              "?by": "p_y_0",
+              "?omf": "t_1",
+              "?px": "p_y_2",
+              "?py": "p_y_1"
             },
             "eff_neg": [
-              "('at', 't_14', 'p_x_0', 'p_x_1')",
-              "('blank', 'p_x_0', 'p_x_0')"
+              "('at', 't_1', 'p_y_2', 'p_y_1')",
+              "('blank', 'p_y_2', 'p_y_0')"
             ],
             "eff_pos": [
-              "('at', 't_14', 'p_x_0', 'p_x_0')",
-              "('blank', 'p_x_0', 'p_x_1')"
+              "('at', 't_1', 'p_y_2', 'p_y_0')",
+              "('blank', 'p_y_2', 'p_y_1')"
             ],
             "name": "move-down",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 't_14', 'p_x_0', 'p_x_1')",
-              "('blank', 'p_x_0', 'p_x_0')",
-              "('inc', 'p_x_0', 'p_x_1')",
-              "('position', 'p_x_0')",
-              "('position', 'p_x_1')",
-              "('tile', 't_14')"
-            ]
-          },
-          {
-            "binding": {
-              "?by": "p_x_0",
-              "?omf": "t_14",
-              "?px": "p_y_0",
-              "?py": "p_x_1"
-            },
-            "eff_neg": [
-              "('at', 't_14', 'p_y_0', 'p_x_1')",
-              "('blank', 'p_y_0', 'p_x_0')"
-            ],
-            "eff_pos": [
-              "('at', 't_14', 'p_y_0', 'p_x_0')",
-              "('blank', 'p_y_0', 'p_x_1')"
-            ],
-            "name": "move-down",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 't_14', 'p_y_0', 'p_x_1')",
-              "('blank', 'p_y_0', 'p_x_0')",
-              "('inc', 'p_x_0', 'p_x_1')",
-              "('position', 'p_x_0')",
-              "('position', 'p_x_1')",
+              "('at', 't_1', 'p_y_2', 'p_y_1')",
+              "('blank', 'p_y_2', 'p_y_0')",
+              "('inc', 'p_y_0', 'p_y_1')",
               "('position', 'p_y_0')",
-              "('tile', 't_14')"
+              "('position', 'p_y_1')",
+              "('position', 'p_y_2')",
+              "('tile', 't_1')"
             ]
           },
           {
             "binding": {
               "?by": "p_x_0",
-              "?omf": "t_14",
-              "?px": "p_x_3",
-              "?py": "p_x_1"
-            },
-            "eff_neg": [
-              "('at', 't_14', 'p_x_3', 'p_x_1')",
-              "('blank', 'p_x_3', 'p_x_0')"
-            ],
-            "eff_pos": [
-              "('at', 't_14', 'p_x_3', 'p_x_0')",
-              "('blank', 'p_x_3', 'p_x_1')"
-            ],
-            "name": "move-down",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 't_14', 'p_x_3', 'p_x_1')",
-              "('blank', 'p_x_3', 'p_x_0')",
-              "('inc', 'p_x_0', 'p_x_1')",
-              "('position', 'p_x_0')",
-              "('position', 'p_x_1')",
-              "('position', 'p_x_3')",
-              "('tile', 't_14')"
-            ]
-          },
-          {
-            "binding": {
-              "?by": "p_x_0",
-              "?omf": "t_14",
+              "?omf": "t_1",
               "?px": "p_y_2",
               "?py": "p_x_1"
             },
             "eff_neg": [
-              "('at', 't_14', 'p_y_2', 'p_x_1')",
+              "('at', 't_1', 'p_y_2', 'p_x_1')",
               "('blank', 'p_y_2', 'p_x_0')"
             ],
             "eff_pos": [
-              "('at', 't_14', 'p_y_2', 'p_x_0')",
+              "('at', 't_1', 'p_y_2', 'p_x_0')",
               "('blank', 'p_y_2', 'p_x_1')"
             ],
             "name": "move-down",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 't_14', 'p_y_2', 'p_x_1')",
+              "('at', 't_1', 'p_y_2', 'p_x_1')",
               "('blank', 'p_y_2', 'p_x_0')",
               "('inc', 'p_x_0', 'p_x_1')",
               "('position', 'p_x_0')",
               "('position', 'p_x_1')",
               "('position', 'p_y_2')",
-              "('tile', 't_14')"
+              "('tile', 't_1')"
             ]
           },
           {
             "binding": {
-              "?by": "p_x_0",
-              "?omf": "t_14",
-              "?px": "p_y_1",
-              "?py": "p_x_1"
+              "?by": "p_x_2",
+              "?omf": "t_1",
+              "?px": "p_y_2",
+              "?py": "p_x_3"
             },
             "eff_neg": [
-              "('at', 't_14', 'p_y_1', 'p_x_1')",
-              "('blank', 'p_y_1', 'p_x_0')"
+              "('at', 't_1', 'p_y_2', 'p_x_3')",
+              "('blank', 'p_y_2', 'p_x_2')"
             ],
             "eff_pos": [
-              "('at', 't_14', 'p_y_1', 'p_x_0')",
-              "('blank', 'p_y_1', 'p_x_1')"
+              "('at', 't_1', 'p_y_2', 'p_x_2')",
+              "('blank', 'p_y_2', 'p_x_3')"
             ],
             "name": "move-down",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 't_14', 'p_y_1', 'p_x_1')",
-              "('blank', 'p_y_1', 'p_x_0')",
-              "('inc', 'p_x_0', 'p_x_1')",
-              "('position', 'p_x_0')",
-              "('position', 'p_x_1')",
-              "('position', 'p_y_1')",
-              "('tile', 't_14')"
+              "('at', 't_1', 'p_y_2', 'p_x_3')",
+              "('blank', 'p_y_2', 'p_x_2')",
+              "('inc', 'p_x_2', 'p_x_3')",
+              "('position', 'p_x_2')",
+              "('position', 'p_x_3')",
+              "('position', 'p_y_2')",
+              "('tile', 't_1')"
             ]
           },
           {
             "binding": {
-              "?by": "p_x_0",
-              "?omf": "t_14",
-              "?px": "p_x_1",
-              "?py": "p_x_1"
+              "?by": "p_x_1",
+              "?omf": "t_1",
+              "?px": "p_y_2",
+              "?py": "p_x_2"
             },
             "eff_neg": [
-              "('at', 't_14', 'p_x_1', 'p_x_1')",
-              "('blank', 'p_x_1', 'p_x_0')"
+              "('at', 't_1', 'p_y_2', 'p_x_2')",
+              "('blank', 'p_y_2', 'p_x_1')"
             ],
             "eff_pos": [
-              "('at', 't_14', 'p_x_1', 'p_x_0')",
-              "('blank', 'p_x_1', 'p_x_1')"
+              "('at', 't_1', 'p_y_2', 'p_x_1')",
+              "('blank', 'p_y_2', 'p_x_2')"
             ],
             "name": "move-down",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 't_14', 'p_x_1', 'p_x_1')",
-              "('blank', 'p_x_1', 'p_x_0')",
-              "('inc', 'p_x_0', 'p_x_1')",
-              "('position', 'p_x_0')",
-              "('position', 'p_x_1')",
-              "('tile', 't_14')"
-            ]
-          },
-          {
-            "binding": {
-              "?by": "p_x_0",
-              "?omf": "t_14",
-              "?px": "p_x_2",
-              "?py": "p_x_1"
-            },
-            "eff_neg": [
-              "('at', 't_14', 'p_x_2', 'p_x_1')",
-              "('blank', 'p_x_2', 'p_x_0')"
-            ],
-            "eff_pos": [
-              "('at', 't_14', 'p_x_2', 'p_x_0')",
-              "('blank', 'p_x_2', 'p_x_1')"
-            ],
-            "name": "move-down",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 't_14', 'p_x_2', 'p_x_1')",
-              "('blank', 'p_x_2', 'p_x_0')",
-              "('inc', 'p_x_0', 'p_x_1')",
-              "('position', 'p_x_0')",
+              "('at', 't_1', 'p_y_2', 'p_x_2')",
+              "('blank', 'p_y_2', 'p_x_1')",
+              "('inc', 'p_x_1', 'p_x_2')",
               "('position', 'p_x_1')",
               "('position', 'p_x_2')",
-              "('tile', 't_14')"
+              "('position', 'p_y_2')",
+              "('tile', 't_1')"
             ]
           },
           {
             "binding": {
-              "?by": "p_y_0",
-              "?omf": "t_14",
-              "?px": "p_y_3",
-              "?py": "p_y_1"
+              "?by": "p_y_2",
+              "?omf": "t_1",
+              "?px": "p_y_2",
+              "?py": "p_y_3"
             },
             "eff_neg": [
-              "('at', 't_14', 'p_y_3', 'p_y_1')",
-              "('blank', 'p_y_3', 'p_y_0')"
+              "('at', 't_1', 'p_y_2', 'p_y_3')",
+              "('blank', 'p_y_2', 'p_y_2')"
             ],
             "eff_pos": [
-              "('at', 't_14', 'p_y_3', 'p_y_0')",
-              "('blank', 'p_y_3', 'p_y_1')"
+              "('at', 't_1', 'p_y_2', 'p_y_2')",
+              "('blank', 'p_y_2', 'p_y_3')"
             ],
             "name": "move-down",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 't_14', 'p_y_3', 'p_y_1')",
-              "('blank', 'p_y_3', 'p_y_0')",
-              "('inc', 'p_y_0', 'p_y_1')",
-              "('position', 'p_y_0')",
-              "('position', 'p_y_1')",
+              "('at', 't_1', 'p_y_2', 'p_y_3')",
+              "('blank', 'p_y_2', 'p_y_2')",
+              "('inc', 'p_y_2', 'p_y_3')",
+              "('position', 'p_y_2')",
               "('position', 'p_y_3')",
-              "('tile', 't_14')"
+              "('tile', 't_1')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_y_1",
+              "?omf": "t_4",
+              "?px": "p_y_2",
+              "?py": "p_y_2"
+            },
+            "eff_neg": [
+              "('at', 't_4', 'p_y_2', 'p_y_2')",
+              "('blank', 'p_y_2', 'p_y_1')"
+            ],
+            "eff_pos": [
+              "('at', 't_4', 'p_y_2', 'p_y_1')",
+              "('blank', 'p_y_2', 'p_y_2')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_4', 'p_y_2', 'p_y_2')",
+              "('blank', 'p_y_2', 'p_y_1')",
+              "('inc', 'p_y_1', 'p_y_2')",
+              "('position', 'p_y_1')",
+              "('position', 'p_y_2')",
+              "('tile', 't_4')"
             ]
           },
           {
             "binding": {
               "?by": "p_y_0",
-              "?omf": "t_14",
-              "?px": "p_x_0",
+              "?omf": "t_4",
+              "?px": "p_y_2",
               "?py": "p_y_1"
             },
             "eff_neg": [
-              "('at', 't_14', 'p_x_0', 'p_y_1')",
-              "('blank', 'p_x_0', 'p_y_0')"
+              "('at', 't_4', 'p_y_2', 'p_y_1')",
+              "('blank', 'p_y_2', 'p_y_0')"
             ],
             "eff_pos": [
-              "('at', 't_14', 'p_x_0', 'p_y_0')",
-              "('blank', 'p_x_0', 'p_y_1')"
+              "('at', 't_4', 'p_y_2', 'p_y_0')",
+              "('blank', 'p_y_2', 'p_y_1')"
             ],
             "name": "move-down",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 't_14', 'p_x_0', 'p_y_1')",
-              "('blank', 'p_x_0', 'p_y_0')",
+              "('at', 't_4', 'p_y_2', 'p_y_1')",
+              "('blank', 'p_y_2', 'p_y_0')",
               "('inc', 'p_y_0', 'p_y_1')",
+              "('position', 'p_y_0')",
+              "('position', 'p_y_1')",
+              "('position', 'p_y_2')",
+              "('tile', 't_4')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_x_0",
+              "?omf": "t_4",
+              "?px": "p_y_2",
+              "?py": "p_x_1"
+            },
+            "eff_neg": [
+              "('at', 't_4', 'p_y_2', 'p_x_1')",
+              "('blank', 'p_y_2', 'p_x_0')"
+            ],
+            "eff_pos": [
+              "('at', 't_4', 'p_y_2', 'p_x_0')",
+              "('blank', 'p_y_2', 'p_x_1')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_4', 'p_y_2', 'p_x_1')",
+              "('blank', 'p_y_2', 'p_x_0')",
+              "('inc', 'p_x_0', 'p_x_1')",
               "('position', 'p_x_0')",
-              "('position', 'p_y_0')",
-              "('position', 'p_y_1')",
-              "('tile', 't_14')"
+              "('position', 'p_x_1')",
+              "('position', 'p_y_2')",
+              "('tile', 't_4')"
             ]
           },
           {
             "binding": {
-              "?by": "p_y_0",
-              "?omf": "t_14",
-              "?px": "p_y_0",
-              "?py": "p_y_1"
+              "?by": "p_x_2",
+              "?omf": "t_4",
+              "?px": "p_y_2",
+              "?py": "p_x_3"
             },
             "eff_neg": [
-              "('at', 't_14', 'p_y_0', 'p_y_1')",
-              "('blank', 'p_y_0', 'p_y_0')"
+              "('at', 't_4', 'p_y_2', 'p_x_3')",
+              "('blank', 'p_y_2', 'p_x_2')"
             ],
             "eff_pos": [
-              "('at', 't_14', 'p_y_0', 'p_y_0')",
-              "('blank', 'p_y_0', 'p_y_1')"
+              "('at', 't_4', 'p_y_2', 'p_x_2')",
+              "('blank', 'p_y_2', 'p_x_3')"
             ],
             "name": "move-down",
             "pre_neg": [],
             "pre_pos": [
-              "('at', 't_14', 'p_y_0', 'p_y_1')",
-              "('blank', 'p_y_0', 'p_y_0')",
-              "('inc', 'p_y_0', 'p_y_1')",
-              "('position', 'p_y_0')",
-              "('position', 'p_y_1')",
-              "('tile', 't_14')"
-            ]
-          },
-          {
-            "binding": {
-              "?by": "p_y_0",
-              "?omf": "t_14",
-              "?px": "p_x_3",
-              "?py": "p_y_1"
-            },
-            "eff_neg": [
-              "('at', 't_14', 'p_x_3', 'p_y_1')",
-              "('blank', 'p_x_3', 'p_y_0')"
-            ],
-            "eff_pos": [
-              "('at', 't_14', 'p_x_3', 'p_y_0')",
-              "('blank', 'p_x_3', 'p_y_1')"
-            ],
-            "name": "move-down",
-            "pre_neg": [],
-            "pre_pos": [
-              "('at', 't_14', 'p_x_3', 'p_y_1')",
-              "('blank', 'p_x_3', 'p_y_0')",
-              "('inc', 'p_y_0', 'p_y_1')",
+              "('at', 't_4', 'p_y_2', 'p_x_3')",
+              "('blank', 'p_y_2', 'p_x_2')",
+              "('inc', 'p_x_2', 'p_x_3')",
+              "('position', 'p_x_2')",
               "('position', 'p_x_3')",
-              "('position', 'p_y_0')",
-              "('position', 'p_y_1')",
-              "('tile', 't_14')"
+              "('position', 'p_y_2')",
+              "('tile', 't_4')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_x_1",
+              "?omf": "t_4",
+              "?px": "p_y_2",
+              "?py": "p_x_2"
+            },
+            "eff_neg": [
+              "('at', 't_4', 'p_y_2', 'p_x_2')",
+              "('blank', 'p_y_2', 'p_x_1')"
+            ],
+            "eff_pos": [
+              "('at', 't_4', 'p_y_2', 'p_x_1')",
+              "('blank', 'p_y_2', 'p_x_2')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_4', 'p_y_2', 'p_x_2')",
+              "('blank', 'p_y_2', 'p_x_1')",
+              "('inc', 'p_x_1', 'p_x_2')",
+              "('position', 'p_x_1')",
+              "('position', 'p_x_2')",
+              "('position', 'p_y_2')",
+              "('tile', 't_4')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_y_2",
+              "?omf": "t_4",
+              "?px": "p_y_2",
+              "?py": "p_y_3"
+            },
+            "eff_neg": [
+              "('at', 't_4', 'p_y_2', 'p_y_3')",
+              "('blank', 'p_y_2', 'p_y_2')"
+            ],
+            "eff_pos": [
+              "('at', 't_4', 'p_y_2', 'p_y_2')",
+              "('blank', 'p_y_2', 'p_y_3')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_4', 'p_y_2', 'p_y_3')",
+              "('blank', 'p_y_2', 'p_y_2')",
+              "('inc', 'p_y_2', 'p_y_3')",
+              "('position', 'p_y_2')",
+              "('position', 'p_y_3')",
+              "('tile', 't_4')"
             ]
           }
         ]
@@ -3020,12 +3019,12 @@
         "action_schema_count": 4,
         "engine": "fast-downward",
         "engine_metrics": {
-          "engine_internal_time": "0.17893409729003906"
+          "engine_internal_time": "0.2309861183166504"
         },
         "fluent_count": 5,
         "illegal_step": null,
         "object_count": 23,
-        "parser_elapsed_sec": 0.061936,
+        "parser_elapsed_sec": 0.079659,
         "plan": [
           "move-down(t_1, p_x_0, p_y_1, p_y_0)",
           "move-right(t_4, p_x_1, p_y_1, p_x_0)",
@@ -3035,7 +3034,7 @@
         "plan_length": 4,
         "problem_kind": "PROBLEM_CLASS: ['ACTION_BASED']\nTYPING: ['FLAT_TYPING']",
         "problem_name": "npuzzle-4-4",
-        "replay_elapsed_sec": 0.064091,
+        "replay_elapsed_sec": 0.085999,
         "replay_goal": true,
         "replay_samples": [
           {
@@ -3063,7 +3062,7 @@
             "state_hash_before": -3328768918484407452
           }
         ],
-        "solve_elapsed_sec": 0.517017,
+        "solve_elapsed_sec": 0.681623,
         "solve_status": "PlanGenerationResultStatus.SOLVED_SATISFICING",
         "solved": true,
         "validated": true,
@@ -3076,7 +3075,7 @@
       "pass": true,
       "pddlpy": {
         "applicable_initial": 0,
-        "elapsed_sec": 0.06743,
+        "elapsed_sec": 0.087377,
         "goal_atom_count": 2,
         "ground_actions": 140,
         "grounding_truncated_at": null,
@@ -3093,151 +3092,31 @@
         "samples": [
           {
             "binding": {
-              "?x": "s_1_3",
-              "?y": "s_1_2"
+              "?x": "s_5_4",
+              "?y": "s_5_5"
             },
             "eff_neg": [
-              "('has_player', 's_1_3')"
+              "('has_player', 's_5_4')"
             ],
             "eff_pos": [
-              "('has_player', 's_1_2')"
+              "('has_player', 's_5_5')"
             ],
             "name": "move-player",
             "pre_neg": [
-              "('has_box', 's_1_2')"
+              "('has_box', 's_5_5')"
             ],
             "pre_pos": [
-              "('adjacent', 's_1_3', 's_1_2')",
-              "('has_player', 's_1_3')"
+              "('adjacent', 's_5_4', 's_5_5')",
+              "('has_player', 's_5_4')"
             ]
           },
           {
             "binding": {
               "?x": "s_3_4",
-              "?y": "s_2_4"
-            },
-            "eff_neg": [
-              "('has_player', 's_3_4')"
-            ],
-            "eff_pos": [
-              "('has_player', 's_2_4')"
-            ],
-            "name": "move-player",
-            "pre_neg": [
-              "('has_box', 's_2_4')"
-            ],
-            "pre_pos": [
-              "('adjacent', 's_3_4', 's_2_4')",
-              "('has_player', 's_3_4')"
-            ]
-          },
-          {
-            "binding": {
-              "?x": "s_3_3",
-              "?y": "s_2_3"
-            },
-            "eff_neg": [
-              "('has_player', 's_3_3')"
-            ],
-            "eff_pos": [
-              "('has_player', 's_2_3')"
-            ],
-            "name": "move-player",
-            "pre_neg": [
-              "('has_box', 's_2_3')"
-            ],
-            "pre_pos": [
-              "('adjacent', 's_3_3', 's_2_3')",
-              "('has_player', 's_3_3')"
-            ]
-          },
-          {
-            "binding": {
-              "?x": "s_2_5",
-              "?y": "s_1_5"
-            },
-            "eff_neg": [
-              "('has_player', 's_2_5')"
-            ],
-            "eff_pos": [
-              "('has_player', 's_1_5')"
-            ],
-            "name": "move-player",
-            "pre_neg": [
-              "('has_box', 's_1_5')"
-            ],
-            "pre_pos": [
-              "('adjacent', 's_2_5', 's_1_5')",
-              "('has_player', 's_2_5')"
-            ]
-          },
-          {
-            "binding": {
-              "?x": "s_4_2",
-              "?y": "s_5_2"
-            },
-            "eff_neg": [
-              "('has_player', 's_4_2')"
-            ],
-            "eff_pos": [
-              "('has_player', 's_5_2')"
-            ],
-            "name": "move-player",
-            "pre_neg": [
-              "('has_box', 's_5_2')"
-            ],
-            "pre_pos": [
-              "('adjacent', 's_4_2', 's_5_2')",
-              "('has_player', 's_4_2')"
-            ]
-          },
-          {
-            "binding": {
-              "?x": "s_3_1",
-              "?y": "s_2_1"
-            },
-            "eff_neg": [
-              "('has_player', 's_3_1')"
-            ],
-            "eff_pos": [
-              "('has_player', 's_2_1')"
-            ],
-            "name": "move-player",
-            "pre_neg": [
-              "('has_box', 's_2_1')"
-            ],
-            "pre_pos": [
-              "('adjacent', 's_3_1', 's_2_1')",
-              "('has_player', 's_3_1')"
-            ]
-          },
-          {
-            "binding": {
-              "?x": "s_4_4",
-              "?y": "s_4_5"
-            },
-            "eff_neg": [
-              "('has_player', 's_4_4')"
-            ],
-            "eff_pos": [
-              "('has_player', 's_4_5')"
-            ],
-            "name": "move-player",
-            "pre_neg": [
-              "('has_box', 's_4_5')"
-            ],
-            "pre_pos": [
-              "('adjacent', 's_4_4', 's_4_5')",
-              "('has_player', 's_4_4')"
-            ]
-          },
-          {
-            "binding": {
-              "?x": "s_4_3",
               "?y": "s_4_4"
             },
             "eff_neg": [
-              "('has_player', 's_4_3')"
+              "('has_player', 's_3_4')"
             ],
             "eff_pos": [
               "('has_player', 's_4_4')"
@@ -3247,28 +3126,8 @@
               "('has_box', 's_4_4')"
             ],
             "pre_pos": [
-              "('adjacent', 's_4_3', 's_4_4')",
-              "('has_player', 's_4_3')"
-            ]
-          },
-          {
-            "binding": {
-              "?x": "s_3_2",
-              "?y": "s_2_2"
-            },
-            "eff_neg": [
-              "('has_player', 's_3_2')"
-            ],
-            "eff_pos": [
-              "('has_player', 's_2_2')"
-            ],
-            "name": "move-player",
-            "pre_neg": [
-              "('has_box', 's_2_2')"
-            ],
-            "pre_pos": [
-              "('adjacent', 's_3_2', 's_2_2')",
-              "('has_player', 's_3_2')"
+              "('adjacent', 's_3_4', 's_4_4')",
+              "('has_player', 's_3_4')"
             ]
           },
           {
@@ -3293,31 +3152,151 @@
           },
           {
             "binding": {
-              "?x": "s_5_1",
-              "?y": "s_5_2"
+              "?x": "s_1_3",
+              "?y": "s_1_4"
             },
             "eff_neg": [
-              "('has_player', 's_5_1')"
+              "('has_player', 's_1_3')"
             ],
             "eff_pos": [
-              "('has_player', 's_5_2')"
+              "('has_player', 's_1_4')"
             ],
             "name": "move-player",
             "pre_neg": [
-              "('has_box', 's_5_2')"
+              "('has_box', 's_1_4')"
             ],
             "pre_pos": [
-              "('adjacent', 's_5_1', 's_5_2')",
-              "('has_player', 's_5_1')"
+              "('adjacent', 's_1_3', 's_1_4')",
+              "('has_player', 's_1_3')"
             ]
           },
           {
             "binding": {
-              "?x": "s_5_3",
+              "?x": "s_5_4",
+              "?y": "s_4_4"
+            },
+            "eff_neg": [
+              "('has_player', 's_5_4')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_4_4')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_4_4')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_5_4', 's_4_4')",
+              "('has_player', 's_5_4')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_2_4",
+              "?y": "s_2_3"
+            },
+            "eff_neg": [
+              "('has_player', 's_2_4')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_2_3')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_2_3')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_2_4', 's_2_3')",
+              "('has_player', 's_2_4')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_1_5",
+              "?y": "s_1_4"
+            },
+            "eff_neg": [
+              "('has_player', 's_1_5')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_1_4')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_1_4')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_1_5', 's_1_4')",
+              "('has_player', 's_1_5')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_2_3",
+              "?y": "s_1_3"
+            },
+            "eff_neg": [
+              "('has_player', 's_2_3')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_1_3')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_1_3')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_2_3', 's_1_3')",
+              "('has_player', 's_2_3')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_3_4",
+              "?y": "s_2_4"
+            },
+            "eff_neg": [
+              "('has_player', 's_3_4')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_2_4')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_2_4')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_3_4', 's_2_4')",
+              "('has_player', 's_3_4')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_1_4",
+              "?y": "s_2_4"
+            },
+            "eff_neg": [
+              "('has_player', 's_1_4')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_2_4')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_2_4')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_1_4', 's_2_4')",
+              "('has_player', 's_1_4')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_4_4",
               "?y": "s_5_4"
             },
             "eff_neg": [
-              "('has_player', 's_5_3')"
+              "('has_player', 's_4_4')"
             ],
             "eff_pos": [
               "('has_player', 's_5_4')"
@@ -3327,8 +3306,28 @@
               "('has_box', 's_5_4')"
             ],
             "pre_pos": [
-              "('adjacent', 's_5_3', 's_5_4')",
-              "('has_player', 's_5_3')"
+              "('adjacent', 's_4_4', 's_5_4')",
+              "('has_player', 's_4_4')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_3_2",
+              "?y": "s_3_1"
+            },
+            "eff_neg": [
+              "('has_player', 's_3_2')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_3_1')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_3_1')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_3_2', 's_3_1')",
+              "('has_player', 's_3_2')"
             ]
           }
         ]
@@ -3338,12 +3337,12 @@
         "action_schema_count": 2,
         "engine": "fast-downward",
         "engine_metrics": {
-          "engine_internal_time": "0.10932517051696777"
+          "engine_internal_time": "0.14114165306091309"
         },
         "fluent_count": 4,
         "illegal_step": null,
         "object_count": 25,
-        "parser_elapsed_sec": 0.127269,
+        "parser_elapsed_sec": 0.156956,
         "plan": [
           "move-player(s_4_2, s_3_2)",
           "push-box(s_3_2, s_3_3, s_3_4)",
@@ -3362,7 +3361,7 @@
         "plan_length": 13,
         "problem_kind": "PROBLEM_CLASS: ['ACTION_BASED']\nCONDITIONS_KIND: ['NEGATIVE_CONDITIONS']\nTYPING: ['FLAT_TYPING']",
         "problem_name": "simple1",
-        "replay_elapsed_sec": 0.017375,
+        "replay_elapsed_sec": 0.023499,
         "replay_goal": true,
         "replay_samples": [
           {
@@ -3426,7 +3425,7 @@
             "state_hash_before": -7095306536657605666
           }
         ],
-        "solve_elapsed_sec": 0.148677,
+        "solve_elapsed_sec": 0.193513,
         "solve_status": "PlanGenerationResultStatus.SOLVED_SATISFICING",
         "solved": true,
         "validated": true,
