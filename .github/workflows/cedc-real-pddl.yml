@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - 'experiments/real_pddl_partial_executor.py'
+      - 'experiments/real_pddl_partial_executor_v2.py'
       - '.github/workflows/cedc-real-pddl.yml'
   workflow_dispatch:
 
@@ -26,9 +26,9 @@ jobs:
           git clone -q https://github.com/JonasGoesgens/SIFT.git public_sift
           git -C public_sift checkout -q 0f4518ffa609322a24521609f80d70728f07ac09
           test "$(git -C public_sift rev-parse HEAD)" = "0f4518ffa609322a24521609f80d70728f07ac09"
-          curl -fsSL 'https://raw.githubusercontent.com/jujumelona/storage.llm/cedc-real-pddl-validation/experiments/real_pddl_partial_executor.py' -o real_pddl_partial_executor.py
+          curl -fsSL 'https://raw.githubusercontent.com/jujumelona/storage.llm/cedc-real-pddl-validation/experiments/real_pddl_partial_executor_v2.py' -o real_pddl_partial_executor_v2.py
           set +e
-          python3 real_pddl_partial_executor.py public_sift real_pddl_partial_results > real_pddl_partial_results/run.log 2>&1
+          python3 real_pddl_partial_executor_v2.py public_sift real_pddl_partial_results > real_pddl_partial_results/run.log 2>&1
           rc=$?
           set -e
           if [ -f real_pddl_partial_results/REAL_PDDL_PARTIAL_EXECUTOR.json ]; then
@@ -72,13 +72,13 @@ jobs:
               sha256sum "public_sift/$f"
             done > real_pddl_partial_results/PDDL_SHA256SUMS.txt
           fi
-          if [ -f real_pddl_partial_executor.py ]; then sha256sum real_pddl_partial_executor.py > real_pddl_partial_results/VALIDATOR_SHA256.txt; fi
+          if [ -f real_pddl_partial_executor_v2.py ]; then sha256sum real_pddl_partial_executor_v2.py > real_pddl_partial_results/VALIDATOR_SHA256.txt; fi
 
       - name: Upload partial executor results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cedc-real-pddl-partial-executor-semantic-universe
+          name: cedc-real-pddl-partial-executor-semantic-universe-v2
           path: real_pddl_partial_results
           if-no-files-found: error
           retention-days: 30
