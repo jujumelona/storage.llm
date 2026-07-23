@@ -1,0 +1,102 @@
+name: Frozen Product-Lifted CodeTrace full external falsification 3w
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/frozen_product_prepare_3w.py'
+      - '.github/workflows/frozen-product-codetrace-full-3w.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Acquire frozen implementations
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p experiments
+          BASE_SRC='https://raw.githubusercontent.com/jujumelona/storage.llm/product-obligation-codetrace-blind-20260723/experiments'
+          for f in product_lifted_agentprocess.py product_lifted_agentprocess_v2.py product_lifted_codetrace_full_blind.py codetrace_full_parser_v2.py codetrace_full_parallel_prepare.py; do
+            curl -fL --retry 8 --retry-all-errors "$BASE_SRC/$f" -o "experiments/$f"
+          done
+          curl -fL --retry 8 --retry-all-errors \
+            'https://raw.githubusercontent.com/jujumelona/storage.llm/frozen-product-codetrace-full-20260723/experiments/frozen_product_codetrace_full.py' \
+            -o experiments/frozen_product_codetrace_full.py
+          python -m py_compile experiments/*.py
+          sha256sum experiments/*.py > FROZEN_SOURCE_HASHES.txt
+      - name: Install dependencies and source training set
+        run: |
+          python -m pip install -q 'datasets>=3.0' 'huggingface_hub>=0.28' zstandard pyarrow
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          print(snapshot_download(repo_id='LulaCola/AgentProcessBench',repo_type='dataset',local_dir='/tmp/AgentProcessBench'))
+          PY
+      - name: Reconstruct untouched full split with three workers and sealed labels
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf frozen3_prepare frozen3_results frozen3_replay /tmp/frozen3_cache /tmp/frozen3_blind
+          PYTHONPATH=experiments python -u experiments/frozen_product_prepare_3w.py \
+            --split full --out frozen3_prepare --cache /tmp/frozen3_cache --workers 3 | tee frozen3_prepare.log
+          mkdir -p /tmp/frozen3_blind
+          cp frozen3_prepare/blind_events.jsonl /tmp/frozen3_blind/blind_events.jsonl
+          test ! -e /tmp/frozen3_blind/labels_sealed.json
+          sha256sum frozen3_prepare/blind_events.jsonl frozen3_prepare/labels_sealed.json > frozen3_prepare/PREPARE_HASHES.txt
+          cat frozen3_prepare/prepare_manifest.json
+      - name: Blind prediction
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p frozen3_results
+          PYTHONPATH=experiments python -u experiments/frozen_product_codetrace_full.py predict \
+            --source /tmp/AgentProcessBench --blind /tmp/frozen3_blind/blind_events.jsonl \
+            --out frozen3_results/blind_predictions_prelabel.json | tee frozen3_results/predict.log
+          cp experiments/*.py frozen3_results/
+          cp FROZEN_SOURCE_HASHES.txt frozen3_results/
+          cp frozen3_prepare/prepare_manifest.json frozen3_prepare/parse_stats.json frozen3_prepare/PREPARE_HASHES.txt frozen3_results/
+          sha256sum frozen3_results/blind_predictions_prelabel.json experiments/frozen_product_codetrace_full.py > frozen3_results/PRE_LABEL_HASHES.txt
+      - name: Deterministic replay
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p frozen3_replay
+          PYTHONPATH=experiments python -u experiments/frozen_product_codetrace_full.py predict \
+            --source /tmp/AgentProcessBench --blind /tmp/frozen3_blind/blind_events.jsonl \
+            --out frozen3_replay/blind_predictions_prelabel.json >/tmp/frozen3_replay.log
+          cmp frozen3_results/blind_predictions_prelabel.json frozen3_replay/blind_predictions_prelabel.json
+          cmp frozen3_results/blind_predictions_prelabel.json.sha256 frozen3_replay/blind_predictions_prelabel.json.sha256
+          echo true > frozen3_results/deterministic_replay.txt
+      - name: Open sealed labels after prediction
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PYTHONPATH=experiments python -u experiments/frozen_product_codetrace_full.py evaluate \
+            --predictions frozen3_results/blind_predictions_prelabel.json \
+            --labels frozen3_prepare/labels_sealed.json \
+            --manifest frozen3_prepare/prepare_manifest.json \
+            --out frozen3_results | tee frozen3_results/evaluate.log
+          cp frozen3_prepare/labels_sealed.json frozen3_results/labels_sealed_after_prediction.json
+          cat frozen3_results/summary.json
+      - name: Package
+        run: |
+          python - <<'PY'
+          import shutil
+          shutil.make_archive('FROZEN_PRODUCT_CODETRACE_FULL_3W_RESULTS','zip','frozen3_results')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FROZEN_PRODUCT_CODETRACE_FULL_3W_RESULTS
+          path: |
+            FROZEN_PRODUCT_CODETRACE_FULL_3W_RESULTS.zip
+            frozen3_results/
+          retention-days: 7
