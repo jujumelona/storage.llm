@@ -1,0 +1,3456 @@
+{
+  "cases": {
+    "delivery": {
+      "domain_file": "pddl_files/delivery/delivery.pddl",
+      "exists": true,
+      "pass": true,
+      "pddlpy": {
+        "applicable_initial": 0,
+        "elapsed_sec": 0.03046,
+        "goal_atom_count": 2,
+        "ground_actions": 270,
+        "grounding_truncated_at": null,
+        "initial_atom_count": 31,
+        "object_count": 14,
+        "operator_names": [
+          "drop-package",
+          "move",
+          "pick-package"
+        ],
+        "per_operator": {
+          "drop-package": 54,
+          "move": 162,
+          "pick-package": 54
+        },
+        "samples": [
+          {
+            "binding": {
+              "?p": "p3",
+              "?t": "t2",
+              "?x": "c_0_1"
+            },
+            "eff_neg": [
+              "('carrying', 't2', 'p3')"
+            ],
+            "eff_pos": [
+              "('at', 'p3', 'c_0_1')",
+              "('empty', 't2')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't2', 'c_0_1')",
+              "('carrying', 't2', 'p3')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p3",
+              "?t": "t2",
+              "?x": "c_0_2"
+            },
+            "eff_neg": [
+              "('carrying', 't2', 'p3')"
+            ],
+            "eff_pos": [
+              "('at', 'p3', 'c_0_2')",
+              "('empty', 't2')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't2', 'c_0_2')",
+              "('carrying', 't2', 'p3')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p3",
+              "?t": "t2",
+              "?x": "c_2_2"
+            },
+            "eff_neg": [
+              "('carrying', 't2', 'p3')"
+            ],
+            "eff_pos": [
+              "('at', 'p3', 'c_2_2')",
+              "('empty', 't2')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't2', 'c_2_2')",
+              "('carrying', 't2', 'p3')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p3",
+              "?t": "t2",
+              "?x": "c_1_1"
+            },
+            "eff_neg": [
+              "('carrying', 't2', 'p3')"
+            ],
+            "eff_pos": [
+              "('at', 'p3', 'c_1_1')",
+              "('empty', 't2')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't2', 'c_1_1')",
+              "('carrying', 't2', 'p3')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p3",
+              "?t": "t2",
+              "?x": "c_1_2"
+            },
+            "eff_neg": [
+              "('carrying', 't2', 'p3')"
+            ],
+            "eff_pos": [
+              "('at', 'p3', 'c_1_2')",
+              "('empty', 't2')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't2', 'c_1_2')",
+              "('carrying', 't2', 'p3')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p3",
+              "?t": "t2",
+              "?x": "c_2_0"
+            },
+            "eff_neg": [
+              "('carrying', 't2', 'p3')"
+            ],
+            "eff_pos": [
+              "('at', 'p3', 'c_2_0')",
+              "('empty', 't2')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't2', 'c_2_0')",
+              "('carrying', 't2', 'p3')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p3",
+              "?t": "t2",
+              "?x": "c_1_0"
+            },
+            "eff_neg": [
+              "('carrying', 't2', 'p3')"
+            ],
+            "eff_pos": [
+              "('at', 'p3', 'c_1_0')",
+              "('empty', 't2')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't2', 'c_1_0')",
+              "('carrying', 't2', 'p3')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p3",
+              "?t": "t2",
+              "?x": "c_2_1"
+            },
+            "eff_neg": [
+              "('carrying', 't2', 'p3')"
+            ],
+            "eff_pos": [
+              "('at', 'p3', 'c_2_1')",
+              "('empty', 't2')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't2', 'c_2_1')",
+              "('carrying', 't2', 'p3')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p3",
+              "?t": "t2",
+              "?x": "c_0_0"
+            },
+            "eff_neg": [
+              "('carrying', 't2', 'p3')"
+            ],
+            "eff_pos": [
+              "('at', 'p3', 'c_0_0')",
+              "('empty', 't2')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't2', 'c_0_0')",
+              "('carrying', 't2', 'p3')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p2",
+              "?t": "t2",
+              "?x": "c_0_1"
+            },
+            "eff_neg": [
+              "('carrying', 't2', 'p2')"
+            ],
+            "eff_pos": [
+              "('at', 'p2', 'c_0_1')",
+              "('empty', 't2')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't2', 'c_0_1')",
+              "('carrying', 't2', 'p2')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p2",
+              "?t": "t2",
+              "?x": "c_0_2"
+            },
+            "eff_neg": [
+              "('carrying', 't2', 'p2')"
+            ],
+            "eff_pos": [
+              "('at', 'p2', 'c_0_2')",
+              "('empty', 't2')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't2', 'c_0_2')",
+              "('carrying', 't2', 'p2')"
+            ]
+          },
+          {
+            "binding": {
+              "?p": "p2",
+              "?t": "t2",
+              "?x": "c_2_2"
+            },
+            "eff_neg": [
+              "('carrying', 't2', 'p2')"
+            ],
+            "eff_pos": [
+              "('at', 'p2', 'c_2_2')",
+              "('empty', 't2')"
+            ],
+            "name": "drop-package",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't2', 'c_2_2')",
+              "('carrying', 't2', 'p2')"
+            ]
+          }
+        ]
+      },
+      "problem_file": "pddl_files/delivery/delivery-3-3-3-2.pddl",
+      "unified_planning": {
+        "action_schema_count": 3,
+        "engine": "fast-downward",
+        "engine_metrics": {
+          "engine_internal_time": "0.1040043830871582"
+        },
+        "fluent_count": 4,
+        "illegal_step": null,
+        "object_count": 14,
+        "parser_elapsed_sec": 0.041095,
+        "plan": [
+          "move(t2, c_1_1, c_0_1)",
+          "pick-package(t2, p2, c_0_1)",
+          "move(t2, c_0_1, c_1_1)",
+          "move(t2, c_1_1, c_2_1)",
+          "drop-package(t2, p2, c_2_1)",
+          "move(t2, c_2_1, c_2_0)",
+          "pick-package(t2, p1, c_2_0)",
+          "move(t2, c_2_0, c_2_1)",
+          "drop-package(t2, p1, c_2_1)"
+        ],
+        "plan_length": 9,
+        "problem_kind": "PROBLEM_CLASS: ['ACTION_BASED']\nCONDITIONS_KIND: ['EQUALITIES', 'NEGATIVE_CONDITIONS']\nTYPING: ['HIERARCHICAL_TYPING', 'FLAT_TYPING']",
+        "problem_name": "delivery-3x3-2-2",
+        "replay_elapsed_sec": 0.00782,
+        "replay_goal": true,
+        "replay_samples": [
+          {
+            "action": "move(t2, c_1_1, c_0_1)",
+            "index": 0,
+            "state_hash_after": 1922445420668322404,
+            "state_hash_before": -651727216212444714
+          },
+          {
+            "action": "pick-package(t2, p2, c_0_1)",
+            "index": 1,
+            "state_hash_after": 1407098173285549050,
+            "state_hash_before": 1922445420668322404
+          },
+          {
+            "action": "move(t2, c_0_1, c_1_1)",
+            "index": 2,
+            "state_hash_after": -9437979324336056,
+            "state_hash_before": 1407098173285549050
+          },
+          {
+            "action": "move(t2, c_1_1, c_2_1)",
+            "index": 3,
+            "state_hash_after": 5488308046654740752,
+            "state_hash_before": -9437979324336056
+          },
+          {
+            "action": "drop-package(t2, p2, c_2_1)",
+            "index": 4,
+            "state_hash_after": 6456680698275275373,
+            "state_hash_before": 5488308046654740752
+          },
+          {
+            "action": "move(t2, c_2_1, c_2_0)",
+            "index": 5,
+            "state_hash_after": -5619304558535441643,
+            "state_hash_before": 6456680698275275373
+          },
+          {
+            "action": "pick-package(t2, p1, c_2_0)",
+            "index": 6,
+            "state_hash_after": -403208402437691089,
+            "state_hash_before": -5619304558535441643
+          },
+          {
+            "action": "move(t2, c_2_0, c_2_1)",
+            "index": 7,
+            "state_hash_after": 1295067176460159063,
+            "state_hash_before": -403208402437691089
+          },
+          {
+            "action": "drop-package(t2, p1, c_2_1)",
+            "index": 8,
+            "state_hash_after": -8889976962480745020,
+            "state_hash_before": 1295067176460159063
+          }
+        ],
+        "solve_elapsed_sec": 0.122635,
+        "solve_status": "PlanGenerationResultStatus.SOLVED_SATISFICING",
+        "solved": true,
+        "validated": true,
+        "validation_status": "ValidationResultStatus.VALID"
+      }
+    },
+    "ferry": {
+      "domain_file": "pddl_files/ferry/ferry.pddl",
+      "exists": true,
+      "pass": true,
+      "pddlpy": {
+        "applicable_initial": 0,
+        "elapsed_sec": 0.024761,
+        "goal_atom_count": 2,
+        "ground_actions": 80,
+        "grounding_truncated_at": null,
+        "initial_atom_count": 13,
+        "object_count": 11,
+        "operator_names": [
+          "board",
+          "debark",
+          "sail"
+        ],
+        "per_operator": {
+          "board": 30,
+          "debark": 30,
+          "sail": 20
+        },
+        "samples": [
+          {
+            "binding": {
+              "?car": "car5",
+              "?loc": "loc1"
+            },
+            "eff_neg": [
+              "('at', 'car5', 'loc1')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car5')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car5', 'loc1')",
+              "('at-ferry', 'loc1')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car5",
+              "?loc": "loc3"
+            },
+            "eff_neg": [
+              "('at', 'car5', 'loc3')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car5')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car5', 'loc3')",
+              "('at-ferry', 'loc3')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car5",
+              "?loc": "loc5"
+            },
+            "eff_neg": [
+              "('at', 'car5', 'loc5')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car5')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car5', 'loc5')",
+              "('at-ferry', 'loc5')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car5",
+              "?loc": "loc2"
+            },
+            "eff_neg": [
+              "('at', 'car5', 'loc2')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car5')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car5', 'loc2')",
+              "('at-ferry', 'loc2')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car5",
+              "?loc": "loc4"
+            },
+            "eff_neg": [
+              "('at', 'car5', 'loc4')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car5')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car5', 'loc4')",
+              "('at-ferry', 'loc4')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car1",
+              "?loc": "loc1"
+            },
+            "eff_neg": [
+              "('at', 'car1', 'loc1')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car1')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car1', 'loc1')",
+              "('at-ferry', 'loc1')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car1",
+              "?loc": "loc3"
+            },
+            "eff_neg": [
+              "('at', 'car1', 'loc3')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car1')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car1', 'loc3')",
+              "('at-ferry', 'loc3')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car1",
+              "?loc": "loc5"
+            },
+            "eff_neg": [
+              "('at', 'car1', 'loc5')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car1')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car1', 'loc5')",
+              "('at-ferry', 'loc5')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car1",
+              "?loc": "loc2"
+            },
+            "eff_neg": [
+              "('at', 'car1', 'loc2')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car1')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car1', 'loc2')",
+              "('at-ferry', 'loc2')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car1",
+              "?loc": "loc4"
+            },
+            "eff_neg": [
+              "('at', 'car1', 'loc4')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car1')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car1', 'loc4')",
+              "('at-ferry', 'loc4')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car3",
+              "?loc": "loc1"
+            },
+            "eff_neg": [
+              "('at', 'car3', 'loc1')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car3')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car3', 'loc1')",
+              "('at-ferry', 'loc1')",
+              "('empty-ferry',)"
+            ]
+          },
+          {
+            "binding": {
+              "?car": "car3",
+              "?loc": "loc3"
+            },
+            "eff_neg": [
+              "('at', 'car3', 'loc3')",
+              "('empty-ferry',)"
+            ],
+            "eff_pos": [
+              "('on', 'car3')"
+            ],
+            "name": "board",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 'car3', 'loc3')",
+              "('at-ferry', 'loc3')",
+              "('empty-ferry',)"
+            ]
+          }
+        ]
+      },
+      "problem_file": "pddl_files/ferry/ferry-6-5.pddl",
+      "unified_planning": {
+        "action_schema_count": 3,
+        "engine": "fast-downward",
+        "engine_metrics": {
+          "engine_internal_time": "0.097259521484375"
+        },
+        "fluent_count": 5,
+        "illegal_step": null,
+        "object_count": 11,
+        "parser_elapsed_sec": 0.077158,
+        "plan": [
+          "sail(loc2, loc1)",
+          "board(car1, loc1)",
+          "sail(loc1, loc3)",
+          "debark(car1, loc3)",
+          "sail(loc3, loc1)",
+          "board(car2, loc1)",
+          "sail(loc1, loc3)",
+          "debark(car2, loc3)"
+        ],
+        "plan_length": 8,
+        "problem_kind": "PROBLEM_CLASS: ['ACTION_BASED']\nCONDITIONS_KIND: ['NEGATIVE_CONDITIONS']\nTYPING: ['FLAT_TYPING']",
+        "problem_name": "ferry-01",
+        "replay_elapsed_sec": 0.006002,
+        "replay_goal": true,
+        "replay_samples": [
+          {
+            "action": "sail(loc2, loc1)",
+            "index": 0,
+            "state_hash_after": -7680287799243221919,
+            "state_hash_before": -5176145558711235936
+          },
+          {
+            "action": "board(car1, loc1)",
+            "index": 1,
+            "state_hash_after": -6635240581504922914,
+            "state_hash_before": -7680287799243221919
+          },
+          {
+            "action": "sail(loc1, loc3)",
+            "index": 2,
+            "state_hash_after": 3197452202075176370,
+            "state_hash_before": -6635240581504922914
+          },
+          {
+            "action": "debark(car1, loc3)",
+            "index": 3,
+            "state_hash_after": -9119283173105086953,
+            "state_hash_before": 3197452202075176370
+          },
+          {
+            "action": "sail(loc3, loc1)",
+            "index": 4,
+            "state_hash_after": 1064131868934306171,
+            "state_hash_before": -9119283173105086953
+          },
+          {
+            "action": "board(car2, loc1)",
+            "index": 5,
+            "state_hash_after": -1135929747751827835,
+            "state_hash_before": 1064131868934306171
+          },
+          {
+            "action": "sail(loc1, loc3)",
+            "index": 6,
+            "state_hash_after": 9189911593531191785,
+            "state_hash_before": -1135929747751827835
+          },
+          {
+            "action": "debark(car2, loc3)",
+            "index": 7,
+            "state_hash_after": 3003834468003088841,
+            "state_hash_before": 9189911593531191785
+          }
+        ],
+        "solve_elapsed_sec": 0.112022,
+        "solve_status": "PlanGenerationResultStatus.SOLVED_SATISFICING",
+        "solved": true,
+        "validated": true,
+        "validation_status": "ValidationResultStatus.VALID"
+      }
+    },
+    "gripper": {
+      "domain_file": "pddl_files/gripper/gripper.pddl",
+      "exists": true,
+      "pass": true,
+      "pddlpy": {
+        "applicable_initial": 0,
+        "elapsed_sec": 0.042603,
+        "goal_atom_count": 3,
+        "ground_actions": 98,
+        "grounding_truncated_at": null,
+        "initial_atom_count": 27,
+        "object_count": 13,
+        "operator_names": [
+          "drop",
+          "move",
+          "pick"
+        ],
+        "per_operator": {
+          "drop": 48,
+          "move": 2,
+          "pick": 48
+        },
+        "samples": [
+          {
+            "binding": {
+              "?gripper": "middle",
+              "?obj": "ball6",
+              "?room": "roomb"
+            },
+            "eff_neg": [
+              "('carry', 'ball6', 'middle')"
+            ],
+            "eff_pos": [
+              "('at', 'ball6', 'roomb')",
+              "('free', 'middle')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'roomb')",
+              "('ball', 'ball6')",
+              "('carry', 'ball6', 'middle')",
+              "('gripper', 'middle')",
+              "('room', 'roomb')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "left",
+              "?obj": "ball6",
+              "?room": "roomb"
+            },
+            "eff_neg": [
+              "('carry', 'ball6', 'left')"
+            ],
+            "eff_pos": [
+              "('at', 'ball6', 'roomb')",
+              "('free', 'left')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'roomb')",
+              "('ball', 'ball6')",
+              "('carry', 'ball6', 'left')",
+              "('gripper', 'left')",
+              "('room', 'roomb')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "right",
+              "?obj": "ball6",
+              "?room": "roomb"
+            },
+            "eff_neg": [
+              "('carry', 'ball6', 'right')"
+            ],
+            "eff_pos": [
+              "('at', 'ball6', 'roomb')",
+              "('free', 'right')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'roomb')",
+              "('ball', 'ball6')",
+              "('carry', 'ball6', 'right')",
+              "('gripper', 'right')",
+              "('room', 'roomb')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "middle",
+              "?obj": "ball6",
+              "?room": "rooma"
+            },
+            "eff_neg": [
+              "('carry', 'ball6', 'middle')"
+            ],
+            "eff_pos": [
+              "('at', 'ball6', 'rooma')",
+              "('free', 'middle')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'rooma')",
+              "('ball', 'ball6')",
+              "('carry', 'ball6', 'middle')",
+              "('gripper', 'middle')",
+              "('room', 'rooma')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "left",
+              "?obj": "ball6",
+              "?room": "rooma"
+            },
+            "eff_neg": [
+              "('carry', 'ball6', 'left')"
+            ],
+            "eff_pos": [
+              "('at', 'ball6', 'rooma')",
+              "('free', 'left')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'rooma')",
+              "('ball', 'ball6')",
+              "('carry', 'ball6', 'left')",
+              "('gripper', 'left')",
+              "('room', 'rooma')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "right",
+              "?obj": "ball6",
+              "?room": "rooma"
+            },
+            "eff_neg": [
+              "('carry', 'ball6', 'right')"
+            ],
+            "eff_pos": [
+              "('at', 'ball6', 'rooma')",
+              "('free', 'right')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'rooma')",
+              "('ball', 'ball6')",
+              "('carry', 'ball6', 'right')",
+              "('gripper', 'right')",
+              "('room', 'rooma')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "middle",
+              "?obj": "ball5",
+              "?room": "roomb"
+            },
+            "eff_neg": [
+              "('carry', 'ball5', 'middle')"
+            ],
+            "eff_pos": [
+              "('at', 'ball5', 'roomb')",
+              "('free', 'middle')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'roomb')",
+              "('ball', 'ball5')",
+              "('carry', 'ball5', 'middle')",
+              "('gripper', 'middle')",
+              "('room', 'roomb')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "left",
+              "?obj": "ball5",
+              "?room": "roomb"
+            },
+            "eff_neg": [
+              "('carry', 'ball5', 'left')"
+            ],
+            "eff_pos": [
+              "('at', 'ball5', 'roomb')",
+              "('free', 'left')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'roomb')",
+              "('ball', 'ball5')",
+              "('carry', 'ball5', 'left')",
+              "('gripper', 'left')",
+              "('room', 'roomb')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "right",
+              "?obj": "ball5",
+              "?room": "roomb"
+            },
+            "eff_neg": [
+              "('carry', 'ball5', 'right')"
+            ],
+            "eff_pos": [
+              "('at', 'ball5', 'roomb')",
+              "('free', 'right')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'roomb')",
+              "('ball', 'ball5')",
+              "('carry', 'ball5', 'right')",
+              "('gripper', 'right')",
+              "('room', 'roomb')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "middle",
+              "?obj": "ball5",
+              "?room": "rooma"
+            },
+            "eff_neg": [
+              "('carry', 'ball5', 'middle')"
+            ],
+            "eff_pos": [
+              "('at', 'ball5', 'rooma')",
+              "('free', 'middle')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'rooma')",
+              "('ball', 'ball5')",
+              "('carry', 'ball5', 'middle')",
+              "('gripper', 'middle')",
+              "('room', 'rooma')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "left",
+              "?obj": "ball5",
+              "?room": "rooma"
+            },
+            "eff_neg": [
+              "('carry', 'ball5', 'left')"
+            ],
+            "eff_pos": [
+              "('at', 'ball5', 'rooma')",
+              "('free', 'left')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'rooma')",
+              "('ball', 'ball5')",
+              "('carry', 'ball5', 'left')",
+              "('gripper', 'left')",
+              "('room', 'rooma')"
+            ]
+          },
+          {
+            "binding": {
+              "?gripper": "right",
+              "?obj": "ball5",
+              "?room": "rooma"
+            },
+            "eff_neg": [
+              "('carry', 'ball5', 'right')"
+            ],
+            "eff_pos": [
+              "('at', 'ball5', 'rooma')",
+              "('free', 'right')"
+            ],
+            "name": "drop",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at-robby', 'rooma')",
+              "('ball', 'ball5')",
+              "('carry', 'ball5', 'right')",
+              "('gripper', 'right')",
+              "('room', 'rooma')"
+            ]
+          }
+        ]
+      },
+      "problem_file": "pddl_files/gripper/gripper_8_3.pddl",
+      "unified_planning": {
+        "action_schema_count": 3,
+        "engine": "fast-downward",
+        "engine_metrics": {
+          "engine_internal_time": "0.1161336898803711"
+        },
+        "fluent_count": 8,
+        "illegal_step": null,
+        "object_count": 13,
+        "parser_elapsed_sec": 0.05475,
+        "plan": [
+          "pick(ball1, rooma, left)",
+          "pick(ball2, rooma, middle)",
+          "pick(ball3, rooma, right)",
+          "move(rooma, roomb)",
+          "drop(ball1, roomb, left)",
+          "drop(ball2, roomb, middle)",
+          "drop(ball3, roomb, right)"
+        ],
+        "plan_length": 7,
+        "problem_kind": "PROBLEM_CLASS: ['ACTION_BASED']\nCONDITIONS_KIND: ['NEGATIVE_CONDITIONS']\nTYPING: ['FLAT_TYPING']",
+        "problem_name": "gripper-3",
+        "replay_elapsed_sec": 0.009543,
+        "replay_goal": true,
+        "replay_samples": [
+          {
+            "action": "pick(ball1, rooma, left)",
+            "index": 0,
+            "state_hash_after": 8824810674590506314,
+            "state_hash_before": 7967119429122081984
+          },
+          {
+            "action": "pick(ball2, rooma, middle)",
+            "index": 1,
+            "state_hash_after": -7654499028094382230,
+            "state_hash_before": 8824810674590506314
+          },
+          {
+            "action": "pick(ball3, rooma, right)",
+            "index": 2,
+            "state_hash_after": -8238131906801697611,
+            "state_hash_before": -7654499028094382230
+          },
+          {
+            "action": "move(rooma, roomb)",
+            "index": 3,
+            "state_hash_after": 8128420949276398005,
+            "state_hash_before": -8238131906801697611
+          },
+          {
+            "action": "drop(ball1, roomb, left)",
+            "index": 4,
+            "state_hash_after": 5799282789045436633,
+            "state_hash_before": 8128420949276398005
+          },
+          {
+            "action": "drop(ball2, roomb, middle)",
+            "index": 5,
+            "state_hash_after": -409069118845157151,
+            "state_hash_before": 5799282789045436633
+          },
+          {
+            "action": "drop(ball3, roomb, right)",
+            "index": 6,
+            "state_hash_after": 5216209779690431667,
+            "state_hash_before": -409069118845157151
+          }
+        ],
+        "solve_elapsed_sec": 0.143957,
+        "solve_status": "PlanGenerationResultStatus.SOLVED_SATISFICING",
+        "solved": true,
+        "validated": true,
+        "validation_status": "ValidationResultStatus.VALID"
+      }
+    },
+    "hanoi": {
+      "domain_file": "pddl_files/hanoi/hanoi.pddl",
+      "exists": true,
+      "pass": true,
+      "pddlpy": {
+        "applicable_initial": 0,
+        "elapsed_sec": 0.067772,
+        "goal_atom_count": 10,
+        "ground_actions": 2197,
+        "grounding_truncated_at": null,
+        "initial_atom_count": 88,
+        "object_count": 13,
+        "operator_names": [
+          "move"
+        ],
+        "per_operator": {
+          "move": 2197
+        },
+        "samples": [
+          {
+            "binding": {
+              "?disc": "d2",
+              "?from": "d2",
+              "?to": "d2"
+            },
+            "eff_neg": [
+              "('clear', 'd2')",
+              "('on', 'd2', 'd2')"
+            ],
+            "eff_pos": [
+              "('clear', 'd2')",
+              "('on', 'd2', 'd2')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd2')",
+              "('on', 'd2', 'd2')",
+              "('smaller', 'd2', 'd2')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "d2",
+              "?from": "d2",
+              "?to": "d8"
+            },
+            "eff_neg": [
+              "('clear', 'd8')",
+              "('on', 'd2', 'd2')"
+            ],
+            "eff_pos": [
+              "('clear', 'd2')",
+              "('on', 'd2', 'd8')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd2')",
+              "('clear', 'd8')",
+              "('on', 'd2', 'd2')",
+              "('smaller', 'd2', 'd2')",
+              "('smaller', 'd2', 'd8')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "d2",
+              "?from": "d2",
+              "?to": "d9"
+            },
+            "eff_neg": [
+              "('clear', 'd9')",
+              "('on', 'd2', 'd2')"
+            ],
+            "eff_pos": [
+              "('clear', 'd2')",
+              "('on', 'd2', 'd9')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd2')",
+              "('clear', 'd9')",
+              "('on', 'd2', 'd2')",
+              "('smaller', 'd2', 'd2')",
+              "('smaller', 'd2', 'd9')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "d2",
+              "?from": "d2",
+              "?to": "d5"
+            },
+            "eff_neg": [
+              "('clear', 'd5')",
+              "('on', 'd2', 'd2')"
+            ],
+            "eff_pos": [
+              "('clear', 'd2')",
+              "('on', 'd2', 'd5')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd2')",
+              "('clear', 'd5')",
+              "('on', 'd2', 'd2')",
+              "('smaller', 'd2', 'd2')",
+              "('smaller', 'd2', 'd5')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "d2",
+              "?from": "d2",
+              "?to": "peg1"
+            },
+            "eff_neg": [
+              "('clear', 'peg1')",
+              "('on', 'd2', 'd2')"
+            ],
+            "eff_pos": [
+              "('clear', 'd2')",
+              "('on', 'd2', 'peg1')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd2')",
+              "('clear', 'peg1')",
+              "('on', 'd2', 'd2')",
+              "('smaller', 'd2', 'd2')",
+              "('smaller', 'd2', 'peg1')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "d2",
+              "?from": "d2",
+              "?to": "d1"
+            },
+            "eff_neg": [
+              "('clear', 'd1')",
+              "('on', 'd2', 'd2')"
+            ],
+            "eff_pos": [
+              "('clear', 'd2')",
+              "('on', 'd2', 'd1')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd1')",
+              "('clear', 'd2')",
+              "('on', 'd2', 'd2')",
+              "('smaller', 'd2', 'd1')",
+              "('smaller', 'd2', 'd2')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "d2",
+              "?from": "d2",
+              "?to": "d6"
+            },
+            "eff_neg": [
+              "('clear', 'd6')",
+              "('on', 'd2', 'd2')"
+            ],
+            "eff_pos": [
+              "('clear', 'd2')",
+              "('on', 'd2', 'd6')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd2')",
+              "('clear', 'd6')",
+              "('on', 'd2', 'd2')",
+              "('smaller', 'd2', 'd2')",
+              "('smaller', 'd2', 'd6')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "d2",
+              "?from": "d2",
+              "?to": "d4"
+            },
+            "eff_neg": [
+              "('clear', 'd4')",
+              "('on', 'd2', 'd2')"
+            ],
+            "eff_pos": [
+              "('clear', 'd2')",
+              "('on', 'd2', 'd4')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd2')",
+              "('clear', 'd4')",
+              "('on', 'd2', 'd2')",
+              "('smaller', 'd2', 'd2')",
+              "('smaller', 'd2', 'd4')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "d2",
+              "?from": "d2",
+              "?to": "peg3"
+            },
+            "eff_neg": [
+              "('clear', 'peg3')",
+              "('on', 'd2', 'd2')"
+            ],
+            "eff_pos": [
+              "('clear', 'd2')",
+              "('on', 'd2', 'peg3')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd2')",
+              "('clear', 'peg3')",
+              "('on', 'd2', 'd2')",
+              "('smaller', 'd2', 'd2')",
+              "('smaller', 'd2', 'peg3')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "d2",
+              "?from": "d2",
+              "?to": "peg2"
+            },
+            "eff_neg": [
+              "('clear', 'peg2')",
+              "('on', 'd2', 'd2')"
+            ],
+            "eff_pos": [
+              "('clear', 'd2')",
+              "('on', 'd2', 'peg2')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd2')",
+              "('clear', 'peg2')",
+              "('on', 'd2', 'd2')",
+              "('smaller', 'd2', 'd2')",
+              "('smaller', 'd2', 'peg2')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "d2",
+              "?from": "d2",
+              "?to": "d7"
+            },
+            "eff_neg": [
+              "('clear', 'd7')",
+              "('on', 'd2', 'd2')"
+            ],
+            "eff_pos": [
+              "('clear', 'd2')",
+              "('on', 'd2', 'd7')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd2')",
+              "('clear', 'd7')",
+              "('on', 'd2', 'd2')",
+              "('smaller', 'd2', 'd2')",
+              "('smaller', 'd2', 'd7')"
+            ]
+          },
+          {
+            "binding": {
+              "?disc": "d2",
+              "?from": "d2",
+              "?to": "d3"
+            },
+            "eff_neg": [
+              "('clear', 'd3')",
+              "('on', 'd2', 'd2')"
+            ],
+            "eff_pos": [
+              "('clear', 'd2')",
+              "('on', 'd2', 'd3')"
+            ],
+            "name": "move",
+            "pre_neg": [],
+            "pre_pos": [
+              "('clear', 'd2')",
+              "('clear', 'd3')",
+              "('on', 'd2', 'd2')",
+              "('smaller', 'd2', 'd2')",
+              "('smaller', 'd2', 'd3')"
+            ]
+          }
+        ]
+      },
+      "problem_file": "pddl_files/hanoi/hanoi-3-10.pddl",
+      "unified_planning": {
+        "action_schema_count": 1,
+        "engine": "fast-downward",
+        "engine_metrics": {
+          "engine_internal_time": "0.3318819999694824"
+        },
+        "fluent_count": 3,
+        "illegal_step": null,
+        "object_count": 13,
+        "parser_elapsed_sec": 0.05847,
+        "plan": [
+          "move(d1, d2, peg2)",
+          "move(d2, d3, peg3)",
+          "move(d1, peg2, d2)",
+          "move(d3, d4, peg2)",
+          "move(d1, d2, d4)",
+          "move(d2, peg3, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, peg3)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, peg2, d4)",
+          "move(d1, d2, peg2)",
+          "move(d2, d5, d3)",
+          "move(d1, peg2, d2)",
+          "move(d5, d6, peg2)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, peg3, d5)",
+          "move(d1, d2, peg3)",
+          "move(d1, peg3, d4)",
+          "move(d2, d3, peg3)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, peg3, d3)",
+          "move(d1, d6, d2)",
+          "move(d6, d7, peg3)",
+          "move(d1, d2, d7)",
+          "move(d1, d7, d6)",
+          "move(d2, d3, d7)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d7, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, peg2, d6)",
+          "move(d1, d2, peg2)",
+          "move(d2, d3, d5)",
+          "move(d1, peg2, d2)",
+          "move(d3, d4, peg2)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d7)",
+          "move(d1, d7, d4)",
+          "move(d2, d3, d7)",
+          "move(d1, d4, d2)",
+          "move(d3, peg2, d4)",
+          "move(d1, d2, peg2)",
+          "move(d2, d7, d3)",
+          "move(d1, peg2, d2)",
+          "move(d7, d8, peg2)",
+          "move(d1, d2, d8)",
+          "move(d2, d3, d7)",
+          "move(d1, d8, d2)",
+          "move(d3, d4, d8)",
+          "move(d1, d2, d4)",
+          "move(d2, d7, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d8, d4)",
+          "move(d1, d2, d8)",
+          "move(d2, d5, d3)",
+          "move(d1, d8, d2)",
+          "move(d5, d6, d8)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d7)",
+          "move(d1, d7, d4)",
+          "move(d2, d3, d7)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d7, d3)",
+          "move(d1, d6, d2)",
+          "move(d6, peg3, d7)",
+          "move(d1, d2, peg3)",
+          "move(d1, peg3, d6)",
+          "move(d2, d3, peg3)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, peg3, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, peg3)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, d8, d6)",
+          "move(d1, d2, d8)",
+          "move(d2, d3, d5)",
+          "move(d1, d8, d2)",
+          "move(d3, d4, d8)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, peg3, d5)",
+          "move(d1, d2, peg3)",
+          "move(d1, peg3, d4)",
+          "move(d2, d3, peg3)",
+          "move(d1, d4, d2)",
+          "move(d3, d8, d4)",
+          "move(d1, d2, d8)",
+          "move(d2, peg3, d3)",
+          "move(d1, d8, d2)",
+          "move(d8, d9, peg3)",
+          "move(d1, d2, d9)",
+          "move(d1, d9, d8)",
+          "move(d2, d3, d9)",
+          "move(d1, d8, d2)",
+          "move(d3, d4, d8)",
+          "move(d1, d2, d4)",
+          "move(d2, d9, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d9)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d8, d4)",
+          "move(d1, d2, d8)",
+          "move(d2, d5, d3)",
+          "move(d1, d8, d2)",
+          "move(d5, d6, d8)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d9, d5)",
+          "move(d1, d2, d9)",
+          "move(d1, d9, d4)",
+          "move(d2, d3, d9)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d9, d3)",
+          "move(d1, d6, d2)",
+          "move(d6, d7, d9)",
+          "move(d1, d2, d7)",
+          "move(d1, d7, d6)",
+          "move(d2, d3, d7)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d7, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, d8, d6)",
+          "move(d1, d2, d8)",
+          "move(d2, d3, d5)",
+          "move(d1, d8, d2)",
+          "move(d3, d4, d8)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d7)",
+          "move(d1, d7, d4)",
+          "move(d2, d3, d7)",
+          "move(d1, d4, d2)",
+          "move(d3, d8, d4)",
+          "move(d1, d2, d8)",
+          "move(d2, d7, d3)",
+          "move(d1, d8, d2)",
+          "move(d7, peg2, d8)",
+          "move(d1, d2, peg2)",
+          "move(d2, d3, d7)",
+          "move(d1, peg2, d2)",
+          "move(d3, d4, peg2)",
+          "move(d1, d2, d4)",
+          "move(d2, d7, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, peg2, d4)",
+          "move(d1, d2, peg2)",
+          "move(d2, d5, d3)",
+          "move(d1, peg2, d2)",
+          "move(d5, d6, peg2)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d7)",
+          "move(d2, d3, d4)",
+          "move(d1, d7, d2)",
+          "move(d3, d6, d7)",
+          "move(d1, d2, d6)",
+          "move(d2, d4, d3)",
+          "move(d1, d6, d4)",
+          "move(d2, d3, d6)",
+          "move(d1, d4, d2)",
+          "move(d3, d7, d4)",
+          "move(d1, d2, d7)",
+          "move(d2, d6, d3)",
+          "move(d1, d7, d2)",
+          "move(d6, d9, d7)",
+          "move(d1, d2, d9)",
+          "move(d1, d9, d6)",
+          "move(d2, d3, d9)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d9, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d9)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, peg2, d6)",
+          "move(d1, d2, peg2)",
+          "move(d1, peg2, d5)",
+          "move(d2, d3, peg2)",
+          "move(d1, d5, d2)",
+          "move(d3, d4, d5)",
+          "move(d1, d2, d4)",
+          "move(d2, peg2, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d9, peg2)",
+          "move(d1, d2, d9)",
+          "move(d2, d3, d4)",
+          "move(d1, d9, d2)",
+          "move(d3, d5, d9)",
+          "move(d1, d2, d5)",
+          "move(d2, d4, d3)",
+          "move(d1, d5, d2)",
+          "move(d4, peg2, d5)",
+          "move(d1, d2, peg2)",
+          "move(d1, peg2, d4)",
+          "move(d2, d3, peg2)",
+          "move(d1, d4, d2)",
+          "move(d3, d9, d4)",
+          "move(d1, d2, d9)",
+          "move(d2, peg2, d3)",
+          "move(d1, d9, d2)",
+          "move(d9, d10, peg2)",
+          "move(d1, d2, d10)",
+          "move(d2, d3, d9)",
+          "move(d1, d10, d2)",
+          "move(d3, d4, d10)",
+          "move(d1, d2, d4)",
+          "move(d2, d9, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d9)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d10, d4)",
+          "move(d1, d2, d10)",
+          "move(d2, d5, d3)",
+          "move(d1, d10, d2)",
+          "move(d5, d6, d10)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d9, d5)",
+          "move(d1, d2, d9)",
+          "move(d2, d3, d4)",
+          "move(d1, d9, d2)",
+          "move(d3, d6, d9)",
+          "move(d1, d2, d6)",
+          "move(d2, d4, d3)",
+          "move(d1, d6, d4)",
+          "move(d2, d3, d6)",
+          "move(d1, d4, d2)",
+          "move(d3, d9, d4)",
+          "move(d1, d2, d9)",
+          "move(d2, d6, d3)",
+          "move(d1, d9, d2)",
+          "move(d6, d7, d9)",
+          "move(d1, d2, d7)",
+          "move(d2, d3, d6)",
+          "move(d1, d7, d2)",
+          "move(d3, d4, d7)",
+          "move(d1, d2, d4)",
+          "move(d2, d6, d3)",
+          "move(d1, d4, d2)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d4)",
+          "move(d1, d6, d2)",
+          "move(d3, d7, d6)",
+          "move(d1, d2, d7)",
+          "move(d2, d4, d3)",
+          "move(d1, d7, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, d10, d6)",
+          "move(d1, d2, d10)",
+          "move(d2, d3, d5)",
+          "move(d1, d10, d2)",
+          "move(d3, d4, d10)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d7)",
+          "move(d1, d7, d4)",
+          "move(d2, d3, d7)",
+          "move(d1, d4, d2)",
+          "move(d3, d10, d4)",
+          "move(d1, d2, d10)",
+          "move(d2, d7, d3)",
+          "move(d1, d10, d2)",
+          "move(d7, d8, d10)",
+          "move(d1, d2, d8)",
+          "move(d2, d3, d7)",
+          "move(d1, d8, d2)",
+          "move(d3, d4, d8)",
+          "move(d1, d2, d4)",
+          "move(d2, d7, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d8, d4)",
+          "move(d1, d2, d8)",
+          "move(d2, d5, d3)",
+          "move(d1, d8, d2)",
+          "move(d5, d6, d8)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d7)",
+          "move(d1, d7, d4)",
+          "move(d2, d3, d7)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d7, d3)",
+          "move(d1, d6, d2)",
+          "move(d6, d9, d7)",
+          "move(d1, d2, d9)",
+          "move(d1, d9, d6)",
+          "move(d2, d3, d9)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d9, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d9)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, d8, d6)",
+          "move(d1, d2, d8)",
+          "move(d2, d3, d5)",
+          "move(d1, d8, d2)",
+          "move(d3, d4, d8)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d9, d5)",
+          "move(d1, d2, d9)",
+          "move(d1, d9, d4)",
+          "move(d2, d3, d9)",
+          "move(d1, d4, d2)",
+          "move(d3, d8, d4)",
+          "move(d1, d2, d8)",
+          "move(d2, d9, d3)",
+          "move(d1, d8, d2)",
+          "move(d8, peg3, d9)",
+          "move(d1, d2, peg3)",
+          "move(d1, peg3, d8)",
+          "move(d2, d3, peg3)",
+          "move(d1, d8, d2)",
+          "move(d3, d4, d8)",
+          "move(d1, d2, d4)",
+          "move(d2, peg3, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, peg3)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d8, d4)",
+          "move(d1, d2, d8)",
+          "move(d2, d5, d3)",
+          "move(d1, d8, d2)",
+          "move(d5, d6, d8)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, peg3, d5)",
+          "move(d1, d2, peg3)",
+          "move(d1, peg3, d4)",
+          "move(d2, d3, peg3)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, peg3, d3)",
+          "move(d1, d6, d2)",
+          "move(d6, d7, peg3)",
+          "move(d1, d2, d7)",
+          "move(d1, d7, d6)",
+          "move(d2, d3, d7)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d7, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, d8, d6)",
+          "move(d1, d2, d8)",
+          "move(d1, d8, d5)",
+          "move(d2, d3, d8)",
+          "move(d1, d5, d2)",
+          "move(d3, d4, d5)",
+          "move(d1, d2, d4)",
+          "move(d2, d8, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d8)",
+          "move(d1, d2, d7)",
+          "move(d2, d3, d4)",
+          "move(d1, d7, d2)",
+          "move(d3, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d2, d4, d3)",
+          "move(d1, d5, d2)",
+          "move(d4, d8, d5)",
+          "move(d1, d2, d8)",
+          "move(d1, d8, d4)",
+          "move(d2, d3, d8)",
+          "move(d1, d4, d2)",
+          "move(d3, d7, d4)",
+          "move(d1, d2, d7)",
+          "move(d2, d8, d3)",
+          "move(d1, d7, d2)",
+          "move(d7, d10, d8)",
+          "move(d1, d2, d10)",
+          "move(d2, d3, d7)",
+          "move(d1, d10, d2)",
+          "move(d3, d4, d10)",
+          "move(d1, d2, d4)",
+          "move(d2, d7, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d10, d4)",
+          "move(d1, d2, d10)",
+          "move(d2, d5, d3)",
+          "move(d1, d10, d2)",
+          "move(d5, d6, d10)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d7)",
+          "move(d2, d3, d4)",
+          "move(d1, d7, d2)",
+          "move(d3, d6, d7)",
+          "move(d1, d2, d6)",
+          "move(d2, d4, d3)",
+          "move(d1, d6, d4)",
+          "move(d2, d3, d6)",
+          "move(d1, d4, d2)",
+          "move(d3, d7, d4)",
+          "move(d1, d2, d7)",
+          "move(d2, d6, d3)",
+          "move(d1, d7, d2)",
+          "move(d6, peg3, d7)",
+          "move(d1, d2, peg3)",
+          "move(d1, peg3, d6)",
+          "move(d2, d3, peg3)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, peg3, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, peg3)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, d10, d6)",
+          "move(d1, d2, d10)",
+          "move(d2, d3, d5)",
+          "move(d1, d10, d2)",
+          "move(d3, d4, d10)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, peg3, d5)",
+          "move(d1, d2, peg3)",
+          "move(d1, peg3, d4)",
+          "move(d2, d3, peg3)",
+          "move(d1, d4, d2)",
+          "move(d3, d10, d4)",
+          "move(d1, d2, d10)",
+          "move(d2, peg3, d3)",
+          "move(d1, d10, d2)",
+          "move(d10, peg1, peg3)",
+          "move(d1, d2, peg1)",
+          "move(d2, d3, d10)",
+          "move(d1, peg1, d2)",
+          "move(d3, d4, peg1)",
+          "move(d1, d2, d4)",
+          "move(d2, d10, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d10)",
+          "move(d1, d2, d5)",
+          "move(d2, d3, d4)",
+          "move(d1, d5, d2)",
+          "move(d3, peg1, d5)",
+          "move(d1, d2, peg1)",
+          "move(d2, d4, d3)",
+          "move(d1, peg1, d2)",
+          "move(d4, d10, peg1)",
+          "move(d1, d2, d10)",
+          "move(d1, d10, d4)",
+          "move(d2, d3, d10)",
+          "move(d1, d4, d2)",
+          "move(d3, d5, d4)",
+          "move(d1, d2, d5)",
+          "move(d2, d10, d3)",
+          "move(d1, d5, d2)",
+          "move(d5, d6, d10)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, peg1, d5)",
+          "move(d1, d2, peg1)",
+          "move(d1, peg1, d4)",
+          "move(d2, d3, peg1)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, peg1, d3)",
+          "move(d1, d6, d2)",
+          "move(d6, d7, peg1)",
+          "move(d1, d2, d7)",
+          "move(d2, d3, d6)",
+          "move(d1, d7, d2)",
+          "move(d3, d4, d7)",
+          "move(d1, d2, d4)",
+          "move(d2, d6, d3)",
+          "move(d1, d4, d2)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d4)",
+          "move(d1, d6, d2)",
+          "move(d3, d7, d6)",
+          "move(d1, d2, d7)",
+          "move(d2, d4, d3)",
+          "move(d1, d7, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, d10, d6)",
+          "move(d1, d2, d10)",
+          "move(d2, d3, d5)",
+          "move(d1, d10, d2)",
+          "move(d3, d4, d10)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d7)",
+          "move(d1, d7, d4)",
+          "move(d2, d3, d7)",
+          "move(d1, d4, d2)",
+          "move(d3, d10, d4)",
+          "move(d1, d2, d10)",
+          "move(d2, d7, d3)",
+          "move(d1, d10, d2)",
+          "move(d7, d8, d10)",
+          "move(d1, d2, d8)",
+          "move(d2, d3, d7)",
+          "move(d1, d8, d2)",
+          "move(d3, d4, d8)",
+          "move(d1, d2, d4)",
+          "move(d2, d7, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d8, d4)",
+          "move(d1, d2, d8)",
+          "move(d2, d5, d3)",
+          "move(d1, d8, d2)",
+          "move(d5, d6, d8)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d7)",
+          "move(d1, d7, d4)",
+          "move(d2, d3, d7)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d7, d3)",
+          "move(d1, d6, d2)",
+          "move(d6, peg1, d7)",
+          "move(d1, d2, peg1)",
+          "move(d1, peg1, d6)",
+          "move(d2, d3, peg1)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, peg1, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, peg1)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, d8, d6)",
+          "move(d1, d2, d8)",
+          "move(d2, d3, d5)",
+          "move(d1, d8, d2)",
+          "move(d3, d4, d8)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, peg1, d5)",
+          "move(d1, d2, peg1)",
+          "move(d1, peg1, d4)",
+          "move(d2, d3, peg1)",
+          "move(d1, d4, d2)",
+          "move(d3, d8, d4)",
+          "move(d1, d2, d8)",
+          "move(d2, peg1, d3)",
+          "move(d1, d8, d2)",
+          "move(d8, d9, peg1)",
+          "move(d1, d2, d9)",
+          "move(d2, d3, d8)",
+          "move(d1, d9, d2)",
+          "move(d3, d4, d9)",
+          "move(d1, d2, d4)",
+          "move(d2, d8, d3)",
+          "move(d1, d4, d2)",
+          "move(d1, d2, d8)",
+          "move(d2, d3, d4)",
+          "move(d1, d8, d2)",
+          "move(d3, d9, d8)",
+          "move(d1, d2, d9)",
+          "move(d2, d4, d3)",
+          "move(d1, d9, d2)",
+          "move(d4, d5, d9)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d8, d4)",
+          "move(d1, d2, d8)",
+          "move(d2, d5, d3)",
+          "move(d1, d8, d2)",
+          "move(d5, d6, d8)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d9, d5)",
+          "move(d1, d2, d9)",
+          "move(d2, d3, d4)",
+          "move(d1, d9, d2)",
+          "move(d3, d6, d9)",
+          "move(d1, d2, d6)",
+          "move(d2, d4, d3)",
+          "move(d1, d6, d2)",
+          "move(d1, d2, d4)",
+          "move(d2, d3, d6)",
+          "move(d1, d4, d2)",
+          "move(d3, d9, d4)",
+          "move(d1, d2, d9)",
+          "move(d2, d6, d3)",
+          "move(d1, d9, d2)",
+          "move(d6, d7, d9)",
+          "move(d1, d2, d7)",
+          "move(d2, d3, d6)",
+          "move(d1, d7, d2)",
+          "move(d3, d4, d7)",
+          "move(d1, d2, d4)",
+          "move(d2, d6, d3)",
+          "move(d1, d4, d2)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d4)",
+          "move(d1, d6, d2)",
+          "move(d3, d7, d6)",
+          "move(d1, d2, d7)",
+          "move(d2, d4, d3)",
+          "move(d1, d7, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d2, d3, d4)",
+          "move(d1, d5, d3)",
+          "move(d2, d4, d5)",
+          "move(d1, d3, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, d8, d6)",
+          "move(d1, d2, d8)",
+          "move(d2, d3, d5)",
+          "move(d1, d8, d2)",
+          "move(d3, d4, d8)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d7)",
+          "move(d1, d7, d4)",
+          "move(d2, d3, d7)",
+          "move(d1, d4, d2)",
+          "move(d3, d8, d4)",
+          "move(d1, d2, d8)",
+          "move(d2, d7, d3)",
+          "move(d1, d8, d2)",
+          "move(d7, d10, d8)",
+          "move(d1, d2, d10)",
+          "move(d2, d3, d7)",
+          "move(d1, d10, d2)",
+          "move(d3, d4, d10)",
+          "move(d1, d2, d4)",
+          "move(d2, d7, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d10, d4)",
+          "move(d1, d2, d10)",
+          "move(d2, d5, d3)",
+          "move(d1, d10, d2)",
+          "move(d5, d6, d10)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d7)",
+          "move(d2, d3, d4)",
+          "move(d1, d7, d2)",
+          "move(d3, d6, d7)",
+          "move(d1, d2, d6)",
+          "move(d2, d4, d3)",
+          "move(d1, d6, d4)",
+          "move(d2, d3, d6)",
+          "move(d1, d4, d2)",
+          "move(d3, d7, d4)",
+          "move(d1, d2, d7)",
+          "move(d2, d6, d3)",
+          "move(d1, d7, d2)",
+          "move(d6, d9, d7)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d9)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d9, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d9)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, d10, d6)",
+          "move(d1, d2, d10)",
+          "move(d2, d3, d5)",
+          "move(d1, d10, d2)",
+          "move(d3, d4, d10)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d9, d5)",
+          "move(d1, d2, d4)",
+          "move(d2, d3, d9)",
+          "move(d1, d4, d2)",
+          "move(d3, d10, d4)",
+          "move(d1, d2, d10)",
+          "move(d2, d9, d3)",
+          "move(d1, d10, d2)",
+          "move(d9, peg2, d10)",
+          "move(d1, d2, peg2)",
+          "move(d2, d3, d9)",
+          "move(d1, peg2, d2)",
+          "move(d3, d4, peg2)",
+          "move(d1, d2, d4)",
+          "move(d2, d9, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d9)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, peg2, d4)",
+          "move(d1, d2, peg2)",
+          "move(d2, d5, d3)",
+          "move(d1, peg2, d2)",
+          "move(d5, d6, peg2)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d9, d5)",
+          "move(d1, d2, d9)",
+          "move(d1, d9, d4)",
+          "move(d2, d3, d9)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d9, d3)",
+          "move(d1, d6, d2)",
+          "move(d6, d7, d9)",
+          "move(d1, d2, d7)",
+          "move(d1, d7, d6)",
+          "move(d2, d3, d7)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d7, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d2, d3, d4)",
+          "move(d1, d5, d3)",
+          "move(d2, d4, d5)",
+          "move(d1, d3, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, peg2, d6)",
+          "move(d1, d2, peg2)",
+          "move(d2, d3, d5)",
+          "move(d1, peg2, d2)",
+          "move(d3, d4, peg2)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d4)",
+          "move(d2, d3, d7)",
+          "move(d1, d4, d2)",
+          "move(d3, peg2, d4)",
+          "move(d1, d2, peg2)",
+          "move(d2, d7, d3)",
+          "move(d1, peg2, d2)",
+          "move(d7, d8, peg2)",
+          "move(d1, d2, d8)",
+          "move(d2, d3, d7)",
+          "move(d1, d8, d2)",
+          "move(d3, d4, d8)",
+          "move(d1, d2, d4)",
+          "move(d2, d7, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d8, d4)",
+          "move(d1, d2, d8)",
+          "move(d2, d5, d3)",
+          "move(d1, d8, d2)",
+          "move(d5, d6, d8)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d7)",
+          "move(d2, d3, d4)",
+          "move(d1, d7, d2)",
+          "move(d3, d6, d7)",
+          "move(d1, d2, d6)",
+          "move(d2, d4, d3)",
+          "move(d1, d6, d4)",
+          "move(d2, d3, d6)",
+          "move(d1, d4, d2)",
+          "move(d3, d7, d4)",
+          "move(d1, d2, d7)",
+          "move(d2, d6, d3)",
+          "move(d1, d7, d2)",
+          "move(d6, d9, d7)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d9)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d9, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d9)",
+          "move(d1, d2, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, d8, d6)",
+          "move(d1, d2, d8)",
+          "move(d2, d3, d5)",
+          "move(d1, d8, d2)",
+          "move(d3, d4, d8)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d9, d5)",
+          "move(d1, d2, d4)",
+          "move(d2, d3, d9)",
+          "move(d1, d4, d2)",
+          "move(d3, d8, d4)",
+          "move(d1, d2, d8)",
+          "move(d2, d9, d3)",
+          "move(d1, d8, d2)",
+          "move(d8, peg1, d9)",
+          "move(d1, d2, peg1)",
+          "move(d2, d3, d8)",
+          "move(d1, peg1, d2)",
+          "move(d3, d4, peg1)",
+          "move(d1, d2, d4)",
+          "move(d2, d8, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d8)",
+          "move(d1, d2, d5)",
+          "move(d2, d3, d4)",
+          "move(d1, d5, d2)",
+          "move(d3, peg1, d5)",
+          "move(d1, d2, peg1)",
+          "move(d2, d4, d3)",
+          "move(d1, peg1, d2)",
+          "move(d4, d8, peg1)",
+          "move(d1, d2, d8)",
+          "move(d1, d8, d4)",
+          "move(d2, d3, d8)",
+          "move(d1, d4, d2)",
+          "move(d3, d5, d4)",
+          "move(d1, d2, d5)",
+          "move(d2, d8, d3)",
+          "move(d1, d5, d2)",
+          "move(d5, d6, d8)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, peg1, d5)",
+          "move(d1, d2, peg1)",
+          "move(d1, peg1, d4)",
+          "move(d2, d3, peg1)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, peg1, d3)",
+          "move(d1, d6, d2)",
+          "move(d6, d7, peg1)",
+          "move(d1, d2, d7)",
+          "move(d2, d3, d6)",
+          "move(d1, d7, d2)",
+          "move(d3, d4, d7)",
+          "move(d1, d2, d4)",
+          "move(d2, d6, d3)",
+          "move(d1, d4, d2)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d4)",
+          "move(d1, d6, d2)",
+          "move(d3, d7, d6)",
+          "move(d1, d2, d7)",
+          "move(d2, d4, d3)",
+          "move(d1, d7, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d2, d3, d4)",
+          "move(d1, d5, d3)",
+          "move(d2, d4, d5)",
+          "move(d1, d3, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, d8, d6)",
+          "move(d1, d2, d8)",
+          "move(d2, d3, d5)",
+          "move(d1, d8, d2)",
+          "move(d3, d4, d8)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d4)",
+          "move(d2, d3, d7)",
+          "move(d1, d4, d2)",
+          "move(d3, d8, d4)",
+          "move(d1, d2, d8)",
+          "move(d2, d7, d3)",
+          "move(d1, d8, d2)",
+          "move(d7, peg2, d8)",
+          "move(d1, d2, peg2)",
+          "move(d2, d3, d7)",
+          "move(d1, peg2, d2)",
+          "move(d3, d4, peg2)",
+          "move(d1, d2, d4)",
+          "move(d2, d7, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, d7)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, peg2, d4)",
+          "move(d1, d2, peg2)",
+          "move(d2, d5, d3)",
+          "move(d1, peg2, d2)",
+          "move(d5, d6, peg2)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, d5)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d7, d5)",
+          "move(d1, d2, d7)",
+          "move(d1, d7, d4)",
+          "move(d2, d3, d7)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d7, d3)",
+          "move(d1, d6, d2)",
+          "move(d6, peg1, d7)",
+          "move(d1, d2, d6)",
+          "move(d2, d3, peg1)",
+          "move(d1, d6, d2)",
+          "move(d3, d4, d6)",
+          "move(d1, d2, d4)",
+          "move(d2, peg1, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, d5, peg1)",
+          "move(d1, d2, d5)",
+          "move(d1, d5, d4)",
+          "move(d2, d3, d5)",
+          "move(d1, d4, d2)",
+          "move(d3, d6, d4)",
+          "move(d1, d2, d6)",
+          "move(d2, d5, d3)",
+          "move(d1, d6, d2)",
+          "move(d5, peg2, d6)",
+          "move(d1, d2, peg2)",
+          "move(d2, d3, d5)",
+          "move(d1, peg2, d2)",
+          "move(d3, d4, peg2)",
+          "move(d1, d2, d4)",
+          "move(d2, d5, d3)",
+          "move(d1, d4, d2)",
+          "move(d4, peg1, d5)",
+          "move(d1, d2, d4)",
+          "move(d2, d3, peg1)",
+          "move(d1, d4, d2)",
+          "move(d3, peg2, d4)",
+          "move(d1, d2, peg2)",
+          "move(d2, peg1, d3)",
+          "move(d1, peg2, d2)"
+        ],
+        "plan_length": 1193,
+        "problem_kind": "PROBLEM_CLASS: ['ACTION_BASED']\nCONDITIONS_KIND: ['EQUALITIES', 'NEGATIVE_CONDITIONS']\nTYPING: ['FLAT_TYPING']",
+        "problem_name": "hanoi-10",
+        "replay_elapsed_sec": 0.48478,
+        "replay_goal": true,
+        "replay_samples": [
+          {
+            "action": "move(d1, d2, peg2)",
+            "index": 0,
+            "state_hash_after": 2425445654299850698,
+            "state_hash_before": -8873501400992408072
+          },
+          {
+            "action": "move(d2, d3, peg3)",
+            "index": 1,
+            "state_hash_after": 1496352666696683243,
+            "state_hash_before": 2425445654299850698
+          },
+          {
+            "action": "move(d1, peg2, d2)",
+            "index": 2,
+            "state_hash_after": -5641312313407560487,
+            "state_hash_before": 1496352666696683243
+          },
+          {
+            "action": "move(d3, d4, peg2)",
+            "index": 3,
+            "state_hash_after": -445562190866274190,
+            "state_hash_before": -5641312313407560487
+          },
+          {
+            "action": "move(d1, d2, d4)",
+            "index": 4,
+            "state_hash_after": -7476900136734046730,
+            "state_hash_before": -445562190866274190
+          },
+          {
+            "action": "move(d1, d4, d2)",
+            "index": 1188,
+            "state_hash_after": 4682076884383257472,
+            "state_hash_before": 2384560767435062788
+          },
+          {
+            "action": "move(d3, peg2, d4)",
+            "index": 1189,
+            "state_hash_after": 620678462631796523,
+            "state_hash_before": 4682076884383257472
+          },
+          {
+            "action": "move(d1, d2, peg2)",
+            "index": 1190,
+            "state_hash_after": -5913504210329832167,
+            "state_hash_before": 620678462631796523
+          },
+          {
+            "action": "move(d2, peg1, d3)",
+            "index": 1191,
+            "state_hash_after": -1945721235112499195,
+            "state_hash_before": -5913504210329832167
+          },
+          {
+            "action": "move(d1, peg2, d2)",
+            "index": 1192,
+            "state_hash_after": 4723568327153893943,
+            "state_hash_before": -1945721235112499195
+          }
+        ],
+        "solve_elapsed_sec": 0.422208,
+        "solve_status": "PlanGenerationResultStatus.SOLVED_SATISFICING",
+        "solved": true,
+        "validated": true,
+        "validation_status": "ValidationResultStatus.VALID"
+      }
+    },
+    "n-puzzle": {
+      "domain_file": "pddl_files/npuzzle/npuzzle.pddl",
+      "exists": true,
+      "pass": true,
+      "pddlpy": {
+        "applicable_initial": 0,
+        "elapsed_sec": 0.109601,
+        "goal_atom_count": 1,
+        "ground_actions": 2880,
+        "grounding_truncated_at": null,
+        "initial_atom_count": 45,
+        "object_count": 23,
+        "operator_names": [
+          "move-down",
+          "move-left",
+          "move-right",
+          "move-up"
+        ],
+        "per_operator": {
+          "move-down": 720,
+          "move-left": 720,
+          "move-right": 720,
+          "move-up": 720
+        },
+        "samples": [
+          {
+            "binding": {
+              "?by": "p_x_0",
+              "?omf": "t_14",
+              "?px": "p_y_3",
+              "?py": "p_x_1"
+            },
+            "eff_neg": [
+              "('at', 't_14', 'p_y_3', 'p_x_1')",
+              "('blank', 'p_y_3', 'p_x_0')"
+            ],
+            "eff_pos": [
+              "('at', 't_14', 'p_y_3', 'p_x_0')",
+              "('blank', 'p_y_3', 'p_x_1')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_14', 'p_y_3', 'p_x_1')",
+              "('blank', 'p_y_3', 'p_x_0')",
+              "('inc', 'p_x_0', 'p_x_1')",
+              "('position', 'p_x_0')",
+              "('position', 'p_x_1')",
+              "('position', 'p_y_3')",
+              "('tile', 't_14')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_x_0",
+              "?omf": "t_14",
+              "?px": "p_x_0",
+              "?py": "p_x_1"
+            },
+            "eff_neg": [
+              "('at', 't_14', 'p_x_0', 'p_x_1')",
+              "('blank', 'p_x_0', 'p_x_0')"
+            ],
+            "eff_pos": [
+              "('at', 't_14', 'p_x_0', 'p_x_0')",
+              "('blank', 'p_x_0', 'p_x_1')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_14', 'p_x_0', 'p_x_1')",
+              "('blank', 'p_x_0', 'p_x_0')",
+              "('inc', 'p_x_0', 'p_x_1')",
+              "('position', 'p_x_0')",
+              "('position', 'p_x_1')",
+              "('tile', 't_14')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_x_0",
+              "?omf": "t_14",
+              "?px": "p_y_0",
+              "?py": "p_x_1"
+            },
+            "eff_neg": [
+              "('at', 't_14', 'p_y_0', 'p_x_1')",
+              "('blank', 'p_y_0', 'p_x_0')"
+            ],
+            "eff_pos": [
+              "('at', 't_14', 'p_y_0', 'p_x_0')",
+              "('blank', 'p_y_0', 'p_x_1')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_14', 'p_y_0', 'p_x_1')",
+              "('blank', 'p_y_0', 'p_x_0')",
+              "('inc', 'p_x_0', 'p_x_1')",
+              "('position', 'p_x_0')",
+              "('position', 'p_x_1')",
+              "('position', 'p_y_0')",
+              "('tile', 't_14')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_x_0",
+              "?omf": "t_14",
+              "?px": "p_x_3",
+              "?py": "p_x_1"
+            },
+            "eff_neg": [
+              "('at', 't_14', 'p_x_3', 'p_x_1')",
+              "('blank', 'p_x_3', 'p_x_0')"
+            ],
+            "eff_pos": [
+              "('at', 't_14', 'p_x_3', 'p_x_0')",
+              "('blank', 'p_x_3', 'p_x_1')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_14', 'p_x_3', 'p_x_1')",
+              "('blank', 'p_x_3', 'p_x_0')",
+              "('inc', 'p_x_0', 'p_x_1')",
+              "('position', 'p_x_0')",
+              "('position', 'p_x_1')",
+              "('position', 'p_x_3')",
+              "('tile', 't_14')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_x_0",
+              "?omf": "t_14",
+              "?px": "p_y_2",
+              "?py": "p_x_1"
+            },
+            "eff_neg": [
+              "('at', 't_14', 'p_y_2', 'p_x_1')",
+              "('blank', 'p_y_2', 'p_x_0')"
+            ],
+            "eff_pos": [
+              "('at', 't_14', 'p_y_2', 'p_x_0')",
+              "('blank', 'p_y_2', 'p_x_1')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_14', 'p_y_2', 'p_x_1')",
+              "('blank', 'p_y_2', 'p_x_0')",
+              "('inc', 'p_x_0', 'p_x_1')",
+              "('position', 'p_x_0')",
+              "('position', 'p_x_1')",
+              "('position', 'p_y_2')",
+              "('tile', 't_14')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_x_0",
+              "?omf": "t_14",
+              "?px": "p_y_1",
+              "?py": "p_x_1"
+            },
+            "eff_neg": [
+              "('at', 't_14', 'p_y_1', 'p_x_1')",
+              "('blank', 'p_y_1', 'p_x_0')"
+            ],
+            "eff_pos": [
+              "('at', 't_14', 'p_y_1', 'p_x_0')",
+              "('blank', 'p_y_1', 'p_x_1')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_14', 'p_y_1', 'p_x_1')",
+              "('blank', 'p_y_1', 'p_x_0')",
+              "('inc', 'p_x_0', 'p_x_1')",
+              "('position', 'p_x_0')",
+              "('position', 'p_x_1')",
+              "('position', 'p_y_1')",
+              "('tile', 't_14')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_x_0",
+              "?omf": "t_14",
+              "?px": "p_x_1",
+              "?py": "p_x_1"
+            },
+            "eff_neg": [
+              "('at', 't_14', 'p_x_1', 'p_x_1')",
+              "('blank', 'p_x_1', 'p_x_0')"
+            ],
+            "eff_pos": [
+              "('at', 't_14', 'p_x_1', 'p_x_0')",
+              "('blank', 'p_x_1', 'p_x_1')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_14', 'p_x_1', 'p_x_1')",
+              "('blank', 'p_x_1', 'p_x_0')",
+              "('inc', 'p_x_0', 'p_x_1')",
+              "('position', 'p_x_0')",
+              "('position', 'p_x_1')",
+              "('tile', 't_14')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_x_0",
+              "?omf": "t_14",
+              "?px": "p_x_2",
+              "?py": "p_x_1"
+            },
+            "eff_neg": [
+              "('at', 't_14', 'p_x_2', 'p_x_1')",
+              "('blank', 'p_x_2', 'p_x_0')"
+            ],
+            "eff_pos": [
+              "('at', 't_14', 'p_x_2', 'p_x_0')",
+              "('blank', 'p_x_2', 'p_x_1')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_14', 'p_x_2', 'p_x_1')",
+              "('blank', 'p_x_2', 'p_x_0')",
+              "('inc', 'p_x_0', 'p_x_1')",
+              "('position', 'p_x_0')",
+              "('position', 'p_x_1')",
+              "('position', 'p_x_2')",
+              "('tile', 't_14')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_y_0",
+              "?omf": "t_14",
+              "?px": "p_y_3",
+              "?py": "p_y_1"
+            },
+            "eff_neg": [
+              "('at', 't_14', 'p_y_3', 'p_y_1')",
+              "('blank', 'p_y_3', 'p_y_0')"
+            ],
+            "eff_pos": [
+              "('at', 't_14', 'p_y_3', 'p_y_0')",
+              "('blank', 'p_y_3', 'p_y_1')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_14', 'p_y_3', 'p_y_1')",
+              "('blank', 'p_y_3', 'p_y_0')",
+              "('inc', 'p_y_0', 'p_y_1')",
+              "('position', 'p_y_0')",
+              "('position', 'p_y_1')",
+              "('position', 'p_y_3')",
+              "('tile', 't_14')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_y_0",
+              "?omf": "t_14",
+              "?px": "p_x_0",
+              "?py": "p_y_1"
+            },
+            "eff_neg": [
+              "('at', 't_14', 'p_x_0', 'p_y_1')",
+              "('blank', 'p_x_0', 'p_y_0')"
+            ],
+            "eff_pos": [
+              "('at', 't_14', 'p_x_0', 'p_y_0')",
+              "('blank', 'p_x_0', 'p_y_1')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_14', 'p_x_0', 'p_y_1')",
+              "('blank', 'p_x_0', 'p_y_0')",
+              "('inc', 'p_y_0', 'p_y_1')",
+              "('position', 'p_x_0')",
+              "('position', 'p_y_0')",
+              "('position', 'p_y_1')",
+              "('tile', 't_14')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_y_0",
+              "?omf": "t_14",
+              "?px": "p_y_0",
+              "?py": "p_y_1"
+            },
+            "eff_neg": [
+              "('at', 't_14', 'p_y_0', 'p_y_1')",
+              "('blank', 'p_y_0', 'p_y_0')"
+            ],
+            "eff_pos": [
+              "('at', 't_14', 'p_y_0', 'p_y_0')",
+              "('blank', 'p_y_0', 'p_y_1')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_14', 'p_y_0', 'p_y_1')",
+              "('blank', 'p_y_0', 'p_y_0')",
+              "('inc', 'p_y_0', 'p_y_1')",
+              "('position', 'p_y_0')",
+              "('position', 'p_y_1')",
+              "('tile', 't_14')"
+            ]
+          },
+          {
+            "binding": {
+              "?by": "p_y_0",
+              "?omf": "t_14",
+              "?px": "p_x_3",
+              "?py": "p_y_1"
+            },
+            "eff_neg": [
+              "('at', 't_14', 'p_x_3', 'p_y_1')",
+              "('blank', 'p_x_3', 'p_y_0')"
+            ],
+            "eff_pos": [
+              "('at', 't_14', 'p_x_3', 'p_y_0')",
+              "('blank', 'p_x_3', 'p_y_1')"
+            ],
+            "name": "move-down",
+            "pre_neg": [],
+            "pre_pos": [
+              "('at', 't_14', 'p_x_3', 'p_y_1')",
+              "('blank', 'p_x_3', 'p_y_0')",
+              "('inc', 'p_y_0', 'p_y_1')",
+              "('position', 'p_x_3')",
+              "('position', 'p_y_0')",
+              "('position', 'p_y_1')",
+              "('tile', 't_14')"
+            ]
+          }
+        ]
+      },
+      "problem_file": "pddl_files/npuzzle/npuzzle-4-4.pddl",
+      "unified_planning": {
+        "action_schema_count": 4,
+        "engine": "fast-downward",
+        "engine_metrics": {
+          "engine_internal_time": "0.17893409729003906"
+        },
+        "fluent_count": 5,
+        "illegal_step": null,
+        "object_count": 23,
+        "parser_elapsed_sec": 0.061936,
+        "plan": [
+          "move-down(t_1, p_x_0, p_y_1, p_y_0)",
+          "move-right(t_4, p_x_1, p_y_1, p_x_0)",
+          "move-right(t_7, p_x_2, p_y_1, p_x_1)",
+          "move-down(t_8, p_x_2, p_y_2, p_y_1)"
+        ],
+        "plan_length": 4,
+        "problem_kind": "PROBLEM_CLASS: ['ACTION_BASED']\nTYPING: ['FLAT_TYPING']",
+        "problem_name": "npuzzle-4-4",
+        "replay_elapsed_sec": 0.064091,
+        "replay_goal": true,
+        "replay_samples": [
+          {
+            "action": "move-down(t_1, p_x_0, p_y_1, p_y_0)",
+            "index": 0,
+            "state_hash_after": -1754314685862116796,
+            "state_hash_before": 4680310068319519363
+          },
+          {
+            "action": "move-right(t_4, p_x_1, p_y_1, p_x_0)",
+            "index": 1,
+            "state_hash_after": 744944036533612475,
+            "state_hash_before": -1754314685862116796
+          },
+          {
+            "action": "move-right(t_7, p_x_2, p_y_1, p_x_1)",
+            "index": 2,
+            "state_hash_after": -3328768918484407452,
+            "state_hash_before": 744944036533612475
+          },
+          {
+            "action": "move-down(t_8, p_x_2, p_y_2, p_y_1)",
+            "index": 3,
+            "state_hash_after": -1044874922798898578,
+            "state_hash_before": -3328768918484407452
+          }
+        ],
+        "solve_elapsed_sec": 0.517017,
+        "solve_status": "PlanGenerationResultStatus.SOLVED_SATISFICING",
+        "solved": true,
+        "validated": true,
+        "validation_status": "ValidationResultStatus.VALID"
+      }
+    },
+    "sokoban": {
+      "domain_file": "pddl_files/sokoban/sokoban.pddl",
+      "exists": true,
+      "pass": true,
+      "pddlpy": {
+        "applicable_initial": 0,
+        "elapsed_sec": 0.06743,
+        "goal_atom_count": 2,
+        "ground_actions": 140,
+        "grounding_truncated_at": null,
+        "initial_atom_count": 144,
+        "object_count": 25,
+        "operator_names": [
+          "move-player",
+          "push-box"
+        ],
+        "per_operator": {
+          "move-player": 80,
+          "push-box": 60
+        },
+        "samples": [
+          {
+            "binding": {
+              "?x": "s_1_3",
+              "?y": "s_1_2"
+            },
+            "eff_neg": [
+              "('has_player', 's_1_3')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_1_2')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_1_2')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_1_3', 's_1_2')",
+              "('has_player', 's_1_3')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_3_4",
+              "?y": "s_2_4"
+            },
+            "eff_neg": [
+              "('has_player', 's_3_4')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_2_4')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_2_4')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_3_4', 's_2_4')",
+              "('has_player', 's_3_4')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_3_3",
+              "?y": "s_2_3"
+            },
+            "eff_neg": [
+              "('has_player', 's_3_3')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_2_3')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_2_3')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_3_3', 's_2_3')",
+              "('has_player', 's_3_3')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_2_5",
+              "?y": "s_1_5"
+            },
+            "eff_neg": [
+              "('has_player', 's_2_5')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_1_5')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_1_5')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_2_5', 's_1_5')",
+              "('has_player', 's_2_5')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_4_2",
+              "?y": "s_5_2"
+            },
+            "eff_neg": [
+              "('has_player', 's_4_2')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_5_2')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_5_2')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_4_2', 's_5_2')",
+              "('has_player', 's_4_2')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_3_1",
+              "?y": "s_2_1"
+            },
+            "eff_neg": [
+              "('has_player', 's_3_1')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_2_1')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_2_1')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_3_1', 's_2_1')",
+              "('has_player', 's_3_1')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_4_4",
+              "?y": "s_4_5"
+            },
+            "eff_neg": [
+              "('has_player', 's_4_4')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_4_5')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_4_5')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_4_4', 's_4_5')",
+              "('has_player', 's_4_4')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_4_3",
+              "?y": "s_4_4"
+            },
+            "eff_neg": [
+              "('has_player', 's_4_3')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_4_4')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_4_4')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_4_3', 's_4_4')",
+              "('has_player', 's_4_3')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_3_2",
+              "?y": "s_2_2"
+            },
+            "eff_neg": [
+              "('has_player', 's_3_2')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_2_2')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_2_2')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_3_2', 's_2_2')",
+              "('has_player', 's_3_2')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_1_4",
+              "?y": "s_1_3"
+            },
+            "eff_neg": [
+              "('has_player', 's_1_4')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_1_3')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_1_3')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_1_4', 's_1_3')",
+              "('has_player', 's_1_4')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_5_1",
+              "?y": "s_5_2"
+            },
+            "eff_neg": [
+              "('has_player', 's_5_1')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_5_2')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_5_2')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_5_1', 's_5_2')",
+              "('has_player', 's_5_1')"
+            ]
+          },
+          {
+            "binding": {
+              "?x": "s_5_3",
+              "?y": "s_5_4"
+            },
+            "eff_neg": [
+              "('has_player', 's_5_3')"
+            ],
+            "eff_pos": [
+              "('has_player', 's_5_4')"
+            ],
+            "name": "move-player",
+            "pre_neg": [
+              "('has_box', 's_5_4')"
+            ],
+            "pre_pos": [
+              "('adjacent', 's_5_3', 's_5_4')",
+              "('has_player', 's_5_3')"
+            ]
+          }
+        ]
+      },
+      "problem_file": "pddl_files/sokoban/sokoban-5-5_3.pddl",
+      "unified_planning": {
+        "action_schema_count": 2,
+        "engine": "fast-downward",
+        "engine_metrics": {
+          "engine_internal_time": "0.10932517051696777"
+        },
+        "fluent_count": 4,
+        "illegal_step": null,
+        "object_count": 25,
+        "parser_elapsed_sec": 0.127269,
+        "plan": [
+          "move-player(s_4_2, s_3_2)",
+          "push-box(s_3_2, s_3_3, s_3_4)",
+          "move-player(s_3_3, s_2_3)",
+          "push-box(s_2_3, s_2_2, s_2_1)",
+          "move-player(s_2_2, s_2_3)",
+          "move-player(s_2_3, s_2_4)",
+          "move-player(s_2_4, s_2_5)",
+          "move-player(s_2_5, s_3_5)",
+          "move-player(s_3_5, s_4_5)",
+          "push-box(s_4_5, s_4_4, s_4_3)",
+          "push-box(s_4_4, s_3_4, s_2_4)",
+          "move-player(s_3_4, s_4_4)",
+          "push-box(s_4_4, s_4_3, s_4_2)"
+        ],
+        "plan_length": 13,
+        "problem_kind": "PROBLEM_CLASS: ['ACTION_BASED']\nCONDITIONS_KIND: ['NEGATIVE_CONDITIONS']\nTYPING: ['FLAT_TYPING']",
+        "problem_name": "simple1",
+        "replay_elapsed_sec": 0.017375,
+        "replay_goal": true,
+        "replay_samples": [
+          {
+            "action": "move-player(s_4_2, s_3_2)",
+            "index": 0,
+            "state_hash_after": -3983037131000490563,
+            "state_hash_before": -6860376857444319453
+          },
+          {
+            "action": "push-box(s_3_2, s_3_3, s_3_4)",
+            "index": 1,
+            "state_hash_after": 1742532776188478476,
+            "state_hash_before": -3983037131000490563
+          },
+          {
+            "action": "move-player(s_3_3, s_2_3)",
+            "index": 2,
+            "state_hash_after": 2572859545003646767,
+            "state_hash_before": 1742532776188478476
+          },
+          {
+            "action": "push-box(s_2_3, s_2_2, s_2_1)",
+            "index": 3,
+            "state_hash_after": -8987289925697398190,
+            "state_hash_before": 2572859545003646767
+          },
+          {
+            "action": "move-player(s_2_2, s_2_3)",
+            "index": 4,
+            "state_hash_after": -5904594163841382761,
+            "state_hash_before": -8987289925697398190
+          },
+          {
+            "action": "move-player(s_3_5, s_4_5)",
+            "index": 8,
+            "state_hash_after": 3003229498094962281,
+            "state_hash_before": -2563424288847703493
+          },
+          {
+            "action": "push-box(s_4_5, s_4_4, s_4_3)",
+            "index": 9,
+            "state_hash_after": 8045973486311205166,
+            "state_hash_before": 3003229498094962281
+          },
+          {
+            "action": "push-box(s_4_4, s_3_4, s_2_4)",
+            "index": 10,
+            "state_hash_after": 3365809315517411267,
+            "state_hash_before": 8045973486311205166
+          },
+          {
+            "action": "move-player(s_3_4, s_4_4)",
+            "index": 11,
+            "state_hash_after": -7095306536657605666,
+            "state_hash_before": 3365809315517411267
+          },
+          {
+            "action": "push-box(s_4_4, s_4_3, s_4_2)",
+            "index": 12,
+            "state_hash_after": -2409989591045915425,
+            "state_hash_before": -7095306536657605666
+          }
+        ],
+        "solve_elapsed_sec": 0.148677,
+        "solve_status": "PlanGenerationResultStatus.SOLVED_SATISFICING",
+        "solved": true,
+        "validated": true,
+        "validation_status": "ValidationResultStatus.VALID"
+      }
+    }
+  },
+  "engine": "fast-downward",
+  "grounder": "pddlpy==1.2.1",
+  "per_case_timeout_sec": 240,
+  "planner_stack": "unified-planning + up-fast-downward",
+  "source_commit": "0f4518ffa609322a24521609f80d70728f07ac09",
+  "source_repo": "https://github.com/JonasGoesgens/SIFT",
+  "summary": {
+    "all_passed": true,
+    "passed": 6,
+    "plan_lengths": {
+      "delivery": 9,
+      "ferry": 8,
+      "gripper": 7,
+      "hanoi": 1193,
+      "n-puzzle": 4,
+      "sokoban": 13
+    },
+    "total": 6
+  }
+}
