@@ -46,3 +46,4 @@ jobs:
           name: CODETRACE_PARSER_GATE_RESULTS
           path: CODETRACE_PARSER_GATE_RESULTS.zip
           retention-days: 7
+# synchronize-trigger
