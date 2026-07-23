@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'experiments/event_cone_falsification.py'
+      - 'experiments/event_cone_falsification_v2.py'
       - '.github/workflows/event-cone-falsification.yml'
   workflow_dispatch:
 
@@ -16,7 +17,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - name: Run event-cone counterfactual experiment
+      - name: Run continuous event-cone counterfactual experiment
         shell: bash
         run: |
           set -u
@@ -29,8 +30,9 @@ jobs:
           base='https://raw.githubusercontent.com/jujumelona/storage.llm/cedc-real-pddl-validation/experiments'
           curl -fsSL "$base/real_pddl_trace_schema_equivalence.py" -o real_pddl_trace_schema_equivalence.py
           curl -fsSL "$base/event_cone_falsification.py" -o event_cone_falsification.py
+          curl -fsSL "$base/event_cone_falsification_v2.py" -o event_cone_falsification_v2.py
           set +e
-          python3 event_cone_falsification.py public_sift event_cone_results > event_cone_results/run.log 2>&1
+          python3 event_cone_falsification_v2.py public_sift event_cone_results > event_cone_results/run.log 2>&1
           rc=$?
           set -e
           if [ -f event_cone_results/EVENT_CONE_FALSIFICATION.json ]; then
@@ -61,14 +63,14 @@ jobs:
       - name: Record hashes
         if: always()
         run: |
-          sha256sum event_cone_falsification.py real_pddl_trace_schema_equivalence.py > event_cone_results/VALIDATOR_SHA256.txt || true
+          sha256sum event_cone_falsification.py event_cone_falsification_v2.py real_pddl_trace_schema_equivalence.py > event_cone_results/VALIDATOR_SHA256.txt || true
           git -C public_sift rev-parse HEAD > event_cone_results/SIFT_COMMIT.txt || true
 
       - name: Upload event-cone results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: event-cone-public-pddl-falsification
+          name: event-cone-public-pddl-falsification-v2
           path: event_cone_results
           if-no-files-found: error
           retention-days: 30
