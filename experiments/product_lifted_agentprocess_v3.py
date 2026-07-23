@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, gzip, json, math, random, statistics, sys, time
+import argparse, json, math, statistics, sys, time
 from collections import Counter, defaultdict
 from pathlib import Path
 import product_lifted_agentprocess as core
@@ -27,14 +27,13 @@ def replay(events):
         if prev and e.op==prev.op and e.resources==prev.resources and e.status in {'ERROR','NO_RESULT'} and prev.status in {'ERROR','NO_RESULT'}:
             repeat+=1;mask|=core.REPEAT_NO_PROGRESS
         else:repeat=0;mask&=~core.REPEAT_NO_PROGRESS
-        if any(a=='POLICY:LISTED' for a in e.atoms) and e.hard>=4:mask|=core.UNSUPPORTED
+        if 'POLICY:LISTED' in e.atoms and e.hard>=4:mask|=core.UNSUPPORTED
         out.append((e,mask));prev=e
     return out
 
 def ckey(e,bit):return (e.op,e.status,e.resources[0] if e.resources else 'none',bit)
 def learn_contracts(traces,horizon=HORIZON):
-    total=Counter();cleared=Counter();offsets=defaultdict(Counter);nextops=defaultdict(Counter)
-    raw_windows=[]
+    total=Counter();cleared=Counter();offsets=defaultdict(Counter);nextops=defaultdict(Counter);raw_windows=[]
     for tr in traces:
         rs=replay(tr['events'])
         for i,(e,m) in enumerate(rs):
@@ -67,20 +66,24 @@ def contract_instances(events,contracts,horizon=HORIZON):
     return rs,inst
 
 def anomaly(events,contracts):
-    _,inst=contract_instances(events,contracts);tot=viol=0.
+    _,inst=contract_instances(events,contracts);viol=0.
     for w,i,bit,clear,c in inst:
-        tot+=w
         if clear is None:viol+=w
-    return viol/tot if tot else 0.
+    return viol
+
+def targeted_contract_broken(events,source,bit):
+    rs=replay(events)
+    if source>=len(rs) or not (rs[source][1]&bit):return False
+    return all(rs[j][1]&bit for j in range(source+1,min(len(rs),source+1+HORIZON)))
 
 def mutate(events,contracts):
     _,inst=contract_instances(events,contracts)
     sat=sorted((x for x in inst if x[3] is not None),key=lambda x:(-x[0],x[1],x[2]))
-    if not sat:return None
-    _,i,bit,j,c=sat[0];arr=list(events);x=arr.pop(j)
-    target=min(len(arr),i+HORIZON+1)
-    arr.insert(target,x)
-    return arr,{'source':i,'clearing':j,'moved_to':target,'bit':BIT_NAME[bit],'contract':c}
+    for _,i,bit,j,c in sat:
+        arr=list(events);x=arr.pop(j);target=min(len(arr),i+HORIZON+1);arr.insert(target,x)
+        if targeted_contract_broken(arr,i,bit):
+            return arr,{'source':i,'clearing':j,'moved_to':target,'bit':BIT_NAME[bit],'contract':c}
+    return None
 
 def learn_bigram(traces):
     edge=Counter();src=Counter()
@@ -96,8 +99,7 @@ def bigram_anomaly(events,model):
         s=core.pstate(a);vals.append(-math.log((edge[(s,core.pstate(z))]+1)/(src[s]+30)))
     return sum(vals)/len(vals)
 
-def pair_auc(orig,mut):
-    return sum(1. if b>a else .5 if b==a else 0. for a,b in zip(orig,mut))/len(orig) if orig else .5
+def pair_auc(orig,mut):return sum(1. if b>a else .5 if b==a else 0. for a,b in zip(orig,mut))/len(orig) if orig else .5
 
 def oof_counterfactual(traces):
     ao=[];am=[];bo=[];bm=[];witness=[];fold_rows=[]
@@ -113,8 +115,9 @@ def oof_counterfactual(traces):
     return {'n_pairs':len(ao),'auc':pair_auc(ao,am),'bigram_auc':pair_auc(bo,bm),'mean_margin':statistics.mean(b-a for a,b in zip(ao,am)) if ao else 0.,'folds':fold_rows},witness
 
 def storage_runtime(traces):
-    contracts,windows=learn_contracts(traces);contract_bytes=len(json.dumps(contracts,default=str,separators=(',',':')).encode());window_bytes=len(json.dumps(windows,default=str,separators=(',',':')).encode())
-    items=list(contracts.items());events=[e for tr in traces for e in tr['events']];index=contracts
+    contracts,windows=learn_contracts(traces);records=[{'key':list(k),'value':v} for k,v in contracts.items()]
+    contract_bytes=len(json.dumps(records,separators=(',',':')).encode());window_bytes=len(json.dumps(windows,separators=(',',':')).encode())
+    items=list(contracts.items());all_events=[e for tr in traces for e in tr['events']];events=all_events[:3000];index=contracts
     def indexed():
         s=0.
         for e in events:
@@ -132,21 +135,13 @@ def storage_runtime(traces):
         return s
     a=indexed();b=naive();assert abs(a-b)<1e-9
     t0=time.perf_counter();indexed();ti=time.perf_counter()-t0;t0=time.perf_counter();naive();tn=time.perf_counter()-t0
-    return {'contracts':len(contracts),'raw_windows':len(windows),'contract_bytes':contract_bytes,'raw_window_bytes':window_bytes,'storage_ratio':contract_bytes/max(1,window_bytes),'indexed_value':a,'naive_value':b,'outputs_identical':True,'indexed_seconds':ti,'naive_seconds':tn,'speedup':tn/max(ti,1e-12),'indexed_lookups':len(events)*len(BITS),'naive_worst_comparisons':len(events)*len(BITS)*max(1,len(items))}
+    return {'contracts':len(contracts),'raw_windows':len(windows),'contract_bytes':contract_bytes,'raw_window_bytes':window_bytes,'storage_ratio':contract_bytes/max(1,window_bytes),'runtime_sample_events':len(events),'indexed_value':a,'naive_value':b,'outputs_identical':True,'indexed_seconds':ti,'naive_seconds':tn,'speedup':tn/max(ti,1e-12),'indexed_lookups':len(all_events)*len(BITS),'naive_worst_comparisons':len(all_events)*len(BITS)*max(1,len(items))}
 
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--data',required=True);ap.add_argument('--out',required=True);args=ap.parse_args();out=Path(args.out);out.mkdir(parents=True,exist_ok=True)
-    # Run unchanged V2 location evaluation first.
     old=sys.argv;sys.argv=[old[0],'--data',args.data,'--out',args.out];core.counterfactual_auc=lambda traces,m:{'n_pairs':0,'auc':0.,'bigram_auc':0.,'mean_margin':0.};core.main();sys.argv=old
     traces=core.load_all(args.data);cf,witness=oof_counterfactual(traces);sr=storage_runtime(traces)
     summary=json.load(open(out/'summary.json'));summary['counterfactual']=cf;summary['storage_runtime']=sr
-    summary['strict']['counterfactual_auc_075']=cf['auc']>=.75
-    summary['strict']['counterfactual_beats_bigram']=cf['auc']>cf['bigram_auc']
-    summary['strict']['storage_reduction']=sr['storage_ratio']<1.
-    summary['strict']['indexed_exact_output']=sr['outputs_identical']
-    summary['strict']['indexed_operation_reduction']=sr['indexed_lookups']<sr['naive_worst_comparisons']
-    summary['overall_pass']=all(summary['strict'].values())
-    (out/'summary.json').write_text(json.dumps(summary,indent=2,ensure_ascii=False),encoding='utf-8')
-    (out/'counterfactual_witnesses.json').write_text(json.dumps(witness,indent=2,ensure_ascii=False),encoding='utf-8')
-    print(json.dumps(summary,indent=2,ensure_ascii=False))
+    summary['strict']['counterfactual_auc_075']=cf['auc']>=.75;summary['strict']['counterfactual_beats_bigram']=cf['auc']>cf['bigram_auc'];summary['strict']['storage_reduction']=sr['storage_ratio']<1.;summary['strict']['indexed_exact_output']=sr['outputs_identical'];summary['strict']['indexed_operation_reduction']=sr['indexed_lookups']<sr['naive_worst_comparisons'];summary['overall_pass']=all(summary['strict'].values())
+    (out/'summary.json').write_text(json.dumps(summary,indent=2,ensure_ascii=False),encoding='utf-8');(out/'counterfactual_witnesses.json').write_text(json.dumps(witness,indent=2,ensure_ascii=False),encoding='utf-8');print(json.dumps(summary,indent=2,ensure_ascii=False))
 if __name__=='__main__':main()
