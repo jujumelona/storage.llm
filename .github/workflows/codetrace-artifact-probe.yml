@@ -1,10 +1,11 @@
-name: CodeTrace full artifact schema probe
+name: CodeTrace parser structural gate parallel
 
 on:
   pull_request:
     branches: [main]
     paths:
-      - 'experiments/codetrace_artifact_probe.py'
+      - 'experiments/codetrace_parser_gate.py'
+      - 'experiments/codetrace_parser_gate_parallel.py'
       - '.github/workflows/codetrace-artifact-probe.yml'
   workflow_dispatch:
 
@@ -14,19 +15,34 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install and probe
+      - name: Install
         run: |
           python -m pip install -q 'datasets>=3.0' 'huggingface_hub>=0.28' zstandard pyarrow
-          python -u experiments/codetrace_artifact_probe.py | tee codetrace_artifact_probe.log
-          cp codetrace_artifact_probe.log codetrace_artifact_probe/
+      - name: Run low-concurrency label-free parser gate
+        run: |
+          rm -rf codetrace_parser_gate_parallel CODETRACE_PARSER_GATE_PARALLEL_RESULTS.zip
+          PYTHONPATH=experiments python -u experiments/codetrace_parser_gate_parallel.py | tee codetrace_parser_gate_parallel.log
+          cp codetrace_parser_gate_parallel.log codetrace_parser_gate_parallel/
+      - name: Package
+        if: always()
+        run: |
+          python - <<'PY'
+          import pathlib, zipfile
+          root=pathlib.Path('codetrace_parser_gate_parallel')
+          if root.exists():
+              with zipfile.ZipFile('CODETRACE_PARSER_GATE_PARALLEL_RESULTS.zip','w',zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(root.rglob('*')):
+                      if p.is_file(): z.write(p,p.relative_to(root.parent))
+          PY
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: CODETRACE_ARTIFACT_PROBE
-          path: codetrace_artifact_probe/
-          retention-days: 3
+          name: CODETRACE_PARSER_GATE_PARALLEL_RESULTS
+          path: CODETRACE_PARSER_GATE_PARALLEL_RESULTS.zip
+          retention-days: 7
