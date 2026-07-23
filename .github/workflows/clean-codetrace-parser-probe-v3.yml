@@ -1,6 +1,11 @@
 name: Clean CodeTrace official parser probe v3
 
 on:
+  push:
+    branches: [codetrace-parser-clean3-20260723]
+    paths:
+      - 'experiments/clean_codetrace_parser_probe_v3.py'
+      - '.github/workflows/clean-codetrace-parser-probe-v3.yml'
   pull_request:
     branches: [main]
     paths:
