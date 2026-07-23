@@ -1,0 +1,60 @@
+name: Product-Lifted Obligation Graph AgentProcessBench falsification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/product_lifted_agentprocess.py'
+      - '.github/workflows/product-lifted-agentprocess.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Acquire AgentProcessBench
+        run: |
+          python -m pip install -q 'huggingface_hub>=0.28'
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          print(snapshot_download(repo_id='LulaCola/AgentProcessBench',repo_type='dataset',local_dir='/tmp/AgentProcessBench'))
+          PY
+          find /tmp/AgentProcessBench -maxdepth 2 -type f -name '*.jsonl' -print
+      - name: Run strict falsification
+        run: |
+          set -euxo pipefail
+          python -m py_compile experiments/product_lifted_agentprocess.py
+          rm -rf product_lifted_results
+          python -u experiments/product_lifted_agentprocess.py --data /tmp/AgentProcessBench --out product_lifted_results | tee product_lifted_results.log
+          cp product_lifted_results.log product_lifted_results/run.log
+          cp experiments/product_lifted_agentprocess.py product_lifted_results/
+          cat product_lifted_results/summary.json
+      - name: Determinism replay
+        run: |
+          set -euxo pipefail
+          rm -rf product_lifted_replay
+          python -u experiments/product_lifted_agentprocess.py --data /tmp/AgentProcessBench --out product_lifted_replay >/tmp/replay.log
+          cmp product_lifted_results/summary.json product_lifted_replay/summary.json
+          cmp product_lifted_results/predictions.csv product_lifted_replay/predictions.csv
+          echo true > product_lifted_results/deterministic_replay.txt
+      - name: Package
+        run: |
+          python - <<'PY'
+          import shutil
+          shutil.make_archive('PRODUCT_LIFTED_AGENTPROCESS_RESULTS','zip','product_lifted_results')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PRODUCT_LIFTED_AGENTPROCESS_RESULTS
+          path: |
+            PRODUCT_LIFTED_AGENTPROCESS_RESULTS.zip
+            product_lifted_results/
+          retention-days: 7
