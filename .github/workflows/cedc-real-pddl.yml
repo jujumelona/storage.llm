@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'experiments/real_pddl_trace_schema_equivalence.py'
+      - 'experiments/real_pddl_trace_schema_equivalence_v2.py'
       - '.github/workflows/cedc-real-pddl.yml'
   workflow_dispatch:
 
@@ -26,9 +27,11 @@ jobs:
           git clone -q https://github.com/JonasGoesgens/SIFT.git public_sift
           git -C public_sift checkout -q 0f4518ffa609322a24521609f80d70728f07ac09
           test "$(git -C public_sift rev-parse HEAD)" = "0f4518ffa609322a24521609f80d70728f07ac09"
-          curl -fsSL 'https://raw.githubusercontent.com/jujumelona/storage.llm/cedc-real-pddl-validation/experiments/real_pddl_trace_schema_equivalence.py' -o real_pddl_trace_schema_equivalence.py
+          base='https://raw.githubusercontent.com/jujumelona/storage.llm/cedc-real-pddl-validation/experiments'
+          curl -fsSL "$base/real_pddl_trace_schema_equivalence.py" -o real_pddl_trace_schema_equivalence.py
+          curl -fsSL "$base/real_pddl_trace_schema_equivalence_v2.py" -o real_pddl_trace_schema_equivalence_v2.py
           set +e
-          python3 real_pddl_trace_schema_equivalence.py public_sift real_pddl_schema_results > real_pddl_schema_results/run.log 2>&1
+          python3 real_pddl_trace_schema_equivalence_v2.py public_sift real_pddl_schema_results > real_pddl_schema_results/run.log 2>&1
           rc=$?
           set -e
           if [ -f real_pddl_schema_results/REAL_PDDL_TRACE_SCHEMA_EQUIVALENCE.json ]; then
@@ -38,10 +41,13 @@ jobs:
           print('CEDC_SCHEMA_SUMMARY=' + json.dumps(r['summary'], sort_keys=True, separators=(',', ':')))
           for name, case in sorted(r['cases'].items()):
               h = case.get('heldout', {})
+              e = case.get('effect_audit', {})
               print('CEDC_SCHEMA_CASE=' + json.dumps({
                   'domain': name,
                   'pass': case.get('pass', False),
-                  'effect_exact': case.get('effect_audit', {}).get('all_exact'),
+                  'executable_effect_exact': e.get('all_exact'),
+                  'raw_syntactic_effect_exact': e.get('raw_syntactic_exact'),
+                  'inapplicable_partitions': e.get('semantically_inapplicable_partitions'),
                   'attempts': h.get('total', 0),
                   'fp': h.get('fp', 0),
                   'fn': h.get('fn', 0),
@@ -56,20 +62,20 @@ jobs:
           else
             echo 'CEDC_SCHEMA_SUMMARY=MISSING'
           fi
-          tail -n 120 real_pddl_schema_results/run.log || true
+          tail -n 100 real_pddl_schema_results/run.log || true
           exit "$rc"
 
       - name: Record hashes
         if: always()
         run: |
-          sha256sum real_pddl_trace_schema_equivalence.py > real_pddl_schema_results/VALIDATOR_SHA256.txt || true
+          sha256sum real_pddl_trace_schema_equivalence.py real_pddl_trace_schema_equivalence_v2.py > real_pddl_schema_results/VALIDATOR_SHA256.txt || true
           git -C public_sift rev-parse HEAD > real_pddl_schema_results/SIFT_COMMIT.txt || true
 
       - name: Upload schema equivalence results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cedc-real-pddl-trace-schema-equivalence
+          name: cedc-real-pddl-trace-schema-equivalence-v2
           path: real_pddl_schema_results
           if-no-files-found: error
           retention-days: 30
