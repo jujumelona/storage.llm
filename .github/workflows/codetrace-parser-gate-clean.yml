@@ -1,0 +1,52 @@
+name: CodeTrace parser structural gate clean
+
+on:
+  push:
+    branches: [codetrace-parser-gate-clean-20260723]
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/codetrace-parser-gate-clean.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: jujumelona/storage.llm
+          ref: codetrace-parser-gate-20260723
+          path: frozen
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: |
+          python -m pip install -q 'datasets>=3.0' 'huggingface_hub>=0.28' zstandard pyarrow
+      - name: Run frozen label-free parser gate
+        run: |
+          PYTHONPATH=frozen/experiments python -u frozen/experiments/codetrace_parser_gate.py | tee codetrace_parser_gate.log
+          cp codetrace_parser_gate.log codetrace_parser_gate/
+      - name: Package
+        if: always()
+        run: |
+          python - <<'PY'
+          import pathlib, zipfile
+          root=pathlib.Path('codetrace_parser_gate')
+          if root.exists():
+              with zipfile.ZipFile('CODETRACE_PARSER_GATE_RESULTS.zip','w',zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(root.rglob('*')):
+                      if p.is_file(): z.write(p,p.relative_to(root.parent))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: CODETRACE_PARSER_GATE_RESULTS
+          path: CODETRACE_PARSER_GATE_RESULTS.zip
+          retention-days: 7
