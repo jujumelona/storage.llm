@@ -1,10 +1,10 @@
-name: Product-Lifted CodeTrace full blind parallel
+name: CodeTrace parser structural gate existing slot
 
 on:
   pull_request:
     branches: [main]
     paths:
-      - 'experiments/codetrace_full_parallel_prepare.py'
+      - 'experiments/codetrace_parser_gate.py'
       - '.github/workflows/product-lifted-codetrace-full-parallel.yml'
   workflow_dispatch:
 
@@ -14,61 +14,34 @@ permissions:
 jobs:
   evaluate:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install and acquire frozen source
+      - name: Install
         run: |
           python -m pip install -q 'datasets>=3.0' 'huggingface_hub>=0.28' zstandard pyarrow
-          python - <<'PY'
-          from huggingface_hub import snapshot_download
-          print(snapshot_download(repo_id='LulaCola/AgentProcessBench',repo_type='dataset',local_dir='/tmp/AgentProcessBench'))
-          PY
-      - name: Parallel reconstruct and seal
+      - name: Run frozen label-free parser gate
         run: |
-          set -euxo pipefail
-          rm -rf codetrace_parallel_prepare codetrace_parallel_results codetrace_parallel_replay /tmp/ctbp_cache /tmp/ctbp_blind
-          PYTHONPATH=experiments python -u experiments/codetrace_full_parallel_prepare.py --out codetrace_parallel_prepare --cache /tmp/ctbp_cache --workers 12 | tee codetrace_parallel_prepare.log
-          mkdir -p /tmp/ctbp_blind
-          cp codetrace_parallel_prepare/blind_events.jsonl /tmp/ctbp_blind/blind_events.jsonl
-          test ! -e /tmp/ctbp_blind/labels_sealed.json
-          sha256sum codetrace_parallel_prepare/blind_events.jsonl codetrace_parallel_prepare/labels_sealed.json > codetrace_parallel_prepare/PREPARE_HASHES.txt
-          cat codetrace_parallel_prepare/prepare_manifest.json
-      - name: Blind prediction
-        run: |
-          set -euxo pipefail
-          mkdir -p codetrace_parallel_results
-          PYTHONPATH=experiments python -u experiments/product_lifted_codetrace_full_blind.py predict --source /tmp/AgentProcessBench --blind /tmp/ctbp_blind/blind_events.jsonl --out codetrace_parallel_results/blind_predictions_prelabel.json | tee codetrace_parallel_results/predict.log
-          cp experiments/product_lifted_codetrace_full_blind.py experiments/codetrace_full_parallel_prepare.py experiments/product_lifted_agentprocess.py experiments/product_lifted_agentprocess_v2.py codetrace_parallel_results/
-          cp codetrace_parallel_prepare/prepare_manifest.json codetrace_parallel_prepare/parse_stats.json codetrace_parallel_prepare/PREPARE_HASHES.txt codetrace_parallel_results/
-          sha256sum codetrace_parallel_results/blind_predictions_prelabel.json experiments/product_lifted_codetrace_full_blind.py > codetrace_parallel_results/PRE_LABEL_HASHES.txt
-      - name: Determinism replay
-        run: |
-          set -euxo pipefail
-          mkdir -p codetrace_parallel_replay
-          PYTHONPATH=experiments python -u experiments/product_lifted_codetrace_full_blind.py predict --source /tmp/AgentProcessBench --blind /tmp/ctbp_blind/blind_events.jsonl --out codetrace_parallel_replay/blind_predictions_prelabel.json >/tmp/replay.log
-          cmp codetrace_parallel_results/blind_predictions_prelabel.json codetrace_parallel_replay/blind_predictions_prelabel.json
-          cmp codetrace_parallel_results/blind_predictions_prelabel.json.sha256 codetrace_parallel_replay/blind_predictions_prelabel.json.sha256
-          echo true > codetrace_parallel_results/deterministic_replay.txt
-      - name: Open sealed labels
-        run: |
-          set -euxo pipefail
-          PYTHONPATH=experiments python -u experiments/product_lifted_codetrace_full_blind.py evaluate --predictions codetrace_parallel_results/blind_predictions_prelabel.json --labels codetrace_parallel_prepare/labels_sealed.json --manifest codetrace_parallel_prepare/prepare_manifest.json --out codetrace_parallel_results | tee codetrace_parallel_results/evaluate.log
-          cp codetrace_parallel_prepare/labels_sealed.json codetrace_parallel_results/labels_sealed_after_prediction.json
-          cat codetrace_parallel_results/summary.json
+          rm -rf codetrace_parser_gate CODETRACE_PARSER_GATE_RESULTS.zip
+          PYTHONPATH=experiments python -u experiments/codetrace_parser_gate.py | tee codetrace_parser_gate.log
+          cp codetrace_parser_gate.log codetrace_parser_gate/
       - name: Package
+        if: always()
         run: |
           python - <<'PY'
-          import shutil
-          shutil.make_archive('PRODUCT_LIFTED_CODETRACE_FULL_PARALLEL_RESULTS','zip','codetrace_parallel_results')
+          import pathlib, zipfile
+          root=pathlib.Path('codetrace_parser_gate')
+          if root.exists():
+              with zipfile.ZipFile('CODETRACE_PARSER_GATE_RESULTS.zip','w',zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(root.rglob('*')):
+                      if p.is_file(): z.write(p,p.relative_to(root.parent))
           PY
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: PRODUCT_LIFTED_CODETRACE_FULL_PARALLEL_RESULTS
-          path: |
-            PRODUCT_LIFTED_CODETRACE_FULL_PARALLEL_RESULTS.zip
-            codetrace_parallel_results/
+          name: CODETRACE_PARSER_GATE_RESULTS
+          path: CODETRACE_PARSER_GATE_RESULTS.zip
           retention-days: 7
