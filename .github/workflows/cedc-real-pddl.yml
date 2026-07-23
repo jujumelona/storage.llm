@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   exact-plan-replay:
@@ -18,6 +18,9 @@ jobs:
     steps:
       - name: Checkout validation branch
         uses: actions/checkout@v4
+        with:
+          ref: cedc-real-pddl-validation
+          fetch-depth: 1
 
       - name: Set up result directory
         run: mkdir -p real_pddl_results
@@ -58,6 +61,20 @@ jobs:
             done > real_pddl_results/PDDL_SHA256SUMS.txt
           fi
           sha256sum experiments/real_pddl_plan_replay.py > real_pddl_results/VALIDATOR_SHA256.txt
+
+      - name: Persist machine-readable result on validation branch
+        if: success()
+        run: |
+          mkdir -p experiments/real_pddl_results
+          cp real_pddl_results/REAL_PDDL_PLAN_REPLAY.json experiments/real_pddl_results/
+          cp real_pddl_results/REAL_PDDL_PLAN_REPLAY.md experiments/real_pddl_results/
+          cp real_pddl_results/PDDL_SHA256SUMS.txt experiments/real_pddl_results/
+          cp real_pddl_results/VALIDATOR_SHA256.txt experiments/real_pddl_results/
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add experiments/real_pddl_results
+          git commit -m 'Record exact real PDDL validation results [skip ci]' || true
+          git push origin HEAD:cedc-real-pddl-validation
 
       - name: Upload exact real PDDL results
         if: always()
