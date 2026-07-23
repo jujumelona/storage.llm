@@ -1,0 +1,38 @@
+name: Clean CodeTrace official parser probe v3
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/clean_codetrace_parser_probe_v3.py'
+      - '.github/workflows/clean-codetrace-parser-probe-v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: NJU-LINK/CodeTracer
+          path: codetracer-src
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install and run
+        run: |
+          python -m pip install -q 'datasets>=3.0' 'huggingface_hub>=0.28' zstandard pyarrow
+          python -m pip install -q -e codetracer-src
+          PYTHONPATH=codetracer-src/src python -u experiments/clean_codetrace_parser_probe_v3.py | tee probe.log
+          cp probe.log probe_out/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: CLEAN_CODETRACE_PARSER_PROBE_V3
+          path: probe_out/
+          retention-days: 3
