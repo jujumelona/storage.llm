@@ -1,0 +1,74 @@
+name: Event-cone public PDDL falsification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/event_cone_falsification.py'
+      - '.github/workflows/event-cone-falsification.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  event-cone-falsification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Run event-cone counterfactual experiment
+        shell: bash
+        run: |
+          set -u
+          mkdir -p event_cone_results
+          python3 -m pip install -q 'pddlpy==1.2.1' 'unified-planning==1.3.0' 'up-fast-downward==0.5.2' > /tmp/pip.log 2>&1
+          python3 -m pip freeze > event_cone_results/environment.txt
+          git clone -q https://github.com/JonasGoesgens/SIFT.git public_sift
+          git -C public_sift checkout -q 0f4518ffa609322a24521609f80d70728f07ac09
+          test "$(git -C public_sift rev-parse HEAD)" = "0f4518ffa609322a24521609f80d70728f07ac09"
+          base='https://raw.githubusercontent.com/jujumelona/storage.llm/cedc-real-pddl-validation/experiments'
+          curl -fsSL "$base/real_pddl_trace_schema_equivalence.py" -o real_pddl_trace_schema_equivalence.py
+          curl -fsSL "$base/event_cone_falsification.py" -o event_cone_falsification.py
+          set +e
+          python3 event_cone_falsification.py public_sift event_cone_results > event_cone_results/run.log 2>&1
+          rc=$?
+          set -e
+          if [ -f event_cone_results/EVENT_CONE_FALSIFICATION.json ]; then
+            python3 - <<'PY'
+          import json
+          r = json.load(open('event_cone_results/EVENT_CONE_FALSIFICATION.json', encoding='utf-8'))
+          print('EVENT_CONE_SUMMARY=' + json.dumps(r['summary'], sort_keys=True, separators=(',', ':')))
+          for name, case in sorted(r['cases'].items()):
+              print('EVENT_CONE_CASE=' + json.dumps({
+                  'domain': name,
+                  'pass': case.get('pass', False),
+                  'interventions': case.get('interventions'),
+                  'effective': case.get('effective_interventions'),
+                  'emergent': case.get('emergent_interventions'),
+                  'object_exact': case.get('methods', {}).get('object_overlap', {}).get('exact'),
+                  'fact_exact': case.get('methods', {}).get('static_fact_graph', {}).get('exact'),
+                  'dynamic_exact': case.get('methods', {}).get('dynamic_guard_diff', {}).get('exact'),
+                  'dynamic_recompute': case.get('methods', {}).get('dynamic_guard_diff', {}).get('mean_recomputed_fraction'),
+                  'error': case.get('error'),
+              }, sort_keys=True, separators=(',', ':')))
+          PY
+          else
+            echo 'EVENT_CONE_SUMMARY=MISSING'
+          fi
+          tail -n 100 event_cone_results/run.log || true
+          exit "$rc"
+
+      - name: Record hashes
+        if: always()
+        run: |
+          sha256sum event_cone_falsification.py real_pddl_trace_schema_equivalence.py > event_cone_results/VALIDATOR_SHA256.txt || true
+          git -C public_sift rev-parse HEAD > event_cone_results/SIFT_COMMIT.txt || true
+
+      - name: Upload event-cone results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: event-cone-public-pddl-falsification
+          path: event_cone_results
+          if-no-files-found: error
+          retention-days: 30
