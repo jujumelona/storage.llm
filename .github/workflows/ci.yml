@@ -42,3 +42,4 @@ jobs:
           name: CODETRACE_PARSER_GATE_PARALLEL_RESULTS
           path: CODETRACE_PARSER_GATE_PARALLEL_RESULTS.zip
           retention-days: 7
+# trigger-parallel-ci-after-open
