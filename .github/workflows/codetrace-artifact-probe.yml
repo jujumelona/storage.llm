@@ -1,11 +1,10 @@
-name: CodeTrace parser structural gate parallel
+name: CodeTrace targeted schema probe
 
 on:
   pull_request:
     branches: [main]
     paths:
-      - 'experiments/codetrace_parser_gate.py'
-      - 'experiments/codetrace_parser_gate_parallel.py'
+      - 'experiments/codetrace_targeted_schema_probe.py'
       - '.github/workflows/codetrace-artifact-probe.yml'
   workflow_dispatch:
 
@@ -15,7 +14,7 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,26 +23,25 @@ jobs:
       - name: Install
         run: |
           python -m pip install -q 'datasets>=3.0' 'huggingface_hub>=0.28' zstandard pyarrow
-      - name: Run low-concurrency label-free parser gate
+      - name: Run label-free targeted schema probe
         run: |
-          rm -rf codetrace_parser_gate_parallel CODETRACE_PARSER_GATE_PARALLEL_RESULTS.zip
-          PYTHONPATH=experiments python -u experiments/codetrace_parser_gate_parallel.py | tee codetrace_parser_gate_parallel.log
-          cp codetrace_parser_gate_parallel.log codetrace_parser_gate_parallel/
+          rm -rf codetrace_targeted_schema_probe CODETRACE_TARGETED_SCHEMA_PROBE.zip
+          PYTHONPATH=experiments python -u experiments/codetrace_targeted_schema_probe.py | tee codetrace_targeted_schema_probe.log
+          cp codetrace_targeted_schema_probe.log codetrace_targeted_schema_probe/
       - name: Package
         if: always()
         run: |
           python - <<'PY'
           import pathlib, zipfile
-          root=pathlib.Path('codetrace_parser_gate_parallel')
+          root=pathlib.Path('codetrace_targeted_schema_probe')
           if root.exists():
-              with zipfile.ZipFile('CODETRACE_PARSER_GATE_PARALLEL_RESULTS.zip','w',zipfile.ZIP_DEFLATED) as z:
+              with zipfile.ZipFile('CODETRACE_TARGETED_SCHEMA_PROBE.zip','w',zipfile.ZIP_DEFLATED) as z:
                   for p in sorted(root.rglob('*')):
                       if p.is_file(): z.write(p,p.relative_to(root.parent))
           PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: CODETRACE_PARSER_GATE_PARALLEL_RESULTS
-          path: CODETRACE_PARSER_GATE_PARALLEL_RESULTS.zip
+          name: CODETRACE_TARGETED_SCHEMA_PROBE
+          path: CODETRACE_TARGETED_SCHEMA_PROBE.zip
           retention-days: 7
-# synchronize-parallel-gate-2
