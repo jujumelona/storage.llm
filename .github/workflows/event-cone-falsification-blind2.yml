@@ -1,0 +1,75 @@
+name: Event-cone public PDDL blind2
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/event_cone_falsification.py'
+      - 'experiments/event_cone_falsification_v2.py'
+      - 'experiments/event_cone_falsification_blind2.py'
+      - '.github/workflows/event-cone-falsification-blind2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  event-cone-blind2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Run second blind event-cone suite
+        shell: bash
+        run: |
+          set -u
+          mkdir -p event_cone_blind2_results
+          python3 -m pip install -q 'pddlpy==1.2.1' 'unified-planning==1.3.0' 'up-fast-downward==0.5.2' > /tmp/pip.log 2>&1
+          python3 -m pip freeze > event_cone_blind2_results/environment.txt
+          git clone -q https://github.com/JonasGoesgens/SIFT.git public_sift
+          git -C public_sift checkout -q 0f4518ffa609322a24521609f80d70728f07ac09
+          test "$(git -C public_sift rev-parse HEAD)" = "0f4518ffa609322a24521609f80d70728f07ac09"
+          base='https://raw.githubusercontent.com/jujumelona/storage.llm/cedc-real-pddl-validation/experiments'
+          for f in real_pddl_trace_schema_equivalence.py event_cone_falsification.py event_cone_falsification_v2.py event_cone_falsification_blind2.py; do
+            curl -fsSL "$base/$f" -o "$f"
+          done
+          set +e
+          python3 event_cone_falsification_blind2.py public_sift event_cone_blind2_results > event_cone_blind2_results/run.log 2>&1
+          rc=$?
+          set -e
+          if [ -f event_cone_blind2_results/EVENT_CONE_FALSIFICATION.json ]; then
+            python3 - <<'PY'
+          import json
+          r = json.load(open('event_cone_blind2_results/EVENT_CONE_FALSIFICATION.json', encoding='utf-8'))
+          print('EVENT_CONE_BLIND2_SUMMARY=' + json.dumps(r['summary'], sort_keys=True, separators=(',', ':')))
+          for name, case in sorted(r['cases'].items()):
+              print('EVENT_CONE_BLIND2_CASE=' + json.dumps({
+                  'domain': name,
+                  'pass': case.get('pass', False),
+                  'dynamic_exact': case.get('methods', {}).get('dynamic_guard_diff', {}).get('exact'),
+                  'dynamic_recompute': case.get('methods', {}).get('dynamic_guard_diff', {}).get('mean_recomputed_fraction'),
+                  'object_exact': case.get('methods', {}).get('object_overlap', {}).get('exact'),
+                  'fact_exact': case.get('methods', {}).get('static_fact_graph', {}).get('exact'),
+                  'emergent': case.get('emergent_interventions'),
+                  'error': case.get('error'),
+              }, sort_keys=True, separators=(',', ':')))
+          PY
+          else
+            echo 'EVENT_CONE_BLIND2_SUMMARY=MISSING'
+          fi
+          tail -n 100 event_cone_blind2_results/run.log || true
+          exit "$rc"
+
+      - name: Record hashes
+        if: always()
+        run: |
+          sha256sum real_pddl_trace_schema_equivalence.py event_cone_falsification.py event_cone_falsification_v2.py event_cone_falsification_blind2.py > event_cone_blind2_results/VALIDATOR_SHA256.txt || true
+          git -C public_sift rev-parse HEAD > event_cone_blind2_results/SIFT_COMMIT.txt || true
+
+      - name: Upload blind2 results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: event-cone-public-pddl-blind2
+          path: event_cone_blind2_results
+          if-no-files-found: error
+          retention-days: 30
