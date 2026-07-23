@@ -9,42 +9,51 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   partial-executor:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
-      - name: Checkout validation branch
-        uses: actions/checkout@v4
-        with:
-          ref: cedc-real-pddl-validation
-          fetch-depth: 1
-
-      - name: Set up result directory
-        run: mkdir -p real_pddl_partial_results
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install planner and simulator
+      - name: Run exact partial-observation executor
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install 'unified-planning==1.3.0' 'up-fast-downward==0.5.2'
-          python -m pip freeze > real_pddl_partial_results/parser_environment.txt
-
-      - name: Clone exact public SIFT revision
-        run: |
-          git clone https://github.com/JonasGoesgens/SIFT.git public_sift
-          git -C public_sift checkout 0f4518ffa609322a24521609f80d70728f07ac09
+          set -u
+          mkdir -p real_pddl_partial_results
+          python3 -m pip install -q 'unified-planning==1.3.0' 'up-fast-downward==0.5.2' > /tmp/pip.log 2>&1
+          python3 -m pip freeze > real_pddl_partial_results/parser_environment.txt
+          git clone -q https://github.com/JonasGoesgens/SIFT.git public_sift
+          git -C public_sift checkout -q 0f4518ffa609322a24521609f80d70728f07ac09
           test "$(git -C public_sift rev-parse HEAD)" = "0f4518ffa609322a24521609f80d70728f07ac09"
-
-      - name: Execute masked real PDDL plans with active certificates
-        run: |
-          python experiments/real_pddl_partial_executor.py public_sift real_pddl_partial_results | tee real_pddl_partial_results/run.log
+          curl -fsSL 'https://raw.githubusercontent.com/jujumelona/storage.llm/cedc-real-pddl-validation/experiments/real_pddl_partial_executor.py' -o real_pddl_partial_executor.py
+          set +e
+          python3 real_pddl_partial_executor.py public_sift real_pddl_partial_results > real_pddl_partial_results/run.log 2>&1
+          rc=$?
+          set -e
+          if [ -f real_pddl_partial_results/REAL_PDDL_PARTIAL_EXECUTOR.json ]; then
+            python3 - <<'PY'
+          import json
+          p = 'real_pddl_partial_results/REAL_PDDL_PARTIAL_EXECUTOR.json'
+          r = json.load(open(p, encoding='utf-8'))
+          print('CEDC_PARTIAL_SUMMARY=' + json.dumps(r['summary'], sort_keys=True, separators=(',', ':')))
+          for name, case in sorted(r['cases'].items()):
+              eps = case.get('episodes', [])
+              print('CEDC_CASE=' + json.dumps({
+                  'domain': name,
+                  'pass': case.get('pass', False),
+                  'plan_length': case.get('plan_length'),
+                  'episodes': len(eps),
+                  'queries': sum(e.get('active_query_count', 0) for e in eps),
+                  'dynamic_atoms_per_episode': eps[0].get('dynamic_ground_atom_count') if eps else None,
+                  'error': case.get('error'),
+              }, sort_keys=True, separators=(',', ':')))
+          PY
+          else
+            echo 'CEDC_PARTIAL_SUMMARY=MISSING'
+          fi
+          cat real_pddl_partial_results/run.log
+          exit "$rc"
 
       - name: Record source hashes
         if: always()
@@ -60,21 +69,7 @@ jobs:
               sha256sum "public_sift/$f"
             done > real_pddl_partial_results/PDDL_SHA256SUMS.txt
           fi
-          sha256sum experiments/real_pddl_partial_executor.py > real_pddl_partial_results/VALIDATOR_SHA256.txt
-
-      - name: Persist machine-readable partial-executor result
-        if: success()
-        run: |
-          mkdir -p experiments/real_pddl_results
-          cp real_pddl_partial_results/REAL_PDDL_PARTIAL_EXECUTOR.json experiments/real_pddl_results/
-          cp real_pddl_partial_results/REAL_PDDL_PARTIAL_EXECUTOR.md experiments/real_pddl_results/
-          cp real_pddl_partial_results/PDDL_SHA256SUMS.txt experiments/real_pddl_results/PARTIAL_PDDL_SHA256SUMS.txt
-          cp real_pddl_partial_results/VALIDATOR_SHA256.txt experiments/real_pddl_results/PARTIAL_VALIDATOR_SHA256.txt
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add experiments/real_pddl_results
-          git commit -m 'Record real PDDL partial executor results [skip ci]' || true
-          git push origin HEAD:cedc-real-pddl-validation
+          if [ -f real_pddl_partial_executor.py ]; then sha256sum real_pddl_partial_executor.py > real_pddl_partial_results/VALIDATOR_SHA256.txt; fi
 
       - name: Upload partial executor results
         if: always()
