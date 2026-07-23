@@ -46,4 +46,4 @@ jobs:
           name: CODETRACE_PARSER_GATE_PARALLEL_RESULTS
           path: CODETRACE_PARSER_GATE_PARALLEL_RESULTS.zip
           retention-days: 7
-# synchronize-parallel-gate
+# synchronize-parallel-gate-2
