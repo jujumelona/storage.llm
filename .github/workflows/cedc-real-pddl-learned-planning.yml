@@ -1,0 +1,78 @@
+name: CEDC real PDDL learned-schema planning
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/real_pddl_trace_schema_equivalence.py'
+      - 'experiments/real_pddl_learned_schema_planning.py'
+      - '.github/workflows/cedc-real-pddl-learned-planning.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  learned-schema-planning:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Run autonomous learned-schema planning
+        shell: bash
+        run: |
+          set -u
+          mkdir -p real_pddl_learned_planning_results
+          python3 -m pip install -q 'pddlpy==1.2.1' 'unified-planning==1.3.0' 'up-fast-downward==0.5.2' > /tmp/pip.log 2>&1
+          python3 -m pip freeze > real_pddl_learned_planning_results/environment.txt
+          git clone -q https://github.com/JonasGoesgens/SIFT.git public_sift
+          git -C public_sift checkout -q 0f4518ffa609322a24521609f80d70728f07ac09
+          test "$(git -C public_sift rev-parse HEAD)" = "0f4518ffa609322a24521609f80d70728f07ac09"
+          base='https://raw.githubusercontent.com/jujumelona/storage.llm/cedc-real-pddl-validation/experiments'
+          curl -fsSL "$base/real_pddl_trace_schema_equivalence.py" -o real_pddl_trace_schema_equivalence.py
+          curl -fsSL "$base/real_pddl_learned_schema_planning.py" -o real_pddl_learned_schema_planning.py
+          set +e
+          python3 real_pddl_learned_schema_planning.py public_sift real_pddl_learned_planning_results > real_pddl_learned_planning_results/run.log 2>&1
+          rc=$?
+          set -e
+          if [ -f real_pddl_learned_planning_results/REAL_PDDL_LEARNED_SCHEMA_PLANNING.json ]; then
+            python3 - <<'PY'
+          import json
+          r = json.load(open('real_pddl_learned_planning_results/REAL_PDDL_LEARNED_SCHEMA_PLANNING.json', encoding='utf-8'))
+          print('CEDC_LEARNED_PLAN_SUMMARY=' + json.dumps(r['summary'], sort_keys=True, separators=(',', ':')))
+          print('CEDC_LEAK_AUDIT=' + json.dumps(r['compiler_leak_audit'], sort_keys=True, separators=(',', ':')))
+          for name, case in sorted(r['cases'].items()):
+              print('CEDC_LEARNED_PLAN_CASE=' + json.dumps({
+                  'domain': name,
+                  'pass': case.get('pass', False),
+                  'baseline_len': case.get('original_baseline_plan_length'),
+                  'learned_len': case.get('learned_plan_length'),
+                  'ratio': case.get('plan_length_ratio'),
+                  'original_valid': case.get('original_validation', {}).get('pass'),
+                  'illegal_step': case.get('original_validation', {}).get('illegal_step'),
+                  'learned_rollout': case.get('learned_rollout', {}).get('pass'),
+                  'compiled_actions': case.get('compile', {}).get('compiled_actions'),
+                  'compiled_propositions': case.get('compile', {}).get('compiled_propositions'),
+                  'solve_sec': case.get('solve_sec'),
+                  'error': case.get('error'),
+              }, sort_keys=True, separators=(',', ':')))
+          PY
+          else
+            echo 'CEDC_LEARNED_PLAN_SUMMARY=MISSING'
+          fi
+          tail -n 120 real_pddl_learned_planning_results/run.log || true
+          exit "$rc"
+
+      - name: Record hashes
+        if: always()
+        run: |
+          sha256sum real_pddl_trace_schema_equivalence.py real_pddl_learned_schema_planning.py > real_pddl_learned_planning_results/VALIDATOR_SHA256.txt || true
+          git -C public_sift rev-parse HEAD > real_pddl_learned_planning_results/SIFT_COMMIT.txt || true
+
+      - name: Upload learned planning results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cedc-real-pddl-learned-schema-planning
+          path: real_pddl_learned_planning_results
+          if-no-files-found: error
+          retention-days: 30
