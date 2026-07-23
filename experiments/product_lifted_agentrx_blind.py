@@ -449,7 +449,7 @@ def evaluate_mode(args):
     actual = hashlib.sha256(pred_path.read_bytes()).hexdigest()
     if expected != actual:
         raise RuntimeError("Prediction file changed after blind generation")
-    gt = scan_ground_truth(Path(args.repo) / "data")
+    gt = scan_ground_truth(Path(args.repo))
     matched = []
     for p in payload["predictions"]:
         g = match_gt(p, gt)
