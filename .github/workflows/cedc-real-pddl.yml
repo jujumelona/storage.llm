@@ -1,10 +1,10 @@
-name: CEDC real PDDL solve and replay
+name: CEDC real PDDL partial executor
 
 on:
   pull_request:
     branches: [main]
     paths:
-      - 'experiments/real_pddl_plan_replay.py'
+      - 'experiments/real_pddl_partial_executor.py'
       - '.github/workflows/cedc-real-pddl.yml'
   workflow_dispatch:
 
@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 jobs:
-  exact-plan-replay:
+  partial-executor:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -23,18 +23,18 @@ jobs:
           fetch-depth: 1
 
       - name: Set up result directory
-        run: mkdir -p real_pddl_results
+        run: mkdir -p real_pddl_partial_results
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install parser, planner and validator
+      - name: Install planner and simulator
         run: |
           python -m pip install --upgrade pip
-          python -m pip install 'pddlpy==1.2.1' 'unified-planning==1.3.0' 'up-fast-downward==0.5.2'
-          python -m pip freeze > real_pddl_results/parser_environment.txt
+          python -m pip install 'unified-planning==1.3.0' 'up-fast-downward==0.5.2'
+          python -m pip freeze > real_pddl_partial_results/parser_environment.txt
 
       - name: Clone exact public SIFT revision
         run: |
@@ -42,11 +42,11 @@ jobs:
           git -C public_sift checkout 0f4518ffa609322a24521609f80d70728f07ac09
           test "$(git -C public_sift rev-parse HEAD)" = "0f4518ffa609322a24521609f80d70728f07ac09"
 
-      - name: Solve, validate and replay exact Table 1 problems
+      - name: Execute masked real PDDL plans with active certificates
         run: |
-          python experiments/real_pddl_plan_replay.py public_sift real_pddl_results | tee real_pddl_results/run.log
+          python experiments/real_pddl_partial_executor.py public_sift real_pddl_partial_results | tee real_pddl_partial_results/run.log
 
-      - name: Record exact source hashes
+      - name: Record source hashes
         if: always()
         run: |
           if [ -d public_sift/pddl_files ]; then
@@ -58,29 +58,29 @@ jobs:
               pddl_files/npuzzle/npuzzle.pddl pddl_files/npuzzle/npuzzle-4-4.pddl \
               pddl_files/sokoban/sokoban.pddl pddl_files/sokoban/sokoban-5-5_3.pddl; do
               sha256sum "public_sift/$f"
-            done > real_pddl_results/PDDL_SHA256SUMS.txt
+            done > real_pddl_partial_results/PDDL_SHA256SUMS.txt
           fi
-          sha256sum experiments/real_pddl_plan_replay.py > real_pddl_results/VALIDATOR_SHA256.txt
+          sha256sum experiments/real_pddl_partial_executor.py > real_pddl_partial_results/VALIDATOR_SHA256.txt
 
-      - name: Persist machine-readable result on validation branch
+      - name: Persist machine-readable partial-executor result
         if: success()
         run: |
           mkdir -p experiments/real_pddl_results
-          cp real_pddl_results/REAL_PDDL_PLAN_REPLAY.json experiments/real_pddl_results/
-          cp real_pddl_results/REAL_PDDL_PLAN_REPLAY.md experiments/real_pddl_results/
-          cp real_pddl_results/PDDL_SHA256SUMS.txt experiments/real_pddl_results/
-          cp real_pddl_results/VALIDATOR_SHA256.txt experiments/real_pddl_results/
+          cp real_pddl_partial_results/REAL_PDDL_PARTIAL_EXECUTOR.json experiments/real_pddl_results/
+          cp real_pddl_partial_results/REAL_PDDL_PARTIAL_EXECUTOR.md experiments/real_pddl_results/
+          cp real_pddl_partial_results/PDDL_SHA256SUMS.txt experiments/real_pddl_results/PARTIAL_PDDL_SHA256SUMS.txt
+          cp real_pddl_partial_results/VALIDATOR_SHA256.txt experiments/real_pddl_results/PARTIAL_VALIDATOR_SHA256.txt
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add experiments/real_pddl_results
-          git commit -m 'Record exact real PDDL validation results [skip ci]' || true
+          git commit -m 'Record real PDDL partial executor results [skip ci]' || true
           git push origin HEAD:cedc-real-pddl-validation
 
-      - name: Upload exact real PDDL results
+      - name: Upload partial executor results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cedc-real-pddl-plan-replay
-          path: real_pddl_results
+          name: cedc-real-pddl-partial-executor
+          path: real_pddl_partial_results
           if-no-files-found: error
           retention-days: 30
