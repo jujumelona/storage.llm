@@ -1,11 +1,10 @@
-name: CEDC real PDDL partial executor
+name: CEDC real PDDL trace schema equivalence
 
 on:
   pull_request:
     branches: [main]
     paths:
-      - 'experiments/real_pddl_partial_executor_v2.py'
-      - 'experiments/real_pddl_partial_executor_v3.py'
+      - 'experiments/real_pddl_trace_schema_equivalence.py'
       - '.github/workflows/cedc-real-pddl.yml'
   workflow_dispatch:
 
@@ -13,74 +12,64 @@ permissions:
   contents: read
 
 jobs:
-  partial-executor:
+  trace-schema-equivalence:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
-      - name: Run exact partial-observation executor
+      - name: Run trace-only small-to-large schema learner
         shell: bash
         run: |
           set -u
-          mkdir -p real_pddl_partial_results
+          mkdir -p real_pddl_schema_results
           python3 -m pip install -q 'pddlpy==1.2.1' 'unified-planning==1.3.0' 'up-fast-downward==0.5.2' > /tmp/pip.log 2>&1
-          python3 -m pip freeze > real_pddl_partial_results/parser_environment.txt
+          python3 -m pip freeze > real_pddl_schema_results/environment.txt
           git clone -q https://github.com/JonasGoesgens/SIFT.git public_sift
           git -C public_sift checkout -q 0f4518ffa609322a24521609f80d70728f07ac09
           test "$(git -C public_sift rev-parse HEAD)" = "0f4518ffa609322a24521609f80d70728f07ac09"
-          base='https://raw.githubusercontent.com/jujumelona/storage.llm/cedc-real-pddl-validation/experiments'
-          curl -fsSL "$base/real_pddl_partial_executor_v2.py" -o real_pddl_partial_executor_v2.py
-          curl -fsSL "$base/real_pddl_partial_executor_v3.py" -o real_pddl_partial_executor_v3.py
+          curl -fsSL 'https://raw.githubusercontent.com/jujumelona/storage.llm/cedc-real-pddl-validation/experiments/real_pddl_trace_schema_equivalence.py' -o real_pddl_trace_schema_equivalence.py
           set +e
-          python3 real_pddl_partial_executor_v3.py public_sift real_pddl_partial_results > real_pddl_partial_results/run.log 2>&1
+          python3 real_pddl_trace_schema_equivalence.py public_sift real_pddl_schema_results > real_pddl_schema_results/run.log 2>&1
           rc=$?
           set -e
-          if [ -f real_pddl_partial_results/REAL_PDDL_PARTIAL_EXECUTOR.json ]; then
+          if [ -f real_pddl_schema_results/REAL_PDDL_TRACE_SCHEMA_EQUIVALENCE.json ]; then
             python3 - <<'PY'
           import json
-          r = json.load(open('real_pddl_partial_results/REAL_PDDL_PARTIAL_EXECUTOR.json', encoding='utf-8'))
-          print('CEDC_PARTIAL_SUMMARY=' + json.dumps(r['summary'], sort_keys=True, separators=(',', ':')))
+          r = json.load(open('real_pddl_schema_results/REAL_PDDL_TRACE_SCHEMA_EQUIVALENCE.json', encoding='utf-8'))
+          print('CEDC_SCHEMA_SUMMARY=' + json.dumps(r['summary'], sort_keys=True, separators=(',', ':')))
           for name, case in sorted(r['cases'].items()):
-              eps = case.get('episodes', [])
-              stats = case.get('universe_stats', {})
-              print('CEDC_CASE=' + json.dumps({
+              h = case.get('heldout', {})
+              print('CEDC_SCHEMA_CASE=' + json.dumps({
                   'domain': name,
                   'pass': case.get('pass', False),
-                  'plan_length': case.get('plan_length'),
-                  'episodes': len(eps),
-                  'queries': sum(e.get('active_query_count', 0) for e in eps),
-                  'semantic_dynamic_atoms': stats.get('semantic_dynamic_atom_count'),
-                  'raw_groundings': stats.get('raw_ground_action_bindings'),
-                  'admitted_groundings': stats.get('statically_admitted_bindings'),
+                  'effect_exact': case.get('effect_audit', {}).get('all_exact'),
+                  'attempts': h.get('total', 0),
+                  'fp': h.get('fp', 0),
+                  'fn': h.get('fn', 0),
+                  'abstain': h.get('abstain', 0),
+                  'successor_exact': h.get('successor_exact', 0),
+                  'successor_tested': h.get('successor_tested', 0),
+                  'rollout': case.get('rollout', {}).get('pass'),
+                  'rollout_steps': case.get('rollout', {}).get('plan_length'),
                   'error': case.get('error'),
               }, sort_keys=True, separators=(',', ':')))
           PY
           else
-            echo 'CEDC_PARTIAL_SUMMARY=MISSING'
+            echo 'CEDC_SCHEMA_SUMMARY=MISSING'
           fi
-          cat real_pddl_partial_results/run.log
+          tail -n 120 real_pddl_schema_results/run.log || true
           exit "$rc"
 
-      - name: Record source hashes
+      - name: Record hashes
         if: always()
         run: |
-          if [ -d public_sift/pddl_files ]; then
-            for f in \
-              pddl_files/gripper/gripper.pddl pddl_files/gripper/gripper_8_3.pddl \
-              pddl_files/ferry/ferry.pddl pddl_files/ferry/ferry-6-5.pddl \
-              pddl_files/delivery/delivery.pddl pddl_files/delivery/delivery-3-3-3-2.pddl \
-              pddl_files/hanoi/hanoi.pddl pddl_files/hanoi/hanoi-3-10.pddl \
-              pddl_files/npuzzle/npuzzle.pddl pddl_files/npuzzle/npuzzle-4-4.pddl \
-              pddl_files/sokoban/sokoban.pddl pddl_files/sokoban/sokoban-5-5_3.pddl; do
-              sha256sum "public_sift/$f"
-            done > real_pddl_partial_results/PDDL_SHA256SUMS.txt
-          fi
-          sha256sum real_pddl_partial_executor_v2.py real_pddl_partial_executor_v3.py > real_pddl_partial_results/VALIDATOR_SHA256.txt
+          sha256sum real_pddl_trace_schema_equivalence.py > real_pddl_schema_results/VALIDATOR_SHA256.txt || true
+          git -C public_sift rev-parse HEAD > real_pddl_schema_results/SIFT_COMMIT.txt || true
 
-      - name: Upload partial executor results
+      - name: Upload schema equivalence results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cedc-real-pddl-partial-executor-semantic-universe-v3
-          path: real_pddl_partial_results
+          name: cedc-real-pddl-trace-schema-equivalence
+          path: real_pddl_schema_results
           if-no-files-found: error
           retention-days: 30
