@@ -19,11 +19,13 @@ jobs:
       - name: Checkout validation branch
         uses: actions/checkout@v4
 
+      - name: Set up result directory
+        run: mkdir -p real_pddl_results
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: pip
 
       - name: Install parser
         run: |
@@ -39,15 +41,16 @@ jobs:
 
       - name: Parse and ground public PDDL
         run: |
-          mkdir -p real_pddl_results
           python experiments/real_pddl_inventory.py public_sift real_pddl_results | tee real_pddl_results/run.log
 
       - name: Record source hashes
         if: always()
         run: |
-          find public_sift/pddl_files -type f -name '*.pddl' -print0 | sort -z | xargs -0 sha256sum > real_pddl_results/PDDL_SHA256SUMS.txt
+          if [ -d public_sift/pddl_files ]; then
+            find public_sift/pddl_files -type f -name '*.pddl' -print0 | sort -z | xargs -0 sha256sum > real_pddl_results/PDDL_SHA256SUMS.txt
+          fi
           sha256sum experiments/real_pddl_inventory.py > real_pddl_results/VALIDATOR_SHA256.txt
-          cp parser_environment.txt real_pddl_results/
+          if [ -f parser_environment.txt ]; then cp parser_environment.txt real_pddl_results/; fi
 
       - name: Upload real PDDL results
         if: always()
