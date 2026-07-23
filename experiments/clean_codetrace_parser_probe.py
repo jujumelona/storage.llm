@@ -8,7 +8,7 @@ from huggingface_hub import hf_hub_download
 
 OUT=Path("probe_out")
 OUT.mkdir(exist_ok=True)
-print("clean-parser-probe-start", flush=True)
+print("clean-parser-probe-v2-start", flush=True)
 
 MODS={
     "miniswe":"codetracer.skills.seed.miniswe.parser",
