@@ -1,0 +1,90 @@
+name: Product-Lifted Obligation Graph AgentRx blind transfer
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/product_lifted_agentrx_blind.py'
+      - '.github/workflows/product-lifted-agentrx-blind.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Acquire frozen source benchmark and untouched AgentRx
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install -q 'huggingface_hub>=0.28'
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          print(snapshot_download(repo_id='LulaCola/AgentProcessBench', repo_type='dataset', local_dir='/tmp/AgentProcessBench'))
+          PY
+          git clone --depth 1 https://github.com/microsoft/AgentRx.git /tmp/AgentRxRepo
+          mkdir -p /tmp/AgentRxBlind
+          cp -R /tmp/AgentRxRepo/trajectories /tmp/AgentRxBlind/trajectories
+          test ! -e /tmp/AgentRxBlind/data
+          find /tmp/AgentRxBlind -type f | sort | head -100
+      - name: Blind prediction before labels are available
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m py_compile experiments/product_lifted_agentrx_blind.py
+          rm -rf agentrx_blind_results agentrx_blind_replay
+          mkdir -p agentrx_blind_results
+          PYTHONPATH=experiments python -u experiments/product_lifted_agentrx_blind.py predict \
+            --source /tmp/AgentProcessBench \
+            --trajectories /tmp/AgentRxBlind/trajectories \
+            --out agentrx_blind_results/blind_predictions_prelabel.json \
+            | tee agentrx_blind_results/predict.log
+          cp experiments/product_lifted_agentrx_blind.py agentrx_blind_results/
+          cp experiments/product_lifted_agentprocess.py agentrx_blind_results/
+          cp experiments/product_lifted_agentprocess_v2.py agentrx_blind_results/
+          sha256sum agentrx_blind_results/blind_predictions_prelabel.json experiments/product_lifted_agentrx_blind.py \
+            > agentrx_blind_results/PRE_LABEL_HASHES.txt
+      - name: Deterministic blind replay
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p agentrx_blind_replay
+          PYTHONPATH=experiments python -u experiments/product_lifted_agentrx_blind.py predict \
+            --source /tmp/AgentProcessBench \
+            --trajectories /tmp/AgentRxBlind/trajectories \
+            --out agentrx_blind_replay/blind_predictions_prelabel.json \
+            >/tmp/agentrx_replay.log
+          cmp agentrx_blind_results/blind_predictions_prelabel.json agentrx_blind_replay/blind_predictions_prelabel.json
+          cmp agentrx_blind_results/blind_predictions_prelabel.json.sha256 agentrx_blind_replay/blind_predictions_prelabel.json.sha256
+          echo true > agentrx_blind_results/deterministic_replay.txt
+      - name: Open labels only after predictions and evaluate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PYTHONPATH=experiments python -u experiments/product_lifted_agentrx_blind.py evaluate \
+            --repo /tmp/AgentRxRepo \
+            --predictions agentrx_blind_results/blind_predictions_prelabel.json \
+            --out agentrx_blind_results \
+            | tee agentrx_blind_results/evaluate.log
+          cat agentrx_blind_results/summary.json
+      - name: Package
+        shell: bash
+        run: |
+          python - <<'PY'
+          import shutil
+          shutil.make_archive('PRODUCT_LIFTED_AGENTRX_BLIND_RESULTS','zip','agentrx_blind_results')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PRODUCT_LIFTED_AGENTRX_BLIND_RESULTS
+          path: |
+            PRODUCT_LIFTED_AGENTRX_BLIND_RESULTS.zip
+            agentrx_blind_results/
+          retention-days: 7
