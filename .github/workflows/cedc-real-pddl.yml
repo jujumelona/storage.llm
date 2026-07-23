@@ -21,7 +21,7 @@ jobs:
         run: |
           set -u
           mkdir -p real_pddl_partial_results
-          python3 -m pip install -q 'unified-planning==1.3.0' 'up-fast-downward==0.5.2' > /tmp/pip.log 2>&1
+          python3 -m pip install -q 'pddlpy==1.2.1' 'unified-planning==1.3.0' 'up-fast-downward==0.5.2' > /tmp/pip.log 2>&1
           python3 -m pip freeze > real_pddl_partial_results/parser_environment.txt
           git clone -q https://github.com/JonasGoesgens/SIFT.git public_sift
           git -C public_sift checkout -q 0f4518ffa609322a24521609f80d70728f07ac09
@@ -39,13 +39,16 @@ jobs:
           print('CEDC_PARTIAL_SUMMARY=' + json.dumps(r['summary'], sort_keys=True, separators=(',', ':')))
           for name, case in sorted(r['cases'].items()):
               eps = case.get('episodes', [])
+              stats = case.get('universe_stats', {})
               print('CEDC_CASE=' + json.dumps({
                   'domain': name,
                   'pass': case.get('pass', False),
                   'plan_length': case.get('plan_length'),
                   'episodes': len(eps),
                   'queries': sum(e.get('active_query_count', 0) for e in eps),
-                  'dynamic_atoms_per_episode': eps[0].get('dynamic_ground_atom_count') if eps else None,
+                  'semantic_dynamic_atoms': stats.get('semantic_dynamic_atom_count'),
+                  'raw_groundings': stats.get('raw_ground_action_bindings'),
+                  'admitted_groundings': stats.get('statically_admitted_bindings'),
                   'error': case.get('error'),
               }, sort_keys=True, separators=(',', ':')))
           PY
@@ -75,7 +78,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cedc-real-pddl-partial-executor
+          name: cedc-real-pddl-partial-executor-semantic-universe
           path: real_pddl_partial_results
           if-no-files-found: error
           retention-days: 30
