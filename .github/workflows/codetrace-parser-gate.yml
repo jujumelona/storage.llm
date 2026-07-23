@@ -31,7 +31,7 @@ jobs:
         if: always()
         run: |
           python - <<'PY'
-          import json, pathlib, zipfile
+          import pathlib, zipfile
           root=pathlib.Path('codetrace_parser_gate')
           if root.exists():
               with zipfile.ZipFile('CODETRACE_PARSER_GATE_RESULTS.zip','w',zipfile.ZIP_DEFLATED) as z:
@@ -44,3 +44,4 @@ jobs:
           name: CODETRACE_PARSER_GATE_RESULTS
           path: CODETRACE_PARSER_GATE_RESULTS.zip
           retention-days: 7
+# trigger-after-workflow-install
