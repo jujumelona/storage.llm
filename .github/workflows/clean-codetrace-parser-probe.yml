@@ -17,14 +17,18 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: NJU-LINK/CodeTracer
+          path: codetracer-src
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Install and run
         run: |
           python -m pip install -q 'datasets>=3.0' 'huggingface_hub>=0.28' zstandard pyarrow
-          python -m pip install -q git+https://github.com/NJU-LINK/CodeTracer.git
-          python -u experiments/clean_codetrace_parser_probe.py | tee probe.log
+          python -m pip install -q -e codetracer-src
+          PYTHONPATH=codetracer-src/src python -u experiments/clean_codetrace_parser_probe.py | tee probe.log
           cp probe.log probe_out/
       - uses: actions/upload-artifact@v4
         if: always()
