@@ -1,0 +1,73 @@
+name: Product-Lifted Obligation Graph V3 strict falsification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/product_lifted_agentprocess.py'
+      - 'experiments/product_lifted_agentprocess_v2.py'
+      - 'experiments/product_lifted_agentprocess_v3.py'
+      - '.github/workflows/product-lifted-agentprocess-v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Acquire AgentProcessBench
+        run: |
+          python -m pip install -q 'huggingface_hub>=0.28'
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download(repo_id='LulaCola/AgentProcessBench',repo_type='dataset',local_dir='/tmp/AgentProcessBench')
+          PY
+      - name: Run V3 strict falsification
+        run: |
+          set -euxo pipefail
+          python -m py_compile experiments/product_lifted_agentprocess.py experiments/product_lifted_agentprocess_v2.py experiments/product_lifted_agentprocess_v3.py
+          rm -rf product_lifted_v3_results
+          python -u experiments/product_lifted_agentprocess_v3.py --data /tmp/AgentProcessBench --out product_lifted_v3_results | tee product_lifted_v3_results.log
+          cp product_lifted_v3_results.log product_lifted_v3_results/run.log
+          cp experiments/product_lifted_agentprocess.py experiments/product_lifted_agentprocess_v2.py experiments/product_lifted_agentprocess_v3.py product_lifted_v3_results/
+          cat product_lifted_v3_results/summary.json
+      - name: Determinism replay
+        run: |
+          set -euxo pipefail
+          rm -rf product_lifted_v3_replay
+          python -u experiments/product_lifted_agentprocess_v3.py --data /tmp/AgentProcessBench --out product_lifted_v3_replay >/tmp/v3replay.log
+          cmp product_lifted_v3_results/predictions.csv product_lifted_v3_replay/predictions.csv
+          python - <<'PY'
+          import gzip,json
+          a=json.load(gzip.open('product_lifted_v3_results/PRODUCT_LIFTED_SINGLE_CHECKPOINT.json.gz','rt'))
+          b=json.load(gzip.open('product_lifted_v3_replay/PRODUCT_LIFTED_SINGLE_CHECKPOINT.json.gz','rt'))
+          assert a==b
+          sa=json.load(open('product_lifted_v3_results/summary.json'));sb=json.load(open('product_lifted_v3_replay/summary.json'))
+          sa.pop('load_seconds',None);sb.pop('load_seconds',None)
+          for x in (sa,sb):
+              r=x.get('storage_runtime',{});r.pop('indexed_seconds',None);r.pop('naive_seconds',None);r.pop('speedup',None)
+          assert sa==sb
+          PY
+          echo true > product_lifted_v3_results/deterministic_replay.txt
+      - name: Package
+        if: always()
+        run: |
+          python - <<'PY'
+          import pathlib,shutil
+          if pathlib.Path('product_lifted_v3_results').exists():shutil.make_archive('PRODUCT_LIFTED_AGENTPROCESS_V3_RESULTS','zip','product_lifted_v3_results')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: PRODUCT_LIFTED_AGENTPROCESS_V3_RESULTS
+          path: |
+            PRODUCT_LIFTED_AGENTPROCESS_V3_RESULTS.zip
+            product_lifted_v3_results/
+          retention-days: 7
