@@ -1,0 +1,96 @@
+name: Product-Lifted CodeTrace full raw-trajectory blind transfer
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/product_lifted_codetrace_full_blind.py'
+      - '.github/workflows/product-lifted-codetrace-full-blind.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install and acquire frozen source
+        run: |
+          python -m pip install -q 'datasets>=3.0' 'huggingface_hub>=0.28' zstandard pyarrow
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          print(snapshot_download(repo_id='LulaCola/AgentProcessBench',repo_type='dataset',local_dir='/tmp/AgentProcessBench'))
+          PY
+      - name: Reconstruct 1000 raw trajectories and seal labels
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m py_compile experiments/product_lifted_codetrace_full_blind.py
+          rm -rf codetrace_full_prepare codetrace_full_results codetrace_full_replay /tmp/codetrace_full_blind /tmp/ctb_cache
+          PYTHONPATH=experiments python -u experiments/product_lifted_codetrace_full_blind.py prepare \
+            --out codetrace_full_prepare --cache /tmp/ctb_cache | tee codetrace_full_prepare.log
+          mkdir -p /tmp/codetrace_full_blind
+          cp codetrace_full_prepare/blind_events.jsonl /tmp/codetrace_full_blind/blind_events.jsonl
+          test ! -e /tmp/codetrace_full_blind/labels_sealed.json
+          sha256sum codetrace_full_prepare/blind_events.jsonl codetrace_full_prepare/labels_sealed.json \
+            > codetrace_full_prepare/PREPARE_HASHES.txt
+          cat codetrace_full_prepare/prepare_manifest.json
+      - name: Blind prediction before labels
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p codetrace_full_results
+          PYTHONPATH=experiments python -u experiments/product_lifted_codetrace_full_blind.py predict \
+            --source /tmp/AgentProcessBench \
+            --blind /tmp/codetrace_full_blind/blind_events.jsonl \
+            --out codetrace_full_results/blind_predictions_prelabel.json | tee codetrace_full_results/predict.log
+          cp experiments/product_lifted_codetrace_full_blind.py codetrace_full_results/
+          cp experiments/product_lifted_agentprocess.py codetrace_full_results/
+          cp experiments/product_lifted_agentprocess_v2.py codetrace_full_results/
+          cp codetrace_full_prepare/prepare_manifest.json codetrace_full_results/
+          cp codetrace_full_prepare/parse_stats.json codetrace_full_results/
+          cp codetrace_full_prepare/PREPARE_HASHES.txt codetrace_full_results/
+          sha256sum codetrace_full_results/blind_predictions_prelabel.json experiments/product_lifted_codetrace_full_blind.py \
+            > codetrace_full_results/PRE_LABEL_HASHES.txt
+      - name: Deterministic replay
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p codetrace_full_replay
+          PYTHONPATH=experiments python -u experiments/product_lifted_codetrace_full_blind.py predict \
+            --source /tmp/AgentProcessBench \
+            --blind /tmp/codetrace_full_blind/blind_events.jsonl \
+            --out codetrace_full_replay/blind_predictions_prelabel.json >/tmp/codetrace_full_replay.log
+          cmp codetrace_full_results/blind_predictions_prelabel.json codetrace_full_replay/blind_predictions_prelabel.json
+          cmp codetrace_full_results/blind_predictions_prelabel.json.sha256 codetrace_full_replay/blind_predictions_prelabel.json.sha256
+          echo true > codetrace_full_results/deterministic_replay.txt
+      - name: Open sealed labels after prediction
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PYTHONPATH=experiments python -u experiments/product_lifted_codetrace_full_blind.py evaluate \
+            --predictions codetrace_full_results/blind_predictions_prelabel.json \
+            --labels codetrace_full_prepare/labels_sealed.json \
+            --manifest codetrace_full_prepare/prepare_manifest.json \
+            --out codetrace_full_results | tee codetrace_full_results/evaluate.log
+          cp codetrace_full_prepare/labels_sealed.json codetrace_full_results/labels_sealed_after_prediction.json
+          cat codetrace_full_results/summary.json
+      - name: Package
+        run: |
+          python - <<'PY'
+          import shutil
+          shutil.make_archive('PRODUCT_LIFTED_CODETRACE_FULL_BLIND_RESULTS','zip','codetrace_full_results')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PRODUCT_LIFTED_CODETRACE_FULL_BLIND_RESULTS
+          path: |
+            PRODUCT_LIFTED_CODETRACE_FULL_BLIND_RESULTS.zip
+            codetrace_full_results/
+          retention-days: 7
