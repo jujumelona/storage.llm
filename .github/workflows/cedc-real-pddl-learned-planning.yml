@@ -6,6 +6,7 @@ on:
     paths:
       - 'experiments/real_pddl_trace_schema_equivalence.py'
       - 'experiments/real_pddl_learned_schema_planning.py'
+      - 'experiments/real_pddl_learned_schema_planning_v2.py'
       - '.github/workflows/cedc-real-pddl-learned-planning.yml'
   workflow_dispatch:
 
@@ -30,8 +31,9 @@ jobs:
           base='https://raw.githubusercontent.com/jujumelona/storage.llm/cedc-real-pddl-validation/experiments'
           curl -fsSL "$base/real_pddl_trace_schema_equivalence.py" -o real_pddl_trace_schema_equivalence.py
           curl -fsSL "$base/real_pddl_learned_schema_planning.py" -o real_pddl_learned_schema_planning.py
+          curl -fsSL "$base/real_pddl_learned_schema_planning_v2.py" -o real_pddl_learned_schema_planning_v2.py
           set +e
-          python3 real_pddl_learned_schema_planning.py public_sift real_pddl_learned_planning_results > real_pddl_learned_planning_results/run.log 2>&1
+          python3 real_pddl_learned_schema_planning_v2.py public_sift real_pddl_learned_planning_results > real_pddl_learned_planning_results/run.log 2>&1
           rc=$?
           set -e
           if [ -f real_pddl_learned_planning_results/REAL_PDDL_LEARNED_SCHEMA_PLANNING.json ]; then
@@ -65,14 +67,14 @@ jobs:
       - name: Record hashes
         if: always()
         run: |
-          sha256sum real_pddl_trace_schema_equivalence.py real_pddl_learned_schema_planning.py > real_pddl_learned_planning_results/VALIDATOR_SHA256.txt || true
+          sha256sum real_pddl_trace_schema_equivalence.py real_pddl_learned_schema_planning.py real_pddl_learned_schema_planning_v2.py > real_pddl_learned_planning_results/VALIDATOR_SHA256.txt || true
           git -C public_sift rev-parse HEAD > real_pddl_learned_planning_results/SIFT_COMMIT.txt || true
 
       - name: Upload learned planning results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cedc-real-pddl-learned-schema-planning
+          name: cedc-real-pddl-learned-schema-planning-v2
           path: real_pddl_learned_planning_results
           if-no-files-found: error
           retention-days: 30
