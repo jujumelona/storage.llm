@@ -13,15 +13,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install public parquet client
+      - name: Install JSON benchmark client
         run: pip install -q 'datasets==2.19.2' pyarrow
-      - name: Switch loader to official auto-converted parquet and run frozen evaluation
+      - name: Switch loader to official subset-balanced JSONL files
         run: |
           python - <<'PY'
           p='experiments/cpoc_attributionbench.py'
           s=open(p).read()
           old="kw=dict(path='osunlp/AttributionBench',name='subset_balanced');return [[dict(x) for x in load_dataset(**kw,split=s)] for s in ('train','test','test_ood')]"
-          new="urls={s:f'https://huggingface.co/api/datasets/osunlp/AttributionBench/parquet/subset_balanced/{s}/0.parquet' for s in ('train','test','test_ood')};return [[dict(x) for x in load_dataset('parquet',data_files={s:urls[s]},split=s)] for s in ('train','test','test_ood')]"
+          new="urls={'train':'https://huggingface.co/datasets/osunlp/AttributionBench/resolve/main/train_all_subset_balanced.jsonl','test':'https://huggingface.co/datasets/osunlp/AttributionBench/resolve/main/test_all_subset_balanced.jsonl','test_ood':'https://huggingface.co/datasets/osunlp/AttributionBench/resolve/main/test_ood_all_subset_balanced.jsonl'};return [[dict(x) for x in load_dataset('json',data_files={s:urls[s]},split=s)] for s in ('train','test','test_ood')]"
           assert old in s
           open(p,'w').write(s.replace(old,new))
           PY
