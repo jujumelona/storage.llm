@@ -1,0 +1,36 @@
+name: CPOC AttributionBench strict falsification
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  evaluate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install public benchmark client
+        run: pip install -q 'datasets>=3,<4' 'huggingface_hub>=0.27' pyarrow
+      - name: Run train-only tuning and frozen test plus OOD evaluation
+        run: python experiments/cpoc_attributionbench.py --out cpoc_attr_results
+      - name: Deterministic replay
+        run: |
+          python experiments/cpoc_attributionbench.py --out cpoc_attr_replay
+          diff cpoc_attr_results/summary.json cpoc_attr_replay/summary.json
+          diff cpoc_attr_results/test_predictions.jsonl cpoc_attr_replay/test_predictions.jsonl
+          diff cpoc_attr_results/ood_predictions.jsonl cpoc_attr_replay/ood_predictions.jsonl
+      - name: Package
+        run: |
+          cp experiments/cpoc_attributionbench.py cpoc_attr_results/
+          cp .github/workflows/cpoc-attributionbench.yml cpoc_attr_results/
+          sha256sum experiments/cpoc_attributionbench.py > cpoc_attr_results/code.sha256
+          zip -qr CPOC_ATTRIBUTIONBENCH_RESULTS.zip cpoc_attr_results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CPOC_ATTRIBUTIONBENCH_RESULTS
+          path: CPOC_ATTRIBUTIONBENCH_RESULTS.zip
+          retention-days: 7
