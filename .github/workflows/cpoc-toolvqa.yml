@@ -1,0 +1,52 @@
+name: Counterfactual Provenance Obligation Circuit strict falsification
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  evaluate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install public dataset client
+        run: pip install -q 'huggingface_hub>=0.27' hf_xet
+      - name: Prepare blind source and seal human importance labels
+        run: |
+          python experiments/cpoc_toolvqa.py prepare --out cpoc_run/sealed --cache cpoc_run/cache
+          mkdir -p cpoc_run/blind_input cpoc_run/private_labels
+          cp cpoc_run/sealed/blind.jsonl cpoc_run/blind_input/blind.jsonl
+          cp cpoc_run/sealed/labels_sealed.json cpoc_run/private_labels/labels_sealed.json
+          cp cpoc_run/sealed/prepare_manifest.json cpoc_run/
+          rm -rf cpoc_run/sealed
+      - name: Blind prediction without importance labels
+        run: |
+          test ! -e cpoc_run/blind_input/labels_sealed.json
+          python experiments/cpoc_toolvqa.py predict --input cpoc_run/blind_input/blind.jsonl --out cpoc_run/prediction
+      - name: Deterministic blind replay
+        run: |
+          cp cpoc_run/prediction/predictions.json.sha256 cpoc_run/first.sha
+          rm -rf cpoc_run/replay
+          python experiments/cpoc_toolvqa.py predict --input cpoc_run/blind_input/blind.jsonl --out cpoc_run/replay
+          diff cpoc_run/first.sha cpoc_run/replay/predictions.json.sha256
+      - name: Open sealed labels only after predictions
+        run: |
+          python experiments/cpoc_toolvqa.py evaluate \
+            --predictions cpoc_run/prediction/predictions.json \
+            --labels cpoc_run/private_labels/labels_sealed.json \
+            --out cpoc_run/evaluation
+      - name: Package proof
+        run: |
+          cp experiments/cpoc_toolvqa.py cpoc_run/
+          cp .github/workflows/cpoc-toolvqa.yml cpoc_run/
+          sha256sum experiments/cpoc_toolvqa.py > cpoc_run/code.sha256
+          zip -qr CPOC_TOOLVQA_STRICT_RESULTS.zip cpoc_run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CPOC_TOOLVQA_STRICT_RESULTS
+          path: CPOC_TOOLVQA_STRICT_RESULTS.zip
+          retention-days: 7
