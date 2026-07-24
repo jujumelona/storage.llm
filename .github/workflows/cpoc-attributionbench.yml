@@ -15,8 +15,15 @@ jobs:
           python-version: '3.11'
       - name: Install benchmark-compatible client
         run: pip install -q 'datasets==2.19.2' 'huggingface_hub>=0.27,<1' pyarrow
-      - name: Run train-only tuning and frozen test plus OOD evaluation
-        run: python experiments/cpoc_attributionbench.py --out cpoc_attr_results
+      - name: Enable official remote dataset loader and run frozen evaluation
+        run: |
+          python - <<'PY'
+          p='experiments/cpoc_attributionbench.py'
+          s=open(p).read()
+          s=s.replace("load_dataset(**kw,split=s)","load_dataset(**kw,split=s,trust_remote_code=True)")
+          open(p,'w').write(s)
+          PY
+          python experiments/cpoc_attributionbench.py --out cpoc_attr_results
       - name: Deterministic replay
         run: |
           python experiments/cpoc_attributionbench.py --out cpoc_attr_replay
