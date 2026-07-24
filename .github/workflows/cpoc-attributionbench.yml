@@ -15,27 +15,11 @@ jobs:
           python-version: '3.11'
       - name: Install official Hub Xet client
         run: pip install -q 'huggingface_hub>=0.27,<1' hf_xet
-      - name: Download official JSONL locally and run frozen evaluation
-        run: |
-          python - <<'PY'
-          p='experiments/cpoc_attributionbench.py'
-          s=open(p).read()
-          old="def load_rows():\n    from datasets import load_dataset\n    kw=dict(path='osunlp/AttributionBench',name='subset_balanced');return [[dict(x) for x in load_dataset(**kw,split=s)] for s in ('train','test','test_ood')]"
-          new="""def load_rows():
-    from huggingface_hub import hf_hub_download
-    names=('train_all_subset_balanced.jsonl','test_all_subset_balanced.jsonl','test_ood_all_subset_balanced.jsonl')
-    out=[]
-    for name in names:
-        fp=hf_hub_download('osunlp/AttributionBench',name,repo_type='dataset')
-        with open(fp,encoding='utf-8') as f: out.append([json.loads(line) for line in f if line.strip()])
-    return out"""
-          assert old in s
-          open(p,'w').write(s.replace(old,new))
-          PY
-          python experiments/cpoc_attributionbench.py --out cpoc_attr_results
+      - name: Download official JSONL and run frozen evaluation
+        run: python experiments/run_cpoc_attributionbench_hub.py --out cpoc_attr_results
       - name: Deterministic replay
         run: |
-          python experiments/cpoc_attributionbench.py --out cpoc_attr_replay
+          python experiments/run_cpoc_attributionbench_hub.py --out cpoc_attr_replay
           python - <<'PY'
           import json
           a=json.load(open('cpoc_attr_results/summary.json')); b=json.load(open('cpoc_attr_replay/summary.json'))
@@ -48,8 +32,9 @@ jobs:
       - name: Package
         run: |
           cp experiments/cpoc_attributionbench.py cpoc_attr_results/
+          cp experiments/run_cpoc_attributionbench_hub.py cpoc_attr_results/
           cp .github/workflows/cpoc-attributionbench.yml cpoc_attr_results/
-          sha256sum experiments/cpoc_attributionbench.py > cpoc_attr_results/code.sha256
+          sha256sum experiments/cpoc_attributionbench.py experiments/run_cpoc_attributionbench_hub.py > cpoc_attr_results/code.sha256
           zip -qr CPOC_ATTRIBUTIONBENCH_RESULTS.zip cpoc_attr_results
       - uses: actions/upload-artifact@v4
         with:
