@@ -13,15 +13,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install benchmark-compatible client
-        run: pip install -q 'datasets==2.19.2' 'huggingface_hub>=0.27,<1' pyarrow
-      - name: Enable official remote dataset loader and run frozen evaluation
+      - name: Install public parquet client
+        run: pip install -q 'datasets==2.19.2' pyarrow
+      - name: Switch loader to official auto-converted parquet and run frozen evaluation
         run: |
           python - <<'PY'
           p='experiments/cpoc_attributionbench.py'
           s=open(p).read()
-          s=s.replace("load_dataset(**kw,split=s)","load_dataset(**kw,split=s,trust_remote_code=True)")
-          open(p,'w').write(s)
+          old="kw=dict(path='osunlp/AttributionBench',name='subset_balanced');return [[dict(x) for x in load_dataset(**kw,split=s)] for s in ('train','test','test_ood')]"
+          new="urls={s:f'https://huggingface.co/api/datasets/osunlp/AttributionBench/parquet/subset_balanced/{s}/0.parquet' for s in ('train','test','test_ood')};return [[dict(x) for x in load_dataset('parquet',data_files={s:urls[s]},split=s)] for s in ('train','test','test_ood')]"
+          assert old in s
+          open(p,'w').write(s.replace(old,new))
           PY
           python experiments/cpoc_attributionbench.py --out cpoc_attr_results
       - name: Deterministic replay
