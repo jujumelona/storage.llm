@@ -13,15 +13,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install JSON benchmark client
-        run: pip install -q 'datasets==2.19.2' pyarrow
-      - name: Switch loader to official subset-balanced JSONL files
+      - name: Install official Hub Xet client
+        run: pip install -q 'huggingface_hub>=0.27,<1' hf_xet
+      - name: Download official JSONL locally and run frozen evaluation
         run: |
           python - <<'PY'
           p='experiments/cpoc_attributionbench.py'
           s=open(p).read()
-          old="kw=dict(path='osunlp/AttributionBench',name='subset_balanced');return [[dict(x) for x in load_dataset(**kw,split=s)] for s in ('train','test','test_ood')]"
-          new="urls={'train':'https://huggingface.co/datasets/osunlp/AttributionBench/resolve/main/train_all_subset_balanced.jsonl','test':'https://huggingface.co/datasets/osunlp/AttributionBench/resolve/main/test_all_subset_balanced.jsonl','test_ood':'https://huggingface.co/datasets/osunlp/AttributionBench/resolve/main/test_ood_all_subset_balanced.jsonl'};return [[dict(x) for x in load_dataset('json',data_files={s:urls[s]},split=s)] for s in ('train','test','test_ood')]"
+          old="def load_rows():\n    from datasets import load_dataset\n    kw=dict(path='osunlp/AttributionBench',name='subset_balanced');return [[dict(x) for x in load_dataset(**kw,split=s)] for s in ('train','test','test_ood')]"
+          new="""def load_rows():
+    from huggingface_hub import hf_hub_download
+    names=('train_all_subset_balanced.jsonl','test_all_subset_balanced.jsonl','test_ood_all_subset_balanced.jsonl')
+    out=[]
+    for name in names:
+        fp=hf_hub_download('osunlp/AttributionBench',name,repo_type='dataset')
+        with open(fp,encoding='utf-8') as f: out.append([json.loads(line) for line in f if line.strip()])
+    return out"""
           assert old in s
           open(p,'w').write(s.replace(old,new))
           PY
