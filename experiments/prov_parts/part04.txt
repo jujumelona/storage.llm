@@ -1,0 +1,137 @@
+            # Remove one source event from each set for a sequence baseline.
+            ce = pv.pool.atom_event[next(iter(cut))]
+            re = pv.pool.atom_event[next(iter(random_cut))]
+            cut_events = [e for j, e in enumerate(tr["events"]) if j != ce]
+            rnd_events = [e for j, e in enumerate(tr["events"]) if j != re]
+            cut_bigram.append(bigram_anomaly(cut_events, bg))
+            random_bigram.append(bigram_anomaly(rnd_events, bg))
+            records.append(
+                {
+                    "tid": tr["tid"],
+                    "dataset": tr["dataset"],
+                    "fold": fold,
+                    "target": target,
+                    "cut_atoms": [pv.pool.atom_name[x] for x in sorted(cut)],
+                    "random_atoms": [pv.pool.atom_name[x] for x in sorted(random_cut)],
+                    "cut_breaks_target": cut_false,
+                    "random_breaks_target": random_false,
+                    "cut_downstream_false": ca,
+                    "random_downstream_false": ra,
+                    "cut_bigram": cut_bigram[-1],
+                    "random_bigram": random_bigram[-1],
+                }
+            )
+
+    def pair_auc(a, b):
+        return sum(1.0 if x > y else 0.5 if x == y else 0.0 for x, y in zip(a, b)) / len(a) if a else 0.5
+
+    return {
+        "n_pairs": total,
+        "minimal_cut_proof_rate": proof_ok / total if total else 0.0,
+        "random_same_size_break_rate": random_break / total if total else 0.0,
+        "cut_vs_random_downstream_auc": pair_auc(cut_anomaly, random_anomaly),
+        "bigram_cut_vs_random_auc": pair_auc(cut_bigram, random_bigram),
+        "mean_downstream_margin": statistics.mean(a - b for a, b in zip(cut_anomaly, random_anomaly)) if total else 0.0,
+    }, records
+
+
+def storage_runtime(traces):
+    compact = expanded = edge_bytes = roots_count = gates = 0
+    sample = []
+    for tr in traces:
+        pv = get_prov(tr)
+        compact += pv.pool.compact_bytes()
+        expanded += len(json.dumps([pv.pool.expanded(r) for r in pv.roots], separators=(",", ":")).encode())
+        edge_bytes += len(json.dumps(pv.real_dependencies, separators=(",", ":")).encode())
+        roots_count += len(pv.roots)
+        gates += len(pv.pool.nodes)
+        if len(sample) < 3000:
+            sample.extend((pv.pool, r) for r in pv.roots[: max(0, 3000 - len(sample))])
+    t0 = time.perf_counter()
+    memo_value = sum(pool.value(root) for pool, root in sample)
+    memo_seconds = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    raw_value = sum(pool.value_nomemo(root) for pool, root in sample)
+    raw_seconds = time.perf_counter() - t0
+    assert memo_value == raw_value
+    return {
+        "traces": len(traces),
+        "roots": roots_count,
+        "gates": gates,
+        "compact_circuit_bytes": compact,
+        "expanded_formula_bytes": expanded,
+        "raw_dependency_edge_bytes": edge_bytes,
+        "compact_vs_expanded_ratio": compact / max(1, expanded),
+        "sample_roots": len(sample),
+        "memoized_value": memo_value,
+        "raw_value": raw_value,
+        "outputs_identical": True,
+        "memoized_seconds": memo_seconds,
+        "recursive_seconds": raw_seconds,
+        "evaluation_speedup": raw_seconds / max(memo_seconds, 1e-12),
+    }
+
+
+def serial_counter(counter):
+    return [[repr(k), v] for k, v in counter.items()]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    traces = core.load_all(args.data)
+
+    metrics, aggregate, folds = fold_eval(traces)
+    holdouts = dataset_holdout(traces)
+    boot_product = paired_bootstrap(aggregate, "provenance_product", "product")
+    boot_current = paired_bootstrap(aggregate, "provenance_product", "current")
+    boot_rewire = paired_bootstrap(aggregate, "provenance_product", "provenance_rewired")
+    cf, witnesses = circuit_counterfactual(traces)
+    storage = storage_runtime(traces)
+
+    full_train = [t for t in traces if stable_int("final:" + t["tid"]) % 5]
+    full_val = [t for t in traces if not stable_int("final:" + t["tid"]) % 5]
+    cfg = core.choose(full_train, full_val)
+    weights = choose_provenance(full_train, full_val, cfg)
+    pm = train_prov(traces)
+    checkpoint = {
+        "architecture": "Counterfactual Provenance-Obligation Circuit",
+        "seed": SEED,
+        "base_config": cfg,
+        "provenance_weights": weights,
+        "gate_schema": ["FALSE", "TRUE", "ATOM", "AND", "OR"],
+        "provenance_total": serial_counter(pm["total"]),
+        "provenance_positive": serial_counter(pm["positive"]),
+        "base_rate": pm["base"],
+        "no_dense_or_embedding": True,
+    }
+    cp_path = out / "PROVENANCE_OBLIGATION_SINGLE_CHECKPOINT.json.gz"
+    with gzip.open(cp_path, "wt", encoding="utf-8") as f:
+        json.dump(checkpoint, f, separators=(",", ":"))
+
+    rows = []
+    for kind, values in aggregate.items():
+        for tid, ds, p, g in zip(values["tids"], values["datasets"], values["pred"], values["gold"]):
+            rows.append(
+                {
+                    "model": kind,
+                    "tid": tid,
+                    "dataset": ds,
+                    "pred_position": p,
+                    "gold_position": g,
+                    "correct": p == g,
+                    "near1": abs(p - g) <= 1,
+                }
+            )
+    with (out / "predictions.csv").open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=rows[0].keys())
+        w.writeheader()
+        w.writerows(rows)
+    (out / "counterfactual_witnesses.json").write_text(json.dumps(witnesses, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    hold_delta = [r["provenance_product"]["exact"] - r["product"]["exact"] for r in holdouts]
+    strict = {
