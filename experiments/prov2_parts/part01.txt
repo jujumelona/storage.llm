@@ -1,0 +1,60 @@
+    xs=[t for t in ts if t['has_error'] and t['events']];g=[next(i for i,e in enumerate(t['events']) if e.first_error) for t in xs];p=[predict(t,m,pm,w,kind) for t in xs]
+    return {'n':len(g),'exact':v1.acc(p,g),'near1':v1.near(p,g),'pred':p,'gold':g,'tids':[t['tid'] for t in xs],'datasets':[t['dataset'] for t in xs]}
+
+def choose_weights(train,val,cfg):
+    m=core.train_model(train,cfg);pm=train_prov(train);best=None
+    for w in WEIGHTS:
+        e=evaluate(val,m,pm,w,'provenance_product');r=evaluate(val,m,pm,w,'provenance_rewired')
+        key=(e['exact'],e['near1'],e['exact']-r['exact'],-w['mix'])
+        if best is None or key>best[0]:best=(key,w)
+    return dict(best[1])
+
+
+def fold_eval(ts):
+    agg={k:{'pred':[],'gold':[],'tids':[],'datasets':[]} for k in KINDS};folds=[]
+    for f in range(5):
+        test=[t for t in ts if core.hashfold(t['tid'])==f];rest=[t for t in ts if core.hashfold(t['tid'])!=f]
+        val=[t for t in rest if core.stable_int('v:'+t['tid'])%5==0];train=[t for t in rest if t not in val]
+        cfg=core.choose(train,val);w=choose_weights(train,val,cfg);m=core.train_model(rest,cfg);pm=train_prov(rest);row={'fold':f,'cfg':cfg,'weights':w}
+        for k in KINDS:
+            e=evaluate(test,m,pm,w,k);row[k]={'n':e['n'],'exact':e['exact'],'near1':e['near1']}
+            for q in ('pred','gold','tids','datasets'):agg[k][q]+=e[q]
+        folds.append(row)
+    met={k:{'n':len(x['gold']),'exact':v1.acc(x['pred'],x['gold']),'near1':v1.near(x['pred'],x['gold'])} for k,x in agg.items()}
+    return met,agg,folds
+
+
+def holds(ts):
+    out=[]
+    for ds in core.DATASETS:
+        test=[t for t in ts if t['dataset']==ds];rest=[t for t in ts if t['dataset']!=ds]
+        val=[t for t in rest if core.stable_int('h:'+t['tid'])%5==0];train=[t for t in rest if t not in val]
+        cfg=core.choose(train,val);w=choose_weights(train,val,cfg);m=core.train_model(rest,cfg);pm=train_prov(rest);row={'heldout':ds,'cfg':cfg,'weights':w}
+        for k in KINDS:
+            e=evaluate(test,m,pm,w,k);row[k]={'n':e['n'],'exact':e['exact'],'near1':e['near1']}
+        out.append(row)
+    return out
+
+
+def main():
+    ap=argparse.ArgumentParser();ap.add_argument('--data',required=True);ap.add_argument('--out',required=True);a=ap.parse_args();out=Path(a.out);out.mkdir(parents=True,exist_ok=True)
+    v1.prov_keys_original=v1.prov_keys;ts=core.load_all(a.data);met,agg,folds=fold_eval(ts);ho=holds(ts)
+    bp=v1.paired_bootstrap(agg,'provenance_product','product');br=v1.paired_bootstrap(agg,'provenance_product','provenance_rewired');bc=v1.paired_bootstrap(agg,'provenance_product','current')
+    cf,wit=v1.circuit_counterfactual(ts);st=v1.storage_runtime(ts)
+    hdelta=[x['provenance_product']['exact']-x['product']['exact'] for x in ho]
+    strict={'reproduces_frozen_product':abs(met['product']['exact']-.511400651465798)<.005,
+      'beats_product':met['provenance_product']['exact']>met['product']['exact'],
+      'bootstrap_product_positive':bp['bootstrap_95_ci'][0]>0,
+      'rewire_drop_1pp':met['provenance_product']['exact']>=met['provenance_rewired']['exact']+.01,
+      'bootstrap_rewire_positive':br['bootstrap_95_ci'][0]>0,
+      'all_holdouts_nonnegative':all(x>=-1e-12 for x in hdelta),
+      'cut_proof':cf['minimal_cut_proof_rate']>=.99,'cut_auc':cf['cut_vs_random_downstream_auc']>=.65,'storage':st['compact_vs_expanded_ratio']<1}
+    summary={'benchmark':'AgentProcessBench','architecture':'Counterfactual Provenance-Relation Obligation Circuit V2','trajectories':len(ts),'events':sum(len(t['events']) for t in ts),'oof':met,'folds':folds,'dataset_holdout':ho,'paired_vs_product':bp,'paired_vs_rewired':br,'paired_vs_current':bc,'counterfactual':cf,'storage_runtime':st,'strict':strict,'overall_pass':all(strict.values())}
+    rows=[]
+    for k,x in agg.items():
+      for tid,ds,p,g in zip(x['tids'],x['datasets'],x['pred'],x['gold']):rows.append({'model':k,'tid':tid,'dataset':ds,'pred_position':p,'gold_position':g,'correct':p==g})
+    with (out/'predictions.csv').open('w',newline='',encoding='utf-8') as f:w=csv.DictWriter(f,fieldnames=rows[0]);w.writeheader();w.writerows(rows)
+    (out/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8');(out/'witnesses.json').write_text(json.dumps(wit,indent=2),encoding='utf-8')
+    with gzip.open(out/'PROVENANCE_RELATION_CIRCUIT_CHECKPOINT.json.gz','wt') as f:json.dump({'architecture':summary['architecture'],'weights':folds,'no_dense':True},f)
+    print(json.dumps(summary,indent=2))
+if __name__=='__main__':main()
