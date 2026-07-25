@@ -81,8 +81,12 @@ jobs:
           mkdir -p run_a run_b
           cp prepared/blind.jsonl run_a/blind.jsonl
           cp prepared/blind.jsonl run_b/blind.jsonl
-          python experiments/provenance_obligation_trove_fast.py --blind run_a/blind.jsonl --out run_a/predictions.json
-          python experiments/provenance_obligation_trove_fast.py --blind run_b/blind.jsonl --out run_b/predictions.json
+          python experiments/provenance_obligation_trove_fast.py --blind run_a/blind.jsonl --out run_a/predictions.json &
+          PID_A=$!
+          python experiments/provenance_obligation_trove_fast.py --blind run_b/blind.jsonl --out run_b/predictions.json &
+          PID_B=$!
+          wait $PID_A
+          wait $PID_B
           python - <<'PY'
           import json
           a=json.load(open('run_a/predictions.json'));b=json.load(open('run_b/predictions.json'))
