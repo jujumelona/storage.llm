@@ -282,7 +282,7 @@ def intervention_eval(test:list[Trace],contracts:Contracts,max_pairs=3000):
         allp=set((i,a) for i,s in enumerate(tr.steps) for a in s.output_atoms)
         claim_used={(e.src,e.atom) for e in c.incoming.get(len(tr.steps),[]) if e.atom.kind not in {'WEAK','SEQ'}}
         bridge_used={x for x in c.used_atoms if x not in claim_used}
-        critical=list(bridge_used or c.used_atoms)
+        critical=sorted(bridge_used or c.used_atoms,key=lambda x:(x[0],x[1].kind,x[1].value))
         unused=[(i,a) for i,s in enumerate(tr.steps) for a in s.output_atoms if (i,a) not in c.used_atoms]
         if not critical or not unused: continue
         ca=RNG.choice(critical)
@@ -294,10 +294,10 @@ def intervention_eval(test:list[Trace],contracts:Contracts,max_pairs=3000):
         cit_pos.append(citation_anomaly(c,pc));cit_neg.append(citation_anomaly(c,pn))
         top_pos.append(anomaly(top,set()));top_neg.append(anomaly(top,set()))
         if bridge_used:
-            candidates=list(allp);scores=[anomaly(c,allp-{x}) for x in candidates]
+            candidates=sorted(allp,key=lambda x:(x[0],x[1].kind,x[1].value));scores=[anomaly(c,allp-{x}) for x in candidates]
             pred=candidates[max(range(len(scores)),key=lambda i:(scores[i],-i))]
             cut_hit.append(int(pred in bridge_used))
-            cit_pred=next(iter(claim_used),candidates[0]);cit_cut.append(int(cit_pred in bridge_used))
+            cit_pred=(sorted(claim_used,key=lambda x:(x[0],x[1].kind,x[1].value))[0] if claim_used else candidates[0]);cit_cut.append(int(cit_pred in bridge_used))
         rc=build_circuit(rename_trace(tr),contracts)
         rename_same.append(int([(e.src,e.dst,e.atom.kind) for e in c.edges]==[(e.src,e.dst,e.atom.kind) for e in rc.edges] and obligations(c)[2]==obligations(rc)[2]))
         rows.append({'tid':tr.tid,'steps':len(tr.steps),'critical_step':ca[0],'critical_kind':ca[1].kind,'critical_value_hash':hashlib.sha256(ca[1].value.encode()).hexdigest()[:16],'noncritical_step':na[0],'cpoc_critical':sp,'cpoc_noncritical':sn,'citation_critical':cit_pos[-1],'citation_noncritical':cit_neg[-1]})
@@ -326,7 +326,7 @@ def runtime_eval(test:list[Trace],contracts:Contracts,limit=300):
     interventions=[]
     for c in circuits:
         allp=set((i,a) for i,s in enumerate(c.trace.steps) for a in s.output_atoms)
-        for x in list(allp)[:12]:interventions.append((c,allp,x))
+        for x in sorted(allp,key=lambda x:(x[0],x[1].kind,x[1].value))[:12]:interventions.append((c,allp,x))
     t0=time.perf_counter();na=[]
     for c,allp,x in interventions:
         cc=build_circuit(c.trace,contracts);na.append(anomaly(cc,allp-{x}))
