@@ -96,16 +96,14 @@ def rank01(xs):
     return r
 
 
+BASE_KINDS={'current','ueta','graph','product_no_topology','product'}
+
+
 def scores(tr,m,pm,w,kind):
-    if kind in {'current','ueta','graph','product_no_topology','product'}:return core.scores(tr,m,kind)
+    if kind in BASE_KINDS:return core.scores(tr,m,kind)
     pv=v1.get_prov(tr,rewire=(kind=='provenance_rewired'),no_resource=(kind=='provenance_no_resource'))
     ps=[prov_score_v2(tr,i,pm,w,pv) for i in range(len(tr['events']))]
     if kind=='provenance_only':return ps
     br=rank01(core.scores(tr,m,'product'));pr=rank01(ps)
-    return [a+w['mix']*b for a,b in zip(br,pr)]
-
-
-def predict(tr,m,pm,w,kind):
-    z=scores(tr,m,pm,w,kind);return max(range(len(z)),key=lambda i:(z[i],-i)) if z else -1
-
-def evaluate(ts,m,pm,w,kind):
+    # Preserve the frozen V3 early-unavoidable decision as a structural anchor.
+    # Provenance can move the boundary only when relation evidence overcomes it.
