@@ -1,0 +1,41 @@
+        "beats_product_exact": metrics["provenance_product"]["exact"] > metrics["product"]["exact"],
+        "bootstrap_vs_product_lower_positive": boot_product["bootstrap_95_ci"][0] > 0,
+        "rewire_reduces_exact_by_1pp": metrics["provenance_product"]["exact"] >= metrics["provenance_rewired"]["exact"] + 0.01,
+        "bootstrap_vs_rewire_lower_positive": boot_rewire["bootstrap_95_ci"][0] > 0,
+        "all_dataset_holdouts_nonnegative": all(x >= -1e-12 for x in hold_delta),
+        "minimal_cut_proof_99pct": cf["minimal_cut_proof_rate"] >= 0.99,
+        "cut_beats_random_auc_065": cf["cut_vs_random_downstream_auc"] >= 0.65,
+        "cut_beats_bigram": cf["cut_vs_random_downstream_auc"] > cf["bigram_cut_vs_random_auc"],
+        "shared_circuit_storage_reduction": storage["compact_vs_expanded_ratio"] < 1.0,
+        "circuit_eval_exact": storage["outputs_identical"],
+    }
+    summary = {
+        "benchmark": "AgentProcessBench",
+        "architecture": "Counterfactual Provenance-Obligation Circuit",
+        "trajectories": len(traces),
+        "error_trajectories": metrics["provenance_product"]["n"],
+        "events": sum(len(t["events"]) for t in traces),
+        "oof": metrics,
+        "folds": folds,
+        "dataset_holdout": holdouts,
+        "paired_provenance_minus_product": boot_product,
+        "paired_provenance_minus_current": boot_current,
+        "paired_provenance_minus_rewired": boot_rewire,
+        "counterfactual": cf,
+        "storage_runtime": storage,
+        "checkpoint_bytes": cp_path.stat().st_size,
+        "strict": strict,
+        "overall_pass": all(strict.values()),
+        "scope": "Explicit tool-trace first-error localization and evidence-deletion verification; not general natural-language reasoning.",
+    }
+    (out / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out / "README.txt").write_text(
+        "Counterfactual Provenance-Obligation Circuit strict AgentProcessBench falsification.\n"
+        "No embeddings, dense latent vectors, pretrained encoders, LLM calls, TF-IDF/SVD, nearest-vector retrieval, code generation, or external solvers.\n",
+        encoding="utf-8",
+    )
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
