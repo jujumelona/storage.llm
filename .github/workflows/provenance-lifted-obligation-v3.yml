@@ -1,0 +1,97 @@
+name: Provenance-Lifted Obligation Product Graph V3 falsification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/prov_parts/**'
+      - 'experiments/prov2_parts/**'
+      - 'experiments/prov3_parts/**'
+      - '.github/workflows/provenance-lifted-obligation-v3.yml'
+      - 'experiments/product_lifted_agentprocess.py'
+      - 'experiments/product_lifted_agentprocess_v2.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Acquire public AgentProcessBench
+        run: |
+          python -m pip install -q 'huggingface_hub>=0.28'
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download(repo_id='LulaCola/AgentProcessBench', repo_type='dataset', local_dir='/tmp/AgentProcessBench')
+          PY
+      - name: Assemble frozen circuit layers
+        run: |
+          set -euxo pipefail
+          cat experiments/prov_parts/part*.txt > experiments/counterfactual_provenance_obligation.py
+          cat experiments/prov2_parts/part*.txt > experiments/counterfactual_provenance_obligation_v2.py
+          cat experiments/prov3_parts/part*.txt > experiments/counterfactual_provenance_lifted_v3.py
+          python -m py_compile \
+            experiments/product_lifted_agentprocess.py \
+            experiments/product_lifted_agentprocess_v2.py \
+            experiments/counterfactual_provenance_obligation.py \
+            experiments/counterfactual_provenance_obligation_v2.py \
+            experiments/counterfactual_provenance_lifted_v3.py
+          sha256sum experiments/counterfactual_provenance_lifted_v3.py | tee v3_source.sha256
+      - name: Run strict lifted-state graph falsification
+        run: |
+          set -euxo pipefail
+          rm -rf provenance_lifted_v3_results
+          python -u experiments/counterfactual_provenance_lifted_v3.py \
+            --data /tmp/AgentProcessBench \
+            --out provenance_lifted_v3_results \
+            | tee provenance_lifted_v3_results.log
+          cp provenance_lifted_v3_results.log provenance_lifted_v3_results/run.log
+          cp v3_source.sha256 provenance_lifted_v3_results/
+          cp experiments/counterfactual_provenance_*.py provenance_lifted_v3_results/
+          cp experiments/product_lifted_agentprocess.py experiments/product_lifted_agentprocess_v2.py provenance_lifted_v3_results/
+          cat provenance_lifted_v3_results/summary.json
+      - name: Deterministic replay
+        run: |
+          set -euxo pipefail
+          rm -rf provenance_lifted_v3_replay
+          python -u experiments/counterfactual_provenance_lifted_v3.py \
+            --data /tmp/AgentProcessBench \
+            --out provenance_lifted_v3_replay >/tmp/prov_lifted_replay.log
+          cmp provenance_lifted_v3_results/predictions.csv provenance_lifted_v3_replay/predictions.csv
+          cmp provenance_lifted_v3_results/witnesses.json provenance_lifted_v3_replay/witnesses.json
+          python - <<'PY'
+          import gzip,json
+          a=json.load(gzip.open('provenance_lifted_v3_results/PROVENANCE_LIFTED_GRAPH_CHECKPOINT.json.gz','rt'))
+          b=json.load(gzip.open('provenance_lifted_v3_replay/PROVENANCE_LIFTED_GRAPH_CHECKPOINT.json.gz','rt'))
+          assert a==b
+          a=json.load(open('provenance_lifted_v3_results/summary.json'))
+          b=json.load(open('provenance_lifted_v3_replay/summary.json'))
+          for x in (a,b):
+              r=x.get('storage_runtime',{})
+              r.pop('memoized_seconds',None);r.pop('recursive_seconds',None);r.pop('evaluation_speedup',None)
+          assert a==b
+          PY
+          echo true > provenance_lifted_v3_results/deterministic_replay.txt
+      - name: Package
+        if: always()
+        run: |
+          python - <<'PY'
+          import pathlib,shutil
+          p=pathlib.Path('provenance_lifted_v3_results')
+          if p.exists():shutil.make_archive('PROVENANCE_LIFTED_OBLIGATION_V3_RESULTS','zip',p)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: PROVENANCE_LIFTED_OBLIGATION_V3_RESULTS
+          path: |
+            PROVENANCE_LIFTED_OBLIGATION_V3_RESULTS.zip
+            provenance_lifted_v3_results/
+          retention-days: 7
