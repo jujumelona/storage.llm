@@ -20,7 +20,10 @@ jobs:
       - name: Download and inspect schema
         run: |
           python -m pip install -q gdown
-          gdown --id '1bbTpKgwZXePRYCoIcbvsVccNErQfisLt' -O trove_dataset.bin
+          gdown 'https://drive.google.com/uc?id=1bbTpKgwZXePRYCoIcbvsVccNErQfisLt' -O trove_dataset.bin || \
+          curl -L --fail --retry 8 --retry-all-errors \
+            'https://drive.usercontent.google.com/download?id=1bbTpKgwZXePRYCoIcbvsVccNErQfisLt&export=download&confirm=t' \
+            -o trove_dataset.bin
           mkdir -p TROVE_DATA probe
           python - <<'PY'
           import json,zipfile,tarfile
@@ -40,9 +43,7 @@ jobs:
               if first is None:continue
               item={'path':str(fp.relative_to(out)),'keys':sorted(first),'types':{k:type(v).__name__ for k,v in first.items()}}
               for k in ('target_sent','prompt_global','ground_truth_global','input_sentences','input_sentence_indices','input_doc_indices','combine_retriver'):
-                  if k in first:
-                      v=first[k]
-                      item[k+'_sample']=str(v)[:5000]
+                  if k in first:item[k+'_sample']=str(first[k])[:5000]
               report.append(item)
           Path('probe/schema.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
           print('files',len(report))
