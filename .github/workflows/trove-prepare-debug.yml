@@ -1,0 +1,49 @@
+name: TROVE prepare diagnostic
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/trove-prepare-debug.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download and run prepare with captured log
+        run: |
+          python -m pip install -q gdown
+          gdown 'https://drive.google.com/uc?id=1bbTpKgwZXePRYCoIcbvsVccNErQfisLt' -O trove_dataset.bin
+          mkdir -p TROVE_DATA debug prepared
+          python - <<'PY'
+          import zipfile,tarfile
+          from pathlib import Path
+          p=Path('trove_dataset.bin');o=Path('TROVE_DATA')
+          if zipfile.is_zipfile(p):
+              with zipfile.ZipFile(p) as z:z.extractall(o)
+          elif tarfile.is_tarfile(p):
+              with tarfile.open(p) as t:t.extractall(o)
+          else:raise RuntimeError('archive')
+          PY
+          set +e
+          python experiments/provenance_obligation_trove.py prepare --root TROVE_DATA --out prepared > debug/prepare.log 2>&1
+          echo $? > debug/return_code.txt
+          set -e
+          find prepared -maxdepth 1 -type f -printf '%f %s\n' > debug/files.txt || true
+          head -c 5000 prepared/blind.jsonl > debug/blind_head.txt 2>/dev/null || true
+          cp prepared/prepare_manifest.json debug/ 2>/dev/null || true
+          cat debug/prepare.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: TROVE_PREPARE_DEBUG
+          path: debug
+          retention-days: 3
