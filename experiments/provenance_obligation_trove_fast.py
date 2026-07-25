@@ -122,20 +122,25 @@ def predict(blind: Path, out: Path):
             "circuit_meta": {k: m[k] for k in ("selected", "covered_weight", "atom_count", "edge_count", "index_keys")},
         })
         circuit_bytes += len(json.dumps({"a": m["atom_count"], "e": m["edge_count"], "i": m["index_keys"], "p": p}, ensure_ascii=False).encode())
-    indexed_seconds = time.perf_counter() - t0
+    production_seconds = time.perf_counter() - t0
 
-    t1 = time.perf_counter()
+    # Fair route/index audit: identical selection work, features already compiled once.
+    t_index = time.perf_counter()
+    indexed_audit = [select(r, fs, True)[0] for r, fs, _ in cached]
+    indexed_seconds = time.perf_counter() - t_index
+    t_naive = time.perf_counter()
     naive = [select(r, fs, False)[0] for r, fs, _ in cached]
-    naive_seconds = time.perf_counter() - t1
-    identical = all(x["circuit"] == y for x, y in zip(preds, naive))
+    naive_seconds = time.perf_counter() - t_naive
+    identical = all(x == y for x, y in zip(indexed_audit, naive)) and all(x["circuit"] == y for x, y in zip(preds, indexed_audit))
     payload = {
         "model": "Counterfactual_Provenance_Obligation_Circuit_V2",
         "predictions": preds,
         "storage_runtime": {
             "raw_bytes": blind.stat().st_size, "circuit_bytes": circuit_bytes,
             "storage_ratio": circuit_bytes / max(1, blind.stat().st_size),
-            "feature_seconds": feature_seconds, "indexed_seconds": indexed_seconds,
-            "naive_seconds": naive_seconds, "speedup": naive_seconds / max(indexed_seconds, 1e-9),
+            "feature_seconds": feature_seconds, "production_seconds": production_seconds,
+            "indexed_seconds": indexed_seconds, "naive_seconds": naive_seconds,
+            "speedup": naive_seconds / max(indexed_seconds, 1e-9),
             "outputs_identical": identical,
         },
         "forbidden": {"embedding": False, "tfidf": False, "pretrained_encoder": False, "llm": False, "nearest_vector": False, "external_solver": False},
