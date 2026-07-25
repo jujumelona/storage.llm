@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse,csv,gzip,json,math,random,statistics
+from collections import Counter
+from pathlib import Path
+import product_lifted_agentprocess as core
+import product_lifted_agentprocess_v2 as basev2
+import counterfactual_provenance_obligation as v1
+
+SEED=20260725
+KINDS=v1.KINDS
+
+
+def relation_name(a,b):
+    x=(a,b)
+    table={
+      ('READ','MUTATE'):'READ_TO_MUTATE',('AUTH','MUTATE'):'AUTH_TO_MUTATE',
+      ('MUTATE','VERIFY'):'MUTATE_TO_VERIFY',('VERIFY','FINAL'):'VERIFY_TO_FINAL',
+      ('READ','FINAL'):'READ_TO_FINAL',('MUTATE','FINAL'):'MUTATE_TO_FINAL',
+      ('ERROR','READ'):'ERROR_TO_RECOVERY',('ERROR','VERIFY'):'ERROR_TO_RECOVERY',
+    }
+    return table.get(x,f'{a}_TO_{b}')
+
+
+def relation_features(tr,i,pv):
+    e=tr['events'][i];root=pv.roots[i];atoms=pv.pool.atoms(root);rels=[];dist=[];same=0
+    for a in atoms:
+        j=pv.pool.atom_event.get(a,-1)
+        if not (0<=j<i):continue
+        s=tr['events'][j];sr=v1.reskey(s);trg=v1.reskey(e)
+        sm=int(sr==trg and sr!='none');same+=sm;d=i-j;dist.append(d)
+        rels.append((relation_name(s.op,e.op),s.op,s.status,sm,v1.small_bucket(d)))
+    two=[]
+    for a in atoms:
+        j=pv.pool.atom_event.get(a,-1)
+        if not (0<=j<i):continue
+        for aa in pv.pool.atoms(pv.roots[j]):
+            k=pv.pool.atom_event.get(aa,-1)
+            if 0<=k<j:
+                two.append((tr['events'][k].op,tr['events'][j].op,e.op,int(v1.reskey(tr['events'][k])==v1.reskey(e))))
+    cuts=pv.pool.cutsets(root) if pv.pool.value(root) else ()
+    mincut=min(cuts,key=lambda x:(len(x),tuple(x))) if cuts else frozenset()
+    cutrels=[]
+    for a in mincut:
+        j=pv.pool.atom_event.get(a,-1)
+        if 0<=j<i:cutrels.append(relation_name(tr['events'][j].op,e.op))
+    return {'rels':tuple(sorted(rels)),'two':tuple(sorted(set(two))[:6]),'cutrels':tuple(sorted(cutrels)),
+            'same':same,'mind':min(dist) if dist else 0,'maxd':max(dist) if dist else 0,
+            'srcops':tuple(sorted(set(x[1] for x in rels))),'nrels':len(rels)}
+
+
+def prov_keys_v2(tr,i,pv):
+    old=v1.prov_keys_original(tr,i,pv);rf=relation_features(tr,i,pv);e=tr['events'][i]
+    out=list(old)
+    for rel,src,st,sm,d in rf['rels']:
+        out.append(('EDGE',rel,st,sm,d,e.status))
+        out.append(('EDGEOP',src,e.op,sm,d))
+    for x in rf['two']:out.append(('PATH2',)+x)
+    out += [('EDGESET',rf['srcops'],e.op,v1.small_bucket(rf['nrels']),v1.small_bucket(rf['same'])),
+            ('CUTREL',rf['cutrels'],e.op,v1.small_bucket(len(rf['cutrels']))),
+            ('EDGEDIST',e.op,v1.small_bucket(rf['mind']),v1.small_bucket(rf['maxd']))]
+    return out
+
+
+def prov_score_v2(tr,i,pm,w,pv):
+    f=pv.features[i];rf=relation_features(tr,i,pv)
+    vals=[core.loglift(k,pm['total'],pm['positive'],pm['base']) for k in prov_keys_v2(tr,i,pv)]
+    emp=sum(sorted(vals,reverse=True)[:6])
+    coherent=sum(1 for r,*_ in rf['rels'] if r in {'READ_TO_MUTATE','AUTH_TO_MUTATE','MUTATE_TO_VERIFY','VERIFY_TO_FINAL','READ_TO_FINAL','MUTATE_TO_FINAL'})
+    return w['emp']*emp+w['gap']*(1-f['truth'])+w['boundary']*f['boundary']+w['tail']*math.log1p(f['false_tail'])+w['coh']*coherent+w['unique']*int(f['cut']==1 and f['fanout']>=2)
+
+
+WEIGHTS=[
+ {'emp':.10,'gap':0.,'boundary':0.,'tail':0.,'coh':.02,'unique':.02,'mix':.10},
+ {'emp':.20,'gap':.05,'boundary':.10,'tail':.02,'coh':.03,'unique':.03,'mix':.20},
+ {'emp':.35,'gap':.10,'boundary':.20,'tail':.03,'coh':.04,'unique':.04,'mix':.35},
+ {'emp':.55,'gap':.15,'boundary':.30,'tail':.04,'coh':.05,'unique':.05,'mix':.50},
+ {'emp':.80,'gap':.20,'boundary':.45,'tail':.06,'coh':.07,'unique':.07,'mix':.75},
+]
+
+
+def train_prov(traces):
+    n=Counter();p=Counter();N=P=0
+    for tr in traces:
+        pv=v1.get_prov(tr)
+        for i,e in enumerate(tr['events']):
+            N+=1;P+=int(e.first_error)
+            for k in prov_keys_v2(tr,i,pv):n[k]+=1;p[k]+=int(e.first_error)
+    return {'total':n,'positive':p,'base':(P+.7)/(N+1.4)}
+
+
+def rank01(xs):
+    if len(xs)<=1:return [0.]
+    order=sorted(range(len(xs)),key=lambda i:(xs[i],-i));r=[0.]*len(xs)
+    for j,i in enumerate(order):r[i]=j/(len(xs)-1)
+    return r
+
+
+def scores(tr,m,pm,w,kind):
+    if kind in {'current','ueta','graph','product_no_topology','product'}:return core.scores(tr,m,kind)
+    pv=v1.get_prov(tr,rewire=(kind=='provenance_rewired'),no_resource=(kind=='provenance_no_resource'))
+    ps=[prov_score_v2(tr,i,pm,w,pv) for i in range(len(tr['events']))]
+    if kind=='provenance_only':return ps
+    br=rank01(core.scores(tr,m,'product'));pr=rank01(ps)
+    return [a+w['mix']*b for a,b in zip(br,pr)]
+
+
+def predict(tr,m,pm,w,kind):
+    z=scores(tr,m,pm,w,kind);return max(range(len(z)),key=lambda i:(z[i],-i)) if z else -1
+
+def evaluate(ts,m,pm,w,kind):
