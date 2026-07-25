@@ -1,0 +1,96 @@
+name: Counterfactual Provenance Obligation ToolVQA falsification
+
+on:
+  pull_request:
+    paths:
+      - 'experiments/provenance_obligation_toolvqa.py'
+      - '.github/workflows/provenance-obligation-toolvqa.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Acquire official ToolVQA train and test
+        run: |
+          mkdir -p data
+          curl -L --fail --retry 8 --retry-all-errors \
+            'https://huggingface.co/datasets/DietCoke4671/ToolVQA/resolve/main/train.jsonl?download=true' \
+            -o data/train.jsonl
+          curl -L --fail --retry 8 --retry-all-errors \
+            'https://huggingface.co/datasets/DietCoke4671/ToolVQA/resolve/main/test.jsonl?download=true' \
+            -o data/test.jsonl
+          test $(wc -c < data/train.jsonl) -gt 50000000
+          test $(wc -c < data/test.jsonl) -gt 5000000
+
+      - name: Seal human importance labels
+        run: |
+          mkdir -p prepared sealed
+          python experiments/provenance_obligation_toolvqa.py prepare \
+            --train data/train.jsonl --test data/test.jsonl --out prepared
+          mv prepared/labels_sealed.json sealed/labels_sealed.json
+          sha256sum prepared/blind.json sealed/labels_sealed.json > sealed/input_hashes.txt
+          rm -f data/test.jsonl
+
+      - name: Blind prediction before labels are reopened
+        run: |
+          mkdir -p predictor_a predictor_b
+          cp experiments/provenance_obligation_toolvqa.py predictor_a/model.py
+          cp experiments/provenance_obligation_toolvqa.py predictor_b/model.py
+          cp prepared/blind.json predictor_a/blind.json
+          cp prepared/blind.json predictor_b/blind.json
+          python predictor_a/model.py predict \
+            --train data/train.jsonl --blind predictor_a/blind.json --out predictor_a/predictions.json
+          python predictor_b/model.py predict \
+            --train data/train.jsonl --blind predictor_b/blind.json --out predictor_b/predictions.json
+          cmp predictor_a/predictions.json predictor_b/predictions.json
+          cmp predictor_a/predictions.json.sha256 predictor_b/predictions.json.sha256
+
+      - name: Open labels and evaluate only after prediction hash
+        run: |
+          mkdir -p results
+          cp predictor_a/predictions.json predictor_a/predictions.json.sha256 results/
+          python experiments/provenance_obligation_toolvqa.py evaluate \
+            --pred results/predictions.json \
+            --labels sealed/labels_sealed.json \
+            --outdir results
+          cp prepared/prepare_manifest.json sealed/input_hashes.txt results/
+          cp experiments/provenance_obligation_toolvqa.py results/model_wrapper.py
+          python - <<'PY'
+          import ast,base64,re,zlib
+          from pathlib import Path
+          s=Path('experiments/provenance_obligation_toolvqa.py').read_text()
+          m=re.search(r"b64decode\((['\"])(.*?)\1\)",s,re.S)
+          if m:
+              Path('results/model_source.py').write_bytes(zlib.decompress(base64.b64decode(ast.literal_eval(m.group(1)+m.group(2)+m.group(1)))))
+          PY
+          python -m py_compile results/model_source.py
+          cat results/summary.json
+
+      - name: Package evidence
+        run: |
+          cp data/train.jsonl /tmp/train_manifest_source.jsonl
+          python - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          p=Path('/tmp/train_manifest_source.jsonl')
+          out={'train_bytes':p.stat().st_size,'train_sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+          Path('results/train_manifest.json').write_text(json.dumps(out,indent=2))
+          PY
+          cd results
+          zip -9 -r ../COUNTERFACTUAL_PROVENANCE_OBLIGATION_TOOLVQA_RESULTS.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: COUNTERFACTUAL_PROVENANCE_OBLIGATION_TOOLVQA_RESULTS
+          path: COUNTERFACTUAL_PROVENANCE_OBLIGATION_TOOLVQA_RESULTS.zip
+          retention-days: 7
