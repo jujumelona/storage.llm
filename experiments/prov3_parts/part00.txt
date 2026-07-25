@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse,csv,gzip,json,math,random,statistics
+from collections import Counter,defaultdict,deque
+from pathlib import Path
+import product_lifted_agentprocess as core
+import product_lifted_agentprocess_v2 as basev2
+import counterfactual_provenance_obligation as v1
+import counterfactual_provenance_obligation_v2 as relv2
+
+SEED=20260725
+BASE_KINDS=('current','ueta','graph','product_no_topology','product')
+KINDS=BASE_KINDS+('provenance_lifted','provenance_lifted_rewired','provenance_lifted_no_resource')
+
+
+def lstate(tr,i,pv,coarse=False):
+    e=tr['events'][i];f=pv.features[i];rf=relv2.relation_features(tr,i,pv)
+    rel=tuple(sorted(set(x[0] for x in rf['rels'])))[:3]
+    if coarse:
+        return (e.op,e.status,e.mask,int(f['truth']),f['boundary'],v1.small_bucket(f['cut']),v1.small_bucket(rf['same']))
+    return (core.pstate(e),int(f['truth']),f['boundary'],v1.small_bucket(f['support']),v1.small_bucket(f['cut']),v1.small_bucket(rf['same']),rel)
+
+
+def build_graph(traces,rewire=False,no_resource=False):
+    graph=defaultdict(Counter);states=set();n=Counter();p=Counter();cn=Counter();cp=Counter()
+    for tr in traces:
+        pv=v1.get_prov(tr,rewire=rewire,no_resource=no_resource);seq=[]
+        for i,e in enumerate(tr['events']):
+            s=lstate(tr,i,pv);c=lstate(tr,i,pv,True);seq.append(s);states.add(s);n[s]+=1;p[s]+=int(e.first_error);cn[c]+=1;cp[c]+=int(e.first_error)
+        for a,b in zip(seq,seq[1:]):graph[a][b]+=1
+    return {'graph':graph,'states':states,'n':n,'p':p,'cn':cn,'cp':cp}
+
+
+def closure(graph,states,bad):
+    u=set(bad);changed=True
+    while changed:
+        changed=False
+        for s in states-u:
+            succ=set(graph.get(s,{}))
+            if succ and succ<=u:u.add(s);changed=True
+    return u
+
+
+def distances(graph,bad):
+    rev=defaultdict(set)
+    for a,zs in graph.items():
+        for z in zs:rev[z].add(a)
+    d={s:0 for s in bad};q=deque(bad)
+    while q:
+        x=q.popleft()
+        for y in rev.get(x,()):
+            if y not in d:d[y]=d[x]+1;q.append(y)
+    return d
+
+CONFIGS=[]
+for support in (2,3,5):
+  for precision in (.20,.30,.40,.50):
+    for margin in (0.,.10,.20,.35):
+      CONFIGS.append({'support':support,'precision':precision,'margin':margin,'unavoidable_bonus':1.0,'distance_bonus':.35})
+
+
+def train_lifted(traces,cfg,rewire=False,no_resource=False):
+    m=build_graph(traces,rewire,no_resource);bad=set()
+    for s in m['states']:
+        post=(m['p'][s]+.7)/(m['n'][s]+1.4)
+        hard=s[0][2] if isinstance(s[0],tuple) and len(s[0])>2 else 0
+        if m['n'][s]>=cfg['support'] and post>=cfg['precision']:bad.add(s)
+        if hard>=4:bad.add(s)
+    m['bad']=bad;m['unavoidable']=closure(m['graph'],m['states'],bad);m['distance']=distances(m['graph'],bad);m['cfg']=cfg
+    return m
+
+
+def posterior(tr,i,pv,m):
+    s=lstate(tr,i,pv);c=lstate(tr,i,pv,True)
+    exact=(m['p'][s]+.7)/(m['n'][s]+1.4) if m['n'][s] else 0.
+    coarse=(m['cp'][c]+.7)/(m['cn'][c]+1.4) if m['cn'][c] else 0.
+    return max(exact,coarse),m['n'][s]
+
+
+def lifted_predict(tr,base_model,lm,rewire=False,no_resource=False):
+    if not tr['events']:return -1
+    base=core.predict(tr,base_model,'product');pv=v1.get_prov(tr,rewire=rewire,no_resource=no_resource)
+    seq=[lstate(tr,i,pv) for i in range(len(tr['events']))]
+    candidates=[]
+    for i,s in enumerate(seq):
+        entered=s in lm['unavoidable'] and (i==0 or seq[i-1] not in lm['unavoidable'])
+        if not entered:continue
+        post,sup=posterior(tr,i,pv,lm);bp,_=posterior(tr,base,pv,lm)
+        margin=post-bp
+        if sup>=lm['cfg']['support'] and margin>=lm['cfg']['margin']:
+            f=pv.features[i]
+            candidates.append((i,post,margin,f['boundary'],f['false_tail']))
+    if candidates:return min(candidates,key=lambda x:x[0])[0]
+    return base
+
+
+def evaluate(ts,base_model,lm,kind):
+    xs=[t for t in ts if t['has_error'] and t['events']];gold=[next(i for i,e in enumerate(t['events']) if e.first_error) for t in xs]
+    if kind in BASE_KINDS:pred=[core.predict(t,base_model,kind) for t in xs]
+    else:pred=[lifted_predict(t,base_model,lm,rewire=kind.endswith('rewired'),no_resource=kind.endswith('no_resource')) for t in xs]
+    return {'n':len(gold),'exact':v1.acc(pred,gold),'near1':v1.near(pred,gold),'pred':pred,'gold':gold,'tids':[t['tid'] for t in xs],'datasets':[t['dataset'] for t in xs]}
+
+
+def choose_cfg(train,val,base_cfg):
+    bm=core.train_model(train,base_cfg);best=None
+    for cfg in CONFIGS:
+        lm=train_lifted(train,cfg);ev=evaluate(val,bm,lm,'provenance_lifted')
+        rw=train_lifted(train,cfg,rewire=True);er=evaluate(val,bm,rw,'provenance_lifted_rewired')
