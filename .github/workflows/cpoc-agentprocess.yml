@@ -1,0 +1,79 @@
+name: Counterfactual Provenance-Obligation Circuit strict falsification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/cpoc-agentprocess.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Materialize frozen experiment
+        run: |
+          echo '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' | base64 -d | gzip -d > experiments/cpoc_agentprocess.py
+          python -m py_compile experiments/product_lifted_agentprocess.py experiments/product_lifted_agentprocess_v2.py experiments/product_lifted_agentprocess_v3.py experiments/cpoc_agentprocess.py
+          sha256sum experiments/cpoc_agentprocess.py | tee /tmp/cpoc_code.sha256
+      - name: Acquire AgentProcessBench
+        run: |
+          python -m pip install -q 'huggingface_hub>=0.28'
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download(repo_id='LulaCola/AgentProcessBench',repo_type='dataset',local_dir='/tmp/AgentProcessBench')
+          PY
+      - name: Run strict falsification
+        run: |
+          set -euxo pipefail
+          rm -rf cpoc_results
+          python -u experiments/cpoc_agentprocess.py --data /tmp/AgentProcessBench --out cpoc_results | tee cpoc_results.log
+          cp cpoc_results.log cpoc_results/run.log
+          cp experiments/cpoc_agentprocess.py cpoc_results/
+          cp /tmp/cpoc_code.sha256 cpoc_results/
+          cp experiments/product_lifted_agentprocess.py experiments/product_lifted_agentprocess_v2.py experiments/product_lifted_agentprocess_v3.py cpoc_results/
+          cat cpoc_results/summary.json
+      - name: Determinism replay
+        run: |
+          set -euxo pipefail
+          rm -rf cpoc_replay
+          python -u experiments/cpoc_agentprocess.py --data /tmp/AgentProcessBench --out cpoc_replay >/tmp/cpoc_replay.log
+          cmp cpoc_results/predictions.csv cpoc_replay/predictions.csv
+          cmp cpoc_results/evidence_deletion_witnesses.json cpoc_replay/evidence_deletion_witnesses.json
+          python - <<'PY'
+          import gzip,json
+          a=json.load(gzip.open('cpoc_results/CPOC_SINGLE_CHECKPOINT.json.gz','rt'))
+          b=json.load(gzip.open('cpoc_replay/CPOC_SINGLE_CHECKPOINT.json.gz','rt'))
+          assert a==b
+          sa=json.load(open('cpoc_results/summary.json'));sb=json.load(open('cpoc_replay/summary.json'))
+          sa.pop('load_seconds',None);sb.pop('load_seconds',None)
+          for x in (sa,sb):
+              r=x.get('storage_runtime',{})
+              for k in ('indexed_seconds','naive_seconds','speedup'):r.pop(k,None)
+          assert sa==sb
+          PY
+          echo true > cpoc_results/deterministic_replay.txt
+      - name: Package
+        if: always()
+        run: |
+          python - <<'PY'
+          import pathlib,shutil
+          if pathlib.Path('cpoc_results').exists():
+              shutil.make_archive('CPOC_AGENTPROCESS_RESULTS','zip','cpoc_results')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: CPOC_AGENTPROCESS_RESULTS
+          path: |
+            CPOC_AGENTPROCESS_RESULTS.zip
+            cpoc_results/
+          retention-days: 7
