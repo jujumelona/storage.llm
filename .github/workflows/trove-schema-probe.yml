@@ -26,7 +26,7 @@ jobs:
             -o trove_dataset.bin
           mkdir -p TROVE_DATA probe
           python - <<'PY'
-          import json,zipfile,tarfile
+          import json,zipfile,tarfile,traceback
           from pathlib import Path
           p=Path('trove_dataset.bin');out=Path('TROVE_DATA')
           if zipfile.is_zipfile(p):
@@ -36,19 +36,26 @@ jobs:
           else:raise RuntimeError('unknown archive')
           report=[]
           for fp in sorted(out.rglob('*.jsonl')):
-              first=None
-              with fp.open(encoding='utf-8',errors='ignore') as f:
-                  for line in f:
-                      if line.strip():first=json.loads(line);break
-              if first is None:continue
-              item={'path':str(fp.relative_to(out)),'keys':sorted(first),'types':{k:type(v).__name__ for k,v in first.items()}}
-              for k in ('target_sent','prompt_global','ground_truth_global','input_sentences','input_sentence_indices','input_doc_indices','combine_retriver'):
-                  if k in first:item[k+'_sample']=str(first[k])[:5000]
+              item={'path':str(fp.relative_to(out)),'size':fp.stat().st_size}
+              try:
+                  first=None
+                  with fp.open(encoding='utf-8',errors='ignore') as f:
+                      for line in f:
+                          if not line.strip():continue
+                          try:first=json.loads(line);break
+                          except Exception as e:item['first_parse_error']=type(e).__name__+':'+str(e)[:300]
+                  if isinstance(first,dict):
+                      item['keys']=sorted(first);item['types']={k:type(v).__name__ for k,v in first.items()}
+                      for k in ('target_sent','prompt_global','ground_truth_global','input_sentences','input_sentence_indices','input_doc_indices','combine_retriver'):
+                          if k in first:item[k+'_sample']=str(first[k])[:5000]
+                  else:item['error']='no dict record'
+              except Exception as e:item['error']=type(e).__name__+':'+str(e)[:500]
               report.append(item)
           Path('probe/schema.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-          print('files',len(report))
+          print('files',len(report),'with_keys',sum('keys' in x for x in report))
           PY
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: TROVE_SCHEMA_PROBE
           path: probe/schema.json
