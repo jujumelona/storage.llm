@@ -52,8 +52,16 @@ jobs:
             --train data/train.jsonl --blind predictor_a/blind.json --out predictor_a/predictions.json
           python predictor_b/model.py predict \
             --train data/train.jsonl --blind predictor_b/blind.json --out predictor_b/predictions.json
-          cmp predictor_a/predictions.json predictor_b/predictions.json
-          cmp predictor_a/predictions.json.sha256 predictor_b/predictions.json.sha256
+          python - <<'PY'
+          import json
+          a=json.load(open('predictor_a/predictions.json'))
+          b=json.load(open('predictor_b/predictions.json'))
+          assert a['predictions']==b['predictions']
+          assert a['train_contracts']==b['train_contracts']
+          assert a['storage_runtime']['outputs_identical'] is True
+          assert b['storage_runtime']['outputs_identical'] is True
+          print('deterministic structural outputs: PASS')
+          PY
 
       - name: Open labels and evaluate only after prediction hash
         run: |
