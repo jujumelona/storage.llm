@@ -1,0 +1,50 @@
+        key=(ev['exact'],ev['near1'],ev['exact']-er['exact'],-cfg['margin'],-cfg['support'])
+        if best is None or key>best[0]:best=(key,cfg)
+    return dict(best[1])
+
+
+def fold_eval(ts):
+    agg={k:{'pred':[],'gold':[],'tids':[],'datasets':[]} for k in KINDS};folds=[]
+    for f in range(5):
+        test=[t for t in ts if core.hashfold(t['tid'])==f];rest=[t for t in ts if core.hashfold(t['tid'])!=f]
+        val=[t for t in rest if core.stable_int('v:'+t['tid'])%5==0];train=[t for t in rest if t not in val]
+        bcfg=core.choose(train,val);cfg=choose_cfg(train,val,bcfg);bm=core.train_model(rest,bcfg);lm=train_lifted(rest,cfg)
+        row={'fold':f,'base_cfg':bcfg,'lifted_cfg':cfg,'lifted_states':len(lm['states']),'unavoidable':len(lm['unavoidable'])}
+        for k in KINDS:
+            use=lm if k=='provenance_lifted' or k in BASE_KINDS else train_lifted(rest,cfg,rewire=k.endswith('rewired'),no_resource=k.endswith('no_resource'))
+            e=evaluate(test,bm,use,k);row[k]={'n':e['n'],'exact':e['exact'],'near1':e['near1']}
+            for q in ('pred','gold','tids','datasets'):agg[k][q]+=e[q]
+        folds.append(row)
+    met={k:{'n':len(x['gold']),'exact':v1.acc(x['pred'],x['gold']),'near1':v1.near(x['pred'],x['gold'])} for k,x in agg.items()}
+    return met,agg,folds
+
+
+def holdouts(ts):
+    rows=[]
+    for ds in core.DATASETS:
+        test=[t for t in ts if t['dataset']==ds];rest=[t for t in ts if t['dataset']!=ds]
+        val=[t for t in rest if core.stable_int('h:'+t['tid'])%5==0];train=[t for t in rest if t not in val]
+        bcfg=core.choose(train,val);cfg=choose_cfg(train,val,bcfg);bm=core.train_model(rest,bcfg);lm=train_lifted(rest,cfg)
+        row={'heldout':ds,'base_cfg':bcfg,'lifted_cfg':cfg}
+        for k in KINDS:
+            use=lm if k=='provenance_lifted' or k in BASE_KINDS else train_lifted(rest,cfg,rewire=k.endswith('rewired'),no_resource=k.endswith('no_resource'))
+            e=evaluate(test,bm,use,k);row[k]={'n':e['n'],'exact':e['exact'],'near1':e['near1']}
+        rows.append(row)
+    return rows
+
+
+def main():
+    ap=argparse.ArgumentParser();ap.add_argument('--data',required=True);ap.add_argument('--out',required=True);a=ap.parse_args();out=Path(a.out);out.mkdir(parents=True,exist_ok=True)
+    v1.prov_keys_original=v1.prov_keys;ts=core.load_all(a.data);met,agg,folds=fold_eval(ts);ho=holdouts(ts)
+    bp=v1.paired_bootstrap(agg,'provenance_lifted','product');br=v1.paired_bootstrap(agg,'provenance_lifted','provenance_lifted_rewired');bc=v1.paired_bootstrap(agg,'provenance_lifted','current')
+    cf,wit=v1.circuit_counterfactual(ts);st=v1.storage_runtime(ts);hd=[x['provenance_lifted']['exact']-x['product']['exact'] for x in ho]
+    strict={'reproduces_frozen_product':abs(met['product']['exact']-.511400651465798)<.005,'beats_product':met['provenance_lifted']['exact']>met['product']['exact'],'bootstrap_product_positive':bp['bootstrap_95_ci'][0]>0,'rewire_drop_1pp':met['provenance_lifted']['exact']>=met['provenance_lifted_rewired']['exact']+.01,'bootstrap_rewire_positive':br['bootstrap_95_ci'][0]>0,'all_holdouts_nonnegative':all(x>=-1e-12 for x in hd),'cut_proof':cf['minimal_cut_proof_rate']>=.99,'cut_auc':cf['cut_vs_random_downstream_auc']>=.65,'storage':st['compact_vs_expanded_ratio']<1}
+    summary={'benchmark':'AgentProcessBench','architecture':'Provenance-Lifted Obligation Product Graph V3','trajectories':len(ts),'events':sum(len(t['events']) for t in ts),'oof':met,'folds':folds,'dataset_holdout':ho,'paired_vs_product':bp,'paired_vs_rewired':br,'paired_vs_current':bc,'counterfactual':cf,'storage_runtime':st,'strict':strict,'overall_pass':all(strict.values())}
+    rows=[]
+    for k,x in agg.items():
+      for tid,ds,p,g in zip(x['tids'],x['datasets'],x['pred'],x['gold']):rows.append({'model':k,'tid':tid,'dataset':ds,'pred_position':p,'gold_position':g,'correct':p==g})
+    with (out/'predictions.csv').open('w',newline='',encoding='utf-8') as f:w=csv.DictWriter(f,fieldnames=rows[0]);w.writeheader();w.writerows(rows)
+    (out/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8');(out/'witnesses.json').write_text(json.dumps(wit,indent=2),encoding='utf-8')
+    with gzip.open(out/'PROVENANCE_LIFTED_GRAPH_CHECKPOINT.json.gz','wt') as f:json.dump({'architecture':summary['architecture'],'folds':folds,'no_dense':True},f)
+    print(json.dumps(summary,indent=2))
+if __name__=='__main__':main()
