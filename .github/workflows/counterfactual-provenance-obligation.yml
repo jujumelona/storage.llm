@@ -1,0 +1,94 @@
+name: Counterfactual Provenance-Obligation Circuit falsification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/prov_parts/**'
+      - '.github/workflows/counterfactual-provenance-obligation.yml'
+      - 'experiments/product_lifted_agentprocess.py'
+      - 'experiments/product_lifted_agentprocess_v2.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Acquire public AgentProcessBench
+        run: |
+          python -m pip install -q 'huggingface_hub>=0.28'
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download(repo_id='LulaCola/AgentProcessBench', repo_type='dataset', local_dir='/tmp/AgentProcessBench')
+          PY
+      - name: Assemble and syntax-check frozen circuit
+        run: |
+          set -euxo pipefail
+          cat experiments/prov_parts/part*.txt > experiments/counterfactual_provenance_obligation.py
+          python -m py_compile \
+            experiments/product_lifted_agentprocess.py \
+            experiments/product_lifted_agentprocess_v2.py \
+            experiments/counterfactual_provenance_obligation.py
+          sha256sum experiments/counterfactual_provenance_obligation.py | tee circuit_source.sha256
+      - name: Run strict 5-fold and dataset-holdout falsification
+        run: |
+          set -euxo pipefail
+          rm -rf provenance_obligation_results
+          python -u experiments/counterfactual_provenance_obligation.py \
+            --data /tmp/AgentProcessBench \
+            --out provenance_obligation_results \
+            | tee provenance_obligation_results.log
+          cp provenance_obligation_results.log provenance_obligation_results/run.log
+          cp circuit_source.sha256 provenance_obligation_results/
+          cp experiments/counterfactual_provenance_obligation.py provenance_obligation_results/
+          cp experiments/product_lifted_agentprocess.py experiments/product_lifted_agentprocess_v2.py provenance_obligation_results/
+          cat provenance_obligation_results/summary.json
+      - name: Deterministic replay
+        run: |
+          set -euxo pipefail
+          rm -rf provenance_obligation_replay
+          python -u experiments/counterfactual_provenance_obligation.py \
+            --data /tmp/AgentProcessBench \
+            --out provenance_obligation_replay >/tmp/prov_replay.log
+          cmp provenance_obligation_results/predictions.csv provenance_obligation_replay/predictions.csv
+          cmp provenance_obligation_results/counterfactual_witnesses.json provenance_obligation_replay/counterfactual_witnesses.json
+          python - <<'PY'
+          import gzip, json
+          a=json.load(gzip.open('provenance_obligation_results/PROVENANCE_OBLIGATION_SINGLE_CHECKPOINT.json.gz','rt'))
+          b=json.load(gzip.open('provenance_obligation_replay/PROVENANCE_OBLIGATION_SINGLE_CHECKPOINT.json.gz','rt'))
+          assert a==b
+          a=json.load(open('provenance_obligation_results/summary.json'))
+          b=json.load(open('provenance_obligation_replay/summary.json'))
+          for x in (a,b):
+              r=x.get('storage_runtime',{})
+              r.pop('memoized_seconds',None)
+              r.pop('recursive_seconds',None)
+              r.pop('evaluation_speedup',None)
+          assert a==b
+          PY
+          echo true > provenance_obligation_results/deterministic_replay.txt
+      - name: Package
+        if: always()
+        run: |
+          python - <<'PY'
+          import pathlib, shutil
+          p=pathlib.Path('provenance_obligation_results')
+          if p.exists():
+              shutil.make_archive('COUNTERFACTUAL_PROVENANCE_OBLIGATION_RESULTS','zip',p)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: COUNTERFACTUAL_PROVENANCE_OBLIGATION_RESULTS
+          path: |
+            COUNTERFACTUAL_PROVENANCE_OBLIGATION_RESULTS.zip
+            provenance_obligation_results/
+          retention-days: 7
