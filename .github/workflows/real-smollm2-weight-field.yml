@@ -5,6 +5,10 @@ on:
     paths:
       - ".github/workflows/real-smollm2-weight-field.yml"
       - "experiments/real_smollm2_weight_field.py"
+  pull_request:
+    paths:
+      - ".github/workflows/real-smollm2-weight-field.yml"
+      - "experiments/real_smollm2_weight_field.py"
   workflow_dispatch:
 
 permissions:
