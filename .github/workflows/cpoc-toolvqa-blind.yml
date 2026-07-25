@@ -1,0 +1,92 @@
+name: CPOC ToolVQA annotation-sealed blind falsification
+
+on:
+  pull_request:
+    paths:
+      - 'experiments/cpoc_toolvqa_blind.py'
+      - '.github/workflows/cpoc-toolvqa-blind.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Acquire fixed public ToolVQA data
+        run: |
+          python -m pip install -q 'huggingface_hub>=0.34' hf_xet
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          from pathlib import Path
+          import shutil
+          d=Path('data');d.mkdir(exist_ok=True)
+          for n in ('train.jsonl','test.jsonl'):
+              shutil.copy2(hf_hub_download('DietCoke4671/ToolVQA',n,repo_type='dataset'),d/n)
+          PY
+          echo 'f5b42611308af053a9eaf927417cf167eb539763a319fa05a79568b64b281e25  data/train.jsonl' | sha256sum -c -
+          echo '4986ef5714da0259f8de66179ddeea4361c83642a74ade9d2bb879a4f2b11e20  data/test.jsonl' | sha256sum -c -
+      - name: Compile blind records and seal annotation labels
+        run: |
+          python -m py_compile experiments/cpoc_toolvqa_blind.py
+          python experiments/cpoc_toolvqa_blind.py prepare --input data/train.jsonl --out prepared_train
+          python experiments/cpoc_toolvqa_blind.py prepare --input data/test.jsonl --out prepared_test
+          mkdir blind_only sealed
+          cp prepared_train/blind.jsonl blind_only/train.jsonl
+          cp prepared_test/blind.jsonl blind_only/test.jsonl
+          cp prepared_test/labels_sealed.json sealed/labels.json
+          cp prepared_test/prepare.json sealed/prepare.json
+          rm -rf prepared_train prepared_test data
+          test ! -e blind_only/labels_sealed.json
+      - name: Blind prediction without thought annotations
+        run: |
+          python experiments/cpoc_toolvqa_blind.py predict --train blind_only/train.jsonl --test blind_only/test.jsonl --labels-guard blind_only/labels_sealed.json --out predictions.json
+      - name: Deterministic blind replay
+        run: |
+          python experiments/cpoc_toolvqa_blind.py predict --train blind_only/train.jsonl --test blind_only/test.jsonl --labels-guard blind_only/labels_sealed.json --out predictions_replay.json
+          python - <<'PY'
+          import json
+          a=json.load(open('predictions.json'));b=json.load(open('predictions_replay.json'))
+          a.pop('runtime_seconds',None);b.pop('runtime_seconds',None)
+          assert a==b
+          print('DETERMINISTIC_BLIND_REPLAY_PASS')
+          PY
+      - name: Open sealed annotation provenance only after prediction
+        run: |
+          python experiments/cpoc_toolvqa_blind.py evaluate --predictions predictions.json --labels sealed/labels.json --out final_summary.json
+      - name: Package all outcomes including failures
+        run: |
+          mkdir -p CPOC_TOOLVQA_BLIND_PROOF/code CPOC_TOOLVQA_BLIND_PROOF/results
+          cp experiments/cpoc_toolvqa_blind.py .github/workflows/cpoc-toolvqa-blind.yml CPOC_TOOLVQA_BLIND_PROOF/code/
+          cp predictions.json predictions.json.sha256 final_summary.json sealed/prepare.json CPOC_TOOLVQA_BLIND_PROOF/results/
+          cat > CPOC_TOOLVQA_BLIND_PROOF/README.txt <<'EOF'
+          Annotation-sealed external falsification of Counterfactual Provenance-Obligation Circuit.
+
+          Predictor-visible fields:
+          - tool names
+          - tool outputs
+          - actual tool input arguments
+          - final answer claim
+
+          Withheld until predictions were fixed:
+          - thought
+          - thought_query
+          - thought_choose
+          - independently compiled bridge-evidence labels
+
+          Contracts are learned only from public ToolVQA train records. Test thresholds are not tuned.
+          TRACE-Bench provenance annotations were not publicly discoverable, so this uses its public ToolVQA source benchmark.
+          EOF
+          sha256sum CPOC_TOOLVQA_BLIND_PROOF/code/* CPOC_TOOLVQA_BLIND_PROOF/results/* > CPOC_TOOLVQA_BLIND_PROOF/SHA256SUMS.txt
+          zip -qr CPOC_TOOLVQA_BLIND_PROOF.zip CPOC_TOOLVQA_BLIND_PROOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CPOC_TOOLVQA_BLIND_PROOF
+          path: CPOC_TOOLVQA_BLIND_PROOF.zip
+          retention-days: 7
