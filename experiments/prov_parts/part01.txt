@@ -1,0 +1,149 @@
+        elif node[0] == "FALSE":
+            cuts = tuple()
+        elif node[0] == "AND":
+            # An AND is false when any one child is false.
+            cuts = self._minimal(itertools.chain.from_iterable(self.cutsets(c) for c in node[1]))
+        elif node[0] == "OR":
+            # An OR is false only when every child is false.
+            child = [self.cutsets(c) for c in node[1]]
+            if any(not x for x in child):
+                cuts = tuple()
+            else:
+                combos = []
+                for choice in itertools.product(*child):
+                    combos.append(frozenset().union(*choice))
+                    if len(combos) > 4096:
+                        break
+                cuts = self._minimal(combos)
+        else:
+            raise ValueError(node[0])
+        self._cut_cache[root] = cuts
+        return cuts
+
+    def compact_bytes(self) -> int:
+        payload = []
+        for n in self.nodes:
+            if n[0] in {"AND", "OR"}:
+                payload.append((n[0], list(n[1])))
+            else:
+                payload.append(n)
+        return len(json.dumps(payload, separators=(",", ":")).encode())
+
+    def expanded(self, root: int):
+        n = self.nodes[root]
+        if n[0] in {"AND", "OR"}:
+            return [n[0], [self.expanded(c) for c in n[1]]]
+        return list(n)
+
+
+@dataclass
+class ProvTrace:
+    pool: GatePool
+    roots: list[int]
+    evidence_by_event: dict[int, int]
+    features: list[dict]
+    real_dependencies: list[tuple[int, int]]
+
+
+def reskey(e, no_resource=False) -> str:
+    if no_resource:
+        return "any"
+    return e.resources[0] if e.resources else "none"
+
+
+def compile_provenance(tr, rewire=False, no_resource=False) -> ProvTrace:
+    pool = GatePool()
+    roots: list[int] = []
+    evidence_by_event: dict[int, int] = {}
+    deps: list[tuple[int, int]] = []
+    latest_evidence: dict[str, list[int]] = defaultdict(list)
+    latest_claim: dict[str, list[int]] = defaultdict(list)
+    latest_mutation: dict[str, int] = {}
+    latest_auth: list[int] = []
+    all_evidence: list[int] = []
+
+    def semantic_candidates(i: int, key: str, preferred=None) -> list[int]:
+        cand: list[int] = []
+        if preferred:
+            for k in preferred:
+                cand.extend(latest_evidence.get(k, [])[-2:])
+                cand.extend(latest_claim.get(k, [])[-1:])
+        cand.extend(latest_evidence.get(key, [])[-3:])
+        cand.extend(latest_claim.get(key, [])[-2:])
+        if not cand:
+            cand.extend(all_evidence[-2:])
+        cand = list(dict.fromkeys(cand))
+        if rewire and all_evidence:
+            earlier = [a for a in all_evidence if pool.atom_event.get(a, -1) < i]
+            if earlier:
+                count = min(max(1, len(cand)), min(2, len(earlier)))
+                start = stable_int(f"rw:{tr['tid']}:{i}:{key}") % len(earlier)
+                cand = [earlier[(start + j * 3) % len(earlier)] for j in range(count)]
+        return cand
+
+    for i, e in enumerate(tr["events"]):
+        key = reskey(e, no_resource)
+        current_atom = None
+        if e.status in OBSERVED:
+            current_atom = pool.atom(f"OBS:{i}:{e.op}:{e.status}:{key}", i)
+            evidence_by_event[i] = current_atom
+            all_evidence.append(current_atom)
+        confirm_atom = None
+        if "USER:CONFIRM" in e.atoms:
+            confirm_atom = pool.atom(f"USER_CONFIRM:{i}", i)
+            all_evidence.append(confirm_atom)
+        policy_auth = "POLICY:AUTH" in e.atoms
+        policy_confirm = "POLICY:CONFIRM" in e.atoms
+
+        if e.status in {"ERROR", "NO_RESULT"}:
+            root = pool.false
+        elif e.op == "READ":
+            root = current_atom if current_atom is not None and e.status == "SUCCESS" else pool.false
+        elif e.op == "AUTH":
+            root = current_atom if current_atom is not None and e.status == "SUCCESS" else pool.false
+        elif e.op == "VERIFY":
+            req = []
+            if key in latest_mutation:
+                req.append(latest_mutation[key])
+            if current_atom is not None and e.status == "SUCCESS":
+                req.append(current_atom)
+            root = pool.AND(*req) if req else pool.false
+        elif e.op == "MUTATE":
+            req = []
+            support = semantic_candidates(i, key)
+            if support:
+                req.append(pool.OR(*support))
+            if policy_auth:
+                req.append(pool.OR(*latest_auth[-2:]) if latest_auth else pool.false)
+            if policy_confirm:
+                req.append(confirm_atom if confirm_atom is not None else pool.false)
+            if current_atom is not None and e.status == "SUCCESS":
+                req.append(current_atom)
+            root = pool.AND(*req) if req else pool.false
+        elif e.op == "EXECUTE":
+            req = semantic_candidates(i, key)
+            if key in latest_mutation:
+                req.append(latest_mutation[key])
+            if current_atom is not None and e.status == "SUCCESS":
+                req.append(current_atom)
+            root = pool.AND(pool.OR(*req[:-1]), req[-1]) if len(req) > 1 else (req[0] if req else pool.false)
+        elif e.op == "FINAL":
+            supports = []
+            for k in sorted(latest_claim):
+                supports.extend(latest_claim[k][-1:])
+            supports = supports[-6:]
+            support_root = pool.OR(*supports) if supports else pool.false
+            unresolved = e.mask & (
+                core.UNRESOLVED_ERROR
+                | core.NEED_VERIFY
+                | core.PARTIAL_EVIDENCE
+                | core.NEED_AUTH
+                | core.NEED_CONFIRM
+                | core.UNSUPPORTED
+            )
+            root = pool.AND(support_root, pool.false if unresolved else pool.true)
+        elif e.op in {"PLAN", "ASK"}:
+            # Planning and clarification do not claim tool-grounded completion.
+            root = pool.true
+        else:
+            support = semantic_candidates(i, key)
