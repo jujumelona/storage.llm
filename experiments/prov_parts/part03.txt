@@ -1,0 +1,149 @@
+    pred = [predict(tr, model, pm, weights, kind) for tr in xs]
+    return {
+        "n": len(xs),
+        "exact": acc(pred, gold),
+        "near1": near(pred, gold),
+        "pred": pred,
+        "gold": gold,
+        "tids": [tr["tid"] for tr in xs],
+        "datasets": [tr["dataset"] for tr in xs],
+    }
+
+
+def choose_provenance(train, val, base_cfg):
+    m = core.train_model(train, base_cfg)
+    pm = train_prov(train)
+    best = None
+    for w in PROV_WEIGHTS:
+        ev = evaluate(val, m, pm, w, "provenance_product")
+        rw = evaluate(val, m, pm, w, "provenance_rewired")
+        key = (ev["exact"], ev["near1"], ev["exact"] - rw["exact"], -w["emp"])
+        if best is None or key > best[0]:
+            best = (key, w)
+    return dict(best[1])
+
+
+def fold_eval(traces):
+    aggregate = {k: {"pred": [], "gold": [], "tids": [], "datasets": []} for k in KINDS}
+    folds = []
+    for fold in range(5):
+        test = [t for t in traces if core.hashfold(t["tid"]) == fold]
+        rest = [t for t in traces if core.hashfold(t["tid"]) != fold]
+        val = [t for t in rest if stable_int("pv:" + t["tid"]) % 5 == 0]
+        train = [t for t in rest if t not in val]
+        cfg = core.choose(train, val)
+        weights = choose_provenance(train, val, cfg)
+        model = core.train_model(rest, cfg)
+        pm = train_prov(rest)
+        row = {"fold": fold, "train": len(rest), "test": len(test), "cfg": cfg, "prov_weights": weights}
+        for kind in KINDS:
+            ev = evaluate(test, model, pm, weights, kind)
+            row[kind] = {"n": ev["n"], "exact": ev["exact"], "near1": ev["near1"]}
+            for field in ("pred", "gold", "tids", "datasets"):
+                aggregate[kind][field].extend(ev[field])
+        folds.append(row)
+    metrics = {k: {"n": len(v["gold"]), "exact": acc(v["pred"], v["gold"]), "near1": near(v["pred"], v["gold"])} for k, v in aggregate.items()}
+    return metrics, aggregate, folds
+
+
+def dataset_holdout(traces):
+    rows = []
+    for ds in core.DATASETS:
+        test = [t for t in traces if t["dataset"] == ds]
+        rest = [t for t in traces if t["dataset"] != ds]
+        val = [t for t in rest if stable_int("ph:" + t["tid"]) % 5 == 0]
+        train = [t for t in rest if t not in val]
+        cfg = core.choose(train, val)
+        weights = choose_provenance(train, val, cfg)
+        model = core.train_model(rest, cfg)
+        pm = train_prov(rest)
+        row = {"heldout": ds, "train": len(rest), "test": len(test), "cfg": cfg, "prov_weights": weights}
+        for kind in KINDS:
+            ev = evaluate(test, model, pm, weights, kind)
+            row[kind] = {"n": ev["n"], "exact": ev["exact"], "near1": ev["near1"]}
+        rows.append(row)
+    return rows
+
+
+def paired_bootstrap(agg, a, b, n=10000):
+    A, B = agg[a], agg[b]
+    vals = [int(p == g) - int(q == g) for p, q, g in zip(A["pred"], B["pred"], A["gold"])]
+    rng = random.Random(SEED + stable_int(a + b) % 100000)
+    boots = []
+    for _ in range(n):
+        boots.append(sum(vals[rng.randrange(len(vals))] for _ in vals) / len(vals))
+    boots.sort()
+    improved = sum(x > 0 for x in vals)
+    degraded = sum(x < 0 for x in vals)
+    return {
+        "gain": statistics.mean(vals),
+        "bootstrap_95_ci": [boots[int(0.025 * n)], boots[int(0.975 * n)]],
+        "improved": improved,
+        "degraded": degraded,
+    }
+
+
+def learn_bigram(traces):
+    edge = Counter()
+    source = Counter()
+    for tr in traces:
+        for a, b in zip(tr["events"], tr["events"][1:]):
+            edge[(core.pstate(a), core.pstate(b))] += 1
+            source[core.pstate(a)] += 1
+    return edge, source
+
+
+def bigram_anomaly(events, bg):
+    edge, source = bg
+    if len(events) < 2:
+        return 0.0
+    vals = []
+    for a, b in zip(events, events[1:]):
+        s = core.pstate(a)
+        vals.append(-math.log((edge[(s, core.pstate(b))] + 1) / (source[s] + 30)))
+    return sum(vals) / len(vals)
+
+
+def circuit_counterfactual(traces):
+    records = []
+    cut_anomaly, random_anomaly = [], []
+    cut_bigram, random_bigram = [], []
+    proof_ok = 0
+    random_break = 0
+    total = 0
+    for fold in range(5):
+        test = [t for t in traces if core.hashfold(t["tid"]) == fold]
+        train = [t for t in traces if core.hashfold(t["tid"]) != fold]
+        bg = learn_bigram(train)
+        for tr in test:
+            pv = get_prov(tr)
+            candidates = []
+            for i, root in enumerate(pv.roots):
+                if i < 1 or not pv.pool.value(root):
+                    continue
+                cuts = pv.pool.cutsets(root)
+                if not cuts:
+                    continue
+                cut = min(cuts, key=lambda x: (len(x), tuple(sorted(x))))
+                if not cut or len(cut) > 3:
+                    continue
+                future_use = sum(bool(pv.pool.atoms(r) & cut) for r in pv.roots[i:])
+                candidates.append((future_use, pv.features[i]["depth"], -len(cut), -i, i, cut))
+            if not candidates:
+                continue
+            _, _, _, _, target, cut = max(candidates)
+            eligible = [a for a in pv.pool.atom_event if pv.pool.atom_event[a] <= target and a not in cut]
+            if len(eligible) < len(cut):
+                continue
+            start = stable_int("randcut:" + tr["tid"]) % len(eligible)
+            random_cut = frozenset(eligible[(start + j * 5) % len(eligible)] for j in range(len(cut)))
+            root = pv.roots[target]
+            cut_false = not pv.pool.value(root, frozenset(cut))
+            random_false = not pv.pool.value(root, random_cut)
+            proof_ok += int(cut_false)
+            random_break += int(random_false)
+            total += 1
+            ca = sum(not pv.pool.value(r, frozenset(cut)) for r in pv.roots[target:])
+            ra = sum(not pv.pool.value(r, random_cut) for r in pv.roots[target:])
+            cut_anomaly.append(ca)
+            random_anomaly.append(ra)
