@@ -1,0 +1,125 @@
+name: Counterfactual Provenance Obligation TROVE sequential proof
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/provenance-obligation-trove-sequential.yml'
+      - 'experiments/provenance_obligation_trove*.py'
+      - 'experiments/trove_src/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Acquire official TROVE dataset
+        run: |
+          python -m pip install -q gdown numpy
+          gdown 'https://drive.google.com/uc?id=1bbTpKgwZXePRYCoIcbvsVccNErQfisLt' -O trove_dataset.bin || \
+          curl -L --fail --retry 8 --retry-all-errors \
+            'https://drive.usercontent.google.com/download?id=1bbTpKgwZXePRYCoIcbvsVccNErQfisLt&export=download&confirm=t' \
+            -o trove_dataset.bin
+          test $(wc -c < trove_dataset.bin) -gt 10000
+          mkdir -p TROVE_DATA
+          python - <<'PY'
+          import gzip,shutil,zipfile,tarfile
+          from pathlib import Path
+          p=Path('trove_dataset.bin');o=Path('TROVE_DATA');h=p.read_bytes()[:16]
+          if zipfile.is_zipfile(p):
+              with zipfile.ZipFile(p) as z:z.extractall(o)
+          elif tarfile.is_tarfile(p):
+              with tarfile.open(p) as t:t.extractall(o)
+          elif h.startswith(b'\x1f\x8b'):
+              q=Path('trove_dataset.tar')
+              with gzip.open(p,'rb') as s,q.open('wb') as d:shutil.copyfileobj(s,d)
+              with tarfile.open(q) as t:t.extractall(o)
+          else:raise RuntimeError('unknown archive')
+          print('archive',p.stat().st_size,'jsonl',len(list(o.rglob('*.jsonl'))))
+          PY
+
+      - name: Verify exact source and seal labels
+        run: |
+          python -m py_compile experiments/provenance_obligation_trove*.py
+          python - <<'PY'
+          import base64,hashlib,random,importlib.util
+          from pathlib import Path
+          root=Path('experiments/trove_src')
+          names=['part00.b64','part01.b64','part02.b64']+[f'part03_{i}.b64' for i in range(5)]+['part04.b64']
+          src=base64.b64decode(''.join((root/n).read_text().strip() for n in names))
+          assert hashlib.sha256(src).hexdigest()=='f835c5ee407626ae14423610462f51e2cc3d8232abec36905aa86b42bcd5735f'
+          compile(src,'model_source.py','exec')
+          spec=importlib.util.spec_from_file_location('o','experiments/provenance_obligation_trove.py');o=importlib.util.module_from_spec(spec);spec.loader.exec_module(o)
+          spec=importlib.util.spec_from_file_location('a','experiments/provenance_obligation_trove_bitset.py');a=importlib.util.module_from_spec(spec);spec.loader.exec_module(a)
+          rng=random.Random(20260725)
+          for _ in range(1000):
+              x=[rng.randrange(12) for _ in range(rng.randrange(60))];y=[rng.randrange(12) for _ in range(rng.randrange(80))]
+              assert o.lcs_ratio(x,y)==a.exact_bitset_lcs_ratio(x,y)
+          print('source and accelerator exact: PASS')
+          PY
+          mkdir -p prepared sealed
+          python experiments/provenance_obligation_trove.py prepare --root TROVE_DATA --out prepared
+          mv prepared/labels_sealed.json sealed/labels_sealed.json
+          sha256sum prepared/blind.jsonl sealed/labels_sealed.json > sealed/input_hashes.txt
+          rm -rf TROVE_DATA trove_dataset.bin
+
+      - name: Blind streaming prediction A
+        run: |
+          mkdir -p run_a
+          python experiments/provenance_obligation_trove_stream.py \
+            --blind prepared/blind.jsonl --output run_a/predictions.jsonl --manifest run_a/manifest.json
+
+      - name: Blind streaming deterministic replay B
+        run: |
+          mkdir -p run_b
+          python experiments/provenance_obligation_trove_stream.py \
+            --blind prepared/blind.jsonl --output run_b/predictions.jsonl --manifest run_b/manifest.json
+          cmp run_a/predictions.jsonl run_b/predictions.jsonl
+          cmp run_a/predictions.jsonl.sha256 run_b/predictions.jsonl.sha256
+          python - <<'PY'
+          import json
+          a=json.load(open('run_a/manifest.json'));b=json.load(open('run_b/manifest.json'))
+          assert a['prediction_sha256']==b['prediction_sha256']
+          assert a['storage_runtime']['outputs_identical'] and b['storage_runtime']['outputs_identical']
+          assert a['rows']==4505 and a['candidate_pairs']==1453187
+          print('deterministic replay: PASS')
+          PY
+
+      - name: Open labels and evaluate all pairs
+        run: |
+          mkdir -p results
+          cp run_a/predictions.jsonl run_a/predictions.jsonl.sha256 run_a/manifest.json results/
+          python experiments/provenance_obligation_trove_stream_eval.py \
+            --predictions results/predictions.jsonl \
+            --pred-manifest results/manifest.json \
+            --labels sealed/labels_sealed.json --outdir results
+          cp prepared/prepare_manifest.json sealed/input_hashes.txt results/
+          cp experiments/provenance_obligation_trove*.py results/
+          cp -r experiments/trove_src results/trove_src
+          python - <<'PY'
+          import base64
+          from pathlib import Path
+          r=Path('experiments/trove_src');n=['part00.b64','part01.b64','part02.b64']+[f'part03_{i}.b64' for i in range(5)]+['part04.b64']
+          Path('results/model_source.py').write_bytes(base64.b64decode(''.join((r/x).read_text().strip() for x in n)))
+          PY
+          python -m py_compile results/*.py
+          cat results/summary.json
+
+      - name: Package evidence
+        run: |
+          cd results
+          zip -9 -r ../COUNTERFACTUAL_PROVENANCE_OBLIGATION_TROVE_RESULTS.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: COUNTERFACTUAL_PROVENANCE_OBLIGATION_TROVE_RESULTS
+          path: COUNTERFACTUAL_PROVENANCE_OBLIGATION_TROVE_RESULTS.zip
+          retention-days: 7
