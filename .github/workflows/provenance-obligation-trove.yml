@@ -5,6 +5,7 @@ on:
     paths:
       - 'experiments/provenance_obligation_trove.py'
       - 'experiments/provenance_obligation_trove_fast.py'
+      - 'experiments/provenance_obligation_trove_bitset.py'
       - 'experiments/trove_src/**'
       - '.github/workflows/provenance-obligation-trove.yml'
   workflow_dispatch:
@@ -59,16 +60,23 @@ jobs:
 
       - name: Verify source integrity and seal provenance links
         run: |
-          python -m py_compile experiments/provenance_obligation_trove.py experiments/provenance_obligation_trove_fast.py
+          python -m py_compile experiments/provenance_obligation_trove.py experiments/provenance_obligation_trove_fast.py experiments/provenance_obligation_trove_bitset.py
           python - <<'PY'
-          import base64,hashlib
+          import base64,hashlib,random,importlib.util
           from pathlib import Path
           root=Path('experiments/trove_src')
           names=['part00.b64','part01.b64','part02.b64']+[f'part03_{i}.b64' for i in range(5)]+['part04.b64']
           src=base64.b64decode(''.join((root/n).read_text().strip() for n in names))
           assert hashlib.sha256(src).hexdigest()=='f835c5ee407626ae14423610462f51e2cc3d8232abec36905aa86b42bcd5735f'
           compile(src,'model_source.py','exec')
-          print('source integrity: PASS',len(src))
+          # Verify accelerated LCS is exactly equal to the original dynamic program.
+          spec=importlib.util.spec_from_file_location('orig','experiments/provenance_obligation_trove.py');o=importlib.util.module_from_spec(spec);spec.loader.exec_module(o)
+          spec2=importlib.util.spec_from_file_location('acc','experiments/provenance_obligation_trove_bitset.py');a=importlib.util.module_from_spec(spec2);spec2.loader.exec_module(a)
+          rng=random.Random(20260725)
+          for _ in range(1000):
+              x=[rng.randrange(12) for _ in range(rng.randrange(60))];y=[rng.randrange(12) for _ in range(rng.randrange(80))]
+              assert o.lcs_ratio(x,y)==a.exact_bitset_lcs_ratio(x,y)
+          print('source and exact LCS acceleration: PASS',len(src))
           PY
           mkdir -p prepared sealed
           python experiments/provenance_obligation_trove.py prepare --root TROVE_DATA --out prepared
@@ -81,9 +89,9 @@ jobs:
           mkdir -p run_a run_b
           cp prepared/blind.jsonl run_a/blind.jsonl
           cp prepared/blind.jsonl run_b/blind.jsonl
-          python experiments/provenance_obligation_trove_fast.py --blind run_a/blind.jsonl --out run_a/predictions.json &
+          python experiments/provenance_obligation_trove_bitset.py --blind run_a/blind.jsonl --out run_a/predictions.json &
           PID_A=$!
-          python experiments/provenance_obligation_trove_fast.py --blind run_b/blind.jsonl --out run_b/predictions.json &
+          python experiments/provenance_obligation_trove_bitset.py --blind run_b/blind.jsonl --out run_b/predictions.json &
           PID_B=$!
           wait $PID_A
           wait $PID_B
@@ -105,6 +113,7 @@ jobs:
           cp prepared/prepare_manifest.json sealed/input_hashes.txt results/
           cp experiments/provenance_obligation_trove.py results/model_wrapper.py
           cp experiments/provenance_obligation_trove_fast.py results/model_fast_runner.py
+          cp experiments/provenance_obligation_trove_bitset.py results/model_bitset_runner.py
           cp -r experiments/trove_src results/trove_src
           python - <<'PY'
           import base64
@@ -113,7 +122,7 @@ jobs:
           names=['part00.b64','part01.b64','part02.b64']+[f'part03_{i}.b64' for i in range(5)]+['part04.b64']
           Path('results/model_source.py').write_bytes(base64.b64decode(''.join((root/n).read_text().strip() for n in names)))
           PY
-          python -m py_compile results/model_source.py results/model_fast_runner.py
+          python -m py_compile results/model_source.py results/model_fast_runner.py results/model_bitset_runner.py
           cat results/summary.json
 
       - name: Package evidence
