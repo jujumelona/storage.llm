@@ -1,0 +1,54 @@
+name: TROVE schema probe
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/trove-schema-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download and inspect schema
+        run: |
+          python -m pip install -q gdown
+          gdown --id '1bbTpKgwZXePRYCoIcbvsVccNErQfisLt' -O trove_dataset.bin
+          mkdir -p TROVE_DATA probe
+          python - <<'PY'
+          import json,zipfile,tarfile
+          from pathlib import Path
+          p=Path('trove_dataset.bin');out=Path('TROVE_DATA')
+          if zipfile.is_zipfile(p):
+              with zipfile.ZipFile(p) as z:z.extractall(out)
+          elif tarfile.is_tarfile(p):
+              with tarfile.open(p) as t:t.extractall(out)
+          else:raise RuntimeError('unknown archive')
+          report=[]
+          for fp in sorted(out.rglob('*.jsonl')):
+              first=None
+              with fp.open(encoding='utf-8',errors='ignore') as f:
+                  for line in f:
+                      if line.strip():first=json.loads(line);break
+              if first is None:continue
+              item={'path':str(fp.relative_to(out)),'keys':sorted(first),'types':{k:type(v).__name__ for k,v in first.items()}}
+              for k in ('target_sent','prompt_global','ground_truth_global','input_sentences','input_sentence_indices','input_doc_indices','combine_retriver'):
+                  if k in first:
+                      v=first[k]
+                      item[k+'_sample']=str(v)[:5000]
+              report.append(item)
+          Path('probe/schema.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('files',len(report))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TROVE_SCHEMA_PROBE
+          path: probe/schema.json
+          retention-days: 3
