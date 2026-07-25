@@ -1,0 +1,95 @@
+name: Counterfactual Provenance-Relation Circuit V2 falsification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'experiments/prov_parts/**'
+      - 'experiments/prov2_parts/**'
+      - '.github/workflows/counterfactual-provenance-obligation-v2.yml'
+      - 'experiments/product_lifted_agentprocess.py'
+      - 'experiments/product_lifted_agentprocess_v2.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Acquire public AgentProcessBench
+        run: |
+          python -m pip install -q 'huggingface_hub>=0.28'
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download(repo_id='LulaCola/AgentProcessBench', repo_type='dataset', local_dir='/tmp/AgentProcessBench')
+          PY
+      - name: Assemble frozen V1 and relation-aware V2
+        run: |
+          set -euxo pipefail
+          cat experiments/prov_parts/part*.txt > experiments/counterfactual_provenance_obligation.py
+          cat experiments/prov2_parts/part*.txt > experiments/counterfactual_provenance_obligation_v2.py
+          python -m py_compile \
+            experiments/product_lifted_agentprocess.py \
+            experiments/product_lifted_agentprocess_v2.py \
+            experiments/counterfactual_provenance_obligation.py \
+            experiments/counterfactual_provenance_obligation_v2.py
+          sha256sum experiments/counterfactual_provenance_obligation_v2.py | tee v2_source.sha256
+      - name: Run exact-split strict V2 falsification
+        run: |
+          set -euxo pipefail
+          rm -rf provenance_relation_v2_results
+          python -u experiments/counterfactual_provenance_obligation_v2.py \
+            --data /tmp/AgentProcessBench \
+            --out provenance_relation_v2_results \
+            | tee provenance_relation_v2_results.log
+          cp provenance_relation_v2_results.log provenance_relation_v2_results/run.log
+          cp v2_source.sha256 provenance_relation_v2_results/
+          cp experiments/counterfactual_provenance_obligation.py provenance_relation_v2_results/
+          cp experiments/counterfactual_provenance_obligation_v2.py provenance_relation_v2_results/
+          cp experiments/product_lifted_agentprocess.py experiments/product_lifted_agentprocess_v2.py provenance_relation_v2_results/
+          cat provenance_relation_v2_results/summary.json
+      - name: Deterministic replay
+        run: |
+          set -euxo pipefail
+          rm -rf provenance_relation_v2_replay
+          python -u experiments/counterfactual_provenance_obligation_v2.py \
+            --data /tmp/AgentProcessBench \
+            --out provenance_relation_v2_replay >/tmp/prov_v2_replay.log
+          cmp provenance_relation_v2_results/predictions.csv provenance_relation_v2_replay/predictions.csv
+          cmp provenance_relation_v2_results/witnesses.json provenance_relation_v2_replay/witnesses.json
+          python - <<'PY'
+          import gzip,json
+          a=json.load(gzip.open('provenance_relation_v2_results/PROVENANCE_RELATION_CIRCUIT_CHECKPOINT.json.gz','rt'))
+          b=json.load(gzip.open('provenance_relation_v2_replay/PROVENANCE_RELATION_CIRCUIT_CHECKPOINT.json.gz','rt'))
+          assert a==b
+          a=json.load(open('provenance_relation_v2_results/summary.json'))
+          b=json.load(open('provenance_relation_v2_replay/summary.json'))
+          for x in (a,b):
+              r=x.get('storage_runtime',{})
+              r.pop('memoized_seconds',None);r.pop('recursive_seconds',None);r.pop('evaluation_speedup',None)
+          assert a==b
+          PY
+          echo true > provenance_relation_v2_results/deterministic_replay.txt
+      - name: Package
+        if: always()
+        run: |
+          python - <<'PY'
+          import pathlib,shutil
+          p=pathlib.Path('provenance_relation_v2_results')
+          if p.exists():shutil.make_archive('COUNTERFACTUAL_PROVENANCE_RELATION_V2_RESULTS','zip',p)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: COUNTERFACTUAL_PROVENANCE_RELATION_V2_RESULTS
+          path: |
+            COUNTERFACTUAL_PROVENANCE_RELATION_V2_RESULTS.zip
+            provenance_relation_v2_results/
+          retention-days: 7
