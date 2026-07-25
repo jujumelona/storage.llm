@@ -1,3 +1,13 @@
+    anchor=core.predict(tr,m,'product')
+    if 0<=anchor<len(br):br[anchor]+=1.0
+    return [a+w['mix']*b for a,b in zip(br,pr)]
+
+
+def predict(tr,m,pm,w,kind):
+    if kind in BASE_KINDS:return core.predict(tr,m,kind)
+    z=scores(tr,m,pm,w,kind);return max(range(len(z)),key=lambda i:(z[i],-i)) if z else -1
+
+def evaluate(ts,m,pm,w,kind):
     xs=[t for t in ts if t['has_error'] and t['events']];g=[next(i for i,e in enumerate(t['events']) if e.first_error) for t in xs];p=[predict(t,m,pm,w,kind) for t in xs]
     return {'n':len(g),'exact':v1.acc(p,g),'near1':v1.near(p,g),'pred':p,'gold':g,'tids':[t['tid'] for t in xs],'datasets':[t['dataset'] for t in xs]}
 
@@ -55,6 +65,3 @@ def main():
       for tid,ds,p,g in zip(x['tids'],x['datasets'],x['pred'],x['gold']):rows.append({'model':k,'tid':tid,'dataset':ds,'pred_position':p,'gold_position':g,'correct':p==g})
     with (out/'predictions.csv').open('w',newline='',encoding='utf-8') as f:w=csv.DictWriter(f,fieldnames=rows[0]);w.writeheader();w.writerows(rows)
     (out/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8');(out/'witnesses.json').write_text(json.dumps(wit,indent=2),encoding='utf-8')
-    with gzip.open(out/'PROVENANCE_RELATION_CIRCUIT_CHECKPOINT.json.gz','wt') as f:json.dump({'architecture':summary['architecture'],'weights':folds,'no_dense':True},f)
-    print(json.dumps(summary,indent=2))
-if __name__=='__main__':main()
