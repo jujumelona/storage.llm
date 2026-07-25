@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'experiments/provenance_obligation_trove.py'
+      - 'experiments/provenance_obligation_trove_fast.py'
       - 'experiments/trove_src/**'
       - '.github/workflows/provenance-obligation-trove.yml'
   workflow_dispatch:
@@ -58,7 +59,7 @@ jobs:
 
       - name: Verify source integrity and seal provenance links
         run: |
-          python -m py_compile experiments/provenance_obligation_trove.py
+          python -m py_compile experiments/provenance_obligation_trove.py experiments/provenance_obligation_trove_fast.py
           python - <<'PY'
           import base64,hashlib
           from pathlib import Path
@@ -80,8 +81,8 @@ jobs:
           mkdir -p run_a run_b
           cp prepared/blind.jsonl run_a/blind.jsonl
           cp prepared/blind.jsonl run_b/blind.jsonl
-          python experiments/provenance_obligation_trove.py predict --blind run_a/blind.jsonl --out run_a/predictions.json
-          python experiments/provenance_obligation_trove.py predict --blind run_b/blind.jsonl --out run_b/predictions.json
+          python experiments/provenance_obligation_trove_fast.py --blind run_a/blind.jsonl --out run_a/predictions.json
+          python experiments/provenance_obligation_trove_fast.py --blind run_b/blind.jsonl --out run_b/predictions.json
           python - <<'PY'
           import json
           a=json.load(open('run_a/predictions.json'));b=json.load(open('run_b/predictions.json'))
@@ -99,6 +100,7 @@ jobs:
             --pred results/predictions.json --labels sealed/labels_sealed.json --outdir results
           cp prepared/prepare_manifest.json sealed/input_hashes.txt results/
           cp experiments/provenance_obligation_trove.py results/model_wrapper.py
+          cp experiments/provenance_obligation_trove_fast.py results/model_fast_runner.py
           cp -r experiments/trove_src results/trove_src
           python - <<'PY'
           import base64
@@ -107,7 +109,7 @@ jobs:
           names=['part00.b64','part01.b64','part02.b64']+[f'part03_{i}.b64' for i in range(5)]+['part04.b64']
           Path('results/model_source.py').write_bytes(base64.b64decode(''.join((root/n).read_text().strip() for n in names)))
           PY
-          python -m py_compile results/model_source.py
+          python -m py_compile results/model_source.py results/model_fast_runner.py
           cat results/summary.json
 
       - name: Package evidence
