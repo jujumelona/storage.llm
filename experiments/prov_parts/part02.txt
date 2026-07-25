@@ -1,0 +1,157 @@
+            pieces = []
+            if support:
+                pieces.append(pool.OR(*support))
+            if current_atom is not None and e.status == "SUCCESS":
+                pieces.append(current_atom)
+            root = pool.AND(*pieces) if pieces else pool.true
+
+        roots.append(root)
+        for a in pool.atoms(root):
+            deps.append((pool.atom_event.get(a, -1), i))
+        if current_atom is not None and e.status == "SUCCESS":
+            latest_evidence[key].append(current_atom)
+        if pool.value(root):
+            latest_claim[key].append(root)
+        if e.op == "MUTATE":
+            latest_mutation[key] = root
+        if e.op == "AUTH" and pool.value(root):
+            latest_auth.append(root)
+
+    atom_fanout = Counter()
+    for root in roots:
+        for a in pool.atoms(root):
+            atom_fanout[a] += 1
+    false_suffix = [0] * (len(roots) + 1)
+    for i in range(len(roots) - 1, -1, -1):
+        false_suffix[i] = false_suffix[i + 1] + int(not pool.value(roots[i]))
+
+    features = []
+    for i, (e, root) in enumerate(zip(tr["events"], roots)):
+        atoms = pool.atoms(root)
+        truth = pool.value(root)
+        cuts = pool.cutsets(root) if truth else tuple()
+        cut_size = min((len(x) for x in cuts), default=0)
+        own = evidence_by_event.get(i)
+        fanout = atom_fanout.get(own, 0) if own is not None else 0
+        boundary = int(not truth and (i == 0 or pool.value(roots[i - 1])))
+        same_resource = 0
+        for a in atoms:
+            ai = pool.atom_event.get(a, -1)
+            if 0 <= ai < len(tr["events"]):
+                same_resource += int(reskey(tr["events"][ai], no_resource) == reskey(e, no_resource))
+        features.append(
+            {
+                "truth": int(truth),
+                "support": len(atoms),
+                "depth": pool.depth(root),
+                "cut": cut_size,
+                "alternatives": len(cuts),
+                "fanout": fanout,
+                "boundary": boundary,
+                "false_tail": false_suffix[i + 1],
+                "same_resource": same_resource,
+                "resource": reskey(e, no_resource),
+                "op": e.op,
+                "status": e.status,
+                "mask": e.mask,
+                "hard": e.hard,
+            }
+        )
+    return ProvTrace(pool, roots, evidence_by_event, features, deps)
+
+
+_CACHE: dict[tuple[str, bool, bool], ProvTrace] = {}
+
+
+def get_prov(tr, rewire=False, no_resource=False):
+    key = (tr["tid"], rewire, no_resource)
+    if key not in _CACHE:
+        _CACHE[key] = compile_provenance(tr, rewire=rewire, no_resource=no_resource)
+    return _CACHE[key]
+
+
+def prov_keys(tr, i, pv: ProvTrace):
+    e = tr["events"][i]
+    f = pv.features[i]
+    return [
+        ("PV", f["truth"], small_bucket(f["support"]), small_bucket(f["depth"]), small_bucket(f["cut"]), small_bucket(f["fanout"]), f["boundary"]),
+        ("PVOP", e.op, e.status, f["truth"], small_bucket(f["cut"]), small_bucket(f["false_tail"])),
+        ("PVMASK", e.mask, f["truth"], f["boundary"]),
+        ("PVRES", f["resource"], f["truth"], small_bucket(f["same_resource"])),
+        ("PVFLOW", e.op, small_bucket(f["fanout"]), small_bucket(f["alternatives"]), f["boundary"]),
+    ]
+
+
+def train_prov(traces, no_resource=False):
+    total = Counter()
+    positive = Counter()
+    base_events = 0
+    pos_events = 0
+    for tr in traces:
+        pv = get_prov(tr, no_resource=no_resource)
+        for i, e in enumerate(tr["events"]):
+            base_events += 1
+            pos_events += int(e.first_error)
+            for k in prov_keys(tr, i, pv):
+                total[k] += 1
+                positive[k] += int(e.first_error)
+    base = (pos_events + 0.7) / (base_events + 1.4)
+    return {"total": total, "positive": positive, "base": base}
+
+
+PROV_WEIGHTS = [
+    {"emp": 0.35, "gap": 0.25, "boundary": 0.45, "tail": 0.08, "fanout": 0.04},
+    {"emp": 0.55, "gap": 0.35, "boundary": 0.70, "tail": 0.10, "fanout": 0.05},
+    {"emp": 0.80, "gap": 0.45, "boundary": 0.90, "tail": 0.12, "fanout": 0.06},
+    {"emp": 1.00, "gap": 0.65, "boundary": 1.10, "tail": 0.14, "fanout": 0.08},
+    {"emp": 1.20, "gap": 0.80, "boundary": 1.35, "tail": 0.18, "fanout": 0.10},
+]
+
+
+def prov_score(tr, i, pm, weights, pv: ProvTrace):
+    f = pv.features[i]
+    vals = [core.loglift(k, pm["total"], pm["positive"], pm["base"]) for k in prov_keys(tr, i, pv)]
+    empirical = sum(sorted(vals, reverse=True)[:4])
+    structural = (
+        weights["gap"] * (1 - f["truth"])
+        + weights["boundary"] * f["boundary"]
+        + weights["tail"] * math.log1p(f["false_tail"])
+        + weights["fanout"] * math.log1p(f["fanout"])
+    )
+    return weights["emp"] * empirical + structural
+
+
+def all_scores(tr, model, pm, weights, kind):
+    if kind in {"current", "ueta", "graph", "product_no_topology", "product"}:
+        return core.scores(tr, model, kind)
+    if kind == "provenance_rewired":
+        pv = get_prov(tr, rewire=True)
+    elif kind == "provenance_no_resource":
+        pv = get_prov(tr, no_resource=True)
+    else:
+        pv = get_prov(tr)
+    ps = [prov_score(tr, i, pm, weights, pv) for i in range(len(tr["events"]))]
+    if kind == "provenance_only":
+        return ps
+    base = core.scores(tr, model, "product")
+    return [a + b for a, b in zip(base, ps)]
+
+
+def predict(tr, model, pm, weights, kind):
+    ss = all_scores(tr, model, pm, weights, kind)
+    if not ss:
+        return -1
+    return max(range(len(ss)), key=lambda i: (ss[i], -i))
+
+
+def acc(pred, gold):
+    return sum(a == b for a, b in zip(pred, gold)) / len(gold) if gold else 0.0
+
+
+def near(pred, gold, radius=1):
+    return sum(abs(a - b) <= radius for a, b in zip(pred, gold)) / len(gold) if gold else 0.0
+
+
+def evaluate(traces, model, pm, weights, kind):
+    xs = [tr for tr in traces if tr["has_error"] and tr["events"]]
+    gold = [next(i for i, e in enumerate(tr["events"]) if e.first_error) for tr in xs]
