@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import gzip
+import hashlib
+import itertools
+import json
+import math
+import random
+import statistics
+import sys
+import time
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+
+import product_lifted_agentprocess as core
+import product_lifted_agentprocess_v2 as v2  # patches core scores/predict with V2 scorer
+
+SEED = 20260725
+KINDS = (
+    "current",
+    "ueta",
+    "graph",
+    "product_no_topology",
+    "product",
+    "provenance_only",
+    "provenance_product",
+    "provenance_rewired",
+    "provenance_no_resource",
+)
+SUCCESS = {"SUCCESS"}
+OBSERVED = {"SUCCESS", "PARTIAL", "ERROR"}
+
+
+def stable_int(text: str) -> int:
+    return int(hashlib.sha256(text.encode()).hexdigest()[:16], 16)
+
+
+def small_bucket(n: int) -> str:
+    if n <= 0:
+        return "0"
+    if n == 1:
+        return "1"
+    if n <= 3:
+        return "2-3"
+    if n <= 7:
+        return "4-7"
+    if n <= 15:
+        return "8-15"
+    return "16+"
+
+
+class GatePool:
+    """Hash-consed monotone Boolean provenance circuit."""
+
+    def __init__(self) -> None:
+        self.nodes: list[tuple] = [("FALSE",), ("TRUE",)]
+        self.memo: dict[tuple, int] = {self.nodes[0]: 0, self.nodes[1]: 1}
+        self.atom_event: dict[int, int] = {}
+        self.atom_name: dict[int, str] = {}
+        self._atoms_cache: dict[int, frozenset[int]] = {}
+        self._depth_cache: dict[int, int] = {}
+        self._cut_cache: dict[int, tuple[frozenset[int], ...]] = {}
+
+    @property
+    def false(self) -> int:
+        return 0
+
+    @property
+    def true(self) -> int:
+        return 1
+
+    def atom(self, name: str, event_index: int) -> int:
+        key = ("ATOM", name)
+        gid = self.memo.get(key)
+        if gid is None:
+            gid = len(self.nodes)
+            self.memo[key] = gid
+            self.nodes.append(key)
+            self.atom_event[gid] = event_index
+            self.atom_name[gid] = name
+        return gid
+
+    def _compound(self, op: str, children) -> int:
+        flat: list[int] = []
+        for c in children:
+            if op == "AND" and c == self.false:
+                return self.false
+            if op == "OR" and c == self.true:
+                return self.true
+            if op == "AND" and c == self.true:
+                continue
+            if op == "OR" and c == self.false:
+                continue
+            node = self.nodes[c]
+            if node[0] == op:
+                flat.extend(node[1])
+            else:
+                flat.append(c)
+        flat = sorted(set(flat))
+        if not flat:
+            return self.true if op == "AND" else self.false
+        if len(flat) == 1:
+            return flat[0]
+        key = (op, tuple(flat))
+        gid = self.memo.get(key)
+        if gid is None:
+            gid = len(self.nodes)
+            self.memo[key] = gid
+            self.nodes.append(key)
+        return gid
+
+    def AND(self, *children: int) -> int:
+        return self._compound("AND", children)
+
+    def OR(self, *children: int) -> int:
+        return self._compound("OR", children)
+
+    def value(self, root: int, missing: frozenset[int] = frozenset(), memo=None) -> bool:
+        if memo is None:
+            memo = {}
+        key = (root, missing)
+        if key in memo:
+            return memo[key]
+        node = self.nodes[root]
+        if node[0] == "FALSE":
+            v = False
+        elif node[0] == "TRUE":
+            v = True
+        elif node[0] == "ATOM":
+            v = root not in missing
+        elif node[0] == "AND":
+            v = all(self.value(c, missing, memo) for c in node[1])
+        elif node[0] == "OR":
+            v = any(self.value(c, missing, memo) for c in node[1])
+        else:
+            raise ValueError(node[0])
+        memo[key] = v
+        return v
+
+    def value_nomemo(self, root: int, missing: frozenset[int] = frozenset()) -> bool:
+        node = self.nodes[root]
+        if node[0] == "FALSE":
+            return False
+        if node[0] == "TRUE":
+            return True
+        if node[0] == "ATOM":
+            return root not in missing
+        if node[0] == "AND":
+            return all(self.value_nomemo(c, missing) for c in node[1])
+        if node[0] == "OR":
+            return any(self.value_nomemo(c, missing) for c in node[1])
+        raise ValueError(node[0])
+
+    def atoms(self, root: int) -> frozenset[int]:
+        if root in self._atoms_cache:
+            return self._atoms_cache[root]
+        node = self.nodes[root]
+        if node[0] == "ATOM":
+            out = frozenset((root,))
+        elif node[0] in {"AND", "OR"}:
+            out = frozenset().union(*(self.atoms(c) for c in node[1]))
+        else:
+            out = frozenset()
+        self._atoms_cache[root] = out
+        return out
+
+    def depth(self, root: int) -> int:
+        if root in self._depth_cache:
+            return self._depth_cache[root]
+        node = self.nodes[root]
+        if node[0] in {"FALSE", "TRUE", "ATOM"}:
+            d = 0
+        else:
+            d = 1 + max(self.depth(c) for c in node[1])
+        self._depth_cache[root] = d
+        return d
+
+    @staticmethod
+    def _minimal(sets, limit=64, max_size=8):
+        unique = sorted(set(sets), key=lambda s: (len(s), tuple(sorted(s))))
+        out = []
+        for s in unique:
+            if len(s) > max_size:
+                continue
+            if any(x <= s for x in out):
+                continue
+            out.append(s)
+            if len(out) >= limit:
+                break
+        return tuple(out)
+
+    def cutsets(self, root: int) -> tuple[frozenset[int], ...]:
+        """Minimal evidence deletions that make a currently true monotone root false."""
+        if root in self._cut_cache:
+            return self._cut_cache[root]
+        node = self.nodes[root]
+        if node[0] == "ATOM":
+            cuts = (frozenset((root,)),)
+        elif node[0] == "TRUE":
+            cuts = tuple()
