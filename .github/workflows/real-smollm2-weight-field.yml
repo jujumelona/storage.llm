@@ -1,4 +1,4 @@
-# validation trigger: proper-loss v8
+# validation trigger: lineage feature-union v9
 name: Real SmolLM2 Weight-Field Validation
 
 on:
@@ -14,6 +14,7 @@ on:
       - "experiments/real_smollm2_v7_batched_replication.py"
       - "experiments/real_smollm2_v7_batched_replication_fixed.py"
       - "experiments/real_smollm2_v8_proper_choice_loss.py"
+      - "experiments/real_smollm2_v9_lineage_feature_union.py"
   pull_request:
     paths:
       - ".github/workflows/real-smollm2-weight-field.yml"
@@ -26,6 +27,7 @@ on:
       - "experiments/real_smollm2_v7_batched_replication.py"
       - "experiments/real_smollm2_v7_batched_replication_fixed.py"
       - "experiments/real_smollm2_v8_proper_choice_loss.py"
+      - "experiments/real_smollm2_v9_lineage_feature_union.py"
   workflow_dispatch:
 
 permissions:
@@ -58,18 +60,18 @@ jobs:
           path: ~/.cache/huggingface
           key: smollm2-135m-proper-choice-loss-v8
 
-      - name: Run proper choice-normalized validation
+      - name: Run lineage feature-union validation
         shell: bash
         run: |
-          mkdir -p out/real_smollm2_v8_proper_choice_loss
+          mkdir -p out/real_smollm2_v9_lineage_feature_union
           set -o pipefail
-          python experiments/real_smollm2_v8_proper_choice_loss.py 2>&1 | tee out/real_smollm2_v8_proper_choice_loss/RUN.log
+          python experiments/real_smollm2_v9_lineage_feature_union.py 2>&1 | tee out/real_smollm2_v9_lineage_feature_union/RUN.log
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: real-smollm2-v8-proper-choice-loss-results
-          path: out/real_smollm2_v8_proper_choice_loss
+          name: real-smollm2-v9-lineage-feature-union-results
+          path: out/real_smollm2_v9_lineage_feature_union
           if-no-files-found: warn
           retention-days: 7
