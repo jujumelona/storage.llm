@@ -14,18 +14,14 @@ from datasets import load_dataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 HERE = Path(__file__).resolve().parent
-
-
-def load_module(name: str, filename: str):
-    spec = importlib.util.spec_from_file_location(name, HERE / filename)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-v1 = load_module("wf_v1", "real_smollm2_weight_field.py")
-v5 = load_module("wf_v5", "real_smollm2_v5_strict.py")
+spec1 = importlib.util.spec_from_file_location("weight_field_v1", HERE / "real_smollm2_weight_field.py")
+v1 = importlib.util.module_from_spec(spec1)
+assert spec1.loader is not None
+spec1.loader.exec_module(v1)
+spec5 = importlib.util.spec_from_file_location("weight_field_v5", HERE / "real_smollm2_v5_strict.py")
+v5 = importlib.util.module_from_spec(spec5)
+assert spec5.loader is not None
+spec5.loader.exec_module(v5)
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -223,7 +219,10 @@ def main():
         "boolq_chat": deterministic_sample(boolq_rows(chat_tokenizer), N, 105),
     }
     wiki = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    wiki_texts = [row["text"] for row in wiki if row["text"].strip()][4400:5200]
+    # Frozen, non-empty holdout range. The previous [4400:5200] range was empty.
+    wiki_texts = [row["text"] for row in wiki if row["text"].strip()][2200:2450]
+    if not wiki_texts:
+        raise RuntimeError("empty WikiText holdout")
 
     models = {"parent_base": model_base, "parent_instruct": model_instruct, "fixed_candidate": model_candidate}
     all_records = {}
@@ -231,6 +230,8 @@ def main():
     for name, model in models.items():
         start = time.time()
         records = {"wikitext": v5.evaluate_wiki_blocks(model, tokenizer, wiki_texts)}
+        if not records["wikitext"]:
+            raise RuntimeError("zero WikiText blocks")
         for domain, rows in datasets.items():
             records[domain] = evaluate_mcq_batched(model, tokenizer, rows)
         all_records[name] = records
