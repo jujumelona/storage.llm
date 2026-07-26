@@ -1,0 +1,41 @@
+name: Extract V5 Results Only
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/extract-v5-results-only.yml"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: real-smollm2-v5-strict-results
+          path: downloaded
+          run-id: 30188826134
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build results-only package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p results_only
+          find downloaded -maxdepth 2 -type f -print
+          for f in RESULTS.json REPORT.md EXAMPLE_METRICS.csv PARTIAL.json RUN.log; do
+            p=$(find downloaded -name "$f" -type f | head -n 1 || true)
+            if [ -n "$p" ]; then cp "$p" "results_only/$f"; fi
+          done
+          ls -lah results_only
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: real-smollm2-v5-strict-results-only
+          path: results_only
+          if-no-files-found: error
+          retention-days: 7
