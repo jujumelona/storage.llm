@@ -5,7 +5,6 @@ import importlib.util
 import json
 import math
 import shutil
-import time
 from pathlib import Path
 
 import numpy as np
@@ -35,29 +34,21 @@ def evaluate_mcq_choice_normalized(
     examples: list[dict],
     batch_sequences: int = v7.BATCH_SEQUENCES,
 ):
-    """Evaluate a finite answer set with a proper renormalized choice loss.
+    """Finite-answer-set evaluation with renormalized sequence probability.
 
-    For candidate answer string j, let
-        s_j = -log P(answer_j | prompt)
-    be the total sequence negative log likelihood. The choice probability is
-        q_j = exp(-s_j) / sum_k exp(-s_k),
-    and the reported loss is -log q_y. This measures discrimination among
-    the stated answer choices; it cannot improve merely by raising every
-    answer token probability together.
+    s_j = -log P(answer_j | prompt)
+    q_j = exp(-s_j) / sum_k exp(-s_k)
+    loss = -log q_correct
     """
     flat: list[dict] = []
-    option_token_lengths: list[list[int]] = [[] for _ in examples]
-
     for example_id, row in enumerate(examples):
         prompt_ids = v7.v1.encode_no_special(tokenizer, row["prompt"])
         if not prompt_ids:
             prompt_ids = [tokenizer.eos_token_id]
-
         for choice_id, choice in enumerate(row["choices"]):
             option_ids = v7.v1.encode_no_special(tokenizer, " " + choice)
             if not option_ids:
                 option_ids = [tokenizer.eos_token_id]
-            option_token_lengths[example_id].append(len(option_ids))
             flat.append({
                 "example_id": example_id,
                 "choice_id": choice_id,
@@ -79,7 +70,6 @@ def evaluate_mcq_choice_normalized(
         max_len = max(len(item["sequence"]) for item in batch_items)
         input_ids = torch.full((len(batch_items), max_len), pad, dtype=torch.long)
         attention_mask = torch.zeros_like(input_ids)
-
         for i, item in enumerate(batch_items):
             seq = item["sequence"]
             input_ids[i, : len(seq)] = torch.tensor(seq, dtype=torch.long)
@@ -91,7 +81,6 @@ def evaluate_mcq_choice_normalized(
             use_cache=False,
         ).logits.float()
         logp = logits.log_softmax(-1)
-
         for i, item in enumerate(batch_items):
             seq = item["sequence"]
             token_positions = torch.arange(item["start"], len(seq), dtype=torch.long)
@@ -108,26 +97,20 @@ def evaluate_mcq_choice_normalized(
         )
         label = int(row["label"])
         prediction = int(np.argmin(nlls))
-        # Stable logsumexp(-nlls).
-        logits = -nlls
-        max_logit = float(np.max(logits))
-        log_partition = max_logit + math.log(float(np.exp(logits - max_logit).sum()))
+        answer_logits = -nlls
+        max_logit = float(np.max(answer_logits))
+        log_partition = max_logit + math.log(
+            float(np.exp(answer_logits - max_logit).sum())
+        )
         choice_nll = float(nlls[label] + log_partition)
-
         records.append({
             "example_id": example_id,
-            # Existing summary/bootstrap code reads correct_nll. It now means
-            # the proper answer-set-normalized cross entropy, not raw token NLL.
+            # Compatibility name: this field now stores proper choice loss.
             "correct_nll": choice_nll,
-            "choice_nll": choice_nll,
-            "raw_correct_sequence_nll": float(nlls[label]),
             "correct": int(prediction == label),
             "prediction": prediction,
             "label": label,
-            "num_choices": int(len(nlls)),
-            "option_token_lengths": option_token_lengths[example_id],
         })
-
     return records
 
 
@@ -135,9 +118,6 @@ v7.evaluate_mcq_batched = evaluate_mcq_choice_normalized
 
 
 def main() -> None:
-    # The source main performs the frozen candidate construction, benchmark
-    # sampling, paired bootstrap, exact-copy audit, canonical rotation audit,
-    # checkpoint reload audit, and writes raw records.
     v7.main()
 
     result_path = ROOT / "RESULTS.json"
@@ -181,8 +161,7 @@ def main() -> None:
         for domain in mcq_domains
     }
 
-    # Frozen before this run: at most 1% loss regression and 2 percentage
-    # points accuracy regression against the per-domain better parent.
+    # Frozen before evaluation.
     loss_within_1pct = all(
         summaries["fixed_candidate"][domain]["nll"]
         <= 1.01 * best_parent_loss[domain]
@@ -198,7 +177,6 @@ def main() -> None:
         for parent in ["parent_base", "parent_instruct"]
     )
     rotation_pass = bool(result["canonical_rotation"]["pass"])
-
     strict_promoted = bool(
         loss_within_1pct
         and accuracy_within_2pp
@@ -237,13 +215,12 @@ def main() -> None:
     if not strict_promoted:
         shutil.rmtree(ROOT / "CANONICAL_ROTATED_MODEL", ignore_errors=True)
 
-    report_lines = [
+    (ROOT / "REPORT.md").write_text("\n".join([
         "# Proper Choice-Normalized Cross-Benchmark Validation",
         "",
         f"Status: **{result['status']}**",
         "",
-        "MCQ metric:",
-        "`s_j = -log P(answer_j | prompt)` and "
+        "MCQ metric: `s_j = -log P(answer_j|prompt)` and "
         "`loss = -log(exp(-s_y)/sum_j exp(-s_j))`.",
         "",
         f"Composite significantly beats both parents: **{composite_significant}**",
@@ -251,10 +228,8 @@ def main() -> None:
         f"Every MCQ accuracy within 2pp of the better parent: **{accuracy_within_2pp}**",
         f"Canonical rotation audit passed: **{rotation_pass}**",
         f"Final promotion: **{strict_promoted}**",
-    ]
-    (ROOT / "REPORT.md").write_text("\n".join(report_lines), encoding="utf-8")
+    ]), encoding="utf-8")
     print(json.dumps(result, indent=2))
-
     gc.collect()
 
 
