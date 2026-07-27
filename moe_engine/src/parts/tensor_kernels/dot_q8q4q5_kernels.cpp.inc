@@ -16,19 +16,17 @@ static float moe_dot_gguf_q8_0_row(
         const float d = moe_raw_fp16_to_f32(d16);
         const int8_t* q = reinterpret_cast<const int8_t*>(packed + 2u);
         const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
-        if (!std::isfinite(d)) {
-            return std::numeric_limits<float>::quiet_NaN();
-        }
 #if defined(__AVX2__)
-        const __m256 vscale = _mm256_set1_ps(d);
+        // PERF: Scale-factor hoisting — accumulate q*x first, multiply by d once.
+        // Removes N/8 vector multiplications per block (4 for Q8_0's 32-element blocks).
         __m256 vacc = _mm256_setzero_ps();
         uint32_t i = 0;
         for (; i + 7u < limit; i += 8u) {
             const __m256 qv = moe_i8x8_to_ps(q + i);
             const __m256 xv = _mm256_loadu_ps(x + start + i);
-            vacc = moe_madd_ps(_mm256_mul_ps(qv, vscale), xv, vacc);
+            vacc = moe_madd_ps(qv, xv, vacc);
         }
-        acc += moe_dot_hsum256_ps(vacc);
+        acc += moe_dot_hsum256_ps(vacc) * d;
         for (; i < limit; ++i) {
             acc += d * (float)q[i] * x[start + i];
         }
@@ -40,6 +38,44 @@ static float moe_dot_gguf_q8_0_row(
         packed += block_bytes;
     }
     return acc;
+}
+
+static int moe_dot_gguf_q8_0_two_rows(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const float* x,
+    uint32_t cols,
+    float* out0,
+    float* out1
+) {
+    if (!packed0 || !packed1 || !x || !out0 || !out1) {
+        return 0;
+    }
+    *out0 = moe_dot_gguf_q8_0_row(packed0, x, cols);
+    *out1 = moe_dot_gguf_q8_0_row(packed1, x, cols);
+    return 1;
+}
+
+static int moe_dot_gguf_q8_0_four_rows(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const uint8_t* packed2,
+    const uint8_t* packed3,
+    const float* x,
+    uint32_t cols,
+    float* out0,
+    float* out1,
+    float* out2,
+    float* out3
+) {
+    if (!packed0 || !packed1 || !packed2 || !packed3 || !x || !out0 || !out1 || !out2 || !out3) {
+        return 0;
+    }
+    *out0 = moe_dot_gguf_q8_0_row(packed0, x, cols);
+    *out1 = moe_dot_gguf_q8_0_row(packed1, x, cols);
+    *out2 = moe_dot_gguf_q8_0_row(packed2, x, cols);
+    *out3 = moe_dot_gguf_q8_0_row(packed3, x, cols);
+    return 1;
 }
 
 static float moe_dot_gguf_q8_1_row(
@@ -59,19 +95,16 @@ static float moe_dot_gguf_q8_1_row(
         const float d = moe_raw_fp16_to_f32(d16);
         const int8_t* q = reinterpret_cast<const int8_t*>(packed + 4u);
         const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
-        if (!std::isfinite(d)) {
-            return std::numeric_limits<float>::quiet_NaN();
-        }
 #if defined(__AVX2__)
-        const __m256 vscale = _mm256_set1_ps(d);
+        // PERF: Scale-factor hoisting for Q8_1.
         __m256 vacc = _mm256_setzero_ps();
         uint32_t i = 0;
         for (; i + 7u < limit; i += 8u) {
             const __m256 qv = moe_i8x8_to_ps(q + i);
             const __m256 xv = _mm256_loadu_ps(x + start + i);
-            vacc = moe_madd_ps(_mm256_mul_ps(qv, vscale), xv, vacc);
+            vacc = moe_madd_ps(qv, xv, vacc);
         }
-        acc += moe_dot_hsum256_ps(vacc);
+        acc += moe_dot_hsum256_ps(vacc) * d;
         for (; i < limit; ++i) {
             acc += d * (float)q[i] * x[start + i];
         }
@@ -101,19 +134,20 @@ static float moe_dot_gguf_q8_k_row(
         std::memcpy(&d, packed, sizeof(d));
         const int8_t* q = reinterpret_cast<const int8_t*>(packed + 4u);
         const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
-        if (!std::isfinite(d)) {
-            return std::numeric_limits<float>::quiet_NaN();
-        }
 #if defined(__AVX2__)
-        const __m256 vscale = _mm256_set1_ps(d);
-        __m256 vacc = _mm256_setzero_ps();
+        // PERF: Scale-factor hoisting for Q8_K (256-element blocks).
+        // Eliminates 32 _mm256_mul_ps per block.
+        __m256 vacc0 = _mm256_setzero_ps();
+        __m256 vacc1 = _mm256_setzero_ps();
         uint32_t i = 0;
-        for (; i + 7u < limit; i += 8u) {
-            const __m256 qv = moe_i8x8_to_ps(q + i);
-            const __m256 xv = _mm256_loadu_ps(x + start + i);
-            vacc = moe_madd_ps(_mm256_mul_ps(qv, vscale), xv, vacc);
+        for (; i + 15u < limit; i += 16u) {
+            vacc0 = moe_madd_ps(moe_i8x8_to_ps(q + i),      _mm256_loadu_ps(x + start + i),      vacc0);
+            vacc1 = moe_madd_ps(moe_i8x8_to_ps(q + i + 8u), _mm256_loadu_ps(x + start + i + 8u), vacc1);
         }
-        acc += moe_dot_hsum256_ps(vacc);
+        for (; i + 7u < limit; i += 8u) {
+            vacc0 = moe_madd_ps(moe_i8x8_to_ps(q + i), _mm256_loadu_ps(x + start + i), vacc0);
+        }
+        acc += moe_dot_hsum256_ps(_mm256_add_ps(vacc0, vacc1)) * d;
         for (; i < limit; ++i) {
             acc += d * (float)q[i] * x[start + i];
         }
@@ -144,9 +178,6 @@ static float moe_dot_gguf_q4_0_row(
         const float d = moe_raw_fp16_to_f32(d16);
         const uint8_t* qs = packed + 2u;
         const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
-        if (!std::isfinite(d)) {
-            return std::numeric_limits<float>::quiet_NaN();
-        }
         for (uint32_t i = 0; i < limit; ++i) {
             const uint8_t byte = qs[i & 15u];
             const uint8_t q = (i < 16u) ? (byte & 0x0fu) : (byte >> 4);
@@ -177,9 +208,6 @@ static float moe_dot_gguf_q4_1_row(
         const float m = moe_raw_fp16_to_f32(m16);
         const uint8_t* qs = packed + 4u;
         const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
-        if (!std::isfinite(d) || !std::isfinite(m)) {
-            return std::numeric_limits<float>::quiet_NaN();
-        }
         for (uint32_t i = 0; i < limit; ++i) {
             const uint8_t byte = qs[i & 15u];
             const uint8_t q = (i < 16u) ? (byte & 0x0fu) : (byte >> 4);
@@ -209,9 +237,6 @@ static float moe_dot_gguf_q5_0_row(
         const float d = moe_raw_fp16_to_f32(d16);
         const uint8_t* qs = packed + 6u;
         const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
-        if (!std::isfinite(d)) {
-            return std::numeric_limits<float>::quiet_NaN();
-        }
         for (uint32_t i = 0; i < limit; ++i) {
             const uint8_t byte = qs[i & 15u];
             const uint32_t low = (i < 16u) ? (byte & 0x0fu) : (byte >> 4);

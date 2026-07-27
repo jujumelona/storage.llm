@@ -38,8 +38,9 @@ static uint64_t tier_budget(const moe_pc_engine* engine, moe_tier_t tier) {
             //   → experts forced to DB tier → unnecessary storage I/O on Apple Silicon.
             // Solution: Return UINT64_MAX for unified memory. OS manages memory pressure.
             // Impact: Metal/APU can now place experts in RAM tier; budget is OS-managed.
-            if (engine->true_zero_copy_validated.load(std::memory_order_acquire)) {
-                return UINT64_MAX;
+            if (engine->true_zero_copy_validated.load(std::memory_order_acquire) ||
+                engine->juju_execution_path == moe_JUJU_EXEC_FULL_COMPUTE_MEM) {
+                return UINT64_MAX / 128ull;
             }
             return engine->config.ram_budget_bytes;
         case moe_TIER_DB:

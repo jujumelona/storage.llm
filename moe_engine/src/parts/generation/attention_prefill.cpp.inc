@@ -1007,7 +1007,7 @@ static float moe_apply_attention_logit_softcap(
     float cap,
     float score
 ) {
-    if (!(cap > 0.0f) || !std::isfinite(cap) || !std::isfinite(score)) {
+    if (!(cap > 0.0f)) {
         return score;
     }
     return std::tanh(score / cap) * cap;

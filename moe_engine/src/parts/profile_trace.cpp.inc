@@ -117,12 +117,18 @@ static int moe_profile_tag_enabled(const char* tag) {
 }
 
 static uint64_t moe_profile_now_us() {
+    if (!moe_profile_enabled()) {
+        return 0;
+    }
     using clock = std::chrono::steady_clock;
     return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
         clock::now().time_since_epoch()).count();
 }
 
 static double moe_profile_elapsed_ms(uint64_t start_us) {
+    if (start_us == 0) {
+        return 0.0;
+    }
     const uint64_t now_us = moe_profile_now_us();
     return now_us >= start_us ? (double)(now_us - start_us) / 1000.0 : 0.0;
 }

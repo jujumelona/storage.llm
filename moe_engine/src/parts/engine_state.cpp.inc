@@ -13,6 +13,37 @@ static constexpr size_t moe_GATE_SNAPSHOT_EPOCH_SLOTS = (moe_GATE_SNAPSHOT_MAX_L
 
 static std::atomic<uint64_t> g_moe_engine_generation{0};
 
+struct CachedPrefixEntry {
+    std::vector<int32_t> tokens;
+    struct SlotData {
+        std::vector<uint8_t> k_idx;
+        std::vector<uint8_t> v_idx;
+        std::vector<float> k_norms;
+        std::vector<float> v_norms;
+        std::vector<uint8_t> k_qjl;
+        std::vector<uint8_t> v_qjl;
+        std::vector<float> k_residual_norms;
+        std::vector<float> v_residual_norms;
+        std::vector<uint8_t> k_idx_outlier;
+        std::vector<uint8_t> k_idx_normal;
+        std::vector<uint8_t> v_idx_outlier;
+        std::vector<uint8_t> v_idx_normal;
+        std::vector<float> k_norms_outlier;
+        std::vector<float> k_norms_normal;
+        std::vector<float> v_norms_outlier;
+        std::vector<float> v_norms_normal;
+        std::vector<float> k_residual_norms_outlier;
+        std::vector<float> k_residual_norms_normal;
+        std::vector<float> v_residual_norms_outlier;
+        std::vector<float> v_residual_norms_normal;
+        std::vector<float> k_sink;
+        std::vector<float> v_sink;
+        uint32_t sink_tokens = 0;
+    };
+    std::vector<SlotData> slots;
+    uint64_t last_used = 0;
+};
+
 struct moe_generation_output_cache_entry_t {
     std::vector<int32_t> input_tokens;
     std::vector<uint32_t> output_tokens;
@@ -21,6 +52,7 @@ struct moe_generation_output_cache_entry_t {
     int stop_on_eos = 0;
     uint64_t last_used = 0;
 };
+
 
 struct moe_pc_engine {
     uint64_t engine_generation = 0;
@@ -676,6 +708,8 @@ std::atomic<int> storage_format_plan_available{0};
     std::atomic<uint64_t> prefix_kv_cache_misses{0};
     std::atomic<uint64_t> prefix_kv_cache_insertions{0};
     std::atomic<uint32_t> prefix_kv_cache_committed_tokens{0};
+    std::vector<CachedPrefixEntry> prefix_qkv_cache_entries;
+    uint64_t prefix_qkv_cache_clock = 0;
     std::mutex generation_output_cache_mutex;
     std::vector<moe_generation_output_cache_entry_t> generation_output_cache_entries;
     uint64_t generation_output_cache_clock = 0;

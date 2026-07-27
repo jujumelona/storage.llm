@@ -41,33 +41,34 @@ static float moe_dot_raw_fp16_row(const uint8_t* packed, const float* x, uint32_
     for (; col < cols; ++col) {
         acc += moe_raw_fp16_to_f32(fp16[col]) * x[col];
     }
-    // BUGFIX 699: Final NaN/Inf check
-    if (!std::isfinite(acc)) {
-        return 0.0f;
-    }
     return acc;
 #elif defined(__F16C__) && defined(__AVX2__)
     const uint16_t* fp16 = reinterpret_cast<const uint16_t*>(packed);
     __m256 acc0 = _mm256_setzero_ps();
     __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
     uint32_t col = 0;
+    for (; col + 31u < cols; col += 32u) {
+        __builtin_prefetch(fp16 + col + 64u, 0, 0);
+        __builtin_prefetch(x + col + 64u, 0, 0);
+        __m256i h32_0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(fp16 + col));
+        __m256i h32_1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(fp16 + col + 16u));
+        acc0 = moe_madd_ps(_mm256_cvtph_ps(_mm256_castsi256_si128(h32_0)), _mm256_loadu_ps(x + col), acc0);
+        acc1 = moe_madd_ps(_mm256_cvtph_ps(_mm256_extracti128_si256(h32_0, 1)), _mm256_loadu_ps(x + col + 8u), acc1);
+        acc2 = moe_madd_ps(_mm256_cvtph_ps(_mm256_castsi256_si128(h32_1)), _mm256_loadu_ps(x + col + 16u), acc2);
+        acc3 = moe_madd_ps(_mm256_cvtph_ps(_mm256_extracti128_si256(h32_1, 1)), _mm256_loadu_ps(x + col + 24u), acc3);
+    }
     for (; col + 15u < cols; col += 16u) {
-        __m128i h0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(fp16 + col));
-        __m128i h1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(fp16 + col + 8u));
-        __m256 f0 = _mm256_cvtph_ps(h0);
-        __m256 f1 = _mm256_cvtph_ps(h1);
-        __m256 x0 = _mm256_loadu_ps(x + col);
-        __m256 x1 = _mm256_loadu_ps(x + col + 8u);
-        acc0 = moe_madd_ps(f0, x0, acc0);
-        acc1 = moe_madd_ps(f1, x1, acc1);
+        __m256i h32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(fp16 + col));
+        acc0 = moe_madd_ps(_mm256_cvtph_ps(_mm256_castsi256_si128(h32)), _mm256_loadu_ps(x + col), acc0);
+        acc1 = moe_madd_ps(_mm256_cvtph_ps(_mm256_extracti128_si256(h32, 1)), _mm256_loadu_ps(x + col + 8u), acc1);
     }
     for (; col + 7u < cols; col += 8u) {
         __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(fp16 + col));
-        __m256 f = _mm256_cvtph_ps(h);
-        __m256 xv = _mm256_loadu_ps(x + col);
-        acc0 = moe_madd_ps(f, xv, acc0);
+        acc0 = moe_madd_ps(_mm256_cvtph_ps(h), _mm256_loadu_ps(x + col), acc0);
     }
-    acc0 = _mm256_add_ps(acc0, acc1);
+    acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
     // horizontal sum
     __m128 lo = _mm256_castps256_ps128(acc0);
     __m128 hi = _mm256_extractf128_ps(acc0, 1);
@@ -79,13 +80,9 @@ static float moe_dot_raw_fp16_row(const uint8_t* packed, const float* x, uint32_
     for (; col < cols; ++col) {
         acc += moe_raw_fp16_to_f32(fp16[col]) * x[col];
     }
-    // BUGFIX 699: Final NaN/Inf check
-    if (!std::isfinite(acc)) {
-        return 0.0f;
-    }
     return acc;
 #elif defined(__ARM_NEON) || defined(__aarch64__)
-    // BUGFIX 문제9: ARM NEON SIMD for Apple Silicon / ARM64 ?�★??
+    // BUGFIX 문제9: ARM NEON SIMD for Apple Silicon / ARM64 ?★??
     // Problem: Only AVX-512/AVX2 paths existed, ARM fell back to scalar loop
     // Impact: 8x slower on Apple Silicon M2/M3 despite Metal zero-copy
     // Solution: Add NEON intrinsics for FP16 dot product
@@ -107,10 +104,6 @@ static float moe_dot_raw_fp16_row(const uint8_t* packed, const float* x, uint32_
     for (; col < cols; ++col) {
         acc += moe_raw_fp16_to_f32(fp16[col]) * x[col];
     }
-    // BUGFIX 699: Final NaN/Inf check
-    if (!std::isfinite(acc)) {
-        return 0.0f;
-    }
     return acc;
 #else
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
@@ -131,10 +124,6 @@ static float moe_dot_raw_fp16_row(const uint8_t* packed, const float* x, uint32_
         uint16_t v;
         std::memcpy(&v, packed + (uint64_t)col * 2ull, sizeof(v));
         acc += moe_raw_fp16_to_f32(v) * x[col];
-    }
-    // BUGFIX 699: Final NaN/Inf check
-    if (!std::isfinite(acc)) {
-        return 0.0f;
     }
     return acc;
 #endif
@@ -177,30 +166,30 @@ static float moe_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32_
     for (; col < cols; ++col) {
         acc += fp32[col] * x[col];
     }
-    // BUGFIX 700: Final NaN/Inf check
-    if (!std::isfinite(acc)) {
-        return 0.0f;
-    }
     return acc;
 #elif defined(__AVX2__)
     const float* fp32 = reinterpret_cast<const float*>(packed);
     __m256 acc0 = _mm256_setzero_ps();
     __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
     uint32_t col = 0;
+    for (; col + 31u < cols; col += 32u) {
+        __builtin_prefetch(fp32 + col + 64u, 0, 0);
+        __builtin_prefetch(x + col + 64u, 0, 0);
+        acc0 = moe_madd_ps(_mm256_loadu_ps(fp32 + col),       _mm256_loadu_ps(x + col),       acc0);
+        acc1 = moe_madd_ps(_mm256_loadu_ps(fp32 + col + 8u),  _mm256_loadu_ps(x + col + 8u),  acc1);
+        acc2 = moe_madd_ps(_mm256_loadu_ps(fp32 + col + 16u), _mm256_loadu_ps(x + col + 16u), acc2);
+        acc3 = moe_madd_ps(_mm256_loadu_ps(fp32 + col + 24u), _mm256_loadu_ps(x + col + 24u), acc3);
+    }
     for (; col + 15u < cols; col += 16u) {
-        __m256 f0 = _mm256_loadu_ps(fp32 + col);
-        __m256 f1 = _mm256_loadu_ps(fp32 + col + 8u);
-        __m256 x0 = _mm256_loadu_ps(x + col);
-        __m256 x1 = _mm256_loadu_ps(x + col + 8u);
-        acc0 = moe_madd_ps(f0, x0, acc0);
-        acc1 = moe_madd_ps(f1, x1, acc1);
+        acc0 = moe_madd_ps(_mm256_loadu_ps(fp32 + col),      _mm256_loadu_ps(x + col),      acc0);
+        acc1 = moe_madd_ps(_mm256_loadu_ps(fp32 + col + 8u), _mm256_loadu_ps(x + col + 8u), acc1);
     }
     for (; col + 7u < cols; col += 8u) {
-        __m256 f = _mm256_loadu_ps(fp32 + col);
-        __m256 xv = _mm256_loadu_ps(x + col);
-        acc0 = moe_madd_ps(f, xv, acc0);
+        acc0 = moe_madd_ps(_mm256_loadu_ps(fp32 + col), _mm256_loadu_ps(x + col), acc0);
     }
-    acc0 = _mm256_add_ps(acc0, acc1);
+    acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
     // horizontal sum
     __m128 lo = _mm256_castps256_ps128(acc0);
     __m128 hi = _mm256_extractf128_ps(acc0, 1);
@@ -211,10 +200,6 @@ static float moe_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32_
     // tail
     for (; col < cols; ++col) {
         acc += fp32[col] * x[col];
-    }
-    // BUGFIX 700: Final NaN/Inf check
-    if (!std::isfinite(acc)) {
-        return 0.0f;
     }
     return acc;
 #elif defined(__ARM_NEON) || defined(__aarch64__)
@@ -239,10 +224,6 @@ static float moe_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32_
     for (; col < cols; ++col) {
         acc += fp32[col] * x[col];
     }
-    // BUGFIX 700: Final NaN/Inf check
-    if (!std::isfinite(acc)) {
-        return 0.0f;
-    }
     return acc;
 #else
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
@@ -263,10 +244,6 @@ static float moe_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32_
         float v;
         std::memcpy(&v, packed + (uint64_t)col * 4ull, sizeof(v));
         acc += v * x[col];
-    }
-    // BUGFIX 700: Final NaN/Inf check
-    if (!std::isfinite(acc)) {
-        return 0.0f;
     }
     return acc;
 #endif
@@ -324,10 +301,6 @@ static float moe_dot_raw_bf16_row(const uint8_t* packed, const float* x, uint32_
         acc += moe_tensor_bf16_to_f32(v) * x[i];
     }
 #endif
-    // BUGFIX 701: Final NaN/Inf check
-    if (!std::isfinite(acc)) {
-        return 0.0f;
-    }
     return acc;
 }
 

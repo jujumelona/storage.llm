@@ -761,14 +761,18 @@ static int moe_engine_apply_juju_strategy(
     }
     moe_rt_cap_cpu_juju_parallelism(engine, &cfg);
 
+    const int has_gpu = engine->config.prefer_gpu && caps_gpu_backend_available(engine->backend_caps);
     moe_juju_execution_path_t path = moe_juju_select_execution_path(
-        engine->config.prefer_gpu && caps_gpu_backend_available(engine->backend_caps),
+        has_gpu,
         model_bytes,
         expert_bytes,
         &tier0,
         &tier1,
         &tier2
     );
+    if (!has_gpu) {
+        path = moe_JUJU_EXEC_FULL_COMPUTE_MEM;
+    }
 
     moe_io_config_t io = engine->io_config;
     moe_rt_apply_juju_io_flags(engine, path, cfg, &io);

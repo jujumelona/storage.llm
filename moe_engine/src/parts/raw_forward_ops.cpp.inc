@@ -250,9 +250,6 @@ static int moe_apply_unweighted_rmsnorm_f32(
     }
     double ss = 0.0;
     for (uint32_t i = 0; i < count; ++i) {
-        if (!std::isfinite(input[i])) {
-            return 0;
-        }
         ss += (double)input[i] * (double)input[i];
     }
     if (!std::isfinite(ss) || ss < 0.0) {
@@ -263,11 +260,7 @@ static int moe_apply_unweighted_rmsnorm_f32(
         return 0;
     }
     for (uint32_t i = 0; i < count; ++i) {
-        const float v = input[i] * norm;
-        if (!std::isfinite(v)) {
-            return 0;
-        }
-        output[i] = v;
+        output[i] = input[i] * norm;
     }
     return 1;
 }
@@ -332,9 +325,6 @@ int moe_pc_engine_raw_rmsnorm_f32(
     ss = buf[0] + buf[1] + buf[2] + buf[3];
 #endif
     for (; i < input_count; ++i) {
-        if (!std::isfinite(input[i])) {
-            return 0;
-        }
         ss += (double)input[i] * (double)input[i];
     }
     if (!std::isfinite(ss) || ss < 0.0) {
@@ -380,18 +370,107 @@ int moe_pc_engine_raw_rmsnorm_f32(
             (double)weight_min,
             (double)weight_max);
     }
-    const int ok = moe_parallel_rows(engine, input_count, 0, [&](uint32_t i) {
-        const float w = moe_raw_scalar_to_f32(raw.base + (uint64_t)i * (uint64_t)elem, raw.scalar_encoding);
-        if (!std::isfinite(w)) {
-            return 0;
+    // PERF: AVX2 SIMD RMSNorm multiply.
+    // Original scalar loop called moe_raw_scalar_to_f32 per element (function call overhead).
+    // AVX2 path converts 8 BF16/FP16 weights to FP32 in a single SIMD operation.
+    int ok = 1;
+    uint32_t idx = 0;
+#if defined(__AVX2__)
+    const __m256 vnorm = _mm256_set1_ps(norm);
+    if (elem == 2 && !unit_offset) {
+        // BF16 or FP16 fast path: 16 weights at a time with 256-bit vector load
+        const int is_bf16 = (raw.scalar_encoding == 3 || raw.scalar_encoding == 4);
+        for (; idx + 15 < input_count; idx += 16) {
+            __m256i raw32 = _mm256_loadu_si256((const __m256i*)(raw.base + (uint64_t)idx * 2ull));
+            __m128i raw16_lo = _mm256_castsi256_si128(raw32);
+            __m128i raw16_hi = _mm256_extracti128_si256(raw32, 1);
+            __m256 w0, w1;
+            if (is_bf16) {
+                w0 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw16_lo), 16));
+                w1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw16_hi), 16));
+            } else {
+                w0 = _mm256_cvtph_ps(raw16_lo);
+                w1 = _mm256_cvtph_ps(raw16_hi);
+            }
+            __m256 in0 = _mm256_loadu_ps(input + idx);
+            __m256 in1 = _mm256_loadu_ps(input + idx + 8);
+            _mm256_storeu_ps(output + idx,     _mm256_mul_ps(_mm256_mul_ps(in0, vnorm), w0));
+            _mm256_storeu_ps(output + idx + 8, _mm256_mul_ps(_mm256_mul_ps(in1, vnorm), w1));
         }
-        const float result = input[i] * norm * (unit_offset ? (1.0f + w) : w);
-        if (!std::isfinite(result)) {
-            return 0;
+        for (; idx + 7 < input_count; idx += 8) {
+            __m128i raw16 = _mm_loadu_si128((const __m128i*)(raw.base + (uint64_t)idx * 2ull));
+            __m256 weights = is_bf16 ? _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw16), 16)) : _mm256_cvtph_ps(raw16);
+            __m256 vinput = _mm256_loadu_ps(input + idx);
+            _mm256_storeu_ps(output + idx, _mm256_mul_ps(_mm256_mul_ps(vinput, vnorm), weights));
         }
-        output[i] = result;
-        return 1;
-    });
+    } else if (elem == 2 && unit_offset) {
+        // BF16 or FP16 with unit offset: w_eff = 1.0 + w
+        const __m256 vone = _mm256_set1_ps(1.0f);
+        const int is_bf16 = (raw.scalar_encoding == 3 || raw.scalar_encoding == 4);
+        for (; idx + 15 < input_count; idx += 16) {
+            __m256i raw32 = _mm256_loadu_si256((const __m256i*)(raw.base + (uint64_t)idx * 2ull));
+            __m128i raw16_lo = _mm256_castsi256_si128(raw32);
+            __m128i raw16_hi = _mm256_extracti128_si256(raw32, 1);
+            __m256 w0, w1;
+            if (is_bf16) {
+                w0 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw16_lo), 16));
+                w1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw16_hi), 16));
+            } else {
+                w0 = _mm256_cvtph_ps(raw16_lo);
+                w1 = _mm256_cvtph_ps(raw16_hi);
+            }
+            w0 = _mm256_add_ps(vone, w0);
+            w1 = _mm256_add_ps(vone, w1);
+            __m256 in0 = _mm256_loadu_ps(input + idx);
+            __m256 in1 = _mm256_loadu_ps(input + idx + 8);
+            _mm256_storeu_ps(output + idx,     _mm256_mul_ps(_mm256_mul_ps(in0, vnorm), w0));
+            _mm256_storeu_ps(output + idx + 8, _mm256_mul_ps(_mm256_mul_ps(in1, vnorm), w1));
+        }
+        for (; idx + 7 < input_count; idx += 8) {
+            __m128i raw16 = _mm_loadu_si128((const __m128i*)(raw.base + (uint64_t)idx * 2ull));
+            __m256 weights = is_bf16 ? _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw16), 16)) : _mm256_cvtph_ps(raw16);
+            weights = _mm256_add_ps(vone, weights);
+            __m256 vinput = _mm256_loadu_ps(input + idx);
+            _mm256_storeu_ps(output + idx, _mm256_mul_ps(_mm256_mul_ps(vinput, vnorm), weights));
+        }
+    } else if (elem == 4 && !unit_offset) {
+        // FP32 weights fast path: 16 elements at a time
+        for (; idx + 15 < input_count; idx += 16) {
+            __m256 w0 = _mm256_loadu_ps((const float*)(raw.base + (uint64_t)idx * 4ull));
+            __m256 w1 = _mm256_loadu_ps((const float*)(raw.base + ((uint64_t)idx + 8ull) * 4ull));
+            __m256 in0 = _mm256_loadu_ps(input + idx);
+            __m256 in1 = _mm256_loadu_ps(input + idx + 8);
+            _mm256_storeu_ps(output + idx,     _mm256_mul_ps(_mm256_mul_ps(in0, vnorm), w0));
+            _mm256_storeu_ps(output + idx + 8, _mm256_mul_ps(_mm256_mul_ps(in1, vnorm), w1));
+        }
+        for (; idx + 7 < input_count; idx += 8) {
+            __m256 weights = _mm256_loadu_ps((const float*)(raw.base + (uint64_t)idx * 4ull));
+            __m256 vinput = _mm256_loadu_ps(input + idx);
+            _mm256_storeu_ps(output + idx, _mm256_mul_ps(_mm256_mul_ps(vinput, vnorm), weights));
+        }
+    } else if (elem == 4 && unit_offset) {
+        const __m256 vone = _mm256_set1_ps(1.0f);
+        for (; idx + 15 < input_count; idx += 16) {
+            __m256 w0 = _mm256_add_ps(vone, _mm256_loadu_ps((const float*)(raw.base + (uint64_t)idx * 4ull)));
+            __m256 w1 = _mm256_add_ps(vone, _mm256_loadu_ps((const float*)(raw.base + ((uint64_t)idx + 8ull) * 4ull)));
+            __m256 in0 = _mm256_loadu_ps(input + idx);
+            __m256 in1 = _mm256_loadu_ps(input + idx + 8);
+            _mm256_storeu_ps(output + idx,     _mm256_mul_ps(_mm256_mul_ps(in0, vnorm), w0));
+            _mm256_storeu_ps(output + idx + 8, _mm256_mul_ps(_mm256_mul_ps(in1, vnorm), w1));
+        }
+        for (; idx + 7 < input_count; idx += 8) {
+            __m256 weights = _mm256_add_ps(vone, _mm256_loadu_ps((const float*)(raw.base + (uint64_t)idx * 4ull)));
+            __m256 vinput = _mm256_loadu_ps(input + idx);
+            _mm256_storeu_ps(output + idx, _mm256_mul_ps(_mm256_mul_ps(vinput, vnorm), weights));
+        }
+    }
+#endif
+    // Scalar tail (and non-AVX2 fallback)
+    for (; idx < input_count; ++idx) {
+        const float w = moe_raw_scalar_to_f32(raw.base + (uint64_t)idx * (uint64_t)elem, raw.scalar_encoding);
+        const float result = input[idx] * norm * (unit_offset ? (1.0f + w) : w);
+        output[idx] = result;
+    }
     if (ok && moe_profile_level() >= 2) {
         double output_ss = 0.0;
         double output_abs = 0.0;

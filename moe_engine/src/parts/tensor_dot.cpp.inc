@@ -184,23 +184,14 @@ static int moe_dot_tensor_record_row(
     }
     if (weight_format == moe_WEIGHT_ENCODING_RAW_FP16) {
         *out_value = moe_dot_raw_fp16_row(packed, x, rec->info.cols);
-        if (!std::isfinite(*out_value)) {
-            return 0;
-        }
         return 1;
     }
     if (weight_format == moe_WEIGHT_ENCODING_RAW_BF16) {
         *out_value = moe_dot_raw_bf16_row(packed, x, rec->info.cols);
-        if (!std::isfinite(*out_value)) {
-            return 0;
-        }
         return 1;
     }
     if (weight_format == moe_WEIGHT_ENCODING_RAW_FP32) {
         *out_value = moe_dot_raw_fp32_row(packed, x, rec->info.cols);
-        if (!std::isfinite(*out_value)) {
-            return 0;
-        }
         return 1;
     }
     if (weight_format == moe_WEIGHT_ENCODING_NVFP4) {
@@ -474,7 +465,7 @@ static int moe_dot_tensor_fast_view_row(
     }
     if (view->simple_dot) {
         *out_value = view->simple_dot(packed, x, view->cols);
-        return std::isfinite(*out_value) ? 1 : 0;
+        return 1;
     }
     switch (view->weight_format) {
         case moe_WEIGHT_ENCODING_RAW_FP16:
@@ -566,7 +557,7 @@ static int moe_dot_tensor_fast_view_row(
         default:
             return 0;
     }
-    return std::isfinite(*out_value) ? 1 : 0;
+    return 1;
 }
 
 static int moe_dot_tensor_fast_view_row_batch(
@@ -639,7 +630,7 @@ static int moe_dot_tensor_fast_view_two_rows(
         a->mxfp4_pairwise_order == b->mxfp4_pairwise_order) {
         moe_dot_gguf_mxfp4_two_rows_with_layout(
             pa, pb, x, a->cols, a->mxfp4_layout, a->mxfp4_pairwise_order, out_a, out_b);
-        return std::isfinite(*out_a) && std::isfinite(*out_b) ? 1 : 0;
+        return 1;
     }
     return moe_dot_tensor_fast_view_row(engine, a, row, x, x_count, out_a) &&
            moe_dot_tensor_fast_view_row(engine, b, row, x, x_count, out_b);
@@ -666,7 +657,7 @@ static int moe_dot_tensor_fast_view_adjacent_rows(
     if (view->weight_format == moe_WEIGHT_ENCODING_MXFP4) {
         moe_dot_gguf_mxfp4_two_rows_with_layout(
             p0, p1, x, view->cols, view->mxfp4_layout, view->mxfp4_pairwise_order, out0, out1);
-        return std::isfinite(*out0) && std::isfinite(*out1) ? 1 : 0;
+        return 1;
     }
     return moe_dot_tensor_fast_view_row(engine, view, row, x, x_count, out0) &&
            moe_dot_tensor_fast_view_row(engine, view, row + 1u, x, x_count, out1);
@@ -698,14 +689,35 @@ static int moe_dot_tensor_fast_view_adjacent_four_rows(
         moe_dot_gguf_mxfp4_four_rows_with_layout(
             p0, p1, p2, p3, x, view->cols, view->mxfp4_layout,
             view->mxfp4_pairwise_order, out0, out1, out2, out3);
-        return std::isfinite(*out0) && std::isfinite(*out1) &&
-               std::isfinite(*out2) && std::isfinite(*out3) ? 1 : 0;
+        return 1;
     }
     return moe_dot_tensor_fast_view_adjacent_rows(
                engine, view, row, x, x_count, out0, out1) &&
            moe_dot_tensor_fast_view_adjacent_rows(
                engine, view, row + 2u, x, x_count, out2, out3);
 }
+
+static int moe_dot_tensor_fast_view_two_views_adjacent_four_rows(
+    moe_pc_engine_t* engine,
+    const moe_tensor_row_fast_view_t* view0,
+    const moe_tensor_row_fast_view_t* view1,
+    uint32_t row,
+    const float* x,
+    uint32_t x_count,
+    float* out0_v0, float* out1_v0, float* out2_v0, float* out3_v0,
+    float* out0_v1, float* out1_v1, float* out2_v1, float* out3_v1
+) {
+    if (!moe_dot_tensor_fast_view_adjacent_four_rows(
+            engine, view0, row, x, x_count, out0_v0, out1_v0, out2_v0, out3_v0)) {
+        return 0;
+    }
+    if (!moe_dot_tensor_fast_view_adjacent_four_rows(
+            engine, view1, row, x, x_count, out0_v1, out1_v1, out2_v1, out3_v1)) {
+        return 0;
+    }
+    return 1;
+}
+
 
 // ============================================================================
 // Batched Matrix-Vector Multiplication (GEMM Wrapper)

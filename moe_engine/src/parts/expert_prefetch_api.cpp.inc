@@ -428,7 +428,9 @@ int moe_pc_engine_startup_warm_model(moe_pc_engine_t* engine) {
         if (end && end != env && parsed > 0ul) {
             warm_candidate_limit = std::min<size_t>(warm_candidate_limit, (size_t)parsed);
         }
-    } else if (moe_storage_runtime_cpu_ram_path(engine) && layer_count > 0) {
+    } else if (moe_storage_runtime_cpu_ram_path(engine) &&
+               engine->juju_execution_path != moe_JUJU_EXEC_FULL_COMPUTE_MEM &&
+               layer_count > 0) {
         const uint64_t experts_per_layer =
             std::min<uint64_t>((uint64_t)c->experts_per_moe_layer, 64ull);
         const uint64_t cpu_storage_cap =

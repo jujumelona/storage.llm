@@ -122,6 +122,8 @@ static void moe_engine_reset_qkv_cache(moe_pc_engine* engine) {
     {
         std::lock_guard<std::mutex> prefix_lock(engine->prefix_kv_cache_mutex);
         engine->prefix_kv_cache_tokens.clear();
+        engine->prefix_qkv_cache_entries.clear();
+        engine->prefix_qkv_cache_clock = 0;
         engine->prefix_kv_cache_committed_tokens.store(0, std::memory_order_relaxed);
     }
     {

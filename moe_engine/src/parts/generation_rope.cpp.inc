@@ -128,7 +128,40 @@ static void moe_rope_inplace(
         sin_table.size() >= row_offset + half_dim) {
         const float* cos_row = cos_table.data() + row_offset;
         const float* sin_row = sin_table.data() + row_offset;
-        for (uint32_t j = 0; j < half_dim; ++j) {
+        uint32_t j = 0;
+#if defined(__AVX2__)
+        alignas(32) static const float sign_mask[8] = {-1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f};
+        const __m256 vsign = _mm256_load_ps(sign_mask);
+        for (; j + 7u < half_dim; j += 8u) {
+            const uint32_t i = j * 2u;
+            __m256 c8 = _mm256_loadu_ps(cos_row + j);
+            __m256 s8 = _mm256_loadu_ps(sin_row + j);
+            __m256 vcos0 = _mm256_moveldup_ps(c8);
+            __m256 vcos1 = _mm256_movehdup_ps(c8);
+            __m256 vsin0 = _mm256_mul_ps(_mm256_moveldup_ps(s8), vsign);
+            __m256 vsin1 = _mm256_mul_ps(_mm256_movehdup_ps(s8), vsign);
+            __m256 vx0 = _mm256_loadu_ps(data + i);
+            __m256 vx1 = _mm256_loadu_ps(data + i + 8u);
+            __m256 vx_swap0 = _mm256_shuffle_ps(vx0, vx0, _MM_SHUFFLE(2, 3, 0, 1));
+            __m256 vx_swap1 = _mm256_shuffle_ps(vx1, vx1, _MM_SHUFFLE(2, 3, 0, 1));
+            _mm256_storeu_ps(data + i, _mm256_fmadd_ps(vx_swap0, vsin0, _mm256_mul_ps(vx0, vcos0)));
+            _mm256_storeu_ps(data + i + 8u, _mm256_fmadd_ps(vx_swap1, vsin1, _mm256_mul_ps(vx1, vcos1)));
+        }
+        for (; j + 3u < half_dim; j += 4u) {
+            const uint32_t i = j * 2u;
+            __m128 c4 = _mm_loadu_ps(cos_row + j);
+            __m128 s4 = _mm_loadu_ps(sin_row + j);
+            __m256 vcos = _mm256_set_m128(_mm_unpackhi_ps(c4, c4), _mm_unpacklo_ps(c4, c4));
+            __m256 vsin = _mm256_set_m128(_mm_unpackhi_ps(s4, s4), _mm_unpacklo_ps(s4, s4));
+            vsin = _mm256_mul_ps(vsin, vsign);
+
+            __m256 vx = _mm256_loadu_ps(data + i);
+            __m256 vx_swap = _mm256_shuffle_ps(vx, vx, _MM_SHUFFLE(2, 3, 0, 1));
+            __m256 res = _mm256_fmadd_ps(vx_swap, vsin, _mm256_mul_ps(vx, vcos));
+            _mm256_storeu_ps(data + i, res);
+        }
+#endif
+        for (; j < half_dim; ++j) {
             const uint32_t i = j * 2u;
             const float cos_t = cos_row[j];
             const float sin_t = sin_row[j];
@@ -142,7 +175,25 @@ static void moe_rope_inplace(
     const float* cached_cos = nullptr;
     const float* cached_sin = nullptr;
     if (moe_rope_runtime_row(dim, position, base, &cached_cos, &cached_sin)) {
-        for (uint32_t j = 0; j < half_dim; ++j) {
+        uint32_t j = 0;
+#if defined(__AVX2__)
+        alignas(32) static const float sign_mask[8] = {-1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f};
+        const __m256 vsign = _mm256_load_ps(sign_mask);
+        for (; j + 3u < half_dim; j += 4u) {
+            const uint32_t i = j * 2u;
+            __m128 c4 = _mm_loadu_ps(cached_cos + j);
+            __m128 s4 = _mm_loadu_ps(cached_sin + j);
+            __m256 vcos = _mm256_set_m128(_mm_unpackhi_ps(c4, c4), _mm_unpacklo_ps(c4, c4));
+            __m256 vsin = _mm256_set_m128(_mm_unpackhi_ps(s4, s4), _mm_unpacklo_ps(s4, s4));
+            vsin = _mm256_mul_ps(vsin, vsign);
+
+            __m256 vx = _mm256_loadu_ps(data + i);
+            __m256 vx_swap = _mm256_shuffle_ps(vx, vx, _MM_SHUFFLE(2, 3, 0, 1));
+            __m256 res = _mm256_fmadd_ps(vx_swap, vsin, _mm256_mul_ps(vx, vcos));
+            _mm256_storeu_ps(data + i, res);
+        }
+#endif
+        for (; j < half_dim; ++j) {
             const uint32_t i = j * 2u;
             const float cos_t = cached_cos[j];
             const float sin_t = cached_sin[j];
@@ -190,7 +241,20 @@ static void moe_rope_rotate_half_inplace(
         sin_table.size() >= row_offset + half_dim) {
         const float* cos_row = cos_table.data() + row_offset;
         const float* sin_row = sin_table.data() + row_offset;
-        for (uint32_t j = 0; j < half_dim; ++j) {
+        uint32_t j = 0;
+#if defined(__AVX2__)
+        for (; j + 7u < half_dim; j += 8u) {
+            const __m256 vcos = _mm256_loadu_ps(cos_row + j);
+            const __m256 vsin = _mm256_loadu_ps(sin_row + j);
+            const __m256 vx0  = _mm256_loadu_ps(data + j);
+            const __m256 vx1  = _mm256_loadu_ps(data + j + half_dim);
+            const __m256 res0 = _mm256_sub_ps(_mm256_mul_ps(vx0, vcos), _mm256_mul_ps(vx1, vsin));
+            const __m256 res1 = _mm256_add_ps(_mm256_mul_ps(vx1, vcos), _mm256_mul_ps(vx0, vsin));
+            _mm256_storeu_ps(data + j, res0);
+            _mm256_storeu_ps(data + j + half_dim, res1);
+        }
+#endif
+        for (; j < half_dim; ++j) {
             const float cos_t = cos_row[j];
             const float sin_t = sin_row[j];
             const float x0 = data[j];
@@ -203,7 +267,20 @@ static void moe_rope_rotate_half_inplace(
     const float* cached_cos = nullptr;
     const float* cached_sin = nullptr;
     if (moe_rope_runtime_row(dim, position, base, &cached_cos, &cached_sin)) {
-        for (uint32_t j = 0; j < half_dim; ++j) {
+        uint32_t j = 0;
+#if defined(__AVX2__)
+        for (; j + 7u < half_dim; j += 8u) {
+            const __m256 vcos = _mm256_loadu_ps(cached_cos + j);
+            const __m256 vsin = _mm256_loadu_ps(cached_sin + j);
+            const __m256 vx0  = _mm256_loadu_ps(data + j);
+            const __m256 vx1  = _mm256_loadu_ps(data + j + half_dim);
+            const __m256 res0 = _mm256_sub_ps(_mm256_mul_ps(vx0, vcos), _mm256_mul_ps(vx1, vsin));
+            const __m256 res1 = _mm256_add_ps(_mm256_mul_ps(vx1, vcos), _mm256_mul_ps(vx0, vsin));
+            _mm256_storeu_ps(data + j, res0);
+            _mm256_storeu_ps(data + j + half_dim, res1);
+        }
+#endif
+        for (; j < half_dim; ++j) {
             const float cos_t = cached_cos[j];
             const float sin_t = cached_sin[j];
             const float x0 = data[j];

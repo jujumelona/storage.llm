@@ -8,9 +8,11 @@ static void moe_forward_trace_vec(
 #ifdef STORAGELLM_PPL_DIAG_ENABLED
     storagellm_ppl_diag_forward_vec(stage, position, layer, values, count);
 #endif
-    if (!values || count == 0 ||
-        (!moe_profile_tag_enabled("forward_vec") &&
-         !moe_profile_tag_enabled("op_parity_vec"))) {
+    if (moe_profile_level() <= 0 || !values || count == 0) {
+        return;
+    }
+    if (!moe_profile_tag_enabled("forward_vec") &&
+        !moe_profile_tag_enabled("op_parity_vec")) {
         return;
     }
     double ss = 0.0;
@@ -309,7 +311,20 @@ static int moe_apply_attention_residual_contract_f32(
     }
     int post_norm_used = 0;
     if (layer_plan.attention_residual_before_ffn_norm) {
-        for (uint32_t i = 0; i < hidden_size; ++i) {
+        // PERF: AVX2 vectorized residual add (pre-norm path)
+        uint32_t i = 0;
+#if defined(__AVX2__)
+        for (; i + 31u < hidden_size; i += 32u) {
+            _mm256_storeu_ps(shared_buffer + i,       _mm256_add_ps(_mm256_loadu_ps(residual + i),       _mm256_loadu_ps(attention_output + i)));
+            _mm256_storeu_ps(shared_buffer + i + 8u,  _mm256_add_ps(_mm256_loadu_ps(residual + i + 8u),  _mm256_loadu_ps(attention_output + i + 8u)));
+            _mm256_storeu_ps(shared_buffer + i + 16u, _mm256_add_ps(_mm256_loadu_ps(residual + i + 16u), _mm256_loadu_ps(attention_output + i + 16u)));
+            _mm256_storeu_ps(shared_buffer + i + 24u, _mm256_add_ps(_mm256_loadu_ps(residual + i + 24u), _mm256_loadu_ps(attention_output + i + 24u)));
+        }
+        for (; i + 7u < hidden_size; i += 8u) {
+            _mm256_storeu_ps(shared_buffer + i, _mm256_add_ps(_mm256_loadu_ps(residual + i), _mm256_loadu_ps(attention_output + i)));
+        }
+#endif
+        for (; i < hidden_size; ++i) {
             shared_buffer[i] = residual[i] + attention_output[i];
         }
         post_norm_used = moe_layer_post_attention_output_norm_f32(
@@ -330,11 +345,24 @@ static int moe_apply_attention_residual_contract_f32(
         if (post_norm_used) {
             attn_residual = norm_buffer;
         }
-        for (uint32_t i = 0; i < hidden_size; ++i) {
-            hidden[i] = residual[i] + attn_residual[i];
+        // PERF: AVX2 vectorized residual add (post-norm path)
+        uint32_t ri = 0;
+#if defined(__AVX2__)
+        for (; ri + 31u < hidden_size; ri += 32u) {
+            _mm256_storeu_ps(hidden + ri,       _mm256_add_ps(_mm256_loadu_ps(residual + ri),       _mm256_loadu_ps(attn_residual + ri)));
+            _mm256_storeu_ps(hidden + ri + 8u,  _mm256_add_ps(_mm256_loadu_ps(residual + ri + 8u),  _mm256_loadu_ps(attn_residual + ri + 8u)));
+            _mm256_storeu_ps(hidden + ri + 16u, _mm256_add_ps(_mm256_loadu_ps(residual + ri + 16u), _mm256_loadu_ps(attn_residual + ri + 16u)));
+            _mm256_storeu_ps(hidden + ri + 24u, _mm256_add_ps(_mm256_loadu_ps(residual + ri + 24u), _mm256_loadu_ps(attn_residual + ri + 24u)));
+        }
+        for (; ri + 7u < hidden_size; ri += 8u) {
+            _mm256_storeu_ps(hidden + ri, _mm256_add_ps(_mm256_loadu_ps(residual + ri), _mm256_loadu_ps(attn_residual + ri)));
+        }
+#endif
+        for (; ri < hidden_size; ++ri) {
+            hidden[ri] = residual[ri] + attn_residual[ri];
         }
     }
-    moe_profile_log(
+    if (moe_profile_enabled()) moe_profile_log(
         "forward_post_attention_contract",
         "layer=%d used=%d residual_first=%d",
         layer, post_norm_used, layer_plan.attention_residual_before_ffn_norm);
@@ -518,7 +546,7 @@ static int moe_forward_one_token_f32(
                 moe_generation_set_error(stats, "input rmsnorm failed");
                 return 0;
             }
-            moe_profile_log(
+            if (moe_profile_enabled()) moe_profile_log(
                 "forward_split_input_norm",
                 "position=%u layer=%u ms=%.3f",
                 position, layer, moe_profile_elapsed_ms(split_input_norm_start_us));
@@ -529,7 +557,7 @@ static int moe_forward_one_token_f32(
                 moe_generation_set_error(stats, "attention block failed");
                 return 0;
             }
-            moe_profile_log(
+            if (moe_profile_enabled()) moe_profile_log(
                 "forward_split_standard_attention",
                 "position=%u layer=%u ms=%.3f",
                 position, layer, moe_profile_elapsed_ms(split_standard_attn_start_us));
@@ -542,13 +570,13 @@ static int moe_forward_one_token_f32(
                 moe_generation_set_error(stats, "post-attention norm tensor is required but could not be mapped");
                 return 0;
             }
-            moe_profile_log(
+            if (moe_profile_enabled()) moe_profile_log(
                 "forward_split_post_attention_norm",
                 "position=%u layer=%u graph_residual_first=%d ms=%.3f",
                 position, layer, layer_plan.attention_residual_before_ffn_norm,
                 moe_profile_elapsed_ms(split_post_norm_start_us));
             const uint64_t split_residual_start_us = moe_profile_now_us();
-            moe_profile_log(
+            if (moe_profile_enabled()) moe_profile_log(
                 "forward_split_residual",
                 "position=%u layer=%u ms=%.3f",
                 position, layer, moe_profile_elapsed_ms(split_residual_start_us));

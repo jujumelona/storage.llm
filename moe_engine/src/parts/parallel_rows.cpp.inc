@@ -276,15 +276,44 @@ static inline int moe_parallel_rows_call(RowFn& fn, uint32_t row) {
     }
 }
 
+// Minimum row count below which thread pool dispatch overhead (~2-5µs)
+// exceeds the compute savings from parallelism for single-token decode.
+// For decode, each row is typically one dot product (e.g., 7168-dim × quantized).
+// Empirically, row counts under 64 on modern CPUs complete faster inline.
+static uint32_t moe_parallel_rows_serial_threshold() {
+    static const uint32_t threshold = []() -> uint32_t {
+        const uint32_t override_val = moe_parse_env_u32("STORAGELLM_CPU_ROW_SERIAL_THRESHOLD");
+        return override_val > 0 ? override_val : 64u;
+    }();
+    return threshold;
+}
+
 template <typename RowFn>
 static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t block_rows, RowFn fn) {
     if (row_count == 0) {
         return 1;
     }
     moe_cpu_enable_fast_fp_mode();
-    const uint64_t trace_start_us = moe_profile_now_us();
-    const char* trace_label = moe_profile_parallel_label();
     uint32_t workers = row_hw_threads();
+
+    // PERF: Fast serial path for small workloads — skip ALL pool/OMP overhead.
+    // For single-token decode, many parallel_rows calls have small row counts
+    // (RMSNorm apply, RoPE heads, KV append, residual add, etc.) where the
+    // dispatch+wait overhead dominates. Run these inline.
+    const uint32_t serial_threshold = moe_parallel_rows_serial_threshold();
+    if (!engine || workers <= 1 || row_count <= serial_threshold) {
+        int ok = 1;
+        for (uint32_t row = 0; row < row_count; ++row) {
+            if (!moe_parallel_rows_call(fn, row)) {
+                ok = 0;
+                break;
+            }
+        }
+        return ok;
+    }
+
+    const uint64_t trace_start_us = moe_profile_enabled() ? moe_profile_now_us() : 0;
+    const char* trace_label = moe_profile_enabled() ? moe_profile_parallel_label() : "unlabeled";
     if (block_rows == 0) {
         block_rows = auto_row_block(engine, row_count, workers);
     }
@@ -292,7 +321,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     if (workers > max_blocks) {
         workers = max_blocks;
     }
-    if (!engine || workers <= 1) {
+    if (workers <= 1) {
         int ok = 1;
         for (uint32_t row = 0; row < row_count; ++row) {
             if (!moe_parallel_rows_call(fn, row)) {
@@ -303,7 +332,8 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
         moe_profile_log(
             "parallel_rows",
             "label=%s rows=%u block=%u workers=%u mode=serial ok=%d ms=%.3f",
-            trace_label, row_count, block_rows, workers, ok, moe_profile_elapsed_ms(trace_start_us));
+            trace_label, row_count, block_rows, workers, ok,
+            trace_start_us ? moe_profile_elapsed_ms(trace_start_us) : 0.0);
         return ok;
     }
 
@@ -341,10 +371,12 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
         if (engine) {
             engine->cpu_row_active.fetch_sub(1, std::memory_order_relaxed);
         }
-        moe_profile_log(
-            "parallel_rows",
-            "label=%s rows=%u block=%u workers=%u mode=nested_serial active_before=%d ok=%d ms=%.3f",
-            trace_label, row_count, block_rows, workers, prev_active, ok, moe_profile_elapsed_ms(trace_start_us));
+        if (trace_start_us) {
+            moe_profile_log(
+                "parallel_rows",
+                "label=%s rows=%u block=%u workers=%u mode=nested_serial active_before=%d ok=%d ms=%.3f",
+                trace_label, row_count, block_rows, workers, prev_active, ok, moe_profile_elapsed_ms(trace_start_us));
+        }
         return ok;
     }
 
@@ -374,11 +406,13 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
         if (engine) {
             engine->cpu_row_active.fetch_sub(1, std::memory_order_relaxed);
         }
-        moe_profile_log(
-            "parallel_rows",
-            "label=%s rows=%u block=%u workers=%u mode=omp ok=%d ms=%.3f",
-            trace_label, row_count, block_rows, workers,
-            ok.load(std::memory_order_acquire), moe_profile_elapsed_ms(trace_start_us));
+        if (trace_start_us) {
+            moe_profile_log(
+                "parallel_rows",
+                "label=%s rows=%u block=%u workers=%u mode=omp ok=%d ms=%.3f",
+                trace_label, row_count, block_rows, workers,
+                ok.load(std::memory_order_acquire), moe_profile_elapsed_ms(trace_start_us));
+        }
         return ok.load(std::memory_order_acquire) ? 1 : 0;
     }
 #endif
@@ -479,10 +513,12 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
         engine->cpu_row_active.fetch_sub(1, std::memory_order_relaxed);
     }
     const int final_ok = ok.load(std::memory_order_acquire);
-    moe_profile_log(
-        "parallel_rows",
-        "label=%s rows=%u block=%u workers=%u pool_workers=%u mode=pool ok=%d ms=%.3f",
-        trace_label, row_count, block_rows, workers, pool_workers, final_ok,
-        moe_profile_elapsed_ms(trace_start_us));
+    if (trace_start_us) {
+        moe_profile_log(
+            "parallel_rows",
+            "label=%s rows=%u block=%u workers=%u pool_workers=%u mode=pool ok=%d ms=%.3f",
+            trace_label, row_count, block_rows, workers, pool_workers, final_ok,
+            moe_profile_elapsed_ms(trace_start_us));
+    }
     return final_ok;
 }

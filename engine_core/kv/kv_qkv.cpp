@@ -413,13 +413,34 @@ static int qkv_store_qjl_residual_for_token(
             qkv_apply_hadamard_rotation_inverse(y_tilde, state->rotation_signs, x_mse, dim)) {
             // Fast inverse rotation path for Hadamard-backed QKV states.
         } else {
-        for (int i = 0; i < dim; ++i) {
-            float sum = 0.0f;
-            for (int j = 0; j < dim; ++j) {
-                sum += state->rotation_matrix[(size_t)j * (size_t)dim + (size_t)i] * y_tilde[j];
+#if defined(__AVX2__)
+            for (int i = 0; i < dim; ++i) {
+                x_mse[i] = 0.0f;
             }
-            x_mse[i] = sum;
-        }
+            for (int j = 0; j < dim; ++j) {
+                const float y_val = y_tilde[j];
+                const __m256 vy = _mm256_set1_ps(y_val);
+                const float* row = &state->rotation_matrix[(size_t)j * (size_t)dim];
+                int i = 0;
+                for (; i + 7 < dim; i += 8) {
+                    __m256 vrow = _mm256_loadu_ps(row + i);
+                    __m256 vx = _mm256_loadu_ps(x_mse + i);
+                    vx = _mm256_fmadd_ps(vrow, vy, vx);
+                    _mm256_storeu_ps(x_mse + i, vx);
+                }
+                for (; i < dim; ++i) {
+                    x_mse[i] += row[i] * y_val;
+                }
+            }
+#else
+            for (int i = 0; i < dim; ++i) {
+                float sum = 0.0f;
+                for (int j = 0; j < dim; ++j) {
+                    sum += state->rotation_matrix[(size_t)j * (size_t)dim + (size_t)i] * y_tilde[j];
+                }
+                x_mse[i] = sum;
+            }
+#endif
         }
     } else {
         memcpy(x_mse, y_tilde, (size_t)dim * sizeof(float));
@@ -431,6 +452,28 @@ static int qkv_store_qjl_residual_for_token(
         r_norm_sq += residual[i] * residual[i];
     }
     residual_norms[token_idx] = sqrtf(std::max(0.0f, r_norm_sq));
+#if defined(__AVX2__)
+    for (int i = 0; i < dim; ++i) {
+        __m256 vsum = _mm256_setzero_ps();
+        const float* row = &state->qjl_matrix[(size_t)i * (size_t)dim];
+        int j = 0;
+        for (; j + 7 < dim; j += 8) {
+            __m256 vr = _mm256_loadu_ps(residual + j);
+            __m256 vq = _mm256_loadu_ps(row + j);
+            vsum = _mm256_fmadd_ps(vq, vr, vsum);
+        }
+        __m128 vhi = _mm256_extractf128_ps(vsum, 1);
+        __m128 vlo = _mm256_castps256_ps128(vsum);
+        __m128 v4 = _mm_add_ps(vlo, vhi);
+        v4 = _mm_add_ps(v4, _mm_movehl_ps(v4, v4));
+        v4 = _mm_add_ss(v4, _mm_shuffle_ps(v4, v4, 1));
+        float sum = _mm_cvtss_f32(v4);
+        for (; j < dim; ++j) {
+            sum += row[j] * residual[j];
+        }
+        s_times_r[i] = sum;
+    }
+#else
     for (int i = 0; i < dim; ++i) {
         float sum = 0.0f;
         for (int j = 0; j < dim; ++j) {
@@ -438,6 +481,7 @@ static int qkv_store_qjl_residual_for_token(
         }
         s_times_r[i] = sum;
     }
+#endif
     const size_t qjl_stride = ((size_t)dim + 7u) / 8u;
     qkv_pack_signs(s_times_r, qjl_base + (size_t)token_idx * qjl_stride, dim);
     return 1;

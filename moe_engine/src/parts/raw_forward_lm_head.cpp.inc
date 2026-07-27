@@ -41,6 +41,39 @@ static int moe_lm_head_fill_scores_f32(
     }
     uint32_t i = 0;
     if (mxfp4_direct) {
+        for (; i + 8u <= count; i += 8u) {
+            const uint8_t* row0 = raw.base + (uint64_t)(start_row + i) * row_bytes;
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            float s4 = 0.0f, s5 = 0.0f, s6 = 0.0f, s7 = 0.0f;
+            moe_dot_gguf_mxfp4_four_rows_with_layout(
+                row0,
+                row0 + row_bytes,
+                row0 + row_bytes * 2u,
+                row0 + row_bytes * 3u,
+                hidden,
+                hidden_count,
+                mxfp4_layout,
+                mxfp4_pairwise_order,
+                &s0, &s1, &s2, &s3);
+            moe_dot_gguf_mxfp4_four_rows_with_layout(
+                row0 + row_bytes * 4u,
+                row0 + row_bytes * 5u,
+                row0 + row_bytes * 6u,
+                row0 + row_bytes * 7u,
+                hidden,
+                hidden_count,
+                mxfp4_layout,
+                mxfp4_pairwise_order,
+                &s4, &s5, &s6, &s7);
+            scores[i + 0u] = moe_apply_final_logit_softcap_cached(logit_softcap, s0);
+            scores[i + 1u] = moe_apply_final_logit_softcap_cached(logit_softcap, s1);
+            scores[i + 2u] = moe_apply_final_logit_softcap_cached(logit_softcap, s2);
+            scores[i + 3u] = moe_apply_final_logit_softcap_cached(logit_softcap, s3);
+            scores[i + 4u] = moe_apply_final_logit_softcap_cached(logit_softcap, s4);
+            scores[i + 5u] = moe_apply_final_logit_softcap_cached(logit_softcap, s5);
+            scores[i + 6u] = moe_apply_final_logit_softcap_cached(logit_softcap, s6);
+            scores[i + 7u] = moe_apply_final_logit_softcap_cached(logit_softcap, s7);
+        }
         for (; i + 4u <= count; i += 4u) {
             const uint8_t* row0 = raw.base + (uint64_t)(start_row + i) * row_bytes;
             float s0 = 0.0f;
@@ -64,10 +97,6 @@ static int moe_lm_head_fill_scores_f32(
             scores[i + 1u] = moe_apply_final_logit_softcap_cached(logit_softcap, s1);
             scores[i + 2u] = moe_apply_final_logit_softcap_cached(logit_softcap, s2);
             scores[i + 3u] = moe_apply_final_logit_softcap_cached(logit_softcap, s3);
-            if (!std::isfinite(scores[i + 0u]) || !std::isfinite(scores[i + 1u]) ||
-                !std::isfinite(scores[i + 2u]) || !std::isfinite(scores[i + 3u])) {
-                return 0;
-            }
         }
     }
     for (; i < count; ++i) {
@@ -80,9 +109,6 @@ static int moe_lm_head_fill_scores_f32(
             score = moe_raw_tensor_dot_row(raw, start_row + i, hidden, hidden_count);
         }
         scores[i] = moe_apply_final_logit_softcap_cached(logit_softcap, score);
-        if (!std::isfinite(scores[i])) {
-            return 0;
-        }
     }
     return 1;
 }
@@ -345,9 +371,11 @@ int moe_pc_engine_lm_head_top1_f32(
                 for(int k=0; k<4; ++k) {
                     __m256 v_score = _mm256_load_ps(scores + k*8);
                     __m256 v_cmp = _mm256_cmp_ps(v_score, v_max, _CMP_GT_OQ);
-                    v_max = _mm256_blendv_ps(v_max, v_score, v_cmp);
-                    __m256i curr_idx = _mm256_add_epi32(v_idx, _mm256_set1_epi32(t + k*8));
-                    v_best = _mm256_blendv_epi8(v_best, curr_idx, _mm256_castps_si256(v_cmp));
+                    if (_mm256_movemask_ps(v_cmp) != 0) {
+                        v_max = _mm256_blendv_ps(v_max, v_score, v_cmp);
+                        __m256i curr_idx = _mm256_add_epi32(v_idx, _mm256_set1_epi32(t + k*8));
+                        v_best = _mm256_blendv_epi8(v_best, curr_idx, _mm256_castps_si256(v_cmp));
+                    }
                 }
                 float max_arr[8];
                 uint32_t best_arr[8];

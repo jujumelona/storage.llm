@@ -1375,11 +1375,7 @@ static int moe_layer_moe_mlp_f32(
                 gate_up_failed.store(1, std::memory_order_relaxed);
                 return 1;
             }
-            // BUGFIX 850: Check gate/up results for NaN before activation ★★★
-            if (!std::isfinite(gate_v) || !std::isfinite(up_v)) {
-                gate_up_failed.store(1, std::memory_order_relaxed);
-                return 1;
-            }
+
             work[e].gate[r] = moe_generation_gated_activation_cached(activation_mode, gate_v, up_v);
         }
         return 1;
@@ -1486,8 +1482,7 @@ static int moe_layer_moe_mlp_f32(
                         dot_ok = moe_dot_tensor_fast_view_row(
                             engine, &shards[e].down_view, row0, work[e].gate, expert_intermediate, &v0);
                     }
-                    if (!dot_ok || !std::isfinite(v0) || (has_pair && !std::isfinite(v1)) ||
-                        (has_row2 && !std::isfinite(v2)) || (has_quad && !std::isfinite(v3))) {
+                    if (!dot_ok) {
                         fused_ok.store(0, std::memory_order_relaxed);
                         return 1;
                     }
@@ -1503,11 +1498,7 @@ static int moe_layer_moe_mlp_f32(
                         acc2 += v2 * scale;
                     }
                 }
-                if (!std::isfinite(acc0) || (has_pair && !std::isfinite(acc1)) ||
-                    (has_row2 && !std::isfinite(acc2)) || (has_quad && !std::isfinite(acc3))) {
-                    fused_ok.store(0, std::memory_order_relaxed);
-                    return 1;
-                }
+
                 s->residual[row0] = acc0;
                 if (has_pair) {
                     s->residual[row1] = acc1;

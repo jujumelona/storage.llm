@@ -36,6 +36,198 @@ static uint32_t moe_generation_output_cache_capacity() {
     return std::max(1u, std::min<uint32_t>(parsed, 128u));
 }
 
+struct QkvSlotSizes {
+    size_t k_idx_bytes = 0;
+    size_t v_idx_bytes = 0;
+    size_t k_norms_bytes = 0;
+    size_t v_norms_bytes = 0;
+    size_t k_qjl_bytes = 0;
+    size_t v_qjl_bytes = 0;
+    size_t k_res_norms_bytes = 0;
+    size_t v_res_norms_bytes = 0;
+    
+    size_t k_idx_out_bytes = 0;
+    size_t k_idx_norm_bytes = 0;
+    size_t v_idx_out_bytes = 0;
+    size_t v_idx_norm_bytes = 0;
+    
+    size_t k_norms_out_bytes = 0;
+    size_t k_norms_norm_bytes = 0;
+    size_t v_norms_out_bytes = 0;
+    size_t v_norms_norm_bytes = 0;
+    
+    size_t k_res_norms_out_bytes = 0;
+    size_t k_res_norms_norm_bytes = 0;
+    size_t v_res_norms_out_bytes = 0;
+    size_t v_res_norms_norm_bytes = 0;
+    
+    size_t k_sink_bytes = 0;
+    size_t v_sink_bytes = 0;
+};
+
+static QkvSlotSizes get_qkv_slot_sizes(const qkv_state_t* slot, const qkv_config_t* cfg, uint32_t L) {
+    QkvSlotSizes s;
+    int dim = slot->head_dim;
+    int k_bits = slot->k_bits;
+    int v_bits = slot->v_bits;
+    
+    const bool qjl_streams = cfg->enable_qjl &&
+        qkv_bits_codebook(k_bits) && qkv_bits_codebook(v_bits) &&
+        k_bits > 1 && v_bits > 1;
+    
+    const bool split_requested = cfg->outlier_channels > 0 && cfg->outlier_channels < dim;
+    
+    const int k_storage_bits = qjl_streams ? k_bits - 1 : k_bits;
+    const int v_storage_bits = qjl_streams ? v_bits - 1 : v_bits;
+    
+    s.k_idx_bytes = ((size_t)L * (size_t)dim * (size_t)k_storage_bits + 7) / 8;
+    s.v_idx_bytes = ((size_t)L * (size_t)dim * (size_t)v_storage_bits + 7) / 8;
+    s.k_norms_bytes = (size_t)L * sizeof(float);
+    s.v_norms_bytes = (size_t)L * sizeof(float);
+    
+    if (qjl_streams && slot->k_qjl && slot->v_qjl) {
+        s.k_qjl_bytes = (size_t)L * slot->qjl_token_bytes;
+        s.v_qjl_bytes = (size_t)L * slot->qjl_token_bytes;
+        s.k_res_norms_bytes = (size_t)L * sizeof(float);
+        s.v_res_norms_bytes = (size_t)L * sizeof(float);
+    }
+    
+    if (split_requested && slot->outlier_indices) {
+        int n_out = cfg->outlier_channels;
+        int n_norm = dim - n_out;
+        
+        const int k_outlier_bits = qkv_outlier_bits_for_target(cfg, QKV_TARGET_KEY);
+        const int k_normal_bits = qkv_normal_bits_for_target(cfg, QKV_TARGET_KEY);
+        const int v_outlier_bits = qkv_outlier_bits_for_target(cfg, QKV_TARGET_VALUE);
+        const int v_normal_bits = qkv_normal_bits_for_target(cfg, QKV_TARGET_VALUE);
+        
+        const bool k_split_qjl = qjl_streams &&
+            qkv_bits_codebook(k_outlier_bits) && qkv_bits_codebook(k_normal_bits) &&
+            k_outlier_bits > 1 && k_normal_bits > 1;
+        const bool v_split_qjl = qjl_streams &&
+            qkv_bits_codebook(v_outlier_bits) && qkv_bits_codebook(v_normal_bits) &&
+            v_outlier_bits > 1 && v_normal_bits > 1;
+            
+        const int k_out_storage_bits = k_split_qjl ? k_outlier_bits - 1 : k_outlier_bits;
+        const int k_norm_storage_bits = k_split_qjl ? k_normal_bits - 1 : k_normal_bits;
+        const int v_out_storage_bits = v_split_qjl ? v_outlier_bits - 1 : v_outlier_bits;
+        const int v_norm_storage_bits = v_split_qjl ? v_normal_bits - 1 : v_normal_bits;
+        
+        s.k_idx_out_bytes = ((size_t)L * (size_t)n_out * (size_t)k_out_storage_bits + 7) / 8;
+        s.k_idx_norm_bytes = ((size_t)L * (size_t)n_norm * (size_t)k_norm_storage_bits + 7) / 8;
+        s.v_idx_out_bytes = ((size_t)L * (size_t)n_out * (size_t)v_out_storage_bits + 7) / 8;
+        s.v_idx_norm_bytes = ((size_t)L * (size_t)n_norm * (size_t)v_norm_storage_bits + 7) / 8;
+        
+        s.k_norms_out_bytes = (size_t)L * sizeof(float);
+        s.k_norms_norm_bytes = (size_t)L * sizeof(float);
+        s.v_norms_out_bytes = (size_t)L * sizeof(float);
+        s.v_norms_norm_bytes = (size_t)L * sizeof(float);
+        
+        if (qjl_streams && slot->k_residual_norms_outlier) {
+            s.k_res_norms_out_bytes = (size_t)L * sizeof(float);
+            s.k_res_norms_norm_bytes = (size_t)L * sizeof(float);
+            s.v_res_norms_out_bytes = (size_t)L * sizeof(float);
+            s.v_res_norms_norm_bytes = (size_t)L * sizeof(float);
+        }
+    }
+    
+    if (slot->sink_tokens > 0 && slot->k_sink && slot->v_sink) {
+        s.k_sink_bytes = (size_t)slot->sink_tokens * (size_t)dim * sizeof(float);
+        s.v_sink_bytes = (size_t)slot->sink_tokens * (size_t)dim * sizeof(float);
+    }
+    
+    return s;
+}
+
+static void copy_qkv_slot_to_data(const qkv_state_t* slot, const qkv_config_t* cfg, uint32_t L, CachedPrefixEntry::SlotData& d) {
+    QkvSlotSizes s = get_qkv_slot_sizes(slot, cfg, L);
+    
+    auto copy_vec = [](const void* src, size_t bytes, std::vector<uint8_t>& dst) {
+        if (src && bytes > 0) {
+            dst.resize(bytes);
+            std::memcpy(dst.data(), src, bytes);
+        }
+    };
+    auto copy_vec_float = [](const float* src, size_t bytes, std::vector<float>& dst) {
+        if (src && bytes > 0) {
+            dst.resize(bytes / sizeof(float));
+            std::memcpy(dst.data(), src, bytes);
+        }
+    };
+    
+    copy_vec(slot->k_idx, s.k_idx_bytes, d.k_idx);
+    copy_vec(slot->v_idx, s.v_idx_bytes, d.v_idx);
+    copy_vec_float(slot->k_norms, s.k_norms_bytes, d.k_norms);
+    copy_vec_float(slot->v_norms, s.v_norms_bytes, d.v_norms);
+    
+    copy_vec(slot->k_qjl, s.k_qjl_bytes, d.k_qjl);
+    copy_vec(slot->v_qjl, s.v_qjl_bytes, d.v_qjl);
+    copy_vec_float(slot->k_residual_norms, s.k_res_norms_bytes, d.k_residual_norms);
+    copy_vec_float(slot->v_residual_norms, s.v_res_norms_bytes, d.v_residual_norms);
+    
+    copy_vec(slot->k_idx_outlier, s.k_idx_out_bytes, d.k_idx_outlier);
+    copy_vec(slot->k_idx_normal, s.k_idx_norm_bytes, d.k_idx_normal);
+    copy_vec(slot->v_idx_outlier, s.v_idx_out_bytes, d.v_idx_outlier);
+    copy_vec(slot->v_idx_normal, s.v_idx_norm_bytes, d.v_idx_normal);
+    
+    copy_vec_float(slot->k_norms_outlier, s.k_norms_out_bytes, d.k_norms_outlier);
+    copy_vec_float(slot->k_norms_normal, s.k_norms_norm_bytes, d.k_norms_normal);
+    copy_vec_float(slot->v_norms_outlier, s.v_norms_out_bytes, d.v_norms_outlier);
+    copy_vec_float(slot->v_norms_normal, s.v_norms_norm_bytes, d.v_norms_normal);
+    
+    copy_vec_float(slot->k_residual_norms_outlier, s.k_res_norms_out_bytes, d.k_residual_norms_outlier);
+    copy_vec_float(slot->k_residual_norms_normal, s.k_res_norms_norm_bytes, d.k_residual_norms_normal);
+    copy_vec_float(slot->v_residual_norms_outlier, s.v_res_norms_out_bytes, d.v_residual_norms_outlier);
+    copy_vec_float(slot->v_residual_norms_normal, s.v_res_norms_norm_bytes, d.v_residual_norms_normal);
+    
+    copy_vec_float(slot->k_sink, s.k_sink_bytes, d.k_sink);
+    copy_vec_float(slot->v_sink, s.v_sink_bytes, d.v_sink);
+    d.sink_tokens = slot->sink_tokens;
+}
+
+static void copy_qkv_data_to_slot(const CachedPrefixEntry::SlotData& d, const qkv_config_t* cfg, uint32_t L, qkv_state_t* slot) {
+    QkvSlotSizes s = get_qkv_slot_sizes(slot, cfg, L);
+    
+    auto restore_vec = [](const std::vector<uint8_t>& src, size_t bytes, void* dst) {
+        if (dst && bytes > 0 && src.size() >= bytes) {
+            std::memcpy(dst, src.data(), bytes);
+        }
+    };
+    auto restore_vec_float = [](const std::vector<float>& src, size_t bytes, float* dst) {
+        if (dst && bytes > 0 && src.size() >= bytes / sizeof(float)) {
+            std::memcpy(dst, src.data(), bytes);
+        }
+    };
+    
+    restore_vec(d.k_idx, s.k_idx_bytes, slot->k_idx);
+    restore_vec(d.v_idx, s.v_idx_bytes, slot->v_idx);
+    restore_vec_float(d.k_norms, s.k_norms_bytes, slot->k_norms);
+    restore_vec_float(d.v_norms, s.v_norms_bytes, slot->v_norms);
+    
+    restore_vec(d.k_qjl, s.k_qjl_bytes, slot->k_qjl);
+    restore_vec(d.v_qjl, s.v_qjl_bytes, slot->v_qjl);
+    restore_vec_float(d.k_residual_norms, s.k_res_norms_bytes, slot->k_residual_norms);
+    restore_vec_float(d.v_residual_norms, s.v_res_norms_bytes, slot->v_residual_norms);
+    
+    restore_vec(d.k_idx_outlier, s.k_idx_out_bytes, slot->k_idx_outlier);
+    restore_vec(d.k_idx_normal, s.k_idx_norm_bytes, slot->k_idx_normal);
+    restore_vec(d.v_idx_outlier, s.v_idx_out_bytes, slot->v_idx_outlier);
+    restore_vec(d.v_idx_normal, s.v_idx_norm_bytes, slot->v_idx_normal);
+    
+    restore_vec_float(d.k_norms_outlier, s.k_norms_out_bytes, slot->k_norms_outlier);
+    restore_vec_float(d.k_norms_normal, s.k_norms_norm_bytes, slot->k_norms_normal);
+    restore_vec_float(d.v_norms_outlier, s.v_norms_out_bytes, slot->v_norms_outlier);
+    restore_vec_float(d.v_norms_normal, s.v_norms_norm_bytes, slot->v_norms_normal);
+    
+    restore_vec_float(d.k_residual_norms_outlier, s.k_res_norms_out_bytes, slot->k_residual_norms_outlier);
+    restore_vec_float(d.k_residual_norms_normal, s.k_res_norms_norm_bytes, slot->k_residual_norms_normal);
+    restore_vec_float(d.v_residual_norms_outlier, s.v_res_norms_out_bytes, slot->v_residual_norms_outlier);
+    restore_vec_float(d.v_residual_norms_normal, s.v_res_norms_norm_bytes, slot->v_residual_norms_normal);
+    
+    restore_vec_float(d.k_sink, s.k_sink_bytes, slot->k_sink);
+    restore_vec_float(d.v_sink, s.v_sink_bytes, slot->v_sink);
+}
+
 static uint32_t moe_generation_prefix_kv_cache_match(
     moe_pc_engine_t* engine,
     const int32_t* tokens,
@@ -44,20 +236,37 @@ static uint32_t moe_generation_prefix_kv_cache_match(
     if (!engine || !tokens || token_count == 0 || !moe_generation_prefix_kv_cache_enabled()) {
         return 0;
     }
-    std::lock_guard<std::mutex> lock(engine->prefix_kv_cache_mutex);
-    const uint32_t cached_count =
-        (uint32_t)std::min<size_t>(engine->prefix_kv_cache_tokens.size(), (size_t)UINT32_MAX);
-    const uint32_t limit = std::min(token_count, cached_count);
-    uint32_t matched = 0;
-    while (matched < limit && engine->prefix_kv_cache_tokens[matched] == tokens[matched]) {
-        ++matched;
+    
+    std::lock_guard<std::mutex> prefix_lock(engine->prefix_kv_cache_mutex);
+    
+    uint32_t longest_match = 0;
+    int best_entry_idx = -1;
+    
+    for (size_t entry_idx = 0; entry_idx < engine->prefix_qkv_cache_entries.size(); ++entry_idx) {
+        const auto& entry = engine->prefix_qkv_cache_entries[entry_idx];
+        const uint32_t limit = std::min(token_count, (uint32_t)entry.tokens.size());
+        uint32_t matched = 0;
+        while (matched < limit && entry.tokens[matched] == tokens[matched]) {
+            ++matched;
+        }
+        if (matched > longest_match) {
+            longest_match = matched;
+            best_entry_idx = (int)entry_idx;
+        }
     }
-    if (matched > 0) {
+    
+    if (longest_match > 0 && best_entry_idx >= 0) {
+        engine->prefix_qkv_cache_entries[best_entry_idx].last_used = ++engine->prefix_qkv_cache_clock;
+        engine->prefix_kv_cache_tokens.assign(
+            engine->prefix_qkv_cache_entries[best_entry_idx].tokens.begin(),
+            engine->prefix_qkv_cache_entries[best_entry_idx].tokens.begin() + longest_match);
+            
         engine->prefix_kv_cache_hits.fetch_add(1, std::memory_order_relaxed);
     } else {
         engine->prefix_kv_cache_misses.fetch_add(1, std::memory_order_relaxed);
     }
-    return matched;
+    
+    return longest_match;
 }
 
 static int moe_generation_prefix_kv_cache_next_token(
@@ -84,6 +293,72 @@ static int moe_generation_prefix_kv_cache_next_token(
     return 1;
 }
 
+static int moe_generation_prefix_kv_cache_restore(
+    moe_pc_engine_t* engine,
+    uint32_t L,
+    uint32_t capacity
+) {
+    if (!engine || L == 0 || capacity == 0) {
+        return 0;
+    }
+    
+    std::vector<CachedPrefixEntry::SlotData> slots_to_restore;
+    
+    {
+        std::lock_guard<std::mutex> prefix_lock(engine->prefix_kv_cache_mutex);
+        const CachedPrefixEntry* matched_entry = nullptr;
+        for (const auto& entry : engine->prefix_qkv_cache_entries) {
+            if (entry.tokens.size() >= L) {
+                bool match = true;
+                for (uint32_t i = 0; i < L; ++i) {
+                    if (entry.tokens[i] != engine->prefix_kv_cache_tokens[i]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    matched_entry = &entry;
+                    break;
+                }
+            }
+        }
+        if (!matched_entry) {
+            return 0;
+        }
+        slots_to_restore = matched_entry->slots;
+    }
+    
+    uint32_t head_dim = engine->attn_config.head_dim ? engine->attn_config.head_dim : 128u;
+    uint32_t head_stride = engine->model_config_num_key_value_heads ? engine->model_config_num_key_value_heads : 1u;
+    uint32_t num_layers = engine->dynamic_shape.num_hidden_layers ? engine->dynamic_shape.num_hidden_layers : 1u;
+    size_t slot_count = (size_t)num_layers * (size_t)head_stride;
+    
+    if (slots_to_restore.size() < slot_count) {
+        return 0;
+    }
+    
+    for (uint32_t layer = 0; layer < num_layers; ++layer) {
+        for (uint32_t head = 0; head < head_stride; ++head) {
+            size_t slot_idx = 0;
+            qkv_state_t* slot = moe_qkv_ensure_layer_head_state_locked(
+                engine, layer, head, head_stride, capacity, head_dim, &slot_idx);
+            if (!slot || slot_idx >= slot_count) {
+                return 0;
+            }
+            
+            std::lock_guard<std::mutex> head_guard(*engine->qkv_head_state_locks[slot_idx]);
+            copy_qkv_data_to_slot(slots_to_restore[slot_idx], &engine->qkv_cfg, L, slot);
+            
+            if (slot_idx < engine->qkv_head_state_filled_tokens.size()) {
+                engine->qkv_head_state_filled_tokens[slot_idx] = std::max(
+                    engine->qkv_head_state_filled_tokens[slot_idx],
+                    (uint32_t)L);
+            }
+        }
+    }
+    return 1;
+}
+
 static void moe_generation_prefix_kv_cache_insert(
     moe_pc_engine_t* engine,
     const int32_t* tokens,
@@ -92,10 +367,73 @@ static void moe_generation_prefix_kv_cache_insert(
     if (!engine || !tokens || token_count == 0 || !moe_generation_prefix_kv_cache_enabled()) {
         return;
     }
-    std::lock_guard<std::mutex> lock(engine->prefix_kv_cache_mutex);
-    engine->prefix_kv_cache_tokens.assign(tokens, tokens + token_count);
-    engine->prefix_kv_cache_committed_tokens.store(token_count, std::memory_order_relaxed);
-    engine->prefix_kv_cache_insertions.fetch_add(1, std::memory_order_relaxed);
+    
+    CachedPrefixEntry entry;
+    entry.tokens.assign(tokens, tokens + token_count);
+    
+    {
+        std::lock_guard<std::mutex> qkv_lock(engine->qkv_mutex);
+        
+        uint32_t num_layers = engine->dynamic_shape.num_hidden_layers ? engine->dynamic_shape.num_hidden_layers : 1u;
+        uint32_t head_stride = engine->model_config_num_key_value_heads ? engine->model_config_num_key_value_heads : 1u;
+        size_t slot_count = (size_t)num_layers * (size_t)head_stride;
+        
+        if (engine->qkv_head_state_slots.size() >= slot_count) {
+            entry.slots.resize(slot_count);
+            for (size_t i = 0; i < slot_count; ++i) {
+                if (i < engine->qkv_head_state_valid.size() && engine->qkv_head_state_valid[i]) {
+                    const qkv_state_t* slot = &engine->qkv_head_state_slots[i];
+                    if (i < engine->qkv_head_state_filled_tokens.size() &&
+                        engine->qkv_head_state_filled_tokens[i] >= token_count &&
+                        slot->n_tokens >= (int)token_count) {
+                        
+                        std::lock_guard<std::mutex> head_guard(*engine->qkv_head_state_locks[i]);
+                        copy_qkv_slot_to_data(slot, &engine->qkv_cfg, token_count, entry.slots[i]);
+                    }
+                }
+            }
+        }
+    }
+    
+    {
+        std::lock_guard<std::mutex> prefix_lock(engine->prefix_kv_cache_mutex);
+        
+        engine->prefix_kv_cache_tokens.assign(tokens, tokens + token_count);
+        engine->prefix_kv_cache_committed_tokens.store(token_count, std::memory_order_relaxed);
+        engine->prefix_kv_cache_insertions.fetch_add(1, std::memory_order_relaxed);
+        
+        if (entry.slots.empty()) {
+            return;
+        }
+        
+        entry.last_used = ++engine->prefix_qkv_cache_clock;
+        
+        int found_idx = -1;
+        for (size_t i = 0; i < engine->prefix_qkv_cache_entries.size(); ++i) {
+            if (engine->prefix_qkv_cache_entries[i].tokens == entry.tokens) {
+                found_idx = (int)i;
+                break;
+            }
+        }
+        
+        if (found_idx >= 0) {
+            engine->prefix_qkv_cache_entries[found_idx] = std::move(entry);
+        } else {
+            const size_t max_capacity = 16u;
+            if (engine->prefix_qkv_cache_entries.size() >= max_capacity) {
+                size_t evict_idx = 0;
+                uint64_t oldest = std::numeric_limits<uint64_t>::max();
+                for (size_t i = 0; i < engine->prefix_qkv_cache_entries.size(); ++i) {
+                    if (engine->prefix_qkv_cache_entries[i].last_used < oldest) {
+                        oldest = engine->prefix_qkv_cache_entries[i].last_used;
+                        evict_idx = i;
+                    }
+                }
+                engine->prefix_qkv_cache_entries.erase(engine->prefix_qkv_cache_entries.begin() + evict_idx);
+            }
+            engine->prefix_qkv_cache_entries.push_back(std::move(entry));
+        }
+    }
 }
 
 static uint32_t moe_generation_output_cache_lookup(
@@ -454,6 +792,10 @@ int moe_pc_engine_generate_token_ids(
                 if (!moe_qkv_only_ensure_capacity(
                         engine, &scratch, attn_cfg, prefix_reuse_tokens - 1u, pre_allocate_kv)) {
                     moe_generation_set_error(out_stats, "prefix QKV capacity allocation failed");
+                    return 0;
+                }
+                if (!moe_generation_prefix_kv_cache_restore(engine, prefix_reuse_tokens, scratch.qkv_capacity_tokens)) {
+                    moe_generation_set_error(out_stats, "prefix QKV cache restore failed");
                     return 0;
                 }
                 engine->generation_token.store(prefix_reuse_tokens, std::memory_order_relaxed);

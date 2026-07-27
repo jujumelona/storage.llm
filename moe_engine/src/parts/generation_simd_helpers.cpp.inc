@@ -49,10 +49,25 @@ static inline void moe_scale_f32(float* values, float scale, uint32_t count) {
     uint32_t i = 0;
 #if defined(__AVX2__)
     const __m256 vscale = _mm256_set1_ps(scale);
+    // PERF: 32-wide unroll to hide FMA 4-cycle latency (2024-2025 AVX2 register blocking)
+    for (; i + 31u < count; i += 32u) {
+        __m256 v0 = _mm256_loadu_ps(values + i);
+        __m256 v1 = _mm256_loadu_ps(values + i + 8u);
+        __m256 v2 = _mm256_loadu_ps(values + i + 16u);
+        __m256 v3 = _mm256_loadu_ps(values + i + 24u);
+        _mm256_storeu_ps(values + i,       _mm256_mul_ps(v0, vscale));
+        _mm256_storeu_ps(values + i + 8u,  _mm256_mul_ps(v1, vscale));
+        _mm256_storeu_ps(values + i + 16u, _mm256_mul_ps(v2, vscale));
+        _mm256_storeu_ps(values + i + 24u, _mm256_mul_ps(v3, vscale));
+    }
+    for (; i + 15u < count; i += 16u) {
+        __m256 v0 = _mm256_loadu_ps(values + i);
+        __m256 v1 = _mm256_loadu_ps(values + i + 8u);
+        _mm256_storeu_ps(values + i,      _mm256_mul_ps(v0, vscale));
+        _mm256_storeu_ps(values + i + 8u, _mm256_mul_ps(v1, vscale));
+    }
     for (; i + 7u < count; i += 8u) {
-        __m256 v = _mm256_loadu_ps(values + i);
-        v = _mm256_mul_ps(v, vscale);
-        _mm256_storeu_ps(values + i, v);
+        _mm256_storeu_ps(values + i, _mm256_mul_ps(_mm256_loadu_ps(values + i), vscale));
     }
 #endif
     for (; i < count; ++i) {
@@ -64,6 +79,17 @@ static inline void moe_axpy_f32(float* dst, const float* src, float alpha, uint3
     uint32_t i = 0;
 #if defined(__AVX2__)
     const __m256 valpha = _mm256_set1_ps(alpha);
+    // PERF: 48-wide unroll with prefetch to overlap compute/memory for attention V accumulation
+    for (; i + 47u < count; i += 48u) {
+        __builtin_prefetch(src + i + 64u, 0, 1);
+        __builtin_prefetch(dst + i + 64u, 1, 1);
+        _mm256_storeu_ps(dst + i,       moe_madd_ps(valpha, _mm256_loadu_ps(src + i),       _mm256_loadu_ps(dst + i)));
+        _mm256_storeu_ps(dst + i + 8u,  moe_madd_ps(valpha, _mm256_loadu_ps(src + i + 8u),  _mm256_loadu_ps(dst + i + 8u)));
+        _mm256_storeu_ps(dst + i + 16u, moe_madd_ps(valpha, _mm256_loadu_ps(src + i + 16u), _mm256_loadu_ps(dst + i + 16u)));
+        _mm256_storeu_ps(dst + i + 24u, moe_madd_ps(valpha, _mm256_loadu_ps(src + i + 24u), _mm256_loadu_ps(dst + i + 24u)));
+        _mm256_storeu_ps(dst + i + 32u, moe_madd_ps(valpha, _mm256_loadu_ps(src + i + 32u), _mm256_loadu_ps(dst + i + 32u)));
+        _mm256_storeu_ps(dst + i + 40u, moe_madd_ps(valpha, _mm256_loadu_ps(src + i + 40u), _mm256_loadu_ps(dst + i + 40u)));
+    }
     for (; i + 31u < count; i += 32u) {
         _mm256_storeu_ps(dst + i,       moe_madd_ps(valpha, _mm256_loadu_ps(src + i),       _mm256_loadu_ps(dst + i)));
         _mm256_storeu_ps(dst + i + 8u,  moe_madd_ps(valpha, _mm256_loadu_ps(src + i + 8u),  _mm256_loadu_ps(dst + i + 8u)));
@@ -87,6 +113,15 @@ static inline void moe_axpy_bf16_row_f32(float* dst, const uint8_t* row, float a
     uint32_t i = 0;
 #if defined(__AVX2__)
     const __m256 valpha = _mm256_set1_ps(alpha);
+    for (; i + 15u < count; i += 16u) {
+        const __m256i packed32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + (uint64_t)i * 2ull));
+        const __m128i p0 = _mm256_castsi256_si128(packed32);
+        const __m128i p1 = _mm256_extracti128_si256(packed32, 1);
+        const __m256 v0 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(p0), 16));
+        const __m256 v1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(p1), 16));
+        _mm256_storeu_ps(dst + i,      moe_madd_ps(valpha, v0, _mm256_loadu_ps(dst + i)));
+        _mm256_storeu_ps(dst + i + 8u, moe_madd_ps(valpha, v1, _mm256_loadu_ps(dst + i + 8u)));
+    }
     for (; i + 7u < count; i += 8u) {
         const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + (uint64_t)i * 2ull));
         const __m256i expanded = _mm256_cvtepu16_epi32(packed);
