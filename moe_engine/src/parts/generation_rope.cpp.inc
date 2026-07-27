@@ -248,8 +248,8 @@ static void moe_rope_rotate_half_inplace(
             const __m256 vsin = _mm256_loadu_ps(sin_row + j);
             const __m256 vx0  = _mm256_loadu_ps(data + j);
             const __m256 vx1  = _mm256_loadu_ps(data + j + half_dim);
-            const __m256 res0 = _mm256_sub_ps(_mm256_mul_ps(vx0, vcos), _mm256_mul_ps(vx1, vsin));
-            const __m256 res1 = _mm256_add_ps(_mm256_mul_ps(vx1, vcos), _mm256_mul_ps(vx0, vsin));
+            const __m256 res0 = _mm256_fmsub_ps(vx0, vcos, _mm256_mul_ps(vx1, vsin));
+            const __m256 res1 = _mm256_fmadd_ps(vx1, vcos, _mm256_mul_ps(vx0, vsin));
             _mm256_storeu_ps(data + j, res0);
             _mm256_storeu_ps(data + j + half_dim, res1);
         }

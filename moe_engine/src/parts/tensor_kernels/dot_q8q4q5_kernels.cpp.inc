@@ -75,6 +75,13 @@ static int moe_dot_gguf_q8_0_four_rows(
     const uint32_t block_cols = 32u;
     const uint32_t block_bytes = 34u;
     for (uint32_t start = 0; start < cols; start += block_cols) {
+#if defined(__AVX2__)
+        // PERF: Software prefetch next block weights into L1 cache (~256 bytes ahead)
+        _mm_prefetch(reinterpret_cast<const char*>(packed0 + 256), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(packed1 + 256), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(packed2 + 256), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(packed3 + 256), _MM_HINT_T0);
+#endif
         uint16_t d0_16 = 0, d1_16 = 0, d2_16 = 0, d3_16 = 0;
         std::memcpy(&d0_16, packed0, 2);
         std::memcpy(&d1_16, packed1, 2);
@@ -130,6 +137,96 @@ static int moe_dot_gguf_q8_0_four_rows(
         packed3 += block_bytes;
     }
     *out0 = acc0; *out1 = acc1; *out2 = acc2; *out3 = acc3;
+    return 1;
+}
+
+static int moe_dot_gguf_q8_0_eight_rows(
+    const uint8_t* p0, const uint8_t* p1, const uint8_t* p2, const uint8_t* p3,
+    const uint8_t* p4, const uint8_t* p5, const uint8_t* p6, const uint8_t* p7,
+    const float* x, uint32_t cols,
+    float* out0, float* out1, float* out2, float* out3,
+    float* out4, float* out5, float* out6, float* out7
+) {
+    if (!p0 || !p1 || !p2 || !p3 || !p4 || !p5 || !p6 || !p7 || !x ||
+        !out0 || !out1 || !out2 || !out3 || !out4 || !out5 || !out6 || !out7) {
+        return 0;
+    }
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float acc4 = 0.0f, acc5 = 0.0f, acc6 = 0.0f, acc7 = 0.0f;
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 34u;
+    for (uint32_t start = 0; start < cols; start += block_cols) {
+#if defined(__AVX2__)
+        _mm_prefetch(reinterpret_cast<const char*>(p0 + 256), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(p1 + 256), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(p2 + 256), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(p3 + 256), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(p4 + 256), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(p5 + 256), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(p6 + 256), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(p7 + 256), _MM_HINT_T0);
+#endif
+        uint16_t d0_16 = 0, d1_16 = 0, d2_16 = 0, d3_16 = 0;
+        uint16_t d4_16 = 0, d5_16 = 0, d6_16 = 0, d7_16 = 0;
+        std::memcpy(&d0_16, p0, 2); std::memcpy(&d1_16, p1, 2);
+        std::memcpy(&d2_16, p2, 2); std::memcpy(&d3_16, p3, 2);
+        std::memcpy(&d4_16, p4, 2); std::memcpy(&d5_16, p5, 2);
+        std::memcpy(&d6_16, p6, 2); std::memcpy(&d7_16, p7, 2);
+        const float d0 = moe_raw_fp16_to_f32(d0_16), d1 = moe_raw_fp16_to_f32(d1_16);
+        const float d2 = moe_raw_fp16_to_f32(d2_16), d3 = moe_raw_fp16_to_f32(d3_16);
+        const float d4 = moe_raw_fp16_to_f32(d4_16), d5 = moe_raw_fp16_to_f32(d5_16);
+        const float d6 = moe_raw_fp16_to_f32(d6_16), d7 = moe_raw_fp16_to_f32(d7_16);
+        const int8_t* q0 = reinterpret_cast<const int8_t*>(p0 + 2u);
+        const int8_t* q1 = reinterpret_cast<const int8_t*>(p1 + 2u);
+        const int8_t* q2 = reinterpret_cast<const int8_t*>(p2 + 2u);
+        const int8_t* q3 = reinterpret_cast<const int8_t*>(p3 + 2u);
+        const int8_t* q4 = reinterpret_cast<const int8_t*>(p4 + 2u);
+        const int8_t* q5 = reinterpret_cast<const int8_t*>(p5 + 2u);
+        const int8_t* q6 = reinterpret_cast<const int8_t*>(p6 + 2u);
+        const int8_t* q7 = reinterpret_cast<const int8_t*>(p7 + 2u);
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
+#if defined(__AVX2__)
+        __m256 vacc0 = _mm256_setzero_ps(), vacc1 = _mm256_setzero_ps();
+        __m256 vacc2 = _mm256_setzero_ps(), vacc3 = _mm256_setzero_ps();
+        __m256 vacc4 = _mm256_setzero_ps(), vacc5 = _mm256_setzero_ps();
+        __m256 vacc6 = _mm256_setzero_ps(), vacc7 = _mm256_setzero_ps();
+        uint32_t i = 0;
+        for (; i + 7u < limit; i += 8u) {
+            const __m256 xv = _mm256_loadu_ps(x + start + i);
+            vacc0 = moe_madd_ps(moe_i8x8_to_ps(q0 + i), xv, vacc0);
+            vacc1 = moe_madd_ps(moe_i8x8_to_ps(q1 + i), xv, vacc1);
+            vacc2 = moe_madd_ps(moe_i8x8_to_ps(q2 + i), xv, vacc2);
+            vacc3 = moe_madd_ps(moe_i8x8_to_ps(q3 + i), xv, vacc3);
+            vacc4 = moe_madd_ps(moe_i8x8_to_ps(q4 + i), xv, vacc4);
+            vacc5 = moe_madd_ps(moe_i8x8_to_ps(q5 + i), xv, vacc5);
+            vacc6 = moe_madd_ps(moe_i8x8_to_ps(q6 + i), xv, vacc6);
+            vacc7 = moe_madd_ps(moe_i8x8_to_ps(q7 + i), xv, vacc7);
+        }
+        acc0 += moe_dot_hsum256_ps(vacc0) * d0; acc1 += moe_dot_hsum256_ps(vacc1) * d1;
+        acc2 += moe_dot_hsum256_ps(vacc2) * d2; acc3 += moe_dot_hsum256_ps(vacc3) * d3;
+        acc4 += moe_dot_hsum256_ps(vacc4) * d4; acc5 += moe_dot_hsum256_ps(vacc5) * d5;
+        acc6 += moe_dot_hsum256_ps(vacc6) * d6; acc7 += moe_dot_hsum256_ps(vacc7) * d7;
+        for (; i < limit; ++i) {
+            const float xi = x[start + i];
+            acc0 += d0 * (float)q0[i] * xi; acc1 += d1 * (float)q1[i] * xi;
+            acc2 += d2 * (float)q2[i] * xi; acc3 += d3 * (float)q3[i] * xi;
+            acc4 += d4 * (float)q4[i] * xi; acc5 += d5 * (float)q5[i] * xi;
+            acc6 += d6 * (float)q6[i] * xi; acc7 += d7 * (float)q7[i] * xi;
+        }
+#else
+        for (uint32_t i = 0; i < limit; ++i) {
+            const float xi = x[start + i];
+            acc0 += d0 * (float)q0[i] * xi; acc1 += d1 * (float)q1[i] * xi;
+            acc2 += d2 * (float)q2[i] * xi; acc3 += d3 * (float)q3[i] * xi;
+            acc4 += d4 * (float)q4[i] * xi; acc5 += d5 * (float)q5[i] * xi;
+            acc6 += d6 * (float)q6[i] * xi; acc7 += d7 * (float)q7[i] * xi;
+        }
+#endif
+        p0 += block_bytes; p1 += block_bytes; p2 += block_bytes; p3 += block_bytes;
+        p4 += block_bytes; p5 += block_bytes; p6 += block_bytes; p7 += block_bytes;
+    }
+    *out0 = acc0; *out1 = acc1; *out2 = acc2; *out3 = acc3;
+    *out4 = acc4; *out5 = acc5; *out6 = acc6; *out7 = acc7;
     return 1;
 }
 

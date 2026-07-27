@@ -1,22 +1,11 @@
 // Raw forward - LM head operations
 
 static inline float moe_apply_final_logit_softcap_cached(float cap, float score) {
-    // BUGFIX 719: Logit softcap NaN handling ★★
-    // Problem: No validation of score before tanh
-    // Impact: NaN in logit propagates to final token selection
-    // Solution: Check for NaN in score and tanh result
-    if (!(cap > 0.0f) || !std::isfinite(score)) {
+    if (!(cap > 0.0f)) {
         return score;
     }
     const float scaled = score / cap;
-    if (!std::isfinite(scaled)) {
-        return score > 0.0f ? cap : -cap;
-    }
-    const float tanh_val = std::tanh(scaled);
-    if (!std::isfinite(tanh_val)) {
-        return score > 0.0f ? cap : -cap;
-    }
-    return tanh_val * cap;
+    return std::tanh(scaled) * cap;
 }
 
 static uint32_t moe_lm_head_worker_hint() {
