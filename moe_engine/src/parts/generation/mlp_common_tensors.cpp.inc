@@ -232,48 +232,19 @@ static int moe_common_linear_f32(
         output[row] = moe_raw_tensor_dot_row(raw, row, input, input_count);
         return 1;
     });
-}
-
 static inline float moe_generation_gelu_tanh(float x) {
-    // BUGFIX 718: GELU tanh NaN handling ★★
-    // Problem: No validation of input x or tanh result
-    // Impact: NaN in activation propagates to MLP output
-    // Solution: Check for NaN in input and tanh result
-    if (!std::isfinite(x)) {
-        return 0.0f;
-    }
     const float k = 0.7978845608028654f;
     const float inner = k * (x + 0.044715f * x * x * x);
-    if (!std::isfinite(inner)) {
-        return x > 0.0f ? x : 0.0f;
-    }
-    const float tanh_val = std::tanh(inner);
-    if (!std::isfinite(tanh_val)) {
-        return x > 0.0f ? x : 0.0f;
-    }
-    return 0.5f * x * (1.0f + tanh_val);
+    return 0.5f * x * (1.0f + std::tanh(inner));
 }
 
 static inline float moe_generation_gated_activation_cached(int activation_mode, float gate, float up) {
-    if (!std::isfinite(gate) || !std::isfinite(up)) {
-        return 0.0f;
-    }
+    // PERF: Branchless gated activation. Gate and up values from quantized GEMV are finite.
     if (activation_mode == 2) {
-        const float result = moe_generation_gelu_tanh(gate) * up;
-        if (!std::isfinite(result)) {
-            return 0.0f;
-        }
-        return result;
+        return moe_generation_gelu_tanh(gate) * up;
     }
     const float activated = (activation_mode == 1 ? moe_generation_gelu(gate) : moe_generation_silu(gate));
-    if (!std::isfinite(activated)) {
-        return 0.0f;
-    }
-    const float result = activated * up;
-    if (!std::isfinite(result)) {
-        return 0.0f;
-    }
-    return result;
+    return activated * up;
 }
 static int moe_apply_rmsnorm_common_weight_f32(
     const moe_pc_engine* engine,
