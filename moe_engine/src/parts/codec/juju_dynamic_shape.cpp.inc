@@ -169,13 +169,8 @@ static void moe_juju_probe_note_index_json(
     if (moe_json_get_u64_local(index_json, "num_hidden_layers", &value) ||
         moe_json_get_u64_local(index_json, "n_layers", &value) ||
         moe_json_get_u64_local(index_json, "block_count", &value) ||
-        moe_json_get_u64_local(index_json, "llama.block_count", &value) ||
-        moe_json_get_u64_local(index_json, "gemma2.block_count", &value) ||
-        moe_json_get_u64_local(index_json, "gemma.block_count", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2.block_count", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2moe.block_count", &value) ||
-        moe_json_get_u64_local(index_json, "phi3.block_count", &value) ||
-        moe_json_get_u64_local(index_json, "mixtral.block_count", &value)) {
+        moe_json_get_u64_local(index_json, "num_hidden_layers", &value) ||
+        moe_json_get_u64_local(index_json, "n_layer", &value)) {
         probe->shape.num_hidden_layers = moe_u64_to_u32_clamped(value, probe->shape.num_hidden_layers);
     }
     if (moe_json_get_u64_local(index_json, "hidden_size", &value) ||
