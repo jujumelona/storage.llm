@@ -244,6 +244,8 @@ static void moe_rope_rotate_half_inplace(
         uint32_t j = 0;
 #if defined(__AVX2__)
         for (; j + 7u < half_dim; j += 8u) {
+            _mm_prefetch(reinterpret_cast<const char*>(cos_row + j + 32), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(sin_row + j + 32), _MM_HINT_T0);
             const __m256 vcos = _mm256_loadu_ps(cos_row + j);
             const __m256 vsin = _mm256_loadu_ps(sin_row + j);
             const __m256 vx0  = _mm256_loadu_ps(data + j);

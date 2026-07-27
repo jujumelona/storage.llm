@@ -11,6 +11,10 @@ static float moe_dot_gguf_q8_0_row(
     const uint32_t block_cols = 32u;
     const uint32_t block_bytes = 34u;
     for (uint32_t start = 0; start < cols; start += block_cols) {
+#if defined(__AVX2__)
+        _mm_prefetch(reinterpret_cast<const char*>(packed + 512), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(x + start + 64), _MM_HINT_T0);
+#endif
         uint16_t d16 = 0;
         std::memcpy(&d16, packed, sizeof(d16));
         const float d = moe_raw_fp16_to_f32(d16);

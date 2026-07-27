@@ -175,8 +175,8 @@ static float moe_dot_raw_fp32_row(const uint8_t* packed, const float* x, uint32_
     __m256 acc3 = _mm256_setzero_ps();
     uint32_t col = 0;
     for (; col + 31u < cols; col += 32u) {
-        __builtin_prefetch(fp32 + col + 64u, 0, 0);
-        __builtin_prefetch(x + col + 64u, 0, 0);
+        _mm_prefetch(reinterpret_cast<const char*>(fp32 + col + 128u), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(x + col + 128u), _MM_HINT_T0);
         acc0 = moe_madd_ps(_mm256_loadu_ps(fp32 + col),       _mm256_loadu_ps(x + col),       acc0);
         acc1 = moe_madd_ps(_mm256_loadu_ps(fp32 + col + 8u),  _mm256_loadu_ps(x + col + 8u),  acc1);
         acc2 = moe_madd_ps(_mm256_loadu_ps(fp32 + col + 16u), _mm256_loadu_ps(x + col + 16u), acc2);
