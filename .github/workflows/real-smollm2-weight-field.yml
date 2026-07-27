@@ -1,4 +1,4 @@
-# validation trigger: minimal-bit sequence selector v14
+# validation trigger: dual-prefix regret-weighted selector v16
 name: Real SmolLM2 Weight-Field Validation
 
 on:
@@ -7,11 +7,13 @@ on:
       - ".github/workflows/real-smollm2-weight-field.yml"
       - "experiments/real_smollm2_v13_validated_task_arithmetic.py"
       - "experiments/real_smollm2_v14_minimal_selector.py"
+      - "experiments/real_smollm2_v16_dual_prefix_selector.py"
   pull_request:
     paths:
       - ".github/workflows/real-smollm2-weight-field.yml"
       - "experiments/real_smollm2_v13_validated_task_arithmetic.py"
       - "experiments/real_smollm2_v14_minimal_selector.py"
+      - "experiments/real_smollm2_v16_dual_prefix_selector.py"
   workflow_dispatch:
 
 permissions:
@@ -38,18 +40,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: smollm2-135m-minimal-selector-v14
-      - name: Run minimal-bit selector validation
+          key: smollm2-135m-dual-prefix-selector-v16
+      - name: Run dual-prefix selector validation
         shell: bash
         run: |
-          mkdir -p out/real_smollm2_v14_minimal_selector
+          mkdir -p out/real_smollm2_v16_dual_prefix_selector
           set -o pipefail
-          python experiments/real_smollm2_v14_minimal_selector.py 2>&1 | tee out/real_smollm2_v14_minimal_selector/RUN.log
+          python experiments/real_smollm2_v16_dual_prefix_selector.py 2>&1 | tee out/real_smollm2_v16_dual_prefix_selector/RUN.log
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: real-smollm2-v14-minimal-selector-results
-          path: out/real_smollm2_v14_minimal_selector
+          name: real-smollm2-v16-dual-prefix-selector-results
+          path: out/real_smollm2_v16_dual_prefix_selector
           if-no-files-found: warn
           retention-days: 7
