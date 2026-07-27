@@ -71,10 +71,65 @@ static int moe_dot_gguf_q8_0_four_rows(
     if (!packed0 || !packed1 || !packed2 || !packed3 || !x || !out0 || !out1 || !out2 || !out3) {
         return 0;
     }
-    *out0 = moe_dot_gguf_q8_0_row(packed0, x, cols);
-    *out1 = moe_dot_gguf_q8_0_row(packed1, x, cols);
-    *out2 = moe_dot_gguf_q8_0_row(packed2, x, cols);
-    *out3 = moe_dot_gguf_q8_0_row(packed3, x, cols);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 34u;
+    for (uint32_t start = 0; start < cols; start += block_cols) {
+        uint16_t d0_16 = 0, d1_16 = 0, d2_16 = 0, d3_16 = 0;
+        std::memcpy(&d0_16, packed0, 2);
+        std::memcpy(&d1_16, packed1, 2);
+        std::memcpy(&d2_16, packed2, 2);
+        std::memcpy(&d3_16, packed3, 2);
+        const float d0 = moe_raw_fp16_to_f32(d0_16);
+        const float d1 = moe_raw_fp16_to_f32(d1_16);
+        const float d2 = moe_raw_fp16_to_f32(d2_16);
+        const float d3 = moe_raw_fp16_to_f32(d3_16);
+        const int8_t* q0 = reinterpret_cast<const int8_t*>(packed0 + 2u);
+        const int8_t* q1 = reinterpret_cast<const int8_t*>(packed1 + 2u);
+        const int8_t* q2 = reinterpret_cast<const int8_t*>(packed2 + 2u);
+        const int8_t* q3 = reinterpret_cast<const int8_t*>(packed3 + 2u);
+        const uint32_t limit = std::min<uint32_t>(block_cols, cols - start);
+#if defined(__AVX2__)
+        // PERF: Fused 4-row GEMV — load vector x ONCE into SIMD register for 4 rows.
+        // Cuts input vector L1/L2 memory bandwidth demand by 75%.
+        __m256 vacc0 = _mm256_setzero_ps();
+        __m256 vacc1 = _mm256_setzero_ps();
+        __m256 vacc2 = _mm256_setzero_ps();
+        __m256 vacc3 = _mm256_setzero_ps();
+        uint32_t i = 0;
+        for (; i + 7u < limit; i += 8u) {
+            const __m256 xv = _mm256_loadu_ps(x + start + i);
+            vacc0 = moe_madd_ps(moe_i8x8_to_ps(q0 + i), xv, vacc0);
+            vacc1 = moe_madd_ps(moe_i8x8_to_ps(q1 + i), xv, vacc1);
+            vacc2 = moe_madd_ps(moe_i8x8_to_ps(q2 + i), xv, vacc2);
+            vacc3 = moe_madd_ps(moe_i8x8_to_ps(q3 + i), xv, vacc3);
+        }
+        acc0 += moe_dot_hsum256_ps(vacc0) * d0;
+        acc1 += moe_dot_hsum256_ps(vacc1) * d1;
+        acc2 += moe_dot_hsum256_ps(vacc2) * d2;
+        acc3 += moe_dot_hsum256_ps(vacc3) * d3;
+        for (; i < limit; ++i) {
+            const float xi = x[start + i];
+            acc0 += d0 * (float)q0[i] * xi;
+            acc1 += d1 * (float)q1[i] * xi;
+            acc2 += d2 * (float)q2[i] * xi;
+            acc3 += d3 * (float)q3[i] * xi;
+        }
+#else
+        for (uint32_t i = 0; i < limit; ++i) {
+            const float xi = x[start + i];
+            acc0 += d0 * (float)q0[i] * xi;
+            acc1 += d1 * (float)q1[i] * xi;
+            acc2 += d2 * (float)q2[i] * xi;
+            acc3 += d3 * (float)q3[i] * xi;
+        }
+#endif
+        packed0 += block_bytes;
+        packed1 += block_bytes;
+        packed2 += block_bytes;
+        packed3 += block_bytes;
+    }
+    *out0 = acc0; *out1 = acc1; *out2 = acc2; *out3 = acc3;
     return 1;
 }
 
