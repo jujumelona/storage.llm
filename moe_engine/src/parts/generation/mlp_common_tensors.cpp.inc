@@ -88,26 +88,19 @@ static int moe_raw_tensor_dot_adjacent_four_rows_direct(
         moe_dot_gguf_mxfp4_four_rows_with_layout(
             p0, p1, p2, p3, input, input_count,
             mxfp4_layout, mxfp4_pairwise_order, out0, out1, out2, out3);
-        return std::isfinite(*out0) && std::isfinite(*out1) &&
-               std::isfinite(*out2) && std::isfinite(*out3);
+        return 1;
     }
     if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
         return moe_dot_gguf_q8_0_four_rows(
-                   p0, p1, p2, p3, input, input_count, out0, out1, out2, out3) &&
-               std::isfinite(*out0) && std::isfinite(*out1) &&
-               std::isfinite(*out2) && std::isfinite(*out3);
+            p0, p1, p2, p3, input, input_count, out0, out1, out2, out3);
     }
     if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
         return moe_dot_gguf_q5_1_four_rows(
-                   p0, p1, p2, p3, input, input_count, out0, out1, out2, out3) &&
-               std::isfinite(*out0) && std::isfinite(*out1) &&
-               std::isfinite(*out2) && std::isfinite(*out3);
+            p0, p1, p2, p3, input, input_count, out0, out1, out2, out3);
     }
     if (effective_weight_format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
         return moe_dot_gguf_q5_k_four_rows(
-                   p0, p1, p2, p3, input, input_count, out0, out1, out2, out3) &&
-               std::isfinite(*out0) && std::isfinite(*out1) &&
-               std::isfinite(*out2) && std::isfinite(*out3);
+            p0, p1, p2, p3, input, input_count, out0, out1, out2, out3);
     }
     return 0;
 }
@@ -149,22 +142,19 @@ static int moe_raw_tensor_dot_same_row_two_tensors_direct(
         moe_dot_gguf_mxfp4_two_rows_with_layout(
             gate_row, up_row, input, input_count, gate_layout,
             moe_mxfp4_pairwise_nibble_order_enabled(), out_gate, out_up);
-        return std::isfinite(*out_gate) && std::isfinite(*out_up);
+        return 1;
     }
     if (gate_effective_format == moe_WEIGHT_ENCODING_GGUF_Q8_0) {
         return moe_dot_gguf_q8_0_two_rows(
-                   gate_row, up_row, input, input_count, out_gate, out_up) &&
-               std::isfinite(*out_gate) && std::isfinite(*out_up);
+            gate_row, up_row, input, input_count, out_gate, out_up);
     }
     if (gate_effective_format == moe_WEIGHT_ENCODING_GGUF_Q5_1) {
         return moe_dot_gguf_q5_1_two_rows(
-                   gate_row, up_row, input, input_count, out_gate, out_up) &&
-               std::isfinite(*out_gate) && std::isfinite(*out_up);
+            gate_row, up_row, input, input_count, out_gate, out_up);
     }
     if (gate_effective_format == moe_WEIGHT_ENCODING_GGUF_Q5_K) {
         return moe_dot_gguf_q5_k_two_rows(
-                   gate_row, up_row, input, input_count, out_gate, out_up) &&
-               std::isfinite(*out_gate) && std::isfinite(*out_up);
+            gate_row, up_row, input, input_count, out_gate, out_up);
     }
     return 0;
 }
