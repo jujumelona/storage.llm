@@ -300,6 +300,7 @@ int moe_pc_engine_raw_rmsnorm_f32(
     // This prevents out-of-bounds read on x1 when input_count is not multiple of 16
     // Example: input_count=12 → without this check, x1 would read [8..15] → OOB at [12..15]
     for (; i + 15 < input_count; i += 16) {
+        _mm_prefetch(reinterpret_cast<const char*>(input + i + 32), _MM_HINT_T0);
         __m256 x0 = _mm256_loadu_ps(input + i);
         __m256 x1 = _mm256_loadu_ps(input + i + 8);
         // Convert float to double for higher precision accumulation

@@ -385,7 +385,7 @@ static int moe_parallel_rows(moe_pc_engine* engine, uint32_t row_count, uint32_t
     if (use_openmp_rows && workers > 1 && row_count >= 64u) {
         std::atomic<int> ok{1};
         const uint32_t block_count = (row_count + block_rows - 1u) / block_rows;
-#pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
+#pragma omp parallel for schedule(static) num_threads(workers)
         for (int64_t block = 0; block < (int64_t)block_count; ++block) {
             if (!ok.load(std::memory_order_acquire)) {
                 continue;

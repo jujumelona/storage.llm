@@ -46,6 +46,10 @@ static float moe_dot_gguf_q5_1_row(
         const moe_q5_high_mask_table_t& kQ5HighMask = moe_q5_high_mask_table();
         const __m128i nibble_mask = _mm_set1_epi8(0x0f);
         for (uint32_t start = 0; start < cols; start += block_cols) {
+#if defined(__AVX2__)
+            _mm_prefetch(reinterpret_cast<const char*>(packed + 512), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(x + start + 32), _MM_HINT_T0);
+#endif
             uint16_t d16 = 0;
             uint16_t m16 = 0;
             uint32_t qh = 0;

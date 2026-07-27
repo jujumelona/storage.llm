@@ -105,6 +105,29 @@ static int moe_raw_tensor_dot_adjacent_four_rows_direct(
     return 0;
 }
 
+static int moe_raw_tensor_dot_eight_rows_direct(
+    const moe_raw_tensor_cache_entry& raw,
+    uint32_t start_row,
+    uint64_t row_bytes,
+    const float* input,
+    uint32_t input_count,
+    uint8_t effective_weight_format,
+    float* out0, float* out1, float* out2, float* out3,
+    float* out4, float* out5, float* out6, float* out7
+) {
+    if (!raw.base || raw.math_transposed || raw.cols != input_count ||
+        start_row + 8u > raw.rows || row_bytes == 0 ||
+        raw.bytes < row_bytes * (uint64_t)raw.rows ||
+        effective_weight_format != moe_WEIGHT_ENCODING_GGUF_Q8_0) {
+        return 0;
+    }
+    const uint8_t* p0 = raw.base + (uint64_t)start_row * row_bytes;
+    return moe_dot_gguf_q8_0_eight_rows(
+        p0, p0 + row_bytes, p0 + row_bytes * 2u, p0 + row_bytes * 3u,
+        p0 + row_bytes * 4u, p0 + row_bytes * 5u, p0 + row_bytes * 6u, p0 + row_bytes * 7u,
+        input, input_count, out0, out1, out2, out3, out4, out5, out6, out7);
+}
+
 static int moe_raw_tensor_dot_same_row_two_tensors_direct(
     const moe_raw_tensor_cache_entry& gate,
     const moe_raw_tensor_cache_entry& up,

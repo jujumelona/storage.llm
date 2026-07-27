@@ -459,6 +459,8 @@
         if (s->kv_entry.size() < kv_entry_dim) {
             s->kv_entry.resize(kv_entry_dim);
         }
+        _mm_prefetch(reinterpret_cast<const char*>(s->attn_kv_a.data()), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(s->attn_value.data()), _MM_HINT_T0);
         std::memcpy(s->kv_entry.data(), s->attn_kv_a.data(), (size_t)k_dim * sizeof(float));
         std::memcpy(s->kv_entry.data() + k_dim, s->attn_value.data(), (size_t)kv_v_dim * sizeof(float));
         // Persist the current token into QKV for future positions. The active
