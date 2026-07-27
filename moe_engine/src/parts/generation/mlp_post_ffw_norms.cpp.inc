@@ -23,6 +23,15 @@ struct moe_post_ffw_norm_role_cache_entry {
     moe_raw_tensor_cache_entry raw{};
 };
 
+struct moe_post_ffw_norm_has_cache_entry {
+    const moe_pc_engine* engine = nullptr;
+    uint64_t generation = 0;
+    int32_t layer = -1;
+    uint32_t role_id = 0;
+    int ready = 0;
+    int has = 0;
+};
+
 static int moe_map_post_ffw_norm_role_cached_f32(
     moe_pc_engine* engine,
     int32_t layer,
@@ -80,6 +89,40 @@ static int moe_map_post_ffw_norm_role_cached_f32(
         *out_source = entry.source;
     }
     return 1;
+}
+
+static int moe_layer_has_post_ffw_norm_role_cached(
+    const moe_pc_engine* engine,
+    int32_t layer,
+    uint32_t role_id,
+    const char* role
+) {
+    if (!engine || !role || !moe_graph_ir_math_required(engine)) {
+        return 0;
+    }
+    thread_local std::vector<moe_post_ffw_norm_has_cache_entry> cache;
+    const uint64_t generation = engine->engine_generation;
+    for (const moe_post_ffw_norm_has_cache_entry& entry : cache) {
+        if (entry.ready && entry.engine == engine && entry.generation == generation &&
+            entry.layer == layer && entry.role_id == role_id) {
+            return entry.has;
+        }
+    }
+    moe_post_ffw_norm_has_cache_entry entry{};
+    entry.engine = engine;
+    entry.generation = generation;
+    entry.layer = layer;
+    entry.role_id = role_id;
+    entry.ready = 1;
+    const char* const roles[] = { role };
+    entry.has =
+        moe_graph_ir_layer_has_op_role_any(engine, layer, roles, 1) ||
+        moe_graph_ir_layer_contract_declares_tensor_role(engine, layer, "norms", role);
+    if (cache.size() >= 256u) {
+        cache.erase(cache.begin());
+    }
+    cache.push_back(entry);
+    return entry.has;
 }
 
 static int moe_apply_post_ffw_norm_role_cached_f32(
@@ -165,14 +208,7 @@ static int moe_layer_has_post_ffw_norm_weight(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
-    static const char* const roles[] = { "post_ffw_norm" };
-    if (moe_graph_ir_math_required(engine) &&
-        moe_graph_ir_layer_has_op_role_any(
-            engine, layer, roles, sizeof(roles) / sizeof(roles[0]))) {
-        return 1;
-    }
-    if (moe_graph_ir_math_required(engine) &&
-        moe_graph_ir_layer_contract_declares_tensor_role(engine, layer, "norms", "post_ffw_norm")) {
+    if (moe_layer_has_post_ffw_norm_role_cached(engine, layer, 0, "post_ffw_norm")) {
         return 1;
     }
     return
@@ -206,14 +242,7 @@ static int moe_layer_has_post_ffw_norm1_weight(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
-    static const char* const roles[] = { "post_ffw_norm_1" };
-    if (moe_graph_ir_math_required(engine) &&
-        moe_graph_ir_layer_has_op_role_any(
-            engine, layer, roles, sizeof(roles) / sizeof(roles[0]))) {
-        return 1;
-    }
-    if (moe_graph_ir_math_required(engine) &&
-        moe_graph_ir_layer_contract_declares_tensor_role(engine, layer, "norms", "post_ffw_norm_1")) {
+    if (moe_layer_has_post_ffw_norm_role_cached(engine, layer, 1, "post_ffw_norm_1")) {
         return 1;
     }
     return
@@ -247,14 +276,7 @@ static int moe_layer_has_post_ffw_norm2_weight(
     const moe_pc_engine* engine,
     int32_t layer
 ) {
-    static const char* const roles[] = { "post_ffw_norm_2" };
-    if (moe_graph_ir_math_required(engine) &&
-        moe_graph_ir_layer_has_op_role_any(
-            engine, layer, roles, sizeof(roles) / sizeof(roles[0]))) {
-        return 1;
-    }
-    if (moe_graph_ir_math_required(engine) &&
-        moe_graph_ir_layer_contract_declares_tensor_role(engine, layer, "norms", "post_ffw_norm_2")) {
+    if (moe_layer_has_post_ffw_norm_role_cached(engine, layer, 2, "post_ffw_norm_2")) {
         return 1;
     }
     return

@@ -1,4 +1,35 @@
 // K-quant kernels
+struct moe_q5_high_mask_table_t {
+    uint8_t masks[256][8];
+    moe_q5_high_mask_table_t() : masks{} {
+        for (uint32_t m = 0; m < 256u; ++m) {
+            for (uint32_t i = 0; i < 8u; ++i) {
+                masks[m][i] = (m & (1u << i)) ? 16u : 0u;
+            }
+        }
+    }
+};
+
+static const moe_q5_high_mask_table_t& moe_q5_high_mask_table() {
+    static const moe_q5_high_mask_table_t table;
+    return table;
+}
+
+#if defined(__AVX2__)
+static inline __m256 moe_q5_1_values8_avx2(
+    __m128i nibbles,
+    const uint8_t* high_masks,
+    __m256 vd,
+    __m256 vm
+) {
+    const __m128i h = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(high_masks));
+    const __m128i q = _mm_or_si128(nibbles, h);
+    return _mm256_add_ps(
+        _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(q)), vd),
+        vm);
+}
+#endif
+
 static float moe_dot_gguf_q5_1_row(
     const uint8_t* packed,
     const float* x,
@@ -12,17 +43,7 @@ static float moe_dot_gguf_q5_1_row(
     const uint32_t block_bytes = 24u;
 #if defined(__AVX2__)
     if ((cols % block_cols) == 0u) {
-        struct Q5HighMaskTable {
-            uint8_t masks[256][8];
-            Q5HighMaskTable() : masks{} {
-                for (uint32_t m = 0; m < 256u; ++m) {
-                    for (uint32_t i = 0; i < 8u; ++i) {
-                        masks[m][i] = (m & (1u << i)) ? 16u : 0u;
-                    }
-                }
-            }
-        };
-        static const Q5HighMaskTable kQ5HighMask;
+        const moe_q5_high_mask_table_t& kQ5HighMask = moe_q5_high_mask_table();
         const __m128i nibble_mask = _mm_set1_epi8(0x0f);
         for (uint32_t start = 0; start < cols; start += block_cols) {
             uint16_t d16 = 0;
@@ -42,31 +63,23 @@ static float moe_dot_gguf_q5_1_row(
             __m256 vacc = _mm256_setzero_ps();
 
             const __m128i q0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs));
-            const __m128i h0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(kQ5HighMask.masks[(qh >> 0u) & 0xffu]));
-            const __m256 v0 = _mm256_add_ps(
-                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_or_si128(_mm_and_si128(q0, nibble_mask), h0))), vd),
-                vm);
+            const __m256 v0 = moe_q5_1_values8_avx2(
+                _mm_and_si128(q0, nibble_mask), kQ5HighMask.masks[(qh >> 0u) & 0xffu], vd, vm);
             vacc = moe_madd_ps(v0, _mm256_loadu_ps(x + start), vacc);
 
             const __m128i q1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + 8u));
-            const __m128i h1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(kQ5HighMask.masks[(qh >> 8u) & 0xffu]));
-            const __m256 v1 = _mm256_add_ps(
-                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_or_si128(_mm_and_si128(q1, nibble_mask), h1))), vd),
-                vm);
+            const __m256 v1 = moe_q5_1_values8_avx2(
+                _mm_and_si128(q1, nibble_mask), kQ5HighMask.masks[(qh >> 8u) & 0xffu], vd, vm);
             vacc = moe_madd_ps(v1, _mm256_loadu_ps(x + start + 8u), vacc);
 
             const __m128i hq0 = _mm_and_si128(_mm_srli_epi16(q0, 4), nibble_mask);
-            const __m128i h2 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(kQ5HighMask.masks[(qh >> 16u) & 0xffu]));
-            const __m256 v2 = _mm256_add_ps(
-                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_or_si128(hq0, h2))), vd),
-                vm);
+            const __m256 v2 = moe_q5_1_values8_avx2(
+                hq0, kQ5HighMask.masks[(qh >> 16u) & 0xffu], vd, vm);
             vacc = moe_madd_ps(v2, _mm256_loadu_ps(x + start + 16u), vacc);
 
             const __m128i hq1 = _mm_and_si128(_mm_srli_epi16(q1, 4), nibble_mask);
-            const __m128i h3 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(kQ5HighMask.masks[(qh >> 24u) & 0xffu]));
-            const __m256 v3 = _mm256_add_ps(
-                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_or_si128(hq1, h3))), vd),
-                vm);
+            const __m256 v3 = moe_q5_1_values8_avx2(
+                hq1, kQ5HighMask.masks[(qh >> 24u) & 0xffu], vd, vm);
             vacc = moe_madd_ps(v3, _mm256_loadu_ps(x + start + 24u), vacc);
 
             acc += moe_dot_hsum256_ps(vacc);
@@ -96,6 +109,273 @@ static float moe_dot_gguf_q5_1_row(
         packed += block_bytes;
     }
     return acc;
+}
+
+static int moe_dot_gguf_q5_1_two_rows(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const float* x,
+    uint32_t cols,
+    float* out0,
+    float* out1
+) {
+    if (!packed0 || !packed1 || !x || !out0 || !out1) {
+        return 0;
+    }
+#if defined(__AVX2__)
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 24u;
+    if ((cols % block_cols) == 0u) {
+        const moe_q5_high_mask_table_t& kQ5HighMask = moe_q5_high_mask_table();
+        const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        for (uint32_t start = 0; start < cols; start += block_cols) {
+            uint16_t d16_0 = 0;
+            uint16_t m16_0 = 0;
+            uint32_t qh0 = 0;
+            uint16_t d16_1 = 0;
+            uint16_t m16_1 = 0;
+            uint32_t qh1 = 0;
+            std::memcpy(&d16_0, packed0, sizeof(d16_0));
+            std::memcpy(&m16_0, packed0 + 2u, sizeof(m16_0));
+            std::memcpy(&qh0, packed0 + 4u, sizeof(qh0));
+            std::memcpy(&d16_1, packed1, sizeof(d16_1));
+            std::memcpy(&m16_1, packed1 + 2u, sizeof(m16_1));
+            std::memcpy(&qh1, packed1 + 4u, sizeof(qh1));
+            const float d0 = moe_raw_fp16_to_f32(d16_0);
+            const float m0 = moe_raw_fp16_to_f32(m16_0);
+            const float d1 = moe_raw_fp16_to_f32(d16_1);
+            const float m1 = moe_raw_fp16_to_f32(m16_1);
+            if (!std::isfinite(d0) || !std::isfinite(m0) ||
+                !std::isfinite(d1) || !std::isfinite(m1)) {
+                return 0;
+            }
+            const __m256 vd0 = _mm256_set1_ps(d0);
+            const __m256 vm0 = _mm256_set1_ps(m0);
+            const __m256 vd1 = _mm256_set1_ps(d1);
+            const __m256 vm1 = _mm256_set1_ps(m1);
+            const uint8_t* qs0 = packed0 + 8u;
+            const uint8_t* qs1 = packed1 + 8u;
+            const __m128i q0a = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs0));
+            const __m128i q0b = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs0 + 8u));
+            const __m128i q1a = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs1));
+            const __m128i q1b = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs1 + 8u));
+            __m256 vacc0 = _mm256_setzero_ps();
+            __m256 vacc1 = _mm256_setzero_ps();
+
+            const __m256 x0 = _mm256_loadu_ps(x + start);
+            const __m256 x1 = _mm256_loadu_ps(x + start + 8u);
+            const __m256 x2 = _mm256_loadu_ps(x + start + 16u);
+            const __m256 x3 = _mm256_loadu_ps(x + start + 24u);
+            vacc0 = moe_madd_ps(
+                moe_q5_1_values8_avx2(_mm_and_si128(q0a, nibble_mask), kQ5HighMask.masks[(qh0 >> 0u) & 0xffu], vd0, vm0),
+                x0,
+                vacc0);
+            vacc1 = moe_madd_ps(
+                moe_q5_1_values8_avx2(_mm_and_si128(q1a, nibble_mask), kQ5HighMask.masks[(qh1 >> 0u) & 0xffu], vd1, vm1),
+                x0,
+                vacc1);
+            vacc0 = moe_madd_ps(
+                moe_q5_1_values8_avx2(_mm_and_si128(q0b, nibble_mask), kQ5HighMask.masks[(qh0 >> 8u) & 0xffu], vd0, vm0),
+                x1,
+                vacc0);
+            vacc1 = moe_madd_ps(
+                moe_q5_1_values8_avx2(_mm_and_si128(q1b, nibble_mask), kQ5HighMask.masks[(qh1 >> 8u) & 0xffu], vd1, vm1),
+                x1,
+                vacc1);
+            vacc0 = moe_madd_ps(
+                moe_q5_1_values8_avx2(_mm_and_si128(_mm_srli_epi16(q0a, 4), nibble_mask), kQ5HighMask.masks[(qh0 >> 16u) & 0xffu], vd0, vm0),
+                x2,
+                vacc0);
+            vacc1 = moe_madd_ps(
+                moe_q5_1_values8_avx2(_mm_and_si128(_mm_srli_epi16(q1a, 4), nibble_mask), kQ5HighMask.masks[(qh1 >> 16u) & 0xffu], vd1, vm1),
+                x2,
+                vacc1);
+            vacc0 = moe_madd_ps(
+                moe_q5_1_values8_avx2(_mm_and_si128(_mm_srli_epi16(q0b, 4), nibble_mask), kQ5HighMask.masks[(qh0 >> 24u) & 0xffu], vd0, vm0),
+                x3,
+                vacc0);
+            vacc1 = moe_madd_ps(
+                moe_q5_1_values8_avx2(_mm_and_si128(_mm_srli_epi16(q1b, 4), nibble_mask), kQ5HighMask.masks[(qh1 >> 24u) & 0xffu], vd1, vm1),
+                x3,
+                vacc1);
+            acc0 += moe_dot_hsum256_ps(vacc0);
+            acc1 += moe_dot_hsum256_ps(vacc1);
+            packed0 += block_bytes;
+            packed1 += block_bytes;
+        }
+        *out0 = acc0;
+        *out1 = acc1;
+        return 1;
+    }
+#endif
+    *out0 = moe_dot_gguf_q5_1_row(packed0, x, cols);
+    *out1 = moe_dot_gguf_q5_1_row(packed1, x, cols);
+    return std::isfinite(*out0) && std::isfinite(*out1) ? 1 : 0;
+}
+
+static int moe_dot_gguf_q5_1_four_rows(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const uint8_t* packed2,
+    const uint8_t* packed3,
+    const float* x,
+    uint32_t cols,
+    float* out0,
+    float* out1,
+    float* out2,
+    float* out3
+) {
+    if (!packed0 || !packed1 || !packed2 || !packed3 || !x ||
+        !out0 || !out1 || !out2 || !out3) {
+        return 0;
+    }
+#if defined(__AVX2__)
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 24u;
+    if ((cols % block_cols) == 0u) {
+        const moe_q5_high_mask_table_t& kQ5HighMask = moe_q5_high_mask_table();
+        const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+        const uint8_t* rows[4] = { packed0, packed1, packed2, packed3 };
+        __m256 vacc[4] = {
+            _mm256_setzero_ps(), _mm256_setzero_ps(),
+            _mm256_setzero_ps(), _mm256_setzero_ps()
+        };
+        for (uint32_t start = 0; start < cols; start += block_cols) {
+            const __m256 x0 = _mm256_loadu_ps(x + start);
+            const __m256 x1 = _mm256_loadu_ps(x + start + 8u);
+            const __m256 x2 = _mm256_loadu_ps(x + start + 16u);
+            const __m256 x3 = _mm256_loadu_ps(x + start + 24u);
+            for (uint32_t r = 0; r < 4u; ++r) {
+                uint16_t d16 = 0;
+                uint16_t m16 = 0;
+                uint32_t qh = 0;
+                std::memcpy(&d16, rows[r], sizeof(d16));
+                std::memcpy(&m16, rows[r] + 2u, sizeof(m16));
+                std::memcpy(&qh, rows[r] + 4u, sizeof(qh));
+                const float d = moe_raw_fp16_to_f32(d16);
+                const float m = moe_raw_fp16_to_f32(m16);
+                if (!std::isfinite(d) || !std::isfinite(m)) {
+                    return 0;
+                }
+                const __m256 vd = _mm256_set1_ps(d);
+                const __m256 vm = _mm256_set1_ps(m);
+                const uint8_t* qs = rows[r] + 8u;
+                const __m128i q0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs));
+                const __m128i q1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + 8u));
+                vacc[r] = moe_madd_ps(
+                    moe_q5_1_values8_avx2(_mm_and_si128(q0, nibble_mask), kQ5HighMask.masks[(qh >> 0u) & 0xffu], vd, vm),
+                    x0,
+                    vacc[r]);
+                vacc[r] = moe_madd_ps(
+                    moe_q5_1_values8_avx2(_mm_and_si128(q1, nibble_mask), kQ5HighMask.masks[(qh >> 8u) & 0xffu], vd, vm),
+                    x1,
+                    vacc[r]);
+                vacc[r] = moe_madd_ps(
+                    moe_q5_1_values8_avx2(_mm_and_si128(_mm_srli_epi16(q0, 4), nibble_mask), kQ5HighMask.masks[(qh >> 16u) & 0xffu], vd, vm),
+                    x2,
+                    vacc[r]);
+                vacc[r] = moe_madd_ps(
+                    moe_q5_1_values8_avx2(_mm_and_si128(_mm_srli_epi16(q1, 4), nibble_mask), kQ5HighMask.masks[(qh >> 24u) & 0xffu], vd, vm),
+                    x3,
+                    vacc[r]);
+                rows[r] += block_bytes;
+            }
+        }
+        const float acc[4] = {
+            moe_dot_hsum256_ps(vacc[0]), moe_dot_hsum256_ps(vacc[1]),
+            moe_dot_hsum256_ps(vacc[2]), moe_dot_hsum256_ps(vacc[3])
+        };
+        *out0 = acc[0];
+        *out1 = acc[1];
+        *out2 = acc[2];
+        *out3 = acc[3];
+        return std::isfinite(acc[0]) && std::isfinite(acc[1]) &&
+               std::isfinite(acc[2]) && std::isfinite(acc[3]) ? 1 : 0;
+    }
+#endif
+    return moe_dot_gguf_q5_1_two_rows(packed0, packed1, x, cols, out0, out1) &&
+           moe_dot_gguf_q5_1_two_rows(packed2, packed3, x, cols, out2, out3);
+}
+
+static int moe_dot_gguf_q5_1_row_batch(
+    const uint8_t* packed,
+    const float* const* batch_x,
+    uint32_t batch_size,
+    uint32_t cols,
+    float* out_values
+) {
+    if (!packed || !batch_x || !out_values || batch_size == 0) {
+        return 0;
+    }
+    for (uint32_t b = 0; b < batch_size; ++b) {
+        out_values[b] = 0.0f;
+    }
+#if defined(__AVX2__)
+    const uint32_t block_cols = 32u;
+    const uint32_t block_bytes = 24u;
+    if ((cols % block_cols) == 0u) {
+        const moe_q5_high_mask_table_t& kQ5HighMask = moe_q5_high_mask_table();
+        const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+        for (uint32_t start = 0; start < cols; start += block_cols) {
+            uint16_t d16 = 0;
+            uint16_t m16 = 0;
+            uint32_t qh = 0;
+            std::memcpy(&d16, packed, sizeof(d16));
+            std::memcpy(&m16, packed + 2u, sizeof(m16));
+            std::memcpy(&qh, packed + 4u, sizeof(qh));
+            const float d = moe_raw_fp16_to_f32(d16);
+            const float m = moe_raw_fp16_to_f32(m16);
+            if (!std::isfinite(d) || !std::isfinite(m)) {
+                return 0;
+            }
+            const __m256 vd = _mm256_set1_ps(d);
+            const __m256 vm = _mm256_set1_ps(m);
+            const uint8_t* qs = packed + 8u;
+            const __m128i q0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs));
+            const __m128i q1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs + 8u));
+            const __m256 v0 = moe_q5_1_values8_avx2(
+                _mm_and_si128(q0, nibble_mask), kQ5HighMask.masks[(qh >> 0u) & 0xffu], vd, vm);
+            const __m256 v1 = moe_q5_1_values8_avx2(
+                _mm_and_si128(q1, nibble_mask), kQ5HighMask.masks[(qh >> 8u) & 0xffu], vd, vm);
+            const __m256 v2 = moe_q5_1_values8_avx2(
+                _mm_and_si128(_mm_srli_epi16(q0, 4), nibble_mask), kQ5HighMask.masks[(qh >> 16u) & 0xffu], vd, vm);
+            const __m256 v3 = moe_q5_1_values8_avx2(
+                _mm_and_si128(_mm_srli_epi16(q1, 4), nibble_mask), kQ5HighMask.masks[(qh >> 24u) & 0xffu], vd, vm);
+            for (uint32_t b = 0; b < batch_size; ++b) {
+                const float* x = batch_x[b];
+                if (!x) {
+                    continue;
+                }
+                __m256 vacc = _mm256_setzero_ps();
+                vacc = moe_madd_ps(v0, _mm256_loadu_ps(x + start), vacc);
+                vacc = moe_madd_ps(v1, _mm256_loadu_ps(x + start + 8u), vacc);
+                vacc = moe_madd_ps(v2, _mm256_loadu_ps(x + start + 16u), vacc);
+                vacc = moe_madd_ps(v3, _mm256_loadu_ps(x + start + 24u), vacc);
+                out_values[b] += moe_dot_hsum256_ps(vacc);
+            }
+            packed += block_bytes;
+        }
+        for (uint32_t b = 0; b < batch_size; ++b) {
+            if (!std::isfinite(out_values[b])) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+#endif
+    for (uint32_t b = 0; b < batch_size; ++b) {
+        if (!batch_x[b]) {
+            out_values[b] = 0.0f;
+            continue;
+        }
+        out_values[b] = moe_dot_gguf_q5_1_row(packed, batch_x[b], cols);
+        if (!std::isfinite(out_values[b])) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static float moe_gguf_q2_k_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {
@@ -363,6 +643,225 @@ static float moe_gguf_q5_k_row_impl(const uint8_t* packed, const float* x, float
         return 0.0f;
     }
     return acc;
+}
+
+static int moe_dot_gguf_q5_k_two_rows(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const float* x,
+    uint32_t cols,
+    float* out0,
+    float* out1
+) {
+    if (!packed0 || !packed1 || !x || !out0 || !out1) {
+        return 0;
+    }
+#if defined(__AVX2__)
+    if ((cols % 256u) == 0u) {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+        const __m128i high_value = _mm_set1_epi8(16);
+        const __m128i zero = _mm_setzero_si128();
+        for (uint32_t base = 0; base < cols; base += 256u) {
+            const float d0 = moe_load_f16le(packed0);
+            const float min0 = moe_load_f16le(packed0 + 2u);
+            const float d1 = moe_load_f16le(packed1);
+            const float min1 = moe_load_f16le(packed1 + 2u);
+            if (!std::isfinite(d0) || !std::isfinite(min0) ||
+                !std::isfinite(d1) || !std::isfinite(min1)) {
+                return 0;
+            }
+            const uint8_t* scales0 = packed0 + 4u;
+            const uint8_t* qh0 = packed0 + 16u;
+            const uint8_t* ql0 = packed0 + 48u;
+            const uint8_t* scales1 = packed1 + 4u;
+            const uint8_t* qh1 = packed1 + 16u;
+            const uint8_t* ql1 = packed1 + 48u;
+            uint32_t is = 0;
+            uint8_t u1 = 1;
+            uint8_t u2 = 2;
+            for (uint32_t j = 0; j < 256u; j += 64u) {
+                uint8_t sc0a = 0;
+                uint8_t mn0a = 0;
+                uint8_t sc0b = 0;
+                uint8_t mn0b = 0;
+                uint8_t sc1a = 0;
+                uint8_t mn1a = 0;
+                uint8_t sc1b = 0;
+                uint8_t mn1b = 0;
+                moe_get_scale_min_k4(is + 0u, scales0, &sc0a, &mn0a);
+                moe_get_scale_min_k4(is + 1u, scales0, &sc0b, &mn0b);
+                moe_get_scale_min_k4(is + 0u, scales1, &sc1a, &mn1a);
+                moe_get_scale_min_k4(is + 1u, scales1, &sc1b, &mn1b);
+                const __m256 d0a = _mm256_set1_ps(d0 * (float)sc0a);
+                const __m256 m0a = _mm256_set1_ps(min0 * (float)mn0a);
+                const __m256 d0b = _mm256_set1_ps(d0 * (float)sc0b);
+                const __m256 m0b = _mm256_set1_ps(min0 * (float)mn0b);
+                const __m256 d1a = _mm256_set1_ps(d1 * (float)sc1a);
+                const __m256 m1a = _mm256_set1_ps(min1 * (float)mn1a);
+                const __m256 d1b = _mm256_set1_ps(d1 * (float)sc1b);
+                const __m256 m1b = _mm256_set1_ps(min1 * (float)mn1b);
+                const __m128i high_mask1 = _mm_set1_epi8((char)u1);
+                const __m128i high_mask2 = _mm_set1_epi8((char)u2);
+                __m256 vacc0 = _mm256_setzero_ps();
+                __m256 vacc1 = _mm256_setzero_ps();
+                for (uint32_t l = 0; l < 32u; l += 8u) {
+                    const __m256 xlo = _mm256_loadu_ps(x + base + j + l);
+                    const __m256 xhi = _mm256_loadu_ps(x + base + j + 32u + l);
+
+                    const __m128i qbytes0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ql0 + l));
+                    const __m128i hbytes0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qh0 + l));
+                    const __m128i lo_hi0 = _mm_andnot_si128(
+                        _mm_cmpeq_epi8(_mm_and_si128(hbytes0, high_mask1), zero), high_value);
+                    const __m128i hi_hi0 = _mm_andnot_si128(
+                        _mm_cmpeq_epi8(_mm_and_si128(hbytes0, high_mask2), zero), high_value);
+                    const __m128i lo0 = _mm_or_si128(_mm_and_si128(qbytes0, nibble_mask), lo_hi0);
+                    const __m128i hi0 = _mm_or_si128(
+                        _mm_and_si128(_mm_srli_epi16(qbytes0, 4), nibble_mask), hi_hi0);
+                    vacc0 = moe_madd_ps(
+                        _mm256_sub_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo0)), d0a), m0a),
+                        xlo,
+                        vacc0);
+                    vacc0 = moe_madd_ps(
+                        _mm256_sub_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi0)), d0b), m0b),
+                        xhi,
+                        vacc0);
+
+                    const __m128i qbytes1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ql1 + l));
+                    const __m128i hbytes1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qh1 + l));
+                    const __m128i lo_hi1 = _mm_andnot_si128(
+                        _mm_cmpeq_epi8(_mm_and_si128(hbytes1, high_mask1), zero), high_value);
+                    const __m128i hi_hi1 = _mm_andnot_si128(
+                        _mm_cmpeq_epi8(_mm_and_si128(hbytes1, high_mask2), zero), high_value);
+                    const __m128i lo1 = _mm_or_si128(_mm_and_si128(qbytes1, nibble_mask), lo_hi1);
+                    const __m128i hi1 = _mm_or_si128(
+                        _mm_and_si128(_mm_srli_epi16(qbytes1, 4), nibble_mask), hi_hi1);
+                    vacc1 = moe_madd_ps(
+                        _mm256_sub_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo1)), d1a), m1a),
+                        xlo,
+                        vacc1);
+                    vacc1 = moe_madd_ps(
+                        _mm256_sub_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi1)), d1b), m1b),
+                        xhi,
+                        vacc1);
+                }
+                acc0 += moe_dot_hsum256_ps(vacc0);
+                acc1 += moe_dot_hsum256_ps(vacc1);
+                ql0 += 32u;
+                ql1 += 32u;
+                is += 2u;
+                u1 = (uint8_t)(u1 << 2);
+                u2 = (uint8_t)(u2 << 2);
+            }
+            packed0 += 176u;
+            packed1 += 176u;
+        }
+        *out0 = acc0;
+        *out1 = acc1;
+        return std::isfinite(acc0) && std::isfinite(acc1) ? 1 : 0;
+    }
+#endif
+    *out0 = moe_gguf_q5_k_row_impl(packed0, x, nullptr, cols);
+    *out1 = moe_gguf_q5_k_row_impl(packed1, x, nullptr, cols);
+    return std::isfinite(*out0) && std::isfinite(*out1) ? 1 : 0;
+}
+
+static int moe_dot_gguf_q5_k_four_rows(
+    const uint8_t* packed0,
+    const uint8_t* packed1,
+    const uint8_t* packed2,
+    const uint8_t* packed3,
+    const float* x,
+    uint32_t cols,
+    float* out0,
+    float* out1,
+    float* out2,
+    float* out3
+) {
+    if (!packed0 || !packed1 || !packed2 || !packed3 || !x ||
+        !out0 || !out1 || !out2 || !out3) {
+        return 0;
+    }
+#if defined(__AVX2__)
+    if ((cols % 256u) == 0u) {
+        const uint8_t* rows[4] = { packed0, packed1, packed2, packed3 };
+        float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+        const __m128i high_value = _mm_set1_epi8(16);
+        const __m128i zero = _mm_setzero_si128();
+        for (uint32_t base = 0; base < cols; base += 256u) {
+            for (uint32_t j = 0, is = 0; j < 256u; j += 64u, is += 2u) {
+                const uint8_t u1 = (uint8_t)(1u << (j / 32u));
+                const uint8_t u2 = (uint8_t)(2u << (j / 32u));
+                const __m128i high_mask1 = _mm_set1_epi8((char)u1);
+                const __m128i high_mask2 = _mm_set1_epi8((char)u2);
+                __m256 da[4];
+                __m256 ma[4];
+                __m256 db[4];
+                __m256 mb[4];
+                const uint8_t* qh_rows[4];
+                const uint8_t* ql_rows[4];
+                for (uint32_t r = 0; r < 4u; ++r) {
+                    const float d = moe_load_f16le(rows[r]);
+                    const float minv = moe_load_f16le(rows[r] + 2u);
+                    if (!std::isfinite(d) || !std::isfinite(minv)) {
+                        return 0;
+                    }
+                    uint8_t sca = 0;
+                    uint8_t mna = 0;
+                    uint8_t scb = 0;
+                    uint8_t mnb = 0;
+                    const uint8_t* scales = rows[r] + 4u;
+                    moe_get_scale_min_k4(is + 0u, scales, &sca, &mna);
+                    moe_get_scale_min_k4(is + 1u, scales, &scb, &mnb);
+                    da[r] = _mm256_set1_ps(d * (float)sca);
+                    ma[r] = _mm256_set1_ps(minv * (float)mna);
+                    db[r] = _mm256_set1_ps(d * (float)scb);
+                    mb[r] = _mm256_set1_ps(minv * (float)mnb);
+                    qh_rows[r] = rows[r] + 16u;
+                    ql_rows[r] = rows[r] + 48u + j / 2u;
+                }
+                for (uint32_t l = 0; l < 32u; l += 8u) {
+                    const __m256 xlo = _mm256_loadu_ps(x + base + j + l);
+                    const __m256 xhi = _mm256_loadu_ps(x + base + j + 32u + l);
+                    for (uint32_t r = 0; r < 4u; ++r) {
+                        const __m128i qbytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ql_rows[r] + l));
+                        const __m128i hbytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qh_rows[r] + l));
+                        const __m128i lo_hi = _mm_andnot_si128(
+                            _mm_cmpeq_epi8(_mm_and_si128(hbytes, high_mask1), zero), high_value);
+                        const __m128i hi_hi = _mm_andnot_si128(
+                            _mm_cmpeq_epi8(_mm_and_si128(hbytes, high_mask2), zero), high_value);
+                        const __m128i lo = _mm_or_si128(_mm_and_si128(qbytes, nibble_mask), lo_hi);
+                        const __m128i hi = _mm_or_si128(
+                            _mm_and_si128(_mm_srli_epi16(qbytes, 4), nibble_mask), hi_hi);
+                        __m256 vacc = _mm256_setzero_ps();
+                        vacc = moe_madd_ps(
+                            _mm256_sub_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo)), da[r]), ma[r]),
+                            xlo,
+                            vacc);
+                        vacc = moe_madd_ps(
+                            _mm256_sub_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi)), db[r]), mb[r]),
+                            xhi,
+                            vacc);
+                        acc[r] += moe_dot_hsum256_ps(vacc);
+                    }
+                }
+            }
+            for (uint32_t r = 0; r < 4u; ++r) {
+                rows[r] += 176u;
+            }
+        }
+        *out0 = acc[0];
+        *out1 = acc[1];
+        *out2 = acc[2];
+        *out3 = acc[3];
+        return std::isfinite(acc[0]) && std::isfinite(acc[1]) &&
+               std::isfinite(acc[2]) && std::isfinite(acc[3]) ? 1 : 0;
+    }
+#endif
+    return moe_dot_gguf_q5_k_two_rows(packed0, packed1, x, cols, out0, out1) &&
+           moe_dot_gguf_q5_k_two_rows(packed2, packed3, x, cols, out2, out3);
 }
 
 static float moe_gguf_q6_k_row_impl(const uint8_t* packed, const float* x, float* out, uint32_t cols) {

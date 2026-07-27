@@ -473,8 +473,14 @@ static int moe_layer_dense_mlp_from_suffixes_f32(
     {
         moe_profile_parallel_label_scope rows_label("dense_mlp_gate_up");
         if (!moe_parallel_rows(engine, intermediate, 0, [&](uint32_t row) {
-            const float g = moe_raw_tensor_dot_row(gate, row, input, hidden_size);
-            const float u = moe_raw_tensor_dot_row(up, row, input, hidden_size);
+            float g = 0.0f;
+            float u = 0.0f;
+            if (!moe_raw_tensor_dot_same_row_two_tensors_direct(
+                    gate, up, row, gate_row_bytes, up_row_bytes, input, hidden_size,
+                    gate_effective_format, up_effective_format, &g, &u)) {
+                g = moe_raw_tensor_dot_row(gate, row, input, hidden_size);
+                u = moe_raw_tensor_dot_row(up, row, input, hidden_size);
+            }
             s->gate[row] = moe_generation_gated_activation_cached(activation_mode, g, u);
             return 1;
         })) {
@@ -1302,11 +1308,21 @@ static int moe_layer_shared_expert_dense_mlp_f32(
     }
     const uint64_t total_start_us = moe_profile_now_us();
     const int activation_mode = moe_engine_gelu_activation_mode(engine);
+    const uint64_t gate_row_bytes = gate.base ? moe_raw_tensor_row_bytes(gate, gate.cols) : 0;
+    const uint64_t up_row_bytes = up.base ? moe_raw_tensor_row_bytes(up, up.cols) : 0;
+    const uint8_t gate_effective_format = moe_effective_weight_format_for_row_bytes(gate, gate.cols);
+    const uint8_t up_effective_format = moe_effective_weight_format_for_row_bytes(up, up.cols);
     {
         moe_profile_parallel_label_scope rows_label("shared_dense_mlp_gate_up");
         if (!moe_parallel_rows(engine, intermediate, 0, [&](uint32_t row) {
-            const float g = moe_raw_tensor_dot_row(gate, row, input, hidden_size);
-            const float u = moe_raw_tensor_dot_row(up, row, input, hidden_size);
+            float g = 0.0f;
+            float u = 0.0f;
+            if (!moe_raw_tensor_dot_same_row_two_tensors_direct(
+                    gate, up, row, gate_row_bytes, up_row_bytes, input, hidden_size,
+                    gate_effective_format, up_effective_format, &g, &u)) {
+                g = moe_raw_tensor_dot_row(gate, row, input, hidden_size);
+                u = moe_raw_tensor_dot_row(up, row, input, hidden_size);
+            }
             s->gate[row] = moe_generation_gated_activation_cached(activation_mode, g, u);
             return 1;
         })) {

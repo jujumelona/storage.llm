@@ -249,6 +249,12 @@ typedef struct {
     int work_buf_stride;
     int work_buf_workers;
 
+    // Decode-side memoization.  These hold the exact float rows produced by
+    // qkv_dequant_one(), not original FP KV, so attention math is unchanged.
+    float* k_dequant_cache;    // [n_tokens, head_dim]
+    float* v_dequant_cache;    // [n_tokens, head_dim]
+    uint8_t* dequant_valid;    // [n_tokens], K and V valid together
+
     // Shape
     int n_tokens;
     int head_dim;

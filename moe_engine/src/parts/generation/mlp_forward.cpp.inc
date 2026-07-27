@@ -1375,7 +1375,11 @@ static int moe_layer_moe_mlp_f32(
                 gate_up_failed.store(1, std::memory_order_relaxed);
                 return 1;
             }
-
+            // BUGFIX 850: Check gate/up results for NaN before activation ★★★
+            if (!std::isfinite(gate_v) || !std::isfinite(up_v)) {
+                gate_up_failed.store(1, std::memory_order_relaxed);
+                return 1;
+            }
             work[e].gate[r] = moe_generation_gated_activation_cached(activation_mode, gate_v, up_v);
         }
         return 1;
@@ -1441,7 +1445,7 @@ static int moe_layer_moe_mlp_f32(
             moe_profile_parallel_label_scope fused_down_rows_label("moe_mlp_down_accum_fused");
             static const uint32_t fused_down_block_rows = []() -> uint32_t {
                 const uint32_t env_block = moe_parse_env_u32("STORAGELLM_MLP_FUSED_DOWN_BLOCK_ROWS");
-                return env_block > 0 ? std::max(1u, std::min<uint32_t>(env_block, 128u)) : 32u;
+                return env_block > 0 ? std::max(1u, std::min<uint32_t>(env_block, 128u)) : 64u;
             }();
             const uint32_t row_group_count = (hidden_size + 3u) >> 2u;
             const uint32_t fused_down_group_block_rows = std::max(1u, fused_down_block_rows >> 2u);
@@ -1482,7 +1486,8 @@ static int moe_layer_moe_mlp_f32(
                         dot_ok = moe_dot_tensor_fast_view_row(
                             engine, &shards[e].down_view, row0, work[e].gate, expert_intermediate, &v0);
                     }
-                    if (!dot_ok) {
+                    if (!dot_ok || !std::isfinite(v0) || (has_pair && !std::isfinite(v1)) ||
+                        (has_row2 && !std::isfinite(v2)) || (has_quad && !std::isfinite(v3))) {
                         fused_ok.store(0, std::memory_order_relaxed);
                         return 1;
                     }
@@ -1498,7 +1503,11 @@ static int moe_layer_moe_mlp_f32(
                         acc2 += v2 * scale;
                     }
                 }
-
+                if (!std::isfinite(acc0) || (has_pair && !std::isfinite(acc1)) ||
+                    (has_row2 && !std::isfinite(acc2)) || (has_quad && !std::isfinite(acc3))) {
+                    fused_ok.store(0, std::memory_order_relaxed);
+                    return 1;
+                }
                 s->residual[row0] = acc0;
                 if (has_pair) {
                     s->residual[row1] = acc1;
@@ -2453,6 +2462,22 @@ static int moe_run_expert_triplet_row_batch_f32(
         if (row_end > intermediate_size) {
             row_end = intermediate_size;
         }
+        if (batch_size == 1u) {
+            const float* single_hidden = batch_hidden[0];
+            for (uint32_t row = row_begin; row < row_end; ++row) {
+                float gate_v = 0.0f;
+                float up_v = 0.0f;
+                moe_tensor_row_fast_prefetch(&gate_view, row + 1u);
+                moe_tensor_row_fast_prefetch(&up_view, row + 1u);
+                if (!moe_dot_tensor_fast_view_two_rows(
+                        engine, &gate_view, &up_view, row,
+                        single_hidden, hidden_size, &gate_v, &up_v)) {
+                    return 0;
+                }
+                gate_pool[row] = moe_generation_gated_activation_cached(activation_mode, gate_v, up_v);
+            }
+            return 1;
+        }
         for (uint32_t row = row_begin; row < row_end; ++row) {
             moe_tensor_row_fast_prefetch(&gate_view, row + 1u);
             moe_tensor_row_fast_prefetch(&up_view, row + 1u);
@@ -2500,6 +2525,27 @@ static int moe_run_expert_triplet_row_batch_f32(
         uint32_t row_end = row_begin + down_tile_rows;
         if (row_end > out_count) {
             row_end = out_count;
+        }
+        if (batch_size == 1u) {
+            const float* activated = activated_inputs[0];
+            uint32_t row = row_begin;
+            for (; row + 4u <= row_end; row += 4u) {
+                moe_tensor_row_fast_prefetch(&down_view, row + 4u);
+                if (!moe_dot_tensor_fast_view_adjacent_four_rows(
+                        engine, &down_view, row, activated, intermediate_size,
+                        &out_pool[row + 0u], &out_pool[row + 1u],
+                        &out_pool[row + 2u], &out_pool[row + 3u])) {
+                    return 0;
+                }
+            }
+            for (; row < row_end; ++row) {
+                moe_tensor_row_fast_prefetch(&down_view, row + 1u);
+                if (!moe_dot_tensor_fast_view_row(
+                        engine, &down_view, row, activated, intermediate_size, &out_pool[row])) {
+                    return 0;
+                }
+            }
+            return 1;
         }
         for (uint32_t row = row_begin; row < row_end; ++row) {
             moe_tensor_row_fast_prefetch(&down_view, row + 1u);
@@ -3628,14 +3674,17 @@ static int moe_layer_moe_mlp_prefill_batch_f32(
             }
         }
     }
+    const uint32_t cpu_row_threads = row_hw_threads();
+    const uint32_t cpu_group_parallel_min =
+        std::max<uint32_t>(2u, std::min<uint32_t>(cpu_row_threads, 16u));
     const int cpu_group_parallel =
         !gpu_batch_ready &&
         grouped_done_chunks.empty() &&
-        active_experts.size() > 1u &&
-        row_hw_threads() > 1u;
+        active_experts.size() >= cpu_group_parallel_min &&
+        cpu_row_threads > 1u;
     if (cpu_group_parallel) {
         const uint32_t worker_count = std::min<uint32_t>(
-            row_hw_threads(),
+            cpu_row_threads,
             (uint32_t)std::min<size_t>(active_experts.size(), 256u));
         std::atomic<uint32_t> next_group{0};
         std::atomic<uint32_t> active_groups_parallel{0};

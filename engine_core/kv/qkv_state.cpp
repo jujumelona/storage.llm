@@ -595,6 +595,9 @@ void qkv_state_free(qkv_state_t* state) {
     free(state->scratch_rotated_q);
     free(state->work_codes_buf);
     free(state->work_qjl_buf);
+    free(state->k_dequant_cache);
+    free(state->v_dequant_cache);
+    free(state->dequant_valid);
     free(state->outlier_indices);
     free(state->k_outlier_indices);
     free(state->v_outlier_indices);
