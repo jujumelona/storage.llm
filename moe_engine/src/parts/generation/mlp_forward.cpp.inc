@@ -56,15 +56,29 @@ static int moe_accumulate_branch_checked_f32(
     if (!acc || !branch || hidden_size == 0) {
         return 0;
     }
-    for (uint32_t i = 0; i < hidden_size; ++i) {
-        const float v = branch[i];
-        if (!std::isfinite(v)) {
-            std::fprintf(stderr,
-                "[storagellm mlp] non-finite %s branch layer=%d index=%u\n",
-                branch_name ? branch_name : "unknown", layer, i);
-            return 0;
-        }
-        acc[i] += v;
+    uint32_t i = 0;
+#if defined(__AVX2__)
+    for (; i + 31u < hidden_size; i += 32u) {
+        __m256 a0 = _mm256_loadu_ps(acc + i);
+        __m256 a1 = _mm256_loadu_ps(acc + i + 8u);
+        __m256 a2 = _mm256_loadu_ps(acc + i + 16u);
+        __m256 a3 = _mm256_loadu_ps(acc + i + 24u);
+        __m256 b0 = _mm256_loadu_ps(branch + i);
+        __m256 b1 = _mm256_loadu_ps(branch + i + 8u);
+        __m256 b2 = _mm256_loadu_ps(branch + i + 16u);
+        __m256 b3 = _mm256_loadu_ps(branch + i + 24u);
+        _mm256_storeu_ps(acc + i,       _mm256_add_ps(a0, b0));
+        _mm256_storeu_ps(acc + i + 8u,  _mm256_add_ps(a1, b1));
+        _mm256_storeu_ps(acc + i + 16u, _mm256_add_ps(a2, b2));
+        _mm256_storeu_ps(acc + i + 24u, _mm256_add_ps(a3, b3));
+    }
+    for (; i + 7u < hidden_size; i += 8u) {
+        _mm256_storeu_ps(acc + i, _mm256_add_ps(
+            _mm256_loadu_ps(acc + i), _mm256_loadu_ps(branch + i)));
+    }
+#endif
+    for (; i < hidden_size; ++i) {
+        acc[i] += branch[i];
     }
     return 1;
 }
