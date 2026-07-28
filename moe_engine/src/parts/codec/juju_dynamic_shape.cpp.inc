@@ -175,81 +175,39 @@ static void moe_juju_probe_note_index_json(
     }
     if (moe_json_get_u64_local(index_json, "hidden_size", &value) ||
         moe_json_get_u64_local(index_json, "hidden_dim", &value) ||
-        moe_json_get_u64_local(index_json, "llama.embedding_length", &value) ||
-        moe_json_get_u64_local(index_json, "gemma2.embedding_length", &value) ||
-        moe_json_get_u64_local(index_json, "gemma.embedding_length", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2.embedding_length", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2moe.embedding_length", &value) ||
-        moe_json_get_u64_local(index_json, "phi3.embedding_length", &value) ||
-        moe_json_get_u64_local(index_json, "mixtral.embedding_length", &value)) {
+        moe_json_get_u64_local(index_json, "embedding_length", &value)) {
         probe->shape.hidden_size = moe_u64_to_u32_clamped(value, probe->shape.hidden_size);
     }
-    if (moe_json_get_u64_local(index_json, "vocab_size", &value) ||
-        moe_json_get_u64_local(index_json, "llama.vocab_size", &value) ||
-        moe_json_get_u64_local(index_json, "gemma2.vocab_size", &value) ||
-        moe_json_get_u64_local(index_json, "gemma.vocab_size", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2.vocab_size", &value)) {
+    if (moe_json_get_u64_local(index_json, "vocab_size", &value)) {
         probe->shape.vocab_size = moe_u64_to_u32_clamped(value, probe->shape.vocab_size);
     }
     if (moe_json_get_u64_local(index_json, "experts_per_moe_layer", &value) ||
         moe_json_get_u64_local(index_json, "n_experts", &value) ||
-        moe_json_get_u64_local(index_json, "llama.expert_count", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2moe.expert_count", &value) ||
-        moe_json_get_u64_local(index_json, "mixtral.expert_count", &value)) {
+        moe_json_get_u64_local(index_json, "expert_count", &value)) {
         probe->shape.experts_per_moe_layer = moe_u64_to_u32_clamped(value, probe->shape.experts_per_moe_layer);
         probe->shape.projection_count = 3;
     }
     if (moe_json_get_u64_local(index_json, "expert_intermediate_size", &value) ||
         moe_json_get_u64_local(index_json, "expert_intermediate_dim", &value) ||
-        moe_json_get_u64_local(index_json, "llama.expert_feed_forward_length", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2moe.expert_feed_forward_length", &value) ||
-        moe_json_get_u64_local(index_json, "mixtral.expert_feed_forward_length", &value)) {
+        moe_json_get_u64_local(index_json, "expert_feed_forward_length", &value)) {
         probe->shape.expert_intermediate_size = moe_u64_to_u32_clamped(value, probe->shape.expert_intermediate_size);
     }
     if (moe_json_get_u64_local(index_json, "num_attention_heads", &value) ||
         moe_json_get_u64_local(index_json, "n_heads", &value) ||
-        moe_json_get_u64_local(index_json, "head_count", &value) ||
-        moe_json_get_u64_local(index_json, "llama.attention.head_count", &value) ||
-        moe_json_get_u64_local(index_json, "gemma2.attention.head_count", &value) ||
-        moe_json_get_u64_local(index_json, "gemma.attention.head_count", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2.attention.head_count", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2moe.attention.head_count", &value) ||
-        moe_json_get_u64_local(index_json, "phi3.attention.head_count", &value) ||
-        moe_json_get_u64_local(index_json, "mixtral.attention.head_count", &value)) {
+        moe_json_get_u64_local(index_json, "head_count", &value)) {
         probe->attn.num_heads = moe_u64_to_u32_clamped(value, probe->attn.num_heads);
     }
     if (moe_json_get_u64_local(index_json, "num_key_value_heads", &value) ||
         moe_json_get_u64_local(index_json, "n_kv_heads", &value) ||
-        moe_json_get_u64_local(index_json, "head_count_kv", &value) ||
-        moe_json_get_u64_local(index_json, "llama.attention.head_count_kv", &value) ||
-        moe_json_get_u64_local(index_json, "gemma2.attention.head_count_kv", &value) ||
-        moe_json_get_u64_local(index_json, "gemma.attention.head_count_kv", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2.attention.head_count_kv", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2moe.attention.head_count_kv", &value) ||
-        moe_json_get_u64_local(index_json, "phi3.attention.head_count_kv", &value) ||
-        moe_json_get_u64_local(index_json, "mixtral.attention.head_count_kv", &value)) {
+        moe_json_get_u64_local(index_json, "head_count_kv", &value)) {
         probe->attn.num_kv_heads = moe_u64_to_u32_clamped(value, probe->attn.num_kv_heads);
     }
     if (moe_json_get_u64_local(index_json, "head_dim", &value) ||
-        moe_json_get_u64_local(index_json, "key_length", &value) ||
-        moe_json_get_u64_local(index_json, "llama.attention.key_length", &value) ||
-        moe_json_get_u64_local(index_json, "gemma2.attention.key_length", &value) ||
-        moe_json_get_u64_local(index_json, "gemma.attention.key_length", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2.attention.key_length", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2moe.attention.key_length", &value) ||
-        moe_json_get_u64_local(index_json, "phi3.attention.key_length", &value) ||
-        moe_json_get_u64_local(index_json, "mixtral.attention.key_length", &value)) {
+        moe_json_get_u64_local(index_json, "key_length", &value)) {
         probe->attn.head_dim = moe_u64_to_u32_clamped(value, probe->attn.head_dim);
     }
     if (moe_json_get_u64_local(index_json, "value_head_dim", &value) ||
-        moe_json_get_u64_local(index_json, "value_length", &value) ||
-        moe_json_get_u64_local(index_json, "llama.attention.value_length", &value) ||
-        moe_json_get_u64_local(index_json, "gemma2.attention.value_length", &value) ||
-        moe_json_get_u64_local(index_json, "gemma.attention.value_length", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2.attention.value_length", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2moe.attention.value_length", &value) ||
-        moe_json_get_u64_local(index_json, "phi3.attention.value_length", &value) ||
-        moe_json_get_u64_local(index_json, "mixtral.attention.value_length", &value)) {
+        moe_json_get_u64_local(index_json, "value_length", &value)) {
         probe->attn.v_head_dim = moe_u64_to_u32_clamped(value, probe->attn.v_head_dim);
     }
     if (moe_json_get_u64_local(index_json, "kv_lora_rank", &value)) {
@@ -277,36 +235,17 @@ static void moe_juju_probe_note_index_json(
         }
     }
     if (moe_json_get_u64_local(index_json, "context_length", &value) ||
-        moe_json_get_u64_local(index_json, "max_position_embeddings", &value) ||
-        moe_json_get_u64_local(index_json, "llama.context_length", &value) ||
-        moe_json_get_u64_local(index_json, "gemma2.context_length", &value) ||
-        moe_json_get_u64_local(index_json, "gemma.context_length", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2.context_length", &value) ||
-        moe_json_get_u64_local(index_json, "qwen2moe.context_length", &value) ||
-        moe_json_get_u64_local(index_json, "phi3.context_length", &value) ||
-        moe_json_get_u64_local(index_json, "mixtral.context_length", &value)) {
+        moe_json_get_u64_local(index_json, "max_position_embeddings", &value)) {
         probe->attn.max_seq_len = moe_u64_to_u32_clamped(value, probe->attn.max_seq_len);
     }
     if (moe_json_get_double_local(index_json, "rope_theta", &double_value) ||
         moe_json_get_double_local(index_json, "theta", &double_value) ||
-        moe_json_get_double_local(index_json, "llama.rope.freq_base", &double_value) ||
-        moe_json_get_double_local(index_json, "gemma2.rope.freq_base", &double_value) ||
-        moe_json_get_double_local(index_json, "gemma.rope.freq_base", &double_value) ||
-        moe_json_get_double_local(index_json, "qwen2.rope.freq_base", &double_value) ||
-        moe_json_get_double_local(index_json, "qwen2moe.rope.freq_base", &double_value) ||
-        moe_json_get_double_local(index_json, "phi3.rope.freq_base", &double_value) ||
-        moe_json_get_double_local(index_json, "mixtral.rope.freq_base", &double_value)) {
+        moe_json_get_double_local(index_json, "freq_base", &double_value)) {
         probe->attn.rope_theta = (float)double_value;
     }
     if (moe_json_get_double_local(index_json, "rms_norm_eps", &double_value) ||
         moe_json_get_double_local(index_json, "norm_eps", &double_value) ||
-        moe_json_get_double_local(index_json, "llama.attention.layer_norm_rms_epsilon", &double_value) ||
-        moe_json_get_double_local(index_json, "gemma2.attention.layer_norm_rms_epsilon", &double_value) ||
-        moe_json_get_double_local(index_json, "gemma.attention.layer_norm_rms_epsilon", &double_value) ||
-        moe_json_get_double_local(index_json, "qwen2.attention.layer_norm_rms_epsilon", &double_value) ||
-        moe_json_get_double_local(index_json, "qwen2moe.attention.layer_norm_rms_epsilon", &double_value) ||
-        moe_json_get_double_local(index_json, "phi3.attention.layer_norm_rms_epsilon", &double_value) ||
-        moe_json_get_double_local(index_json, "mixtral.attention.layer_norm_rms_epsilon", &double_value)) {
+        moe_json_get_double_local(index_json, "layer_norm_rms_epsilon", &double_value)) {
         probe->attn.rms_norm_eps = (float)double_value;
     }
     if (probe->architecture.empty() &&

@@ -38,6 +38,20 @@ static float moe_generation_gated_activation(const moe_pc_engine* engine, float 
 }
 
 #if defined(__AVX2__)
+static inline __m256 moe_avx2_exp_ps(__m256 x) {
+    x = _mm256_max_ps(_mm256_set1_ps(-87.0f), _mm256_min_ps(_mm256_set1_ps(88.0f), x));
+    const __m256 scaled = _mm256_fmadd_ps(_mm256_set1_ps(12102203.0f), x, _mm256_set1_ps(1065353216.0f));
+    const __m256i bits = _mm256_cvtps_epi32(scaled);
+    return _mm256_castsi256_ps(bits);
+}
+
+static inline __m256 moe_avx2_silu_ps(__m256 x) {
+    const __m256 neg_x = _mm256_sub_ps(_mm256_setzero_ps(), x);
+    const __m256 exp_neg_x = moe_avx2_exp_ps(neg_x);
+    const __m256 denom = _mm256_add_ps(_mm256_set1_ps(1.0f), exp_neg_x);
+    return _mm256_div_ps(x, denom);
+}
+
 static inline void moe_generation_vector_gated_activation_avx2(
     const moe_pc_engine* engine,
     const float* gate,
@@ -60,9 +74,7 @@ static inline void moe_generation_vector_gated_activation_avx2(
                 reinterpret_cast<float*>(&act)[k] = moe_generation_gelu(reinterpret_cast<const float*>(&vg)[k]);
             }
         } else {
-            for (int k = 0; k < 8; ++k) {
-                reinterpret_cast<float*>(&act)[k] = moe_generation_silu(reinterpret_cast<const float*>(&vg)[k]);
-            }
+            act = moe_avx2_silu_ps(vg);
         }
         __m256 res = _mm256_mul_ps(act, vu);
         _mm256_storeu_ps(out + i, res);
