@@ -624,12 +624,12 @@
                 attn_logit_softcap,
                 moe_dot_f32(q, k, head_dim) * scale);
             if (score > max_score) {
-                const float rescale = std::exp(max_score - score);
+                const float rescale = std::expf(max_score - score);
                 denom *= rescale;
                 moe_scale_f32(out_h, rescale, v_head_dim);
                 max_score = score;
             }
-            const float w = std::exp(score - max_score);
+            const float w = std::expf(score - max_score);
             denom += w;
             const float* v = entry + k_dim + (uint64_t)kv_h * v_head_dim;
             moe_axpy_f32(out_h, v, w, v_head_dim);

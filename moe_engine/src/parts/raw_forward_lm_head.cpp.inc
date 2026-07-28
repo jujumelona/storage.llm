@@ -646,9 +646,9 @@ int moe_pc_engine_lm_head_token_logprob_f32(
                         ++local_greater_than_target;
                     }
                     if (score <= local_max) {
-                        local_sum += std::exp((double)score - (double)local_max);
+                        local_sum += (double)std::expf(score - local_max);
                     } else if (std::isfinite(local_max)) {
-                        local_sum = local_sum * std::exp((double)local_max - (double)score) + 1.0;
+                        local_sum = local_sum * (double)std::expf(local_max - score) + 1.0;
                         local_max = score;
                     } else {
                         local_max = score;
@@ -687,9 +687,9 @@ int moe_pc_engine_lm_head_token_logprob_f32(
                         ++local_greater_than_target;
                     }
                     if (score <= local_max) {
-                        local_sum += std::exp((double)score - (double)local_max);
+                        local_sum += (double)std::expf(score - local_max);
                     } else if (std::isfinite(local_max)) {
-                        local_sum = local_sum * std::exp((double)local_max - (double)score) + 1.0;
+                        local_sum = local_sum * (double)std::expf(local_max - score) + 1.0;
                         local_max = score;
                     } else {
                         local_max = score;
@@ -725,9 +725,9 @@ int moe_pc_engine_lm_head_token_logprob_f32(
                     ++local_greater_than_target;
                 }
                 if (score <= local_max) {
-                    local_sum += std::exp((double)score - (double)local_max);
+                    local_sum += (double)std::expf(score - local_max);
                 } else if (std::isfinite(local_max)) {
-                    local_sum = local_sum * std::exp((double)local_max - (double)score) + 1.0;
+                    local_sum = local_sum * (double)std::expf(local_max - score) + 1.0;
                     local_max = score;
                 } else {
                     local_max = score;

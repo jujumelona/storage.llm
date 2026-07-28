@@ -285,12 +285,12 @@
                 // Solution: Clamp rescale to prevent extreme underflow (min 1e-30f)
                 // Impact: Improves numerical stability in attention with large score ranges
                 const float rescale_exp = h_max - score;
-                const float rescale = rescale_exp > -69.0f ? std::exp(rescale_exp) : 1e-30f;
+                const float rescale = rescale_exp > -69.0f ? std::expf(rescale_exp) : 1e-30f;
                 h_denom *= rescale;
                 moe_scale_f32(cw_h, rescale, cdim);
                 h_max = score;
             }
-            const float w = std::exp(score - h_max);
+            const float w = std::expf(score - h_max);
             h_denom += w;
             moe_axpy_f32(cw_h, c_kv, w, cdim);
         }
